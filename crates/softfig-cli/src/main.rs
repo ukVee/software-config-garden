@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod cmd_daemon;
 mod cmd_migrate;
+mod cmd_onboard;
 mod cmd_repo;
 mod cmd_reveal;
 mod cmd_vault;
@@ -15,6 +16,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Scaffold a fresh garden from the default skeleton, init the Vault,
+    /// and write a born-in-FUSE genesis commit (first-run wizard).
+    Onboard(cmd_onboard::OnboardArgs),
+
     /// Manage the on-disk Vault (encryption keys, identity, recovery).
     #[command(subcommand)]
     Vault(cmd_vault::VaultCmd),
@@ -55,6 +60,7 @@ struct MigrateCli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Onboard(args) => cmd_onboard::run(args),
         Cmd::Vault(cmd) => cmd_vault::run(cmd),
         Cmd::Init(args) => cmd_repo::init(args),
         Cmd::Commit(args) => cmd_repo::commit(args),

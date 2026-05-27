@@ -137,6 +137,60 @@ impl Repo {
         ))
     }
 
+    /// Born-in-FUSE: create a fresh garden directly in the relocated
+    /// `state_root` layout, skipping the legacy `<garden_root>/.softfig/`
+    /// step and the three-phase `migrate`. The Vault must already be
+    /// initialized under `state_root` (via `Vault::init(state_root, …)`,
+    /// whose `VaultPaths::for_garden` is an alias for `for_state_root`).
+    ///
+    /// `staging` holds the working-tree content to encrypt into the
+    /// genesis commit (e.g. a stamped skeleton in a tempdir); `garden_root`
+    /// is the eventual FUSE mount path recorded on the repo. No plaintext
+    /// is written under `garden_root` — the daemon serves it via FUSE once
+    /// mounted.
+    pub fn create_fresh(
+        garden_root: &Path,
+        state_root: &Path,
+        staging: &Path,
+        session: &VaultSession,
+    ) -> Result<(Self, Hash)> {
+        let paths = StorePaths::with_state_root(garden_root, state_root);
+
+        let vault = Vault::at_state_root(state_root);
+        if !vault.is_initialized() {
+            return Err(CoreError::VaultMissing(vault.paths().root.clone()));
+        }
+        if paths.exists() {
+            return Err(CoreError::RepoExists(paths.softfig_dir()));
+        }
+
+        std::fs::create_dir_all(paths.softfig_dir())?;
+        let objects = ObjectStore::new(paths.clone());
+        objects.ensure_root()?;
+
+        let now = unix_seconds();
+        let repo_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let mut db = Db::create(&paths, &repo_id, now)?;
+
+        let snapshot = walk::walk(staging)?;
+        let blueprint = tree::build(&objects, session, &snapshot.root)?;
+
+        let intent = Intent::init("garden initialized");
+        let commit_hash = write_commit_tx(&mut db, session, None, &blueprint, intent, now)?;
+
+        Ok((
+            Self {
+                paths,
+                db,
+                objects,
+                garden_root: garden_root.to_path_buf(),
+                tip_changed: None,
+                blob_encryptor: None,
+            },
+            commit_hash,
+        ))
+    }
+
     pub fn paths(&self) -> &StorePaths {
         &self.paths
     }

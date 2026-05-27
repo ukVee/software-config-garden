@@ -9,6 +9,7 @@ members = [
     "crates/softfig-keeperd",
     "crates/softfig-mcp",
     "crates/softfig-fuse",
+    "crates/softfig-onboard",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ softfig-vault   = { path = "crates/softfig-vault" }
 softfig-store   = { path = "crates/softfig-store" }
 softfig-core    = { path = "crates/softfig-core" }
 softfig-ipc     = { path = "crates/softfig-ipc" }
+softfig-onboard = { path = "crates/softfig-onboard" }
 
 # Crypto
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
@@ -51,6 +53,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 walkdir = "2"
 hostname = "0.4"
 uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+
+# M-onboard — embedded default-garden skeleton template
+include_dir = "0.7"
 
 # Errors
 thiserror = "2"

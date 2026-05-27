@@ -4,20 +4,24 @@ Implementation repo for **soft-fig** — the program that combines machine memor
 
 ## Status
 
-**M1a + M1b + M1c + M1d + M2a + M2b + M2c done (2026-05-05 → 2026-05-16).** This garden is self-hosting under signed VCS history with two encryption layers at three granularities: Layer A whole-garden ciphertext, Layer B per-file selective secrets, and M2c per-region inline `<vault id="…">…</vault>` secrets. The daemon mounts a FUSE plaintext-view at the garden root when configured with a relocated `state_root`; sealed paths (matching `.softfig/vault/sealed-paths.toml` globs) are encrypted under per-file HKDF subkeys and projected as `[sealed:<path>]\n` placeholders. Files containing inline `<vault>` tags get per-region HKDF subkeys, base64-inline ciphertext on disk, and `<vault id="…">[encrypted]</vault>` projected through FUSE on read. `softfig reveal <path>` writes plaintext to a 0600 file under `$XDG_RUNTIME_DIR` and commits a `vault_reveal` audit intent; the `--id <id>` repeatable flag reveals just one or more region plaintexts. The same `softfig-keeperd` binary handles M1c-compat, M2a, M2b, and M2c configs from one binary; Layer B is inert until the first `sealed-paths.toml` lands and inline-region encryption is inert until `<vault>` bytes appear in a tracked file.
+**M1a + M1b + M1c + M1d + M2a + M2b + M2c done (2026-05-05 → 2026-05-16); M-onboard done (2026-05-26).** This garden is self-hosting under signed VCS history with two encryption layers at three granularities: Layer A whole-garden ciphertext, Layer B per-file selective secrets, and M2c per-region inline `<vault id="…">…</vault>` secrets. The daemon mounts a FUSE plaintext-view at the garden root when configured with a relocated `state_root`; sealed paths (matching `.softfig/vault/sealed-paths.toml` globs) are encrypted under per-file HKDF subkeys and projected as `[sealed:<path>]\n` placeholders. Files containing inline `<vault>` tags get per-region HKDF subkeys, base64-inline ciphertext on disk, and `<vault id="…">[encrypted]</vault>` projected through FUSE on read. `softfig reveal <path>` writes plaintext to a 0600 file under `$XDG_RUNTIME_DIR` and commits a `vault_reveal` audit intent; the `--id <id>` repeatable flag reveals just one or more region plaintexts. The same `softfig-keeperd` binary handles M1c-compat, M2a, M2b, and M2c configs from one binary; Layer B is inert until the first `sealed-paths.toml` lands and inline-region encryption is inert until `<vault>` bytes appear in a tracked file.
+
+**M-onboard** adds the first-run front door: `softfig onboard` scaffolds a fresh garden from an embedded default-layout skeleton (`templates/default-garden/`, baked in via `include_dir!`), inits the Vault, and writes a born-in-FUSE genesis commit directly in the `state_root` layout — no plaintext is ever written at the garden root, and the three-phase `migrate` dance is reserved for converting the legacy tablet garden. The scaffold logic lives in the frontend-agnostic `softfig-onboard` crate so a future MCP tool wraps the same `onboard()` entry point. The daemon now resolves its config via `KeeperConfig::discover` (reads `<garden>/.softfig/keeper.toml`), so a born-in-FUSE or migrated garden boots straight into FUSE mode. Install plumbing is a documented runbook (`docs/onboard-laptop.md`) plus `scripts/onboard-device.sh`.
 
 | Area | State |
 |---|---|
-| Cargo workspace | ✅ eight member crates |
+| Cargo workspace | ✅ nine member crates |
 | `softfig-vault` crate | ✅ init / unlock / encrypt-blob / decrypt-blob / sign / rotate-key / recover; `at_state_root` for the M2a relocated layout; **M2b**: `layer_b` module with `derive_subkey` / `encrypt` / `decrypt`, `VaultSession::encrypt_layer_b` / `decrypt_layer_b` / `verify_master_passphrase`; **M2c**: `derive_region_subkey(M, path, id)` (`HKDF(M, salt=path‖0x00‖id, info=b"softfig:layer-b-region/v1")`) + `VaultSession::{encrypt_layer_b_region, decrypt_layer_b_region}` |
 | `softfig-store` crate | ✅ ciphertext object directory (`.softfig/objects/<aa>/<rest>`) + sqlite metadata schema; WAL mode set on every open; `StorePaths` accepts a `state_root` distinct from `garden_root` |
 | `softfig-core` crate | ✅ garden walker, tree blueprint, JCS-canonicalized + signed commits, log iteration, fsck; `Repo::open_with` accepts a state_root; `Repo::set_tip_changed_callback` for the FUSE driver to subscribe; **M2b**: `BlobEncryptor` trait + `Repo::set_blob_encryptor` + `tree::build_with` extension point so the daemon can route sealed paths through Layer B without leaking glob logic into `softfig-core`; **M2c**: `"manual_edit"` added to `KNOWN_INTENTS` (latent bug fix — classifier produced it but the closed-enum validator silently rejected it) |
 | `softfig-ipc` crate | ✅ JSON-Lines protocol envelope + typed verb args/replies + sync `connect`/`call` over `UnixStream`; includes `migrate_finalize`; **M2b**: `vault_reveal` / `vault_seal` / `vault_unseal` / `vault_list_sealed` verbs + corresponding args/replies + `MasterPasswordRequired` / `SealedPathNotFound` / `IdleStatusOnly` error kinds; **M2c**: `VaultRevealArgs.id: Option<String>` (skip-serializing) + `MalformedVaultTag` / `DuplicateVaultId` error kinds |
-| `softfig-keeperd` binary | ✅ daemon with `SO_PEERCRED` + 0600 socket, full IPC verb set, mixed-mode dispatch on keeper.toml's `state_root`, shared `DirtySetAccumulator` consumed by both `InotifyDriver` and FUSE via `AccumulatorSink`; **M2b**: `layer_b` module with `SealedPaths` matcher (globset-based) + `LayerBHook` doubling as `BlobEncryptor` and `SealedQuery`; four new IPC handlers; `DaemonInner` carries the shared hook + `last_reveal_at` idle-window state; `keeper.toml` gains `[reveal] idle_seconds = 0`; **M2c**: `layer_b` restructured as directory module — `layer_b/regions.rs` (RegionParser registry, scan + base64-disambiguator, write-path placeholder preservation, `with_substitutions` helper) + `layer_b/mod.rs` extensions (`LayerBHook` gains session + prior-tip slots, `BlobEncryptor::encrypt` got region-aware write path, `SealedQuery::redact_regions` impl, `PriorTipGuard` RAII helper around every commit_workdir site, `promote_manual_edit_for_new_ids` watcher sub-rule); `vault_reveal` handler gains the `id` branch (region-only reveal + temp-file naming + audit-intent extension) |
+| `softfig-keeperd` binary | ✅ daemon with `SO_PEERCRED` + 0600 socket, full IPC verb set, mixed-mode dispatch on keeper.toml's `state_root` (**M-onboard**: `main.rs` now boots via `KeeperConfig::discover` so a born-in-FUSE/migrated garden auto-enters FUSE mode; absent keeper.toml falls back to M1c-compat), shared `DirtySetAccumulator` consumed by both `InotifyDriver` and FUSE via `AccumulatorSink`; **M2b**: `layer_b` module with `SealedPaths` matcher (globset-based) + `LayerBHook` doubling as `BlobEncryptor` and `SealedQuery`; four new IPC handlers; `DaemonInner` carries the shared hook + `last_reveal_at` idle-window state; `keeper.toml` gains `[reveal] idle_seconds = 0`; **M2c**: `layer_b` restructured as directory module — `layer_b/regions.rs` (RegionParser registry, scan + base64-disambiguator, write-path placeholder preservation, `with_substitutions` helper) + `layer_b/mod.rs` extensions (`LayerBHook` gains session + prior-tip slots, `BlobEncryptor::encrypt` got region-aware write path, `SealedQuery::redact_regions` impl, `PriorTipGuard` RAII helper around every commit_workdir site, `promote_manual_edit_for_new_ids` watcher sub-rule); `vault_reveal` handler gains the `id` branch (region-only reveal + temp-file naming + audit-intent extension) |
 | `softfig-mcp` binary | ✅ stateless stdio bridge — `initialize` / `tools/list` / `tools/call`; one tool: `propose_doc_update` |
-| `softfig-cli` (`softfig` binary) | ✅ vault subcommands + VCS subcommands + `daemon {start, stop, status, unlock}` + bridge fast path on commit/log/show/fsck + `migrate {prepare, finalize}` + no-arg `migrate` phase status; migrated gardens refuse direct-mode `commit/log/show/fsck`; **M2b**: `softfig reveal <path>` and `softfig vault {seal, unseal, list-sealed}`; **M2c**: repeatable `--id <id>` flag on `reveal` with single-prompt master-password caching across multiple region calls |
+| `softfig-cli` (`softfig` binary) | ✅ vault subcommands + VCS subcommands + `daemon {start, stop, status, unlock}` + bridge fast path on commit/log/show/fsck + `migrate {prepare, finalize}` + no-arg `migrate` phase status; migrated gardens refuse direct-mode `commit/log/show/fsck`; **M2b**: `softfig reveal <path>` and `softfig vault {seal, unseal, list-sealed}`; **M2c**: repeatable `--id <id>` flag on `reveal` with single-prompt master-password caching across multiple region calls; **M-onboard**: `softfig onboard [--garden-root P] [--state-root P] [--machine NAME] [--customize] [--yes]` first-run wizard (`cmd_onboard.rs`), thin TTY frontend over `softfig-onboard`; stops before the passphrase step when no TTY |
+| `softfig-onboard` crate | ✅ **M-onboard** — frontend-agnostic scaffold core: embedded `templates/default-garden/` via `include_dir!`, `OnboardOptions` / `ScaffoldPlan`, `plan()` (placeholder substitution + concept-dir filter + defensive `.keep` synthesis), `apply()`, `onboard()` / `onboard_with_params()` (Vault init at `state_root` → stamp to tempdir → `Repo::create_fresh` → drop staging → write keeper.toml pointer); depends on `softfig-vault` + `softfig-core` |
 | `softfig-fuse` crate | ✅ M2a — `FuseMount::mount(garden, state, session, sink)` returns a `MountHandle`; reads decrypt blobs via the shared `VaultSession`, writes go through an in-memory overlay that the daemon's M1d accumulator flushes into commits; `MountHandle::on_tip_changed` clears the overlay + stat cache on each new tip; **M2b**: `FuseMount::mount_with(..., Option<Arc<dyn SealedQuery>>)` projects `[sealed:<path>]\n` placeholders for sealed reads (computed on read, never stored); **M2c**: `SealedQuery::redact_regions` default-impl method + `SharedState::redacted_cache` (broadcast invalidation on `tip_changed`); read path funnels post-Layer-A bytes through `redact_regions` for non-whole-file-sealed paths |
 | Layer B selective secrets | ✅ M2b file-level seal/unseal + `softfig reveal` flow + auto-migration on glob add; ✅ M2c inline `<vault id="…">…</vault>` regions + per-region reveal + classifier auto-promotion on new-id introduction |
+| Onboarding / first-run | ✅ **M-onboard** — `softfig onboard` scaffolds a fresh garden born-in-FUSE; install runbook + `scripts/onboard-device.sh`; program repo under local git |
 | Sync, Templating + symlinks pillars, GUI, AUR | not started — M3+ |
 
 Spec source-of-truth still lives in the garden at `~/soft-fig_garden/meta/spec-*.md`. Read those for design intent.
@@ -27,6 +31,10 @@ Spec source-of-truth still lives in the garden at `~/soft-fig_garden/meta/spec-*
 ```
 software-config_garden/
 ├── Cargo.toml                          # [workspace]
+├── .gitignore                          # excludes target/, keeps Cargo.lock
+├── templates/default-garden/           # M-onboard — embedded skeleton (include_dir!)
+├── scripts/onboard-device.sh           # M-onboard — install runbook script
+├── docs/onboard-laptop.md              # M-onboard — manual onboarding runbook
 ├── packaging/systemd/
 │   └── softfig-keeperd.service         # drafted user unit (mirror to ~/dotfiles/...)
 └── crates/
@@ -45,9 +53,11 @@ software-config_garden/
     ├── softfig-mcp/                    # stdio MCP bridge
     │   └── src/main.rs
     ├── softfig-cli/                    # `softfig` binary
-    │   └── src/{main,cmd_vault,cmd_repo,cmd_daemon,cmd_migrate,cmd_reveal}.rs
-    └── softfig-fuse/                   # M2a — FUSE plaintext-view of Layer A
-        └── src/{lib,fs,inodes,overlay,tree_view}.rs
+    │   └── src/{main,cmd_vault,cmd_repo,cmd_daemon,cmd_migrate,cmd_reveal,cmd_onboard}.rs
+    ├── softfig-fuse/                   # M2a — FUSE plaintext-view of Layer A
+    │   └── src/{lib,fs,inodes,overlay,tree_view}.rs
+    └── softfig-onboard/                # M-onboard — scaffold core (frontend-agnostic)
+        └── src/{lib,keeper_pointer,tests}.rs
 ```
 
 ## On-disk layout
@@ -76,6 +86,14 @@ On-disk state moves to `<state_root>/.softfig/` (default
 └── keeper.toml          # state_root = "<state_root>"
 ```
 
+**Born-in-FUSE (M-onboard):** `softfig onboard` creates this same M2a
+layout directly (no `migrate`). The encrypted state is written to
+`<state_root>/.softfig/` from the first commit; a `keeper.toml` pointer is
+written to **both** `<garden_root>/.softfig/keeper.toml` (where
+`KeeperConfig::discover` reads it) and `<state_root>/.softfig/keeper.toml`.
+No plaintext is ever written at `<garden_root>` — the daemon serves it via
+FUSE on unlock.
+
 ## Crypto + canonicalization
 
 - AEAD: XChaCha20-Poly1305 (Vault blob layer)
@@ -95,7 +113,7 @@ Commits are signed by hashing the canonical commit form first: `commit_hash = BL
 ```bash
 cd ~/projects/software-config_garden
 cargo build --workspace          # debug build
-cargo test --workspace           # 91 tests (M2c regions + reveal --id + classifier-promote + M2a/M2b carryovers), <3s with fast Argon2
+cargo test --workspace           # 99 tests (M-onboard: +5 onboard scaffold/born-in-FUSE, +2 keeperd discover, +1 CLI date; M2c + M2a/M2b carryovers), <3s with fast Argon2
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p softfig-cli -- --help
 cargo run -p softfig-cli -- vault --help
@@ -107,6 +125,7 @@ Tests use minimum Argon2id cost (`m_cost=8 KiB, t_cost=1, p_cost=1`) so the suit
 ## CLI surface
 
 ```text
+softfig onboard [--garden-root P] [--state-root P] [--machine NAME] [--customize] [--yes]  # M-onboard first-run wizard
 softfig vault init        | status | rotate-key | recover         # crypto state
 softfig init              # writes a genesis commit over the existing vault
 softfig commit --intent <name> -m <msg> [-f <path>]... [--kv k=v]... [--payload-json '{...}']
@@ -142,7 +161,7 @@ AND the daemon to have an active FUSE mount.
 - Garden view: `~/soft-fig_garden/projects/software-config_garden/` — milestone tracking, decisions, notes.
 - Vision: `~/soft-fig_garden/meta/program-vision.md`.
 - Design playgrounds: `~/soft-fig_garden/meta/spec-{vault,vcs,keeper,sync,templating,symlinks}.md`.
-- Decision log: `~/soft-fig_garden/journal/decisions/decision-add-keeper-vision.md`, `decision-vault-pillar.md`, `decision-trust-matrix.md`, `decision-softfig-vault-impl.md`, `decision-softfig-vcs-impl.md`, `decision-softfig-keeperd-impl.md`, `decision-softfig-watcher-refactor-impl.md`, `decision-softfig-fuse-impl.md`, `decision-softfig-layer-b-impl.md`, `decision-softfig-m2c-impl.md`.
+- Decision log: `~/soft-fig_garden/journal/decisions/decision-add-keeper-vision.md`, `decision-vault-pillar.md`, `decision-trust-matrix.md`, `decision-softfig-vault-impl.md`, `decision-softfig-vcs-impl.md`, `decision-softfig-keeperd-impl.md`, `decision-softfig-watcher-refactor-impl.md`, `decision-softfig-fuse-impl.md`, `decision-softfig-layer-b-impl.md`, `decision-softfig-m2c-impl.md`, `decision-softfig-onboard-impl.md`.
 
 ## How to behave here
 

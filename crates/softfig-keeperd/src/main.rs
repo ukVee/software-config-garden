@@ -25,7 +25,11 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let mut config = KeeperConfig::new(&cli.garden);
+    // Resolve `state_root` from `<garden>/.softfig/keeper.toml` so a
+    // born-in-FUSE (or migrated) garden boots straight into FUSE mode. A
+    // garden without keeper.toml resolves to M1c-compat (state_root None),
+    // identical to the old `KeeperConfig::new` behavior.
+    let mut config = KeeperConfig::discover(&cli.garden)?;
     if let Some(s) = cli.socket {
         config = config.with_socket(s);
     }

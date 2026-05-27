@@ -107,3 +107,37 @@ impl KeeperConfig {
         self.state_root.is_some()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn discover_without_keeper_toml_is_m1c_compat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = KeeperConfig::discover(tmp.path()).unwrap();
+        assert!(!cfg.is_fuse_mode(), "no keeper.toml → no FUSE");
+        assert_eq!(cfg.state_dir(), tmp.path());
+    }
+
+    #[test]
+    fn discover_born_in_fuse_keeper_toml_enters_fuse_mode() {
+        // A born-in-FUSE garden (as `softfig onboard` writes it): the
+        // garden root holds a keeper.toml pointing at a relocated state
+        // root. `discover` must put the daemon in FUSE mode.
+        let garden = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let softfig = garden.path().join(".softfig");
+        fs::create_dir_all(&softfig).unwrap();
+        fs::write(
+            softfig.join("keeper.toml"),
+            format!("state_root = {:?}\n", state.path()),
+        )
+        .unwrap();
+
+        let cfg = KeeperConfig::discover(garden.path()).unwrap();
+        assert!(cfg.is_fuse_mode(), "keeper.toml with state_root → FUSE");
+        assert_eq!(cfg.state_dir(), state.path());
+    }
+}
