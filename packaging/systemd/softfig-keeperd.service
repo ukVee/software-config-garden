@@ -1,0 +1,27 @@
+[Unit]
+Description=soft-fig per-device keeper daemon
+Documentation=https://github.com/ukv/software-config_garden
+# The daemon talks to a vault on disk; nothing graphical, so don't gate
+# on the desktop session. Mirrors sliver-dock.service's headless shape.
+After=default.target
+
+[Service]
+Type=simple
+# %h expands to the user's home; the daemon is a per-user installation.
+ExecStart=%h/.local/bin/softfig-keeperd --garden %h/soft-fig_garden
+Restart=always
+RestartSec=2
+
+# Headless daemon — no stdout chatter into the journal beyond errors.
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (extends naturally to the AUR PKGBUILD later):
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+# We need read+write to ~/soft-fig_garden and $XDG_RUNTIME_DIR; both are
+# under the user's own tree, so no extra ReadWritePaths= entries.
+
+[Install]
+WantedBy=default.target

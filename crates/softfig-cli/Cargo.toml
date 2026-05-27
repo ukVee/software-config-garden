@@ -1,0 +1,25 @@
+[package]
+name = "softfig-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig CLI: vault subcommands now, more later."
+
+[[bin]]
+name = "softfig"
+path = "src/main.rs"
+
+[dependencies]
+softfig-vault.workspace = true
+softfig-store.workspace = true
+softfig-core.workspace = true
+softfig-ipc.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

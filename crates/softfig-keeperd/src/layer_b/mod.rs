@@ -1,0 +1,691 @@
+//! M2b Layer B integration: `sealed-paths.toml` matcher, daemon-side
+//! pre-commit encryption hook, FUSE [`SealedQuery`] implementation, and
+//! the auto-migration walk.
+//!
+//! Per the locked picks in `meta/spec-vault.md` "M2b implementation
+//! slice":
+//!
+//! * The matcher loads `<state_dir>/.softfig/vault/sealed-paths.toml`
+//!   (a Layer A file — never visible through FUSE) and applies union
+//!   glob semantics over the entries.
+//! * The hook is a [`softfig_core::BlobEncryptor`] installed on the
+//!   `Repo` at unlock time. For each file's path, it checks the matcher
+//!   and routes sealed paths through `VaultSession::encrypt_layer_b`;
+//!   the rest stay Layer A.
+//! * The same matcher is exposed as [`softfig_fuse::SealedQuery`] so
+//!   the FUSE read path can project the `[sealed:<path>]\n` placeholder
+//!   instead of decrypted Layer A bytes.
+//! * The auto-migration walk runs after a `schema_change` commit that
+//!   touched `sealed-paths.toml`: it walks `garden_root`, finds newly
+//!   matching tracked files, and triggers a fresh `commit_workdir` with
+//!   a `vault_seal` intent.
+//!
+//! M2c (see [`regions`]) extends the read- and write-path here with
+//! inline `<vault id="…">…</vault>` parsing + region-keyed encryption.
+
+pub mod regions;
+
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
+
+use softfig_core::{BlobEncryptor, Intent, Repo};
+use softfig_fuse::SealedQuery;
+use softfig_store::{Hash, TreeEntryKind};
+use softfig_vault::{is_layer_b, VaultSession};
+use walkdir::WalkDir;
+
+use self::regions::RegionParseError;
+use crate::daemon::{KeeperError, Result};
+
+/// Repo-relative location of the sealed-paths file (lives inside
+/// `.softfig/vault/` next to the rest of the vault state).
+pub const SEALED_PATHS_REL: &str = ".softfig/vault/sealed-paths.toml";
+
+/// Watcher / daemon sub-rule trigger: a `schema_change` whose `kind`
+/// equals this string means "reload SealedPaths + run auto-migration".
+pub const SEALED_PATHS_CHANGED_KIND: &str = "sealed_paths_changed";
+
+/// Repo-relative path the watcher classifier inspects to detect a
+/// sealed-paths edit (relative to garden root; matches what the
+/// daemon's FUSE writes report).
+pub const SEALED_PATHS_PATH: &str = SEALED_PATHS_REL;
+
+/// On-disk schema for `sealed-paths.toml`. v1 is a bare array of glob
+/// strings; structured entries (per-entry overrides, negation) come in
+/// v2 if needed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedPathsFile {
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+impl SealedPathsFile {
+    pub fn load(state_dir: &Path) -> Result<Self> {
+        let path = sealed_paths_file_path(state_dir);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(&path)?;
+        toml::from_str(&raw)
+            .map_err(|e| KeeperError::Other(format!("parse {}: {e}", path.display())))
+    }
+
+    pub fn store(&self, state_dir: &Path) -> Result<()> {
+        let path = sealed_paths_file_path(state_dir);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let raw = toml::to_string_pretty(self)
+            .map_err(|e| KeeperError::Other(format!("encode sealed-paths.toml: {e}")))?;
+        fs::write(&path, raw)?;
+        Ok(())
+    }
+}
+
+pub fn sealed_paths_file_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(SEALED_PATHS_REL)
+}
+
+/// Compiled glob set + a snapshot of the raw glob strings (for
+/// `softfig vault list-sealed`).
+#[derive(Debug)]
+pub struct SealedPaths {
+    set: GlobSet,
+    raw: Vec<String>,
+}
+
+impl SealedPaths {
+    pub fn empty() -> Self {
+        Self {
+            set: GlobSet::empty(),
+            raw: Vec::new(),
+        }
+    }
+
+    /// Compile the glob set. Malformed globs surface as `KeeperError::Other`
+    /// — the daemon's caller (the precommit hook or the explicit `vault seal`
+    /// IPC verb) chooses how to react.
+    pub fn compile(globs: &[String]) -> Result<Self> {
+        let mut b = GlobSetBuilder::new();
+        for g in globs {
+            let glob = Glob::new(g)
+                .map_err(|e| KeeperError::Other(format!("invalid glob {g:?}: {e}")))?;
+            b.add(glob);
+        }
+        let set = b
+            .build()
+            .map_err(|e| KeeperError::Other(format!("globset build: {e}")))?;
+        Ok(Self {
+            set,
+            raw: globs.to_vec(),
+        })
+    }
+
+    pub fn load(state_dir: &Path) -> Result<Self> {
+        let file = SealedPathsFile::load(state_dir)?;
+        Self::compile(&file.paths)
+    }
+
+    pub fn is_sealed(&self, repo_relative: &str) -> bool {
+        if self.raw.is_empty() {
+            return false;
+        }
+        self.set.is_match(repo_relative)
+    }
+
+    pub fn globs(&self) -> &[String] {
+        &self.raw
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+}
+
+/// M2c — snapshot of the prior tip's plaintext, indexed by repo-relative
+/// path. Populated by the daemon just before each `commit_workdir` so
+/// the write-path region encoder can re-embed unchanged `[encrypted]`
+/// placeholders byte-identically. Cleared after the commit lands.
+#[derive(Debug, Default)]
+pub struct PriorTipSnapshot {
+    pub plaintext_by_path: HashMap<String, Vec<u8>>,
+}
+
+/// Daemon-side Layer B integration: holds the active `SealedPaths` and
+/// implements both [`BlobEncryptor`] (for commit-time encryption
+/// routing) and [`SealedQuery`] (for the FUSE read-path placeholder).
+///
+/// Thread-safe — the watcher's `sealed_paths_changed` rule calls
+/// [`LayerBHook::reload`] from a different thread than the one running
+/// commits.
+///
+/// M2c extension: the hook also carries an optional [`VaultSession`]
+/// (set at unlock so the read-path region redactor can trial-decrypt
+/// body candidates without going through `BlobEncryptor::encrypt`) and
+/// an optional [`PriorTipSnapshot`] (set just before every
+/// `commit_workdir` so placeholder bodies re-embed prior ciphertext).
+#[derive(Debug)]
+pub struct LayerBHook {
+    sealed: RwLock<Arc<SealedPaths>>,
+    /// M2c — set at unlock time; used by `redact_regions` to
+    /// trial-decrypt inline region bodies. `None` until the daemon
+    /// transitions to Unlocked.
+    session: RwLock<Option<Arc<VaultSession>>>,
+    /// M2c — set just before every `commit_workdir`; consulted by the
+    /// write-path region encoder when a Plaintext body equals the
+    /// reserved `[encrypted]` placeholder.
+    prior_tip: RwLock<Option<Arc<PriorTipSnapshot>>>,
+}
+
+impl LayerBHook {
+    pub fn new(initial: SealedPaths) -> Self {
+        Self {
+            sealed: RwLock::new(Arc::new(initial)),
+            session: RwLock::new(None),
+            prior_tip: RwLock::new(None),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(SealedPaths::empty())
+    }
+
+    pub fn load(state_dir: &Path) -> Result<Self> {
+        Ok(Self::new(SealedPaths::load(state_dir)?))
+    }
+
+    pub fn reload(&self, state_dir: &Path) -> Result<()> {
+        let next = SealedPaths::load(state_dir)?;
+        *self.sealed.write().unwrap() = Arc::new(next);
+        Ok(())
+    }
+
+    pub fn replace(&self, sealed: SealedPaths) {
+        *self.sealed.write().unwrap() = Arc::new(sealed);
+    }
+
+    pub fn snapshot(&self) -> Arc<SealedPaths> {
+        self.sealed.read().unwrap().clone()
+    }
+
+    /// M2c — install the daemon's unlocked session so the read-path
+    /// region redactor can trial-decrypt body candidates. Called once
+    /// per unlock; `None` clears the slot at shutdown.
+    pub fn set_session(&self, session: Option<Arc<VaultSession>>) {
+        *self.session.write().unwrap() = session;
+    }
+
+    pub fn session(&self) -> Option<Arc<VaultSession>> {
+        self.session.read().unwrap().clone()
+    }
+
+    /// M2c — install the prior-tip plaintext snapshot built by
+    /// [`build_prior_tip_snapshot`]. Daemon calls this before
+    /// `commit_workdir` and clears it after.
+    pub fn install_prior_tip(&self, snap: PriorTipSnapshot) {
+        *self.prior_tip.write().unwrap() = Some(Arc::new(snap));
+    }
+
+    pub fn clear_prior_tip(&self) {
+        *self.prior_tip.write().unwrap() = None;
+    }
+
+    fn prior_tip_snapshot(&self) -> Option<Arc<PriorTipSnapshot>> {
+        self.prior_tip.read().unwrap().clone()
+    }
+}
+
+impl BlobEncryptor for LayerBHook {
+    fn encrypt(
+        &self,
+        path: &str,
+        content: &[u8],
+        session: &VaultSession,
+    ) -> softfig_core::Result<Vec<u8>> {
+        let sealed_snapshot = self.snapshot();
+        if sealed_snapshot.is_sealed(path) {
+            // Layer B whole-file path: derive per-file subkey, encrypt
+            // convergent under XChaCha20-Poly1305. The blob_file starts
+            // with the 0xFF marker so the daemon's FUSE-read path and
+            // any future fsck-aware tool can distinguish from Layer A
+            // bytes. M2c inline-tag handling is skipped — whole-file
+            // seal supersedes per-region encryption.
+            let ct = session
+                .encrypt_layer_b(path, content)
+                .map_err(softfig_core::CoreError::Vault)?;
+            return Ok(ct);
+        }
+        // M2c — inline `<vault>` region path. Parse → on error, reject
+        // the commit (fail-closed). On success: substitute placeholders
+        // / encrypt fresh plaintext, then run the result through Layer
+        // A as a single blob.
+        let parser = regions::parser_for(path);
+        let spans = match regions::parse(parser, content, session, path) {
+            Ok(spans) => spans,
+            Err(e) => {
+                return Err(softfig_core::CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed vault tag in {path}: {e}"),
+                )));
+            }
+        };
+        if spans.is_empty() {
+            // No tags — straight Layer A, behavior identical to M2b.
+            return Ok(session.encrypt_blob(content)?);
+        }
+        let prior = self.prior_tip_snapshot();
+        let prior_bytes = prior
+            .as_ref()
+            .and_then(|s| s.plaintext_by_path.get(path).cloned());
+        let prior_spans: Vec<_> = match prior_bytes.as_deref() {
+            Some(prior) => regions::parse(parser, prior, session, path)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let post = regions::apply_write_path(
+            content,
+            &spans,
+            path,
+            session,
+            prior_bytes.as_deref(),
+            &prior_spans,
+        )
+        .map_err(|e: RegionParseError| {
+            softfig_core::CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("vault region rewrite for {path}: {e}"),
+            ))
+        })?;
+        Ok(session.encrypt_blob(&post)?)
+    }
+}
+
+impl SealedQuery for LayerBHook {
+    fn is_sealed(&self, repo_relative: &str) -> bool {
+        self.snapshot().is_sealed(repo_relative)
+    }
+
+    fn redact_regions(&self, repo_relative: &str, content: Vec<u8>) -> Vec<u8> {
+        // Whole-file seal is handled by the FUSE driver's
+        // `[sealed:<path>]\n` upstream path — short-circuit so we don't
+        // try to parse already-projected placeholders.
+        if self.snapshot().is_sealed(repo_relative) {
+            return content;
+        }
+        let Some(session) = self.session() else {
+            // No session installed yet (pre-unlock); pass through.
+            return content;
+        };
+        let parser = regions::parser_for(repo_relative);
+        let spans = match regions::parse(parser, &content, &session, repo_relative) {
+            Ok(spans) => spans,
+            Err(_) => return regions::malformed_placeholder(repo_relative),
+        };
+        if spans.is_empty() {
+            return content;
+        }
+        regions::render_read_view(content, &spans)
+    }
+}
+
+/// M2c — walk the repo's current tip tree and return a snapshot of
+/// every blob's plaintext (decrypted under whichever layer it was
+/// originally encrypted with). Used by the daemon to populate
+/// [`LayerBHook::install_prior_tip`] before each `commit_workdir` so
+/// the write-path region encoder can re-embed unchanged placeholders
+/// byte-identically.
+///
+/// O(N files) — fine for the typical garden size (~hundreds of files);
+/// lazy on-demand lookup is a future optimization tracked under the
+/// region-cache eviction open question.
+pub fn build_prior_tip_snapshot(
+    repo: &Repo,
+    session: &VaultSession,
+) -> Result<PriorTipSnapshot> {
+    let mut snap = PriorTipSnapshot::default();
+    let Some(tip) = repo.tip()? else {
+        return Ok(snap);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(KeeperError::Store)?;
+    walk_tree_into(repo, session, &row.root_tree, "", &mut snap)?;
+    Ok(snap)
+}
+
+fn walk_tree_into(
+    repo: &Repo,
+    session: &VaultSession,
+    tree: &Hash,
+    prefix: &str,
+    snap: &mut PriorTipSnapshot,
+) -> Result<()> {
+    let entries = repo.db().get_tree(tree).map_err(KeeperError::Store)?;
+    for e in entries {
+        let child_path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
+        match e.kind {
+            TreeEntryKind::Blob => {
+                let cipher = repo.objects().get(&e.target).map_err(KeeperError::Store)?;
+                let plain = if is_layer_b(&cipher) {
+                    session
+                        .decrypt_layer_b(&child_path, &cipher)
+                        .map_err(KeeperError::Vault)?
+                } else {
+                    session.decrypt_blob(&cipher).map_err(KeeperError::Vault)?
+                };
+                snap.plaintext_by_path.insert(child_path, plain);
+            }
+            TreeEntryKind::Tree => {
+                walk_tree_into(repo, session, &e.target, &child_path, snap)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// M2c — RAII guard that installs a prior-tip snapshot on a
+/// [`LayerBHook`] and clears it on drop. Use this around every
+/// `repo.commit_workdir(...)` call site so placeholder preservation
+/// has fresh prior-tip context for each commit.
+#[derive(Debug)]
+pub struct PriorTipGuard<'a> {
+    hook: &'a LayerBHook,
+}
+
+impl<'a> PriorTipGuard<'a> {
+    pub fn install(hook: &'a LayerBHook, repo: &Repo, session: &VaultSession) -> Result<Self> {
+        let snap = build_prior_tip_snapshot(repo, session)?;
+        hook.install_prior_tip(snap);
+        Ok(Self { hook })
+    }
+}
+
+impl Drop for PriorTipGuard<'_> {
+    fn drop(&mut self) {
+        self.hook.clear_prior_tip();
+    }
+}
+
+/// Convenience: snapshot prior tip → commit → clear, in one call.
+pub fn commit_with_regions(
+    hook: &LayerBHook,
+    repo: &mut Repo,
+    session: &VaultSession,
+    intent: Intent,
+) -> Result<Hash> {
+    let _guard = PriorTipGuard::install(hook, repo, session)?;
+    let hash = repo.commit_workdir(session, intent).map_err(KeeperError::Core)?;
+    Ok(hash)
+}
+
+/// M2c — watcher classifier sub-rule. Walk `paths` (repo-relative,
+/// relative to `garden_root`) looking for inline `<vault id="…">`
+/// regions whose ids are present in the current file but absent from
+/// the same path's prior-tip plaintext (snapshot in `prior_snap`).
+///
+/// Returns a single batched `vault_seal` [`Intent`] covering every
+/// affected path + every newly-introduced id when at least one new
+/// id is found. Returns `None` when no path introduces a new id —
+/// the watcher then falls through to the original `manual_edit`.
+///
+/// Edits to *existing* ids (same id, ciphertext body changed) do NOT
+/// fire: that case is normal content churn — `vault_reveal` owns
+/// audit for plaintext exposure, not re-encryption.
+pub fn promote_manual_edit_for_new_ids(
+    paths: &[String],
+    garden_root: &Path,
+    session: &VaultSession,
+    prior_snap: &PriorTipSnapshot,
+) -> Option<Intent> {
+    use std::collections::BTreeSet;
+
+    let mut affected_paths: Vec<String> = Vec::new();
+    let mut new_ids: BTreeSet<String> = BTreeSet::new();
+
+    for rel in paths {
+        let abs = garden_root.join(rel);
+        let Ok(content) = fs::read(&abs) else { continue };
+        let parser = regions::parser_for(rel);
+        let current_spans = regions::parse(parser, &content, session, rel).ok()?;
+        if current_spans.is_empty() {
+            continue;
+        }
+        let current_ids: BTreeSet<String> =
+            current_spans.iter().map(|s| s.id.clone()).collect();
+        let prior_ids: BTreeSet<String> = match prior_snap.plaintext_by_path.get(rel) {
+            Some(prior) => regions::parse(parser, prior, session, rel)
+                .ok()
+                .map(|spans| spans.iter().map(|s| s.id.clone()).collect())
+                .unwrap_or_default(),
+            None => BTreeSet::new(),
+        };
+        let added: Vec<String> = current_ids.difference(&prior_ids).cloned().collect();
+        if !added.is_empty() {
+            affected_paths.push(rel.clone());
+            new_ids.extend(added);
+        }
+    }
+
+    if affected_paths.is_empty() {
+        return None;
+    }
+    let ids_vec: Vec<String> = new_ids.into_iter().collect();
+    let intent = Intent::new(
+        "vault_seal",
+        serde_json::json!({
+            "paths": affected_paths,
+            "ids": ids_vec,
+            "reason": "inline vault tags introduced",
+        }),
+    )
+    .ok()?;
+    Some(intent)
+}
+
+/// Walk the working tree (rooted at `garden_root`) and return the list
+/// of tracked, repo-relative files matched by `sealed`. Used by the
+/// auto-migration step and by `softfig vault list-sealed`.
+pub fn enumerate_matching(garden_root: &Path, sealed: &SealedPaths) -> Vec<String> {
+    if sealed.is_empty() {
+        return Vec::new();
+    }
+    let mut out = BTreeSet::new();
+    for entry in WalkDir::new(garden_root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !is_softfig(e.path(), garden_root))
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(garden_root) else {
+            continue;
+        };
+        let Some(rel_str) = rel.to_str() else { continue };
+        // Normalize to forward slashes (already the case on Linux, but
+        // be explicit).
+        let rel_str = rel_str.replace('\\', "/");
+        if sealed.is_sealed(&rel_str) {
+            out.insert(rel_str);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn is_softfig(path: &Path, root: &Path) -> bool {
+    if let Ok(rel) = path.strip_prefix(root) {
+        if let Some(first) = rel.components().next() {
+            return first.as_os_str() == ".softfig";
+        }
+    }
+    false
+}
+
+/// Append a glob to `sealed-paths.toml` (creating the file if absent).
+/// Returns true if the glob was actually added (false = already present
+/// — no-op).
+pub fn append_glob(state_dir: &Path, glob: &str) -> Result<bool> {
+    let mut file = SealedPathsFile::load(state_dir)?;
+    if file.paths.iter().any(|g| g == glob) {
+        return Ok(false);
+    }
+    file.paths.push(glob.to_string());
+    file.store(state_dir)?;
+    Ok(true)
+}
+
+/// Remove a glob from `sealed-paths.toml`. Returns true if it was
+/// present (false = no-op).
+pub fn remove_glob(state_dir: &Path, glob: &str) -> Result<bool> {
+    let mut file = SealedPathsFile::load(state_dir)?;
+    let before = file.paths.len();
+    file.paths.retain(|g| g != glob);
+    if file.paths.len() == before {
+        return Ok(false);
+    }
+    file.store(state_dir)?;
+    Ok(true)
+}
+
+/// Compose a `schema_change` intent for a sealed-paths.toml edit.
+pub fn schema_change_intent(decision_slug: &str, sub_kind: &str) -> softfig_core::Result<Intent> {
+    Intent::new(
+        "schema_change",
+        serde_json::json!({
+            "decision_slug": decision_slug,
+            "paths_changed": [SEALED_PATHS_REL],
+            "kind": sub_kind,
+        }),
+    )
+}
+
+/// Compose a `vault_seal` intent for the auto-migration commit.
+pub fn vault_seal_intent(paths: &[String], reason: &str) -> softfig_core::Result<Intent> {
+    Intent::new(
+        "vault_seal",
+        serde_json::json!({
+            "paths": paths,
+            "reason": reason,
+        }),
+    )
+}
+
+/// Compose a `vault_reveal` intent (audit-only — no plaintext, no hash).
+///
+/// M2c — when `id` is `Some(name)` the audit payload gains an `"id"`
+/// field; when `None`, the field is omitted entirely so M2b-era commits
+/// stay bit-identical on serialization (the
+/// `m2b_compat_serialization` regression test pins this invariant).
+pub fn vault_reveal_intent(
+    path: &str,
+    actor: &str,
+    timestamp_unix: i64,
+    id: Option<&str>,
+) -> softfig_core::Result<Intent> {
+    let mut payload = serde_json::json!({
+        "path": path,
+        "actor": actor,
+        "timestamp": timestamp_unix,
+    });
+    if let Some(name) = id {
+        payload["id"] = serde_json::Value::String(name.to_string());
+    }
+    Intent::new("vault_reveal", payload)
+}
+
+/// True if the schema-change payload describes a sealed-paths.toml edit
+/// (used by the watcher classifier to fire the auto-migration walk).
+pub fn payload_is_sealed_paths_change(payload: &serde_json::Value) -> bool {
+    payload
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s == SEALED_PATHS_CHANGED_KIND)
+        .unwrap_or(false)
+}
+
+/// Adapter that exposes a [`LayerBHook`] as the trait objects
+/// [`BlobEncryptor`] and [`SealedQuery`] expect. Single `Arc` shared
+/// across the daemon, the FUSE driver, and the watcher.
+pub type SharedLayerB = Arc<LayerBHook>;
+
+/// Convenience: build a shared hook by loading from disk.
+pub fn shared_hook_from_disk(state_dir: &Path) -> Result<SharedLayerB> {
+    Ok(Arc::new(LayerBHook::load(state_dir)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_file(p: &Path, body: &str) {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn empty_matcher_seals_nothing() {
+        let sp = SealedPaths::empty();
+        assert!(!sp.is_sealed("anything"));
+        assert!(!sp.is_sealed("secrets/foo.toml"));
+    }
+
+    #[test]
+    fn union_glob_semantics() {
+        let sp = SealedPaths::compile(&[
+            "secrets/**".to_string(),
+            "**/api-keys.toml".to_string(),
+        ])
+        .unwrap();
+        assert!(sp.is_sealed("secrets/foo.toml"));
+        assert!(sp.is_sealed("secrets/dir/bar.toml"));
+        assert!(sp.is_sealed("anywhere/api-keys.toml"));
+        assert!(!sp.is_sealed("readme.md"));
+        assert!(!sp.is_sealed("journal/decisions/decision-x.md"));
+    }
+
+    #[test]
+    fn enumerate_matching_skips_softfig() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path();
+        write_file(&g.join("secrets/foo.toml"), "shh");
+        write_file(&g.join("secrets/dir/bar.toml"), "also shh");
+        write_file(&g.join("public.md"), "hello");
+        write_file(&g.join(".softfig/db.sqlite"), "ignored");
+        let sp = SealedPaths::compile(&["secrets/**".to_string()]).unwrap();
+        let found = enumerate_matching(g, &sp);
+        assert!(found.contains(&"secrets/foo.toml".to_string()));
+        assert!(found.contains(&"secrets/dir/bar.toml".to_string()));
+        assert!(!found.iter().any(|p| p.starts_with(".softfig")));
+        assert!(!found.contains(&"public.md".to_string()));
+    }
+
+    #[test]
+    fn sealed_paths_file_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        std::fs::create_dir_all(state_dir.join(".softfig/vault")).unwrap();
+        let file = SealedPathsFile {
+            paths: vec!["secrets/**".into(), "logs/*.private".into()],
+        };
+        file.store(state_dir).unwrap();
+        let back = SealedPathsFile::load(state_dir).unwrap();
+        assert_eq!(back.paths, file.paths);
+    }
+}

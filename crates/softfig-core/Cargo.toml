@@ -1,0 +1,26 @@
+[package]
+name = "softfig-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig VCS core: walker, tree builder, commit creator + signer, log, fsck."
+
+[dependencies]
+softfig-vault.workspace = true
+softfig-store.workspace = true
+
+blake3.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+hostname.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

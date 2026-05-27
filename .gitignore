@@ -1,0 +1,10 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Runtime / state that must never be committed
+*.sock
+
+# Editor / OS cruft
+*.swp
+.DS_Store

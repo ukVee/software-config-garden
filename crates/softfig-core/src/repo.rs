@@ -1,0 +1,289 @@
+//! High-level Repo type: open / init / commit / log.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use softfig_store::{
+    put_commit, put_tree, set_ref, CommitRow, Db, Hash, ObjectStore, StorePaths,
+};
+use softfig_vault::{Vault, VaultSession};
+
+use crate::commit::CanonicalCommit;
+use crate::error::{CoreError, Result};
+use crate::intent::Intent;
+use crate::tree::{self, BlobEncryptor, Blueprint, LayerAEncryptor};
+use crate::walk;
+
+pub const TIP_REF: &str = "tip";
+
+/// Subscriber called after a successful `commit_workdir` advances the tip.
+/// One slot per repo for v1; M2a wires the FUSE driver here so it can
+/// drop its stat cache and broadcast inval_inode notifications. If a
+/// second consumer ever shows up (sync push?), promote to a Vec.
+pub type TipChangedCallback = Box<dyn Fn(&Hash) + Send + Sync>;
+
+/// A garden's VCS repository. Holds the path layout, an opened sqlite
+/// connection, and the object store. Does not hold a `VaultSession` —
+/// callers pass the session to operations that need crypto.
+pub struct Repo {
+    paths: StorePaths,
+    db: Db,
+    objects: ObjectStore,
+    garden_root: PathBuf,
+    tip_changed: Option<TipChangedCallback>,
+    /// M2b: optional Layer-B-aware blob encryptor installed by the
+    /// daemon at unlock time. `None` = Layer A only (default for direct
+    /// CLI mode and M1c-compat M2a/no-Layer-B configs).
+    blob_encryptor: Option<Arc<dyn BlobEncryptor>>,
+}
+
+impl std::fmt::Debug for Repo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Repo")
+            .field("paths", &self.paths)
+            .field("db", &self.db)
+            .field("objects", &self.objects)
+            .field("garden_root", &self.garden_root)
+            .field(
+                "tip_changed",
+                &self.tip_changed.as_ref().map(|_| "<callback>"),
+            )
+            .field(
+                "blob_encryptor",
+                &self.blob_encryptor.as_ref().map(|_| "<encryptor>"),
+            )
+            .finish()
+    }
+}
+
+impl Repo {
+    /// Open an existing repo at `<garden_root>/.softfig/` (M1c-compat).
+    pub fn open(garden_root: &Path) -> Result<Self> {
+        Self::open_with(garden_root, None)
+    }
+
+    /// Open an existing repo whose state lives at a relocated path.
+    /// Pass `state_root = None` for the M1c-compat layout, or
+    /// `Some(path)` for M2a (path is the dir containing `.softfig/`).
+    pub fn open_with(garden_root: &Path, state_root: Option<&Path>) -> Result<Self> {
+        let paths = match state_root {
+            Some(s) => StorePaths::with_state_root(garden_root, s),
+            None => StorePaths::for_garden(garden_root),
+        };
+        if !paths.exists() {
+            return Err(CoreError::RepoMissing(paths.softfig_dir()));
+        }
+        let db = Db::open(&paths)?;
+        let objects = ObjectStore::new(paths.clone());
+        Ok(Self {
+            paths,
+            db,
+            objects,
+            garden_root: garden_root.to_path_buf(),
+            tip_changed: None,
+            blob_encryptor: None,
+        })
+    }
+
+    /// Initialize a fresh repo on top of an existing Vault. Walks the
+    /// current working tree, encrypts every blob, builds trees, signs and
+    /// records a genesis `init` commit, and sets `tip`.
+    ///
+    /// Errors if `.softfig/vault/` is absent (run `softfig vault init`
+    /// first) or if `.softfig/db.sqlite` is already present.
+    pub fn init(garden_root: &Path, session: &VaultSession) -> Result<(Self, Hash)> {
+        let paths = StorePaths::for_garden(garden_root);
+
+        let vault = Vault::at(garden_root);
+        if !vault.is_initialized() {
+            return Err(CoreError::VaultMissing(vault.paths().root.clone()));
+        }
+        if paths.exists() {
+            return Err(CoreError::RepoExists(paths.softfig_dir()));
+        }
+
+        std::fs::create_dir_all(paths.softfig_dir())?;
+        let objects = ObjectStore::new(paths.clone());
+        objects.ensure_root()?;
+
+        let now = unix_seconds();
+        let repo_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let mut db = Db::create(&paths, &repo_id, now)?;
+
+        let snapshot = walk::walk(garden_root)?;
+        let blueprint = tree::build(&objects, session, &snapshot.root)?;
+
+        let intent = Intent::init("garden initialized");
+        let commit_hash = write_commit_tx(
+            &mut db,
+            session,
+            None,
+            &blueprint,
+            intent,
+            now,
+        )?;
+
+        Ok((
+            Self {
+                paths,
+                db,
+                objects,
+                garden_root: garden_root.to_path_buf(),
+                tip_changed: None,
+                blob_encryptor: None,
+            },
+            commit_hash,
+        ))
+    }
+
+    pub fn paths(&self) -> &StorePaths {
+        &self.paths
+    }
+
+    pub fn garden_root(&self) -> &Path {
+        &self.garden_root
+    }
+
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    pub fn db_mut(&mut self) -> &mut Db {
+        &mut self.db
+    }
+
+    pub fn objects(&self) -> &ObjectStore {
+        &self.objects
+    }
+
+    /// Read the repo's persistent identifier from `meta.repo_id`. Used by
+    /// `softfig migrate prepare` to derive the XDG state dir for this
+    /// garden.
+    pub fn repo_id(&self) -> Result<String> {
+        self.db
+            .meta_get("repo_id")?
+            .ok_or_else(|| CoreError::RepoMissing(self.paths.softfig_dir()))
+    }
+
+    /// Current `tip` commit, if any.
+    pub fn tip(&self) -> Result<Option<Hash>> {
+        Ok(self.db.try_get_ref(TIP_REF)?)
+    }
+
+    /// Install (or replace) the tip-changed callback. Fired after a
+    /// successful `commit_workdir` lands a new tip. M2a wires the FUSE
+    /// driver here.
+    pub fn set_tip_changed_callback<F>(&mut self, cb: F)
+    where
+        F: Fn(&Hash) + Send + Sync + 'static,
+    {
+        self.tip_changed = Some(Box::new(cb));
+    }
+
+    /// Install (or replace) the blob encryptor used by `commit_workdir`.
+    /// M2b's daemon registers an encryptor here so sealed paths route
+    /// through Layer B; direct-mode CLI callers leave this `None` and
+    /// the default Layer A path is used.
+    pub fn set_blob_encryptor(&mut self, enc: Arc<dyn BlobEncryptor>) {
+        self.blob_encryptor = Some(enc);
+    }
+
+    /// Walk the working tree, build a blueprint, and write a new commit
+    /// whose parent is the current tip. Returns the new commit hash.
+    pub fn commit_workdir(
+        &mut self,
+        session: &VaultSession,
+        intent: Intent,
+    ) -> Result<Hash> {
+        let parent = self.tip()?;
+        let snapshot = walk::walk(&self.garden_root)?;
+        let default_enc = LayerAEncryptor;
+        let encryptor: &dyn BlobEncryptor = match self.blob_encryptor.as_ref() {
+            Some(enc) => enc.as_ref(),
+            None => &default_enc,
+        };
+        let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor)?;
+        let now = unix_seconds();
+        let hash = write_commit_tx(&mut self.db, session, parent, &blueprint, intent, now)?;
+        if let Some(cb) = &self.tip_changed {
+            cb(&hash);
+        }
+        Ok(hash)
+    }
+}
+
+/// Transactional commit writer: insert all new tree rows + the commit
+/// row + bump tip, all in one sqlite tx.
+fn write_commit_tx(
+    db: &mut Db,
+    session: &VaultSession,
+    parent: Option<Hash>,
+    blueprint: &Blueprint,
+    intent: Intent,
+    timestamp: i64,
+) -> Result<Hash> {
+    let author_device = local_device_label();
+    let author_pubkey = session.identity_pubkey().to_bytes();
+    let master_key_id = session.active_master_key_id();
+    let (intent_name, intent_payload) = intent.into_parts();
+
+    // Re-canonicalize the payload alone so the row stores the canonical
+    // form. Reading back + re-canonicalizing yields identical bytes.
+    let payload_canon_bytes = serde_jcs::to_vec(&intent_payload)?;
+    let payload_canon_str = String::from_utf8(payload_canon_bytes)
+        .expect("JCS output is ASCII-only");
+    let payload_canon_value: serde_json::Value =
+        serde_json::from_str(&payload_canon_str)?;
+
+    let canon = CanonicalCommit {
+        parent,
+        root_tree: blueprint.root,
+        author_device: &author_device,
+        author_pubkey,
+        timestamp,
+        intent: &intent_name,
+        payload: &payload_canon_value,
+        master_key_id,
+    };
+    let hash = canon.hash()?;
+    let signature_bytes = session.sign(hash.as_bytes()).to_bytes();
+
+    let row = CommitRow {
+        hash,
+        parent,
+        root_tree: blueprint.root,
+        author_device,
+        author_pubkey,
+        timestamp,
+        intent: intent_name,
+        payload: payload_canon_str,
+        master_key_id,
+        signature: signature_bytes,
+    };
+
+    db.with_tx(|conn| {
+        for (tree_hash, entries) in &blueprint.trees {
+            put_tree(conn, tree_hash, entries)?;
+        }
+        put_commit(conn, &row)?;
+        set_ref(conn, TIP_REF, &hash)?;
+        Ok(())
+    })?;
+
+    Ok(hash)
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn local_device_label() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
+}

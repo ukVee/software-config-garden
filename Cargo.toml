@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/softfig-vault",
+    "crates/softfig-store",
+    "crates/softfig-core",
+    "crates/softfig-cli",
+    "crates/softfig-ipc",
+    "crates/softfig-keeperd",
+    "crates/softfig-mcp",
+    "crates/softfig-fuse",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MPL-2.0"
+repository = "https://github.com/ukv/software-config_garden"
+
+[workspace.dependencies]
+softfig-vault   = { path = "crates/softfig-vault" }
+softfig-store   = { path = "crates/softfig-store" }
+softfig-core    = { path = "crates/softfig-core" }
+softfig-ipc     = { path = "crates/softfig-ipc" }
+
+# Crypto
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+blake3 = "1.5"
+argon2 = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+rand_core = "0.6"
+bip39 = { version = "2", default-features = false, features = ["rand", "std"] }
+zeroize = { version = "1.8", features = ["derive"] }
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Encoding / IO
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_jcs = "0.1"
+toml = "0.8"
+hex = "0.4"
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Filesystem / time / identity helpers
+walkdir = "2"
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+# Errors
+thiserror = "2"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+rpassword = "7"
+anyhow = "1"
+
+# Daemon / watcher
+notify = "6"
+notify-debouncer-full = "0.3"
+signal-hook = "0.3"
+libc = "0.2"
+
+# Layer B sealed-paths glob matching (M2b)
+globset = "0.4"
+
+# M2c — inline <vault> tag parsing (TOML) + base64-inline ciphertext bodies
+toml_edit = "0.22"
+base64 = "0.22"
+
+# FUSE
+fuser = "0.14"
+lru = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

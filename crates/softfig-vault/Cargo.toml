@@ -1,0 +1,28 @@
+[package]
+name = "softfig-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Single-device Vault for soft-fig: master key, passphrase + recovery unlock, key rotation, identity-key signing, content-addressable blob encryption."
+
+[dependencies]
+chacha20poly1305.workspace = true
+blake3.workspace = true
+argon2.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+bip39.workspace = true
+zeroize.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+toml.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

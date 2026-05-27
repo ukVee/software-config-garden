@@ -1,0 +1,19 @@
+[package]
+name = "softfig-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig MCP stdio bridge: per-Claude-session translator from MCP JSON-RPC to softfig-keeperd IPC."
+
+[[bin]]
+name = "softfig-mcp"
+path = "src/main.rs"
+
+[dependencies]
+softfig-ipc.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

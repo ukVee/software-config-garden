@@ -1,0 +1,22 @@
+[package]
+name = "softfig-fuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig FUSE plaintext-view of the encrypted Layer A working tree."
+
+[dependencies]
+softfig-vault.workspace = true
+softfig-store.workspace = true
+softfig-core.workspace = true
+
+fuser.workspace = true
+lru.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+softfig-vault = { workspace = true }

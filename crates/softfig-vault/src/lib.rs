@@ -1,0 +1,29 @@
+//! Single-device Vault for soft-fig.
+//!
+//! Layer A only: encrypted-at-rest blob storage, identity-key signing for
+//! the future VCS layer. Multi-device features (trust matrix, peer unlock,
+//! panic counter), Layer B selective secrets, FUSE, and TPM mode are not
+//! in this slice — see `meta/spec-vault.md` in the soft-fig garden for the
+//! full target.
+
+#![forbid(unsafe_code)]
+#![warn(missing_debug_implementations)]
+
+pub mod blob;
+pub mod error;
+pub mod identity;
+pub mod kek;
+pub mod layer_b;
+pub mod master;
+pub mod params;
+pub mod recovery;
+pub mod session;
+pub mod storage;
+mod vault;
+
+pub use error::{Result, VaultError};
+pub use layer_b::{is_layer_b, LayerBKey};
+pub use recovery::RecoveryPhrase;
+pub use session::VaultSession;
+pub use storage::{discover_garden, VaultPaths};
+pub use vault::Vault;
