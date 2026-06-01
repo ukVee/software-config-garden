@@ -160,6 +160,13 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::VAULT_SEAL => handlers::vault_seal(daemon, req.args),
         op::VAULT_UNSEAL => handlers::vault_unseal(daemon, req.args),
         op::VAULT_LIST_SEALED => handlers::vault_list_sealed(daemon, req.args),
+        op::LOG_DECISION => crate::actions::log_decision(daemon, req.args),
+        op::LOG_INCIDENT => crate::actions::log_incident(daemon, req.args),
+        op::ARCHIVE => crate::actions::archive(daemon, req.args),
+        op::ADD_PROJECT => crate::actions::add_project(daemon, req.args),
+        op::REFRESH_SNAPSHOT => crate::actions::refresh_snapshot(daemon, req.args),
+        op::LIST_TREE => crate::reads::list_tree(daemon, req.args),
+        op::READ_FILE => crate::reads::read_file(daemon, req.args),
         op::SHUTDOWN => handlers::shutdown(daemon, req.args),
         other => Err((
             ErrorKind::BadArgs,

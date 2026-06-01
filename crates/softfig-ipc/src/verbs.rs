@@ -29,6 +29,28 @@ pub mod op {
     /// M2b: read-only listing of `sealed-paths.toml` globs + the tracked
     /// files that currently match.
     pub const VAULT_LIST_SEALED: &str = "vault_list_sealed";
+    /// M3a: write a `journal/decisions/decision-<slug>.md` stub with a
+    /// daemon-stamped header, commit `decision_logged`.
+    pub const LOG_DECISION: &str = "log_decision";
+    /// M3a: write a `journal/incidents/incident-<date>-<slug>.md` stub,
+    /// commit `incident_logged`.
+    pub const LOG_INCIDENT: &str = "log_incident";
+    /// M3a: move a tracked path under `journal/archive/<name>/`, commit
+    /// `archive_move`.
+    pub const ARCHIVE: &str = "archive";
+    /// M3a: stamp the four reserved-name stubs under `projects/<name>/`,
+    /// commit `project_added`.
+    pub const ADD_PROJECT: &str = "add_project";
+    /// M3a: write caller-supplied content to a path under `snapshots/`,
+    /// commit `snapshot_refresh`. The daemon never executes user code.
+    pub const REFRESH_SNAPSHOT: &str = "refresh_snapshot";
+    /// M3b: list the immediate children of a garden-relative directory in
+    /// the committed tip tree. Read-only.
+    pub const LIST_TREE: &str = "list_tree";
+    /// M3b: read a garden-relative file's daemon-redacted content from the
+    /// committed tip tree. Sealed files / inline regions are projected, not
+    /// decrypted. Read-only.
+    pub const READ_FILE: &str = "read_file";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +259,158 @@ pub struct VaultListSealedReply {
     pub globs: Vec<String>,
     /// Tracked files in the working tree that match at least one glob.
     pub matching_files: Vec<String>,
+}
+
+// ---- M3a: typed garden-write action surface ---------------------------
+
+/// `log_decision({slug, summary?, body}) -> {path, hash}`.
+///
+/// The daemon stamps the `# decision: <title>` header + `Date:` line and
+/// writes the body below — the caller supplies only the slug, an optional
+/// title (defaults to the slug), and the body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogDecisionArgs {
+    /// `[a-z0-9-]+`, length 1–64. Becomes `decision-<slug>.md`.
+    pub slug: String,
+    /// Title used in the `# decision: <summary>` header line. Defaults to
+    /// the slug when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Markdown body written below the daemon-stamped header.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogDecisionReply {
+    /// Garden-relative path the daemon wrote.
+    pub path: String,
+    pub hash: String,
+}
+
+/// `log_incident({slug, summary, body, date?}) -> {path, hash}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogIncidentArgs {
+    /// `[a-z0-9-]+`, length 1–64. Becomes the trailing `-<slug>` of the
+    /// `incident-<date>-<slug>.md` filename.
+    pub slug: String,
+    /// One-line summary stamped into the `# <YYYY-MM-DD> — <summary>`
+    /// header.
+    pub summary: String,
+    /// Markdown body written below the header.
+    pub body: String,
+    /// `YYYYMMDD` date for the filename. Defaults to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogIncidentReply {
+    pub path: String,
+    pub hash: String,
+}
+
+/// `archive({src, archive_name?}) -> {from, to, hash}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveArgs {
+    /// Garden-relative path of the file or directory to archive.
+    pub src: String,
+    /// Single path component naming the archive bucket under
+    /// `journal/archive/<archive_name>/`. Defaults to the basename of
+    /// `src`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveReply {
+    /// Source path (garden-relative) that was moved.
+    pub from: String,
+    /// Destination path (garden-relative) it now lives at.
+    pub to: String,
+    pub hash: String,
+}
+
+/// `add_project({name, repo_path?, summary?}) -> {path, hash, files}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddProjectArgs {
+    /// `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, length 1–64. Becomes
+    /// `projects/<name>/`.
+    pub name: String,
+    /// Absolute path of the real code repo, inlined into the `CLAUDE.md`
+    /// stub when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    /// One-line description stamped into the stubs when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddProjectReply {
+    /// The created `projects/<name>/` directory (garden-relative).
+    pub path: String,
+    pub hash: String,
+    /// The four reserved-name stub files written, garden-relative.
+    pub files: Vec<String>,
+}
+
+/// `refresh_snapshot({path, content}) -> {path, hash}`. Path must lie
+/// under `snapshots/` and its parent dir must already exist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshSnapshotArgs {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshSnapshotReply {
+    pub path: String,
+    pub hash: String,
+}
+
+// ---- M3b: read-only browse surface ------------------------------------
+
+/// `list_tree({path?}) -> {entries}`. Lists the immediate children of a
+/// garden-relative directory in the committed tip tree. `path` omitted (or
+/// empty) means the garden root.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListTreeArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTreeReply {
+    pub entries: Vec<TreeEntry>,
+}
+
+/// One child of a directory listing. `path` is the full garden-relative
+/// path of the entry (e.g. `journal/decisions`), suitable for feeding back
+/// into `list_tree`/`read_file`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// `read_file({path}) -> {path, content, sealed}`. Returns the file's
+/// daemon-redacted content from the committed tip tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadFileArgs {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadFileReply {
+    pub path: String,
+    /// Daemon-redacted UTF-8 content: whole-file-sealed paths surface as
+    /// `[sealed:<path>]`, inline `<vault id="…">` regions as `[encrypted]`.
+    /// Never raw ciphertext or sealed plaintext. Non-UTF-8 content is
+    /// replaced by a short placeholder; very large files are truncated.
+    pub content: String,
+    /// True when the whole file is sealed (Layer B).
+    pub sealed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

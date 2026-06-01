@@ -10,6 +10,7 @@ members = [
     "crates/softfig-mcp",
     "crates/softfig-fuse",
     "crates/softfig-onboard",
+    "crates/softfig-tui",
 ]
 
 [workspace.package]
@@ -82,6 +83,10 @@ base64 = "0.22"
 # FUSE
 fuser = "0.14"
 lru = "0.12"
+
+# TUI (M3b)
+ratatui = "0.29"
+crossterm = "0.28"
 
 [profile.release]
 lto = "thin"

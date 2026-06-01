@@ -1,0 +1,22 @@
+[package]
+name = "softfig-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig terminal UI: a ratatui frontend over softfig-keeperd (browse, history, actions, unlock)."
+
+[[bin]]
+name = "softfig-tui"
+path = "src/main.rs"
+
+[dependencies]
+softfig-ipc.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+ratatui.workspace = true
+crossterm.workspace = true

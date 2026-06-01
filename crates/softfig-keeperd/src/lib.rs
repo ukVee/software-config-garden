@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod actions;
 pub mod classify;
 pub mod config;
 pub mod daemon;
@@ -20,6 +21,7 @@ pub mod keeper_toml;
 pub mod layer_b;
 pub mod migrate;
 pub mod peer;
+pub mod reads;
 pub mod server;
 pub mod state;
 pub mod watcher;

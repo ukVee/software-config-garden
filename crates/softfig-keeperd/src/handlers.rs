@@ -817,7 +817,7 @@ pub fn vault_list_sealed(daemon: &Daemon, _args: serde_json::Value) -> HandlerRe
 /// Walk a tree's nested rows looking for the blob hash at
 /// `repo_relative`. Returns `None` if the path doesn't exist or names
 /// a directory.
-fn resolve_path_in_tree(
+pub(crate) fn resolve_path_in_tree(
     repo: &Repo,
     root_tree: &Hash,
     rel: &str,
@@ -921,14 +921,14 @@ fn validate_reveal_id(id: &str) -> std::result::Result<(), (ErrorKind, String)> 
     Ok(())
 }
 
-fn path_to_repo_rel_string(garden_root: &Path, abs: &Path) -> Option<String> {
+pub(crate) fn path_to_repo_rel_string(garden_root: &Path, abs: &Path) -> Option<String> {
     abs.strip_prefix(garden_root)
         .ok()
         .and_then(|p| p.to_str())
         .map(|s| s.replace('\\', "/"))
 }
 
-fn require_unlocked(inner: &crate::daemon::DaemonInner) -> std::result::Result<(), (ErrorKind, String)> {
+pub(crate) fn require_unlocked(inner: &crate::daemon::DaemonInner) -> std::result::Result<(), (ErrorKind, String)> {
     match inner.state {
         State::Unlocked => Ok(()),
         State::Locked => Err((ErrorKind::VaultLocked, "vault is locked".into())),
@@ -936,7 +936,7 @@ fn require_unlocked(inner: &crate::daemon::DaemonInner) -> std::result::Result<(
     }
 }
 
-fn validate_repo_path(garden_root: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
+pub(crate) fn validate_repo_path(garden_root: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
     if rel.is_empty() {
         return Err("empty path".into());
     }

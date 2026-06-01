@@ -33,10 +33,10 @@ Either run the helper script:
 ./scripts/onboard-device.sh
 ```
 
-…which builds `--release`, installs `softfig`, `softfig-keeperd`, and
-`softfig-mcp` into `~/.local/bin`, checks for `fuse3`, then **prompts**
-before enabling the systemd user unit and before registering the MCP
-server in `~/.claude.json`.
+…which builds `--release`, installs `softfig`, `softfig-keeperd`,
+`softfig-mcp`, and `softfig-tui` into `~/.local/bin`, checks for `fuse3`,
+then **prompts** before enabling the systemd user unit and before
+registering the MCP server in `~/.claude.json`.
 
 Or do it by hand:
 
@@ -45,6 +45,7 @@ cargo build --release
 install -m0755 target/release/softfig         ~/.local/bin/
 install -m0755 target/release/softfig-keeperd  ~/.local/bin/
 install -m0755 target/release/softfig-mcp      ~/.local/bin/
+install -m0755 target/release/softfig-tui      ~/.local/bin/
 ```
 
 ## 3. Scaffold the garden
@@ -110,6 +111,28 @@ the skeleton, then helps survey the machine (installed packages, enabled
 services, hardware, the device's bombadil profile) and fill the concept
 stubs. The `snapshots/` refresh-script pattern (e.g. `refresh-pacman.sh`)
 is the model for capturing mutating state.
+
+## 6. (optional) Drive the garden from the terminal (M3b TUI)
+
+`softfig-tui` is a ratatui frontend over the running daemon — handy on a
+headless box over SSH, or just for a tactile view. It talks to the same
+socket as the CLI and MCP; start the daemon + unlock first (the TUI can
+also unlock in-app).
+
+```bash
+softfig-tui
+```
+
+Keys: `1`/`2` switch Browse / History · `j k ↑ ↓` move · `Enter`/`l`/`→`
+open file or expand dir · `h`/`←` collapse · `u` unlock · `:` command
+palette (runs `log_decision`, `log_incident`, `archive`, `add_project`,
+`refresh_snapshot`, `propose`) · `r` refresh · `?` help · `q` quit.
+
+Browse content comes through the daemon's read-only `list_tree` /
+`read_file` verbs, which redact server-side: sealed files show
+`[sealed:<path>]`, inline `<vault id="…">` regions show `[encrypted]` —
+the TUI never receives sealed plaintext (reveals stay CLI-only:
+`softfig reveal`).
 
 ## What's deferred
 

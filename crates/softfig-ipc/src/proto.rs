@@ -107,6 +107,21 @@ pub enum ErrorKind {
     /// same `id`. Rejected on write so the on-read region disambiguator
     /// remains unique-keyed.
     DuplicateVaultId,
+    /// M3a: a `log_decision` / `log_incident` slug failed the
+    /// `[a-z0-9-]+` (length 1–64) charset rule.
+    InvalidSlug,
+    /// M3a: an `add_project` name failed the
+    /// `[a-z0-9]([a-z0-9-]*[a-z0-9])?` (length 1–64) rule.
+    InvalidProjectName,
+    /// M3a: a create-style action (`log_decision`, `log_incident`,
+    /// `add_project`, or `archive`'s destination) targeted a path that is
+    /// already present in the tree. No accidental clobber.
+    PathAlreadyExists,
+    /// M3a: `archive` named a `src` that doesn't exist.
+    SourceNotFound,
+    /// M3a: `refresh_snapshot` was given a path outside `snapshots/` or
+    /// whose parent directory doesn't exist.
+    InvalidSnapshotPath,
     /// Unknown / unhandled internal error.
     Internal,
 }

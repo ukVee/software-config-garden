@@ -4,7 +4,7 @@
 # encrypted, FUSE-mounted garden on a new device.
 #
 # Posture (M-onboard locked pick #6 / the install-reach open-question lean):
-#   * AUTOMATIC, no prompt: release build + install the three binaries to
+#   * AUTOMATIC, no prompt: release build + install the four binaries to
 #     ~/.local/bin, and check that fuse3 is present.
 #   * PROMPTED, reversible, user-consented: enabling the systemd --user
 #     unit and registering the MCP server in ~/.claude.json.
@@ -17,7 +17,7 @@ set -euo pipefail
 
 BIN_DIR="${HOME}/.local/bin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARIES=(softfig softfig-keeperd softfig-mcp)
+BINARIES=(softfig softfig-keeperd softfig-mcp softfig-tui)
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m!!!\033[0m %s\n' "$*"; }
@@ -99,6 +99,8 @@ Done. Next:
        softfig daemon start --garden "\$HOME/soft-fig_garden"
   3. Unlock the session once per boot:
        softfig daemon unlock
+  4. (optional) Drive the garden from the terminal UI:
+       softfig-tui
 
 See docs/onboard-laptop.md for the full walkthrough.
 EOF
