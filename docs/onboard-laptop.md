@@ -123,16 +123,26 @@ also unlock in-app).
 softfig-tui
 ```
 
-Keys: `1`/`2` switch Browse / History · `j k ↑ ↓` move · `Enter`/`l`/`→`
-open file or expand dir · `h`/`←` collapse · `u` unlock · `:` command
-palette (runs `log_decision`, `log_incident`, `archive`, `add_project`,
-`refresh_snapshot`, `propose`) · `r` refresh · `?` help · `q` quit.
+Keys: `1`/`2`/`3` switch Browse / History / Vault · `j k ↑ ↓` move ·
+`Enter`/`l`/`→` open file / expand dir / reveal (Vault) · `h`/`←` collapse ·
+`x` reveal selected sealed file · `c` copy the last reveal's value · `u`
+unlock · `:` command palette (runs `log_decision`, `log_incident`,
+`archive`, `add_project`, `refresh_snapshot`, `propose`, `seal`, `unseal`) ·
+`r` refresh · `?` help · `q` quit.
 
 Browse content comes through the daemon's read-only `list_tree` /
 `read_file` verbs, which redact server-side: sealed files show
 `[sealed:<path>]`, inline `<vault id="…">` regions show `[encrypted]` —
-the TUI never receives sealed plaintext (reveals stay CLI-only:
-`softfig reveal`).
+the TUI never receives sealed plaintext.
+
+The **`3:Vault` tab** lists the sealed-path globs + the files they match.
+`seal` / `unseal` (palette) add or remove a glob. **Reveal** (`x` or `Enter`)
+prompts for the master password and shows only the daemon's `0600` temp-file
+path + re-auth expiry — the plaintext is *never* rendered in the TUI. `c`
+copies that value to the Wayland clipboard by piping the temp file straight
+into `wl-copy` (needs `wl-clipboard`; the bytes never pass through the TUI's
+memory). Whole-file reveal only — inline `<vault id="…">` region reveal stays
+CLI-only (`softfig reveal --id`).
 
 ## What's deferred
 

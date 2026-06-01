@@ -8,6 +8,7 @@
 //! never receives sealed plaintext.
 
 pub mod app;
+pub mod clip;
 pub mod command;
 pub mod forms;
 pub mod ipc;

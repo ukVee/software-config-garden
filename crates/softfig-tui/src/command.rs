@@ -6,6 +6,8 @@ use crate::forms::ActionKind;
 pub enum Command {
     Browse,
     History,
+    Vault,
+    Reveal,
     Reload,
     Unlock,
     Quit,
@@ -19,6 +21,8 @@ pub fn parse_command(input: &str) -> Command {
     match t {
         "browse" | "b" => Command::Browse,
         "history" | "log" | "h" => Command::History,
+        "vault" | "v" => Command::Vault,
+        "reveal" | "x" => Command::Reveal,
         "reload" | "r" => Command::Reload,
         "unlock" => Command::Unlock,
         "quit" | "q" => Command::Quit,
@@ -36,7 +40,9 @@ pub fn parse_command(input: &str) -> Command {
 
 /// Names offered in the palette hint line.
 pub fn command_hints() -> String {
-    let mut names = vec!["browse", "history", "reload", "unlock", "quit", "help"];
+    let mut names = vec![
+        "browse", "history", "vault", "reveal", "reload", "unlock", "quit", "help",
+    ];
     for k in ActionKind::ALL {
         names.push(k.command_name());
     }
@@ -64,6 +70,19 @@ mod tests {
         assert_eq!(
             parse_command("propose"),
             Command::Action(ActionKind::ProposeDocUpdate)
+        );
+    }
+
+    #[test]
+    fn vault_commands() {
+        assert_eq!(parse_command("vault"), Command::Vault);
+        assert_eq!(parse_command("v"), Command::Vault);
+        assert_eq!(parse_command("reveal"), Command::Reveal);
+        assert_eq!(parse_command("x"), Command::Reveal);
+        assert_eq!(parse_command("seal"), Command::Action(ActionKind::VaultSeal));
+        assert_eq!(
+            parse_command("unseal"),
+            Command::Action(ActionKind::VaultUnseal)
         );
     }
 

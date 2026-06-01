@@ -4,10 +4,15 @@
 //! their own modules and carry the unit tests; this module wires them to
 //! the worker-thread [`IpcClient`] and the key stream.
 
+use std::path::Path;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{json, Value};
-use softfig_ipc::{LogReply, ReadFileReply, ShowReply, StatusReply};
+use softfig_ipc::{
+    LogReply, ReadFileReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
+};
 
+use crate::clip;
 use crate::command::{parse_command, Command};
 use crate::forms::{ActionForm, ActionKind};
 use crate::ipc::{IpcClient, Reply, Tag};
@@ -17,6 +22,7 @@ use crate::tree::TreeModel;
 pub enum View {
     Browse,
     History,
+    Vault,
 }
 
 #[derive(Debug)]
@@ -24,8 +30,19 @@ pub enum Overlay {
     None,
     Palette(String),
     Unlock { buf: String, error: Option<String> },
+    /// Masked master-password prompt for `vault_reveal` against `path`.
+    Reveal { path: String, buf: String, error: Option<String> },
     Form(ActionForm),
     Help,
+}
+
+/// The result of a successful reveal — the daemon's temp-file path + the
+/// re-auth expiry. Never holds the plaintext itself.
+#[derive(Debug, Clone)]
+pub struct RevealInfo {
+    pub path: String,
+    pub temp_path: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +63,11 @@ pub struct App {
     pub preview_title: String,
     pub history: Vec<HistoryLine>,
     pub history_selected: usize,
+    pub vault_globs: Vec<String>,
+    pub vault_files: Vec<String>,
+    pub vault_selected: usize,
+    pub vault_loaded: bool,
+    pub reveal: Option<RevealInfo>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -69,6 +91,11 @@ impl App {
             preview_title: "preview".into(),
             history: Vec::new(),
             history_selected: 0,
+            vault_globs: Vec::new(),
+            vault_files: Vec::new(),
+            vault_selected: 0,
+            vault_loaded: false,
+            reveal: None,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -102,6 +129,10 @@ impl App {
         ipc.send("log", json!({ "limit": 200 }), Tag::History);
     }
 
+    fn load_vault(&self, ipc: &mut IpcClient) {
+        ipc.send("vault_list_sealed", json!({}), Tag::VaultList);
+    }
+
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
     fn refresh_view(&self, ipc: &mut IpcClient) {
@@ -111,6 +142,9 @@ impl App {
         ipc.send("status", json!({}), Tag::Status);
         if self.view == View::History {
             self.load_history(ipc);
+        }
+        if self.vault_loaded {
+            self.load_vault(ipc);
         }
     }
 
@@ -220,6 +254,43 @@ impl App {
                     }
                 }
             },
+            Tag::VaultList => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<VaultListSealedReply>(v) {
+                        self.vault_globs = r.globs;
+                        self.vault_files = r.matching_files;
+                        self.vault_loaded = true;
+                        if self.vault_selected >= self.vault_files.len() {
+                            self.vault_selected = self.vault_files.len().saturating_sub(1);
+                        }
+                    }
+                }
+                Err((_, m)) => self.status = format!("vault list: {m}"),
+            },
+            Tag::Reveal { path } => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<VaultRevealReply>(v) {
+                        self.status = format!(
+                            "revealed {path} → {} · press c to copy",
+                            r.temp_path
+                        );
+                        self.reveal = Some(RevealInfo {
+                            path,
+                            temp_path: r.temp_path,
+                            expires_at: r.expires_at,
+                        });
+                        self.overlay = Overlay::None;
+                    }
+                }
+                Err((kind, m)) => {
+                    let msg = format!("reveal {path} failed ({kind:?}): {m}");
+                    if let Overlay::Reveal { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
         }
     }
 
@@ -230,6 +301,7 @@ impl App {
             Overlay::None => self.handle_key_main(key, ipc),
             Overlay::Palette(_) => self.handle_key_palette(key, ipc),
             Overlay::Unlock { .. } => self.handle_key_unlock(key, ipc),
+            Overlay::Reveal { .. } => self.handle_key_reveal(key, ipc),
             Overlay::Form(_) => self.handle_key_form(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
@@ -255,8 +327,16 @@ impl App {
                     self.load_history(ipc);
                 }
             }
+            KeyCode::Char('3') => {
+                self.view = View::Vault;
+                if !self.vault_loaded && !self.locked {
+                    self.load_vault(ipc);
+                }
+            }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
+            KeyCode::Char('x') => self.start_reveal(ipc),
+            KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
             KeyCode::Down | KeyCode::Char('j') => self.nav_down(ipc),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.activate(ipc),
@@ -271,6 +351,9 @@ impl App {
             View::History => {
                 self.history_selected = self.history_selected.saturating_sub(1);
             }
+            View::Vault => {
+                self.vault_selected = self.vault_selected.saturating_sub(1);
+            }
         }
     }
 
@@ -280,6 +363,11 @@ impl App {
             View::History => {
                 if self.history_selected + 1 < self.history.len() {
                     self.history_selected += 1;
+                }
+            }
+            View::Vault => {
+                if self.vault_selected + 1 < self.vault_files.len() {
+                    self.vault_selected += 1;
                 }
             }
         }
@@ -310,6 +398,7 @@ impl App {
                     ipc.send("show", json!({ "hash": h.hash }), Tag::Show);
                 }
             }
+            View::Vault => self.start_reveal(ipc),
         }
     }
 
@@ -353,6 +442,13 @@ impl App {
                     self.load_history(ipc);
                 }
             }
+            Command::Vault => {
+                self.view = View::Vault;
+                if !self.locked {
+                    self.load_vault(ipc);
+                }
+            }
+            Command::Reveal => self.start_reveal(ipc),
             Command::Reload if !self.locked => self.refresh_view(ipc),
             Command::Reload => {}
             Command::Unlock => {
@@ -397,6 +493,76 @@ impl App {
         }
     }
 
+    /// Open the masked reveal prompt for the currently-selected sealed file.
+    fn start_reveal(&mut self, _ipc: &mut IpcClient) {
+        if self.locked {
+            self.status = "locked — unlock before revealing".into();
+            return;
+        }
+        let target = match self.view {
+            View::Vault => self.vault_files.get(self.vault_selected).cloned(),
+            View::Browse => self
+                .tree
+                .selected_row()
+                .filter(|r| !r.is_dir)
+                .map(|r| r.path.clone()),
+            View::History => None,
+        };
+        match target {
+            Some(path) => {
+                self.overlay = Overlay::Reveal {
+                    path,
+                    buf: String::new(),
+                    error: None,
+                }
+            }
+            None => self.status = "select a sealed file to reveal".into(),
+        }
+    }
+
+    fn handle_key_reveal(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::Reveal { path, buf, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Enter => {
+                let path = path.clone();
+                let pass = buf.clone();
+                ipc.send(
+                    "vault_reveal",
+                    json!({ "path": path, "master_password": pass }),
+                    Tag::Reveal { path: path.clone() },
+                );
+                self.status = format!("revealing {path}…");
+            }
+            _ => {}
+        }
+    }
+
+    /// Copy the last reveal's plaintext into the Wayland clipboard. The
+    /// bytes flow from the daemon's 0600 temp file straight into `wl-copy`'s
+    /// stdin — they never enter this process's memory.
+    fn copy_reveal(&mut self) {
+        let Some(info) = self.reveal.clone() else {
+            self.status = "nothing to copy — reveal a secret first".into();
+            return;
+        };
+        if !clip::clipboard_available() {
+            self.status =
+                format!("no clipboard tool (wl-copy) — temp file at {}", info.temp_path);
+            return;
+        }
+        self.status = match clip::copy_file_to_clipboard(Path::new(&info.temp_path)) {
+            Ok(()) => format!("copied {} to clipboard", info.path),
+            Err(e) => format!("copy failed: {e} — temp file at {}", info.temp_path),
+        };
+    }
+
     fn handle_key_form(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         // Ctrl-S submits regardless of focused field.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -438,6 +604,18 @@ fn short_hash(h: &str) -> String {
 }
 
 fn summarize_action(v: &Value) -> String {
+    // Vault seal: report how many tracked files were newly Layer-B-sealed.
+    if let Some(sealed) = v.get("newly_sealed").and_then(|x| x.as_array()) {
+        return format!("sealed {} file(s)", sealed.len());
+    }
+    // Vault unseal: whether the pattern was actually present.
+    if let Some(removed) = v.get("removed").and_then(|x| x.as_bool()) {
+        return if removed {
+            "removed".into()
+        } else {
+            "pattern not present".into()
+        };
+    }
     for key in ["path", "to", "hash"] {
         if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
             return format!("{key}={s}");
@@ -492,5 +670,92 @@ mod tests {
         );
         assert_eq!(summarize_action(&json!({"hash":"abc"})), "hash=abc");
         assert_eq!(summarize_action(&json!({})), "ok");
+    }
+
+    #[test]
+    fn summarize_vault_replies() {
+        assert_eq!(
+            summarize_action(&json!({"newly_sealed":["a","b"],"schema_commit":"x"})),
+            "sealed 2 file(s)"
+        );
+        assert_eq!(summarize_action(&json!({"removed":true})), "removed");
+        assert_eq!(
+            summarize_action(&json!({"removed":false})),
+            "pattern not present"
+        );
+    }
+
+    fn dummy_ipc() -> IpcClient {
+        // The worker thread idles until a send; the VaultList / Reveal Ok
+        // paths issue none, so a bogus socket path is never connected.
+        IpcClient::spawn(std::path::PathBuf::from("/nonexistent/softfig.sock"))
+    }
+
+    #[test]
+    fn vault_list_populates_view() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::VaultList,
+                result: Ok(json!({
+                    "globs": ["secrets/**"],
+                    "matching_files": ["secrets/api-keys.toml", "secrets/coords.txt"],
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.vault_loaded);
+        assert_eq!(app.vault_globs, vec!["secrets/**".to_string()]);
+        assert_eq!(app.vault_files.len(), 2);
+    }
+
+    #[test]
+    fn reveal_reply_records_path_not_plaintext() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::Reveal {
+            path: "secrets/api-keys.toml".into(),
+            buf: "pw".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::Reveal {
+                    path: "secrets/api-keys.toml".into(),
+                },
+                result: Ok(json!({
+                    "temp_path": "/run/user/1000/softfig-reveal-abc.toml",
+                    "expires_at": 1000,
+                })),
+            },
+            &mut ipc,
+        );
+        let info = app.reveal.expect("reveal recorded");
+        assert_eq!(info.temp_path, "/run/user/1000/softfig-reveal-abc.toml");
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("press c to copy"));
+    }
+
+    #[test]
+    fn start_reveal_needs_a_selected_file() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Vault;
+        let mut ipc = dummy_ipc();
+        // No sealed files loaded → no overlay, a hint instead.
+        app.start_reveal(&mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+
+        app.vault_files = vec!["secrets/api-keys.toml".into()];
+        app.start_reveal(&mut ipc);
+        match &app.overlay {
+            Overlay::Reveal { path, .. } => assert_eq!(path, "secrets/api-keys.toml"),
+            other => panic!("expected reveal overlay, got {other:?}"),
+        }
     }
 }

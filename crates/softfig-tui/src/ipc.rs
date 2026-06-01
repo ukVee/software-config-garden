@@ -24,6 +24,8 @@ pub enum Tag {
     History,
     Show,
     Action { title: String },
+    VaultList,
+    Reveal { path: String },
 }
 
 #[derive(Debug)]

@@ -41,6 +41,31 @@ fn renders_browse_frame() {
 }
 
 #[test]
+fn renders_vault_frame() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Vault;
+    app.vault_globs = vec!["secrets/**".into()];
+    app.vault_files = vec!["secrets/api-keys.toml".into()];
+    app.vault_loaded = true;
+    app.reveal = Some(softfig_tui::app::RevealInfo {
+        path: "secrets/api-keys.toml".into(),
+        temp_path: "/run/user/1000/softfig-reveal-abc.toml".into(),
+        expires_at: 1000,
+    });
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Vault"), "vault tab missing:\n{rendered}");
+    assert!(rendered.contains("api-keys.toml"), "sealed file missing");
+    assert!(rendered.contains("sealed globs"), "globs panel missing");
+    assert!(rendered.contains("temp"), "reveal temp path missing");
+}
+
+#[test]
 fn renders_help_overlay() {
     let mut app = App::new();
     app.locked = false;

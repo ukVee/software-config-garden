@@ -19,16 +19,20 @@ pub enum ActionKind {
     AddProject,
     RefreshSnapshot,
     ProposeDocUpdate,
+    VaultSeal,
+    VaultUnseal,
 }
 
 impl ActionKind {
-    pub const ALL: [ActionKind; 6] = [
+    pub const ALL: [ActionKind; 8] = [
         ActionKind::LogDecision,
         ActionKind::LogIncident,
         ActionKind::Archive,
         ActionKind::AddProject,
         ActionKind::RefreshSnapshot,
         ActionKind::ProposeDocUpdate,
+        ActionKind::VaultSeal,
+        ActionKind::VaultUnseal,
     ];
 
     /// The palette command keyword for this action.
@@ -40,6 +44,8 @@ impl ActionKind {
             ActionKind::AddProject => "add_project",
             ActionKind::RefreshSnapshot => "refresh_snapshot",
             ActionKind::ProposeDocUpdate => "propose",
+            ActionKind::VaultSeal => "seal",
+            ActionKind::VaultUnseal => "unseal",
         }
     }
 
@@ -51,6 +57,8 @@ impl ActionKind {
             ActionKind::AddProject => "add_project",
             ActionKind::RefreshSnapshot => "refresh_snapshot",
             ActionKind::ProposeDocUpdate => "propose_doc_update",
+            ActionKind::VaultSeal => "vault_seal",
+            ActionKind::VaultUnseal => "vault_unseal",
         }
     }
 }
@@ -138,6 +146,8 @@ impl ActionForm {
                 Field::line("project", false),
                 Field::body("content"),
             ],
+            ActionKind::VaultSeal => vec![Field::line("glob pattern (e.g. secrets/**)", false)],
+            ActionKind::VaultUnseal => vec![Field::line("glob pattern to remove", false)],
         };
         ActionForm {
             kind,
@@ -290,8 +300,33 @@ impl ActionForm {
                     }),
                 ))
             }
+            ActionKind::VaultSeal => {
+                let pattern = self.val(0);
+                let pattern = pattern.trim();
+                validate_glob(pattern)?;
+                Ok((op::VAULT_SEAL, json!({ "pattern": pattern })))
+            }
+            ActionKind::VaultUnseal => {
+                let pattern = self.val(0);
+                let pattern = pattern.trim();
+                validate_glob(pattern)?;
+                Ok((op::VAULT_UNSEAL, json!({ "pattern": pattern })))
+            }
         }
     }
+}
+
+/// A glob pattern for seal/unseal. The daemon's `globset` parser is the
+/// authority on syntax; this only catches the obvious empty / oversized
+/// cases for instant feedback.
+pub fn validate_glob(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("pattern must not be empty".into());
+    }
+    if pattern.len() > 256 {
+        return Err("pattern length must be ≤ 256".into());
+    }
+    Ok(())
 }
 
 pub fn validate_slug(slug: &str) -> Result<(), String> {
@@ -401,6 +436,20 @@ mod tests {
         assert_eq!(op, op::REFRESH_SNAPSHOT);
         assert_eq!(args["path"], "snapshots/packages/pacman/list.md");
         assert_eq!(args["content"], "data");
+    }
+
+    #[test]
+    fn vault_seal_builds_request() {
+        let mut f = ActionForm::for_kind(ActionKind::VaultSeal);
+        for c in "secrets/**".chars() {
+            f.input_char(c);
+        }
+        let (op, args) = f.to_request().unwrap();
+        assert_eq!(op, op::VAULT_SEAL);
+        assert_eq!(args["pattern"], "secrets/**");
+
+        let empty = ActionForm::for_kind(ActionKind::VaultUnseal);
+        assert!(empty.to_request().is_err());
     }
 
     #[test]
