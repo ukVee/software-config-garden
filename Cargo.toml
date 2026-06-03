@@ -11,6 +11,7 @@ members = [
     "crates/softfig-fuse",
     "crates/softfig-onboard",
     "crates/softfig-tui",
+    "crates/softfig-deploy",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ softfig-store   = { path = "crates/softfig-store" }
 softfig-core    = { path = "crates/softfig-core" }
 softfig-ipc     = { path = "crates/softfig-ipc" }
 softfig-onboard = { path = "crates/softfig-onboard" }
+softfig-deploy  = { path = "crates/softfig-deploy" }
 
 # Crypto
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }

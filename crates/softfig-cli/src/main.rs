@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
 mod cmd_daemon;
+mod cmd_deploy;
 mod cmd_migrate;
 mod cmd_onboard;
 mod cmd_repo;
@@ -47,6 +48,11 @@ enum Cmd {
     /// `$XDG_RUNTIME_DIR` (mode 0600); records an audit `vault_reveal`
     /// commit.
     Reveal(cmd_reveal::RevealArgs),
+
+    /// Deploy the garden's `config/deploy.toml` table onto the filesystem
+    /// (the `bombadil link` replacement; M4a static spine). Requires the
+    /// garden unlocked.
+    Deploy(cmd_deploy::DeployArgs),
 }
 
 #[derive(Args, Debug)]
@@ -70,5 +76,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Daemon(cmd) => cmd_daemon::run(cmd),
         Cmd::Migrate(args) => cmd_migrate::run(args.cmd, args.status),
         Cmd::Reveal(args) => cmd_reveal::run(args),
+        Cmd::Deploy(args) => cmd_deploy::run(args),
     }
 }

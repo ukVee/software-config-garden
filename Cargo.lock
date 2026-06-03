@@ -1542,6 +1542,7 @@ dependencies = [
  "serde",
  "serde_json",
  "softfig-core",
+ "softfig-deploy",
  "softfig-ipc",
  "softfig-onboard",
  "softfig-store",
@@ -1566,6 +1567,16 @@ dependencies = [
  "thiserror",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "softfig-deploy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

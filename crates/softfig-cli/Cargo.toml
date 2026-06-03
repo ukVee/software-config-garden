@@ -17,6 +17,7 @@ softfig-store.workspace = true
 softfig-core.workspace = true
 softfig-ipc.workspace = true
 softfig-onboard.workspace = true
+softfig-deploy.workspace = true
 clap.workspace = true
 hostname.workspace = true
 rpassword.workspace = true
