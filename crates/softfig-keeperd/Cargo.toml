@@ -34,7 +34,6 @@ globset.workspace = true
 walkdir.workspace = true
 
 # M2c — inline <vault> tag parsing + base64 inline ciphertext bodies
-toml_edit.workspace = true
 base64.workspace = true
 
 [dev-dependencies]

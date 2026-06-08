@@ -10,9 +10,10 @@
 //!   (line-aware byte scan, skips fenced code blocks *and* inline
 //!   backtick code spans so prose that documents `<vault …>` tags isn't
 //!   parsed as a real region),
-//!   [`Toml`](RegionParser::Toml) (toml_edit validates syntax then the
-//!   PlainText scan runs over the raw bytes; falls back to PlainText if
-//!   parse fails), and [`PlainText`](RegionParser::PlainText) (UTF-8
+//!   [`Toml`](RegionParser::Toml) (raw-byte scan that masks `#` comments
+//!   — the TOML analog of the markdown code-span exemption — so
+//!   documented tags aren't parsed, while still finding tags embedded in
+//!   string values), and [`PlainText`](RegionParser::PlainText) (UTF-8
 //!   sniff + raw byte scan). YAML / JSON / source-code parsers land as
 //!   additive enum variants later.
 //! * Per-region subkey via [`VaultSession::derive_layer_b_region_subkey`]
@@ -438,26 +439,121 @@ fn compute_markdown_mask(content: &[u8]) -> Vec<bool> {
     out
 }
 
+/// State of the line-and-string-aware TOML scan used by
+/// [`compute_toml_mask`]. Only [`Comment`](TomlScan::Comment) bytes are
+/// disallowed; the string states exist solely so a `#` *inside* a string
+/// isn't mistaken for a comment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlScan {
+    Normal,
+    Comment,
+    Basic,     // "…"
+    Literal,   // '…'
+    MlBasic,   // """…"""
+    MlLiteral, // '''…'''
+}
+
 fn compute_toml_mask(content: &[u8]) -> Vec<bool> {
-    // v1 simplification: gate by toml_edit syntactic validity. On parse
-    // success, allow the raw-bytes scan over the whole document (so
-    // `<vault>` tags inside literal multi-line strings are detected
-    // without needing per-string-value span translation). On parse
-    // failure, fall back to PlainText behavior (raw scan) per
-    // open-question 3 lean — a user with a half-edited file shouldn't
-    // lose redaction.
+    // Non-UTF-8 → no regions (binary pass-through, matching `parse`).
+    if std::str::from_utf8(content).is_err() {
+        return vec![false; content.len()];
+    }
+    // v1 model: allow the raw-bytes scan over the whole document (so
+    // `<vault>` tags inside literal/basic string values are still
+    // detected without per-string span translation) EXCEPT inside `#`
+    // comments. A `#` outside any string starts a comment to end of
+    // line; those bytes are masked so prose that documents a
+    // `<vault …>` tag in a comment isn't parsed as a real region — the
+    // TOML analog of the markdown inline-code / fenced-block exemption.
+    // This runs even on syntactically invalid TOML per the
+    // open-question-3 lean: a half-edited file shouldn't lose redaction
+    // (so the mask is hand-rolled rather than gated on a toml parse).
     //
-    // Known v1 limitations (additive fixes in later slices):
-    //  * `<vault>` tags inside TOML comments are NOT rejected.
-    //  * `<vault>` tags inside basic strings with `\"` escapes are NOT
-    //    found (the literal `<vault id="…">` byte sequence is not
-    //    present in the file in that case).
-    let s = match std::str::from_utf8(content) {
-        Ok(s) => s,
-        Err(_) => return vec![false; content.len()],
-    };
-    let _ = toml_edit::ImDocument::parse(s);
-    vec![true; content.len()]
+    // Known v1 limitation (additive fix in a later slice): `<vault>`
+    // tags inside basic strings with `\"` escapes are NOT found (the
+    // literal `<vault id="…">` byte sequence is not present in the file
+    // in that case).
+    let mut out = vec![true; content.len()];
+    let mut state = TomlScan::Normal;
+    let mut i = 0usize;
+    while i < content.len() {
+        let b = content[i];
+        match state {
+            TomlScan::Normal => match b {
+                b'#' => {
+                    out[i] = false;
+                    state = TomlScan::Comment;
+                    i += 1;
+                }
+                b'"' if content[i + 1..].starts_with(b"\"\"") => {
+                    state = TomlScan::MlBasic;
+                    i += 3;
+                }
+                b'"' => {
+                    state = TomlScan::Basic;
+                    i += 1;
+                }
+                b'\'' if content[i + 1..].starts_with(b"''") => {
+                    state = TomlScan::MlLiteral;
+                    i += 3;
+                }
+                b'\'' => {
+                    state = TomlScan::Literal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            TomlScan::Comment => {
+                if b == b'\n' {
+                    // The newline ends the comment and is not part of it.
+                    state = TomlScan::Normal;
+                } else {
+                    out[i] = false;
+                }
+                i += 1;
+            }
+            TomlScan::Basic => match b {
+                b'\\' => i += 2, // escape: skip the escaped byte
+                b'"' => {
+                    state = TomlScan::Normal;
+                    i += 1;
+                }
+                // A single-line string can't span a newline; recover so a
+                // stray quote doesn't swallow the rest of the file.
+                b'\n' => {
+                    state = TomlScan::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            TomlScan::Literal => match b {
+                b'\'' | b'\n' => {
+                    state = TomlScan::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            TomlScan::MlBasic => {
+                if b == b'\\' {
+                    i += 2; // escape (incl. line-ending backslash)
+                } else if b == b'"' && content[i..].starts_with(b"\"\"\"") {
+                    state = TomlScan::Normal;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            TomlScan::MlLiteral => {
+                if b == b'\'' && content[i..].starts_with(b"'''") {
+                    state = TomlScan::Normal;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn strip_leading_spaces(line: &[u8]) -> &[u8] {
@@ -555,6 +651,42 @@ mod tests {
         let spans = parse(RegionParser::Toml, body, &session, "x.toml").unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].id, "foo");
+    }
+
+    #[test]
+    fn toml_skips_comment_tag() {
+        let session = fresh_session();
+        // A `<vault>` tag inside a `#` comment is documentation, not a
+        // region; a real region in a string value still parses.
+        let body = b"# docs: <vault id=\"doc\">x</vault>\napi = '''<vault id=\"real\">SECRET</vault>'''\n";
+        let spans = parse(RegionParser::Toml, body, &session, "x.toml").unwrap();
+        assert_eq!(spans.len(), 1, "comment tag should be skipped; got {spans:?}");
+        assert_eq!(spans[0].id, "real");
+    }
+
+    #[test]
+    fn toml_hash_inside_string_is_not_a_comment() {
+        let session = fresh_session();
+        // The `#` lives inside a literal string, so it does NOT start a
+        // comment — the region embedded after it must still be found.
+        let body = b"note = 'see # <vault id=\"x\">SECRET</vault> here'\n";
+        let spans = parse(RegionParser::Toml, body, &session, "x.toml").unwrap();
+        assert_eq!(spans.len(), 1, "in-string `#` must not mask the region; got {spans:?}");
+        assert_eq!(spans[0].id, "x");
+    }
+
+    #[test]
+    fn toml_comment_documentation_does_not_brick_file() {
+        // Regression mirroring the markdown case: a comment documenting
+        // the vault syntax with an ellipsis id must not fail the file
+        // closed to `[malformed vault tag in …]`.
+        let session = fresh_session();
+        let body =
+            "# wrap a value as `<vault id=\"…\">…</vault>` (region-level seal)\nkey = \"plain\"\n"
+                .as_bytes();
+        let spans = parse(RegionParser::Toml, body, &session, "secrets.toml")
+            .expect("commented vault docs must not error");
+        assert!(spans.is_empty(), "comment mention must yield no regions; got {spans:?}");
     }
 
     #[test]
