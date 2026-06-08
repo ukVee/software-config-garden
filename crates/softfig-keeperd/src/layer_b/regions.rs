@@ -7,7 +7,9 @@
 //!   parser only looks for `<vault id="…">` open tags and `</vault>`
 //!   close tags as literal bytes — it never synthesizes the wrapper.
 //! * Closed-enum [`RegionParser`]. v1 ships [`Markdown`](RegionParser::Markdown)
-//!   (line-aware byte scan, skips fenced code blocks),
+//!   (line-aware byte scan, skips fenced code blocks *and* inline
+//!   backtick code spans so prose that documents `<vault …>` tags isn't
+//!   parsed as a real region),
 //!   [`Toml`](RegionParser::Toml) (toml_edit validates syntax then the
 //!   PlainText scan runs over the raw bytes; falls back to PlainText if
 //!   parse fails), and [`PlainText`](RegionParser::PlainText) (UTF-8
@@ -374,7 +376,7 @@ fn is_allowed(allow: &[bool], byte_offset: usize) -> bool {
 // --- per-format byte masks ----------------------------------------------
 
 fn compute_markdown_mask(content: &[u8]) -> Vec<bool> {
-    let mut out = Vec::with_capacity(content.len());
+    let mut out = vec![false; content.len()];
     let mut in_fence = false;
     let mut line_start = 0usize;
     while line_start <= content.len() {
@@ -389,11 +391,41 @@ fn compute_markdown_mask(content: &[u8]) -> Vec<bool> {
         // The fence line itself is part of the code block (not
         // available for vault tags).
         let line_in_fence = in_fence || toggles;
-        for _ in 0..(line_end - line_start) {
-            out.push(!line_in_fence);
+        if line_in_fence {
+            // Whole line is fenced code — nothing here is a real tag.
+            // (`out` is pre-zeroed, so the bytes stay disallowed.)
+        } else {
+            // Outside any fenced block: also disallow inline backtick
+            // code spans, so documentation that mentions `<vault …>` in
+            // backticks isn't parsed as a real region. Inline spans are
+            // line-scoped (a v1 simplification mirroring the fenced-only
+            // line-aware design): a backtick run opens a span, a run of
+            // the same length closes it, and any leftover open span is
+            // dropped at the newline.
+            let mut inline_run: Option<usize> = None;
+            let mut j = line_start;
+            while j < line_end {
+                if content[j] == b'`' {
+                    let run_start = j;
+                    while j < line_end && content[j] == b'`' {
+                        j += 1;
+                    }
+                    // Backtick delimiters are never tag bytes; leave them
+                    // disallowed and toggle the span state.
+                    let run_len = j - run_start;
+                    match inline_run {
+                        None => inline_run = Some(run_len),
+                        Some(open) if open == run_len => inline_run = None,
+                        Some(_) => { /* mismatched run stays inside the span */ }
+                    }
+                } else {
+                    out[j] = inline_run.is_none();
+                    j += 1;
+                }
+            }
         }
         if has_newline {
-            out.push(!line_in_fence);
+            out[line_end] = !line_in_fence;
         }
         if toggles {
             in_fence = !in_fence;
@@ -402,9 +434,6 @@ fn compute_markdown_mask(content: &[u8]) -> Vec<bool> {
             break;
         }
         line_start = line_end + 1;
-    }
-    while out.len() < content.len() {
-        out.push(true);
     }
     out
 }
@@ -491,6 +520,32 @@ mod tests {
         let spans = parse(RegionParser::Markdown, body, &session, "x.md").unwrap();
         assert_eq!(spans.len(), 1, "fenced tag should be skipped; got {spans:?}");
         assert_eq!(spans[0].id, "bar");
+    }
+
+    #[test]
+    fn markdown_skips_inline_code_span() {
+        let session = fresh_session();
+        // A tag inside an inline backtick span is documentation, not a
+        // region; a bare tag on the same line still parses.
+        let body = b"docs: `<vault id=\"foo\">SECRET</vault>` then <vault id=\"bar\">OPEN</vault>\n";
+        let spans = parse(RegionParser::Markdown, body, &session, "x.md").unwrap();
+        assert_eq!(spans.len(), 1, "inline-code tag should be skipped; got {spans:?}");
+        assert_eq!(spans[0].id, "bar");
+    }
+
+    #[test]
+    fn inline_code_documentation_does_not_brick_file() {
+        // Regression: the default-garden CLAUDE.md documents the vault
+        // syntax inline as `<vault id="…">…</vault>` (ellipsis id). Before
+        // inline-code masking this poisoned `validate_id` and failed the
+        // whole file closed to `[malformed vault tag in …]`.
+        let session = fresh_session();
+        let body =
+            "5. **No secrets in plaintext.** … inline `<vault id=\"…\">…</vault>` tags).\n"
+                .as_bytes();
+        let spans = parse(RegionParser::Markdown, body, &session, "CLAUDE.md")
+            .expect("inline-code vault docs must not error");
+        assert!(spans.is_empty(), "documentation mention must yield no regions; got {spans:?}");
     }
 
     #[test]
