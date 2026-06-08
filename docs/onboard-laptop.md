@@ -144,6 +144,41 @@ into `wl-copy` (needs `wl-clipboard`; the bytes never pass through the TUI's
 memory). Whole-file reveal only — inline `<vault id="…">` region reveal stays
 CLI-only (`softfig reveal --id`).
 
+## Troubleshooting
+
+### `softfig daemon unlock` fails with `Operation not permitted (os error 1)`
+
+The daemon reached the FUSE-mount step and the mount was denied with EPERM.
+The usual cause is **systemd unit hardening fighting the FUSE mount**. The
+daemon mounts via the setuid-root `fusermount3` helper, which is broken by:
+
+- `NoNewPrivileges=true` — makes `execve()` ignore the setuid bit, so
+  `fusermount3` runs unprivileged and the `mount(2)` syscall returns EPERM.
+- `ProtectSystem=` / `PrivateTmp=` and other namespacing options — give the
+  unit its own mount namespace, so even a successful mount stays invisible
+  to your shell (`ls ~/soft-fig_garden` shows only `keeper.toml`).
+
+The shipped `packaging/systemd/softfig-keeperd.service` carries none of
+these. If you hit the error, you're likely running an **older copy of the
+unit** — reinstall it and restart:
+
+```bash
+install -m0644 packaging/systemd/softfig-keeperd.service \
+  ~/.config/systemd/user/softfig-keeperd.service
+systemctl --user daemon-reload
+systemctl --user restart softfig-keeperd
+softfig daemon unlock
+```
+
+To confirm the unit is the culprit, run the daemon **outside systemd** —
+it works there because none of the hardening applies:
+
+```bash
+systemctl --user stop softfig-keeperd
+softfig daemon start --garden "$HOME/soft-fig_garden"
+softfig daemon unlock        # succeeds
+```
+
 ## What's deferred
 
 - **Templating + secret-aware deploy** (M4b/M4c) — the static deploy spine

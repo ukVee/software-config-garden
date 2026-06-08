@@ -16,12 +16,23 @@ RestartSec=2
 StandardOutput=journal
 StandardError=journal
 
-# Hardening (extends naturally to the AUR PKGBUILD later):
-ProtectSystem=full
-PrivateTmp=true
-NoNewPrivileges=true
-# We need read+write to ~/soft-fig_garden and $XDG_RUNTIME_DIR; both are
-# under the user's own tree, so no extra ReadWritePaths= entries.
+# DELIBERATELY no filesystem/privilege sandboxing here. This daemon's job
+# is to project a FUSE mount into the user's login session, and the usual
+# hardening knobs are fundamentally incompatible with that:
+#   * NoNewPrivileges=true makes execve() ignore the setuid bit, so the
+#     setuid-root `fusermount3` helper that fuser shells out to cannot
+#     mount -> EPERM ("Operation not permitted", os error 1) on
+#     `softfig daemon unlock`.
+#   * ProtectSystem=, PrivateTmp= (and the other namespacing options) give
+#     the unit its own mount namespace with non-shared propagation; a FUSE
+#     mount created inside it stays trapped in that namespace and is
+#     invisible to the user's interactive shell — `ls ~/soft-fig_garden`
+#     would still show only the keeper.toml pointer after a "successful"
+#     unlock.
+# If hardening is ever reintroduced (e.g. in the AUR PKGBUILD), it must use
+# only knobs that neither block setuid nor create a mount namespace, and
+# any namespacing option additionally needs MountFlags=shared.
+# See docs/onboard-laptop.md (Troubleshooting).
 
 [Install]
 WantedBy=default.target
