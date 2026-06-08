@@ -146,8 +146,11 @@ CLI-only (`softfig reveal --id`).
 
 ## What's deferred
 
-- **Templating + symlink deploy** (M4) — onboarding does dumb one-shot
-  `{{name}}` substitution, not the templating engine.
+- **Templating + secret-aware deploy** (M4b/M4c) — the static deploy spine
+  (`softfig deploy`, M4a) has landed, but onboarding still does dumb one-shot
+  `{{name}}` substitution, not the MiniJinja templating engine (M4b) or
+  render-time Vault secrets/posthooks (M4c). A freshly onboarded laptop garden
+  has no `config/` tree to deploy yet — that arrives at the dogfood ceremony.
 - **Cross-device sync / pairing** (M5) — "clone" here is plain git; the
   laptop garden is standalone.
 - **AUR packaging + post-install automation** (M7) — this runbook is the

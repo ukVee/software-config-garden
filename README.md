@@ -12,10 +12,11 @@ files documenting one Arch laptop — worked well enough that it became the
 prototype for a program other people could adopt. This repo is that program.
 
 **Status:** the engine, first-run experience, and Keeper surfaces (CLI, MCP,
-and the `softfig-tui` terminal UI) are built and self-hosting;
-templating/symlink deployment, cross-device sync, a GUI, and AUR packaging are
-not started. See [Status](#status) and [Roadmap](#roadmap). This is a
-single-author work in progress, not a released tool.
+and the `softfig-tui` terminal UI) are built and self-hosting, and the
+templating/symlink pillar has its static deploy spine (`softfig deploy`, M4a);
+template rendering, cross-device sync, a GUI, and AUR packaging are not started.
+See [Status](#status) and [Roadmap](#roadmap). This is a single-author work in
+progress, not a released tool.
 
 ---
 
@@ -89,7 +90,7 @@ The **Keeper** is the user-facing client over the pillars:
 
 ## Status
 
-Built and tested (`cargo test --workspace` green, 165 tests):
+Built and tested (`cargo test --workspace` green, 176 tests):
 
 - **M1a–M1d** — Vault (crypto + key lifecycle), VCS (content-addressed
   ciphertext store + signed commits + SQLite metadata), the headless daemon,
@@ -108,6 +109,13 @@ Built and tested (`cargo test --workspace` green, 165 tests):
   daemon (Browse / History / Vault tabs, modal action forms, in-app unlock) backed
   by read-only `list_tree` / `read_file` verbs with daemon-side redaction. The
   Vault tab does masked whole-file reveals — plaintext never reaches the terminal.
+- **M4a** — the static deploy spine, opening the templating/symlink pillar (the
+  `bombadil link` → `softfig deploy` replacement): a frontend-neutral
+  `softfig-deploy` crate (`plan` diff / `apply` I/O) materializes a declarative
+  `config/deploy.toml` source→target table onto the filesystem — symlink-to-cache
+  (the FUSE plaintext is ephemeral, so a stable `0700`/`0600` deploy-cache backs
+  the link) or a `# managed by softfig` stamped copy, dry-run + conflict-safe,
+  `$HOME` file targets only.
 
 What's planned but not yet started lives in [Roadmap](#roadmap).
 
@@ -116,14 +124,18 @@ What's planned but not yet started lives in [Roadmap](#roadmap).
 
 ## Roadmap
 
-What's planned, in rough order — none of it is started. The
+What's planned, in rough order — M4 is underway (its static deploy spine has
+landed; see [Status](#status)), the rest is not started. The
 [five pillars](#the-five-pillars) table says what each item *is*; this says
 *when*. Each milestone is design-locked in the garden specs before
 implementation (see [Design](#design-where-the-thinking-lives)).
 
-- **M4 — Templating + symlink deployment** *(next up).* The bombadil
-  replacement: `bombadil link` → `softfig deploy`. Confirmed as the next
-  milestone; not yet design-locked.
+- **M4 — Templating + symlink deployment** *(underway).* The bombadil
+  replacement: `bombadil link` → `softfig deploy`. **M4a — the static deploy
+  spine — has shipped** (source→target table, dry-run/conflict-safe `apply`,
+  `$HOME` file targets). Remaining: **M4b** (MiniJinja template rendering +
+  profile-scoped vars), **M4c** (render-time Vault secrets + posthooks), and a
+  separate `/etc`-deploy slice.
 - **M5 — Cross-device sync.** Device pairing, the trust matrix, peer-assisted
   unlock, and read-only peer mirroring over a WireGuard LAN. Single owner per
   garden — no multi-master merging.
@@ -168,7 +180,7 @@ indistinguishable without the key.
 
 ## Repository layout
 
-A Cargo workspace (Rust 2024 edition, ≥ 1.85) of ten crates:
+A Cargo workspace (Rust 2024 edition, ≥ 1.85) of eleven crates:
 
 ```
 crates/
@@ -181,7 +193,8 @@ crates/
 ├── softfig-cli/       the `softfig` binary
 ├── softfig-fuse/      FUSE plaintext-view of the encrypted store
 ├── softfig-onboard/   frontend-agnostic scaffold core (embedded skeleton + born-in-FUSE)
-└── softfig-tui/       ratatui terminal frontend over the daemon (Browse / History / Vault)
+├── softfig-tui/       ratatui terminal frontend over the daemon (Browse / History / Vault)
+└── softfig-deploy/    deploy spine: source→target table → symlink-to-cache / stamped copy (the `bombadil link` replacement)
 
 templates/default-garden/   the embedded skeleton, baked in via include_dir!
 scripts/onboard-device.sh    build + install helper
@@ -289,6 +302,7 @@ softfig daemon start | stop | status | unlock
 softfig reveal <path> [--id <region-id>]...   # plaintext to a 0600 temp file; never to stdout
 softfig vault   seal | unseal | list-sealed
 softfig migrate [prepare | finalize]          # convert a legacy non-FUSE garden
+softfig deploy  [--dry-run] [--force]         # materialize config/deploy.toml onto the FS (M4a)
 ```
 
 `commit`/`log`/`show`/`fsck` auto-detect a running daemon and route through it
