@@ -19,7 +19,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MPL-2.0"
-repository = "https://github.com/ukv/software-config_garden"
+repository = "https://github.com/ukVee/software-config-garden"
 
 [workspace.dependencies]
 softfig-vault   = { path = "crates/softfig-vault" }
