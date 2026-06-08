@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -28,6 +28,18 @@ use crate::{DirtyEventSink, MountHandle, Result, SealedQuery};
 
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 512;
+
+/// The mount runs with `DefaultPermissions`, so the kernel checks access
+/// against each inode's owner *before* our handlers run. Present every
+/// inode as owned by the keeper process (its effective uid/gid) so the
+/// non-root daemon can write through its own mount.
+///
+/// `geteuid`/`getegid` are infallible FFI with no safety preconditions —
+/// the only reason they're `unsafe` is the `extern "C"` boundary.
+#[allow(unsafe_code)]
+static OWNER_UID: LazyLock<u32> = LazyLock::new(|| unsafe { libc::geteuid() });
+#[allow(unsafe_code)]
+static OWNER_GID: LazyLock<u32> = LazyLock::new(|| unsafe { libc::getegid() });
 
 pub(crate) struct SharedState {
     /// Re-opened sqlite handle for read-only tip resolution. WAL means
@@ -393,8 +405,8 @@ impl Filesystem for FuseFs {
             kind: FileType::Directory,
             perm: 0o755,
             nlink: 2,
-            uid: 0,
-            gid: 0,
+            uid: *OWNER_UID,
+            gid: *OWNER_GID,
             rdev: 0,
             blksize: BLOCK_SIZE,
             flags: 0,
@@ -597,8 +609,8 @@ impl FuseFs {
                     kind: FileType::RegularFile,
                     perm: (mode & 0o7777) as u16,
                     nlink: 1,
-                    uid: 0,
-                    gid: 0,
+                    uid: *OWNER_UID,
+                    gid: *OWNER_GID,
                     rdev: 0,
                     blksize: BLOCK_SIZE,
                     flags: 0,
@@ -625,8 +637,8 @@ impl FuseFs {
                     kind: FileType::RegularFile,
                     perm: (entry.mode & 0o7777) as u16,
                     nlink: 1,
-                    uid: 0,
-                    gid: 0,
+                    uid: *OWNER_UID,
+                    gid: *OWNER_GID,
                     rdev: 0,
                     blksize: BLOCK_SIZE,
                     flags: 0,
@@ -648,8 +660,8 @@ impl FuseFs {
             kind: FileType::Directory,
             perm: (mode & 0o7777) as u16,
             nlink: 2,
-            uid: 0,
-            gid: 0,
+            uid: *OWNER_UID,
+            gid: *OWNER_GID,
             rdev: 0,
             blksize: BLOCK_SIZE,
             flags: 0,
