@@ -11,6 +11,7 @@ pub const ACTIVE_FILE: &str = "active.toml";
 pub const KEK_SELF_FILE: &str = "k.self";
 pub const KEK_RECOVERY_FILE: &str = "k.recovery";
 pub const IDENTITY_FILE: &str = "identity.key";
+pub const TRANSPORT_FILE: &str = "transport.key";
 pub const MASTER_DIR: &str = "master";
 
 /// Path helper centralizing the on-disk layout. Construct via `VaultPaths::for_garden`.
@@ -49,6 +50,9 @@ impl VaultPaths {
     }
     pub fn identity(&self) -> PathBuf {
         self.root.join(IDENTITY_FILE)
+    }
+    pub fn transport(&self) -> PathBuf {
+        self.root.join(TRANSPORT_FILE)
     }
     pub fn master_dir(&self) -> PathBuf {
         self.root.join(MASTER_DIR)

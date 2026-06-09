@@ -12,6 +12,7 @@ use crate::params::{aad, ActiveKey, VaultParams};
 use crate::recovery::RecoveryPhrase;
 use crate::session::VaultSession;
 use crate::storage::{self, VaultPaths};
+use crate::transport::{self, TransportKey};
 
 #[derive(Debug, Clone)]
 pub struct Vault {
@@ -95,6 +96,10 @@ impl Vault {
         let identity = Identity::generate();
         identity::write_identity(&paths, &kek, &identity)?;
 
+        // M5a: the X25519 transport key joins M and the identity under K.
+        let transport = TransportKey::generate();
+        transport::write_transport(&paths, &kek, &transport)?;
+
         let mut masters = MasterKeyStore::new(1);
         masters.insert(m1);
 
@@ -103,6 +108,7 @@ impl Vault {
             kek,
             masters,
             identity,
+            transport,
         };
         Ok((Self { paths }, session, recovery))
     }
@@ -128,11 +134,15 @@ impl Vault {
         let kek = kek::unwrap_kek_under_passphrase(secret, &wrapped, &params.argon2, wrap_aad)?;
         let masters = master::read_all(&self.paths, &kek, active.master_key_id)?;
         let identity = identity::read_identity(&self.paths, &kek)?;
+        // M5a: auto-generate the transport key on unlock if absent, so vaults
+        // initialised before M5a gain one without re-init.
+        let transport = transport::read_or_init_transport(&self.paths, &kek)?;
         Ok(VaultSession {
             paths: self.paths.clone(),
             kek,
             masters,
             identity,
+            transport,
         })
     }
 

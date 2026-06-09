@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package softfig.net.control.v1;
+
+// Top-level wire frame for the control plane. Every control-plane message
+// exchanged over an established Noise session is a Frame. The body is a oneof
+// so the protocol extends by adding variants — pairing, relay, and discovery
+// messages arrive in later M5a slices; data-plane messages (commit-push,
+// object-fetch, ...) land in M5b+ — without breaking older peers. Field-number
+// ranges are reserved below so future variants never collide.
+//
+// NOTE for signing (M5a-2): protobuf is not canonical. Any signed message must
+// sign a defined canonical byte encoding, or carry the exact serialized bytes
+// alongside the signature; never sign a re-serialization.
+message Frame {
+  oneof kind {
+    Ping ping = 1;
+    Pong pong = 2;
+    // M5a-2 (pairing):   PairRequest = 10; PairConfirm = 11;
+    // M5a-3 (relay):     RelayConnect = 20; RelayData = 21; StateAnnounce = 22;
+    // M5b+ (data plane): defined in their own slices, 100+.
+  }
+  reserved 3 to 9, 12 to 19, 23 to 99; // held for the slices noted above
+}
+
+// Identity payload carried *inside* the Noise handshake (not a Frame). The XX
+// handshake authenticates only the X25519 static key; this binds the device's
+// Ed25519 identity to that static. M5a-2 adds the Ed25519 self-signature over
+// the X25519 static (field 4) to complete the attestation.
+message HelloPayload {
+  uint32 protocol_version = 1;
+  bytes device_id = 2;       // Ed25519 identity public key (32 bytes)
+  string device_name = 3;
+  // M5a-2: bytes static_attestation = 4; // Ed25519 sig over the X25519 static
+  reserved 4 to 15;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;          // echoes the Ping nonce
+}

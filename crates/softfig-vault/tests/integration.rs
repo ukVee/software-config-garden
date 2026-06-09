@@ -261,3 +261,95 @@ fn discover_garden_walks_up() {
 fn canonical(p: &Path) -> std::path::PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
+
+// --- M5a: X25519 transport key ---------------------------------------------
+
+#[test]
+fn init_writes_transport_key() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_vault, session, _recovery) =
+        Vault::init_with_params(tmp.path(), PASSPHRASE, fast_params()).expect("init");
+
+    assert!(
+        tmp.path().join(".softfig/vault/transport.key").is_file(),
+        "transport.key missing after init"
+    );
+    assert_ne!(
+        session.transport_pubkey(),
+        [0u8; 32],
+        "transport pubkey must not be all-zero"
+    );
+}
+
+/// `transport_pubkey()` is genuinely the X25519 public key of the secret the
+/// Noise layer is handed — the relationship `softfig-net`/snow relies on.
+#[test]
+fn transport_pubkey_is_x25519_of_secret() {
+    let (_tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let expected =
+        x25519_dalek::x25519(*session.transport_secret(), x25519_dalek::X25519_BASEPOINT_BYTES);
+    assert_eq!(session.transport_pubkey(), expected);
+}
+
+#[test]
+fn transport_key_stable_across_unlock() {
+    let (_tmp, vault) = fresh_vault();
+    let (pubkey, secret) = {
+        let s = vault.unlock(PASSPHRASE).expect("unlock");
+        (s.transport_pubkey(), *s.transport_secret())
+    };
+    let s2 = vault.unlock(PASSPHRASE).expect("re-unlock");
+    assert_eq!(s2.transport_pubkey(), pubkey, "transport pubkey survives re-unlock");
+    assert_eq!(*s2.transport_secret(), secret, "transport secret survives re-unlock");
+}
+
+#[test]
+fn distinct_vaults_have_distinct_transport_keys() {
+    let (_a, va) = fresh_vault();
+    let (_b, vb) = fresh_vault();
+    let pa = va.unlock(PASSPHRASE).expect("unlock a").transport_pubkey();
+    let pb = vb.unlock(PASSPHRASE).expect("unlock b").transport_pubkey();
+    assert_ne!(pa, pb, "two fresh vaults must mint different transport keys");
+}
+
+/// Pre-M5a vaults have no `transport.key`; unlock must mint and persist one.
+#[test]
+fn transport_key_auto_generated_on_unlock_when_absent() {
+    let (tmp, vault) = fresh_vault();
+    let key_path = tmp.path().join(".softfig/vault/transport.key");
+
+    // Simulate a vault initialised before M5a.
+    fs::remove_file(&key_path).expect("remove transport.key");
+    assert!(!key_path.exists());
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock without transport key");
+    assert!(key_path.is_file(), "unlock should have minted transport.key");
+    let regenerated = session.transport_pubkey();
+    drop(session);
+
+    // The minted key is now stable across subsequent unlocks (not re-minted).
+    let session2 = vault.unlock(PASSPHRASE).expect("re-unlock");
+    assert_eq!(
+        session2.transport_pubkey(),
+        regenerated,
+        "auto-generated transport key must persist, not re-mint each unlock"
+    );
+}
+
+/// A present-but-corrupt transport key is a tamper signal, not a silent
+/// regeneration.
+#[test]
+fn corrupt_transport_key_is_rejected() {
+    let (tmp, vault) = fresh_vault();
+    let key_path = tmp.path().join(".softfig/vault/transport.key");
+    let mut bytes = fs::read(&key_path).expect("read transport.key");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01; // flip a tag byte
+    fs::write(&key_path, &bytes).expect("write corrupt transport.key");
+
+    match vault.unlock(PASSPHRASE) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("expected AuthFailed on corrupt transport key, got {other:?}"),
+    }
+}

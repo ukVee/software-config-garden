@@ -9,6 +9,7 @@ use crate::kek::Kek;
 use crate::layer_b::{self, LayerBKey};
 use crate::master::MasterKeyStore;
 use crate::storage::VaultPaths;
+use crate::transport::TransportKey;
 
 #[derive(Debug)]
 pub struct VaultSession {
@@ -16,6 +17,7 @@ pub struct VaultSession {
     pub(crate) kek: Kek,
     pub(crate) masters: MasterKeyStore,
     pub(crate) identity: Identity,
+    pub(crate) transport: TransportKey,
 }
 
 impl VaultSession {
@@ -119,6 +121,18 @@ impl VaultSession {
 
     pub fn identity_pubkey(&self) -> VerifyingKey {
         self.identity.pubkey()
+    }
+
+    /// This device's X25519 transport public key (the Noise static pubkey).
+    /// Exchanged in the Noise handshake; persisted in a peer's ring (M5a-2).
+    pub fn transport_pubkey(&self) -> [u8; 32] {
+        self.transport.pubkey()
+    }
+
+    /// This device's raw X25519 transport secret, for establishing Noise
+    /// sessions in `softfig-net`. Zeroized when the session drops (lock).
+    pub fn transport_secret(&self) -> &[u8; 32] {
+        self.transport.secret_bytes()
     }
 
     /// Generate a new master key generation, persist it under K, set it

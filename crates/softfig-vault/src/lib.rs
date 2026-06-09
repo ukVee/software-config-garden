@@ -19,6 +19,7 @@ pub mod params;
 pub mod recovery;
 pub mod session;
 pub mod storage;
+pub mod transport;
 mod vault;
 
 pub use error::{Result, VaultError};

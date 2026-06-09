@@ -1,0 +1,16 @@
+[package]
+name = "softfig-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig networking (M5a): app-level Noise transport over TCP + a protobuf control plane for cross-device sync. Frontend-neutral; hosted by keeperd."
+
+[dependencies]
+snow.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

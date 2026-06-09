@@ -162,7 +162,53 @@ ritual close instead.)
 
 ## Slice status
 
-- [ ] **M5a-1** — secure pipe foundation
+- [x] **M5a-1** — secure pipe foundation ✅ (2026-06-09 — see notes below)
 - [ ] **M5a-2** — pairing (SAS) + network trust ring
 - [ ] **M5a-3** — discovery + relay
 - [ ] **M5a-4** — daemon + CLI/IPC wiring; close M5a
+
+## M5a-1 — landed (2026-06-09)
+
+**Tests:** `cargo test --workspace` green (clippy `--workspace --all-targets -D warnings`
+clean). New: **softfig-net 7** (4 transport unit tests — XX establish + hello exchange, tamper
+rejection, IK reconnect with learned static, wrong-static-key rejection; 3 loopback-TCP
+integration tests — XX ping/pong, IK reconnect, large-message chunking) + **softfig-vault 6**
+(transport key written at init, pubkey == X25519(secret), stable across unlock, distinct per
+vault, auto-generated on unlock when absent, corrupt key rejected).
+
+**Concurrency decision — sync + threads (not tokio).** Recorded in `softfig-net/src/lib.rs`
+docs. Blocking, thread-per-connection: matches the existing daemon/IPC style, device counts in
+a personal mesh are tiny, and it keeps the dependency/reasoning surface small. `NoiseSession`
+is generic over `Read + Write`, so the IO substrate can change later without touching the
+crypto/framing if a future slice ever needs many-peer fan-out.
+
+**What landed (vs the plan):**
+- **Vault:** `transport.key` beside `identity.key`, wrapped under K with `aad::TRANSPORT`.
+  `Session::transport_secret()` (raw `&[u8;32]` for snow) / `transport_pubkey()` (X25519
+  pubkey). Generated at `init`; **auto-generated + persisted on unlock if absent** for pre-M5a
+  vaults; zeroized on lock via the `Zeroizing` secret. A present-but-corrupt key errors (tamper
+  signal), never silently regenerates. Pubkey derived with the `x25519-dalek` free function
+  `x25519(secret, basepoint)` — no `StaticSecret` feature needed.
+- **`softfig-net`** (12th workspace member, lib): `error`, `proto`, `transport`.
+- **Noise suite:** `Noise_{XX,IK}_25519_ChaChaPoly_BLAKE2s` via `snow` 0.10 (pure-Rust
+  default-resolver; BLAKE2s is the Noise hash, the rest match the in-tree stack). All four
+  handshakes (XX initiator/responder, IK initiator/responder) carry `HelloPayload` in the
+  encrypted handshake payloads.
+- **Frame codec:** `send_bytes`/`recv_bytes` carry an arbitrary message as a 4-byte BE length
+  prefix + body, chunked into ≤ 65519-byte Noise plaintexts, each wire-framed with a 2-byte BE
+  length (the partial last chunk means a frame lands on an exact plaintext boundary, so recv
+  needs no inter-call buffering). `send_frame`/`recv_frame` layer the protobuf `Frame` on top.
+  `send_bytes`/`recv_bytes` are the seam the M5b data plane will reuse for large object bytes.
+- **Protobuf** (`prost` 0.14 + `prost-build` build.rs; requires `protoc` at build time —
+  libprotoc 34.1 present, noted in `build.rs`): `control.proto` with a `Frame` oneof envelope +
+  `HelloPayload` + `Ping`/`Pong`. Field-number ranges **reserved** for the next slices —
+  pairing `10,11`, relay `20–22`, data plane `100+`; `HelloPayload` reserves field `4` for the
+  M5a-2 Ed25519 static attestation.
+
+**Deltas / notes for later slices:**
+- `snow` 0.10's `local_private_key`/`remote_public_key` builder methods return `Result` (minor
+  vs older API).
+- **SAS + the Ed25519 attestation are explicitly M5a-2.** XX authenticates only the X25519
+  static; M5a-2 adds the in-`HelloPayload` Ed25519 identity-pubkey + self-signature over the
+  X25519 static (the reserved field 4) and derives the SAS from the XX handshake hash.
+- No new VCS intents; M5a-1 wrote only the vault-internal `transport.key`.

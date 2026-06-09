@@ -12,6 +12,7 @@ members = [
     "crates/softfig-onboard",
     "crates/softfig-tui",
     "crates/softfig-deploy",
+    "crates/softfig-net",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ softfig-core    = { path = "crates/softfig-core" }
 softfig-ipc     = { path = "crates/softfig-ipc" }
 softfig-onboard = { path = "crates/softfig-onboard" }
 softfig-deploy  = { path = "crates/softfig-deploy" }
+softfig-net     = { path = "crates/softfig-net" }
 
 # Crypto
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
@@ -36,6 +38,7 @@ argon2 = "0.5"
 hkdf = "0.12"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = "2"
 rand = "0.8"
 rand_core = "0.6"
 bip39 = { version = "2", default-features = false, features = ["rand", "std"] }
@@ -89,6 +92,12 @@ lru = "0.12"
 # TUI (M3b)
 ratatui = "0.29"
 crossterm = "0.28"
+
+# Networking — M5a transport + pairing (softfig-net)
+# App-level Noise (snow) over TCP; protobuf control plane (prost).
+snow = "0.10"
+prost = "0.14"
+prost-build = "0.14"
 
 [profile.release]
 lto = "thin"

@@ -21,6 +21,8 @@ pub mod aad {
     pub const KEK_SELF: &[u8] = b"softfig.kek.self.v1";
     pub const KEK_RECOVERY: &[u8] = b"softfig.kek.recovery.v1";
     pub const IDENTITY: &[u8] = b"softfig.identity.v1";
+    /// X25519 transport key — the Noise static key for softfig-net (M5a).
+    pub const TRANSPORT: &[u8] = b"softfig.transport.v1";
     pub const BLOB: &[u8] = b"softfig.blob.v1";
 
     /// Master keys are AAD-bound to their generation id so two generations
