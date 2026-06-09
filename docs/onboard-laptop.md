@@ -150,9 +150,16 @@ CLI-only (`softfig reveal --id`).
 
 ### `softfig daemon unlock` fails with `Operation not permitted (os error 1)`
 
-The daemon reached the FUSE-mount step and the mount was denied with EPERM.
-The usual cause is **systemd unit hardening fighting the FUSE mount**. The
-daemon mounts via the setuid-root `fusermount3` helper, which is broken by:
+The daemon reached the FUSE-mount step and the `mount(2)` was denied with
+EPERM. This identical symptom has had **two distinct, unrelated root causes**
+on real devices — both are documented below. The quickest split: run the
+daemon **outside** systemd (Cause 1's last block). If that *fixes* it, you
+have Cause 1 (the unit). If it *still* fails the same way, you have Cause 2
+(the mount options).
+
+#### Cause 1 — systemd unit hardening fighting the FUSE mount (seen on the laptop)
+
+The daemon mounts via the setuid-root `fusermount3` helper, which is broken by:
 
 - `NoNewPrivileges=true` — makes `execve()` ignore the setuid bit, so
   `fusermount3` runs unprivileged and the `mount(2)` syscall returns EPERM.
@@ -173,13 +180,34 @@ softfig daemon unlock
 ```
 
 To confirm the unit is the culprit, run the daemon **outside systemd** —
-it works there because none of the hardening applies:
+if it works there, none of the hardening applies and the unit is the problem:
 
 ```bash
 systemctl --user stop softfig-keeperd
 softfig daemon start --garden "$HOME/soft-fig_garden"
-softfig daemon unlock        # succeeds
+softfig daemon unlock        # succeeds -> Cause 1; still EPERM -> Cause 2
 ```
+
+#### Cause 2 — `allow_other` pulled in by `AutoUnmount` (seen on the tablet)
+
+Independent of systemd. `fuser` silently appends `allow_other` whenever the
+daemon requests the `AutoUnmount` mount option, and `fusermount3` rejects
+`allow_other` unless `user_allow_other` is enabled in `/etc/fuse.conf` — which
+surfaces as the same opaque EPERM. The tell is this line in the daemon's
+stderr / journal:
+
+```bash
+journalctl --user -u softfig-keeperd -e | grep fusermount3
+# fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf
+```
+
+Fixed in `softfig-fuse`: the daemon no longer requests `AutoUnmount`, so the
+garden mounts **owner-only** with no `/etc/fuse.conf` change. (Enabling
+`user_allow_other` would "fix" it too, but it exposes the decrypted plaintext
+to other uids/root — the wrong trade for a vault, so we don't.) The daemon
+unmounts explicitly on every clean path and reclaims a crashed daemon's stale
+mount on the next mount, so dropping `AutoUnmount` costs nothing. If you see
+the line above, you're on a pre-fix build — rebuild and reinstall the binaries.
 
 ## What's deferred
 

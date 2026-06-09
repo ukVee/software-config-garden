@@ -32,7 +32,14 @@ StandardError=journal
 # If hardening is ever reintroduced (e.g. in the AUR PKGBUILD), it must use
 # only knobs that neither block setuid nor create a mount namespace, and
 # any namespacing option additionally needs MountFlags=shared.
-# See docs/onboard-laptop.md (Troubleshooting).
+#
+# NOTE: a *separate, unrelated* bug once produced an identically-worded EPERM
+# on `softfig daemon unlock` — the daemon requesting fuser's AutoUnmount,
+# which implicitly adds `allow_other` (rejected without `user_allow_other` in
+# /etc/fuse.conf). That was a mount-option bug fixed in softfig-fuse, NOT this
+# hardening. Don't assume an unlock EPERM is always this unit; check the
+# daemon's `fusermount3:` stderr line first.
+# See docs/onboard-laptop.md (Troubleshooting) for both causes.
 
 [Install]
 WantedBy=default.target

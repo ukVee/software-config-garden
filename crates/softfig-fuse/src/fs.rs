@@ -177,8 +177,22 @@ impl FuseMount {
             fuser::MountOption::FSName("softfig".into()),
             fuser::MountOption::Subtype("softfig".into()),
             fuser::MountOption::DefaultPermissions,
-            fuser::MountOption::AutoUnmount,
         ];
+        // Deliberately NOT `AutoUnmount`. fuser implicitly appends
+        // `allow_other` whenever AutoUnmount is set (see fuser
+        // `Session::new`), and `fusermount3` rejects `allow_other` unless
+        // `user_allow_other` is enabled in /etc/fuse.conf — which surfaces
+        // as an opaque `mount: Operation not permitted (EPERM)`. We never
+        // want `allow_other` regardless: the decrypted garden must stay
+        // readable only by the owning uid, never other users or root.
+        //
+        // The daemon already unmounts explicitly on every clean path
+        // (entry to `Stopping`, `migrate_finalize`) via
+        // `MountHandle::unmount`, so AutoUnmount only ever covered an
+        // abnormal daemon death (SIGKILL/OOM/panic) leaving a dead mount.
+        // `clear_stale_mount` reclaims that on the next mount instead, so
+        // a crashed-then-restarted daemon self-heals without `allow_other`.
+        clear_stale_mount(garden_root);
         let bg = fuser::spawn_mount2(fs, garden_root, &opts)?;
 
         Ok(MountHandle {
@@ -836,4 +850,53 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Reclaim a stale FUSE mount left at `mount_point` by a previously
+/// crashed daemon (one that died without running `MountHandle::unmount`).
+///
+/// Without `AutoUnmount`, the kernel does not auto-reap such a mount; it
+/// lingers as a dead endpoint (`ls` → `ENOTCONN`) and a fresh
+/// `spawn_mount2` would stack on top of the corpse. We detect an existing
+/// `fuse*` mount exactly at `mount_point` and lazily unmount it via the
+/// setuid `fusermount3` helper (`-z` so a busy/dead mount still detaches).
+/// No-op when nothing is mounted there — the common case.
+fn clear_stale_mount(mount_point: &Path) {
+    if !is_fuse_mount(mount_point) {
+        return;
+    }
+    // `fusermount3 -u -q -z` is the same unmount path fuser itself uses;
+    // `-z` (lazy) handles the dead/busy endpoint. Failure is non-fatal:
+    // the subsequent mount will surface any real problem.
+    let _ = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg("-q")
+        .arg("-z")
+        .arg("--")
+        .arg(mount_point)
+        .status();
+}
+
+/// True if `/proc/self/mountinfo` shows a `fuse*` filesystem mounted
+/// exactly at `target`. Garden roots are plain ASCII paths with no spaces
+/// (a garden house rule), so the kernel's octal-escaped mountinfo field
+/// compares verbatim.
+fn is_fuse_mount(target: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let target = target.to_string_lossy();
+    for line in content.lines() {
+        // mountinfo: `… root mount_point opts … - fstype source superopts`.
+        // Field index 4 (0-based) before " - " is the mount point.
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mount_point = pre.split_whitespace().nth(4);
+        let fstype = post.split_whitespace().next().unwrap_or("");
+        if mount_point == Some(target.as_ref()) && fstype.starts_with("fuse") {
+            return true;
+        }
+    }
+    false
 }
