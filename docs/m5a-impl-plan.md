@@ -163,7 +163,7 @@ ritual close instead.)
 ## Slice status
 
 - [x] **M5a-1** — secure pipe foundation ✅ (2026-06-09 — see notes below)
-- [ ] **M5a-2** — pairing (SAS) + network trust ring
+- [x] **M5a-2** — pairing (SAS) + network trust ring ✅ (2026-06-09 — see notes below)
 - [ ] **M5a-3** — discovery + relay
 - [ ] **M5a-4** — daemon + CLI/IPC wiring; close M5a
 
@@ -212,3 +212,92 @@ crypto/framing if a future slice ever needs many-peer fan-out.
   static; M5a-2 adds the in-`HelloPayload` Ed25519 identity-pubkey + self-signature over the
   X25519 static (the reserved field 4) and derives the SAS from the XX handshake hash.
 - No new VCS intents; M5a-1 wrote only the vault-internal `transport.key`.
+
+## M5a-2 — landed (2026-06-09)
+
+**Tests:** `cargo test --workspace` green; clippy `--workspace --all-targets -D
+warnings` clean. **softfig-net 7 → 26** (+19). New: `attest` 4, `sas` 3, `ring` 6,
+`pairing` 5 (lib unit), plus `tests/pairing_tcp.rs` 1 (end-to-end pair → persist →
+reload → IK over loopback TCP). The four M5a-1 transport unit tests + 3
+`transport_tcp` integration tests are unchanged. Done-criteria covered: matching
+SAS + symmetric ring entries on legit pair; simulated MITM → mismatched SAS;
+tampered attestation rejected (both handshake directions *and* on ring load); a
+valid-but-wrong-key attestation rejected; unpair removes the entry.
+
+**SAS encoding — six decimal digits, exact HKDF derivation.** Picked numeric
+digits over a word list: locale-independent, readable/typeable on the headless
+server, and no wordlist to vendor and keep byte-identical across future
+public-program implementations. Six digits (~20 bits) matches the Bluetooth
+numeric-comparison convention; an online one-shot MITM has a 1/10^6 per-attempt
+chance of colliding both legs, and a mismatch aborts. Derivation (in `sas.rs`,
+also documented there):
+
+```text
+okm  = HKDF-SHA256(salt = b"softfig/pairing/sas/salt/v1",
+                   ikm  = h,                       # 32-byte Noise XX handshake hash (BLAKE2s)
+                   info = b"softfig/pairing/sas/numeric/v1",
+                   L    = 8)
+code = be_u64(okm) mod 1_000_000                   # rendered "XXX XXX"
+```
+
+Raising the digit count later is a versioned bump of the `info` string.
+
+**Attestation.** `HelloPayload` field 4 (`bytes static_attestation`) now carries
+each device's Ed25519 signature over its **own** X25519 transport static. Verifier
+binds the peer's `device_id` (Ed25519 identity, field 2) to the X25519 static the
+XX handshake authenticated — XX alone proves only possession of *some* transport
+key. The signed message is domain-separated (`b"softfig/pairing/transport-
+attestation/v1" || x25519_pub`) so it can never be confused with a VCS commit
+signature made by the same identity key. The Ed25519 secret never enters
+`softfig-net`: the caller (keeperd, M5a-4) precomputes the signature via
+`VaultSession::sign(&static_attestation_message(&transport_pubkey))` and supplies
+it through `pairing::LocalDevice` — mirroring how M5a-1 passes the raw X25519
+secret rather than a vault handle.
+
+**`peers.toml` schema** (`<state_root>/.softfig/peers.toml`, beside — *not* inside
+— the vault's `.softfig/vault/`):
+
+```toml
+version = 1
+
+[[peer]]
+device_id        = "<hex ed25519 pubkey, 32 B>"   # stable device id / fingerprint
+name             = "laptop"
+transport_pubkey = "<hex x25519 pubkey, 32 B>"     # keys IK reconnect
+endpoints        = ["192.168.1.20:9100"]           # empty at pairing; filled by M5a-3 mDNS/relay
+attestation      = "<hex ed25519 sig, 64 B>"       # peer's self-sig over its x25519 static
+paired_at        = 1717900000                      # unix seconds (no date crate in-tree)
+```
+
+`Ring::load` re-verifies every row's attestation and rejects the whole file on any
+failure (a tamper signal, not a row to skip); `save` is atomic (temp + rename);
+`upsert`/`remove` are symmetric/idempotent. This ring is **distinct** from the
+unlock-ACL `trust.toml` and from future shared-subtree membership.
+
+**Deltas / notes for later slices:**
+- **Pairing rides entirely in the XX handshake** (attestation in the encrypted
+  handshake payload; SAS confirmation is out-of-band/user-driven). No
+  `PairRequest`/`PairConfirm` **control frames** were needed — `Frame` fields
+  10–11 stay *reserved* for a future control-frame pairing step (e.g. a
+  relay-brokered or multi-step confirm in M5a-3/M5a-4) rather than being spent
+  now. There is deliberately no "confirm" message on the wire, so a MITM cannot
+  forge agreement.
+- **Ring stores the peer's *self*-attestation**, not a local *vouching*
+  signature. The decision doc phrased the stored attestation as "its own
+  Ed25519-signed pairing attestation over {peer device-id, peer X25519 pubkey,
+  timestamp}"; storing the peer's self-attestation instead makes each row
+  independently verifiable against the `device_id` it claims (no need for the
+  owner's identity pubkey to re-check on load) and directly satisfies the
+  "binds the two keys" property. A local counter-signature/vouching layer can be
+  added when ring propagation at N>2 needs it (M5d reuses the trust-matrix
+  ledger machinery) — noted as an open question in the decision doc.
+- **`endpoints` left empty by pairing.** A peer's reachable endpoints are not
+  knowable from an inbound TCP connection; M5a-3 (mDNS/relay) owns populating and
+  refreshing them. The field exists in the schema so the format is stable now.
+- **New deps on `softfig-net`:** `hkdf`, `sha2`, `ed25519-dalek`, `hex`, `serde`,
+  `toml` (all already workspace deps); `x25519-dalek` + `tempfile` are
+  dev-only (tests derive an X25519 pubkey from a raw secret to forge
+  attestations — production never needs to, the vault supplies both halves).
+- **New `NetError` variants** `RingDecode`/`RingEncode` (`toml` de/ser).
+- No new VCS intents; M5a-2 writes only `peers.toml` (caller-driven) and reads
+  vault-internal keys via the M5a-1 accessors.
