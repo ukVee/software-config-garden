@@ -352,7 +352,7 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
 
     // Snapshot the bits we need before mutating state, then drop the
     // lock so the FUSE handlers can wind down without deadlocking.
-    let (garden_root, state_dir, was_fuse) = {
+    let (garden_root, state_dir, was_fuse, reveal_idle) = {
         let inner = daemon.inner.lock().unwrap();
         require_unlocked(&inner)?;
         if !inner.config.is_fuse_mode() {
@@ -371,6 +371,7 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
             inner.config.garden_root.clone(),
             inner.config.state_dir().to_path_buf(),
             inner.fuse.is_some(),
+            inner.config.reveal.idle_seconds,
         )
     };
 
@@ -395,7 +396,32 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     let (old_state_deleted, old_state_skipped) =
         crate::migrate::delete_dir(&garden_root.join(".softfig"));
 
-    // Step 4: remount FUSE on top of the now-empty garden_root.
+    // Step 3.5: re-establish the discovery pointer. Step 3 removed
+    // `garden_root/.softfig` wholesale, including the `keeper.toml` that
+    // `KeeperConfig::discover` reads on the next daemon start. Without it a
+    // rebooted daemon resolves to M1c-compat (no FUSE) and the migrated
+    // garden never remounts — its ciphertext stays safe in `state_dir` but
+    // orphaned, and `~/<garden>` comes up empty. Write a fresh pointer onto
+    // the real (still-unmounted) garden root, mirroring the born-in-FUSE
+    // layout. MUST precede the step-4 remount: once FUSE is back up, a
+    // `garden_root/.softfig` write lands in the overlay, not on disk.
+    let pointer = crate::keeper_toml::KeeperToml {
+        state_root: Some(state_dir.clone()),
+        reveal: crate::keeper_toml::RevealToml {
+            idle_seconds: reveal_idle,
+        },
+    };
+    if let Err(e) = pointer.store(&garden_root) {
+        eprintln!(
+            "keeperd: migrate_finalize: FAILED to re-write \
+             {}/.softfig/keeper.toml ({e}); the garden will NOT auto-FUSE-mount \
+             after a restart until that pointer is restored (state_root = {})",
+            garden_root.display(),
+            state_dir.display()
+        );
+    }
+
+    // Step 4: remount FUSE on top of the now-pointer-only garden_root.
     let remounted = {
         let mut inner = daemon.inner.lock().unwrap();
         let session = match inner.session.as_ref() {
