@@ -30,7 +30,7 @@ mod inodes;
 mod overlay;
 mod tree_view;
 
-pub use fs::FuseMount;
+pub use fs::{clear_stale_mount, FuseMount};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

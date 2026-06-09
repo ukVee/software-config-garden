@@ -861,7 +861,12 @@ fn unix_now() -> i64 {
 /// `fuse*` mount exactly at `mount_point` and lazily unmount it via the
 /// setuid `fusermount3` helper (`-z` so a busy/dead mount still detaches).
 /// No-op when nothing is mounted there — the common case.
-fn clear_stale_mount(mount_point: &Path) {
+///
+/// Called both from the FUSE mount path (before each `spawn_mount2`) and
+/// from `softfig-keeperd`'s startup, *before* `KeeperConfig::discover`
+/// reads `keeper.toml` through the garden root — a dead mount there would
+/// otherwise make discovery fall back to the wrong (non-FUSE) layout.
+pub fn clear_stale_mount(mount_point: &Path) {
     if !is_fuse_mount(mount_point) {
         return;
     }
