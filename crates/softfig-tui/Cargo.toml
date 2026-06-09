@@ -18,5 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 
-ratatui.workspace = true
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which we use to
+# clamp preview scrolling to the wrapped line count (the garden's markdown has
+# long single-line paragraphs, so a raw line count would badly under-count).
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm.workspace = true

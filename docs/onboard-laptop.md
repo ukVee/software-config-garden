@@ -125,10 +125,12 @@ softfig-tui
 
 Keys: `1`/`2`/`3` switch Browse / History / Vault · `j k ↑ ↓` move ·
 `Enter`/`l`/`→` open file / expand dir / reveal (Vault) · `h`/`←` collapse ·
-`x` reveal selected sealed file · `c` copy the last reveal's value · `u`
-unlock · `:` command palette (runs `log_decision`, `log_incident`,
-`archive`, `add_project`, `refresh_snapshot`, `propose`, `seal`, `unseal`) ·
-`r` refresh · `?` help · `q` quit.
+scroll the preview (right pane) vim-style: `^e`/`^y` line, `^d`/`^u`
+half-page, `^f`/`^b` (or `PgDn`/`PgUp`) full-page, `g`/`G` top / bottom,
+mouse wheel line-wise · `x` reveal selected sealed file · `c` copy the last
+reveal's value · `u` unlock · `:` command palette (runs `log_decision`,
+`log_incident`, `archive`, `add_project`, `refresh_snapshot`, `propose`,
+`seal`, `unseal`) · `r` refresh · `?` help · `q` quit.
 
 Browse content comes through the daemon's read-only `list_tree` /
 `read_file` verbs, which redact server-side: sealed files show

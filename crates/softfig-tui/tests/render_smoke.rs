@@ -30,7 +30,7 @@ fn renders_browse_frame() {
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| ui::render(f, &app)).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
 
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("softfig-tui"), "header missing:\n{rendered}");
@@ -56,13 +56,41 @@ fn renders_vault_frame() {
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| ui::render(f, &app)).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
 
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Vault"), "vault tab missing:\n{rendered}");
     assert!(rendered.contains("api-keys.toml"), "sealed file missing");
     assert!(rendered.contains("sealed globs"), "globs panel missing");
     assert!(rendered.contains("temp"), "reveal temp path missing");
+}
+
+#[test]
+fn renders_scrolled_preview() {
+    // A preview taller than the pane, scrolled down, must show the lower
+    // lines (not the top) and surface a scroll-position indicator.
+    let mut app = App::new();
+    app.locked = false;
+    app.tree.set_children("", vec![entry("long.md", false)]);
+    app.preview = (0..100)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.preview_title = "long.md".into();
+    app.preview_scroll = 40;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    // At offset 40 the top of the file is scrolled away and line40+ is shown.
+    assert!(rendered.contains("line40"), "scrolled content missing:\n{rendered}");
+    assert!(!rendered.contains("line0 "), "top line should be scrolled off");
+    assert!(rendered.contains('%'), "scroll-position indicator missing");
+    // The renderer recorded the live geometry for the key/mouse handlers.
+    assert!(app.preview_total >= 100, "wrapped total not recorded");
+    assert!(app.preview_viewport > 0, "viewport not recorded");
 }
 
 #[test]
@@ -73,7 +101,7 @@ fn renders_help_overlay() {
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| ui::render(f, &app)).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
 
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("command palette"), "help text missing");

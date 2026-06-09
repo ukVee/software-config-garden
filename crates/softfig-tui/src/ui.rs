@@ -16,7 +16,7 @@ fn sel_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -73,7 +73,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn render_body(f: &mut Frame, app: &App, area: Rect) {
+fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -212,14 +212,36 @@ fn render_vault_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_preview(f: &mut Frame, app: &App, area: Rect) {
-    let p = Paragraph::new(app.preview.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.preview_title.clone()),
-        )
-        .wrap(Wrap { trim: false });
+fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
+    // Borders take one row/column on each side; wrapping + clamping work in
+    // terms of that inner content box.
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+
+    let text = Paragraph::new(app.preview.as_str()).wrap(Wrap { trim: false });
+    let total = text.line_count(inner_w) as u16;
+
+    // Record the live geometry so key/mouse handlers can size pages and clamp.
+    app.preview_viewport = inner_h;
+    app.preview_total = total;
+    let max = total.saturating_sub(inner_h);
+    let offset = app.preview_scroll.min(max);
+    app.preview_scroll = offset;
+
+    let title = if total > inner_h {
+        let pct = if max == 0 {
+            100
+        } else {
+            (offset as u32 * 100 / max as u32) as u16
+        };
+        format!("{}  [{pct}%]", app.preview_title)
+    } else {
+        app.preview_title.clone()
+    };
+
+    let p = text
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((offset, 0));
     f.render_widget(p, area);
 }
 
@@ -363,6 +385,11 @@ soft-fig TUI — keys
   j k ↑ ↓      move selection
   Enter l →    open file / expand dir / show commit / reveal (vault)
   h ←          collapse dir
+  scroll preview (right pane):
+    ^e ^y      line down / up        wheel  line-wise
+    ^d ^u      half-page down / up
+    ^f ^b      full-page down / up   PgDn/PgUp same
+    g G        top / bottom
   x            reveal selected sealed file
   c            copy last reveal's value to clipboard
   r            refresh view

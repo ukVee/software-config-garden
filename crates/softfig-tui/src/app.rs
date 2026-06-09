@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
 use softfig_ipc::{
     LogReply, ReadFileReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
@@ -61,6 +61,14 @@ pub struct App {
     pub tree: TreeModel,
     pub preview: String,
     pub preview_title: String,
+    /// Vertical scroll offset of the preview pane, in wrapped-line units.
+    pub preview_scroll: u16,
+    /// Visible content rows of the preview pane; written by the renderer so
+    /// page/half-page key math and clamping have the live viewport height.
+    pub preview_viewport: u16,
+    /// Total wrapped line count of the current preview at the last render
+    /// width; written by the renderer so scrolling clamps to the real bottom.
+    pub preview_total: u16,
     pub history: Vec<HistoryLine>,
     pub history_selected: usize,
     pub vault_globs: Vec<String>,
@@ -89,6 +97,9 @@ impl App {
             tree: TreeModel::new(),
             preview: String::new(),
             preview_title: "preview".into(),
+            preview_scroll: 0,
+            preview_viewport: 0,
+            preview_total: 0,
             history: Vec::new(),
             history_selected: 0,
             vault_globs: Vec::new(),
@@ -207,6 +218,7 @@ impl App {
                         } else {
                             path
                         };
+                        self.preview_scroll = 0;
                     }
                 }
                 Err((_, m)) => self.status = format!("read_file {path}: {m}"),
@@ -235,6 +247,7 @@ impl App {
                     if let Ok(r) = serde_json::from_value::<ShowReply>(v) {
                         self.preview = format_commit(&r);
                         self.preview_title = format!("commit {}", short_hash(&r.commit.hash));
+                        self.preview_scroll = 0;
                     }
                 }
                 Err((_, m)) => self.status = format!("show: {m}"),
@@ -310,6 +323,22 @@ impl App {
     }
 
     fn handle_key_main(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        // Vim-style preview scrolling on the Ctrl chord, kept off the bare
+        // h/j/k/l keys so list navigation is untouched. Half/full page sizes
+        // come from the viewport the renderer recorded last frame.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let half = (self.preview_viewport / 2).max(1) as i32;
+            let full = self.preview_viewport.max(1) as i32;
+            match key.code {
+                KeyCode::Char('e') => return self.scroll_preview(1),
+                KeyCode::Char('y') => return self.scroll_preview(-1),
+                KeyCode::Char('d') => return self.scroll_preview(half),
+                KeyCode::Char('u') => return self.scroll_preview(-half),
+                KeyCode::Char('f') => return self.scroll_preview(full),
+                KeyCode::Char('b') => return self.scroll_preview(-full),
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.overlay = Overlay::Help,
@@ -341,8 +370,43 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.nav_down(ipc),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.activate(ipc),
             KeyCode::Left | KeyCode::Char('h') => self.collapse_selected(),
+            KeyCode::PageDown => self.scroll_preview(self.preview_viewport.max(1) as i32),
+            KeyCode::PageUp => self.scroll_preview(-(self.preview_viewport.max(1) as i32)),
+            KeyCode::Char('g') => self.preview_to_top(),
+            KeyCode::Char('G') => self.preview_to_bottom(),
             _ => {}
         }
+    }
+
+    /// Wheel events scroll the preview pane, three lines per notch.
+    pub fn handle_mouse(&mut self, ev: MouseEvent, _ipc: &mut IpcClient) {
+        match ev.kind {
+            MouseEventKind::ScrollDown => self.scroll_preview(3),
+            MouseEventKind::ScrollUp => self.scroll_preview(-3),
+            _ => {}
+        }
+    }
+
+    /// Largest valid scroll offset: enough to bring the last wrapped line to
+    /// the bottom of the viewport, never past it.
+    fn preview_max_scroll(&self) -> u16 {
+        self.preview_total.saturating_sub(self.preview_viewport)
+    }
+
+    /// Move the preview offset by `delta` lines (negative = up), clamped to
+    /// `[0, preview_max_scroll]`.
+    fn scroll_preview(&mut self, delta: i32) {
+        let max = self.preview_max_scroll() as i32;
+        let next = (self.preview_scroll as i32 + delta).clamp(0, max);
+        self.preview_scroll = next as u16;
+    }
+
+    fn preview_to_top(&mut self) {
+        self.preview_scroll = 0;
+    }
+
+    fn preview_to_bottom(&mut self) {
+        self.preview_scroll = self.preview_max_scroll();
     }
 
     fn nav_up(&mut self) {
@@ -739,6 +803,85 @@ mod tests {
         assert_eq!(info.temp_path, "/run/user/1000/softfig-reveal-abc.toml");
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("press c to copy"));
+    }
+
+    #[test]
+    fn preview_scroll_clamps_and_pages() {
+        let mut app = App::new();
+        // Renderer-supplied geometry: 10 visible rows over 50 wrapped lines.
+        app.preview_viewport = 10;
+        app.preview_total = 50;
+        assert_eq!(app.preview_scroll, 0);
+
+        app.scroll_preview(5);
+        assert_eq!(app.preview_scroll, 5);
+        app.scroll_preview(-100); // clamp at the top
+        assert_eq!(app.preview_scroll, 0);
+
+        app.preview_to_bottom();
+        assert_eq!(app.preview_scroll, 40, "max = total - viewport");
+        app.scroll_preview(100); // never past the bottom
+        assert_eq!(app.preview_scroll, 40);
+        app.preview_to_top();
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn short_preview_does_not_scroll() {
+        let mut app = App::new();
+        // Content shorter than the viewport → max scroll is zero.
+        app.preview_viewport = 20;
+        app.preview_total = 5;
+        app.scroll_preview(10);
+        assert_eq!(app.preview_scroll, 0);
+        app.preview_to_bottom();
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn preview_scroll_resets_on_new_file() {
+        let mut app = App::new();
+        app.locked = false;
+        app.preview_viewport = 10;
+        app.preview_total = 50;
+        app.preview_scroll = 20;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::ReadFile {
+                    path: "meta/CLAUDE.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "meta/CLAUDE.md",
+                    "content": "fresh file",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.preview, "fresh file");
+        assert_eq!(app.preview_scroll, 0, "opening a new file jumps to the top");
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_preview() {
+        let mut app = App::new();
+        app.preview_viewport = 5;
+        app.preview_total = 100;
+        let mut ipc = dummy_ipc();
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown), &mut ipc);
+        assert_eq!(app.preview_scroll, 3);
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown), &mut ipc);
+        assert_eq!(app.preview_scroll, 6);
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp), &mut ipc);
+        assert_eq!(app.preview_scroll, 3);
     }
 
     #[test]
