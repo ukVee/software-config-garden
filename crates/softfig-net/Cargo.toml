@@ -18,6 +18,8 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 serde.workspace = true
 toml.workspace = true
+# M5a-3 discovery: LAN mDNS (_softfig._tcp) announce + browse, no async runtime.
+mdns-sd.workspace = true
 
 [dev-dependencies]
 # Tests derive an X25519 public key from a raw secret to forge attestations;

@@ -18,11 +18,27 @@
 //! [`recv_frame`](NoiseSession::recv_frame) layer the protobuf [`Frame`] on
 //! top. The codec is generic over `Read + Write`, so `TcpStream` is the
 //! production substrate while tests can use any duplex stream.
+//!
+//! # Splitting a session (M5a-3 relay)
+//!
+//! The transport mode is backed by `snow`'s **stateless** cipher states
+//! (explicit per-message nonces) rather than the stateful `TransportState`.
+//! This is wire-identical — transport messages still carry nonces 0, 1, 2, …
+//! per direction — but it lets a session be [`split`](NoiseSession::split) into
+//! an independent [`NoiseReader`] (recv half) and [`NoiseWriter`] (send half),
+//! each holding a shared `Arc` of the cipher state and its own nonce counter.
+//! The two halves touch *disjoint* cipher directions, so they run on separate
+//! threads with no locking — exactly what a blind relay needs to forward frames
+//! full-duplex between two peers (read from A while writing to B, and vice
+//! versa). The non-split path is unchanged.
 
 use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 
 use prost::Message;
-use snow::{HandshakeState, TransportState};
+use snow::{HandshakeState, StatelessTransportState};
 
 use crate::error::{NetError, Result};
 use crate::proto::{Frame, HelloPayload};
@@ -56,7 +72,9 @@ const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 /// the byte stream (`TcpStream` in production).
 pub struct NoiseSession<S> {
     io: S,
-    transport: TransportState,
+    transport: StatelessTransportState,
+    send_nonce: u64,
+    recv_nonce: u64,
     peer_static: [u8; KEY_LEN],
     peer_hello: HelloPayload,
     handshake_hash: [u8; HASH_LEN],
@@ -95,51 +113,12 @@ impl<S: Read + Write> NoiseSession<S> {
     /// Send an arbitrary-length message: a 4-byte big-endian length prefix
     /// followed by `msg`, chunked into Noise transport messages.
     pub fn send_bytes(&mut self, msg: &[u8]) -> Result<()> {
-        let len = u32::try_from(msg.len()).map_err(|_| NetError::Protocol("message too large"))?;
-
-        // Header + body as one logical stream, partitioned into Noise-sized
-        // chunks. The last chunk is partial, so the receiver lands on exactly
-        // `4 + len` plaintext bytes with nothing straddling into the next
-        // message — which is why no inter-call buffering is needed on recv.
-        let mut framed = Vec::with_capacity(4 + msg.len());
-        framed.extend_from_slice(&len.to_be_bytes());
-        framed.extend_from_slice(msg);
-
-        let mut out = vec![0u8; NOISE_MAX_MSG];
-        for chunk in framed.chunks(MAX_PLAINTEXT_CHUNK) {
-            let n = self.transport.write_message(chunk, &mut out)?;
-            write_lp(&mut self.io, &out[..n])?;
-        }
-        self.io.flush()?;
-        Ok(())
+        send_bytes_inner(&mut self.io, &self.transport, &mut self.send_nonce, msg)
     }
 
     /// Receive one message sent by [`send_bytes`](Self::send_bytes).
     pub fn recv_bytes(&mut self) -> Result<Vec<u8>> {
-        let mut acc: Vec<u8> = Vec::new();
-        let mut expected: Option<usize> = None;
-        let mut out = vec![0u8; NOISE_MAX_MSG];
-
-        loop {
-            let ct = read_lp(&mut self.io)?;
-            let n = self.transport.read_message(&ct, &mut out)?;
-            acc.extend_from_slice(&out[..n]);
-
-            if expected.is_none() && acc.len() >= 4 {
-                let len = u32::from_be_bytes(acc[..4].try_into().unwrap()) as usize;
-                if len > MAX_MESSAGE_LEN {
-                    return Err(NetError::Protocol("message exceeds maximum length"));
-                }
-                expected = Some(len);
-            }
-            if let Some(len) = expected {
-                if acc.len() >= 4 + len {
-                    acc.drain(..4);
-                    acc.truncate(len);
-                    return Ok(acc);
-                }
-            }
-        }
+        recv_bytes_inner(&mut self.io, &self.transport, &mut self.recv_nonce)
     }
 
     /// Send a protobuf control [`Frame`].
@@ -151,6 +130,162 @@ impl<S: Read + Write> NoiseSession<S> {
     pub fn recv_frame(&mut self) -> Result<Frame> {
         let bytes = self.recv_bytes()?;
         Ok(Frame::decode(bytes.as_slice())?)
+    }
+}
+
+/// The read/write halves produced by [`NoiseSession::split`].
+pub type SplitSession<S> = (
+    NoiseReader<<S as SplitIo>::Read>,
+    NoiseWriter<<S as SplitIo>::Write>,
+);
+
+impl<S: SplitIo> NoiseSession<S> {
+    /// Split into independent read and write halves for full-duplex use across
+    /// two threads (the relay forwarder). The cipher state is shared by `Arc`;
+    /// each half owns its own nonce counter and a clone of the byte stream, and
+    /// the two halves drive disjoint cipher directions, so no locking is needed.
+    /// Nonce counters carry over, so a session may be used normally (e.g. to
+    /// read a `RelayConnect`) before being split.
+    pub fn split(self) -> Result<SplitSession<S>> {
+        let (read_io, write_io) = self.io.split_io()?;
+        let transport = Arc::new(self.transport);
+        Ok((
+            NoiseReader {
+                io: read_io,
+                transport: Arc::clone(&transport),
+                recv_nonce: self.recv_nonce,
+            },
+            NoiseWriter {
+                io: write_io,
+                transport,
+                send_nonce: self.send_nonce,
+            },
+        ))
+    }
+}
+
+/// The receive half of a [`split`](NoiseSession::split) session.
+pub struct NoiseReader<R> {
+    io: R,
+    transport: Arc<StatelessTransportState>,
+    recv_nonce: u64,
+}
+
+impl<R: Read> NoiseReader<R> {
+    /// Receive one message (see [`NoiseSession::recv_bytes`]).
+    pub fn recv_bytes(&mut self) -> Result<Vec<u8>> {
+        recv_bytes_inner(&mut self.io, &self.transport, &mut self.recv_nonce)
+    }
+
+    /// Receive one protobuf control [`Frame`].
+    pub fn recv_frame(&mut self) -> Result<Frame> {
+        Ok(Frame::decode(self.recv_bytes()?.as_slice())?)
+    }
+}
+
+/// The send half of a [`split`](NoiseSession::split) session.
+pub struct NoiseWriter<W> {
+    io: W,
+    transport: Arc<StatelessTransportState>,
+    send_nonce: u64,
+}
+
+impl<W: Write> NoiseWriter<W> {
+    /// Send one message (see [`NoiseSession::send_bytes`]).
+    pub fn send_bytes(&mut self, msg: &[u8]) -> Result<()> {
+        send_bytes_inner(&mut self.io, &self.transport, &mut self.send_nonce, msg)
+    }
+
+    /// Send one protobuf control [`Frame`].
+    pub fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        self.send_bytes(&frame.encode_to_vec())
+    }
+}
+
+/// A duplex byte stream that can be cloned into independent read and write
+/// halves for [`NoiseSession::split`]. Implemented for the real socket types;
+/// both halves share the same underlying file descriptor (`try_clone`).
+pub trait SplitIo: Sized {
+    type Read: Read + Send;
+    type Write: Write + Send;
+    fn split_io(self) -> std::io::Result<(Self::Read, Self::Write)>;
+}
+
+impl SplitIo for TcpStream {
+    type Read = TcpStream;
+    type Write = TcpStream;
+    fn split_io(self) -> std::io::Result<(TcpStream, TcpStream)> {
+        let write = self.try_clone()?;
+        Ok((self, write))
+    }
+}
+
+impl SplitIo for UnixStream {
+    type Read = UnixStream;
+    type Write = UnixStream;
+    fn split_io(self) -> std::io::Result<(UnixStream, UnixStream)> {
+        let write = self.try_clone()?;
+        Ok((self, write))
+    }
+}
+
+// --- Codec -----------------------------------------------------------------
+
+fn send_bytes_inner<W: Write>(
+    io: &mut W,
+    transport: &StatelessTransportState,
+    nonce: &mut u64,
+    msg: &[u8],
+) -> Result<()> {
+    let len = u32::try_from(msg.len()).map_err(|_| NetError::Protocol("message too large"))?;
+
+    // Header + body as one logical stream, partitioned into Noise-sized chunks.
+    // The last chunk is partial, so the receiver lands on exactly `4 + len`
+    // plaintext bytes with nothing straddling into the next message — which is
+    // why no inter-call buffering is needed on recv.
+    let mut framed = Vec::with_capacity(4 + msg.len());
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(msg);
+
+    let mut out = vec![0u8; NOISE_MAX_MSG];
+    for chunk in framed.chunks(MAX_PLAINTEXT_CHUNK) {
+        let n = transport.write_message(*nonce, chunk, &mut out)?;
+        *nonce += 1;
+        write_lp(io, &out[..n])?;
+    }
+    io.flush()?;
+    Ok(())
+}
+
+fn recv_bytes_inner<R: Read>(
+    io: &mut R,
+    transport: &StatelessTransportState,
+    nonce: &mut u64,
+) -> Result<Vec<u8>> {
+    let mut acc: Vec<u8> = Vec::new();
+    let mut expected: Option<usize> = None;
+    let mut out = vec![0u8; NOISE_MAX_MSG];
+
+    loop {
+        let ct = read_lp(io)?;
+        let n = transport.read_message(*nonce, &ct, &mut out)?;
+        *nonce += 1;
+        acc.extend_from_slice(&out[..n]);
+
+        if expected.is_none() && acc.len() >= 4 {
+            let len = u32::from_be_bytes(acc[..4].try_into().unwrap()) as usize;
+            if len > MAX_MESSAGE_LEN {
+                return Err(NetError::Protocol("message exceeds maximum length"));
+            }
+            expected = Some(len);
+        }
+        if let Some(len) = expected {
+            if acc.len() >= 4 + len {
+                acc.drain(..4);
+                acc.truncate(len);
+                return Ok(acc);
+            }
+        }
     }
 }
 
@@ -267,14 +402,16 @@ fn read_handshake_hello(hs: &mut HandshakeState, msg: &[u8]) -> Result<HelloPayl
 }
 
 /// Capture the peer static and the handshake hash (both before the handshake
-/// state is consumed), then transition into transport mode.
+/// state is consumed), then transition into stateless transport mode.
 fn finish<S>(io: S, hs: HandshakeState, peer_hello: HelloPayload) -> Result<NoiseSession<S>> {
     let peer_static = remote_static(&hs)?;
     let handshake_hash = handshake_hash(&hs)?;
-    let transport = hs.into_transport_mode()?;
+    let transport = hs.into_stateless_transport_mode()?;
     Ok(NoiseSession {
         io,
         transport,
+        send_nonce: 0,
+        recv_nonce: 0,
         peer_static,
         peer_hello,
         handshake_hash,
@@ -322,7 +459,6 @@ mod tests {
 
     use super::*;
     use crate::proto::frame;
-    use std::os::unix::net::UnixStream;
     use std::thread;
 
     fn hello(name: &str) -> HelloPayload {
@@ -359,7 +495,11 @@ mod tests {
         let mut framed = (body.len() as u32).to_be_bytes().to_vec();
         framed.extend_from_slice(&body);
         let mut out = vec![0u8; NOISE_MAX_MSG];
-        let n = init.transport.write_message(&framed, &mut out).unwrap();
+        let n = init
+            .transport
+            .write_message(init.send_nonce, &framed, &mut out)
+            .unwrap();
+        init.send_nonce += 1;
         out[n - 1] ^= 0x01;
         write_lp(&mut init.io, &out[..n]).unwrap();
 
@@ -413,5 +553,32 @@ mod tests {
         );
         // The initiator then fails too (responder dropped the connection).
         assert!(client.is_err());
+    }
+
+    #[test]
+    fn split_session_round_trips_both_directions() {
+        // The relay relies on split(): one thread reads while another writes on
+        // the same underlying session, driving disjoint cipher directions.
+        let (init, resp) = xx_pair([9u8; 32], [10u8; 32]);
+        let (mut ir, mut iw) = init.split().unwrap();
+        let (mut rr, mut rw) = resp.split().unwrap();
+
+        let responder = thread::spawn(move || {
+            // Echo two frames back, reading on one half and writing on the other.
+            for _ in 0..2 {
+                let f = rr.recv_frame().unwrap();
+                let nonce = match f.kind {
+                    Some(frame::Kind::Ping(p)) => p.nonce,
+                    other => panic!("expected ping, got {other:?}"),
+                };
+                rw.send_frame(&Frame::pong(nonce)).unwrap();
+            }
+        });
+
+        iw.send_frame(&Frame::ping(1)).unwrap();
+        assert!(matches!(ir.recv_frame().unwrap().kind, Some(frame::Kind::Pong(p)) if p.nonce == 1));
+        iw.send_frame(&Frame::ping(2)).unwrap();
+        assert!(matches!(ir.recv_frame().unwrap().kind, Some(frame::Kind::Pong(p)) if p.nonce == 2));
+        responder.join().unwrap();
     }
 }

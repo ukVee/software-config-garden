@@ -49,7 +49,10 @@ pub struct LocalDevice {
 }
 
 impl LocalDevice {
-    fn hello(&self) -> HelloPayload {
+    /// This device's in-handshake identity payload: Ed25519 `device_id`, name,
+    /// and the self-signed transport attestation. Reused by the relay client
+    /// (M5a-3) for the outer control connection's handshake.
+    pub fn hello(&self) -> HelloPayload {
         let mut hello = HelloPayload::new(self.device_id.to_vec(), self.device_name.clone());
         hello.static_attestation = self.static_attestation.to_vec();
         hello

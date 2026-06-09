@@ -24,6 +24,10 @@ pub enum NetError {
     #[error("ring encode: {0}")]
     RingEncode(#[from] toml::ser::Error),
 
+    /// An mDNS discovery failure (`mdns-sd`).
+    #[error("mdns: {0}")]
+    Mdns(#[from] mdns_sd::Error),
+
     /// A framing or protocol-level violation that isn't a crypto failure
     /// (e.g. an oversized frame, a key of the wrong length, a malformed ring
     /// entry, or a rejected pairing attestation).

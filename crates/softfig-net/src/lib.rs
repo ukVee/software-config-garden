@@ -12,7 +12,12 @@
 //! M5a-2 adds pairing: the [`sas`] short code derived from the Noise handshake
 //! hash, the Ed25519 transport [`attest`]ation carried in the handshake, the
 //! [`pairing`] state machine, and the signed peer [`ring`] (`peers.toml`).
-//! Later slices add mDNS discovery and the zero-trust relay.
+//!
+//! M5a-3 makes peers reachable, LAN and off-LAN: [`discovery`] announces and
+//! browses `_softfig._tcp` over mDNS (refreshing ring endpoints), the
+//! [`relay`] is a blind, ring-authorized dumb-pipe for off-LAN peers (the
+//! end-to-end Noise session tunnels through it as opaque `RelayData`), and
+//! [`connect`] picks a route — LAN-direct first, relay as fallback.
 //!
 //! # Concurrency model: sync + threads (decision)
 //!
@@ -31,20 +36,29 @@
 #![forbid(unsafe_code)]
 
 pub mod attest;
+pub mod connect;
+pub mod discovery;
 pub mod error;
 pub mod pairing;
 pub mod proto;
+pub mod relay;
 pub mod ring;
 pub mod sas;
 pub mod transport;
 
 pub use attest::{static_attestation_message, verify_static_attestation};
+pub use connect::{connect_first, plan_routes, Route};
+pub use discovery::{Advertisement, DiscoveredPeer, PeerTxt};
 pub use error::{NetError, Result};
 pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
-pub use proto::{Frame, HelloPayload, Ping, Pong};
+pub use proto::{Frame, HelloPayload, Ping, Pong, RelayConnect, RelayData, StateAnnounce};
+pub use relay::{relay_accept, relay_connect, Relay, RelayStream};
 pub use ring::{ring_path, Ring, RingEntry};
 pub use sas::Sas;
-pub use transport::{ik_initiator, ik_responder, xx_initiator, xx_responder, NoiseSession};
+pub use transport::{
+    ik_initiator, ik_responder, xx_initiator, xx_responder, NoiseReader, NoiseSession, NoiseWriter,
+    SplitIo, SplitSession,
+};
 
 /// Control-plane protocol version, carried in the handshake [`HelloPayload`].
 /// Bump on an incompatible control-plane change.

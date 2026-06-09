@@ -16,11 +16,16 @@ message Frame {
   oneof kind {
     Ping ping = 1;
     Pong pong = 2;
-    // M5a-2 (pairing):   PairRequest = 10; PairConfirm = 11;
-    // M5a-3 (relay):     RelayConnect = 20; RelayData = 21; StateAnnounce = 22;
+    // M5a-3 (relay/discovery): the control plane that carries off-LAN reach.
+    RelayConnect relay_connect = 20;   // device -> relay: bridge me to a peer
+    RelayData relay_data = 21;         // forwarded opaque end-to-end ciphertext
+    StateAnnounce state_announce = 22; // device -> relay: register reachability
     // M5b+ (data plane): defined in their own slices, 100+.
   }
-  reserved 3 to 9, 12 to 19, 23 to 99; // held for the slices noted above
+  // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
+  // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
+  // 23-99 are held for later control-plane variants; 100+ is the data plane.
+  reserved 3 to 19, 23 to 99;
 }
 
 // Identity payload carried *inside* the Noise handshake (not a Frame). The XX
@@ -42,4 +47,32 @@ message Ping {
 
 message Pong {
   uint64 nonce = 1;          // echoes the Ping nonce
+}
+
+// --- M5a-3 relay control plane ---------------------------------------------
+//
+// These frames ride inside the *outer* Noise session a device holds to the
+// relay (which authenticates the device and encrypts the relay-control
+// metadata). The relay terminates that outer layer. The *inner* peer-to-peer
+// Noise IK session is end-to-end: its wire bytes travel as RelayData payloads,
+// which the relay forwards verbatim and can neither read nor alter.
+
+// device -> relay: "I am reachable as this device-id." Advisory; the relay
+// authorizes by the authenticated outer-session static against its ring, not by
+// this field, and cross-checks it against the handshake identity.
+message StateAnnounce {
+  bytes device_id = 1;  // Ed25519 identity public key (32 bytes)
+  bool paired = 2;      // mirrors the mDNS paired/unpaired TXT flag
+}
+
+// device -> relay: "bridge me to this peer." The relay matches it against
+// another registered ring-member device and splices the two outer sessions.
+message RelayConnect {
+  bytes target_device_id = 1;  // Ed25519 identity of the peer to reach
+}
+
+// A chunk of the inner end-to-end Noise IK session's wire bytes, forwarded
+// blindly by the relay. Opaque ciphertext under keys the relay never holds.
+message RelayData {
+  bytes payload = 1;
 }

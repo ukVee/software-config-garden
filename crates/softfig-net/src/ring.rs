@@ -157,6 +157,26 @@ impl Ring {
         self.peers.retain(|e| &e.device_id != device_id);
         self.peers.len() != before
     }
+
+    /// Merge freshly-discovered `endpoints` into the row for `device_id`,
+    /// de-duplicating and preserving order. Returns whether a matching ring
+    /// member existed (a discovery for a non-member is ignored). Used by M5a-3
+    /// discovery to refresh a peer's reachable endpoints from mDNS / the relay;
+    /// merging rather than replacing keeps a known-good endpoint if a single
+    /// browse happens to miss it. Persist with [`Ring::save`] to keep it.
+    pub fn merge_endpoints(&mut self, device_id: &[u8; KEY_LEN], endpoints: &[String]) -> bool {
+        match self.peers.iter_mut().find(|e| &e.device_id == device_id) {
+            Some(entry) => {
+                for ep in endpoints {
+                    if !entry.endpoints.contains(ep) {
+                        entry.endpoints.push(ep.clone());
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 // --- TOML representation ----------------------------------------------------

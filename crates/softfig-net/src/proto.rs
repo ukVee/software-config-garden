@@ -10,7 +10,9 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/softfig.net.control.v1.rs"));
 }
 
-pub use generated::{frame, Frame, HelloPayload, Ping, Pong};
+pub use generated::{
+    frame, Frame, HelloPayload, Ping, Pong, RelayConnect, RelayData, StateAnnounce,
+};
 
 impl Frame {
     /// A `Ping` control frame.
@@ -24,6 +26,31 @@ impl Frame {
     pub fn pong(nonce: u64) -> Self {
         Self {
             kind: Some(frame::Kind::Pong(Pong { nonce })),
+        }
+    }
+
+    /// A `StateAnnounce` frame: register reachability with the relay.
+    pub fn state_announce(device_id: Vec<u8>, paired: bool) -> Self {
+        Self {
+            kind: Some(frame::Kind::StateAnnounce(StateAnnounce {
+                device_id,
+                paired,
+            })),
+        }
+    }
+
+    /// A `RelayConnect` frame: ask the relay to bridge to `target_device_id`.
+    pub fn relay_connect(target_device_id: Vec<u8>) -> Self {
+        Self {
+            kind: Some(frame::Kind::RelayConnect(RelayConnect { target_device_id })),
+        }
+    }
+
+    /// A `RelayData` frame carrying an opaque chunk of inner end-to-end
+    /// ciphertext for the relay to forward.
+    pub fn relay_data(payload: Vec<u8>) -> Self {
+        Self {
+            kind: Some(frame::Kind::RelayData(RelayData { payload })),
         }
     }
 }

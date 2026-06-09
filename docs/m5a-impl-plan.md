@@ -164,7 +164,7 @@ ritual close instead.)
 
 - [x] **M5a-1** — secure pipe foundation ✅ (2026-06-09 — see notes below)
 - [x] **M5a-2** — pairing (SAS) + network trust ring ✅ (2026-06-09 — see notes below)
-- [ ] **M5a-3** — discovery + relay
+- [x] **M5a-3** — discovery + relay ✅ (2026-06-09 — see notes below)
 - [ ] **M5a-4** — daemon + CLI/IPC wiring; close M5a
 
 ## M5a-1 — landed (2026-06-09)
@@ -301,3 +301,94 @@ unlock-ACL `trust.toml` and from future shared-subtree membership.
 - **New `NetError` variants** `RingDecode`/`RingEncode` (`toml` de/ser).
 - No new VCS intents; M5a-2 writes only `peers.toml` (caller-driven) and reads
   vault-internal keys via the M5a-1 accessors.
+
+## M5a-3 — landed (2026-06-09)
+
+**Tests:** `cargo test --workspace` green; clippy `--workspace --all-targets -D
+warnings` clean. **softfig-net 26 → 46 (+20).** New lib unit (+18): transport
+`split` 1, relay `authorize` 4, `discovery` 5, `connect` 8. New integration
+(+2): `tests/relay_tcp.rs` — (1) an **in-process relay forwards an end-to-end
+Noise IK ping/pong between two clients** over loopback TCP, and (2) a
+**non-ring-member registration is rejected**. All M5a-1/M5a-2 tests unchanged
+except the transport tamper unit test (updated for the stateless
+`write_message(nonce, …)` signature). Done-criteria covered: relay forwards an
+e2e session through an in-process relay; non-member rejected; LAN-vs-relay
+selection unit-tested (`connect` 8 tests). mDNS announce/browse is the
+**documented manual smoke step** (needs real multicast; can't run headless).
+
+**Transport refactor — stateless cipher state + `split()` (the enabling
+change).** A blind, full-duplex relay must read frames from peer A while
+*simultaneously* writing to peer B on the same outer session (and vice versa),
+which a single stateful `snow::TransportState` (`&mut self`, deadlocks under a
+shared lock) cannot do. `NoiseSession` is now backed by `snow`'s
+**`StatelessTransportState`** (explicit per-message nonces, `&self` read/write)
+plus two `u64` nonce counters. This is **wire-identical** (transport messages
+still carry nonces 0,1,2,… per direction), so every prior test passed unchanged.
+[`NoiseSession::split`] hands back a [`NoiseReader`] + [`NoiseWriter`] that share
+the cipher state by `Arc` and own disjoint nonce counters + cloned stream halves
+(`SplitIo` via `TcpStream::try_clone`); the two halves drive disjoint cipher
+directions, so the relay forwards on two threads with **no locking**. Nonce
+counters carry over, so a session can be read normally (the relay reads
+`RelayConnect`) *before* being split into the pump. The M5b data plane reuses
+this split for full-duplex bulk transfer.
+
+**mDNS — `mdns-sd` 0.20, `_softfig._tcp.local.`** (no async runtime; matches the
+sync+threads model). TXT record (keys are short for the 255-byte TXT budget):
+`fp` = device-id fingerprint (lowercase hex of the Ed25519 identity =
+`RingEntry::fingerprint()`), `pr` = paired flag (`"1"`/`"0"`), `v` =
+`PROTOCOL_VERSION`. The TXT carries **only the fingerprint, never a key or
+secret** — it is a reachability *hint*; authentication still happens in the Noise
+handshake against the ring's stored key, so a spoofed announcement at worst
+wastes one failed dial. The pure TXT encode/parse + `Ring::merge_endpoints`
+refresh (dedup, merge-not-replace so a missed browse doesn't drop a known-good
+endpoint) are unit-tested; `announce`/`browse`/`resolved_to_peer` wrap `mdns-sd`
+and are the manual smoke step. **Endpoints (left empty by M5a-2 pairing) are
+owned here** — `refresh_ring_endpoints` matches a resolved peer to its ring row
+by fingerprint and folds in `host:port` (IPv6 bracketed); the caller persists
+the ring to keep them.
+
+**Relay control/registration protocol + authorization seam.** Two Noise layers:
+the relay terminates the **outer** device↔relay control session (device =
+`ik_initiator` knowing the relay's static from pairing; relay = `ik_responder`)
+and forwards the **inner** end-to-end peer session blindly. Roles are decided by
+the **first frame after the outer handshake** (one read, no blocking a parked
+target): `StateAnnounce` ⇒ "I'm reachable" → the relay **parks** the session in a
+`Mutex<HashMap<device_id, NoiseSession>>`; `RelayConnect{target}` ⇒ the relay
+**removes** the parked target and **splices** the two sessions, pumping
+`RelayData` full-duplex (two threads, the split halves) until either side
+closes. A device that is both reachable and an initiator opens two connections.
+The inner session tunnels through a **`RelayStream`** (`Read+Write` adapter:
+writes → `RelayData` frames, reads reassemble `RelayData` payloads into a byte
+stream), so the unchanged `ik_initiator`/`ik_responder` run over it verbatim —
+the relay sees only opaque inner ciphertext. **Authorization seam
+(`Relay::authorize`): ring members only — no open relay.** The outer IK proved
+possession of the peer's `peer_static`; the relay additionally requires the
+claimed `device_id` to be a ring row whose `transport_pubkey == peer_static` and
+whose in-handshake attestation binds the two. Any mismatch rejects (4 unit
+tests: member-ok, non-member, wrong-key, tampered-attestation).
+
+**LAN-vs-relay connection selection (`connect`).** Split into a pure policy
+[`plan_routes`] (every ring `endpoints` entry as a `Route::Direct(host:port)` in
+ring order, then `Route::Relay` iff a relay is configured; empty ⇒ peer
+currently unreachable) and a generic fallback driver [`connect_first`] that takes
+an `attempt` closure and returns the first success (keeping the network out of
+both makes selection unit-testable headless). keeperd (M5a-4) supplies the
+closure that TCP-connects + `ik_initiator`s a `Direct` route or `relay_connect`s
+a `Relay` route, choosing how to unify the two session types.
+
+**Deltas / notes for later slices:**
+- **Frame control variants added** — `RelayConnect = 20`, `RelayData = 21`,
+  `StateAnnounce = 22`; `Frame.reserved` tightened to `3 to 19, 23 to 99` so
+  **pairing fields 10,11 are now formally reserved** for a future control-frame
+  pairing step (M5a-2 pairing rides in the XX handshake, so none was spent).
+- **New deps:** `mdns-sd` 0.20 (workspace dep). **New `NetError::Mdns`** (`#[from]
+  mdns_sd::Error`).
+- **Relay/discovery/connect are runtime — no on-disk vault/VCS state.** Endpoint
+  refresh writes only the in-memory ring (caller persists `peers.toml`). **No new
+  VCS intents.**
+- **M5a-3 follow-ups (M5b/M5a-4):** parked relay targets never time out (idle
+  registration leaks until the connection drops); no keepalive/reconnect or
+  relay fairness/bandwidth limits; the inner protocol here is request/response,
+  so the split forwarder's full-duplex bulk path is built but unstressed (M5b's
+  data plane should exercise it). The two-device pair/relay over real mDNS +
+  real network remains the **manual real-machine smoke step** for M5a-4's close.

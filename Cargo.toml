@@ -98,6 +98,8 @@ crossterm = "0.28"
 snow = "0.10"
 prost = "0.14"
 prost-build = "0.14"
+# M5a-3 discovery: mDNS / DNS-SD with no async runtime dependency.
+mdns-sd = "0.20"
 
 [profile.release]
 lto = "thin"
