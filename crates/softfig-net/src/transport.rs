@@ -33,6 +33,10 @@ const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 /// Length of an X25519 static key.
 const KEY_LEN: usize = 32;
 
+/// Length of the Noise handshake hash. BLAKE2s (our Noise hash) is 256-bit, so
+/// `get_handshake_hash()` always returns 32 bytes; the SAS is derived from it.
+const HASH_LEN: usize = 32;
+
 /// Noise's hard cap on a single transport/handshake message (including the
 /// 16-byte AEAD tag). Both the on-wire length prefix (a `u16`) and our chunk
 /// size derive from this.
@@ -55,6 +59,7 @@ pub struct NoiseSession<S> {
     transport: TransportState,
     peer_static: [u8; KEY_LEN],
     peer_hello: HelloPayload,
+    handshake_hash: [u8; HASH_LEN],
 }
 
 impl<S> std::fmt::Debug for NoiseSession<S> {
@@ -75,6 +80,14 @@ impl<S> NoiseSession<S> {
     /// The identity payload the peer presented inside the handshake.
     pub fn peer_hello(&self) -> &HelloPayload {
         &self.peer_hello
+    }
+
+    /// The Noise handshake hash `h` — identical on both honest endpoints of a
+    /// session, divergent across the two legs of a man-in-the-middle. The SAS
+    /// short code is derived from this (see [`crate::sas`]). Captured before
+    /// the handshake state was consumed into transport mode.
+    pub fn handshake_hash(&self) -> &[u8; HASH_LEN] {
+        &self.handshake_hash
     }
 }
 
@@ -253,17 +266,25 @@ fn read_handshake_hello(hs: &mut HandshakeState, msg: &[u8]) -> Result<HelloPayl
     Ok(HelloPayload::decode(&payload[..n])?)
 }
 
-/// Capture the peer static (before the handshake is consumed) and transition
-/// into transport mode.
+/// Capture the peer static and the handshake hash (both before the handshake
+/// state is consumed), then transition into transport mode.
 fn finish<S>(io: S, hs: HandshakeState, peer_hello: HelloPayload) -> Result<NoiseSession<S>> {
     let peer_static = remote_static(&hs)?;
+    let handshake_hash = handshake_hash(&hs)?;
     let transport = hs.into_transport_mode()?;
     Ok(NoiseSession {
         io,
         transport,
         peer_static,
         peer_hello,
+        handshake_hash,
     })
+}
+
+fn handshake_hash(hs: &HandshakeState) -> Result<[u8; HASH_LEN]> {
+    hs.get_handshake_hash()
+        .try_into()
+        .map_err(|_| NetError::Protocol("handshake hash wrong length"))
 }
 
 fn remote_static(hs: &HandshakeState) -> Result<[u8; KEY_LEN]> {

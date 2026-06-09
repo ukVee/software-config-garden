@@ -9,8 +9,10 @@
 //! Logic lives here; CLI/TUI are thin wrappers and keeperd hosts an instance
 //! (the `softfig-deploy` / `softfig-onboard` precedent).
 //!
-//! Later slices add pairing (SAS + Ed25519 attestation), the signed peer ring,
-//! mDNS discovery, and the zero-trust relay.
+//! M5a-2 adds pairing: the [`sas`] short code derived from the Noise handshake
+//! hash, the Ed25519 transport [`attest`]ation carried in the handshake, the
+//! [`pairing`] state machine, and the signed peer [`ring`] (`peers.toml`).
+//! Later slices add mDNS discovery and the zero-trust relay.
 //!
 //! # Concurrency model: sync + threads (decision)
 //!
@@ -28,12 +30,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attest;
 pub mod error;
+pub mod pairing;
 pub mod proto;
+pub mod ring;
+pub mod sas;
 pub mod transport;
 
+pub use attest::{static_attestation_message, verify_static_attestation};
 pub use error::{NetError, Result};
+pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 pub use proto::{Frame, HelloPayload, Ping, Pong};
+pub use ring::{ring_path, Ring, RingEntry};
+pub use sas::Sas;
 pub use transport::{ik_initiator, ik_responder, xx_initiator, xx_responder, NoiseSession};
 
 /// Control-plane protocol version, carried in the handshake [`HelloPayload`].

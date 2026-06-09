@@ -1840,10 +1840,18 @@ dependencies = [
 name = "softfig-net"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
  "prost",
  "prost-build",
+ "serde",
+ "sha2",
  "snow",
+ "tempfile",
  "thiserror",
+ "toml",
+ "x25519-dalek",
 ]
 
 [[package]]

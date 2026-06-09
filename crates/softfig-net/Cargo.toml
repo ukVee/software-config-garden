@@ -11,6 +11,19 @@ description = "soft-fig networking (M5a): app-level Noise transport over TCP + a
 snow.workspace = true
 prost.workspace = true
 thiserror.workspace = true
+# M5a-2 pairing: SAS (HKDF-SHA256), Ed25519 attestation, the peers.toml ring.
+hkdf.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+# Tests derive an X25519 public key from a raw secret to forge attestations;
+# production never needs this (the vault supplies both halves).
+x25519-dalek.workspace = true
+tempfile.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

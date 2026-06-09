@@ -30,12 +30,16 @@ impl Frame {
 
 impl HelloPayload {
     /// Build the in-handshake identity payload at the current protocol version.
-    /// `device_id` is the device's Ed25519 identity public key.
+    /// `device_id` is the device's Ed25519 identity public key. The
+    /// `static_attestation` (field 4) starts empty; the pairing layer fills it
+    /// with the Ed25519 signature over the X25519 static (see
+    /// [`crate::pairing::LocalDevice`]).
     pub fn new(device_id: Vec<u8>, device_name: impl Into<String>) -> Self {
         Self {
             protocol_version: crate::PROTOCOL_VERSION,
             device_id,
             device_name: device_name.into(),
+            static_attestation: Vec::new(),
         }
     }
 }

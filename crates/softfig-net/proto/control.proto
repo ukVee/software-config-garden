@@ -25,14 +25,15 @@ message Frame {
 
 // Identity payload carried *inside* the Noise handshake (not a Frame). The XX
 // handshake authenticates only the X25519 static key; this binds the device's
-// Ed25519 identity to that static. M5a-2 adds the Ed25519 self-signature over
-// the X25519 static (field 4) to complete the attestation.
+// Ed25519 identity to that static. The Ed25519 self-signature in field 4 is
+// over the X25519 static (domain-separated — see softfig-net's `attest`
+// module), completing the attestation the verifier checks during pairing.
 message HelloPayload {
   uint32 protocol_version = 1;
-  bytes device_id = 2;       // Ed25519 identity public key (32 bytes)
+  bytes device_id = 2;          // Ed25519 identity public key (32 bytes)
   string device_name = 3;
-  // M5a-2: bytes static_attestation = 4; // Ed25519 sig over the X25519 static
-  reserved 4 to 15;
+  bytes static_attestation = 4; // Ed25519 sig (64 bytes) over the X25519 static
+  reserved 5 to 15;
 }
 
 message Ping {
