@@ -66,6 +66,67 @@ fn renders_vault_frame() {
 }
 
 #[test]
+fn renders_peers_frame() {
+    use softfig_ipc::{PairPeer, PendingPairing};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Peers;
+    app.peers = vec![PairPeer {
+        fingerprint: "1".repeat(64),
+        name: "tablet".into(),
+        transport_pubkey: "a".repeat(64),
+        endpoints: vec!["192.168.1.5:9100".into()],
+        paired_at: 1_700_000_000,
+    }];
+    app.pending = vec![PendingPairing {
+        pairing_id: "pid-1".into(),
+        sas: "123 456".into(),
+        fingerprint: "2".repeat(64),
+        name: "laptop".into(),
+    }];
+    app.peers_loaded = true;
+    app.peer_rows = vec![
+        softfig_tui::app::PeerRow::Peer(0),
+        softfig_tui::app::PeerRow::Pending(0),
+    ];
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Peers"), "peers tab missing:\n{rendered}");
+    assert!(rendered.contains("tablet"), "ring member missing");
+    assert!(rendered.contains("laptop"), "pending peer missing");
+    assert!(rendered.contains("123 456"), "SAS missing");
+    assert!(rendered.contains("ring member"), "detail header missing");
+}
+
+#[test]
+fn renders_pair_confirm_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Peers;
+    app.overlay = softfig_tui::app::Overlay::PairConfirm {
+        pairing_id: "pid-1".into(),
+        sas: "987 654".into(),
+        fingerprint: "f".repeat(64),
+        name: "laptop".into(),
+        error: None,
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("confirm pairing"), "overlay title missing:\n{rendered}");
+    assert!(rendered.contains("987 654"), "SAS missing in overlay");
+    assert!(rendered.contains("y confirm"), "confirm hint missing");
+}
+
+#[test]
 fn renders_scrolled_preview() {
     // A preview taller than the pane, scrolled down, must show the lower
     // lines (not the top) and surface a scroll-position indicator.

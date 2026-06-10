@@ -7,7 +7,12 @@ pub enum Command {
     Browse,
     History,
     Vault,
+    Peers,
     Reveal,
+    /// Open the "initiate pairing" overlay (`pair_begin`).
+    Pair,
+    /// Unpair the selected ring member (`pair_remove`).
+    Unpair,
     Reload,
     Unlock,
     Quit,
@@ -22,7 +27,10 @@ pub fn parse_command(input: &str) -> Command {
         "browse" | "b" => Command::Browse,
         "history" | "log" | "h" => Command::History,
         "vault" | "v" => Command::Vault,
+        "peers" => Command::Peers,
         "reveal" | "x" => Command::Reveal,
+        "pair" => Command::Pair,
+        "unpair" => Command::Unpair,
         "reload" | "r" => Command::Reload,
         "unlock" => Command::Unlock,
         "quit" | "q" => Command::Quit,
@@ -41,7 +49,8 @@ pub fn parse_command(input: &str) -> Command {
 /// Names offered in the palette hint line.
 pub fn command_hints() -> String {
     let mut names = vec![
-        "browse", "history", "vault", "reveal", "reload", "unlock", "quit", "help",
+        "browse", "history", "vault", "peers", "reveal", "pair", "unpair", "reload", "unlock",
+        "quit", "help",
     ];
     for k in ActionKind::ALL {
         names.push(k.command_name());
@@ -84,6 +93,15 @@ mod tests {
             parse_command("unseal"),
             Command::Action(ActionKind::VaultUnseal)
         );
+    }
+
+    #[test]
+    fn peer_commands() {
+        assert_eq!(parse_command("peers"), Command::Peers);
+        assert_eq!(parse_command("pair"), Command::Pair);
+        assert_eq!(parse_command("unpair"), Command::Unpair);
+        assert!(command_hints().contains("pair"));
+        assert!(command_hints().contains("peers"));
     }
 
     #[test]

@@ -9,7 +9,8 @@ use std::path::Path;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
 use softfig_ipc::{
-    LogReply, ReadFileReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
+    LogReply, PairBeginReply, PairConfirmReply, PairListReply, PairPeer, PairRemoveReply,
+    PendingPairing, ReadFileReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
 };
 
 use crate::clip;
@@ -23,6 +24,26 @@ pub enum View {
     Browse,
     History,
     Vault,
+    Peers,
+}
+
+/// One navigable row in the Peers view: either a ring member or a pairing
+/// still awaiting SAS confirmation. The two collections are flattened into a
+/// single selection list (peers first, then pending) so `j`/`k` move over
+/// both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRow {
+    /// Index into [`App::peers`].
+    Peer(usize),
+    /// Index into [`App::pending`].
+    Pending(usize),
+}
+
+/// Which field the `pair_begin` overlay is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairField {
+    Fingerprint,
+    Endpoint,
 }
 
 #[derive(Debug)]
@@ -33,6 +54,31 @@ pub enum Overlay {
     /// Masked master-password prompt for `vault_reveal` against `path`.
     Reveal { path: String, buf: String, error: Option<String> },
     Form(ActionForm),
+    /// Initiate a pairing: collect the peer fingerprint + optional endpoint,
+    /// then run `pair_begin`. Stays open until the SAS comes back (then it is
+    /// replaced by [`Overlay::PairConfirm`]) or the daemon errors.
+    PairBegin {
+        fingerprint: String,
+        endpoint: String,
+        focus: PairField,
+        error: Option<String>,
+    },
+    /// Compare the SAS out of band, then `pair_confirm` (or abort). Reached
+    /// from a `pair_begin` reply (initiator) or by selecting a parked pending
+    /// pairing (responder).
+    PairConfirm {
+        pairing_id: String,
+        sas: String,
+        fingerprint: String,
+        name: String,
+        error: Option<String>,
+    },
+    /// Confirm removing a ring member (`pair_remove`).
+    Unpair {
+        fingerprint: String,
+        name: String,
+        error: Option<String>,
+    },
     Help,
 }
 
@@ -76,6 +122,13 @@ pub struct App {
     pub vault_selected: usize,
     pub vault_loaded: bool,
     pub reveal: Option<RevealInfo>,
+    pub peers: Vec<PairPeer>,
+    pub pending: Vec<PendingPairing>,
+    /// Flattened selection model over `peers` ++ `pending`, rebuilt on each
+    /// `pair_list` reply.
+    pub peer_rows: Vec<PeerRow>,
+    pub peers_selected: usize,
+    pub peers_loaded: bool,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -107,6 +160,11 @@ impl App {
             vault_selected: 0,
             vault_loaded: false,
             reveal: None,
+            peers: Vec::new(),
+            pending: Vec::new(),
+            peer_rows: Vec::new(),
+            peers_selected: 0,
+            peers_loaded: false,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -144,6 +202,10 @@ impl App {
         ipc.send("vault_list_sealed", json!({}), Tag::VaultList);
     }
 
+    fn load_peers(&self, ipc: &mut IpcClient) {
+        ipc.send("pair_list", json!({}), Tag::PairList);
+    }
+
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
     fn refresh_view(&self, ipc: &mut IpcClient) {
@@ -157,6 +219,29 @@ impl App {
         if self.vault_loaded {
             self.load_vault(ipc);
         }
+        if self.peers_loaded {
+            self.load_peers(ipc);
+        }
+    }
+
+    /// Rebuild the flattened peer/pending selection list (peers first, then
+    /// pending) and clamp the selection into range.
+    fn rebuild_peer_rows(&mut self) {
+        let mut rows = Vec::with_capacity(self.peers.len() + self.pending.len());
+        for i in 0..self.peers.len() {
+            rows.push(PeerRow::Peer(i));
+        }
+        for i in 0..self.pending.len() {
+            rows.push(PeerRow::Pending(i));
+        }
+        self.peer_rows = rows;
+        if self.peers_selected >= self.peer_rows.len() {
+            self.peers_selected = self.peer_rows.len().saturating_sub(1);
+        }
+    }
+
+    pub fn selected_peer_row(&self) -> Option<PeerRow> {
+        self.peer_rows.get(self.peers_selected).copied()
     }
 
     // ---- reply handling ----
@@ -304,6 +389,78 @@ impl App {
                     }
                 }
             },
+            Tag::PairList => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<PairListReply>(v) {
+                        self.peers = r.peers;
+                        self.pending = r.pending;
+                        self.peers_loaded = true;
+                        self.rebuild_peer_rows();
+                    }
+                }
+                Err((_, m)) => self.status = format!("pair list: {m}"),
+            },
+            Tag::PairBegin => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<PairBeginReply>(v) {
+                        self.status =
+                            format!("compare SAS with {} — y confirm · n abort", r.name);
+                        self.overlay = Overlay::PairConfirm {
+                            pairing_id: r.pairing_id,
+                            sas: r.sas,
+                            fingerprint: r.fingerprint,
+                            name: r.name,
+                            error: None,
+                        };
+                    }
+                }
+                Err((kind, m)) => {
+                    let msg = format!("pair failed ({kind:?}): {m}");
+                    if let Overlay::PairBegin { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
+            Tag::PairConfirm => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<PairConfirmReply>(v) {
+                        self.status = format!("paired with {} ({})", r.name, short_fp(&r.fingerprint));
+                    } else {
+                        self.status = "paired".into();
+                    }
+                    self.overlay = Overlay::None;
+                    self.load_peers(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("confirm failed ({kind:?}): {m}");
+                    if let Overlay::PairConfirm { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
+            Tag::PairRemove => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<PairRemoveReply>(v) {
+                        Ok(r) if r.removed => format!("unpaired {}", short_fp(&r.fingerprint)),
+                        Ok(r) => format!("no change ({} not in ring)", short_fp(&r.fingerprint)),
+                        Err(_) => "unpaired".into(),
+                    };
+                    self.overlay = Overlay::None;
+                    self.load_peers(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("unpair failed ({kind:?}): {m}");
+                    if let Overlay::Unpair { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
         }
     }
 
@@ -316,6 +473,9 @@ impl App {
             Overlay::Unlock { .. } => self.handle_key_unlock(key, ipc),
             Overlay::Reveal { .. } => self.handle_key_reveal(key, ipc),
             Overlay::Form(_) => self.handle_key_form(key, ipc),
+            Overlay::PairBegin { .. } => self.handle_key_pair_begin(key, ipc),
+            Overlay::PairConfirm { .. } => self.handle_key_pair_confirm(key, ipc),
+            Overlay::Unpair { .. } => self.handle_key_unpair(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -362,8 +522,16 @@ impl App {
                     self.load_vault(ipc);
                 }
             }
+            KeyCode::Char('4') => {
+                self.view = View::Peers;
+                if !self.peers_loaded && !self.locked {
+                    self.load_peers(ipc);
+                }
+            }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
+            KeyCode::Char('p') if self.view == View::Peers => self.open_pair_begin(),
+            KeyCode::Char('D') if self.view == View::Peers => self.start_unpair(),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
@@ -418,6 +586,9 @@ impl App {
             View::Vault => {
                 self.vault_selected = self.vault_selected.saturating_sub(1);
             }
+            View::Peers => {
+                self.peers_selected = self.peers_selected.saturating_sub(1);
+            }
         }
     }
 
@@ -432,6 +603,11 @@ impl App {
             View::Vault => {
                 if self.vault_selected + 1 < self.vault_files.len() {
                     self.vault_selected += 1;
+                }
+            }
+            View::Peers => {
+                if self.peers_selected + 1 < self.peer_rows.len() {
+                    self.peers_selected += 1;
                 }
             }
         }
@@ -463,6 +639,10 @@ impl App {
                 }
             }
             View::Vault => self.start_reveal(ipc),
+            // Activating a parked pending pairing opens the SAS-confirm
+            // overlay; activating a settled ring member is a no-op (its
+            // details already show in the right pane).
+            View::Peers => self.confirm_selected_pending(),
         }
     }
 
@@ -512,7 +692,21 @@ impl App {
                     self.load_vault(ipc);
                 }
             }
+            Command::Peers => {
+                self.view = View::Peers;
+                if !self.locked {
+                    self.load_peers(ipc);
+                }
+            }
             Command::Reveal => self.start_reveal(ipc),
+            Command::Pair => {
+                self.view = View::Peers;
+                self.open_pair_begin();
+            }
+            Command::Unpair => {
+                self.view = View::Peers;
+                self.start_unpair();
+            }
             Command::Reload if !self.locked => self.refresh_view(ipc),
             Command::Reload => {}
             Command::Unlock => {
@@ -570,7 +764,7 @@ impl App {
                 .selected_row()
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
-            View::History => None,
+            View::History | View::Peers => None,
         };
         match target {
             Some(path) => {
@@ -627,6 +821,154 @@ impl App {
         };
     }
 
+    // ---- pairing (M5a) ----
+
+    /// Open the "initiate pairing" overlay (the initiator side of `pair_begin`).
+    fn open_pair_begin(&mut self) {
+        if self.locked {
+            self.status = "locked — unlock before pairing".into();
+            return;
+        }
+        self.overlay = Overlay::PairBegin {
+            fingerprint: String::new(),
+            endpoint: String::new(),
+            focus: PairField::Fingerprint,
+            error: None,
+        };
+    }
+
+    /// If a pending pairing is selected, open its SAS-confirm overlay (the
+    /// responder side, or re-confirming an initiated one).
+    fn confirm_selected_pending(&mut self) {
+        match self.selected_peer_row() {
+            Some(PeerRow::Pending(i)) => {
+                if let Some(p) = self.pending.get(i) {
+                    self.overlay = Overlay::PairConfirm {
+                        pairing_id: p.pairing_id.clone(),
+                        sas: p.sas.clone(),
+                        fingerprint: p.fingerprint.clone(),
+                        name: p.name.clone(),
+                        error: None,
+                    };
+                }
+            }
+            Some(PeerRow::Peer(_)) => {
+                self.status = "already paired — D to unpair".into();
+            }
+            None => self.status = "no pending pairing selected".into(),
+        }
+    }
+
+    /// If a ring member is selected, open the unpair-confirm overlay.
+    fn start_unpair(&mut self) {
+        match self.selected_peer_row() {
+            Some(PeerRow::Peer(i)) => {
+                if let Some(p) = self.peers.get(i) {
+                    self.overlay = Overlay::Unpair {
+                        fingerprint: p.fingerprint.clone(),
+                        name: p.name.clone(),
+                        error: None,
+                    };
+                }
+            }
+            _ => self.status = "select a paired device to unpair".into(),
+        }
+    }
+
+    fn handle_key_pair_begin(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::PairBegin {
+            fingerprint,
+            endpoint,
+            focus,
+            ..
+        } = &mut self.overlay
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+                *focus = match focus {
+                    PairField::Fingerprint => PairField::Endpoint,
+                    PairField::Endpoint => PairField::Fingerprint,
+                };
+            }
+            KeyCode::Backspace => {
+                match focus {
+                    PairField::Fingerprint => fingerprint.pop(),
+                    PairField::Endpoint => endpoint.pop(),
+                };
+            }
+            KeyCode::Char(c) => match focus {
+                PairField::Fingerprint => fingerprint.push(c),
+                PairField::Endpoint => endpoint.push(c),
+            },
+            KeyCode::Enter => self.submit_pair_begin(ipc),
+            _ => {}
+        }
+    }
+
+    fn submit_pair_begin(&mut self, ipc: &mut IpcClient) {
+        let Overlay::PairBegin {
+            fingerprint,
+            endpoint,
+            error,
+            ..
+        } = &mut self.overlay
+        else {
+            return;
+        };
+        let fp = fingerprint.trim().to_string();
+        if fp.is_empty() {
+            *error = Some("fingerprint must not be empty".into());
+            return;
+        }
+        let mut args = json!({ "fingerprint": fp });
+        let ep = endpoint.trim();
+        if !ep.is_empty() {
+            args["endpoint"] = json!(ep);
+        }
+        *error = None;
+        self.status = "pairing… (running handshake)".into();
+        ipc.send("pair_begin", args, Tag::PairBegin);
+    }
+
+    fn handle_key_pair_confirm(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::PairConfirm { pairing_id, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = Overlay::None;
+                self.status = "pairing aborted (not confirmed)".into();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let id = pairing_id.clone();
+                self.status = "confirming…".into();
+                ipc.send("pair_confirm", json!({ "pairing_id": id }), Tag::PairConfirm);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_unpair(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::Unpair { fingerprint, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = Overlay::None;
+                self.status = "unpair cancelled".into();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let fp = fingerprint.clone();
+                self.status = "unpairing…".into();
+                ipc.send("pair_remove", json!({ "fingerprint": fp }), Tag::PairRemove);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key_form(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         // Ctrl-S submits regardless of focused field.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -665,6 +1007,12 @@ impl App {
 
 fn short_hash(h: &str) -> String {
     h.chars().take(10).collect()
+}
+
+/// First 16 hex chars of a device-id / transport fingerprint for compact
+/// display (mirrors the CLI's `short_fp`).
+pub fn short_fp(fp: &str) -> &str {
+    &fp[..16.min(fp.len())]
 }
 
 fn summarize_action(v: &Value) -> String {
@@ -882,6 +1230,160 @@ mod tests {
         assert_eq!(app.preview_scroll, 6);
         app.handle_mouse(wheel(MouseEventKind::ScrollUp), &mut ipc);
         assert_eq!(app.preview_scroll, 3);
+    }
+
+    fn peer(name: &str, fp: &str) -> PairPeer {
+        PairPeer {
+            fingerprint: fp.into(),
+            name: name.into(),
+            transport_pubkey: "aa".repeat(32),
+            endpoints: vec!["192.168.1.5:9100".into()],
+            paired_at: 1_700_000_000,
+        }
+    }
+
+    fn pending(name: &str, fp: &str, sas: &str) -> PendingPairing {
+        PendingPairing {
+            pairing_id: format!("pid-{name}"),
+            sas: sas.into(),
+            fingerprint: fp.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn pair_list_flattens_and_clamps() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::PairList,
+                result: Ok(serde_json::to_value(softfig_ipc::PairListReply {
+                    peers: vec![peer("tablet", &"11".repeat(32))],
+                    pending: vec![pending("laptop", &"22".repeat(32), "123 456")],
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert!(app.peers_loaded);
+        assert_eq!(app.peers.len(), 1);
+        assert_eq!(app.pending.len(), 1);
+        // Peers first, then pending.
+        assert_eq!(
+            app.peer_rows,
+            vec![PeerRow::Peer(0), PeerRow::Pending(0)]
+        );
+    }
+
+    #[test]
+    fn pair_begin_reply_opens_confirm() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::PairBegin {
+            fingerprint: "22".repeat(32),
+            endpoint: String::new(),
+            focus: PairField::Fingerprint,
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::PairBegin,
+                result: Ok(serde_json::to_value(PairBeginReply {
+                    pairing_id: "pid-1".into(),
+                    sas: "123 456".into(),
+                    fingerprint: "22".repeat(32),
+                    name: "laptop".into(),
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        match &app.overlay {
+            Overlay::PairConfirm { sas, name, pairing_id, .. } => {
+                assert_eq!(sas, "123 456");
+                assert_eq!(name, "laptop");
+                assert_eq!(pairing_id, "pid-1");
+            }
+            other => panic!("expected PairConfirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activate_pending_confirms_peer_does_not() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Peers;
+        app.peers = vec![peer("tablet", &"11".repeat(32))];
+        app.pending = vec![pending("laptop", &"22".repeat(32), "123 456")];
+        app.rebuild_peer_rows();
+        let mut ipc = dummy_ipc();
+
+        // Row 0 is the settled peer → activating does not open a confirm.
+        app.peers_selected = 0;
+        app.activate(&mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+
+        // Row 1 is the pending pairing → activating opens the SAS confirm.
+        app.peers_selected = 1;
+        app.activate(&mut ipc);
+        match &app.overlay {
+            Overlay::PairConfirm { name, sas, .. } => {
+                assert_eq!(name, "laptop");
+                assert_eq!(sas, "123 456");
+            }
+            other => panic!("expected PairConfirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unpair_targets_ring_member_only() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Peers;
+        app.peers = vec![peer("tablet", &"11".repeat(32))];
+        app.pending = vec![pending("laptop", &"22".repeat(32), "123 456")];
+        app.rebuild_peer_rows();
+
+        app.peers_selected = 0; // a ring member
+        app.start_unpair();
+        match &app.overlay {
+            Overlay::Unpair { name, fingerprint, .. } => {
+                assert_eq!(name, "tablet");
+                assert_eq!(fingerprint, &"11".repeat(32));
+            }
+            other => panic!("expected Unpair, got {other:?}"),
+        }
+
+        app.overlay = Overlay::None;
+        app.peers_selected = 1; // the pending row → cannot unpair
+        app.start_unpair();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("paired device"));
+    }
+
+    #[test]
+    fn pair_begin_requires_a_fingerprint() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::PairBegin {
+            fingerprint: "   ".into(),
+            endpoint: String::new(),
+            focus: PairField::Fingerprint,
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_pair_begin(&mut ipc);
+        match &app.overlay {
+            Overlay::PairBegin { error, .. } => {
+                assert!(error.as_deref().unwrap().contains("fingerprint"));
+            }
+            other => panic!("expected PairBegin still open, got {other:?}"),
+        }
     }
 
     #[test]

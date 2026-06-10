@@ -454,9 +454,16 @@ require unlock). No `softfig-net` change — this slice only *wires* it.
   by the inbound listener) it confirms that one; otherwise it initiates. Either
   way it prints the SAS and prompts `[y/N]` (skip with `--yes`) before
   confirming. Relay hosting is a `keeper.toml [relay]` flag, not a subcommand.
-- **TUI:** pairing surface **stubbed/deferred** (noted posture; a `softfig-tui`
-  pairing tab is a follow-up, like the M3b vault-TUI follow-up). Pairing is fully
-  usable from the CLI; the live render was never the M5a-4 gate.
+- **TUI:** pairing surface was **stubbed/deferred** in M5a-4 (CLI-complete; a
+  `softfig-tui` pairing tab was a follow-up, like the M3b vault-TUI follow-up).
+  **Follow-up SHIPPED 2026-06-10:** a `4:Peers` master/detail tab over the four
+  pairing verbs — ring members + pending pairings flattened into one selection
+  list, `p` initiate (`pair_begin` overlay → SAS-confirm), `Enter` confirm a
+  parked pending (responder side), `D` unpair (`pair_remove`), `r`/auto refresh
+  via `pair_list`; SAS shown in a dedicated confirm overlay (compare out of band,
+  `y`/`n`), `:peers`/`:pair`/`:unpair` palette commands. No new IPC/crypto — pure
+  frontend wiring over M5a-4's verbs. Live render/keys remain a manual smoke step
+  (no TTY in sandbox), same posture as the rest of the TUI.
 
 **Manual real-machine smoke step (remaining):** the two-device flow over real
 mDNS + real network, and a real relay forward — bring up two unlocked daemons on

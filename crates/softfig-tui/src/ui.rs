@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Overlay, View};
+use crate::app::{short_fp, App, Overlay, PairField, PeerRow, View};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
 
@@ -39,6 +39,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
             render_reveal(f, path, buf, error.as_deref(), area)
         }
         Overlay::Form(form) => render_form(f, form, area),
+        Overlay::PairBegin {
+            fingerprint,
+            endpoint,
+            focus,
+            error,
+        } => render_pair_begin(f, fingerprint, endpoint, *focus, error.as_deref(), area),
+        Overlay::PairConfirm {
+            sas,
+            fingerprint,
+            name,
+            error,
+            ..
+        } => render_pair_confirm(f, sas, fingerprint, name, error.as_deref(), area),
+        Overlay::Unpair {
+            fingerprint,
+            name,
+            error,
+        } => render_unpair(f, fingerprint, name, error.as_deref(), area),
         Overlay::Help => render_help(f, area),
     }
 }
@@ -67,6 +85,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         tab("1:Browse", app.view == View::Browse),
         tab("2:History", app.view == View::History),
         tab("3:Vault", app.view == View::Vault),
+        tab("4:Peers", app.view == View::Peers),
         Span::raw("  "),
         Span::styled(format!("[{state}] tip:{tip}"), dim),
     ]);
@@ -91,6 +110,10 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
         View::Vault => {
             render_vault(f, app, cols[0]);
             render_vault_detail(f, app, cols[1]);
+        }
+        View::Peers => {
+            render_peers(f, app, cols[0]);
+            render_peers_detail(f, app, cols[1]);
         }
     }
 }
@@ -212,6 +235,110 @@ fn render_vault_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+fn render_peers(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.peer_rows.is_empty() {
+        vec![ListItem::new("(no paired devices — p to pair)")]
+    } else {
+        app.peer_rows
+            .iter()
+            .map(|row| match row {
+                PeerRow::Peer(i) => {
+                    let p = &app.peers[*i];
+                    ListItem::new(format!("🔗 {}  {}", p.name, short_fp(&p.fingerprint)))
+                }
+                PeerRow::Pending(i) => {
+                    let p = &app.pending[*i];
+                    ListItem::new(Line::styled(
+                        format!("⏳ {}  SAS {}", p.name, p.sas),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                }
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !app.peer_rows.is_empty() {
+        st.select(Some(app.peers_selected.min(app.peer_rows.len() - 1)));
+    }
+    let title = format!(
+        "peers — {} paired · {} pending",
+        app.peers.len(),
+        app.pending.len()
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    match app.selected_peer_row() {
+        Some(PeerRow::Peer(i)) => {
+            let p = &app.peers[i];
+            lines.push(Line::styled(
+                "ring member",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ));
+            lines.push(Line::raw(format!("  name:        {}", p.name)));
+            lines.push(Line::raw(format!("  fingerprint: {}", p.fingerprint)));
+            lines.push(Line::raw(format!("  transport:   {}", p.transport_pubkey)));
+            let endpoints = if p.endpoints.is_empty() {
+                "(none discovered)".to_string()
+            } else {
+                p.endpoints.join(", ")
+            };
+            lines.push(Line::raw(format!("  endpoints:   {endpoints}")));
+            lines.push(Line::raw(format!("  paired at:   {} (unix)", p.paired_at)));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  D unpair this device",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Some(PeerRow::Pending(i)) => {
+            let p = &app.pending[i];
+            lines.push(Line::styled(
+                "pending — awaiting SAS confirmation",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow),
+            ));
+            lines.push(Line::raw(format!("  name:        {}", p.name)));
+            lines.push(Line::raw(format!("  fingerprint: {}", p.fingerprint)));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                format!("  SAS  {}", p.sas),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Green),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  compare the SAS on both devices, then Enter to confirm",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        None => {
+            lines.push(Line::styled(
+                "no devices",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  p initiate pairing with a peer's fingerprint",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "p pair · Enter confirm pending · D unpair · r refresh",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("peer detail"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
 fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
@@ -322,6 +449,135 @@ fn render_reveal(f: &mut Frame, path: &str, buf: &str, error: Option<&str>, area
     f.render_widget(p, rect);
 }
 
+fn render_pair_begin(
+    f: &mut Frame,
+    fingerprint: &str,
+    endpoint: &str,
+    focus: PairField,
+    error: Option<&str>,
+    area: Rect,
+) {
+    let rect = centered_rect(75, 45, area);
+    f.render_widget(Clear, rect);
+
+    let focused = Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan);
+    let unfocused = Style::default().fg(Color::Gray);
+    let mark = |on: bool| if on { "> " } else { "  " };
+    let fp_on = focus == PairField::Fingerprint;
+    let ep_on = focus == PairField::Endpoint;
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}fingerprint: ", mark(fp_on)),
+                if fp_on { focused } else { unfocused },
+            ),
+            Span::raw(fingerprint.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{}endpoint:    ", mark(ep_on)),
+                if ep_on { focused } else { unfocused },
+            ),
+            Span::raw(endpoint.to_string()),
+        ]),
+        Line::styled(
+            "  (endpoint optional — host:port; leave blank to use mDNS discovery)",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::styled(
+        "Enter pair · Tab switch field · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("pair a device"),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+fn render_pair_confirm(
+    f: &mut Frame,
+    sas: &str,
+    fingerprint: &str,
+    name: &str,
+    error: Option<&str>,
+    area: Rect,
+) {
+    let rect = centered_rect(70, 45, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::raw(format!("peer:        {name}")),
+        Line::raw(format!("fingerprint: {fingerprint}")),
+        Line::raw(""),
+        Line::styled(
+            format!("SAS  {sas}"),
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Green),
+        ),
+        Line::raw(""),
+        Line::raw("Compare this code with the other device."),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "y confirm (codes match) · n / Esc abort",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("confirm pairing"),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+fn render_unpair(f: &mut Frame, fingerprint: &str, name: &str, error: Option<&str>, area: Rect) {
+    let rect = centered_rect(65, 35, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::raw(format!("Remove {name} from the trust ring?")),
+        Line::raw(format!("  {fingerprint}")),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "y unpair · n / Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("unpair device"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
 fn render_form(f: &mut Frame, form: &ActionForm, area: Rect) {
     let rect = centered_rect(80, 70, area);
     f.render_widget(Clear, rect);
@@ -376,14 +632,15 @@ fn render_form(f: &mut Frame, form: &ActionForm, area: Rect) {
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
-    let rect = centered_rect(70, 60, area);
+    let rect = centered_rect(82, 90, area);
     f.render_widget(Clear, rect);
     let body = "\
 soft-fig TUI — keys
 
-  1 / 2 / 3    switch Browse / History / Vault
+  1 / 2 / 3 / 4  switch Browse / History / Vault / Peers
   j k ↑ ↓      move selection
   Enter l →    open file / expand dir / show commit / reveal (vault)
+               / confirm pending pairing (peers)
   h ←          collapse dir
   scroll preview (right pane):
     ^e ^y      line down / up        wheel  line-wise
@@ -392,6 +649,8 @@ soft-fig TUI — keys
     g G        top / bottom
   x            reveal selected sealed file
   c            copy last reveal's value to clipboard
+  p            pair a device (peers view)
+  D            unpair selected device (peers view)
   r            refresh view
   u            unlock (when locked)
   :            command palette
@@ -399,10 +658,14 @@ soft-fig TUI — keys
   q            quit
 
 command palette runs actions: log_decision, log_incident,
-archive, add_project, refresh_snapshot, propose, seal, unseal
+archive, add_project, refresh_snapshot, propose, seal, unseal,
+and pair / unpair / peers
 
 vault: reveal writes plaintext to a 0600 temp file and never
 shows it in this TUI; c pipes that file straight to wl-copy
+
+peers: pairing rides the Noise XX handshake; compare the SAS
+short code on both devices before confirming (defeats a MITM)
 
 any key closes this help";
     let p = Paragraph::new(body)

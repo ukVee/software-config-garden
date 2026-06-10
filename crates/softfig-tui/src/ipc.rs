@@ -26,6 +26,14 @@ pub enum Tag {
     Action { title: String },
     VaultList,
     Reveal { path: String },
+    /// M5a: list the network trust ring + pending pairings (`pair_list`).
+    PairList,
+    /// M5a: initiate a pairing (`pair_begin`); reply carries the SAS to confirm.
+    PairBegin,
+    /// M5a: confirm a parked pairing's SAS (`pair_confirm`).
+    PairConfirm,
+    /// M5a: remove a peer from the ring (`pair_remove`).
+    PairRemove,
 }
 
 #[derive(Debug)]
