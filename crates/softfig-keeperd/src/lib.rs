@@ -20,6 +20,7 @@ pub mod handlers;
 pub mod keeper_toml;
 pub mod layer_b;
 pub mod migrate;
+pub mod net;
 pub mod peer;
 pub mod reads;
 pub mod server;

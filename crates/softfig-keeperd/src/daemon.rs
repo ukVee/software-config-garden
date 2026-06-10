@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::config::KeeperConfig;
 use crate::layer_b::SharedLayerB;
+use crate::net::{NetRuntime, PendingPairs};
 use crate::state::State;
 use crate::watcher::DirtySetAccumulator;
 
@@ -65,6 +66,15 @@ pub struct DaemonInner {
     /// Used by the idle-window check in `handle_vault_reveal` —
     /// `None` means no recent reveal, prompt required.
     pub last_reveal_at: Option<Instant>,
+    /// M5a-4: the live `softfig-net` host (inbound listener + mDNS +
+    /// optional relay). `Some` while unlocked and `[net] enabled`;
+    /// dropped on lock/shutdown (which stops its threads + unregisters
+    /// the mDNS service).
+    pub net: Option<NetRuntime>,
+    /// M5a-4: pairings whose `XX` handshake completed and are awaiting
+    /// the user's out-of-band SAS confirmation (`pair_confirm`). Each
+    /// holds a live socket, so they are pruned + dropped on lock.
+    pub pending_pairs: PendingPairs,
 }
 
 impl DaemonInner {
@@ -77,6 +87,8 @@ impl DaemonInner {
             fuse: None,
             layer_b: Arc::new(crate::layer_b::LayerBHook::empty()),
             last_reveal_at: None,
+            net: None,
+            pending_pairs: PendingPairs::default(),
         }
     }
 }
@@ -167,6 +179,11 @@ impl DaemonHandle {
         // need the session for any in-flight reads, and unmount blocks
         // until the kernel acknowledges all in-flight requests.
         let _ = inner.fuse.take();
+        // M5a-4: stop the net host (joins its threads, unregisters mDNS)
+        // and drop any parked pairings + their live sockets before the
+        // session's keys go away.
+        let _ = inner.net.take();
+        inner.pending_pairs.clear();
         // Drop the unlocked session — no need to wait for the
         // accept loop to exit before zeroizing keys.
         inner.session = None;

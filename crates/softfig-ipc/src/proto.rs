@@ -122,6 +122,12 @@ pub enum ErrorKind {
     /// M3a: `refresh_snapshot` was given a path outside `snapshots/` or
     /// whose parent directory doesn't exist.
     InvalidSnapshotPath,
+    /// M5a-4: `pair_begin` could not establish or authenticate the Noise
+    /// channel to the peer — TCP-connect failed, the handshake failed, the
+    /// peer's attestation did not verify, or the peer's identity did not match
+    /// the requested fingerprint. Distinct from `NotFound` (peer endpoint not
+    /// known) and `BadArgs` (malformed fingerprint).
+    PairFailed,
     /// Unknown / unhandled internal error.
     Internal,
 }

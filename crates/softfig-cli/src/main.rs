@@ -4,6 +4,7 @@ mod cmd_daemon;
 mod cmd_deploy;
 mod cmd_migrate;
 mod cmd_onboard;
+mod cmd_pair;
 mod cmd_repo;
 mod cmd_reveal;
 mod cmd_vault;
@@ -53,6 +54,14 @@ enum Cmd {
     /// (the `bombadil link` replacement; M4a static spine). Requires the
     /// garden unlocked.
     Deploy(cmd_deploy::DeployArgs),
+
+    /// Pair with another device over the network trust ring (M5a). Runs the
+    /// Noise `XX` handshake + SAS confirmation, then persists the peer.
+    Pair(cmd_pair::PairArgs),
+    /// List paired devices (the network trust ring) + any pending pairings.
+    Peers(cmd_pair::PeersArgs),
+    /// Remove a device from the ring (unpair) by fingerprint.
+    Unpair(cmd_pair::UnpairArgs),
 }
 
 #[derive(Args, Debug)]
@@ -77,5 +86,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Migrate(args) => cmd_migrate::run(args.cmd, args.status),
         Cmd::Reveal(args) => cmd_reveal::run(args),
         Cmd::Deploy(args) => cmd_deploy::run(args),
+        Cmd::Pair(args) => cmd_pair::pair(args),
+        Cmd::Peers(args) => cmd_pair::peers(args),
+        Cmd::Unpair(args) => cmd_pair::unpair(args),
     }
 }

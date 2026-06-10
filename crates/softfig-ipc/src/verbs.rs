@@ -51,6 +51,17 @@ pub mod op {
     /// committed tip tree. Sealed files / inline regions are projected, not
     /// decrypted. Read-only.
     pub const READ_FILE: &str = "read_file";
+    /// M5a-4: begin pairing as the initiator — TCP-connect to the target
+    /// device, run the Noise `XX` handshake + attestation, and park the
+    /// pending pairing awaiting SAS confirmation. Returns the SAS to compare.
+    pub const PAIR_BEGIN: &str = "pair_begin";
+    /// M5a-4: confirm a parked pairing (the SAS matched on the other device);
+    /// persist the peer into the `peers.toml` network trust ring.
+    pub const PAIR_CONFIRM: &str = "pair_confirm";
+    /// M5a-4: list the network trust ring (`peers.toml`).
+    pub const PAIR_LIST: &str = "pair_list";
+    /// M5a-4: remove a peer from the ring (unpair) by device-id fingerprint.
+    pub const PAIR_REMOVE: &str = "pair_remove";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +422,105 @@ pub struct ReadFileReply {
     pub content: String,
     /// True when the whole file is sealed (Layer B).
     pub sealed: bool,
+}
+
+// ---- M5a-4: network pairing (transport + trust ring) ------------------
+
+/// `pair_begin({fingerprint, endpoint?}) -> {pairing_id, sas, fingerprint,
+/// name}`. The daemon connects to the peer (LAN-direct TCP), runs the Noise
+/// `XX` pairing handshake, verifies the peer's attestation, derives the SAS,
+/// and parks the live session keyed by `pairing_id`. The caller shows the SAS
+/// to the user, who confirms it matches the peer device, then calls
+/// `pair_confirm`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairBeginArgs {
+    /// The target device's Ed25519 identity fingerprint (lowercase hex), full
+    /// or a unique prefix. Used to resolve the endpoint from mDNS discovery and
+    /// to verify the peer that answers is the intended one.
+    pub fingerprint: String,
+    /// Explicit `host:port` to dial, overriding mDNS discovery. Required while
+    /// the peer is not yet discoverable (e.g. headless / no multicast).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairBeginReply {
+    /// Opaque handle for the parked pairing; pass to `pair_confirm`.
+    pub pairing_id: String,
+    /// The SAS short code, grouped `"XXX XXX"`, to compare with the peer.
+    pub sas: String,
+    /// The peer's actual device-id fingerprint (lowercase hex), as
+    /// authenticated by the handshake.
+    pub fingerprint: String,
+    /// The peer's advertised device name.
+    pub name: String,
+}
+
+/// `pair_confirm({pairing_id}) -> {fingerprint, name}`. The user confirmed the
+/// SAS matched; persist the parked peer into the ring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairConfirmArgs {
+    pub pairing_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairConfirmReply {
+    pub fingerprint: String,
+    pub name: String,
+}
+
+/// `pair_list({}) -> {peers, pending}`. Read-only listing of the network trust
+/// ring plus any pairings awaiting SAS confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PairListArgs {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairListReply {
+    pub peers: Vec<PairPeer>,
+    /// Pairings whose handshake completed but whose SAS the user has not yet
+    /// confirmed (initiator-side from `pair_begin`, or responder-side parked by
+    /// the inbound listener). Confirm with `pair_confirm`.
+    #[serde(default)]
+    pub pending: Vec<PendingPairing>,
+}
+
+/// One parked pairing awaiting confirmation, as surfaced to `softfig peers`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPairing {
+    pub pairing_id: String,
+    /// SAS short code, grouped `"XXX XXX"`, to compare with the peer.
+    pub sas: String,
+    pub fingerprint: String,
+    pub name: String,
+}
+
+/// One ring member, as surfaced to `softfig peers`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairPeer {
+    /// Device-id fingerprint (lowercase hex of the Ed25519 identity).
+    pub fingerprint: String,
+    pub name: String,
+    /// X25519 transport public key (lowercase hex).
+    pub transport_pubkey: String,
+    /// Reachable `host:port` endpoints discovered for this peer (may be empty).
+    pub endpoints: Vec<String>,
+    /// When pairing happened, Unix seconds.
+    pub paired_at: i64,
+}
+
+/// `pair_remove({fingerprint}) -> {removed, fingerprint}`. Unpair by device-id
+/// fingerprint (full or unique prefix).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairRemoveArgs {
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairRemoveReply {
+    pub removed: bool,
+    /// The full fingerprint that was matched and removed.
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

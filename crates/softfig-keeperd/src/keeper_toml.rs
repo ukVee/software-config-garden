@@ -35,6 +35,16 @@ pub struct KeeperToml {
     /// `idle_seconds = 0` (always re-prompt).
     #[serde(default)]
     pub reveal: RevealToml,
+    /// M5a-4: cross-device networking (the `softfig-net` host). Absent table
+    /// defaults to `enabled = true`, listening on `0.0.0.0:9100`.
+    #[serde(default)]
+    pub net: NetToml,
+    /// M5a-4: relay configuration. The hosting half (`enabled`/`listen`) makes
+    /// this device an always-on blind relay; the client half
+    /// (`endpoint`/`static_key`) tells a NAT'd device how to reach one. Absent
+    /// table = no relay hosted, no relay client configured.
+    #[serde(default)]
+    pub relay: RelayToml,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -45,6 +55,64 @@ pub struct RevealToml {
     /// re-prompt.
     #[serde(default)]
     pub idle_seconds: u64,
+}
+
+/// `[net]` — the device's own `softfig-net` host (inbound Noise listener +
+/// mDNS advertisement).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetToml {
+    /// Whether to host the networking instance on unlock. Default `true`.
+    #[serde(default = "default_net_enabled")]
+    pub enabled: bool,
+    /// Inbound Noise listener bind address (`host:port`); also the port mDNS
+    /// advertises. Default `0.0.0.0:9100`.
+    #[serde(default = "default_net_listen")]
+    pub listen: String,
+    /// Human-readable device name advertised in the handshake / mDNS. Defaults
+    /// to the system hostname when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+impl Default for NetToml {
+    fn default() -> Self {
+        Self {
+            enabled: default_net_enabled(),
+            listen: default_net_listen(),
+            device_name: None,
+        }
+    }
+}
+
+fn default_net_enabled() -> bool {
+    true
+}
+
+fn default_net_listen() -> String {
+    "0.0.0.0:9100".to_string()
+}
+
+/// `[relay]` — relay hosting (`enabled`/`listen`) and relay-client reach
+/// (`endpoint`/`static_key`). The two halves are independent: the always-on
+/// server sets the hosting half; a NAT'd device sets the client half.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelayToml {
+    /// Host a blind relay on this device. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay listener bind address (`host:port`). Required when `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// `host:port` of a relay this device reaches as a client (off-LAN
+    /// fallback). Consumed by the M5b reconnect path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// The relay's X25519 transport public key (lowercase hex), learned at
+    /// pairing — keys the outer control session to the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_key: Option<String>,
 }
 
 impl KeeperToml {
@@ -94,11 +162,51 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = KeeperToml {
             state_root: Some(PathBuf::from("/var/lib/softfig/abc")),
-            reveal: RevealToml::default(),
+            ..Default::default()
         };
         cfg.store(tmp.path()).unwrap();
         let back = KeeperToml::load(tmp.path()).unwrap();
         assert_eq!(back.state_root, cfg.state_root);
         assert_eq!(back.reveal.idle_seconds, 0);
+    }
+
+    #[test]
+    fn net_defaults_when_absent() {
+        // A keeper.toml with only state_root → net enabled, default listen.
+        let tmp = tempfile::tempdir().unwrap();
+        let softfig = tmp.path().join(".softfig");
+        fs::create_dir_all(&softfig).unwrap();
+        fs::write(
+            softfig.join(KEEPER_TOML),
+            "state_root = \"/var/lib/softfig/abc\"\n",
+        )
+        .unwrap();
+        let cfg = KeeperToml::load(tmp.path()).unwrap();
+        assert!(cfg.net.enabled);
+        assert_eq!(cfg.net.listen, "0.0.0.0:9100");
+        assert!(cfg.net.device_name.is_none());
+        assert!(!cfg.relay.enabled);
+    }
+
+    #[test]
+    fn parses_net_and_relay_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let softfig = tmp.path().join(".softfig");
+        fs::create_dir_all(&softfig).unwrap();
+        fs::write(
+            softfig.join(KEEPER_TOML),
+            "state_root = \"/s\"\n\n\
+             [net]\nenabled = true\nlisten = \"0.0.0.0:9300\"\ndevice_name = \"tablet\"\n\n\
+             [relay]\nenabled = true\nlisten = \"0.0.0.0:9301\"\n\
+             endpoint = \"relay.example:9301\"\nstatic_key = \"abcd\"\n",
+        )
+        .unwrap();
+        let cfg = KeeperToml::load(tmp.path()).unwrap();
+        assert_eq!(cfg.net.listen, "0.0.0.0:9300");
+        assert_eq!(cfg.net.device_name.as_deref(), Some("tablet"));
+        assert!(cfg.relay.enabled);
+        assert_eq!(cfg.relay.listen.as_deref(), Some("0.0.0.0:9301"));
+        assert_eq!(cfg.relay.endpoint.as_deref(), Some("relay.example:9301"));
+        assert_eq!(cfg.relay.static_key.as_deref(), Some("abcd"));
     }
 }

@@ -165,7 +165,7 @@ ritual close instead.)
 - [x] **M5a-1** — secure pipe foundation ✅ (2026-06-09 — see notes below)
 - [x] **M5a-2** — pairing (SAS) + network trust ring ✅ (2026-06-09 — see notes below)
 - [x] **M5a-3** — discovery + relay ✅ (2026-06-09 — see notes below)
-- [ ] **M5a-4** — daemon + CLI/IPC wiring; close M5a
+- [x] **M5a-4** — daemon + CLI/IPC wiring ✅ (2026-06-10 — see notes below). **M5a COMPLETE.**
 
 ## M5a-1 — landed (2026-06-09)
 
@@ -392,3 +392,91 @@ a `Relay` route, choosing how to unify the two session types.
   so the split forwarder's full-duplex bulk path is built but unstressed (M5b's
   data plane should exercise it). The two-device pair/relay over real mDNS +
   real network remains the **manual real-machine smoke step** for M5a-4's close.
+
+## M5a-4 — landed (2026-06-10) — **M5a COMPLETE**
+
+**Tests:** `cargo test --workspace` green (248 total, +10); clippy
+`--workspace --all-targets -D warnings` clean. New: **softfig-keeperd
+`keeper_toml` +2** (net defaults when absent; `[net]`/`[relay]` parse) +
+**`tests/m5a4_pairing.rs` 8** — the initiator `pair_begin → pair_confirm`
+round-trip over loopback TCP (matching SAS on both ends, ring persists +
+verifies on reload, `pair_list`/`pair_remove`), the net-host lifecycle
+(`NetRuntime` binds + mDNS-starts + clean-shutdown-joins on a real unlock,
+ephemeral port), and the error paths (no endpoint → `NotFound`, unreachable →
+`PairFailed`, bad fingerprint → `BadArgs`, unknown id/peer → `NotFound`, verbs
+require unlock). No `softfig-net` change — this slice only *wires* it.
+
+**What landed:**
+- **keeperd hosts a `softfig-net` instance** — new `softfig-keeperd/src/net.rs`.
+  On unlock the daemon builds a [`LocalDevice`] from the vault session
+  (`transport_secret` + `identity_pubkey` as `device_id` + a freshly-signed
+  `static_attestation`) and — when `[net] enabled` + the `enable_net` runtime
+  flag — starts a `NetRuntime`: an inbound TCP listener, the mDNS responder
+  (announce + a browse loop that folds resolved peers into the ring +
+  a fingerprint→endpoint discovery cache), and, if `[relay] enabled`, the blind
+  relay listener. Dropped on lock/shutdown (threads poll a stop flag and are
+  joined; the mDNS service is unregistered) so the transport-secret copies don't
+  outlive the session. All best-effort: a bind / mDNS / relay failure is logged
+  and skipped, never fatal to `unlock` (the FUSE/network manual-smoke posture).
+- **Inbound role derived from ring state (no new wire discriminator).** A device
+  whose ring is still empty (a *fresh* device being added) serves the pairing
+  **responder** (`pair_responder`, parks the result for `pair_confirm`); once it
+  has ≥1 peer it serves the **reconnect responder** (`ik_responder`), authorizes
+  the peer against the ring, and runs a `Ping`/`Pong` liveness echo. This maps
+  the decision doc's "fresh device announces / paired device initiates" exactly
+  onto ring state, so no connection-type byte was added (M5a-4 adds no protocol).
+- **Bind port / config keys (recorded):** `keeper.toml` gains `[net] enabled`
+  (default `true`), `[net] listen` (default `0.0.0.0:9100` — the inbound Noise
+  listener, also the mDNS port), `[net] device_name` (override; default = the
+  system hostname read from `/proc/sys/kernel/hostname`, no `unsafe`), and the
+  `[relay]` block deferred from M5a-3: hosting `enabled`/`listen` **plus** the
+  client `endpoint`/`static_key` a NAT'd device needs to reach a relay (parsed +
+  stored for the M5b reconnect path). `KeeperToml` keeps `deny_unknown_fields`.
+- **IPC (softfig-ipc):** `pair_begin` / `pair_confirm` / `pair_list` /
+  `pair_remove` op constants + args/replies; new `ErrorKind::PairFailed`
+  (connect/handshake/attestation failure, distinct from `NotFound`/`BadArgs`).
+  `PairListReply` carries both ring `peers` and `pending` pairings. All require
+  Unlocked, behind the existing `SO_PEERCRED` auth.
+- **Pairing handlers (keeperd):** `pair_begin` snapshots the `LocalDevice` +
+  resolves the endpoint under the daemon lock, then runs the **blocking** `XX`
+  handshake with the lock **released** (network IO never holds the daemon mutex),
+  verifies the peer matches the requested fingerprint, and parks a
+  `PendingPair<TcpStream>` keyed by an opaque `pairing_id` (pruned past a 5-min
+  TTL). `pair_confirm` pulls the parked pair, `.confirm()`s, and persists the
+  `RingEntry` into `peers.toml` (the on-disk ring is the source of truth; the
+  live `NetRuntime` ring is mirrored so the listener authorizes the new peer
+  immediately). `pair_list` reads the ring + pending; `pair_remove` resolves a
+  full-or-prefix fingerprint to a unique peer and unpairs.
+- **CLI:** `softfig pair <fingerprint> [--endpoint host:port] [--yes]`,
+  `softfig peers`, `softfig unpair <id>`. Daemon-only (no direct-mode fallback —
+  pairing needs the daemon's keys + parked sessions). `pair <fp>` is
+  dual-purpose: if a *pending* pairing matches `<fp>` (the responder side parked
+  by the inbound listener) it confirms that one; otherwise it initiates. Either
+  way it prints the SAS and prompts `[y/N]` (skip with `--yes`) before
+  confirming. Relay hosting is a `keeper.toml [relay]` flag, not a subcommand.
+- **TUI:** pairing surface **stubbed/deferred** (noted posture; a `softfig-tui`
+  pairing tab is a follow-up, like the M3b vault-TUI follow-up). Pairing is fully
+  usable from the CLI; the live render was never the M5a-4 gate.
+
+**Manual real-machine smoke step (remaining):** the two-device flow over real
+mDNS + real network, and a real relay forward — bring up two unlocked daemons on
+a LAN; on the fresh device `softfig peers` shows the incoming pairing parked by
+its listener; compare the SAS and `softfig pair <fp>` on both; confirm symmetric
+ring rows; then take one device off-LAN with `[relay]` configured on the server
+and confirm an `IK` reconnect routes LAN-direct first, relay as fallback. Can't
+run headless (no multicast / second host / TTY in the sandbox), same posture as
+FUSE/TUI.
+
+**Deltas / notes for later slices (M5b):**
+- **No new VCS intents.** M5a-4 writes only `peers.toml` (caller-driven) +
+  vault-internal keys via the M5a-1 accessors — as designed.
+- **Relay authorizes against the ring as it stood at relay start.** A re-pair
+  mid-flight needs a relay restart to be authorized (carried M5a-3 follow-up).
+  The relay accept loop is keeperd's own interruptible loop calling
+  `Relay::serve` (not the blocking `relay::run`) so a lock drops its key copy.
+- **Relay *client* (`endpoint`/`static_key`) is parsed + stored but not yet
+  dialled** — the LAN-vs-relay reconnect (`plan_routes`/`connect_first`) is
+  unit-tested in `softfig-net`; wiring a live reconnect verb is M5b's job.
+- **Parked-pairing / inbound-pairing UX is initiator-first.** The responder-side
+  confirm rides the same `pair_confirm` verb (surfaced via `pair_list` pending);
+  a richer responder UX + the TUI tab are M5b/follow-up polish.

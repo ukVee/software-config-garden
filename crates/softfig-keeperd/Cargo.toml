@@ -17,6 +17,7 @@ softfig-store.workspace = true
 softfig-core.workspace = true
 softfig-ipc.workspace = true
 softfig-fuse = { path = "../softfig-fuse" }
+softfig-net.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
@@ -33,8 +34,17 @@ libc.workspace = true
 globset.workspace = true
 walkdir.workspace = true
 
+# M5a-4 — host the softfig-net instance: construct the mDNS ServiceDaemon and
+# drain its browse events (softfig-net owns the announce/browse/parse logic).
+mdns-sd.workspace = true
+
 # M2c — inline <vault> tag parsing + base64 inline ciphertext bodies
 base64.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# M5a-4 pairing test: forge a second device (Ed25519 id + X25519 static +
+# attestation) to run `pair_responder` over loopback TCP against the daemon's
+# `pair_begin`. Production never forges — the vault supplies both halves.
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true

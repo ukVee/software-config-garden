@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::keeper_toml::KeeperToml;
+use crate::keeper_toml::{KeeperToml, NetToml, RelayToml};
 
 #[derive(Debug, Clone)]
 pub struct KeeperConfig {
@@ -21,8 +21,68 @@ pub struct KeeperConfig {
     /// over `garden_root` after the unlock transition. Tests disable
     /// this to exercise the daemon's M2a wiring without the real mount.
     pub enable_fuse: bool,
+    /// M5a-4: when true (and `[net] enabled`), the daemon hosts the
+    /// `softfig-net` instance (inbound listener + mDNS + optional relay)
+    /// after `unlock`. Tests disable this so the pairing *verbs* can be
+    /// exercised without binding real sockets / multicast.
+    pub enable_net: bool,
     /// M2b: `softfig reveal` re-prompt policy.
     pub reveal: RevealConfig,
+    /// M5a-4: cross-device networking config from `[net]`.
+    pub net: NetConfig,
+    /// M5a-4: relay config from `[relay]`.
+    pub relay: RelayConfig,
+}
+
+/// M5a-4: the device's own `softfig-net` host config (`[net]`).
+#[derive(Debug, Clone)]
+pub struct NetConfig {
+    /// Whether the user configured networking on (`[net] enabled`).
+    pub enabled: bool,
+    /// Inbound Noise listener bind address (`host:port`).
+    pub listen: String,
+    /// Device name override; `None` → system hostname.
+    pub device_name: Option<String>,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        Self::from(NetToml::default())
+    }
+}
+
+impl From<NetToml> for NetConfig {
+    fn from(t: NetToml) -> Self {
+        Self {
+            enabled: t.enabled,
+            listen: t.listen,
+            device_name: t.device_name,
+        }
+    }
+}
+
+/// M5a-4: relay config (`[relay]`) — hosting + client halves.
+#[derive(Debug, Clone, Default)]
+pub struct RelayConfig {
+    /// Host a blind relay on this device.
+    pub enabled: bool,
+    /// Relay listener bind address (required when `enabled`).
+    pub listen: Option<String>,
+    /// `host:port` of a relay reached as a client (M5b reconnect fallback).
+    pub endpoint: Option<String>,
+    /// The relay's X25519 transport public key, lowercase hex.
+    pub static_key: Option<String>,
+}
+
+impl From<RelayToml> for RelayConfig {
+    fn from(t: RelayToml) -> Self {
+        Self {
+            enabled: t.enabled,
+            listen: t.listen,
+            endpoint: t.endpoint,
+            static_key: t.static_key,
+        }
+    }
 }
 
 /// M2b: `softfig reveal` configuration. `idle_seconds = 0` (the default)
@@ -42,7 +102,10 @@ impl KeeperConfig {
             socket_path: softfig_ipc::runtime_socket_path(),
             enable_watcher: true,
             enable_fuse: true,
+            enable_net: true,
             reveal: RevealConfig::default(),
+            net: NetConfig::default(),
+            relay: RelayConfig::default(),
         }
     }
 
@@ -65,9 +128,12 @@ impl KeeperConfig {
             socket_path: softfig_ipc::runtime_socket_path(),
             enable_watcher: true,
             enable_fuse: true,
+            enable_net: true,
             reveal: RevealConfig {
                 idle_seconds: cfg.reveal.idle_seconds,
             },
+            net: cfg.net.into(),
+            relay: cfg.relay.into(),
         })
     }
 
@@ -93,6 +159,14 @@ impl KeeperConfig {
 
     pub fn without_fuse(mut self) -> Self {
         self.enable_fuse = false;
+        self
+    }
+
+    /// Disable the `softfig-net` host (inbound listener / mDNS / relay). The
+    /// pairing verbs still work — they drive their own outbound sockets and the
+    /// on-disk ring — so tests exercise pair/list/remove without real sockets.
+    pub fn without_net(mut self) -> Self {
+        self.enable_net = false;
         self
     }
 

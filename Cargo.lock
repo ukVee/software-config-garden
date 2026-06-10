@@ -1870,9 +1870,11 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "ed25519-dalek",
  "globset",
  "hex",
  "libc",
+ "mdns-sd",
  "notify",
  "notify-debouncer-full",
  "serde",
@@ -1881,12 +1883,14 @@ dependencies = [
  "softfig-core",
  "softfig-fuse",
  "softfig-ipc",
+ "softfig-net",
  "softfig-store",
  "softfig-vault",
  "tempfile",
  "thiserror",
  "toml",
  "walkdir",
+ "x25519-dalek",
 ]
 
 [[package]]

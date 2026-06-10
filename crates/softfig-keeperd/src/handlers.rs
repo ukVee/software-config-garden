@@ -12,11 +12,12 @@ use softfig_core::{fsck as run_fsck, log_collect, Intent, Repo};
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
     CommitArgs, CommitReply, DocFile, FsckReply, LogArgs, LogEntry, LogReply,
-    MigrateFinalizeArgs, MigrateFinalizeReply, ProposeDocUpdateArgs,
-    ProposeDocUpdateReply, ShowArgs, ShowCommit, ShowReply, ShowTreeEntry,
-    StatusReply, UnlockArgs, UnlockReply, VaultListSealedReply, VaultRevealArgs,
-    VaultRevealReply, VaultSealArgs, VaultSealReply, VaultUnsealArgs,
-    VaultUnsealReply,
+    MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
+    PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
+    PairRemoveReply, PendingPairing, ProposeDocUpdateArgs, ProposeDocUpdateReply,
+    ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
+    UnlockReply, VaultListSealedReply, VaultRevealArgs, VaultRevealReply,
+    VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
 };
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
@@ -137,10 +138,33 @@ pub fn unlock(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     inner.last_reveal_at = None;
     inner.state = State::Unlocked;
 
+    // M5a-4: host the softfig-net instance (inbound listener + mDNS +
+    // optional relay) for cross-device pairing/reconnect. Best-effort
+    // and gated by `[net] enabled` + the `enable_net` runtime flag (off
+    // in tests), so a bind/mDNS failure never fails the unlock.
+    if daemon_enable_net(&inner) {
+        let session = inner.session.as_ref().expect("unlocked").clone();
+        let name = crate::net::device_name(&inner.config);
+        let local = crate::net::build_local_device(&session, name);
+        let config = inner.config.clone();
+        // Build the runtime without holding the inner lock across thread
+        // spawns that may themselves want it (the inbound loop parks via
+        // the daemon handle). NetRuntime::start needs `daemon`, not `inner`.
+        drop(inner);
+        let runtime = crate::net::NetRuntime::start(daemon, &config, local);
+        daemon.inner.lock().unwrap().net = Some(runtime);
+    }
+
     Ok(serde_json::to_value(UnlockReply {
         state: State::Unlocked.label().to_string(),
     })
     .unwrap())
+}
+
+/// Whether the net host should start: the user's `[net] enabled` AND the
+/// `enable_net` runtime flag (the latter off in tests).
+fn daemon_enable_net(inner: &crate::daemon::DaemonInner) -> bool {
+    inner.config.enable_net && inner.config.net.enabled
 }
 
 pub fn commit(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -342,6 +366,9 @@ pub fn shutdown(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
     let mut inner = daemon.inner.lock().unwrap();
     inner.state = State::Stopping;
     let _ = inner.fuse.take();
+    // M5a-4: stop the net host + drop parked pairings before the session.
+    let _ = inner.net.take();
+    inner.pending_pairs.clear();
     inner.session = None;
     inner.repo = None;
     Ok(serde_json::json!({ "stopped": true }))
@@ -410,6 +437,7 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
         reveal: crate::keeper_toml::RevealToml {
             idle_seconds: reveal_idle,
         },
+        ..Default::default()
     };
     if let Err(e) = pointer.store(&garden_root) {
         eprintln!(
@@ -836,6 +864,193 @@ pub fn vault_list_sealed(daemon: &Daemon, _args: serde_json::Value) -> HandlerRe
         matching_files,
     })
     .unwrap())
+}
+
+// ---- M5a-4: network pairing (transport + trust ring) ------------------
+
+pub fn pair_begin(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: PairBeginArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("pair_begin args: {e}")))?;
+    let fp_query = normalize_fingerprint(&args.fingerprint)?;
+
+    // Snapshot the LocalDevice + resolve the endpoint under the lock, then
+    // release it for the *blocking* XX handshake (never hold the daemon mutex
+    // across network IO).
+    let (local, endpoint) = {
+        let inner = daemon.inner.lock().unwrap();
+        require_unlocked(&inner)?;
+        let session = inner.session.as_ref().expect("unlocked").clone();
+        let name = crate::net::device_name(&inner.config);
+        let local = crate::net::build_local_device(&session, name);
+        let endpoint = match &args.endpoint {
+            Some(ep) => Some(ep.clone()),
+            None => inner.net.as_ref().and_then(|n| n.resolve_endpoint(&fp_query)),
+        };
+        (local, endpoint)
+    };
+    let endpoint = endpoint.ok_or((
+        ErrorKind::NotFound,
+        format!("peer {fp_query} not discovered; pass --endpoint host:port"),
+    ))?;
+
+    let pending = crate::net::initiate_pairing(&local, &endpoint)
+        .map_err(|e| (ErrorKind::PairFailed, format!("pairing {endpoint}: {e}")))?;
+
+    // The XX handshake authenticated the peer; make sure it is the one asked
+    // for (defends against dialing the wrong endpoint for a fingerprint).
+    let peer = pending.peer();
+    let actual_fp = peer.fingerprint();
+    if !actual_fp.starts_with(&fp_query) {
+        return Err((
+            ErrorKind::PairFailed,
+            format!("connected peer {actual_fp} does not match requested {fp_query}"),
+        ));
+    }
+    let sas = pending.sas().grouped();
+    let name = peer.name.clone();
+
+    let parked = crate::net::ParkedPairing {
+        sas: sas.clone(),
+        fingerprint: actual_fp.clone(),
+        name: name.clone(),
+        created: Instant::now(),
+        pending,
+    };
+    let pairing_id = daemon.inner.lock().unwrap().pending_pairs.park(parked);
+
+    Ok(serde_json::to_value(PairBeginReply {
+        pairing_id,
+        sas,
+        fingerprint: actual_fp,
+        name,
+    })
+    .unwrap())
+}
+
+pub fn pair_confirm(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: PairConfirmArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("pair_confirm args: {e}")))?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    let parked = inner.pending_pairs.take(&args.pairing_id).ok_or((
+        ErrorKind::NotFound,
+        format!("unknown pairing_id {:?}", args.pairing_id),
+    ))?;
+
+    // The user confirmed the SAS matched; persist the peer into the ring.
+    let (_session, entry) = parked.pending.confirm();
+    let fingerprint = entry.fingerprint();
+    let name = entry.name.clone();
+    crate::net::persist_ring_entry(&state_dir, entry)
+        .map_err(|e| (ErrorKind::Io, format!("persist ring entry: {e}")))?;
+
+    // Mirror into the live ring so the inbound listener authorizes the new
+    // peer's IK reconnects immediately.
+    if let Some(net) = inner.net.as_ref() {
+        if let Ok(ring) = crate::net::load_ring(&state_dir) {
+            net.sync_ring(&ring);
+        }
+    }
+
+    Ok(serde_json::to_value(PairConfirmReply { fingerprint, name }).unwrap())
+}
+
+pub fn pair_list(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    let ring = crate::net::load_ring(&state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
+    let peers = ring
+        .peers()
+        .iter()
+        .map(|p| PairPeer {
+            fingerprint: p.fingerprint(),
+            name: p.name.clone(),
+            transport_pubkey: hex::encode(p.transport_pubkey),
+            endpoints: p.endpoints.clone(),
+            paired_at: p.paired_at,
+        })
+        .collect();
+    let pending = inner
+        .pending_pairs
+        .list()
+        .into_iter()
+        .map(|(pairing_id, sas, fingerprint, name)| PendingPairing {
+            pairing_id,
+            sas,
+            fingerprint,
+            name,
+        })
+        .collect();
+
+    Ok(serde_json::to_value(PairListReply { peers, pending }).unwrap())
+}
+
+pub fn pair_remove(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: PairRemoveArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("pair_remove args: {e}")))?;
+    let fp_query = normalize_fingerprint(&args.fingerprint)?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    let mut ring = crate::net::load_ring(&state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
+    let matches: Vec<[u8; 32]> = ring
+        .peers()
+        .iter()
+        .filter(|p| p.fingerprint().starts_with(&fp_query))
+        .map(|p| p.device_id)
+        .collect();
+    let device_id = match matches.as_slice() {
+        [] => {
+            return Err((
+                ErrorKind::NotFound,
+                format!("no ring peer matching {fp_query}"),
+            ))
+        }
+        [id] => *id,
+        many => {
+            return Err((
+                ErrorKind::BadArgs,
+                format!("ambiguous fingerprint {fp_query}: {} ring peers match", many.len()),
+            ))
+        }
+    };
+    let full_fp = hex::encode(device_id);
+    let removed = ring.remove(&device_id);
+    if removed {
+        ring.save(&softfig_net::ring::ring_path(&state_dir))
+            .map_err(|e| (ErrorKind::Io, format!("save ring: {e}")))?;
+        if let Some(net) = inner.net.as_ref() {
+            net.sync_ring(&ring);
+        }
+    }
+
+    Ok(serde_json::to_value(PairRemoveReply {
+        removed,
+        fingerprint: full_fp,
+    })
+    .unwrap())
+}
+
+/// Normalize a fingerprint argument: lowercase, validate as 1–64 hex chars
+/// (a full device-id is 64; a unique prefix is accepted for `pair_remove`).
+fn normalize_fingerprint(s: &str) -> std::result::Result<String, (ErrorKind, String)> {
+    let fp = s.trim().to_ascii_lowercase();
+    if fp.is_empty() || fp.len() > 64 || !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("invalid fingerprint {s:?}: expect 1–64 hex chars"),
+        ));
+    }
+    Ok(fp)
 }
 
 // ---- helpers ----
