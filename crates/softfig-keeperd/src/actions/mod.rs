@@ -21,12 +21,14 @@
 
 pub mod conventions;
 
+mod add_note;
 mod add_project;
 mod archive;
 mod log_decision;
 mod log_incident;
 mod refresh_snapshot;
 
+pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
 pub use log_decision::log_decision;

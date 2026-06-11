@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::actions::conventions;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MigrateFinalizeArgs {}
 
@@ -98,4 +100,221 @@ pub fn delete_dir(path: &Path) -> (bool, Vec<String>) {
 #[allow(dead_code)]
 pub(crate) fn _placeholder_path() -> PathBuf {
     PathBuf::new()
+}
+
+// ---- Slice 1 (small-files): accretive monolith → numbered notes -------
+//
+// One-time splitter that turns a monolithic `notes.md` / `troubleshooting.md`
+// into a folder of `NNN-slug.md` single-docs. The core ([`split_monolith`] /
+// [`plan_split`]) is a pure transform so it's exhaustively unit-testable; the
+// production trigger (materialize the folder, archive the monolith, commit)
+// belongs to the migrate/onboard command flow and is wired separately.
+//
+// Splitting rule: each level-2 (`## `) heading starts a note — its heading
+// text is the title, the lines beneath it (up to the next `## `) are the body.
+// The file preamble (the `# <doc>` title, the `> Last reviewed:` stamp, and
+// any intro paragraph before the first section) describes the folder, not a
+// note, so it's dropped. A monolith with no `## ` sections collapses to a
+// single note so nothing is lost. Empty-bodied sections are skipped.
+
+/// One section of a split monolith, pre-render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitNote {
+    pub slug: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// The rendered plan for one accretive folder: numbered note files (in
+/// document order) plus the `.seq` high-water mark to seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPlan {
+    /// `(filename, content)` for each note, e.g. `("001-foo.md", "# foo\n…")`.
+    pub notes: Vec<(String, String)>,
+    /// Value to write into the folder's `.seq` (= note count).
+    pub seq: u32,
+}
+
+/// Parse a monolith into ordered, un-numbered notes. Pure.
+pub fn split_monolith(content: &str) -> Vec<SplitNote> {
+    let lines: Vec<&str> = content.lines().collect();
+    let heads: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_h2(l))
+        .map(|(i, _)| i)
+        .collect();
+
+    if heads.is_empty() {
+        return single_note(&lines);
+    }
+
+    let mut out = Vec::new();
+    for (k, &start) in heads.iter().enumerate() {
+        let end = heads.get(k + 1).copied().unwrap_or(lines.len());
+        let title = heading_text(lines[start]);
+        let body = trim_blank_lines(&lines[start + 1..end]).join("\n");
+        if body.trim().is_empty() {
+            continue;
+        }
+        out.push(SplitNote {
+            slug: conventions::slugify(&title),
+            title,
+            body,
+        });
+    }
+    out
+}
+
+/// Split + number + render each note with the daemon's note template.
+pub fn plan_split(content: &str, date_hyphen: &str) -> SplitPlan {
+    let notes: Vec<(String, String)> = split_monolith(content)
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let number = (i + 1) as u32;
+            (
+                conventions::note_filename(number, &n.slug),
+                conventions::note_doc(&n.title, date_hyphen, &n.body),
+            )
+        })
+        .collect();
+    let seq = notes.len() as u32;
+    SplitPlan { notes, seq }
+}
+
+fn is_h2(line: &str) -> bool {
+    line.starts_with("## ")
+}
+
+/// Strip the leading `#` run + surrounding whitespace from a heading line.
+fn heading_text(line: &str) -> String {
+    line.trim_start_matches('#').trim().to_string()
+}
+
+/// Monolith with no `## ` sections → at most one note from the body that
+/// remains after dropping the `# <title>` line and a `> Last reviewed:`
+/// stamp. Empty body ⇒ no note.
+fn single_note(lines: &[&str]) -> Vec<SplitNote> {
+    let mut i = 0;
+    while i < lines.len() && lines[i].trim().is_empty() {
+        i += 1;
+    }
+    let mut title = String::new();
+    if i < lines.len() && lines[i].starts_with("# ") {
+        title = heading_text(lines[i]);
+        i += 1;
+    }
+    while i < lines.len()
+        && (lines[i].trim().is_empty()
+            || lines[i].trim_start().starts_with("> Last reviewed"))
+    {
+        i += 1;
+    }
+    let body = trim_blank_lines(&lines[i..]).join("\n");
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+    if title.is_empty() {
+        title = "notes".to_string();
+    }
+    vec![SplitNote {
+        slug: conventions::slugify(&title),
+        title,
+        body,
+    }]
+}
+
+/// Drop leading + trailing all-whitespace lines from a slice.
+fn trim_blank_lines<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let mut start = 0;
+    let mut end = lines.len();
+    while start < end && lines[start].trim().is_empty() {
+        start += 1;
+    }
+    while end > start && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    &lines[start..end]
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    const MONOLITH: &str = "\
+# notes
+
+> Last reviewed: 2026-05-30
+
+Running decision log for `waydroid`.
+
+## container networking
+
+Waydroid uses an internal bridge.
+Second line of the section.
+
+## GPU passthrough
+
+Needs the venus driver.
+
+### sub-detail
+
+Nested content stays in the section.
+";
+
+    #[test]
+    fn splits_on_level_two_headings() {
+        let notes = split_monolith(MONOLITH);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].title, "container networking");
+        assert_eq!(notes[0].slug, "container-networking");
+        assert_eq!(
+            notes[0].body,
+            "Waydroid uses an internal bridge.\nSecond line of the section."
+        );
+        assert_eq!(notes[1].title, "GPU passthrough");
+        assert_eq!(notes[1].slug, "gpu-passthrough");
+        // A `###` subsection is part of its parent section's body.
+        assert!(notes[1].body.contains("### sub-detail"));
+        assert!(notes[1].body.contains("Nested content"));
+        // The preamble (title, reviewed stamp, intro) is dropped.
+        assert!(!notes.iter().any(|n| n.body.contains("Running decision log")));
+    }
+
+    #[test]
+    fn plan_numbers_and_stamps() {
+        let plan = plan_split(MONOLITH, "2026-06-10");
+        assert_eq!(plan.seq, 2);
+        assert_eq!(plan.notes[0].0, "001-container-networking.md");
+        assert_eq!(plan.notes[1].0, "002-gpu-passthrough.md");
+        assert!(plan.notes[0].1.starts_with("# container networking\n"));
+        assert!(plan.notes[0].1.contains("> Last reviewed: 2026-06-10\n"));
+        assert!(plan.notes[0].1.ends_with("Second line of the section.\n"));
+    }
+
+    #[test]
+    fn empty_sections_are_skipped() {
+        let src = "## kept\n\nhas body\n\n## dropped\n\n## also-kept\n\nbody2\n";
+        let notes = split_monolith(src);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].title, "kept");
+        assert_eq!(notes[1].title, "also-kept");
+    }
+
+    #[test]
+    fn no_headings_collapses_to_single_note() {
+        let src = "# notes\n\n> Last reviewed: 2026-05-30\n\nJust a blob of prose.\nNo sections here.\n";
+        let notes = split_monolith(src);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "notes");
+        assert_eq!(notes[0].body, "Just a blob of prose.\nNo sections here.");
+    }
+
+    #[test]
+    fn header_only_monolith_yields_nothing() {
+        let src = "# notes\n\n> Last reviewed: 2026-05-30\n";
+        assert!(split_monolith(src).is_empty());
+        assert_eq!(plan_split(src, "2026-06-10").seq, 0);
+    }
 }

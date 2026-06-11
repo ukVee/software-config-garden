@@ -162,6 +162,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::VAULT_LIST_SEALED => handlers::vault_list_sealed(daemon, req.args),
         op::LOG_DECISION => crate::actions::log_decision(daemon, req.args),
         op::LOG_INCIDENT => crate::actions::log_incident(daemon, req.args),
+        op::ADD_NOTE => crate::actions::add_note(daemon, req.args),
+        op::REVISE_NOTE => crate::actions::revise_note(daemon, req.args),
         op::ARCHIVE => crate::actions::archive(daemon, req.args),
         op::ADD_PROJECT => crate::actions::add_project(daemon, req.args),
         op::REFRESH_SNAPSHOT => crate::actions::refresh_snapshot(daemon, req.args),

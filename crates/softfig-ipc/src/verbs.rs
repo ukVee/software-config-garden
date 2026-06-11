@@ -35,6 +35,15 @@ pub mod op {
     /// M3a: write a `journal/incidents/incident-<date>-<slug>.md` stub,
     /// commit `incident_logged`.
     pub const LOG_INCIDENT: &str = "log_incident";
+    /// Slice 1 (small-files): append a numbered note `NNN-slug.md` to an
+    /// accretive folder (`notes/` or `troubleshooting/`). The daemon
+    /// assigns `NNN` from the folder's `.seq` high-water mark and stamps
+    /// the header + reviewed date; commit `note_added`.
+    pub const ADD_NOTE: &str = "add_note";
+    /// Slice 1 (small-files): replace the body of an existing numbered
+    /// note in place, re-stamping the reviewed date. Title, slug, and
+    /// number are immutable; commit `note_revised`.
+    pub const REVISE_NOTE: &str = "revise_note";
     /// M3a: move a tracked path under `journal/archive/<name>/`, commit
     /// `archive_move`.
     pub const ARCHIVE: &str = "archive";
@@ -316,6 +325,53 @@ pub struct LogIncidentArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogIncidentReply {
+    pub path: String,
+    pub hash: String,
+}
+
+// ---- Slice 1 (small-files): numbered notes -----------------------------
+
+/// `add_note({dir, slug, title?, body}) -> {path, hash}`.
+///
+/// `dir` is the garden-relative path of an accretive folder (its basename
+/// must be `notes` or `troubleshooting`). The daemon assigns the next
+/// number from the folder's `.seq` high-water mark, writes
+/// `dir/NNN-slug.md`, and stamps the `# <title>` header + `> Last
+/// reviewed:` line — the caller supplies only the slug, an optional title
+/// (defaults to the slug), and the body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddNoteArgs {
+    /// Garden-relative accretive folder, e.g. `services/waydroid/notes`.
+    pub dir: String,
+    /// `[a-z0-9-]+`, length 1–64. The terse filename address; immutable.
+    pub slug: String,
+    /// Human title used in the `# <title>` header. Defaults to the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Markdown body written below the daemon-stamped header.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddNoteReply {
+    /// Garden-relative path the daemon wrote (`dir/NNN-slug.md`).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `revise_note({dir, id, body}) -> {path, hash}`. Replace the body of
+/// `dir/NNN-*.md` (the note numbered `id`), re-stamping the reviewed date.
+/// The header (title), slug, and number are left untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviseNoteArgs {
+    pub dir: String,
+    /// The note's creation-order number (the `NNN` in its filename).
+    pub id: u32,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviseNoteReply {
     pub path: String,
     pub hash: String,
 }

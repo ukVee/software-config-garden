@@ -122,6 +122,10 @@ pub enum ErrorKind {
     /// M3a: `refresh_snapshot` was given a path outside `snapshots/` or
     /// whose parent directory doesn't exist.
     InvalidSnapshotPath,
+    /// Slice 1 (small-files): `add_note` / `revise_note` was given a `dir`
+    /// whose basename is not an accretive folder (`notes` or
+    /// `troubleshooting`). Notes only live in those folders.
+    NotAccretiveDir,
     /// M5a-4: `pair_begin` could not establish or authenticate the Noise
     /// channel to the peer — TCP-connect failed, the handshake failed, the
     /// peer's attestation did not verify, or the peer's identity did not match

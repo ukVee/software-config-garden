@@ -102,13 +102,20 @@ Built and tested (`cargo test --workspace` green, 176 tests):
 - **M-onboard** — `softfig onboard`, a first-run wizard that scaffolds a fresh
   garden from an embedded skeleton, inits the Vault, and writes a
   *born-in-FUSE* genesis commit (no plaintext ever touches the garden root).
-- **M3a–M3b** — the Keeper's human/agent surface: six daemon-mediated MCP write
+- **M3a–M3b** — the Keeper's human/agent surface: daemon-mediated MCP write
   verbs (`log_decision`, `log_incident`, `archive`, `add_project`,
   `refresh_snapshot`, plus the `propose_doc_update` escape hatch) that stamp
   garden conventions server-side, and `softfig-tui`, a ratatui frontend over the
   daemon (Browse / History / Vault tabs, modal action forms, in-app unlock) backed
   by read-only `list_tree` / `read_file` verbs with daemon-side redaction. The
   Vault tab does masked whole-file reveals — plaintext never reaches the terminal.
+- **Small-files, slice 1** — accretive docs become folders of numbered single-docs:
+  `add_note` / `revise_note` append `NNN-slug.md` files to a `notes/` or
+  `troubleshooting/` folder, the daemon owning the number (a per-folder, never-reused
+  `.seq` high-water mark), the `# title` + `> Last reviewed:` header, and the
+  filename — so a write costs only the irreducible new content, never the whole
+  file. Numbers are immutable; archiving the newest leaves a gap rather than
+  recycling its id.
 - **M4a** — the static deploy spine, opening the templating/symlink pillar (the
   `bombadil link` → `softfig deploy` replacement): a frontend-neutral
   `softfig-deploy` crate (`plan` diff / `apply` I/O) materializes a declarative

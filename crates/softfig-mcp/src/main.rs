@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use softfig_ipc::{
     self,
     verbs::{
-        op, AddProjectArgs, ArchiveArgs, LogDecisionArgs, LogIncidentArgs,
-        ProposeDocUpdateArgs, RefreshSnapshotArgs,
+        op, AddNoteArgs, AddProjectArgs, ArchiveArgs, LogDecisionArgs, LogIncidentArgs,
+        ProposeDocUpdateArgs, RefreshSnapshotArgs, ReviseNoteArgs,
     },
     Request, Response,
 };
@@ -183,6 +183,42 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "add_note",
+            "description": "Append a numbered note to an accretive folder (a notes/ or \
+                            troubleshooting/ dir). The daemon assigns the next number from the \
+                            folder's hidden .seq counter, writes dir/NNN-slug.md, and stamps the \
+                            '# <title>' header + '> Last reviewed:' line — you supply only dir, \
+                            slug, and body (title defaults to slug). Prefer this over \
+                            propose_doc_update for adding a note: it costs you only the new \
+                            content, never the whole file.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["dir", "slug", "body"],
+                "properties": {
+                    "dir": { "type": "string", "description": "garden-relative accretive folder, e.g. services/waydroid/notes" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+, 1-64; the terse filename address (immutable)" },
+                    "title": { "type": "string", "description": "header title; defaults to slug" },
+                    "body": { "type": "string", "description": "markdown body below the header" },
+                },
+            },
+        }),
+        json!({
+            "name": "revise_note",
+            "description": "Replace the body of an existing numbered note in place, re-stamping \
+                            its '> Last reviewed:' date. Title, slug, and number are immutable — \
+                            to 'rename' a note, archive it and add_note a new one. Identify the \
+                            note by its folder + number.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["dir", "id", "body"],
+                "properties": {
+                    "dir": { "type": "string", "description": "the note's accretive folder" },
+                    "id": { "type": "integer", "description": "the note's number (the NNN in its filename)" },
+                    "body": { "type": "string", "description": "the replacement markdown body" },
+                },
+            },
+        }),
+        json!({
             "name": "archive",
             "description": "Move a garden path under journal/archive/<name>/ and commit \
                             archive_move. archive_name defaults to the basename of src.",
@@ -244,6 +280,14 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
         "log_incident" => {
             let a: LogIncidentArgs = serde_json::from_value(args)?;
             (op::LOG_INCIDENT, serde_json::to_value(a)?)
+        }
+        "add_note" => {
+            let a: AddNoteArgs = serde_json::from_value(args)?;
+            (op::ADD_NOTE, serde_json::to_value(a)?)
+        }
+        "revise_note" => {
+            let a: ReviseNoteArgs = serde_json::from_value(args)?;
+            (op::REVISE_NOTE, serde_json::to_value(a)?)
         }
         "archive" => {
             let a: ArchiveArgs = serde_json::from_value(args)?;
@@ -309,14 +353,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_six() {
+    fn tools_list_has_eight() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 8);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "propose_doc_update",
             "log_decision",
             "log_incident",
+            "add_note",
+            "revise_note",
             "archive",
             "add_project",
             "refresh_snapshot",
@@ -329,7 +375,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
     }
 
     #[test]
@@ -344,6 +390,16 @@ mod tests {
                 "log_incident",
                 json!({ "slug": "x", "summary": "s", "body": "b" }),
                 op::LOG_INCIDENT,
+            ),
+            (
+                "add_note",
+                json!({ "dir": "services/waydroid/notes", "slug": "x", "body": "b" }),
+                op::ADD_NOTE,
+            ),
+            (
+                "revise_note",
+                json!({ "dir": "services/waydroid/notes", "id": 3, "body": "b" }),
+                op::REVISE_NOTE,
             ),
             ("archive", json!({ "src": "a/b" }), op::ARCHIVE),
             ("add_project", json!({ "name": "x" }), op::ADD_PROJECT),

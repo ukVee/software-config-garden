@@ -28,8 +28,11 @@ pub fn add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let repo_path = args.repo_path.as_deref();
     let summary = args.summary.as_deref();
 
-    // Render all four stubs up front; reserved-name set matches every
-    // existing project dir in the OG garden.
+    // Render the monolithic stubs + seed the accretive `notes/` folder.
+    // Slice 1: `notes` is a numbered-note folder, not a `notes.md`
+    // monolith — we seed an empty `notes/.seq` high-water mark (the only
+    // tracked file in an otherwise-empty folder) so the first `add_note`
+    // counts from 001. CLAUDE.md/instructions.md/refs.md stay monolithic.
     let files: Vec<(String, String)> = vec![
         (
             format!("{dir_rel}/CLAUDE.md"),
@@ -40,8 +43,8 @@ pub fn add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             conventions::project_instructions_md(&args.name, &date),
         ),
         (
-            format!("{dir_rel}/notes.md"),
-            conventions::project_notes_md(&args.name, &date),
+            format!("{dir_rel}/notes/{}", conventions::SEQ_FILE),
+            "0\n".to_string(),
         ),
         (
             format!("{dir_rel}/refs.md"),

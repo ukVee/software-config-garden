@@ -5,12 +5,22 @@
 //! schema here as Rust constants reuses the OG conventions verbatim and
 //! keeps M3a tight.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use softfig_ipc::ErrorKind;
 
 pub const SLUG_MAX: usize = 64;
 pub const PROJECT_NAME_MAX: usize = 64;
+
+/// Reserved filename for an accretive folder's daemon-owned high-water
+/// mark. Never read or written by Claude — see `meta/spec-small-files.md`.
+pub const SEQ_FILE: &str = ".seq";
+
+/// Reserved-name folders that hold numbered single-doc notes (Slice 1 of
+/// the small-files redesign). The basename of an `add_note`/`revise_note`
+/// `dir` must be one of these.
+pub const ACCRETIVE_FOLDERS: [&str; 2] = ["notes", "troubleshooting"];
 
 // ---- path templates ---------------------------------------------------
 
@@ -26,8 +36,25 @@ pub fn project_dir(name: &str) -> String {
     format!("projects/{name}")
 }
 
-/// The four reserved-name stubs every project dir carries.
-pub const PROJECT_STUBS: [&str; 4] = ["CLAUDE.md", "instructions.md", "notes.md", "refs.md"];
+/// The monolithic reserved-name stubs every project dir carries. The
+/// fourth accretive doc, `notes`, is now a numbered-note **folder** (seeded
+/// as `notes/.seq`), not a `notes.md` monolith — see [`is_accretive_dir`].
+pub const PROJECT_STUBS: [&str; 3] = ["CLAUDE.md", "instructions.md", "refs.md"];
+
+/// Whether `dir_rel`'s basename names an accretive note folder. `add_note`
+/// and `revise_note` only operate on these.
+pub fn is_accretive_dir(dir_rel: &str) -> bool {
+    Path::new(dir_rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|name| ACCRETIVE_FOLDERS.contains(&name))
+        .unwrap_or(false)
+}
+
+/// `NNN-slug.md` — 3-digit zero-padded number + the terse slug address.
+pub fn note_filename(number: u32, slug: &str) -> String {
+    format!("{number:03}-{slug}.md")
+}
 
 // ---- header + body stamping -------------------------------------------
 
@@ -45,6 +72,16 @@ pub fn decision_doc(title: &str, date_hyphen: &str, body: &str) -> String {
 pub fn incident_doc(date_hyphen: &str, summary: &str, body: &str) -> String {
     format!(
         "# {date_hyphen} — {summary}\n\n{}\n",
+        body.trim_end_matches('\n')
+    )
+}
+
+/// `# <title>` + `> Last reviewed:` header, body below. The creation order
+/// is carried by the filename number, so there's no created-date line —
+/// only the reviewed stamp, which `revise_note`/`set_reviewed` bump.
+pub fn note_doc(title: &str, date_hyphen: &str, body: &str) -> String {
+    format!(
+        "# {title}\n\n> Last reviewed: {date_hyphen}\n\n{}\n",
         body.trim_end_matches('\n')
     )
 }
@@ -84,13 +121,6 @@ pub fn project_instructions_md(name: &str, date_hyphen: &str) -> String {
     )
 }
 
-pub fn project_notes_md(name: &str, date_hyphen: &str) -> String {
-    format!(
-        "# notes\n\n> Last reviewed: {date_hyphen}\n\n\
-         Running decision log + non-obvious learnings for `{name}`.\n"
-    )
-}
-
 pub fn project_refs_md(name: &str, date_hyphen: &str, repo_path: Option<&str>) -> String {
     let repo_line = match repo_path {
         Some(p) => format!("- Real repo: `{p}` — its `CLAUDE.md` is authoritative for code.\n"),
@@ -123,6 +153,37 @@ pub fn validate_slug(slug: &str) -> Result<(), (ErrorKind, String)> {
         ));
     }
     Ok(())
+}
+
+/// Derive a valid `[a-z0-9-]+` slug from free text: lowercase, runs of
+/// non-alphanumerics collapse to a single `-`, leading/trailing dashes
+/// trimmed, truncated to [`SLUG_MAX`]. Empty input falls back to `"note"`.
+/// Used by the migration splitter to address sections by their heading.
+pub fn slugify(text: &str) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for ch in text.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(c);
+        } else {
+            pending_dash = true;
+        }
+    }
+    if out.len() > SLUG_MAX {
+        out.truncate(SLUG_MAX);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    if out.is_empty() {
+        out.push_str("note");
+    }
+    out
 }
 
 /// `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, length 1–64 (no leading/trailing dash).
@@ -266,5 +327,44 @@ mod tests {
         assert!(validate_incident_date("2026-05-30").is_err());
         assert!(validate_incident_date("20261301").is_err());
         assert!(validate_incident_date("baddate1").is_err());
+    }
+
+    #[test]
+    fn accretive_dir_rules() {
+        assert!(is_accretive_dir("services/waydroid/notes"));
+        assert!(is_accretive_dir("notes"));
+        assert!(is_accretive_dir("input/controllers/troubleshooting"));
+        assert!(!is_accretive_dir("services/waydroid"));
+        assert!(!is_accretive_dir("notes.md"));
+        assert!(!is_accretive_dir("journal/decisions"));
+        assert!(!is_accretive_dir(""));
+    }
+
+    #[test]
+    fn note_filename_zero_pads() {
+        assert_eq!(note_filename(1, "container-networking"), "001-container-networking.md");
+        assert_eq!(note_filename(42, "gpu"), "042-gpu.md");
+        assert_eq!(note_filename(123, "x"), "123-x.md");
+    }
+
+    #[test]
+    fn note_doc_shape() {
+        let doc = note_doc("GPU passthrough", "2026-06-10", "It needs the venus driver.\n\n");
+        assert_eq!(
+            doc,
+            "# GPU passthrough\n\n> Last reviewed: 2026-06-10\n\nIt needs the venus driver.\n"
+        );
+    }
+
+    #[test]
+    fn slugify_rules() {
+        assert_eq!(slugify("GPU passthrough"), "gpu-passthrough");
+        assert_eq!(slugify("ADB: port collision!"), "adb-port-collision");
+        assert_eq!(slugify("  leading / trailing  "), "leading-trailing");
+        assert_eq!(slugify("---"), "note");
+        assert_eq!(slugify(""), "note");
+        assert!(slugify(&"x ".repeat(80)).len() <= SLUG_MAX);
+        // Slugify output is always a valid slug.
+        assert!(validate_slug(&slugify("Some Heading (v2)")).is_ok());
     }
 }

@@ -1,5 +1,7 @@
-//! M3a integration: the five typed, daemon-mediated garden-write verbs
-//! end to end (happy path + rejection cases per action).
+//! M3a integration: the typed, daemon-mediated garden-write verbs end to
+//! end (happy path + rejection cases per action). Covers the original five
+//! M3a verbs plus the Slice 1 small-files note verbs (`add_note` /
+//! `revise_note`), which share the same harness and contract.
 //!
 //! All gardens are M1c-compat (no `state_root` → no FUSE), so the suite
 //! runs without `/dev/fuse`. The watcher is disabled for predictable
@@ -13,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use softfig_vcs::Repo;
 use softfig_ipc::verbs::{
-    op, AddProjectArgs, AddProjectReply, ArchiveArgs, ArchiveReply, LogDecisionArgs,
-    LogDecisionReply, LogIncidentArgs, LogIncidentReply, RefreshSnapshotArgs,
-    RefreshSnapshotReply,
+    op, AddNoteArgs, AddNoteReply, AddProjectArgs, AddProjectReply, ArchiveArgs, ArchiveReply,
+    LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, RefreshSnapshotArgs,
+    RefreshSnapshotReply, ReviseNoteArgs, ReviseNoteReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::actions::conventions;
@@ -331,12 +333,19 @@ fn add_project_happy_creates_four_stubs() {
     let reply: AddProjectReply = serde_json::from_value(ok_data(resp)).unwrap();
     assert_eq!(reply.path, "projects/cool-proj");
     assert_eq!(reply.files.len(), 4);
-    for stub in ["CLAUDE.md", "instructions.md", "notes.md", "refs.md"] {
+    // Slice 1: `notes` is now a numbered-note folder seeded with `.seq`,
+    // not a `notes.md` monolith.
+    for stub in ["CLAUDE.md", "instructions.md", "notes/.seq", "refs.md"] {
         assert!(
             fx.garden.join(format!("projects/cool-proj/{stub}")).exists(),
             "missing {stub}"
         );
     }
+    assert!(!fx.garden.join("projects/cool-proj/notes.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(fx.garden.join("projects/cool-proj/notes/.seq")).unwrap(),
+        "0\n"
+    );
     let claude = std::fs::read_to_string(fx.garden.join("projects/cool-proj/CLAUDE.md")).unwrap();
     assert!(claude.contains("/home/ukv/projects/cool-proj"));
     let instructions =
@@ -431,4 +440,213 @@ fn refresh_snapshot_rejects_missing_parent() {
         serde_json::json!({ "path": "snapshots/nope/x.md", "content": "c" }),
     );
     assert_eq!(err_kind(resp), ErrorKind::InvalidSnapshotPath);
+}
+
+// ---- add_note / revise_note (Slice 1) ---------------------------------
+
+/// Create a concept dir so its accretive `notes/` folder has a parent to
+/// be materialized under.
+fn make_concept_dir(fx: &Fixture, rel: &str) {
+    std::fs::create_dir_all(fx.garden.join(rel)).unwrap();
+}
+
+#[test]
+fn add_note_happy_assigns_001_and_seq() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "services/waydroid");
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::to_value(AddNoteArgs {
+            dir: "services/waydroid/notes".into(),
+            slug: "container-networking".into(),
+            title: Some("Container networking".into()),
+            body: "Waydroid uses an internal bridge.".into(),
+        })
+        .unwrap(),
+    );
+    let reply: AddNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "services/waydroid/notes/001-container-networking.md");
+
+    let content = std::fs::read_to_string(fx.garden.join(&reply.path)).unwrap();
+    assert!(content.starts_with("# Container networking\n"), "header: {content:?}");
+    assert!(content.contains(&format!("> Last reviewed: {}\n", conventions::today_hyphen())));
+    assert!(content.contains("Waydroid uses an internal bridge."));
+
+    // `.seq` high-water mark bumped to 1.
+    assert_eq!(
+        std::fs::read_to_string(fx.garden.join("services/waydroid/notes/.seq")).unwrap(),
+        "1\n"
+    );
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "note_added");
+    assert_eq!(payload["number"], 1);
+    assert_eq!(payload["slug"], "container-networking");
+    assert_eq!(payload["dir"], "services/waydroid/notes");
+}
+
+#[test]
+fn add_note_title_defaults_to_slug() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "input");
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "input/notes", "slug": "stylus-tilt", "body": "b" }),
+    );
+    let reply: AddNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    let content = std::fs::read_to_string(fx.garden.join(&reply.path)).unwrap();
+    assert!(content.starts_with("# stylus-tilt\n"));
+}
+
+#[test]
+fn add_note_increments_per_folder() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "services/waydroid");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "one", "body": "a" }),
+    );
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "two", "body": "b" }),
+    );
+    let reply: AddNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "services/waydroid/notes/002-two.md");
+    // troubleshooting/ in the same concept dir is an independent sequence.
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/troubleshooting", "slug": "adb", "body": "c" }),
+    );
+    let reply: AddNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "services/waydroid/troubleshooting/001-adb.md");
+}
+
+/// The core invariant: archiving the newest note must NOT hand its number
+/// to the next `add_note` — `.seq` guards against reuse even though the
+/// live-file floor dropped back.
+#[test]
+fn add_note_archive_leaves_a_gap() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "services/waydroid");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "one", "body": "a" }),
+    );
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "two", "body": "b" }),
+    );
+    // Archive the newest (002). `.seq` stays at 2.
+    let resp = fx.call(
+        op::ARCHIVE,
+        serde_json::json!({ "src": "services/waydroid/notes/002-two.md" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "archive: {resp:?}");
+    // Next note is 003, not a reused 002.
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "three", "body": "c" }),
+    );
+    let reply: AddNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "services/waydroid/notes/003-three.md");
+    assert_eq!(
+        std::fs::read_to_string(fx.garden.join("services/waydroid/notes/.seq")).unwrap(),
+        "3\n"
+    );
+}
+
+#[test]
+fn add_note_into_seeded_project_folder() {
+    let fx = Fixture::start();
+    // add_project seeds notes/.seq = 0; the first note must count from 001.
+    fx.call(op::ADD_PROJECT, serde_json::json!({ "name": "demo" }));
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "projects/demo/notes", "slug": "kickoff", "body": "start" }),
+    );
+    let reply: AddNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "projects/demo/notes/001-kickoff.md");
+}
+
+#[test]
+fn add_note_rejects_non_accretive_dir() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "services/waydroid");
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid", "slug": "x", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotAccretiveDir);
+}
+
+#[test]
+fn add_note_rejects_bad_slug() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "services/waydroid");
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "Bad_Slug", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::InvalidSlug);
+}
+
+#[test]
+fn add_note_rejects_missing_parent_dir() {
+    let fx = Fixture::start();
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "nope/notes", "slug": "x", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotFound);
+}
+
+#[test]
+fn revise_note_replaces_body_keeps_title() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "services/waydroid");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::to_value(AddNoteArgs {
+            dir: "services/waydroid/notes".into(),
+            slug: "gpu".into(),
+            title: Some("GPU passthrough".into()),
+            body: "old body".into(),
+        })
+        .unwrap(),
+    );
+    let resp = fx.call(
+        op::REVISE_NOTE,
+        serde_json::to_value(ReviseNoteArgs {
+            dir: "services/waydroid/notes".into(),
+            id: 1,
+            body: "new body with venus".into(),
+        })
+        .unwrap(),
+    );
+    let reply: ReviseNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "services/waydroid/notes/001-gpu.md");
+
+    let content = std::fs::read_to_string(fx.garden.join(&reply.path)).unwrap();
+    assert!(content.starts_with("# GPU passthrough\n"), "title preserved: {content:?}");
+    assert!(content.contains("new body with venus"));
+    assert!(!content.contains("old body"));
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "note_revised");
+    assert_eq!(payload["id"], 1);
+}
+
+#[test]
+fn revise_note_rejects_missing_id() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "services/waydroid");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "x", "body": "b" }),
+    );
+    let resp = fx.call(
+        op::REVISE_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "id": 99, "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotFound);
 }

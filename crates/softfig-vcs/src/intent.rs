@@ -18,6 +18,8 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "snapshot_refresh",
     "decision_logged",
     "incident_logged",
+    "note_added",
+    "note_revised",
     "archive_move",
     "project_added",
     "project_archived",
@@ -79,8 +81,8 @@ impl Intent {
 
 const KNOWN_INTENTS_LIST: &str =
     "init, memory_edit, manual_edit, snapshot_refresh, decision_logged, \
-     incident_logged, archive_move, project_added, project_archived, \
-     schema_change, rollback, vault_seal, vault_reveal";
+     incident_logged, note_added, note_revised, archive_move, project_added, \
+     project_archived, schema_change, rollback, vault_seal, vault_reveal";
 
 fn type_name(v: &Value) -> &'static str {
     match v {
