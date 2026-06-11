@@ -24,8 +24,10 @@ pub mod conventions;
 mod add_note;
 mod add_project;
 mod archive;
+mod index;
 mod log_decision;
 mod log_incident;
+mod managed;
 mod refresh_snapshot;
 mod sections;
 

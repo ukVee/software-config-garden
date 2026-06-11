@@ -132,6 +132,29 @@ fn resolve(
     Ok((abs, rel))
 }
 
+/// Whether a plaintext rewrite of `rel` would risk clobbering ciphertext:
+/// the file is whole-file-sealed, carries an inline `<vault>` region, or its
+/// tags are malformed. Used by best-effort managed-region maintenance
+/// (slice 4/5 index + backlinks) to skip protected hosts. An unreadable /
+/// locked / non-UTF-8 host also reads as "protected" (skip) since the
+/// region machinery is text-only and must never guess.
+pub(crate) fn is_vault_protected(inner: &DaemonInner, abs: &Path, rel: &str) -> bool {
+    if inner.layer_b.snapshot().is_sealed(rel) {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(abs) else {
+        return true;
+    };
+    let Some(session) = inner.session.as_ref() else {
+        return true;
+    };
+    let parser = crate::layer_b::regions::parser_for(rel);
+    match crate::layer_b::regions::parse(parser, &bytes, session, rel) {
+        Ok(spans) => !spans.is_empty(),
+        Err(_) => true,
+    }
+}
+
 /// Read the working-tree bytes of `rel` as plaintext, refusing any vault
 /// target so a section rewrite can never clobber ciphertext (see module
 /// docs). Returns the UTF-8 content on success.

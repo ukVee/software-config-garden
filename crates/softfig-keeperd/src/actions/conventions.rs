@@ -86,6 +86,53 @@ pub fn note_doc(title: &str, date_hyphen: &str, body: &str) -> String {
     )
 }
 
+// ---- note field parsers (shared by add_note + the index builder) ------
+
+/// Parse the `NNN` from a `NNN-<slug>.md` filename (exactly three leading
+/// digits then a dash). Anything else (incl. `.seq`, `01-x.md`, `abc-x.md`)
+/// is `None`.
+pub fn parse_note_number(name: &str) -> Option<u32> {
+    let bytes = name.as_bytes();
+    if name.ends_with(".md")
+        && bytes.len() >= 5
+        && bytes[3] == b'-'
+        && bytes[..3].iter().all(u8::is_ascii_digit)
+    {
+        name[..3].parse().ok()
+    } else {
+        None
+    }
+}
+
+/// The first `# <title>` heading text, trimmed. `None` if the doc has no
+/// top-level heading.
+pub fn note_title(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("# ").map(|rest| rest.trim().to_string()))
+}
+
+/// The date on the first `Last reviewed:` line (optionally `> `-quoted /
+/// indented), trimmed. `None` if there's no such line. A prose mention
+/// ("see Last reviewed: …") is skipped — only blanks / quote markers may
+/// precede the label.
+pub fn note_reviewed(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let stripped = line.trim_start_matches([' ', '\t', '>']);
+        stripped
+            .strip_prefix("Last reviewed:")
+            .map(|date| date.trim().to_string())
+    })
+}
+
+/// The `<slug>` of a `NNN-<slug>.md` filename, used only as a title
+/// fallback. Falls back to `"note"` for a malformed name.
+pub fn slug_from_note_name(name: &str) -> String {
+    name.strip_suffix(".md")
+        .and_then(|stem| stem.split_once('-').map(|(_, slug)| slug.to_string()))
+        .unwrap_or_else(|| "note".to_string())
+}
+
 // ---- project stub templates -------------------------------------------
 
 /// `CLAUDE.md` is the routing doc — no `Last reviewed:` line (it's not a
@@ -354,6 +401,41 @@ mod tests {
             doc,
             "# GPU passthrough\n\n> Last reviewed: 2026-06-10\n\nIt needs the venus driver.\n"
         );
+    }
+
+    #[test]
+    fn parse_note_number_accepts_notes_only() {
+        assert_eq!(parse_note_number("001-container.md"), Some(1));
+        assert_eq!(parse_note_number("042-gpu-passthrough.md"), Some(42));
+        assert_eq!(parse_note_number(".seq"), None);
+        assert_eq!(parse_note_number("01-short.md"), None);
+        assert_eq!(parse_note_number("001-x.txt"), None);
+        assert_eq!(parse_note_number("abc-x.md"), None);
+        assert_eq!(parse_note_number("001x.md"), None);
+    }
+
+    #[test]
+    fn note_title_reads_first_heading() {
+        let doc = "# GPU passthrough\n\n> Last reviewed: 2026-06-10\n\nbody\n";
+        assert_eq!(note_title(doc).as_deref(), Some("GPU passthrough"));
+        assert_eq!(note_title("no heading here\n"), None);
+    }
+
+    #[test]
+    fn note_reviewed_reads_quoted_and_bare() {
+        let doc = "# N\n\n> Last reviewed: 2026-06-10\n\nbody\n";
+        assert_eq!(note_reviewed(doc).as_deref(), Some("2026-06-10"));
+        assert_eq!(note_reviewed("Last reviewed: 2020-01-01\n").as_deref(), Some("2020-01-01"));
+        assert_eq!(note_reviewed("# N\n\nno stamp\n"), None);
+        // A prose mention is not a stamp line.
+        assert_eq!(note_reviewed("see Last reviewed: foo\n"), None);
+    }
+
+    #[test]
+    fn slug_from_note_name_strips_number_and_ext() {
+        assert_eq!(slug_from_note_name("004-adb-port.md"), "adb-port");
+        assert_eq!(slug_from_note_name("001-x.md"), "x");
+        assert_eq!(slug_from_note_name("garbled"), "note");
     }
 
     #[test]

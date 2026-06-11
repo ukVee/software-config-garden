@@ -81,6 +81,10 @@ pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     write_file(&seq_abs, format!("{number}\n").as_bytes())?;
     write_file(&note_abs, content.as_bytes())?;
 
+    // Slice 4: refresh this folder's index table in the parent CLAUDE.md,
+    // folded into the same commit (best-effort — never blocks the note).
+    super::index::refresh_folder_index(daemon, &inner, &garden_root, &dir_rel);
+
     let payload = serde_json::json!({ "dir": dir_rel, "slug": args.slug, "number": number });
     let intent =
         Intent::new("note_added", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
@@ -126,11 +130,17 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // the body wholesale — header/slug/number are left untouched.
     let existing = std::fs::read_to_string(&note_abs)
         .map_err(|e| (ErrorKind::Io, format!("read {note_rel}: {e}")))?;
-    let title = extract_title(&existing).unwrap_or_else(|| slug_from_filename(&note_abs));
+    let filename = note_abs.file_name().and_then(|s| s.to_str()).unwrap_or("note.md");
+    let title = conventions::note_title(&existing)
+        .unwrap_or_else(|| conventions::slug_from_note_name(filename));
     let content = conventions::note_doc(&title, &conventions::today_hyphen(), &args.body);
 
     daemon.mark_self_write(note_abs.clone());
     write_file(&note_abs, content.as_bytes())?;
+
+    // Slice 4: re-stamping the reviewed date changes the index's Reviewed
+    // column, so refresh the folder's table in the parent CLAUDE.md too.
+    super::index::refresh_folder_index(daemon, &inner, &garden_root, &dir_rel);
 
     let payload = serde_json::json!({ "dir": dir_rel, "id": args.id });
     let intent =
@@ -169,28 +179,13 @@ fn highest_live_number(dir_abs: &Path) -> u32 {
             if let Some(n) = entry
                 .file_name()
                 .to_str()
-                .and_then(parse_leading_number)
+                .and_then(conventions::parse_note_number)
             {
                 max = max.max(n);
             }
         }
     }
     max
-}
-
-/// Parse the `NNN` from a `NNN-<slug>.md` filename (exactly three leading
-/// digits then a dash). Anything else (incl. `.seq`) is `None`.
-fn parse_leading_number(name: &str) -> Option<u32> {
-    let bytes = name.as_bytes();
-    if name.ends_with(".md")
-        && bytes.len() >= 5
-        && bytes[3] == b'-'
-        && bytes[..3].iter().all(u8::is_ascii_digit)
-    {
-        name[..3].parse().ok()
-    } else {
-        None
-    }
 }
 
 fn find_note_by_id(dir_abs: &Path, id: u32) -> Option<PathBuf> {
@@ -202,50 +197,3 @@ fn find_note_by_id(dir_abs: &Path, id: u32) -> Option<PathBuf> {
     })
 }
 
-/// First `# <title>` heading line, title text trimmed. `None` if the file
-/// has no top-level heading (manually mangled) — the caller falls back to
-/// the filename slug so a revise never drops the title.
-fn extract_title(content: &str) -> Option<String> {
-    content.lines().find_map(|line| {
-        line.strip_prefix("# ").map(|rest| rest.trim().to_string())
-    })
-}
-
-/// The `<slug>` of a `NNN-<slug>.md` path, used only as a title fallback.
-fn slug_from_filename(note_abs: &Path) -> String {
-    note_abs
-        .file_name()
-        .and_then(|s| s.to_str())
-        .and_then(|name| name.strip_suffix(".md"))
-        .and_then(|stem| stem.split_once('-').map(|(_, slug)| slug.to_string()))
-        .unwrap_or_else(|| "note".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_leading_number_accepts_notes_only() {
-        assert_eq!(parse_leading_number("001-container.md"), Some(1));
-        assert_eq!(parse_leading_number("042-gpu-passthrough.md"), Some(42));
-        assert_eq!(parse_leading_number(".seq"), None);
-        assert_eq!(parse_leading_number("01-short.md"), None);
-        assert_eq!(parse_leading_number("001-x.txt"), None);
-        assert_eq!(parse_leading_number("abc-x.md"), None);
-        assert_eq!(parse_leading_number("001x.md"), None);
-    }
-
-    #[test]
-    fn extract_title_reads_first_heading() {
-        let doc = "# GPU passthrough\n\n> Last reviewed: 2026-06-10\n\nbody\n";
-        assert_eq!(extract_title(doc).as_deref(), Some("GPU passthrough"));
-        assert_eq!(extract_title("no heading here\n"), None);
-    }
-
-    #[test]
-    fn slug_from_filename_strips_number_and_ext() {
-        assert_eq!(slug_from_filename(Path::new("a/b/004-adb-port.md")), "adb-port");
-        assert_eq!(slug_from_filename(Path::new("001-x.md")), "x");
-    }
-}

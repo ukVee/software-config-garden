@@ -9,7 +9,7 @@ use softfig_vcs::Intent;
 use softfig_ipc::verbs::{ArchiveArgs, ArchiveReply};
 use softfig_ipc::ErrorKind;
 
-use super::commit_now;
+use super::{commit_now, conventions};
 use crate::daemon::Daemon;
 use crate::handlers::{path_to_repo_rel_string, require_unlocked, validate_repo_path, HandlerResult};
 
@@ -59,6 +59,17 @@ pub fn archive(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     daemon.mark_self_write(src_abs.clone());
     daemon.mark_self_write(dst_abs.clone());
     std::fs::rename(&src_abs, &dst_abs).map_err(|e| (ErrorKind::Io, format!("rename: {e}")))?;
+
+    // Slice 4: if the archived path was a numbered note, its folder's index
+    // table just lost a row — refresh it in the parent CLAUDE.md (best-effort,
+    // folded into this commit).
+    if conventions::parse_note_number(&basename).is_some() {
+        if let Some(parent) = Path::new(&src_rel).parent().and_then(|p| p.to_str()) {
+            if conventions::is_accretive_dir(parent) {
+                super::index::refresh_folder_index(daemon, &inner, &garden_root, parent);
+            }
+        }
+    }
 
     let intent = Intent::new(
         "archive_move",

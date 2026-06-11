@@ -800,3 +800,119 @@ fn set_reviewed_rejects_missing_line() {
     let resp = fx.call(op::SET_REVIEWED, serde_json::json!({ "path": "n.md" }));
     assert_eq!(err_kind(resp), ErrorKind::NotFound);
 }
+
+// ---- auto index tables (Slice 4) --------------------------------------
+
+/// `add_note` into a folder whose parent concept dir has a `CLAUDE.md`
+/// injects + grows a daemon-owned index region in that routing doc.
+#[test]
+fn add_note_builds_index_in_parent_claude_md() {
+    let fx = Fixture::start();
+    write_doc(&fx, "services/waydroid/CLAUDE.md", "# services/waydroid/\n\nrouting prose\n");
+
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::to_value(AddNoteArgs {
+            dir: "services/waydroid/notes".into(),
+            slug: "container-networking".into(),
+            title: Some("Container networking".into()),
+            body: "uses a bridge".into(),
+        })
+        .unwrap(),
+    );
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({
+            "dir": "services/waydroid/notes",
+            "slug": "gpu-passthrough",
+            "title": "GPU passthrough",
+            "body": "venus driver",
+        }),
+    );
+
+    let claude =
+        std::fs::read_to_string(fx.garden.join("services/waydroid/CLAUDE.md")).unwrap();
+    // Hand-authored prose preserved.
+    assert!(claude.starts_with("# services/waydroid/\n\nrouting prose\n"));
+    // Managed region present with both rows, linked relative to the host.
+    assert!(claude.contains("<!-- softfig:index notes -->"), "{claude}");
+    assert!(claude.contains("<!-- /softfig:index notes -->"), "{claude}");
+    assert!(claude.contains(
+        "| 001 | [Container networking](notes/001-container-networking.md) |"
+    ));
+    assert!(claude.contains("| 002 | [GPU passthrough](notes/002-gpu-passthrough.md) |"));
+
+    // The index write rides along inside the `note_added` commit.
+    assert_eq!(fx.tip_intent().0, "note_added");
+}
+
+/// `revise_note` re-stamps the reviewed date, so the index's Reviewed
+/// column must follow.
+#[test]
+fn revise_note_updates_index_reviewed_column() {
+    let fx = Fixture::start();
+    write_doc(&fx, "input/CLAUDE.md", "# input/\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "input/notes", "slug": "tilt", "title": "Stylus tilt", "body": "old" }),
+    );
+    // Backdate the note's reviewed line, then revise it.
+    let note = fx.garden.join("input/notes/001-tilt.md");
+    let stale = std::fs::read_to_string(&note)
+        .unwrap()
+        .replace(&conventions::today_hyphen(), "2020-01-01");
+    std::fs::write(&note, stale).unwrap();
+
+    fx.call(
+        op::REVISE_NOTE,
+        serde_json::json!({ "dir": "input/notes", "id": 1, "body": "new" }),
+    );
+    let claude = std::fs::read_to_string(fx.garden.join("input/CLAUDE.md")).unwrap();
+    assert!(
+        claude.contains(&format!(
+            "| 001 | [Stylus tilt](notes/001-tilt.md) | {} |",
+            conventions::today_hyphen()
+        )),
+        "{claude}"
+    );
+}
+
+/// Archiving the only note empties the folder, so its index region is
+/// dropped from the routing doc; a re-added note recreates it.
+#[test]
+fn archive_last_note_removes_index_region() {
+    let fx = Fixture::start();
+    write_doc(&fx, "audio/CLAUDE.md", "# audio/\n\nhow audio fits.\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "audio/notes", "slug": "pw", "title": "Pipewire", "body": "x" }),
+    );
+    assert!(std::fs::read_to_string(fx.garden.join("audio/CLAUDE.md"))
+        .unwrap()
+        .contains("<!-- softfig:index notes -->"));
+
+    let resp = fx.call(
+        op::ARCHIVE,
+        serde_json::json!({ "src": "audio/notes/001-pw.md" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "archive: {resp:?}");
+    let claude = std::fs::read_to_string(fx.garden.join("audio/CLAUDE.md")).unwrap();
+    assert!(!claude.contains("softfig:index notes"), "region should be gone: {claude}");
+    // Hand-authored prose survives the removal.
+    assert!(claude.contains("how audio fits."));
+}
+
+/// No host `CLAUDE.md` → index maintenance is silently skipped (the note
+/// still lands). Guards the best-effort contract.
+#[test]
+fn add_note_without_host_claude_md_still_succeeds() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "storage");
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "storage/notes", "slug": "luks", "body": "b" }),
+    );
+    let reply: AddNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "storage/notes/001-luks.md");
+    assert!(!fx.garden.join("storage/CLAUDE.md").exists());
+}
