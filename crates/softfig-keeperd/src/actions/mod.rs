@@ -27,6 +27,7 @@ mod archive;
 mod log_decision;
 mod log_incident;
 mod refresh_snapshot;
+mod sections;
 
 pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
@@ -34,6 +35,7 @@ pub use archive::archive;
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;
 pub use refresh_snapshot::refresh_snapshot;
+pub use sections::{add_section, append_to_section, edit_section, set_reviewed};
 
 use std::path::Path;
 

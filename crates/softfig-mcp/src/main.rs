@@ -16,8 +16,9 @@ use serde_json::{json, Value};
 use softfig_ipc::{
     self,
     verbs::{
-        op, AddNoteArgs, AddProjectArgs, ArchiveArgs, LogDecisionArgs, LogIncidentArgs,
-        ProposeDocUpdateArgs, RefreshSnapshotArgs, ReviseNoteArgs,
+        op, AddNoteArgs, AddProjectArgs, AddSectionArgs, AppendToSectionArgs, ArchiveArgs,
+        EditSectionArgs, LogDecisionArgs, LogIncidentArgs, ProposeDocUpdateArgs,
+        RefreshSnapshotArgs, ReviseNoteArgs, SetReviewedArgs,
     },
     Request, Response,
 };
@@ -219,6 +220,70 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "edit_section",
+            "description": "Replace the body of an existing heading-addressed section in ANY \
+                            markdown doc (note, CLAUDE.md, decision), keeping the heading line. \
+                            You emit only the new body — never the rest of the file. Address the \
+                            section by its heading text (case-sensitive, level-agnostic): 'Cross-refs' \
+                            or '## Cross-refs' both match; the match must be unique. Refused on \
+                            vault-sealed targets. Prefer this over propose_doc_update for editing one \
+                            section.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "heading", "body"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative markdown doc" },
+                    "heading": { "type": "string", "description": "section heading text; '#' prefix optional" },
+                    "body": { "type": "string", "description": "replacement markdown body (heading kept by daemon)" },
+                },
+            },
+        }),
+        json!({
+            "name": "append_to_section",
+            "description": "Add a row/bullet/line to the end of an existing section's body (before \
+                            the next heading) in any markdown doc — the cheap 'add one item' op. \
+                            You emit only the new line(s). Same heading addressing + vault refusal \
+                            as edit_section.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "heading", "text"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative markdown doc" },
+                    "heading": { "type": "string", "description": "target section heading text; '#' prefix optional" },
+                    "text": { "type": "string", "description": "new content to append (e.g. a list row)" },
+                },
+            },
+        }),
+        json!({
+            "name": "add_section",
+            "description": "Append a brand-new section to the end of any markdown doc. The daemon \
+                            stamps the heading line; you emit the heading text + body. Include \
+                            leading '#'s to set the level ('## Foo' → level 2), else it defaults to \
+                            '##'. The heading must not already exist. Refused on vault-sealed targets.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "heading", "body"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative markdown doc" },
+                    "heading": { "type": "string", "description": "new section heading text; '#' prefix sets level" },
+                    "body": { "type": "string", "description": "markdown body below the new heading" },
+                },
+            },
+        }),
+        json!({
+            "name": "set_reviewed",
+            "description": "Bump a doc's 'Last reviewed:' line (optionally '> '-quoted) to today's \
+                            date. Zero content — you pass only the path; the daemon owns the date. \
+                            Errors if the doc has no such line.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative doc with a 'Last reviewed:' line" },
+                },
+            },
+        }),
+        json!({
             "name": "archive",
             "description": "Move a garden path under journal/archive/<name>/ and commit \
                             archive_move. archive_name defaults to the basename of src.",
@@ -289,6 +354,22 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: ReviseNoteArgs = serde_json::from_value(args)?;
             (op::REVISE_NOTE, serde_json::to_value(a)?)
         }
+        "edit_section" => {
+            let a: EditSectionArgs = serde_json::from_value(args)?;
+            (op::EDIT_SECTION, serde_json::to_value(a)?)
+        }
+        "append_to_section" => {
+            let a: AppendToSectionArgs = serde_json::from_value(args)?;
+            (op::APPEND_TO_SECTION, serde_json::to_value(a)?)
+        }
+        "add_section" => {
+            let a: AddSectionArgs = serde_json::from_value(args)?;
+            (op::ADD_SECTION, serde_json::to_value(a)?)
+        }
+        "set_reviewed" => {
+            let a: SetReviewedArgs = serde_json::from_value(args)?;
+            (op::SET_REVIEWED, serde_json::to_value(a)?)
+        }
         "archive" => {
             let a: ArchiveArgs = serde_json::from_value(args)?;
             (op::ARCHIVE, serde_json::to_value(a)?)
@@ -353,9 +434,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_eight() {
+    fn tools_list_has_twelve() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 12);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "propose_doc_update",
@@ -363,6 +444,10 @@ mod tests {
             "log_incident",
             "add_note",
             "revise_note",
+            "edit_section",
+            "append_to_section",
+            "add_section",
+            "set_reviewed",
             "archive",
             "add_project",
             "refresh_snapshot",
@@ -375,7 +460,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -401,6 +486,22 @@ mod tests {
                 json!({ "dir": "services/waydroid/notes", "id": 3, "body": "b" }),
                 op::REVISE_NOTE,
             ),
+            (
+                "edit_section",
+                json!({ "path": "services/x/notes/001-a.md", "heading": "Foo", "body": "b" }),
+                op::EDIT_SECTION,
+            ),
+            (
+                "append_to_section",
+                json!({ "path": "refs.md", "heading": "Cross-refs", "text": "- row" }),
+                op::APPEND_TO_SECTION,
+            ),
+            (
+                "add_section",
+                json!({ "path": "CLAUDE.md", "heading": "## New", "body": "b" }),
+                op::ADD_SECTION,
+            ),
+            ("set_reviewed", json!({ "path": "notes.md" }), op::SET_REVIEWED),
             ("archive", json!({ "src": "a/b" }), op::ARCHIVE),
             ("add_project", json!({ "name": "x" }), op::ADD_PROJECT),
             (

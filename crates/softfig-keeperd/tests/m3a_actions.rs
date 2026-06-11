@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use softfig_vcs::Repo;
 use softfig_ipc::verbs::{
-    op, AddNoteArgs, AddNoteReply, AddProjectArgs, AddProjectReply, ArchiveArgs, ArchiveReply,
+    op, AddNoteArgs, AddNoteReply, AddProjectArgs, AddProjectReply, AddSectionArgs,
+    AppendToSectionArgs, ArchiveArgs, ArchiveReply, DocEditReply, EditSectionArgs,
     LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, RefreshSnapshotArgs,
-    RefreshSnapshotReply, ReviseNoteArgs, ReviseNoteReply,
+    RefreshSnapshotReply, ReviseNoteArgs, ReviseNoteReply, SetReviewedArgs,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::actions::conventions;
@@ -648,5 +649,154 @@ fn revise_note_rejects_missing_id() {
         op::REVISE_NOTE,
         serde_json::json!({ "dir": "services/waydroid/notes", "id": 99, "body": "b" }),
     );
+    assert_eq!(err_kind(resp), ErrorKind::NotFound);
+}
+
+// ---- section ops + set_reviewed (Slice 2) -----------------------------
+
+/// Write a markdown doc straight into the working tree so the section verbs
+/// have a real file to operate on (they read the working tree like
+/// `revise_note`, then snapshot it on commit).
+fn write_doc(fx: &Fixture, rel: &str, content: &str) {
+    let abs = fx.garden.join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, content).unwrap();
+}
+
+#[test]
+fn edit_section_replaces_body_keeps_siblings() {
+    let fx = Fixture::start();
+    write_doc(&fx, "x.md", "# Doc\n\n## Alpha\n\nold alpha\n\n## Beta\n\nbeta body\n");
+    let resp = fx.call(
+        op::EDIT_SECTION,
+        serde_json::to_value(EditSectionArgs {
+            path: "x.md".into(),
+            heading: "Alpha".into(),
+            body: "new alpha".into(),
+        })
+        .unwrap(),
+    );
+    let reply: DocEditReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "x.md");
+    let content = std::fs::read_to_string(fx.garden.join("x.md")).unwrap();
+    assert_eq!(content, "# Doc\n\n## Alpha\n\nnew alpha\n\n## Beta\n\nbeta body\n");
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "section_edited");
+    assert_eq!(payload["path"], "x.md");
+    assert_eq!(payload["heading"], "Alpha");
+}
+
+#[test]
+fn append_to_section_adds_row() {
+    let fx = Fixture::start();
+    write_doc(&fx, "refs.md", "# refs\n\n## Cross-refs\n\n- foo\n- bar\n");
+    let resp = fx.call(
+        op::APPEND_TO_SECTION,
+        serde_json::to_value(AppendToSectionArgs {
+            path: "refs.md".into(),
+            heading: "## Cross-refs".into(),
+            text: "- baz".into(),
+        })
+        .unwrap(),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "append: {resp:?}");
+    let content = std::fs::read_to_string(fx.garden.join("refs.md")).unwrap();
+    assert_eq!(content, "# refs\n\n## Cross-refs\n\n- foo\n- bar\n- baz\n");
+    assert_eq!(fx.tip_intent().0, "section_appended");
+}
+
+#[test]
+fn add_section_appends_new_section() {
+    let fx = Fixture::start();
+    write_doc(&fx, "x.md", "# Doc\n\n## Alpha\n\na\n");
+    let resp = fx.call(
+        op::ADD_SECTION,
+        serde_json::to_value(AddSectionArgs {
+            path: "x.md".into(),
+            heading: "Gamma".into(),
+            body: "g body".into(),
+        })
+        .unwrap(),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "add: {resp:?}");
+    let content = std::fs::read_to_string(fx.garden.join("x.md")).unwrap();
+    assert_eq!(content, "# Doc\n\n## Alpha\n\na\n\n## Gamma\n\ng body\n");
+    assert_eq!(fx.tip_intent().0, "section_added");
+}
+
+#[test]
+fn edit_section_rejects_missing_and_ambiguous() {
+    let fx = Fixture::start();
+    write_doc(&fx, "x.md", "## A\n\nx\n\n## A\n\ny\n");
+    assert_eq!(
+        err_kind(fx.call(
+            op::EDIT_SECTION,
+            serde_json::json!({ "path": "x.md", "heading": "Nope", "body": "z" }),
+        )),
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        err_kind(fx.call(
+            op::EDIT_SECTION,
+            serde_json::json!({ "path": "x.md", "heading": "A", "body": "z" }),
+        )),
+        ErrorKind::BadArgs
+    );
+}
+
+#[test]
+fn add_section_rejects_existing_heading() {
+    let fx = Fixture::start();
+    write_doc(&fx, "x.md", "## Alpha\n\na\n");
+    let resp = fx.call(
+        op::ADD_SECTION,
+        serde_json::json!({ "path": "x.md", "heading": "Alpha", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::PathAlreadyExists);
+}
+
+#[test]
+fn section_op_refuses_inline_vault_region() {
+    let fx = Fixture::start();
+    // A doc carrying a real inline region: editing any of its sections
+    // would risk clobbering ciphertext, so the daemon refuses outright.
+    write_doc(
+        &fx,
+        "x.md",
+        "# Doc\n\n## Secrets\n\nkey: <vault id=\"api\">SECRET</vault>\n",
+    );
+    let resp = fx.call(
+        op::EDIT_SECTION,
+        serde_json::json!({ "path": "x.md", "heading": "Secrets", "body": "z" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::VaultProtected);
+    // The file is untouched (no clobber, no commit of a redacted body).
+    let content = std::fs::read_to_string(fx.garden.join("x.md")).unwrap();
+    assert!(content.contains("<vault id=\"api\">SECRET</vault>"));
+}
+
+#[test]
+fn set_reviewed_bumps_date() {
+    let fx = Fixture::start();
+    write_doc(&fx, "n.md", "# Note\n\n> Last reviewed: 2020-01-01\n\nbody\n");
+    let resp = fx.call(
+        op::SET_REVIEWED,
+        serde_json::to_value(SetReviewedArgs { path: "n.md".into() }).unwrap(),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "set_reviewed: {resp:?}");
+    let content = std::fs::read_to_string(fx.garden.join("n.md")).unwrap();
+    assert_eq!(
+        content,
+        format!("# Note\n\n> Last reviewed: {}\n\nbody\n", conventions::today_hyphen())
+    );
+    assert_eq!(fx.tip_intent().0, "reviewed_stamped");
+}
+
+#[test]
+fn set_reviewed_rejects_missing_line() {
+    let fx = Fixture::start();
+    write_doc(&fx, "n.md", "# Note\n\nno stamp here\n");
+    let resp = fx.call(op::SET_REVIEWED, serde_json::json!({ "path": "n.md" }));
     assert_eq!(err_kind(resp), ErrorKind::NotFound);
 }

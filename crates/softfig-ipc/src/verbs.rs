@@ -71,6 +71,20 @@ pub mod op {
     pub const PAIR_LIST: &str = "pair_list";
     /// M5a-4: remove a peer from the ring (unpair) by device-id fingerprint.
     pub const PAIR_REMOVE: &str = "pair_remove";
+    /// Slice 2 (small-files): append a brand-new heading-addressed section
+    /// to the end of any markdown doc. The heading must not already exist;
+    /// commit `section_added`.
+    pub const ADD_SECTION: &str = "add_section";
+    /// Slice 2 (small-files): replace the body of an existing
+    /// heading-addressed section, keeping the heading line. The heading must
+    /// exist and be unique; commit `section_edited`.
+    pub const EDIT_SECTION: &str = "edit_section";
+    /// Slice 2 (small-files): append text to the end of an existing
+    /// section's body (the "add a row/bullet" op); commit `section_appended`.
+    pub const APPEND_TO_SECTION: &str = "append_to_section";
+    /// Slice 2 (small-files): rewrite a doc's `Last reviewed:` line to today.
+    /// Zero content tokens — just a path; commit `reviewed_stamped`.
+    pub const SET_REVIEWED: &str = "set_reviewed";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -372,6 +386,67 @@ pub struct ReviseNoteArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviseNoteReply {
+    pub path: String,
+    pub hash: String,
+}
+
+// ---- Slice 2 (small-files): universal section editing ------------------
+
+/// `add_section({path, heading, body}) -> {path, hash}`. Append a brand-new
+/// section to the end of `path`. `heading` is the section's heading text
+/// (matched case-sensitively, level-agnostically); include leading `#`s to
+/// choose the level (defaults to `##`). Errors: heading already present
+/// (`PathAlreadyExists`), target whole-file-sealed or containing an inline
+/// `<vault>` region (`VaultProtected`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddSectionArgs {
+    /// Garden-relative path of the markdown doc.
+    pub path: String,
+    /// Heading text. Leading `#`s set the level (`## Foo` → level 2); bare
+    /// text defaults to `##`.
+    pub heading: String,
+    /// Markdown body written below the daemon-stamped heading line.
+    pub body: String,
+}
+
+/// `edit_section({path, heading, body}) -> {path, hash}`. Replace the body
+/// of an existing section, keeping its heading line. `heading` matches by
+/// text (level-agnostic); the match must be unique. Errors: no such heading
+/// (`NotFound`), ambiguous heading (`BadArgs`), vault target
+/// (`VaultProtected`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditSectionArgs {
+    pub path: String,
+    pub heading: String,
+    pub body: String,
+}
+
+/// `append_to_section({path, heading, text}) -> {path, hash}`. Add `text`
+/// after the last content line of an existing section (before the next
+/// heading) — the "add a row/bullet" op. Same matching + error contract as
+/// `edit_section`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendToSectionArgs {
+    pub path: String,
+    pub heading: String,
+    /// The new content to append (one or more lines, e.g. a list row).
+    pub text: String,
+}
+
+/// `set_reviewed({path}) -> {path, hash}`. Rewrite the doc's `Last
+/// reviewed:` line (optionally `> `-quoted) to today's date. Errors: no
+/// such line (`NotFound`), vault target (`VaultProtected`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetReviewedArgs {
+    pub path: String,
+}
+
+/// Shared reply for the Slice 2 doc-editing verbs (`add_section`,
+/// `edit_section`, `append_to_section`, `set_reviewed`): the daemon owns
+/// every mechanical field, so the caller only learns where it landed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocEditReply {
+    /// Garden-relative path the daemon rewrote.
     pub path: String,
     pub hash: String,
 }

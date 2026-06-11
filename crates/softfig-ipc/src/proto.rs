@@ -132,6 +132,11 @@ pub enum ErrorKind {
     /// the requested fingerprint. Distinct from `NotFound` (peer endpoint not
     /// known) and `BadArgs` (malformed fingerprint).
     PairFailed,
+    /// Slice 2 (small-files): a section / `set_reviewed` op targeted a file
+    /// that is whole-file-sealed or contains an inline `<vault id=…>`
+    /// region. Those go through the vault-aware path; the daemon refuses so
+    /// a plaintext rewrite can never clobber ciphertext.
+    VaultProtected,
     /// Unknown / unhandled internal error.
     Internal,
 }
