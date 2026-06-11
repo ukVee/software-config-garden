@@ -5,7 +5,7 @@
 //!
 //! All gardens are M1c-compat (no `state_root` → no FUSE), so the suite
 //! runs without `/dev/fuse`. Files reach the committed tip via
-//! `propose_doc_update` (which commits through the same `BlobEncryptor`
+//! `replace_file` (which commits through the same `BlobEncryptor`
 //! hook the watcher/FUSE writes use), so sealing + inline-region
 //! encryption happen exactly as in production.
 
@@ -98,16 +98,12 @@ impl Fixture {
         send(&self.socket, &Request::new(op_name, args))
     }
 
-    /// Commit one file into the tip via `propose_doc_update` (goes through
+    /// Commit one file into the tip via `replace_file` (goes through
     /// the same BlobEncryptor hook as real writes).
     fn write_file(&self, path: &str, content: &str) {
         let resp = self.call(
-            op::PROPOSE_DOC_UPDATE,
-            serde_json::json!({
-                "summary": "test fixture",
-                "project": "test",
-                "files": [{ "path": path, "content": content }],
-            }),
+            op::REPLACE_FILE,
+            serde_json::json!({ "path": path, "content": content }),
         );
         assert!(matches!(resp, Response::Ok { .. }), "write {path}: {resp:?}");
     }

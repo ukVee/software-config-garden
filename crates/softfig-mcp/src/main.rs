@@ -1,8 +1,8 @@
 //! softfig-mcp — stateless stdio bridge translating MCP JSON-RPC tool
 //! calls into IPC requests against a running `softfig-keeperd`.
 //!
-//! Spawned per Claude Code session. One method exposed for v1:
-//! `propose_doc_update(summary, files, project)`.
+//! Spawned per Claude Code session. Exposes the typed garden-write verbs
+//! plus the `replace_file` break-glass escape hatch.
 //!
 //! MCP wire shape (subset of JSON-RPC 2.0): one request per stdin line,
 //! one response per stdout line. We implement the minimum the Claude
@@ -17,8 +17,8 @@ use softfig_ipc::{
     self,
     verbs::{
         op, AddNoteArgs, AddProjectArgs, AddSectionArgs, AppendToSectionArgs, ArchiveArgs,
-        EditSectionArgs, LogDecisionArgs, LogIncidentArgs, ProposeDocUpdateArgs,
-        RefreshSnapshotArgs, ReviseNoteArgs, SetReviewedArgs,
+        EditSectionArgs, LogDecisionArgs, LogIncidentArgs, RefreshSnapshotArgs,
+        ReplaceFileArgs, ReviseNoteArgs, SetReviewedArgs,
     },
     Request, Response,
 };
@@ -124,34 +124,6 @@ fn handle_line(line: &str) -> Value {
 fn tool_defs() -> Vec<Value> {
     vec![
         json!({
-            "name": "propose_doc_update",
-            "description": "Free-form escape hatch: propose a documentation update inside \
-                            the soft-fig garden. The keeper daemon writes the verbatim files \
-                            and creates a memory_edit commit. Prefer the typed verbs \
-                            (log_decision, log_incident, archive, add_project, \
-                            refresh_snapshot) when one fits — they stamp garden conventions \
-                            for you.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["summary", "files", "project"],
-                "properties": {
-                    "summary": { "type": "string" },
-                    "project": { "type": "string" },
-                    "files": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["path", "content"],
-                            "properties": {
-                                "path": { "type": "string" },
-                                "content": { "type": "string" },
-                            },
-                        },
-                    },
-                },
-            },
-        }),
-        json!({
             "name": "log_decision",
             "description": "Record a garden decision. The keeper daemon writes \
                             journal/decisions/decision-<slug>.md with a stamped \
@@ -190,7 +162,7 @@ fn tool_defs() -> Vec<Value> {
                             folder's hidden .seq counter, writes dir/NNN-slug.md, and stamps the \
                             '# <title>' header + '> Last reviewed:' line — you supply only dir, \
                             slug, and body (title defaults to slug). Prefer this over \
-                            propose_doc_update for adding a note: it costs you only the new \
+                            replace_file for adding a note: it costs you only the new \
                             content, never the whole file.",
             "inputSchema": {
                 "type": "object",
@@ -226,7 +198,7 @@ fn tool_defs() -> Vec<Value> {
                             You emit only the new body — never the rest of the file. Address the \
                             section by its heading text (case-sensitive, level-agnostic): 'Cross-refs' \
                             or '## Cross-refs' both match; the match must be unique. Refused on \
-                            vault-sealed targets. Prefer this over propose_doc_update for editing one \
+                            vault-sealed targets. Prefer this over replace_file for editing one \
                             section.",
             "inputSchema": {
                 "type": "object",
@@ -326,6 +298,27 @@ fn tool_defs() -> Vec<Value> {
                 },
             },
         }),
+        json!({
+            "name": "replace_file",
+            "description": "BREAK-GLASS: overwrite a garden file with verbatim bytes — no \
+                            convention stamping, so you hand-write the ENTIRE file (frontmatter, \
+                            dates, headers, and all). Expensive and discouraged. Prefer the \
+                            structural verbs, which stamp conventions and cost you only the new \
+                            content: add_note/revise_note (notes), \
+                            add_section/edit_section/append_to_section (any markdown doc), \
+                            set_reviewed (date bumps), log_decision/log_incident/archive/\
+                            add_project/refresh_snapshot (their kinds). Reach for replace_file \
+                            only when no structural verb fits — e.g. creating or rewriting a \
+                            monolithic CLAUDE.md/instructions.md/refs.md. Commits memory_edit.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative path to overwrite" },
+                    "content": { "type": "string", "description": "verbatim file bytes (you write the whole file)" },
+                },
+            },
+        }),
     ]
 }
 
@@ -334,9 +327,9 @@ fn tool_defs() -> Vec<Value> {
 /// rejects malformed arguments before we ever open the socket.
 fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
     let pair = match name {
-        "propose_doc_update" => {
-            let a: ProposeDocUpdateArgs = serde_json::from_value(args)?;
-            (op::PROPOSE_DOC_UPDATE, serde_json::to_value(a)?)
+        "replace_file" => {
+            let a: ReplaceFileArgs = serde_json::from_value(args)?;
+            (op::REPLACE_FILE, serde_json::to_value(a)?)
         }
         "log_decision" => {
             let a: LogDecisionArgs = serde_json::from_value(args)?;
@@ -388,7 +381,7 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
 }
 
 /// Render a one-line human summary of a verb's success `data`. Handles
-/// every reply shape in the six-tool surface (path / from+to / files).
+/// every reply shape in the tool surface (path / from+to).
 fn summarize(name: &str, data: &Value) -> String {
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
@@ -396,9 +389,6 @@ fn summarize(name: &str, data: &Value) -> String {
         data.get("to").and_then(|v| v.as_str()),
     ) {
         return format!("{name}: {from} -> {to}; commit {hash}");
-    }
-    if let Some(n) = data.get("files_written").and_then(|v| v.as_u64()) {
-        return format!("{name}: wrote {n} file(s); commit {hash}");
     }
     if let Some(p) = data.get("path").and_then(|v| v.as_str()) {
         return format!("{name}: wrote {p}; commit {hash}");
@@ -439,7 +429,7 @@ mod tests {
         assert_eq!(defs.len(), 12);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
-            "propose_doc_update",
+            "replace_file",
             "log_decision",
             "log_incident",
             "add_note",
@@ -510,9 +500,9 @@ mod tests {
                 op::REFRESH_SNAPSHOT,
             ),
             (
-                "propose_doc_update",
-                json!({ "summary": "s", "files": [{ "path": "p", "content": "c" }], "project": "x" }),
-                op::PROPOSE_DOC_UPDATE,
+                "replace_file",
+                json!({ "path": "p", "content": "c" }),
+                op::REPLACE_FILE,
             ),
         ];
         for (name, args, want) in cases {
@@ -532,9 +522,6 @@ mod tests {
             .contains("wrote p"));
         assert!(summarize("archive", &json!({ "from": "a", "to": "b", "hash": "h" }))
             .contains("a -> b"));
-        assert!(
-            summarize("propose_doc_update", &json!({ "files_written": 2, "hash": "h" }))
-                .contains("2 file(s)")
-        );
+        assert!(summarize("replace_file", &json!({ "path": "p", "hash": "h" })).contains("wrote p"));
     }
 }

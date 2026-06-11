@@ -77,8 +77,8 @@ mod tests {
             Command::Action(ActionKind::LogDecision)
         );
         assert_eq!(
-            parse_command("propose"),
-            Command::Action(ActionKind::ProposeDocUpdate)
+            parse_command("replace"),
+            Command::Action(ActionKind::ReplaceFile)
         );
     }
 

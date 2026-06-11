@@ -1,5 +1,5 @@
 //! End-to-end coverage for M1c: spin up a daemon in a tempdir on a
-//! tempfile socket, drive unlock → commit → log → fsck → propose →
+//! tempfile socket, drive unlock → commit → log → fsck → replace_file →
 //! shutdown. Uses minimum-cost Argon2 so the suite stays under a
 //! second per the project's test-perf convention.
 
@@ -12,8 +12,8 @@ use softfig_vcs::Repo;
 use softfig_ipc::{
     self,
     verbs::{
-        op, CommitArgs, CommitReply, DocFile, FsckReply, LogReply,
-        ProposeDocUpdateArgs, ProposeDocUpdateReply, StatusReply, UnlockArgs,
+        op, CommitArgs, CommitReply, FsckReply, LogReply,
+        ReplaceFileArgs, ReplaceFileReply, StatusReply, UnlockArgs,
     },
     ErrorKind, Request, Response,
 };
@@ -158,22 +158,18 @@ fn full_lifecycle() {
     assert!(f.problems.is_empty(), "fsck reported problems: {:?}", f.problems);
     assert_eq!(f.commits_checked, 2);
 
-    // propose_doc_update writes the file and creates a memory_edit commit
-    let req = ProposeDocUpdateArgs {
-        summary: "doc update via mcp".into(),
-        files: vec![DocFile {
-            path: "notes/added.md".into(),
-            content: "new note from claude\n".into(),
-        }],
-        project: "test".into(),
+    // replace_file writes the file and creates a memory_edit commit
+    let req = ReplaceFileArgs {
+        path: "notes/added.md".into(),
+        content: "new note from claude\n".into(),
     };
-    let reply: ProposeDocUpdateReply = serde_json::from_value(unwrap_ok(rpc(
+    let reply: ReplaceFileReply = serde_json::from_value(unwrap_ok(rpc(
         &socket,
-        op::PROPOSE_DOC_UPDATE,
+        op::REPLACE_FILE,
         serde_json::to_value(req).unwrap(),
     )))
     .unwrap();
-    assert_eq!(reply.files_written, 1);
+    assert_eq!(reply.path, "notes/added.md");
     let written = garden.join("notes/added.md");
     assert!(written.exists());
     assert_eq!(fs::read_to_string(&written).unwrap(), "new note from claude\n");
@@ -195,7 +191,7 @@ fn full_lifecycle() {
 }
 
 #[test]
-fn rejects_traversal_in_propose_paths() {
+fn rejects_traversal_in_replace_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let garden = tmp.path();
     let (_v, session, _r) =
@@ -227,17 +223,13 @@ fn rejects_traversal_in_propose_paths() {
     );
 
     for bad in ["../escape.md", "/etc/passwd", "a/../../b.md"] {
-        let req = ProposeDocUpdateArgs {
-            summary: "bad".into(),
-            files: vec![DocFile {
-                path: bad.into(),
-                content: "x".into(),
-            }],
-            project: "t".into(),
+        let req = ReplaceFileArgs {
+            path: bad.into(),
+            content: "x".into(),
         };
         let r = rpc(
             &socket,
-            op::PROPOSE_DOC_UPDATE,
+            op::REPLACE_FILE,
             serde_json::to_value(req).unwrap(),
         );
         match r {

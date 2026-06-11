@@ -154,7 +154,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::LOG => handlers::log(daemon, req.args),
         op::SHOW => handlers::show(daemon, req.args),
         op::FSCK => handlers::fsck(daemon, req.args),
-        op::PROPOSE_DOC_UPDATE => handlers::propose_doc_update(daemon, req.args),
+        op::REPLACE_FILE => handlers::replace_file(daemon, req.args),
         op::MIGRATE_FINALIZE => handlers::migrate_finalize(daemon, req.args),
         op::VAULT_REVEAL => handlers::vault_reveal(daemon, req.args),
         op::VAULT_SEAL => handlers::vault_seal(daemon, req.args),

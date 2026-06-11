@@ -18,7 +18,7 @@ pub enum ActionKind {
     Archive,
     AddProject,
     RefreshSnapshot,
-    ProposeDocUpdate,
+    ReplaceFile,
     VaultSeal,
     VaultUnseal,
 }
@@ -30,7 +30,7 @@ impl ActionKind {
         ActionKind::Archive,
         ActionKind::AddProject,
         ActionKind::RefreshSnapshot,
-        ActionKind::ProposeDocUpdate,
+        ActionKind::ReplaceFile,
         ActionKind::VaultSeal,
         ActionKind::VaultUnseal,
     ];
@@ -43,7 +43,7 @@ impl ActionKind {
             ActionKind::Archive => "archive",
             ActionKind::AddProject => "add_project",
             ActionKind::RefreshSnapshot => "refresh_snapshot",
-            ActionKind::ProposeDocUpdate => "propose",
+            ActionKind::ReplaceFile => "replace",
             ActionKind::VaultSeal => "seal",
             ActionKind::VaultUnseal => "unseal",
         }
@@ -56,7 +56,7 @@ impl ActionKind {
             ActionKind::Archive => "archive",
             ActionKind::AddProject => "add_project",
             ActionKind::RefreshSnapshot => "refresh_snapshot",
-            ActionKind::ProposeDocUpdate => "propose_doc_update",
+            ActionKind::ReplaceFile => "replace_file",
             ActionKind::VaultSeal => "vault_seal",
             ActionKind::VaultUnseal => "vault_unseal",
         }
@@ -140,10 +140,8 @@ impl ActionForm {
                 Field::line("path (under snapshots/)", false),
                 Field::body("content"),
             ],
-            ActionKind::ProposeDocUpdate => vec![
+            ActionKind::ReplaceFile => vec![
                 Field::line("path", false),
-                Field::line("summary", false),
-                Field::line("project", false),
                 Field::body("content"),
             ],
             ActionKind::VaultSeal => vec![Field::line("glob pattern (e.g. secrets/**)", false)],
@@ -276,29 +274,14 @@ impl ActionForm {
                 let content = self.val(1);
                 Ok((op::REFRESH_SNAPSHOT, json!({ "path": path, "content": content })))
             }
-            ActionKind::ProposeDocUpdate => {
+            ActionKind::ReplaceFile => {
                 let path = self.val(0);
                 let path = path.trim();
                 if path.is_empty() {
                     return Err("path must not be empty".into());
                 }
-                let summary = self.val(1);
-                if summary.trim().is_empty() {
-                    return Err("summary must not be empty".into());
-                }
-                let project = self.val(2);
-                if project.trim().is_empty() {
-                    return Err("project must not be empty".into());
-                }
-                let content = self.val(3);
-                Ok((
-                    op::PROPOSE_DOC_UPDATE,
-                    json!({
-                        "summary": summary.trim(),
-                        "project": project.trim(),
-                        "files": [{ "path": path, "content": content }],
-                    }),
-                ))
+                let content = self.val(1);
+                Ok((op::REPLACE_FILE, json!({ "path": path, "content": content })))
             }
             ActionKind::VaultSeal => {
                 let pattern = self.val(0);

@@ -11,10 +11,10 @@ use base64::Engine as _;
 use softfig_vcs::{fsck as run_fsck, log_collect, Intent, Repo};
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
-    CommitArgs, CommitReply, DocFile, FsckReply, LogArgs, LogEntry, LogReply,
+    CommitArgs, CommitReply, FsckReply, LogArgs, LogEntry, LogReply,
     MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
-    PairRemoveReply, PendingPairing, ProposeDocUpdateArgs, ProposeDocUpdateReply,
+    PairRemoveReply, PendingPairing, ReplaceFileArgs, ReplaceFileReply,
     ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
     UnlockReply, VaultListSealedReply, VaultRevealArgs, VaultRevealReply,
     VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
@@ -298,51 +298,29 @@ pub fn fsck(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
     Ok(serde_json::to_value(reply).unwrap())
 }
 
-pub fn propose_doc_update(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
-    let args: ProposeDocUpdateArgs = serde_json::from_value(args)
-        .map_err(|e| (ErrorKind::BadArgs, format!("propose_doc_update args: {e}")))?;
-
-    if args.files.is_empty() {
-        return Err((ErrorKind::BadArgs, "files must be non-empty".into()));
-    }
+/// Break-glass verbatim file write — the narrowed/renamed
+/// `propose_doc_update`. Writes one file with no convention stamping and
+/// commits `memory_edit`. Callers should prefer the structural verbs.
+pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: ReplaceFileArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("replace_file args: {e}")))?;
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let garden_root = inner.config.garden_root.clone();
 
-    // Validate every path BEFORE writing any so a bad input doesn't
-    // leave a half-applied state.
-    let resolved: Vec<(PathBuf, String, &DocFile)> = args
-        .files
-        .iter()
-        .map(|f| {
-            let resolved = validate_repo_path(&garden_root, &f.path)
-                .map_err(|m| (ErrorKind::BadArgs, m))?;
-            Ok::<_, (ErrorKind, String)>((resolved, f.path.clone(), f))
-        })
-        .collect::<std::result::Result<_, _>>()?;
+    let abs = validate_repo_path(&garden_root, &args.path).map_err(|m| (ErrorKind::BadArgs, m))?;
 
-    // Mark every target path in the suppress map BEFORE any IO so the
+    // Mark the target path in the suppress map BEFORE any IO so the
     // watcher (running in parallel) drops the events.
-    for (abs, _, _) in &resolved {
-        daemon.mark_self_write(abs.clone());
-    }
+    daemon.mark_self_write(abs.clone());
 
-    let mut written = 0usize;
-    for (abs, _, doc) in &resolved {
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| (ErrorKind::Io, e.to_string()))?;
-        }
-        std::fs::write(abs, &doc.content).map_err(|e| (ErrorKind::Io, e.to_string()))?;
-        written += 1;
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| (ErrorKind::Io, e.to_string()))?;
     }
+    std::fs::write(&abs, &args.content).map_err(|e| (ErrorKind::Io, e.to_string()))?;
 
-    // Build memory_edit payload: { summary, files: [paths], project }.
-    let payload = serde_json::json!({
-        "summary": args.summary,
-        "files": resolved.iter().map(|(_, rel, _)| rel.clone()).collect::<Vec<_>>(),
-        "project": args.project,
-    });
+    let payload = serde_json::json!({ "path": args.path });
     let intent =
         Intent::new("memory_edit", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
 
@@ -355,9 +333,9 @@ pub fn propose_doc_update(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         .commit_workdir(session, intent)
         .map_err(|e| err_to_response(e.into()))?;
 
-    Ok(serde_json::to_value(ProposeDocUpdateReply {
+    Ok(serde_json::to_value(ReplaceFileReply {
+        path: args.path,
         hash: hash.to_string(),
-        files_written: written,
     })
     .unwrap())
 }

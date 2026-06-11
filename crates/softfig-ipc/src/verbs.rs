@@ -14,7 +14,11 @@ pub mod op {
     pub const LOG: &str = "log";
     pub const SHOW: &str = "show";
     pub const FSCK: &str = "fsck";
-    pub const PROPOSE_DOC_UPDATE: &str = "propose_doc_update";
+    /// Break-glass: overwrite a single garden file with verbatim bytes (no
+    /// convention stamping) and commit `memory_edit`. The narrowed/renamed
+    /// `propose_doc_update`; callers should prefer the structural verbs
+    /// (`add_note`, `*_section`, `log_*`, …) that stamp conventions.
+    pub const REPLACE_FILE: &str = "replace_file";
     pub const MIGRATE_FINALIZE: &str = "migrate_finalize";
     pub const SHUTDOWN: &str = "shutdown";
     /// M2b: write plaintext of a sealed file to `$XDG_RUNTIME_DIR` and
@@ -185,17 +189,12 @@ pub struct FsckReply {
     pub problems: Vec<String>,
 }
 
+/// `replace_file({path, content}) -> {path, hash}`. **Break-glass.** Writes
+/// `content` to `path` verbatim — no convention stamping, you hand-write the
+/// whole file (frontmatter and all). Discouraged in favor of the structural
+/// verbs; commit `memory_edit`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProposeDocUpdateArgs {
-    pub summary: String,
-    pub files: Vec<DocFile>,
-    /// Slug or name of the originating project; recorded in the commit
-    /// payload for traceability.
-    pub project: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocFile {
+pub struct ReplaceFileArgs {
     /// Garden-relative path. Validated server-side: must lie inside the
     /// garden root and not traverse `..`.
     pub path: String,
@@ -203,9 +202,10 @@ pub struct DocFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProposeDocUpdateReply {
+pub struct ReplaceFileReply {
+    /// Garden-relative path the daemon wrote.
+    pub path: String,
     pub hash: String,
-    pub files_written: usize,
 }
 
 /// Daemon-orchestrated phase 3 of `softfig migrate`. Empty args; the
