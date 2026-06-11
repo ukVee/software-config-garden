@@ -376,7 +376,7 @@ fn is_allowed(allow: &[bool], byte_offset: usize) -> bool {
 
 // --- per-format byte masks ----------------------------------------------
 
-fn compute_markdown_mask(content: &[u8]) -> Vec<bool> {
+pub(crate) fn compute_markdown_mask(content: &[u8]) -> Vec<bool> {
     let mut out = vec![false; content.len()];
     let mut in_fence = false;
     let mut line_start = 0usize;

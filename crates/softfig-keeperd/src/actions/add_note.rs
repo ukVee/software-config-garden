@@ -84,6 +84,9 @@ pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // Slice 4: refresh this folder's index table in the parent CLAUDE.md,
     // folded into the same commit (best-effort — never blocks the note).
     super::index::refresh_folder_index(daemon, &inner, &garden_root, &dir_rel);
+    // Slice 5: a new note may carry `[[…]]` refs and may itself satisfy a
+    // previously-dangling ref, so recompute the backlink graph.
+    super::backlinks::refresh_all(daemon, &inner, &garden_root);
 
     let payload = serde_json::json!({ "dir": dir_rel, "slug": args.slug, "number": number });
     let intent =
@@ -141,6 +144,10 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // Slice 4: re-stamping the reviewed date changes the index's Reviewed
     // column, so refresh the folder's table in the parent CLAUDE.md too.
     super::index::refresh_folder_index(daemon, &inner, &garden_root, &dir_rel);
+    // Slice 5: revising the body rewrites it from the note template (dropping
+    // any prior backlinks region) and may add/remove `[[…]]` refs — recompute
+    // so the region is restored and edges stay accurate.
+    super::backlinks::refresh_all(daemon, &inner, &garden_root);
 
     let payload = serde_json::json!({ "dir": dir_rel, "id": args.id });
     let intent =

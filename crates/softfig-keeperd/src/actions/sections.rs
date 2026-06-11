@@ -132,27 +132,24 @@ fn resolve(
     Ok((abs, rel))
 }
 
-/// Whether a plaintext rewrite of `rel` would risk clobbering ciphertext:
-/// the file is whole-file-sealed, carries an inline `<vault>` region, or its
-/// tags are malformed. Used by best-effort managed-region maintenance
-/// (slice 4/5 index + backlinks) to skip protected hosts. An unreadable /
-/// locked / non-UTF-8 host also reads as "protected" (skip) since the
-/// region machinery is text-only and must never guess.
-pub(crate) fn is_vault_protected(inner: &DaemonInner, abs: &Path, rel: &str) -> bool {
+/// Read `rel`'s working-tree bytes as plaintext **iff** a plaintext rewrite
+/// is safe — the file isn't whole-file-sealed and carries no inline
+/// `<vault>` region (malformed tags count as unsafe). Returns `None` for a
+/// protected, unreadable, or non-UTF-8 file. The read-once primitive behind
+/// best-effort managed-region maintenance (slice 4 index + slice 5
+/// backlinks), which must never clobber ciphertext or guess.
+pub(crate) fn read_if_unprotected(inner: &DaemonInner, abs: &Path, rel: &str) -> Option<String> {
     if inner.layer_b.snapshot().is_sealed(rel) {
-        return true;
+        return None;
     }
-    let Ok(bytes) = std::fs::read(abs) else {
-        return true;
-    };
-    let Some(session) = inner.session.as_ref() else {
-        return true;
-    };
+    let bytes = std::fs::read(abs).ok()?;
+    let session = inner.session.as_ref()?;
     let parser = crate::layer_b::regions::parser_for(rel);
     match crate::layer_b::regions::parse(parser, &bytes, session, rel) {
-        Ok(spans) => !spans.is_empty(),
-        Err(_) => true,
+        Ok(spans) if spans.is_empty() => {}
+        _ => return None, // inline region present, or malformed → don't touch
     }
+    String::from_utf8(bytes).ok()
 }
 
 /// Read the working-tree bytes of `rel` as plaintext, refusing any vault
@@ -204,6 +201,10 @@ fn write_and_commit(
 ) -> HandlerResult {
     daemon.mark_self_write(abs.to_path_buf());
     write_file(abs, new_content.as_bytes())?;
+    // Slice 5: a section edit can add/remove `[[…]]` refs in any doc, so
+    // recompute the backlink graph before committing (best-effort).
+    let garden_root = inner.config.garden_root.clone();
+    super::backlinks::refresh_all(daemon, inner, &garden_root);
     let (_level, heading_text) = edit::parse_heading_arg(heading_arg);
     let payload = serde_json::json!({ "path": rel, "heading": heading_text });
     let intent = Intent::new(intent_name, payload)

@@ -70,14 +70,10 @@ pub fn refresh_folder_index(
     let folder_name = Path::new(folder_rel).file_name()?.to_str()?;
     let host_rel = host_rel(folder_rel)?;
     let host_abs = garden_root.join(&host_rel);
-    if !host_abs.is_file() {
-        return None; // best-effort: never fabricate a routing doc
-    }
-    // Never let a plaintext rewrite clobber ciphertext.
-    if super::sections::is_vault_protected(inner, &host_abs, &host_rel) {
-        return None;
-    }
-    let content = std::fs::read_to_string(&host_abs).ok()?;
+    // Read the host CLAUDE.md only if it exists and is safe to rewrite (not
+    // vault-protected). A missing host yields `None` — index maintenance
+    // never fabricates a routing doc nor clobbers ciphertext.
+    let content = super::sections::read_if_unprotected(inner, &host_abs, &host_rel)?;
 
     let rows = collect_rows(&garden_root.join(folder_rel));
     let tag = region_tag(folder_name);

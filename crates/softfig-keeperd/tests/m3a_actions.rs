@@ -916,3 +916,103 @@ fn add_note_without_host_claude_md_still_succeeds() {
     assert_eq!(reply.path, "storage/notes/001-luks.md");
     assert!(!fx.garden.join("storage/CLAUDE.md").exists());
 }
+
+// ---- auto backlinks (Slice 5) -----------------------------------------
+
+/// A `[[NNN-slug]]` sibling ref in one note grows a backlinks region in the
+/// referenced note (listing the referrer's garden-relative path).
+#[test]
+fn add_note_sibling_ref_creates_backlink() {
+    let fx = Fixture::start();
+    write_doc(&fx, "services/waydroid/CLAUDE.md", "# services/waydroid/\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "base", "title": "Base", "body": "the base" }),
+    );
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "services/waydroid/notes", "slug": "uses", "title": "Uses", "body": "builds on [[001-base]]." }),
+    );
+
+    let base =
+        std::fs::read_to_string(fx.garden.join("services/waydroid/notes/001-base.md")).unwrap();
+    assert!(base.contains("<!-- softfig:backlinks -->"), "{base}");
+    assert!(base.contains("- `services/waydroid/notes/002-uses.md`"), "{base}");
+    // The referencing note keeps its `[[…]]` body verbatim.
+    let uses =
+        std::fs::read_to_string(fx.garden.join("services/waydroid/notes/002-uses.md")).unwrap();
+    assert!(uses.contains("builds on [[001-base]]."));
+}
+
+/// A `[[path]]` ref authored in a non-accretive doc resolves once the target
+/// is created — the previously-dangling edge lights up on `add_note`.
+#[test]
+fn path_ref_backlink_appears_when_target_added() {
+    let fx = Fixture::start();
+    write_doc(
+        &fx,
+        "storage/CLAUDE.md",
+        "# storage/\n\nsee [[storage/notes/001-luks.md]] for the setup.\n",
+    );
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "storage/notes", "slug": "luks", "title": "LUKS", "body": "disk crypto" }),
+    );
+    let note = std::fs::read_to_string(fx.garden.join("storage/notes/001-luks.md")).unwrap();
+    assert!(note.contains("- `storage/CLAUDE.md`"), "{note}");
+}
+
+/// Revising a note to drop its only `[[…]]` ref removes the now-stale
+/// backlinks region from the former target.
+#[test]
+fn revise_note_dropping_ref_removes_backlink() {
+    let fx = Fixture::start();
+    write_doc(&fx, "input/CLAUDE.md", "# input/\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "input/notes", "slug": "base", "title": "Base", "body": "b" }),
+    );
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "input/notes", "slug": "uses", "title": "Uses", "body": "see [[001-base]]" }),
+    );
+    assert!(std::fs::read_to_string(fx.garden.join("input/notes/001-base.md"))
+        .unwrap()
+        .contains("softfig:backlinks"));
+
+    fx.call(
+        op::REVISE_NOTE,
+        serde_json::json!({ "dir": "input/notes", "id": 2, "body": "no more refs" }),
+    );
+    let base = std::fs::read_to_string(fx.garden.join("input/notes/001-base.md")).unwrap();
+    assert!(!base.contains("softfig:backlinks"), "stale region remained: {base}");
+}
+
+/// Archiving a referenced note repoints inbound `[[…]]` refs at the archived
+/// location so they don't dangle.
+#[test]
+fn archive_repoints_inbound_refs() {
+    let fx = Fixture::start();
+    write_doc(&fx, "audio/CLAUDE.md", "# audio/\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "audio/notes", "slug": "base", "title": "Base", "body": "b" }),
+    );
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "audio/notes", "slug": "uses", "title": "Uses", "body": "see [[001-base]]" }),
+    );
+
+    let resp = fx.call(
+        op::ARCHIVE,
+        serde_json::json!({ "src": "audio/notes/001-base.md", "archive_name": "base" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "archive: {resp:?}");
+
+    let uses = std::fs::read_to_string(fx.garden.join("audio/notes/002-uses.md")).unwrap();
+    assert!(
+        uses.contains("[[journal/archive/base/001-base.md]]"),
+        "ref not repointed: {uses}"
+    );
+    assert!(!uses.contains("[[001-base]]"), "old ref remained: {uses}");
+}

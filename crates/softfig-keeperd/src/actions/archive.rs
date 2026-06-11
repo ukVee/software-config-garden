@@ -70,6 +70,11 @@ pub fn archive(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             }
         }
     }
+    // Slice 5: repoint inbound `[[…]]` references at the archived location so
+    // they don't dangle, then recompute the backlink graph (any doc can be a
+    // backlink target, so this runs for every archive, not just notes).
+    super::backlinks::rewrite_refs_to_archived(daemon, &inner, &garden_root, &src_rel, &dst_rel);
+    super::backlinks::refresh_all(daemon, &inner, &garden_root);
 
     let intent = Intent::new(
         "archive_move",

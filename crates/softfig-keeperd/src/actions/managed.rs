@@ -43,6 +43,11 @@ fn locate(lines: &[&str], tag: &str) -> Option<(usize, usize)> {
     Some((open_idx, close_idx))
 }
 
+/// Whether `content` already hosts a region tagged `tag`.
+pub fn has_region(content: &str, tag: &str) -> bool {
+    locate(&content.split('\n').collect::<Vec<_>>(), tag).is_some()
+}
+
 /// Insert or replace the region `tag` so its inner body is exactly `body`
 /// (which must not contain the marker lines and carries no surrounding
 /// newlines). Present → swap the inner lines, keeping the markers in place.
