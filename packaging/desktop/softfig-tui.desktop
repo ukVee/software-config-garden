@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=softfig-tui
+GenericName=soft-fig TUI
+Comment=Terminal UI for the soft-fig keeper daemon
+# softfig-tui is a ratatui app, so it must run inside a terminal. We launch
+# foot ourselves (Terminal=false) and tag the window app-id so a graphical
+# dock/taskbar can match the running window back to this entry.
+Exec=foot --app-id=softfig-tui softfig-tui
+Icon=utilities-terminal
+Terminal=false
+StartupWMClass=softfig-tui
+Categories=Utility;
+Keywords=softfig;keeper;garden;config;
