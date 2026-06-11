@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use softfig_core::Intent;
+use softfig_vcs::Intent;
 
 use crate::classify::{self, DirtySet};
 use crate::daemon::{Daemon, DaemonInner, SUPPRESS_WINDOW_MS};

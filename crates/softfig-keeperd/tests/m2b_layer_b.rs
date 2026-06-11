@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_ipc::{
     self,
     verbs::{
@@ -139,7 +139,7 @@ fn layer_b_seal_writes_layer_b_blob() {
     // and check the marker byte.
     let store_paths = softfig_store::StorePaths::for_garden(garden);
     let db = softfig_store::Db::open(&store_paths).unwrap();
-    let tip = db.try_get_ref(softfig_core::TIP_REF).unwrap().unwrap();
+    let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
     let row = db.get_commit(&tip).unwrap();
 
     let blob_hash = resolve_path(&db, &row.root_tree, &["secrets", "foo.toml"])
@@ -449,7 +449,7 @@ fn unseal_removes_glob_but_keeps_blobs_sealed() {
     // unseal does NOT bulk-decrypt (intentional, per the M2b lock).
     let store_paths = softfig_store::StorePaths::for_garden(garden);
     let db = softfig_store::Db::open(&store_paths).unwrap();
-    let tip = db.try_get_ref(softfig_core::TIP_REF).unwrap().unwrap();
+    let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
     let row = db.get_commit(&tip).unwrap();
     let blob_hash = resolve_path(&db, &row.root_tree, &["secrets", "foo.toml"])
         .expect("path in tip tree");
@@ -478,7 +478,7 @@ fn unseal_removes_glob_but_keeps_blobs_sealed() {
 
 #[test]
 fn layer_b_hook_routes_sealed_paths() {
-    use softfig_core::BlobEncryptor;
+    use softfig_vcs::BlobEncryptor;
     use softfig_fuse::SealedQuery;
     use softfig_keeperd::layer_b::{LayerBHook, SealedPaths};
     use softfig_vault::is_layer_b;

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 softfig-vault = { workspace = true }
-softfig-core = { workspace = true }
+softfig-vcs = { workspace = true }
 
 include_dir = { workspace = true }
 thiserror = { workspace = true }

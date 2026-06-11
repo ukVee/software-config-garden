@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use softfig_core::Intent;
+use softfig_vcs::Intent;
 use softfig_ipc::verbs::{ArchiveArgs, ArchiveReply};
 use softfig_ipc::ErrorKind;
 

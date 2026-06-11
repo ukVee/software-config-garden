@@ -186,7 +186,7 @@ A Cargo workspace (Rust 2024 edition, ≥ 1.85) of eleven crates:
 crates/
 ├── softfig-vault/     crypto + key lifecycle (init, unlock, encrypt, sign, rotate, recover)
 ├── softfig-store/     ciphertext object dir + SQLite metadata schema
-├── softfig-core/      VCS: garden walker, trees, signed commits, log, fsck
+├── softfig-vcs/      VCS: garden walker, trees, signed commits, log, fsck
 ├── softfig-ipc/       JSON-Lines protocol over a Unix socket
 ├── softfig-keeperd/   the daemon: watcher, FUSE mount, Layer B hooks, IPC handlers
 ├── softfig-mcp/       stateless stdio MCP bridge for Claude sessions

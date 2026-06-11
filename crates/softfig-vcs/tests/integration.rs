@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::Path;
 
-use softfig_core::{
+use softfig_vcs::{
     fsck, log_collect, verify_commit, CanonicalCommit, FsckReport, Intent, Repo,
 };
 use softfig_store::{Db, Hash, ObjectStore, StorePaths, TreeEntryKind};

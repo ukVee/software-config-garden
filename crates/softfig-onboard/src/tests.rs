@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_store::TreeEntryKind;
 use softfig_vault::params::{Argon2Params, VaultParams};
 

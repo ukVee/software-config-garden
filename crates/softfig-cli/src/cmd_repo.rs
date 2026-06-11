@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
-use softfig_core::{
+use softfig_vcs::{
     fsck as run_fsck, log_collect, FsckReport, Intent, Repo, KNOWN_INTENTS,
 };
 use softfig_ipc::verbs::{

@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use include_dir::{include_dir, Dir, DirEntry};
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_vault::params::VaultParams;
 use softfig_vault::Vault;
 
@@ -66,7 +66,7 @@ pub enum OnboardError {
     #[error(transparent)]
     Vault(#[from] softfig_vault::VaultError),
     #[error(transparent)]
-    Core(#[from] softfig_core::CoreError),
+    Core(#[from] softfig_vcs::CoreError),
 }
 
 pub type Result<T> = std::result::Result<T, OnboardError>;

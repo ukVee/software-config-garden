@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_ipc::verbs::{
     op, AddProjectArgs, AddProjectReply, ArchiveArgs, ArchiveReply, LogDecisionArgs,
     LogDecisionReply, LogIncidentArgs, LogIncidentReply, RefreshSnapshotArgs,

@@ -8,7 +8,7 @@
 //! * The matcher loads `<state_dir>/.softfig/vault/sealed-paths.toml`
 //!   (a Layer A file — never visible through FUSE) and applies union
 //!   glob semantics over the entries.
-//! * The hook is a [`softfig_core::BlobEncryptor`] installed on the
+//! * The hook is a [`softfig_vcs::BlobEncryptor`] installed on the
 //!   `Repo` at unlock time. For each file's path, it checks the matcher
 //!   and routes sealed paths through `VaultSession::encrypt_layer_b`;
 //!   the rest stay Layer A.
@@ -33,7 +33,7 @@ use std::sync::{Arc, RwLock};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
-use softfig_core::{BlobEncryptor, Intent, Repo};
+use softfig_vcs::{BlobEncryptor, Intent, Repo};
 use softfig_fuse::SealedQuery;
 use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::{is_layer_b, VaultSession};
@@ -247,7 +247,7 @@ impl BlobEncryptor for LayerBHook {
         path: &str,
         content: &[u8],
         session: &VaultSession,
-    ) -> softfig_core::Result<Vec<u8>> {
+    ) -> softfig_vcs::Result<Vec<u8>> {
         let sealed_snapshot = self.snapshot();
         if sealed_snapshot.is_sealed(path) {
             // Layer B whole-file path: derive per-file subkey, encrypt
@@ -258,7 +258,7 @@ impl BlobEncryptor for LayerBHook {
             // seal supersedes per-region encryption.
             let ct = session
                 .encrypt_layer_b(path, content)
-                .map_err(softfig_core::CoreError::Vault)?;
+                .map_err(softfig_vcs::CoreError::Vault)?;
             return Ok(ct);
         }
         // M2c — inline `<vault>` region path. Parse → on error, reject
@@ -269,7 +269,7 @@ impl BlobEncryptor for LayerBHook {
         let spans = match regions::parse(parser, content, session, path) {
             Ok(spans) => spans,
             Err(e) => {
-                return Err(softfig_core::CoreError::Io(std::io::Error::new(
+                return Err(softfig_vcs::CoreError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("malformed vault tag in {path}: {e}"),
                 )));
@@ -297,7 +297,7 @@ impl BlobEncryptor for LayerBHook {
             &prior_spans,
         )
         .map_err(|e: RegionParseError| {
-            softfig_core::CoreError::Io(std::io::Error::new(
+            softfig_vcs::CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("vault region rewrite for {path}: {e}"),
             ))
@@ -561,7 +561,7 @@ pub fn remove_glob(state_dir: &Path, glob: &str) -> Result<bool> {
 }
 
 /// Compose a `schema_change` intent for a sealed-paths.toml edit.
-pub fn schema_change_intent(decision_slug: &str, sub_kind: &str) -> softfig_core::Result<Intent> {
+pub fn schema_change_intent(decision_slug: &str, sub_kind: &str) -> softfig_vcs::Result<Intent> {
     Intent::new(
         "schema_change",
         serde_json::json!({
@@ -573,7 +573,7 @@ pub fn schema_change_intent(decision_slug: &str, sub_kind: &str) -> softfig_core
 }
 
 /// Compose a `vault_seal` intent for the auto-migration commit.
-pub fn vault_seal_intent(paths: &[String], reason: &str) -> softfig_core::Result<Intent> {
+pub fn vault_seal_intent(paths: &[String], reason: &str) -> softfig_vcs::Result<Intent> {
     Intent::new(
         "vault_seal",
         serde_json::json!({
@@ -594,7 +594,7 @@ pub fn vault_reveal_intent(
     actor: &str,
     timestamp_unix: i64,
     id: Option<&str>,
-) -> softfig_core::Result<Intent> {
+) -> softfig_vcs::Result<Intent> {
     let mut payload = serde_json::json!({
         "path": path,
         "actor": actor,

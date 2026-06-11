@@ -10,7 +10,7 @@ description = "soft-fig FUSE plaintext-view of the encrypted Layer A working tre
 [dependencies]
 softfig-vault.workspace = true
 softfig-store.workspace = true
-softfig-core.workspace = true
+softfig-vcs.workspace = true
 
 fuser.workspace = true
 lru.workspace = true

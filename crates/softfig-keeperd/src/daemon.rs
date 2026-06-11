@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_fuse::MountHandle;
 use softfig_vault::VaultSession;
 use thiserror::Error;
@@ -31,7 +31,7 @@ pub enum KeeperError {
     #[error("vault: {0}")]
     Vault(#[from] softfig_vault::VaultError),
     #[error("core: {0}")]
-    Core(#[from] softfig_core::CoreError),
+    Core(#[from] softfig_vcs::CoreError),
     #[error("store: {0}")]
     Store(#[from] softfig_store::StoreError),
     #[error("json: {0}")]

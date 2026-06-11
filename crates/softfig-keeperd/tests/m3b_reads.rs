@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_ipc::verbs::{op, ListTreeReply, ReadFileReply};
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};

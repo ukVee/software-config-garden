@@ -35,7 +35,7 @@ pub use refresh_snapshot::refresh_snapshot;
 
 use std::path::Path;
 
-use softfig_core::Intent;
+use softfig_vcs::Intent;
 use softfig_ipc::ErrorKind;
 use softfig_store::Hash;
 

@@ -1,7 +1,7 @@
 //! `log_decision` — write `journal/decisions/decision-<slug>.md` with a
 //! daemon-stamped header, commit `decision_logged`.
 
-use softfig_core::Intent;
+use softfig_vcs::Intent;
 use softfig_ipc::verbs::{LogDecisionArgs, LogDecisionReply};
 use softfig_ipc::ErrorKind;
 

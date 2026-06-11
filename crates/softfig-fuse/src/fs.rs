@@ -17,7 +17,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
 use softfig_vault::VaultSession;
 
@@ -77,7 +77,7 @@ impl SharedState {
     pub(crate) fn rotate_tip(&self) {
         let new_tip = {
             let db = self.db.lock().unwrap();
-            db.try_get_ref(softfig_core::TIP_REF).ok().flatten()
+            db.try_get_ref(softfig_vcs::TIP_REF).ok().flatten()
         };
         // M2c — drop the redacted-content cache on every tip change;
         // the new tip may have introduced/removed/re-encrypted vault
@@ -141,7 +141,7 @@ impl FuseMount {
         let db = Db::open(&paths)?;
         let objects = ObjectStore::new(paths.clone());
 
-        let tip = db.try_get_ref(softfig_core::TIP_REF)?;
+        let tip = db.try_get_ref(softfig_vcs::TIP_REF)?;
         let view = match tip {
             Some(h) => {
                 let row = db.get_commit(&h)?;

@@ -9,7 +9,7 @@
 //! Reads require Unlocked — decryption needs the session — but never
 //! write, never commit, and never touch the suppression map.
 
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
     ListTreeArgs, ListTreeReply, ReadFileArgs, ReadFileReply, TreeEntry,

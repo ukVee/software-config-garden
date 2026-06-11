@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use softfig_core::{fsck as run_fsck, log_collect, Intent, Repo};
+use softfig_vcs::{fsck as run_fsck, log_collect, Intent, Repo};
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
     CommitArgs, CommitReply, DocFile, FsckReply, LogArgs, LogEntry, LogReply,

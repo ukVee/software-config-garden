@@ -1,7 +1,7 @@
 //! `add_project` — atomically stamp the four reserved-name stubs under
 //! `projects/<name>/` and commit a single `project_added` (Pick G).
 
-use softfig_core::Intent;
+use softfig_vcs::Intent;
 use softfig_ipc::verbs::{AddProjectArgs, AddProjectReply};
 use softfig_ipc::ErrorKind;
 

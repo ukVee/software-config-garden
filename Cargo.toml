@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/softfig-vault",
     "crates/softfig-store",
-    "crates/softfig-core",
+    "crates/softfig-vcs",
     "crates/softfig-cli",
     "crates/softfig-ipc",
     "crates/softfig-keeperd",
@@ -25,7 +25,7 @@ repository = "https://github.com/ukVee/software-config-garden"
 [workspace.dependencies]
 softfig-vault   = { path = "crates/softfig-vault" }
 softfig-store   = { path = "crates/softfig-store" }
-softfig-core    = { path = "crates/softfig-core" }
+softfig-vcs    = { path = "crates/softfig-vcs" }
 softfig-ipc     = { path = "crates/softfig-ipc" }
 softfig-onboard = { path = "crates/softfig-onboard" }
 softfig-deploy  = { path = "crates/softfig-deploy" }

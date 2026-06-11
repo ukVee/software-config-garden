@@ -1,7 +1,7 @@
 //! `log_incident` — write `journal/incidents/incident-<date>-<slug>.md`
 //! with a daemon-stamped header, commit `incident_logged`.
 
-use softfig_core::Intent;
+use softfig_vcs::Intent;
 use softfig_ipc::verbs::{LogIncidentArgs, LogIncidentReply};
 use softfig_ipc::ErrorKind;
 

@@ -46,7 +46,7 @@ pub enum FuseError {
     #[error("vault: {0}")]
     Vault(#[from] softfig_vault::VaultError),
     #[error("core: {0}")]
-    Core(#[from] softfig_core::CoreError),
+    Core(#[from] softfig_vcs::CoreError),
     #[error("{0}")]
     Other(String),
 }

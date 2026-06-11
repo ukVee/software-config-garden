@@ -3,7 +3,7 @@
 //! daemon never executes user code). Unlike the create-style actions this
 //! overwrites: a refresh replaces the previous snapshot data.
 
-use softfig_core::Intent;
+use softfig_vcs::Intent;
 use softfig_ipc::verbs::{RefreshSnapshotArgs, RefreshSnapshotReply};
 use softfig_ipc::ErrorKind;
 

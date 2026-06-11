@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_ipc::{
     self,
     verbs::{

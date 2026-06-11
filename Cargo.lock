@@ -1801,32 +1801,13 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
- "softfig-core",
  "softfig-deploy",
  "softfig-ipc",
  "softfig-onboard",
  "softfig-store",
  "softfig-vault",
+ "softfig-vcs",
  "toml",
-]
-
-[[package]]
-name = "softfig-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "ed25519-dalek",
- "hex",
- "hostname",
- "serde",
- "serde_jcs",
- "serde_json",
- "softfig-store",
- "softfig-vault",
- "tempfile",
- "thiserror",
- "uuid",
- "walkdir",
 ]
 
 [[package]]
@@ -1846,9 +1827,9 @@ dependencies = [
  "fuser",
  "libc",
  "lru",
- "softfig-core",
  "softfig-store",
  "softfig-vault",
+ "softfig-vcs",
  "tempfile",
  "thiserror",
 ]
@@ -1880,12 +1861,12 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
- "softfig-core",
  "softfig-fuse",
  "softfig-ipc",
  "softfig-net",
  "softfig-store",
  "softfig-vault",
+ "softfig-vcs",
  "tempfile",
  "thiserror",
  "toml",
@@ -1928,9 +1909,9 @@ version = "0.1.0"
 dependencies = [
  "include_dir",
  "serde",
- "softfig-core",
  "softfig-store",
  "softfig-vault",
+ "softfig-vcs",
  "tempfile",
  "thiserror",
  "toml",
@@ -1983,6 +1964,25 @@ dependencies = [
  "toml",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "softfig-vcs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+ "hostname",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "softfig-store",
+ "softfig-vault",
+ "tempfile",
+ "thiserror",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

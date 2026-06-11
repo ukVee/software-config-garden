@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 softfig-vault.workspace = true
 softfig-store.workspace = true
-softfig-core.workspace = true
+softfig-vcs.workspace = true
 softfig-ipc.workspace = true
 softfig-fuse = { path = "../softfig-fuse" }
 softfig-net.workspace = true

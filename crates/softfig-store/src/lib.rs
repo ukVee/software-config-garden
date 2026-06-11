@@ -9,7 +9,7 @@
 //!   holding `meta`, `refs`, `commits`, `trees`, and `tree_entries`.
 //!
 //! Higher-level VCS semantics (walking the working tree, building trees,
-//! creating signed commits, fsck reachability checks) live in `softfig-core`
+//! creating signed commits, fsck reachability checks) live in `softfig-vcs`
 //! on top of this crate.
 
 #![forbid(unsafe_code)]

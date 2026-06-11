@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
-use softfig_core::Repo;
+use softfig_vcs::Repo;
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{op, MigrateFinalizeArgs, MigrateFinalizeReply},

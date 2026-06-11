@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::json;
-use softfig_core::{BlobEncryptor, Repo};
+use softfig_vcs::{BlobEncryptor, Repo};
 use softfig_fuse::SealedQuery;
 use softfig_ipc::{
     self,
@@ -167,7 +167,7 @@ fn region_write_round_trip_blob_and_redact_view() {
     // back to SECRET under the per-region subkey.
     let store_paths = softfig_store::StorePaths::for_garden(garden);
     let db = softfig_store::Db::open(&store_paths).unwrap();
-    let tip = db.try_get_ref(softfig_core::TIP_REF).unwrap().unwrap();
+    let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
     let row = db.get_commit(&tip).unwrap();
     let blob_hash = resolve_path(&db, &row.root_tree, &["notes", "secret.md"])
         .expect("notes/secret.md present in tip tree");
@@ -256,7 +256,7 @@ fn placeholder_preservation_two_regions() {
     let objects = softfig_store::ObjectStore::new(store_paths.clone());
 
     let read_committed_bytes = || -> Vec<u8> {
-        let tip = db.try_get_ref(softfig_core::TIP_REF).unwrap().unwrap();
+        let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
         let row = db.get_commit(&tip).unwrap();
         let h =
             resolve_path(&db, &row.root_tree, &["notes", "multi.md"]).expect("path present");
@@ -562,7 +562,7 @@ fn m2b_compat_serialization_for_whole_file_reveal() {
     // pins M2b commit bit-identity.
     let store_paths = softfig_store::StorePaths::for_garden(garden);
     let db = softfig_store::Db::open(&store_paths).unwrap();
-    let tip = db.try_get_ref(softfig_core::TIP_REF).unwrap().unwrap();
+    let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
     let row = db.get_commit(&tip).unwrap();
     assert_eq!(row.intent, "vault_reveal");
     let parsed: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
@@ -614,7 +614,7 @@ fn region_round_trip_toml_literal_multiline() {
     // literal `TOKEN42`.
     let store_paths = softfig_store::StorePaths::for_garden(garden);
     let db = softfig_store::Db::open(&store_paths).unwrap();
-    let tip = db.try_get_ref(softfig_core::TIP_REF).unwrap().unwrap();
+    let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
     let row = db.get_commit(&tip).unwrap();
     let blob_hash = resolve_path(&db, &row.root_tree, &["config.toml"])
         .expect("config.toml present");
