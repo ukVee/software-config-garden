@@ -17,8 +17,8 @@ use softfig_vcs::Repo;
 use softfig_ipc::verbs::{
     op, AddNoteArgs, AddNoteReply, AddProjectArgs, AddProjectReply, AddSectionArgs,
     AppendToSectionArgs, ArchiveArgs, ArchiveReply, DocEditReply, EditSectionArgs,
-    LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, RefreshSnapshotArgs,
-    RefreshSnapshotReply, ReviseNoteArgs, ReviseNoteReply, SetReviewedArgs,
+    LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, MigrateSplitReply,
+    RefreshSnapshotArgs, RefreshSnapshotReply, ReviseNoteArgs, ReviseNoteReply, SetReviewedArgs,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::actions::conventions;
@@ -1015,4 +1015,101 @@ fn archive_repoints_inbound_refs() {
         "ref not repointed: {uses}"
     );
     assert!(!uses.contains("[[001-base]]"), "old ref remained: {uses}");
+}
+
+// ---- migrate_split (one-time monolith → numbered notes) ---------------
+
+#[test]
+fn migrate_split_dry_run_then_apply_then_idempotent() {
+    let fx = Fixture::start();
+    // A concept dir with a legacy monolith carrying two `## ` sections plus
+    // a preamble (title + reviewed stamp + intro) that the split drops.
+    write_doc(&fx, "services/waydroid/CLAUDE.md", "# services/waydroid\n");
+    write_doc(
+        &fx,
+        "services/waydroid/notes.md",
+        "# notes\n\n> Last reviewed: 2026-05-01\n\nintro prose\n\n\
+         ## container networking\n\nWaydroid uses an internal bridge.\n\n\
+         ## GPU passthrough\n\nNeeds the venus driver.\n",
+    );
+
+    // Dry run: discovers the monolith, plans 2 notes, writes/commits nothing.
+    let resp = fx.call(op::MIGRATE_SPLIT, serde_json::json!({ "apply": false }));
+    let reply: MigrateSplitReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(!reply.applied);
+    assert_eq!(reply.splits.len(), 1);
+    let s = &reply.splits[0];
+    assert_eq!(s.from, "services/waydroid/notes.md");
+    assert_eq!(s.folder, "services/waydroid/notes");
+    assert_eq!(s.notes, 2);
+    assert!(s.hash.is_none() && s.archived_to.is_none());
+    assert!(reply.skipped.is_empty());
+    // Nothing materialized by a dry run.
+    assert!(!fx.garden.join("services/waydroid/notes").exists());
+    assert!(fx.garden.join("services/waydroid/notes.md").exists());
+
+    // Apply: materialize the folder, archive the monolith, commit.
+    let resp = fx.call(op::MIGRATE_SPLIT, serde_json::json!({ "apply": true }));
+    let reply: MigrateSplitReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.applied);
+    assert_eq!(reply.splits.len(), 1);
+    let s = &reply.splits[0];
+    assert_eq!(s.notes, 2);
+    assert_eq!(
+        s.archived_to.as_deref(),
+        Some("journal/archive/services-waydroid-notes/notes.md")
+    );
+    assert!(s.hash.is_some());
+
+    // Numbered notes + seq materialized; the monolith left its old path.
+    let n1 = std::fs::read_to_string(
+        fx.garden.join("services/waydroid/notes/001-container-networking.md"),
+    )
+    .unwrap();
+    assert!(n1.starts_with("# container networking\n"), "header: {n1:?}");
+    assert!(n1.contains(&format!("> Last reviewed: {}", conventions::today_hyphen())));
+    assert!(n1.contains("internal bridge"));
+    let n2 =
+        std::fs::read_to_string(fx.garden.join("services/waydroid/notes/002-gpu-passthrough.md"))
+            .unwrap();
+    assert!(n2.contains("venus driver"));
+    let seq = std::fs::read_to_string(fx.garden.join("services/waydroid/notes/.seq")).unwrap();
+    assert_eq!(seq.trim(), "2");
+    assert!(!fx.garden.join("services/waydroid/notes.md").exists());
+    assert!(fx
+        .garden
+        .join("journal/archive/services-waydroid-notes/notes.md")
+        .exists());
+
+    // The commit is a monolith_split with the right payload.
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "monolith_split");
+    assert_eq!(payload["from"], "services/waydroid/notes.md");
+    assert_eq!(payload["folder"], "services/waydroid/notes");
+    assert_eq!(payload["notes"], 2);
+
+    // Idempotent: the monolith is archived out of the tree, so a re-run finds
+    // nothing to split and makes no further changes.
+    let resp = fx.call(op::MIGRATE_SPLIT, serde_json::json!({ "apply": true }));
+    let reply: MigrateSplitReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.splits.is_empty(), "re-run split: {:?}", reply.splits);
+    assert!(reply.skipped.is_empty(), "re-run skipped: {:?}", reply.skipped);
+}
+
+/// A monolith whose accretive folder already exists (a partial/prior
+/// migration) is reported as skipped, never clobbered.
+#[test]
+fn migrate_split_skips_when_folder_exists() {
+    let fx = Fixture::start();
+    write_doc(&fx, "audio/CLAUDE.md", "# audio\n");
+    write_doc(&fx, "audio/troubleshooting.md", "## x\n\nbody\n");
+    write_doc(&fx, "audio/troubleshooting/.seq", "0\n");
+
+    let resp = fx.call(op::MIGRATE_SPLIT, serde_json::json!({ "apply": true }));
+    let reply: MigrateSplitReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.splits.is_empty());
+    assert_eq!(reply.skipped.len(), 1);
+    assert_eq!(reply.skipped[0].path, "audio/troubleshooting.md");
+    assert!(reply.skipped[0].reason.contains("already exists"));
+    assert!(fx.garden.join("audio/troubleshooting.md").exists());
 }

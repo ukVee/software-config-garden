@@ -24,7 +24,7 @@ use clap::{Args, Subcommand};
 use softfig_vcs::Repo;
 use softfig_ipc::{
     runtime_socket_path,
-    verbs::{op, MigrateFinalizeArgs, MigrateFinalizeReply},
+    verbs::{op, MigrateFinalizeArgs, MigrateFinalizeReply, MigrateSplitArgs, MigrateSplitReply},
     ClientError,
 };
 use softfig_vault::{discover_garden, Vault};
@@ -42,6 +42,10 @@ pub enum MigrateCmd {
     /// plaintext working tree and the legacy `.softfig/` (best-effort)
     /// and remount FUSE.
     Finalize(FinalizeArgs),
+    /// One-time small-files split: rewrite every `notes.md` /
+    /// `troubleshooting.md` monolith into its sibling numbered-note folder
+    /// and archive the original. Dry-run preview unless `--apply`.
+    Split(SplitArgs),
 }
 
 #[derive(Args, Debug)]
@@ -64,6 +68,17 @@ pub struct FinalizeArgs {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct SplitArgs {
+    /// Commit the split. Without it, only a dry-run preview is printed.
+    #[arg(long)]
+    pub apply: bool,
+    /// Override the socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+}
+
 #[derive(Args, Debug, Default)]
 pub struct StatusArgs {
     #[arg(long)]
@@ -74,6 +89,7 @@ pub fn run(cmd: Option<MigrateCmd>, status: StatusArgs) -> Result<()> {
     match cmd {
         Some(MigrateCmd::Prepare(args)) => prepare(args),
         Some(MigrateCmd::Finalize(args)) => finalize(args),
+        Some(MigrateCmd::Split(args)) => split(args),
         None => print_status(status),
     }
 }
@@ -183,6 +199,54 @@ fn finalize(args: FinalizeArgs) -> Result<()> {
         }
         Err(e) => Err(anyhow!("{e}")),
     }
+}
+
+fn split(args: SplitArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let req_args = serde_json::to_value(MigrateSplitArgs { apply: args.apply })?;
+    match try_daemon_call(&socket, op::MIGRATE_SPLIT, req_args) {
+        Ok(Some(value)) => {
+            let reply: MigrateSplitReply = serde_json::from_value(value)?;
+            if reply.splits.is_empty() && reply.skipped.is_empty() {
+                println!("no monoliths to split.");
+                return Ok(());
+            }
+            if reply.applied {
+                for s in &reply.splits {
+                    let short = s.hash.as_deref().map(short_hash).unwrap_or("???????");
+                    println!("split {} -> {} notes  [{short}]", s.from, s.notes);
+                }
+            } else if !reply.splits.is_empty() {
+                println!("would split:");
+                for s in &reply.splits {
+                    println!("  {}  -> {}/ ({} notes)", s.from, s.folder, s.notes);
+                }
+            }
+            if !reply.skipped.is_empty() {
+                println!("skipped:");
+                for s in &reply.skipped {
+                    println!("  {}: {}", s.path, s.reason);
+                }
+            }
+            if !reply.applied && !reply.splits.is_empty() {
+                println!();
+                println!("re-run with --apply to commit.");
+            }
+            Ok(())
+        }
+        Ok(None) => Err(anyhow!(
+            "no daemon at {} — start one first (`softfig daemon start`)",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("daemon error ({:?}): {message}", kind))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+fn short_hash(hash: &str) -> &str {
+    &hash[..hash.len().min(8)]
 }
 
 fn print_status(args: StatusArgs) -> Result<()> {

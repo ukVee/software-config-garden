@@ -20,6 +20,11 @@ pub mod op {
     /// (`add_note`, `*_section`, `log_*`, …) that stamp conventions.
     pub const REPLACE_FILE: &str = "replace_file";
     pub const MIGRATE_FINALIZE: &str = "migrate_finalize";
+    /// Slice 1 (small-files): one-time splitter. Walk the working tree for
+    /// `notes.md` / `troubleshooting.md` monoliths, rewrite each into its
+    /// sibling accretive folder of numbered notes, archive the monolith, and
+    /// commit one `monolith_split` per file. Dry-run unless `apply`.
+    pub const MIGRATE_SPLIT: &str = "migrate_split";
     pub const SHUTDOWN: &str = "shutdown";
     /// M2b: write plaintext of a sealed file to `$XDG_RUNTIME_DIR` and
     /// commit an audit `vault_reveal` intent.
@@ -652,6 +657,49 @@ pub struct PairRemoveReply {
     pub removed: bool,
     /// The full fingerprint that was matched and removed.
     pub fingerprint: String,
+}
+
+/// `migrate split [--apply]` — one-time monolith → numbered-notes splitter.
+/// Dry-run (preview only, no writes) unless `apply` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MigrateSplitArgs {
+    /// Commit the split. Without it the daemon only discovers + plans.
+    #[serde(default)]
+    pub apply: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrateSplitReply {
+    /// True when the splits were committed; false for a dry-run preview.
+    pub applied: bool,
+    /// One entry per monolith that was (or would be) split.
+    pub splits: Vec<SplitOutcome>,
+    /// Monoliths found but not split, with the reason (already-migrated
+    /// folder, no `## ` sections, read error).
+    pub skipped: Vec<SplitSkip>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitOutcome {
+    /// Garden-relative monolith path (e.g. `projects/foo/notes.md`).
+    pub from: String,
+    /// Garden-relative accretive folder it split into (e.g.
+    /// `projects/foo/notes`).
+    pub folder: String,
+    /// Number of numbered notes produced.
+    pub notes: usize,
+    /// Where the monolith was archived. `None` in a dry-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_to: Option<String>,
+    /// Hash of the `monolith_split` commit. `None` in a dry-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitSkip {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

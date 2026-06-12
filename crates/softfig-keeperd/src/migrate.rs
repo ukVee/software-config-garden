@@ -225,6 +225,112 @@ fn single_note(lines: &[&str]) -> Vec<SplitNote> {
     }]
 }
 
+// ---- Slice 1 production trigger: discover + address monoliths ---------
+//
+// `softfig migrate split` walks the working tree for the legacy `notes.md` /
+// `troubleshooting.md` monoliths and rewrites each into its sibling accretive
+// folder (`notes/` / `troubleshooting/`). The pure pieces — which path is a
+// monolith, what folder it maps to, and where its archived copy lands — live
+// here next to [`plan_split`]; the daemon orchestration (materialize, archive,
+// commit) is `crate::actions::migrate_split`.
+
+/// A monolith found in the working tree and the accretive folder it splits
+/// into. Both are garden-relative, `/`-separated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Monolith {
+    pub path: String,
+    pub folder: String,
+}
+
+/// If `rel` names a splittable monolith — a `notes.md` / `troubleshooting.md`
+/// outside `journal/archive/` — return `(target_folder_rel, kind)`. The folder
+/// is the sibling accretive dir (`<parent>/notes`); a top-level monolith maps
+/// to a root-level folder. Pure.
+pub fn monolith_target(rel: &str) -> Option<(String, &'static str)> {
+    if rel == "journal/archive" || rel.starts_with("journal/archive/") {
+        return None;
+    }
+    let path = Path::new(rel);
+    let kind = match path.file_name()?.to_str()? {
+        "notes.md" => "notes",
+        "troubleshooting.md" => "troubleshooting",
+        _ => return None,
+    };
+    let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+    let folder = if parent.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{parent}/{kind}")
+    };
+    Some((folder, kind))
+}
+
+/// Collision-free archive bucket for a monolith whose target folder is
+/// `folder_rel`. Multiple `notes.md` across the tree would otherwise collide
+/// on one `journal/archive/notes/` bucket, so flatten the path to a single
+/// component (`projects/foo/notes` → `projects-foo-notes`). Pure.
+pub fn archive_bucket(folder_rel: &str) -> String {
+    folder_rel.replace('/', "-")
+}
+
+/// Walk `garden_root`'s working tree for monoliths. Returns the splittable ones
+/// (whose target folder doesn't yet exist), sorted by path, plus `(path,
+/// reason)` pairs for monoliths skipped because their folder already exists (a
+/// partial or repeated migration). Skips `.softfig/` and `journal/archive/`.
+pub fn discover_monoliths(garden_root: &Path) -> (Vec<Monolith>, Vec<(String, String)>) {
+    let mut found = Vec::new();
+    let mut skipped = Vec::new();
+    walk_tree(garden_root, garden_root, &mut |rel| {
+        if let Some((folder, _kind)) = monolith_target(rel) {
+            if garden_root.join(&folder).exists() {
+                skipped.push((
+                    rel.to_string(),
+                    format!("target folder {folder}/ already exists"),
+                ));
+            } else {
+                found.push(Monolith {
+                    path: rel.to_string(),
+                    folder,
+                });
+            }
+        }
+    });
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    skipped.sort();
+    (found, skipped)
+}
+
+fn walk_tree(root: &Path, dir: &Path, visit: &mut impl FnMut(&str)) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            if entry.file_name() == ".softfig" {
+                continue;
+            }
+            if rel_of(root, &path).as_deref() == Some("journal/archive") {
+                continue;
+            }
+            walk_tree(root, &path, visit);
+        } else if ft.is_file() {
+            if let Some(rel) = rel_of(root, &path) {
+                visit(&rel);
+            }
+        }
+    }
+}
+
+fn rel_of(root: &Path, path: &Path) -> Option<String> {
+    Some(path.strip_prefix(root).ok()?.to_str()?.replace('\\', "/"))
+}
+
 /// Drop leading + trailing all-whitespace lines from a slice.
 fn trim_blank_lines<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
     let mut start = 0;
@@ -316,5 +422,71 @@ Nested content stays in the section.
         let src = "# notes\n\n> Last reviewed: 2026-05-30\n";
         assert!(split_monolith(src).is_empty());
         assert_eq!(plan_split(src, "2026-06-10").seq, 0);
+    }
+}
+
+#[cfg(test)]
+mod discover_tests {
+    use super::*;
+
+    #[test]
+    fn monolith_target_addresses_both_kinds() {
+        assert_eq!(
+            monolith_target("notes.md"),
+            Some(("notes".into(), "notes"))
+        );
+        assert_eq!(
+            monolith_target("projects/foo/notes.md"),
+            Some(("projects/foo/notes".into(), "notes"))
+        );
+        assert_eq!(
+            monolith_target("services/x/troubleshooting.md"),
+            Some(("services/x/troubleshooting".into(), "troubleshooting"))
+        );
+    }
+
+    #[test]
+    fn monolith_target_rejects_non_monoliths() {
+        // Archived copies, already-numbered notes, and unrelated docs.
+        assert_eq!(monolith_target("journal/archive/old-notes/notes.md"), None);
+        assert_eq!(monolith_target("notes/001-foo.md"), None);
+        assert_eq!(monolith_target("README.md"), None);
+        assert_eq!(monolith_target("instructions.md"), None);
+    }
+
+    #[test]
+    fn archive_bucket_flattens_path() {
+        assert_eq!(archive_bucket("notes"), "notes");
+        assert_eq!(archive_bucket("projects/foo/notes"), "projects-foo-notes");
+    }
+
+    #[test]
+    fn discover_finds_unmigrated_skips_existing_and_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+
+        // A top-level monolith with no sibling folder → splittable.
+        write("notes.md", "## a\n\nbody\n");
+        // A nested monolith → splittable.
+        write("projects/foo/notes.md", "## b\n\nbody\n");
+        // A monolith whose accretive folder already exists → skipped.
+        write("services/x/troubleshooting.md", "## c\n\nbody\n");
+        write("services/x/troubleshooting/.seq", "0\n");
+        // Already-archived monolith + the daemon state dir → ignored entirely.
+        write("journal/archive/old/notes.md", "## d\n\nbody\n");
+        write(".softfig/keeper.toml", "x = 1\n");
+
+        let (found, skipped) = discover_monoliths(root);
+        let found_paths: Vec<&str> = found.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(found_paths, ["notes.md", "projects/foo/notes.md"]);
+        assert_eq!(found[0].folder, "notes");
+        assert_eq!(found[1].folder, "projects/foo/notes");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "services/x/troubleshooting.md");
     }
 }
