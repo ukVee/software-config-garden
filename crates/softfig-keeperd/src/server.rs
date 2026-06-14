@@ -179,6 +179,9 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::PAIR_LIST => handlers::pair_list(daemon, req.args),
         op::PAIR_REMOVE => handlers::pair_remove(daemon, req.args),
         op::DISCOVER_LIST => handlers::discover_list(daemon, req.args),
+        op::REPLICA_GRANT => handlers::replica_grant(daemon, req.args),
+        op::REPLICA_REVOKE => handlers::replica_revoke(daemon, req.args),
+        op::REPLICA_STATUS => handlers::replica_status(daemon, req.args),
         op::SHUTDOWN => handlers::shutdown(daemon, req.args),
         other => Err((
             ErrorKind::BadArgs,

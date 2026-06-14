@@ -42,6 +42,7 @@ pub mod error;
 pub mod pairing;
 pub mod proto;
 pub mod relay;
+pub mod replica;
 pub mod ring;
 pub mod sas;
 pub mod transport;
@@ -51,8 +52,16 @@ pub use connect::{connect_first, plan_routes, Route};
 pub use discovery::{Advertisement, DiscoveredPeer, PeerTxt};
 pub use error::{NetError, Result};
 pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
-pub use proto::{Frame, HelloPayload, Ping, Pong, RelayConnect, RelayData, StateAnnounce};
+pub use proto::{
+    CommitData, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, ObjectData, Ping, Pong,
+    RelayConnect, RelayData, ReplicaDone, ReplicaGrant, StateAnnounce, TipAnnounce, TreeData,
+    TreeEntryMsg,
+};
 pub use relay::{relay_accept, relay_connect, Relay, RelayStream};
+pub use replica::{
+    grant_signing_bytes, pull_replication, serve_replication, tipannounce_signing_bytes,
+    verify_grant, verify_tipannounce, PullSummary, ReplicaSink, ReplicaSource, ServeSummary,
+};
 pub use ring::{ring_path, Ring, RingEntry};
 pub use sas::Sas;
 pub use transport::{

@@ -85,6 +85,18 @@ pub mod op {
     /// discovery cache so the CLI/TUI can pair by name without typing a
     /// fingerprint.
     pub const DISCOVER_LIST: &str = "discover_list";
+    /// M5b: grant a ring member permission to host this device's chain backup —
+    /// add it to the owner-side `push_to` allow-list. The owner then pushes its
+    /// signed ciphertext chain to that host (which must also have opted in via
+    /// `[replica] host = true`).
+    pub const REPLICA_GRANT: &str = "replica_grant";
+    /// M5b: revoke a replication grant (remove from `push_to`). Stops new
+    /// pushes; cannot un-send ciphertext the host already holds.
+    pub const REPLICA_REVOKE: &str = "replica_revoke";
+    /// M5b: backup-health metadata — who this device pushes to, whether it is a
+    /// host, and per-peer mirror stats for chains it hosts. Read-only; never a
+    /// document browser (peer-doc reading is the deferred M5b-view slice).
+    pub const REPLICA_STATUS: &str = "replica_status";
     /// Slice 2 (small-files): append a brand-new heading-addressed section
     /// to the end of any markdown doc. The heading must not already exist;
     /// commit `section_added`.
@@ -695,6 +707,75 @@ pub struct DiscoveredDevice {
     pub endpoint: Option<String>,
     /// Seconds since this device was last seen on the LAN (0 = just now).
     pub last_seen_secs: u64,
+}
+
+// ---- M5b: replication (zero-knowledge device-chain backup) ------------
+
+/// `replica_grant({fingerprint}) -> {fingerprint, granted}`. Add a ring member
+/// (by device-id fingerprint, full or unique prefix) to the owner's `push_to`
+/// allow-list, authorizing it to host this device's chain backup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaGrantArgs {
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaGrantReply {
+    /// The full fingerprint that was matched and granted.
+    pub fingerprint: String,
+    /// False when it was already granted (idempotent no-op).
+    pub granted: bool,
+}
+
+/// `replica_revoke({fingerprint}) -> {fingerprint, revoked}`. Remove a host from
+/// `push_to`. Stops future pushes; the host keeps any ciphertext already sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaRevokeArgs {
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaRevokeReply {
+    pub fingerprint: String,
+    /// False when it was not in the allow-list (idempotent no-op).
+    pub revoked: bool,
+}
+
+/// `replica_status({}) -> {host, push_to, hosted}`. Backup-health metadata only.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReplicaStatusArgs {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaStatusReply {
+    /// Whether this device hosts backups (`[replica] host`).
+    pub host: bool,
+    /// Device-id fingerprints this device pushes its chain to (`push_to`).
+    pub push_to: Vec<String>,
+    /// Per-peer mirror stats for chains this device hosts (empty unless `host`).
+    pub hosted: Vec<HostedChain>,
+}
+
+/// One peer chain this device mirrors, as surfaced to `softfig replica status`.
+/// Metadata only — the mirror is opaque ciphertext this device cannot read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostedChain {
+    /// The owner's device-id fingerprint (lowercase hex of its Ed25519 identity).
+    pub fingerprint: String,
+    /// The owner's advertised name, if known from the ring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The mirror's current tip commit hash (hex), or null if nothing synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<String>,
+    /// Chain height (commit count) at the mirror's tip.
+    pub height: u64,
+    /// Number of ciphertext objects stored in the mirror.
+    pub objects: u64,
+    /// Total bytes of stored ciphertext objects.
+    pub bytes: u64,
+    /// Unix seconds of the last successful sync, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<i64>,
 }
 
 /// `migrate split [--apply]` — one-time monolith → numbered-notes splitter.

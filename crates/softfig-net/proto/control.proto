@@ -20,12 +20,26 @@ message Frame {
     RelayConnect relay_connect = 20;   // device -> relay: bridge me to a peer
     RelayData relay_data = 21;         // forwarded opaque end-to-end ciphertext
     StateAnnounce state_announce = 22; // device -> relay: register reachability
-    // M5b+ (data plane): defined in their own slices, 100+.
+    // M5b (data plane): zero-knowledge device-chain replication, 100+. The
+    // chain owner is the *source* (serves rows + ciphertext); the backup host
+    // is the *sink* (drives the pull, verifies, fast-forwards a ciphertext-only
+    // mirror it cannot decrypt). See softfig-net's `replica` module.
+    ReplicaGrant replica_grant = 100;  // owner -> host: signed "you may mirror me"
+    GetTip get_tip = 101;              // sink -> source: "what is your tip?"
+    TipAnnounce tip_announce = 102;    // source -> sink: signed tip + height
+    GetCommit get_commit = 103;        // sink -> source: fetch one commit row
+    CommitData commit_data = 104;      // source -> sink: a commit row (or not-found)
+    GetTree get_tree = 105;            // sink -> source: fetch one tree's rows
+    TreeData tree_data = 106;          // source -> sink: a tree's entries (or not-found)
+    GetObject get_object = 107;        // sink -> source: fetch one ciphertext blob
+    ObjectData object_data = 108;      // source -> sink: ciphertext bytes (or not-found)
+    ReplicaDone replica_done = 109;    // sink -> source: pull complete, close
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
-  // 23-99 are held for later control-plane variants; 100+ is the data plane.
-  reserved 3 to 19, 23 to 99;
+  // 23-99 are held for later control-plane variants; 100-199 is the M5b data
+  // plane; 200+ stays open for later sync slices (shared subtrees, M5d+).
+  reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
 // Identity payload carried *inside* the Noise handshake (not a Frame). The XX
@@ -76,3 +90,100 @@ message RelayConnect {
 message RelayData {
   bytes payload = 1;
 }
+
+// --- M5b data plane: device-chain replication ------------------------------
+//
+// One owner (single writer of a linear device chain) replicates its signed,
+// content-addressed *ciphertext* to authorized backup hosts that verify and
+// store it but cannot decrypt it. Two-sided consent: the host opts in
+// (keeper.toml [replica] host = true) AND the owner grants the host per-peer
+// (a signed ReplicaGrant minted from the owner's push_to list). The host
+// fast-forwards only — a single honest owner never forks, so a non-fast-forward
+// is a tamper/compromise signal the host rejects + alarms on.
+
+// owner -> host, sent first on a replication session: "I authorize you (grantee)
+// to mirror my chain." Signed by the owner's Ed25519 identity over a
+// domain-separated encoding (see softfig-net's `replica::grant_signing_bytes`),
+// so the host can confirm the connecting ring member really granted *this* host
+// *this* chain. The owner only mints this for hosts in its push_to allow-list;
+// the host only honours it when its own [replica] host flag is set.
+message ReplicaGrant {
+  bytes grantee_device_id = 1; // the host's Ed25519 identity (32 bytes)
+  bytes chain_id = 2;          // the owner's chain id (repo_id bytes)
+  int64 issued_at = 3;         // Unix seconds the grant was minted
+  bytes signature = 4;         // Ed25519 over grant_signing_bytes(...)
+}
+
+// sink -> source: "what is your chain's current tip?" Empty request.
+message GetTip {}
+
+// source -> sink: the chain's current tip + height, signed by the owner. The
+// signature (over tipannounce_signing_bytes) and monotonic height back the
+// fast-forward-only + anti-rollback rules; per-commit signatures remain the
+// authoritative integrity check. An empty tip_hash means "no commits yet".
+message TipAnnounce {
+  bytes chain_id = 1;
+  bytes tip_hash = 2;  // 32-byte BLAKE3 commit hash; empty = no commits
+  uint64 height = 3;   // commit count from genesis to tip
+  bytes signature = 4; // Ed25519 over tipannounce_signing_bytes(...)
+}
+
+// sink -> source: fetch one commit row by hash.
+message GetCommit {
+  bytes hash = 1;
+}
+
+// source -> sink: one commit row, mirroring the store's `commits` schema. The
+// sink re-canonicalizes + re-hashes, checks the Ed25519 signature under
+// author_pubkey, and binds author_pubkey to the chain owner's ring identity.
+message CommitData {
+  bool found = 1;            // false: source has no such commit
+  bytes hash = 2;
+  bytes parent = 3;         // empty = genesis (no parent)
+  bytes root_tree = 4;
+  string author_device = 5;
+  bytes author_pubkey = 6;  // Ed25519 identity (32 bytes)
+  int64 timestamp = 7;
+  string intent = 8;
+  string payload = 9;       // canonical JCS bytes of the payload object (utf-8)
+  uint32 master_key_id = 10;
+  bytes signature = 11;     // Ed25519 (64 bytes) over the commit hash
+}
+
+// sink -> source: fetch one tree's entry rows by tree hash.
+message GetTree {
+  bytes hash = 1;
+}
+
+// source -> sink: a tree's entries. The sink verifies
+// hash == BLAKE3(canonical_tree_bytes(entries)) before storing.
+message TreeData {
+  bool found = 1;
+  bytes hash = 2;
+  repeated TreeEntryMsg entries = 3;
+}
+
+message TreeEntryMsg {
+  string name = 1;
+  string kind = 2;   // "blob" | "tree"
+  uint32 mode = 3;
+  bytes target = 4;  // 32-byte hash of the child blob or subtree
+}
+
+// sink -> source: fetch one content-addressed ciphertext blob by hash.
+message GetObject {
+  bytes hash = 1;
+}
+
+// source -> sink: the ciphertext blob bytes. Opaque — the host stores them
+// without the key. The sink verifies BLAKE3(payload) == hash. Large blobs are
+// carried whole here; the transport's send_bytes/recv_bytes chunks the frame
+// across Noise's 64 KiB message cap transparently.
+message ObjectData {
+  bool found = 1;
+  bytes hash = 2;
+  bytes payload = 3; // ciphertext blob_file bytes
+}
+
+// sink -> source: the pull completed; the source may close the session.
+message ReplicaDone {}

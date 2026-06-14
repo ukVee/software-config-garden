@@ -11,11 +11,12 @@ use base64::Engine as _;
 use softfig_vcs::{fsck as run_fsck, log_collect, Intent, Repo};
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
-    CommitArgs, CommitReply, DiscoverListReply, FsckReply, LogArgs, LogEntry, LogReply,
+    CommitArgs, CommitReply, DiscoverListReply, FsckReply, HostedChain, LogArgs, LogEntry, LogReply,
     MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
     PairRemoveReply, PendingPairing, ReplaceFileArgs, ReplaceFileReply,
-    ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
+    ReplicaGrantArgs, ReplicaGrantReply, ReplicaRevokeArgs, ReplicaRevokeReply,
+    ReplicaStatusReply, ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
     UnlockReply, VaultListSealedReply, VaultRevealArgs, VaultRevealReply,
     VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
 };
@@ -1043,6 +1044,144 @@ pub fn discover_list(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult
     };
 
     Ok(serde_json::to_value(DiscoverListReply { devices }).unwrap())
+}
+
+// ---- M5b: replication (zero-knowledge device-chain backup) ------------
+
+pub fn replica_grant(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: ReplicaGrantArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("replica_grant args: {e}")))?;
+    let fp_query = normalize_fingerprint(&args.fingerprint)?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    // You may only grant a *paired* peer (a ring member): resolve the query to a
+    // single ring device-id, so a typo can't authorize a stranger.
+    let full_fp = resolve_ring_fingerprint(&state_dir, &fp_query)?;
+
+    let mut ledger = crate::replica::GrantLedger::load(&state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load replica ledger: {e}")))?;
+    let granted = ledger.grant(&full_fp);
+    if granted {
+        ledger
+            .save(&state_dir)
+            .map_err(|e| (ErrorKind::Io, format!("save replica ledger: {e}")))?;
+    }
+    Ok(serde_json::to_value(ReplicaGrantReply {
+        fingerprint: full_fp,
+        granted,
+    })
+    .unwrap())
+}
+
+pub fn replica_revoke(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: ReplicaRevokeArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("replica_revoke args: {e}")))?;
+    let fp_query = normalize_fingerprint(&args.fingerprint)?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    let mut ledger = crate::replica::GrantLedger::load(&state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load replica ledger: {e}")))?;
+    // Revoke works against the ledger itself (not the ring) so an unpaired host
+    // can still be cleaned up. Match the query as a full id or a unique prefix.
+    let matches: Vec<String> = ledger
+        .push_to
+        .iter()
+        .filter(|f| f.starts_with(&fp_query))
+        .cloned()
+        .collect();
+    let full_fp = match matches.as_slice() {
+        [] => {
+            return Err((
+                ErrorKind::NotFound,
+                format!("no replication grant matching {fp_query}"),
+            ))
+        }
+        [one] => one.clone(),
+        many => {
+            return Err((
+                ErrorKind::BadArgs,
+                format!("ambiguous fingerprint {fp_query}: {} grants match", many.len()),
+            ))
+        }
+    };
+    let revoked = ledger.revoke(&full_fp);
+    if revoked {
+        ledger
+            .save(&state_dir)
+            .map_err(|e| (ErrorKind::Io, format!("save replica ledger: {e}")))?;
+    }
+    Ok(serde_json::to_value(ReplicaRevokeReply {
+        fingerprint: full_fp,
+        revoked,
+    })
+    .unwrap())
+}
+
+pub fn replica_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+    let replica_root = inner.config.replica_root();
+    let host = inner.config.replica.host;
+
+    let push_to = crate::replica::GrantLedger::load(&state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load replica ledger: {e}")))?
+        .push_to;
+
+    // Reading the mirror dirs is filesystem-only (no network, no decryption), so
+    // it is fine under the lock; the trees are tiny metadata reads.
+    let hosted = crate::replica::list_hosted(&replica_root)
+        .into_iter()
+        .map(|m| HostedChain {
+            fingerprint: m.fingerprint,
+            name: m.name,
+            tip: m.tip,
+            height: m.height,
+            objects: m.objects,
+            bytes: m.bytes,
+            last_sync: m.last_sync,
+        })
+        .collect();
+
+    Ok(serde_json::to_value(ReplicaStatusReply {
+        host,
+        push_to,
+        hosted,
+    })
+    .unwrap())
+}
+
+/// Resolve a fingerprint query (full or unique prefix) to a single ring
+/// member's full device-id fingerprint, or an error if none / ambiguous.
+fn resolve_ring_fingerprint(
+    state_dir: &std::path::Path,
+    fp_query: &str,
+) -> std::result::Result<String, (ErrorKind, String)> {
+    let ring = crate::net::load_ring(state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
+    let matches: Vec<String> = ring
+        .peers()
+        .iter()
+        .map(|p| p.fingerprint())
+        .filter(|f| f.starts_with(fp_query))
+        .collect();
+    match matches.as_slice() {
+        [] => Err((
+            ErrorKind::NotFound,
+            format!("no paired peer matching {fp_query}; pair it first"),
+        )),
+        [one] => Ok(one.clone()),
+        many => Err((
+            ErrorKind::BadArgs,
+            format!("ambiguous fingerprint {fp_query}: {} ring peers match", many.len()),
+        )),
+    }
 }
 
 /// Normalize a fingerprint argument: lowercase, validate as 1–64 hex chars

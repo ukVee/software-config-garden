@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::keeper_toml::{KeeperToml, NetToml, RelayToml};
+use crate::keeper_toml::{KeeperToml, NetToml, RelayToml, ReplicaToml};
 
 #[derive(Debug, Clone)]
 pub struct KeeperConfig {
@@ -32,6 +32,25 @@ pub struct KeeperConfig {
     pub net: NetConfig,
     /// M5a-4: relay config from `[relay]`.
     pub relay: RelayConfig,
+    /// M5b: replication config from `[replica]` (the static host opt-in).
+    pub replica: ReplicaConfig,
+    /// M5b: root dir for per-peer ciphertext mirrors. `None` → the XDG default
+    /// `~/.local/share/softfig/peers/`. Overridable so tests mirror into a
+    /// tempdir instead of the real data home.
+    pub replica_root: Option<PathBuf>,
+}
+
+/// M5b: replication config (`[replica]`).
+#[derive(Debug, Clone, Default)]
+pub struct ReplicaConfig {
+    /// This device hosts ciphertext backups for granted ring members.
+    pub host: bool,
+}
+
+impl From<ReplicaToml> for ReplicaConfig {
+    fn from(t: ReplicaToml) -> Self {
+        Self { host: t.host }
+    }
 }
 
 /// M5a-4: the device's own `softfig-net` host config (`[net]`).
@@ -110,6 +129,8 @@ impl KeeperConfig {
             reveal: RevealConfig::default(),
             net: NetConfig::default(),
             relay: RelayConfig::default(),
+            replica: ReplicaConfig::default(),
+            replica_root: None,
         }
     }
 
@@ -138,6 +159,8 @@ impl KeeperConfig {
             },
             net: cfg.net.into(),
             relay: cfg.relay.into(),
+            replica: cfg.replica.into(),
+            replica_root: None,
         })
     }
 
@@ -172,6 +195,35 @@ impl KeeperConfig {
     pub fn without_net(mut self) -> Self {
         self.enable_net = false;
         self
+    }
+
+    /// M5b: override the per-peer mirror root (default
+    /// `~/.local/share/softfig/peers/`). Tests point this at a tempdir.
+    pub fn with_replica_root(mut self, root: impl AsRef<Path>) -> Self {
+        self.replica_root = Some(root.as_ref().to_path_buf());
+        self
+    }
+
+    /// M5b: make this device a backup host (`[replica] host = true`).
+    pub fn as_replica_host(mut self, host: bool) -> Self {
+        self.replica.host = host;
+        self
+    }
+
+    /// M5b: the root dir holding per-peer ciphertext mirrors. The configured
+    /// override, else `$XDG_DATA_HOME/softfig/peers` (falling back to
+    /// `~/.local/share/softfig/peers`, then a relative `softfig/peers` if even
+    /// `$HOME` is unset — the last only happens in a degenerate environment).
+    pub fn replica_root(&self) -> PathBuf {
+        if let Some(root) = &self.replica_root {
+            return root.clone();
+        }
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("softfig").join("peers")
     }
 
     /// Directory containing the on-disk `.softfig/`. Equals

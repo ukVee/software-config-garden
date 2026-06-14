@@ -23,6 +23,7 @@ pub mod migrate;
 pub mod net;
 pub mod peer;
 pub mod reads;
+pub mod replica;
 pub mod server;
 pub mod state;
 pub mod watcher;

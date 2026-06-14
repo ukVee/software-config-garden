@@ -33,6 +33,13 @@ pub enum NetError {
     /// entry, or a rejected pairing attestation).
     #[error("protocol: {0}")]
     Protocol(&'static str),
+
+    /// M5b: a replication sink/source failure carrying a dynamic message —
+    /// a storage error, a malformed wire row, or a security-relevant check the
+    /// host rejected (bad commit signature, wrong author, content-address
+    /// mismatch). The caller surfaces these (and alarms on the tamper cases).
+    #[error("replica: {0}")]
+    Replica(String),
 }
 
 pub type Result<T> = std::result::Result<T, NetError>;

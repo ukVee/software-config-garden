@@ -45,6 +45,14 @@ pub struct KeeperToml {
     /// table = no relay hosted, no relay client configured.
     #[serde(default)]
     pub relay: RelayToml,
+    /// M5b: replication. The static host opt-in (`host = true`) makes this
+    /// device store zero-knowledge ciphertext backups for ring members the
+    /// owner has granted it. The owner-side per-peer grant list lives in a
+    /// separate, runtime-mutable `replica.toml` (managed by `replica_grant` /
+    /// `replica_revoke`), not here — same network-state-beside-the-vault posture
+    /// as `peers.toml`. Absent table = not a backup host.
+    #[serde(default)]
+    pub replica: ReplicaToml,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -124,6 +132,18 @@ pub struct RelayToml {
     /// pairing — keys the outer control session to the relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_key: Option<String>,
+}
+
+/// `[replica]` — M5b backup-host opt-in. Just the static host flag; the
+/// owner-side `push_to` grant list is runtime state in `replica.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaToml {
+    /// Store ciphertext backups for granted ring members. Default `false`.
+    /// Toggled in `keeper.toml` (a static opt-in, same posture as `[relay]`),
+    /// not via a subcommand.
+    #[serde(default)]
+    pub host: bool,
 }
 
 impl KeeperToml {

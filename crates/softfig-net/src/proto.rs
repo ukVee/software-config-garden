@@ -11,7 +11,9 @@ mod generated {
 }
 
 pub use generated::{
-    frame, Frame, HelloPayload, Ping, Pong, RelayConnect, RelayData, StateAnnounce,
+    frame, CommitData, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, ObjectData,
+    Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, StateAnnounce, TipAnnounce,
+    TreeData, TreeEntryMsg,
 };
 
 impl Frame {
@@ -51,6 +53,78 @@ impl Frame {
     pub fn relay_data(payload: Vec<u8>) -> Self {
         Self {
             kind: Some(frame::Kind::RelayData(RelayData { payload })),
+        }
+    }
+
+    // --- M5b data-plane frame constructors ---------------------------------
+
+    /// A `ReplicaGrant` frame (owner -> host).
+    pub fn replica_grant(grant: ReplicaGrant) -> Self {
+        Self {
+            kind: Some(frame::Kind::ReplicaGrant(grant)),
+        }
+    }
+
+    /// A `GetTip` request frame (sink -> source).
+    pub fn get_tip() -> Self {
+        Self {
+            kind: Some(frame::Kind::GetTip(GetTip {})),
+        }
+    }
+
+    /// A `TipAnnounce` frame (source -> sink).
+    pub fn tip_announce(ann: TipAnnounce) -> Self {
+        Self {
+            kind: Some(frame::Kind::TipAnnounce(ann)),
+        }
+    }
+
+    /// A `GetCommit` request frame (sink -> source).
+    pub fn get_commit(hash: Vec<u8>) -> Self {
+        Self {
+            kind: Some(frame::Kind::GetCommit(GetCommit { hash })),
+        }
+    }
+
+    /// A `CommitData` response frame (source -> sink).
+    pub fn commit_data(commit: CommitData) -> Self {
+        Self {
+            kind: Some(frame::Kind::CommitData(commit)),
+        }
+    }
+
+    /// A `GetTree` request frame (sink -> source).
+    pub fn get_tree(hash: Vec<u8>) -> Self {
+        Self {
+            kind: Some(frame::Kind::GetTree(GetTree { hash })),
+        }
+    }
+
+    /// A `TreeData` response frame (source -> sink).
+    pub fn tree_data(tree: TreeData) -> Self {
+        Self {
+            kind: Some(frame::Kind::TreeData(tree)),
+        }
+    }
+
+    /// A `GetObject` request frame (sink -> source).
+    pub fn get_object(hash: Vec<u8>) -> Self {
+        Self {
+            kind: Some(frame::Kind::GetObject(GetObject { hash })),
+        }
+    }
+
+    /// An `ObjectData` response frame (source -> sink).
+    pub fn object_data(object: ObjectData) -> Self {
+        Self {
+            kind: Some(frame::Kind::ObjectData(object)),
+        }
+    }
+
+    /// A `ReplicaDone` frame (sink -> source).
+    pub fn replica_done() -> Self {
+        Self {
+            kind: Some(frame::Kind::ReplicaDone(ReplicaDone {})),
         }
     }
 }

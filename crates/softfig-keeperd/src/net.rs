@@ -40,15 +40,21 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use softfig_ipc::verbs::DiscoveredDevice;
 use softfig_net::discovery::{self, Advertisement};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
-use softfig_net::proto::{frame, Frame};
+use softfig_net::proto::{frame, Frame, ReplicaGrant, TipAnnounce};
 use softfig_net::relay::Relay;
 use softfig_net::ring::{ring_path, Ring, RingEntry};
-use softfig_net::transport::{ik_responder, NoiseSession};
-use softfig_net::{static_attestation_message, NetError};
+use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
+use softfig_net::{
+    pull_replication, serve_replication, static_attestation_message, verify_grant, NetError,
+    ServeSummary,
+};
 use softfig_vault::VaultSession;
+use softfig_vcs::Repo;
 
 use crate::config::KeeperConfig;
 use crate::daemon::Daemon;
+use crate::replica::{self, MirrorStore, RepoSource};
+use crate::state::State;
 
 /// How long a parked (initiator- or responder-side) pairing lives before it is
 /// pruned. The user confirms the SAS out of band; this bounds the live socket a
@@ -63,6 +69,20 @@ const POLL_MS: u64 = 150;
 /// sighting before it is treated as gone. Generous so a momentarily-quiet
 /// device doesn't drop out of the list mid-pair.
 const DISCOVERY_TTL: Duration = Duration::from_secs(300);
+
+/// M5b: how often the owner's replica loop re-pushes its chain to each granted,
+/// reachable host. The host's pull short-circuits when already up to date, so
+/// each reconcile is cheap; the loop doubles as catch-up (a host that was
+/// offline is reached on a later tick — the tip-driven reconcile, not a queue).
+/// (Real-time push-on-commit is a noted follow-up; this interval bounds latency.)
+const REPLICA_RECONCILE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// A short settle delay before the first replica reconcile, so unlock finishes
+/// and mDNS has a chance to populate ring endpoints first.
+const REPLICA_INITIAL_DELAY: Duration = Duration::from_secs(2);
+
+/// Per-attempt dial timeout for an outbound replication push.
+const PUSH_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // --- Discovery cache (Slice A pick-list) ------------------------------------
 
@@ -400,6 +420,11 @@ impl NetRuntime {
             );
         }
 
+        // M5b: the owner-side replica push loop. Outbound-only, so it runs even
+        // if the inbound listener failed to bind; it no-ops when this device has
+        // granted no hosts (empty push_to).
+        threads.push(spawn_replica_loop(daemon.clone(), local.clone(), stop.clone()));
+
         Self {
             ring,
             discovery_cache,
@@ -530,25 +555,111 @@ fn serve_inbound(daemon: Daemon, local: &LocalDevice, ring: &Arc<Mutex<Ring>>, c
             Err(e) => eprintln!("keeperd: net: inbound pairing failed: {e}"),
         }
     } else {
-        // Established device: IK reconnect, authorize against the ring, echo.
+        // Established device: IK reconnect, authorize against the ring, then
+        // dispatch on the first frame (liveness ping vs. a replication push).
         match ik_responder(conn, &local.transport_secret, &local.hello()) {
-            Ok(session) => {
-                if is_ring_member(ring, session.peer_static()) {
-                    serve_echo(session);
-                } else {
-                    eprintln!("keeperd: net: rejecting reconnect from unknown transport key");
+            Ok(session) => match ring_member_entry(ring, session.peer_static()) {
+                Some(owner) => serve_established(&daemon, local, &owner, session),
+                None => {
+                    eprintln!("keeperd: net: rejecting reconnect from unknown transport key")
                 }
-            }
+            },
             Err(e) => eprintln!("keeperd: net: inbound IK handshake failed: {e}"),
         }
     }
 }
 
-/// Whether `transport_pubkey` belongs to a current ring member.
-fn is_ring_member(ring: &Arc<Mutex<Ring>>, transport_pubkey: &[u8; 32]) -> bool {
+/// Dispatch an established inbound session on its first frame: a `Ping` is a
+/// liveness probe (echo loop); a `ReplicaGrant` is an owner pushing its chain to
+/// us as a backup host (verify the grant, then mirror via `pull_replication`).
+fn serve_established(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    owner: &RingEntry,
+    mut session: NoiseSession<TcpStream>,
+) {
+    let Ok(frame) = session.recv_frame() else {
+        return; // peer closed or errored before the first frame
+    };
+    match frame.kind {
+        Some(frame::Kind::Ping(p)) => {
+            // Answer the probe, then keep echoing; a failed send just makes the
+            // echo loop's next read fail and return.
+            let _ = session.send_frame(&Frame::pong(p.nonce));
+            serve_echo(session);
+        }
+        Some(frame::Kind::ReplicaGrant(grant)) => {
+            serve_replica_ingest(daemon, local, owner, grant, session)
+        }
+        // Anything else ends the session cleanly.
+        _ => {}
+    }
+}
+
+/// Host side of a replication push: confirm we opted in (`[replica] host`),
+/// verify the owner's signed grant names *us* as grantee, then mirror the chain
+/// into the per-peer ciphertext store via the fast-forward-only sink. A pull
+/// failure (notably a non-fast-forward fork) is logged as an ALARM — the mirror
+/// is left untouched, never force-updated.
+fn serve_replica_ingest(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    owner: &RingEntry,
+    grant: ReplicaGrant,
+    mut session: NoiseSession<TcpStream>,
+) {
+    let (host_enabled, replica_root) = {
+        let inner = daemon.inner.lock().unwrap();
+        (inner.config.replica.host, inner.config.replica_root())
+    };
+    let owner_fp = owner.fingerprint();
+    if !host_enabled {
+        eprintln!(
+            "keeperd: net: replica grant from {owner_fp} ignored ([replica] host = false)"
+        );
+        return;
+    }
+    if !verify_grant(&grant, &owner.device_id, &local.device_id) {
+        eprintln!("keeperd: net: replica grant from {owner_fp} rejected (bad/foreign grant)");
+        return;
+    }
+    let mut mirror = match MirrorStore::open_or_create(
+        &replica_root,
+        &owner.device_id,
+        &owner.name,
+        &grant.chain_id,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("keeperd: net: replica mirror open for {owner_fp} failed: {e}");
+            return;
+        }
+    };
+    match pull_replication(&mut session, &mut mirror) {
+        Ok(summary) => {
+            if summary.commits > 0 {
+                eprintln!(
+                    "keeperd: net: mirrored {owner_fp}: +{} commits, +{} objects",
+                    summary.commits, summary.objects
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "keeperd: net: replica INGEST REJECTED from {owner_fp} (tamper/fork alarm): {e}"
+        ),
+    }
+}
+
+/// The ring member owning `transport_pubkey`, if any — the IK-authenticated
+/// peer's authoritative identity (the ring binds device-id ↔ transport key, so
+/// this is trusted over the handshake `HelloPayload`).
+fn ring_member_entry(ring: &Arc<Mutex<Ring>>, transport_pubkey: &[u8; 32]) -> Option<RingEntry> {
     ring.lock()
-        .map(|r| r.peers().iter().any(|p| &p.transport_pubkey == transport_pubkey))
-        .unwrap_or(false)
+        .ok()?
+        .peers()
+        .iter()
+        .find(|p| &p.transport_pubkey == transport_pubkey)
+        .cloned()
 }
 
 /// Minimal liveness service over an established reconnect session: answer each
@@ -679,6 +790,151 @@ fn start_relay(
         })
         .map_err(|e| format!("spawn relay thread: {e}"))?;
     Ok((bound, handle))
+}
+
+// --- M5b owner-side replica push loop ---------------------------------------
+
+/// The owner's replica reconcile loop. Every [`REPLICA_RECONCILE_INTERVAL`] it
+/// re-pushes this device's chain to each granted host that has a known endpoint.
+/// Outbound-only; quiet when nothing is granted or no host is reachable.
+fn spawn_replica_loop(
+    daemon: Daemon,
+    local: LocalDevice,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("keeperd-net-replica".into())
+        .spawn(move || {
+            sleep_with_stop(&stop, REPLICA_INITIAL_DELAY);
+            while !stop.load(Ordering::SeqCst) {
+                reconcile_replicas(&daemon, &local);
+                sleep_with_stop(&stop, REPLICA_RECONCILE_INTERVAL);
+            }
+        })
+        .expect("spawn net replica thread")
+}
+
+/// Sleep up to `dur`, waking early (within [`POLL_MS`]) if `stop` is set, so a
+/// lock/shutdown stops the loop promptly.
+fn sleep_with_stop(stop: &Arc<AtomicBool>, dur: Duration) {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(POLL_MS));
+    }
+}
+
+/// One reconcile pass: snapshot the signed announce + per-host grants under the
+/// daemon lock, then push to each granted, reachable host with the lock
+/// released (never hold the mutex across network IO).
+fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
+    let snapshot = {
+        let inner = daemon.inner.lock().unwrap();
+        if inner.state != State::Unlocked {
+            return;
+        }
+        let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
+            return;
+        };
+        let state_dir = inner.config.state_dir().to_path_buf();
+        let ledger = replica::GrantLedger::load(&state_dir).unwrap_or_default();
+        if ledger.push_to.is_empty() {
+            return;
+        }
+        let announce = match replica::build_announce(repo, session) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("keeperd: net: replica announce build failed: {e}");
+                return;
+            }
+        };
+        let ring = load_ring(&state_dir).unwrap_or_default();
+        let mut targets: Vec<(RingEntry, ReplicaGrant)> = Vec::new();
+        for fp in &ledger.push_to {
+            if let Some(host) = ring.peers().iter().find(|p| &p.fingerprint() == fp) {
+                if host.endpoints.is_empty() {
+                    continue; // not currently reachable; caught up on a later tick
+                }
+                let grant = replica::mint_grant(&host.device_id, &announce.chain_id, session);
+                targets.push((host.clone(), grant));
+            }
+        }
+        let garden_root = inner.config.garden_root.clone();
+        let state_root = inner.config.state_root.clone();
+        (announce, garden_root, state_root, targets)
+    };
+    let (announce, garden_root, state_root, targets) = snapshot;
+
+    for (host, grant) in targets {
+        match push_to_host(local, &host, &announce, &grant, &garden_root, state_root.as_deref()) {
+            Ok(summary) if summary.commits_served > 0 => eprintln!(
+                "keeperd: net: pushed chain to {}: served {} commits",
+                host.fingerprint(),
+                summary.commits_served
+            ),
+            Ok(_) => {} // host already up to date
+            Err(e) => eprintln!(
+                "keeperd: net: replica push to {} skipped: {e}",
+                host.fingerprint()
+            ),
+        }
+    }
+}
+
+/// Push this device's chain to one host: dial a known endpoint, run the Noise
+/// `IK` handshake (keyed by the host's stored transport static), present the
+/// signed grant, then serve the chain while the host pulls + verifies +
+/// fast-forwards. Tries each endpoint until one connects. v1 is LAN-direct only;
+/// relayed off-LAN push is a follow-up (the relay forward is M5a infrastructure).
+fn push_to_host(
+    local: &LocalDevice,
+    host: &RingEntry,
+    announce: &TipAnnounce,
+    grant: &ReplicaGrant,
+    garden_root: &std::path::Path,
+    state_root: Option<&std::path::Path>,
+) -> Result<ServeSummary, String> {
+    let mut last_err = "no known endpoint".to_string();
+    for endpoint in &host.endpoints {
+        let addr = match endpoint.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            Some(a) => a,
+            None => {
+                last_err = format!("could not resolve {endpoint}");
+                continue;
+            }
+        };
+        let stream = match TcpStream::connect_timeout(&addr, PUSH_DIAL_TIMEOUT) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = format!("connect {endpoint}: {e}");
+                continue;
+            }
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+        let mut session =
+            match ik_initiator(stream, &local.transport_secret, &host.transport_pubkey, &local.hello())
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = format!("IK handshake {endpoint}: {e}");
+                    continue;
+                }
+            };
+        if let Err(e) = session.send_frame(&Frame::replica_grant(grant.clone())) {
+            last_err = format!("send grant {endpoint}: {e}");
+            continue;
+        }
+        let repo = match Repo::open_with(garden_root, state_root) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("open repo: {e}")),
+        };
+        let source = RepoSource::new(repo, announce.clone());
+        return serve_replication(&mut session, &source).map_err(|e| e.to_string());
+    }
+    Err(last_err)
 }
 
 /// Announce on the LAN, returning the registered fullname (empty on failure).

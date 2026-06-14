@@ -5,6 +5,7 @@ mod cmd_deploy;
 mod cmd_migrate;
 mod cmd_onboard;
 mod cmd_pair;
+mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
 mod cmd_vault;
@@ -62,6 +63,11 @@ enum Cmd {
     Peers(cmd_pair::PeersArgs),
     /// Remove a device from the ring (unpair) by fingerprint.
     Unpair(cmd_pair::UnpairArgs),
+
+    /// Zero-knowledge device-chain replication (M5b): grant/revoke which paired
+    /// hosts may back up this device's chain, and show backup health.
+    #[command(subcommand)]
+    Replica(cmd_replica::ReplicaCmd),
 }
 
 #[derive(Args, Debug)]
@@ -89,5 +95,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Pair(args) => cmd_pair::pair(args),
         Cmd::Peers(args) => cmd_pair::peers(args),
         Cmd::Unpair(args) => cmd_pair::unpair(args),
+        Cmd::Replica(cmd) => cmd_replica::run(cmd),
     }
 }

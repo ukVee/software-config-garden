@@ -26,6 +26,9 @@ mdns-sd.workspace = true
 # production never needs this (the vault supplies both halves).
 x25519-dalek.workspace = true
 tempfile.workspace = true
+# Replica protocol tests mint self-consistent content addresses for the mock
+# chain (the production content-addressing lives in softfig-store).
+blake3.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
