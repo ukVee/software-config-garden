@@ -160,10 +160,22 @@ softfig migrate                                                    # M2a — pha
 softfig migrate prepare [--state-root <path>]                      # M2a phase 1 (no daemon, refuses if socket present)
 softfig migrate finalize                                           # M2a phase 3 (IPC verb to running M2a daemon)
 softfig deploy [--garden-root P] [--cache-root P] [--dry-run] [--force]  # M4a — materialize config/deploy.toml onto the FS
-softfig pair <fingerprint> [--endpoint host:port] [--yes]         # M5a-4 — pair with a peer (SAS confirm)
+softfig pair [<fingerprint>] [--endpoint host:port] [--yes]       # M5a-4 — pair with a peer (SAS confirm); no-arg → LAN pick-list (Slice A)
 softfig peers                                                     # M5a-4 — list the network trust ring + pending pairings
 softfig unpair <fingerprint>                                     # M5a-4 — remove a peer from the ring
 ```
+
+**Pairing-UX Slice A (LAN pick-list)** removes the "type a long fingerprint"
+friction on the LAN — no new crypto, the SAS still authenticates, the pick-list
+only *addresses*. The mDNS TXT gains an `nm` (name) field (`keeper.toml [net]
+advertise_name = true`, default on, falls back to fingerprint-only when off); a
+read-only `discover_list` IPC verb surfaces the daemon's mDNS discovery cache
+(nearby devices not yet in the ring); `softfig pair` with **no argument** shows
+an interactive by-name picker; the TUI `4:Peers` tab gains a "discovered nearby"
+section where `p`/Enter on a device auto-fills its fingerprint + endpoint into
+the existing `pair_begin` → SAS flow. See the garden's
+`journal/decisions/decision-softfig-pairing-ux.md` "Slice A". (Slice B — PAKE
+numeric-code rendezvous, off-LAN — stays deferred/paper-locked.)
 
 `commit/log/show/fsck` auto-detect a running daemon by `connect()`-ing
 to `$XDG_RUNTIME_DIR/softfig-keeperd.sock`; on success the operation
@@ -192,7 +204,11 @@ AND the daemon to have an active FUSE mount. **M5a-4**: `pair_begin` /
 Unlocked). `pair_begin` runs the blocking Noise `XX` handshake with the daemon
 mutex released and parks the result; `pair_confirm` persists the peer into
 `peers.toml`. The daemon hosts the `softfig-net` instance (inbound listener +
-mDNS + optional `[relay]`) on unlock.
+mDNS + optional `[relay]`) on unlock. **Pairing-UX Slice A**: `discover_list`
+(read-only; require Unlocked) surfaces the mDNS discovery cache's
+nearby-but-unpaired devices `{name, fingerprint, endpoint, last_seen_secs}` as
+the LAN pick-list — filtered against the ring + this device, fed by the TXT
+`nm` name field.
 
 ## Cross-refs
 

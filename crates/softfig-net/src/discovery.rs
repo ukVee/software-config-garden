@@ -41,6 +41,12 @@ pub const TXT_FINGERPRINT: &str = "fp";
 pub const TXT_PAIRED: &str = "pr";
 /// TXT key for the control-plane protocol version.
 pub const TXT_VERSION: &str = "v";
+/// TXT key for the friendly device name (pairing-UX Slice A). A **convenience
+/// hint only** — pairing still authenticates via the Noise handshake + SAS, so
+/// a spoofed `nm` changes nothing. Omitted entirely when `[net]
+/// advertise_name = false`, in which case browsers fall back to the
+/// fingerprint.
+pub const TXT_NAME: &str = "nm";
 
 /// What this device announces on the LAN.
 #[derive(Clone, Debug)]
@@ -51,6 +57,10 @@ pub struct Advertisement {
     pub paired: bool,
     /// The TCP port the keeper's Noise listener is bound to.
     pub port: u16,
+    /// Friendly device name to publish in the TXT `nm` field. `None` (or an
+    /// all-whitespace name) omits the field — the privacy fall-back that a
+    /// `advertise_name = false` deployment selects.
+    pub name: Option<String>,
 }
 
 impl Advertisement {
@@ -59,16 +69,21 @@ impl Advertisement {
         hex::encode(self.device_id)
     }
 
-    /// The TXT properties to publish, as a `key -> value` map.
+    /// The TXT properties to publish, as a `key -> value` map. The `nm` field
+    /// is included only when [`Advertisement::name`] is a non-empty string.
     pub fn txt_properties(&self) -> HashMap<String, String> {
-        HashMap::from([
+        let mut props = HashMap::from([
             (TXT_FINGERPRINT.to_string(), self.fingerprint()),
             (
                 TXT_PAIRED.to_string(),
                 if self.paired { "1" } else { "0" }.to_string(),
             ),
             (TXT_VERSION.to_string(), crate::PROTOCOL_VERSION.to_string()),
-        ])
+        ]);
+        if let Some(name) = self.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            props.insert(TXT_NAME.to_string(), name.to_string());
+        }
+        props
     }
 }
 
@@ -79,6 +94,9 @@ pub struct PeerTxt {
     pub fingerprint: String,
     /// Whether the peer advertised itself as paired.
     pub paired: bool,
+    /// The peer's advertised friendly name (TXT `nm`), if it published one. A
+    /// hint for the pick-list; never trusted for anything security-sensitive.
+    pub name: Option<String>,
 }
 
 /// A peer resolved on the LAN: its TXT identity plus reachable `host:port`
@@ -100,7 +118,16 @@ pub fn parse_txt(props: &HashMap<String, String>) -> Option<PeerTxt> {
         return None;
     }
     let paired = props.get(TXT_PAIRED).map(|v| v == "1").unwrap_or(false);
-    Some(PeerTxt { fingerprint, paired })
+    let name = props
+        .get(TXT_NAME)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(PeerTxt {
+        fingerprint,
+        paired,
+        name,
+    })
 }
 
 /// Fold a discovered peer's endpoints into the matching ring row (by
@@ -193,10 +220,33 @@ mod tests {
             device_id: SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes(),
             paired: true,
             port: 9100,
+            name: Some("laptop".into()),
         };
         let parsed = parse_txt(&ad.txt_properties()).expect("valid txt");
         assert_eq!(parsed.fingerprint, ad.fingerprint());
         assert!(parsed.paired);
+        assert_eq!(parsed.name.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn advertisement_omits_name_when_absent_or_blank() {
+        // Slice A privacy fall-back: `advertise_name = false` → name None →
+        // no `nm` key at all (browsers see only the fingerprint).
+        let ad = Advertisement {
+            device_id: SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes(),
+            paired: false,
+            port: 9100,
+            name: None,
+        };
+        assert!(!ad.txt_properties().contains_key(TXT_NAME));
+        assert!(parse_txt(&ad.txt_properties()).unwrap().name.is_none());
+
+        // An all-whitespace name is treated the same as absent.
+        let blank = Advertisement {
+            name: Some("   ".into()),
+            ..ad.clone()
+        };
+        assert!(!blank.txt_properties().contains_key(TXT_NAME));
     }
 
     #[test]
@@ -208,6 +258,8 @@ mod tests {
         // Missing flag → defaults to unpaired, still parses.
         props.remove(TXT_PAIRED);
         assert!(!parse_txt(&props).unwrap().paired);
+        // A missing `nm` parses with name None (not an error).
+        assert!(parse_txt(&props).unwrap().name.is_none());
     }
 
     #[test]
@@ -251,6 +303,7 @@ mod tests {
             txt: PeerTxt {
                 fingerprint: hex::encode(device_id),
                 paired: true,
+                name: Some("laptop".into()),
             },
             endpoints: vec!["192.168.1.20:9100".into(), "192.168.1.20:9100".into()],
         };
@@ -267,6 +320,7 @@ mod tests {
             txt: PeerTxt {
                 fingerprint: fingerprint_of(9), // not in the ring
                 paired: true,
+                name: None,
             },
             endpoints: vec!["10.0.0.5:9100".into()],
         };

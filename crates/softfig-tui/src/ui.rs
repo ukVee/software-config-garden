@@ -253,6 +253,14 @@ fn render_peers(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::Yellow),
                     ))
                 }
+                PeerRow::Discovered(i) => {
+                    let d = &app.discovered[*i];
+                    let name = d.name.as_deref().unwrap_or("(unnamed)");
+                    ListItem::new(Line::styled(
+                        format!("📡 {}  {}", name, short_fp(&d.fingerprint)),
+                        Style::default().fg(Color::Cyan),
+                    ))
+                }
             })
             .collect()
     };
@@ -261,9 +269,10 @@ fn render_peers(f: &mut Frame, app: &App, area: Rect) {
         st.select(Some(app.peers_selected.min(app.peer_rows.len() - 1)));
     }
     let title = format!(
-        "peers — {} paired · {} pending",
+        "peers — {} paired · {} pending · {} nearby",
         app.peers.len(),
-        app.pending.len()
+        app.pending.len(),
+        app.discovered.len()
     );
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -315,6 +324,28 @@ fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        Some(PeerRow::Discovered(i)) => {
+            let d = &app.discovered[i];
+            lines.push(Line::styled(
+                "discovered nearby — not yet paired",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ));
+            lines.push(Line::raw(format!(
+                "  name:        {}",
+                d.name.as_deref().unwrap_or("(unnamed)")
+            )));
+            lines.push(Line::raw(format!("  fingerprint: {}", d.fingerprint)));
+            lines.push(Line::raw(format!(
+                "  endpoint:    {}",
+                d.endpoint.as_deref().unwrap_or("(none)")
+            )));
+            lines.push(Line::raw(format!("  last seen:   {}s ago", d.last_seen_secs)));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  p / Enter to pair (then compare the SAS)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         None => {
             lines.push(Line::styled(
                 "no devices",
@@ -329,7 +360,7 @@ fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "p pair · Enter confirm pending · D unpair · r refresh",
+        "p pair · Enter confirm/pair · D unpair · r refresh",
         Style::default().fg(Color::DarkGray),
     ));
 

@@ -29,7 +29,7 @@
 //! host: it owns the live sockets, the threads, and the lock-free snapshotting
 //! that keeps network IO off the daemon mutex.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use softfig_ipc::verbs::DiscoveredDevice;
 use softfig_net::discovery::{self, Advertisement};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 use softfig_net::proto::{frame, Frame};
@@ -57,6 +58,67 @@ const PAIRING_TTL: Duration = Duration::from_secs(300);
 /// Poll cadence for the interruptible accept / browse loops, so a lock (drop of
 /// the runtime) is honoured promptly without a blocking accept.
 const POLL_MS: u64 = 150;
+
+/// How long a discovered device lingers in the pick-list after its last mDNS
+/// sighting before it is treated as gone. Generous so a momentarily-quiet
+/// device doesn't drop out of the list mid-pair.
+const DISCOVERY_TTL: Duration = Duration::from_secs(300);
+
+// --- Discovery cache (Slice A pick-list) ------------------------------------
+
+/// One nearby device the mDNS browse loop has resolved, cached for the
+/// `discover_list` pick-list and for `pair_begin` endpoint resolution. The
+/// `name` is a convenience hint from the peer's TXT `nm` field — addressing,
+/// not authentication (the SAS still authenticates).
+#[derive(Clone, Debug)]
+pub struct DiscoveredEntry {
+    /// The peer's advertised friendly name (TXT `nm`), if any.
+    pub name: Option<String>,
+    /// Reachable `host:port` endpoints from the resolved mDNS addresses.
+    pub endpoints: Vec<String>,
+    /// The peer's self-reported paired flag (TXT `pr`). Informational only —
+    /// the pick-list filters on *our* ring membership, not this.
+    pub paired: bool,
+    /// When this device was last resolved on the LAN.
+    pub last_seen: Instant,
+}
+
+/// Build the pick-list of discovered-but-unpaired nearby devices from the
+/// browse cache. Filters out our own announcement, current ring members, and
+/// sightings older than [`DISCOVERY_TTL`]; sorts by name then fingerprint for a
+/// stable display. Pure (no sockets / clock beyond the passed `now`) so it is
+/// unit-tested headless — the live mDNS that fills the cache is the manual
+/// real-machine smoke step.
+fn build_discover_list(
+    cache: &HashMap<String, DiscoveredEntry>,
+    ring: &Ring,
+    local_fingerprint: &str,
+    now: Instant,
+) -> Vec<DiscoveredDevice> {
+    let ring_fps: HashSet<String> = ring.peers().iter().map(|p| p.fingerprint()).collect();
+    let mut devices: Vec<DiscoveredDevice> = cache
+        .iter()
+        .filter(|(fp, entry)| {
+            fp.as_str() != local_fingerprint
+                && !ring_fps.contains(*fp)
+                && now.saturating_duration_since(entry.last_seen) < DISCOVERY_TTL
+        })
+        .map(|(fp, entry)| DiscoveredDevice {
+            name: entry.name.clone(),
+            fingerprint: fp.clone(),
+            endpoint: entry.endpoints.first().cloned(),
+            last_seen_secs: now.saturating_duration_since(entry.last_seen).as_secs(),
+        })
+        .collect();
+    devices.sort_by(|a, b| {
+        a.name
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.name.as_deref().unwrap_or(""))
+            .then_with(|| a.fingerprint.cmp(&b.fingerprint))
+    });
+    devices
+}
 
 /// Build this device's [`LocalDevice`] pairing material from an unlocked vault
 /// session. The Ed25519 identity secret never leaves the vault — the
@@ -217,9 +279,11 @@ pub struct NetRuntime {
     /// browse loop (endpoint refresh). `peers.toml` on disk stays the source of
     /// truth; this mirror is kept in step by the pairing verbs.
     ring: Arc<Mutex<Ring>>,
-    /// Discovery cache: fingerprint -> reachable `host:port` endpoints, filled
-    /// by the browse loop. `pair_begin` consults it to resolve a fingerprint.
-    discovery_cache: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Discovery cache: fingerprint -> the device's last mDNS sighting (name,
+    /// endpoints, paired flag, timestamp), filled by the browse loop.
+    /// `pair_begin` consults it to resolve a fingerprint; `discover_list`
+    /// surfaces it as the pick-list.
+    discovery_cache: Arc<Mutex<HashMap<String, DiscoveredEntry>>>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     /// The mDNS daemon handle + the registered fullname, retained to
@@ -247,7 +311,7 @@ impl NetRuntime {
     pub fn start(daemon: &Daemon, config: &KeeperConfig, local: LocalDevice) -> Self {
         let state_dir = config.state_dir().to_path_buf();
         let ring = Arc::new(Mutex::new(load_ring(&state_dir).unwrap_or_default()));
-        let discovery_cache: Arc<Mutex<HashMap<String, Vec<String>>>> =
+        let discovery_cache: Arc<Mutex<HashMap<String, DiscoveredEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
@@ -287,10 +351,17 @@ impl NetRuntime {
             match ServiceDaemon::new() {
                 Ok(svc) => {
                     let paired = ring.lock().map(|r| !r.is_empty()).unwrap_or(false);
+                    // Slice A: publish the friendly name unless the deployment
+                    // opted into a fingerprint-only broadcast.
+                    let name = config
+                        .net
+                        .advertise_name
+                        .then(|| local.device_name.clone());
                     let ad = Advertisement {
                         device_id: local.device_id,
                         paired,
                         port: addr.port(),
+                        name,
                     };
                     let fullname = announce_best_effort(&svc, &ad);
                     threads.push(spawn_browse_loop(
@@ -345,19 +416,30 @@ impl NetRuntime {
     pub fn resolve_endpoint(&self, fingerprint: &str) -> Option<String> {
         let cache = self.discovery_cache.lock().ok()?;
         // Exact match first, then a unique prefix.
-        if let Some(eps) = cache.get(fingerprint) {
-            return eps.first().cloned();
+        if let Some(entry) = cache.get(fingerprint) {
+            return entry.endpoints.first().cloned();
         }
         let mut hit = None;
-        for (fp, eps) in cache.iter() {
+        for (fp, entry) in cache.iter() {
             if fp.starts_with(fingerprint) {
                 if hit.is_some() {
                     return None; // ambiguous prefix
                 }
-                hit = eps.first().cloned();
+                hit = entry.endpoints.first().cloned();
             }
         }
         hit
+    }
+
+    /// Snapshot the discovery pick-list (Slice A): nearby devices that are not
+    /// us and not already in `ring`, freshest sightings only. Empty if
+    /// discovery has resolved nothing yet.
+    pub fn discover_list(&self, ring: &Ring, local_fingerprint: &str) -> Vec<DiscoveredDevice> {
+        let cache = match self.discovery_cache.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        build_discover_list(&cache, ring, local_fingerprint, Instant::now())
     }
 
     /// Mirror a ring change (pair confirm / unpair) into the live ring so the
@@ -494,7 +576,7 @@ fn serve_echo(mut session: NoiseSession<TcpStream>) {
 fn spawn_browse_loop(
     svc: ServiceDaemon,
     ring: Arc<Mutex<Ring>>,
-    discovery_cache: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    discovery_cache: Arc<Mutex<HashMap<String, DiscoveredEntry>>>,
     state_dir: std::path::PathBuf,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -512,10 +594,19 @@ fn spawn_browse_loop(
                 match receiver.recv_timeout(Duration::from_millis(POLL_MS)) {
                     Ok(ServiceEvent::ServiceResolved(resolved)) => {
                         if let Some(peer) = discovery::resolved_to_peer(&resolved) {
-                            // Cache for `pair_begin` endpoint resolution (paired
-                            // or not), then fold into a ring member if known.
+                            // Cache for `pair_begin` endpoint resolution + the
+                            // `discover_list` pick-list (name from TXT `nm`),
+                            // then fold into a ring member if known.
                             if let Ok(mut cache) = discovery_cache.lock() {
-                                cache.insert(peer.txt.fingerprint.clone(), peer.endpoints.clone());
+                                cache.insert(
+                                    peer.txt.fingerprint.clone(),
+                                    DiscoveredEntry {
+                                        name: peer.txt.name.clone(),
+                                        endpoints: peer.endpoints.clone(),
+                                        paired: peer.txt.paired,
+                                        last_seen: Instant::now(),
+                                    },
+                                );
                             }
                             let persist = {
                                 let mut r = ring.lock().unwrap();
@@ -622,5 +713,93 @@ fn primary_local_ip() -> Option<IpAddr> {
         None
     } else {
         Some(ip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id_bytes(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    fn fp_hex(seed: u8) -> String {
+        hex::encode(id_bytes(seed))
+    }
+
+    /// A ring holding the given device-id seeds. Attestation is irrelevant here
+    /// (`upsert` does not verify), so the rows are built directly.
+    fn ring_with(seeds: &[u8]) -> Ring {
+        let mut ring = Ring::default();
+        for &s in seeds {
+            ring.upsert(RingEntry {
+                device_id: id_bytes(s),
+                name: format!("peer-{s}"),
+                transport_pubkey: [0u8; 32],
+                endpoints: vec![],
+                attestation: [0u8; 64],
+                paired_at: 1,
+            });
+        }
+        ring
+    }
+
+    fn entry(name: Option<&str>, last_seen: Instant) -> DiscoveredEntry {
+        DiscoveredEntry {
+            name: name.map(str::to_string),
+            endpoints: vec!["192.168.1.9:9100".into()],
+            paired: false,
+            last_seen,
+        }
+    }
+
+    #[test]
+    fn discover_list_filters_self_ring_and_stale() {
+        let me = fp_hex(1);
+        let paired = fp_hex(2);
+        let nearby = fp_hex(3);
+        let stale = fp_hex(4);
+
+        // `base` is "real now"; `now` is far enough ahead that a `base`-stamped
+        // sighting is past the TTL while `now`-stamped ones are fresh. Built
+        // additively so the test never underflows the monotonic clock.
+        let base = Instant::now();
+        let now = base + DISCOVERY_TTL * 2;
+
+        let ring = ring_with(&[2]); // the `paired` device is in our ring
+
+        let mut cache = HashMap::new();
+        cache.insert(me.clone(), entry(Some("self"), now));
+        cache.insert(paired.clone(), entry(Some("tablet"), now));
+        cache.insert(nearby.clone(), entry(Some("laptop"), now));
+        cache.insert(stale.clone(), entry(Some("ghost"), base));
+
+        let list = build_discover_list(&cache, &ring, &me, now);
+
+        // Only the fresh, unpaired, non-self device survives.
+        assert_eq!(list.len(), 1, "got {list:?}");
+        assert_eq!(list[0].fingerprint, nearby);
+        assert_eq!(list[0].name.as_deref(), Some("laptop"));
+        assert_eq!(list[0].endpoint.as_deref(), Some("192.168.1.9:9100"));
+        assert_eq!(list[0].last_seen_secs, 0);
+    }
+
+    #[test]
+    fn discover_list_sorts_by_name_then_fingerprint() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        // `apple` < `banana`; the unnamed one sorts first (empty name) but after
+        // by fingerprint among unnamed.
+        cache.insert(fp_hex(20), entry(Some("banana"), now));
+        cache.insert(fp_hex(21), entry(Some("apple"), now));
+        cache.insert(fp_hex(22), entry(None, now));
+
+        let list = build_discover_list(&cache, &Ring::default(), &fp_hex(99), now);
+        let names: Vec<_> = list.iter().map(|d| d.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![None, Some("apple".into()), Some("banana".into())]
+        );
     }
 }

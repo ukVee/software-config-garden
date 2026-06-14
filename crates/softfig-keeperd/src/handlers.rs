@@ -11,7 +11,7 @@ use base64::Engine as _;
 use softfig_vcs::{fsck as run_fsck, log_collect, Intent, Repo};
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
-    CommitArgs, CommitReply, FsckReply, LogArgs, LogEntry, LogReply,
+    CommitArgs, CommitReply, DiscoverListReply, FsckReply, LogArgs, LogEntry, LogReply,
     MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
     PairRemoveReply, PendingPairing, ReplaceFileArgs, ReplaceFileReply,
@@ -1016,6 +1016,33 @@ pub fn pair_remove(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         fingerprint: full_fp,
     })
     .unwrap())
+}
+
+/// Pairing-UX Slice A: the LAN pick-list. Surfaces the mDNS discovery cache's
+/// nearby-but-unpaired devices so the CLI/TUI can pair by name. Read-only; no
+/// network IO (the browse loop fills the cache out of band).
+pub fn discover_list(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    let ring = crate::net::load_ring(&state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
+    let local_fp = hex::encode(
+        inner
+            .session
+            .as_ref()
+            .expect("unlocked")
+            .identity_pubkey()
+            .to_bytes(),
+    );
+
+    let devices = match inner.net.as_ref() {
+        Some(net) => net.discover_list(&ring, &local_fp),
+        None => Vec::new(),
+    };
+
+    Ok(serde_json::to_value(DiscoverListReply { devices }).unwrap())
 }
 
 /// Normalize a fingerprint argument: lowercase, validate as 1–64 hex chars

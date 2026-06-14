@@ -43,6 +43,9 @@ pub struct NetConfig {
     pub listen: String,
     /// Device name override; `None` → system hostname.
     pub device_name: Option<String>,
+    /// Pairing-UX Slice A: advertise the device name in the mDNS TXT `nm`
+    /// field. `false` → fingerprint-only broadcast.
+    pub advertise_name: bool,
 }
 
 impl Default for NetConfig {
@@ -57,6 +60,7 @@ impl From<NetToml> for NetConfig {
             enabled: t.enabled,
             listen: t.listen,
             device_name: t.device_name,
+            advertise_name: t.advertise_name,
         }
     }
 }

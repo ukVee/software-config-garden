@@ -25,8 +25,8 @@ use clap::Args;
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{
-        op, PairBeginArgs, PairBeginReply, PairConfirmArgs, PairConfirmReply, PairListReply,
-        PairRemoveArgs, PairRemoveReply, PendingPairing,
+        op, DiscoverListReply, DiscoveredDevice, PairBeginArgs, PairBeginReply, PairConfirmArgs,
+        PairConfirmReply, PairListReply, PairRemoveArgs, PairRemoveReply, PendingPairing,
     },
     Request,
 };
@@ -34,8 +34,9 @@ use softfig_ipc::{
 #[derive(Args, Debug)]
 pub struct PairArgs {
     /// The peer's device-id fingerprint (lowercase hex), full or a unique
-    /// prefix.
-    pub fingerprint: String,
+    /// prefix. Omit it to pick a discovered device from a list by name (LAN
+    /// pick-list).
+    pub fingerprint: Option<String>,
     /// Explicit `host:port` to dial, overriding mDNS discovery. Required while
     /// the peer is not yet discoverable on the LAN.
     #[arg(long)]
@@ -68,33 +69,108 @@ pub struct UnpairArgs {
 pub fn pair(args: PairArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
 
+    // No fingerprint → LAN pick-list: surface discovered devices by name, let
+    // the user choose, and thread its cached endpoint into the initiate path.
+    let (fingerprint, endpoint) = match args.fingerprint {
+        Some(fp) => (fp, args.endpoint),
+        None => match pick_discovered(&socket)? {
+            Some(device) => (device.fingerprint, device.endpoint),
+            None => return Ok(()),
+        },
+    };
+
+    pair_with(&socket, &fingerprint, endpoint, args.yes)
+}
+
+/// The shared pair flow for both a typed fingerprint and a picked device:
+/// confirm a matching parked pending pairing if one exists (responder side),
+/// otherwise initiate to the peer (initiator side). `endpoint` overrides mDNS
+/// resolution when present.
+fn pair_with(
+    socket: &Path,
+    fingerprint: &str,
+    endpoint: Option<String>,
+    assume_yes: bool,
+) -> Result<()> {
     // Is there already a parked pairing matching this fingerprint (responder
     // side, parked by the inbound listener)? If so, confirm that one.
-    let list: PairListReply = serde_json::from_value(daemon_call(
-        &socket,
-        op::PAIR_LIST,
-        serde_json::Value::Null,
-    )?)?;
-    let query = args.fingerprint.trim().to_ascii_lowercase();
+    let list: PairListReply =
+        serde_json::from_value(daemon_call(socket, op::PAIR_LIST, serde_json::Value::Null)?)?;
+    let query = fingerprint.trim().to_ascii_lowercase();
     if let Some(p) = list.pending.iter().find(|p| p.fingerprint.starts_with(&query)) {
-        return confirm_flow(&socket, &p.pairing_id, &p.sas, &p.fingerprint, &p.name, args.yes);
+        return confirm_flow(socket, &p.pairing_id, &p.sas, &p.fingerprint, &p.name, assume_yes);
     }
 
     // Otherwise initiate.
     let begin_args = serde_json::to_value(PairBeginArgs {
-        fingerprint: args.fingerprint.clone(),
-        endpoint: args.endpoint.clone(),
+        fingerprint: fingerprint.to_string(),
+        endpoint,
     })?;
     let reply: PairBeginReply =
-        serde_json::from_value(daemon_call(&socket, op::PAIR_BEGIN, begin_args)?)?;
+        serde_json::from_value(daemon_call(socket, op::PAIR_BEGIN, begin_args)?)?;
     confirm_flow(
-        &socket,
+        socket,
         &reply.pairing_id,
         &reply.sas,
         &reply.fingerprint,
         &reply.name,
-        args.yes,
+        assume_yes,
     )
+}
+
+/// Show the LAN pick-list of discovered, unpaired devices and read the user's
+/// choice. `Ok(None)` means nothing to pick or the user cancelled.
+fn pick_discovered(socket: &Path) -> Result<Option<DiscoveredDevice>> {
+    let reply: DiscoverListReply =
+        serde_json::from_value(daemon_call(socket, op::DISCOVER_LIST, serde_json::Value::Null)?)?;
+    let mut devices = reply.devices;
+    if devices.is_empty() {
+        println!(
+            "no devices discovered nearby — pass a fingerprint (`softfig pair <fp>`) \
+             or --endpoint host:port"
+        );
+        return Ok(None);
+    }
+
+    println!("discovered nearby ({}):", devices.len());
+    for (i, d) in devices.iter().enumerate() {
+        println!("  {}) {}", i + 1, describe_device(d));
+    }
+    print!("pick a device [1-{}], or q to cancel: ", devices.len());
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+
+    match parse_pick(&line, devices.len()) {
+        Some(i) => Ok(Some(devices.swap_remove(i))),
+        None => {
+            println!("cancelled");
+            Ok(None)
+        }
+    }
+}
+
+/// One pick-list row: name (or `(unnamed)`), short fingerprint, endpoint, age.
+fn describe_device(d: &DiscoveredDevice) -> String {
+    let name = d.name.as_deref().unwrap_or("(unnamed)");
+    let endpoint = d.endpoint.as_deref().unwrap_or("(no endpoint)");
+    format!(
+        "{name}  {}  {endpoint}  (seen {}s ago)",
+        short_fp(&d.fingerprint),
+        d.last_seen_secs
+    )
+}
+
+/// Parse a pick-list selection: a 1-based index within `1..=len` → a 0-based
+/// index. Blank, `q`, out-of-range, or non-numeric all mean "no choice".
+fn parse_pick(input: &str, len: usize) -> Option<usize> {
+    let t = input.trim();
+    let n: usize = t.parse().ok()?;
+    if (1..=len).contains(&n) {
+        Some(n - 1)
+    } else {
+        None
+    }
 }
 
 /// Show the SAS, prompt (unless `--yes`), then confirm or abort.
@@ -207,5 +283,40 @@ fn daemon_call(socket: &Path, op: &str, args: serde_json::Value) -> Result<serde
     match resp.into_result() {
         Ok(v) => Ok(v),
         Err((kind, message)) => Err(anyhow!("{message}").context(format!("daemon error ({kind:?})"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pick_accepts_in_range_one_based() {
+        assert_eq!(parse_pick("1", 3), Some(0));
+        assert_eq!(parse_pick(" 3 \n", 3), Some(2));
+    }
+
+    #[test]
+    fn parse_pick_rejects_out_of_range_and_noise() {
+        assert_eq!(parse_pick("0", 3), None);
+        assert_eq!(parse_pick("4", 3), None);
+        assert_eq!(parse_pick("", 3), None);
+        assert_eq!(parse_pick("q", 3), None);
+        assert_eq!(parse_pick("two", 3), None);
+        assert_eq!(parse_pick("1", 0), None);
+    }
+
+    #[test]
+    fn describe_device_handles_missing_name_and_endpoint() {
+        let d = DiscoveredDevice {
+            name: None,
+            fingerprint: "ab".repeat(32),
+            endpoint: None,
+            last_seen_secs: 7,
+        };
+        let s = describe_device(&d);
+        assert!(s.contains("(unnamed)"));
+        assert!(s.contains("(no endpoint)"));
+        assert!(s.contains("seen 7s ago"));
     }
 }

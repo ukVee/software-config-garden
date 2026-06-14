@@ -80,6 +80,11 @@ pub mod op {
     pub const PAIR_LIST: &str = "pair_list";
     /// M5a-4: remove a peer from the ring (unpair) by device-id fingerprint.
     pub const PAIR_REMOVE: &str = "pair_remove";
+    /// Pairing-UX Slice A: list nearby-but-unpaired devices the mDNS browse
+    /// loop has discovered (the LAN pick-list). Read-only; surfaces the
+    /// discovery cache so the CLI/TUI can pair by name without typing a
+    /// fingerprint.
+    pub const DISCOVER_LIST: &str = "discover_list";
     /// Slice 2 (small-files): append a brand-new heading-addressed section
     /// to the end of any markdown doc. The heading must not already exist;
     /// commit `section_added`.
@@ -657,6 +662,39 @@ pub struct PairRemoveReply {
     pub removed: bool,
     /// The full fingerprint that was matched and removed.
     pub fingerprint: String,
+}
+
+// ---- Pairing-UX Slice A: LAN pick-list --------------------------------
+
+/// `discover_list({}) -> {devices}`. Read-only snapshot of the daemon's mDNS
+/// discovery cache, filtered to devices **not yet in the ring** (and not this
+/// device). The pick-list that lets a user pair by name instead of typing a
+/// fingerprint. Empty when networking is off or nothing has been discovered.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscoverListArgs {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoverListReply {
+    pub devices: Vec<DiscoveredDevice>,
+}
+
+/// One nearby, unpaired device seen over mDNS. `name`/`endpoint` are
+/// convenience hints from the broadcast — pairing still authenticates via the
+/// Noise handshake + SAS, so neither is security-load-bearing; they only
+/// *address* the peer for `pair_begin`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveredDevice {
+    /// The peer's advertised friendly name (TXT `nm`), if it published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The peer's device-id fingerprint (lowercase hex of its Ed25519
+    /// identity) — what `pair_begin` resolves and authenticates against.
+    pub fingerprint: String,
+    /// A reachable `host:port` to dial, if discovery resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Seconds since this device was last seen on the LAN (0 = just now).
+    pub last_seen_secs: u64,
 }
 
 /// `migrate split [--apply]` — one-time monolith → numbered-notes splitter.

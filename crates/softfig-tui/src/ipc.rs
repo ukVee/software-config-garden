@@ -28,6 +28,8 @@ pub enum Tag {
     Reveal { path: String },
     /// M5a: list the network trust ring + pending pairings (`pair_list`).
     PairList,
+    /// Pairing-UX Slice A: list nearby unpaired devices (`discover_list`).
+    DiscoverList,
     /// M5a: initiate a pairing (`pair_begin`); reply carries the SAS to confirm.
     PairBegin,
     /// M5a: confirm a parked pairing's SAS (`pair_confirm`).

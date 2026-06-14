@@ -73,6 +73,12 @@ pub struct NetToml {
     /// to the system hostname when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
+    /// Pairing-UX Slice A: publish the device name in the mDNS TXT `nm` field
+    /// so peers can pick it from a list by name. Default `true`; set `false`
+    /// for a fingerprint-only broadcast (privacy fall-back). The name is a
+    /// convenience hint only — pairing still authenticates via the SAS.
+    #[serde(default = "default_advertise_name")]
+    pub advertise_name: bool,
 }
 
 impl Default for NetToml {
@@ -81,11 +87,16 @@ impl Default for NetToml {
             enabled: default_net_enabled(),
             listen: default_net_listen(),
             device_name: None,
+            advertise_name: default_advertise_name(),
         }
     }
 }
 
 fn default_net_enabled() -> bool {
+    true
+}
+
+fn default_advertise_name() -> bool {
     true
 }
 
@@ -185,7 +196,25 @@ mod tests {
         assert!(cfg.net.enabled);
         assert_eq!(cfg.net.listen, "0.0.0.0:9100");
         assert!(cfg.net.device_name.is_none());
+        assert!(cfg.net.advertise_name, "advertise_name defaults on");
         assert!(!cfg.relay.enabled);
+    }
+
+    #[test]
+    fn advertise_name_can_be_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let softfig = tmp.path().join(".softfig");
+        fs::create_dir_all(&softfig).unwrap();
+        fs::write(
+            softfig.join(KEEPER_TOML),
+            "state_root = \"/s\"\n\n[net]\nadvertise_name = false\n",
+        )
+        .unwrap();
+        let cfg = KeeperToml::load(tmp.path()).unwrap();
+        assert!(!cfg.net.advertise_name);
+        // Other [net] fields still take their defaults.
+        assert!(cfg.net.enabled);
+        assert_eq!(cfg.net.listen, "0.0.0.0:9100");
     }
 
     #[test]

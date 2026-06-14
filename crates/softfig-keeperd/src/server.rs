@@ -178,6 +178,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::PAIR_CONFIRM => handlers::pair_confirm(daemon, req.args),
         op::PAIR_LIST => handlers::pair_list(daemon, req.args),
         op::PAIR_REMOVE => handlers::pair_remove(daemon, req.args),
+        op::DISCOVER_LIST => handlers::discover_list(daemon, req.args),
         op::SHUTDOWN => handlers::shutdown(daemon, req.args),
         other => Err((
             ErrorKind::BadArgs,

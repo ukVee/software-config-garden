@@ -22,8 +22,8 @@ use softfig_vcs::Repo;
 use softfig_ipc::{
     self,
     verbs::{
-        op, PairBeginArgs, PairBeginReply, PairConfirmArgs, PairConfirmReply, PairListReply,
-        PairRemoveArgs, PairRemoveReply, UnlockArgs,
+        op, DiscoverListReply, PairBeginArgs, PairBeginReply, PairConfirmArgs, PairConfirmReply,
+        PairListReply, PairRemoveArgs, PairRemoveReply, UnlockArgs,
     },
     ErrorKind, Request, Response,
 };
@@ -345,6 +345,47 @@ fn net_host_starts_on_unlock_and_serves_verbs() {
         serde_json::from_value(unwrap_ok(rpc(&socket, op::PAIR_LIST, json!({})))).unwrap();
     assert!(list.peers.is_empty());
 
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn discover_list_is_empty_without_net() {
+    // With the net host disabled (no browse loop), the pick-list is empty but
+    // the verb still answers cleanly on an unlocked daemon.
+    let (handle, socket, _tmp) = unlocked_daemon();
+    let reply: DiscoverListReply =
+        serde_json::from_value(unwrap_ok(rpc(&socket, op::DISCOVER_LIST, json!({})))).unwrap();
+    assert!(reply.devices.is_empty());
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn discover_list_requires_unlock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let garden = tmp.path();
+    let (_v, session, _r) =
+        Vault::init_with_params(garden, PASS.as_bytes(), fast_params()).unwrap();
+    Repo::init(garden, &session).unwrap();
+    drop(session);
+    let socket = garden.join("keeperd.sock");
+    let handle = Daemon::new(
+        KeeperConfig::new(garden)
+            .with_socket(&socket)
+            .without_watcher()
+            .without_net(),
+    )
+    .start()
+    .unwrap();
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let kind = expect_err(rpc(&socket, op::DISCOVER_LIST, json!({})));
+    assert_eq!(kind, ErrorKind::VaultLocked);
     handle.shutdown();
     handle.join().unwrap();
 }

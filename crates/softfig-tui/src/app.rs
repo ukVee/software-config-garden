@@ -9,8 +9,9 @@ use std::path::Path;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
 use softfig_ipc::{
-    LogReply, PairBeginReply, PairConfirmReply, PairListReply, PairPeer, PairRemoveReply,
-    PendingPairing, ReadFileReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
+    DiscoverListReply, DiscoveredDevice, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
+    PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ShowReply, StatusReply,
+    VaultListSealedReply, VaultRevealReply,
 };
 
 use crate::clip;
@@ -27,16 +28,18 @@ pub enum View {
     Peers,
 }
 
-/// One navigable row in the Peers view: either a ring member or a pairing
-/// still awaiting SAS confirmation. The two collections are flattened into a
-/// single selection list (peers first, then pending) so `j`/`k` move over
-/// both.
+/// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
+/// confirmation, or a nearby device discovered over mDNS (Slice A pick-list).
+/// The three collections are flattened into a single selection list (peers,
+/// then pending, then discovered) so `j`/`k` move over all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRow {
     /// Index into [`App::peers`].
     Peer(usize),
     /// Index into [`App::pending`].
     Pending(usize),
+    /// Index into [`App::discovered`].
+    Discovered(usize),
 }
 
 /// Which field the `pair_begin` overlay is editing.
@@ -124,8 +127,10 @@ pub struct App {
     pub reveal: Option<RevealInfo>,
     pub peers: Vec<PairPeer>,
     pub pending: Vec<PendingPairing>,
-    /// Flattened selection model over `peers` ++ `pending`, rebuilt on each
-    /// `pair_list` reply.
+    /// Nearby unpaired devices discovered over mDNS (`discover_list`).
+    pub discovered: Vec<DiscoveredDevice>,
+    /// Flattened selection model over `peers` ++ `pending` ++ `discovered`,
+    /// rebuilt on each `pair_list` / `discover_list` reply.
     pub peer_rows: Vec<PeerRow>,
     pub peers_selected: usize,
     pub peers_loaded: bool,
@@ -162,6 +167,7 @@ impl App {
             reveal: None,
             peers: Vec::new(),
             pending: Vec::new(),
+            discovered: Vec::new(),
             peer_rows: Vec::new(),
             peers_selected: 0,
             peers_loaded: false,
@@ -204,6 +210,7 @@ impl App {
 
     fn load_peers(&self, ipc: &mut IpcClient) {
         ipc.send("pair_list", json!({}), Tag::PairList);
+        ipc.send("discover_list", json!({}), Tag::DiscoverList);
     }
 
     /// Re-fetch every directory whose children are loaded, so the view
@@ -224,15 +231,25 @@ impl App {
         }
     }
 
-    /// Rebuild the flattened peer/pending selection list (peers first, then
-    /// pending) and clamp the selection into range.
+    /// Rebuild the flattened selection list (ring peers, then pending, then
+    /// discovered-nearby) and clamp the selection into range. A discovered
+    /// device already shown as a ring member or a pending pairing is skipped so
+    /// it isn't listed twice.
     fn rebuild_peer_rows(&mut self) {
-        let mut rows = Vec::with_capacity(self.peers.len() + self.pending.len());
+        let mut rows =
+            Vec::with_capacity(self.peers.len() + self.pending.len() + self.discovered.len());
         for i in 0..self.peers.len() {
             rows.push(PeerRow::Peer(i));
         }
         for i in 0..self.pending.len() {
             rows.push(PeerRow::Pending(i));
+        }
+        for (i, d) in self.discovered.iter().enumerate() {
+            let already_shown = self.peers.iter().any(|p| p.fingerprint == d.fingerprint)
+                || self.pending.iter().any(|p| p.fingerprint == d.fingerprint);
+            if !already_shown {
+                rows.push(PeerRow::Discovered(i));
+            }
         }
         self.peer_rows = rows;
         if self.peers_selected >= self.peer_rows.len() {
@@ -400,6 +417,16 @@ impl App {
                 }
                 Err((_, m)) => self.status = format!("pair list: {m}"),
             },
+            // Discovery is best-effort surfacing; an error just leaves the
+            // pick-list as-is (no status nag).
+            Tag::DiscoverList => {
+                if let Ok(v) = reply.result {
+                    if let Ok(r) = serde_json::from_value::<DiscoverListReply>(v) {
+                        self.discovered = r.devices;
+                        self.rebuild_peer_rows();
+                    }
+                }
+            }
             Tag::PairBegin => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<PairBeginReply>(v) {
@@ -530,7 +557,7 @@ impl App {
             }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
-            KeyCode::Char('p') if self.view == View::Peers => self.open_pair_begin(),
+            KeyCode::Char('p') if self.view == View::Peers => self.pair_selected(ipc),
             KeyCode::Char('D') if self.view == View::Peers => self.start_unpair(),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
@@ -640,9 +667,9 @@ impl App {
             }
             View::Vault => self.start_reveal(ipc),
             // Activating a parked pending pairing opens the SAS-confirm
-            // overlay; activating a settled ring member is a no-op (its
-            // details already show in the right pane).
-            View::Peers => self.confirm_selected_pending(),
+            // overlay; a discovered device initiates pairing; a settled ring
+            // member is a no-op (its details already show in the right pane).
+            View::Peers => self.activate_selected_peer(ipc),
         }
     }
 
@@ -837,9 +864,19 @@ impl App {
         };
     }
 
-    /// If a pending pairing is selected, open its SAS-confirm overlay (the
-    /// responder side, or re-confirming an initiated one).
-    fn confirm_selected_pending(&mut self) {
+    /// `p` on the Peers tab. On a discovered device it kicks off pairing with
+    /// the cached fingerprint + endpoint (no typing); otherwise it opens the
+    /// manual "initiate pairing" overlay (off-LAN / not-yet-discovered peers).
+    fn pair_selected(&mut self, ipc: &mut IpcClient) {
+        match self.selected_peer_row() {
+            Some(PeerRow::Discovered(i)) => self.pair_discovered(i, ipc),
+            _ => self.open_pair_begin(),
+        }
+    }
+
+    /// Enter on the Peers tab: confirm a parked pending pairing, initiate a
+    /// discovered device, or no-op on a settled ring member.
+    fn activate_selected_peer(&mut self, ipc: &mut IpcClient) {
         match self.selected_peer_row() {
             Some(PeerRow::Pending(i)) => {
                 if let Some(p) = self.pending.get(i) {
@@ -852,11 +889,33 @@ impl App {
                     };
                 }
             }
+            Some(PeerRow::Discovered(i)) => self.pair_discovered(i, ipc),
             Some(PeerRow::Peer(_)) => {
                 self.status = "already paired — D to unpair".into();
             }
-            None => self.status = "no pending pairing selected".into(),
+            None => self.status = "nothing selected".into(),
         }
+    }
+
+    /// Initiate pairing with a discovered device: send `pair_begin` with its
+    /// cached fingerprint + endpoint. The reply opens the SAS-confirm overlay,
+    /// exactly as the manual path does — only the addressing is auto-filled.
+    fn pair_discovered(&mut self, i: usize, ipc: &mut IpcClient) {
+        if self.locked {
+            self.status = "locked — unlock before pairing".into();
+            return;
+        }
+        let Some(d) = self.discovered.get(i) else {
+            self.status = "no discovered device selected".into();
+            return;
+        };
+        let mut args = json!({ "fingerprint": d.fingerprint });
+        if let Some(ep) = &d.endpoint {
+            args["endpoint"] = json!(ep);
+        }
+        let who = d.name.clone().unwrap_or_else(|| short_fp(&d.fingerprint).to_string());
+        self.status = format!("pairing with {who}… (running handshake)");
+        ipc.send("pair_begin", args, Tag::PairBegin);
     }
 
     /// If a ring member is selected, open the unpair-confirm overlay.
@@ -1384,6 +1443,70 @@ mod tests {
             }
             other => panic!("expected PairBegin still open, got {other:?}"),
         }
+    }
+
+    fn discovered(name: Option<&str>, fp: &str, endpoint: Option<&str>) -> DiscoveredDevice {
+        DiscoveredDevice {
+            name: name.map(str::to_string),
+            fingerprint: fp.into(),
+            endpoint: endpoint.map(str::to_string),
+            last_seen_secs: 3,
+        }
+    }
+
+    #[test]
+    fn discover_list_appends_rows_and_skips_duplicates() {
+        let mut app = App::new();
+        app.peers = vec![peer("tablet", &"11".repeat(32))];
+        app.pending = vec![pending("laptop", &"22".repeat(32), "123 456")];
+        // One discovered device duplicates the ring member (skipped); one is new.
+        app.discovered = vec![
+            discovered(Some("tablet"), &"11".repeat(32), Some("10.0.0.2:9100")),
+            discovered(Some("desktop"), &"33".repeat(32), Some("10.0.0.3:9100")),
+        ];
+        app.rebuild_peer_rows();
+        assert_eq!(
+            app.peer_rows,
+            vec![
+                PeerRow::Peer(0),
+                PeerRow::Pending(0),
+                PeerRow::Discovered(1), // index 0 was a dup of the ring member
+            ]
+        );
+    }
+
+    #[test]
+    fn p_on_discovered_initiates_pairing() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Peers;
+        app.discovered = vec![discovered(Some("desktop"), &"33".repeat(32), Some("10.0.0.3:9100"))];
+        app.rebuild_peer_rows();
+        app.peers_selected = 0; // the lone discovered row
+        let mut ipc = dummy_ipc();
+
+        app.pair_selected(&mut ipc);
+        // No overlay yet (it opens on the pair_begin reply); status reflects the
+        // in-flight handshake against the named device.
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("desktop"), "status was {:?}", app.status);
+    }
+
+    #[test]
+    fn p_on_ring_member_opens_manual_overlay() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Peers;
+        app.peers = vec![peer("tablet", &"11".repeat(32))];
+        app.rebuild_peer_rows();
+        app.peers_selected = 0; // a ring member, not discovered
+        let mut ipc = dummy_ipc();
+
+        app.pair_selected(&mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::PairBegin { .. }),
+            "p on a non-discovered row opens the manual initiate overlay"
+        );
     }
 
     #[test]
