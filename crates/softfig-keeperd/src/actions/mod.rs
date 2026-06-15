@@ -38,7 +38,7 @@ mod split;
 pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
-pub use growlight::{add_backlog_item, add_slice, log_baton, set_item_status};
+pub use growlight::{add_backlog_item, add_slice, growlight_init, log_baton, set_item_status};
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;
 pub use refresh_snapshot::refresh_snapshot;

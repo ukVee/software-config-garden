@@ -130,6 +130,12 @@ pub mod op {
     /// `growlight/backlog/CLAUDE.md` (enforces at most one `active`). Commit
     /// `item_status_set`.
     pub const SET_ITEM_STATUS: &str = "set_item_status";
+    /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
+    /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
+    /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
+    /// Idempotent retrofit; one `growlight_initialized` commit, or none if the
+    /// pillar already exists. Mirrors `migrate split`.
+    pub const GROWLIGHT_INIT: &str = "growlight_init";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -967,5 +973,26 @@ pub struct SetItemStatusReply {
     pub status: String,
     /// The queue doc the daemon rewrote (`growlight/backlog/CLAUDE.md`).
     pub path: String,
+    pub hash: String,
+}
+
+/// `growlight_init({}) -> {created, skipped, nav_wired, committed, hash}`.
+/// Scaffold the `growlight/` pillar (Phase 2). Idempotent: only writes what's
+/// missing, so a re-run on an already-set-up garden creates nothing and makes
+/// no commit.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GrowlightInitArgs {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrowlightInitReply {
+    /// Garden-relative pillar paths newly created this run.
+    pub created: Vec<String>,
+    /// Pillar paths already present, left untouched.
+    pub skipped: Vec<String>,
+    /// Existing nav docs the daemon edited (root `CLAUDE.md`, `meta/*`).
+    pub nav_wired: Vec<String>,
+    /// False on a fully-idempotent re-run (nothing changed, no commit).
+    pub committed: bool,
+    /// The resulting commit hash, or the current tip if nothing changed.
     pub hash: String,
 }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, AddBacklogItemReply, AddSliceReply, LogBatonReply, SetItemStatusReply,
+    op, AddBacklogItemReply, AddSliceReply, GrowlightInitReply, LogBatonReply, SetItemStatusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -424,6 +424,140 @@ fn set_item_status_without_backlog_is_not_found() {
         err_kind(fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "active" }))),
         ErrorKind::NotFound
     );
+}
+
+// ---- growlight init (Phase 2a scaffolder) -----------------------------
+
+/// A default-garden-shaped root `CLAUDE.md`: the two nav headings the
+/// scaffolder edits, each with a trailing trap (`---` after the map, prose
+/// after the boundary table) that a naive section-append would land in.
+const SEED_CLAUDE: &str = "# test garden\n\n\
+    ## Where does X belong? (boundary decision table)\n\n\
+    | If about... | Read first | Then |\n\
+    |---|---|---|\n\
+    | packages | `packages/` | snapshots |\n\n\
+    Boundary rule: own each concept once.\n\n\
+    ---\n\n\
+    ## Top-level map\n\n\
+    - `meta/` — docs about the garden.\n\
+    - `journal/` — dated decisions.\n\n\
+    ---\n\n\
+    ## How to behave\n\n\
+    route via the table.\n";
+
+const SEED_RESERVED: &str = "# Reserved filenames\n\n## v1 reserved set\n\n\
+    | Name | Purpose |\n|---|---|\n| `CLAUDE.md` | navigator |\n";
+
+const SEED_CONVENTIONS: &str =
+    "# Conventions\n\n## Concept folders vs snapshots folders\n\nstable vs mutating.\n";
+
+#[test]
+fn growlight_init_scaffolds_the_pillar_and_commits() {
+    let fx = Fixture::start();
+    let resp = fx.call(op::GROWLIGHT_INIT, serde_json::json!({}));
+    let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
+
+    assert!(reply.committed);
+    // All seven pillar files are created on a fresh garden.
+    for rel in [
+        "growlight/CLAUDE.md",
+        "growlight/protocol.md",
+        "growlight/session-policy.md",
+        "growlight/backlog/CLAUDE.md",
+        "growlight/backlog/tasks/.seq",
+        "growlight/baton-log/CLAUDE.md",
+        "growlight/baton-log/.seq",
+    ] {
+        assert!(reply.created.contains(&rel.to_string()), "missing {rel}");
+    }
+
+    // Routing doc maps its children; protocol + policy come from the templates.
+    assert!(fx.read("growlight/CLAUDE.md").contains("## Children"));
+    assert!(fx
+        .read("growlight/protocol.md")
+        .contains("SOFT-FIG GROWLIGHT — operating protocol"));
+    assert!(fx
+        .read("growlight/session-policy.md")
+        .contains("## The two budgets"));
+    // The backlog routing doc is the same stub the MCP verbs seed (empty queue).
+    assert!(fx.backlog().contains("<!-- softfig:queue -->"));
+    // Numbered folders start clean so their first entry is 001.
+    assert_eq!(fx.read("growlight/backlog/tasks/.seq"), "0\n");
+    assert_eq!(fx.read("growlight/baton-log/.seq"), "0\n");
+
+    let (intent, _) = fx.tip_intent();
+    assert_eq!(intent, "growlight_initialized");
+}
+
+#[test]
+fn growlight_init_is_idempotent_without_an_empty_commit() {
+    let fx = Fixture::start();
+    fx.call(op::GROWLIGHT_INIT, serde_json::json!({}));
+    let tip_before = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+
+    let resp = fx.call(op::GROWLIGHT_INIT, serde_json::json!({}));
+    let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(!reply.committed, "re-run must not commit");
+    assert!(reply.created.is_empty());
+    assert_eq!(reply.hash, tip_before, "re-run returns the current tip");
+    // The seven pillar files are reported as kept, not recreated.
+    assert_eq!(reply.skipped.len(), 7);
+
+    let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    assert_eq!(tip_after, tip_before, "no new commit on a no-op init");
+}
+
+#[test]
+fn growlight_init_wires_nav_when_docs_are_present() {
+    let fx = Fixture::start();
+    std::fs::write(fx.garden.join("CLAUDE.md"), SEED_CLAUDE).unwrap();
+    std::fs::create_dir_all(fx.garden.join("meta")).unwrap();
+    std::fs::write(fx.garden.join("meta/reserved-filenames.md"), SEED_RESERVED).unwrap();
+    std::fs::write(fx.garden.join("meta/conventions.md"), SEED_CONVENTIONS).unwrap();
+
+    let resp = fx.call(op::GROWLIGHT_INIT, serde_json::json!({}));
+    let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
+    for rel in ["CLAUDE.md", "meta/reserved-filenames.md", "meta/conventions.md"] {
+        assert!(reply.nav_wired.contains(&rel.to_string()), "nav missed {rel}");
+    }
+
+    let root = fx.read("CLAUDE.md");
+    // Map bullet lands after the last bullet, before the trailing `---`.
+    assert!(root.contains("- `journal/` — dated decisions.\n- `growlight/` — the autonomous"));
+    // Boundary row lands after the last table row, before the prose.
+    assert!(root.contains("| packages | `packages/` | snapshots |\n| the autonomous work loop"));
+    assert!(fx
+        .read("meta/reserved-filenames.md")
+        .contains("## growlight pillar reserved names"));
+    assert!(fx
+        .read("meta/conventions.md")
+        .contains("## Agent runtime state lives outside the garden"));
+
+    // Re-running does not duplicate the wiring.
+    let before = fx.read("CLAUDE.md");
+    let resp2 = fx.call(op::GROWLIGHT_INIT, serde_json::json!({}));
+    let reply2: GrowlightInitReply = serde_json::from_value(ok_data(resp2)).unwrap();
+    assert!(reply2.nav_wired.is_empty());
+    assert_eq!(fx.read("CLAUDE.md"), before, "nav wiring is idempotent");
+}
+
+#[test]
+fn growlight_init_coexists_with_phase1_verbs() {
+    // The MCP verbs self-materialize backlog/CLAUDE.md; init must keep it.
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    let resp = fx.call(op::GROWLIGHT_INIT, serde_json::json!({}));
+    let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
+
+    assert!(
+        reply.skipped.contains(&"growlight/backlog/CLAUDE.md".to_string()),
+        "must not clobber an existing backlog"
+    );
+    assert!(reply.created.contains(&"growlight/protocol.md".to_string()));
+    // The queued item survived the scaffold.
+    assert!(fx
+        .backlog()
+        .contains("| 1 | m5b | milestone | Backup | queued |"));
 }
 
 #[test]

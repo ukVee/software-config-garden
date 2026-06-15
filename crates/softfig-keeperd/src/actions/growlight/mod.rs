@@ -18,8 +18,11 @@
 //! live only in the `queue` region of `growlight/backlog/CLAUDE.md`; item docs
 //! never carry status (the locked Phase-1 schema pick).
 
+mod init;
 mod paths;
 mod queue;
+
+pub use init::growlight_init;
 
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{

@@ -31,9 +31,29 @@ pub fn backlog_dir() -> String {
     format!("{PILLAR}/backlog")
 }
 
+/// The pillar's top routing/map doc. Created by the Phase-2 scaffolder.
+pub fn pillar_claude() -> String {
+    format!("{PILLAR}/CLAUDE.md")
+}
+
+/// The injected operating contract (embedded-template-sourced).
+pub fn protocol_md() -> String {
+    format!("{PILLAR}/protocol.md")
+}
+
+/// The editable two-budget policy (embedded-template-sourced).
+pub fn session_policy_md() -> String {
+    format!("{PILLAR}/session-policy.md")
+}
+
 /// Routing doc that hosts the queue table.
 pub fn backlog_claude() -> String {
     format!("{PILLAR}/backlog/CLAUDE.md")
+}
+
+/// Routing doc for the append-only baton-log folder.
+pub fn baton_log_claude() -> String {
+    format!("{PILLAR}/baton-log/CLAUDE.md")
 }
 
 /// A milestone's dir. The verbs target [`milestone_claude`] /
@@ -114,6 +134,52 @@ pub fn backlog_claude_stub() -> String {
     )
 }
 
+/// The pillar's top routing doc — maps the four children and states the
+/// MCP-only mutation rule. Created by `growlight init`; navigator, no
+/// `Last reviewed:` stamp.
+pub fn pillar_claude_stub() -> String {
+    format!(
+        "# {PILLAR}/\n\n\
+         The autonomous work-loop pillar — how soft-fig makes progress \"while it's \
+         dark\" (the human away). A curated **baton** carried between fresh sessions \
+         beats a lossy `/compact`: the loop never compacts, it `/clear`-reseeds from a \
+         small pointer index. Durable state lives here (via softfig-mcp) and in the code \
+         repos (git); the churny runtime (baton, usage, questions) lives *outside* the \
+         garden, in the app config namespace (`$XDG_CONFIG_HOME/softfig/growlight/`).\n\n\
+         This pillar is set up by `softfig growlight init` and driven by \
+         `softfig growlight start`. Normal `claude` is untouched — growlight hooks load \
+         only via the launcher's generated settings.\n\n\
+         ## Children\n\n\
+         - `protocol.md` — the fixed operating contract, injected into every loop \
+         session (boot, budgets, work, handoff, stuck, queue). Don't edit casually.\n\
+         - `session-policy.md` — the two budget numbers + value-max strategy. Tune here.\n\
+         - `backlog/` — the work queue: milestones (→ ordered slices) and standalone \
+         tasks. Status + order live in the managed queue table in `backlog/CLAUDE.md`.\n\
+         - `baton-log/` — append-only, numbered iteration entries (audit only; never \
+         injected). Added via `log_baton`.\n\n\
+         ## How to behave here\n\n\
+         - Mutate this pillar only through the softfig-mcp growlight verbs (`log_baton`, \
+         `add_backlog_item`, `add_slice`, `set_item_status`) — never by hand.\n\
+         - The runtime baton/usage/questions are NOT in the garden; find them under \
+         `$XDG_CONFIG_HOME/softfig/growlight/`.\n\
+         - Status + queue order are owned by the queue table; change them with \
+         `set_item_status`, not by editing the doc.\n"
+    )
+}
+
+/// The baton-log folder's routing doc. Navigator, no `Last reviewed:` stamp.
+pub fn baton_log_claude_stub() -> String {
+    format!(
+        "# {PILLAR}/baton-log/\n\n\
+         Append-only, numbered iteration entries — one per handoff. The loop's audit \
+         trail: what shipped, pointers, and the budgets at handoff. **Never injected** \
+         into a session (the baton carries forward state, not this log) and **excluded \
+         from the `[[…]]` backlink graph**.\n\n\
+         Entries are added by the `log_baton` softfig-mcp verb, numbered `NNN-<slug>.md` \
+         like notes. Don't add or edit entries by hand.\n"
+    )
+}
+
 /// A milestone's mission/finish-criteria doc. No status line — status lives
 /// in the queue table. `add_slice` maintains the `## Slices` index here.
 pub fn milestone_doc(id: &str, title: &str, mission: &str, finish: &str) -> String {
@@ -179,11 +245,27 @@ mod tests {
 
     #[test]
     fn paths_are_lowercase_pillar_relative() {
+        assert_eq!(pillar_claude(), "growlight/CLAUDE.md");
+        assert_eq!(protocol_md(), "growlight/protocol.md");
+        assert_eq!(session_policy_md(), "growlight/session-policy.md");
         assert_eq!(backlog_claude(), "growlight/backlog/CLAUDE.md");
+        assert_eq!(baton_log_claude(), "growlight/baton-log/CLAUDE.md");
         assert_eq!(milestone_dir("m5b"), "growlight/backlog/milestones/m5b");
         assert_eq!(slices_dir("m5b"), "growlight/backlog/milestones/m5b/slices");
         assert_eq!(tasks_dir(), "growlight/backlog/tasks");
         assert_eq!(baton_log_dir(), "growlight/baton-log");
+    }
+
+    #[test]
+    fn routing_stubs_map_their_children() {
+        let pillar = pillar_claude_stub();
+        assert!(pillar.starts_with("# growlight/\n"));
+        for child in ["protocol.md", "session-policy.md", "backlog/", "baton-log/"] {
+            assert!(pillar.contains(child), "pillar map missing {child}");
+        }
+        // Navigators carry no reviewed stamp.
+        assert!(!pillar.contains("Last reviewed:"));
+        assert!(baton_log_claude_stub().contains("Never injected"));
     }
 
     #[test]

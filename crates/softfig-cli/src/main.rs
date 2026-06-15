@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod cmd_daemon;
 mod cmd_deploy;
+mod cmd_growlight;
 mod cmd_migrate;
 mod cmd_onboard;
 mod cmd_pair;
@@ -68,6 +69,11 @@ enum Cmd {
     /// hosts may back up this device's chain, and show backup health.
     #[command(subcommand)]
     Replica(cmd_replica::ReplicaCmd),
+
+    /// growlight — the autonomous work-loop pillar. `init` scaffolds it into
+    /// an already-onboarded garden (Phase 2a).
+    #[command(subcommand)]
+    Growlight(cmd_growlight::GrowlightCmd),
 }
 
 #[derive(Args, Debug)]
@@ -96,5 +102,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Peers(args) => cmd_pair::peers(args),
         Cmd::Unpair(args) => cmd_pair::unpair(args),
         Cmd::Replica(cmd) => cmd_replica::run(cmd),
+        Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
     }
 }

@@ -173,6 +173,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::ADD_BACKLOG_ITEM => crate::actions::add_backlog_item(daemon, req.args),
         op::ADD_SLICE => crate::actions::add_slice(daemon, req.args),
         op::SET_ITEM_STATUS => crate::actions::set_item_status(daemon, req.args),
+        op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
         op::ARCHIVE => crate::actions::archive(daemon, req.args),
         op::ADD_PROJECT => crate::actions::add_project(daemon, req.args),
         op::REFRESH_SNAPSHOT => crate::actions::refresh_snapshot(daemon, req.args),
