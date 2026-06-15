@@ -342,14 +342,8 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 }
 
 pub fn shutdown(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
-    let mut inner = daemon.inner.lock().unwrap();
-    inner.state = State::Stopping;
-    let _ = inner.fuse.take();
-    // M5a-4: stop the net host + drop parked pairings before the session.
-    let _ = inner.net.take();
-    inner.pending_pairs.clear();
-    inner.session = None;
-    inner.repo = None;
+    // Same graceful teardown as a SIGTERM/SIGINT and `DaemonHandle::drop`.
+    daemon.request_shutdown();
     Ok(serde_json::json!({ "stopped": true }))
 }
 

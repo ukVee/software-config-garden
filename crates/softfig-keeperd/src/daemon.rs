@@ -133,6 +133,27 @@ impl Daemon {
         self.inner.lock().unwrap().state
     }
 
+    /// The graceful teardown shared by every shutdown trigger — the IPC
+    /// `shutdown` op (`softfig daemon stop`), a SIGTERM/SIGINT caught in
+    /// `main`, and [`DaemonHandle`]'s explicit shutdown + `Drop`. Marks
+    /// the daemon `Stopping` (so the accept loop exits on its next poll),
+    /// then drops the FUSE mount BEFORE the session: dropping the mount
+    /// handle unmounts and blocks until the kernel acks all in-flight
+    /// requests, and those FS handlers still need the session to serve
+    /// reads. Then stops the net host (joins its threads, unregisters
+    /// mDNS), drops parked pairings + their live sockets, and zeroizes
+    /// the session/repo. Idempotent — safe to call more than once (e.g.
+    /// a signal followed by `DaemonHandle::drop`).
+    pub fn request_shutdown(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.state = State::Stopping;
+        let _ = inner.fuse.take();
+        let _ = inner.net.take();
+        inner.pending_pairs.clear();
+        inner.session = None;
+        inner.repo = None;
+    }
+
     /// Mark a path as "written by the daemon itself" — watcher events
     /// for that path are dropped until the suppression window expires.
     pub fn mark_self_write(&self, path: PathBuf) {
@@ -170,24 +191,11 @@ impl DaemonHandle {
         &self.socket_path
     }
 
-    /// Request orderly shutdown. Sets state to Stopping; the accept
-    /// loop notices on its next poll iteration and exits.
+    /// Request orderly shutdown: runs the shared graceful teardown
+    /// ([`Daemon::request_shutdown`]); the accept loop notices the
+    /// `Stopping` state on its next poll iteration and exits.
     pub fn shutdown(&self) {
-        let mut inner = self.daemon.inner.lock().unwrap();
-        inner.state = State::Stopping;
-        // Drop the FUSE mount BEFORE the session — the FS handlers
-        // need the session for any in-flight reads, and unmount blocks
-        // until the kernel acknowledges all in-flight requests.
-        let _ = inner.fuse.take();
-        // M5a-4: stop the net host (joins its threads, unregisters mDNS)
-        // and drop any parked pairings + their live sockets before the
-        // session's keys go away.
-        let _ = inner.net.take();
-        inner.pending_pairs.clear();
-        // Drop the unlocked session — no need to wait for the
-        // accept loop to exit before zeroizing keys.
-        inner.session = None;
-        inner.repo = None;
+        self.daemon.request_shutdown();
     }
 
     /// Block until the accept loop exits. Returns its result. Also

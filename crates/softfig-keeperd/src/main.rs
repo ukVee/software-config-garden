@@ -1,6 +1,9 @@
 use std::path::PathBuf;
+use std::thread;
 
 use clap::Parser;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use softfig_keeperd::{Daemon, KeeperConfig};
 
 #[derive(Parser, Debug)]
@@ -54,6 +57,29 @@ fn main() -> anyhow::Result<()> {
         "softfig-keeperd: listening on {} (state: locked)",
         handle.socket_path().display()
     );
+
+    // SIGTERM (`systemctl --user stop`, logout, shutdown) and SIGINT
+    // (Ctrl-C) must run the SAME graceful teardown as `softfig daemon
+    // stop`: unmount FUSE, stop net, zeroize the session. Without a
+    // handler the default disposition kills the process mid-mount,
+    // leaving the garden mountpoint wedged in ENOTCONN until a manual
+    // `fusermount -u`. signal-hook delivers through a self-pipe, so the
+    // teardown runs here in normal thread context (the OS handler only
+    // writes a byte — staying async-signal-safe). Once `request_shutdown`
+    // marks the daemon `Stopping`, the accept loop exits on its next poll
+    // and `handle.join()` below returns for a clean process exit.
+    let shutdown_daemon = handle.daemon.clone();
+    let mut signals = Signals::new([SIGTERM, SIGINT])?;
+    thread::Builder::new()
+        .name("keeperd-signal".into())
+        .spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                eprintln!(
+                    "softfig-keeperd: caught signal {sig}; unmounting + shutting down"
+                );
+                shutdown_daemon.request_shutdown();
+            }
+        })?;
 
     handle.join()?;
     Ok(())

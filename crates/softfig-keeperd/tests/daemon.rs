@@ -390,3 +390,77 @@ fn watcher_classifies_new_decision_file() {
     handle.join().unwrap();
 }
 
+/// Regression for the SIGTERM graceful-shutdown path. A plain SIGTERM
+/// (what `systemctl --user stop softfig-keeperd`, logout, and shutdown all
+/// deliver) must run the SAME teardown as `softfig daemon stop`: a clean
+/// unmount and exit, never an abrupt kill that wedges the FUSE mount in
+/// ENOTCONN. We spawn the real daemon binary (no FUSE / no watcher, so the
+/// test needs no vault), wait for the socket, send SIGTERM, and assert the
+/// process exits successfully on its own and removes its socket on the way
+/// out. SIGINT shares the exact same handler, so covering SIGTERM covers it
+/// too.
+#[test]
+fn sigterm_triggers_graceful_shutdown() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let garden = tmp.path();
+    let socket = unique_socket(garden);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_softfig-keeperd"))
+        .arg("--garden")
+        .arg(garden)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--no-watcher")
+        .spawn()
+        .expect("spawn keeperd");
+
+    // Wait for the accept loop to bind the socket (~2s budget).
+    let mut up = false;
+    for _ in 0..100 {
+        if socket.exists() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(up, "daemon never bound its socket");
+
+    // Send SIGTERM — exactly what systemctl/logout/shutdown deliver.
+    let killed = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("run kill");
+    assert!(killed.success(), "kill -TERM failed");
+
+    // The daemon must exit cleanly on its own — no SIGKILL fallback.
+    let mut exited = None;
+    for _ in 0..150 {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                exited = Some(status);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let status = match exited {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon did not exit within ~3s of SIGTERM");
+        }
+    };
+    assert!(status.success(), "daemon exited non-zero on SIGTERM: {status:?}");
+
+    // A clean exit removes the socket (accept loop + DaemonHandle::drop);
+    // an abrupt signal kill would leave it behind.
+    assert!(
+        !socket.exists(),
+        "socket left behind after graceful SIGTERM shutdown"
+    );
+}
+
