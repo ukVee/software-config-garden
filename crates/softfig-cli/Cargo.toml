@@ -23,6 +23,7 @@ hostname.workspace = true
 rpassword.workspace = true
 anyhow.workspace = true
 hex.workspace = true
+zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

@@ -1808,6 +1808,7 @@ dependencies = [
  "softfig-vault",
  "softfig-vcs",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
