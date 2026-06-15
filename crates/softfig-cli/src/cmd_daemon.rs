@@ -37,6 +37,15 @@ pub enum DaemonCmd {
     /// the token — held in this process's RAM the whole time, never on disk or
     /// in the model's context. Requires `[growlight] allow_relock = true`.
     Cycle(CycleArgs),
+    /// Growlight (fallback): arm a relock token for an out-of-band restart.
+    /// Persists the one-time token to a `0600` tmpfs file and prints its path;
+    /// restart the daemon however you like, then run `softfig daemon relock`.
+    /// Prefer `cycle` — `arm` leaves the token briefly at rest beside the blob.
+    RelockArm(BasicArgs),
+    /// Growlight (fallback): redeem the token armed by `relock-arm` after the
+    /// daemon has restarted Locked. The daemon reads its own persisted token
+    /// file — no token bytes pass through this command.
+    Relock(BasicArgs),
 }
 
 #[derive(Args, Debug)]
@@ -76,6 +85,8 @@ pub fn run(cmd: DaemonCmd) -> Result<()> {
         DaemonCmd::Status(args) => status(args),
         DaemonCmd::Unlock(args) => unlock(args),
         DaemonCmd::Cycle(args) => cycle(args),
+        DaemonCmd::RelockArm(args) => relock_arm(args),
+        DaemonCmd::Relock(args) => relock(args),
     }
 }
 
@@ -231,6 +242,53 @@ fn cycle(args: CycleArgs) -> Result<()> {
         .and_then(|s| s.as_str())
         .unwrap_or("unlocked");
     println!("cycle: daemon resumed ({state})");
+    Ok(())
+}
+
+/// Growlight `relock-arm`: persist a one-time token + the wrapped-KEK blob to
+/// tmpfs for an out-of-band restart, then print the paths. This command never
+/// sees the token bytes — the daemon writes them and we only relay the path.
+fn relock_arm(args: BasicArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let mint: RelockMintReply = match try_daemon_call(&socket, op::RELOCK_MINT, json!({ "persist": true })) {
+        Ok(Some(v)) => serde_json::from_value(v)?,
+        Ok(None) => bail!("no running daemon at {} to arm", socket.display()),
+        Err(ClientError::Daemon { kind: ErrorKind::RelockDisabled, .. }) => bail!(
+            "relock is disabled. Set `[growlight] allow_relock = true` in \
+             .softfig/keeper.toml by hand (human-only), then re-run."
+        ),
+        Err(ClientError::Daemon { kind: ErrorKind::VaultLocked, .. }) => {
+            bail!("the daemon is locked — relock can only resume an already-unlocked session")
+        }
+        Err(e) => bail!("relock arm failed: {e}"),
+    };
+    println!("relock: armed (expires_at {})", mint.expires_at);
+    if let Some(tp) = &mint.token_path {
+        println!("token   {tp}");
+    }
+    println!("blob    {}", mint.blob_path);
+    println!("restart the daemon, then run: softfig daemon relock");
+    Ok(())
+}
+
+/// Growlight `relock`: redeem the armed token after the daemon restarted.
+/// Sends no token — the daemon reads its own persisted token file.
+fn relock(args: BasicArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let data = match try_daemon_call(&socket, op::RELOCK_REDEEM, json!({})) {
+        Ok(Some(v)) => v,
+        Ok(None) => bail!("no running daemon at {} to relock", socket.display()),
+        Err(ClientError::Daemon { kind: ErrorKind::NotFound, message }) => bail!(
+            "nothing to redeem: {message}. Did you `softfig daemon relock-arm` first \
+             (and has the token not expired)?"
+        ),
+        Err(e) => bail!(
+            "relock redeem failed: {e}. The garden remains locked; re-unlock with \
+             `softfig daemon unlock`."
+        ),
+    };
+    let state = data.get("state").and_then(|s| s.as_str()).unwrap_or("unlocked");
+    println!("relock: daemon resumed ({state})");
     Ok(())
 }
 
