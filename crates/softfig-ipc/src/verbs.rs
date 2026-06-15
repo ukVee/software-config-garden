@@ -111,6 +111,25 @@ pub mod op {
     /// Slice 2 (small-files): rewrite a doc's `Last reviewed:` line to today.
     /// Zero content tokens — just a path; commit `reviewed_stamped`.
     pub const SET_REVIEWED: &str = "set_reviewed";
+    /// growlight Phase 1: append a numbered iteration entry to the
+    /// `growlight/baton-log/` audit folder (item, slice, iteration, what
+    /// shipped, budgets). Mirrors `add_note`; commit `baton_logged`.
+    pub const LOG_BATON: &str = "log_baton";
+    /// growlight Phase 1: seed a backlog item — a milestone
+    /// (`growlight/backlog/milestones/<id>/`) or a standalone task
+    /// (`growlight/backlog/tasks/NNN-<slug>.md`) — and enqueue it (status
+    /// `queued`) in the managed queue table. Mirrors `add_project`; commit
+    /// `backlog_item_added`.
+    pub const ADD_BACKLOG_ITEM: &str = "add_backlog_item";
+    /// growlight Phase 1: append a numbered slice under a milestone
+    /// (`growlight/backlog/milestones/<id>/slices/NNN-<slug>.md`) and refresh
+    /// the milestone's slices index. Commit `slice_added`.
+    pub const ADD_SLICE: &str = "add_slice";
+    /// growlight Phase 1: set a backlog item's status (`queued|active|done|
+    /// blocked`) by flipping its cell in the authoritative queue table in
+    /// `growlight/backlog/CLAUDE.md` (enforces at most one `active`). Commit
+    /// `item_status_set`.
+    pub const SET_ITEM_STATUS: &str = "set_item_status";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -837,4 +856,116 @@ pub struct MigrateFinalizeReply {
     /// True if FUSE was remounted at the end. False means the user
     /// should `softfig daemon stop && softfig daemon start` to recover.
     pub remounted: bool,
+}
+
+// ---- growlight Phase 1: the work-loop pillar verbs ---------------------
+
+/// `log_baton({item, iteration, summary, ...}) -> {path, hash}`. Append a
+/// numbered audit entry to `growlight/baton-log/`. The daemon assigns the
+/// number from the folder's `.seq` high-water mark, derives the filename
+/// slug (`<item>-iter-<iteration>` unless `slug` is given), and stamps the
+/// iteration-metadata header above `summary`. Audit-only; never injected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogBatonArgs {
+    /// Backlog item id this iteration worked (milestone id or task `NNN`).
+    pub item: String,
+    /// Monotonic iteration counter carried by the baton.
+    pub iteration: u32,
+    /// What shipped this iteration + pointers (the entry body).
+    pub summary: String,
+    /// `milestone | task`; informational. Defaults to `milestone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
+    /// Active slice id (milestones only); `None` for tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice: Option<String>,
+    /// Loop status at handoff (`IN_PROGRESS`, `HALTED_RATE_LIMIT`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Last observed context-window used %.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_pct: Option<u32>,
+    /// Last observed 5h-session rate used %.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_5h_pct: Option<u32>,
+    /// Override the derived filename slug (`[a-z0-9-]+`, 1–64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogBatonReply {
+    /// Garden-relative path the daemon wrote (`growlight/baton-log/NNN-slug.md`).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `add_backlog_item({item_type, slug, title, mission, finish_criteria}) ->
+/// {id, path, hash}`. Seed a milestone or task and enqueue it (`queued`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddBacklogItemArgs {
+    /// `milestone | task`.
+    pub item_type: String,
+    /// `[a-z0-9-]+`, 1–64. For a milestone this is its id + dir name
+    /// (`milestones/<slug>/`); for a task it's the filename slug under
+    /// `tasks/` (the daemon assigns the task's numeric id).
+    pub slug: String,
+    /// Human title shown in the queue table + the item doc heading.
+    pub title: String,
+    /// Why this item exists (the item doc's `## Mission`).
+    pub mission: String,
+    /// Checkable completion criteria (the item doc's `## Finish criteria`).
+    pub finish_criteria: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddBacklogItemReply {
+    /// The item's queue id (milestone slug, or the task's `NNN`).
+    pub id: String,
+    /// Garden-relative path of the item's main doc.
+    pub path: String,
+    pub hash: String,
+}
+
+/// `add_slice({milestone, slug, title?, body}) -> {path, hash}`. Append a
+/// numbered slice doc under an existing milestone and refresh its slices
+/// index. The daemon assigns the slice number from `slices/.seq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddSliceArgs {
+    /// The owning milestone's id (its `milestones/<id>/` dir name).
+    pub milestone: String,
+    /// `[a-z0-9-]+`, 1–64; the slice's terse filename address.
+    pub slug: String,
+    /// Slice heading title. Defaults to the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The slice's plan/spec markdown body.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddSliceReply {
+    /// Garden-relative path the daemon wrote.
+    pub path: String,
+    pub hash: String,
+}
+
+/// `set_item_status({id, status}) -> {id, status, path, hash}`. Flip a
+/// backlog item's status cell in the authoritative queue table. Setting
+/// `active` is refused when a different item is already `active`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetItemStatusArgs {
+    /// The item's queue id (milestone slug or task `NNN`).
+    pub id: String,
+    /// `queued | active | done | blocked`.
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetItemStatusReply {
+    pub id: String,
+    pub status: String,
+    /// The queue doc the daemon rewrote (`growlight/backlog/CLAUDE.md`).
+    pub path: String,
+    pub hash: String,
 }

@@ -48,6 +48,24 @@ pub fn has_region(content: &str, tag: &str) -> bool {
     locate(&content.split('\n').collect::<Vec<_>>(), tag).is_some()
 }
 
+/// Extract the inner body of region `tag` — the lines between the markers,
+/// with the one blank pad line on each side stripped — as a `\n`-joined
+/// string. `None` if the region is absent. The inverse of `upsert`'s body
+/// argument, so a daemon-owned region can be parsed back into structured
+/// state (e.g. the growlight queue table).
+pub fn region_body(content: &str, tag: &str) -> Option<String> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let (open_idx, close_idx) = locate(&lines, tag)?;
+    let mut body = &lines[open_idx + 1..close_idx];
+    while body.first().is_some_and(|l| l.trim().is_empty()) {
+        body = &body[1..];
+    }
+    while body.last().is_some_and(|l| l.trim().is_empty()) {
+        body = &body[..body.len() - 1];
+    }
+    Some(body.join("\n"))
+}
+
 /// Insert or replace the region `tag` so its inner body is exactly `body`
 /// (which must not contain the marker lines and carries no surrounding
 /// newlines). Present → swap the inner lines, keeping the markers in place.
@@ -169,6 +187,13 @@ mod tests {
         let doc = "# Doc\n\nbody\n";
         let with = upsert(doc, TAG, TABLE);
         assert_eq!(remove(&with, TAG), doc);
+    }
+
+    #[test]
+    fn region_body_round_trips_upsert() {
+        let doc = upsert("# Doc\n\nlead\n", TAG, TABLE);
+        assert_eq!(region_body(&doc, TAG).as_deref(), Some(TABLE));
+        assert_eq!(region_body("# Doc\n\nno region\n", TAG), None);
     }
 
     #[test]

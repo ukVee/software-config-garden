@@ -13,13 +13,11 @@
 //! a belt-and-braces guard against a missing/stale `.seq` (e.g. a folder
 //! created before this feature), which can only ever raise the next id.
 
-use std::path::{Path, PathBuf};
-
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{AddNoteArgs, AddNoteReply, ReviseNoteArgs, ReviseNoteReply};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, write_file};
+use super::{commit_now, conventions, numbering, write_file};
 use crate::daemon::Daemon;
 use crate::handlers::{
     path_to_repo_rel_string, require_unlocked, validate_repo_path, HandlerResult,
@@ -61,25 +59,15 @@ pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         }
     }
 
-    let number = next_number(&dir_abs);
+    let number = numbering::next_number(&dir_abs);
     let filename = conventions::note_filename(number, &args.slug);
     let note_rel = format!("{dir_rel}/{filename}");
-    let note_abs = garden_root.join(&note_rel);
-    // The number is fresh, so this can only collide if `.seq` was corrupt
-    // and a live file already squats the slot — refuse rather than clobber.
-    if note_abs.exists() {
-        return Err((ErrorKind::PathAlreadyExists, format!("{note_rel}: already exists")));
-    }
 
     let title = args.title.as_deref().unwrap_or(&args.slug);
     let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
 
     // Bump the high-water mark in the same commit as the new note.
-    let seq_abs = dir_abs.join(conventions::SEQ_FILE);
-    daemon.mark_self_write(seq_abs.clone());
-    daemon.mark_self_write(note_abs.clone());
-    write_file(&seq_abs, format!("{number}\n").as_bytes())?;
-    write_file(&note_abs, content.as_bytes())?;
+    numbering::write_numbered(daemon, &dir_abs, number, &filename, &note_rel, &content)?;
 
     // Slice 4: refresh this folder's index table in the parent CLAUDE.md,
     // folded into the same commit (best-effort — never blocks the note).
@@ -122,7 +110,7 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         ));
     }
 
-    let note_abs = find_note_by_id(&dir_abs, args.id).ok_or((
+    let note_abs = numbering::find_by_id(&dir_abs, args.id).ok_or((
         ErrorKind::NotFound,
         format!("{dir_rel}: no note numbered {:03}", args.id),
     ))?;
@@ -160,47 +148,5 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         hash: hash.to_string(),
     })
     .unwrap())
-}
-
-// ---- numbering + lookup helpers ---------------------------------------
-
-/// The next note number for `dir_abs`: one past the larger of the `.seq`
-/// high-water mark and the highest live `NNN-*.md` file. A fresh/missing
-/// `.seq` reads as 0; the live-file floor guarantees we never re-issue a
-/// number already in use even if `.seq` lags.
-fn next_number(dir_abs: &Path) -> u32 {
-    read_seq(dir_abs).max(highest_live_number(dir_abs)) + 1
-}
-
-fn read_seq(dir_abs: &Path) -> u32 {
-    std::fs::read_to_string(dir_abs.join(conventions::SEQ_FILE))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-}
-
-fn highest_live_number(dir_abs: &Path) -> u32 {
-    let mut max = 0;
-    if let Ok(rd) = std::fs::read_dir(dir_abs) {
-        for entry in rd.flatten() {
-            if let Some(n) = entry
-                .file_name()
-                .to_str()
-                .and_then(conventions::parse_note_number)
-            {
-                max = max.max(n);
-            }
-        }
-    }
-    max
-}
-
-fn find_note_by_id(dir_abs: &Path, id: u32) -> Option<PathBuf> {
-    let prefix = format!("{id:03}-");
-    std::fs::read_dir(dir_abs).ok()?.flatten().find_map(|entry| {
-        let name = entry.file_name();
-        let name = name.to_str()?;
-        (name.starts_with(&prefix) && name.ends_with(".md")).then(|| entry.path())
-    })
 }
 

@@ -145,8 +145,11 @@ fn walk(garden_root: &Path, dir: &Path, out: &mut Vec<String>) {
             continue;
         };
         if ft.is_dir() {
-            if rel == "journal/archive" {
-                continue; // graveyard: neither source nor target
+            if rel == "journal/archive" || rel == "growlight/baton-log" {
+                // graveyard + the growlight audit log: never source nor target.
+                // The baton-log is append-only and "never injected", so its
+                // `[[…]]` mentions must not forge edges onto live item docs.
+                continue;
             }
             walk(garden_root, &path, out);
         } else if ft.is_file() && name.ends_with(".md") {
@@ -156,10 +159,13 @@ fn walk(garden_root: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 /// Whether `rel` is excluded from being a backlink target (the archive
-/// graveyard). Mirrors the source-walk skip so an archived doc never grows a
-/// region.
+/// graveyard + the growlight baton-log). Mirrors the source-walk skip so an
+/// archived doc — or an audit-only baton entry — never grows a region.
 fn is_excluded(rel: &str) -> bool {
-    rel == "journal/archive" || rel.starts_with("journal/archive/")
+    rel == "journal/archive"
+        || rel.starts_with("journal/archive/")
+        || rel == "growlight/baton-log"
+        || rel.starts_with("growlight/baton-log/")
 }
 
 // ---- pure reference core ----------------------------------------------

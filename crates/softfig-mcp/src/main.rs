@@ -16,9 +16,10 @@ use serde_json::{json, Value};
 use softfig_ipc::{
     self,
     verbs::{
-        op, AddNoteArgs, AddProjectArgs, AddSectionArgs, AppendToSectionArgs, ArchiveArgs,
-        EditSectionArgs, LogDecisionArgs, LogIncidentArgs, RefreshSnapshotArgs,
-        ReplaceFileArgs, ReviseNoteArgs, SetReviewedArgs,
+        op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddSectionArgs, AddSliceArgs,
+        AppendToSectionArgs, ArchiveArgs, EditSectionArgs, LogBatonArgs, LogDecisionArgs,
+        LogIncidentArgs, RefreshSnapshotArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs,
+        SetReviewedArgs,
     },
     Request, Response,
 };
@@ -299,6 +300,83 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "log_baton",
+            "description": "growlight: append a numbered iteration entry to growlight/baton-log/ \
+                            (the work-loop audit log). The daemon assigns the number from the \
+                            folder's .seq counter, derives the filename, and stamps the \
+                            iteration-metadata block (item/slice/iteration/status/budgets) above \
+                            your summary. Append-only audit; never injected into a session and \
+                            excluded from the backlink graph.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["item", "iteration", "summary"],
+                "properties": {
+                    "item": { "type": "string", "description": "backlog item id worked this iteration (milestone id or task NNN)" },
+                    "iteration": { "type": "integer", "description": "the baton's iteration counter" },
+                    "summary": { "type": "string", "description": "what shipped this iteration + pointers (the entry body)" },
+                    "item_type": { "type": "string", "description": "milestone | task; defaults to milestone" },
+                    "slice": { "type": "string", "description": "active slice id (milestones only)" },
+                    "status": { "type": "string", "description": "loop status at handoff, e.g. IN_PROGRESS / HALTED_RATE_LIMIT" },
+                    "ctx_pct": { "type": "integer", "description": "last observed context-window used %" },
+                    "session_5h_pct": { "type": "integer", "description": "last observed 5h-session rate used %" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+ filename slug; defaults to <item>-iter-<iteration>" },
+                },
+            },
+        }),
+        json!({
+            "name": "add_backlog_item",
+            "description": "growlight: seed a backlog item and enqueue it (status queued). A \
+                            milestone creates growlight/backlog/milestones/<slug>/ (mission + \
+                            finish criteria + an empty slices folder); a task creates a numbered \
+                            growlight/backlog/tasks/NNN-<slug>.md. Status + order live only in the \
+                            managed queue table in backlog/CLAUDE.md — change them with \
+                            set_item_status, never by hand. slug is [a-z0-9-]+ (lowercase).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["item_type", "slug", "title", "mission", "finish_criteria"],
+                "properties": {
+                    "item_type": { "type": "string", "description": "milestone | task" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+, 1-64; milestone id / dir name, or the task filename slug" },
+                    "title": { "type": "string", "description": "human title for the queue table + item heading" },
+                    "mission": { "type": "string", "description": "why this item exists (## Mission)" },
+                    "finish_criteria": { "type": "string", "description": "checkable completion criteria (## Finish criteria)" },
+                },
+            },
+        }),
+        json!({
+            "name": "add_slice",
+            "description": "growlight: append a numbered slice doc under an existing milestone \
+                            (growlight/backlog/milestones/<id>/slices/NNN-<slug>.md) and refresh the \
+                            milestone's slices index. The daemon assigns the slice number from the \
+                            folder's .seq counter and stamps the header + reviewed date.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["milestone", "slug", "body"],
+                "properties": {
+                    "milestone": { "type": "string", "description": "the owning milestone's id (its milestones/<id>/ dir)" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+, 1-64; the slice's terse filename address" },
+                    "title": { "type": "string", "description": "slice heading; defaults to slug" },
+                    "body": { "type": "string", "description": "the slice's plan/spec markdown body" },
+                },
+            },
+        }),
+        json!({
+            "name": "set_item_status",
+            "description": "growlight: set a backlog item's status (queued|active|done|blocked) by \
+                            flipping its cell in the authoritative queue table in \
+                            growlight/backlog/CLAUDE.md. At most one item may be active — setting \
+                            active is refused while another item is active. Identify the item by \
+                            its queue id (milestone slug or task NNN).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id", "status"],
+                "properties": {
+                    "id": { "type": "string", "description": "the item's queue id (milestone slug or task NNN)" },
+                    "status": { "type": "string", "description": "queued | active | done | blocked" },
+                },
+            },
+        }),
+        json!({
             "name": "replace_file",
             "description": "BREAK-GLASS: overwrite a garden file with verbatim bytes — no \
                             convention stamping, so you hand-write the ENTIRE file (frontmatter, \
@@ -375,6 +453,22 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: RefreshSnapshotArgs = serde_json::from_value(args)?;
             (op::REFRESH_SNAPSHOT, serde_json::to_value(a)?)
         }
+        "log_baton" => {
+            let a: LogBatonArgs = serde_json::from_value(args)?;
+            (op::LOG_BATON, serde_json::to_value(a)?)
+        }
+        "add_backlog_item" => {
+            let a: AddBacklogItemArgs = serde_json::from_value(args)?;
+            (op::ADD_BACKLOG_ITEM, serde_json::to_value(a)?)
+        }
+        "add_slice" => {
+            let a: AddSliceArgs = serde_json::from_value(args)?;
+            (op::ADD_SLICE, serde_json::to_value(a)?)
+        }
+        "set_item_status" => {
+            let a: SetItemStatusArgs = serde_json::from_value(args)?;
+            (op::SET_ITEM_STATUS, serde_json::to_value(a)?)
+        }
         other => anyhow::bail!("unknown tool {other:?}"),
     };
     Ok(pair)
@@ -424,9 +518,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twelve() {
+    fn tools_list_has_sixteen() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 12);
+        assert_eq!(defs.len(), 16);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -441,6 +535,10 @@ mod tests {
             "archive",
             "add_project",
             "refresh_snapshot",
+            "log_baton",
+            "add_backlog_item",
+            "add_slice",
+            "set_item_status",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -450,7 +548,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 16);
     }
 
     #[test]
@@ -498,6 +596,26 @@ mod tests {
                 "refresh_snapshot",
                 json!({ "path": "snapshots/x", "content": "c" }),
                 op::REFRESH_SNAPSHOT,
+            ),
+            (
+                "log_baton",
+                json!({ "item": "m5b", "iteration": 7, "summary": "shipped the pipe" }),
+                op::LOG_BATON,
+            ),
+            (
+                "add_backlog_item",
+                json!({ "item_type": "task", "slug": "sigterm-unmount", "title": "t", "mission": "m", "finish_criteria": "f" }),
+                op::ADD_BACKLOG_ITEM,
+            ),
+            (
+                "add_slice",
+                json!({ "milestone": "m5b", "slug": "secure-pipe", "body": "b" }),
+                op::ADD_SLICE,
+            ),
+            (
+                "set_item_status",
+                json!({ "id": "m5b", "status": "active" }),
+                op::SET_ITEM_STATUS,
             ),
             (
                 "replace_file",

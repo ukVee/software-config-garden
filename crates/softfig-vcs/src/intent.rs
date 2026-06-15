@@ -28,6 +28,10 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "archive_move",
     "project_added",
     "project_archived",
+    "baton_logged",
+    "backlog_item_added",
+    "slice_added",
+    "item_status_set",
     "schema_change",
     "rollback",
     "vault_seal",
@@ -88,7 +92,8 @@ const KNOWN_INTENTS_LIST: &str =
     "init, memory_edit, manual_edit, snapshot_refresh, decision_logged, \
      incident_logged, note_added, note_revised, monolith_split, section_added, \
      section_edited, section_appended, reviewed_stamped, archive_move, \
-     project_added, project_archived, schema_change, rollback, vault_seal, \
+     project_added, project_archived, baton_logged, backlog_item_added, \
+     slice_added, item_status_set, schema_change, rollback, vault_seal, \
      vault_reveal";
 
 fn type_name(v: &Value) -> &'static str {
