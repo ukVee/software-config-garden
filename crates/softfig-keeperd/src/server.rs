@@ -173,6 +173,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::REPLACE_FILE => handlers::replace_file(daemon, req.args),
         op::MIGRATE_FINALIZE => handlers::migrate_finalize(daemon, req.args),
         op::MIGRATE_SPLIT => crate::actions::migrate_split(daemon, req.args),
+        op::MIGRATE_CONFIG => crate::actions::migrate_config(daemon, req.args),
         op::VAULT_REVEAL => handlers::vault_reveal(daemon, req.args),
         op::VAULT_SEAL => handlers::vault_seal(daemon, req.args),
         op::VAULT_UNSEAL => handlers::vault_unseal(daemon, req.args),

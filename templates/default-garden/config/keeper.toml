@@ -1,0 +1,37 @@
+# soft-fig in-garden daemon config.
+#
+# This file IS garden content: encrypted at rest, versioned by the VCS, and
+# carried along by M5b backup. Edit it here — the daemon re-reads it each time
+# it unlocks. Bootstrap-only settings stay OUT of the garden, in the local
+# (never-backed-up) `.softfig/keeper.toml` pointer: `state_root` (needed before
+# unlock, to find the vault) and the security opt-in `[growlight] allow_relock`
+# (kept off this agent-writable surface so the loop can't self-enable it).
+
+[net]
+# Host the cross-device networking instance (inbound Noise listener + mDNS) on
+# unlock.
+enabled = true
+# Inbound Noise listener bind address (host:port); also the port mDNS advertises.
+listen = "0.0.0.0:9100"
+# Advertise this device's name in the mDNS TXT `nm` field so peers can pick it
+# from a list. false = fingerprint-only broadcast (privacy fall-back). The name
+# is a convenience hint only — pairing still authenticates via the SAS.
+advertise_name = true
+# Human-readable device name; defaults to the system hostname when omitted.
+# device_name = "this-device"
+
+[relay]
+# Host a blind relay on this device (always-on servers only).
+enabled = false
+# listen = "0.0.0.0:9101"          # required when enabled
+# endpoint = "relay.example:9101"   # a relay this NAT'd device reaches as client
+# static_key = "…"                  # the relay's X25519 transport pubkey (hex)
+
+[replica]
+# Store zero-knowledge ciphertext backups for ring members the owner grants.
+host = false
+
+[reveal]
+# Seconds after a successful `softfig reveal` during which the next reveal may
+# skip the master-password prompt. 0 = always re-prompt.
+idle_seconds = 0

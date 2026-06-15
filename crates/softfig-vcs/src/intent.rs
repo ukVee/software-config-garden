@@ -33,6 +33,7 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "slice_added",
     "item_status_set",
     "growlight_initialized",
+    "config_migrated",
     "schema_change",
     "rollback",
     "vault_seal",

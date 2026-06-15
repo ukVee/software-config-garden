@@ -25,6 +25,11 @@ pub mod op {
     /// sibling accretive folder of numbered notes, archive the monolith, and
     /// commit one `monolith_split` per file. Dry-run unless `apply`.
     pub const MIGRATE_SPLIT: &str = "migrate_split";
+    /// Config-in-garden: one-time migration that lifts the post-unlock policy
+    /// (`[net]`/`[relay]`/`[replica]`/`[reveal]`) out of the local `.softfig/`
+    /// pointer into the encrypted, versioned, backed-up `config/keeper.toml`
+    /// inside the garden, committing `config_migrated`. Dry-run unless `apply`.
+    pub const MIGRATE_CONFIG: &str = "migrate_config";
     pub const SHUTDOWN: &str = "shutdown";
     /// M2b: write plaintext of a sealed file to `$XDG_RUNTIME_DIR` and
     /// commit an audit `vault_reveal` intent.
@@ -909,6 +914,32 @@ pub struct SplitOutcome {
 pub struct SplitSkip {
     pub path: String,
     pub reason: String,
+}
+
+/// `migrate config [--apply]` — one-time lift of the post-unlock policy from the
+/// local `.softfig/keeper.toml` pointer into the in-garden `config/keeper.toml`.
+/// Dry-run (no writes) unless `apply` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MigrateConfigArgs {
+    /// Write + commit `config/keeper.toml`. Without it the daemon only reports
+    /// what it would write.
+    #[serde(default)]
+    pub apply: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrateConfigReply {
+    /// Garden-relative path that was (or would be) written.
+    pub path: String,
+    /// True when `config/keeper.toml` was written + committed; false for a
+    /// dry-run preview.
+    pub applied: bool,
+    /// True when `config/keeper.toml` already existed and nothing was done
+    /// (idempotent re-run).
+    pub already: bool,
+    /// Hash of the `config_migrated` commit. `None` in a dry-run or no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

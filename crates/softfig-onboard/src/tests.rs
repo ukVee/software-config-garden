@@ -44,6 +44,9 @@ fn plan_default_includes_skeleton_and_excludes_program_meta() {
     assert!(plan.contains("meta/conventions.md"));
     assert!(plan.contains("meta/reserved-filenames.md"));
     assert!(plan.contains("journal/decisions/.keep"));
+    // Config-in-garden: every fresh garden is born with an editable in-garden
+    // daemon config.
+    assert!(plan.contains("config/keeper.toml"), "in-garden config scaffolded");
 
     // At least one stub per always-on dir and a sampling of concept dirs.
     assert!(plan.contains("inbox/CLAUDE.md"));

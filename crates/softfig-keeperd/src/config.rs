@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::keeper_toml::{GrowlightToml, KeeperToml, NetToml, RelayToml, ReplicaToml};
+use crate::keeper_toml::{GardenConfig, GrowlightToml, KeeperToml, NetToml, RelayToml, ReplicaToml};
 
 #[derive(Debug, Clone)]
 pub struct KeeperConfig {
@@ -183,6 +183,20 @@ impl KeeperConfig {
         })
     }
 
+    /// Overlay the in-garden `config/keeper.toml` onto this config after unlock.
+    /// Touches only the post-unlock policy fields (`reveal`/`net`/`relay`/
+    /// `replica.host`); leaves the bootstrap/local fields (`state_root`,
+    /// `socket_path`, `growlight.allow_relock`, `replica_root`, the `enable_*`
+    /// runtime flags) untouched — those are sourced from the pointer / runtime,
+    /// never from the garden. Called only when the file is present; an absent
+    /// file keeps the boot-time pointer values.
+    pub fn apply_garden_config(&mut self, gc: GardenConfig) {
+        self.reveal.idle_seconds = gc.reveal.idle_seconds;
+        self.net = gc.net.into();
+        self.relay = gc.relay.into();
+        self.replica.host = gc.replica.host;
+    }
+
     pub fn with_reveal_idle_seconds(mut self, secs: u64) -> Self {
         self.reveal.idle_seconds = secs;
         self
@@ -294,5 +308,45 @@ mod tests {
         let cfg = KeeperConfig::discover(garden.path()).unwrap();
         assert!(cfg.is_fuse_mode(), "keeper.toml with state_root → FUSE");
         assert_eq!(cfg.state_dir(), state.path());
+    }
+
+    #[test]
+    fn apply_garden_config_overlays_policy_only() {
+        use crate::keeper_toml::{GardenConfig, NetToml, RelayToml, ReplicaToml, RevealToml};
+
+        // A boot config with pointer-sourced bootstrap/local fields set.
+        let mut cfg = KeeperConfig::new("/garden")
+            .with_state_root("/state")
+            .with_socket("/run/sock")
+            .allow_relock(true)
+            .with_replica_root("/peers");
+
+        let gc = GardenConfig {
+            reveal: RevealToml { idle_seconds: 30 },
+            net: NetToml {
+                listen: "0.0.0.0:9300".into(),
+                advertise_name: false,
+                ..NetToml::default()
+            },
+            relay: RelayToml {
+                enabled: true,
+                ..RelayToml::default()
+            },
+            replica: ReplicaToml { host: true },
+        };
+        cfg.apply_garden_config(gc);
+
+        // Policy overridden from the garden.
+        assert_eq!(cfg.reveal.idle_seconds, 30);
+        assert_eq!(cfg.net.listen, "0.0.0.0:9300");
+        assert!(!cfg.net.advertise_name);
+        assert!(cfg.relay.enabled);
+        assert!(cfg.replica.host);
+
+        // Bootstrap/local fields untouched by the overlay.
+        assert_eq!(cfg.state_root.as_deref(), Some(Path::new("/state")));
+        assert_eq!(cfg.socket_path, Path::new("/run/sock"));
+        assert!(cfg.growlight.allow_relock, "allow_relock stays from pointer");
+        assert_eq!(cfg.replica_root.as_deref(), Some(Path::new("/peers")));
     }
 }

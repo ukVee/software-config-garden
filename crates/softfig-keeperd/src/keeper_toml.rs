@@ -63,7 +63,7 @@ pub struct KeeperToml {
     pub growlight: GrowlightToml,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RevealToml {
     /// Number of seconds after a successful reveal during which the
@@ -75,7 +75,7 @@ pub struct RevealToml {
 
 /// `[net]` — the device's own `softfig-net` host (inbound Noise listener +
 /// mDNS advertisement).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetToml {
     /// Whether to host the networking instance on unlock. Default `true`.
@@ -123,7 +123,7 @@ fn default_net_listen() -> String {
 /// `[relay]` — relay hosting (`enabled`/`listen`) and relay-client reach
 /// (`endpoint`/`static_key`). The two halves are independent: the always-on
 /// server sets the hosting half; a NAT'd device sets the client half.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RelayToml {
     /// Host a blind relay on this device. Default `false`.
@@ -144,7 +144,7 @@ pub struct RelayToml {
 
 /// `[replica]` — M5b backup-host opt-in. Just the static host flag; the
 /// owner-side `push_to` grant list is runtime state in `replica.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicaToml {
     /// Store ciphertext backups for granted ring members. Default `false`.
@@ -195,6 +195,75 @@ impl KeeperToml {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
         })?;
         fs::write(path, raw)
+    }
+}
+
+/// Directory inside the garden holding the in-garden config files
+/// (`config/keeper.toml`, and — Slice 2 — `config/peers.toml`).
+pub const CONFIG_DIR: &str = "config";
+
+/// `config/keeper.toml` — the in-garden, encrypted, versioned, M5b-backed,
+/// hand-editable daemon config. Holds exactly the settings consumed *after*
+/// unlock (`[net]`/`[relay]`/`[replica]`/`[reveal]`). The bootstrap `state_root`
+/// (read before unlock) and the security opt-in `[growlight] allow_relock`
+/// (kept off the agent-writable garden surface) stay in the plaintext
+/// `.softfig/keeper.toml` pointer instead. See
+/// `journal/decisions/decision-softfig-config-in-garden.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GardenConfig {
+    #[serde(default)]
+    pub reveal: RevealToml,
+    #[serde(default)]
+    pub net: NetToml,
+    #[serde(default)]
+    pub relay: RelayToml,
+    #[serde(default)]
+    pub replica: ReplicaToml,
+}
+
+impl GardenConfig {
+    /// Absolute path of the in-garden config for a garden root.
+    pub fn path(garden_root: &Path) -> PathBuf {
+        garden_root.join(CONFIG_DIR).join(KEEPER_TOML)
+    }
+
+    /// Load `<garden_root>/config/keeper.toml`. An absent file returns
+    /// `Ok(None)` so the caller keeps the pointer's boot-time values — this is
+    /// what makes a not-yet-migrated garden keep working unchanged. A present
+    /// but unparseable file propagates as an error.
+    pub fn load(garden_root: &Path) -> std::io::Result<Option<Self>> {
+        let path = Self::path(garden_root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&path)?;
+        let cfg = toml::from_str(&raw).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {e}", path.display()),
+            )
+        })?;
+        Ok(Some(cfg))
+    }
+
+    /// Serialize to the TOML written into the garden (used by onboard's seed and
+    /// the `migrate config` writer).
+    pub fn to_toml(&self) -> std::io::Result<String> {
+        toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// The post-unlock policy half of a pointer [`KeeperToml`]. `migrate config`
+    /// uses this to lift any policy a legacy pointer still carries into the
+    /// garden; for a born-minimal pointer it yields the defaults.
+    pub fn from_keeper(k: &KeeperToml) -> Self {
+        Self {
+            reveal: k.reveal.clone(),
+            net: k.net.clone(),
+            relay: k.relay.clone(),
+            replica: k.replica.clone(),
+        }
     }
 }
 
@@ -297,5 +366,91 @@ mod tests {
         assert_eq!(cfg.relay.listen.as_deref(), Some("0.0.0.0:9301"));
         assert_eq!(cfg.relay.endpoint.as_deref(), Some("relay.example:9301"));
         assert_eq!(cfg.relay.static_key.as_deref(), Some("abcd"));
+    }
+
+    // ── GardenConfig (config/keeper.toml) ──────────────────────────────────
+
+    #[test]
+    fn garden_config_absent_is_none() {
+        // A garden with no config/keeper.toml → None, so the caller keeps the
+        // pointer's boot values (the non-migrated path).
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(GardenConfig::load(tmp.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn garden_config_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = GardenConfig {
+            net: NetToml {
+                listen: "0.0.0.0:9300".into(),
+                device_name: Some("tablet".into()),
+                advertise_name: false,
+                ..NetToml::default()
+            },
+            relay: RelayToml {
+                enabled: true,
+                listen: Some("0.0.0.0:9301".into()),
+                ..RelayToml::default()
+            },
+            replica: ReplicaToml { host: true },
+            reveal: RevealToml { idle_seconds: 42 },
+        };
+        let path = GardenConfig::path(tmp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, cfg.to_toml().unwrap()).unwrap();
+
+        let back = GardenConfig::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn garden_config_from_minimal_pointer_is_defaults() {
+        // A born-minimal pointer (just state_root) yields the default policy —
+        // what `migrate config` seeds into our garden.
+        let pointer = KeeperToml {
+            state_root: Some(PathBuf::from("/s")),
+            ..Default::default()
+        };
+        let gc = GardenConfig::from_keeper(&pointer);
+        assert_eq!(gc, GardenConfig::default());
+        // The serialized seed parses back to the same thing.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = GardenConfig::path(tmp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, gc.to_toml().unwrap()).unwrap();
+        assert_eq!(GardenConfig::load(tmp.path()).unwrap().unwrap(), gc);
+    }
+
+    #[test]
+    fn garden_config_lifts_pointer_policy() {
+        // A legacy pointer carrying policy → from_keeper lifts exactly the
+        // post-unlock fields (net/relay/replica/reveal), nothing else.
+        let pointer = KeeperToml {
+            state_root: Some(PathBuf::from("/s")),
+            reveal: RevealToml { idle_seconds: 7 },
+            relay: RelayToml {
+                enabled: true,
+                ..RelayToml::default()
+            },
+            growlight: GrowlightToml { allow_relock: true },
+            ..Default::default()
+        };
+        let gc = GardenConfig::from_keeper(&pointer);
+        assert_eq!(gc.reveal.idle_seconds, 7);
+        assert!(gc.relay.enabled);
+        // growlight is deliberately NOT part of GardenConfig — it stays in the
+        // pointer. (GardenConfig has no such field; this just documents intent.)
+    }
+
+    #[test]
+    fn garden_config_rejects_unknown_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = GardenConfig::path(tmp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // `state_root` belongs in the pointer, not the garden config — a stray
+        // one must be rejected, not silently ignored.
+        fs::write(&path, "state_root = \"/x\"\n").unwrap();
+        assert!(GardenConfig::load(tmp.path()).is_err());
     }
 }

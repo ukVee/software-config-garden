@@ -23,7 +23,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use softfig_ipc::{
     runtime_socket_path,
-    verbs::{op, MigrateFinalizeArgs, MigrateFinalizeReply, MigrateSplitArgs, MigrateSplitReply},
+    verbs::{
+        op, MigrateConfigArgs, MigrateConfigReply, MigrateFinalizeArgs, MigrateFinalizeReply,
+        MigrateSplitArgs, MigrateSplitReply,
+    },
     ClientError,
 };
 use softfig_vault::{discover_garden, Vault};
@@ -46,6 +49,11 @@ pub enum MigrateCmd {
     /// `troubleshooting.md` monolith into its sibling numbered-note folder
     /// and archive the original. Dry-run preview unless `--apply`.
     Split(SplitArgs),
+    /// One-time config-in-garden lift: write the post-unlock daemon policy
+    /// (`[net]`/`[relay]`/`[replica]`/`[reveal]`) into the encrypted, versioned,
+    /// backed-up `config/keeper.toml` inside the garden. Dry-run unless
+    /// `--apply`.
+    Config(ConfigArgs),
 }
 
 #[derive(Args, Debug)]
@@ -79,6 +87,18 @@ pub struct SplitArgs {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct ConfigArgs {
+    /// Write + commit `config/keeper.toml`. Without it, only a dry-run preview
+    /// is printed.
+    #[arg(long)]
+    pub apply: bool,
+    /// Override the socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+}
+
 #[derive(Args, Debug, Default)]
 pub struct StatusArgs {
     #[arg(long)]
@@ -90,6 +110,7 @@ pub fn run(cmd: Option<MigrateCmd>, status: StatusArgs) -> Result<()> {
         Some(MigrateCmd::Prepare(args)) => prepare(args),
         Some(MigrateCmd::Finalize(args)) => finalize(args),
         Some(MigrateCmd::Split(args)) => split(args),
+        Some(MigrateCmd::Config(args)) => config(args),
         None => print_status(status),
     }
 }
@@ -232,6 +253,35 @@ fn split(args: SplitArgs) -> Result<()> {
                 }
             }
             if !reply.applied && !reply.splits.is_empty() {
+                println!();
+                println!("re-run with --apply to commit.");
+            }
+            Ok(())
+        }
+        Ok(None) => Err(anyhow!(
+            "no daemon at {} — start one first (`softfig daemon start`)",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("daemon error ({:?}): {message}", kind))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+fn config(args: ConfigArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let req_args = serde_json::to_value(MigrateConfigArgs { apply: args.apply })?;
+    match try_daemon_call(&socket, op::MIGRATE_CONFIG, req_args) {
+        Ok(Some(value)) => {
+            let reply: MigrateConfigReply = serde_json::from_value(value)?;
+            if reply.already {
+                println!("{} already exists; nothing to migrate.", reply.path);
+            } else if reply.applied {
+                let short = reply.hash.as_deref().map(short_hash).unwrap_or("???????");
+                println!("migrated config -> {}  [{short}]", reply.path);
+            } else {
+                println!("would write {}", reply.path);
                 println!();
                 println!("re-run with --apply to commit.");
             }

@@ -92,6 +92,7 @@ pub fn unlock(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     establish_session_locked(daemon, &mut inner, session)?;
     drop(inner);
+    apply_garden_config(daemon);
     start_net_if_enabled(daemon);
 
     Ok(serde_json::to_value(UnlockReply {
@@ -175,6 +176,30 @@ fn establish_session_locked(
     inner.last_reveal_at = None;
     inner.state = State::Unlocked;
     Ok(())
+}
+
+/// Overlay the in-garden `config/keeper.toml` (`[net]`/`[relay]`/`[replica]`/
+/// `[reveal]`) onto the running config once the session is up and FUSE is
+/// mounted — must run *after* `establish_session_locked` (so the file is
+/// readable through the mount) and *before* `start_net_if_enabled` (which reads
+/// `config.net`). An absent file leaves the boot-time pointer values in place
+/// (the non-migrated path); a parse error logs and does the same rather than
+/// failing the unlock. Reads the file with no lock held (FUSE serves it on its
+/// own threads), then locks `inner` only to apply.
+fn apply_garden_config(daemon: &Daemon) {
+    let garden_root = {
+        let inner = daemon.inner.lock().unwrap();
+        inner.config.garden_root.clone()
+    };
+    match crate::keeper_toml::GardenConfig::load(&garden_root) {
+        Ok(Some(gc)) => {
+            daemon.inner.lock().unwrap().config.apply_garden_config(gc);
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!(
+            "keeperd: config/keeper.toml load failed ({e}); using pointer/default values"
+        ),
+    }
 }
 
 /// M5a-4: host the softfig-net instance (inbound listener + mDNS + optional
@@ -324,6 +349,7 @@ pub fn relock_redeem(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
 
     establish_session_locked(daemon, &mut inner, session)?;
     drop(inner);
+    apply_garden_config(daemon);
     start_net_if_enabled(daemon);
 
     // Single-use: remove the blob + any persisted token now that it redeemed.

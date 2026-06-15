@@ -17,7 +17,8 @@ use softfig_vcs::Repo;
 use softfig_ipc::verbs::{
     op, AddNoteArgs, AddNoteReply, AddProjectArgs, AddProjectReply, AddSectionArgs,
     AppendToSectionArgs, ArchiveArgs, ArchiveReply, DocEditReply, EditSectionArgs,
-    LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, MigrateSplitReply,
+    LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, MigrateConfigReply,
+    MigrateSplitReply,
     RefreshSnapshotArgs, RefreshSnapshotReply, ReviseNoteArgs, ReviseNoteReply, SetReviewedArgs,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
@@ -1112,4 +1113,42 @@ fn migrate_split_skips_when_folder_exists() {
     assert_eq!(reply.skipped[0].path, "audio/troubleshooting.md");
     assert!(reply.skipped[0].reason.contains("already exists"));
     assert!(fx.garden.join("audio/troubleshooting.md").exists());
+}
+
+// ---- migrate_config (one-time keeper.toml → config/keeper.toml) --------
+
+#[test]
+fn migrate_config_dry_run_then_apply_then_idempotent() {
+    use softfig_keeperd::keeper_toml::GardenConfig;
+    let fx = Fixture::start();
+
+    // Dry run: reports the path; writes/commits nothing.
+    let resp = fx.call(op::MIGRATE_CONFIG, serde_json::json!({ "apply": false }));
+    let reply: MigrateConfigReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(!reply.applied && !reply.already);
+    assert_eq!(reply.path, "config/keeper.toml");
+    assert!(reply.hash.is_none());
+    assert!(!fx.garden.join("config/keeper.toml").exists());
+
+    // Apply: write + commit config/keeper.toml.
+    let resp = fx.call(op::MIGRATE_CONFIG, serde_json::json!({ "apply": true }));
+    let reply: MigrateConfigReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.applied && !reply.already);
+    assert!(reply.hash.is_some());
+
+    // The committed file parses and — from a born-minimal pointer — equals the
+    // default policy.
+    let gc = GardenConfig::load(&fx.garden).unwrap().unwrap();
+    assert_eq!(gc, GardenConfig::default());
+
+    // The commit is a `config_migrated` naming the path.
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "config_migrated");
+    assert_eq!(payload["path"], "config/keeper.toml");
+
+    // Idempotent: a re-run finds the file already present and does nothing.
+    let resp = fx.call(op::MIGRATE_CONFIG, serde_json::json!({ "apply": true }));
+    let reply: MigrateConfigReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.already && !reply.applied);
+    assert!(reply.hash.is_none());
 }
