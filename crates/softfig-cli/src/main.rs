@@ -71,7 +71,8 @@ enum Cmd {
     Replica(cmd_replica::ReplicaCmd),
 
     /// growlight — the autonomous work-loop pillar. `init` scaffolds it into
-    /// an already-onboarded garden (Phase 2a).
+    /// an already-onboarded garden; `start` sets up the loop runtime and
+    /// launches the agent in loop mode.
     #[command(subcommand)]
     Growlight(cmd_growlight::GrowlightCmd),
 }
