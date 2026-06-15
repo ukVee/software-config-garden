@@ -79,7 +79,9 @@ pub fn run(args: OnboardArgs) -> Result<()> {
         Some(prompt_concept_dirs()?)
     } else {
         if args.customize {
-            println!("(--customize ignored: no interactive terminal; scaffolding the full default)");
+            println!(
+                "(--customize ignored: no interactive terminal; scaffolding the full default)"
+            );
         }
         None
     };
@@ -111,8 +113,7 @@ pub fn run(args: OnboardArgs) -> Result<()> {
 
     println!();
     println!("Scaffolding skeleton + writing genesis commit…");
-    let outcome = onboard(&opts, pass1.as_bytes())
-        .context("onboarding failed")?;
+    let outcome = onboard(&opts, pass1.as_bytes()).context("onboarding failed")?;
 
     print_recovery(&outcome.recovery_phrase);
 

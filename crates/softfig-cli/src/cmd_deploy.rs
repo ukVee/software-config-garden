@@ -97,7 +97,12 @@ fn print_plan(plan: &Plan) {
             .as_deref()
             .map(|r| format!(" — {r}"))
             .unwrap_or_default();
-        println!("  {verb:>8}  {}  →  {}{}", e.name, e.target_abs.display(), extra);
+        println!(
+            "  {verb:>8}  {}  →  {}{}",
+            e.name,
+            e.target_abs.display(),
+            extra
+        );
     }
 }
 

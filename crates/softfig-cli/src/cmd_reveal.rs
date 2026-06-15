@@ -102,10 +102,7 @@ fn validate_id(id: &str) -> Result<()> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        return Err(anyhow!(
-            "--id {:?}: charset must be [a-zA-Z0-9_-]+",
-            id
-        ));
+        return Err(anyhow!("--id {:?}: charset must be [a-zA-Z0-9_-]+", id));
     }
     Ok(())
 }
@@ -127,7 +124,10 @@ impl std::fmt::Display for CallError {
     }
 }
 
-fn call_reveal(socket: &Path, args: &VaultRevealArgs) -> std::result::Result<VaultRevealReply, CallError> {
+fn call_reveal(
+    socket: &Path,
+    args: &VaultRevealArgs,
+) -> std::result::Result<VaultRevealReply, CallError> {
     let req_args =
         serde_json::to_value(args).map_err(|e| CallError::Other(format!("encode: {e}")))?;
     match try_daemon_call(socket, op::VAULT_REVEAL, req_args) {

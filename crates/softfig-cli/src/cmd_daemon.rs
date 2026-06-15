@@ -68,9 +68,7 @@ fn start(args: StartArgs) -> Result<()> {
     if let Some(s) = args.socket {
         cmd.arg("--socket").arg(s);
     }
-    let status = cmd
-        .status()
-        .context("failed to launch softfig-keeperd")?;
+    let status = cmd.status().context("failed to launch softfig-keeperd")?;
     std::process::exit(status.code().unwrap_or(1));
 }
 

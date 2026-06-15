@@ -97,8 +97,19 @@ fn pair_with(
     let list: PairListReply =
         serde_json::from_value(daemon_call(socket, op::PAIR_LIST, serde_json::Value::Null)?)?;
     let query = fingerprint.trim().to_ascii_lowercase();
-    if let Some(p) = list.pending.iter().find(|p| p.fingerprint.starts_with(&query)) {
-        return confirm_flow(socket, &p.pairing_id, &p.sas, &p.fingerprint, &p.name, assume_yes);
+    if let Some(p) = list
+        .pending
+        .iter()
+        .find(|p| p.fingerprint.starts_with(&query))
+    {
+        return confirm_flow(
+            socket,
+            &p.pairing_id,
+            &p.sas,
+            &p.fingerprint,
+            &p.name,
+            assume_yes,
+        );
     }
 
     // Otherwise initiate.
@@ -121,8 +132,11 @@ fn pair_with(
 /// Show the LAN pick-list of discovered, unpaired devices and read the user's
 /// choice. `Ok(None)` means nothing to pick or the user cancelled.
 fn pick_discovered(socket: &Path) -> Result<Option<DiscoveredDevice>> {
-    let reply: DiscoverListReply =
-        serde_json::from_value(daemon_call(socket, op::DISCOVER_LIST, serde_json::Value::Null)?)?;
+    let reply: DiscoverListReply = serde_json::from_value(daemon_call(
+        socket,
+        op::DISCOVER_LIST,
+        serde_json::Value::Null,
+    )?)?;
     let mut devices = reply.devices;
     if devices.is_empty() {
         println!(
@@ -201,8 +215,11 @@ fn confirm_flow(
 
 pub fn peers(args: PeersArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
-    let reply: PairListReply =
-        serde_json::from_value(daemon_call(&socket, op::PAIR_LIST, serde_json::Value::Null)?)?;
+    let reply: PairListReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::PAIR_LIST,
+        serde_json::Value::Null,
+    )?)?;
 
     if reply.peers.is_empty() {
         println!("no paired devices");
@@ -231,12 +248,7 @@ pub fn peers(args: PeersArgs) -> Result<()> {
 }
 
 fn print_pending(p: &PendingPairing) {
-    println!(
-        "  {}  {}  SAS {}",
-        short_fp(&p.fingerprint),
-        p.name,
-        p.sas
-    );
+    println!("  {}  {}  SAS {}", short_fp(&p.fingerprint), p.name, p.sas);
 }
 
 pub fn unpair(args: UnpairArgs) -> Result<()> {
@@ -282,7 +294,9 @@ fn daemon_call(socket: &Path, op: &str, args: serde_json::Value) -> Result<serde
     let resp = softfig_ipc::call(&mut stream, &req)?;
     match resp.into_result() {
         Ok(v) => Ok(v),
-        Err((kind, message)) => Err(anyhow!("{message}").context(format!("daemon error ({kind:?})"))),
+        Err((kind, message)) => {
+            Err(anyhow!("{message}").context(format!("daemon error ({kind:?})")))
+        }
     }
 }
 

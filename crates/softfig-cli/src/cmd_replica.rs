@@ -67,7 +67,10 @@ fn grant(args: GrantArgs) -> Result<()> {
     let reply: ReplicaGrantReply =
         serde_json::from_value(daemon_call(&socket, op::REPLICA_GRANT, call)?)?;
     if reply.granted {
-        println!("granted: {} may now host this device's chain backup", reply.fingerprint);
+        println!(
+            "granted: {} may now host this device's chain backup",
+            reply.fingerprint
+        );
     } else {
         println!("no change ({} was already granted)", reply.fingerprint);
     }
@@ -94,8 +97,11 @@ fn revoke(args: GrantArgs) -> Result<()> {
 
 fn status(args: StatusArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
-    let reply: ReplicaStatusReply =
-        serde_json::from_value(daemon_call(&socket, op::REPLICA_STATUS, serde_json::Value::Null)?)?;
+    let reply: ReplicaStatusReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::REPLICA_STATUS,
+        serde_json::Value::Null,
+    )?)?;
 
     println!("backup host: {}", if reply.host { "yes" } else { "no" });
 

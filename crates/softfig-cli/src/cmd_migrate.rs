@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
-use softfig_vcs::Repo;
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{op, MigrateFinalizeArgs, MigrateFinalizeReply, MigrateSplitArgs, MigrateSplitReply},
     ClientError,
 };
 use softfig_vault::{discover_garden, Vault};
+use softfig_vcs::Repo;
 
 use crate::cmd_daemon::try_daemon_call;
 
@@ -134,9 +134,8 @@ fn prepare(args: PrepareArgs) -> Result<()> {
         ));
     }
 
-    fs::create_dir_all(&state_root).with_context(|| {
-        format!("create state root {}", state_root.display())
-    })?;
+    fs::create_dir_all(&state_root)
+        .with_context(|| format!("create state root {}", state_root.display()))?;
     let dest_softfig = state_root.join(".softfig");
     copy_dir_recursive(&softfig_in_garden, &dest_softfig).with_context(|| {
         format!(
@@ -156,7 +155,11 @@ fn prepare(args: PrepareArgs) -> Result<()> {
     println!("prepared:");
     println!("  garden       {}", garden.display());
     println!("  state_root   {}", state_root.display());
-    println!("  copied       {}/.softfig → {}/.softfig", garden.display(), state_root.display());
+    println!(
+        "  copied       {}/.softfig → {}/.softfig",
+        garden.display(),
+        state_root.display()
+    );
     println!();
     println!("next: `softfig daemon start` (or restart) to pick up the new keeper.toml,");
     println!("then verify FUSE mount, then `softfig migrate finalize`.");
@@ -272,7 +275,9 @@ fn print_status(args: StatusArgs) -> Result<()> {
                 println!("plaintext_present {plaintext_present}");
                 println!("old_state_present {old_state_present}");
                 if plaintext_present || old_state_present {
-                    println!("next              run `softfig migrate finalize` once FUSE is mounted");
+                    println!(
+                        "next              run `softfig migrate finalize` once FUSE is mounted"
+                    );
                 } else {
                     println!("next              fully migrated; nothing to do");
                 }

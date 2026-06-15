@@ -4,7 +4,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use softfig_ipc::{
     runtime_socket_path,
-    verbs::{op, VaultListSealedReply, VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply},
+    verbs::{
+        op, VaultListSealedReply, VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
+    },
 };
 use softfig_vault::{discover_garden, RecoveryPhrase, Vault};
 
@@ -158,7 +160,10 @@ fn init(garden: PathBuf) -> Result<()> {
 
     println!();
     println!("Vault initialized.");
-    println!("  active master_key_id : {}", session.active_master_key_id());
+    println!(
+        "  active master_key_id : {}",
+        session.active_master_key_id()
+    );
     println!(
         "  identity pubkey      : {}",
         hex::encode(session.identity_pubkey().to_bytes())
@@ -175,7 +180,10 @@ fn status(garden: PathBuf) -> Result<()> {
     let pass = prompt_passphrase("Passphrase: ")?;
     let session = vault.unlock(pass.as_bytes())?;
     println!("Vault: {}", vault.paths().root.display());
-    println!("  active master_key_id : {}", session.active_master_key_id());
+    println!(
+        "  active master_key_id : {}",
+        session.active_master_key_id()
+    );
     println!(
         "  generations on disk  : {:?}",
         session.known_master_key_ids()

@@ -2,15 +2,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
-use softfig_vcs::{
-    fsck as run_fsck, log_collect, FsckReport, Intent, Repo, KNOWN_INTENTS,
-};
 use softfig_ipc::verbs::{
     op, CommitArgs as IpcCommitArgs, FsckReply, LogArgs as IpcLogArgs, LogReply,
     ShowArgs as IpcShowArgs, ShowReply,
 };
 use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::{discover_garden, Vault};
+use softfig_vcs::{fsck as run_fsck, log_collect, FsckReport, Intent, Repo, KNOWN_INTENTS};
 
 use crate::cmd_daemon::try_daemon_call;
 
@@ -103,8 +101,8 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         intent: intent_name.clone(),
         payload: payload.clone(),
     })?;
-    if let Some(reply) = try_daemon_call(&socket, op::COMMIT, req_args)
-        .map_err(|e| anyhow!("daemon: {e}"))?
+    if let Some(reply) =
+        try_daemon_call(&socket, op::COMMIT, req_args).map_err(|e| anyhow!("daemon: {e}"))?
     {
         let hash = reply
             .get("hash")
@@ -134,8 +132,8 @@ pub fn log(args: LogArgs) -> Result<()> {
 
     let socket = softfig_ipc::runtime_socket_path();
     let req_args = serde_json::to_value(IpcLogArgs { limit: args.limit })?;
-    if let Some(reply) = try_daemon_call(&socket, op::LOG, req_args)
-        .map_err(|e| anyhow!("daemon: {e}"))?
+    if let Some(reply) =
+        try_daemon_call(&socket, op::LOG, req_args).map_err(|e| anyhow!("daemon: {e}"))?
     {
         let log_reply: LogReply = serde_json::from_value(reply)?;
         if log_reply.commits.is_empty() {
@@ -164,7 +162,11 @@ pub fn log(args: LogArgs) -> Result<()> {
         }
     };
     let commits = log_collect(repo.db(), tip)?;
-    let limit = if args.limit == 0 { commits.len() } else { args.limit.min(commits.len()) };
+    let limit = if args.limit == 0 {
+        commits.len()
+    } else {
+        args.limit.min(commits.len())
+    };
     for c in commits.iter().take(limit) {
         println!(
             "{} {} {} {}",
@@ -184,8 +186,8 @@ pub fn show(args: ShowArgs) -> Result<()> {
     let req_args = serde_json::to_value(IpcShowArgs {
         hash: args.commit.clone(),
     })?;
-    if let Some(reply) = try_daemon_call(&socket, op::SHOW, req_args)
-        .map_err(|e| anyhow!("daemon: {e}"))?
+    if let Some(reply) =
+        try_daemon_call(&socket, op::SHOW, req_args).map_err(|e| anyhow!("daemon: {e}"))?
     {
         let show: ShowReply = serde_json::from_value(reply)?;
         let c = &show.commit;
@@ -230,7 +232,11 @@ pub fn show(args: ShowArgs) -> Result<()> {
     println!("root_tree       {}", row.root_tree);
     println!("author_device   {}", row.author_device);
     println!("author_pubkey   {}", hex::encode(row.author_pubkey));
-    println!("timestamp       {} ({})", row.timestamp, iso8601(row.timestamp));
+    println!(
+        "timestamp       {} ({})",
+        row.timestamp,
+        iso8601(row.timestamp)
+    );
     println!("intent          {}", row.intent);
     println!("master_key_id   {}", row.master_key_id);
     println!("signature       {}", hex::encode(row.signature));
@@ -253,9 +259,8 @@ pub fn fsck(args: FsckArgs) -> Result<()> {
     let garden = resolve_existing(args.garden)?;
 
     let socket = softfig_ipc::runtime_socket_path();
-    if let Some(reply) =
-        try_daemon_call(&socket, op::FSCK, serde_json::Value::Null)
-            .map_err(|e| anyhow!("daemon: {e}"))?
+    if let Some(reply) = try_daemon_call(&socket, op::FSCK, serde_json::Value::Null)
+        .map_err(|e| anyhow!("daemon: {e}"))?
     {
         let r: FsckReply = serde_json::from_value(reply)?;
         println!(
@@ -263,7 +268,10 @@ pub fn fsck(args: FsckArgs) -> Result<()> {
             r.commits_checked, r.trees_checked, r.objects_checked
         );
         if !r.orphan_objects.is_empty() {
-            println!("orphan objects ({} — gc would collect):", r.orphan_objects.len());
+            println!(
+                "orphan objects ({} — gc would collect):",
+                r.orphan_objects.len()
+            );
             for h in &r.orphan_objects {
                 println!("  {h}");
             }
@@ -288,7 +296,10 @@ pub fn fsck(args: FsckArgs) -> Result<()> {
         report.commits_checked, report.trees_checked, report.objects_checked
     );
     if !report.orphan_objects.is_empty() {
-        println!("orphan objects ({} — gc would collect):", report.orphan_objects.len());
+        println!(
+            "orphan objects ({} — gc would collect):",
+            report.orphan_objects.len()
+        );
         for h in &report.orphan_objects {
             println!("  {h}");
         }
@@ -338,8 +349,8 @@ fn forbid_direct_mode_when_migrated(garden: &Path) -> Result<()> {
     struct Cfg {
         state_root: Option<PathBuf>,
     }
-    let cfg: Cfg = toml::from_str(&raw)
-        .with_context(|| format!("parse {}", toml_path.display()))?;
+    let cfg: Cfg =
+        toml::from_str(&raw).with_context(|| format!("parse {}", toml_path.display()))?;
     if cfg.state_root.is_some() {
         return Err(anyhow!(
             "this garden is migrated to FUSE — start the daemon (`softfig daemon start`) first"
@@ -371,7 +382,10 @@ fn build_payload(args: &CommitArgs) -> Result<serde_json::Value> {
 
     let mut obj = serde_json::Map::new();
     if let Some(msg) = &args.message {
-        obj.insert("summary".to_string(), serde_json::Value::String(msg.clone()));
+        obj.insert(
+            "summary".to_string(),
+            serde_json::Value::String(msg.clone()),
+        );
     }
     if !args.files.is_empty() {
         obj.insert(
