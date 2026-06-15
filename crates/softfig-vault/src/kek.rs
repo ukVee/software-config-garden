@@ -113,6 +113,51 @@ pub fn unwrap_kek_under_passphrase(
     Ok(Kek::from_bytes(k))
 }
 
+/// Derive a 32-byte AEAD key from a full-entropy 256-bit relock token via a
+/// single HKDF-SHA256 step. No Argon2: the token is already full-entropy, so
+/// stretching it would only add latency. The `info` label domain-separates
+/// this key from any other HKDF use of the same token material.
+fn derive_from_token(token: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let hk = Hkdf::<Sha256>::new(None, token);
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    hk.expand(crate::params::aad::KEK_RELOCK, out.as_mut())
+        .expect("hkdf expand to 32 bytes is infallible");
+    out
+}
+
+/// Wrap K under a relock token. On-disk format: nonce(24) || ciphertext+tag.
+/// No salt — the token is full-entropy and the wrap key is HKDF'd directly
+/// (see [`derive_from_token`]). `aad` authenticates the purpose tag, the
+/// vault fingerprint, and the token's expiry (see [`crate::relock`]).
+pub fn wrap_kek_under_token(token: &[u8; KEY_LEN], kek: &Kek, aad: &[u8]) -> Vec<u8> {
+    let mut nonce = [0u8; AEAD_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let derived = derive_from_token(token);
+    let ct = aead_seal(&derived, &nonce, aad, kek.expose());
+    let mut out = Vec::with_capacity(AEAD_NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    out
+}
+
+pub fn unwrap_kek_under_token(token: &[u8; KEY_LEN], wrapped: &[u8], aad: &[u8]) -> Result<Kek> {
+    if wrapped.len() < AEAD_NONCE_LEN {
+        return Err(VaultError::Malformed("wrapped relock kek too short"));
+    }
+    let nonce: [u8; AEAD_NONCE_LEN] = wrapped[..AEAD_NONCE_LEN].try_into().unwrap();
+    let ct = &wrapped[AEAD_NONCE_LEN..];
+    let derived = derive_from_token(token);
+    let pt = aead_open(&derived, &nonce, aad, ct)?;
+    if pt.len() != KEY_LEN {
+        return Err(VaultError::Malformed("relock kek plaintext wrong length"));
+    }
+    let mut k = [0u8; KEY_LEN];
+    k.copy_from_slice(&pt);
+    Ok(Kek::from_bytes(k))
+}
+
 /// Wrap arbitrary bytes (e.g., M, identity keypair) under K. Format: nonce(24) || ciphertext+tag.
 pub fn wrap_under_kek(kek: &Kek, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; AEAD_NONCE_LEN];

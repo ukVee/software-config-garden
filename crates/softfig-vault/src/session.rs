@@ -135,6 +135,32 @@ impl VaultSession {
         self.transport.secret_bytes()
     }
 
+    /// Growlight relock: mint a one-time token and wrap the live KEK under it,
+    /// so an unattended daemon restart can rebuild this session without the
+    /// passphrase. Returns `(token, blob)`: the caller hands `token` to the
+    /// `cycle` process (RAM) or persists it (`relock-arm`), and writes `blob`
+    /// to tmpfs. The token expires at `now + ttl_secs` (unix seconds), bound
+    /// into the blob's AAD so it cannot be tampered longer. See
+    /// [`crate::relock`].
+    pub fn mint_relock(
+        &self,
+        now: i64,
+        ttl_secs: i64,
+    ) -> Result<(crate::relock::RelockToken, crate::relock::RelockBlob)> {
+        let expires_at = now + ttl_secs;
+        let fingerprint = crate::relock::vault_fingerprint(&self.paths)?;
+        let aad = crate::relock::relock_aad(&fingerprint, expires_at);
+        let token = crate::relock::RelockToken::generate();
+        let wrapped = crate::kek::wrap_kek_under_token(token.expose(), &self.kek, &aad);
+        Ok((
+            token,
+            crate::relock::RelockBlob {
+                expires_at,
+                wrapped,
+            },
+        ))
+    }
+
     /// Generate a new master key generation, persist it under K, set it
     /// active. Existing generations are kept on disk so historical blobs
     /// continue to decrypt.

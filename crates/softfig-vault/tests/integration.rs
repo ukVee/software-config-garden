@@ -353,3 +353,114 @@ fn corrupt_transport_key_is_rejected() {
         other => panic!("expected AuthFailed on corrupt transport key, got {other:?}"),
     }
 }
+
+// ---- growlight relock token -------------------------------------------
+
+const NOW: i64 = 1_700_000_000;
+
+/// Mint a token from a live session, then redeem it on a fresh `Vault`
+/// handle (simulating the daemon restart) — the rebuilt session must carry
+/// the same masters/identity/transport as the original unlock.
+#[test]
+fn relock_mint_redeem_round_trip() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let want_transport = session.transport_pubkey();
+    let want_identity = session.identity_pubkey().to_bytes();
+    let want_master = session.active_master_key_id();
+
+    let (token, blob) = session.mint_relock(NOW, softfig_vault::RELOCK_TTL_SECS).expect("mint");
+    drop(session); // the original session is gone, as it would be across a restart
+
+    // A brand-new handle on the same on-disk vault (the restarted daemon).
+    let fresh = Vault::at(tmp.path());
+    let resumed = fresh
+        .redeem_relock(&token, &blob.encode(), NOW + 60)
+        .expect("redeem");
+    assert_eq!(resumed.transport_pubkey(), want_transport);
+    assert_eq!(resumed.identity_pubkey().to_bytes(), want_identity);
+    assert_eq!(resumed.active_master_key_id(), want_master);
+}
+
+/// Token survives a hex serialization round-trip (the `cycle` reply / the
+/// persisted `relock-arm` file both carry hex).
+#[test]
+fn relock_token_hex_round_trip_redeems() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let (token, blob) = session.mint_relock(NOW, softfig_vault::RELOCK_TTL_SECS).expect("mint");
+    let hex = token.to_hex();
+    drop(session);
+
+    let parsed = softfig_vault::RelockToken::from_hex(&hex).expect("parse hex");
+    Vault::at(tmp.path())
+        .redeem_relock(&parsed, &blob.encode(), NOW + 1)
+        .expect("redeem via hex token");
+}
+
+/// An expired token is refused even with the correct bytes.
+#[test]
+fn relock_expired_token_is_refused() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let (token, blob) = session.mint_relock(NOW, softfig_vault::RELOCK_TTL_SECS).expect("mint");
+    drop(session);
+
+    let past_expiry = NOW + softfig_vault::RELOCK_TTL_SECS + 1;
+    match Vault::at(tmp.path()).redeem_relock(&token, &blob.encode(), past_expiry) {
+        Err(VaultError::RelockExpired) => {}
+        other => panic!("expected RelockExpired, got {other:?}"),
+    }
+}
+
+/// The wrong token never unwraps the KEK.
+#[test]
+fn relock_wrong_token_fails() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let (_token, blob) = session.mint_relock(NOW, softfig_vault::RELOCK_TTL_SECS).expect("mint");
+    drop(session);
+
+    let attacker = softfig_vault::RelockToken::generate();
+    match Vault::at(tmp.path()).redeem_relock(&attacker, &blob.encode(), NOW + 1) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("expected AuthFailed for wrong token, got {other:?}"),
+    }
+}
+
+/// Editing the plaintext `expires_at` to extend the TTL breaks the AAD — the
+/// expiry is authenticated, so a tampered blob fails closed rather than
+/// granting a longer-lived token.
+#[test]
+fn relock_extending_expiry_breaks_aad() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let (token, blob) = session.mint_relock(NOW, softfig_vault::RELOCK_TTL_SECS).expect("mint");
+    drop(session);
+
+    // Forge a blob with a far-future expiry but the original ciphertext.
+    let forged = softfig_vault::RelockBlob {
+        expires_at: NOW + 10 * softfig_vault::RELOCK_TTL_SECS,
+        wrapped: blob.wrapped.clone(),
+    };
+    match Vault::at(tmp.path()).redeem_relock(&token, &forged.encode(), NOW + 1) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("expected AuthFailed for forged expiry, got {other:?}"),
+    }
+}
+
+/// A blob minted against one vault must not redeem against another — the
+/// fingerprint (BLAKE3 of `k.self`) is bound into the AAD.
+#[test]
+fn relock_blob_does_not_cross_gardens() {
+    let (_tmp_a, vault_a) = fresh_vault();
+    let session_a = vault_a.unlock(PASSPHRASE).expect("unlock a");
+    let (token, blob) = session_a.mint_relock(NOW, softfig_vault::RELOCK_TTL_SECS).expect("mint");
+
+    // A second, independent vault (different KEK wrapping → different fp).
+    let (tmp_b, _vault_b) = fresh_vault();
+    match Vault::at(tmp_b.path()).redeem_relock(&token, &blob.encode(), NOW + 1) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("expected AuthFailed across gardens, got {other:?}"),
+    }
+}

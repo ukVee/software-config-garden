@@ -26,6 +26,12 @@ pub enum VaultError {
     #[error("invalid recovery phrase")]
     InvalidRecoveryPhrase,
 
+    #[error("relock token expired")]
+    RelockExpired,
+
+    #[error("malformed relock blob: {0}")]
+    RelockMalformed(&'static str),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

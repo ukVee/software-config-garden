@@ -20,6 +20,10 @@ pub const AEAD_TAG_LEN: usize = 16;
 pub mod aad {
     pub const KEK_SELF: &[u8] = b"softfig.kek.self.v1";
     pub const KEK_RECOVERY: &[u8] = b"softfig.kek.recovery.v1";
+    /// Growlight relock token — the third, ephemeral KEK wrapping keyed by a
+    /// full-entropy 256-bit token (no Argon2). Domain-separates the relock
+    /// blob from the passphrase/recovery wrappings.
+    pub const KEK_RELOCK: &[u8] = b"softfig.kek.relock.v1";
     pub const IDENTITY: &[u8] = b"softfig.identity.v1";
     /// X25519 transport key — the Noise static key for softfig-net (M5a).
     pub const TRANSPORT: &[u8] = b"softfig.transport.v1";

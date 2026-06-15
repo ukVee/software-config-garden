@@ -129,9 +129,18 @@ impl Vault {
             return Err(VaultError::NotInitialized(self.paths.root.clone()));
         }
         let params = storage::load_params(&self.paths)?;
-        let active = storage::load_active(&self.paths)?;
         let wrapped = fs::read(wrap_path)?;
         let kek = kek::unwrap_kek_under_passphrase(secret, &wrapped, &params.argon2, wrap_aad)?;
+        self.build_session(kek)
+    }
+
+    /// Build the in-memory [`VaultSession`] from an already-unwrapped KEK:
+    /// load the active master pointer, read all master generations, the
+    /// identity, and the transport key. Shared by the passphrase/recovery
+    /// `unlock` paths and the growlight `redeem_relock` path — every route to
+    /// Unlocked lands the same session shape.
+    pub(crate) fn build_session(&self, kek: Kek) -> Result<VaultSession> {
+        let active = storage::load_active(&self.paths)?;
         let masters = master::read_all(&self.paths, &kek, active.master_key_id)?;
         let identity = identity::read_identity(&self.paths, &kek)?;
         // M5a: auto-generate the transport key on unlock if absent, so vaults
@@ -144,6 +153,33 @@ impl Vault {
             identity,
             transport,
         })
+    }
+
+    /// Growlight relock: redeem a minted token + its on-tmpfs blob into a
+    /// full [`VaultSession`], identical to a passphrase `unlock`. Verifies the
+    /// authenticated expiry against `now` (unix seconds), recomputes the vault
+    /// fingerprint, and unwraps the KEK under the token. Fails closed on
+    /// expiry, fingerprint mismatch (cross-garden reuse), or a tampered blob.
+    ///
+    /// The caller (daemon) is responsible for reading + deleting the blob file
+    /// — this never touches the filesystem beyond the vault tree.
+    pub fn redeem_relock(
+        &self,
+        token: &crate::relock::RelockToken,
+        blob_bytes: &[u8],
+        now: i64,
+    ) -> Result<VaultSession> {
+        if !self.is_initialized() {
+            return Err(VaultError::NotInitialized(self.paths.root.clone()));
+        }
+        let blob = crate::relock::RelockBlob::decode(blob_bytes)?;
+        if now >= blob.expires_at {
+            return Err(VaultError::RelockExpired);
+        }
+        let fingerprint = crate::relock::vault_fingerprint(&self.paths)?;
+        let aad = crate::relock::relock_aad(&fingerprint, blob.expires_at);
+        let kek = kek::unwrap_kek_under_token(token.expose(), &blob.wrapped, &aad)?;
+        self.build_session(kek)
     }
 
     /// Recover from a forgotten passphrase: unlock with the recovery phrase,
