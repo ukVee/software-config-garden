@@ -1122,18 +1122,21 @@ fn migrate_config_dry_run_then_apply_then_idempotent() {
     use softfig_keeperd::keeper_toml::GardenConfig;
     let fx = Fixture::start();
 
-    // Dry run: reports the path; writes/commits nothing.
+    // Dry run: reports the path it would write; writes/commits nothing. This
+    // garden never paired, so only keeper.toml is in play (no peers.toml).
     let resp = fx.call(op::MIGRATE_CONFIG, serde_json::json!({ "apply": false }));
     let reply: MigrateConfigReply = serde_json::from_value(ok_data(resp)).unwrap();
-    assert!(!reply.applied && !reply.already);
-    assert_eq!(reply.path, "config/keeper.toml");
+    assert!(!reply.applied);
+    assert_eq!(reply.migrated, vec!["config/keeper.toml".to_string()]);
+    assert!(reply.skipped.is_empty());
     assert!(reply.hash.is_none());
     assert!(!fx.garden.join("config/keeper.toml").exists());
 
     // Apply: write + commit config/keeper.toml.
     let resp = fx.call(op::MIGRATE_CONFIG, serde_json::json!({ "apply": true }));
     let reply: MigrateConfigReply = serde_json::from_value(ok_data(resp)).unwrap();
-    assert!(reply.applied && !reply.already);
+    assert!(reply.applied);
+    assert_eq!(reply.migrated, vec!["config/keeper.toml".to_string()]);
     assert!(reply.hash.is_some());
 
     // The committed file parses and — from a born-minimal pointer — equals the
@@ -1141,14 +1144,17 @@ fn migrate_config_dry_run_then_apply_then_idempotent() {
     let gc = GardenConfig::load(&fx.garden).unwrap().unwrap();
     assert_eq!(gc, GardenConfig::default());
 
-    // The commit is a `config_migrated` naming the path.
+    // The commit is a `config_migrated` naming the migrated paths.
     let (intent, payload) = fx.tip_intent();
     assert_eq!(intent, "config_migrated");
-    assert_eq!(payload["path"], "config/keeper.toml");
+    assert_eq!(payload["paths"][0], "config/keeper.toml");
 
-    // Idempotent: a re-run finds the file already present and does nothing.
+    // Idempotent: a re-run finds keeper.toml present (skipped) and, with no
+    // legacy ring, nothing else to do — no write, no commit.
     let resp = fx.call(op::MIGRATE_CONFIG, serde_json::json!({ "apply": true }));
     let reply: MigrateConfigReply = serde_json::from_value(ok_data(resp)).unwrap();
-    assert!(reply.already && !reply.applied);
+    assert!(!reply.applied);
+    assert!(reply.migrated.is_empty());
+    assert_eq!(reply.skipped, vec!["config/keeper.toml".to_string()]);
     assert!(reply.hash.is_none());
 }

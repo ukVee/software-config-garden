@@ -275,13 +275,22 @@ fn config(args: ConfigArgs) -> Result<()> {
     match try_daemon_call(&socket, op::MIGRATE_CONFIG, req_args) {
         Ok(Some(value)) => {
             let reply: MigrateConfigReply = serde_json::from_value(value)?;
-            if reply.already {
-                println!("{} already exists; nothing to migrate.", reply.path);
-            } else if reply.applied {
+            for p in &reply.skipped {
+                println!("{p} already exists; skipped.");
+            }
+            if reply.applied {
                 let short = reply.hash.as_deref().map(short_hash).unwrap_or("???????");
-                println!("migrated config -> {}  [{short}]", reply.path);
+                println!("migrated config [{short}]:");
+                for p in &reply.migrated {
+                    println!("  {p}");
+                }
+            } else if reply.migrated.is_empty() {
+                println!("nothing to migrate.");
             } else {
-                println!("would write {}", reply.path);
+                println!("would write:");
+                for p in &reply.migrated {
+                    println!("  {p}");
+                }
                 println!();
                 println!("re-run with --apply to commit.");
             }

@@ -916,28 +916,31 @@ pub struct SplitSkip {
     pub reason: String,
 }
 
-/// `migrate config [--apply]` — one-time lift of the post-unlock policy from the
-/// local `.softfig/keeper.toml` pointer into the in-garden `config/keeper.toml`.
-/// Dry-run (no writes) unless `apply` is set.
+/// `migrate config [--apply]` — one-time lift of the post-unlock daemon policy
+/// and the trust-ring membership out of the local `.softfig/` files into the
+/// in-garden `config/{keeper,peers}.toml`. Dry-run (no writes) unless `apply` is
+/// set. Both files migrate in one `config_migrated` commit.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MigrateConfigArgs {
-    /// Write + commit `config/keeper.toml`. Without it the daemon only reports
-    /// what it would write.
+    /// Write + commit the in-garden config files. Without it the daemon only
+    /// reports what it would write.
     #[serde(default)]
     pub apply: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrateConfigReply {
-    /// Garden-relative path that was (or would be) written.
-    pub path: String,
-    /// True when `config/keeper.toml` was written + committed; false for a
-    /// dry-run preview.
+    /// Garden-relative paths written + committed this run (in a dry-run, the
+    /// paths that *would* be written). Handles the partial state where one file
+    /// is already migrated and the other isn't.
+    pub migrated: Vec<String>,
+    /// Garden-relative paths skipped because they already exist in the garden
+    /// (an idempotent re-run, or a partial earlier migration).
+    pub skipped: Vec<String>,
+    /// True when at least one file was written + committed (false for a dry-run
+    /// preview or an all-skipped / nothing-to-migrate no-op).
     pub applied: bool,
-    /// True when `config/keeper.toml` already existed and nothing was done
-    /// (idempotent re-run).
-    pub already: bool,
-    /// Hash of the `config_migrated` commit. `None` in a dry-run or no-op.
+    /// Hash of the single `config_migrated` commit. `None` in a dry-run or no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
 }

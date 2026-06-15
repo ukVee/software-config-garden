@@ -1100,6 +1100,7 @@ pub fn pair_confirm(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
     let state_dir = inner.config.state_dir().to_path_buf();
 
     let parked = inner.pending_pairs.take(&args.pairing_id).ok_or((
@@ -1107,19 +1108,22 @@ pub fn pair_confirm(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         format!("unknown pairing_id {:?}", args.pairing_id),
     ))?;
 
-    // The user confirmed the SAS matched; persist the peer into the ring.
+    // The user confirmed the SAS matched; add the peer to the ring's
+    // membership, which is the source of truth inside the garden. Load (with
+    // the legacy fallback), upsert, then write `config/peers.toml` + commit
+    // `peers_changed` + refresh the endpoint sidecar.
     let (_session, entry) = parked.pending.confirm();
     let fingerprint = entry.fingerprint();
     let name = entry.name.clone();
-    crate::net::persist_ring_entry(&state_dir, entry)
-        .map_err(|e| (ErrorKind::Io, format!("persist ring entry: {e}")))?;
+    let mut ring = crate::net::load_ring(&garden_root, &state_dir)
+        .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
+    ring.upsert(entry);
+    crate::net::write_and_commit_membership(daemon, &mut inner, &garden_root, &state_dir, &ring)?;
 
     // Mirror into the live ring so the inbound listener authorizes the new
     // peer's IK reconnects immediately.
     if let Some(net) = inner.net.as_ref() {
-        if let Ok(ring) = crate::net::load_ring(&state_dir) {
-            net.sync_ring(&ring);
-        }
+        net.sync_ring(&ring);
     }
 
     Ok(serde_json::to_value(PairConfirmReply { fingerprint, name }).unwrap())
@@ -1128,9 +1132,10 @@ pub fn pair_confirm(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 pub fn pair_list(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
     let inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
     let state_dir = inner.config.state_dir().to_path_buf();
 
-    let ring = crate::net::load_ring(&state_dir)
+    let ring = crate::net::load_ring(&garden_root, &state_dir)
         .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
     let peers = ring
         .peers()
@@ -1163,11 +1168,12 @@ pub fn pair_remove(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         .map_err(|e| (ErrorKind::BadArgs, format!("pair_remove args: {e}")))?;
     let fp_query = normalize_fingerprint(&args.fingerprint)?;
 
-    let inner = daemon.inner.lock().unwrap();
+    let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
     let state_dir = inner.config.state_dir().to_path_buf();
 
-    let mut ring = crate::net::load_ring(&state_dir)
+    let mut ring = crate::net::load_ring(&garden_root, &state_dir)
         .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
     let matches: Vec<[u8; 32]> = ring
         .peers()
@@ -1193,8 +1199,7 @@ pub fn pair_remove(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let full_fp = hex::encode(device_id);
     let removed = ring.remove(&device_id);
     if removed {
-        ring.save(&softfig_net::ring::ring_path(&state_dir))
-            .map_err(|e| (ErrorKind::Io, format!("save ring: {e}")))?;
+        crate::net::write_and_commit_membership(daemon, &mut inner, &garden_root, &state_dir, &ring)?;
         if let Some(net) = inner.net.as_ref() {
             net.sync_ring(&ring);
         }
@@ -1213,9 +1218,10 @@ pub fn pair_remove(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 pub fn discover_list(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
     let inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
     let state_dir = inner.config.state_dir().to_path_buf();
 
-    let ring = crate::net::load_ring(&state_dir)
+    let ring = crate::net::load_ring(&garden_root, &state_dir)
         .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
     let local_fp = hex::encode(
         inner
@@ -1243,11 +1249,12 @@ pub fn replica_grant(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
 
     let inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
     let state_dir = inner.config.state_dir().to_path_buf();
 
     // You may only grant a *paired* peer (a ring member): resolve the query to a
     // single ring device-id, so a typo can't authorize a stranger.
-    let full_fp = resolve_ring_fingerprint(&state_dir, &fp_query)?;
+    let full_fp = resolve_ring_fingerprint(&garden_root, &state_dir, &fp_query)?;
 
     let mut ledger = crate::replica::GrantLedger::load(&state_dir)
         .map_err(|e| (ErrorKind::Io, format!("load replica ledger: {e}")))?;
@@ -1348,10 +1355,11 @@ pub fn replica_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResul
 /// Resolve a fingerprint query (full or unique prefix) to a single ring
 /// member's full device-id fingerprint, or an error if none / ambiguous.
 fn resolve_ring_fingerprint(
+    garden_root: &std::path::Path,
     state_dir: &std::path::Path,
     fp_query: &str,
 ) -> std::result::Result<String, (ErrorKind, String)> {
-    let ring = crate::net::load_ring(state_dir)
+    let ring = crate::net::load_ring(garden_root, state_dir)
         .map_err(|e| (ErrorKind::Io, format!("load ring: {e}")))?;
     let matches: Vec<String> = ring
         .peers()

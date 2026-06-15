@@ -104,6 +104,30 @@ impl Ring {
         Ok(Self { peers })
     }
 
+    /// Serialize **membership only** (endpoints stripped) to a TOML string —
+    /// the form persisted to the in-garden `config/peers.toml`. Endpoints are
+    /// volatile mDNS state that would dirty the garden on every sighting; they
+    /// live in the [`crate::endpoint_cache`] sidecar instead. Unlike
+    /// [`Ring::save`], this hands the bytes back so the caller can write them
+    /// through its own self-write-suppressed path (one write event the watcher
+    /// can drop), rather than a temp+rename (two events `mark_self_write` can't
+    /// both catch).
+    pub fn to_membership_toml(&self) -> Result<String> {
+        let doc = RingDoc {
+            version: RING_VERSION,
+            peer: self
+                .peers
+                .iter()
+                .map(|e| {
+                    let mut row = PeerRow::from_entry(e);
+                    row.endpoints.clear();
+                    row
+                })
+                .collect(),
+        };
+        Ok(toml::to_string_pretty(&doc)?)
+    }
+
     /// Atomically write the ring (temp file + rename), creating `.softfig/` if
     /// needed.
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -202,7 +226,7 @@ struct PeerRow {
     device_id: String,
     name: String,
     transport_pubkey: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoints: Vec<String>,
     attestation: String,
     paired_at: i64,
@@ -288,6 +312,33 @@ mod tests {
         let loaded = Ring::load(&path).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.peers(), ring.peers());
+    }
+
+    #[test]
+    fn membership_toml_strips_endpoints() {
+        let mut ring = Ring::default();
+        ring.upsert(entry(1, 2, "laptop")); // entry() seeds an endpoint
+        let toml = ring.to_membership_toml().unwrap();
+        assert!(
+            !toml.contains("endpoints"),
+            "membership form must omit endpoints, got:\n{toml}"
+        );
+        assert!(toml.contains("name = \"laptop\""));
+        // It round-trips back to a verifiable, endpoint-free membership ring.
+        let dir = tempfile::tempdir().unwrap();
+        let path = ring_path(dir.path());
+        fs::write(&path_with_dirs(&path), &toml).unwrap();
+        let loaded = Ring::load(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.peers()[0].endpoints.is_empty());
+        assert!(loaded.peers()[0].verify());
+    }
+
+    /// Create the parent dir for `path` and return it (membership writes don't
+    /// go through `Ring::save`, so this test does the mkdir itself).
+    fn path_with_dirs(path: &Path) -> &Path {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
     }
 
     #[test]

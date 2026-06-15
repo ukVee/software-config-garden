@@ -38,21 +38,25 @@ use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use softfig_ipc::verbs::DiscoveredDevice;
+use softfig_ipc::ErrorKind;
 use softfig_net::discovery::{self, Advertisement};
+use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 use softfig_net::proto::{frame, Frame, ReplicaGrant, TipAnnounce};
 use softfig_net::relay::Relay;
-use softfig_net::ring::{ring_path, Ring, RingEntry};
+use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
     pull_replication, serve_replication, static_attestation_message, verify_grant, NetError,
     ServeSummary,
 };
+use softfig_store::Hash;
 use softfig_vault::VaultSession;
-use softfig_vcs::Repo;
+use softfig_vcs::{Intent, Repo};
 
 use crate::config::KeeperConfig;
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, DaemonInner};
+use crate::keeper_toml::CONFIG_DIR;
 use crate::replica::{self, MirrorStore, RepoSource};
 use crate::state::State;
 
@@ -275,19 +279,70 @@ pub fn initiate_pairing(local: &LocalDevice, endpoint: &str) -> Result<PendingPa
     pair_initiator(stream, local)
 }
 
-// --- Ring persistence helpers (peers.toml is the source of truth) -----------
+// --- Ring persistence: split membership (garden) from endpoints (sidecar) ----
+//
+// Membership (device id / name / transport key / attestation / paired_at) is
+// the **source of truth** and lives inside the garden at `config/peers.toml`
+// (encrypted, versioned, M5b-backed). Volatile endpoints live in a local
+// `.softfig/peers-endpoints.toml` sidecar, never committed — so an mDNS sighting
+// never dirties the garden. Membership writes go through the pairing handlers
+// (`mark_self_write` + one self-write + a `peers_changed` commit), not here.
 
-/// Upsert `entry` into the on-disk ring and persist it atomically.
-pub fn persist_ring_entry(state_dir: &std::path::Path, entry: RingEntry) -> Result<(), NetError> {
-    let path = ring_path(state_dir);
-    let mut ring = Ring::load(&path)?;
-    ring.upsert(entry);
-    ring.save(&path)
+/// Garden-relative path of the membership ring: `config/peers.toml`.
+pub fn membership_path(garden_root: &std::path::Path) -> std::path::PathBuf {
+    garden_root.join(CONFIG_DIR).join(RING_FILE)
 }
 
-/// Load the on-disk ring (an absent file is an empty ring).
-pub fn load_ring(state_dir: &std::path::Path) -> Result<Ring, NetError> {
-    Ring::load(&ring_path(state_dir))
+/// Load the live ring: membership from the garden `config/peers.toml` (falling
+/// back to the legacy `.softfig/peers.toml` when the in-garden file is absent —
+/// non-breaking, and once the garden file exists the legacy one is ignored),
+/// then merge volatile endpoints from the sidecar. `Ring::load` re-verifies
+/// every attestation on both paths, so a tampered membership file is rejected.
+pub fn load_ring(garden_root: &std::path::Path, state_dir: &std::path::Path) -> Result<Ring, NetError> {
+    let membership = membership_path(garden_root);
+    let mut ring = if membership.exists() {
+        Ring::load(&membership)?
+    } else {
+        Ring::load(&ring_path(state_dir))?
+    };
+    EndpointCache::load(&endpoint_cache_path(state_dir))?.apply(&mut ring);
+    Ok(ring)
+}
+
+/// Persist a membership change (pair confirm / unpair) at the structural root:
+/// serialize the ring's **membership** (endpoints stripped) to the garden's
+/// `config/peers.toml` working tree as one self-write-suppressed write, commit
+/// `peers_changed`, then refresh the volatile endpoint sidecar from the same
+/// ring so reconnect-after-restart still works. The caller holds `inner` (the
+/// commit needs it), has already up/removed the ring row, and passes the
+/// `daemon` so the watcher drops the write event.
+pub fn write_and_commit_membership(
+    daemon: &Daemon,
+    inner: &mut DaemonInner,
+    garden_root: &std::path::Path,
+    state_dir: &std::path::Path,
+    ring: &Ring,
+) -> Result<Hash, (ErrorKind, String)> {
+    let abs = membership_path(garden_root);
+    // Suppress the watcher event BEFORE the write (the watcher runs in parallel).
+    daemon.mark_self_write(abs.clone());
+    let toml = ring
+        .to_membership_toml()
+        .map_err(|e| (ErrorKind::Internal, format!("serialize membership: {e}")))?;
+    crate::actions::write_file(&abs, toml.as_bytes())?;
+
+    let payload = serde_json::json!({ "summary": format!("{} ring members", ring.len()) });
+    let intent = Intent::new("peers_changed", payload)
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    let hash = crate::actions::commit_now(inner, intent)?;
+
+    // Refresh the volatile endpoint sidecar (never committed) so a known peer's
+    // endpoints survive a restart. Best-effort: a sidecar failure must not undo
+    // the committed membership change.
+    if let Err(e) = EndpointCache::capture(ring).save(&endpoint_cache_path(state_dir)) {
+        eprintln!("keeperd: net: endpoint sidecar save: {e}");
+    }
+    Ok(hash)
 }
 
 // --- The live runtime: listener + mDNS + optional relay ---------------------
@@ -330,7 +385,10 @@ impl NetRuntime {
     /// to `unlock`.
     pub fn start(daemon: &Daemon, config: &KeeperConfig, local: LocalDevice) -> Self {
         let state_dir = config.state_dir().to_path_buf();
-        let ring = Arc::new(Mutex::new(load_ring(&state_dir).unwrap_or_default()));
+        let garden_root = config.garden_root.clone();
+        let ring = Arc::new(Mutex::new(
+            load_ring(&garden_root, &state_dir).unwrap_or_default(),
+        ));
         let discovery_cache: Arc<Mutex<HashMap<String, DiscoveredEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -724,9 +782,14 @@ fn spawn_browse_loop(
                                 discovery::refresh_ring_endpoints(&mut r, &peer)
                             };
                             if persist {
+                                // A known peer's endpoints changed — refresh the
+                                // volatile sidecar (NOT the committed membership
+                                // file), so an mDNS sighting never dirties the
+                                // garden.
                                 let snapshot = ring.lock().unwrap().clone();
-                                if let Err(e) = snapshot.save(&ring_path(&state_dir)) {
-                                    eprintln!("keeperd: net: ring save after discovery: {e}");
+                                let cache = EndpointCache::capture(&snapshot);
+                                if let Err(e) = cache.save(&endpoint_cache_path(&state_dir)) {
+                                    eprintln!("keeperd: net: endpoint sidecar save: {e}");
                                 }
                             }
                         }
@@ -850,7 +913,7 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
                 return;
             }
         };
-        let ring = load_ring(&state_dir).unwrap_or_default();
+        let ring = load_ring(&inner.config.garden_root, &state_dir).unwrap_or_default();
         let mut targets: Vec<(RingEntry, ReplicaGrant)> = Vec::new();
         for fp in &ledger.push_to {
             if let Some(host) = ring.peers().iter().find(|p| &p.fingerprint() == fp) {

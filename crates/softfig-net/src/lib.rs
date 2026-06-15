@@ -38,6 +38,7 @@
 pub mod attest;
 pub mod connect;
 pub mod discovery;
+pub mod endpoint_cache;
 pub mod error;
 pub mod pairing;
 pub mod proto;
@@ -50,6 +51,7 @@ pub mod transport;
 pub use attest::{static_attestation_message, verify_static_attestation};
 pub use connect::{connect_first, plan_routes, Route};
 pub use discovery::{Advertisement, DiscoveredPeer, PeerTxt};
+pub use endpoint_cache::{endpoint_cache_path, EndpointCache};
 pub use error::{NetError, Result};
 pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 pub use proto::{

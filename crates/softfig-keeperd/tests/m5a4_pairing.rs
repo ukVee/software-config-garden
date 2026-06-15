@@ -22,13 +22,15 @@ use softfig_vcs::Repo;
 use softfig_ipc::{
     self,
     verbs::{
-        op, DiscoverListReply, PairBeginArgs, PairBeginReply, PairConfirmArgs, PairConfirmReply,
-        PairListReply, PairRemoveArgs, PairRemoveReply, UnlockArgs,
+        op, DiscoverListReply, MigrateConfigReply, PairBeginArgs, PairBeginReply, PairConfirmArgs,
+        PairConfirmReply, PairListReply, PairRemoveArgs, PairRemoveReply, UnlockArgs,
     },
     ErrorKind, Request, Response,
 };
 use softfig_keeperd::{Daemon, KeeperConfig};
+use softfig_net::endpoint_cache::endpoint_cache_path;
 use softfig_net::pairing::{pair_responder, LocalDevice};
+use softfig_net::ring::{ring_path, Ring, RingEntry};
 use softfig_net::static_attestation_message;
 use softfig_vault::{params::VaultParams, Vault};
 
@@ -115,6 +117,77 @@ fn forge_device(name: &str, id_seed: u8, tk_seed: u8) -> LocalDevice {
     }
 }
 
+/// Forge a verifiable ring entry (Ed25519 id + X25519 static + self
+/// attestation) with the given reachable endpoints — what a legacy
+/// `.softfig/peers.toml` row looks like before the config-in-garden migration.
+fn forge_ring_entry(id_seed: u8, tk_seed: u8, name: &str, endpoints: Vec<String>) -> RingEntry {
+    let id = SigningKey::from_bytes(&[id_seed; 32]);
+    let transport_pubkey =
+        x25519_dalek::x25519([tk_seed; 32], x25519_dalek::X25519_BASEPOINT_BYTES);
+    let attestation = id
+        .sign(&static_attestation_message(&transport_pubkey))
+        .to_bytes();
+    RingEntry {
+        device_id: id.verifying_key().to_bytes(),
+        name: name.into(),
+        transport_pubkey,
+        endpoints,
+        attestation,
+        paired_at: 1_700_000_000,
+    }
+}
+
+/// `migrate config` lifts the legacy `.softfig/peers.toml` ring into the
+/// in-garden `config/peers.toml` (membership only) and seeds the volatile
+/// endpoint sidecar, so the read path (`pair_list`) then sources membership from
+/// the garden + endpoints from the sidecar. M1c-compat: garden == state_dir.
+#[test]
+fn migrate_config_lifts_peers_membership() {
+    let (handle, socket, _tmp) = unlocked_daemon();
+    let root = _tmp.path();
+
+    // A legacy ring with one paired peer carrying an endpoint.
+    let entry = forge_ring_entry(11, 22, "old-laptop", vec!["192.168.1.40:9100".into()]);
+    let peer_fp = entry.fingerprint();
+    let mut legacy = Ring::default();
+    legacy.upsert(entry);
+    legacy.save(&ring_path(root)).unwrap();
+
+    // Apply the migration: both keeper.toml and peers.toml move in one commit.
+    let reply: MigrateConfigReply = serde_json::from_value(unwrap_ok(rpc(
+        &socket,
+        op::MIGRATE_CONFIG,
+        json!({ "apply": true }),
+    )))
+    .unwrap();
+    assert!(reply.applied);
+    assert!(reply.migrated.contains(&"config/peers.toml".to_string()));
+    assert!(reply.migrated.contains(&"config/keeper.toml".to_string()));
+
+    // The in-garden membership exists, verifies, and carries no endpoints.
+    let membership = Ring::load(&root.join("config").join("peers.toml")).unwrap();
+    assert_eq!(membership.len(), 1);
+    assert!(membership.peers()[0].verify());
+    assert!(membership.peers()[0].endpoints.is_empty());
+
+    // The legacy ring is left in place (load now ignores it; it's not deleted).
+    assert!(ring_path(root).exists());
+
+    // The volatile endpoint sidecar was seeded from the legacy ring's endpoints.
+    assert!(endpoint_cache_path(root).exists());
+
+    // End-to-end read path: pair_list now sources membership from the garden and
+    // re-merges the endpoint from the sidecar.
+    let list: PairListReply =
+        serde_json::from_value(unwrap_ok(rpc(&socket, op::PAIR_LIST, json!({})))).unwrap();
+    assert_eq!(list.peers.len(), 1);
+    assert_eq!(list.peers[0].fingerprint, peer_fp);
+    assert_eq!(list.peers[0].endpoints, vec!["192.168.1.40:9100".to_string()]);
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
 /// Bind a loopback listener and serve one `pair_responder` for `device`,
 /// returning the bound endpoint and a channel that yields the responder-side
 /// SAS once the handshake completes.
@@ -191,10 +264,17 @@ fn pair_begin_confirm_list_remove_round_trip() {
     assert_eq!(post.peers[0].name, "test-peer");
     assert!(post.pending.is_empty());
 
-    // The ring persisted to disk and verifies on reload.
-    let ring = softfig_net::ring::Ring::load(&softfig_net::ring::ring_path(_tmp.path())).unwrap();
+    // Membership persisted to the in-garden `config/peers.toml` (M1c-compat
+    // here, so garden_root == state_dir == the tempdir) and verifies on reload.
+    // The legacy `.softfig/peers.toml` is no longer the source of truth.
+    let membership = _tmp.path().join("config").join("peers.toml");
+    let ring = softfig_net::ring::Ring::load(&membership).unwrap();
     assert_eq!(ring.len(), 1);
     assert!(ring.peers()[0].verify());
+    assert!(
+        ring.peers()[0].endpoints.is_empty(),
+        "committed membership carries no volatile endpoints"
+    );
 
     // pair_remove by a unique prefix unpairs.
     let removed: PairRemoveReply = serde_json::from_value(unwrap_ok(rpc(
