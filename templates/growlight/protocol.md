@@ -23,6 +23,15 @@ protocol is fixed; the baton changes each iteration.
    root-cause fixes, no patchwork; refresh garden+project docs when a milestone
    verifies). Never relitigate LOCKED DECISIONS.
 
+3b. DAEMON RESTART (relock). If a step needs the keeperd daemon cycled (e.g. you
+   rebuilt softfig-keeperd), run `softfig daemon cycle` as ONE step: it bounces
+   the daemon and resumes the unlocked session without the passphrase, holding
+   the one-time token in its own RAM (never logged, never in the baton). If it
+   reports relock is disabled (or returns RelockDisabled): do NOT work around it
+   — `[growlight] allow_relock` is the human's to set. Write the baton, set
+   status BLOCKED_ON_HUMAN ("needs daemon restart; relock disabled"), stop. Never
+   attempt a cold unlock (you don't have the passphrase).
+
 4. HUMAN CHECKPOINTS. For choices that are genuinely the user's (direction,
    scope, irreversible/outward-facing, ambiguous requirements): append to FOR
    THE HUMAN with a proposed default. Semi: proceed on the default but flag it;
