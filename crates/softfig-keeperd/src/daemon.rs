@@ -147,6 +147,14 @@ impl Daemon {
     pub fn request_shutdown(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.state = State::Stopping;
+        // Growlight: prune an *expired* relock blob, but never a live one — a
+        // graceful `daemon stop` is exactly the bounce a pending `cycle` relies
+        // on, so the unexpired blob must survive for the new daemon to redeem.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        crate::relock::prune_expired(inner.config.state_dir(), now);
         let _ = inner.fuse.take();
         let _ = inner.net.take();
         inner.pending_pairs.clear();

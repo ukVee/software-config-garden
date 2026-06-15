@@ -136,6 +136,17 @@ pub mod op {
     /// Idempotent retrofit; one `growlight_initialized` commit, or none if the
     /// pillar already exists. Mirrors `migrate split`.
     pub const GROWLIGHT_INIT: &str = "growlight_init";
+    /// Growlight relock: mint a one-time token wrapping the live KEK so an
+    /// unattended daemon restart can resume this session. Requires Unlocked +
+    /// `[growlight] allow_relock = true`. `persist=false` (cycle) returns the
+    /// token in the reply; `persist=true` (relock-arm) writes it to a tmpfs
+    /// file and returns the path. Commit-free; CLI-over-IPC, never MCP.
+    pub const RELOCK_MINT: &str = "relock_mint";
+    /// Growlight relock: redeem a minted token + its tmpfs blob to rebuild the
+    /// session on a freshly-restarted (Locked) daemon. `cycle` passes the token
+    /// hex (held in CLI RAM); `relock` passes nothing and the daemon reads its
+    /// own persisted token file. Single-use: the blob is deleted on success.
+    pub const RELOCK_REDEEM: &str = "relock_redeem";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +157,60 @@ pub struct StatusReply {
     pub tip: Option<String>,
     pub garden_root: String,
     pub protocol_version: u8,
+    /// Growlight: true when an unexpired relock token is armed for this garden
+    /// (a `cycle`/`relock-arm` is in flight). `#[serde(default)]` keeps older
+    /// daemons/clients wire-compatible.
+    #[serde(default)]
+    pub relock_pending: bool,
+    /// Unix seconds at which the armed relock token expires, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relock_expires_at: Option<i64>,
+}
+
+// ---- growlight relock token -------------------------------------------
+
+/// `relock_mint({persist}) -> RelockMintReply`. Mint a one-time token wrapping
+/// the live KEK. Requires Unlocked + `[growlight] allow_relock`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RelockMintArgs {
+    /// `false` (cycle): return the token hex in the reply for the caller to
+    /// hold in RAM. `true` (relock-arm): persist the token to a `0600` tmpfs
+    /// file and return its path instead.
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelockMintReply {
+    /// Whether the token was persisted to disk (`persist=true`).
+    pub persisted: bool,
+    /// Unix seconds at which the token expires.
+    pub expires_at: i64,
+    /// Absolute tmpfs path of the wrapped-KEK blob (the redeem reads this).
+    pub blob_path: String,
+    /// The token, lowercase hex — present only when `persisted=false` (cycle).
+    /// Kept out of the model context: the `cycle` CLI holds it in RAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Absolute tmpfs path of the persisted token — present only when
+    /// `persisted=true` (relock-arm). The redeem reads it server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_path: Option<String>,
+}
+
+/// `relock_redeem({token?}) -> RelockRedeemReply`. Rebuild the session on a
+/// Locked daemon. `token` present = cycle (hex held in CLI RAM); `token`
+/// absent = relock (the daemon reads its own persisted token file).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RelockRedeemArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelockRedeemReply {
+    /// "unlocked" on success.
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

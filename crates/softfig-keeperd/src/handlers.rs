@@ -14,7 +14,8 @@ use softfig_ipc::verbs::{
     CommitArgs, CommitReply, DiscoverListReply, FsckReply, HostedChain, LogArgs, LogEntry, LogReply,
     MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
-    PairRemoveReply, PendingPairing, ReplaceFileArgs, ReplaceFileReply,
+    PairRemoveReply, PendingPairing, RelockMintArgs, RelockMintReply, RelockRedeemArgs,
+    RelockRedeemReply, ReplaceFileArgs, ReplaceFileReply,
     ReplicaGrantArgs, ReplicaGrantReply, ReplicaRevokeArgs, ReplicaRevokeReply,
     ReplicaStatusReply, ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
     UnlockReply, VaultListSealedReply, VaultRevealArgs, VaultRevealReply,
@@ -22,7 +23,7 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
-use softfig_vault::Vault;
+use softfig_vault::{RelockToken, Vault, RELOCK_TTL_SECS};
 
 use crate::daemon::{Daemon, KeeperError};
 use crate::layer_b::{self, LayerBHook, PriorTipGuard, SealedPaths};
@@ -39,13 +40,26 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
         Some(repo) => repo.tip().ok().flatten().map(|h| h.to_string()),
         None => None,
     };
+    // Growlight: surface an armed relock token (lazily prunes an expired one).
+    let relock_expires_at =
+        crate::relock::pending_expires_at(inner.config.state_dir(), unix_now());
     let reply = StatusReply {
         state: inner.state.label().to_string(),
         tip: tip_hex,
         garden_root: inner.config.garden_root.display().to_string(),
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
+        relock_pending: relock_expires_at.is_some(),
+        relock_expires_at,
     };
     Ok(serde_json::to_value(reply).unwrap())
+}
+
+/// Current unix time in seconds (saturating at 0 before the epoch).
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub fn unlock(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -63,7 +77,6 @@ pub fn unlock(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         .unwrap());
     }
 
-    let garden_root = inner.config.garden_root.clone();
     let state_dir = inner.config.state_dir().to_path_buf();
     let vault = Vault::at_state_root(&state_dir);
     if !vault.is_initialized() {
@@ -77,6 +90,29 @@ pub fn unlock(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         .unlock(args.passphrase.as_bytes())
         .map_err(|e| (ErrorKind::AuthFailed, e.to_string()))?;
 
+    establish_session_locked(daemon, &mut inner, session)?;
+    drop(inner);
+    start_net_if_enabled(daemon);
+
+    Ok(serde_json::to_value(UnlockReply {
+        state: State::Unlocked.label().to_string(),
+    })
+    .unwrap())
+}
+
+/// Build the live daemon state from a freshly-unlocked `VaultSession`: open the
+/// repo, wire the Layer B hook as blob-encryptor + sealed-query, mount FUSE,
+/// and flip to `Unlocked`. Shared by `unlock` (passphrase/recovery) and
+/// `relock_redeem` so every route to Unlocked lands an identical session —
+/// masters / identity / transport / FUSE all brought up the same way. The
+/// caller holds `inner` and is responsible for the `start_net_if_enabled`
+/// tail (which must drop the lock across thread spawns).
+fn establish_session_locked(
+    daemon: &Daemon,
+    inner: &mut crate::daemon::DaemonInner,
+    session: softfig_vault::VaultSession,
+) -> std::result::Result<(), (ErrorKind, String)> {
+    let garden_root = inner.config.garden_root.clone();
     let state_root = inner.config.state_root.clone();
     let mut repo = Repo::open_with(&garden_root, state_root.as_deref())
         .map_err(|e| err_to_response(e.into()))?;
@@ -138,34 +174,166 @@ pub fn unlock(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     inner.layer_b = hook;
     inner.last_reveal_at = None;
     inner.state = State::Unlocked;
+    Ok(())
+}
 
-    // M5a-4: host the softfig-net instance (inbound listener + mDNS +
-    // optional relay) for cross-device pairing/reconnect. Best-effort
-    // and gated by `[net] enabled` + the `enable_net` runtime flag (off
-    // in tests), so a bind/mDNS failure never fails the unlock.
-    if daemon_enable_net(&inner) {
-        let session = inner.session.as_ref().expect("unlocked").clone();
-        let name = crate::net::device_name(&inner.config);
-        let local = crate::net::build_local_device(&session, name);
-        let config = inner.config.clone();
-        // Build the runtime without holding the inner lock across thread
-        // spawns that may themselves want it (the inbound loop parks via
-        // the daemon handle). NetRuntime::start needs `daemon`, not `inner`.
-        drop(inner);
-        let runtime = crate::net::NetRuntime::start(daemon, &config, local);
-        daemon.inner.lock().unwrap().net = Some(runtime);
+/// M5a-4: host the softfig-net instance (inbound listener + mDNS + optional
+/// relay) for cross-device pairing/reconnect, if `[net] enabled` and the
+/// `enable_net` runtime flag are both on. Best-effort — a bind/mDNS failure
+/// never fails the unlock. Locks `inner` itself and drops the lock across the
+/// thread spawns (the inbound loop parks via the daemon handle).
+fn start_net_if_enabled(daemon: &Daemon) {
+    let inner = daemon.inner.lock().unwrap();
+    if !daemon_enable_net(&inner) {
+        return;
     }
-
-    Ok(serde_json::to_value(UnlockReply {
-        state: State::Unlocked.label().to_string(),
-    })
-    .unwrap())
+    let session = match inner.session.as_ref() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let name = crate::net::device_name(&inner.config);
+    let local = crate::net::build_local_device(&session, name);
+    let config = inner.config.clone();
+    drop(inner);
+    let runtime = crate::net::NetRuntime::start(daemon, &config, local);
+    daemon.inner.lock().unwrap().net = Some(runtime);
 }
 
 /// Whether the net host should start: the user's `[net] enabled` AND the
 /// `enable_net` runtime flag (the latter off in tests).
 fn daemon_enable_net(inner: &crate::daemon::DaemonInner) -> bool {
     inner.config.enable_net && inner.config.net.enabled
+}
+
+/// Growlight relock — mint. Wrap the live KEK under a one-time token and write
+/// the blob to tmpfs so an unattended daemon restart can resume this session.
+/// Requires Unlocked **and** `[growlight] allow_relock` (the human's opt-in;
+/// the agent cannot self-enable it). `persist=false` returns the token hex in
+/// the reply (held in the `cycle` CLI's RAM); `persist=true` writes it to a
+/// second `0600` tmpfs file and returns the path.
+pub fn relock_mint(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: RelockMintArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("relock_mint args: {e}")))?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    if !inner.config.growlight.allow_relock {
+        return Err((
+            ErrorKind::RelockDisabled,
+            "relock disabled: set [growlight] allow_relock = true in keeper.toml".into(),
+        ));
+    }
+
+    let state_dir = inner.config.state_dir().to_path_buf();
+    let session = inner.session.as_ref().expect("unlocked").clone();
+    let now = unix_now();
+    let (token, blob) = session
+        .mint_relock(now, RELOCK_TTL_SECS)
+        .map_err(|e| (ErrorKind::Internal, format!("mint relock: {e}")))?;
+
+    let blob_path = crate::relock::blob_path(&state_dir)
+        .ok_or((ErrorKind::Internal, "vault not initialized".into()))?;
+    crate::relock::write_secret_file(&blob_path, &blob.encode())
+        .map_err(|e| (ErrorKind::Io, format!("write relock blob: {e}")))?;
+
+    let mut reply = RelockMintReply {
+        persisted: args.persist,
+        expires_at: blob.expires_at,
+        blob_path: blob_path.display().to_string(),
+        token: None,
+        token_path: None,
+    };
+    if args.persist {
+        let token_path = crate::relock::token_path(&state_dir)
+            .ok_or((ErrorKind::Internal, "vault not initialized".into()))?;
+        crate::relock::write_secret_file(&token_path, token.to_hex().as_bytes())
+            .map_err(|e| (ErrorKind::Io, format!("write relock token: {e}")))?;
+        reply.token_path = Some(token_path.display().to_string());
+    } else {
+        reply.token = Some(token.to_hex());
+    }
+
+    eprintln!(
+        "keeperd: relock token minted (persisted={}, expires_at={})",
+        args.persist, blob.expires_at
+    );
+    Ok(serde_json::to_value(reply).unwrap())
+}
+
+/// Growlight relock — redeem. On a freshly-restarted (Locked) daemon, unwrap
+/// the KEK from the tmpfs blob with the token and rebuild the session exactly
+/// as `unlock` does. `token` present = `cycle` (hex held in CLI RAM); `token`
+/// absent = `relock` (the daemon reads its own persisted token file). The blob
+/// (and any persisted token) is deleted on success — single use.
+pub fn relock_redeem(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: RelockRedeemArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("relock_redeem args: {e}")))?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    match inner.state {
+        State::Locked => {}
+        State::Unlocked => {
+            // Already unlocked — nothing to redeem. Leave the blob to prune.
+            return Ok(serde_json::to_value(RelockRedeemReply {
+                state: State::Unlocked.label().to_string(),
+            })
+            .unwrap());
+        }
+        State::Stopping => return Err((ErrorKind::Internal, "daemon stopping".into())),
+    }
+
+    let state_dir = inner.config.state_dir().to_path_buf();
+    let blob_path = crate::relock::blob_path(&state_dir)
+        .ok_or((ErrorKind::NotFound, "vault not initialized".into()))?;
+    let blob_bytes = std::fs::read(&blob_path).map_err(|_| {
+        (
+            ErrorKind::NotFound,
+            "no relock token armed (mint one first, or it expired)".into(),
+        )
+    })?;
+
+    // Token source: the hex in args (cycle), else the daemon's own persisted
+    // token file (relock). The persisted path is daemon-derived, so a caller
+    // can never point the redeem at an arbitrary file.
+    let token = match args.token.as_deref() {
+        Some(hex) => RelockToken::from_hex(hex)
+            .map_err(|e| (ErrorKind::BadArgs, format!("relock token: {e}")))?,
+        None => {
+            let token_path = crate::relock::token_path(&state_dir)
+                .ok_or((ErrorKind::NotFound, "vault not initialized".into()))?;
+            let hex = std::fs::read_to_string(&token_path).map_err(|_| {
+                (
+                    ErrorKind::NotFound,
+                    "no persisted relock token (mint with persist, or pass the token)".into(),
+                )
+            })?;
+            RelockToken::from_hex(hex.trim())
+                .map_err(|e| (ErrorKind::BadArgs, format!("persisted relock token: {e}")))?
+        }
+    };
+
+    let vault = Vault::at_state_root(&state_dir);
+    let session = vault
+        .redeem_relock(&token, &blob_bytes, unix_now())
+        .map_err(|e| match e {
+            softfig_vault::VaultError::RelockExpired => {
+                (ErrorKind::AuthFailed, "relock token expired".into())
+            }
+            other => (ErrorKind::AuthFailed, other.to_string()),
+        })?;
+
+    establish_session_locked(daemon, &mut inner, session)?;
+    drop(inner);
+    start_net_if_enabled(daemon);
+
+    // Single-use: remove the blob + any persisted token now that it redeemed.
+    crate::relock::remove_artifacts(&state_dir);
+    eprintln!("keeperd: relock token redeemed; session resumed");
+
+    Ok(serde_json::to_value(RelockRedeemReply {
+        state: State::Unlocked.label().to_string(),
+    })
+    .unwrap())
 }
 
 pub fn commit(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {

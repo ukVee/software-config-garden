@@ -19,6 +19,14 @@ use crate::watcher;
 
 const ACCEPT_POLL_MS: u64 = 100;
 
+/// Current unix time in seconds (for relock-blob expiry pruning).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub fn start(daemon: Daemon) -> Result<DaemonHandle> {
     let socket_path = daemon
         .inner
@@ -41,6 +49,14 @@ pub fn start(daemon: Daemon) -> Result<DaemonHandle> {
     let mut perms = std::fs::metadata(&socket_path)?.permissions();
     perms.set_mode(0o600);
     std::fs::set_permissions(&socket_path, perms)?;
+
+    // Growlight: drop any *expired* relock blob from a previous run. A live one
+    // (a `cycle`/`relock` minted just before this restart) is left in place to
+    // be redeemed; tmpfs already wiped it on a reboot.
+    {
+        let inner = daemon.inner.lock().unwrap();
+        crate::relock::prune_expired(inner.config.state_dir(), now_secs());
+    }
 
     let daemon_for_thread = daemon.clone();
     let socket_for_thread = socket_path.clone();
@@ -174,6 +190,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::ADD_SLICE => crate::actions::add_slice(daemon, req.args),
         op::SET_ITEM_STATUS => crate::actions::set_item_status(daemon, req.args),
         op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
+        op::RELOCK_MINT => handlers::relock_mint(daemon, req.args),
+        op::RELOCK_REDEEM => handlers::relock_redeem(daemon, req.args),
         op::ARCHIVE => crate::actions::archive(daemon, req.args),
         op::ADD_PROJECT => crate::actions::add_project(daemon, req.args),
         op::REFRESH_SNAPSHOT => crate::actions::refresh_snapshot(daemon, req.args),

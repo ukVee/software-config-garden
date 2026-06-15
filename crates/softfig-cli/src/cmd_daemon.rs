@@ -99,6 +99,12 @@ fn status(args: BasicArgs) -> Result<()> {
                 reply.tip.as_deref().unwrap_or("(none)")
             );
             println!("protocol        v{}", reply.protocol_version);
+            if reply.relock_pending {
+                match reply.relock_expires_at {
+                    Some(exp) => println!("relock          armed (expires_at {exp})"),
+                    None => println!("relock          armed"),
+                }
+            }
             Ok(())
         }
         Err(e) if e.is_daemon_absent() => {

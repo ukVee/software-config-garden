@@ -53,6 +53,14 @@ pub struct KeeperToml {
     /// as `peers.toml`. Absent table = not a backup host.
     #[serde(default)]
     pub replica: ReplicaToml,
+    /// Growlight relock: the opt-in that lets the autonomous loop resume an
+    /// already-unlocked vault across an unattended daemon restart. Off by
+    /// default; the daemon refuses to mint a relock token unless
+    /// `allow_relock = true`. Because `keeper.toml` is not a garden file and
+    /// Vault ops are never MCP-exposed, the loop physically cannot enable its
+    /// own relock — only the human can. Absent table = relock disabled.
+    #[serde(default)]
+    pub growlight: GrowlightToml,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -146,6 +154,19 @@ pub struct ReplicaToml {
     pub host: bool,
 }
 
+/// `[growlight]` — autonomous-loop policy the daemon enforces. Currently just
+/// the relock opt-in; a deliberate, security-relevant toggle the human sets by
+/// hand (never the agent).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GrowlightToml {
+    /// Permit the relock token (resume an already-unlocked vault across an
+    /// unattended daemon restart). Default `false` — the daemon refuses
+    /// `relock_mint` unless this is `true`.
+    #[serde(default)]
+    pub allow_relock: bool,
+}
+
 impl KeeperToml {
     /// Load `keeper.toml` from the location next to a `.softfig/`. Both
     /// "file absent" and "empty file" return [`KeeperToml::default()`]
@@ -235,6 +256,25 @@ mod tests {
         // Other [net] fields still take their defaults.
         assert!(cfg.net.enabled);
         assert_eq!(cfg.net.listen, "0.0.0.0:9100");
+    }
+
+    #[test]
+    fn growlight_relock_defaults_off_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent table → relock disabled.
+        let cfg = KeeperToml::default();
+        assert!(!cfg.growlight.allow_relock);
+
+        // Explicit opt-in round-trips through store/load.
+        let softfig = tmp.path().join(".softfig");
+        fs::create_dir_all(&softfig).unwrap();
+        fs::write(
+            softfig.join(KEEPER_TOML),
+            "state_root = \"/s\"\n\n[growlight]\nallow_relock = true\n",
+        )
+        .unwrap();
+        let back = KeeperToml::load(tmp.path()).unwrap();
+        assert!(back.growlight.allow_relock, "explicit opt-in parses");
     }
 
     #[test]

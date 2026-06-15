@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::keeper_toml::{KeeperToml, NetToml, RelayToml, ReplicaToml};
+use crate::keeper_toml::{GrowlightToml, KeeperToml, NetToml, RelayToml, ReplicaToml};
 
 #[derive(Debug, Clone)]
 pub struct KeeperConfig {
@@ -38,6 +38,23 @@ pub struct KeeperConfig {
     /// `~/.local/share/softfig/peers/`. Overridable so tests mirror into a
     /// tempdir instead of the real data home.
     pub replica_root: Option<PathBuf>,
+    /// Growlight loop policy from `[growlight]` — currently the relock opt-in.
+    pub growlight: GrowlightConfig,
+}
+
+/// Growlight: autonomous-loop policy (`[growlight]`).
+#[derive(Debug, Clone, Default)]
+pub struct GrowlightConfig {
+    /// Permit minting relock tokens (unattended daemon restart). Default off.
+    pub allow_relock: bool,
+}
+
+impl From<GrowlightToml> for GrowlightConfig {
+    fn from(t: GrowlightToml) -> Self {
+        Self {
+            allow_relock: t.allow_relock,
+        }
+    }
 }
 
 /// M5b: replication config (`[replica]`).
@@ -131,6 +148,7 @@ impl KeeperConfig {
             relay: RelayConfig::default(),
             replica: ReplicaConfig::default(),
             replica_root: None,
+            growlight: GrowlightConfig::default(),
         }
     }
 
@@ -161,6 +179,7 @@ impl KeeperConfig {
             relay: cfg.relay.into(),
             replica: cfg.replica.into(),
             replica_root: None,
+            growlight: cfg.growlight.into(),
         })
     }
 
@@ -207,6 +226,12 @@ impl KeeperConfig {
     /// M5b: make this device a backup host (`[replica] host = true`).
     pub fn as_replica_host(mut self, host: bool) -> Self {
         self.replica.host = host;
+        self
+    }
+
+    /// Growlight: permit relock-token minting (`[growlight] allow_relock`).
+    pub fn allow_relock(mut self, allow: bool) -> Self {
+        self.growlight.allow_relock = allow;
         self
     }
 

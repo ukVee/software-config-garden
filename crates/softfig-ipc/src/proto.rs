@@ -137,6 +137,10 @@ pub enum ErrorKind {
     /// region. Those go through the vault-aware path; the daemon refuses so
     /// a plaintext rewrite can never clobber ciphertext.
     VaultProtected,
+    /// Growlight relock: `relock_mint` was called but `[growlight]
+    /// allow_relock` is not set in `keeper.toml`. The opt-in is the human's to
+    /// grant; the loop must fall back to `BLOCKED_ON_HUMAN`.
+    RelockDisabled,
     /// Unknown / unhandled internal error.
     Internal,
 }
