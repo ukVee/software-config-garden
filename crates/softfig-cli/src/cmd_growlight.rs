@@ -15,6 +15,7 @@
 //! clobbered.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,7 @@ use softfig_ipc::{
 };
 
 use crate::cmd_daemon::try_daemon_call;
-use crate::growlight_backend::{AgentBackend, ClaudeBackend, IterationRequest};
+use crate::growlight_backend::{AgentBackend, ClaudeBackend, IterationOutcome, IterationRequest};
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
 /// supported backend; `--name` tags the loop session, `--settings` loads the
@@ -75,13 +76,19 @@ pub struct StartArgs {
     /// Generate/refresh the runtime files but don't launch the agent.
     #[arg(long)]
     pub no_launch: bool,
-    /// Headless single-shot (full-auto orchestrator, slice 001): instead of the
-    /// interactive loop, invoke `claude -p` ONCE with the generated settings,
-    /// parse the budgets from its result (the §6 full-auto read path), read back
-    /// the resulting baton status, and exit. No loop yet. Semi-auto interactive
-    /// stays the default.
+    /// Headless full-auto orchestrator (spec §13 phase 5): instead of the
+    /// interactive loop, drive `claude -p` in a loop — a fresh process per
+    /// iteration (the context ROLL), the baton the only carried state, budgets
+    /// parsed from each result (the §6 full-auto read path) — until the baton
+    /// reaches a terminal status, the spin guard trips, or `--max-iterations` is
+    /// hit. Semi-auto interactive stays the default.
     #[arg(long)]
     pub auto: bool,
+    /// Cap on `--auto` iterations (default: unbounded — drive until a terminal
+    /// baton status). `--max-iterations 1` reproduces a single headless shot.
+    /// Ignored without `--auto`.
+    #[arg(long)]
+    pub max_iterations: Option<u64>,
 }
 
 pub fn run(cmd: GrowlightCmd) -> Result<()> {
@@ -217,15 +224,27 @@ fn start(args: StartArgs) -> Result<()> {
     if args.auto {
         let backend = ClaudeBackend::new(AGENT_BIN);
         let usage_path = runtime.join("usage.json");
-        println!("\n(--auto) headless single-shot: invoking `{AGENT_BIN} -p` …\n");
-        let report = run_auto(&backend, &loop_path, &baton_path, &usage_path)?;
-        print_auto_report(&report, &usage_path);
+        let log_path = runtime.join("auto-run.log");
+        let mut log = open_run_log(&log_path)?;
+        println!(
+            "\n(--auto) headless orchestrator: driving `{AGENT_BIN} -p` until terminal baton \
+             status …\n"
+        );
+        let summary = run_auto_loop(
+            &backend,
+            &loop_path,
+            &baton_path,
+            &usage_path,
+            args.max_iterations,
+            &mut log,
+        )?;
+        print_loop_summary(&summary, &usage_path, &log_path);
         return Ok(());
     }
     launch_agent(&loop_path)
 }
 
-// ---- headless single-shot driver (full-auto orchestrator, slice 001) ----
+// ---- headless orchestrator (full-auto, slices 001-002) -----------------
 
 /// The prompt that kicks a headless iteration. The SessionStart hook (which
 /// fires under `-p`) injects the full protocol + baton; this just tells the
@@ -234,30 +253,151 @@ const KICK_PROMPT: &str = "Begin this growlight iteration. The operating protoco
     current baton have been injected above — boot per protocol step 1, execute NEXT ACTION as one \
     coherent chunk, then hand off by rewriting the baton.";
 
-/// What a single headless iteration produced, for the closing summary.
-struct AutoReport {
-    /// The baton `status` after the iteration (the loop's terminal-status
-    /// signal; slices 002/003 act on it).
-    status: String,
-    is_error: bool,
-    /// The agent's final result line (its handoff summary), if any.
-    result_text: Option<String>,
-    ctx_pct: u8,
-    five_hour_status: Option<String>,
-    five_hour_resets_at: Option<i64>,
+/// Baton statuses on which the orchestrator keeps driving (re-invokes a fresh
+/// iteration). Everything else — QUEUE_EMPTY / STUCK / BLOCKED_ON_HUMAN /
+/// HALTED_RATE_LIMIT, and any unrecognized or missing status — stops the loop.
+/// (Pausing and resuming on HALTED_RATE_LIMIT is slice 003's budget governor;
+/// here it just stops.)
+fn is_continue_status(status: &str) -> bool {
+    matches!(status, "IN_PROGRESS" | "ITEM_COMPLETE")
+}
+
+/// Trip the spin guard once the baton's NEXT ACTION repeats unchanged across
+/// this many consecutive iterations (protocol step 6) — the orchestrator's
+/// backstop for an agent that keeps reporting IN_PROGRESS without moving.
+const STALL_LIMIT: usize = 2;
+
+/// Why the `--auto` loop stopped.
+#[derive(Debug, PartialEq)]
+enum StopReason {
+    /// The last iteration wrote a terminal baton status (carried here).
+    Terminal(String),
+    /// NEXT ACTION was unchanged across `STALL_LIMIT` iterations → STUCK.
+    SpinGuard,
+    /// `--max-iterations` was reached with a still-non-terminal baton.
+    MaxIterations,
+}
+
+/// The outcome of an `--auto` loop run, for the closing summary.
+#[derive(Debug)]
+struct LoopSummary {
+    iterations: u64,
+    stop: StopReason,
+    last_status: String,
+    last_item: Option<String>,
+}
+
+/// Drive the agent headlessly in a loop: re-invoke a fresh process per iteration
+/// (the fresh process *is* the context ROLL; the baton is the only carried
+/// state) until the baton reaches a terminal status, the spin guard trips, or
+/// `max_iterations` is hit. Each iteration persists budgets to `usage.json` (via
+/// [`run_auto`]) and is recorded to `log` — the orchestrator's run log, which
+/// lives in the runtime dir, never the garden (spec §3). Generic over the
+/// backend so the driver is testable with a scripted fake — no `claude` spawn.
+fn run_auto_loop(
+    backend: &dyn AgentBackend,
+    loop_path: &Path,
+    baton_path: &Path,
+    usage_path: &Path,
+    max_iterations: Option<u64>,
+    log: &mut dyn Write,
+) -> Result<LoopSummary> {
+    let bound = max_iterations
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "unbounded".to_string());
+    let _ = writeln!(log, "--- growlight --auto run (max_iterations={bound}) ---");
+
+    let mut iterations: u64 = 0;
+    let mut prev_next_action: Option<String> = None;
+    let mut same_streak: usize = 0;
+    let mut last_status = "UNKNOWN".to_string();
+    let mut last_item: Option<String> = None;
+
+    loop {
+        // Don't start an iteration past the cap (or after a terminal status,
+        // which returns below before looping).
+        if let Some(max) = max_iterations {
+            if iterations >= max {
+                let _ = writeln!(log, "stop: --max-iterations ({max}) reached");
+                return Ok(LoopSummary {
+                    iterations,
+                    stop: StopReason::MaxIterations,
+                    last_status,
+                    last_item,
+                });
+            }
+        }
+
+        let (outcome, view) = run_auto(backend, loop_path, baton_path, usage_path)?;
+        iterations += 1;
+
+        let status = view.status.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+        last_status = status.clone();
+        last_item = view.item.clone();
+
+        let line = format!(
+            "iter {iterations}: item={} baton_iter={} status={}{} ctx={}%",
+            view.item.as_deref().unwrap_or("-"),
+            view.iteration
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            status,
+            if outcome.is_error { " (agent ERROR)" } else { "" },
+            outcome.usage.context_window.used_percentage,
+        );
+        let _ = writeln!(log, "{line}");
+        println!("  {line}");
+        if let Some(text) = outcome.result_text.as_deref().map(str::trim) {
+            if !text.is_empty() {
+                let preview = first_line_preview(text, 100);
+                let _ = writeln!(log, "       said: {preview}");
+                println!("       {preview}");
+            }
+        }
+
+        // Terminal status → stop before starting another iteration.
+        if !is_continue_status(&status) {
+            let _ = writeln!(log, "stop: terminal baton status {status}");
+            return Ok(LoopSummary {
+                iterations,
+                stop: StopReason::Terminal(status),
+                last_status,
+                last_item,
+            });
+        }
+
+        // Spin guard (protocol step 6): NEXT ACTION unchanged across iterations.
+        let stalled = match (prev_next_action.as_deref(), view.next_action.as_deref()) {
+            (Some(p), Some(c)) => p == c,
+            _ => false,
+        };
+        same_streak = if stalled { same_streak + 1 } else { 1 };
+        prev_next_action = view.next_action.clone();
+        if same_streak >= STALL_LIMIT {
+            let _ = writeln!(
+                log,
+                "stop: spin guard — NEXT ACTION unchanged across {same_streak} iterations (STUCK)"
+            );
+            return Ok(LoopSummary {
+                iterations,
+                stop: StopReason::SpinGuard,
+                last_status,
+                last_item,
+            });
+        }
+    }
 }
 
 /// Drive ONE headless iteration through the agent-backend seam: invoke, persist
 /// the parsed budgets in the `usage.json` shape (so semi-auto and full-auto are
-/// interchangeable downstream), and read back the baton status. Generic over
-/// the backend so the driver is testable with a scripted fake; printing is the
-/// caller's job.
+/// interchangeable downstream), and re-read the baton. Generic over the backend
+/// so the driver is testable with a scripted fake; the loop is the caller.
 fn run_auto(
     backend: &dyn AgentBackend,
     loop_path: &Path,
     baton_path: &Path,
     usage_path: &Path,
-) -> Result<AutoReport> {
+) -> Result<(IterationOutcome, BatonView)> {
     let req = IterationRequest {
         settings: loop_path.to_path_buf(),
         prompt: KICK_PROMPT.to_string(),
@@ -270,36 +410,35 @@ fn run_auto(
     write_file(usage_path, &usage_json)?;
 
     let baton = fs::read_to_string(baton_path).unwrap_or_default();
-    Ok(AutoReport {
-        status: parse_baton_status(&baton).unwrap_or_else(|| "UNKNOWN".to_string()),
-        is_error: outcome.is_error,
-        result_text: outcome.result_text,
-        ctx_pct: outcome.usage.context_window.used_percentage,
-        five_hour_status: outcome.usage.rate_limits.five_hour.status.clone(),
-        five_hour_resets_at: outcome.usage.rate_limits.five_hour.resets_at,
-    })
+    Ok((outcome, parse_baton(&baton)))
 }
 
-fn print_auto_report(report: &AutoReport, usage_path: &Path) {
-    println!("iteration complete:");
-    println!("  baton status   {}", report.status);
+fn print_loop_summary(summary: &LoopSummary, usage_path: &Path, log_path: &Path) {
     println!(
-        "  agent result   {}",
-        if report.is_error { "ERROR" } else { "ok" }
+        "\norchestrator stopped after {} iteration(s):",
+        summary.iterations
     );
-    if let Some(text) = report.result_text.as_deref().map(str::trim) {
-        if !text.is_empty() {
-            println!("  agent said     {}", first_line_preview(text, 100));
+    match &summary.stop {
+        StopReason::Terminal(s) => println!("  reason   terminal baton status: {s}"),
+        StopReason::SpinGuard => {
+            println!("  reason   spin guard — NEXT ACTION unchanged (STUCK)")
         }
+        StopReason::MaxIterations => println!("  reason   --max-iterations reached"),
     }
-    println!("  context        {}% used", report.ctx_pct);
-    match (&report.five_hour_status, report.five_hour_resets_at) {
-        (Some(s), Some(r)) => println!("  5h rate-limit  {s} (resets at {r})"),
-        (Some(s), None) => println!("  5h rate-limit  {s}"),
-        _ => println!("  5h rate-limit  (no event in this run)"),
-    }
-    println!("  budgets        {}", usage_path.display());
-    println!("\n(slice 001: single-shot only — the loop is slice 002.)");
+    println!("  item     {}", summary.last_item.as_deref().unwrap_or("-"));
+    println!("  status   {}", summary.last_status);
+    println!("  budgets  {}", usage_path.display());
+    println!("  run log  {}", log_path.display());
+}
+
+/// Open (creating if needed) the orchestrator's run log in append mode. The log
+/// lives in the runtime dir, never the garden (spec §3 garden/runtime split).
+fn open_run_log(path: &Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening run log {}", path.display()))
 }
 
 /// First line of `text`, truncated to at most `max` chars, with an ellipsis if
@@ -313,27 +452,76 @@ fn first_line_preview(text: &str, max: usize) -> String {
     out
 }
 
-/// Extract the `status:` value from the baton's YAML frontmatter. Pure; the
-/// driver surfaces the loop's terminal status after an iteration.
-fn parse_baton_status(baton: &str) -> Option<String> {
+/// The fields the orchestrator reads back from the runtime baton each iteration:
+/// the terminal-status signal plus the progress signal (item / iteration /
+/// NEXT ACTION) the spin guard keys off.
+struct BatonView {
+    status: Option<String>,
+    item: Option<String>,
+    iteration: Option<u64>,
+    next_action: Option<String>,
+}
+
+/// Parse the runtime baton: `status` / `item` / `iteration` from the YAML
+/// frontmatter and the `# NEXT ACTION` section body. Pure; the orchestrator
+/// re-reads this after every iteration to decide whether to keep driving.
+fn parse_baton(baton: &str) -> BatonView {
+    let mut status = None;
+    let mut item = None;
+    let mut iteration = None;
+
     let mut lines = baton.lines();
     // Frontmatter opens with a `---` fence.
-    if lines.next()?.trim() != "---" {
-        return None;
-    }
-    for line in lines {
-        let line = line.trim();
-        if line == "---" {
-            break;
-        }
-        if let Some(rest) = line.strip_prefix("status:") {
-            let v = rest.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
+    if lines.next().map(str::trim) == Some("---") {
+        for line in lines.by_ref() {
+            let line = line.trim();
+            if line == "---" {
+                break;
+            }
+            if let Some(v) = line.strip_prefix("status:") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    status = Some(v.to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("item:") {
+                let v = v.trim();
+                if !v.is_empty() && v != "null" {
+                    item = Some(v.to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("iteration:") {
+                iteration = v.trim().parse::<u64>().ok();
             }
         }
     }
-    None
+
+    BatonView {
+        status,
+        item,
+        iteration,
+        next_action: extract_section(baton, "# NEXT ACTION"),
+    }
+}
+
+/// Extract a top-level (`# `) section body from the baton — everything between
+/// `heading` and the next `# ` heading — trimmed. `None` if absent or empty.
+fn extract_section(baton: &str, heading: &str) -> Option<String> {
+    let mut body: Vec<&str> = Vec::new();
+    let mut in_section = false;
+    for line in baton.lines() {
+        if in_section {
+            if line.starts_with("# ") {
+                break;
+            }
+            body.push(line);
+        } else if line.trim() == heading {
+            in_section = true;
+        }
+    }
+    if !in_section {
+        return None;
+    }
+    let trimmed = body.join("\n").trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// Ask the daemon where the garden is mounted (so injection paths are derived,
@@ -724,6 +912,8 @@ mod tests {
 
     // ---- headless single-shot driver (slice 001) -----------------------
 
+    use std::cell::Cell;
+
     use crate::growlight_backend::{
         ContextWindow, IterationOutcome, RateLimits, RateWindow, UsageSnapshot,
     };
@@ -738,13 +928,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_baton_status_reads_frontmatter_and_ignores_the_body() {
-        let baton = "---\nloop: g\nstatus: QUEUE_EMPTY\nitem: null\n---\n# NEXT ACTION\nstatus: not-this\n";
-        assert_eq!(parse_baton_status(baton).as_deref(), Some("QUEUE_EMPTY"));
-        // No frontmatter fence → None.
-        assert!(parse_baton_status("status: nope\n").is_none());
-        // Fence but no status line → None.
-        assert!(parse_baton_status("---\nloop: g\n---\n").is_none());
+    fn parse_baton_reads_frontmatter_and_the_next_action_section() {
+        let baton = "---\nloop: g\nstatus: QUEUE_EMPTY\nitem: full-auto-orchestrator\n\
+                     item_type: milestone\niteration: 4\n---\n# NEXT ACTION\ndo the thing\n\
+                     more detail\n\n# FINISH CRITERIA\nstatus: not-this\n";
+        let v = parse_baton(baton);
+        assert_eq!(v.status.as_deref(), Some("QUEUE_EMPTY"));
+        // `item:` must not be confused with `item_type:`.
+        assert_eq!(v.item.as_deref(), Some("full-auto-orchestrator"));
+        assert_eq!(v.iteration, Some(4));
+        // NEXT ACTION stops at the next `# ` heading and ignores the body's
+        // `status:` line.
+        assert_eq!(v.next_action.as_deref(), Some("do the thing\nmore detail"));
+
+        // No frontmatter fence → no fields.
+        let none = parse_baton("status: nope\n");
+        assert!(none.status.is_none());
+        assert!(none.next_action.is_none());
+
+        // `item: null` is treated as absent.
+        let nullish = parse_baton("---\nstatus: IN_PROGRESS\nitem: null\n---\n# NEXT ACTION\nx\n");
+        assert!(nullish.item.is_none());
+        assert_eq!(nullish.status.as_deref(), Some("IN_PROGRESS"));
+        assert_eq!(nullish.next_action.as_deref(), Some("x"));
     }
 
     /// A scripted backend (the §12 seam's test double) so the driver runs with
@@ -793,7 +999,7 @@ mod tests {
         fs::write(&baton, "---\nstatus: BLOCKED_ON_HUMAN\nitem: null\n---\n# NEXT ACTION\n").unwrap();
         let usage = dir.join("usage.json");
 
-        let report = run_auto(
+        let (outcome, view) = run_auto(
             &FakeBackend {
                 is_error: false,
                 ctx_pct: 7,
@@ -804,11 +1010,14 @@ mod tests {
         )
         .unwrap();
 
-        // Baton status read back through the seam.
-        assert_eq!(report.status, "BLOCKED_ON_HUMAN");
-        assert!(!report.is_error);
-        assert_eq!(report.ctx_pct, 7);
-        assert_eq!(report.five_hour_status.as_deref(), Some("allowed"));
+        // Baton fields read back through the seam.
+        assert_eq!(view.status.as_deref(), Some("BLOCKED_ON_HUMAN"));
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.usage.context_window.used_percentage, 7);
+        assert_eq!(
+            outcome.usage.rate_limits.five_hour.status.as_deref(),
+            Some("allowed")
+        );
 
         // usage.json persisted in the statusline-compatible shape.
         let v: serde_json::Value =
@@ -820,6 +1029,191 @@ mod tests {
         // Headless: no rate-limit percentage.
         assert!(v["rate_limits"]["five_hour"]["used_percentage"].is_null());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- the orchestration loop (slice 002) ----------------------------
+
+    /// A scripted backend (the §12 seam's test double) that simulates the
+    /// agent's per-iteration baton write: each call writes the next scripted
+    /// baton to `baton_path`, so the driver re-reads a *changing* baton with no
+    /// `claude` spawn. The call count proves fresh-process-per-iteration and
+    /// that no iteration runs after a terminal status.
+    struct ScriptedBackend {
+        baton_path: PathBuf,
+        batons: Vec<String>,
+        calls: Cell<usize>,
+    }
+
+    impl ScriptedBackend {
+        fn new(baton_path: &Path, batons: Vec<String>) -> Self {
+            Self {
+                baton_path: baton_path.to_path_buf(),
+                batons,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl AgentBackend for ScriptedBackend {
+        fn run_iteration(&self, req: &IterationRequest) -> Result<IterationOutcome> {
+            // The driver must hand us the generated settings + a real kick.
+            assert!(!req.settings.as_os_str().is_empty());
+            assert!(!req.prompt.is_empty());
+            let i = self.calls.get();
+            let content = self
+                .batons
+                .get(i)
+                .or_else(|| self.batons.last())
+                .cloned()
+                .unwrap_or_default();
+            fs::write(&self.baton_path, content).unwrap();
+            self.calls.set(i + 1);
+            Ok(IterationOutcome {
+                is_error: false,
+                result_text: Some(format!("iteration {i} done")),
+                usage: UsageSnapshot {
+                    context_window: ContextWindow {
+                        used_percentage: 10,
+                        remaining_percentage: 90,
+                        context_window_size: 1_000_000,
+                        current_tokens: 100_000,
+                    },
+                    rate_limits: RateLimits::default(),
+                    ts: 0.0,
+                },
+            })
+        }
+    }
+
+    /// A baton with the given frontmatter status/item and NEXT ACTION body.
+    fn fm(status: &str, item: &str, next_action: &str) -> String {
+        format!("---\nstatus: {status}\nitem: {item}\niteration: 1\n---\n# NEXT ACTION\n{next_action}\n")
+    }
+
+    /// `(dir, loop_path, baton, usage)` for a loop test; the loop file is a stub
+    /// (the scripted backend never reads it, only asserts it's non-empty).
+    fn loop_paths(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = unique_tmp(tag);
+        fs::create_dir_all(&dir).unwrap();
+        let loop_path = dir.join("loop.json");
+        fs::write(&loop_path, "{}").unwrap();
+        (dir.clone(), loop_path, dir.join("baton.md"), dir.join("usage.json"))
+    }
+
+    #[test]
+    fn loop_stops_on_each_terminal_status_without_an_extra_iteration() {
+        for status in ["QUEUE_EMPTY", "STUCK", "BLOCKED_ON_HUMAN"] {
+            let (dir, loop_path, baton, usage) = loop_paths(&format!("term-{status}"));
+            let backend = ScriptedBackend::new(&baton, vec![fm(status, "x", "na")]);
+            let mut log = Vec::new();
+            let summary =
+                run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+            assert_eq!(summary.iterations, 1, "{status}: exactly one iteration");
+            assert_eq!(summary.stop, StopReason::Terminal(status.to_string()));
+            // No iteration started after the terminal status was written.
+            assert_eq!(backend.calls.get(), 1, "{status}: backend called once");
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn loop_drains_a_multi_iteration_backlog_to_queue_empty() {
+        let (dir, loop_path, baton, usage) = loop_paths("drain");
+        // Fresh process per iteration: each call writes a different baton, the
+        // last one terminal. ITEM_COMPLETE is a continue-status.
+        let backend = ScriptedBackend::new(
+            &baton,
+            vec![
+                fm("IN_PROGRESS", "item-a", "step 1"),
+                fm("IN_PROGRESS", "item-a", "step 2"),
+                fm("ITEM_COMPLETE", "item-a", "wrap up"),
+                fm("QUEUE_EMPTY", "null", "nothing left"),
+            ],
+        );
+        let mut log = Vec::new();
+        let summary =
+            run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+        assert_eq!(summary.iterations, 4);
+        assert_eq!(summary.stop, StopReason::Terminal("QUEUE_EMPTY".to_string()));
+        assert_eq!(backend.calls.get(), 4);
+        // Budgets persisted each iteration (last write present).
+        assert!(usage.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn loop_spin_guard_trips_when_next_action_is_unchanged() {
+        let (dir, loop_path, baton, usage) = loop_paths("spin");
+        // Same NEXT ACTION every iteration → no progress → STUCK.
+        let stuck = fm("IN_PROGRESS", "item-a", "the exact same next action");
+        let backend = ScriptedBackend::new(&baton, vec![stuck.clone(), stuck]);
+        let mut log = Vec::new();
+        let summary =
+            run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+        assert_eq!(summary.stop, StopReason::SpinGuard);
+        assert_eq!(summary.iterations, STALL_LIMIT as u64);
+        assert_eq!(backend.calls.get(), STALL_LIMIT);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn loop_respects_max_iterations_on_a_progressing_baton() {
+        let (dir, loop_path, baton, usage) = loop_paths("maxiter");
+        // Always IN_PROGRESS with a *different* NEXT ACTION → never terminal,
+        // never spin-guarded; only --max-iterations stops it.
+        let backend = ScriptedBackend::new(
+            &baton,
+            vec![
+                fm("IN_PROGRESS", "item-a", "step 1"),
+                fm("IN_PROGRESS", "item-a", "step 2"),
+                fm("IN_PROGRESS", "item-a", "step 3"),
+                fm("IN_PROGRESS", "item-a", "step 4"),
+            ],
+        );
+        let mut log = Vec::new();
+        let summary =
+            run_auto_loop(&backend, &loop_path, &baton, &usage, Some(3), &mut log).unwrap();
+        assert_eq!(summary.stop, StopReason::MaxIterations);
+        assert_eq!(summary.iterations, 3);
+        assert_eq!(backend.calls.get(), 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_iterations_one_reproduces_the_single_shot() {
+        let (dir, loop_path, baton, usage) = loop_paths("single");
+        let backend =
+            ScriptedBackend::new(&baton, vec![fm("IN_PROGRESS", "item-a", "keep going")]);
+        let mut log = Vec::new();
+        let summary =
+            run_auto_loop(&backend, &loop_path, &baton, &usage, Some(1), &mut log).unwrap();
+        assert_eq!(summary.iterations, 1);
+        assert_eq!(summary.stop, StopReason::MaxIterations);
+        assert_eq!(backend.calls.get(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_log_records_iterations_and_the_stop_reason() {
+        let (dir, loop_path, baton, usage) = loop_paths("log");
+        let backend = ScriptedBackend::new(
+            &baton,
+            vec![
+                fm("IN_PROGRESS", "item-a", "go"),
+                fm("QUEUE_EMPTY", "null", "done"),
+            ],
+        );
+        let mut log = Vec::new();
+        run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+        let text = String::from_utf8(log).unwrap();
+        assert!(text.contains("iter 1:"), "log: {text}");
+        assert!(text.contains("iter 2:"), "log: {text}");
+        assert!(text.contains("status=QUEUE_EMPTY"), "log: {text}");
+        assert!(
+            text.contains("stop: terminal baton status QUEUE_EMPTY"),
+            "log: {text}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
