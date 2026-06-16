@@ -26,6 +26,7 @@ use softfig_ipc::{
 };
 
 use crate::cmd_daemon::try_daemon_call;
+use crate::growlight_backend::{AgentBackend, ClaudeBackend, IterationRequest};
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
 /// supported backend; `--name` tags the loop session, `--settings` loads the
@@ -74,6 +75,13 @@ pub struct StartArgs {
     /// Generate/refresh the runtime files but don't launch the agent.
     #[arg(long)]
     pub no_launch: bool,
+    /// Headless single-shot (full-auto orchestrator, slice 001): instead of the
+    /// interactive loop, invoke `claude -p` ONCE with the generated settings,
+    /// parse the budgets from its result (the §6 full-auto read path), read back
+    /// the resulting baton status, and exit. No loop yet. Semi-auto interactive
+    /// stays the default.
+    #[arg(long)]
+    pub auto: bool,
 }
 
 pub fn run(cmd: GrowlightCmd) -> Result<()> {
@@ -189,8 +197,9 @@ fn start(args: StartArgs) -> Result<()> {
 
     // The statusline budget dump is jq-based (spec §6). Without jq it degrades
     // to 0% — which would let the loop run past its budgets silently — so warn
-    // loudly rather than fail quietly.
-    if !jq_present() {
+    // loudly rather than fail quietly. The headless `--auto` path reads budgets
+    // from the `-p` result instead of the statusline, so it doesn't need jq.
+    if !args.auto && !jq_present() {
         eprintln!(
             "warning: `jq` not found on PATH — the statusline can't write usage.json, so the \
              loop's budget tracking (context / 5h) won't work. Install jq."
@@ -205,7 +214,126 @@ fn start(args: StartArgs) -> Result<()> {
         );
         return Ok(());
     }
+    if args.auto {
+        let backend = ClaudeBackend::new(AGENT_BIN);
+        let usage_path = runtime.join("usage.json");
+        println!("\n(--auto) headless single-shot: invoking `{AGENT_BIN} -p` …\n");
+        let report = run_auto(&backend, &loop_path, &baton_path, &usage_path)?;
+        print_auto_report(&report, &usage_path);
+        return Ok(());
+    }
     launch_agent(&loop_path)
+}
+
+// ---- headless single-shot driver (full-auto orchestrator, slice 001) ----
+
+/// The prompt that kicks a headless iteration. The SessionStart hook (which
+/// fires under `-p`) injects the full protocol + baton; this just tells the
+/// agent to boot and act on it.
+const KICK_PROMPT: &str = "Begin this growlight iteration. The operating protocol and your \
+    current baton have been injected above — boot per protocol step 1, execute NEXT ACTION as one \
+    coherent chunk, then hand off by rewriting the baton.";
+
+/// What a single headless iteration produced, for the closing summary.
+struct AutoReport {
+    /// The baton `status` after the iteration (the loop's terminal-status
+    /// signal; slices 002/003 act on it).
+    status: String,
+    is_error: bool,
+    /// The agent's final result line (its handoff summary), if any.
+    result_text: Option<String>,
+    ctx_pct: u8,
+    five_hour_status: Option<String>,
+    five_hour_resets_at: Option<i64>,
+}
+
+/// Drive ONE headless iteration through the agent-backend seam: invoke, persist
+/// the parsed budgets in the `usage.json` shape (so semi-auto and full-auto are
+/// interchangeable downstream), and read back the baton status. Generic over
+/// the backend so the driver is testable with a scripted fake; printing is the
+/// caller's job.
+fn run_auto(
+    backend: &dyn AgentBackend,
+    loop_path: &Path,
+    baton_path: &Path,
+    usage_path: &Path,
+) -> Result<AutoReport> {
+    let req = IterationRequest {
+        settings: loop_path.to_path_buf(),
+        prompt: KICK_PROMPT.to_string(),
+    };
+    let outcome = backend.run_iteration(&req)?;
+
+    // The §6 full-auto budget read path: persist the parsed budgets where the
+    // semi-auto statusline would have teed them.
+    let usage_json = format!("{}\n", serde_json::to_string_pretty(&outcome.usage)?);
+    write_file(usage_path, &usage_json)?;
+
+    let baton = fs::read_to_string(baton_path).unwrap_or_default();
+    Ok(AutoReport {
+        status: parse_baton_status(&baton).unwrap_or_else(|| "UNKNOWN".to_string()),
+        is_error: outcome.is_error,
+        result_text: outcome.result_text,
+        ctx_pct: outcome.usage.context_window.used_percentage,
+        five_hour_status: outcome.usage.rate_limits.five_hour.status.clone(),
+        five_hour_resets_at: outcome.usage.rate_limits.five_hour.resets_at,
+    })
+}
+
+fn print_auto_report(report: &AutoReport, usage_path: &Path) {
+    println!("iteration complete:");
+    println!("  baton status   {}", report.status);
+    println!(
+        "  agent result   {}",
+        if report.is_error { "ERROR" } else { "ok" }
+    );
+    if let Some(text) = report.result_text.as_deref().map(str::trim) {
+        if !text.is_empty() {
+            println!("  agent said     {}", first_line_preview(text, 100));
+        }
+    }
+    println!("  context        {}% used", report.ctx_pct);
+    match (&report.five_hour_status, report.five_hour_resets_at) {
+        (Some(s), Some(r)) => println!("  5h rate-limit  {s} (resets at {r})"),
+        (Some(s), None) => println!("  5h rate-limit  {s}"),
+        _ => println!("  5h rate-limit  (no event in this run)"),
+    }
+    println!("  budgets        {}", usage_path.display());
+    println!("\n(slice 001: single-shot only — the loop is slice 002.)");
+}
+
+/// First line of `text`, truncated to at most `max` chars, with an ellipsis if
+/// anything was dropped. Char-boundary safe.
+fn first_line_preview(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    let mut out: String = line.chars().take(max).collect();
+    if line.chars().count() > max || text.lines().nth(1).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Extract the `status:` value from the baton's YAML frontmatter. Pure; the
+/// driver surfaces the loop's terminal status after an iteration.
+fn parse_baton_status(baton: &str) -> Option<String> {
+    let mut lines = baton.lines();
+    // Frontmatter opens with a `---` fence.
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("status:") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Ask the daemon where the garden is mounted (so injection paths are derived,
@@ -590,6 +718,107 @@ mod tests {
             "first",
             "live state not clobbered"
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- headless single-shot driver (slice 001) -----------------------
+
+    use crate::growlight_backend::{
+        ContextWindow, IterationOutcome, RateLimits, RateWindow, UsageSnapshot,
+    };
+
+    #[test]
+    fn first_line_preview_truncates_on_chars_and_extra_lines() {
+        assert_eq!(first_line_preview("short", 100), "short");
+        assert_eq!(first_line_preview("one\ntwo", 100), "one…"); // more lines
+        assert_eq!(first_line_preview("abcdef", 3), "abc…"); // char limit
+        // Multibyte: must not split a char (no panic) and counts by char.
+        assert_eq!(first_line_preview("héllo", 2), "hé…");
+    }
+
+    #[test]
+    fn parse_baton_status_reads_frontmatter_and_ignores_the_body() {
+        let baton = "---\nloop: g\nstatus: QUEUE_EMPTY\nitem: null\n---\n# NEXT ACTION\nstatus: not-this\n";
+        assert_eq!(parse_baton_status(baton).as_deref(), Some("QUEUE_EMPTY"));
+        // No frontmatter fence → None.
+        assert!(parse_baton_status("status: nope\n").is_none());
+        // Fence but no status line → None.
+        assert!(parse_baton_status("---\nloop: g\n---\n").is_none());
+    }
+
+    /// A scripted backend (the §12 seam's test double) so the driver runs with
+    /// no `claude` spawn.
+    struct FakeBackend {
+        is_error: bool,
+        ctx_pct: u8,
+    }
+
+    impl AgentBackend for FakeBackend {
+        fn run_iteration(&self, req: &IterationRequest) -> Result<IterationOutcome> {
+            // The driver must hand us the generated settings + a real kick.
+            assert!(!req.settings.as_os_str().is_empty());
+            assert!(!req.prompt.is_empty());
+            Ok(IterationOutcome {
+                is_error: self.is_error,
+                result_text: Some("done".to_string()),
+                usage: UsageSnapshot {
+                    context_window: ContextWindow {
+                        used_percentage: self.ctx_pct,
+                        remaining_percentage: 100 - self.ctx_pct,
+                        context_window_size: 1_000_000,
+                        current_tokens: 12_345,
+                    },
+                    rate_limits: RateLimits {
+                        five_hour: RateWindow {
+                            used_percentage: None,
+                            resets_at: Some(1781666400),
+                            status: Some("allowed".to_string()),
+                        },
+                        seven_day: RateWindow::default(),
+                    },
+                    ts: 42.0,
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn run_auto_persists_usage_in_the_usage_json_shape_and_reads_back_status() {
+        let dir = unique_tmp("auto");
+        fs::create_dir_all(&dir).unwrap();
+        let loop_path = dir.join("loop.json");
+        fs::write(&loop_path, "{}").unwrap();
+        let baton = dir.join("baton.md");
+        fs::write(&baton, "---\nstatus: BLOCKED_ON_HUMAN\nitem: null\n---\n# NEXT ACTION\n").unwrap();
+        let usage = dir.join("usage.json");
+
+        let report = run_auto(
+            &FakeBackend {
+                is_error: false,
+                ctx_pct: 7,
+            },
+            &loop_path,
+            &baton,
+            &usage,
+        )
+        .unwrap();
+
+        // Baton status read back through the seam.
+        assert_eq!(report.status, "BLOCKED_ON_HUMAN");
+        assert!(!report.is_error);
+        assert_eq!(report.ctx_pct, 7);
+        assert_eq!(report.five_hour_status.as_deref(), Some("allowed"));
+
+        // usage.json persisted in the statusline-compatible shape.
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&usage).unwrap()).unwrap();
+        assert_eq!(v["context_window"]["used_percentage"], 7);
+        assert_eq!(v["context_window"]["context_window_size"], 1_000_000);
+        assert_eq!(v["rate_limits"]["five_hour"]["status"], "allowed");
+        assert_eq!(v["rate_limits"]["five_hour"]["resets_at"], 1781666400i64);
+        // Headless: no rate-limit percentage.
+        assert!(v["rate_limits"]["five_hour"]["used_percentage"].is_null());
 
         fs::remove_dir_all(&dir).ok();
     }
