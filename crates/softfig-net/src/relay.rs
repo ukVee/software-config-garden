@@ -30,17 +30,21 @@
 //! A device that wants to be both reachable *and* an initiator opens two
 //! connections (one parked, one initiating).
 //!
-//! **M5a scope / follow-ups (M5b):** parked targets never time out (an idle
-//! registration leaks until the connection drops); there is no
-//! keepalive/reconnect or relay-side fairness/bandwidth limit; and the inner
-//! protocol here is request/response, so full-duplex bulk throughput is untested
-//! (the split forwarder supports it, but M5b's data plane should stress it).
+//! **M5a scope / follow-ups (M5b):** parked registrations age out after
+//! [`REGISTRATION_TTL`] (pruned lazily on the next register / connect / observe),
+//! so a target whose connection died no longer lingers to be spliced as a corpse
+//! by the next initiator; a still-reachable target simply re-announces to refresh
+//! its slot (a standing keepalive/reconnect is still a follow-up). There is no
+//! relay-side fairness/bandwidth limit; and the inner protocol here is
+//! request/response, so full-duplex bulk throughput is untested (the split
+//! forwarder supports it, but M5b's data plane should stress it).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::attest::{verify_static_attestation, KEY_LEN, SIG_LEN};
 use crate::error::{NetError, Result};
@@ -147,6 +151,20 @@ pub fn relay_connect<S: Read + Write>(
 
 // --- Relay side: authorize, park, splice -----------------------------------
 
+/// How long a parked registration lives before it is pruned. A parked target
+/// has no keepalive reader (its `serve` returns after parking), so a slot whose
+/// connection died is otherwise indistinguishable from a live idle one; this
+/// bounds how long a dead slot can linger before it ages out. Mirrors keeperd's
+/// `PAIRING_TTL`. A still-reachable target re-announces to refresh its slot.
+const REGISTRATION_TTL: Duration = Duration::from_secs(300);
+
+/// A parked (reachable) registration: the parked outer session plus the instant
+/// it was registered, so a stale slot can age out (see [`REGISTRATION_TTL`]).
+struct Parked<S> {
+    session: NoiseSession<S>,
+    since: Instant,
+}
+
 /// A blind, ring-authorized relay. Generic over the stream type so it can run
 /// over loopback `TcpStream` in production and any duplex stream in tests; the
 /// accept loop ([`run`]) is `TcpStream`-specific.
@@ -154,31 +172,56 @@ pub struct Relay<S: SplitIo + Read + Write + Send + 'static> {
     relay_secret: [u8; KEY_LEN],
     relay_hello: HelloPayload,
     ring: Ring,
-    registry: Mutex<HashMap<[u8; KEY_LEN], NoiseSession<S>>>,
+    registry: Mutex<HashMap<[u8; KEY_LEN], Parked<S>>>,
+    registration_ttl: Duration,
 }
 
 impl<S: SplitIo + Read + Write + Send + 'static> Relay<S> {
     /// Build a relay that authorizes registrations against `ring`. `relay_device`
     /// supplies the relay's own X25519 transport secret and the identity hello
     /// for the outer handshake (keeperd assembles it from its vault in M5a-4).
+    /// Parked registrations age out after [`REGISTRATION_TTL`].
     pub fn new(relay_device: &LocalDevice, ring: Ring) -> Arc<Self> {
+        Self::new_with_ttl(relay_device, ring, REGISTRATION_TTL)
+    }
+
+    /// As [`new`](Self::new) but with an explicit parked-registration TTL. Mainly
+    /// a tuning/test seam (a short TTL lets a stale-slot timeout be exercised
+    /// without waiting [`REGISTRATION_TTL`]).
+    pub fn new_with_ttl(relay_device: &LocalDevice, ring: Ring, registration_ttl: Duration) -> Arc<Self> {
         Arc::new(Self {
             relay_secret: relay_device.transport_secret,
             relay_hello: relay_device.hello(),
             ring,
             registry: Mutex::new(HashMap::new()),
+            registration_ttl,
         })
     }
 
-    /// Number of currently-parked (reachable) registrations. Lets a caller/test
-    /// observe that a target has registered before initiating to it.
+    /// Number of currently-parked (reachable) registrations, after pruning any
+    /// that have aged out. Lets a caller/test observe that a target has
+    /// registered before initiating to it.
     pub fn registered(&self) -> usize {
-        self.registry.lock().unwrap().len()
+        let mut registry = self.registry.lock().unwrap();
+        self.prune(&mut registry);
+        registry.len()
     }
 
-    /// Whether `device_id` is currently parked as reachable.
+    /// Whether `device_id` is currently parked as reachable. Prunes first, so an
+    /// aged-out (dead) slot is not reported as reachable.
     pub fn is_registered(&self, device_id: &[u8; KEY_LEN]) -> bool {
-        self.registry.lock().unwrap().contains_key(device_id)
+        let mut registry = self.registry.lock().unwrap();
+        self.prune(&mut registry);
+        registry.contains_key(device_id)
+    }
+
+    /// Drop parked registrations older than [`Self::registration_ttl`]. Lazy
+    /// prune-on-access (run before every register, connect, and observe), so a
+    /// parked target whose connection died ages out instead of being spliced as
+    /// a corpse by the next initiator — no background thread, keeping the relay's
+    /// blind, no-per-slot-reader model.
+    fn prune(&self, registry: &mut HashMap<[u8; KEY_LEN], Parked<S>>) {
+        registry.retain(|_, p| p.since.elapsed() < self.registration_ttl);
     }
 
     /// Serve one connection end-to-end: outer handshake, authorize against the
@@ -191,9 +234,20 @@ impl<S: SplitIo + Read + Write + Send + 'static> Relay<S> {
 
         match session.recv_frame()?.kind {
             Some(frame::Kind::StateAnnounce(_)) => {
-                // Reachable target: park keyed by the authenticated device-id.
-                // The connecting peer's serve() removes and drives it.
-                self.registry.lock().unwrap().insert(device_id, session);
+                // Reachable target: park keyed by the authenticated device-id,
+                // stamped with the registration time so a dead slot ages out
+                // (prune-on-access) instead of lingering until an initiator
+                // splices a corpse. The connecting peer's serve() removes and
+                // drives it; a re-announce refreshes the slot (overwrites the key).
+                let mut registry = self.registry.lock().unwrap();
+                self.prune(&mut registry);
+                registry.insert(
+                    device_id,
+                    Parked {
+                        session,
+                        since: Instant::now(),
+                    },
+                );
                 Ok(())
             }
             Some(frame::Kind::RelayConnect(rc)) => {
@@ -202,12 +256,14 @@ impl<S: SplitIo + Read + Write + Send + 'static> Relay<S> {
                     .as_slice()
                     .try_into()
                     .map_err(|_| NetError::Protocol("relay target id wrong length"))?;
-                let target_session = self
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .remove(&target)
-                    .ok_or(NetError::Protocol("relay target not registered"))?;
+                let target_session = {
+                    let mut registry = self.registry.lock().unwrap();
+                    self.prune(&mut registry);
+                    registry
+                        .remove(&target)
+                        .ok_or(NetError::Protocol("relay target not registered"))?
+                        .session
+                };
                 splice(session, target_session)
             }
             _ => Err(NetError::Protocol("unexpected first relay frame")),
