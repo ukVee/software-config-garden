@@ -505,7 +505,12 @@ pub fn enumerate_matching(garden_root: &Path, sealed: &SealedPaths) -> Vec<Strin
         .min_depth(1)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !is_softfig(e.path(), garden_root))
+        .filter_entry(|e| {
+            e.path()
+                .strip_prefix(garden_root)
+                .map(|rel| !softfig_vcs::ignore::is_ignored(rel))
+                .unwrap_or(true)
+        })
         .flatten()
     {
         if !entry.file_type().is_file() {
@@ -523,15 +528,6 @@ pub fn enumerate_matching(garden_root: &Path, sealed: &SealedPaths) -> Vec<Strin
         }
     }
     out.into_iter().collect()
-}
-
-fn is_softfig(path: &Path, root: &Path) -> bool {
-    if let Ok(rel) = path.strip_prefix(root) {
-        if let Some(first) = rel.components().next() {
-            return first.as_os_str() == ".softfig";
-        }
-    }
-    false
 }
 
 /// Append a glob to `sealed-paths.toml` (creating the file if absent).

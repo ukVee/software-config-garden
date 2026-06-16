@@ -1,7 +1,8 @@
 //! Filesystem watcher. Source-agnostic accumulator + inotify driver.
 //!
-//! [`DirtySetAccumulator`] owns the dirty-set buffer, the `.softfig/`
-//! filter, the daemon's self-event suppression-map check, and the flush
+//! [`DirtySetAccumulator`] owns the dirty-set buffer, the VCS-ignore
+//! filter (`softfig_vcs::ignore` — `.softfig`, `.claude`, …), the daemon's
+//! self-event suppression-map check, and the flush
 //! hook (→ classifier → `commit_workdir`). Sources push [`DirtyEvent`]s
 //! into it. The inotify driver here is one such source; M2a's FUSE
 //! driver will be the next.
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use softfig_vcs::Intent;
+use softfig_vcs::{ignore::is_ignored, Intent};
 
 use crate::classify::{self, DirtySet};
 use crate::daemon::{Daemon, DaemonInner, SUPPRESS_WINDOW_MS};
@@ -266,11 +267,12 @@ impl DirtySetAccumulator {
         }
     }
 
-    /// True if the path should be buffered (not under `.softfig/` and
-    /// not currently in the daemon's self-write suppression map).
+    /// True if the path should be buffered (not VCS-ignored — `.softfig`,
+    /// `.claude`, … — and not currently in the daemon's self-write
+    /// suppression map).
     fn accept(&self, rel: &str) -> bool {
         let p = Path::new(rel);
-        if is_softfig_path(p) {
+        if is_ignored(p) {
             return false;
         }
         if self.is_self_write(&self.garden_root.join(rel)) {
@@ -504,24 +506,21 @@ fn repo_relative(abs: &Path, garden_root: &Path, watch_root: &Path) -> Option<St
     Some(rel.to_string_lossy().into_owned())
 }
 
-/// True if a repo-relative path is inside `.softfig/`.
-pub fn is_softfig_path(rel: &Path) -> bool {
-    rel.components()
-        .next()
-        .map(|c| c.as_os_str() == ".softfig")
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn softfig_paths_filter() {
-        assert!(is_softfig_path(Path::new(".softfig/objects/aa/bb")));
-        assert!(is_softfig_path(Path::new(".softfig")));
-        assert!(!is_softfig_path(Path::new("journal/decisions/decision-x.md")));
-        assert!(!is_softfig_path(Path::new("a.md")));
+    fn ignored_paths_are_filtered() {
+        // The accumulator's `accept` delegates to the shared VCS-ignore
+        // predicate; both `.softfig` (daemon state) and `.claude` (agent
+        // scratch) are filtered out, real garden content is kept.
+        assert!(is_ignored(Path::new(".softfig/objects/aa/bb")));
+        assert!(is_ignored(Path::new(".softfig")));
+        assert!(is_ignored(Path::new(".claude/settings.local.json")));
+        assert!(is_ignored(Path::new(".claude")));
+        assert!(!is_ignored(Path::new("journal/decisions/decision-x.md")));
+        assert!(!is_ignored(Path::new("a.md")));
     }
 
     #[test]

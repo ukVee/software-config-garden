@@ -242,6 +242,32 @@ fn init_skips_softfig_dir() {
 }
 
 #[test]
+fn init_skips_claude_dir() {
+    // `.claude/` is Claude Code's per-session scratch (task 002): it must
+    // never enter a snapshot/commit, the same way `.softfig/` is skipped.
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(
+        tmp.path(),
+        &[
+            ("README.md", "x"),
+            (".claude/settings.local.json", "{\"permissions\":[]}"),
+        ],
+    );
+    let session = init_vault_at(tmp.path());
+    let (_repo, genesis) = Repo::init(tmp.path(), &session).unwrap();
+
+    let repo = Repo::open(tmp.path()).unwrap();
+    let row = repo.db().get_commit(&genesis).unwrap();
+    let entries = repo.db().get_tree(&row.root_tree).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"README.md"), "real content tracked: {names:?}");
+    assert!(
+        !names.contains(&".claude"),
+        "must not track agent scratch: {names:?}"
+    );
+}
+
+#[test]
 fn convergent_blob_dedup_in_object_store() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(

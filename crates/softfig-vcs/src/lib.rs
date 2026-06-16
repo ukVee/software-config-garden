@@ -14,6 +14,7 @@
 pub mod commit;
 pub mod error;
 pub mod fsck;
+pub mod ignore;
 pub mod intent;
 pub mod log;
 pub mod repo;
@@ -23,6 +24,7 @@ pub mod walk;
 pub use commit::{verify_commit, CanonicalCommit};
 pub use error::{CoreError, Result};
 pub use fsck::{run as fsck, FsckReport};
+pub use ignore::{is_ignored, IGNORED_TOP_LEVEL};
 pub use intent::{Intent, KNOWN_INTENTS};
 pub use log::{collect as log_collect, LogIter};
 pub use repo::{Repo, TipChangedCallback, TIP_REF};

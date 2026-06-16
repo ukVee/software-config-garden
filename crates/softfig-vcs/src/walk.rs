@@ -6,7 +6,8 @@
 //!
 //! Rules:
 //!
-//! * Skip the entire `.softfig/` directory (the VCS's own state).
+//! * Skip VCS-ignored top-level directories (`.softfig`, `.claude`, …) — see
+//!   [`crate::ignore`] for the single source of truth.
 //! * Empty directories are tracked iff they contain a `.keep` sentinel
 //!   file. Empty-and-sentinel-free directories are dropped from the
 //!   snapshot — same convention git uses with `.gitkeep`.
@@ -45,7 +46,6 @@ pub struct WalkSnapshot {
     pub root: TreeNode,
 }
 
-const SOFTFIG_DIR_NAME: &str = ".softfig";
 const KEEP_FILE: &str = ".keep";
 const MODE_MASK: u32 = 0o7777;
 
@@ -60,7 +60,15 @@ pub fn walk(root: &Path) -> Result<WalkSnapshot> {
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| !is_softfig(e.path(), root))
+        .filter_entry(|e| {
+            // Strip to a repo-relative path so the shared ignore predicate
+            // matches on the top-level component. The root itself strips to
+            // an empty path (never ignored) and is excluded by min_depth(1).
+            e.path()
+                .strip_prefix(root)
+                .map(|rel| !crate::ignore::is_ignored(rel))
+                .unwrap_or(true)
+        })
     {
         let entry = entry?;
         let path = entry.path();
@@ -93,16 +101,6 @@ pub fn walk(root: &Path) -> Result<WalkSnapshot> {
     Ok(WalkSnapshot {
         root: TreeNode::Dir(root_node),
     })
-}
-
-fn is_softfig(path: &Path, root: &Path) -> bool {
-    if let Ok(rel) = path.strip_prefix(root) {
-        let mut comps = rel.components();
-        if let Some(first) = comps.next() {
-            return first.as_os_str() == SOFTFIG_DIR_NAME;
-        }
-    }
-    false
 }
 
 fn path_components(relative: &Path) -> Result<Vec<String>> {
