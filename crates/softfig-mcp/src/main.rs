@@ -362,17 +362,18 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "set_item_status",
-            "description": "growlight: set a backlog item's status (queued|active|done|blocked) by \
-                            flipping its cell in the authoritative queue table in \
+            "description": "growlight: set a backlog item's status (queued|active|done|blocked|deferred) \
+                            by flipping its cell in the authoritative queue table in \
                             growlight/backlog/CLAUDE.md. At most one item may be active — setting \
-                            active is refused while another item is active. Identify the item by \
-                            its queue id (milestone slug or task NNN).",
+                            active is refused while another item is active. `deferred` parks an item \
+                            whose only gap is a manual smoketest the loop can't run (non-terminal; the \
+                            loop drains on). Identify the item by its queue id (milestone slug or task NNN).",
             "inputSchema": {
                 "type": "object",
                 "required": ["id", "status"],
                 "properties": {
                     "id": { "type": "string", "description": "the item's queue id (milestone slug or task NNN)" },
-                    "status": { "type": "string", "description": "queued | active | done | blocked" },
+                    "status": { "type": "string", "description": "queued | active | done | blocked | deferred" },
                 },
             },
         }),
