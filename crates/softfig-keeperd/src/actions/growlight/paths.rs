@@ -19,8 +19,12 @@ pub const QUEUE_TAG: &str = "queue";
 
 /// The two backlog item kinds.
 pub const ITEM_TYPES: [&str; 2] = ["milestone", "task"];
-/// The status lattice an item moves through.
-pub const STATUSES: [&str; 4] = ["queued", "active", "done", "blocked"];
+/// The status lattice an item moves through. `deferred` is non-terminal: the
+/// loop parks an item there when its only remaining finish criteria are manual
+/// smoketests the agent physically can't run (a second device, a live TTY,
+/// multicast, hardware), then drains on to the next item — distinct from
+/// `blocked`, the genuine stop for "the agent can't proceed without a human."
+pub const STATUSES: [&str; 5] = ["queued", "active", "done", "blocked", "deferred"];
 
 // ---- path templates ----------------------------------------------------
 
@@ -97,7 +101,7 @@ pub fn validate_item_type(ty: &str) -> Result<(), (ErrorKind, String)> {
     }
 }
 
-/// `queued | active | done | blocked`.
+/// `queued | active | done | blocked | deferred`.
 pub fn validate_status(status: &str) -> Result<(), (ErrorKind, String)> {
     if STATUSES.contains(&status) {
         Ok(())
@@ -274,6 +278,7 @@ mod tests {
         assert!(validate_item_type("task").is_ok());
         assert!(validate_item_type("epic").is_err());
         assert!(validate_status("active").is_ok());
+        assert!(validate_status("deferred").is_ok());
         assert!(validate_status("paused").is_err());
     }
 

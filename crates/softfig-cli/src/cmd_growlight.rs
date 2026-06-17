@@ -259,11 +259,14 @@ const KICK_PROMPT: &str = "Begin this growlight iteration. The operating protoco
     coherent chunk, then hand off by rewriting the baton.";
 
 /// Baton statuses on which the orchestrator keeps driving (re-invokes a fresh
-/// iteration). HALTED_RATE_LIMIT pauses-and-resumes via the budget governor;
+/// iteration). ITEM_DEFERRED is a clean handoff like ITEM_COMPLETE — the agent
+/// parked an item whose only gap is a manual smoketest it can't run (protocol
+/// step 7) and moved on, so the loop drives the next item rather than stopping.
+/// HALTED_RATE_LIMIT pauses-and-resumes via the budget governor;
 /// BLOCKED_ON_HUMAN / QUEUE_EMPTY / STUCK, and any unrecognized or missing
 /// status, stop the loop. (The governor routing lives in [`decide_step`].)
 fn is_continue_status(status: &str) -> bool {
-    matches!(status, "IN_PROGRESS" | "ITEM_COMPLETE")
+    matches!(status, "IN_PROGRESS" | "ITEM_COMPLETE" | "ITEM_DEFERRED")
 }
 
 /// Trip the spin guard once the baton's NEXT ACTION repeats unchanged across
@@ -1577,6 +1580,8 @@ mod tests {
         let ok = usage((Some("allowed"), Some(1)), (None, None));
         // Clean continue.
         assert_eq!(decide_step(&view("IN_PROGRESS", "go"), &ok, false), LoopStep::Continue);
+        // A deferred item is a clean handoff → keep driving the next item.
+        assert_eq!(decide_step(&view("ITEM_DEFERRED", "go"), &ok, false), LoopStep::Continue);
         // Stalled continue → spin guard (before the governor).
         assert_eq!(
             decide_step(&view("IN_PROGRESS", "go"), &ok, true),

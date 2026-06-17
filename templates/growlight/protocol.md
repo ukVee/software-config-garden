@@ -36,7 +36,10 @@ protocol is fixed; the baton changes each iteration.
    scope, irreversible/outward-facing, ambiguous requirements): append to FOR
    THE HUMAN with a proposed default. Semi: proceed on the default but flag it;
    pause only if risky. Auto: take the safest default, flag loudly in the log.
-   When answered, fold into LOCKED DECISIONS and drop the question.
+   When answered, fold into LOCKED DECISIONS and drop the question. A manual
+   SMOKETEST you physically can't run (a second device, a live TTY, multicast,
+   hardware) is NOT a checkpoint and NOT a blocker — never BLOCKED_ON_HUMAN it;
+   defer it via step 7b.
 
 5. HANDOFF. (a) Rewrite the baton: collapse finished work to one-liners +
    pointers; make NEXT ACTION runnable; update FINISH CRITERIA; bump
@@ -51,3 +54,13 @@ protocol is fixed; the baton changes each iteration.
    set_item_status done, log_baton, then pull the next active backlog item and
    reseed the baton from its spec. If backlog empty: status QUEUE_EMPTY, stop.
    A milestone is done only when all slices are done AND integration verified.
+
+7b. DEFERRED VERIFICATION. If the ONLY unmet criteria are manual smoketests you
+   physically can't run, do NOT stop the loop. Finish and verify everything you
+   can, then record each pending test in the item doc under a `## Deferred
+   verification` section (what to run, expected result) AND in FOR THE HUMAN;
+   set_item_status <id> deferred; log_baton with status ITEM_DEFERRED; pull the
+   next item and reseed. A `deferred` item waits for the human and never
+   re-enters the loop — it is a roll to the next item, not a stop. Reserve
+   `blocked`/BLOCKED_ON_HUMAN strictly for when YOU can't proceed without a human
+   decision or config change (steps 4, 3b).
