@@ -213,6 +213,36 @@ pub fn unix_now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// A wall-clock seam so the between-iteration budget governor's "wait until the
+/// rate-limit window resets" is unit-testable without real sleeps — mirrors the
+/// [`AgentBackend`] seam. The production [`SystemClock`] sleeps the thread; tests
+/// use a fake that records the requested wake times and advances virtual time.
+pub trait Clock {
+    /// Current wall time, Unix seconds.
+    fn now_unix(&self) -> i64;
+    /// Block until `unix` (Unix seconds); a no-op if already at/after it.
+    fn sleep_until(&self, unix: i64);
+}
+
+/// The production clock: real time, real sleeps.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn sleep_until(&self, unix: i64) {
+        let now = self.now_unix();
+        if unix > now {
+            std::thread::sleep(std::time::Duration::from_secs((unix - now) as u64));
+        }
+    }
+}
+
 /// The supported backend: shell out to Claude Code in headless single-shot mode.
 pub struct ClaudeBackend {
     bin: String,

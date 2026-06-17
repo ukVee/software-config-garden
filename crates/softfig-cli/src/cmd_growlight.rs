@@ -27,7 +27,10 @@ use softfig_ipc::{
 };
 
 use crate::cmd_daemon::try_daemon_call;
-use crate::growlight_backend::{AgentBackend, ClaudeBackend, IterationOutcome, IterationRequest};
+use crate::growlight_backend::{
+    AgentBackend, ClaudeBackend, Clock, IterationOutcome, IterationRequest, RateWindow, SystemClock,
+    UsageSnapshot,
+};
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
 /// supported backend; `--name` tags the loop session, `--settings` loads the
@@ -223,6 +226,7 @@ fn start(args: StartArgs) -> Result<()> {
     }
     if args.auto {
         let backend = ClaudeBackend::new(AGENT_BIN);
+        let clock = SystemClock;
         let usage_path = runtime.join("usage.json");
         let log_path = runtime.join("auto-run.log");
         let mut log = open_run_log(&log_path)?;
@@ -232,6 +236,7 @@ fn start(args: StartArgs) -> Result<()> {
         );
         let summary = run_auto_loop(
             &backend,
+            &clock,
             &loop_path,
             &baton_path,
             &usage_path,
@@ -254,10 +259,9 @@ const KICK_PROMPT: &str = "Begin this growlight iteration. The operating protoco
     coherent chunk, then hand off by rewriting the baton.";
 
 /// Baton statuses on which the orchestrator keeps driving (re-invokes a fresh
-/// iteration). Everything else — QUEUE_EMPTY / STUCK / BLOCKED_ON_HUMAN /
-/// HALTED_RATE_LIMIT, and any unrecognized or missing status — stops the loop.
-/// (Pausing and resuming on HALTED_RATE_LIMIT is slice 003's budget governor;
-/// here it just stops.)
+/// iteration). HALTED_RATE_LIMIT pauses-and-resumes via the budget governor;
+/// BLOCKED_ON_HUMAN / QUEUE_EMPTY / STUCK, and any unrecognized or missing
+/// status, stop the loop. (The governor routing lives in [`decide_step`].)
 fn is_continue_status(status: &str) -> bool {
     matches!(status, "IN_PROGRESS" | "ITEM_COMPLETE")
 }
@@ -267,15 +271,148 @@ fn is_continue_status(status: &str) -> bool {
 /// backstop for an agent that keeps reporting IN_PROGRESS without moving.
 const STALL_LIMIT: usize = 2;
 
+/// Reserve thresholds (spec §6 / session-policy): stop *starting* iterations once
+/// a window crosses these, until it resets. Headless `-p` reports no rate-limit
+/// percentage, so the governor's primary signal is the window `status`
+/// (non-"allowed"); these percentages apply only to a backend that does report
+/// one — and a *missing* percentage is NEVER read as 0 (slice 001's correction).
+const FIVE_HOUR_RESERVE_PCT: u8 = 85;
+const SEVEN_DAY_RESERVE_PCT: u8 = 90;
+
 /// Why the `--auto` loop stopped.
 #[derive(Debug, PartialEq)]
 enum StopReason {
-    /// The last iteration wrote a terminal baton status (carried here).
+    /// The last iteration wrote a terminal baton status (QUEUE_EMPTY, an
+    /// agent-written STUCK, an un-resumable HALTED_RATE_LIMIT, or anything
+    /// unrecognized) — carried here.
     Terminal(String),
+    /// BLOCKED_ON_HUMAN — a hard block with no safe default. Surfaced loudly so
+    /// an away human sees the loop needs them (distinct from a clean QUEUE_EMPTY:
+    /// the loop must never fabricate the human's decision — protocol step 4/3b).
+    BlockedOnHuman,
     /// NEXT ACTION was unchanged across `STALL_LIMIT` iterations → STUCK.
     SpinGuard,
     /// `--max-iterations` was reached with a still-non-terminal baton.
     MaxIterations,
+}
+
+/// The orchestrator's between-iteration decision, from the just-finished result.
+#[derive(Debug, PartialEq)]
+enum LoopStep {
+    /// Start the next iteration immediately.
+    Continue,
+    /// A rate window is exhausted — wait until its reset, then resume.
+    Pause(PauseInfo),
+    /// Stop the loop.
+    Stop(StopReason),
+}
+
+/// A budget-governor pause: which window, when it resets, and why (for the log).
+#[derive(Debug, PartialEq)]
+struct PauseInfo {
+    reset_at: i64,
+    window: &'static str,
+    reason: String,
+}
+
+/// Whether a rate window is at/over its reserve: a non-"allowed" headless status,
+/// or — for a backend that reports one — a used-percentage at/over `reserve_pct`.
+/// A *missing* percentage never trips (slice 001: never read it as `0`).
+fn window_tripped(w: &RateWindow, reserve_pct: u8) -> bool {
+    matches!(w.status.as_deref(), Some(s) if s != "allowed")
+        || matches!(w.used_percentage, Some(p) if p >= reserve_pct)
+}
+
+/// If a rate window is over reserve *and* we know when it resets, the pause to
+/// take. 7d takes precedence over 5h (the longer wall). `None` when nothing is
+/// tripped, or when a tripped window has no known reset (can't time a resume —
+/// the caller surfaces that rather than sleeping blind).
+fn pause_for(usage: &UsageSnapshot) -> Option<PauseInfo> {
+    let seven = &usage.rate_limits.seven_day;
+    if window_tripped(seven, SEVEN_DAY_RESERVE_PCT) {
+        return seven.resets_at.map(|reset_at| PauseInfo {
+            reset_at,
+            window: "seven_day",
+            reason: format!(
+                "7d window {} (reserve {SEVEN_DAY_RESERVE_PCT}%)",
+                seven.status.as_deref().unwrap_or("over-reserve")
+            ),
+        });
+    }
+    let five = &usage.rate_limits.five_hour;
+    if window_tripped(five, FIVE_HOUR_RESERVE_PCT) {
+        return five.resets_at.map(|reset_at| PauseInfo {
+            reset_at,
+            window: "five_hour",
+            reason: format!(
+                "5h window {} (reserve {FIVE_HOUR_RESERVE_PCT}%)",
+                five.status.as_deref().unwrap_or("over-reserve")
+            ),
+        });
+    }
+    None
+}
+
+/// The soonest known reset across both windows (5h preferred — it's the session
+/// budget). Used to time the resume for an agent-declared HALTED_RATE_LIMIT whose
+/// window status didn't independently trip the governor.
+fn any_reset(usage: &UsageSnapshot) -> Option<(i64, &'static str)> {
+    usage
+        .rate_limits
+        .five_hour
+        .resets_at
+        .map(|r| (r, "five_hour"))
+        .or_else(|| {
+            usage
+                .rate_limits
+                .seven_day
+                .resets_at
+                .map(|r| (r, "seven_day"))
+        })
+}
+
+/// The between-iteration decision (pure): from the just-finished baton status +
+/// parsed budgets + whether the spin streak hit its limit, decide whether to
+/// continue, pause for a rate window, or stop. Effects (log / stamp / sleep) are
+/// the loop's — so the governor is unit-tested without real time or a real agent.
+///
+/// `is_error` alone is *not* a pause trigger: an error without a non-"allowed"
+/// window has no reset time to wait for, so it's logged and the agent's baton
+/// status governs; the spin guard is the backstop if it makes no progress.
+fn decide_step(view: &BatonView, usage: &UsageSnapshot, stalled: bool) -> LoopStep {
+    match view.status.as_deref().unwrap_or("UNKNOWN") {
+        // Agent halted on a rate limit → resume at the reset (governor pause),
+        // never a terminal stop. Prefer an independently-tripped window, else the
+        // soonest known reset; no reset time at all → can't time a resume, so
+        // surface it as terminal rather than spin.
+        "HALTED_RATE_LIMIT" => pause_for(usage)
+            .or_else(|| {
+                any_reset(usage).map(|(reset_at, window)| PauseInfo {
+                    reset_at,
+                    window,
+                    reason: "agent HALTED_RATE_LIMIT".to_string(),
+                })
+            })
+            .map(LoopStep::Pause)
+            .unwrap_or_else(|| {
+                LoopStep::Stop(StopReason::Terminal("HALTED_RATE_LIMIT".to_string()))
+            }),
+        // Hard human block — surfaced distinctly, never worked around.
+        "BLOCKED_ON_HUMAN" => LoopStep::Stop(StopReason::BlockedOnHuman),
+        // Any other non-continue status (QUEUE_EMPTY, agent STUCK, unknown).
+        s if !is_continue_status(s) => LoopStep::Stop(StopReason::Terminal(s.to_string())),
+        // Continue-status: stop if stalled, else pause if a window is over
+        // reserve, else keep driving.
+        _ => {
+            if stalled {
+                LoopStep::Stop(StopReason::SpinGuard)
+            } else if let Some(p) = pause_for(usage) {
+                LoopStep::Pause(p)
+            } else {
+                LoopStep::Continue
+            }
+        }
+    }
 }
 
 /// The outcome of an `--auto` loop run, for the closing summary.
@@ -296,6 +433,7 @@ struct LoopSummary {
 /// backend so the driver is testable with a scripted fake — no `claude` spawn.
 fn run_auto_loop(
     backend: &dyn AgentBackend,
+    clock: &dyn Clock,
     loop_path: &Path,
     baton_path: &Path,
     usage_path: &Path,
@@ -355,37 +493,129 @@ fn run_auto_loop(
             }
         }
 
-        // Terminal status → stop before starting another iteration.
-        if !is_continue_status(&status) {
-            let _ = writeln!(log, "stop: terminal baton status {status}");
-            return Ok(LoopSummary {
-                iterations,
-                stop: StopReason::Terminal(status),
-                last_status,
-                last_item,
-            });
-        }
-
-        // Spin guard (protocol step 6): NEXT ACTION unchanged across iterations.
-        let stalled = match (prev_next_action.as_deref(), view.next_action.as_deref()) {
-            (Some(p), Some(c)) => p == c,
-            _ => false,
-        };
-        same_streak = if stalled { same_streak + 1 } else { 1 };
+        // Spin streak (protocol step 6): consecutive iterations with an unchanged
+        // NEXT ACTION. Computed every iteration; only acted on for a continue-
+        // status (a terminal status stops first, in `decide_step`).
+        let same = matches!(
+            (prev_next_action.as_deref(), view.next_action.as_deref()),
+            (Some(p), Some(c)) if p == c
+        );
+        same_streak = if same { same_streak + 1 } else { 1 };
         prev_next_action = view.next_action.clone();
-        if same_streak >= STALL_LIMIT {
-            let _ = writeln!(
-                log,
-                "stop: spin guard — NEXT ACTION unchanged across {same_streak} iterations (STUCK)"
-            );
-            return Ok(LoopSummary {
-                iterations,
-                stop: StopReason::SpinGuard,
-                last_status,
-                last_item,
-            });
+        let stalled = same_streak >= STALL_LIMIT;
+
+        match decide_step(&view, &outcome.usage, stalled) {
+            // Budget governor (between iterations): wait out the rate window, then
+            // drive the next iteration on the refreshed budget. The in-session
+            // protocol (2b) can only stop the current process; this owns what
+            // happens *between* processes.
+            LoopStep::Pause(p) => governor_pause(clock, baton_path, &p, log)?,
+            LoopStep::Continue => {}
+            LoopStep::Stop(reason) => {
+                log_stop(&reason, same_streak, log);
+                if reason == StopReason::BlockedOnHuman {
+                    surface_blocked(&view, log);
+                }
+                return Ok(LoopSummary {
+                    iterations,
+                    stop: reason,
+                    last_status,
+                    last_item,
+                });
+            }
         }
     }
+}
+
+/// Apply a governor pause: surface it (run log + stdout), stamp the runtime baton
+/// HALTED_RATE_LIMIT so a human peeking mid-pause sees the halt, then sleep until
+/// the reset via the [`Clock`] seam. Returns after the wait; the loop then drives
+/// the next iteration on the refreshed budget.
+fn governor_pause(
+    clock: &dyn Clock,
+    baton_path: &Path,
+    p: &PauseInfo,
+    log: &mut dyn Write,
+) -> Result<()> {
+    let wait = (p.reset_at - clock.now_unix()).max(0);
+    let _ = writeln!(
+        log,
+        "governor: HALTED_RATE_LIMIT — {} ; pausing {wait}s until reset {}",
+        p.reason, p.reset_at
+    );
+    println!(
+        "  governor: rate limit ({}) — pausing {wait}s until reset {}",
+        p.window, p.reset_at
+    );
+    stamp_baton_status(baton_path, "HALTED_RATE_LIMIT")?;
+    clock.sleep_until(p.reset_at);
+    let _ = writeln!(log, "governor: resumed after rate-limit pause ({})", p.window);
+    Ok(())
+}
+
+/// Loudly surface a BLOCKED_ON_HUMAN stop: the loop can't proceed without a human
+/// and must never fabricate the decision (protocol step 4/3b). Goes to the run
+/// log and stderr; the baton's NEXT ACTION carries what's needed.
+fn surface_blocked(view: &BatonView, log: &mut dyn Write) {
+    let na = view
+        .next_action
+        .as_deref()
+        .map(|n| first_line_preview(n, 200))
+        .unwrap_or_else(|| "(see baton NEXT ACTION)".to_string());
+    let _ = writeln!(log, "BLOCKED_ON_HUMAN: needs a human decision — {na}");
+    eprintln!("\n*** growlight --auto BLOCKED_ON_HUMAN — needs you ***");
+    eprintln!("  {na}");
+}
+
+/// Record a stop in the run log.
+fn log_stop(reason: &StopReason, same_streak: usize, log: &mut dyn Write) {
+    let msg = match reason {
+        StopReason::Terminal(s) => format!("stop: terminal baton status {s}"),
+        StopReason::BlockedOnHuman => "stop: BLOCKED_ON_HUMAN (needs a human)".to_string(),
+        StopReason::SpinGuard => format!(
+            "stop: spin guard — NEXT ACTION unchanged across {same_streak} iterations (STUCK)"
+        ),
+        StopReason::MaxIterations => "stop: --max-iterations reached".to_string(),
+    };
+    let _ = writeln!(log, "{msg}");
+}
+
+/// Stamp the runtime baton's frontmatter `status:` (best-effort surfacing for a
+/// human peeking mid-pause; the next iteration's agent rewrites the baton). A
+/// no-op if the baton can't be read or has no frontmatter status line.
+fn stamp_baton_status(baton_path: &Path, new_status: &str) -> Result<()> {
+    let Ok(baton) = fs::read_to_string(baton_path) else {
+        return Ok(());
+    };
+    let restamped = restamp_status(&baton, new_status);
+    if restamped != baton {
+        write_file(baton_path, &restamped)?;
+    }
+    Ok(())
+}
+
+/// Replace the frontmatter `status:` line with `status: <new>` (only within the
+/// opening `---` fence — never a `status:` in the body). Returns the input
+/// unchanged if there's no frontmatter. Pure.
+fn restamp_status(baton: &str, new_status: &str) -> String {
+    let mut lines: Vec<String> = baton.lines().map(str::to_string).collect();
+    if lines.first().map(|l| l.trim()) != Some("---") {
+        return baton.to_string();
+    }
+    for line in lines.iter_mut().skip(1) {
+        if line.trim() == "---" {
+            break; // end of frontmatter
+        }
+        if line.trim_start().starts_with("status:") {
+            *line = format!("status: {new_status}");
+            break;
+        }
+    }
+    let mut out = lines.join("\n");
+    if baton.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Drive ONE headless iteration through the agent-backend seam: invoke, persist
@@ -420,6 +650,9 @@ fn print_loop_summary(summary: &LoopSummary, usage_path: &Path, log_path: &Path)
     );
     match &summary.stop {
         StopReason::Terminal(s) => println!("  reason   terminal baton status: {s}"),
+        StopReason::BlockedOnHuman => {
+            println!("  reason   BLOCKED_ON_HUMAN — needs a human (never fabricated)")
+        }
         StopReason::SpinGuard => {
             println!("  reason   spin guard — NEXT ACTION unchanged (STUCK)")
         }
@@ -912,11 +1145,40 @@ mod tests {
 
     // ---- headless single-shot driver (slice 001) -----------------------
 
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use crate::growlight_backend::{
         ContextWindow, IterationOutcome, RateLimits, RateWindow, UsageSnapshot,
     };
+
+    /// A [`Clock`] test double: records every `sleep_until` target instead of
+    /// blocking, and advances virtual time to it (so the governor's wait is
+    /// asserted without real sleeps).
+    struct FakeClock {
+        now: Cell<i64>,
+        sleeps: RefCell<Vec<i64>>,
+    }
+
+    impl FakeClock {
+        fn new(now: i64) -> Self {
+            Self {
+                now: Cell::new(now),
+                sleeps: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now_unix(&self) -> i64 {
+            self.now.get()
+        }
+        fn sleep_until(&self, unix: i64) {
+            self.sleeps.borrow_mut().push(unix);
+            if unix > self.now.get() {
+                self.now.set(unix);
+            }
+        }
+    }
 
     #[test]
     fn first_line_preview_truncates_on_chars_and_extra_lines() {
@@ -1103,14 +1365,21 @@ mod tests {
 
     #[test]
     fn loop_stops_on_each_terminal_status_without_an_extra_iteration() {
-        for status in ["QUEUE_EMPTY", "STUCK", "BLOCKED_ON_HUMAN"] {
+        // QUEUE_EMPTY / STUCK are generic terminal stops; BLOCKED_ON_HUMAN gets
+        // its own surfaced variant (slice 003).
+        for (status, expected) in [
+            ("QUEUE_EMPTY", StopReason::Terminal("QUEUE_EMPTY".to_string())),
+            ("STUCK", StopReason::Terminal("STUCK".to_string())),
+            ("BLOCKED_ON_HUMAN", StopReason::BlockedOnHuman),
+        ] {
             let (dir, loop_path, baton, usage) = loop_paths(&format!("term-{status}"));
             let backend = ScriptedBackend::new(&baton, vec![fm(status, "x", "na")]);
+            let clock = FakeClock::new(0);
             let mut log = Vec::new();
             let summary =
-                run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+                run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
             assert_eq!(summary.iterations, 1, "{status}: exactly one iteration");
-            assert_eq!(summary.stop, StopReason::Terminal(status.to_string()));
+            assert_eq!(summary.stop, expected, "{status}");
             // No iteration started after the terminal status was written.
             assert_eq!(backend.calls.get(), 1, "{status}: backend called once");
             fs::remove_dir_all(&dir).ok();
@@ -1131,9 +1400,10 @@ mod tests {
                 fm("QUEUE_EMPTY", "null", "nothing left"),
             ],
         );
+        let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
         assert_eq!(summary.iterations, 4);
         assert_eq!(summary.stop, StopReason::Terminal("QUEUE_EMPTY".to_string()));
         assert_eq!(backend.calls.get(), 4);
@@ -1148,9 +1418,10 @@ mod tests {
         // Same NEXT ACTION every iteration → no progress → STUCK.
         let stuck = fm("IN_PROGRESS", "item-a", "the exact same next action");
         let backend = ScriptedBackend::new(&baton, vec![stuck.clone(), stuck]);
+        let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
         assert_eq!(summary.stop, StopReason::SpinGuard);
         assert_eq!(summary.iterations, STALL_LIMIT as u64);
         assert_eq!(backend.calls.get(), STALL_LIMIT);
@@ -1171,9 +1442,10 @@ mod tests {
                 fm("IN_PROGRESS", "item-a", "step 4"),
             ],
         );
+        let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &loop_path, &baton, &usage, Some(3), &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, Some(3), &mut log).unwrap();
         assert_eq!(summary.stop, StopReason::MaxIterations);
         assert_eq!(summary.iterations, 3);
         assert_eq!(backend.calls.get(), 3);
@@ -1185,9 +1457,10 @@ mod tests {
         let (dir, loop_path, baton, usage) = loop_paths("single");
         let backend =
             ScriptedBackend::new(&baton, vec![fm("IN_PROGRESS", "item-a", "keep going")]);
+        let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &loop_path, &baton, &usage, Some(1), &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, Some(1), &mut log).unwrap();
         assert_eq!(summary.iterations, 1);
         assert_eq!(summary.stop, StopReason::MaxIterations);
         assert_eq!(backend.calls.get(), 1);
@@ -1204,8 +1477,9 @@ mod tests {
                 fm("QUEUE_EMPTY", "null", "done"),
             ],
         );
+        let clock = FakeClock::new(0);
         let mut log = Vec::new();
-        run_auto_loop(&backend, &loop_path, &baton, &usage, None, &mut log).unwrap();
+        run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
         let text = String::from_utf8(log).unwrap();
         assert!(text.contains("iter 1:"), "log: {text}");
         assert!(text.contains("iter 2:"), "log: {text}");
@@ -1214,6 +1488,239 @@ mod tests {
             text.contains("stop: terminal baton status QUEUE_EMPTY"),
             "log: {text}"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- budget governor (slice 003) -----------------------------------
+
+    /// A [`UsageSnapshot`] with the given `(status, resets_at)` per window.
+    fn usage(five: (Option<&str>, Option<i64>), seven: (Option<&str>, Option<i64>)) -> UsageSnapshot {
+        let win = |(status, resets_at): (Option<&str>, Option<i64>)| RateWindow {
+            used_percentage: None,
+            resets_at,
+            status: status.map(str::to_string),
+        };
+        UsageSnapshot {
+            context_window: ContextWindow {
+                used_percentage: 10,
+                remaining_percentage: 90,
+                context_window_size: 1_000_000,
+                current_tokens: 100_000,
+            },
+            rate_limits: RateLimits {
+                five_hour: win(five),
+                seven_day: win(seven),
+            },
+            ts: 0.0,
+        }
+    }
+
+    /// A [`BatonView`] with the given status + NEXT ACTION.
+    fn view(status: &str, next: &str) -> BatonView {
+        BatonView {
+            status: Some(status.to_string()),
+            item: Some("item-a".to_string()),
+            iteration: Some(1),
+            next_action: Some(next.to_string()),
+        }
+    }
+
+    #[test]
+    fn window_tripped_keys_off_status_and_present_percentage_never_missing_as_zero() {
+        let allowed = RateWindow {
+            used_percentage: None,
+            resets_at: Some(1),
+            status: Some("allowed".to_string()),
+        };
+        assert!(!window_tripped(&allowed, 85));
+        // Non-"allowed" status trips regardless of percentage.
+        let rejected = RateWindow {
+            status: Some("rejected".to_string()),
+            ..RateWindow::default()
+        };
+        assert!(window_tripped(&rejected, 85));
+        // A present percentage at/over reserve trips (future percentage backend).
+        let over = RateWindow {
+            used_percentage: Some(90),
+            ..RateWindow::default()
+        };
+        assert!(window_tripped(&over, 85));
+        let under = RateWindow {
+            used_percentage: Some(50),
+            ..RateWindow::default()
+        };
+        assert!(!window_tripped(&under, 85));
+        // Missing everything → never trips (NOT read as 0%).
+        assert!(!window_tripped(&RateWindow::default(), 85));
+    }
+
+    #[test]
+    fn pause_for_prefers_seven_day_and_needs_a_reset_time() {
+        // 7d takes precedence over 5h.
+        let both = usage((Some("rejected"), Some(100)), (Some("rejected"), Some(200)));
+        let p = pause_for(&both).expect("a window is over reserve");
+        assert_eq!(p.window, "seven_day");
+        assert_eq!(p.reset_at, 200);
+        // Only 5h tripped.
+        let five = usage((Some("rejected"), Some(777)), (Some("allowed"), None));
+        let p = pause_for(&five).unwrap();
+        assert_eq!(p.window, "five_hour");
+        assert_eq!(p.reset_at, 777);
+        // Nothing tripped → no pause.
+        assert!(pause_for(&usage((Some("allowed"), Some(1)), (None, None))).is_none());
+        // Tripped but no reset time → can't time a resume → no pause.
+        assert!(pause_for(&usage((Some("rejected"), None), (None, None))).is_none());
+    }
+
+    #[test]
+    fn decide_step_classifies_each_outcome() {
+        let ok = usage((Some("allowed"), Some(1)), (None, None));
+        // Clean continue.
+        assert_eq!(decide_step(&view("IN_PROGRESS", "go"), &ok, false), LoopStep::Continue);
+        // Stalled continue → spin guard (before the governor).
+        assert_eq!(
+            decide_step(&view("IN_PROGRESS", "go"), &ok, true),
+            LoopStep::Stop(StopReason::SpinGuard)
+        );
+        // Terminal statuses.
+        assert_eq!(
+            decide_step(&view("QUEUE_EMPTY", "-"), &ok, false),
+            LoopStep::Stop(StopReason::Terminal("QUEUE_EMPTY".to_string()))
+        );
+        assert_eq!(
+            decide_step(&view("STUCK", "-"), &ok, false),
+            LoopStep::Stop(StopReason::Terminal("STUCK".to_string()))
+        );
+        // BLOCKED_ON_HUMAN is distinct.
+        assert_eq!(
+            decide_step(&view("BLOCKED_ON_HUMAN", "-"), &ok, false),
+            LoopStep::Stop(StopReason::BlockedOnHuman)
+        );
+        // Over-reserve on a continue status → pause (even when not stalled).
+        let rejected = usage((Some("rejected"), Some(900)), (None, None));
+        match decide_step(&view("IN_PROGRESS", "go"), &rejected, false) {
+            LoopStep::Pause(p) => {
+                assert_eq!(p.window, "five_hour");
+                assert_eq!(p.reset_at, 900);
+            }
+            other => panic!("expected pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_step_routes_halted_rate_limit_to_a_pause_or_terminal() {
+        // HALTED_RATE_LIMIT with an independently-tripped window → that reset.
+        let tripped = usage((Some("rejected"), Some(500)), (None, None));
+        match decide_step(&view("HALTED_RATE_LIMIT", "-"), &tripped, false) {
+            LoopStep::Pause(p) => assert_eq!(p.reset_at, 500),
+            other => panic!("expected pause, got {other:?}"),
+        }
+        // HALTED_RATE_LIMIT, no tripped window but a known reset → fall back to it.
+        let allowed_with_reset = usage((Some("allowed"), Some(900)), (None, None));
+        match decide_step(&view("HALTED_RATE_LIMIT", "-"), &allowed_with_reset, false) {
+            LoopStep::Pause(p) => assert_eq!(p.reset_at, 900),
+            other => panic!("expected pause, got {other:?}"),
+        }
+        // HALTED_RATE_LIMIT with no reset time at all → terminal (can't resume).
+        assert_eq!(
+            decide_step(&view("HALTED_RATE_LIMIT", "-"), &usage((None, None), (None, None)), false),
+            LoopStep::Stop(StopReason::Terminal("HALTED_RATE_LIMIT".to_string()))
+        );
+    }
+
+    #[test]
+    fn restamp_status_replaces_only_the_frontmatter_status() {
+        let baton = "---\nloop: g\nstatus: IN_PROGRESS\nitem: x\n---\n# NEXT ACTION\nstatus: not-this\n";
+        let out = restamp_status(baton, "HALTED_RATE_LIMIT");
+        assert!(out.contains("status: HALTED_RATE_LIMIT\n"));
+        assert!(out.contains("status: not-this\n"), "body `status:` untouched");
+        assert!(out.ends_with('\n'));
+        // No frontmatter fence → unchanged.
+        assert_eq!(restamp_status("status: x\n", "Y"), "status: x\n");
+    }
+
+    /// A scripted backend that pairs each iteration's baton with a five_hour
+    /// `(status, resets_at)` so the governor's pause/resume is driven end to end.
+    struct GovernorBackend {
+        baton_path: PathBuf,
+        steps: Vec<(String, Option<&'static str>, Option<i64>)>,
+        calls: Cell<usize>,
+    }
+
+    impl AgentBackend for GovernorBackend {
+        fn run_iteration(&self, req: &IterationRequest) -> Result<IterationOutcome> {
+            assert!(!req.settings.as_os_str().is_empty());
+            assert!(!req.prompt.is_empty());
+            let i = self.calls.get();
+            let (baton, status, reset) = self
+                .steps
+                .get(i)
+                .or_else(|| self.steps.last())
+                .cloned()
+                .unwrap_or_default();
+            fs::write(&self.baton_path, &baton).unwrap();
+            self.calls.set(i + 1);
+            Ok(IterationOutcome {
+                is_error: false,
+                result_text: Some(format!("iter {i}")),
+                usage: usage((status, reset), (None, None)),
+            })
+        }
+    }
+
+    #[test]
+    fn governor_pauses_until_reset_then_resumes() {
+        let (dir, loop_path, baton, usage_path) = loop_paths("governor");
+        let reset = 5_000;
+        let backend = GovernorBackend {
+            baton_path: baton.clone(),
+            steps: vec![
+                // iter 1: progressing, but the 5h window is rejected → pause.
+                (fm("IN_PROGRESS", "item-a", "step 1"), Some("rejected"), Some(reset)),
+                // iter 2: window allowed again → drains to QUEUE_EMPTY.
+                (fm("QUEUE_EMPTY", "null", "done"), Some("allowed"), None),
+            ],
+            calls: Cell::new(0),
+        };
+        let clock = FakeClock::new(1_000);
+        let mut log = Vec::new();
+        let summary =
+            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage_path, None, &mut log).unwrap();
+
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(summary.stop, StopReason::Terminal("QUEUE_EMPTY".to_string()));
+        // Paused exactly once, waiting until the recorded reset (no real sleep).
+        assert_eq!(*clock.sleeps.borrow(), vec![reset]);
+        let text = String::from_utf8(log).unwrap();
+        assert!(text.contains("governor: HALTED_RATE_LIMIT"), "log: {text}");
+        assert!(text.contains("governor: resumed"), "log: {text}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn blocked_on_human_stops_distinctly_and_never_sleeps() {
+        // Mirrors protocol 3b: a step that needs the daemon cycled but relock is
+        // disabled → the agent writes BLOCKED_ON_HUMAN; the orchestrator surfaces
+        // it and stops, never a cold unlock, never a fabricated decision.
+        let (dir, loop_path, baton, usage_path) = loop_paths("blocked");
+        let backend = ScriptedBackend::new(
+            &baton,
+            vec![fm(
+                "BLOCKED_ON_HUMAN",
+                "item-a",
+                "needs daemon restart; relock disabled — set [growlight] allow_relock",
+            )],
+        );
+        let clock = FakeClock::new(0);
+        let mut log = Vec::new();
+        let summary =
+            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage_path, None, &mut log).unwrap();
+        assert_eq!(summary.iterations, 1);
+        assert_eq!(summary.stop, StopReason::BlockedOnHuman);
+        assert_eq!(backend.calls.get(), 1, "no iteration after the block");
+        assert!(clock.sleeps.borrow().is_empty(), "must not sleep on a human block");
+        let text = String::from_utf8(log).unwrap();
+        assert!(text.contains("BLOCKED_ON_HUMAN"), "log: {text}");
         fs::remove_dir_all(&dir).ok();
     }
 }
