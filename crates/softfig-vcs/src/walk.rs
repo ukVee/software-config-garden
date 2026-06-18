@@ -55,6 +55,11 @@ const MODE_MASK: u32 = 0o7777;
 pub fn walk(root: &Path) -> Result<WalkSnapshot> {
     let mut root_node = BTreeMap::<String, TreeNode>::new();
 
+    // Load the exclusion set (built-ins + the garden's `.softfigignore`) once
+    // per walk, so every commit reflects the current ignore file with no
+    // daemon restart. See [`crate::ignore`] for the single source of truth.
+    let ignore = crate::ignore::Ignore::load(root);
+
     for entry in WalkDir::new(root)
         .min_depth(1)
         .follow_links(false)
@@ -66,7 +71,7 @@ pub fn walk(root: &Path) -> Result<WalkSnapshot> {
             // an empty path (never ignored) and is excluded by min_depth(1).
             e.path()
                 .strip_prefix(root)
-                .map(|rel| !crate::ignore::is_ignored(rel))
+                .map(|rel| !ignore.is_ignored(rel))
                 .unwrap_or(true)
         })
     {
@@ -167,5 +172,61 @@ fn prune_empty_dirs(node: &mut BTreeMap<String, TreeNode>) {
                 node.remove(&name);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ignore::IGNORE_FILE;
+
+    fn top_level(snap: &WalkSnapshot) -> &BTreeMap<String, TreeNode> {
+        match &snap.root {
+            TreeNode::Dir(children) => children,
+            TreeNode::File { .. } => panic!("root is always a Dir"),
+        }
+    }
+
+    /// Lay out a small garden with a top-level `scratch/` dir and one tracked
+    /// markdown file, returning the tempdir.
+    fn garden() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("scratch")).unwrap();
+        fs::write(dir.path().join("scratch/draft.md"), b"wip").unwrap();
+        fs::write(dir.path().join("a.md"), b"keep me").unwrap();
+        dir
+    }
+
+    #[test]
+    fn absent_softfigignore_tracks_everything() {
+        let dir = garden();
+        let snap = walk(dir.path()).unwrap();
+        let tl = top_level(&snap);
+        assert!(tl.contains_key("scratch"));
+        assert!(tl.contains_key("a.md"));
+    }
+
+    #[test]
+    fn softfigignore_excludes_a_top_level_dir_but_keeps_itself() {
+        let dir = garden();
+        fs::write(dir.path().join(IGNORE_FILE), "scratch\n").unwrap();
+        let snap = walk(dir.path()).unwrap();
+        let tl = top_level(&snap);
+        // The listed dir is gone from the snapshot...
+        assert!(!tl.contains_key("scratch"));
+        // ...but unlisted content and the (tracked) ignore file itself remain.
+        assert!(tl.contains_key("a.md"));
+        assert!(tl.contains_key(IGNORE_FILE));
+    }
+
+    #[test]
+    fn removing_the_entry_restores_tracking() {
+        let dir = garden();
+        let ignore_path = dir.path().join(IGNORE_FILE);
+        fs::write(&ignore_path, "scratch\n").unwrap();
+        assert!(!top_level(&walk(dir.path()).unwrap()).contains_key("scratch"));
+        // Emptying the file (here, removing it) restores the prior behavior.
+        fs::remove_file(&ignore_path).unwrap();
+        assert!(top_level(&walk(dir.path()).unwrap()).contains_key("scratch"));
     }
 }

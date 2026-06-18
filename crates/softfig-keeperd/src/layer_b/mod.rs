@@ -501,6 +501,9 @@ pub fn enumerate_matching(garden_root: &Path, sealed: &SealedPaths) -> Vec<Strin
         return Vec::new();
     }
     let mut out = BTreeSet::new();
+    // Same exclusion set the committer uses (built-ins + `.softfigignore`),
+    // loaded once for this scan from the garden root.
+    let ignore = softfig_vcs::ignore::Ignore::load(garden_root);
     for entry in WalkDir::new(garden_root)
         .min_depth(1)
         .follow_links(false)
@@ -508,7 +511,7 @@ pub fn enumerate_matching(garden_root: &Path, sealed: &SealedPaths) -> Vec<Strin
         .filter_entry(|e| {
             e.path()
                 .strip_prefix(garden_root)
-                .map(|rel| !softfig_vcs::ignore::is_ignored(rel))
+                .map(|rel| !ignore.is_ignored(rel))
                 .unwrap_or(true)
         })
         .flatten()
@@ -670,6 +673,21 @@ mod tests {
         assert!(found.contains(&"secrets/dir/bar.toml".to_string()));
         assert!(!found.iter().any(|p| p.starts_with(".softfig")));
         assert!(!found.contains(&"public.md".to_string()));
+    }
+
+    #[test]
+    fn enumerate_matching_honors_softfigignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path();
+        write_file(&g.join("secrets/foo.toml"), "shh");
+        write_file(&g.join("scratch/sealed.toml"), "shh too");
+        write_file(&g.join(".softfigignore"), "scratch\n");
+        // A glob that would otherwise match the scratch file.
+        let sp = SealedPaths::compile(&["**/*.toml".to_string()]).unwrap();
+        let found = enumerate_matching(g, &sp);
+        assert!(found.contains(&"secrets/foo.toml".to_string()));
+        // The user-ignored top-level dir is pruned from the scan.
+        assert!(!found.iter().any(|p| p.starts_with("scratch")));
     }
 
     #[test]

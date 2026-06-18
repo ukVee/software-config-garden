@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use softfig_vcs::{ignore::is_ignored, Intent};
+use softfig_vcs::{ignore::Ignore, Intent};
 
 use crate::classify::{self, DirtySet};
 use crate::daemon::{Daemon, DaemonInner, SUPPRESS_WINDOW_MS};
@@ -268,11 +268,16 @@ impl DirtySetAccumulator {
     }
 
     /// True if the path should be buffered (not VCS-ignored — `.softfig`,
-    /// `.claude`, … — and not currently in the daemon's self-write
-    /// suppression map).
+    /// `.claude`, the garden's `.softfigignore` entries — and not currently in
+    /// the daemon's self-write suppression map).
+    ///
+    /// The ignore set is loaded fresh on each call so an edit to
+    /// `.softfigignore` takes effect on the next event without a daemon
+    /// restart; the file is tiny and reads are cheap. `walk()` re-enforces it
+    /// authoritatively at commit time regardless.
     fn accept(&self, rel: &str) -> bool {
         let p = Path::new(rel);
-        if is_ignored(p) {
+        if Ignore::load(&self.garden_root).is_ignored(p) {
             return false;
         }
         if self.is_self_write(&self.garden_root.join(rel)) {
@@ -514,13 +519,15 @@ mod tests {
     fn ignored_paths_are_filtered() {
         // The accumulator's `accept` delegates to the shared VCS-ignore
         // predicate; both `.softfig` (daemon state) and `.claude` (agent
-        // scratch) are filtered out, real garden content is kept.
-        assert!(is_ignored(Path::new(".softfig/objects/aa/bb")));
-        assert!(is_ignored(Path::new(".softfig")));
-        assert!(is_ignored(Path::new(".claude/settings.local.json")));
-        assert!(is_ignored(Path::new(".claude")));
-        assert!(!is_ignored(Path::new("journal/decisions/decision-x.md")));
-        assert!(!is_ignored(Path::new("a.md")));
+        // scratch) are filtered out, real garden content is kept. The
+        // built-in set is the `.softfigignore`-absent case.
+        let ig = Ignore::builtin();
+        assert!(ig.is_ignored(Path::new(".softfig/objects/aa/bb")));
+        assert!(ig.is_ignored(Path::new(".softfig")));
+        assert!(ig.is_ignored(Path::new(".claude/settings.local.json")));
+        assert!(ig.is_ignored(Path::new(".claude")));
+        assert!(!ig.is_ignored(Path::new("journal/decisions/decision-x.md")));
+        assert!(!ig.is_ignored(Path::new("a.md")));
     }
 
     #[test]
