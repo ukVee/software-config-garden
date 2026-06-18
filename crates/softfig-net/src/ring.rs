@@ -327,7 +327,7 @@ mod tests {
         // It round-trips back to a verifiable, endpoint-free membership ring.
         let dir = tempfile::tempdir().unwrap();
         let path = ring_path(dir.path());
-        fs::write(&path_with_dirs(&path), &toml).unwrap();
+        fs::write(path_with_dirs(&path), &toml).unwrap();
         let loaded = Ring::load(&path).unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(loaded.peers()[0].endpoints.is_empty());
