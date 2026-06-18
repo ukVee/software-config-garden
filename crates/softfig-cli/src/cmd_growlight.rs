@@ -182,6 +182,7 @@ fn start(args: StartArgs) -> Result<()> {
         .with_context(|| format!("creating runtime dir {}", runtime.display()))?;
 
     let loop_path = runtime.join("loop.json");
+    let mcp_path = runtime.join("mcp.json");
     let inject_path = runtime.join("inject.sh");
     let statusline_path = runtime.join("statusline.sh");
     let baton_path = runtime.join("baton.md");
@@ -192,6 +193,11 @@ fn start(args: StartArgs) -> Result<()> {
         &loop_path,
         &loop_json(&inject_path, &statusline_path, &garden_root),
     )?;
+    // `--settings` only *permits* softfig-mcp; this *attaches* it, so the
+    // garden verbs exist regardless of where the loop is launched from (the
+    // project-scoped registration in ~/.claude.json only loads with cwd in the
+    // garden). Without it every state-advancing iteration STUCKs (auto-run log).
+    write_file(&mcp_path, &mcp_json(&softfig_mcp_path()))?;
     write_script(&inject_path, &inject_script(&protocol, &baton_path))?;
     write_script(
         &statusline_path,
@@ -222,8 +228,9 @@ fn start(args: StartArgs) -> Result<()> {
     if args.no_launch {
         println!(
             "\n(--no-launch) runtime ready. launch with:\n  {AGENT_BIN} --name {AGENT_NAME} \
-             --settings {}",
-            loop_path.display()
+             --settings {} --mcp-config {}",
+            loop_path.display(),
+            mcp_path.display()
         );
         return Ok(());
     }
@@ -241,6 +248,7 @@ fn start(args: StartArgs) -> Result<()> {
             &backend,
             &clock,
             &loop_path,
+            &mcp_path,
             &baton_path,
             &usage_path,
             args.max_iterations,
@@ -249,7 +257,7 @@ fn start(args: StartArgs) -> Result<()> {
         print_loop_summary(&summary, &usage_path, &log_path);
         return Ok(());
     }
-    launch_agent(&loop_path)
+    launch_agent(&loop_path, &mcp_path)
 }
 
 // ---- headless orchestrator (full-auto, slices 001-002) -----------------
@@ -437,10 +445,15 @@ struct LoopSummary {
 /// [`run_auto`]) and is recorded to `log` — the orchestrator's run log, which
 /// lives in the runtime dir, never the garden (spec §3). Generic over the
 /// backend so the driver is testable with a scripted fake — no `claude` spawn.
+// The trailing four paths (loop.json, mcp.json, baton, usage) are one cohesive
+// runtime-paths set, all derived together in `start()`; threading them as a
+// bundle struct would only obscure a flat driver signature.
+#[allow(clippy::too_many_arguments)]
 fn run_auto_loop(
     backend: &dyn AgentBackend,
     clock: &dyn Clock,
     loop_path: &Path,
+    mcp_path: &Path,
     baton_path: &Path,
     usage_path: &Path,
     max_iterations: Option<u64>,
@@ -472,7 +485,7 @@ fn run_auto_loop(
             }
         }
 
-        let (outcome, view) = run_auto(backend, loop_path, baton_path, usage_path)?;
+        let (outcome, view) = run_auto(backend, loop_path, mcp_path, baton_path, usage_path)?;
         iterations += 1;
 
         let status = view.status.clone().unwrap_or_else(|| "UNKNOWN".to_string());
@@ -631,11 +644,13 @@ fn restamp_status(baton: &str, new_status: &str) -> String {
 fn run_auto(
     backend: &dyn AgentBackend,
     loop_path: &Path,
+    mcp_path: &Path,
     baton_path: &Path,
     usage_path: &Path,
 ) -> Result<(IterationOutcome, BatonView)> {
     let req = IterationRequest {
         settings: loop_path.to_path_buf(),
+        mcp_config: mcp_path.to_path_buf(),
         prompt: KICK_PROMPT.to_string(),
     };
     let outcome = backend.run_iteration(&req)?;
@@ -793,13 +808,15 @@ fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<Path
     }
 }
 
-fn launch_agent(loop_path: &Path) -> Result<()> {
+fn launch_agent(loop_path: &Path, mcp_path: &Path) -> Result<()> {
     println!("\nlaunching {AGENT_BIN} --name {AGENT_NAME} …\n");
     let status = std::process::Command::new(AGENT_BIN)
         .arg("--name")
         .arg(AGENT_NAME)
         .arg("--settings")
         .arg(loop_path)
+        .arg("--mcp-config")
+        .arg(mcp_path)
         .status()
         .with_context(|| format!("failed to launch `{AGENT_BIN}` — is it on PATH?"))?;
     std::process::exit(status.code().unwrap_or(1));
@@ -933,6 +950,48 @@ fn loop_json(inject: &Path, statusline: &Path, garden_root: &Path) -> String {
         }
     });
     format!("{}\n", serde_json::to_string_pretty(&v).unwrap())
+}
+
+/// The `--mcp-config` file the launcher passes alongside `--settings`. The
+/// settings `permissions.allow` entry only *grants* `mcp__softfig-mcp`; it
+/// can't conjure a server that isn't registered. softfig-mcp is normally a
+/// *project-scoped* entry in `~/.claude.json`, which loads only when the agent
+/// runs with cwd inside the garden — but the loop launches from wherever the
+/// human invoked `growlight start`, so the server never attached and every
+/// state-advancing iteration STUCKed (the real cause behind the "permission
+/// gap" trial finding). Attaching it here makes the garden verbs exist for the
+/// loop session regardless of cwd, with no dependency on the user's global
+/// Claude config — the AUR-distributable posture (no hardcoded host paths).
+fn mcp_json(mcp_bin: &Path) -> String {
+    let v = serde_json::json!({
+        "mcpServers": {
+            "softfig-mcp": {
+                "type": "stdio",
+                "command": mcp_bin.display().to_string(),
+                "args": [],
+                "env": {}
+            }
+        }
+    });
+    format!("{}\n", serde_json::to_string_pretty(&v).unwrap())
+}
+
+/// Resolve the `softfig-mcp` bridge binary. It ships beside the `softfig`
+/// launcher (same `cargo install` / AUR package), so prefer the sibling of the
+/// running exe — that keeps a dev build pointing at its own freshly-built
+/// bridge rather than whatever stale copy is on PATH. Fall back to a bare
+/// `softfig-mcp` (PATH lookup by Claude Code's stdio launcher) when the exe
+/// path can't be resolved or the sibling is missing.
+fn softfig_mcp_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("softfig-mcp");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("softfig-mcp")
 }
 
 /// SessionStart hook body: emit the fixed protocol (from the garden pillar) +
@@ -1121,6 +1180,21 @@ mod tests {
         // `//…` is the absolute-path anchor (one literal slash + the rooted path).
         assert!(deny.contains(&"Edit(//home/ukv/soft-fig_garden/**)"));
         assert!(deny.contains(&"Write(//home/ukv/soft-fig_garden/**)"));
+    }
+
+    #[test]
+    fn mcp_json_attaches_softfig_mcp_as_a_stdio_server() {
+        // The settings allow-list only *permits* the server; this file is what
+        // actually *registers* it, so the garden verbs exist under the loop's
+        // launch cwd (not just when cwd is the garden). Without it the headless
+        // loop STUCKs trying to write the baton/commit (auto-run.log).
+        let bin = Path::new("/opt/softfig/bin/softfig-mcp");
+        let json: serde_json::Value =
+            serde_json::from_str(&mcp_json(bin)).expect("valid JSON");
+        let server = &json["mcpServers"]["softfig-mcp"];
+        assert_eq!(server["type"], "stdio");
+        assert_eq!(server["command"], bin.display().to_string());
+        assert_eq!(server["args"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -1320,6 +1394,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let loop_path = dir.join("loop.json");
         fs::write(&loop_path, "{}").unwrap();
+        let mcp = dir.join("mcp.json");
+        fs::write(&mcp, "{}").unwrap();
         let baton = dir.join("baton.md");
         fs::write(&baton, "---\nstatus: BLOCKED_ON_HUMAN\nitem: null\n---\n# NEXT ACTION\n").unwrap();
         let usage = dir.join("usage.json");
@@ -1330,6 +1406,7 @@ mod tests {
                 ctx_pct: 7,
             },
             &loop_path,
+            &mcp,
             &baton,
             &usage,
         )
@@ -1416,14 +1493,17 @@ mod tests {
         format!("---\nstatus: {status}\nitem: {item}\niteration: 1\n---\n# NEXT ACTION\n{next_action}\n")
     }
 
-    /// `(dir, loop_path, baton, usage)` for a loop test; the loop file is a stub
-    /// (the scripted backend never reads it, only asserts it's non-empty).
-    fn loop_paths(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    /// `(dir, loop_path, mcp, baton, usage)` for a loop test; the loop + mcp
+    /// files are stubs (the scripted backend never reads them, only the real
+    /// `ClaudeBackend` passes them through to `claude`).
+    fn loop_paths(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         let dir = unique_tmp(tag);
         fs::create_dir_all(&dir).unwrap();
         let loop_path = dir.join("loop.json");
         fs::write(&loop_path, "{}").unwrap();
-        (dir.clone(), loop_path, dir.join("baton.md"), dir.join("usage.json"))
+        let mcp = dir.join("mcp.json");
+        fs::write(&mcp, "{}").unwrap();
+        (dir.clone(), loop_path, mcp, dir.join("baton.md"), dir.join("usage.json"))
     }
 
     #[test]
@@ -1435,12 +1515,12 @@ mod tests {
             ("STUCK", StopReason::Terminal("STUCK".to_string())),
             ("BLOCKED_ON_HUMAN", StopReason::BlockedOnHuman),
         ] {
-            let (dir, loop_path, baton, usage) = loop_paths(&format!("term-{status}"));
+            let (dir, loop_path, mcp, baton, usage) = loop_paths(&format!("term-{status}"));
             let backend = ScriptedBackend::new(&baton, vec![fm(status, "x", "na")]);
             let clock = FakeClock::new(0);
             let mut log = Vec::new();
             let summary =
-                run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
+                run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
             assert_eq!(summary.iterations, 1, "{status}: exactly one iteration");
             assert_eq!(summary.stop, expected, "{status}");
             // No iteration started after the terminal status was written.
@@ -1451,7 +1531,7 @@ mod tests {
 
     #[test]
     fn loop_drains_a_multi_iteration_backlog_to_queue_empty() {
-        let (dir, loop_path, baton, usage) = loop_paths("drain");
+        let (dir, loop_path, mcp, baton, usage) = loop_paths("drain");
         // Fresh process per iteration: each call writes a different baton, the
         // last one terminal. ITEM_COMPLETE is a continue-status.
         let backend = ScriptedBackend::new(
@@ -1466,7 +1546,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
         assert_eq!(summary.iterations, 4);
         assert_eq!(summary.stop, StopReason::Terminal("QUEUE_EMPTY".to_string()));
         assert_eq!(backend.calls.get(), 4);
@@ -1477,14 +1557,14 @@ mod tests {
 
     #[test]
     fn loop_spin_guard_trips_when_next_action_is_unchanged() {
-        let (dir, loop_path, baton, usage) = loop_paths("spin");
+        let (dir, loop_path, mcp, baton, usage) = loop_paths("spin");
         // Same NEXT ACTION every iteration → no progress → STUCK.
         let stuck = fm("IN_PROGRESS", "item-a", "the exact same next action");
         let backend = ScriptedBackend::new(&baton, vec![stuck.clone(), stuck]);
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
         assert_eq!(summary.stop, StopReason::SpinGuard);
         assert_eq!(summary.iterations, STALL_LIMIT as u64);
         assert_eq!(backend.calls.get(), STALL_LIMIT);
@@ -1493,7 +1573,7 @@ mod tests {
 
     #[test]
     fn loop_respects_max_iterations_on_a_progressing_baton() {
-        let (dir, loop_path, baton, usage) = loop_paths("maxiter");
+        let (dir, loop_path, mcp, baton, usage) = loop_paths("maxiter");
         // Always IN_PROGRESS with a *different* NEXT ACTION → never terminal,
         // never spin-guarded; only --max-iterations stops it.
         let backend = ScriptedBackend::new(
@@ -1508,7 +1588,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, Some(3), &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, Some(3), &mut log).unwrap();
         assert_eq!(summary.stop, StopReason::MaxIterations);
         assert_eq!(summary.iterations, 3);
         assert_eq!(backend.calls.get(), 3);
@@ -1517,13 +1597,13 @@ mod tests {
 
     #[test]
     fn max_iterations_one_reproduces_the_single_shot() {
-        let (dir, loop_path, baton, usage) = loop_paths("single");
+        let (dir, loop_path, mcp, baton, usage) = loop_paths("single");
         let backend =
             ScriptedBackend::new(&baton, vec![fm("IN_PROGRESS", "item-a", "keep going")]);
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, Some(1), &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, Some(1), &mut log).unwrap();
         assert_eq!(summary.iterations, 1);
         assert_eq!(summary.stop, StopReason::MaxIterations);
         assert_eq!(backend.calls.get(), 1);
@@ -1532,7 +1612,7 @@ mod tests {
 
     #[test]
     fn run_log_records_iterations_and_the_stop_reason() {
-        let (dir, loop_path, baton, usage) = loop_paths("log");
+        let (dir, loop_path, mcp, baton, usage) = loop_paths("log");
         let backend = ScriptedBackend::new(
             &baton,
             vec![
@@ -1542,7 +1622,7 @@ mod tests {
         );
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
-        run_auto_loop(&backend, &clock, &loop_path, &baton, &usage, None, &mut log).unwrap();
+        run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
         let text = String::from_utf8(log).unwrap();
         assert!(text.contains("iter 1:"), "log: {text}");
         assert!(text.contains("iter 2:"), "log: {text}");
@@ -1735,7 +1815,7 @@ mod tests {
 
     #[test]
     fn governor_pauses_until_reset_then_resumes() {
-        let (dir, loop_path, baton, usage_path) = loop_paths("governor");
+        let (dir, loop_path, mcp, baton, usage_path) = loop_paths("governor");
         let reset = 5_000;
         let backend = GovernorBackend {
             baton_path: baton.clone(),
@@ -1750,7 +1830,7 @@ mod tests {
         let clock = FakeClock::new(1_000);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage_path, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage_path, None, &mut log).unwrap();
 
         assert_eq!(summary.iterations, 2);
         assert_eq!(summary.stop, StopReason::Terminal("QUEUE_EMPTY".to_string()));
@@ -1767,7 +1847,7 @@ mod tests {
         // Mirrors protocol 3b: a step that needs the daemon cycled but relock is
         // disabled → the agent writes BLOCKED_ON_HUMAN; the orchestrator surfaces
         // it and stops, never a cold unlock, never a fabricated decision.
-        let (dir, loop_path, baton, usage_path) = loop_paths("blocked");
+        let (dir, loop_path, mcp, baton, usage_path) = loop_paths("blocked");
         let backend = ScriptedBackend::new(
             &baton,
             vec![fm(
@@ -1779,7 +1859,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &baton, &usage_path, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage_path, None, &mut log).unwrap();
         assert_eq!(summary.iterations, 1);
         assert_eq!(summary.stop, StopReason::BlockedOnHuman);
         assert_eq!(backend.calls.get(), 1, "no iteration after the block");

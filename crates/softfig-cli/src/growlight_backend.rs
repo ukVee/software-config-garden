@@ -29,9 +29,13 @@ use serde_json::Value;
 
 /// What the driver hands a backend for one iteration: the generated loop
 /// settings (whose SessionStart hook injects protocol + baton — confirmed to
-/// fire under `-p`) and the kick prompt that starts the turn.
+/// fire under `-p`), the generated MCP config that *attaches* `softfig-mcp`
+/// (the settings file only *permits* it — without this the garden verbs don't
+/// exist and the agent can't advance the baton, regardless of cwd), and the
+/// kick prompt that starts the turn.
 pub struct IterationRequest {
     pub settings: PathBuf,
+    pub mcp_config: PathBuf,
     pub prompt: String,
 }
 
@@ -259,13 +263,18 @@ impl ClaudeBackend {
 impl AgentBackend for ClaudeBackend {
     fn run_iteration(&self, req: &IterationRequest) -> Result<IterationOutcome> {
         // SessionStart (confirmed to fire under `-p`) injects protocol + baton
-        // via the same generated `--settings`; `stream-json --verbose` is
-        // required to surface the `rate_limit_event` (plain `json` drops it).
+        // via the same generated `--settings`; `--mcp-config` *attaches*
+        // softfig-mcp so the garden verbs actually exist under `-p` (the
+        // settings allow-list alone can't conjure an unregistered server);
+        // `stream-json --verbose` is required to surface the `rate_limit_event`
+        // (plain `json` drops it).
         let output = Command::new(&self.bin)
             .arg("-p")
             .arg(&req.prompt)
             .arg("--settings")
             .arg(&req.settings)
+            .arg("--mcp-config")
+            .arg(&req.mcp_config)
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
