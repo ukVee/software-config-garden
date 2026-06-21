@@ -103,6 +103,11 @@ pub struct Daemon {
     /// `Daemon::new` so any subsystem can `push` without taking the
     /// daemon's main mutex.
     pub accumulator: Arc<DirtySetAccumulator>,
+    /// The garden mount point, held outside `inner` so the shutdown path can
+    /// forcibly release a wedged FUSE mount **without** taking the daemon
+    /// mutex — the lock a thread blocked on garden I/O may be holding. See
+    /// [`Daemon::request_shutdown`].
+    pub garden_root: PathBuf,
 }
 
 impl Daemon {
@@ -114,12 +119,13 @@ impl Daemon {
         let accumulator = DirtySetAccumulator::new(
             inner.clone(),
             suppress.clone(),
-            garden_root,
+            garden_root.clone(),
         );
         Self {
             inner,
             suppress,
             accumulator,
+            garden_root,
         }
     }
 
@@ -139,26 +145,37 @@ impl Daemon {
     /// the daemon `Stopping`, takes the blocking-to-drop handles out of
     /// `inner`, then **releases the lock before dropping them**.
     ///
-    /// Lock ordering is load-bearing: dropping the FUSE mount unmounts and
-    /// blocks until the kernel drains all in-flight requests — on a *busy*
-    /// mount (active reads/writes, a process with its cwd inside the
-    /// garden) that can block indefinitely — and dropping `net` joins its
-    /// threads. The accept loop polls [`Daemon::state`], which locks
-    /// `inner`. If we held `inner` across those blocking drops, the accept
-    /// loop would starve, never observe `Stopping`, and `handle.join()` in
-    /// `main` would never return — so a SIGTERM caught mid-use wedged the
-    /// process (holding `/dev/fuse` open but unserviced → D-state for
-    /// anything touching the garden) until systemd's 90 s SIGKILL. Taking
-    /// the handles out under the lock and dropping them after it is
-    /// released lets the accept loop exit and the process terminate
-    /// promptly even while the unmount is still draining; when the mount is
-    /// idle the unmount still completes cleanly. The session is an `Arc`
+    /// Busy-mount safety has two layers. **First, lock-free:** we abort the
+    /// FUSE connection ([`softfig_fuse::force_release_mount`]) *before*
+    /// touching `inner`. On a busy mount a thread can be parked in
+    /// uninterruptible D-state on a garden read while holding `inner` (the
+    /// FUSE worker, or a handler / net task mid-read); aborting the connection
+    /// makes that read fail with `ENOTCONN` so the lock is released and the
+    /// accept loop (which also polls [`Daemon::state`] under `inner`) keeps
+    /// running. Without it we'd deadlock trying to lock `inner` here and
+    /// `handle.join()` in `main` would never return — systemd's 90 s SIGKILL,
+    /// the 2026-06-21 wedge. **Second, lock ordering:** even with the mount
+    /// gone, dropping `net` joins its threads, so we take the handles out
+    /// under the lock and drop them *after releasing it* — never hold `inner`
+    /// across a blocking drop, or the accept loop starves and `main` hangs.
+    /// The session is an `Arc`
     /// the FUSE driver also holds, so clearing `inner.session` here only
     /// drops the daemon's reference — the keys aren't zeroized until the
     /// mount (and its worker) are gone too, preserving "mount down before
     /// keys vanish". Idempotent — safe to call more than once (e.g. a
     /// signal followed by `DaemonHandle::drop`).
     pub fn request_shutdown(&self) {
+        // LOCK-FREE FIRST: forcibly release the FUSE mount/connection before
+        // touching `inner`. On a *busy* mount a thread can be parked in D-state
+        // on a garden read — the FUSE worker, or a connection handler / net
+        // task mid-read — while holding `inner`. If we tried to lock `inner`
+        // first we'd deadlock behind it (and the accept loop, also polling
+        // `state()`, would starve), so `main`'s `handle.join()` never returns
+        // and systemd SIGKILLs us after 90 s (the 2026-06-21 wedge). Aborting
+        // the kernel connection makes those reads fail with ENOTCONN at once,
+        // releasing the lock holder so the teardown below — and the whole
+        // process — can finish promptly. No-op when not FUSE-mounted.
+        softfig_fuse::force_release_mount(&self.garden_root);
         let (fuse, net) = {
             let mut inner = self.inner.lock().unwrap();
             inner.state = State::Stopping;

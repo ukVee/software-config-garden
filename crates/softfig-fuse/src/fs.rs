@@ -882,6 +882,57 @@ pub fn clear_stale_mount(mount_point: &Path) {
         .status();
 }
 
+/// Forcibly release the FUSE mount at `mount_point` so a *busy* mount can
+/// never wedge teardown. Two steps, both best-effort and non-fatal:
+///
+/// 1. **Abort the kernel FUSE connection** (`/sys/fs/fuse/connections/NN/abort`).
+///    This makes every in-flight *and* future request fail with `ENOTCONN`
+///    immediately — the background worker's blocking `read(/dev/fuse)`, and
+///    crucially any *other* process (including the daemon's own threads)
+///    parked in uninterruptible **D-state** on a garden read. Without it a
+///    busy mount keeps the connection alive and unserviced after the daemon
+///    stops responding, freezing every task that touches the garden until
+///    systemd's 90 s SIGKILL — the 2026-06-21 incident. This is the
+///    programmatic form of the emergency lever `echo 1 > …/abort`.
+/// 2. **Lazily detach the mountpoint** (`fusermount3 -u -q -z`, MNT_DETACH)
+///    so it leaves the namespace even while busy.
+///
+/// No-op when nothing is mounted at `mount_point` (the connection id is read
+/// from `/proc/self/mountinfo`, which lists nothing there). Safe on an idle
+/// mount: the abort drops zero in-flight requests and the detach unmounts it.
+pub fn force_release_mount(mount_point: &Path) {
+    // Read the connection id BEFORE detaching — mountinfo drops the entry the
+    // moment the mount leaves the namespace.
+    if let Some(minor) = fuse_conn_minor(mount_point) {
+        let _ = std::fs::write(format!("/sys/fs/fuse/connections/{minor}/abort"), b"1");
+    }
+    clear_stale_mount(mount_point);
+}
+
+/// The kernel FUSE connection minor for the `fuse*` filesystem mounted exactly
+/// at `target`, if any. Parsed from `/proc/self/mountinfo` field index 2
+/// (`major:minor` — `0:NN` for FUSE), the same `NN` exposed under
+/// `/sys/fs/fuse/connections/NN/`.
+fn fuse_conn_minor(target: &Path) -> Option<u32> {
+    let content = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let target = target.to_string_lossy();
+    for line in content.lines() {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut fields = pre.split_whitespace();
+        let dev = fields.nth(2); // index 2: major:minor
+        let mount_point = fields.nth(1); // index 4 (one more skipped past index 3)
+        let fstype = post.split_whitespace().next().unwrap_or("");
+        if mount_point == Some(target.as_ref()) && fstype.starts_with("fuse") {
+            return dev
+                .and_then(|d| d.split(':').nth(1))
+                .and_then(|m| m.parse().ok());
+        }
+    }
+    None
+}
+
 /// True if `/proc/self/mountinfo` shows a `fuse*` filesystem mounted
 /// exactly at `target`. Garden roots are plain ASCII paths with no spaces
 /// (a garden house rule), so the kernel's octal-escaped mountinfo field

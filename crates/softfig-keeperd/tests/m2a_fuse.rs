@@ -395,3 +395,123 @@ fn fuse_sink_pushes_into_accumulator() {
     handle.shutdown();
     handle.join().unwrap();
 }
+
+// ---------- Test 6: busy-mount SIGTERM must not wedge. ----------
+
+/// Regression for the 2026-06-21 incident: a SIGTERM delivered while the
+/// FUSE mount is *busy* (a process with its cwd inside the garden, the
+/// growlight loop, in-flight reads) must still tear down in seconds — never
+/// the ~90 s wedge that ends in systemd's SIGKILL. The earlier
+/// graceful-shutdown fixes were only ever verified against an *idle* mount,
+/// so the busy-mount deadlock shipped twice. This test spawns the real
+/// daemon binary, unlocks it to mount a real garden, pins the mount busy
+/// with a child whose cwd is inside it, sends SIGTERM, and asserts the
+/// process exits well under 90 s. The full faithful repro lives here (real
+/// FUSE + watcher) rather than an in-process unit test because the wedge is
+/// a *process*-exit hang, not a `MountHandle::drop` return.
+#[test]
+fn busy_mount_sigterm_shuts_down_promptly() {
+    use std::process::Command;
+
+    if !fuse_available() {
+        eprintln!("fuse unavailable; skipping busy-mount sigterm test");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (garden, _state) = bootstrap_migrated_garden(tmp.path());
+    let socket = unique_socket(tmp.path());
+
+    // Real binary, FUSE mode discovered from keeper.toml, watcher live —
+    // matches the on-device daemon as closely as a test can.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_softfig-keeperd"))
+        .arg("--garden")
+        .arg(&garden)
+        .arg("--socket")
+        .arg(&socket)
+        .spawn()
+        .expect("spawn keeperd");
+    wait_for_socket(&socket);
+
+    let unlock = rpc(
+        &socket,
+        op::UNLOCK,
+        serde_json::to_value(UnlockArgs {
+            passphrase: PASS.into(),
+        })
+        .unwrap(),
+    );
+    if let Response::Err { kind, error, .. } = &unlock {
+        eprintln!("unlock failed (likely sandbox fuse restriction: {kind:?} {error}); skipping");
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+
+    // Let the mount settle, prove it's live, then pin it BUSY with a child
+    // process whose cwd is inside the garden — the exact condition (a shell
+    // / the loop sitting in the mount) that wedged the device.
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = fs::read_to_string(garden.join("a.md"));
+    // Generate continuous read+write traffic *through* the mount (cwd inside,
+    // in-flight FUSE ops, dirty events feeding commit_workdir) — the real
+    // device condition (the growlight loop actively working the garden), far
+    // busier than a passive cwd pin.
+    let mut busy = match Command::new("sh")
+        .arg("-c")
+        .arg("cd \"$0\" && while true; do echo x >> a.md; cat a.md >/dev/null; ls >/dev/null; done")
+        .arg(&garden)
+        .current_dir(&garden)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("could not spawn busy holder ({e}); skipping");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // SIGTERM the daemon while the mount is busy — what systemctl/logout do.
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status();
+
+    // Must exit far under systemd's 90 s DefaultTimeoutStopSec. 15 s is a
+    // generous ceiling that still cleanly distinguishes "prompt" from "wedged".
+    let mut exited = None;
+    for _ in 0..150 {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Tear everything down regardless of outcome so a wedge can't linger.
+    // SIGKILL the daemon FIRST if it hung: that closes /dev/fuse, the kernel
+    // aborts the connection, and the busy holder (possibly blocked in D-state
+    // on the mount) unblocks so we can reap it without hanging the test.
+    let wedged = exited.is_none();
+    if wedged {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = busy.kill();
+    let _ = busy.wait();
+    softfig_fuse::clear_stale_mount(&garden);
+
+    let status = exited
+        .unwrap_or_else(|| panic!("daemon WEDGED: no exit within 15 s of a busy-mount SIGTERM"));
+    assert!(
+        status.success(),
+        "daemon exited non-zero on busy-mount SIGTERM: {status:?}"
+    );
+    assert!(
+        !socket.exists(),
+        "socket left behind after busy-mount SIGTERM"
+    );
+}

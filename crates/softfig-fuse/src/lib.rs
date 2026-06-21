@@ -30,7 +30,7 @@ mod inodes;
 mod overlay;
 mod tree_view;
 
-pub use fs::{clear_stale_mount, FuseMount};
+pub use fs::{clear_stale_mount, force_release_mount, FuseMount};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -132,10 +132,20 @@ impl MountHandle {
         self.state.rotate_tip();
     }
 
-    /// Drop the FUSE session, blocking until the kernel acknowledges
-    /// the unmount. Idempotent — a second call is a no-op.
+    /// Tear down the FUSE session. Idempotent — a second call is a no-op.
+    ///
+    /// Before dropping the `BackgroundSession`, forcibly release the kernel
+    /// mount/connection ([`force_release_mount`]): abort the connection so the
+    /// background worker's `read` returns and nothing stays parked in D-state
+    /// on a *busy* mount, then lazily detach the mountpoint. Without this, a
+    /// SIGTERM/stop delivered while the garden is busy (a cwd inside it, the
+    /// growlight loop, in-flight reads) wedged the daemon until systemd's 90 s
+    /// SIGKILL — the 2026-06-21 incident.
     pub fn unmount(&self) {
-        let bg = { self.background.lock().unwrap().take() };
+        let Some(bg) = ({ self.background.lock().unwrap().take() }) else {
+            return;
+        };
+        fs::force_release_mount(&self.mount_point);
         drop(bg);
     }
 }
