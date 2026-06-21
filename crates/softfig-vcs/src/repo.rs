@@ -13,7 +13,7 @@ use crate::commit::CanonicalCommit;
 use crate::error::{CoreError, Result};
 use crate::intent::Intent;
 use crate::tree::{self, BlobEncryptor, Blueprint, LayerAEncryptor};
-use crate::walk;
+use crate::walk::{self, WalkSnapshot};
 
 pub const TIP_REF: &str = "tip";
 
@@ -243,15 +243,38 @@ impl Repo {
         self.blob_encryptor = Some(enc);
     }
 
-    /// Walk the working tree, build a blueprint, and write a new commit
-    /// whose parent is the current tip. Returns the new commit hash.
+    /// Walk the working tree at `garden_root`, build a blueprint, and write
+    /// a new commit whose parent is the current tip. Returns the new commit
+    /// hash.
+    ///
+    /// This reads the working tree from disk via [`walk::walk`]. A FUSE
+    /// daemon must NOT use this for a mounted garden: `garden_root` is the
+    /// mount it serves, so walking it self-reads the mount while the daemon
+    /// holds its lock — the 2026-06-21 commit-path deadlock. The daemon
+    /// builds its in-memory (tip ∪ overlay) tree and calls
+    /// [`Repo::commit_snapshot`] instead. Direct-mode CLI and M1c-compat
+    /// (non-FUSE) callers keep using this.
     pub fn commit_workdir(
         &mut self,
         session: &VaultSession,
         intent: Intent,
     ) -> Result<Hash> {
-        let parent = self.tip()?;
         let snapshot = walk::walk(&self.garden_root)?;
+        self.commit_snapshot(session, snapshot, intent)
+    }
+
+    /// Commit a pre-built working-tree `snapshot` against the current tip,
+    /// returning the new commit hash. Identical to [`Repo::commit_workdir`]
+    /// except the caller supplies the tree rather than walking
+    /// `garden_root` — letting the FUSE daemon commit from its in-memory
+    /// state without self-reading the mount it serves.
+    pub fn commit_snapshot(
+        &mut self,
+        session: &VaultSession,
+        snapshot: WalkSnapshot,
+        intent: Intent,
+    ) -> Result<Hash> {
+        let parent = self.tip()?;
         let default_enc = LayerAEncryptor;
         let encryptor: &dyn BlobEncryptor = match self.blob_encryptor.as_ref() {
             Some(enc) => enc.as_ref(),

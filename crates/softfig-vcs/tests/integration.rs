@@ -4,11 +4,13 @@
 //! All tests run with the Vault's minimum-cost Argon2 parameters so the
 //! suite stays under a second.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use softfig_vcs::{
-    fsck, log_collect, verify_commit, CanonicalCommit, FsckReport, Intent, Repo,
+    fsck, log_collect, verify_commit, walk, CanonicalCommit, FsckReport, Intent, Repo, TreeNode,
+    WalkSnapshot,
 };
 use softfig_store::{Db, Hash, ObjectStore, StorePaths, TreeEntryKind};
 use softfig_vault::{params::VaultParams, Vault, VaultSession};
@@ -329,4 +331,64 @@ fn objects_store_get_after_put_round_trip() {
     // Filing tree entry kind round-trips.
     assert_eq!(TreeEntryKind::Blob.as_str(), "blob");
     assert_eq!(TreeEntryKind::parse("tree"), Some(TreeEntryKind::Tree));
+}
+
+#[test]
+fn commit_snapshot_commits_the_given_tree_not_the_filesystem() {
+    // The FUSE daemon commits from its in-memory (tip ∪ overlay) tree, never
+    // by walking the mount it serves. Prove `commit_snapshot` honors the
+    // supplied snapshot and ignores the on-disk working tree: build a snapshot
+    // holding a file that does NOT exist on disk and assert it lands in the
+    // commit, while a plain `walk` of the dir would miss it.
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(tmp.path(), &[("a.md", "on-disk")]);
+    let session = init_vault_at(tmp.path());
+    let (mut repo, genesis) = Repo::init(tmp.path(), &session).unwrap();
+
+    // Hand-built in-memory tree — `b.md` is never written to disk.
+    let mut root = BTreeMap::new();
+    root.insert(
+        "a.md".to_string(),
+        TreeNode::File { mode: 0o644, content: b"in-memory".to_vec() },
+    );
+    root.insert(
+        "b.md".to_string(),
+        TreeNode::File { mode: 0o644, content: b"overlay-only".to_vec() },
+    );
+    let snapshot = WalkSnapshot { root: TreeNode::Dir(root) };
+
+    let intent = Intent::new(
+        "memory_edit",
+        serde_json::json!({ "summary": "from in-memory tree", "files": ["a.md", "b.md"] }),
+    )
+    .unwrap();
+    let hash = repo.commit_snapshot(&session, snapshot, intent).unwrap();
+    assert_ne!(hash, genesis);
+    assert_eq!(repo.tip().unwrap(), Some(hash));
+
+    // The committed tree carries the snapshot's files, including the one that
+    // exists only in memory.
+    let row = repo.db().get_commit(&hash).unwrap();
+    let names: Vec<String> = repo
+        .db()
+        .get_tree(&row.root_tree)
+        .unwrap()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert!(names.contains(&"a.md".to_string()), "names = {names:?}");
+    assert!(
+        names.contains(&"b.md".to_string()),
+        "b.md came from the snapshot, not disk: {names:?}"
+    );
+
+    // A filesystem walk would NOT see `b.md` — confirming the commit used the
+    // provided snapshot rather than the working tree.
+    let walked = walk(tmp.path()).unwrap();
+    match &walked.root {
+        TreeNode::Dir(children) => {
+            assert!(!children.contains_key("b.md"), "b.md must not exist on disk")
+        }
+        TreeNode::File { .. } => panic!("walk root is always a Dir"),
+    }
 }
