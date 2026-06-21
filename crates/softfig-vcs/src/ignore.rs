@@ -85,10 +85,22 @@ impl Ignore {
     /// behavior.
     pub fn load(garden_root: &Path) -> Self {
         match std::fs::read_to_string(garden_root.join(IGNORE_FILE)) {
-            Ok(contents) => Self {
-                user_top_level: parse(&contents),
-            },
+            Ok(contents) => Self::from_contents(&contents),
             Err(_) => Self::default(),
+        }
+    }
+
+    /// Build the exclusion set from already-in-hand `.softfigignore`
+    /// contents, the built-ins plus the parsed user names. The in-memory
+    /// twin of [`Ignore::load`] for callers that already hold the bytes —
+    /// e.g. the FUSE driver reconstructing a commit snapshot, which must
+    /// read the ignore file from its own tip/overlay state rather than
+    /// `std::fs`-reading back through the mount it serves (the 2026-06-21
+    /// commit-path deadlock). Empty/comment-only contents yield the
+    /// built-ins only, exactly like an absent file.
+    pub fn from_contents(contents: &str) -> Self {
+        Self {
+            user_top_level: parse(contents),
         }
     }
 

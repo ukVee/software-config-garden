@@ -17,7 +17,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use softfig_vcs::Repo;
+use softfig_vcs::{Ignore, Repo, WalkSnapshot, IGNORE_FILE};
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
 use softfig_vault::VaultSession;
 
@@ -107,6 +107,147 @@ impl SharedState {
             inner.inodes.intern(&p);
         }
         inner.overlay.clear();
+    }
+
+    /// Reconstruct the current working tree — the committed tip-view
+    /// unioned with the pending write overlay — as a
+    /// [`WalkSnapshot`], entirely from in-memory state. Nothing is read
+    /// back through the kernel/mount.
+    ///
+    /// This is the FUSE-mode input to
+    /// [`softfig_vcs::Repo::commit_snapshot`]. Committing a mounted garden
+    /// by walking it ([`softfig_vcs::Repo::commit_workdir`]) self-reads the
+    /// mount while the daemon holds `inner` — the 2026-06-21 commit-path
+    /// deadlock that slices 1-3 retire. Slice 3 wires keeperd's commits
+    /// through here.
+    ///
+    /// Parity contract: in M2a (no [`SealedQuery`] adapter) the result
+    /// matches `softfig_vcs::walk(mount_point)` exactly. It replicates
+    /// walk's rule layer — the shared [`Ignore`] top-level predicate
+    /// loaded from in-memory `.softfigignore`, the `.keep` empty-dir prune
+    /// (here for free: only files are collected, so a directory with no
+    /// file descendant never materializes), the `0o7777` mode mask, and
+    /// BTreeMap ordering (all via [`WalkSnapshot::insert_file`]).
+    ///
+    /// It deliberately does NOT apply the read path's sealed-placeholder
+    /// or `<vault>`-region redaction: a commit must persist the real
+    /// Layer A plaintext (Layer B routing is the committer's job via the
+    /// `BlobEncryptor`), never the `[sealed:…]`/`[encrypted]` projection a
+    /// reader sees. In M2a the two coincide, which is why walk-parity
+    /// holds; under a sealed adapter, walking the mount would commit
+    /// placeholders, so the daemon commits from this snapshot instead.
+    pub(crate) fn workdir_snapshot(&self) -> Result<WalkSnapshot> {
+        // The in-memory `.softfigignore` (overlay precedence, else the tip
+        // blob) drives the same top-level exclusion `walk` applies —
+        // loaded from our own state, never via a mount read that would
+        // re-enter `inner`.
+        let ignore = self.inmem_ignore()?;
+
+        // Phase 1 (under `inner`): collect every live file as
+        // (repo-relative path, mode, content source) by recursively
+        // descending the (tip-view ∪ overlay) tree from the root,
+        // applying `ignore` during descent exactly like walk's
+        // `filter_entry`. Overlay bytes are cloned here; tip blobs carry
+        // only their hash so the bulk decrypt runs lock-free below.
+        let mut files: Vec<(PathBuf, u32, ContentSource)> = Vec::new();
+        {
+            let inner = self.inner.lock().unwrap();
+            collect_files(&inner, &ignore, Path::new(""), &mut files);
+        }
+
+        // Phase 2: resolve content and assemble. Tip blobs decrypt to raw
+        // Layer A plaintext; mode masking + parent-dir creation are walk's
+        // shared rule layer (`WalkSnapshot::insert_file`).
+        let mut snapshot = WalkSnapshot::empty();
+        for (path, mode, source) in files {
+            let content = match source {
+                ContentSource::Overlay(bytes) => bytes,
+                ContentSource::Blob(target) => {
+                    let cipher = self.objects.get(&target)?;
+                    self.session.decrypt_blob(&cipher)?
+                }
+            };
+            snapshot.insert_file(&path, mode, content)?;
+        }
+        // Files-only collection already drops empty dirs, but prune for
+        // symmetry with `walk` and robustness if that ever changes.
+        snapshot.prune_empty_dirs();
+        Ok(snapshot)
+    }
+
+    /// The exclusion set in force for this garden, read from the in-memory
+    /// `.softfigignore` (overlay precedence, else the committed tip blob)
+    /// so reconstruction never `std::fs`-reads it back through the mount.
+    /// Absent/removed/dir-shaped ⇒ the built-in defaults only.
+    fn inmem_ignore(&self) -> Result<Ignore> {
+        let blob = {
+            let inner = self.inner.lock().unwrap();
+            let path = Path::new(IGNORE_FILE);
+            match inner.overlay.get(path) {
+                Some(OverlayEntry::File { content, .. }) => {
+                    return Ok(Ignore::from_contents(&String::from_utf8_lossy(content)));
+                }
+                // A removal marker or a (nonsensical) dir override both
+                // shadow the tip copy — fall back to the built-ins.
+                Some(_) => return Ok(Ignore::builtin()),
+                None => match inner.view.get(path) {
+                    Some(e) if e.kind == EntryKind::Blob => e.target,
+                    _ => return Ok(Ignore::builtin()),
+                },
+            }
+        };
+        let cipher = self.objects.get(&blob)?;
+        let plain = self.session.decrypt_blob(&cipher)?;
+        Ok(Ignore::from_contents(&String::from_utf8_lossy(&plain)))
+    }
+}
+
+/// Where a reconstructed file's bytes come from. Overlay content is
+/// cloned under the `inner` lock; a tip blob carries only its object
+/// hash so decryption happens after the lock is released.
+enum ContentSource {
+    Overlay(Vec<u8>),
+    Blob(Hash),
+}
+
+/// Recursively collect the live files under `dir` from the in-memory
+/// (tip-view ∪ overlay) state, mirroring [`FuseFs::list_children`]'s
+/// precedence: overlay entries win over the tip, and an overlay
+/// `Removed` marker hides the tip copy. `ignore` is applied to each
+/// child before descending/recording — the in-memory analogue of walk's
+/// `filter_entry`, so an ignored top-level dir is never entered. Only
+/// files are recorded; directories exist implicitly via their files'
+/// ancestry, which reproduces walk's `.keep` empty-dir pruning.
+fn collect_files(
+    inner: &Inner,
+    ignore: &Ignore,
+    dir: &Path,
+    out: &mut Vec<(PathBuf, u32, ContentSource)>,
+) {
+    // Overlay children first — they take precedence over the tip.
+    for (path, entry) in inner.overlay.iter() {
+        if path.parent() != Some(dir) || ignore.is_ignored(path) {
+            continue;
+        }
+        match entry {
+            OverlayEntry::Removed => {}
+            OverlayEntry::File { content, mode } => {
+                out.push((path.to_path_buf(), *mode, ContentSource::Overlay(content.clone())));
+            }
+            OverlayEntry::Dir { .. } => collect_files(inner, ignore, path, out),
+        }
+    }
+    // Tip-view children not shadowed by any overlay entry for the same path.
+    for (path, entry) in inner.view.children(dir) {
+        if inner.overlay.get(path).is_some() || ignore.is_ignored(path) {
+            continue;
+        }
+        match entry.kind {
+            EntryKind::Blob => {
+                out.push((path.to_path_buf(), entry.mode, ContentSource::Blob(entry.target)));
+            }
+            EntryKind::Dir => collect_files(inner, ignore, path, out),
+        }
     }
 }
 

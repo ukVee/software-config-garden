@@ -132,6 +132,21 @@ impl MountHandle {
         self.state.rotate_tip();
     }
 
+    /// Reconstruct the current working tree (committed tip-view ∪ pending
+    /// write overlay) as a [`softfig_vcs::WalkSnapshot`], purely from the
+    /// FUSE driver's in-memory state — never reading back through the
+    /// mount it serves.
+    ///
+    /// The daemon (slice 3) feeds the result straight to
+    /// [`softfig_vcs::Repo::commit_snapshot`] so a FUSE-mode commit can't
+    /// self-read the mount under the daemon's lock (the 2026-06-21
+    /// commit-path deadlock). In M2a this matches
+    /// `softfig_vcs::walk(mount_point)` exactly; see
+    /// `SharedState::workdir_snapshot` for the full rule-parity contract.
+    pub fn workdir_snapshot(&self) -> Result<softfig_vcs::WalkSnapshot> {
+        self.state.workdir_snapshot()
+    }
+
     /// Tear down the FUSE session. Idempotent — a second call is a no-op.
     ///
     /// Before dropping the `BackgroundSession`, forcibly release the kernel

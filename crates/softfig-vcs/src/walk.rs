@@ -29,7 +29,7 @@ use walkdir::WalkDir;
 
 use crate::error::{CoreError, Result};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TreeNode {
     Dir(BTreeMap<String, TreeNode>),
     File { mode: u32, content: Vec<u8> },
@@ -41,9 +41,54 @@ impl TreeNode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct WalkSnapshot {
     pub root: TreeNode,
+}
+
+impl WalkSnapshot {
+    /// An empty snapshot — the root is always a `Dir`, even with no
+    /// entries. The shared starting point for both [`walk`] and the FUSE
+    /// driver's in-memory reconstruction (`MountHandle::workdir_snapshot`).
+    pub fn empty() -> Self {
+        WalkSnapshot {
+            root: TreeNode::Dir(BTreeMap::new()),
+        }
+    }
+
+    /// Insert a file at a repo-relative path, creating parent dirs as
+    /// `Dir` nodes along the way. `mode` is masked to the permission bits
+    /// the VCS tracks ([`MODE_MASK`]) — the single place that rule lives,
+    /// so every snapshot source agrees. A non-UTF-8 path component is an
+    /// error.
+    pub fn insert_file(&mut self, rel: &Path, mode: u32, content: Vec<u8>) -> Result<()> {
+        let components = path_components(rel)?;
+        insert_file(self.root_children_mut(), &components, mode, content);
+        Ok(())
+    }
+
+    /// Ensure the directory at a repo-relative path exists as a `Dir`
+    /// node (no-op if already present). Empty dirs created this way are
+    /// dropped by [`Self::prune_empty_dirs`] unless they gain a `.keep`.
+    pub fn ensure_dir(&mut self, rel: &Path) -> Result<()> {
+        let components = path_components(rel)?;
+        ensure_dir(self.root_children_mut(), &components);
+        Ok(())
+    }
+
+    /// Bottom-up prune of empty, `.keep`-sentinel-free directories — the
+    /// same convention git uses with `.gitkeep`. Shared by every snapshot
+    /// builder so the pruning rule has one implementation.
+    pub fn prune_empty_dirs(&mut self) {
+        prune_empty_dirs(self.root_children_mut());
+    }
+
+    fn root_children_mut(&mut self) -> &mut BTreeMap<String, TreeNode> {
+        match &mut self.root {
+            TreeNode::Dir(children) => children,
+            TreeNode::File { .. } => unreachable!("WalkSnapshot root is always a Dir"),
+        }
+    }
 }
 
 const KEEP_FILE: &str = ".keep";
@@ -53,7 +98,7 @@ const MODE_MASK: u32 = 0o7777;
 /// `WalkSnapshot`. The root node is always a `Dir`, even for an empty
 /// garden.
 pub fn walk(root: &Path) -> Result<WalkSnapshot> {
-    let mut root_node = BTreeMap::<String, TreeNode>::new();
+    let mut snapshot = WalkSnapshot::empty();
 
     // Load the exclusion set (built-ins + the garden's `.softfigignore`) once
     // per walk, so every commit reflects the current ignore file with no
@@ -79,8 +124,7 @@ pub fn walk(root: &Path) -> Result<WalkSnapshot> {
         let path = entry.path();
         let relative = path
             .strip_prefix(root)
-            .expect("walkdir starts under root")
-            .to_path_buf();
+            .expect("walkdir starts under root");
 
         let file_type = entry.file_type();
         if file_type.is_symlink() {
@@ -88,24 +132,19 @@ pub fn walk(root: &Path) -> Result<WalkSnapshot> {
             continue;
         }
 
-        let components: Vec<String> = path_components(&relative)?;
-
         if file_type.is_dir() {
-            ensure_dir(&mut root_node, &components);
+            snapshot.ensure_dir(relative)?;
         } else if file_type.is_file() {
             let meta = fs::metadata(path)?;
-            let mode = meta.permissions().mode() & MODE_MASK;
             let content = fs::read(path)?;
-            insert_file(&mut root_node, &components, mode, content);
+            // `insert_file` masks the mode — the rule lives in one place.
+            snapshot.insert_file(relative, meta.permissions().mode(), content)?;
         }
         // Other file types (sockets, fifos, devices) are silently skipped.
     }
 
-    prune_empty_dirs(&mut root_node);
-
-    Ok(WalkSnapshot {
-        root: TreeNode::Dir(root_node),
-    })
+    snapshot.prune_empty_dirs();
+    Ok(snapshot)
 }
 
 fn path_components(relative: &Path) -> Result<Vec<String>> {
@@ -156,7 +195,13 @@ fn insert_file(
             TreeNode::File { .. } => return,
         }
     }
-    here.insert(last.clone(), TreeNode::File { mode, content });
+    here.insert(
+        last.clone(),
+        TreeNode::File {
+            mode: mode & MODE_MASK,
+            content,
+        },
+    );
 }
 
 /// Remove empty directories that don't have a `.keep` marker. Recursively
