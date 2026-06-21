@@ -136,30 +136,50 @@ impl Daemon {
     /// The graceful teardown shared by every shutdown trigger — the IPC
     /// `shutdown` op (`softfig daemon stop`), a SIGTERM/SIGINT caught in
     /// `main`, and [`DaemonHandle`]'s explicit shutdown + `Drop`. Marks
-    /// the daemon `Stopping` (so the accept loop exits on its next poll),
-    /// then drops the FUSE mount BEFORE the session: dropping the mount
-    /// handle unmounts and blocks until the kernel acks all in-flight
-    /// requests, and those FS handlers still need the session to serve
-    /// reads. Then stops the net host (joins its threads, unregisters
-    /// mDNS), drops parked pairings + their live sockets, and zeroizes
-    /// the session/repo. Idempotent — safe to call more than once (e.g.
-    /// a signal followed by `DaemonHandle::drop`).
+    /// the daemon `Stopping`, takes the blocking-to-drop handles out of
+    /// `inner`, then **releases the lock before dropping them**.
+    ///
+    /// Lock ordering is load-bearing: dropping the FUSE mount unmounts and
+    /// blocks until the kernel drains all in-flight requests — on a *busy*
+    /// mount (active reads/writes, a process with its cwd inside the
+    /// garden) that can block indefinitely — and dropping `net` joins its
+    /// threads. The accept loop polls [`Daemon::state`], which locks
+    /// `inner`. If we held `inner` across those blocking drops, the accept
+    /// loop would starve, never observe `Stopping`, and `handle.join()` in
+    /// `main` would never return — so a SIGTERM caught mid-use wedged the
+    /// process (holding `/dev/fuse` open but unserviced → D-state for
+    /// anything touching the garden) until systemd's 90 s SIGKILL. Taking
+    /// the handles out under the lock and dropping them after it is
+    /// released lets the accept loop exit and the process terminate
+    /// promptly even while the unmount is still draining; when the mount is
+    /// idle the unmount still completes cleanly. The session is an `Arc`
+    /// the FUSE driver also holds, so clearing `inner.session` here only
+    /// drops the daemon's reference — the keys aren't zeroized until the
+    /// mount (and its worker) are gone too, preserving "mount down before
+    /// keys vanish". Idempotent — safe to call more than once (e.g. a
+    /// signal followed by `DaemonHandle::drop`).
     pub fn request_shutdown(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.state = State::Stopping;
-        // Growlight: prune an *expired* relock blob, but never a live one — a
-        // graceful `daemon stop` is exactly the bounce a pending `cycle` relies
-        // on, so the unexpired blob must survive for the new daemon to redeem.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        crate::relock::prune_expired(inner.config.state_dir(), now);
-        let _ = inner.fuse.take();
-        let _ = inner.net.take();
-        inner.pending_pairs.clear();
-        inner.session = None;
-        inner.repo = None;
+        let (fuse, net) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state = State::Stopping;
+            // Growlight: prune an *expired* relock blob, but never a live one — a
+            // graceful `daemon stop` is exactly the bounce a pending `cycle` relies
+            // on, so the unexpired blob must survive for the new daemon to redeem.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            crate::relock::prune_expired(inner.config.state_dir(), now);
+            let fuse = inner.fuse.take();
+            let net = inner.net.take();
+            inner.pending_pairs.clear();
+            inner.session = None;
+            inner.repo = None;
+            (fuse, net)
+        };
+        // Lock released — now run the potentially-blocking drops outside it.
+        drop(fuse);
+        drop(net);
     }
 
     /// Mark a path as "written by the daemon itself" — watcher events
