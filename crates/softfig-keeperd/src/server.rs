@@ -141,7 +141,11 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         return Ok(());
     }
 
-    let resp = match serde_json::from_str::<Request>(line.trim_end_matches('\n')) {
+    // Parse first so a `shutdown` can be told apart: its teardown must run only
+    // AFTER the ack is flushed, never before (see below).
+    let parsed = serde_json::from_str::<Request>(line.trim_end_matches('\n'));
+    let is_shutdown = matches!(&parsed, Ok(req) if req.op == softfig_ipc::op::SHUTDOWN);
+    let resp = match parsed {
         Ok(req) => dispatch(&daemon, req),
         Err(e) => Response::err(ErrorKind::BadArgs, format!("decode: {e}")),
     };
@@ -150,6 +154,18 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
     bytes.push(b'\n');
     stream.write_all(&bytes)?;
     stream.flush()?;
+
+    // Ack-before-teardown. The `shutdown` handler deliberately does NOT tear
+    // down; we do it here, only after the reply is on the wire. `write_all` has
+    // already handed the ack to the kernel socket buffer (the peer can still
+    // read it after we exit), so the client is guaranteed its ack before
+    // `request_shutdown` flips the daemon to `Stopping` — which ends the accept
+    // loop and lets `main` race to process exit. The old order (ack written
+    // after teardown) lost that race and surfaced to the client as "daemon
+    // closed connection without replying" (incident 20260622).
+    if is_shutdown {
+        daemon.request_shutdown();
+    }
     Ok(())
 }
 

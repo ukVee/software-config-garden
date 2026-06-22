@@ -143,14 +143,16 @@ pub mod op {
     pub const GROWLIGHT_INIT: &str = "growlight_init";
     /// Growlight relock: mint a one-time token wrapping the live KEK so an
     /// unattended daemon restart can resume this session. Requires Unlocked +
-    /// `[growlight] allow_relock = true`. `persist=false` (cycle) returns the
-    /// token in the reply; `persist=true` (relock-arm) writes it to a tmpfs
-    /// file and returns the path. Commit-free; CLI-over-IPC, never MCP.
+    /// `[growlight] allow_relock = true`. `persist=true` (cycle and relock-arm)
+    /// writes the token to a `0600` tmpfs file and returns the path; the redeem
+    /// reads it server-side. `persist=false` returns the token hex in the reply
+    /// for an in-RAM redeem. Commit-free; CLI-over-IPC, never MCP.
     pub const RELOCK_MINT: &str = "relock_mint";
     /// Growlight relock: redeem a minted token + its tmpfs blob to rebuild the
-    /// session on a freshly-restarted (Locked) daemon. `cycle` passes the token
-    /// hex (held in CLI RAM); `relock` passes nothing and the daemon reads its
-    /// own persisted token file. Single-use: the blob is deleted on success.
+    /// session on a freshly-restarted (Locked) daemon. `cycle`/`relock` pass
+    /// nothing and the daemon reads its own persisted token file; passing the
+    /// token hex redeems an in-RAM token. Single-use: the blob is deleted on
+    /// success.
     pub const RELOCK_REDEEM: &str = "relock_redeem";
 }
 
@@ -178,9 +180,11 @@ pub struct StatusReply {
 /// the live KEK. Requires Unlocked + `[growlight] allow_relock`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RelockMintArgs {
-    /// `false` (cycle): return the token hex in the reply for the caller to
-    /// hold in RAM. `true` (relock-arm): persist the token to a `0600` tmpfs
-    /// file and return its path instead.
+    /// `true` (cycle and relock-arm): persist the token to a `0600` tmpfs file
+    /// and return its path; the redeem reads it server-side, and an aborted
+    /// caller can still recover via `softfig daemon relock`. `false`: return the
+    /// token hex in the reply for an in-RAM redeem (no on-disk copy, but an
+    /// aborted caller loses the token — see incident 20260622).
     #[serde(default)]
     pub persist: bool,
 }
@@ -193,8 +197,9 @@ pub struct RelockMintReply {
     pub expires_at: i64,
     /// Absolute tmpfs path of the wrapped-KEK blob (the redeem reads this).
     pub blob_path: String,
-    /// The token, lowercase hex — present only when `persisted=false` (cycle).
-    /// Kept out of the model context: the `cycle` CLI holds it in RAM.
+    /// The token, lowercase hex — present only when `persisted=false`. Lets a
+    /// caller redeem from RAM with no on-disk copy; `cycle`/`relock-arm` instead
+    /// persist (recoverable on abort) and leave this `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// Absolute tmpfs path of the persisted token — present only when

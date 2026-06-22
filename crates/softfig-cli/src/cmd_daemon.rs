@@ -16,7 +16,6 @@ use softfig_ipc::{
     verbs::{op, RelockMintReply, StatusReply, UnlockArgs, UnlockReply},
     ClientError, ErrorKind, Request,
 };
-use zeroize::Zeroizing;
 
 /// How long `cycle` waits for systemd to respawn the daemon Locked.
 const CYCLE_RESTART_TIMEOUT_SECS: u64 = 30;
@@ -32,10 +31,12 @@ pub enum DaemonCmd {
     /// Prompt for the vault passphrase and forward it to the daemon.
     Unlock(BasicArgs),
     /// Growlight: atomically cycle the daemon onto a rebuilt binary and resume
-    /// the session without the passphrase. Mints a one-time relock token,
-    /// stops the daemon, waits for systemd to respawn it Locked, then redeems
-    /// the token — held in this process's RAM the whole time, never on disk or
-    /// in the model's context. Requires `[growlight] allow_relock = true`.
+    /// the session without the passphrase. Arms a one-time relock token on
+    /// `0600` tmpfs, stops the daemon, waits for systemd to respawn it Locked,
+    /// then redeems the token (the daemon reads its own token file — the bytes
+    /// never enter this process or the model's context). Arming *before* the
+    /// stop makes an aborted cycle recoverable with `softfig daemon relock`
+    /// instead of a cold passphrase unlock. Requires `[growlight] allow_relock`.
     Cycle(CycleArgs),
     /// Growlight (fallback): arm a relock token for an out-of-band restart.
     /// Persists the one-time token to a `0600` tmpfs file and prints its path;
@@ -109,16 +110,51 @@ fn start(args: StartArgs) -> Result<()> {
 
 fn stop(args: BasicArgs) -> Result<()> {
     let path = args.socket.unwrap_or_else(runtime_socket_path);
-    match call_simple(&path, op::SHUTDOWN, serde_json::Value::Null) {
-        Ok(_) => {
+    match send_shutdown_tolerating_close(&path)? {
+        StopOutcome::Stopped => {
             println!("daemon: stopping");
             Ok(())
         }
-        Err(e) if e.is_daemon_absent() => {
+        StopOutcome::NotRunning => {
             println!("daemon: not running");
             Ok(())
         }
-        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// Outcome of asking the daemon to stop.
+enum StopOutcome {
+    /// The daemon acked the stop, or it closed the connection as it tore down —
+    /// both mean the stop is under way.
+    Stopped,
+    /// No daemon was listening to begin with.
+    NotRunning,
+}
+
+/// Send `shutdown`, treating a connection drop around the stop as the stop
+/// itself rather than an error. A daemon that tears its socket/mount down while
+/// stopping can close without acking (and even an ack-before-teardown daemon can
+/// race a fast process exit); for the *stop* op that close IS the daemon going
+/// down, not a failure. Incident 20260622: the old hard-error here aborted
+/// `cycle` before the redeem and stranded the daemon Locked.
+fn send_shutdown_tolerating_close(socket: &Path) -> Result<StopOutcome> {
+    match call_simple(socket, op::SHUTDOWN, serde_json::Value::Null) {
+        Ok(_) => Ok(StopOutcome::Stopped),
+        Err(e) if e.is_daemon_absent() => Ok(StopOutcome::NotRunning),
+        Err(e) if is_connection_drop(&e) => Ok(StopOutcome::Stopped),
+        Err(e) => Err(anyhow!("daemon stop failed: {e}")),
+    }
+}
+
+/// True when the call failed because the connection dropped (no reply / reset /
+/// broken pipe) rather than the daemon returning an error. For the stop op a
+/// dropped connection means the daemon went down.
+fn is_connection_drop(e: &ClientError) -> bool {
+    use std::io::ErrorKind as Io;
+    match e {
+        ClientError::UnexpectedEof => true,
+        ClientError::Io(io) => matches!(io.kind(), Io::ConnectionReset | Io::BrokenPipe),
+        _ => false,
     }
 }
 
@@ -161,19 +197,26 @@ fn unlock(args: BasicArgs) -> Result<()> {
     Ok(())
 }
 
-/// Growlight `cycle`: mint → stop → wait-for-Locked → redeem, all in this one
-/// process so the token never touches disk or the model's context. The only
-/// at-rest artifact is the wrapped-KEK blob on tmpfs, useless without the
-/// token. If anything aborts mid-cycle the token in RAM is lost and the blob
-/// expires — the garden stays locked and the human re-unlocks (safe failure).
+/// Growlight `cycle`: arm → stop → wait-for-Locked → redeem in one process. The
+/// token is armed (persisted `0600` on tmpfs, like `relock-arm`) *before* the
+/// stop, and a socket close during the stop is treated as the stop completing —
+/// so an abort at any step after the mint leaves the token still armed and
+/// recoverable with `softfig daemon relock`, never stranding the daemon Locked
+/// (incident 20260622). Both artifacts are single-use, deleted on a clean
+/// redeem, and tmpfs-only (wiped on reboot); the token bytes never enter this
+/// process or the model's context (the daemon reads its own token file).
 fn cycle(args: CycleArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
 
-    // 1. Mint a non-persisted token (returned in the reply, held in RAM).
-    let mut mint: RelockMintReply = match try_daemon_call(
+    // 1. Arm a relock token, PERSISTED to the 0600 tmpfs path. Arming before the
+    //    stop is what makes a cycle abort recoverable: if any later step fails,
+    //    the token is still armed and `softfig daemon relock` finishes the unlock
+    //    — no cold passphrase, no strand. The daemon writes the token bytes
+    //    itself; they never enter this process or the model's context.
+    let mint: RelockMintReply = match try_daemon_call(
         &socket,
         op::RELOCK_MINT,
-        json!({ "persist": false }),
+        json!({ "persist": true }),
     ) {
         Ok(Some(v)) => serde_json::from_value(v)?,
         Ok(None) => bail!(
@@ -190,18 +233,12 @@ fn cycle(args: CycleArgs) -> Result<()> {
         ),
         Err(e) => bail!("relock mint failed: {e}"),
     };
-    // Move the token into a zeroizing holder and clear the reply's copy.
-    let token = Zeroizing::new(
-        mint.token
-            .take()
-            .ok_or_else(|| anyhow!("daemon did not return a cycle token"))?,
-    );
     let expires_at = mint.expires_at;
-    println!("cycle: relock token minted (expires_at {expires_at}); stopping daemon…");
+    println!("cycle: relock token armed (expires_at {expires_at}); stopping daemon…");
 
-    // 2. Stop the daemon (systemd respawns it onto the new binary, Locked).
-    call_simple(&socket, op::SHUTDOWN, serde_json::Value::Null)
-        .map_err(|e| anyhow!("daemon stop failed: {e}"))?;
+    // 2. Stop the daemon (systemd respawns it onto the new binary, Locked). A
+    //    socket close without an ack here IS the stop completing, not a failure.
+    send_shutdown_tolerating_close(&socket)?;
 
     // 3. Wait for the respawned daemon to bind + report Locked. The old daemon
     //    was Unlocked, so the first `locked` we see is unambiguously the new
@@ -219,22 +256,25 @@ fn cycle(args: CycleArgs) -> Result<()> {
         if Instant::now() >= deadline {
             bail!(
                 "daemon did not come back Locked within {}s. Is the \
-                 softfig-keeperd user service set to auto-restart? The in-RAM \
-                 relock token is now lost and the tmpfs blob will expire \
-                 (expires_at {expires_at}); the garden stays locked — re-unlock \
-                 with `softfig daemon unlock` once the daemon is back.",
+                 softfig-keeperd user service set to auto-restart? The relock \
+                 token is still armed on tmpfs (expires_at {expires_at}); once the \
+                 daemon is back Locked, run `softfig daemon relock` to resume \
+                 without the passphrase (or `softfig daemon unlock`).",
                 args.timeout
             );
         }
     }
     println!("cycle: daemon restarted; redeeming…");
 
-    // 4. Redeem with the in-RAM token → Unlocked. Zeroized on drop.
-    let data = call_simple(&socket, op::RELOCK_REDEEM, json!({ "token": token.as_str() }))
+    // 4. Redeem token-less: the daemon reads its own persisted token file and
+    //    rebuilds the session → Unlocked. Single-use: blob + token deleted on
+    //    success. If this step fails the token stays armed for a manual
+    //    `softfig daemon relock` retry.
+    let data = call_simple(&socket, op::RELOCK_REDEEM, json!({}))
         .map_err(|e| {
             anyhow!(
-                "relock redeem failed: {e}. The garden remains locked; \
-                 re-unlock with `softfig daemon unlock`."
+                "relock redeem failed: {e}. The token is still armed on tmpfs; \
+                 retry `softfig daemon relock`, or re-unlock with `softfig daemon unlock`."
             )
         })?;
     let state = data
@@ -343,4 +383,120 @@ fn which_keeperd() -> Result<PathBuf> {
         }
     }
     Ok(PathBuf::from("softfig-keeperd"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+
+    use softfig_ipc::{Response, PROTOCOL_VERSION};
+
+    /// A scripted mock keeperd reproducing incident 20260622: its `shutdown`
+    /// drops the connection **without** an ack. It then answers `status=locked`
+    /// and `relock_redeem=unlocked`, so a robust `cycle` must drive through to a
+    /// successful (token-less) redeem despite the missing stop-ack — never
+    /// aborting at the stop and stranding the daemon.
+    fn spawn_mock_daemon(socket: PathBuf, redeemed: Arc<AtomicBool>) -> JoinHandle<()> {
+        let listener = UnixListener::bind(&socket).expect("bind mock socket");
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let req: Request = serde_json::from_str(line.trim_end()).unwrap();
+                let resp = match req.op.as_str() {
+                    // cycle arms with persist=true → reply carries the token PATH,
+                    // never the bytes (token redeemed server-side).
+                    op::RELOCK_MINT => Some(Response::ok(json!({
+                        "persisted": true,
+                        "expires_at": 9_999_999_999i64,
+                        "blob_path": "/dev/null/mock.blob",
+                        "token_path": "/dev/null/mock.token",
+                    }))),
+                    op::STATUS => Some(Response::ok(json!({
+                        "state": "locked",
+                        "tip": null,
+                        "garden_root": "/mock-garden",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "relock_pending": true,
+                        "relock_expires_at": 9_999_999_999i64,
+                    }))),
+                    op::RELOCK_REDEEM => {
+                        redeemed.store(true, Ordering::SeqCst);
+                        Some(Response::ok(json!({ "state": "unlocked" })))
+                    }
+                    // The bug under repair: the stop closes the socket with NO reply.
+                    op::SHUTDOWN => None,
+                    other => {
+                        Some(Response::err(ErrorKind::BadArgs, format!("unexpected op {other}")))
+                    }
+                };
+                if let Some(resp) = resp {
+                    let mut bytes = serde_json::to_vec(&resp).unwrap();
+                    bytes.push(b'\n');
+                    let _ = stream.write_all(&bytes);
+                    let _ = stream.flush();
+                }
+                // SHUTDOWN falls through here: `stream` drops unwritten → client EOF.
+                if redeemed.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// criterion 4: a stop that closes the socket without an ack must not strand
+    /// the daemon — `cycle` tolerates the close and still reaches the redeem.
+    #[test]
+    fn cycle_redeems_even_when_stop_closes_without_ack() {
+        let dir =
+            std::env::temp_dir().join(format!("softfig-cycle-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("keeperd.sock");
+        let _ = std::fs::remove_file(&socket);
+
+        let redeemed = Arc::new(AtomicBool::new(false));
+        let _mock = spawn_mock_daemon(socket.clone(), redeemed.clone());
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let res = cycle(CycleArgs { socket: Some(socket.clone()), timeout: 5 });
+        assert!(res.is_ok(), "cycle should redeem despite a missing stop-ack: {res:?}");
+        assert!(
+            redeemed.load(Ordering::SeqCst),
+            "cycle must reach the redeem (no strand) after a stop that closed without acking"
+        );
+
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A clean ack-on-stop also drives the redeem (the daemon-fixed happy path).
+    #[test]
+    fn is_connection_drop_classifies_eof_and_resets() {
+        use std::io::{Error, ErrorKind as Io};
+        assert!(is_connection_drop(&ClientError::UnexpectedEof));
+        assert!(is_connection_drop(&ClientError::Io(Error::from(Io::ConnectionReset))));
+        assert!(is_connection_drop(&ClientError::Io(Error::from(Io::BrokenPipe))));
+        // A daemon-side error is NOT a connection drop — it must still surface.
+        assert!(!is_connection_drop(&ClientError::Daemon {
+            kind: ErrorKind::Internal,
+            message: "boom".into(),
+        }));
+    }
 }

@@ -464,3 +464,75 @@ fn sigterm_triggers_graceful_shutdown() {
     );
 }
 
+/// Regression for incident 20260622: an IPC `shutdown` to a *real* keeperd
+/// process must reply with its ack BEFORE the process tears down and exits.
+/// The bug was the reverse order — teardown flipped the daemon to `Stopping`,
+/// the accept loop ended, and the process raced to exit before the connection
+/// thread flushed the ack, so the client (`daemon cycle`/`daemon stop`) saw
+/// "closed without replying" and a cycle aborted pre-redeem, stranding the
+/// daemon Locked. A cross-process test is the only faithful repro (the exit
+/// race can't happen in-process). With the ack-before-teardown fix the client
+/// always gets `{stopped:true}`, then the process exits cleanly.
+#[test]
+fn ipc_shutdown_acks_before_process_exit() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let garden = tmp.path();
+    let socket = unique_socket(garden);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_softfig-keeperd"))
+        .arg("--garden")
+        .arg(garden)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--no-watcher")
+        .spawn()
+        .expect("spawn keeperd");
+
+    let mut up = false;
+    for _ in 0..100 {
+        if socket.exists() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(up, "daemon never bound its socket");
+
+    // Send `shutdown` and require a proper ack — NOT an EOF. Don't use the
+    // panicking `rpc` helper here: we want to distinguish "closed without
+    // replying" (the bug) from a clean ack.
+    let mut stream = softfig_ipc::connect(&socket).expect("connect");
+    let req = Request::new(op::SHUTDOWN, json!({}));
+    match softfig_ipc::call(&mut stream, &req) {
+        Ok(Response::Ok { data, .. }) => assert_eq!(data["stopped"], true),
+        Ok(Response::Err { kind, error, .. }) => {
+            panic!("shutdown returned an error {kind:?}: {error}")
+        }
+        Err(e) => panic!("shutdown closed the socket without acking (incident 20260622): {e}"),
+    }
+
+    // The daemon still tears down and exits cleanly after acking.
+    let mut exited = None;
+    for _ in 0..150 {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                exited = Some(status);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let status = match exited {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon did not exit within ~3s of an IPC shutdown");
+        }
+    };
+    assert!(status.success(), "daemon exited non-zero after IPC shutdown: {status:?}");
+    assert!(!socket.exists(), "socket left behind after IPC shutdown teardown");
+}
+

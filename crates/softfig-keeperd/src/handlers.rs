@@ -295,9 +295,10 @@ pub fn relock_mint(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
 /// Growlight relock — redeem. On a freshly-restarted (Locked) daemon, unwrap
 /// the KEK from the tmpfs blob with the token and rebuild the session exactly
-/// as `unlock` does. `token` present = `cycle` (hex held in CLI RAM); `token`
-/// absent = `relock` (the daemon reads its own persisted token file). The blob
-/// (and any persisted token) is deleted on success — single use.
+/// as `unlock` does. `token` absent = `cycle`/`relock` (the daemon reads its own
+/// persisted token file); `token` present redeems an in-RAM token (hex held in
+/// CLI RAM). The blob (and any persisted token) is deleted on success — single
+/// use.
 pub fn relock_redeem(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: RelockRedeemArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("relock_redeem args: {e}")))?;
@@ -534,9 +535,15 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     .unwrap())
 }
 
-pub fn shutdown(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
-    // Same graceful teardown as a SIGTERM/SIGINT and `DaemonHandle::drop`.
-    daemon.request_shutdown();
+pub fn shutdown(_daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    // Ack-before-teardown: just return the ack. The connection handler runs the
+    // graceful teardown (`request_shutdown`) only AFTER this reply is flushed to
+    // the client (see `server::handle_connection`). Tearing down here — the old
+    // order — could close the socket and flip the daemon to `Stopping` (ending
+    // the accept loop, racing `main` to process exit) before the ack reached the
+    // wire, so the client saw "closed without replying" and a `daemon cycle`
+    // aborted pre-redeem, stranding the daemon Locked (incident 20260622).
+    // SIGTERM/SIGINT and `DaemonHandle::drop` still call `request_shutdown`.
     Ok(serde_json::json!({ "stopped": true }))
 }
 
