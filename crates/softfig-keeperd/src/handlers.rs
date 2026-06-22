@@ -26,7 +26,7 @@ use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::{RelockToken, Vault, RELOCK_TTL_SECS};
 
 use crate::daemon::{Daemon, KeeperError};
-use crate::layer_b::{self, LayerBHook, PriorTipGuard, SealedPaths};
+use crate::layer_b::{self, LayerBHook, SealedPaths};
 use crate::server::err_to_response;
 use crate::state::State;
 
@@ -668,6 +668,30 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
 
 // ---- M2b: Layer B reveal + seal/unseal/list-sealed --------------------
 
+/// Enumerate the tracked working-tree files matched by `sealed`. In FUSE mode
+/// the file list comes from the driver's in-memory (tip ∪ overlay) state
+/// ([`MountHandle::live_repo_paths`]); direct-mode / M1c-compat daemons (no
+/// mount) fall back to the `garden_root` disk walk. Either way the daemon never
+/// `WalkDir`-walks the mount it serves under `inner` (the 2026-06-21
+/// commit-path deadlock).
+fn enumerate_sealed(
+    inner: &crate::daemon::DaemonInner,
+    sealed: &SealedPaths,
+) -> std::result::Result<Vec<String>, (ErrorKind, String)> {
+    match inner.fuse.as_ref() {
+        Some(mount) => {
+            let paths = mount
+                .live_repo_paths()
+                .map_err(|e| (ErrorKind::Io, format!("live repo paths: {e}")))?;
+            Ok(layer_b::enumerate_matching_from_paths(&paths, sealed))
+        }
+        None => Ok(layer_b::enumerate_matching(
+            &inner.config.garden_root,
+            sealed,
+        )),
+    }
+}
+
 pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: VaultRevealArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("vault_reveal args: {e}")))?;
@@ -870,15 +894,10 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let intent =
         layer_b::vault_reveal_intent(&rel_string, &actor, unix_ts, args.id.as_deref())
             .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    let inner = &mut *inner;
-    let hook = inner.layer_b.clone();
-    let session_ref = inner.session.as_ref().expect("unlocked");
-    let repo = inner.repo.as_mut().expect("unlocked");
-    let _guard =
-        PriorTipGuard::install(&hook, repo, session_ref).map_err(err_to_response)?;
-    repo.commit_workdir(session_ref, intent)
-        .map_err(|e| err_to_response(e.into()))?;
-    drop(_guard);
+    // Commit the audit intent from the in-memory snapshot (FUSE) / disk walk
+    // (direct mode) — `commit_now` installs the `PriorTipGuard` and never
+    // self-reads the mount under `inner`.
+    crate::actions::commit_now(&mut inner, intent)?;
     inner.last_reveal_at = Some(now);
 
     let expires_at = if idle_seconds == 0 {
@@ -908,7 +927,6 @@ pub fn vault_seal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let state_dir = inner.config.state_dir().to_path_buf();
-    let garden_root = inner.config.garden_root.clone();
 
     // Mark the on-disk sealed-paths.toml as a self-write so the
     // (state-root-targeted) watcher's accept filter skips it.
@@ -922,27 +940,22 @@ pub fn vault_seal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     hook.reload(&state_dir)
         .map_err(err_to_response)?;
 
-    // Commit the schema_change.
+    // Commit the schema_change from the in-memory snapshot (FUSE) / disk walk
+    // (direct mode) — `commit_now` installs the `PriorTipGuard` and never
+    // self-reads the mount under `inner`. The reloaded matcher already seals the
+    // newly-matched paths, so this commit re-encrypts them through Layer B.
     let intent = layer_b::schema_change_intent(
         "softfig-layer-b-impl",
         layer_b::SEALED_PATHS_CHANGED_KIND,
     )
     .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    let inner_mut = &mut *inner;
-    let session = inner_mut.session.as_ref().expect("unlocked").clone();
-    let repo = inner_mut.repo.as_mut().expect("unlocked");
-    let schema_guard =
-        PriorTipGuard::install(&hook, repo, &session).map_err(err_to_response)?;
-    let schema_commit = repo
-        .commit_workdir(&session, intent)
-        .map_err(|e| err_to_response(e.into()))?;
-    drop(schema_guard);
+    let schema_commit = crate::actions::commit_now(&mut inner, intent)?;
 
     let mut newly_sealed = Vec::new();
     let mut seal_commit: Option<String> = None;
     if added {
         let snapshot = hook.snapshot();
-        newly_sealed = layer_b::enumerate_matching(&garden_root, &snapshot);
+        newly_sealed = enumerate_sealed(&inner, &snapshot)?;
         if !newly_sealed.is_empty() {
             // Re-snapshot the tree: the blob encryptor (this same hook)
             // will route these paths through Layer B on this pass.
@@ -951,12 +964,7 @@ pub fn vault_seal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
                 "sealed-paths.toml glob added",
             )
             .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-            let seal_guard =
-                PriorTipGuard::install(&hook, repo, &session).map_err(err_to_response)?;
-            let hash = repo
-                .commit_workdir(&session, seal_intent)
-                .map_err(|e| err_to_response(e.into()))?;
-            drop(seal_guard);
+            let hash = crate::actions::commit_now(&mut inner, seal_intent)?;
             seal_commit = Some(hash.to_string());
         }
     }
@@ -989,20 +997,17 @@ pub fn vault_unseal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let removed = layer_b::remove_glob(&state_dir, &args.pattern)
         .map_err(err_to_response)?;
 
+    // Commit while the OLD matcher is still active, from the in-memory snapshot
+    // (FUSE) / disk walk (direct mode) — never self-reading the mount under
+    // `inner`. The snapshot reconstructs each still-sealed file's plaintext (a
+    // Layer B tip blob is decrypted under its subkey), and the old matcher
+    // re-seals it to the identical blob (convergent), so no bulk-decrypt leaks.
     let intent = layer_b::schema_change_intent(
         "softfig-layer-b-impl",
         layer_b::SEALED_PATHS_CHANGED_KIND,
     )
     .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    let inner_mut = &mut *inner;
-    let hook = inner_mut.layer_b.clone();
-    let session = inner_mut.session.as_ref().expect("unlocked");
-    let repo = inner_mut.repo.as_mut().expect("unlocked");
-    let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
-    let schema_commit = repo
-        .commit_workdir(session, intent)
-        .map_err(|e| err_to_response(e.into()))?;
-    drop(_guard);
+    let schema_commit = crate::actions::commit_now(&mut inner, intent)?;
 
     // Now swap the matcher to the new (smaller) glob set.
     inner.layer_b
@@ -1022,8 +1027,7 @@ pub fn vault_list_sealed(daemon: &Daemon, _args: serde_json::Value) -> HandlerRe
 
     let snapshot = inner.layer_b.snapshot();
     let globs = snapshot.globs().to_vec();
-    let garden_root = inner.config.garden_root.clone();
-    let matching_files = layer_b::enumerate_matching(&garden_root, &snapshot);
+    let matching_files = enumerate_sealed(&inner, &snapshot)?;
 
     Ok(serde_json::to_value(VaultListSealedReply {
         globs,

@@ -506,3 +506,204 @@ fn layer_b_hook_routes_sealed_paths() {
 
     let _ = layer_b::SEALED_PATHS_REL;
 }
+
+// ---- Test 7: FUSE-mode seal/reveal/unseal commit from the in-memory snapshot
+// (task 010 — no mount walk under `inner`) + byte-exact Layer B parity --------
+
+/// Skip body when FUSE isn't actually usable in this env (CI sandbox). The
+/// dependency is runtime-resolved (kernel + setuid helper), not build-time.
+fn fuse_available() -> bool {
+    Path::new("/dev/fuse").exists()
+        && (Path::new("/usr/bin/fusermount3").exists()
+            || Path::new("/usr/bin/fusermount").exists())
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Task 010 regression: with a **real FUSE mount**, vault seal/reveal/unseal must
+/// build their commits from the in-memory snapshot — never `WalkDir`/`std::fs`-
+/// walking the mount this daemon serves under `inner` (the 2026-06-21 commit-path
+/// deadlock), and never committing the reader-facing `[sealed:…]` placeholder.
+///
+/// `workdir_snapshot` decrypts a whole-file-sealed (Layer B) tip blob under its
+/// path subkey, and the committer re-seals it convergently, so the on-tip blob is
+/// **byte-identical** to a direct `encrypt_layer_b` of the plaintext — i.e. exact
+/// parity with the disk-walk (`commit_workdir`) path the M1c-compat tests above
+/// pin. The auto-migration `seal_commit` and reveal's audit commit both
+/// re-snapshot a tree whose `secrets/foo.toml` is ALREADY Layer B — the precise
+/// case that errored (`decrypt_blob` on a 0xFF blob) before task 010.
+///
+/// Gated on a usable `/dev/fuse`; skips cleanly in a sandbox.
+#[test]
+fn fuse_seal_reveal_unseal_commit_from_snapshot() {
+    if !fuse_available() {
+        eprintln!("fuse unavailable; skipping");
+        return;
+    }
+
+    const SECRET: &str = "PLAINTEXT_TOKEN_010\n";
+    const PUBLIC: &str = "open content\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let garden = tmp.path().join("garden");
+    let state = tmp.path().join("state");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&garden).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    // Constrain reveal's temp output to a tempdir.
+    // SAFETY: this test binary runs single-threaded per test by default.
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+    }
+
+    // Two plaintext files committed at genesis (Layer A); one will be sealed.
+    write_file(&garden, "secrets/foo.toml", SECRET);
+    write_file(&garden, "public.md", PUBLIC);
+    let (_v, session, _r) =
+        Vault::init_with_params(&garden, PASS.as_bytes(), fast_params()).unwrap();
+    Repo::init(&garden, &session).unwrap();
+    // Keep `session` (same keys as the daemon) for the byte-exact parity check —
+    // pure crypto, no I/O, so using it alongside the running daemon is safe.
+
+    // Migrated layout: `.softfig` in a sibling state root so the mount can't
+    // shadow it; socket outside the garden for the same reason.
+    fs::create_dir_all(&state).unwrap();
+    copy_dir(&garden.join(".softfig"), &state.join(".softfig")).unwrap();
+    let socket = tmp.path().join("keeperd.sock");
+    let cfg = KeeperConfig::new(&garden)
+        .with_state_root(&state)
+        .with_socket(&socket)
+        .without_watcher()
+        .without_net();
+    let handle = match Daemon::new(cfg).start() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("daemon start failed: {e}; skipping");
+            return;
+        }
+    };
+    wait_for_socket(&socket);
+    let unlock_resp = rpc(
+        &socket,
+        op::UNLOCK,
+        serde_json::to_value(UnlockArgs {
+            passphrase: PASS.into(),
+        })
+        .unwrap(),
+    );
+    if let Response::Err { kind, error, .. } = &unlock_resp {
+        eprintln!("unlock failed (likely fuse-mount issue: {kind:?} {error}); skipping");
+        handle.shutdown();
+        let _ = handle.join();
+        return;
+    }
+    let _ = unwrap_ok(unlock_resp);
+    std::thread::sleep(Duration::from_millis(150)); // let the mount settle
+
+    // --- Seal `secrets/**`. The enumerate runs off the in-memory snapshot, and
+    //     the auto-migration seal_commit re-snapshots a tree whose foo.toml is
+    //     already Layer B.
+    let seal: VaultSealReply = serde_json::from_value(unwrap_ok(rpc(
+        &socket,
+        op::VAULT_SEAL,
+        serde_json::to_value(VaultSealArgs {
+            pattern: "secrets/**".into(),
+        })
+        .unwrap(),
+    )))
+    .unwrap();
+    assert!(
+        seal.newly_sealed.contains(&"secrets/foo.toml".to_string()),
+        "in-memory enumerate must find secrets/foo.toml; got {:?}",
+        seal.newly_sealed
+    );
+    assert!(seal.seal_commit.is_some(), "auto-migration seal commit");
+
+    // --- Read both files back THROUGH the kernel mount: secrets is the sealed
+    //     placeholder, public is untouched plaintext (no placeholder committed).
+    let mount_secret = fs::read_to_string(garden.join("secrets/foo.toml")).unwrap();
+    assert_eq!(mount_secret, "[sealed:secrets/foo.toml]\n");
+    assert_eq!(fs::read_to_string(garden.join("public.md")).unwrap(), PUBLIC);
+
+    // --- The committed blob is Layer B and BYTE-IDENTICAL to a direct
+    //     encrypt_layer_b of the plaintext (convergent) → parity with the
+    //     disk-walk path; public.md stays Layer A.
+    let store_paths = softfig_store::StorePaths::with_state_root(&garden, &state);
+    let db = softfig_store::Db::open(&store_paths).unwrap();
+    let objects = softfig_store::ObjectStore::new(store_paths.clone());
+    let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
+    let row = db.get_commit(&tip).unwrap();
+    let secret_hash = resolve_path(&db, &row.root_tree, &["secrets", "foo.toml"])
+        .expect("secrets/foo.toml in tip");
+    let secret_blob = objects.get(&secret_hash).unwrap();
+    assert!(is_layer_b(&secret_blob), "secrets/foo.toml must be Layer B");
+    let expected = session
+        .encrypt_layer_b("secrets/foo.toml", SECRET.as_bytes())
+        .unwrap();
+    assert_eq!(
+        secret_blob, expected,
+        "snapshot-built sealed blob must equal a direct encrypt_layer_b (parity)"
+    );
+    let public_hash =
+        resolve_path(&db, &row.root_tree, &["public.md"]).expect("public.md in tip");
+    assert!(
+        !is_layer_b(&objects.get(&public_hash).unwrap()),
+        "public.md must stay Layer A"
+    );
+
+    // --- Reveal round-trips the ORIGINAL plaintext (its audit commit also
+    //     re-snapshots the Layer B tip blob), proving full integrity.
+    let reveal: VaultRevealReply = serde_json::from_value(unwrap_ok(rpc(
+        &socket,
+        op::VAULT_REVEAL,
+        serde_json::to_value(VaultRevealArgs {
+            path: "secrets/foo.toml".into(),
+            master_password: Some(PASS.into()),
+            probe_only: false,
+            id: None,
+        })
+        .unwrap(),
+    )))
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&reveal.temp_path).unwrap(),
+        SECRET,
+        "reveal must return the original plaintext"
+    );
+
+    // --- Unseal keeps the blob Layer B (no bulk-decrypt) and empties the matcher.
+    let unseal: VaultUnsealReply = serde_json::from_value(unwrap_ok(rpc(
+        &socket,
+        op::VAULT_UNSEAL,
+        serde_json::to_value(VaultUnsealArgs {
+            pattern: "secrets/**".into(),
+        })
+        .unwrap(),
+    )))
+    .unwrap();
+    assert!(unseal.removed);
+    let tip2 = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
+    let row2 = db.get_commit(&tip2).unwrap();
+    let secret_hash2 = resolve_path(&db, &row2.root_tree, &["secrets", "foo.toml"])
+        .expect("secrets/foo.toml in tip after unseal");
+    assert!(
+        is_layer_b(&objects.get(&secret_hash2).unwrap()),
+        "previously-sealed blob stays Layer B after unseal"
+    );
+
+    handle.shutdown();
+    handle.join().unwrap();
+}

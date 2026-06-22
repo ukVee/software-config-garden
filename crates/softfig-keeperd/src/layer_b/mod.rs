@@ -533,6 +533,27 @@ pub fn enumerate_matching(garden_root: &Path, sealed: &SealedPaths) -> Vec<Strin
     out.into_iter().collect()
 }
 
+/// In-memory variant of [`enumerate_matching`]: filter a pre-collected list of
+/// repo-relative working-tree paths (e.g. from the FUSE driver's in-memory
+/// `live_repo_paths`) by the sealed matcher. Lets a FUSE-mode daemon enumerate
+/// sealed files without `WalkDir`-walking the mount it serves under `inner` (the
+/// 2026-06-21 commit-path deadlock). Ignore filtering is the caller's job —
+/// `live_repo_paths` already applies the same exclusion set `enumerate_matching`
+/// loads from disk.
+pub fn enumerate_matching_from_paths(paths: &[String], sealed: &SealedPaths) -> Vec<String> {
+    if sealed.is_empty() {
+        return Vec::new();
+    }
+    let mut out = BTreeSet::new();
+    for rel in paths {
+        let rel = rel.replace('\\', "/");
+        if sealed.is_sealed(&rel) {
+            out.insert(rel);
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Append a glob to `sealed-paths.toml` (creating the file if absent).
 /// Returns true if the glob was actually added (false = already present
 /// — no-op).

@@ -178,6 +178,14 @@ impl MountHandle {
         self.state.read_dir_entries(std::path::Path::new(rel))
     }
 
+    /// Every live, ignore-filtered, repo-relative file path (forward-slash
+    /// strings) — the same set the next [`Self::workdir_snapshot`] commits. The
+    /// daemon filters this by the sealed matcher to enumerate sealed files
+    /// without walking the mount under `inner`.
+    pub fn live_repo_paths(&self) -> Result<Vec<String>> {
+        self.state.live_repo_paths()
+    }
+
     /// Stage a create-or-overwrite into the overlay (mode preserved on
     /// overwrite, else `0o100644`).
     pub fn stage_write(&self, rel: &str, content: Vec<u8>) {

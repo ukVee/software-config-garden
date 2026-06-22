@@ -19,7 +19,7 @@ use fuser::{
 };
 use softfig_vcs::{Ignore, Repo, WalkSnapshot, IGNORE_FILE};
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
-use softfig_vault::VaultSession;
+use softfig_vault::{is_layer_b, VaultSession};
 
 use crate::inodes::{InodeMap, ROOT_INODE};
 use crate::overlay::{Overlay, OverlayEntry};
@@ -131,11 +131,16 @@ impl SharedState {
     ///
     /// It deliberately does NOT apply the read path's sealed-placeholder
     /// or `<vault>`-region redaction: a commit must persist the real
-    /// Layer A plaintext (Layer B routing is the committer's job via the
-    /// `BlobEncryptor`), never the `[sealed:…]`/`[encrypted]` projection a
-    /// reader sees. In M2a the two coincide, which is why walk-parity
-    /// holds; under a sealed adapter, walking the mount would commit
-    /// placeholders, so the daemon commits from this snapshot instead.
+    /// working-tree plaintext (Layer B routing is the committer's job via
+    /// the `BlobEncryptor`), never the `[sealed:…]`/`[encrypted]`
+    /// projection a reader sees. A whole-file-sealed tip blob is stored as
+    /// Layer B (0xFF marker), so it is decrypted under its path-derived
+    /// Layer B subkey back to that plaintext (Phase 2) — the committer then
+    /// re-seals it convergently into the byte-identical blob. The result
+    /// therefore matches a `walk` of the *unsealed plaintext* a direct-mode
+    /// (Disk) daemon commits, NOT a `walk(mount_point)` (which would read
+    /// the reader-facing `[sealed:…]` placeholder); in M2a, with nothing
+    /// sealed, the two coincide and walk-parity holds.
     pub(crate) fn workdir_snapshot(&self) -> Result<WalkSnapshot> {
         // The in-memory `.softfigignore` (overlay precedence, else the tip
         // blob) drives the same top-level exclusion `walk` applies —
@@ -155,16 +160,26 @@ impl SharedState {
             collect_files(&inner, &ignore, Path::new(""), &mut files);
         }
 
-        // Phase 2: resolve content and assemble. Tip blobs decrypt to raw
-        // Layer A plaintext; mode masking + parent-dir creation are walk's
-        // shared rule layer (`WalkSnapshot::insert_file`).
+        // Phase 2: resolve content and assemble. Tip blobs decrypt to their
+        // working-tree plaintext — raw Layer A, except a whole-file-sealed
+        // blob (Layer B, 0xFF marker) is decrypted under its path-derived
+        // Layer B subkey (decrypting it as Layer A would fail the varint/AEAD
+        // parse). Region-sealed files are Layer A (inline base64 bodies) and
+        // take the raw branch. Mirrors `layer_b::walk_tree_into`. Mode masking
+        // + parent-dir creation are walk's shared rule layer
+        // (`WalkSnapshot::insert_file`).
         let mut snapshot = WalkSnapshot::empty();
         for (path, mode, source) in files {
             let content = match source {
                 ContentSource::Overlay(bytes) => bytes,
                 ContentSource::Blob(target) => {
                     let cipher = self.objects.get(&target)?;
-                    self.session.decrypt_blob(&cipher)?
+                    if is_layer_b(&cipher) {
+                        let rel = path.to_string_lossy().replace('\\', "/");
+                        self.session.decrypt_layer_b(&rel, &cipher)?
+                    } else {
+                        self.session.decrypt_blob(&cipher)?
+                    }
                 }
             };
             snapshot.insert_file(&path, mode, content)?;
@@ -201,6 +216,27 @@ impl SharedState {
         Ok(Ignore::from_contents(&String::from_utf8_lossy(&plain)))
     }
 
+    /// Every live (overlay ∪ tip), ignore-filtered, repo-relative file path as a
+    /// forward-slash string — exactly the set [`Self::workdir_snapshot`] would
+    /// commit. Lets the daemon enumerate sealed-matching files (`vault seal`,
+    /// `vault list-sealed`) from in-memory state rather than `WalkDir`-walking
+    /// the mount it serves under `inner` (the 2026-06-21 deadlock). Reuses
+    /// `collect_files` so the enumerated set never drifts from the committed
+    /// set; content bytes it clones for the overlay case are dropped (the
+    /// overlay is normally empty here — the daemon commits before enumerating).
+    pub(crate) fn live_repo_paths(&self) -> Result<Vec<String>> {
+        let ignore = self.inmem_ignore()?;
+        let mut files: Vec<(PathBuf, u32, ContentSource)> = Vec::new();
+        {
+            let inner = self.inner.lock().unwrap();
+            collect_files(&inner, &ignore, Path::new(""), &mut files);
+        }
+        Ok(files
+            .into_iter()
+            .map(|(p, _, _)| p.to_string_lossy().replace('\\', "/"))
+            .collect())
+    }
+
     // ===== Overlay-staging + in-memory queries for daemon M3a actions =====
     //
     // The keeperd M3a verbs used to `std::fs`-read/-write `garden_root`, which
@@ -215,11 +251,13 @@ impl SharedState {
     // watcher event would queue a redundant (double) commit. Paths are
     // repo-relative, the same key shape the FUSE handlers use (root = "").
 
-    /// Raw working-tree bytes for repo-relative `rel`: overlay precedence (a
+    /// Working-tree bytes for repo-relative `rel`: overlay precedence (a
     /// `File`'s content; a `Removed`/`Dir` marker ⇒ `None`), else the committed
-    /// tip blob decrypted to **raw Layer A plaintext** — no sealed/region
-    /// projection, matching [`Self::workdir_snapshot`] (working-tree truth, not
-    /// the reader's redacted view). `None` when absent or a directory.
+    /// tip blob decrypted to its **plaintext** — raw Layer A, except a
+    /// whole-file-sealed (Layer B) blob is decrypted under its path-derived
+    /// subkey. No sealed/region projection, matching [`Self::workdir_snapshot`]
+    /// (working-tree truth, not the reader's redacted view). `None` when absent
+    /// or a directory.
     pub(crate) fn read_workfile(&self, rel: &Path) -> Result<Option<Vec<u8>>> {
         let target = {
             let inner = self.inner.lock().unwrap();
@@ -234,7 +272,12 @@ impl SharedState {
         };
         // Decrypt outside the lock (matches `workdir_snapshot`'s two-phase shape).
         let cipher = self.objects.get(&target)?;
-        Ok(Some(self.session.decrypt_blob(&cipher)?))
+        if is_layer_b(&cipher) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            Ok(Some(self.session.decrypt_layer_b(&rel_str, &cipher)?))
+        } else {
+            Ok(Some(self.session.decrypt_blob(&cipher)?))
+        }
     }
 
     /// Whether repo-relative `rel` resolves to a live file or directory.
