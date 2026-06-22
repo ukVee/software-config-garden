@@ -65,18 +65,43 @@ pub(crate) fn write_file(abs: &Path, bytes: &[u8]) -> Result<(), (ErrorKind, Str
     std::fs::write(abs, bytes).map_err(|e| (ErrorKind::Io, e.to_string()))
 }
 
-/// Run one `commit_workdir` under a fresh [`PriorTipGuard`], mirroring the
-/// M2c-aware commit at every other daemon write site. The caller must hold
-/// the inner lock, have already written every file into the working tree,
-/// and have registered each path in the suppression map.
+/// Run one commit under a fresh [`PriorTipGuard`], mirroring the M2c-aware
+/// commit at every other daemon write site. The caller must hold the inner
+/// lock, have already written every file into the working tree, and have
+/// registered each path in the suppression map.
+///
+/// In FUSE mode the daemon serves `garden_root` itself, so the legacy
+/// `commit_workdir` (which walks `garden_root`) would recursively self-read
+/// the mount while we hold `inner` — the 2026-06-21 commit-path deadlock.
+/// We commit from the FUSE driver's in-memory (tip ∪ overlay) snapshot
+/// instead. The snapshot is captured **before** the commit because
+/// `commit_snapshot`'s `tip_changed` rotates the tip and clears the overlay.
+/// [`MountHandle::workdir_snapshot`](softfig_fuse::MountHandle::workdir_snapshot)
+/// locks the *FUSE* `SharedState` mutex (a different lock from `daemon.inner`)
+/// and never re-enters the kernel, so it is safe under `inner`. Non-FUSE /
+/// M1c-compat callers keep walking the working tree via `commit_workdir`.
 pub(crate) fn commit_now(
     inner: &mut DaemonInner,
     intent: Intent,
 ) -> Result<Hash, (ErrorKind, String)> {
+    // Reborrow `inner.fuse` on its own (disjoint from `repo`/`session`/`hook`
+    // below) and finish the snapshot into an owned value before touching the
+    // repo, so no two `DaemonInner` fields are borrowed at once.
+    let fuse_snapshot = match inner.fuse.as_ref() {
+        Some(mount) => Some(
+            mount
+                .workdir_snapshot()
+                .map_err(|e| (ErrorKind::Io, format!("workdir snapshot: {e}")))?,
+        ),
+        None => None,
+    };
     let hook = inner.layer_b.clone();
     let session = inner.session.as_ref().expect("unlocked");
     let repo = inner.repo.as_mut().expect("unlocked");
     let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
-    repo.commit_workdir(session, intent)
-        .map_err(|e| err_to_response(e.into()))
+    match fuse_snapshot {
+        Some(snapshot) => repo.commit_snapshot(session, snapshot, intent),
+        None => repo.commit_workdir(session, intent),
+    }
+    .map_err(|e| err_to_response(e.into()))
 }

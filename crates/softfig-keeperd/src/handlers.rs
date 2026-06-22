@@ -372,14 +372,9 @@ pub fn commit(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let intent = Intent::new(&args.intent, args.payload)
         .map_err(|e| (ErrorKind::BadArgs, e.to_string()))?;
 
-    let inner = &mut *inner;
-    let hook = inner.layer_b.clone();
-    let session = inner.session.as_ref().expect("unlocked");
-    let repo = inner.repo.as_mut().expect("unlocked");
-    let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
-    let hash = repo
-        .commit_workdir(session, intent)
-        .map_err(|e| err_to_response(e.into()))?;
+    // FUSE-mode-safe commit: in FUSE mode this snapshots the in-memory
+    // (tip ∪ overlay) tree rather than walking the mount under `inner`.
+    let hash = crate::actions::commit_now(&mut inner, intent)?;
     Ok(serde_json::to_value(CommitReply {
         hash: hash.to_string(),
     })
@@ -519,14 +514,10 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let intent =
         Intent::new("memory_edit", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
 
-    let inner = &mut *inner;
-    let hook = inner.layer_b.clone();
-    let session = inner.session.as_ref().expect("unlocked");
-    let repo = inner.repo.as_mut().expect("unlocked");
-    let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
-    let hash = repo
-        .commit_workdir(session, intent)
-        .map_err(|e| err_to_response(e.into()))?;
+    // FUSE-mode-safe commit: snapshot the in-memory tree rather than walking
+    // the mount under `inner` (the std::fs::write above already landed in the
+    // FUSE overlay via the kernel write handler).
+    let hash = crate::actions::commit_now(&mut inner, intent)?;
 
     Ok(serde_json::to_value(ReplaceFileReply {
         path: args.path,

@@ -218,6 +218,22 @@ impl DirtySetAccumulator {
             None => return,
         };
         let hook = inner.layer_b.clone();
+        // In FUSE mode commit from the in-memory (tip ∪ overlay) snapshot, not
+        // by walking `garden_root` (= the mount this daemon serves) — the
+        // 2026-06-21 commit-path deadlock. Captured before borrowing `repo`
+        // (disjoint `DaemonInner` field) and before the commit clears the
+        // overlay. Manual editor writes already live in the overlay (kernel →
+        // FUSE write handler), so the flush just snapshots them.
+        let fuse_snapshot = match inner.fuse.as_ref() {
+            Some(mount) => match mount.workdir_snapshot() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("keeperd: watcher: workdir snapshot failed: {e}");
+                    return;
+                }
+            },
+            None => None,
+        };
         let repo = match inner.repo.as_mut() {
             Some(r) => r,
             None => return,
@@ -260,7 +276,10 @@ impl DirtySetAccumulator {
         };
 
         hook.install_prior_tip(prior_snap);
-        let result = repo.commit_workdir(&session, intent);
+        let result = match fuse_snapshot {
+            Some(snapshot) => repo.commit_snapshot(&session, snapshot, intent),
+            None => repo.commit_workdir(&session, intent),
+        };
         hook.clear_prior_tip();
         if let Err(e) = result {
             eprintln!("keeperd: watcher: commit failed: {e}");
