@@ -189,9 +189,17 @@ fn start(args: StartArgs) -> Result<()> {
     let questions_path = runtime.join("questions.md");
 
     // Generated + derived → always refreshed (self-heal if paths moved).
+    // `~/.claude/projects` is granted to the loop so it can keep its own
+    // claude-memory pointers in sync (they live outside the garden workspace).
+    let claude_projects = home_dir()?.join(".claude").join("projects");
     write_file(
         &loop_path,
-        &loop_json(&inject_path, &statusline_path, &garden_root),
+        &loop_json(
+            &inject_path,
+            &statusline_path,
+            &garden_root,
+            &claude_projects,
+        ),
     )?;
     // `--settings` only *permits* softfig-mcp; this *attaches* it, so the
     // garden verbs exist regardless of where the loop is launched from (the
@@ -981,7 +989,22 @@ fn seed_if_absent(path: &Path, content: &str) -> Result<bool> {
 /// so the MCP-only convention (CLAUDE.md house-rule 1; never raw mv/sed/git) is
 /// enforced structurally, not just by instruction — `deny` overrides `allow`.
 /// The garden path is anchored absolute (`//…`, spec the box's settings use).
-fn loop_json(inject: &Path, statusline: &Path, garden_root: &Path) -> String {
+///
+/// `claude_projects` (`~/.claude/projects`) is added to `additionalDirectories`
+/// so the loop can update its own claude-memory pointers, which live *outside*
+/// the garden workspace. The Edit/Write tools refuse any path outside cwd +
+/// `additionalDirectories` before permission rules are even consulted, so
+/// without this entry the loop can't touch `~/.claude` at all (it just flags the
+/// human — the old behaviour). We grant the `projects/` subtree, not all of
+/// `~/.claude`: per-project memory + transcripts are reachable, but the OAuth
+/// token (`.credentials.json`) and harness settings stay out of an unattended
+/// `--auto` run's reach.
+fn loop_json(
+    inject: &Path,
+    statusline: &Path,
+    garden_root: &Path,
+    claude_projects: &Path,
+) -> String {
     let inject = inject.display().to_string();
     let session_start_block = |source: &str| {
         serde_json::json!({
@@ -1002,6 +1025,9 @@ fn loop_json(inject: &Path, statusline: &Path, garden_root: &Path) -> String {
             "deny": [
                 format!("Edit(/{garden}/**)"),
                 format!("Write(/{garden}/**)")
+            ],
+            "additionalDirectories": [
+                claude_projects.display().to_string()
             ]
         },
         "statusLine": {
@@ -1193,8 +1219,10 @@ mod tests {
         let inject = Path::new("/run/softfig/growlight/inject.sh");
         let statusline = Path::new("/run/softfig/growlight/statusline.sh");
         let garden = Path::new("/home/ukv/soft-fig_garden");
+        let claude_projects = Path::new("/home/ukv/.claude/projects");
         let json: serde_json::Value =
-            serde_json::from_str(&loop_json(inject, statusline, garden)).expect("valid JSON");
+            serde_json::from_str(&loop_json(inject, statusline, garden, claude_projects))
+                .expect("valid JSON");
 
         assert_eq!(json["statusLine"]["type"], "command");
         assert_eq!(
@@ -1222,10 +1250,12 @@ mod tests {
         // softfig-mcp; raw file writes into the garden tree are denied so the
         // MCP-only convention holds even under broad shell/file access.
         let garden = Path::new("/home/ukv/soft-fig_garden");
+        let claude_projects = Path::new("/home/ukv/.claude/projects");
         let json: serde_json::Value = serde_json::from_str(&loop_json(
             Path::new("/run/softfig/growlight/inject.sh"),
             Path::new("/run/softfig/growlight/statusline.sh"),
             garden,
+            claude_projects,
         ))
         .expect("valid JSON");
 
@@ -1246,6 +1276,21 @@ mod tests {
         // `//…` is the absolute-path anchor (one literal slash + the rooted path).
         assert!(deny.contains(&"Edit(//home/ukv/soft-fig_garden/**)"));
         assert!(deny.contains(&"Write(//home/ukv/soft-fig_garden/**)"));
+
+        // The loop must be able to update its own claude-memory pointers, which
+        // sit outside the garden workspace — granted via additionalDirectories,
+        // scoped to `projects/` so credentials/settings stay unreachable.
+        let extra: Vec<&str> = json["permissions"]["additionalDirectories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(extra, vec!["/home/ukv/.claude/projects"]);
+        assert!(
+            !extra.contains(&"/home/ukv/.claude"),
+            "must not grant all of ~/.claude (credentials live there)"
+        );
     }
 
     #[test]

@@ -21,7 +21,11 @@ protocol is fixed; the baton changes each iteration.
 3. WORK. Execute NEXT ACTION as one coherent chunk. Obey all standing feedback
    (garden edits only via softfig-mcp; commit code on main after each unit;
    root-cause fixes, no patchwork; refresh garden+project docs when a milestone
-   verifies). Never relitigate LOCKED DECISIONS.
+   verifies). When a milestone verifies, also keep your own claude-memory
+   pointers under `~/.claude/projects/<garden>/memory/` in sync — you may
+   Edit/Write those directly now (only that subtree is writable; credentials and
+   harness settings elsewhere in `~/.claude` stay off-limits). Never relitigate
+   LOCKED DECISIONS.
 
 3b. DAEMON RESTART (relock). If a step needs the keeperd daemon cycled (e.g. you
    rebuilt softfig-keeperd), run `softfig daemon cycle` as ONE step: it bounces
