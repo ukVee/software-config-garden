@@ -75,6 +75,63 @@ pub fn parse(body: &str) -> Vec<QueueRow> {
     rows
 }
 
+/// Where to move a queue row, relative to the rest of the table. The queue
+/// order *is* the row order of this round-tripped table (no separate rank
+/// key), so a reorder is just relocating one row within the parsed `Vec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Position {
+    /// Make it the first row.
+    Top,
+    /// Make it the last row.
+    Bottom,
+    /// Place it immediately before the row with this id.
+    Before(String),
+    /// Place it immediately after the row with this id.
+    After(String),
+}
+
+/// Why a reorder couldn't be computed; the caller maps these onto IPC errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReorderError {
+    /// The `before`/`after` reference id isn't a row in the queue.
+    RefNotFound(String),
+    /// The `before`/`after` reference id is the moved item itself.
+    RefIsSelf(String),
+}
+
+/// Produce a new row order with the row at index `from` moved per `pos`. Pure:
+/// the input slice is untouched and the moved row keeps its identity — only its
+/// position changes. The 1-based `#` column is recomputed by [`render`], so the
+/// returned `Vec` order alone determines the new queue order. Errors only for a
+/// bad `Before`/`After` reference. Panics only on an out-of-range `from`, which
+/// the caller rules out by deriving `from` from a `position` lookup.
+pub fn reordered(
+    rows: &[QueueRow],
+    from: usize,
+    pos: &Position,
+) -> Result<Vec<QueueRow>, ReorderError> {
+    let mut rest = rows.to_vec();
+    let moved = rest.remove(from);
+    let target = match pos {
+        Position::Top => 0,
+        Position::Bottom => rest.len(),
+        Position::Before(ref_id) => ref_index(&rest, ref_id, &moved.id)?,
+        Position::After(ref_id) => ref_index(&rest, ref_id, &moved.id)? + 1,
+    };
+    rest.insert(target, moved);
+    Ok(rest)
+}
+
+/// Index of `ref_id` among the rows with the moved row already removed.
+fn ref_index(rest: &[QueueRow], ref_id: &str, moved_id: &str) -> Result<usize, ReorderError> {
+    if ref_id == moved_id {
+        return Err(ReorderError::RefIsSelf(ref_id.to_string()));
+    }
+    rest.iter()
+        .position(|r| r.id == ref_id)
+        .ok_or_else(|| ReorderError::RefNotFound(ref_id.to_string()))
+}
+
 /// Escape a literal `|` so it doesn't split a table cell.
 fn escape(s: &str) -> String {
     s.replace('|', "\\|")
@@ -148,6 +205,73 @@ mod tests {
         let table = render(&rows);
         assert!(table.contains("a\\|b path \\| x"));
         assert_eq!(parse(&table), rows);
+    }
+
+    fn sample() -> Vec<QueueRow> {
+        vec![
+            row("a", "task", "A", "done"),
+            row("b", "task", "B", "queued"),
+            row("c", "task", "C", "queued"),
+            row("d", "task", "D", "queued"),
+        ]
+    }
+
+    fn ids(rows: &[QueueRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    #[test]
+    fn reorder_to_top_and_bottom() {
+        let rows = sample();
+        // c -> top
+        assert_eq!(ids(&reordered(&rows, 2, &Position::Top).unwrap()), ["c", "a", "b", "d"]);
+        // b -> bottom
+        assert_eq!(ids(&reordered(&rows, 1, &Position::Bottom).unwrap()), ["a", "c", "d", "b"]);
+    }
+
+    #[test]
+    fn reorder_before_and_after_a_ref() {
+        let rows = sample();
+        // move d before b
+        assert_eq!(
+            ids(&reordered(&rows, 3, &Position::Before("b".into())).unwrap()),
+            ["a", "d", "b", "c"]
+        );
+        // move a after c
+        assert_eq!(
+            ids(&reordered(&rows, 0, &Position::After("c".into())).unwrap()),
+            ["b", "c", "a", "d"]
+        );
+    }
+
+    #[test]
+    fn reorder_can_move_past_a_done_row() {
+        // 'a' is done and first; floating 'd' to the top jumps past it.
+        let rows = sample();
+        assert_eq!(ids(&reordered(&rows, 3, &Position::Top).unwrap()), ["d", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn reorder_to_current_spot_is_identity() {
+        let rows = sample();
+        // 'a' is already first; moving it to top reproduces the input exactly,
+        // which the action treats as a no-op (no commit).
+        assert_eq!(reordered(&rows, 0, &Position::Top).unwrap(), rows);
+        // 'd' is already last; before/after its neighbour back to the same gap.
+        assert_eq!(reordered(&rows, 3, &Position::After("c".into())).unwrap(), rows);
+    }
+
+    #[test]
+    fn reorder_rejects_bad_reference() {
+        let rows = sample();
+        assert_eq!(
+            reordered(&rows, 1, &Position::Before("ghost".into())),
+            Err(ReorderError::RefNotFound("ghost".into()))
+        );
+        assert_eq!(
+            reordered(&rows, 1, &Position::After("b".into())),
+            Err(ReorderError::RefIsSelf("b".into()))
+        );
     }
 
     #[test]

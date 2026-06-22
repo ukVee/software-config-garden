@@ -135,6 +135,12 @@ pub mod op {
     /// `growlight/backlog/CLAUDE.md` (enforces at most one `active`). Commit
     /// `item_status_set`.
     pub const SET_ITEM_STATUS: &str = "set_item_status";
+    /// growlight: move a backlog item's row in the authoritative queue table in
+    /// `growlight/backlog/CLAUDE.md` (`top|bottom|before|after`) WITHOUT touching
+    /// its status. Reprioritizes the drain order; the `#` column re-renders to
+    /// match. Idempotent (a no-op move makes no commit). Commit
+    /// `backlog_item_reordered`.
+    pub const REORDER_BACKLOG_ITEM: &str = "reorder_backlog_item";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -1075,6 +1081,32 @@ pub struct SetItemStatusArgs {
 pub struct SetItemStatusReply {
     pub id: String,
     pub status: String,
+    /// The queue doc the daemon rewrote (`growlight/backlog/CLAUDE.md`).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `reorder_backlog_item({id, position, ref_id?}) -> {id, index, path, hash}`.
+/// Move an item's row in the queue table without changing its status. Order is
+/// the round-tripped row order of the managed `queue` region, so the move just
+/// relocates the row and the `#` column re-renders to match.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorderBacklogItemArgs {
+    /// The item's queue id (milestone slug or task `NNN`) to move.
+    pub id: String,
+    /// Where to move it: `top | bottom | before | after`.
+    pub position: String,
+    /// The reference item's id, required for `before`/`after` and rejected for
+    /// `top`/`bottom`. Must differ from `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorderBacklogItemReply {
+    pub id: String,
+    /// The item's 1-based row number (`#` column) after the move.
+    pub index: usize,
     /// The queue doc the daemon rewrote (`growlight/backlog/CLAUDE.md`).
     pub path: String,
     pub hash: String,

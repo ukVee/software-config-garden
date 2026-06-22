@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, AddBacklogItemReply, AddSliceReply, GrowlightInitReply, LogBatonReply, SetItemStatusReply,
+    op, AddBacklogItemReply, AddSliceReply, GrowlightInitReply, LogBatonReply,
+    ReorderBacklogItemReply, SetItemStatusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -423,6 +424,123 @@ fn set_item_status_without_backlog_is_not_found() {
     assert_eq!(
         err_kind(fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "active" }))),
         ErrorKind::NotFound
+    );
+}
+
+// ---- reorder_backlog_item ---------------------------------------------
+
+#[test]
+fn reorder_moves_a_row_without_touching_status() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup"); // 1
+    fx.add_task("a", "A"); // 001 -> 2
+    fx.add_task("b", "B"); // 002 -> 3
+    fx.add_task("c", "C"); // 003 -> 4
+    // Statuses we expect reorder to leave untouched.
+    fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "active" }));
+    fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "001", "status": "done" }));
+
+    // Float the newest task (003) to the top of the queue.
+    let resp = fx.call(op::REORDER_BACKLOG_ITEM, serde_json::json!({ "id": "003", "position": "top" }));
+    let reply: ReorderBacklogItemReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.id, "003");
+    assert_eq!(reply.index, 1);
+    assert_eq!(reply.path, "growlight/backlog/CLAUDE.md");
+
+    // New order 003, m5b, 001, 002 — every status cell preserved.
+    let backlog = fx.backlog();
+    assert!(backlog.contains("| 1 | 003 | task | C | queued |"));
+    assert!(backlog.contains("| 2 | m5b | milestone | Backup | active |"));
+    assert!(backlog.contains("| 3 | 001 | task | A | done |"));
+    assert!(backlog.contains("| 4 | 002 | task | B | queued |"));
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "backlog_item_reordered");
+    assert_eq!(payload["id"], "003");
+    assert_eq!(payload["index"], 1);
+}
+
+#[test]
+fn reorder_before_after_and_past_done_and_deferred_rows() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup"); // 1
+    fx.add_task("a", "A"); // 001 -> 2
+    fx.add_task("b", "B"); // 002 -> 3
+    fx.add_task("c", "C"); // 003 -> 4
+    fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "done" }));
+    fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "001", "status": "deferred" }));
+
+    // Move 003 before 001 — jumps past the done milestone, lands ahead of the
+    // deferred task. Order becomes m5b, 003, 001, 002.
+    fx.call(
+        op::REORDER_BACKLOG_ITEM,
+        serde_json::json!({ "id": "003", "position": "before", "ref_id": "001" }),
+    );
+    // Sink the done milestone to the bottom via `after` the last row.
+    let resp = fx.call(
+        op::REORDER_BACKLOG_ITEM,
+        serde_json::json!({ "id": "m5b", "position": "after", "ref_id": "002" }),
+    );
+    let reply: ReorderBacklogItemReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.index, 4);
+
+    // Final order 003, 001, 002, m5b with statuses intact.
+    let backlog = fx.backlog();
+    assert!(backlog.contains("| 1 | 003 | task | C | queued |"));
+    assert!(backlog.contains("| 2 | 001 | task | A | deferred |"));
+    assert!(backlog.contains("| 3 | 002 | task | B | queued |"));
+    assert!(backlog.contains("| 4 | m5b | milestone | Backup | done |"));
+}
+
+#[test]
+fn reorder_is_idempotent_without_empty_commit() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    fx.add_task("a", "A");
+    let tip_before = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    // m5b is already first; moving it to top changes nothing.
+    let resp = fx.call(op::REORDER_BACKLOG_ITEM, serde_json::json!({ "id": "m5b", "position": "top" }));
+    let reply: ReorderBacklogItemReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.hash, tip_before);
+    assert_eq!(reply.index, 1);
+    let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    assert_eq!(tip_after, tip_before, "no new commit for a no-op reorder");
+}
+
+#[test]
+fn reorder_rejects_unknown_ids_and_bad_position() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    fx.add_task("a", "A"); // 001
+    // The item to move doesn't exist.
+    assert_eq!(
+        err_kind(fx.call(op::REORDER_BACKLOG_ITEM, serde_json::json!({ "id": "ghost", "position": "top" }))),
+        ErrorKind::NotFound
+    );
+    // The before/after reference doesn't exist.
+    assert_eq!(
+        err_kind(fx.call(
+            op::REORDER_BACKLOG_ITEM,
+            serde_json::json!({ "id": "001", "position": "before", "ref_id": "ghost" })
+        )),
+        ErrorKind::NotFound
+    );
+    // Positioning an item relative to itself is rejected.
+    assert_eq!(
+        err_kind(fx.call(
+            op::REORDER_BACKLOG_ITEM,
+            serde_json::json!({ "id": "001", "position": "after", "ref_id": "001" })
+        )),
+        ErrorKind::BadArgs
+    );
+    // Bad position keyword, and before/after without a ref_id.
+    assert_eq!(
+        err_kind(fx.call(op::REORDER_BACKLOG_ITEM, serde_json::json!({ "id": "001", "position": "sideways" }))),
+        ErrorKind::BadArgs
+    );
+    assert_eq!(
+        err_kind(fx.call(op::REORDER_BACKLOG_ITEM, serde_json::json!({ "id": "001", "position": "before" }))),
+        ErrorKind::BadArgs
     );
 }
 

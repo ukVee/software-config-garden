@@ -27,7 +27,8 @@ pub use init::growlight_init;
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{
     AddBacklogItemArgs, AddBacklogItemReply, AddSliceArgs, AddSliceReply, LogBatonArgs,
-    LogBatonReply, SetItemStatusArgs, SetItemStatusReply,
+    LogBatonReply, ReorderBacklogItemArgs, ReorderBacklogItemReply, SetItemStatusArgs,
+    SetItemStatusReply,
 };
 use softfig_ipc::ErrorKind;
 
@@ -307,6 +308,97 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
         hash: hash.to_string(),
     })
     .unwrap())
+}
+
+// ---- reorder_backlog_item ----------------------------------------------
+
+pub fn reorder_backlog_item(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: ReorderBacklogItemArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("reorder_backlog_item args: {e}")))?;
+    non_empty("id", &args.id)?;
+    let position = paths::parse_position(&args.position, args.ref_id.as_deref())?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let rel = paths::backlog_claude();
+    let index = {
+        let wt = WorkTree::new(daemon, &inner);
+        if !wt.exists(&rel) {
+            return Err((ErrorKind::NotFound, format!("{rel}: no backlog yet")));
+        }
+        let content = super::sections::read_if_unprotected(&wt, &inner, &rel)
+            .ok_or((ErrorKind::VaultProtected, format!("{rel}: unreadable or vault-protected")))?;
+        let rows = managed::region_body(&content, paths::QUEUE_TAG)
+            .map(|b| queue::parse(&b))
+            .unwrap_or_default();
+
+        let from = rows
+            .iter()
+            .position(|r| r.id == args.id)
+            .ok_or((ErrorKind::NotFound, format!("no backlog item with id {:?}", args.id)))?;
+
+        let moved = queue::reordered(&rows, from, &position).map_err(reorder_err)?;
+        let new_index = moved
+            .iter()
+            .position(|r| r.id == args.id)
+            .expect("moved row is still present")
+            + 1;
+
+        // Idempotent: a move that doesn't change the order (e.g. to-top of the
+        // already-top row) writes nothing and mints no commit — return the
+        // current tip, exactly like set_item_status's no-op guard.
+        if moved == rows {
+            let tip = inner
+                .repo
+                .as_ref()
+                .expect("unlocked")
+                .tip()
+                .map_err(|e| err_to_response(e.into()))?
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            return Ok(serde_json::to_value(ReorderBacklogItemReply {
+                id: args.id,
+                index: new_index,
+                path: rel,
+                hash: tip,
+            })
+            .unwrap());
+        }
+
+        // Reorder is orthogonal to status: only the row order changes, every
+        // status cell (and which single item is `active`) is preserved.
+        let new = managed::upsert(&content, paths::QUEUE_TAG, &queue::render(&moved));
+        wt.write(&rel, new.as_bytes())?;
+        new_index
+    };
+
+    let payload = serde_json::json!({ "id": args.id, "index": index });
+    let intent = Intent::new("backlog_item_reordered", payload)
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    let hash = commit_now(&mut inner, intent)?;
+
+    Ok(serde_json::to_value(ReorderBacklogItemReply {
+        id: args.id,
+        index,
+        path: rel,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+/// Map a queue reorder failure onto an IPC error (a bad `before`/`after`
+/// reference id).
+fn reorder_err(e: queue::ReorderError) -> (ErrorKind, String) {
+    match e {
+        queue::ReorderError::RefNotFound(id) => (
+            ErrorKind::NotFound,
+            format!("no backlog item with id {id:?} to position relative to"),
+        ),
+        queue::ReorderError::RefIsSelf(id) => {
+            (ErrorKind::BadArgs, format!("cannot move item {id:?} relative to itself"))
+        }
+    }
 }
 
 // ---- shared helpers ----------------------------------------------------

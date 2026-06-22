@@ -18,8 +18,8 @@ use softfig_ipc::{
     verbs::{
         op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, EditSectionArgs, LogBatonArgs, LogDecisionArgs,
-        LogIncidentArgs, RefreshSnapshotArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs,
-        SetReviewedArgs,
+        LogIncidentArgs, RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs,
+        ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
     },
     Request, Response,
 };
@@ -378,6 +378,26 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "reorder_backlog_item",
+            "description": "growlight: move a backlog item's row in the authoritative queue table \
+                            in growlight/backlog/CLAUDE.md WITHOUT changing its status — the \
+                            first-class way to reprioritize the drain order (don't abuse `deferred`). \
+                            position is top|bottom|before|after; ref_id names the item to move \
+                            before/after (required for before/after, omit for top/bottom). The # \
+                            column re-renders to the new order. Idempotent: a move that doesn't \
+                            change the order makes no commit. Identify items by queue id (milestone \
+                            slug or task NNN).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id", "position"],
+                "properties": {
+                    "id": { "type": "string", "description": "the item to move (milestone slug or task NNN)" },
+                    "position": { "type": "string", "description": "top | bottom | before | after" },
+                    "ref_id": { "type": "string", "description": "the item to move before/after (required for before/after; omit for top/bottom)" },
+                },
+            },
+        }),
+        json!({
             "name": "replace_file",
             "description": "BREAK-GLASS: overwrite a garden file with verbatim bytes — no \
                             convention stamping, so you hand-write the ENTIRE file (frontmatter, \
@@ -470,6 +490,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: SetItemStatusArgs = serde_json::from_value(args)?;
             (op::SET_ITEM_STATUS, serde_json::to_value(a)?)
         }
+        "reorder_backlog_item" => {
+            let a: ReorderBacklogItemArgs = serde_json::from_value(args)?;
+            (op::REORDER_BACKLOG_ITEM, serde_json::to_value(a)?)
+        }
         other => anyhow::bail!("unknown tool {other:?}"),
     };
     Ok(pair)
@@ -524,9 +548,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_sixteen() {
+    fn tools_list_has_seventeen() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 16);
+        assert_eq!(defs.len(), 17);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -545,6 +569,7 @@ mod tests {
             "add_backlog_item",
             "add_slice",
             "set_item_status",
+            "reorder_backlog_item",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -554,7 +579,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
     }
 
     #[test]
@@ -622,6 +647,11 @@ mod tests {
                 "set_item_status",
                 json!({ "id": "m5b", "status": "active" }),
                 op::SET_ITEM_STATUS,
+            ),
+            (
+                "reorder_backlog_item",
+                json!({ "id": "010", "position": "before", "ref_id": "005" }),
+                op::REORDER_BACKLOG_ITEM,
             ),
             (
                 "replace_file",

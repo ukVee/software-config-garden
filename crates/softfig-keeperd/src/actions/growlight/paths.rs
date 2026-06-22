@@ -25,6 +25,8 @@ pub const ITEM_TYPES: [&str; 2] = ["milestone", "task"];
 /// multicast, hardware), then drains on to the next item — distinct from
 /// `blocked`, the genuine stop for "the agent can't proceed without a human."
 pub const STATUSES: [&str; 5] = ["queued", "active", "done", "blocked", "deferred"];
+/// The four move targets `reorder_backlog_item` accepts.
+pub const POSITIONS: [&str; 4] = ["top", "bottom", "before", "after"];
 
 // ---- path templates ----------------------------------------------------
 
@@ -110,6 +112,39 @@ pub fn validate_status(status: &str) -> Result<(), (ErrorKind, String)> {
             ErrorKind::BadArgs,
             format!("status {status:?}: must be one of {}", STATUSES.join(" / ")),
         ))
+    }
+}
+
+/// Parse a `reorder_backlog_item` `position` + optional `ref_id` into a
+/// [`super::queue::Position`]. `before`/`after` require a non-empty `ref_id`;
+/// `top`/`bottom` reject one (a stray ref there is a caller mistake, not
+/// silently dropped).
+pub fn parse_position(
+    position: &str,
+    ref_id: Option<&str>,
+) -> Result<super::queue::Position, (ErrorKind, String)> {
+    use super::queue::Position;
+    let ref_id = ref_id.map(str::trim).filter(|s| !s.is_empty());
+    match position {
+        "top" | "bottom" => {
+            if ref_id.is_some() {
+                return Err((ErrorKind::BadArgs, format!("position {position:?} takes no ref_id")));
+            }
+            Ok(if position == "top" { Position::Top } else { Position::Bottom })
+        }
+        "before" | "after" => {
+            let r = ref_id
+                .ok_or((ErrorKind::BadArgs, format!("position {position:?} requires ref_id")))?;
+            Ok(if position == "before" {
+                Position::Before(r.to_string())
+            } else {
+                Position::After(r.to_string())
+            })
+        }
+        _ => Err((
+            ErrorKind::BadArgs,
+            format!("position {position:?}: must be one of {}", POSITIONS.join(" / ")),
+        )),
     }
 }
 
@@ -280,6 +315,21 @@ mod tests {
         assert!(validate_status("active").is_ok());
         assert!(validate_status("deferred").is_ok());
         assert!(validate_status("paused").is_err());
+    }
+
+    #[test]
+    fn parse_position_maps_keywords_and_gates_ref_id() {
+        use super::super::queue::Position;
+        assert_eq!(parse_position("top", None).unwrap(), Position::Top);
+        assert_eq!(parse_position("bottom", None).unwrap(), Position::Bottom);
+        assert_eq!(parse_position("before", Some("005")).unwrap(), Position::Before("005".into()));
+        assert_eq!(parse_position("after", Some("005")).unwrap(), Position::After("005".into()));
+        // Blank ref_id is treated as absent.
+        assert_eq!(parse_position("top", Some("  ")).unwrap(), Position::Top);
+        // before/after require a ref; top/bottom forbid one; unknown keyword rejected.
+        assert!(parse_position("before", None).is_err());
+        assert!(parse_position("top", Some("005")).is_err());
+        assert!(parse_position("sideways", None).is_err());
     }
 
     #[test]
