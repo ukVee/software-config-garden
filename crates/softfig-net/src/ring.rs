@@ -89,8 +89,17 @@ impl Ring {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = fs::read_to_string(path)?;
-        let doc: RingDoc = toml::from_str(&raw)?;
+        Self::from_toml_str(&fs::read_to_string(path)?)
+    }
+
+    /// Parse and **verify** a ring from already-read `peers.toml` TOML text.
+    /// Same verification as [`Ring::load`] — any row whose attestation fails to
+    /// verify rejects the whole parse (a tampered membership file is a tamper
+    /// signal, not noise to skip). For callers that read the membership file
+    /// through their own mount-safe path (keeperd's `WorkTree`) rather than a
+    /// direct `fs::read`.
+    pub fn from_toml_str(raw: &str) -> Result<Self> {
+        let doc: RingDoc = toml::from_str(raw)?;
         let mut peers = Vec::with_capacity(doc.peer.len());
         for row in doc.peer {
             let entry = row.into_entry()?;

@@ -54,6 +54,7 @@ use softfig_store::Hash;
 use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo};
 
+use crate::actions::WorkTree;
 use crate::config::KeeperConfig;
 use crate::daemon::{Daemon, DaemonInner};
 use crate::keeper_toml::CONFIG_DIR;
@@ -288,21 +289,33 @@ pub fn initiate_pairing(local: &LocalDevice, endpoint: &str) -> Result<PendingPa
 // never dirties the garden. Membership writes go through the pairing handlers
 // (`mark_self_write` + one self-write + a `peers_changed` commit), not here.
 
-/// Garden-relative path of the membership ring: `config/peers.toml`.
-pub fn membership_path(garden_root: &std::path::Path) -> std::path::PathBuf {
-    garden_root.join(CONFIG_DIR).join(RING_FILE)
+/// Repo-relative path of the membership ring within the garden:
+/// `config/peers.toml`. WorkTree paths are repo-relative with `/` separators
+/// (`""` = garden root), so membership reads/writes go through the overlay and
+/// never touch an absolute mount path under `inner`.
+fn membership_rel() -> String {
+    format!("{CONFIG_DIR}/{RING_FILE}")
 }
 
-/// Load the live ring: membership from the garden `config/peers.toml` (falling
-/// back to the legacy `.softfig/peers.toml` when the in-garden file is absent —
-/// non-breaking, and once the garden file exists the legacy one is ignored),
-/// then merge volatile endpoints from the sidecar. `Ring::load` re-verifies
-/// every attestation on both paths, so a tampered membership file is rejected.
-pub fn load_ring(garden_root: &std::path::Path, state_dir: &std::path::Path) -> Result<Ring, NetError> {
-    let membership = membership_path(garden_root);
-    let mut ring = if membership.exists() {
-        Ring::load(&membership)?
+/// Load the live ring: membership from the garden `config/peers.toml` read
+/// through the `worktree` (FUSE overlay / Disk passthrough — never the absolute
+/// mount path under `inner`), falling back to the legacy `.softfig/peers.toml`
+/// when the in-garden file is absent (non-breaking; once the garden file exists
+/// the legacy one is ignored), then merge volatile endpoints from the sidecar.
+/// `from_toml_str`/`Ring::load` re-verify every attestation, so a tampered
+/// membership file is rejected.
+pub(crate) fn load_ring(worktree: &WorkTree, state_dir: &std::path::Path) -> Result<Ring, NetError> {
+    let rel = membership_rel();
+    let mut ring = if worktree.exists(&rel) {
+        // Present-but-unreadable membership is a tamper signal, not a silent
+        // fall-through to the legacy ring.
+        let raw = worktree
+            .read_to_string(&rel)
+            .ok_or(NetError::Protocol("membership peers.toml unreadable"))?;
+        Ring::from_toml_str(&raw)?
     } else {
+        // The legacy ring lives in `.softfig/` (the daemon state dir, outside
+        // the mount), so this direct read is not mount I/O.
         Ring::load(&ring_path(state_dir))?
     };
     EndpointCache::load(&endpoint_cache_path(state_dir))?.apply(&mut ring);
@@ -310,26 +323,30 @@ pub fn load_ring(garden_root: &std::path::Path, state_dir: &std::path::Path) -> 
 }
 
 /// Persist a membership change (pair confirm / unpair) at the structural root:
-/// serialize the ring's **membership** (endpoints stripped) to the garden's
-/// `config/peers.toml` working tree as one self-write-suppressed write, commit
-/// `peers_changed`, then refresh the volatile endpoint sidecar from the same
-/// ring so reconnect-after-restart still works. The caller holds `inner` (the
-/// commit needs it), has already up/removed the ring row, and passes the
-/// `daemon` so the watcher drops the write event.
+/// serialize the ring's **membership** (endpoints stripped) and stage it to the
+/// garden's `config/peers.toml` through the [`WorkTree`] (the FUSE overlay in
+/// mount mode, a self-write-suppressed `std::fs` write on Disk — never a raw
+/// write to the mount path under `inner`), commit `peers_changed` from the
+/// in-memory snapshot via [`commit_now`](crate::actions::commit_now), then
+/// refresh the volatile endpoint sidecar from the same ring so
+/// reconnect-after-restart still works. The caller holds `inner` (the commit
+/// needs it), has already up/removed the ring row, and passes the `daemon` (for
+/// the WorkTree / self-write suppression map).
 pub fn write_and_commit_membership(
     daemon: &Daemon,
     inner: &mut DaemonInner,
-    garden_root: &std::path::Path,
     state_dir: &std::path::Path,
     ring: &Ring,
 ) -> Result<Hash, (ErrorKind, String)> {
-    let abs = membership_path(garden_root);
-    // Suppress the watcher event BEFORE the write (the watcher runs in parallel).
-    daemon.mark_self_write(abs.clone());
     let toml = ring
         .to_membership_toml()
         .map_err(|e| (ErrorKind::Internal, format!("serialize membership: {e}")))?;
-    crate::actions::write_file(&abs, toml.as_bytes())?;
+    // Stage the write through the WorkTree; the next `commit_now` snapshot
+    // (tip ∪ overlay) captures it, so no mount I/O happens under `inner`.
+    {
+        let wt = WorkTree::new(daemon, inner);
+        wt.write(&membership_rel(), toml.as_bytes())?;
+    }
 
     let payload = serde_json::json!({ "summary": format!("{} ring members", ring.len()) });
     let intent = Intent::new("peers_changed", payload)
@@ -382,13 +399,12 @@ impl NetRuntime {
     /// Start the runtime for an unlocked daemon. Best-effort: a failure to bind
     /// the listener, create the mDNS daemon, or start the relay is logged and
     /// skipped (the network is a manual real-machine smoke step), never fatal
-    /// to `unlock`.
-    pub fn start(daemon: &Daemon, config: &KeeperConfig, local: LocalDevice) -> Self {
+    /// to `unlock`. The live `ring` is loaded by the caller *under* `inner`
+    /// (mount-safe via the `WorkTree`) and handed in, so this network setup runs
+    /// entirely off the daemon mutex.
+    pub fn start(daemon: &Daemon, config: &KeeperConfig, local: LocalDevice, ring: Ring) -> Self {
         let state_dir = config.state_dir().to_path_buf();
-        let garden_root = config.garden_root.clone();
-        let ring = Arc::new(Mutex::new(
-            load_ring(&garden_root, &state_dir).unwrap_or_default(),
-        ));
+        let ring = Arc::new(Mutex::new(ring));
         let discovery_cache: Arc<Mutex<HashMap<String, DiscoveredEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -913,7 +929,10 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
                 return;
             }
         };
-        let ring = load_ring(&inner.config.garden_root, &state_dir).unwrap_or_default();
+        let ring = {
+            let wt = WorkTree::new(daemon, &inner);
+            load_ring(&wt, &state_dir).unwrap_or_default()
+        };
         let mut targets: Vec<(RingEntry, ReplicaGrant)> = Vec::new();
         for fp in &ledger.push_to {
             if let Some(host) = ring.peers().iter().find(|p| &p.fingerprint() == fp) {

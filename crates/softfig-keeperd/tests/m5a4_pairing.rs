@@ -10,6 +10,7 @@
 //! smoke step. The error paths (no endpoint, unreachable endpoint, unknown
 //! ids) are checked too.
 
+use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::mpsc;
@@ -22,8 +23,9 @@ use softfig_vcs::Repo;
 use softfig_ipc::{
     self,
     verbs::{
-        op, DiscoverListReply, MigrateConfigReply, PairBeginArgs, PairBeginReply, PairConfirmArgs,
-        PairConfirmReply, PairListReply, PairRemoveArgs, PairRemoveReply, UnlockArgs,
+        op, DiscoverListReply, LogReply, MigrateConfigReply, PairBeginArgs, PairBeginReply,
+        PairConfirmArgs, PairConfirmReply, PairListReply, PairRemoveArgs, PairRemoveReply,
+        UnlockArgs,
     },
     ErrorKind, Request, Response,
 };
@@ -497,6 +499,160 @@ fn pairing_verbs_require_unlock() {
 
     let kind = expect_err(rpc(&socket, op::PAIR_LIST, json!({})));
     assert_eq!(kind, ErrorKind::VaultLocked);
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+/// Skip body when FUSE isn't actually usable in this env (CI sandbox). The
+/// dependency is runtime-resolved (kernel + setuid helper), not build-time.
+fn fuse_available() -> bool {
+    Path::new("/dev/fuse").exists()
+        && (Path::new("/usr/bin/fusermount3").exists()
+            || Path::new("/usr/bin/fusermount").exists())
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Task 009 regression: with a **real FUSE mount**, a pairing membership write
+/// must be staged through the `WorkTree` overlay and land in a `peers_changed`
+/// commit built from the in-memory snapshot — never a raw `std::fs` write to
+/// the mount path under `inner` — and then read back *through the mount*. This
+/// exercises the `WorkTree::Fuse` path (the M1c-compat round-trip test above
+/// only covers `WorkTree::Disk`). Gated on a usable `/dev/fuse`; skips cleanly
+/// in a sandbox.
+#[test]
+fn pair_confirm_membership_commits_and_reads_back_through_fuse_mount() {
+    if !fuse_available() {
+        eprintln!("fuse unavailable; skipping");
+        return;
+    }
+
+    // A migrated layout: the garden is the FUSE mount, `.softfig` lives in a
+    // sibling state root so the mount can't shadow it.
+    let tmp = tempfile::tempdir().unwrap();
+    let garden = tmp.path().join("garden");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&garden).unwrap();
+    let (_v, session, _r) =
+        Vault::init_with_params(&garden, PASS.as_bytes(), fast_params()).unwrap();
+    Repo::init(&garden, &session).unwrap();
+    drop(session);
+    fs::create_dir_all(&state).unwrap();
+    copy_dir(&garden.join(".softfig"), &state.join(".softfig")).unwrap();
+
+    // Socket OUTSIDE the garden — the FUSE mount would shadow it otherwise.
+    let socket = tmp.path().join("keeperd.sock");
+    let cfg = KeeperConfig::new(&garden)
+        .with_state_root(&state)
+        .with_socket(&socket)
+        .without_watcher()
+        .without_net();
+    let handle = match Daemon::new(cfg).start() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("daemon start failed: {e}; skipping");
+            return;
+        }
+    };
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(socket.exists(), "socket never appeared");
+
+    let unlock = rpc(
+        &socket,
+        op::UNLOCK,
+        serde_json::to_value(UnlockArgs {
+            passphrase: PASS.into(),
+        })
+        .unwrap(),
+    );
+    if let Response::Err { kind, error, .. } = &unlock {
+        eprintln!("unlock failed (likely fuse-mount issue: {kind:?} {error}); skipping");
+        handle.shutdown();
+        let _ = handle.join();
+        return;
+    }
+    let _ = unwrap_ok(unlock);
+    thread::sleep(Duration::from_millis(150)); // let the mount settle
+
+    // Genesis-only before pairing.
+    let pre: LogReply =
+        serde_json::from_value(unwrap_ok(rpc(&socket, op::LOG, json!({ "limit": 0 })))).unwrap();
+    assert_eq!(pre.commits.len(), 1, "expected genesis only");
+
+    // Pair with a forged loopback responder. The initiator path is FUSE-neutral;
+    // only `pair_confirm`'s membership persistence touches the working tree.
+    let peer = forge_device("fuse-peer", 9, 10);
+    let peer_fp = hex::encode(peer.device_id);
+    let (endpoint, sas_rx) = spawn_responder(peer);
+    let begin: PairBeginReply = serde_json::from_value(unwrap_ok(rpc(
+        &socket,
+        op::PAIR_BEGIN,
+        serde_json::to_value(PairBeginArgs {
+            fingerprint: peer_fp.clone(),
+            endpoint: Some(endpoint),
+        })
+        .unwrap(),
+    )))
+    .unwrap();
+    let responder_sas = sas_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(begin.sas, responder_sas, "SAS must match on both devices");
+
+    let confirm: PairConfirmReply = serde_json::from_value(unwrap_ok(rpc(
+        &socket,
+        op::PAIR_CONFIRM,
+        serde_json::to_value(PairConfirmArgs {
+            pairing_id: begin.pairing_id,
+        })
+        .unwrap(),
+    )))
+    .unwrap();
+    assert_eq!(confirm.fingerprint, peer_fp);
+
+    // (1) The membership write landed in exactly one new `peers_changed` commit
+    //     (built from the FUSE snapshot, no mount I/O under `inner`).
+    let log: LogReply =
+        serde_json::from_value(unwrap_ok(rpc(&socket, op::LOG, json!({ "limit": 0 })))).unwrap();
+    assert_eq!(log.commits.len(), 2, "membership write must add one commit");
+    assert_eq!(log.commits[0].intent, "peers_changed");
+
+    // (2) `pair_list` reads the peer back via `load_ring` → `WorkTree::Fuse` →
+    //     the mount overlay/tip — no direct mount-path read under `inner`.
+    let post: PairListReply =
+        serde_json::from_value(unwrap_ok(rpc(&socket, op::PAIR_LIST, json!({})))).unwrap();
+    assert_eq!(post.peers.len(), 1);
+    assert_eq!(post.peers[0].fingerprint, peer_fp);
+    assert!(post.pending.is_empty());
+
+    // (3) The committed membership is visible through the kernel mount path
+    //     itself, verifies, and carries no volatile endpoints.
+    let through_mount = Ring::load(&garden.join("config").join("peers.toml"))
+        .expect("read committed membership back through the FUSE mount");
+    assert_eq!(through_mount.len(), 1);
+    assert_eq!(through_mount.peers()[0].fingerprint(), peer_fp);
+    assert!(through_mount.peers()[0].verify());
+    assert!(
+        through_mount.peers()[0].endpoints.is_empty(),
+        "committed membership carries no volatile endpoints"
+    );
 
     handle.shutdown();
     handle.join().unwrap();
