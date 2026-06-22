@@ -1551,18 +1551,18 @@ pub(crate) fn validate_repo_path(garden_root: &Path, rel: &str) -> std::result::
         }
     }
     let abs = garden_root.join(p);
-    // Defense-in-depth: even after the component check, ensure the
-    // resolved path is rooted under the garden.
-    let canon_root = garden_root
-        .canonicalize()
-        .unwrap_or_else(|_| garden_root.to_path_buf());
-    let canon_parent = abs
-        .parent()
-        .map(|p| {
-            p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
-        })
-        .unwrap_or_else(|| canon_root.clone());
-    if !canon_parent.starts_with(&canon_root) {
+    // Defense-in-depth: even after the component check, assert the joined
+    // path is lexically rooted under the garden. This is a PURE path
+    // comparison and must NOT stat the filesystem. `canonicalize()` here
+    // would round-trip through the FUSE mount under `inner` — exactly the
+    // deadlock the commit-from-memory invariant exists to prevent
+    // (decision-softfig-commit-from-memory). It is also unnecessary: the
+    // component loop above already rejects `..`, absolute paths and root
+    // components, so nothing can climb out of `garden_root` lexically; and
+    // every caller resolves the returned path against the in-memory git
+    // tree (path_to_repo_rel_string -> resolve_path_in_tree / WorkTree),
+    // never the live mount, so on-disk symlink resolution would buy nothing.
+    if !abs.starts_with(garden_root) {
         return Err(format!("{rel}: resolves outside garden root"));
     }
     Ok(abs)
@@ -1593,4 +1593,59 @@ fn short_summary(payload_canon: &str) -> String {
 #[allow(dead_code)]
 fn project_label() -> &'static str {
     PROJECT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Intentionally a path that does NOT exist on disk: validate_repo_path is
+    // purely lexical and must never stat the (mount) root — see the no-mount-IO
+    // invariant in decision-softfig-commit-from-memory.
+    fn root() -> PathBuf {
+        PathBuf::from("/nonexistent/garden-root")
+    }
+
+    #[test]
+    fn accepts_simple_relative_paths() {
+        let r = root();
+        assert_eq!(validate_repo_path(&r, "foo.md").unwrap(), r.join("foo.md"));
+        assert_eq!(validate_repo_path(&r, "a/b/c.md").unwrap(), r.join("a/b/c.md"));
+        // A leading ./ is allowed and normalizes away on the join.
+        assert_eq!(validate_repo_path(&r, "./a/b.md").unwrap(), r.join("a/b.md"));
+    }
+
+    #[test]
+    fn validates_without_touching_the_filesystem() {
+        // The root does not exist; a purely lexical validator still succeeds.
+        // This guards against ever reintroducing a canonicalize/exists() stat
+        // of the mount under `inner`.
+        let r = root();
+        assert!(!r.exists());
+        let abs = validate_repo_path(&r, "journal/x.md").unwrap();
+        assert!(abs.starts_with(&r));
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_repo_path(&root(), "").unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn rejects_absolute() {
+        let e = validate_repo_path(&root(), "/etc/passwd").unwrap_err();
+        assert!(e.contains("absolute"), "{e}");
+        // A bare root is also absolute.
+        assert!(validate_repo_path(&root(), "/").unwrap_err().contains("absolute"));
+    }
+
+    #[test]
+    fn rejects_parent_dir_traversal() {
+        // Every form of `..` escape is rejected lexically, with or without an
+        // interior prefix — the protection canonicalize used to backstop.
+        for p in ["..", "../escape", "foo/../bar", "a/b/../../../etc/passwd"] {
+            let e = validate_repo_path(&root(), p).unwrap_err();
+            assert!(e.contains(".."), "{p}: {e}");
+        }
+    }
 }
