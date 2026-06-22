@@ -1835,6 +1835,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-growlightd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "softfig-ipc",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "softfig-ipc"
 version = "0.1.0"
 dependencies = [

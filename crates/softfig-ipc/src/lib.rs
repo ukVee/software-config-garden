@@ -9,13 +9,14 @@
 #![warn(missing_debug_implementations)]
 
 pub mod client;
+pub mod growlightd;
 pub mod proto;
 pub mod socket;
 pub mod verbs;
 
 pub use client::{call, call_reconnecting, connect, ClientError, ReconnectError, RetryPolicy};
 pub use proto::{ErrorKind, Request, Response};
-pub use socket::runtime_socket_path;
+pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};
 pub use verbs::*;
 
 /// Bumped on incompatible wire-format changes. M1c ships v1.
