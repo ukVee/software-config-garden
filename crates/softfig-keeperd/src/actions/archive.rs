@@ -9,7 +9,7 @@ use softfig_vcs::Intent;
 use softfig_ipc::verbs::{ArchiveArgs, ArchiveReply};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions};
+use super::{commit_now, conventions, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{path_to_repo_rel_string, require_unlocked, validate_repo_path, HandlerResult};
 
@@ -24,9 +24,6 @@ pub fn archive(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let src_abs = validate_repo_path(&garden_root, &args.src).map_err(|m| (ErrorKind::BadArgs, m))?;
     let src_rel = path_to_repo_rel_string(&garden_root, &src_abs)
         .ok_or((ErrorKind::BadArgs, "src outside garden root".into()))?;
-    if !src_abs.exists() {
-        return Err((ErrorKind::SourceNotFound, format!("{src_rel}: no such path")));
-    }
 
     let basename = Path::new(&src_rel)
         .file_name()
@@ -48,33 +45,33 @@ pub fn archive(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     }
 
     let dst_rel = format!("journal/archive/{archive_name}/{basename}");
-    let dst_abs = garden_root.join(&dst_rel);
-    if dst_abs.exists() {
-        return Err((ErrorKind::PathAlreadyExists, format!("{dst_rel}: already exists")));
-    }
-    if let Some(parent) = dst_abs.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| (ErrorKind::Io, e.to_string()))?;
-    }
 
-    daemon.mark_self_write(src_abs.clone());
-    daemon.mark_self_write(dst_abs.clone());
-    std::fs::rename(&src_abs, &dst_abs).map_err(|e| (ErrorKind::Io, format!("rename: {e}")))?;
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        if !wt.exists(&src_rel) {
+            return Err((ErrorKind::SourceNotFound, format!("{src_rel}: no such path")));
+        }
+        if wt.exists(&dst_rel) {
+            return Err((ErrorKind::PathAlreadyExists, format!("{dst_rel}: already exists")));
+        }
+        wt.rename(&src_rel, &dst_rel)?;
 
-    // Slice 4: if the archived path was a numbered note, its folder's index
-    // table just lost a row — refresh it in the parent CLAUDE.md (best-effort,
-    // folded into this commit).
-    if conventions::parse_note_number(&basename).is_some() {
-        if let Some(parent) = Path::new(&src_rel).parent().and_then(|p| p.to_str()) {
-            if conventions::is_accretive_dir(parent) {
-                super::index::refresh_folder_index(daemon, &inner, &garden_root, parent);
+        // Slice 4: if the archived path was a numbered note, its folder's index
+        // table just lost a row — refresh it in the parent CLAUDE.md (best-effort,
+        // folded into this commit).
+        if conventions::parse_note_number(&basename).is_some() {
+            if let Some(parent) = Path::new(&src_rel).parent().and_then(|p| p.to_str()) {
+                if conventions::is_accretive_dir(parent) {
+                    super::index::refresh_folder_index(&wt, &inner, parent);
+                }
             }
         }
+        // Slice 5: repoint inbound `[[…]]` references at the archived location so
+        // they don't dangle, then recompute the backlink graph (any doc can be a
+        // backlink target, so this runs for every archive, not just notes).
+        super::backlinks::rewrite_refs_to_archived(&wt, &inner, &src_rel, &dst_rel);
+        super::backlinks::refresh_all(&wt, &inner);
     }
-    // Slice 5: repoint inbound `[[…]]` references at the archived location so
-    // they don't dangle, then recompute the backlink graph (any doc can be a
-    // backlink target, so this runs for every archive, not just notes).
-    super::backlinks::rewrite_refs_to_archived(daemon, &inner, &garden_root, &src_rel, &dst_rel);
-    super::backlinks::refresh_all(daemon, &inner, &garden_root);
 
     let intent = Intent::new(
         "archive_move",

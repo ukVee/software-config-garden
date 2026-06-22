@@ -35,6 +35,7 @@ mod numbering;
 mod refresh_snapshot;
 mod sections;
 mod split;
+mod worktree;
 
 pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
@@ -46,6 +47,7 @@ pub use migrate_config::migrate_config;
 pub use refresh_snapshot::refresh_snapshot;
 pub use sections::{add_section, append_to_section, edit_section, set_reviewed};
 pub use split::migrate_split;
+pub(crate) use worktree::WorkTree;
 
 use std::path::Path;
 

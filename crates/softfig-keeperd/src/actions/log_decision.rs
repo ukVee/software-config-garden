@@ -5,7 +5,7 @@ use softfig_vcs::Intent;
 use softfig_ipc::verbs::{LogDecisionArgs, LogDecisionReply};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, write_file};
+use super::{commit_now, conventions, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{require_unlocked, HandlerResult};
 
@@ -19,19 +19,17 @@ pub fn log_decision(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
     let rel = conventions::decision_path(&args.slug);
-    let abs = garden_root.join(&rel);
-    if abs.exists() {
-        return Err((ErrorKind::PathAlreadyExists, format!("{rel}: already exists")));
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        if wt.exists(&rel) {
+            return Err((ErrorKind::PathAlreadyExists, format!("{rel}: already exists")));
+        }
+        let title = args.summary.as_deref().unwrap_or(&args.slug);
+        let content = conventions::decision_doc(title, &conventions::today_hyphen(), &args.body);
+        wt.write(&rel, content.as_bytes())?;
     }
-
-    let title = args.summary.as_deref().unwrap_or(&args.slug);
-    let content = conventions::decision_doc(title, &conventions::today_hyphen(), &args.body);
-
-    daemon.mark_self_write(abs.clone());
-    write_file(&abs, content.as_bytes())?;
 
     let intent = Intent::new("decision_logged", serde_json::json!({ "slug": args.slug }))
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;

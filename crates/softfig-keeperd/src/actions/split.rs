@@ -18,10 +18,10 @@ use softfig_vcs::Intent;
 use softfig_ipc::verbs::{MigrateSplitArgs, MigrateSplitReply, SplitOutcome, SplitSkip};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, write_file};
+use super::{commit_now, conventions, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{require_unlocked, HandlerResult};
-use crate::migrate::{archive_bucket, discover_monoliths, plan_split};
+use crate::migrate::{archive_bucket, monolith_target, plan_split, Monolith};
 
 pub fn migrate_split(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: MigrateSplitArgs = serde_json::from_value(args)
@@ -29,9 +29,13 @@ pub fn migrate_split(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
-    let (candidates, raw_skips) = discover_monoliths(&garden_root);
+    // Discovery is read-only; run it against the worktree (in FUSE mode the
+    // in-memory tree, never a self-walk of the mount under `inner`).
+    let (candidates, raw_skips) = {
+        let wt = WorkTree::new(daemon, &inner);
+        discover(&wt)
+    };
     let mut skipped: Vec<SplitSkip> = raw_skips
         .into_iter()
         .map(|(path, reason)| SplitSkip { path, reason })
@@ -40,16 +44,16 @@ pub fn migrate_split(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
     let mut splits = Vec::new();
 
     for cand in candidates {
-        let from_abs = garden_root.join(&cand.path);
-        let content = match std::fs::read_to_string(&from_abs) {
-            Ok(c) => c,
-            Err(e) => {
-                skipped.push(SplitSkip {
-                    path: cand.path,
-                    reason: format!("read failed: {e}"),
-                });
-                continue;
-            }
+        let content = {
+            let wt = WorkTree::new(daemon, &inner);
+            wt.read_to_string(&cand.path)
+        };
+        let Some(content) = content else {
+            skipped.push(SplitSkip {
+                path: cand.path,
+                reason: "read failed".into(),
+            });
+            continue;
         };
         let plan = plan_split(&content, &date);
         if plan.notes.is_empty() {
@@ -73,43 +77,30 @@ pub fn migrate_split(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
         }
 
         // ---- apply: materialize the folder, archive the monolith, commit ----
-        let folder_abs = garden_root.join(&cand.folder);
-        for (filename, body) in &plan.notes {
-            let note_abs = folder_abs.join(filename);
-            daemon.mark_self_write(note_abs.clone());
-            write_file(&note_abs, body.as_bytes())?;
-        }
-        let seq_abs = folder_abs.join(conventions::SEQ_FILE);
-        daemon.mark_self_write(seq_abs.clone());
-        write_file(&seq_abs, format!("{}\n", plan.seq).as_bytes())?;
-
         let basename = Path::new(&cand.path)
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or((ErrorKind::Internal, "monolith has no basename".into()))?;
-        let archived_rel =
-            format!("journal/archive/{}/{}", archive_bucket(&cand.folder), basename);
-        let archived_abs = garden_root.join(&archived_rel);
-        if let Some(parent) = archived_abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| (ErrorKind::Io, e.to_string()))?;
-        }
-        daemon.mark_self_write(from_abs.clone());
-        daemon.mark_self_write(archived_abs.clone());
-        std::fs::rename(&from_abs, &archived_abs)
-            .map_err(|e| (ErrorKind::Io, format!("archive {}: {e}", cand.path)))?;
+        let archived_rel = format!("journal/archive/{}/{}", archive_bucket(&cand.folder), basename);
 
-        // Mirror add_note + archive upkeep: index the new folder, repoint
-        // inbound refs at the archived monolith, recompute the backlink graph
-        // — all folded into this commit (best-effort, never blocks the split).
-        super::index::refresh_folder_index(daemon, &inner, &garden_root, &cand.folder);
-        super::backlinks::rewrite_refs_to_archived(
-            daemon,
-            &inner,
-            &garden_root,
-            &cand.path,
-            &archived_rel,
-        );
-        super::backlinks::refresh_all(daemon, &inner, &garden_root);
+        {
+            let wt = WorkTree::new(daemon, &inner);
+            for (filename, body) in &plan.notes {
+                wt.write(&format!("{}/{filename}", cand.folder), body.as_bytes())?;
+            }
+            wt.write(
+                &format!("{}/{}", cand.folder, conventions::SEQ_FILE),
+                format!("{}\n", plan.seq).as_bytes(),
+            )?;
+            wt.rename(&cand.path, &archived_rel)?;
+
+            // Mirror add_note + archive upkeep: index the new folder, repoint
+            // inbound refs at the archived monolith, recompute the backlink graph
+            // — all folded into this commit (best-effort, never blocks the split).
+            super::index::refresh_folder_index(&wt, &inner, &cand.folder);
+            super::backlinks::rewrite_refs_to_archived(&wt, &inner, &cand.path, &archived_rel);
+            super::backlinks::refresh_all(&wt, &inner);
+        }
 
         let payload = serde_json::json!({
             "from": cand.path,
@@ -136,4 +127,47 @@ pub fn migrate_split(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
         skipped,
     })
     .unwrap())
+}
+
+/// Worktree-backed mirror of [`crate::migrate::discover_monoliths`]: find the
+/// splittable `notes.md` / `troubleshooting.md` monoliths (target folder absent)
+/// plus the skipped ones (folder already exists), reading the in-memory tree in
+/// FUSE mode so discovery never self-walks the mount under `inner`.
+fn discover(wt: &WorkTree) -> (Vec<Monolith>, Vec<(String, String)>) {
+    let mut files = Vec::new();
+    collect_files(wt, "", &mut files);
+    let mut found = Vec::new();
+    let mut skipped = Vec::new();
+    for rel in files {
+        if let Some((folder, _kind)) = monolith_target(&rel) {
+            if wt.exists(&folder) {
+                skipped.push((rel, format!("target folder {folder}/ already exists")));
+            } else {
+                found.push(Monolith { path: rel, folder });
+            }
+        }
+    }
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    skipped.sort();
+    (found, skipped)
+}
+
+/// Every file repo-path under `dir_rel`, skipping `.softfig/` and the
+/// `journal/archive/` graveyard — matching `discover_monoliths`' `walk_tree`.
+fn collect_files(wt: &WorkTree, dir_rel: &str, out: &mut Vec<String>) {
+    for entry in wt.read_dir(dir_rel) {
+        let rel = if dir_rel.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{dir_rel}/{}", entry.name)
+        };
+        if entry.is_dir {
+            if entry.name == ".softfig" || rel == "journal/archive" {
+                continue;
+            }
+            collect_files(wt, &rel, out);
+        } else {
+            out.push(rel);
+        }
+    }
 }

@@ -29,10 +29,9 @@
 //! `[[…]]` syntax don't forge edges.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
-use crate::actions::managed;
-use crate::daemon::{Daemon, DaemonInner};
+use crate::actions::{managed, WorkTree};
+use crate::daemon::DaemonInner;
 
 /// Managed-region tag for the backlinks block.
 const BACKLINKS_TAG: &str = "backlinks";
@@ -41,10 +40,13 @@ const BACKLINKS_TAG: &str = "backlinks";
 
 /// Recompute the whole backlink graph from a fresh walk and rewrite every
 /// target region whose content changed. Folded into the caller's in-flight
-/// commit. Best-effort: never errors.
-pub fn refresh_all(daemon: &Daemon, inner: &DaemonInner, garden_root: &Path) {
-    let files = collect_md(garden_root);
-    let exists = |rel: &str| garden_root.join(rel).is_file();
+/// commit. Best-effort: never errors. Every read/write goes through the
+/// [`WorkTree`] — in FUSE mode this whole-garden walk runs against the
+/// in-memory (tip ∪ overlay) state, not by recursively self-reading the mount
+/// under `daemon.inner` (the 2026-06-21 deadlock's worst self-read).
+pub fn refresh_all(wt: &WorkTree, inner: &DaemonInner) {
+    let files = collect_md(wt);
+    let exists = |rel: &str| wt.exists(rel) && !wt.is_dir(rel);
 
     // One read per readable, non-vault markdown file: collect its refs and
     // note whether it already hosts a backlinks region.
@@ -53,8 +55,7 @@ pub fn refresh_all(daemon: &Daemon, inner: &DaemonInner, garden_root: &Path) {
     let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for rel in &files {
-        let abs = garden_root.join(rel);
-        let Some(content) = super::sections::read_if_unprotected(inner, &abs, rel) else {
+        let Some(content) = super::sections::read_if_unprotected(wt, inner, rel) else {
             continue;
         };
         if managed::has_region(&content, BACKLINKS_TAG) {
@@ -86,9 +87,7 @@ pub fn refresh_all(daemon: &Daemon, inner: &DaemonInner, garden_root: &Path) {
             None => managed::remove(content, BACKLINKS_TAG),
         };
         if &new != content {
-            let abs = garden_root.join(&target);
-            daemon.mark_self_write(abs.clone());
-            let _ = std::fs::write(&abs, new.as_bytes());
+            let _ = wt.write(&target, new.as_bytes());
         }
     }
 }
@@ -97,20 +96,17 @@ pub fn refresh_all(daemon: &Daemon, inner: &DaemonInner, garden_root: &Path) {
 /// points at `dst_rel` (the archived location), keeping links from dangling.
 /// Call before [`refresh_all`] on archive. Best-effort.
 pub fn rewrite_refs_to_archived(
-    daemon: &Daemon,
+    wt: &WorkTree,
     inner: &DaemonInner,
-    garden_root: &Path,
     src_rel: &str,
     dst_rel: &str,
 ) {
-    for rel in collect_md(garden_root) {
-        let abs = garden_root.join(&rel);
-        let Some(content) = super::sections::read_if_unprotected(inner, &abs, &rel) else {
+    for rel in collect_md(wt) {
+        let Some(content) = super::sections::read_if_unprotected(wt, inner, &rel) else {
             continue;
         };
         if let Some(new) = refs::rewrite_to(&content, &rel, src_rel, dst_rel) {
-            daemon.mark_self_write(abs.clone());
-            let _ = std::fs::write(&abs, new.as_bytes());
+            let _ = wt.write(&rel, new.as_bytes());
         }
     }
 }
@@ -118,41 +114,31 @@ pub fn rewrite_refs_to_archived(
 /// Collect garden-relative paths of every `.md` file, skipping the
 /// `journal/archive` graveyard and any dot-prefixed entry (`.softfig`,
 /// `.git`, `.seq`, …). Symlinked dirs are not followed.
-fn collect_md(garden_root: &Path) -> Vec<String> {
+fn collect_md(wt: &WorkTree) -> Vec<String> {
     let mut out = Vec::new();
-    walk(garden_root, garden_root, &mut out);
+    walk(wt, "", &mut out);
     out
 }
 
-fn walk(garden_root: &Path, dir: &Path, out: &mut Vec<String>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with('.') {
+fn walk(wt: &WorkTree, dir_rel: &str, out: &mut Vec<String>) {
+    for entry in wt.read_dir(dir_rel) {
+        if entry.name.starts_with('.') {
             continue; // .softfig, .git, .seq, dotfiles
         }
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        let Some(rel) = path
-            .strip_prefix(garden_root)
-            .ok()
-            .and_then(|p| p.to_str())
-            .map(|s| s.replace('\\', "/"))
-        else {
-            continue;
+        let rel = if dir_rel.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{dir_rel}/{}", entry.name)
         };
-        if ft.is_dir() {
+        if entry.is_dir {
             if rel == "journal/archive" || rel == "growlight/baton-log" {
                 // graveyard + the growlight audit log: never source nor target.
                 // The baton-log is append-only and "never injected", so its
                 // `[[…]]` mentions must not forge edges onto live item docs.
                 continue;
             }
-            walk(garden_root, &path, out);
-        } else if ft.is_file() && name.ends_with(".md") {
+            walk(wt, &rel, out);
+        } else if entry.name.ends_with(".md") {
             out.push(rel);
         }
     }

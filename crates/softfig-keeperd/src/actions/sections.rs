@@ -29,7 +29,7 @@
 //! tags are malformed (`MalformedVaultTag`). Headings themselves are never
 //! redacted, so a heading address always matches the daemon's truth.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{
@@ -37,7 +37,7 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, write_file};
+use super::{commit_now, conventions, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{
     path_to_repo_rel_string, require_unlocked, validate_repo_path, HandlerResult,
@@ -54,12 +54,15 @@ pub fn add_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let garden_root = inner.config.garden_root.clone();
-    let (abs, rel) = resolve(&garden_root, &args.path)?;
+    let rel = resolve(&garden_root, &args.path)?;
 
-    let content = load_unprotected(&inner, &abs, &rel)?;
-    let new = edit::add_section(&content, &args.heading, &args.body)
-        .map_err(|e| section_err(&rel, &args.heading, e))?;
-    write_and_commit(daemon, &mut inner, &abs, &rel, new, "section_added", &args.heading)
+    let new = {
+        let wt = WorkTree::new(daemon, &inner);
+        let content = load_unprotected(&wt, &inner, &rel)?;
+        edit::add_section(&content, &args.heading, &args.body)
+            .map_err(|e| section_err(&rel, &args.heading, e))?
+    };
+    write_and_commit(daemon, &mut inner, &rel, new, "section_added", &args.heading)
 }
 
 pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -71,12 +74,15 @@ pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let garden_root = inner.config.garden_root.clone();
-    let (abs, rel) = resolve(&garden_root, &args.path)?;
+    let rel = resolve(&garden_root, &args.path)?;
 
-    let content = load_unprotected(&inner, &abs, &rel)?;
-    let new = edit::edit_section(&content, &args.heading, &args.body)
-        .map_err(|e| section_err(&rel, &args.heading, e))?;
-    write_and_commit(daemon, &mut inner, &abs, &rel, new, "section_edited", &args.heading)
+    let new = {
+        let wt = WorkTree::new(daemon, &inner);
+        let content = load_unprotected(&wt, &inner, &rel)?;
+        edit::edit_section(&content, &args.heading, &args.body)
+            .map_err(|e| section_err(&rel, &args.heading, e))?
+    };
+    write_and_commit(daemon, &mut inner, &rel, new, "section_edited", &args.heading)
 }
 
 pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -88,12 +94,15 @@ pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let garden_root = inner.config.garden_root.clone();
-    let (abs, rel) = resolve(&garden_root, &args.path)?;
+    let rel = resolve(&garden_root, &args.path)?;
 
-    let content = load_unprotected(&inner, &abs, &rel)?;
-    let new = edit::append_to_section(&content, &args.heading, &args.text)
-        .map_err(|e| section_err(&rel, &args.heading, e))?;
-    write_and_commit(daemon, &mut inner, &abs, &rel, new, "section_appended", &args.heading)
+    let new = {
+        let wt = WorkTree::new(daemon, &inner);
+        let content = load_unprotected(&wt, &inner, &rel)?;
+        edit::append_to_section(&content, &args.heading, &args.text)
+            .map_err(|e| section_err(&rel, &args.heading, e))?
+    };
+    write_and_commit(daemon, &mut inner, &rel, new, "section_appended", &args.heading)
 }
 
 pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -102,16 +111,18 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let garden_root = inner.config.garden_root.clone();
-    let (abs, rel) = resolve(&garden_root, &args.path)?;
+    let rel = resolve(&garden_root, &args.path)?;
 
-    let content = load_unprotected(&inner, &abs, &rel)?;
-    let new = edit::set_reviewed(&content, &conventions::today_hyphen()).ok_or((
-        ErrorKind::NotFound,
-        format!("{rel}: no 'Last reviewed:' line to stamp"),
-    ))?;
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        let content = load_unprotected(&wt, &inner, &rel)?;
+        let new = edit::set_reviewed(&content, &conventions::today_hyphen()).ok_or((
+            ErrorKind::NotFound,
+            format!("{rel}: no 'Last reviewed:' line to stamp"),
+        ))?;
+        wt.write(&rel, new.as_bytes())?;
+    }
 
-    daemon.mark_self_write(abs.clone());
-    write_file(&abs, new.as_bytes())?;
     let payload = serde_json::json!({ "path": rel });
     let intent = Intent::new("reviewed_stamped", payload)
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
@@ -122,14 +133,10 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
 // ---- handler helpers ---------------------------------------------------
 
-fn resolve(
-    garden_root: &Path,
-    path: &str,
-) -> Result<(PathBuf, String), (ErrorKind, String)> {
+fn resolve(garden_root: &Path, path: &str) -> Result<String, (ErrorKind, String)> {
     let abs = validate_repo_path(garden_root, path).map_err(|m| (ErrorKind::BadArgs, m))?;
-    let rel = path_to_repo_rel_string(garden_root, &abs)
-        .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))?;
-    Ok((abs, rel))
+    path_to_repo_rel_string(garden_root, &abs)
+        .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))
 }
 
 /// Read `rel`'s working-tree bytes as plaintext **iff** a plaintext rewrite
@@ -138,11 +145,11 @@ fn resolve(
 /// protected, unreadable, or non-UTF-8 file. The read-once primitive behind
 /// best-effort managed-region maintenance (slice 4 index + slice 5
 /// backlinks), which must never clobber ciphertext or guess.
-pub(crate) fn read_if_unprotected(inner: &DaemonInner, abs: &Path, rel: &str) -> Option<String> {
+pub(crate) fn read_if_unprotected(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Option<String> {
     if inner.layer_b.snapshot().is_sealed(rel) {
         return None;
     }
-    let bytes = std::fs::read(abs).ok()?;
+    let bytes = wt.read(rel)?;
     let session = inner.session.as_ref()?;
     let parser = crate::layer_b::regions::parser_for(rel);
     match crate::layer_b::regions::parse(parser, &bytes, session, rel) {
@@ -154,10 +161,11 @@ pub(crate) fn read_if_unprotected(inner: &DaemonInner, abs: &Path, rel: &str) ->
 
 /// Read the working-tree bytes of `rel` as plaintext, refusing any vault
 /// target so a section rewrite can never clobber ciphertext (see module
-/// docs). Returns the UTF-8 content on success.
+/// docs). Returns the UTF-8 content on success. Reads through the
+/// [`WorkTree`], so a FUSE-mode daemon never `std::fs`-reads the mount.
 fn load_unprotected(
+    wt: &WorkTree,
     inner: &DaemonInner,
-    abs: &Path,
     rel: &str,
 ) -> Result<String, (ErrorKind, String)> {
     if inner.layer_b.snapshot().is_sealed(rel) {
@@ -166,10 +174,9 @@ fn load_unprotected(
             format!("{rel}: whole-file sealed — edit via the vault path"),
         ));
     }
-    let bytes = std::fs::read(abs).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => (ErrorKind::NotFound, format!("{rel}: not found")),
-        _ => (ErrorKind::Io, format!("read {rel}: {e}")),
-    })?;
+    let bytes = wt
+        .read(rel)
+        .ok_or((ErrorKind::NotFound, format!("{rel}: not found")))?;
     // Reuse the inline-region parser (it masks fenced/inline-code mentions,
     // so docs that merely *document* the `<vault>` syntax aren't refused).
     let session: &softfig_vault::VaultSession = inner.session.as_ref().expect("unlocked");
@@ -187,24 +194,26 @@ fn load_unprotected(
     String::from_utf8(bytes).map_err(|_| (ErrorKind::BadArgs, format!("{rel}: not UTF-8 text")))
 }
 
-/// Common tail for the three section verbs: stamp the self-write, write the
-/// rebuilt content, commit `intent` with a `{path, heading}` payload, and
-/// reply `{path, hash}`.
+/// Common tail for the three section verbs: write the rebuilt content + refresh
+/// backlinks through a scoped [`WorkTree`] (mount-safe in FUSE mode), then
+/// commit `intent` with a `{path, heading}` payload and reply `{path, hash}`.
+/// The worktree is dropped before the `&mut inner` commit so its shared borrow
+/// of `inner` doesn't collide with `commit_now`.
 fn write_and_commit(
     daemon: &Daemon,
     inner: &mut std::sync::MutexGuard<'_, DaemonInner>,
-    abs: &Path,
     rel: &str,
     new_content: String,
     intent_name: &str,
     heading_arg: &str,
 ) -> HandlerResult {
-    daemon.mark_self_write(abs.to_path_buf());
-    write_file(abs, new_content.as_bytes())?;
-    // Slice 5: a section edit can add/remove `[[…]]` refs in any doc, so
-    // recompute the backlink graph before committing (best-effort).
-    let garden_root = inner.config.garden_root.clone();
-    super::backlinks::refresh_all(daemon, inner, &garden_root);
+    {
+        let wt = WorkTree::new(daemon, inner);
+        wt.write(rel, new_content.as_bytes())?;
+        // Slice 5: a section edit can add/remove `[[…]]` refs in any doc, so
+        // recompute the backlink graph before committing (best-effort).
+        super::backlinks::refresh_all(&wt, inner);
+    }
     let (_level, heading_text) = edit::parse_heading_arg(heading_arg);
     let payload = serde_json::json!({ "path": rel, "heading": heading_text });
     let intent = Intent::new(intent_name, payload)

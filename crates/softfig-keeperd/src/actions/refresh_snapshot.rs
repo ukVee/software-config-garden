@@ -3,11 +3,13 @@
 //! daemon never executes user code). Unlike the create-style actions this
 //! overwrites: a refresh replaces the previous snapshot data.
 
+use std::path::Path;
+
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{RefreshSnapshotArgs, RefreshSnapshotReply};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, write_file};
+use super::{commit_now, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{path_to_repo_rel_string, require_unlocked, validate_repo_path, HandlerResult};
 
@@ -30,21 +32,20 @@ pub fn refresh_snapshot(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
         ));
     }
 
-    // Require the parent dir to already exist (decision lean): refuse to
-    // mint a snapshot subtree from a typo. The matching
-    // `snapshots/<area>/` should already be in place.
-    let parent = abs
-        .parent()
-        .ok_or((ErrorKind::InvalidSnapshotPath, "no parent dir".into()))?;
-    if !parent.is_dir() {
-        return Err((
-            ErrorKind::InvalidSnapshotPath,
-            format!("{rel}: parent directory does not exist"),
-        ));
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        // Require the parent dir to already exist (decision lean): refuse to
+        // mint a snapshot subtree from a typo. The matching `snapshots/<area>/`
+        // should already be in place.
+        let parent_rel = Path::new(&rel).parent().and_then(|p| p.to_str()).unwrap_or("");
+        if !wt.is_dir(parent_rel) {
+            return Err((
+                ErrorKind::InvalidSnapshotPath,
+                format!("{rel}: parent directory does not exist"),
+            ));
+        }
+        wt.write(&rel, args.content.as_bytes())?;
     }
-
-    daemon.mark_self_write(abs.clone());
-    write_file(&abs, args.content.as_bytes())?;
 
     let intent = Intent::new("snapshot_refresh", serde_json::json!({ "path": rel.clone() }))
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;

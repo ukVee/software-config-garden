@@ -5,7 +5,7 @@ use softfig_vcs::Intent;
 use softfig_ipc::verbs::{LogIncidentArgs, LogIncidentReply};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, write_file};
+use super::{commit_now, conventions, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{require_unlocked, HandlerResult};
 
@@ -30,19 +30,17 @@ pub fn log_incident(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
     let rel = conventions::incident_path(&date, &args.slug);
-    let abs = garden_root.join(&rel);
-    if abs.exists() {
-        return Err((ErrorKind::PathAlreadyExists, format!("{rel}: already exists")));
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        if wt.exists(&rel) {
+            return Err((ErrorKind::PathAlreadyExists, format!("{rel}: already exists")));
+        }
+        let hyphen = conventions::compact_to_hyphen(&date);
+        let content = conventions::incident_doc(&hyphen, &args.summary, &args.body);
+        wt.write(&rel, content.as_bytes())?;
     }
-
-    let hyphen = conventions::compact_to_hyphen(&date);
-    let content = conventions::incident_doc(&hyphen, &args.summary, &args.body);
-
-    daemon.mark_self_write(abs.clone());
-    write_file(&abs, content.as_bytes())?;
 
     // Classifier-compatible payload: the slug is the full
     // `incident-<date>-<slug>` stem (matches the watcher's `incident_logged`

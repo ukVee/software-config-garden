@@ -10,78 +10,62 @@
 //! before this feature, or one seeded with no notes yet), which can only ever
 //! raise the next id.
 
-use std::path::{Path, PathBuf};
-
 use softfig_ipc::ErrorKind;
 
-use super::{conventions, write_file};
-use crate::daemon::Daemon;
+use super::{conventions, WorkTree};
 
-/// The next note number for `dir_abs`: one past the larger of the `.seq`
-/// high-water mark and the highest live `NNN-*.md` file.
-pub fn next_number(dir_abs: &Path) -> u32 {
-    read_seq(dir_abs).max(highest_live_number(dir_abs)) + 1
+/// The next note number for accretive folder `dir_rel`: one past the larger of
+/// the `.seq` high-water mark and the highest live `NNN-*.md` file. Reads run
+/// through the [`WorkTree`] so a FUSE-mode commit never stats the mount.
+pub fn next_number(wt: &WorkTree, dir_rel: &str) -> u32 {
+    read_seq(wt, dir_rel).max(highest_live_number(wt, dir_rel)) + 1
 }
 
-fn read_seq(dir_abs: &Path) -> u32 {
-    std::fs::read_to_string(dir_abs.join(conventions::SEQ_FILE))
-        .ok()
+fn read_seq(wt: &WorkTree, dir_rel: &str) -> u32 {
+    wt.read_to_string(&format!("{dir_rel}/{}", conventions::SEQ_FILE))
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0)
 }
 
-fn highest_live_number(dir_abs: &Path) -> u32 {
-    let mut max = 0;
-    if let Ok(rd) = std::fs::read_dir(dir_abs) {
-        for entry in rd.flatten() {
-            if let Some(n) = entry
-                .file_name()
-                .to_str()
-                .and_then(conventions::parse_note_number)
-            {
-                max = max.max(n);
-            }
-        }
-    }
-    max
+fn highest_live_number(wt: &WorkTree, dir_rel: &str) -> u32 {
+    wt.read_dir(dir_rel)
+        .iter()
+        .filter_map(|e| conventions::parse_note_number(&e.name))
+        .max()
+        .unwrap_or(0)
 }
 
-/// Locate the `NNN-*.md` doc numbered `id` in `dir_abs`.
-pub fn find_by_id(dir_abs: &Path, id: u32) -> Option<PathBuf> {
+/// Garden-relative path of the `NNN-*.md` doc numbered `id` in `dir_rel`.
+pub fn find_by_id(wt: &WorkTree, dir_rel: &str, id: u32) -> Option<String> {
     let prefix = format!("{id:03}-");
-    std::fs::read_dir(dir_abs).ok()?.flatten().find_map(|entry| {
-        let name = entry.file_name();
-        let name = name.to_str()?;
-        (name.starts_with(&prefix) && name.ends_with(".md")).then(|| entry.path())
+    wt.read_dir(dir_rel).into_iter().find_map(|e| {
+        (e.name.starts_with(&prefix) && e.name.ends_with(".md"))
+            .then(|| format!("{dir_rel}/{}", e.name))
     })
 }
 
-/// Stamp the next numbered doc into `dir_abs`: bump `.seq` to `number` and
-/// write `filename`/`content`, registering both paths for self-write
-/// suppression so the caller's in-flight `commit_workdir` folds them into one
-/// commit. Refuses if the target already exists (the only way that happens is
-/// a corrupt `.seq` whose number squats a live slot — refuse rather than
-/// clobber). `note_rel` is the garden-relative path used only in the
-/// collision message.
+/// Stamp the next numbered doc into `dir_rel`: bump `.seq` to `number` and
+/// write `note_rel`/`content` through the [`WorkTree`] (which registers both
+/// for self-write suppression in disk mode) so the caller's in-flight commit
+/// folds them into one commit. Refuses if the target already exists (the only
+/// way that happens is a corrupt `.seq` whose number squats a live slot —
+/// refuse rather than clobber). `note_rel` is the garden-relative path of the
+/// new doc (`dir_rel/filename`).
 pub fn write_numbered(
-    daemon: &Daemon,
-    dir_abs: &Path,
+    wt: &WorkTree,
+    dir_rel: &str,
     number: u32,
-    filename: &str,
     note_rel: &str,
     content: &str,
 ) -> Result<(), (ErrorKind, String)> {
-    let note_abs = dir_abs.join(filename);
-    if note_abs.exists() {
+    if wt.exists(note_rel) {
         return Err((
             ErrorKind::PathAlreadyExists,
             format!("{note_rel}: already exists"),
         ));
     }
-    let seq_abs = dir_abs.join(conventions::SEQ_FILE);
-    daemon.mark_self_write(seq_abs.clone());
-    daemon.mark_self_write(note_abs.clone());
-    write_file(&seq_abs, format!("{number}\n").as_bytes())?;
-    write_file(&note_abs, content.as_bytes())?;
+    let seq_rel = format!("{dir_rel}/{}", conventions::SEQ_FILE);
+    wt.write(&seq_rel, format!("{number}\n").as_bytes())?;
+    wt.write(note_rel, content.as_bytes())?;
     Ok(())
 }

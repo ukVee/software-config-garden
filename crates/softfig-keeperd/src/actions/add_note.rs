@@ -13,11 +13,13 @@
 //! a belt-and-braces guard against a missing/stale `.seq` (e.g. a folder
 //! created before this feature), which can only ever raise the next id.
 
+use std::path::Path;
+
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{AddNoteArgs, AddNoteReply, ReviseNoteArgs, ReviseNoteReply};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, numbering, write_file};
+use super::{commit_now, conventions, numbering, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{
     path_to_repo_rel_string, require_unlocked, validate_repo_path, HandlerResult,
@@ -47,34 +49,37 @@ pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             ),
         ));
     }
-    // The concept dir must already exist — `add_note` materializes the
-    // accretive folder on demand, but won't fabricate an arbitrary tree.
-    match dir_abs.parent() {
-        Some(p) if p.is_dir() => {}
-        _ => {
+
+    let (note_rel, number) = {
+        let wt = WorkTree::new(daemon, &inner);
+        // The concept dir must already exist — `add_note` materializes the
+        // accretive folder on demand, but won't fabricate an arbitrary tree.
+        let parent_rel = Path::new(&dir_rel).parent().and_then(|p| p.to_str()).unwrap_or("");
+        if !wt.is_dir(parent_rel) {
             return Err((
                 ErrorKind::NotFound,
                 format!("{dir_rel}: parent concept dir does not exist"),
-            ))
+            ));
         }
-    }
 
-    let number = numbering::next_number(&dir_abs);
-    let filename = conventions::note_filename(number, &args.slug);
-    let note_rel = format!("{dir_rel}/{filename}");
+        let number = numbering::next_number(&wt, &dir_rel);
+        let filename = conventions::note_filename(number, &args.slug);
+        let note_rel = format!("{dir_rel}/{filename}");
 
-    let title = args.title.as_deref().unwrap_or(&args.slug);
-    let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
+        let title = args.title.as_deref().unwrap_or(&args.slug);
+        let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
 
-    // Bump the high-water mark in the same commit as the new note.
-    numbering::write_numbered(daemon, &dir_abs, number, &filename, &note_rel, &content)?;
+        // Bump the high-water mark in the same commit as the new note.
+        numbering::write_numbered(&wt, &dir_rel, number, &note_rel, &content)?;
 
-    // Slice 4: refresh this folder's index table in the parent CLAUDE.md,
-    // folded into the same commit (best-effort — never blocks the note).
-    super::index::refresh_folder_index(daemon, &inner, &garden_root, &dir_rel);
-    // Slice 5: a new note may carry `[[…]]` refs and may itself satisfy a
-    // previously-dangling ref, so recompute the backlink graph.
-    super::backlinks::refresh_all(daemon, &inner, &garden_root);
+        // Slice 4: refresh this folder's index table in the parent CLAUDE.md,
+        // folded into the same commit (best-effort — never blocks the note).
+        super::index::refresh_folder_index(&wt, &inner, &dir_rel);
+        // Slice 5: a new note may carry `[[…]]` refs and may itself satisfy a
+        // previously-dangling ref, so recompute the backlink graph.
+        super::backlinks::refresh_all(&wt, &inner);
+        (note_rel, number)
+    };
 
     let payload = serde_json::json!({ "dir": dir_rel, "slug": args.slug, "number": number });
     let intent =
@@ -110,32 +115,37 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         ));
     }
 
-    let note_abs = numbering::find_by_id(&dir_abs, args.id).ok_or((
-        ErrorKind::NotFound,
-        format!("{dir_rel}: no note numbered {:03}", args.id),
-    ))?;
-    let note_rel = path_to_repo_rel_string(&garden_root, &note_abs)
-        .ok_or((ErrorKind::BadArgs, "note outside garden root".into()))?;
+    let note_rel = {
+        let wt = WorkTree::new(daemon, &inner);
+        let note_rel = numbering::find_by_id(&wt, &dir_rel, args.id).ok_or((
+            ErrorKind::NotFound,
+            format!("{dir_rel}: no note numbered {:03}", args.id),
+        ))?;
 
-    // Preserve the title (immutable). Re-stamp the reviewed date and swap
-    // the body wholesale — header/slug/number are left untouched.
-    let existing = std::fs::read_to_string(&note_abs)
-        .map_err(|e| (ErrorKind::Io, format!("read {note_rel}: {e}")))?;
-    let filename = note_abs.file_name().and_then(|s| s.to_str()).unwrap_or("note.md");
-    let title = conventions::note_title(&existing)
-        .unwrap_or_else(|| conventions::slug_from_note_name(filename));
-    let content = conventions::note_doc(&title, &conventions::today_hyphen(), &args.body);
+        // Preserve the title (immutable). Re-stamp the reviewed date and swap
+        // the body wholesale — header/slug/number are left untouched.
+        let existing = wt
+            .read_to_string(&note_rel)
+            .ok_or((ErrorKind::Io, format!("read {note_rel}: not found")))?;
+        let filename = Path::new(&note_rel)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("note.md");
+        let title = conventions::note_title(&existing)
+            .unwrap_or_else(|| conventions::slug_from_note_name(filename));
+        let content = conventions::note_doc(&title, &conventions::today_hyphen(), &args.body);
 
-    daemon.mark_self_write(note_abs.clone());
-    write_file(&note_abs, content.as_bytes())?;
+        wt.write(&note_rel, content.as_bytes())?;
 
-    // Slice 4: re-stamping the reviewed date changes the index's Reviewed
-    // column, so refresh the folder's table in the parent CLAUDE.md too.
-    super::index::refresh_folder_index(daemon, &inner, &garden_root, &dir_rel);
-    // Slice 5: revising the body rewrites it from the note template (dropping
-    // any prior backlinks region) and may add/remove `[[…]]` refs — recompute
-    // so the region is restored and edges stay accurate.
-    super::backlinks::refresh_all(daemon, &inner, &garden_root);
+        // Slice 4: re-stamping the reviewed date changes the index's Reviewed
+        // column, so refresh the folder's table in the parent CLAUDE.md too.
+        super::index::refresh_folder_index(&wt, &inner, &dir_rel);
+        // Slice 5: revising the body rewrites it from the note template (dropping
+        // any prior backlinks region) and may add/remove `[[…]]` refs — recompute
+        // so the region is restored and edges stay accurate.
+        super::backlinks::refresh_all(&wt, &inner);
+        note_rel
+    };
 
     let payload = serde_json::json!({ "dir": dir_rel, "id": args.id });
     let intent =

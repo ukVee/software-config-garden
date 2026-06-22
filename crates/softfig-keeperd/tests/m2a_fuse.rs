@@ -16,7 +16,7 @@ use softfig_vcs::Repo;
 use softfig_fuse::{DirtyEventSink, FuseMount};
 use softfig_ipc::{
     self,
-    verbs::{op, LogReply, MigrateFinalizeReply, UnlockArgs},
+    verbs::{op, LogIncidentArgs, LogReply, MigrateFinalizeReply, UnlockArgs},
     Request, Response,
 };
 use softfig_keeperd::{
@@ -514,4 +514,200 @@ fn busy_mount_sigterm_shuts_down_promptly() {
         !socket.exists(),
         "socket left behind after busy-mount SIGTERM"
     );
+}
+
+// ---------- Test 7: an M3a write verb commits through the FUSE overlay. ----------
+
+/// Slice 3 (3a + 3b) proof: in FUSE mode an M3a verb (`log_incident`) stages its
+/// write into the in-memory overlay and the daemon commits from the
+/// `workdir_snapshot` — never `std::fs`-touching or self-walking the mount it
+/// serves. Drives the verb through the real daemon + real mount, then asserts
+/// the commit landed (new `incident_logged` tip) and the file reads back through
+/// the mount with the exact body — i.e. the staged overlay write was persisted.
+#[test]
+fn fuse_log_incident_commits_via_overlay() {
+    use std::process::Command;
+
+    if !fuse_available() {
+        eprintln!("fuse unavailable; skipping");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (garden, _state) = bootstrap_migrated_garden(tmp.path());
+    let socket = unique_socket(tmp.path());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_softfig-keeperd"))
+        .arg("--garden")
+        .arg(&garden)
+        .arg("--socket")
+        .arg(&socket)
+        .spawn()
+        .expect("spawn keeperd");
+    wait_for_socket(&socket);
+
+    let unlock = rpc(
+        &socket,
+        op::UNLOCK,
+        serde_json::to_value(UnlockArgs { passphrase: PASS.into() }).unwrap(),
+    );
+    if let Response::Err { kind, error, .. } = &unlock {
+        eprintln!("unlock failed (likely sandbox fuse restriction: {kind:?} {error}); skipping");
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let body = "Repro + fix notes for the commit-path deadlock.\n".repeat(64);
+    let reply = unwrap_ok(rpc(
+        &socket,
+        op::LOG_INCIDENT,
+        serde_json::to_value(LogIncidentArgs {
+            slug: "overlay-commit".into(),
+            summary: "commit via overlay".into(),
+            body: body.clone(),
+            date: Some("20260621".into()),
+        })
+        .unwrap(),
+    ));
+    let rel = reply
+        .get("path")
+        .and_then(|v| v.as_str())
+        .expect("reply path")
+        .to_string();
+    assert_eq!(rel, "journal/incidents/incident-20260621-overlay-commit.md");
+
+    // The commit landed: the new tip is `incident_logged`.
+    let log: LogReply =
+        serde_json::from_value(unwrap_ok(rpc(&socket, op::LOG, json!({ "limit": 1 })))).unwrap();
+    assert_eq!(log.commits[0].intent, "incident_logged");
+
+    // The staged overlay write was persisted + reads back through the mount (in
+    // FUSE mode `garden_root` IS the mount, so this read can only succeed if the
+    // overlay write reached the commit — no `std::fs` plaintext path exists).
+    let read = fs::read_to_string(garden.join(&rel)).expect("read incident through mount");
+    assert!(read.contains(&body), "incident body missing from committed file");
+    assert!(read.contains("2026-06-21"), "daemon-stamped date missing: {read}");
+    assert!(read.contains("commit via overlay"), "summary missing: {read}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    softfig_fuse::clear_stale_mount(&garden);
+}
+
+// ---------- Test 8: a commit on a BUSY mount must not wedge. ----------
+
+/// Regression for the 2026-06-21 *commit-path* deadlock (sibling of the
+/// shutdown one Test 6 covers). Before slice 3 the daemon committed by walking
+/// `garden_root` (= the mount it serves) under `daemon.inner`; when an external
+/// FUSE op was in flight during that self-walk it wedged the whole garden for
+/// ~20 min until SIGKILL. This pins the mount busy with continuous read+write
+/// traffic, fires the exact shape that wedged (an MCP `log_incident` with a big
+/// body), and asserts it commits promptly AND the daemon stays responsive to a
+/// second IPC call. Full faithful repro (real bin + real mount + watcher),
+/// since the wedge is a cross-thread lock starvation, not an in-process hang.
+#[test]
+fn busy_mount_commit_does_not_wedge() {
+    use std::process::Command;
+    use std::sync::mpsc;
+
+    if !fuse_available() {
+        eprintln!("fuse unavailable; skipping busy-mount commit test");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (garden, _state) = bootstrap_migrated_garden(tmp.path());
+    let socket = unique_socket(tmp.path());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_softfig-keeperd"))
+        .arg("--garden")
+        .arg(&garden)
+        .arg("--socket")
+        .arg(&socket)
+        .spawn()
+        .expect("spawn keeperd");
+    wait_for_socket(&socket);
+
+    let unlock = rpc(
+        &socket,
+        op::UNLOCK,
+        serde_json::to_value(UnlockArgs { passphrase: PASS.into() }).unwrap(),
+    );
+    if let Response::Err { kind, error, .. } = &unlock {
+        eprintln!("unlock failed (likely sandbox fuse restriction: {kind:?} {error}); skipping");
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = fs::read_to_string(garden.join("a.md"));
+
+    // Pin the mount BUSY: continuous read+write+ls through it (cwd inside) — the
+    // exact in-flight-FUSE-op condition that collided with the commit's
+    // self-walk (the growlight loop actively working the garden).
+    let mut busy = match Command::new("sh")
+        .arg("-c")
+        .arg("cd \"$0\" && while true; do echo x >> a.md; cat a.md >/dev/null; ls >/dev/null; done")
+        .arg(&garden)
+        .current_dir(&garden)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("could not spawn busy holder ({e}); skipping");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Fire the wedge-shaped write from a worker thread so the test can time it.
+    let (tx, rx) = mpsc::channel();
+    let socket_w = socket.clone();
+    let writer = std::thread::spawn(move || {
+        let big = "Investigation notes; the commit walk wedged right here.\n".repeat(4096); // ~220 KB
+        let resp = rpc(
+            &socket_w,
+            op::LOG_INCIDENT,
+            serde_json::to_value(LogIncidentArgs {
+                slug: "busy-commit".into(),
+                summary: "busy-mount commit".into(),
+                body: big,
+                date: Some("20260621".into()),
+            })
+            .unwrap(),
+        );
+        let _ = tx.send(resp);
+    });
+
+    // It must commit well under the old ~20-min wedge. 20 s is a generous
+    // ceiling that still cleanly distinguishes "prompt" from "wedged".
+    let outcome = rx.recv_timeout(Duration::from_secs(20));
+
+    // On success, prove the daemon stayed responsive *while still under load*
+    // (daemon + busy holder both alive) — a second IPC call must return, not
+    // starve behind a wedged commit holding `inner`.
+    let responsive =
+        outcome.is_ok() && matches!(rpc(&socket, op::STATUS, json!({})), Response::Ok { .. });
+
+    // Teardown order mirrors the busy_mount_sigterm sibling: SIGKILL the daemon
+    // FIRST (closes /dev/fuse, aborting the connection) so the busy holder —
+    // possibly parked in D-state on the mount — and the blocked writer thread
+    // both unblock and can be reaped without hanging the test.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = busy.kill();
+    let _ = busy.wait();
+    let _ = writer.join();
+    softfig_fuse::clear_stale_mount(&garden);
+
+    let committed = outcome
+        .unwrap_or_else(|_| panic!("daemon WEDGED: log_incident did not commit within 20 s on a busy mount"));
+    let data = unwrap_ok(committed);
+    assert_eq!(
+        data.get("path").and_then(|v| v.as_str()),
+        Some("journal/incidents/incident-20260621-busy-commit.md")
+    );
+    assert!(responsive, "daemon unresponsive during a busy-mount commit");
 }

@@ -31,12 +31,10 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, managed, numbering, write_file};
+use super::{commit_now, conventions, managed, numbering, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{require_unlocked, HandlerResult};
 use crate::server::err_to_response;
-
-use std::path::Path;
 
 fn non_empty(field: &str, value: &str) -> Result<(), (ErrorKind, String)> {
     if value.trim().is_empty() {
@@ -70,14 +68,8 @@ pub fn log_baton(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
     let dir_rel = paths::baton_log_dir();
-    let dir_abs = garden_root.join(&dir_rel);
-    let number = numbering::next_number(&dir_abs);
-    let filename = conventions::note_filename(number, &slug);
-    let note_rel = format!("{dir_rel}/{filename}");
-
     let item_type = args.item_type.as_deref().unwrap_or("milestone");
     let content = paths::baton_entry_doc(
         &args.item,
@@ -90,9 +82,17 @@ pub fn log_baton(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         &conventions::today_hyphen(),
         &args.summary,
     );
-    numbering::write_numbered(daemon, &dir_abs, number, &filename, &note_rel, &content)?;
-    // No index, no backlinks: baton-log is append-only audit, never injected,
-    // and excluded from the `[[…]]` graph so entries don't pollute item docs.
+
+    let (note_rel, number) = {
+        let wt = WorkTree::new(daemon, &inner);
+        let number = numbering::next_number(&wt, &dir_rel);
+        let filename = conventions::note_filename(number, &slug);
+        let note_rel = format!("{dir_rel}/{filename}");
+        numbering::write_numbered(&wt, &dir_rel, number, &note_rel, &content)?;
+        // No index, no backlinks: baton-log is append-only audit, never injected,
+        // and excluded from the `[[…]]` graph so entries don't pollute item docs.
+        (note_rel, number)
+    };
 
     let payload = serde_json::json!({
         "item": args.item, "iteration": args.iteration, "slug": slug, "number": number,
@@ -117,50 +117,49 @@ pub fn add_backlog_item(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
     let date = conventions::today_hyphen();
 
-    // Write the item's own doc(s) and compute the id it carries in the queue.
-    let (item_rel, queue_id) = if args.item_type == "milestone" {
-        let claude_rel = paths::milestone_claude(&args.slug);
-        if garden_root.join(&claude_rel).exists() {
-            return Err((
-                ErrorKind::PathAlreadyExists,
-                format!("{claude_rel}: milestone already exists"),
-            ));
-        }
-        let content =
-            paths::milestone_doc(&args.slug, &args.title, &args.mission, &args.finish_criteria);
-        let claude_abs = garden_root.join(&claude_rel);
-        daemon.mark_self_write(claude_abs.clone());
-        write_file(&claude_abs, content.as_bytes())?;
-        // Seed slices/.seq so the first add_slice counts from 001.
-        let seq_rel = format!("{}/{}", paths::slices_dir(&args.slug), conventions::SEQ_FILE);
-        let seq_abs = garden_root.join(&seq_rel);
-        daemon.mark_self_write(seq_abs.clone());
-        write_file(&seq_abs, b"0\n")?;
-        (claude_rel, args.slug.clone())
-    } else {
-        let dir_rel = paths::tasks_dir();
-        let dir_abs = garden_root.join(&dir_rel);
-        let number = numbering::next_number(&dir_abs);
-        let filename = conventions::note_filename(number, &args.slug);
-        let task_rel = format!("{dir_rel}/{filename}");
-        let content = paths::task_doc(&args.title, &date, &args.mission, &args.finish_criteria);
-        numbering::write_numbered(daemon, &dir_abs, number, &filename, &task_rel, &content)?;
-        (task_rel, format!("{number:03}"))
-    };
+    let (item_rel, queue_id) = {
+        let wt = WorkTree::new(daemon, &inner);
 
-    // Enqueue (status `queued`), folded into the same commit.
-    let row = queue::QueueRow {
-        id: queue_id.clone(),
-        item_type: args.item_type.clone(),
-        title: args.title.clone(),
-        status: "queued".into(),
+        // Write the item's own doc(s) and compute the id it carries in the queue.
+        let (item_rel, queue_id) = if args.item_type == "milestone" {
+            let claude_rel = paths::milestone_claude(&args.slug);
+            if wt.exists(&claude_rel) {
+                return Err((
+                    ErrorKind::PathAlreadyExists,
+                    format!("{claude_rel}: milestone already exists"),
+                ));
+            }
+            let content =
+                paths::milestone_doc(&args.slug, &args.title, &args.mission, &args.finish_criteria);
+            wt.write(&claude_rel, content.as_bytes())?;
+            // Seed slices/.seq so the first add_slice counts from 001.
+            let seq_rel = format!("{}/{}", paths::slices_dir(&args.slug), conventions::SEQ_FILE);
+            wt.write(&seq_rel, b"0\n")?;
+            (claude_rel, args.slug.clone())
+        } else {
+            let dir_rel = paths::tasks_dir();
+            let number = numbering::next_number(&wt, &dir_rel);
+            let filename = conventions::note_filename(number, &args.slug);
+            let task_rel = format!("{dir_rel}/{filename}");
+            let content = paths::task_doc(&args.title, &date, &args.mission, &args.finish_criteria);
+            numbering::write_numbered(&wt, &dir_rel, number, &task_rel, &content)?;
+            (task_rel, format!("{number:03}"))
+        };
+
+        // Enqueue (status `queued`), folded into the same commit.
+        let row = queue::QueueRow {
+            id: queue_id.clone(),
+            item_type: args.item_type.clone(),
+            title: args.title.clone(),
+            status: "queued".into(),
+        };
+        enqueue(&wt, &inner, row)?;
+        // Item bodies may carry `[[…]]` refs into the rest of the garden.
+        super::backlinks::refresh_all(&wt, &inner);
+        (item_rel, queue_id)
     };
-    enqueue(daemon, &inner, &garden_root, row)?;
-    // Item bodies may carry `[[…]]` refs into the rest of the garden.
-    super::backlinks::refresh_all(daemon, &inner, &garden_root);
 
     let payload = serde_json::json!({
         "id": queue_id, "item_type": args.item_type, "slug": args.slug,
@@ -188,30 +187,33 @@ pub fn add_slice(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
-    // The milestone must exist (its routing doc hosts the slices index).
-    if !garden_root.join(paths::milestone_claude(&args.milestone)).exists() {
-        return Err((
-            ErrorKind::NotFound,
-            format!("milestone {:?}: no such backlog milestone", args.milestone),
-        ));
-    }
+    let (note_rel, number) = {
+        let wt = WorkTree::new(daemon, &inner);
 
-    let dir_rel = paths::slices_dir(&args.milestone);
-    let dir_abs = garden_root.join(&dir_rel);
-    let number = numbering::next_number(&dir_abs);
-    let filename = conventions::note_filename(number, &args.slug);
-    let note_rel = format!("{dir_rel}/{filename}");
+        // The milestone must exist (its routing doc hosts the slices index).
+        if !wt.exists(&paths::milestone_claude(&args.milestone)) {
+            return Err((
+                ErrorKind::NotFound,
+                format!("milestone {:?}: no such backlog milestone", args.milestone),
+            ));
+        }
 
-    let title = args.title.as_deref().unwrap_or(&args.slug);
-    let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
-    numbering::write_numbered(daemon, &dir_abs, number, &filename, &note_rel, &content)?;
+        let dir_rel = paths::slices_dir(&args.milestone);
+        let number = numbering::next_number(&wt, &dir_rel);
+        let filename = conventions::note_filename(number, &args.slug);
+        let note_rel = format!("{dir_rel}/{filename}");
 
-    // Refresh the milestone's slices index (derived, like the notes index)
-    // and recompute backlinks for any `[[…]]` the slice carries.
-    super::index::refresh_folder_index(daemon, &inner, &garden_root, &dir_rel);
-    super::backlinks::refresh_all(daemon, &inner, &garden_root);
+        let title = args.title.as_deref().unwrap_or(&args.slug);
+        let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
+        numbering::write_numbered(&wt, &dir_rel, number, &note_rel, &content)?;
+
+        // Refresh the milestone's slices index (derived, like the notes index)
+        // and recompute backlinks for any `[[…]]` the slice carries.
+        super::index::refresh_folder_index(&wt, &inner, &dir_rel);
+        super::backlinks::refresh_all(&wt, &inner);
+        (note_rel, number)
+    };
 
     let payload = serde_json::json!({
         "milestone": args.milestone, "slug": args.slug, "number": number,
@@ -233,65 +235,65 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
     let rel = paths::backlog_claude();
-    let abs = garden_root.join(&rel);
-    if !abs.exists() {
-        return Err((ErrorKind::NotFound, format!("{rel}: no backlog yet")));
-    }
-    let content = super::sections::read_if_unprotected(&inner, &abs, &rel)
-        .ok_or((ErrorKind::VaultProtected, format!("{rel}: unreadable or vault-protected")))?;
-    let mut rows = managed::region_body(&content, paths::QUEUE_TAG)
-        .map(|b| queue::parse(&b))
-        .unwrap_or_default();
-
-    let idx = rows
-        .iter()
-        .position(|r| r.id == args.id)
-        .ok_or((ErrorKind::NotFound, format!("no backlog item with id {:?}", args.id)))?;
-
-    // Idempotent re-set: no tree change, so return the current tip rather than
-    // minting an empty commit.
-    if rows[idx].status == args.status {
-        let tip = inner
-            .repo
-            .as_ref()
-            .expect("unlocked")
-            .tip()
-            .map_err(|e| err_to_response(e.into()))?
-            .map(|h| h.to_string())
-            .unwrap_or_default();
-        return Ok(serde_json::to_value(SetItemStatusReply {
-            id: args.id,
-            status: args.status,
-            path: rel,
-            hash: tip,
-        })
-        .unwrap());
-    }
-
-    // Single-active invariant: only one item may be `active` at a time.
-    if args.status == "active" {
-        if let Some(other) = rows
-            .iter()
-            .enumerate()
-            .find(|(i, r)| *i != idx && r.status == "active")
-        {
-            return Err((
-                ErrorKind::BadArgs,
-                format!(
-                    "item {:?} is already active; set it done/blocked first",
-                    other.1.id
-                ),
-            ));
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        if !wt.exists(&rel) {
+            return Err((ErrorKind::NotFound, format!("{rel}: no backlog yet")));
         }
-    }
-    rows[idx].status = args.status.clone();
+        let content = super::sections::read_if_unprotected(&wt, &inner, &rel)
+            .ok_or((ErrorKind::VaultProtected, format!("{rel}: unreadable or vault-protected")))?;
+        let mut rows = managed::region_body(&content, paths::QUEUE_TAG)
+            .map(|b| queue::parse(&b))
+            .unwrap_or_default();
 
-    let new = managed::upsert(&content, paths::QUEUE_TAG, &queue::render(&rows));
-    daemon.mark_self_write(abs.clone());
-    write_file(&abs, new.as_bytes())?;
+        let idx = rows
+            .iter()
+            .position(|r| r.id == args.id)
+            .ok_or((ErrorKind::NotFound, format!("no backlog item with id {:?}", args.id)))?;
+
+        // Idempotent re-set: no tree change, so return the current tip rather
+        // than minting an empty commit.
+        if rows[idx].status == args.status {
+            let tip = inner
+                .repo
+                .as_ref()
+                .expect("unlocked")
+                .tip()
+                .map_err(|e| err_to_response(e.into()))?
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            return Ok(serde_json::to_value(SetItemStatusReply {
+                id: args.id,
+                status: args.status,
+                path: rel,
+                hash: tip,
+            })
+            .unwrap());
+        }
+
+        // Single-active invariant: only one item may be `active` at a time.
+        if args.status == "active" {
+            if let Some(other) = rows
+                .iter()
+                .enumerate()
+                .find(|(i, r)| *i != idx && r.status == "active")
+            {
+                return Err((
+                    ErrorKind::BadArgs,
+                    format!(
+                        "item {:?} is already active; set it done/blocked first",
+                        other.1.id
+                    ),
+                ));
+            }
+        }
+        rows[idx].status = args.status.clone();
+
+        let new = managed::upsert(&content, paths::QUEUE_TAG, &queue::render(&rows));
+        wt.write(&rel, new.as_bytes())?;
+    }
 
     let payload = serde_json::json!({ "id": args.id, "status": args.status });
     let intent = Intent::new("item_status_set", payload)
@@ -313,15 +315,13 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
 /// to the queue region — rejecting a duplicate id — and write it back so the
 /// caller's in-flight commit folds it in.
 fn enqueue(
-    daemon: &Daemon,
+    wt: &WorkTree,
     inner: &DaemonInner,
-    garden_root: &Path,
     row: queue::QueueRow,
 ) -> Result<(), (ErrorKind, String)> {
     let rel = paths::backlog_claude();
-    let abs = garden_root.join(&rel);
-    let content = if abs.exists() {
-        super::sections::read_if_unprotected(inner, &abs, &rel)
+    let content = if wt.exists(&rel) {
+        super::sections::read_if_unprotected(wt, inner, &rel)
             .ok_or((ErrorKind::VaultProtected, format!("{rel}: unreadable or vault-protected")))?
     } else {
         paths::backlog_claude_stub()
@@ -338,7 +338,6 @@ fn enqueue(
     }
     rows.push(row);
     let new = managed::upsert(&content, paths::QUEUE_TAG, &queue::render(&rows));
-    daemon.mark_self_write(abs.clone());
-    write_file(&abs, new.as_bytes())?;
+    wt.write(&rel, new.as_bytes())?;
     Ok(())
 }

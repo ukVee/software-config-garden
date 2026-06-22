@@ -500,23 +500,23 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let garden_root = inner.config.garden_root.clone();
 
     let abs = validate_repo_path(&garden_root, &args.path).map_err(|m| (ErrorKind::BadArgs, m))?;
+    let rel = path_to_repo_rel_string(&garden_root, &abs)
+        .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))?;
 
-    // Mark the target path in the suppress map BEFORE any IO so the
-    // watcher (running in parallel) drops the events.
-    daemon.mark_self_write(abs.clone());
-
-    if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| (ErrorKind::Io, e.to_string()))?;
+    // Write through the worktree: in FUSE mode this stages into the overlay
+    // (no self-write of the mount under `inner`); in disk mode it suppresses
+    // the watcher event + writes. Scoped so its borrow ends before the commit.
+    {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        wt.write(&rel, args.content.as_bytes())?;
     }
-    std::fs::write(&abs, &args.content).map_err(|e| (ErrorKind::Io, e.to_string()))?;
 
     let payload = serde_json::json!({ "path": args.path });
     let intent =
         Intent::new("memory_edit", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
 
     // FUSE-mode-safe commit: snapshot the in-memory tree rather than walking
-    // the mount under `inner` (the std::fs::write above already landed in the
-    // FUSE overlay via the kernel write handler).
+    // the mount under `inner`.
     let hash = crate::actions::commit_now(&mut inner, intent)?;
 
     Ok(serde_json::to_value(ReplaceFileReply {

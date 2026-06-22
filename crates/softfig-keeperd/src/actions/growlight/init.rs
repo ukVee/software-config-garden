@@ -15,13 +15,11 @@
 //! commits) — only the missing pieces are filled, so the action is also
 //! self-healing for a partially-built pillar.
 
-use std::path::Path;
-
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{GrowlightInitArgs, GrowlightInitReply};
 use softfig_ipc::ErrorKind;
 
-use super::super::{commit_now, write_file};
+use super::super::{commit_now, WorkTree};
 use super::paths;
 use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{require_unlocked, HandlerResult};
@@ -79,64 +77,69 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
     let mut created = Vec::new();
     let mut skipped = Vec::new();
-
-    // Pillar files (create-if-absent; status/order in backlog/CLAUDE.md is
-    // never clobbered if the MCP verbs already seeded it). The numbered folders
-    // get a `.seq` seed so their first entry counts from 001, materializing the
-    // dir as a tracked entity at the same time.
-    let pillar: [(String, String); 7] = [
-        (paths::pillar_claude(), paths::pillar_claude_stub()),
-        (paths::protocol_md(), PROTOCOL_MD.to_string()),
-        (paths::session_policy_md(), SESSION_POLICY_MD.to_string()),
-        (paths::backlog_claude(), paths::backlog_claude_stub()),
-        (format!("{}/.seq", paths::tasks_dir()), "0\n".to_string()),
-        (paths::baton_log_claude(), paths::baton_log_claude_stub()),
-        (format!("{}/.seq", paths::baton_log_dir()), "0\n".to_string()),
-    ];
-    for (rel, content) in &pillar {
-        create_if_absent(daemon, &garden_root, rel, content, &mut created, &mut skipped)?;
-    }
-
-    // §14 nav wiring — best-effort + idempotent. Each edit is skipped when the
-    // doc is absent (a minimal garden), sealed, or already wired.
     let mut nav_wired = Vec::new();
-    wire_nav_doc(daemon, &inner, &garden_root, "CLAUDE.md", &mut nav_wired, |content| {
-        let mut doc = content.to_string();
-        let mut changed = false;
-        if let Some(new) =
-            nav::insert_after_last_prefixed(&doc, "Top-level map", "- ", "growlight/", MAP_BULLET)
-        {
-            doc = new;
-            changed = true;
+
+    {
+        let wt = WorkTree::new(daemon, &inner);
+
+        // Pillar files (create-if-absent; status/order in backlog/CLAUDE.md is
+        // never clobbered if the MCP verbs already seeded it). The numbered
+        // folders get a `.seq` seed so their first entry counts from 001,
+        // materializing the dir as a tracked entity at the same time.
+        let pillar: [(String, String); 7] = [
+            (paths::pillar_claude(), paths::pillar_claude_stub()),
+            (paths::protocol_md(), PROTOCOL_MD.to_string()),
+            (paths::session_policy_md(), SESSION_POLICY_MD.to_string()),
+            (paths::backlog_claude(), paths::backlog_claude_stub()),
+            (format!("{}/.seq", paths::tasks_dir()), "0\n".to_string()),
+            (paths::baton_log_claude(), paths::baton_log_claude_stub()),
+            (format!("{}/.seq", paths::baton_log_dir()), "0\n".to_string()),
+        ];
+        for (rel, content) in &pillar {
+            create_if_absent(&wt, rel, content, &mut created, &mut skipped)?;
         }
-        if let Some(new) =
-            nav::insert_after_last_prefixed(&doc, BOUNDARY_HEADING, "|", "growlight/", BOUNDARY_ROW)
-        {
-            doc = new;
-            changed = true;
-        }
-        changed.then_some(doc)
-    })?;
-    wire_nav_doc(
-        daemon,
-        &inner,
-        &garden_root,
-        "meta/reserved-filenames.md",
-        &mut nav_wired,
-        |content| add_section_opt(content, RESERVED_HEADING, RESERVED_BODY),
-    )?;
-    wire_nav_doc(
-        daemon,
-        &inner,
-        &garden_root,
-        "meta/conventions.md",
-        &mut nav_wired,
-        |content| add_section_opt(content, CONVENTIONS_HEADING, CONVENTIONS_BODY),
-    )?;
+
+        // §14 nav wiring — best-effort + idempotent. Each edit is skipped when
+        // the doc is absent (a minimal garden), sealed, or already wired.
+        wire_nav_doc(&wt, &inner, "CLAUDE.md", &mut nav_wired, |content| {
+            let mut doc = content.to_string();
+            let mut changed = false;
+            if let Some(new) =
+                nav::insert_after_last_prefixed(&doc, "Top-level map", "- ", "growlight/", MAP_BULLET)
+            {
+                doc = new;
+                changed = true;
+            }
+            if let Some(new) = nav::insert_after_last_prefixed(
+                &doc,
+                BOUNDARY_HEADING,
+                "|",
+                "growlight/",
+                BOUNDARY_ROW,
+            ) {
+                doc = new;
+                changed = true;
+            }
+            changed.then_some(doc)
+        })?;
+        wire_nav_doc(
+            &wt,
+            &inner,
+            "meta/reserved-filenames.md",
+            &mut nav_wired,
+            |content| add_section_opt(content, RESERVED_HEADING, RESERVED_BODY),
+        )?;
+        wire_nav_doc(
+            &wt,
+            &inner,
+            "meta/conventions.md",
+            &mut nav_wired,
+            |content| add_section_opt(content, CONVENTIONS_HEADING, CONVENTIONS_BODY),
+        )?;
+    }
 
     // Nothing to do → don't mint an empty commit (mirrors set_item_status).
     if created.is_empty() && nav_wired.is_empty() {
@@ -169,22 +172,20 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
 // ---- helpers -----------------------------------------------------------
 
 /// Write `content` to `rel` only if it doesn't already exist, recording the
-/// outcome and registering the path for self-write suppression.
+/// outcome. Routes through the [`WorkTree`] so a FUSE-mode scaffold stages into
+/// the overlay instead of self-writing the mount under `inner`.
 fn create_if_absent(
-    daemon: &Daemon,
-    garden_root: &Path,
+    wt: &WorkTree,
     rel: &str,
     content: &str,
     created: &mut Vec<String>,
     skipped: &mut Vec<String>,
 ) -> Result<(), (ErrorKind, String)> {
-    let abs = garden_root.join(rel);
-    if abs.exists() {
+    if wt.exists(rel) {
         skipped.push(rel.to_string());
         return Ok(());
     }
-    daemon.mark_self_write(abs.clone());
-    write_file(&abs, content.as_bytes())?;
+    wt.write(rel, content.as_bytes())?;
     created.push(rel.to_string());
     Ok(())
 }
@@ -193,20 +194,17 @@ fn create_if_absent(
 /// `edit`, and write it back when `edit` reports a change. Best-effort: a
 /// missing doc on a minimal garden is a no-op, not an error.
 fn wire_nav_doc(
-    daemon: &Daemon,
+    wt: &WorkTree,
     inner: &DaemonInner,
-    garden_root: &Path,
     rel: &str,
     nav_wired: &mut Vec<String>,
     edit: impl FnOnce(&str) -> Option<String>,
 ) -> Result<(), (ErrorKind, String)> {
-    let abs = garden_root.join(rel);
-    let Some(content) = crate::actions::sections::read_if_unprotected(inner, &abs, rel) else {
+    let Some(content) = crate::actions::sections::read_if_unprotected(wt, inner, rel) else {
         return Ok(());
     };
     if let Some(new) = edit(&content) {
-        daemon.mark_self_write(abs.clone());
-        write_file(&abs, new.as_bytes())?;
+        wt.write(rel, new.as_bytes())?;
         nav_wired.push(rel.to_string());
     }
     Ok(())

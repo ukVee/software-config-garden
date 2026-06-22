@@ -22,15 +22,13 @@
 //! so any policy still in the pointer is inert. `state_root` and `[growlight]
 //! allow_relock` stay in the pointer by design.
 
-use std::path::PathBuf;
-
 use softfig_ipc::verbs::{MigrateConfigArgs, MigrateConfigReply};
 use softfig_ipc::ErrorKind;
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::ring::{ring_path, Ring, RING_FILE};
 use softfig_vcs::Intent;
 
-use super::{commit_now, write_file};
+use super::{commit_now, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{require_unlocked, HandlerResult};
 use crate::keeper_toml::{GardenConfig, KeeperToml, CONFIG_DIR, KEEPER_TOML};
@@ -41,72 +39,77 @@ pub fn migrate_config(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
     let state_dir = inner.config.state_dir().to_path_buf();
 
     let mut migrated: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    // Planned writes: (absolute garden path, bytes). Built before any IO so a
+    // Planned writes: (garden-relative path, bytes). Built before any IO so a
     // dry run can report without touching the tree.
-    let mut writes: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
     // The legacy ring whose endpoints we re-seed into the sidecar on apply (so
     // reconnect-after-restart survives the migration). `None` ⇒ no peers move.
     let mut peers_legacy_ring: Option<Ring> = None;
 
-    // --- config/keeper.toml (policy) ---
     let keeper_rel = format!("{CONFIG_DIR}/{KEEPER_TOML}");
-    let keeper_abs = GardenConfig::path(&garden_root);
-    if keeper_abs.exists() {
-        skipped.push(keeper_rel);
-    } else {
-        let pointer = KeeperToml::load(&state_dir).map_err(|e| {
-            (
-                ErrorKind::Io,
-                format!("read pointer keeper.toml at {}: {e}", state_dir.display()),
-            )
-        })?;
-        let toml = GardenConfig::from_keeper(&pointer)
-            .to_toml()
-            .map_err(|e| (ErrorKind::Internal, format!("serialize keeper config: {e}")))?;
-        writes.push((keeper_abs, toml.into_bytes()));
-        migrated.push(keeper_rel);
-    }
-
-    // --- config/peers.toml (membership) ---
     let peers_rel = format!("{CONFIG_DIR}/{RING_FILE}");
-    let peers_abs = garden_root.join(CONFIG_DIR).join(RING_FILE);
-    if peers_abs.exists() {
-        skipped.push(peers_rel);
-    } else {
-        let legacy = ring_path(&state_dir);
-        if legacy.exists() {
-            // `Ring::load` re-verifies every attestation — a tampered legacy
-            // ring is rejected here, not silently carried into the garden.
-            let ring = Ring::load(&legacy)
-                .map_err(|e| (ErrorKind::Io, format!("load legacy peers.toml: {e}")))?;
-            if !ring.is_empty() {
-                let toml = ring
-                    .to_membership_toml()
-                    .map_err(|e| (ErrorKind::Internal, format!("serialize membership: {e}")))?;
-                writes.push((peers_abs, toml.into_bytes()));
-                migrated.push(peers_rel);
-                peers_legacy_ring = Some(ring);
-            }
-            // An empty legacy ring → nothing worth a file.
+
+    {
+        let wt = WorkTree::new(daemon, &inner);
+
+        // --- config/keeper.toml (policy) ---
+        if wt.exists(&keeper_rel) {
+            skipped.push(keeper_rel.clone());
+        } else {
+            let pointer = KeeperToml::load(&state_dir).map_err(|e| {
+                (
+                    ErrorKind::Io,
+                    format!("read pointer keeper.toml at {}: {e}", state_dir.display()),
+                )
+            })?;
+            let toml = GardenConfig::from_keeper(&pointer)
+                .to_toml()
+                .map_err(|e| (ErrorKind::Internal, format!("serialize keeper config: {e}")))?;
+            writes.push((keeper_rel.clone(), toml.into_bytes()));
+            migrated.push(keeper_rel.clone());
         }
-        // No legacy ring (never paired) → peers migration is a no-op.
+
+        // --- config/peers.toml (membership) ---
+        if wt.exists(&peers_rel) {
+            skipped.push(peers_rel.clone());
+        } else {
+            let legacy = ring_path(&state_dir);
+            if legacy.exists() {
+                // `Ring::load` re-verifies every attestation — a tampered legacy
+                // ring is rejected here, not silently carried into the garden.
+                let ring = Ring::load(&legacy)
+                    .map_err(|e| (ErrorKind::Io, format!("load legacy peers.toml: {e}")))?;
+                if !ring.is_empty() {
+                    let toml = ring
+                        .to_membership_toml()
+                        .map_err(|e| (ErrorKind::Internal, format!("serialize membership: {e}")))?;
+                    writes.push((peers_rel.clone(), toml.into_bytes()));
+                    migrated.push(peers_rel.clone());
+                    peers_legacy_ring = Some(ring);
+                }
+                // An empty legacy ring → nothing worth a file.
+            }
+            // No legacy ring (never paired) → peers migration is a no-op.
+        }
+
+        // Apply: stage every planned file through the worktree (mount-safe in
+        // FUSE mode); the single `config_migrated` commit below folds them in.
+        if args.apply && !writes.is_empty() {
+            for (rel, bytes) in &writes {
+                wt.write(rel, bytes)?;
+            }
+        }
     }
 
-    // Dry run, or nothing left to migrate: report, write/commit nothing.
+    // Dry run, or nothing left to migrate: report, commit nothing.
     if !args.apply || writes.is_empty() {
         return reply(migrated, skipped, false, None);
     }
 
-    // Apply: write every planned file, then one `config_migrated` commit.
-    for (abs, bytes) in &writes {
-        daemon.mark_self_write(abs.clone());
-        write_file(abs, bytes)?;
-    }
     let payload = serde_json::json!({
         "summary": format!("migrated config: {}", migrated.join(", ")),
         "paths": migrated.clone(),

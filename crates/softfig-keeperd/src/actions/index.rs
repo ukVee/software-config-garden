@@ -25,8 +25,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::actions::{conventions, managed};
-use crate::daemon::{Daemon, DaemonInner};
+use crate::actions::{conventions, managed, WorkTree};
+use crate::daemon::DaemonInner;
 
 struct Row {
     number: u32,
@@ -62,59 +62,54 @@ fn host_rel(folder_rel: &str) -> Option<String> {
 /// or no net change). Never errors — index upkeep must not block the note
 /// write.
 pub fn refresh_folder_index(
-    daemon: &Daemon,
+    wt: &WorkTree,
     inner: &DaemonInner,
-    garden_root: &Path,
     folder_rel: &str,
-) -> Option<PathBuf> {
-    let folder_name = Path::new(folder_rel).file_name()?.to_str()?;
+) -> Option<String> {
+    let folder_name = Path::new(folder_rel).file_name()?.to_str()?.to_string();
     let host_rel = host_rel(folder_rel)?;
-    let host_abs = garden_root.join(&host_rel);
     // Read the host CLAUDE.md only if it exists and is safe to rewrite (not
     // vault-protected). A missing host yields `None` — index maintenance
     // never fabricates a routing doc nor clobbers ciphertext.
-    let content = super::sections::read_if_unprotected(inner, &host_abs, &host_rel)?;
+    let content = super::sections::read_if_unprotected(wt, inner, &host_rel)?;
 
-    let rows = collect_rows(&garden_root.join(folder_rel));
-    let tag = region_tag(folder_name);
+    let rows = collect_rows(wt, folder_rel);
+    let tag = region_tag(&folder_name);
     let new = if rows.is_empty() {
         // Folder emptied (last note archived) → drop the region entirely so
         // the routing doc stays clean; re-adding a note recreates it.
         managed::remove(&content, &tag)
     } else {
-        managed::upsert(&content, &tag, &render_table(folder_name, &rows))
+        managed::upsert(&content, &tag, &render_table(&folder_name, &rows))
     };
     if new == content {
         return None;
     }
-    daemon.mark_self_write(host_abs.clone());
-    std::fs::write(&host_abs, new.as_bytes()).ok()?;
-    Some(host_abs)
+    wt.write(&host_rel, new.as_bytes()).ok()?;
+    Some(host_rel)
 }
 
-/// Enumerate the numbered notes in `dir_abs`, newest-number last. Each row
-/// carries the note's number, `# ` title (falling back to its filename
-/// slug), and `Last reviewed:` date (empty if unstamped).
-fn collect_rows(dir_abs: &Path) -> Vec<Row> {
+/// Enumerate the numbered notes in accretive folder `folder_rel`, newest-number
+/// last. Each row carries the note's number, `# ` title (falling back to its
+/// filename slug), and `Last reviewed:` date (empty if unstamped). Reads run
+/// through the [`WorkTree`] so a FUSE-mode commit never stats the mount.
+fn collect_rows(wt: &WorkTree, folder_rel: &str) -> Vec<Row> {
     let mut rows = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir_abs) else {
-        return rows;
-    };
-    for entry in rd.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(number) = conventions::parse_note_number(name) else {
+    for entry in wt.read_dir(folder_rel) {
+        let Some(number) = conventions::parse_note_number(&entry.name) else {
             continue;
         };
-        let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        let content = wt
+            .read_to_string(&format!("{folder_rel}/{}", entry.name))
+            .unwrap_or_default();
         let title = conventions::note_title(&content)
-            .unwrap_or_else(|| conventions::slug_from_note_name(name));
+            .unwrap_or_else(|| conventions::slug_from_note_name(&entry.name));
         let reviewed = conventions::note_reviewed(&content).unwrap_or_default();
         rows.push(Row {
             number,
             title,
             reviewed,
-            filename: name.to_string(),
+            filename: entry.name,
         });
     }
     rows.sort_by_key(|r| r.number);

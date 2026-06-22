@@ -200,6 +200,209 @@ impl SharedState {
         let plain = self.session.decrypt_blob(&cipher)?;
         Ok(Ignore::from_contents(&String::from_utf8_lossy(&plain)))
     }
+
+    // ===== Overlay-staging + in-memory queries for daemon M3a actions =====
+    //
+    // The keeperd M3a verbs used to `std::fs`-read/-write `garden_root`, which
+    // in FUSE mode is the mount THIS daemon serves — a self-read/-write of the
+    // mount while the daemon holds `daemon.inner` (the 2026-06-21 deadlock).
+    // These let the daemon read and stage working-tree changes purely against
+    // the in-memory (tip ∪ overlay) state, never re-entering the kernel.
+    //
+    // Writes land in the overlay and are captured by the next
+    // `workdir_snapshot` commit; they deliberately do NOT fire the
+    // `DirtyEventSink` — the daemon commits them explicitly, so emitting a
+    // watcher event would queue a redundant (double) commit. Paths are
+    // repo-relative, the same key shape the FUSE handlers use (root = "").
+
+    /// Raw working-tree bytes for repo-relative `rel`: overlay precedence (a
+    /// `File`'s content; a `Removed`/`Dir` marker ⇒ `None`), else the committed
+    /// tip blob decrypted to **raw Layer A plaintext** — no sealed/region
+    /// projection, matching [`Self::workdir_snapshot`] (working-tree truth, not
+    /// the reader's redacted view). `None` when absent or a directory.
+    pub(crate) fn read_workfile(&self, rel: &Path) -> Result<Option<Vec<u8>>> {
+        let target = {
+            let inner = self.inner.lock().unwrap();
+            match inner.overlay.get(rel) {
+                Some(OverlayEntry::File { content, .. }) => return Ok(Some(content.clone())),
+                Some(OverlayEntry::Removed | OverlayEntry::Dir { .. }) => return Ok(None),
+                None => match inner.view.get(rel) {
+                    Some(e) if e.kind == EntryKind::Blob => e.target,
+                    _ => return Ok(None),
+                },
+            }
+        };
+        // Decrypt outside the lock (matches `workdir_snapshot`'s two-phase shape).
+        let cipher = self.objects.get(&target)?;
+        Ok(Some(self.session.decrypt_blob(&cipher)?))
+    }
+
+    /// Whether repo-relative `rel` resolves to a live file or directory.
+    pub(crate) fn path_exists(&self, rel: &Path) -> bool {
+        self.entry_kind(rel).is_some()
+    }
+
+    /// Whether `rel` is a directory in the working tree (an overlay `Dir` or a
+    /// committed tip tree node). The repo root (`""`) is always a directory.
+    pub(crate) fn path_is_dir(&self, rel: &Path) -> bool {
+        rel.as_os_str().is_empty() || matches!(self.entry_kind(rel), Some(EntryKind::Dir))
+    }
+
+    /// Kind of the working-tree entry at `rel` (overlay precedence), or `None`
+    /// if absent / overlay-removed.
+    fn entry_kind(&self, rel: &Path) -> Option<EntryKind> {
+        let inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.overlay.get(rel) {
+            return match entry {
+                OverlayEntry::File { .. } => Some(EntryKind::Blob),
+                OverlayEntry::Dir { .. } => Some(EntryKind::Dir),
+                OverlayEntry::Removed => None,
+            };
+        }
+        inner.view.get(rel).map(|e| e.kind)
+    }
+
+    /// One-level children of `dir` (repo-relative; `""` = root) as
+    /// `(file_name, is_dir)`, merging overlay over tip and honoring overlay
+    /// removals. Order is unspecified — callers sort.
+    pub(crate) fn read_dir_entries(&self, dir: &Path) -> Vec<(String, bool)> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        // Tip children not shadowed by an overlay entry (override or removal).
+        for (child, entry) in inner.view.children(dir) {
+            if inner.overlay.get(child).is_some() {
+                continue;
+            }
+            seen.insert(child.to_path_buf());
+            if let Some(name) = child.file_name().and_then(|n| n.to_str()) {
+                out.push((name.to_string(), entry.kind == EntryKind::Dir));
+            }
+        }
+        // Overlay children (new files/dirs + overrides), skipping removals.
+        for (path, entry) in inner.overlay.iter() {
+            if path.parent() != Some(dir) || matches!(entry, OverlayEntry::Removed) {
+                continue;
+            }
+            if !seen.insert(path.to_path_buf()) {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                out.push((name.to_string(), matches!(entry, OverlayEntry::Dir { .. })));
+            }
+        }
+        out
+    }
+
+    /// Stage a create-or-overwrite into the overlay, preserving an existing
+    /// file's mode (else `0o100644`, like a plain `std::fs::write`). No kernel
+    /// round-trip and no `DirtyEventSink` event.
+    pub(crate) fn stage_write(&self, rel: &Path, content: Vec<u8>) {
+        let mut inner = self.inner.lock().unwrap();
+        let mode = current_mode(&inner, rel).unwrap_or(0o100644);
+        ensure_overlay_dirs(&mut inner, rel);
+        inner.overlay.insert_file(rel.to_path_buf(), content, mode);
+        inner.inodes.intern(rel);
+    }
+
+    /// Stage a rename into the overlay. Handles a single file and a directory
+    /// (every live file descendant is re-keyed). Each moved file's bytes are
+    /// materialized into the overlay so the move survives the
+    /// overlay-clears-on-commit rotation — mirroring the kernel `rename`
+    /// handler, extended to whole subtrees.
+    pub(crate) fn stage_rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let movers: Vec<PathBuf> = self
+            .live_file_paths()
+            .into_iter()
+            .filter(|p| p == from || p.starts_with(from))
+            .collect();
+        for src in movers {
+            let suffix = src.strip_prefix(from).unwrap_or(Path::new(""));
+            let dst = if suffix.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(suffix)
+            };
+            let content = self.read_workfile(&src)?.unwrap_or_default();
+            let mut inner = self.inner.lock().unwrap();
+            let mode = current_mode(&inner, &src).unwrap_or(0o100644);
+            inner.overlay.mark_removed(src.clone());
+            ensure_overlay_dirs(&mut inner, &dst);
+            inner.overlay.insert_file(dst.clone(), content, mode);
+            inner.inodes.rename(&src, &dst);
+        }
+        Ok(())
+    }
+
+    /// Every live (overlay ∪ tip, removals honored) regular-file repo-relative
+    /// path. Backs [`Self::stage_rename`]'s directory case. No ignore filtering
+    /// — `.softfig`/`.claude` are absent from both the tip tree and the overlay.
+    fn live_file_paths(&self) -> Vec<PathBuf> {
+        let inner = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        collect_live(&inner, Path::new(""), &mut out);
+        out
+    }
+}
+
+/// Ensure overlay `Dir` markers exist for every ancestor directory of `file`
+/// that isn't already present (overlay entry or committed tip dir), mirroring
+/// the `create_dir_all` → kernel `mkdir` chain the old `std::fs` action-write
+/// path triggered. Without this, `collect_files` / `collect_live` — which
+/// descend *only* through known `Dir` entries — would never reach a file staged
+/// under a not-yet-existing directory, silently dropping it from the commit
+/// snapshot. The dir mode is cosmetic (the snapshot derives dir nodes from the
+/// files' ancestry, not from these markers).
+fn ensure_overlay_dirs(inner: &mut Inner, file: &Path) {
+    for anc in file.ancestors().skip(1) {
+        if anc.as_os_str().is_empty() {
+            continue; // the repo root is implicit
+        }
+        if inner.overlay.get(anc).is_some() {
+            continue; // already staged — don't clobber a File/Removed/Dir marker
+        }
+        if matches!(inner.view.get(anc).map(|e| e.kind), Some(EntryKind::Dir)) {
+            continue; // already a committed directory
+        }
+        inner.overlay.insert_dir(anc.to_path_buf(), 0o040755);
+    }
+}
+
+/// Mode of the working-tree entry at `path` (overlay precedence), or `None`.
+fn current_mode(inner: &Inner, path: &Path) -> Option<u32> {
+    if let Some(entry) = inner.overlay.get(path) {
+        return match entry {
+            OverlayEntry::File { mode, .. } => Some(*mode),
+            OverlayEntry::Dir { mode } => Some(*mode),
+            OverlayEntry::Removed => None,
+        };
+    }
+    inner.view.get(path).map(|e| e.mode)
+}
+
+/// Recursively collect live file paths under `dir` from the (tip ∪ overlay)
+/// state, mirroring [`collect_files`]'s precedence (overlay wins; a `Removed`
+/// marker hides the tip copy) without the ignore filter or content.
+fn collect_live(inner: &Inner, dir: &Path, out: &mut Vec<PathBuf>) {
+    for (path, entry) in inner.overlay.iter() {
+        if path.parent() != Some(dir) {
+            continue;
+        }
+        match entry {
+            OverlayEntry::Removed => {}
+            OverlayEntry::File { .. } => out.push(path.to_path_buf()),
+            OverlayEntry::Dir { .. } => collect_live(inner, path, out),
+        }
+    }
+    for (path, entry) in inner.view.children(dir) {
+        if inner.overlay.get(path).is_some() {
+            continue;
+        }
+        match entry.kind {
+            EntryKind::Blob => out.push(path.to_path_buf()),
+            EntryKind::Dir => collect_live(inner, path, out),
+        }
+    }
 }
 
 /// Where a reconstructed file's bytes come from. Overlay content is

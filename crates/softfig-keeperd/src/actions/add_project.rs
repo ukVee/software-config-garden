@@ -5,7 +5,7 @@ use softfig_vcs::Intent;
 use softfig_ipc::verbs::{AddProjectArgs, AddProjectReply};
 use softfig_ipc::ErrorKind;
 
-use super::{commit_now, conventions, write_file};
+use super::{commit_now, conventions, WorkTree};
 use crate::daemon::Daemon;
 use crate::handlers::{require_unlocked, HandlerResult};
 
@@ -16,13 +16,8 @@ pub fn add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
-    let garden_root = inner.config.garden_root.clone();
 
     let dir_rel = conventions::project_dir(&args.name);
-    let dir_abs = garden_root.join(&dir_rel);
-    if dir_abs.exists() {
-        return Err((ErrorKind::PathAlreadyExists, format!("{dir_rel}: already exists")));
-    }
 
     let date = conventions::today_hyphen();
     let repo_path = args.repo_path.as_deref();
@@ -52,16 +47,21 @@ pub fn add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         ),
     ];
 
-    // Register every path in the suppression map BEFORE any IO so the
-    // watcher (if running) drops the events, then write them all. The
-    // single `commit_workdir` below makes the four-file write atomic.
-    let mut written = Vec::with_capacity(files.len());
-    for (rel, content) in &files {
-        let abs = garden_root.join(rel);
-        daemon.mark_self_write(abs.clone());
-        write_file(&abs, content.as_bytes())?;
-        written.push(rel.clone());
-    }
+    // Reject an existing project, then write all four stubs through the
+    // worktree (self-write-suppressed in disk mode, staged into the overlay in
+    // FUSE mode). The single commit below makes the four-file write atomic.
+    let written = {
+        let wt = WorkTree::new(daemon, &inner);
+        if wt.exists(&dir_rel) {
+            return Err((ErrorKind::PathAlreadyExists, format!("{dir_rel}: already exists")));
+        }
+        let mut written = Vec::with_capacity(files.len());
+        for (rel, content) in &files {
+            wt.write(rel, content.as_bytes())?;
+            written.push(rel.clone());
+        }
+        written
+    };
 
     let payload = serde_json::json!({
         "name": args.name,

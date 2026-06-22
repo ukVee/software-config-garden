@@ -147,6 +147,49 @@ impl MountHandle {
         self.state.workdir_snapshot()
     }
 
+    // ===== Overlay-staging + in-memory queries (slice 3b) =====
+    //
+    // The daemon's M3a write verbs route their working-tree reads and writes
+    // through these instead of `std::fs`-ing `garden_root` (= the mount this
+    // daemon serves) while holding `daemon.inner` — the 2026-06-21 deadlock.
+    // All operate on the in-memory (tip ∪ overlay) state with no kernel
+    // round-trip; staged writes are committed by the next `workdir_snapshot`
+    // and do not fire the `DirtyEventSink`. Paths are repo-relative (`""` =
+    // root). See [`fs::SharedState`] for the precedence contract.
+
+    /// Raw working-tree bytes for `rel` (overlay ∪ tip), or `None` if absent
+    /// or a directory.
+    pub fn read_workfile(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+        self.state.read_workfile(std::path::Path::new(rel))
+    }
+
+    /// Whether `rel` resolves to a live file or directory.
+    pub fn path_exists(&self, rel: &str) -> bool {
+        self.state.path_exists(std::path::Path::new(rel))
+    }
+
+    /// Whether `rel` is a directory (overlay `Dir` or committed tip node).
+    pub fn path_is_dir(&self, rel: &str) -> bool {
+        self.state.path_is_dir(std::path::Path::new(rel))
+    }
+
+    /// One-level children of directory `rel` as `(file_name, is_dir)`.
+    pub fn read_dir_entries(&self, rel: &str) -> Vec<(String, bool)> {
+        self.state.read_dir_entries(std::path::Path::new(rel))
+    }
+
+    /// Stage a create-or-overwrite into the overlay (mode preserved on
+    /// overwrite, else `0o100644`).
+    pub fn stage_write(&self, rel: &str, content: Vec<u8>) {
+        self.state.stage_write(std::path::Path::new(rel), content)
+    }
+
+    /// Stage a file-or-directory rename into the overlay.
+    pub fn stage_rename(&self, from: &str, to: &str) -> Result<()> {
+        self.state
+            .stage_rename(std::path::Path::new(from), std::path::Path::new(to))
+    }
+
     /// Tear down the FUSE session. Idempotent — a second call is a no-op.
     ///
     /// Before dropping the `BackgroundSession`, forcibly release the kernel
