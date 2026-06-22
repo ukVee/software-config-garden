@@ -1113,8 +1113,18 @@ fn statusline_script(usage: &Path) -> String {
 # loop's budget read path) and print a compact mode + budget line.
 set -u
 input=$(cat)
-printf '%s' "$input" | jq '{context_window, rate_limits, ts: now}' > @USAGE@ 2>/dev/null || true
-ctx=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // 0' 2>/dev/null || echo 0)
+# Claude Code derives context_window.used_percentage from a cumulative token
+# total over the window, so it can exceed 100 in a long session. Clamp it to a
+# sane 0..100 the governor can trust (spec-growlight.md §6) BEFORE teeing — but
+# only when it is actually a number, so a missing % stays absent (never coerced
+# to a false 0), and keep remaining_percentage consistent with the clamp.
+printf '%s' "$input" | jq '
+  (if (.context_window.used_percentage | type) == "number" then
+        .context_window.used_percentage |= ([., 100] | min) | .context_window.used_percentage |= ([., 0] | max)
+      | .context_window.remaining_percentage = (100 - .context_window.used_percentage)
+   else . end)
+  | {context_window, rate_limits, ts: now}' > @USAGE@ 2>/dev/null || true
+ctx=$(printf '%s' "$input" | jq -r '([(.context_window.used_percentage // 0), 100] | min)' 2>/dev/null || echo 0)
 five=$(printf '%s' "$input" | jq -r '.rate_limits.five_hour.used_percentage // 0' 2>/dev/null || echo 0)
 printf 'softfig-loop · ctx %s%% · 5h %s%%' "$ctx" "$five"
 "#;
@@ -1329,6 +1339,73 @@ mod tests {
         assert!(s.contains("context_window"));
         assert!(s.contains("rate_limits"));
         assert!(s.contains("five_hour.used_percentage"));
+        // The tee must clamp a >100 used_percentage (spec §6) — see the
+        // behavioral test below for the runtime proof.
+        assert!(s.contains("used_percentage |= ([., 100] | min)"));
+    }
+
+    // Run the generated statusline through real jq+bash to prove the clamp.
+    // Self-skips when jq is unavailable (the script can't write usage.json then
+    // anyway — see the jq warning in `cmd_growlight`).
+    fn run_statusline(input: &str) -> serde_json::Value {
+        let dir = std::env::temp_dir().join(format!(
+            "softfig-statusline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let usage = dir.join("usage.json");
+        let script = dir.join("statusline.sh");
+        std::fs::write(&script, statusline_script(&usage)).unwrap();
+
+        let mut child = std::process::Command::new("bash")
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait().unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&usage).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        v
+    }
+
+    #[test]
+    fn statusline_clamps_an_over_100_used_percentage_but_keeps_missing_absent() {
+        if !jq_present() {
+            return; // jq-gated, like the live statusline path itself.
+        }
+        // Claude Code emitting 255% (cumulative tokens over the window) must be
+        // floored to 100 with remaining 0 — never teed through as garbage.
+        let over = r#"{"context_window":{"used_percentage":255,"remaining_percentage":0,"context_window_size":1000000},"rate_limits":{"five_hour":{"used_percentage":12}}}"#;
+        let v = run_statusline(over);
+        assert_eq!(v["context_window"]["used_percentage"], 100);
+        assert_eq!(v["context_window"]["remaining_percentage"], 0);
+        assert_eq!(v["rate_limits"]["five_hour"]["used_percentage"], 12);
+
+        // A sane value passes through untouched.
+        let sane = r#"{"context_window":{"used_percentage":69,"remaining_percentage":31,"context_window_size":1000000},"rate_limits":{}}"#;
+        let v = run_statusline(sane);
+        assert_eq!(v["context_window"]["used_percentage"], 69);
+        assert_eq!(v["context_window"]["remaining_percentage"], 31);
+
+        // A MISSING used_percentage must stay absent — never coerced to a false
+        // 0 the governor could read as a false all-clear (the slice-001 rule).
+        let missing = r#"{"context_window":{"context_window_size":1000000},"rate_limits":{}}"#;
+        let v = run_statusline(missing);
+        assert!(
+            v["context_window"]["used_percentage"].is_null(),
+            "missing % must not be coerced to 0: {v}"
+        );
     }
 
     #[test]

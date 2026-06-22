@@ -68,12 +68,17 @@ pub struct UsageSnapshot {
 
 #[derive(Serialize)]
 pub struct ContextWindow {
-    /// Derived: `round(100 * current_tokens / context_window_size)`, clamped
-    /// `0..=100` (0 when the window size is unknown).
+    /// Derived: `round(100 * current_tokens / context_window_size)`, clamped to
+    /// a saturating `0..=100` (0 when the window size is unknown). The clamp
+    /// matters because `current_tokens` is cumulative — see its note — so the
+    /// raw ratio can exceed 100 in a long session.
     pub used_percentage: u8,
     pub remaining_percentage: u8,
     pub context_window_size: u64,
-    /// The prompt footprint the percentage was derived from (input + cache).
+    /// The token figure the percentage was derived from: `input + cache_read +
+    /// cache_creation`. This is cumulative across the session (cache reads
+    /// accrue per request), NOT the exact live prompt footprint, so it can run
+    /// past `context_window_size` — hence the clamp on `used_percentage`.
     pub current_tokens: u64,
 }
 
@@ -195,8 +200,17 @@ fn derive_context(result: &Value) -> ContextWindow {
         })
         .unwrap_or(0);
 
+    // `current_tokens` is cumulative (input + every cache read across the
+    // session), so the ratio can legitimately exceed the window in a long run —
+    // the percentage is occupancy-ish, not an exact live footprint (spec §6).
+    // Clamp to a saturating 0..=100 floor BEFORE the cast: a bare `f64 as u8`
+    // saturates huge values to 255 and passes 101..=255 straight through (e.g.
+    // 135), either of which reads as garbage to the governor. The else branch
+    // keeps an unknown window at 0 — we never coerce a present over-100 into a
+    // misleading wrapped number, nor an unknown into a false reading here.
     let used_percentage = if context_window_size > 0 {
-        ((current_tokens as f64 / context_window_size as f64) * 100.0).round() as u8
+        (((current_tokens as f64 / context_window_size as f64) * 100.0).round()).clamp(0.0, 100.0)
+            as u8
     } else {
         0
     };
@@ -417,6 +431,27 @@ mod tests {
         assert_eq!(out.usage.context_window.context_window_size, 0);
         assert_eq!(out.usage.context_window.used_percentage, 0);
         assert_eq!(out.usage.context_window.remaining_percentage, 100);
+    }
+
+    #[test]
+    fn cumulative_tokens_over_the_window_saturate_at_100_never_wrap() {
+        // A long agentic run: cumulative input + cache totals (~3.93M) far
+        // exceed a 1M window. The raw ratio is 393% — a bare `f64 as u8` would
+        // saturate that to 255 (and a ~135% run would pass through as 135). The
+        // clamp must floor it at exactly 100, with remaining 0.
+        let over = r#"{"type":"result","is_error":false,"usage":{"input_tokens":30000,"cache_read_input_tokens":3800000,"cache_creation_input_tokens":100000},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#;
+        let out = parse_stream(over, 0.0).unwrap();
+        let cw = &out.usage.context_window;
+        assert_eq!(cw.current_tokens, 3_930_000);
+        assert_eq!(cw.used_percentage, 100, "must saturate, never wrap to 255");
+        assert_eq!(cw.remaining_percentage, 0);
+
+        // A milder overshoot (1.35M / 1M = 135%) — the case `as u8` would have
+        // let slip through unchanged — also floors at 100.
+        let mild = r#"{"type":"result","usage":{"input_tokens":1350000},"modelUsage":{"m":{"contextWindow":1000000}}}"#;
+        let mild_out = parse_stream(mild, 0.0).unwrap();
+        assert_eq!(mild_out.usage.context_window.used_percentage, 100);
+        assert_eq!(mild_out.usage.context_window.remaining_percentage, 0);
     }
 
     #[test]
