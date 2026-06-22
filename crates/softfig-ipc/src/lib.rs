@@ -13,7 +13,7 @@ pub mod proto;
 pub mod socket;
 pub mod verbs;
 
-pub use client::{call, connect, ClientError};
+pub use client::{call, call_reconnecting, connect, ClientError, ReconnectError, RetryPolicy};
 pub use proto::{ErrorKind, Request, Response};
 pub use socket::runtime_socket_path;
 pub use verbs::*;

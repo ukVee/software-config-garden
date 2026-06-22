@@ -499,11 +499,16 @@ fn call_tool(params: &Value) -> Result<Value> {
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     let (op_name, ipc_args) = resolve_tool(name, args)?;
 
+    // softfig-mcp holds no persistent keeperd connection — it connects per
+    // request. A verb issued during a keeperd restart window (daemon
+    // cycle/stop/start or a crash-respawn) would otherwise bubble up the
+    // momentary socket outage as a hard error. `call_reconnecting` rides out a
+    // transient restart with bounded backoff, retrying ONLY pre-send failures
+    // (connect/write — provably not applied) and surfacing a post-send drop
+    // distinctly so a committing verb is never blindly double-applied.
     let socket = softfig_ipc::runtime_socket_path();
-    let mut stream = softfig_ipc::connect(&socket)
-        .map_err(|e| anyhow::anyhow!("connect to keeperd at {}: {e}", socket.display()))?;
     let req = Request::new(op_name, ipc_args);
-    let resp = softfig_ipc::call(&mut stream, &req)?;
+    let resp = softfig_ipc::call_reconnecting(&socket, &req, softfig_ipc::RetryPolicy::default())?;
     match resp {
         Response::Ok { data, .. } => Ok(json!({
             "content": [{ "type": "text", "text": summarize(name, &data) }],
