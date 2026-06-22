@@ -28,8 +28,8 @@ use softfig_ipc::{
 
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
-    AgentBackend, ClaudeBackend, Clock, IterationOutcome, IterationRequest, RateWindow, SystemClock,
-    UsageSnapshot,
+    AgentBackend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, IterationOutcome, IterationRequest,
+    RateWindow, SystemClock, SystemExeProbe, UsageSnapshot,
 };
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
@@ -237,6 +237,9 @@ fn start(args: StartArgs) -> Result<()> {
     if args.auto {
         let backend = ClaudeBackend::new(AGENT_BIN);
         let clock = SystemClock;
+        // Captured before the loop, while our own binary is still the live inode;
+        // re-statted between iterations to catch a mid-run reinstall (task 007).
+        let exe = SystemExeProbe::capture();
         let usage_path = runtime.join("usage.json");
         let log_path = runtime.join("auto-run.log");
         let mut log = open_run_log(&log_path)?;
@@ -247,6 +250,7 @@ fn start(args: StartArgs) -> Result<()> {
         let summary = run_auto_loop(
             &backend,
             &clock,
+            &exe,
             &loop_path,
             &mcp_path,
             &baton_path,
@@ -308,6 +312,12 @@ enum StopReason {
     SpinGuard,
     /// `--max-iterations` was reached with a still-non-terminal baton.
     MaxIterations,
+    /// The on-disk `softfig` at the orchestrator's launch path changed mid-run
+    /// (a reinstall) → the loop is about to drive another iteration on superseded
+    /// code. Per spec §12 the long-lived orchestrator does NOT self-restart, so
+    /// this stops loudly for a human-driven relaunch rather than silently
+    /// spinning stale flags (the iter-5/6 `--mcp-config` regression).
+    BinarySuperseded,
 }
 
 /// The orchestrator's between-iteration decision, from the just-finished result.
@@ -429,6 +439,15 @@ fn decide_step(view: &BatonView, usage: &UsageSnapshot, stalled: bool) -> LoopSt
     }
 }
 
+/// Has the launch binary been superseded since startup? True only when both the
+/// startup baseline and the current on-disk identity are known *and* differ — a
+/// missing reading (un-stattable path) never trips, so the guard can't false-stop
+/// a still-current loop. Pure, so the stale-orchestrator guard (task 007) is
+/// unit-tested without a real reinstall (the [`ExeProbe`] seam supplies both ends).
+fn superseded(baseline: Option<&ExeIdentity>, current: Option<&ExeIdentity>) -> bool {
+    matches!((baseline, current), (Some(b), Some(c)) if b != c)
+}
+
 /// The outcome of an `--auto` loop run, for the closing summary.
 #[derive(Debug)]
 struct LoopSummary {
@@ -452,6 +471,7 @@ struct LoopSummary {
 fn run_auto_loop(
     backend: &dyn AgentBackend,
     clock: &dyn Clock,
+    exe: &dyn ExeProbe,
     loop_path: &Path,
     mcp_path: &Path,
     baton_path: &Path,
@@ -463,6 +483,10 @@ fn run_auto_loop(
         .map(|m| m.to_string())
         .unwrap_or_else(|| "unbounded".to_string());
     let _ = writeln!(log, "--- growlight --auto run (max_iterations={bound}) ---");
+
+    // Stale-orchestrator guard baseline (task 007): the identity of the binary
+    // we launched from, captured now and re-checked between iterations.
+    let exe_baseline = exe.current_identity();
 
     let mut iterations: u64 = 0;
     let mut prev_next_action: Option<String> = None;
@@ -483,6 +507,27 @@ fn run_auto_loop(
                     last_item,
                 });
             }
+        }
+
+        // Stale-orchestrator guard (task 007). A reinstall during the run replaces
+        // the binary at our launch path, but this long-lived process keeps running
+        // the OLD code — and would spawn the next `claude -p` child with stale flags
+        // (the iter-5/6 `--mcp-config` regression that looked like a code-fix
+        // failure and cost two iterations + a human restart to root-cause). Detect
+        // the swap *before* spawning the next child and stop loudly. Per spec §12
+        // the orchestrator does not self-restart (a launcher upgrade is a human-
+        // driven relaunch), so this converts a silent stale spin into an actionable
+        // stop. Skipped on the first pass (`iterations == 0`): the baseline was just
+        // captured, so it can't yet differ from itself.
+        if iterations > 0 && superseded(exe_baseline.as_ref(), exe.current_identity().as_ref()) {
+            log_stop(&StopReason::BinarySuperseded, same_streak, log);
+            surface_superseded(log);
+            return Ok(LoopSummary {
+                iterations,
+                stop: StopReason::BinarySuperseded,
+                last_status,
+                last_item,
+            });
         }
 
         let (outcome, view) = run_auto(backend, loop_path, mcp_path, baton_path, usage_path)?;
@@ -586,6 +631,20 @@ fn surface_blocked(view: &BatonView, log: &mut dyn Write) {
     eprintln!("  {na}");
 }
 
+/// Loudly surface a [`StopReason::BinarySuperseded`] stop: the orchestrator's own
+/// `softfig` was reinstalled mid-run, so it's now executing stale code. Per spec
+/// §12 it does not self-restart — tell the human to relaunch onto the new binary.
+fn surface_superseded(log: &mut dyn Write) {
+    let action = "restart it: `softfig growlight start --auto`";
+    let _ = writeln!(
+        log,
+        "binary superseded: `softfig` was reinstalled while this --auto orchestrator was \
+         running — {action}"
+    );
+    eprintln!("\n*** growlight --auto stopped: binary superseded (reinstalled mid-run) ***");
+    eprintln!("  it would keep driving stale code — {action}");
+}
+
 /// Record a stop in the run log.
 fn log_stop(reason: &StopReason, same_streak: usize, log: &mut dyn Write) {
     let msg = match reason {
@@ -595,6 +654,10 @@ fn log_stop(reason: &StopReason, same_streak: usize, log: &mut dyn Write) {
             "stop: spin guard — NEXT ACTION unchanged across {same_streak} iterations (STUCK)"
         ),
         StopReason::MaxIterations => "stop: --max-iterations reached".to_string(),
+        StopReason::BinarySuperseded => {
+            "stop: binary superseded — `softfig` reinstalled mid-run (stale orchestrator)"
+                .to_string()
+        }
     };
     let _ = writeln!(log, "{msg}");
 }
@@ -678,6 +741,9 @@ fn print_loop_summary(summary: &LoopSummary, usage_path: &Path, log_path: &Path)
             println!("  reason   spin guard — NEXT ACTION unchanged (STUCK)")
         }
         StopReason::MaxIterations => println!("  reason   --max-iterations reached"),
+        StopReason::BinarySuperseded => {
+            println!("  reason   binary superseded — `softfig` reinstalled mid-run; restart --auto")
+        }
     }
     println!("  item     {}", summary.last_item.as_deref().unwrap_or("-"));
     println!("  status   {}", summary.last_status);
@@ -1317,6 +1383,53 @@ mod tests {
         }
     }
 
+    fn exe_id(ino: u64) -> ExeIdentity {
+        ExeIdentity { dev: 1, ino, mtime: 1, size: 1 }
+    }
+
+    /// An [`ExeProbe`] whose binary never changes — the launch binary stays the
+    /// live inode, so the stale-orchestrator guard must never trip. Used by every
+    /// existing loop test that isn't exercising the guard.
+    struct StableExe;
+    impl ExeProbe for StableExe {
+        fn current_identity(&self) -> Option<ExeIdentity> {
+            Some(exe_id(1))
+        }
+    }
+
+    /// An [`ExeProbe`] that reports one identity for its first `flip_after` calls
+    /// to `current_identity()`, then a different one — simulating a reinstall
+    /// mid-run without touching the filesystem. Call order in the loop is:
+    /// baseline (1), then one guard check per pass with `iterations > 0`.
+    struct FlipExe {
+        calls: Cell<usize>,
+        flip_after: usize,
+    }
+    impl FlipExe {
+        fn new(flip_after: usize) -> Self {
+            Self { calls: Cell::new(0), flip_after }
+        }
+    }
+    impl ExeProbe for FlipExe {
+        fn current_identity(&self) -> Option<ExeIdentity> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            Some(exe_id(if n >= self.flip_after { 222 } else { 111 }))
+        }
+    }
+
+    #[test]
+    fn superseded_trips_only_on_a_definite_known_change() {
+        let a = exe_id(1);
+        let b = exe_id(2);
+        assert!(!superseded(Some(&a), Some(&a)), "same identity → no trip");
+        assert!(superseded(Some(&a), Some(&b)), "changed identity → trip");
+        // A missing reading on either side must never trip (no false stop).
+        assert!(!superseded(None, Some(&a)));
+        assert!(!superseded(Some(&a), None));
+        assert!(!superseded(None, None));
+    }
+
     #[test]
     fn first_line_preview_truncates_on_chars_and_extra_lines() {
         assert_eq!(first_line_preview("short", 100), "short");
@@ -1520,7 +1633,7 @@ mod tests {
             let clock = FakeClock::new(0);
             let mut log = Vec::new();
             let summary =
-                run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
+                run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
             assert_eq!(summary.iterations, 1, "{status}: exactly one iteration");
             assert_eq!(summary.stop, expected, "{status}");
             // No iteration started after the terminal status was written.
@@ -1546,7 +1659,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
         assert_eq!(summary.iterations, 4);
         assert_eq!(summary.stop, StopReason::Terminal("QUEUE_EMPTY".to_string()));
         assert_eq!(backend.calls.get(), 4);
@@ -1564,7 +1677,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
         assert_eq!(summary.stop, StopReason::SpinGuard);
         assert_eq!(summary.iterations, STALL_LIMIT as u64);
         assert_eq!(backend.calls.get(), STALL_LIMIT);
@@ -1588,7 +1701,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, Some(3), &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage, Some(3), &mut log).unwrap();
         assert_eq!(summary.stop, StopReason::MaxIterations);
         assert_eq!(summary.iterations, 3);
         assert_eq!(backend.calls.get(), 3);
@@ -1603,7 +1716,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, Some(1), &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage, Some(1), &mut log).unwrap();
         assert_eq!(summary.iterations, 1);
         assert_eq!(summary.stop, StopReason::MaxIterations);
         assert_eq!(backend.calls.get(), 1);
@@ -1622,7 +1735,7 @@ mod tests {
         );
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
-        run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
+        run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage, None, &mut log).unwrap();
         let text = String::from_utf8(log).unwrap();
         assert!(text.contains("iter 1:"), "log: {text}");
         assert!(text.contains("iter 2:"), "log: {text}");
@@ -1631,6 +1744,41 @@ mod tests {
             text.contains("stop: terminal baton status QUEUE_EMPTY"),
             "log: {text}"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- stale-orchestrator guard (task 007) ---------------------------
+
+    #[test]
+    fn binary_superseded_guard_stops_before_spawning_a_stale_iteration() {
+        let (dir, loop_path, mcp, baton, usage) = loop_paths("superseded");
+        // Distinct NEXT ACTIONs so the spin guard never fires first; this baton
+        // never goes terminal, so without the stale-binary guard the loop would
+        // keep driving (here it'd exhaust the scripted batons, then repeat the
+        // last forever). The guard is the only thing that should stop it.
+        let backend = ScriptedBackend::new(
+            &baton,
+            vec![
+                fm("IN_PROGRESS", "item-a", "step 1"),
+                fm("IN_PROGRESS", "item-a", "step 2"),
+                fm("IN_PROGRESS", "item-a", "step 3"),
+            ],
+        );
+        let clock = FakeClock::new(0);
+        // Identity calls in order: baseline (n=0), guard before iter 2 (n=1),
+        // guard before iter 3 (n=2 → flips) → the reinstall is caught before the
+        // 3rd (stale) iteration ever spawns.
+        let exe = FlipExe::new(2);
+        let mut log = Vec::new();
+        let summary = run_auto_loop(
+            &backend, &clock, &exe, &loop_path, &mcp, &baton, &usage, None, &mut log,
+        )
+        .unwrap();
+        assert_eq!(summary.stop, StopReason::BinarySuperseded);
+        assert_eq!(summary.iterations, 2, "stops before the 3rd (stale) iteration");
+        assert_eq!(backend.calls.get(), 2, "no stale child spawned");
+        let text = String::from_utf8(log).unwrap();
+        assert!(text.contains("binary superseded"), "log: {text}");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1830,7 +1978,7 @@ mod tests {
         let clock = FakeClock::new(1_000);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage_path, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage_path, None, &mut log).unwrap();
 
         assert_eq!(summary.iterations, 2);
         assert_eq!(summary.stop, StopReason::Terminal("QUEUE_EMPTY".to_string()));
@@ -1859,7 +2007,7 @@ mod tests {
         let clock = FakeClock::new(0);
         let mut log = Vec::new();
         let summary =
-            run_auto_loop(&backend, &clock, &loop_path, &mcp, &baton, &usage_path, None, &mut log).unwrap();
+            run_auto_loop(&backend, &clock, &StableExe, &loop_path, &mcp, &baton, &usage_path, None, &mut log).unwrap();
         assert_eq!(summary.iterations, 1);
         assert_eq!(summary.stop, StopReason::BlockedOnHuman);
         assert_eq!(backend.calls.get(), 1, "no iteration after the block");

@@ -20,7 +20,7 @@
 //!     the result's token totals ÷ the model's context window; rate-limit % is
 //!     not available headlessly (see [`RateWindow`]).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -247,6 +247,71 @@ impl Clock for SystemClock {
     }
 }
 
+/// Identity of an on-disk binary, for the stale-orchestrator guard (task 007).
+/// A reinstall replaces the file at the launch path with a fresh inode (and
+/// typically a new mtime/size), so any change here means the long-lived `--auto`
+/// orchestrator is now executing superseded code. Compared by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExeIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime: i64,
+    pub size: u64,
+}
+
+/// A seam for "what binary is on disk at my launch path right now", so the
+/// stale-orchestrator guard is unit-testable without a real reinstall — mirrors
+/// the [`Clock`] / [`AgentBackend`] seams. The production [`SystemExeProbe`]
+/// re-stats the path captured from `current_exe()` at startup; tests use a fake
+/// that flips identity on cue.
+pub trait ExeProbe {
+    /// The identity of the binary on disk at the orchestrator's launch path, or
+    /// `None` if it can't be determined — a missing reading must never trip the
+    /// guard, so an un-stattable path simply disables it (never a false stop).
+    fn current_identity(&self) -> Option<ExeIdentity>;
+}
+
+/// The production probe: re-stat the launch path captured once at startup.
+///
+/// The path is taken from `current_exe()` *before* any reinstall and then
+/// re-statted each iteration — we must not call `current_exe()` again, because
+/// once the running file is replaced `/proc/self/exe` reads back
+/// `…/softfig (deleted)`, which would never match the new on-disk file.
+pub struct SystemExeProbe {
+    path: Option<PathBuf>,
+}
+
+impl SystemExeProbe {
+    /// Capture the running binary's launch path now (resolved via
+    /// `current_exe()`) for later re-stat. Infallible: an unresolvable path is
+    /// stored as `None`, which disables the guard rather than failing the loop.
+    pub fn capture() -> Self {
+        Self {
+            path: std::env::current_exe().ok(),
+        }
+    }
+}
+
+impl ExeProbe for SystemExeProbe {
+    fn current_identity(&self) -> Option<ExeIdentity> {
+        self.path.as_deref().and_then(stat_identity)
+    }
+}
+
+/// Stat a path into an [`ExeIdentity`] (Unix dev/ino/mtime/size); `None` if it
+/// can't be statted. Pure-ish (filesystem read only) so the production probe and
+/// its test are both thin.
+fn stat_identity(path: &Path) -> Option<ExeIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some(ExeIdentity {
+        dev: m.dev(),
+        ino: m.ino(),
+        mtime: m.mtime(),
+        size: m.size(),
+    })
+}
+
 /// The supported backend: shell out to Claude Code in headless single-shot mode.
 pub struct ClaudeBackend {
     bin: String,
@@ -352,6 +417,30 @@ mod tests {
         assert_eq!(out.usage.context_window.context_window_size, 0);
         assert_eq!(out.usage.context_window.used_percentage, 0);
         assert_eq!(out.usage.context_window.remaining_percentage, 100);
+    }
+
+    #[test]
+    fn stat_identity_distinguishes_a_replaced_file_and_matches_a_stable_one() {
+        // A reinstall replaces the file at the same path with a new inode/size.
+        // We simulate that by overwriting a temp file with different content and
+        // asserting the identity changes — no real `softfig` reinstall needed.
+        let dir = std::env::temp_dir().join(format!("softfig-exeid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bin");
+
+        std::fs::write(&path, b"v1").unwrap();
+        let a = stat_identity(&path).expect("stat v1");
+        // Same file, re-statted → identical identity (the guard must NOT trip).
+        assert_eq!(stat_identity(&path).as_ref(), Some(&a));
+
+        // Replace the file (drop + recreate → new inode/size, like a reinstall).
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"v2-longer").unwrap();
+        let b = stat_identity(&path).expect("stat v2");
+        assert_ne!(a, b, "a replaced file must read a different identity");
+
+        assert!(stat_identity(&dir.join("does-not-exist")).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
