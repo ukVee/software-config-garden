@@ -15,14 +15,18 @@
 //! clobbered.
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
-    ClientError, runtime_socket_path,
+    ClientError, Request, growlightd_runtime_socket_path, runtime_socket_path,
+    growlightd::{
+        self, AgentDeltaKind, Event, FleetStatusReply, ForceStopArgs, PausedReply, StopLevel,
+        StopReply,
+    },
     verbs::{GrowlightInitArgs, GrowlightInitReply, StatusReply, op},
 };
 
@@ -52,6 +56,28 @@ pub enum GrowlightCmd {
     /// form) and launch the agent in loop mode. Requires the garden unlocked
     /// and `growlight init` already run.
     Start(StartArgs),
+
+    /// Show the orchestrator daemon's fleet status — a one-shot query to
+    /// growlightd's own IPC socket: state, garden root, policy, the admission
+    /// gate (`paused`), and the (phase-1 empty) agent list.
+    Status(ClientArgs),
+
+    /// Tail growlightd's live event stream (the `subscribe` verb): agent
+    /// thoughts/tool-calls, budget changes, lease changes, and bus messages,
+    /// rendered as they arrive. Runs until the daemon stops or you Ctrl-C.
+    Watch(ClientArgs),
+
+    /// Stop one agent at a chosen level (spec §8). `--level after-slice`
+    /// (default) / `after-iteration` record a boundary intent the drive loop
+    /// honours at the next handoff; `hard-kill` interrupts immediately.
+    Stop(StopArgs),
+
+    /// Engage the fleet admission gate — the scheduler admits no new/rolling
+    /// agents until `resume`. Idempotent.
+    Pause(ClientArgs),
+
+    /// Clear the fleet admission gate. Idempotent.
+    Resume(ClientArgs),
 }
 
 #[derive(Args, Debug)]
@@ -94,10 +120,59 @@ pub struct StartArgs {
     pub max_iterations: Option<u64>,
 }
 
+/// Shared args for the growlight client subcommands. They talk to growlightd's
+/// OWN socket (a separate process from keeperd — spec §2/§13), so the override
+/// defaults to the growlightd socket, not keeperd's.
+#[derive(Args, Debug)]
+pub struct ClientArgs {
+    /// Override the growlightd socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct StopArgs {
+    /// Override the growlightd socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// The agent (work-stream) id to stop.
+    #[arg(long)]
+    pub agent: String,
+    /// Stop level (spec §8): the gentlest graceful boundary by default.
+    #[arg(long, value_enum, default_value = "after-slice")]
+    pub level: StopLevelArg,
+}
+
+/// CLI surface for [`StopLevel`]. clap renders these kebab-case on the command
+/// line (`after-slice` / `after-iteration` / `hard-kill`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum StopLevelArg {
+    AfterSlice,
+    AfterIteration,
+    HardKill,
+}
+
+impl From<StopLevelArg> for StopLevel {
+    fn from(arg: StopLevelArg) -> Self {
+        match arg {
+            StopLevelArg::AfterSlice => StopLevel::AfterSlice,
+            StopLevelArg::AfterIteration => StopLevel::AfterIteration,
+            StopLevelArg::HardKill => StopLevel::HardKill,
+        }
+    }
+}
+
 pub fn run(cmd: GrowlightCmd) -> Result<()> {
     match cmd {
         GrowlightCmd::Init(args) => init(args),
         GrowlightCmd::Start(args) => start(args),
+        GrowlightCmd::Status(args) => client_status(args),
+        GrowlightCmd::Watch(args) => client_watch(args),
+        GrowlightCmd::Stop(args) => client_stop(args),
+        GrowlightCmd::Pause(args) => client_pause(args),
+        GrowlightCmd::Resume(args) => client_resume(args),
     }
 }
 
@@ -1209,6 +1284,245 @@ fn today_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+// ---- growlight client subcommands (slice 004) --------------------------
+//
+// Thin clients over growlightd's IPC socket (spec §11/§13), proving the socket
+// is usable from a client without the GUI. They talk to growlightd's OWN socket
+// — a separate process from keeperd — and REPLACE nothing: the foreground
+// `--auto` launcher above stays intact (the milestone's non-disruption
+// criterion). `status`/`stop`/`pause`/`resume` are one-shot `call`s reusing the
+// keeperd client idiom (`try_daemon_call`); `watch` tails the one STREAMING verb
+// (`subscribe`) with a `read_line` → decode-`Event` loop, mirroring growlightd's
+// `tests/subscribe_stream.rs`.
+
+/// Resolve growlightd's socket: the `--socket` override, else
+/// `$XDG_RUNTIME_DIR/softfig-growlightd.sock` (distinct from keeperd's).
+fn growlight_socket(override_: Option<PathBuf>) -> PathBuf {
+    override_.unwrap_or_else(growlightd_runtime_socket_path)
+}
+
+/// One-shot growlightd client call: connect → `call` → decode the typed reply
+/// `T`. Maps the daemon-absent and daemon-error cases to friendly CLI errors
+/// (the keeperd client idiom from `cmd_daemon`, pointed at growlightd's socket).
+fn growlight_call<T: serde::de::DeserializeOwned>(
+    socket: &Path,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<T> {
+    match try_daemon_call(socket, op, args) {
+        Ok(Some(value)) => Ok(serde_json::from_value(value)?),
+        Ok(None) => Err(anyhow!(
+            "no growlightd listening at {} — is the orchestrator daemon running?",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("growlightd error ({kind:?}): {message}"))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+fn client_status(args: ClientArgs) -> Result<()> {
+    let socket = growlight_socket(args.socket);
+    let reply: FleetStatusReply =
+        growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null)?;
+    print_fleet_status(&reply);
+    Ok(())
+}
+
+/// Render a [`FleetStatusReply`] for the terminal.
+fn print_fleet_status(r: &FleetStatusReply) {
+    println!("state         {}", r.state);
+    println!("garden        {}", r.garden_root);
+    println!("protocol      v{}", r.protocol_version);
+    println!("paused        {}", r.paused);
+    println!(
+        "policy        max_agents={} ctx_roll={}% ctx_handoff={}% 5h_halt={}% 7d_halt={}%",
+        r.policy.max_concurrent_agents,
+        r.policy.ctx_roll_pct,
+        r.policy.ctx_handoff_pct,
+        r.policy.session_5h_halt_pct,
+        r.policy.session_7d_halt_pct,
+    );
+    if r.agents.is_empty() {
+        println!("agents        (none)");
+    } else {
+        println!("agents:");
+        for a in &r.agents {
+            println!("  {:<16} {}", a.id, a.status);
+        }
+    }
+}
+
+fn client_pause(args: ClientArgs) -> Result<()> {
+    let socket = growlight_socket(args.socket);
+    let reply: PausedReply =
+        growlight_call(&socket, growlightd::op::PAUSE, serde_json::Value::Null)?;
+    println!("fleet {}", gate_label(reply.paused));
+    Ok(())
+}
+
+fn client_resume(args: ClientArgs) -> Result<()> {
+    let socket = growlight_socket(args.socket);
+    let reply: PausedReply =
+        growlight_call(&socket, growlightd::op::RESUME, serde_json::Value::Null)?;
+    println!("fleet {}", gate_label(reply.paused));
+    Ok(())
+}
+
+fn gate_label(paused: bool) -> &'static str {
+    if paused { "paused" } else { "resumed" }
+}
+
+fn client_stop(args: StopArgs) -> Result<()> {
+    let socket = growlight_socket(args.socket);
+    let force = ForceStopArgs {
+        agent: args.agent,
+        level: args.level.into(),
+    };
+    let reply: StopReply =
+        growlight_call(&socket, growlightd::op::FORCE_STOP, serde_json::to_value(force)?)?;
+    println!(
+        "stop {}: agent {} ({})",
+        if reply.immediate {
+            "applied now"
+        } else {
+            "recorded for the next boundary"
+        },
+        reply.agent,
+        stop_level_label(reply.level),
+    );
+    Ok(())
+}
+
+fn stop_level_label(level: StopLevel) -> &'static str {
+    match level {
+        StopLevel::AfterSlice => "after-slice",
+        StopLevel::AfterIteration => "after-iteration",
+        StopLevel::HardKill => "hard-kill",
+    }
+}
+
+/// `watch`: open a `subscribe` stream and render each [`Event`] as it arrives.
+/// Unlike the one-shot verbs this tails a long-lived stream — it returns when the
+/// daemon stops (EOF) or the user interrupts. The framing (newline-delimited
+/// `Event` JSON, NOT `Response` envelopes) mirrors growlightd's
+/// `tests/subscribe_stream.rs`.
+fn client_watch(args: ClientArgs) -> Result<()> {
+    let socket = growlight_socket(args.socket);
+    let mut stream = softfig_ipc::connect(&socket).map_err(|e| {
+        if e.is_daemon_absent() {
+            anyhow!(
+                "no growlightd listening at {} — is the orchestrator daemon running?",
+                socket.display()
+            )
+        } else {
+            anyhow!("connecting to growlightd: {e}")
+        }
+    })?;
+    send_subscribe(&mut stream)?;
+    eprintln!("watching growlightd at {} — Ctrl-C to stop", socket.display());
+    let mut reader = BufReader::new(stream);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    watch_stream(&mut reader, &mut out)
+}
+
+/// Send the streaming `subscribe` request — the one verb that takes over the
+/// connection. Mirrors the wire write in `tests/subscribe_stream.rs`.
+fn send_subscribe(stream: &mut std::os::unix::net::UnixStream) -> Result<()> {
+    let mut bytes = serde_json::to_vec(&Request::new(
+        growlightd::op::SUBSCRIBE,
+        serde_json::Value::Null,
+    ))?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Read newline-framed [`Event`] frames from `reader` and render each to `out`
+/// until EOF — the pure stream-rendering core of `watch`, so it's unit-tested
+/// with a scripted reader (no socket). A frame that fails to decode is noted and
+/// skipped, never fatal (forward-compatible with event variants this build
+/// predates — e.g. `BusMessage` before the bus exists).
+fn watch_stream(reader: &mut dyn BufRead, out: &mut dyn Write) -> Result<()> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(()); // EOF: the daemon stopped or the connection closed.
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Event>(trimmed) {
+            Ok(event) => writeln!(out, "{}", render_event(&event))?,
+            Err(e) => writeln!(out, "(unrecognized event frame: {e})")?,
+        }
+    }
+}
+
+/// Render one [`Event`] as a single terminal line.
+fn render_event(e: &Event) -> String {
+    match e {
+        Event::AgentDelta { agent, kind, text } => {
+            format!("[{agent}] {} {text}", delta_kind_label(*kind))
+        }
+        Event::BudgetChanged {
+            agent,
+            ctx_pct,
+            session_5h_pct,
+            session_7d_pct,
+        } => {
+            let who = agent.as_deref().unwrap_or("fleet");
+            let mut parts = Vec::new();
+            if let Some(c) = ctx_pct {
+                parts.push(format!("ctx {c}%"));
+            }
+            if let Some(f) = session_5h_pct {
+                parts.push(format!("5h {f}%"));
+            }
+            if let Some(s) = session_7d_pct {
+                parts.push(format!("7d {s}%"));
+            }
+            let body = if parts.is_empty() {
+                "(no reading)".to_string()
+            } else {
+                parts.join(" · ")
+            };
+            format!("[{who}] budget {body}")
+        }
+        Event::LeaseChanged {
+            lease,
+            holder,
+            state,
+        } => {
+            format!(
+                "lease {lease} {state} (holder {})",
+                holder.as_deref().unwrap_or("-")
+            )
+        }
+        Event::BusMessage {
+            from,
+            to,
+            kind,
+            body,
+        } => format!("bus {from}→{to} [{kind}] {body}"),
+    }
+}
+
+/// Short tag for an [`AgentDeltaKind`] in the `watch` stream.
+fn delta_kind_label(kind: AgentDeltaKind) -> &'static str {
+    match kind {
+        AgentDeltaKind::Assistant => "say",
+        AgentDeltaKind::ToolCall => "tool",
+        AgentDeltaKind::Thinking => "think",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2137,5 +2451,304 @@ mod tests {
         let text = String::from_utf8(log).unwrap();
         assert!(text.contains("BLOCKED_ON_HUMAN"), "log: {text}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- growlight IPC clients (slice 004) -----------------------------
+    //
+    // The fake-agent fixture is a REAL `softfig_growlightd::Daemon` booted on a
+    // temp socket; scripted events are published through its hub (the seam a
+    // real `claude -p` tailer feeds), exactly as growlightd's own integration
+    // tests do — no `claude` is ever spawned.
+
+    use softfig_growlightd::{Daemon, DaemonHandle, GrowlightdConfig};
+    use softfig_ipc::connect;
+
+    /// Boot a real growlightd on a temp socket; returns the handle, its socket,
+    /// and the temp dir to clean up.
+    fn boot_growlightd(tag: &str) -> (DaemonHandle, PathBuf, PathBuf) {
+        let dir = unique_tmp(tag);
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("growlightd.sock");
+        let garden = dir.join("garden");
+        let handle = Daemon::new(GrowlightdConfig::new(socket.clone(), garden))
+            .start()
+            .expect("growlightd boots");
+        (handle, socket, dir)
+    }
+
+    /// Wait until `cond` holds (subscription registered, etc.) or panic.
+    fn wait_until(mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "condition not met in time");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn status_client_reads_the_fleet_over_the_socket() {
+        let (handle, socket, dir) = boot_growlightd("client-status");
+        // The typed reply path the `status` subcommand decodes.
+        let reply: FleetStatusReply =
+            growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null).unwrap();
+        assert_eq!(reply.state, "running");
+        assert!(reply.garden_root.ends_with("garden"));
+        assert!(!reply.paused, "starts un-paused");
+        assert_eq!(reply.policy.max_concurrent_agents, 2);
+        assert!(reply.agents.is_empty(), "phase-1 fleet is empty");
+        // The whole subcommand entry point dispatches + decodes without error.
+        client_status(ClientArgs { socket: Some(socket.clone()) }).unwrap();
+        handle.shutdown();
+        handle.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pause_resume_clients_flip_the_gate_and_status_reflects_it() {
+        let (handle, socket, dir) = boot_growlightd("client-pause");
+        let p: PausedReply =
+            growlight_call(&socket, growlightd::op::PAUSE, serde_json::Value::Null).unwrap();
+        assert!(p.paused);
+        let s: FleetStatusReply =
+            growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null).unwrap();
+        assert!(s.paused, "pause surfaces in status over the socket");
+        let r: PausedReply =
+            growlight_call(&socket, growlightd::op::RESUME, serde_json::Value::Null).unwrap();
+        assert!(!r.paused);
+        // Entry points dispatch cleanly (idempotent — re-pausing stays paused).
+        client_pause(ClientArgs { socket: Some(socket.clone()) }).unwrap();
+        client_resume(ClientArgs { socket: Some(socket.clone()) }).unwrap();
+        handle.shutdown();
+        handle.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_client_applies_each_level_over_the_socket() {
+        let (handle, socket, dir) = boot_growlightd("client-stop");
+        // Graceful: records a boundary intent (immediate=false), honoured once.
+        let r: StopReply = growlight_call(
+            &socket,
+            growlightd::op::FORCE_STOP,
+            serde_json::to_value(ForceStopArgs {
+                agent: "loop-1".into(),
+                level: StopLevel::AfterIteration,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r.agent, "loop-1");
+        assert_eq!(r.level, StopLevel::AfterIteration);
+        assert!(!r.immediate);
+        assert_eq!(
+            handle.daemon.take_pending_stop("loop-1"),
+            Some(StopLevel::AfterIteration)
+        );
+        // hard-kill acts immediately (no live child in phase 1, but reports it).
+        let r: StopReply = growlight_call(
+            &socket,
+            growlightd::op::FORCE_STOP,
+            serde_json::to_value(ForceStopArgs {
+                agent: "loop-1".into(),
+                level: StopLevel::HardKill,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(r.immediate, "hard-kill is the immediate escape hatch");
+        // The subcommand entry point maps the clap arg → wire level and records it.
+        client_stop(StopArgs {
+            socket: Some(socket.clone()),
+            agent: "loop-1".into(),
+            level: StopLevelArg::AfterSlice,
+        })
+        .unwrap();
+        assert_eq!(
+            handle.daemon.take_pending_stop("loop-1"),
+            Some(StopLevel::AfterSlice),
+            "client_stop recorded the after-slice boundary intent",
+        );
+        handle.shutdown();
+        handle.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_stream_renders_each_event_kind_and_stops_at_eof() {
+        let frames = [
+            Event::agent_delta("loop-1", AgentDeltaKind::Assistant, "hello"),
+            Event::agent_delta("loop-1", AgentDeltaKind::Thinking, "hmm"),
+            Event::BudgetChanged {
+                agent: Some("loop-1".into()),
+                ctx_pct: Some(42),
+                session_5h_pct: Some(12),
+                session_7d_pct: None,
+            },
+            Event::LeaseChanged {
+                lease: "snapshot:pkgs".into(),
+                holder: Some("loop-1".into()),
+                state: "granted".into(),
+            },
+            Event::BusMessage {
+                from: "human".into(),
+                to: "all".into(),
+                kind: "note".into(),
+                body: "hi".into(),
+            },
+        ];
+        let mut input = String::new();
+        for f in &frames {
+            input.push_str(&serde_json::to_string(f).unwrap());
+            input.push('\n');
+        }
+        // A blank line + a garbage frame must be tolerated, not fatal.
+        input.push('\n');
+        input.push_str("{not json}\n");
+
+        let mut reader = std::io::Cursor::new(input.into_bytes());
+        let mut out = Vec::new();
+        watch_stream(&mut reader, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("[loop-1] say hello"), "{text}");
+        assert!(text.contains("[loop-1] think hmm"), "{text}");
+        assert!(text.contains("[loop-1] budget ctx 42% · 5h 12%"), "{text}");
+        assert!(text.contains("lease snapshot:pkgs granted (holder loop-1)"), "{text}");
+        assert!(text.contains("bus human→all [note] hi"), "{text}");
+        assert!(
+            text.contains("unrecognized event frame"),
+            "a bad frame is noted, not fatal: {text}"
+        );
+    }
+
+    /// THE milestone e2e (finish criterion): growlightd drives a fake agent
+    /// (scripted events via the hub) while a CLI client observes the `watch`
+    /// stream AND exercises a control verb (pause → status shows `paused:true`),
+    /// all over the real IPC socket.
+    #[test]
+    fn e2e_client_watches_a_fake_agent_and_controls_over_the_real_socket() {
+        let (handle, socket, dir) = boot_growlightd("client-e2e");
+
+        // Observe leg: the `watch` wire path — connect + send the streaming
+        // subscribe, exactly as `client_watch` does.
+        let mut stream = connect(&socket).expect("client connects");
+        send_subscribe(&mut stream).unwrap();
+        // Register before publishing, else the events race ahead of the
+        // subscriber and are dropped (mirrors subscribe_stream.rs).
+        wait_until(|| handle.daemon.hub.subscriber_count() >= 1);
+
+        // The fake agent backend: growlightd publishes scripted deltas through
+        // the same hub seam a real `claude -p` tailer would.
+        let scripted = [
+            Event::agent_delta("loop-1", AgentDeltaKind::Assistant, "starting slice 004"),
+            Event::agent_delta("loop-1", AgentDeltaKind::ToolCall, "edit(cmd_growlight.rs)"),
+        ];
+        for e in &scripted {
+            handle.daemon.hub.publish(e.clone());
+        }
+
+        // Read them back live as newline-framed Event JSON and render each
+        // through the watch path (read_line → decode Event → render_event).
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        for expected in &scripted {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read event frame");
+            assert!(n > 0, "stream closed early");
+            let got: Event = serde_json::from_str(line.trim_end()).expect("decode Event");
+            assert_eq!(&got, expected);
+            assert!(
+                render_event(&got).starts_with("[loop-1] "),
+                "the watch renderer formats the live frame"
+            );
+        }
+
+        // Control leg: pause over the socket, then the status client reflects it
+        // — a CLI control verb observable through another CLI client, end to end.
+        let p: PausedReply =
+            growlight_call(&socket, growlightd::op::PAUSE, serde_json::Value::Null).unwrap();
+        assert!(p.paused);
+        let s: FleetStatusReply =
+            growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null).unwrap();
+        assert!(s.paused, "the pause is visible via the status client");
+        assert!(handle.daemon.is_paused(), "and to the drive loop's gate");
+
+        handle.shutdown();
+        handle.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Non-disruption (finish criterion): the existing foreground `--auto`
+    /// orchestrator surface still parses + dispatches, and the new client
+    /// subcommands are purely additive (no shadowing). No real `claude` is
+    /// spawned — we only parse; `run_auto_loop` itself is exercised, unchanged,
+    /// by the loop tests above.
+    #[test]
+    fn auto_loop_surface_is_intact_and_new_clients_are_additive() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+
+        // `--auto` still parses and maps to StartArgs.auto.
+        match TestCli::try_parse_from(["g", "start", "--auto", "--no-launch"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Start(a) => {
+                assert!(a.auto, "--auto still parses");
+                assert!(a.no_launch);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+        // --max-iterations still rides --auto.
+        match TestCli::try_parse_from(["g", "start", "--auto", "--max-iterations", "3"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Start(a) => assert_eq!(a.max_iterations, Some(3)),
+            other => panic!("expected Start, got {other:?}"),
+        }
+
+        // The new client subcommands parse without shadowing init/start.
+        assert!(matches!(
+            TestCli::try_parse_from(["g", "status"]).unwrap().cmd,
+            GrowlightCmd::Status(_)
+        ));
+        assert!(matches!(
+            TestCli::try_parse_from(["g", "watch"]).unwrap().cmd,
+            GrowlightCmd::Watch(_)
+        ));
+        assert!(matches!(
+            TestCli::try_parse_from(["g", "pause"]).unwrap().cmd,
+            GrowlightCmd::Pause(_)
+        ));
+        assert!(matches!(
+            TestCli::try_parse_from(["g", "resume"]).unwrap().cmd,
+            GrowlightCmd::Resume(_)
+        ));
+        assert!(matches!(
+            TestCli::try_parse_from(["g", "init"]).unwrap().cmd,
+            GrowlightCmd::Init(_)
+        ));
+
+        // `stop` takes a required --agent and an optional kebab-case --level.
+        match TestCli::try_parse_from(["g", "stop", "--agent", "loop-1", "--level", "hard-kill"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Stop(a) => {
+                assert_eq!(a.agent, "loop-1");
+                assert_eq!(a.level, StopLevelArg::HardKill);
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        // Default level is after-slice; missing --agent is a parse error.
+        match TestCli::try_parse_from(["g", "stop", "--agent", "a1"]).unwrap().cmd {
+            GrowlightCmd::Stop(a) => assert_eq!(a.level, StopLevelArg::AfterSlice),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        assert!(TestCli::try_parse_from(["g", "stop"]).is_err());
     }
 }

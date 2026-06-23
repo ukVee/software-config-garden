@@ -26,3 +26,9 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+# Tests boot a real growlightd Daemon on a temp socket as the fake-agent fixture
+# for the slice-004 client + e2e tests (spec §13). Dev-only — the CLI client
+# code depends solely on the shared wire types in softfig-ipc::growlightd.
+softfig-growlightd.workspace = true

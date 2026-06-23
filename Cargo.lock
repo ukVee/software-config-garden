@@ -1802,6 +1802,7 @@ dependencies = [
  "serde",
  "serde_json",
  "softfig-deploy",
+ "softfig-growlightd",
  "softfig-ipc",
  "softfig-onboard",
  "softfig-store",
