@@ -33,6 +33,7 @@ pub mod scheduler;
 pub mod server;
 pub mod state;
 pub mod supervisor;
+pub mod usage;
 
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
@@ -57,3 +58,4 @@ pub use supervisor::{
     AgentBackend, AgentHealth, AgentSpec, Backoff, PollOutcome, RerollOutcome, SpawnError,
     StartOutcome, Supervisor,
 };
+pub use usage::{levels_reached, UsageAggregator, UsageSample};
