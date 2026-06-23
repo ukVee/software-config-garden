@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use thiserror::Error;
 
 use crate::config::GrowlightdConfig;
+use crate::hub::EventHub;
 use crate::state::State;
 
 #[derive(Debug, Error)]
@@ -48,12 +49,17 @@ impl DaemonInner {
 #[derive(Debug, Clone)]
 pub struct Daemon {
     pub inner: Arc<Mutex<DaemonInner>>,
+    /// The event hub backing `subscribe`. Lives *outside* `inner` so a producer
+    /// never has to take the daemon lock to publish — and so `publish` can't
+    /// contend with anything holding `inner` (the hub has its own brief lock).
+    pub hub: EventHub,
 }
 
 impl Daemon {
     pub fn new(config: GrowlightdConfig) -> Self {
         Self {
             inner: Arc::new(Mutex::new(DaemonInner::new(config))),
+            hub: EventHub::new(),
         }
     }
 

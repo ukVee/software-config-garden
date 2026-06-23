@@ -17,6 +17,8 @@ use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::state::State;
 
 const ACCEPT_POLL_MS: u64 = 100;
+/// How often a `subscribe` stream wakes between events to re-check `Stopping`.
+const SUBSCRIBE_POLL_MS: u64 = 200;
 
 pub fn start(daemon: Daemon) -> Result<DaemonHandle> {
     let socket_path = daemon.socket_path();
@@ -96,46 +98,83 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         return Ok(());
     }
 
-    // Parse first so `shutdown` can be told apart: its teardown must run only
-    // AFTER the ack is flushed, never before (ack-before-teardown — keeperd
-    // incident 20260622).
-    let parsed = serde_json::from_str::<Request>(line.trim_end_matches('\n'));
-    let is_shutdown = matches!(&parsed, Ok(req) if req.op == op::SHUTDOWN);
-    let resp = match parsed {
-        Ok(req) => dispatch(&daemon, req),
-        Err(e) => Response::err(ErrorKind::BadArgs, format!("decode: {e}")),
+    let req = match serde_json::from_str::<Request>(line.trim_end_matches('\n')) {
+        Ok(req) => req,
+        Err(e) => {
+            return write_one_shot(
+                &mut stream,
+                Response::err(ErrorKind::BadArgs, format!("decode: {e}")),
+            )
+        }
     };
 
+    if req.v != softfig_ipc::PROTOCOL_VERSION {
+        let msg = format!(
+            "unsupported protocol version {} (want {})",
+            req.v,
+            softfig_ipc::PROTOCOL_VERSION
+        );
+        return write_one_shot(&mut stream, Response::err(ErrorKind::BadArgs, msg));
+    }
+
+    match req.op.as_str() {
+        // The one streaming verb: it takes over the connection and writes
+        // newline-framed `Event` objects until the client hangs up or the daemon
+        // stops. Every other verb is one-shot.
+        op::SUBSCRIBE => stream_subscription(&daemon, stream),
+        op::STATUS => write_one_shot(&mut stream, status(&daemon)),
+        // ack-before-teardown: flush the ack, THEN flip to Stopping, so the
+        // client is guaranteed its reply before the accept loop winds down
+        // (keeperd incident 20260622).
+        op::SHUTDOWN => {
+            write_one_shot(&mut stream, Response::ok(serde_json::json!({})))?;
+            daemon.request_shutdown();
+            Ok(())
+        }
+        other => write_one_shot(
+            &mut stream,
+            Response::err(ErrorKind::BadArgs, format!("unknown op {other:?}")),
+        ),
+    }
+}
+
+/// Write one `\n`-framed [`Response`] and flush — the reply path for every verb
+/// except `subscribe`.
+fn write_one_shot(stream: &mut UnixStream, resp: Response) -> Result<()> {
     let mut bytes = serde_json::to_vec(&resp)?;
     bytes.push(b'\n');
     stream.write_all(&bytes)?;
     stream.flush()?;
-
-    // The ack is on the wire; only now flip to Stopping so the client is
-    // guaranteed its reply before the accept loop winds down.
-    if is_shutdown {
-        daemon.request_shutdown();
-    }
     Ok(())
 }
 
-fn dispatch(daemon: &Daemon, req: Request) -> Response {
-    if req.v != softfig_ipc::PROTOCOL_VERSION {
-        return Response::err(
-            ErrorKind::BadArgs,
-            format!(
-                "unsupported protocol version {} (want {})",
-                req.v,
-                softfig_ipc::PROTOCOL_VERSION
-            ),
-        );
+/// `subscribe`: hold the connection open and stream the hub's events as
+/// newline-framed `Event` JSON (NOT `Response` envelopes — the client knows it
+/// asked to subscribe). Ends when the client disconnects (a write fails) or the
+/// daemon enters `Stopping`. All per-subscriber buffering lives in the hub, so a
+/// slow client here can never stall the event producer (spec §13 Observe).
+fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
+    let subscription = daemon.hub.subscribe();
+    loop {
+        if daemon.state() == State::Stopping {
+            break;
+        }
+        match subscription.recv_timeout(Duration::from_millis(SUBSCRIBE_POLL_MS)) {
+            Ok(event) => {
+                let mut bytes = serde_json::to_vec(&event)?;
+                bytes.push(b'\n');
+                // A write error means the client hung up — end the subscription.
+                if stream.write_all(&bytes).and_then(|_| stream.flush()).is_err() {
+                    break;
+                }
+            }
+            // Periodic wake with nothing pending: loop to re-check `Stopping`.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // Hub gone (daemon tearing down): end the stream.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
-
-    match req.op.as_str() {
-        op::STATUS => status(daemon),
-        op::SHUTDOWN => Response::ok(serde_json::json!({})),
-        other => Response::err(ErrorKind::BadArgs, format!("unknown op {other:?}")),
-    }
+    Ok(())
 }
 
 /// `status`: the fleet snapshot. Phase 1 — empty fleet, just identity + policy.
