@@ -32,6 +32,7 @@ pub mod peer;
 pub mod scheduler;
 pub mod server;
 pub mod state;
+pub mod supervisor;
 
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
@@ -52,3 +53,7 @@ pub use scheduler::{
     classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
 };
 pub use state::State;
+pub use supervisor::{
+    AgentBackend, AgentHealth, AgentSpec, Backoff, PollOutcome, RerollOutcome, SpawnError,
+    StartOutcome, Supervisor,
+};
