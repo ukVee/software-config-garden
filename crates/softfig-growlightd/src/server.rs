@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use softfig_ipc::growlightd::{op, FleetStatusReply};
+use softfig_ipc::growlightd::{
+    op, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply, PausedReply,
+    StopAfterSliceArgs, StopLevel, StopReply,
+};
 use softfig_ipc::{ErrorKind, Request, Response};
 
 use crate::daemon::{Daemon, DaemonHandle, Result};
@@ -123,6 +126,13 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         // stops. Every other verb is one-shot.
         op::SUBSCRIBE => stream_subscription(&daemon, stream),
         op::STATUS => write_one_shot(&mut stream, status(&daemon)),
+        // Control family — all one-shot (spec §13 Control). The state they set is
+        // intent the future drive loop reads at safe handoff boundaries (§8).
+        op::PAUSE => write_one_shot(&mut stream, set_paused(&daemon, true)),
+        op::RESUME => write_one_shot(&mut stream, set_paused(&daemon, false)),
+        op::STOP_AFTER_SLICE => write_one_shot(&mut stream, stop_after_slice(&daemon, &req)),
+        op::FORCE_STOP => write_one_shot(&mut stream, force_stop(&daemon, &req)),
+        op::INJECT_MESSAGE => write_one_shot(&mut stream, inject_message(&daemon, &req)),
         // ack-before-teardown: flush the ack, THEN flip to Stopping, so the
         // client is guaranteed its reply before the accept loop winds down
         // (keeperd incident 20260622).
@@ -177,7 +187,8 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
-/// `status`: the fleet snapshot. Phase 1 — empty fleet, just identity + policy.
+/// `status`: the fleet snapshot. Phase 1 — empty fleet, just identity, policy,
+/// and the admission-gate (`paused`) state.
 fn status(daemon: &Daemon) -> Response {
     let inner = daemon.inner.lock().unwrap();
     let reply = FleetStatusReply {
@@ -185,10 +196,128 @@ fn status(daemon: &Daemon) -> Response {
         garden_root: inner.config.garden_root.display().to_string(),
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
         policy: inner.config.policy.summary(),
+        paused: inner.control.paused,
         agents: Vec::new(),
     };
-    match serde_json::to_value(&reply) {
-        Ok(v) => Response::ok(v),
-        Err(e) => Response::err(ErrorKind::Internal, format!("encode status: {e}")),
+    ok_reply(&reply, "status")
+}
+
+/// `pause` / `resume`: flip the fleet admission gate and echo the new state.
+/// Idempotent — the verb sets an absolute state, not a toggle.
+fn set_paused(daemon: &Daemon, paused: bool) -> Response {
+    let mut inner = daemon.inner.lock().unwrap();
+    let paused = if paused {
+        inner.control.pause()
+    } else {
+        inner.control.resume()
+    };
+    ok_reply(&PausedReply { paused }, "pause")
+}
+
+/// `stop_after_slice`: record a graceful "stop after the current slice" boundary
+/// intent for one agent (spec §8 level 1). The drive loop honours it at the next
+/// handoff via [`Daemon::take_pending_stop`]. One-shot ack.
+fn stop_after_slice(daemon: &Daemon, req: &Request) -> Response {
+    let args: StopAfterSliceArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if args.agent.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "agent must be non-empty");
     }
+    daemon
+        .inner
+        .lock()
+        .unwrap()
+        .control
+        .request_stop(&args.agent, StopLevel::AfterSlice);
+    ok_reply(
+        &StopReply {
+            agent: args.agent,
+            level: StopLevel::AfterSlice,
+            immediate: false,
+        },
+        "stop_after_slice",
+    )
+}
+
+/// `force_stop`: the leveled stop (spec §8). `after_slice`/`after_iteration`
+/// record a boundary intent the drive loop reads at the next handoff;
+/// `hard_kill` acts immediately via the kill-safety path
+/// ([`Daemon::hard_kill_agent`]). One-shot ack either way.
+fn force_stop(daemon: &Daemon, req: &Request) -> Response {
+    let args: ForceStopArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if args.agent.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "agent must be non-empty");
+    }
+    if args.level.is_immediate() {
+        // hard_kill: interrupt now, OUTSIDE the lock (the function enforces it).
+        daemon.hard_kill_agent(&args.agent);
+    } else {
+        daemon
+            .inner
+            .lock()
+            .unwrap()
+            .control
+            .request_stop(&args.agent, args.level);
+    }
+    ok_reply(
+        &StopReply {
+            agent: args.agent,
+            level: args.level,
+            immediate: args.level.is_immediate(),
+        },
+        "force_stop",
+    )
+}
+
+/// `inject_message`: queue a message onto an agent's boundary-async inject lane,
+/// delivered at the agent's NEXT baton — never mid-iteration (spec §8). Replies
+/// with the lane depth after the append. One-shot.
+fn inject_message(daemon: &Daemon, req: &Request) -> Response {
+    let args: InjectMessageArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if args.agent.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "agent must be non-empty");
+    }
+    if args.message.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "message must be non-empty");
+    }
+    let queued = daemon
+        .inner
+        .lock()
+        .unwrap()
+        .control
+        .queue_inject(&args.agent, args.message.clone());
+    ok_reply(
+        &InjectReply {
+            agent: args.agent,
+            queued,
+        },
+        "inject_message",
+    )
+}
+
+/// Encode a typed reply as a one-shot `Response::ok`, mapping a serialization
+/// failure to an `Internal` error (`what` names the verb for the message).
+fn ok_reply<T: serde::Serialize>(reply: &T, what: &str) -> Response {
+    match serde_json::to_value(reply) {
+        Ok(v) => Response::ok(v),
+        Err(e) => Response::err(ErrorKind::Internal, format!("encode {what}: {e}")),
+    }
+}
+
+/// Decode a request's `args` into a typed payload, mapping a decode failure to a
+/// `BadArgs` `Response` the caller returns as-is. (Fully-qualified `Result` — the
+/// crate's `daemon::Result` alias is in scope here.)
+fn parse_args<T: serde::de::DeserializeOwned>(
+    req: &Request,
+) -> std::result::Result<T, Response> {
+    serde_json::from_value(req.args.clone())
+        .map_err(|e| Response::err(ErrorKind::BadArgs, format!("decode args: {e}")))
 }

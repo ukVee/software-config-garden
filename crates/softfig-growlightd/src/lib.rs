@@ -19,6 +19,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub mod handshake;
 pub mod hub;
@@ -27,6 +28,7 @@ pub mod server;
 pub mod state;
 
 pub use config::{GrowlightdConfig, Policy};
+pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
