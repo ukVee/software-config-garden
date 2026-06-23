@@ -18,6 +18,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod admission;
 pub mod bus;
 pub mod config;
 pub mod control;
@@ -32,6 +33,9 @@ pub mod scheduler;
 pub mod server;
 pub mod state;
 
+pub use admission::{
+    AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
+};
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use config::{GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
