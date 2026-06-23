@@ -26,6 +26,7 @@ pub mod handshake;
 pub mod hub;
 pub mod leases;
 pub mod notifications;
+pub mod notify_dispatch;
 pub mod peer;
 pub mod scheduler;
 pub mod server;
@@ -39,6 +40,10 @@ pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
 pub use leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
 pub use notifications::{Channel, NotifyEvent, NotifyPolicy, UsageLevel};
+pub use notify_dispatch::{
+    BusEmit, GuiNotifier, LogNotifier, LogSink, Notifier, NotifyDispatcher, PhoneStub, StderrLog,
+    ALERT_FROM, ALERT_KIND,
+};
 pub use scheduler::{
     classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
 };
