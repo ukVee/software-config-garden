@@ -18,6 +18,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod bus;
 pub mod config;
 pub mod control;
 pub mod daemon;
@@ -27,6 +28,7 @@ pub mod peer;
 pub mod server;
 pub mod state;
 
+pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use config::{GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};

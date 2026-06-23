@@ -6,7 +6,10 @@ use clap::Parser;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use softfig_growlightd::{garden_root_via_keeperd, Daemon, GrowlightdConfig, Policy};
+use softfig_growlightd::{
+    garden_root_via_keeperd, spawn_bus_tailer, Daemon, GrowlightdConfig, KeeperdBusSource, Policy,
+    BUS_POLL_MS,
+};
 use softfig_ipc::{growlightd_runtime_socket_path, runtime_socket_path};
 
 #[derive(Parser, Debug)]
@@ -63,6 +66,18 @@ fn main() -> Result<()> {
         garden_root.display(),
     );
 
+    // Fan the coordination bus onto `subscribe`: a background tailer polls
+    // keeperd's read-only `tail_bus` and republishes each new message as an
+    // `Event::BusMessage` (spec §13 Coordinate / the coordination-bus milestone).
+    // keeperd owns the store; growlightd owns the stream — the tailer is the
+    // one-way client bridge between the two separate daemons. A keeperd blip just
+    // fails a poll and retries; it never brings growlightd down.
+    let bus_tailer = spawn_bus_tailer(
+        handle.daemon.clone(),
+        Box::new(KeeperdBusSource::new(keeperd_socket)),
+        std::time::Duration::from_millis(BUS_POLL_MS),
+    )?;
+
     // SIGTERM / SIGINT run the same graceful teardown as the `shutdown` IPC op,
     // delivered through signal-hook's self-pipe so the teardown runs in normal
     // thread context. Once `request_shutdown` flips the daemon to `Stopping`,
@@ -79,5 +94,7 @@ fn main() -> Result<()> {
         })?;
 
     handle.join()?;
+    // The daemon is `Stopping` now; the tailer notices on its next tick and exits.
+    let _ = bus_tailer.join();
     Ok(())
 }

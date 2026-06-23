@@ -156,6 +156,14 @@ pub mod op {
     /// numbered above its stored cursor, in order — and advance the cursor past
     /// them. One `inbox_read` commit when the cursor moves; none if empty.
     pub const READ_INBOX: &str = "read_inbox";
+    /// growlight Phase 2 (bus bridge, slice 003): tail the coordination bus for
+    /// the orchestrator daemon (growlightd). Returns every bus message numbered
+    /// above `since`, in total order — the WHOLE channel (`@all`/`@human`/direct
+    /// alike), not a per-agent lane — as a pure read: no cursor advance, no
+    /// commit (mirrors `read_file`/`list_tree`). growlightd polls this and
+    /// republishes each as a `subscribe` `Event::BusMessage`. keeperd↔growlightd
+    /// only, never an agent-facing MCP verb.
+    pub const TAIL_BUS: &str = "tail_bus";
     /// Growlight relock: mint a one-time token wrapping the live KEK so an
     /// unattended daemon restart can resume this session. Requires Unlocked +
     /// `[growlight] allow_relock = true`. `persist=true` (cycle and relock-arm)
@@ -1201,4 +1209,21 @@ pub struct ChatMessage {
     pub body: String,
     /// Daemon-stamped wall-clock timestamp (informational; order is by number).
     pub ts: String,
+}
+
+/// `tail_bus({since}) -> {messages}`. Every bus message numbered above `since`,
+/// in total order — the whole channel, not a per-agent lane, and a pure read
+/// (no cursor advance, no commit). The orchestrator daemon (growlightd) polls
+/// this to fan the bus onto its `subscribe` stream (spec §13 Coordinate);
+/// `since = 0` returns the full log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailBusArgs {
+    /// Return messages with number strictly greater than this watermark.
+    pub since: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailBusReply {
+    /// Matching messages in total order (ascending number).
+    pub messages: Vec<ChatMessage>,
 }

@@ -30,6 +30,7 @@ use softfig_ipc::verbs::{
     AddBacklogItemArgs, AddBacklogItemReply, AddSliceArgs, AddSliceReply, ChatMessage, LogBatonArgs,
     LogBatonReply, PostMessageArgs, PostMessageReply, ReadInboxArgs, ReadInboxReply,
     ReorderBacklogItemArgs, ReorderBacklogItemReply, SetItemStatusArgs, SetItemStatusReply,
+    TailBusArgs, TailBusReply,
 };
 use softfig_ipc::ErrorKind;
 
@@ -173,17 +174,7 @@ pub fn read_inbox(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         if let Some(n) = advanced_to {
             chat::advance_cursor(&wt, &args.agent, n)?;
         }
-        let messages: Vec<ChatMessage> = unread
-            .into_iter()
-            .map(|m| ChatMessage {
-                number: m.number,
-                from: m.from,
-                to: m.to.to_wire(),
-                kind: m.kind.as_wire().to_string(),
-                body: m.body,
-                ts: m.ts,
-            })
-            .collect();
+        let messages: Vec<ChatMessage> = unread.into_iter().map(to_wire_message).collect();
         (messages, advanced_to)
     };
 
@@ -195,6 +186,46 @@ pub fn read_inbox(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     }
 
     Ok(serde_json::to_value(ReadInboxReply { messages }).unwrap())
+}
+
+/// Tail the coordination bus for the orchestrator daemon (growlightd): every
+/// message numbered above `since`, in total order — the WHOLE channel, not a
+/// per-agent lane (so `@all`/`@human`/direct all surface; the groupchat shows
+/// the human as a member). A pure read: no cursor advance, no commit (mirrors
+/// `read_file`/`list_tree`). growlightd polls this over keeperd's socket and
+/// republishes each as a `subscribe` `Event::BusMessage`; keeperd owns the
+/// store, growlightd owns the stream (spec §2, two separate daemons).
+pub fn tail_bus(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: TailBusArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("tail_bus args: {e}")))?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let messages: Vec<ChatMessage> = {
+        let wt = WorkTree::new(daemon, &inner);
+        chat::all_messages(&wt)
+            .into_iter()
+            .filter(|m| m.number > args.since)
+            .map(to_wire_message)
+            .collect()
+    };
+
+    Ok(serde_json::to_value(TailBusReply { messages }).unwrap())
+}
+
+/// Project a stored bus [`chat::Message`] onto its wire [`ChatMessage`] form —
+/// the single mapping shared by `read_inbox` (per-agent lane) and `tail_bus`
+/// (the whole channel).
+fn to_wire_message(m: chat::Message) -> ChatMessage {
+    ChatMessage {
+        number: m.number,
+        from: m.from,
+        to: m.to.to_wire(),
+        kind: m.kind.as_wire().to_string(),
+        body: m.body,
+        ts: m.ts,
+    }
 }
 
 // ---- add_backlog_item --------------------------------------------------

@@ -210,6 +210,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
         op::POST_MESSAGE => crate::actions::post_message(daemon, req.args),
         op::READ_INBOX => crate::actions::read_inbox(daemon, req.args),
+        op::TAIL_BUS => crate::actions::tail_bus(daemon, req.args),
         op::RELOCK_MINT => handlers::relock_mint(daemon, req.args),
         op::RELOCK_REDEEM => handlers::relock_redeem(daemon, req.args),
         op::ARCHIVE => crate::actions::archive(daemon, req.args),

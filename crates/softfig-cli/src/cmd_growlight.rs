@@ -27,7 +27,7 @@ use softfig_ipc::{
         self, AgentDeltaKind, Event, FleetStatusReply, ForceStopArgs, PausedReply, StopLevel,
         StopReply,
     },
-    verbs::{GrowlightInitArgs, GrowlightInitReply, StatusReply, op},
+    verbs::{GrowlightInitArgs, GrowlightInitReply, PostMessageArgs, PostMessageReply, StatusReply, op},
 };
 
 use crate::cmd_daemon::try_daemon_call;
@@ -78,6 +78,12 @@ pub enum GrowlightCmd {
 
     /// Clear the fleet admission gate. Idempotent.
     Resume(ClientArgs),
+
+    /// Post a message to the coordination bus AS THE HUMAN (`from: @human`). The
+    /// human is a first-class bus member (spec §4a): agents read it in their inbox
+    /// at their next boot, and `growlight watch` shows it live. Routes to keeperd
+    /// (which owns the bus store), unlike the growlightd client verbs above.
+    Say(SayArgs),
 }
 
 #[derive(Args, Debug)]
@@ -118,6 +124,27 @@ pub struct StartArgs {
     /// Ignored without `--auto`.
     #[arg(long)]
     pub max_iterations: Option<u64>,
+}
+
+/// Args for `say` — the human-post seam. Unlike the growlightd client verbs,
+/// posting writes the bus store, which keeperd owns, so this targets keeperd's
+/// socket (spec §2: keeperd owns the store, growlightd owns the stream).
+#[derive(Args, Debug)]
+pub struct SayArgs {
+    /// keeperd socket (the bus store lives in keeperd). Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// Addressee: an agent slug, `@all` (default — every agent's lane), or
+    /// `@human`.
+    #[arg(long, default_value = "@all")]
+    pub to: String,
+    /// Message kind (default `info`): info | coord-request | lease-request |
+    /// question | alert | restart-request.
+    #[arg(long, default_value = "info")]
+    pub kind: String,
+    /// The message text.
+    pub body: String,
 }
 
 /// Shared args for the growlight client subcommands. They talk to growlightd's
@@ -173,6 +200,7 @@ pub fn run(cmd: GrowlightCmd) -> Result<()> {
         GrowlightCmd::Stop(args) => client_stop(args),
         GrowlightCmd::Pause(args) => client_pause(args),
         GrowlightCmd::Resume(args) => client_resume(args),
+        GrowlightCmd::Say(args) => client_say(args),
     }
 }
 
@@ -1514,6 +1542,49 @@ fn render_event(e: &Event) -> String {
     }
 }
 
+/// `say`: post to the coordination bus as the human. The store lives in keeperd,
+/// so this routes to keeperd's `post_message` (NOT growlightd) — the human-post
+/// half of the bus's async turn-boundary model: agents read it in their inbox at
+/// their next boot (spec §4a). The GUI input box is the same seam later.
+fn client_say(args: SayArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let post = human_say_args(&args.to, &args.kind, &args.body);
+    match try_daemon_call(&socket, op::POST_MESSAGE, serde_json::to_value(post)?) {
+        Ok(Some(value)) => {
+            let reply: PostMessageReply = serde_json::from_value(value)?;
+            println!(
+                "posted msg {} → {} [{}]  ({})",
+                reply.number,
+                args.to,
+                args.kind,
+                short_hash(&reply.hash)
+            );
+            Ok(())
+        }
+        Ok(None) => Err(anyhow!(
+            "no daemon at {} — unlock the garden first (`softfig daemon unlock`)",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("daemon error ({kind:?}): {message}"))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// Build the `post_message` args for a human-originated bus post: the sender is
+/// ALWAYS `@human` (the human is a first-class member, never an agent slug); the
+/// CLI only chooses the recipient, kind, and body. Pure, so the human-post seam
+/// is unit-tested without a live daemon.
+fn human_say_args(to: &str, kind: &str, body: &str) -> PostMessageArgs {
+    PostMessageArgs {
+        from: "@human".to_string(),
+        to: to.to_string(),
+        kind: kind.to_string(),
+        body: body.to_string(),
+    }
+}
+
 /// Short tag for an [`AgentDeltaKind`] in the `watch` stream.
 fn delta_kind_label(kind: AgentDeltaKind) -> &'static str {
     match kind {
@@ -1615,6 +1686,23 @@ mod tests {
             !extra.contains(&"/home/ukv/.claude"),
             "must not grant all of ~/.claude (credentials live there)"
         );
+    }
+
+    #[test]
+    fn human_say_always_posts_as_the_human() {
+        // The CLI chooses recipient/kind/body; the sender is forced to @human so
+        // a human post can never masquerade as an agent.
+        let a = human_say_args("@all", "alert", "deploy starting");
+        assert_eq!(a.from, "@human");
+        assert_eq!(a.to, "@all");
+        assert_eq!(a.kind, "alert");
+        assert_eq!(a.body, "deploy starting");
+
+        // Defaults (a bare `say "hi"`) address @all with kind info.
+        let d = human_say_args("@all", "info", "hi");
+        assert_eq!(d.to, "@all");
+        assert_eq!(d.kind, "info");
+        assert_eq!(d.from, "@human");
     }
 
     #[test]

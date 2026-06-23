@@ -190,6 +190,26 @@ impl Event {
             text: text.into(),
         }
     }
+
+    /// Construct an [`Event::BusMessage`] — the coordination-bus producer path
+    /// the growlightd bus bridge fans onto `subscribe` (and the §9 alert hook
+    /// rides the same stream, an alert being just `kind == "alert"`). `kind` is
+    /// the chat wire token passed straight through as the class; `from`/`to` are
+    /// the bus addresses with the `@` sigil stripped (`@all` → `all`,
+    /// `@human` → `human`) to match this variant's documented address form.
+    pub fn bus_message(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        kind: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Event::BusMessage {
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            body: body.into(),
+        }
+    }
 }
 
 /// Which stream-json block an [`Event::AgentDelta`] carries — the three kinds

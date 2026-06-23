@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
     op, AddBacklogItemReply, AddSliceReply, GrowlightInitReply, LogBatonReply, PostMessageReply,
-    ReadInboxReply, ReorderBacklogItemReply, SetItemStatusReply,
+    ReadInboxReply, ReorderBacklogItemReply, SetItemStatusReply, TailBusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -825,4 +825,64 @@ fn post_message_rejects_unknown_kind_and_bad_sender() {
         )),
         ErrorKind::BadArgs
     );
+}
+
+// ---- coordination bus: tail_bus (the growlightd subscribe fan-out source) ----
+
+fn tail(fx: &Fixture, since: u32) -> TailBusReply {
+    let resp = fx.call(op::TAIL_BUS, serde_json::json!({ "since": since }));
+    serde_json::from_value(ok_data(resp)).unwrap()
+}
+
+#[test]
+fn tail_bus_returns_the_whole_channel_since_a_watermark() {
+    let fx = Fixture::start();
+    post(&fx, "agent-a", "@all", "info", "one");
+    post(&fx, "agent-a", "agent-b", "coord-request", "two");
+    post(&fx, "@human", "agent-b", "question", "three");
+
+    // since=0 → the whole channel in total order, INCLUDING the @human-addressed
+    // message (tail_bus is the bus observer, not a per-agent lane like read_inbox).
+    let all = tail(&fx, 0);
+    let nums: Vec<u32> = all.messages.iter().map(|m| m.number).collect();
+    assert_eq!(nums, vec![1, 2, 3]);
+    assert_eq!(all.messages[2].from, "@human");
+    assert_eq!(all.messages[2].to, "agent-b");
+    assert_eq!(all.messages[1].kind, "coord-request");
+
+    // The watermark is exclusive: since=2 skips #1 and #2.
+    let tailed = tail(&fx, 2);
+    assert_eq!(tailed.messages.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3]);
+
+    // Past the tip → empty.
+    assert!(tail(&fx, 3).messages.is_empty());
+}
+
+#[test]
+fn tail_bus_is_a_pure_read_and_mints_no_commit() {
+    let fx = Fixture::start();
+    post(&fx, "agent-a", "@all", "info", "x");
+    let tip_before = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    // Tailing reads the channel without advancing any cursor or committing —
+    // unlike read_inbox, which advances the reader's cursor.
+    assert_eq!(tail(&fx, 0).messages.len(), 1);
+    assert_eq!(tail(&fx, 0).messages.len(), 1, "still there — no cursor consumed it");
+    let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    assert_eq!(tip_after, tip_before, "tail_bus must never mint a commit");
+}
+
+#[test]
+fn a_human_posted_message_is_in_an_agents_inbox_at_next_boot() {
+    // The human-post seam (the `say` CLI / GUI input box): a `from: @human`
+    // message lands in the addressed agent's inbox at its next boot (the agents
+    // read at boot, post at handoff — async turn-boundary, spec §4a). Reuses the
+    // slice-002 read_inbox harness.
+    let fx = Fixture::start();
+    post(&fx, "@human", "agent-b", "question", "what's blocking 003?");
+    let b = inbox(&fx, "agent-b");
+    assert_eq!(b.messages.len(), 1);
+    assert_eq!(b.messages[0].from, "@human");
+    assert_eq!(b.messages[0].body, "what's blocking 003?");
+    // And it surfaces on the bus observer too (what growlightd fans to subscribe).
+    assert_eq!(tail(&fx, 0).messages[0].from, "@human");
 }
