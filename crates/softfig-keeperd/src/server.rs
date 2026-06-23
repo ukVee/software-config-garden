@@ -204,6 +204,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::SET_REVIEWED => crate::actions::set_reviewed(daemon, req.args),
         op::LOG_BATON => crate::actions::log_baton(daemon, req.args),
         op::ADD_BACKLOG_ITEM => crate::actions::add_backlog_item(daemon, req.args),
+        op::ADD_QUEUE => crate::actions::add_queue(daemon, req.args),
         op::ADD_SLICE => crate::actions::add_slice(daemon, req.args),
         op::SET_ITEM_STATUS => crate::actions::set_item_status(daemon, req.args),
         op::REORDER_BACKLOG_ITEM => crate::actions::reorder_backlog_item(daemon, req.args),

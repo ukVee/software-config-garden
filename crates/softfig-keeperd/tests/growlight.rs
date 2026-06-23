@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, AddBacklogItemReply, AddSliceReply, GrowlightInitReply, LogBatonReply, PostMessageReply,
-    ReadInboxReply, ReorderBacklogItemReply, SetItemStatusReply, TailBusReply,
+    op, AddBacklogItemReply, AddQueueReply, AddSliceReply, GrowlightInitReply, LogBatonReply,
+    PostMessageReply, ReadInboxReply, ReorderBacklogItemReply, SetItemStatusReply, TailBusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -135,6 +135,33 @@ impl Fixture {
             }),
         );
         serde_json::from_value(ok_data(resp)).unwrap()
+    }
+
+    fn add_queue(&self, name: &str, repo: &str) -> AddQueueReply {
+        let resp = self.call(op::ADD_QUEUE, serde_json::json!({ "name": name, "repo": repo }));
+        serde_json::from_value(ok_data(resp)).unwrap()
+    }
+
+    fn add_milestone_in(&self, slug: &str, title: &str, queue: &str) -> AddBacklogItemReply {
+        let resp = self.call(
+            op::ADD_BACKLOG_ITEM,
+            serde_json::json!({
+                "item_type": "milestone", "slug": slug, "title": title,
+                "mission": "why", "finish_criteria": "done", "queue": queue,
+            }),
+        );
+        serde_json::from_value(ok_data(resp)).unwrap()
+    }
+
+    /// The text inside one managed item/registry region of the backlog doc.
+    /// `queue`/`queue:<name>`/`queues` don't collide as substrings (the markers
+    /// differ after the tag), so a plain split is precise.
+    fn region(&self, tag: &str) -> String {
+        let backlog = self.backlog();
+        let open = format!("<!-- softfig:{tag} -->");
+        let close = format!("<!-- /softfig:{tag} -->");
+        let after = backlog.split_once(&open).expect("open marker present").1;
+        after.split_once(&close).expect("close marker present").0.to_string()
     }
 }
 
@@ -885,4 +912,142 @@ fn a_human_posted_message_is_in_an_agents_inbox_at_next_boot() {
     assert_eq!(b.messages[0].body, "what's blocking 003?");
     // And it surfaces on the bus observer too (what growlightd fans to subscribe).
     assert_eq!(tail(&fx, 0).messages[0].from, "@human");
+}
+
+// ---- phase 4 slice 001: multiple named queues + part-unit assignment ---
+
+#[test]
+fn add_queue_registers_and_seeds_its_own_region() {
+    let fx = Fixture::start();
+    let reply = fx.add_queue("softfig", "~/projects/software-config_garden");
+    assert_eq!(reply.name, "softfig");
+    assert_eq!(reply.path, "growlight/backlog/CLAUDE.md");
+
+    let backlog = fx.backlog();
+    // Registry row + a fresh, empty per-queue item table under its own heading.
+    assert!(backlog.contains("## Queues"));
+    assert!(fx
+        .region("queues")
+        .contains("| softfig | ~/projects/software-config_garden |"));
+    assert!(backlog.contains("## Queue: softfig"));
+    assert!(backlog.contains("<!-- softfig:queue:softfig -->"));
+    assert!(fx.region("queue:softfig").contains("| # | id | type | title | status |"));
+    // The default queue's region is still present and untouched.
+    assert!(backlog.contains("<!-- softfig:queue -->"));
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "queue_added");
+    assert_eq!(payload["name"], "softfig");
+}
+
+#[test]
+fn add_queue_rejects_duplicate_and_the_reserved_default() {
+    let fx = Fixture::start();
+    fx.add_queue("softfig", "~/p");
+    let dup = fx.call(op::ADD_QUEUE, serde_json::json!({ "name": "softfig", "repo": "~/p2" }));
+    assert_eq!(err_kind(dup), ErrorKind::PathAlreadyExists);
+    let reserved = fx.call(op::ADD_QUEUE, serde_json::json!({ "name": "default", "repo": "~/p" }));
+    assert_eq!(err_kind(reserved), ErrorKind::BadArgs);
+    let empty = fx.call(op::ADD_QUEUE, serde_json::json!({ "name": "phone", "repo": "" }));
+    assert_eq!(err_kind(empty), ErrorKind::BadArgs);
+}
+
+#[test]
+fn an_item_lands_in_its_queues_region_not_the_default() {
+    let fx = Fixture::start();
+    fx.add_queue("softfig", "~/p");
+    fx.add_milestone_in("m-stream", "Stream work", "softfig");
+    // Lands in the softfig region; the default region never sees it.
+    assert!(fx.region("queue:softfig").contains("| 1 | m-stream | milestone | Stream work | queued |"));
+    assert!(!fx.region("queue").contains("m-stream"));
+
+    // A bare add still goes to the default queue (back-compat).
+    fx.add_task("plain", "Plain task");
+    assert!(fx.region("queue").contains("| 1 | 001 | task | Plain task | queued |"));
+    assert!(!fx.region("queue:softfig").contains("Plain task"));
+}
+
+#[test]
+fn add_item_into_an_unregistered_queue_is_not_found() {
+    let fx = Fixture::start();
+    let resp = fx.call(
+        op::ADD_BACKLOG_ITEM,
+        serde_json::json!({
+            "item_type": "task", "slug": "x", "title": "t",
+            "mission": "m", "finish_criteria": "f", "queue": "ghost",
+        }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotFound);
+}
+
+#[test]
+fn active_is_enforced_per_queue_not_globally() {
+    // The fleet invariant: one active part *per queue*, so two queues can each
+    // run an active item concurrently — but a second active in the SAME queue
+    // is still refused (back-compat for the default queue).
+    let fx = Fixture::start();
+    fx.add_milestone("m-def", "Default work");
+    let a = fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m-def", "status": "active" }));
+    assert!(matches!(a, Response::Ok { .. }));
+
+    fx.add_queue("softfig", "~/p");
+    fx.add_milestone_in("m-sf", "Stream work", "softfig");
+    // Activating in the OTHER queue succeeds despite m-def being active.
+    let b = fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m-sf", "status": "active" }));
+    assert!(matches!(b, Response::Ok { .. }), "per-queue active should allow it: {b:?}");
+    let r: SetItemStatusReply = serde_json::from_value(ok_data(b)).unwrap();
+    assert_eq!(r.status, "active");
+    assert!(fx.region("queue:softfig").contains("| 1 | m-sf | milestone | Stream work | active |"));
+
+    // A second active within softfig is rejected.
+    fx.add_milestone_in("m-sf2", "More", "softfig");
+    let c = fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m-sf2", "status": "active" }));
+    assert_eq!(err_kind(c), ErrorKind::BadArgs);
+}
+
+#[test]
+fn status_and_reorder_resolve_a_named_queue_by_bare_id() {
+    // Bare-id addressing keeps working across queues while ids stay unique:
+    // set_item_status / reorder with no `queue` locate the item in softfig.
+    let fx = Fixture::start();
+    fx.add_queue("softfig", "~/p");
+    fx.add_milestone_in("m-a", "A", "softfig");
+    fx.add_milestone_in("m-b", "B", "softfig");
+    fx.add_milestone_in("m-c", "C", "softfig");
+
+    // status by bare id flips the cell in the softfig region.
+    let s = fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m-b", "status": "done" }));
+    assert!(matches!(s, Response::Ok { .. }));
+    assert!(fx.region("queue:softfig").contains("| 2 | m-b | milestone | B | done |"));
+
+    // reorder by bare id is scoped to softfig's order (m-c to top).
+    let r = fx.call(
+        op::REORDER_BACKLOG_ITEM,
+        serde_json::json!({ "id": "m-c", "position": "top" }),
+    );
+    let rr: ReorderBacklogItemReply = serde_json::from_value(ok_data(r)).unwrap();
+    assert_eq!(rr.index, 1);
+    let region = fx.region("queue:softfig");
+    assert!(region.contains("| 1 | m-c "));
+    assert!(region.contains("| 2 | m-a "));
+    // The default queue stayed empty throughout.
+    assert!(!fx.region("queue").contains("milestone"));
+}
+
+#[test]
+fn passing_a_queue_scopes_status_resolution() {
+    let fx = Fixture::start();
+    fx.add_queue("softfig", "~/p");
+    fx.add_milestone_in("m-x", "X", "softfig");
+    // Wrong queue → NotFound; right queue → ok.
+    let wrong = fx.call(
+        op::SET_ITEM_STATUS,
+        serde_json::json!({ "id": "m-x", "status": "done", "queue": "default" }),
+    );
+    assert_eq!(err_kind(wrong), ErrorKind::NotFound);
+    let right = fx.call(
+        op::SET_ITEM_STATUS,
+        serde_json::json!({ "id": "m-x", "status": "done", "queue": "softfig" }),
+    );
+    assert!(matches!(right, Response::Ok { .. }));
 }

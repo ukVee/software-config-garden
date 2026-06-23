@@ -30,6 +30,7 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "project_archived",
     "baton_logged",
     "backlog_item_added",
+    "queue_added",
     "slice_added",
     "item_status_set",
     "backlog_item_reordered",
@@ -99,7 +100,7 @@ const KNOWN_INTENTS_LIST: &str =
      incident_logged, note_added, note_revised, monolith_split, section_added, \
      section_edited, section_appended, reviewed_stamped, archive_move, \
      project_added, project_archived, baton_logged, backlog_item_added, \
-     slice_added, item_status_set, backlog_item_reordered, growlight_initialized, \
+     queue_added, slice_added, item_status_set, backlog_item_reordered, growlight_initialized, \
      chat_message_posted, inbox_read, \
      config_migrated, \
      peers_changed, schema_change, rollback, vault_seal, vault_reveal";

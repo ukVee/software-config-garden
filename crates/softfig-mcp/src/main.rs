@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use softfig_ipc::{
     self,
     verbs::{
-        op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddSectionArgs, AddSliceArgs,
+        op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs, AddSectionArgs,
+        AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
         LogDecisionArgs, LogIncidentArgs, PostMessageArgs, ReadInboxArgs, RefreshSnapshotArgs,
         ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
@@ -344,6 +345,23 @@ fn tool_defs() -> Vec<Value> {
                     "title": { "type": "string", "description": "human title for the queue table + item heading" },
                     "mission": { "type": "string", "description": "why this item exists (## Mission)" },
                     "finish_criteria": { "type": "string", "description": "checkable completion criteria (## Finish criteria)" },
+                    "queue": { "type": "string", "description": "named work-stream queue to enqueue into; omit for the default queue. A named queue must be registered first via add_queue" },
+                },
+            },
+        }),
+        json!({
+            "name": "add_queue",
+            "description": "growlight: register a named work-stream queue with a bound repo path \
+                            (the fleet scheduler's multi-queue model). Seeds the registry + an empty \
+                            per-queue backlog table in growlight/backlog/CLAUDE.md, so several agents \
+                            can drain different queues (projects). The default queue is implicit — \
+                            don't register it. name is [a-z0-9-]+ (lowercase), not `default`.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name", "repo"],
+                "properties": {
+                    "name": { "type": "string", "description": "[a-z0-9-]+, 1-64; the queue name (not `default`)" },
+                    "repo": { "type": "string", "description": "the repo path the queue's parts build against (non-empty)" },
                 },
             },
         }),
@@ -378,6 +396,7 @@ fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "id": { "type": "string", "description": "the item's queue id (milestone slug or task NNN)" },
                     "status": { "type": "string", "description": "queued | active | done | blocked | deferred" },
+                    "queue": { "type": "string", "description": "which queue the item lives in; omit to locate it across all queues (pass only to disambiguate a cross-queue id collision)" },
                 },
             },
         }),
@@ -398,6 +417,7 @@ fn tool_defs() -> Vec<Value> {
                     "id": { "type": "string", "description": "the item to move (milestone slug or task NNN)" },
                     "position": { "type": "string", "description": "top | bottom | before | after" },
                     "ref_id": { "type": "string", "description": "the item to move before/after (required for before/after; omit for top/bottom)" },
+                    "queue": { "type": "string", "description": "which queue the item lives in (reorder is per-queue); omit to locate it across all queues" },
                 },
             },
         }),
@@ -539,6 +559,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: AddBacklogItemArgs = serde_json::from_value(args)?;
             (op::ADD_BACKLOG_ITEM, serde_json::to_value(a)?)
         }
+        "add_queue" => {
+            let a: AddQueueArgs = serde_json::from_value(args)?;
+            (op::ADD_QUEUE, serde_json::to_value(a)?)
+        }
         "add_slice" => {
             let a: AddSliceArgs = serde_json::from_value(args)?;
             (op::ADD_SLICE, serde_json::to_value(a)?)
@@ -667,9 +691,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty() {
+    fn tools_list_has_twenty_one() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 20);
+        assert_eq!(defs.len(), 21);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -686,6 +710,7 @@ mod tests {
             "refresh_snapshot",
             "log_baton",
             "add_backlog_item",
+            "add_queue",
             "add_slice",
             "set_item_status",
             "reorder_backlog_item",
@@ -701,7 +726,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
     }
 
     #[test]
@@ -759,6 +784,11 @@ mod tests {
                 "add_backlog_item",
                 json!({ "item_type": "task", "slug": "sigterm-unmount", "title": "t", "mission": "m", "finish_criteria": "f" }),
                 op::ADD_BACKLOG_ITEM,
+            ),
+            (
+                "add_queue",
+                json!({ "name": "softfig", "repo": "~/projects/software-config_garden" }),
+                op::ADD_QUEUE,
             ),
             (
                 "add_slice",

@@ -132,13 +132,15 @@ fn ref_index(rest: &[QueueRow], ref_id: &str, moved_id: &str) -> Result<usize, R
         .ok_or_else(|| ReorderError::RefNotFound(ref_id.to_string()))
 }
 
-/// Escape a literal `|` so it doesn't split a table cell.
-fn escape(s: &str) -> String {
+/// Escape a literal `|` so it doesn't split a table cell. Shared with the
+/// queue *registry* table ([`super::queues`]), which round-trips the same way.
+pub(super) fn escape(s: &str) -> String {
     s.replace('|', "\\|")
 }
 
-/// Split one `| a | b | … |` line into trimmed, `\|`-unescaped cells.
-fn split_row(line: &str) -> Vec<String> {
+/// Split one `| a | b | … |` line into trimmed, `\|`-unescaped cells. Shared
+/// with [`super::queues`].
+pub(super) fn split_row(line: &str) -> Vec<String> {
     let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
     let mut cells = Vec::new();
     let mut cur = String::new();

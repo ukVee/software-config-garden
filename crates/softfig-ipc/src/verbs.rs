@@ -131,6 +131,11 @@ pub mod op {
     /// `queued`) in the managed queue table. Mirrors `add_project`; commit
     /// `backlog_item_added`.
     pub const ADD_BACKLOG_ITEM: &str = "add_backlog_item";
+    /// growlight Phase 4: register a named work-stream queue with a bound repo
+    /// path (the fleet scheduler's multi-queue model, spec orchestrator §6).
+    /// Seeds the registry + an empty per-queue item table in
+    /// `growlight/backlog/CLAUDE.md`. Commit `queue_added`.
+    pub const ADD_QUEUE: &str = "add_queue";
     /// growlight Phase 1: append a numbered slice under a milestone
     /// (`growlight/backlog/milestones/<id>/slices/NNN-<slug>.md`) and refresh
     /// the milestone's slices index. Commit `slice_added`.
@@ -1153,6 +1158,11 @@ pub struct AddBacklogItemArgs {
     pub mission: String,
     /// Checkable completion criteria (the item doc's `## Finish criteria`).
     pub finish_criteria: String,
+    /// Which named work-stream queue to enqueue into. Omitted/`default` →
+    /// the implicit default queue (back-compat). A named queue must already be
+    /// registered via `add_queue`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1160,6 +1170,26 @@ pub struct AddBacklogItemReply {
     /// The item's queue id (milestone slug, or the task's `NNN`).
     pub id: String,
     /// Garden-relative path of the item's main doc.
+    pub path: String,
+    pub hash: String,
+}
+
+/// `add_queue({name, repo}) -> {name, repo, path, hash}`. Register a named
+/// work-stream queue with a bound repo path (the fleet scheduler's multi-queue
+/// model). The implicit `default` queue is never registered here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddQueueArgs {
+    /// `[a-z0-9-]+`, 1–64; the queue name. `default` is reserved (implicit).
+    pub name: String,
+    /// The repo path the queue's parts build against (advisory; non-empty).
+    pub repo: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddQueueReply {
+    pub name: String,
+    pub repo: String,
+    /// The backlog doc the daemon rewrote (`growlight/backlog/CLAUDE.md`).
     pub path: String,
     pub hash: String,
 }
@@ -1196,6 +1226,10 @@ pub struct SetItemStatusArgs {
     pub id: String,
     /// `queued | active | done | blocked`.
     pub status: String,
+    /// Which queue the item lives in. Omitted → the id is located across all
+    /// queues (unique today); pass it to disambiguate a cross-queue collision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1221,6 +1255,10 @@ pub struct ReorderBacklogItemArgs {
     /// `top`/`bottom`. Must differ from `id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_id: Option<String>,
+    /// Which queue the item lives in (reorder is per-queue). Omitted → the id
+    /// is located across all queues; pass it to disambiguate a collision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -14,8 +14,15 @@ use softfig_ipc::ErrorKind;
 pub const PILLAR: &str = "growlight";
 
 /// Managed-region tag for the authoritative backlog queue table (hosted in
-/// `growlight/backlog/CLAUDE.md`). Status + order live only here.
+/// `growlight/backlog/CLAUDE.md`). Status + order live only here. This is the
+/// implicit **default** queue's region; named queues get `queue:<name>`
+/// regions in the same doc (see [`super::queues`]).
 pub const QUEUE_TAG: &str = "queue";
+
+/// Managed-region tag for the multi-queue *registry* (queue name → bound repo),
+/// also hosted in `growlight/backlog/CLAUDE.md`. Absent until the first
+/// `add_queue`, so a default-only garden is unchanged.
+pub const QUEUES_TAG: &str = "queues";
 
 /// The two backlog item kinds.
 pub const ITEM_TYPES: [&str; 2] = ["milestone", "task"];
