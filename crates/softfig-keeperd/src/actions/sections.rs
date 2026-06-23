@@ -56,13 +56,15 @@ pub fn add_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    let new = {
+    let (new, version) = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
-        edit::add_section(&content, &args.heading, &args.body)
-            .map_err(|e| section_err(&rel, &args.heading, e))?
+        let new = edit::add_section(&content, &args.heading, &args.body)
+            .map_err(|e| section_err(&rel, &args.heading, e))?;
+        let version = edit::section_version(&new, &args.heading).unwrap_or_default();
+        (new, version)
     };
-    write_and_commit(daemon, &mut inner, &rel, new, "section_added", &args.heading)
+    write_and_commit(daemon, &mut inner, &rel, new, "section_added", &args.heading, version)
 }
 
 pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -76,13 +78,16 @@ pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    let new = {
+    let (new, version) = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
-        edit::edit_section(&content, &args.heading, &args.body)
-            .map_err(|e| section_err(&rel, &args.heading, e))?
+        cas_check_section(&content, &args.heading, &args.expected_version)?;
+        let new = edit::edit_section(&content, &args.heading, &args.body)
+            .map_err(|e| section_err(&rel, &args.heading, e))?;
+        let version = edit::section_version(&new, &args.heading).unwrap_or_default();
+        (new, version)
     };
-    write_and_commit(daemon, &mut inner, &rel, new, "section_edited", &args.heading)
+    write_and_commit(daemon, &mut inner, &rel, new, "section_edited", &args.heading, version)
 }
 
 pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -96,13 +101,16 @@ pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    let new = {
+    let (new, version) = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
-        edit::append_to_section(&content, &args.heading, &args.text)
-            .map_err(|e| section_err(&rel, &args.heading, e))?
+        cas_check_section(&content, &args.heading, &args.expected_version)?;
+        let new = edit::append_to_section(&content, &args.heading, &args.text)
+            .map_err(|e| section_err(&rel, &args.heading, e))?;
+        let version = edit::section_version(&new, &args.heading).unwrap_or_default();
+        (new, version)
     };
-    write_and_commit(daemon, &mut inner, &rel, new, "section_appended", &args.heading)
+    write_and_commit(daemon, &mut inner, &rel, new, "section_appended", &args.heading, version)
 }
 
 pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -113,7 +121,7 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    {
+    let version = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
         let new = edit::set_reviewed(&content, &conventions::today_hyphen()).ok_or((
@@ -121,14 +129,41 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             format!("{rel}: no 'Last reviewed:' line to stamp"),
         ))?;
         wt.write(&rel, new.as_bytes())?;
-    }
+        // set_reviewed isn't section-addressed, so its CAS handle is the
+        // whole-file version (informational here — date bumps rarely contend).
+        edit::content_version(&new)
+    };
 
     let payload = serde_json::json!({ "path": rel });
     let intent = Intent::new("reviewed_stamped", payload)
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let inner = &mut *inner;
     let hash = commit_now(inner, intent)?;
-    Ok(serde_json::to_value(DocEditReply { path: rel, hash: hash.to_string() }).unwrap())
+    Ok(serde_json::to_value(DocEditReply { path: rel, hash: hash.to_string(), version }).unwrap())
+}
+
+/// Optimistic-concurrency guard for the section verbs: when the caller supplied
+/// an `expected_version`, the addressed section must still carry it, else
+/// `Conflict` (stale — the caller re-reads + reapplies). A `None` current
+/// version (heading absent / ambiguous) is passed through so the edit transform
+/// surfaces the precise `NotFound` / `Ambiguous` error instead. No lock is held
+/// at any point — a crashed caller strands nothing.
+fn cas_check_section(
+    content: &str,
+    heading: &str,
+    expected: &Option<String>,
+) -> Result<(), (ErrorKind, String)> {
+    if let (Some(want), Some(cur)) = (expected, edit::section_version(content, heading)) {
+        if &cur != want {
+            return Err((
+                ErrorKind::Conflict,
+                format!(
+                    "stale: section {heading:?} changed since version {want} — re-read and retry"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---- handler helpers ---------------------------------------------------
@@ -206,6 +241,7 @@ fn write_and_commit(
     new_content: String,
     intent_name: &str,
     heading_arg: &str,
+    version: String,
 ) -> HandlerResult {
     {
         let wt = WorkTree::new(daemon, inner);
@@ -223,6 +259,7 @@ fn write_and_commit(
     Ok(serde_json::to_value(DocEditReply {
         path: rel.to_string(),
         hash: hash.to_string(),
+        version,
     })
     .unwrap())
 }
@@ -254,6 +291,8 @@ fn section_err(rel: &str, heading: &str, e: edit::SectionError) -> (ErrorKind, S
 // as a final empty element).
 
 pub mod edit {
+    use softfig_store::Hash;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SectionError {
         /// No heading matched the address.
@@ -461,6 +500,53 @@ pub mod edit {
             .then_some(idx)
     }
 
+    // ---- Phase 3 (garden CAS): content versions ------------------------
+
+    /// A content version: the BLAKE3 hex of `s`. Stable + collision-resistant —
+    /// the optimistic-concurrency handle a caller reads and submits back as
+    /// `expected_version`. Whole-file when `s` is the file; section-scoped when
+    /// `s` is a section slice (see [`section_version`]).
+    pub fn content_version(s: &str) -> String {
+        Hash::of(s.as_bytes()).to_hex()
+    }
+
+    /// The exact line slice a section occupies: its heading line through the
+    /// line before the next same-or-higher heading (subsections included) — the
+    /// same span [`edit_section`] replaces, so hashing it yields a version that
+    /// changes iff that section changes.
+    fn section_slice(lines: &[&str], hs: &[Heading], target: &Heading) -> String {
+        let (_bstart, bend) = body_range(lines.len(), hs, target);
+        lines[target.line..bend].join("\n")
+    }
+
+    /// The content version of the uniquely-addressed section. `None` when the
+    /// heading is absent, ambiguous, or empty (the same addressing
+    /// [`edit_section`] enforces) — so a CAS check on a bad address degrades to
+    /// letting the edit itself surface the precise error.
+    pub fn section_version(content: &str, heading_arg: &str) -> Option<String> {
+        let (_level, want) = parse_heading_arg(heading_arg);
+        if want.is_empty() {
+            return None;
+        }
+        let lines: Vec<&str> = content.split('\n').collect();
+        let hs = headings(&lines);
+        let target = find_unique(&hs, &want).ok()?;
+        Some(content_version(&section_slice(&lines, &hs, target)))
+    }
+
+    /// `(heading_text, version)` for every ATX heading, in document order — the
+    /// `read_file` sections list. Each version covers that heading through its
+    /// body end, so editing one section changes only its own entry (a parent
+    /// section's version also covers its subsections, which is the conservative
+    /// truth: editing a subsection does change the parent's span).
+    pub fn section_versions(content: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = content.split('\n').collect();
+        let hs = headings(&lines);
+        hs.iter()
+            .map(|h| (h.text.clone(), content_version(&section_slice(&lines, &hs, h))))
+            .collect()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -600,6 +686,48 @@ pub mod edit {
             let out = edit_section(doc, "Edit", "new").unwrap();
             assert!(out.contains("# T\n\nlead para\n\n## Keep\n\nkeep me\n\n"));
             assert!(out.ends_with("## Edit\n\nnew\n"));
+        }
+
+        // ---- Phase 3 CAS: content versions --------------------------------
+
+        #[test]
+        fn content_version_is_stable_and_distinguishes() {
+            assert_eq!(content_version("abc"), content_version("abc"));
+            assert_ne!(content_version("abc"), content_version("abd"));
+        }
+
+        #[test]
+        fn section_version_changes_only_when_that_section_changes() {
+            let doc = "# T\n\n## A\n\nalpha\n\n## B\n\nbeta\n";
+            let va = section_version(doc, "A").unwrap();
+            let vb = section_version(doc, "B").unwrap();
+            assert_ne!(va, vb, "distinct sections hash distinctly");
+
+            // Editing A moves A's version but leaves B's untouched — the CAS
+            // basis for "different sections of one file never collide".
+            let after = edit_section(doc, "A", "ALPHA!").unwrap();
+            assert_ne!(section_version(&after, "A").unwrap(), va);
+            assert_eq!(section_version(&after, "B").unwrap(), vb);
+        }
+
+        #[test]
+        fn section_version_none_for_absent_or_ambiguous() {
+            let doc = "## A\n\nx\n\n## A\n\ny\n";
+            assert!(section_version(doc, "Nope").is_none());
+            assert!(section_version(doc, "A").is_none()); // ambiguous
+            assert!(section_version(doc, "##").is_none()); // empty heading
+        }
+
+        #[test]
+        fn section_versions_lists_every_heading_in_order() {
+            let doc = "# Title\n\n## A\n\na\n\n## B\n\nb\n";
+            let vs = section_versions(doc);
+            let headings: Vec<&str> = vs.iter().map(|(h, _)| h.as_str()).collect();
+            assert_eq!(headings, vec!["Title", "A", "B"]);
+            // Each entry matches the per-heading section_version.
+            for (h, v) in &vs {
+                assert_eq!(section_version(doc, h).as_deref(), Some(v.as_str()));
+            }
         }
     }
 }

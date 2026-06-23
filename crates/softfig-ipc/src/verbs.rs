@@ -74,6 +74,11 @@ pub mod op {
     /// committed tip tree. Sealed files / inline regions are projected, not
     /// decrypted. Read-only.
     pub const READ_FILE: &str = "read_file";
+    /// Phase 3 (garden CAS, §4d): provenance for a garden path — who/when last
+    /// edited it + the recent edit history — derived from committed commit data
+    /// (author_device, timestamp, intent) by walking the chain and diffing the
+    /// path's blob across each commit. Read-only; never touches the mount.
+    pub const FILE_PROVENANCE: &str = "file_provenance";
     /// M5a-4: begin pairing as the initiator — TCP-connect to the target
     /// device, run the Noise `XX` handshake + attestation, and park the
     /// pending pairing awaiting SAS confirmation. Returns the SAS to compare.
@@ -344,6 +349,13 @@ pub struct ReplaceFileArgs {
     /// garden root and not traverse `..`.
     pub path: String,
     pub content: String,
+    /// Phase 3 CAS (optional): the whole-file content version the caller based
+    /// this rewrite on. When set, the daemon applies only if the file still
+    /// has that version (and still exists); else it returns `Conflict` so the
+    /// caller re-reads. Omit for unconditional last-writer-wins (the legacy
+    /// behaviour, also the create-if-absent path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +363,10 @@ pub struct ReplaceFileReply {
     /// Garden-relative path the daemon wrote.
     pub path: String,
     pub hash: String,
+    /// The whole-file content version after the write — feed it back as the
+    /// next `expected_version` to chain CAS-guarded rewrites without re-reading.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// Daemon-orchestrated phase 3 of `softfig migrate`. Empty args; the
@@ -564,6 +580,13 @@ pub struct EditSectionArgs {
     pub path: String,
     pub heading: String,
     pub body: String,
+    /// Phase 3 CAS (optional): the addressed section's content version the
+    /// caller read. When set, the daemon applies only if that section is still
+    /// unchanged; else it returns `Conflict`. Editing a *different* section of
+    /// the same file never conflicts (versions are per-section). Omit for
+    /// unconditional last-writer-wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
 }
 
 /// `append_to_section({path, heading, text}) -> {path, hash}`. Add `text`
@@ -576,6 +599,10 @@ pub struct AppendToSectionArgs {
     pub heading: String,
     /// The new content to append (one or more lines, e.g. a list row).
     pub text: String,
+    /// Phase 3 CAS (optional): the addressed section's content version the
+    /// caller read; see [`EditSectionArgs::expected_version`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
 }
 
 /// `set_reviewed({path}) -> {path, hash}`. Rewrite the doc's `Last
@@ -594,6 +621,13 @@ pub struct DocEditReply {
     /// Garden-relative path the daemon rewrote.
     pub path: String,
     pub hash: String,
+    /// Phase 3 CAS: the content version of the affected target *after* the
+    /// edit. For the section verbs it's the addressed section's new version
+    /// (feed it back as the next `expected_version`); for `set_reviewed` it's
+    /// the whole-file version. `#[serde(default)]` keeps older clients
+    /// wire-compatible.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// `archive({src, archive_name?}) -> {from, to, hash}`.
@@ -698,6 +732,66 @@ pub struct ReadFileReply {
     pub content: String,
     /// True when the whole file is sealed (Layer B).
     pub sealed: bool,
+    /// Phase 3 CAS: whole-file content version of the (redacted) content —
+    /// pass to `replace_file`'s `expected_version`. `#[serde(default)]` keeps
+    /// older clients/daemons wire-compatible.
+    #[serde(default)]
+    pub version: String,
+    /// Phase 3 CAS: per-section content versions for every addressable ATX
+    /// heading, in document order. Pick the one for the heading you intend to
+    /// edit and pass it as the section verb's `expected_version`. Empty for
+    /// sealed / non-markdown / sectionless content.
+    #[serde(default)]
+    pub sections: Vec<SectionVersion>,
+}
+
+/// One addressable section's CAS handle: its heading text + current content
+/// version. Surfaced by `read_file` so a caller can guard a section edit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SectionVersion {
+    /// The heading text (no leading `#`s), as `edit_section`/`append_to_section`
+    /// address it.
+    pub heading: String,
+    /// The section's content version (heading line + body).
+    pub version: String,
+}
+
+// ---- Phase 3 (garden CAS §4d): file provenance ------------------------
+
+/// `file_provenance({path, limit?}) -> {path, edits}`. Who/when last edited a
+/// garden path, plus its recent edit history — the §4d awareness query. Pure
+/// read over committed commit data (no mount I/O): the daemon walks the commit
+/// chain and reports each commit whose tree changed `path`'s blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileProvenanceArgs {
+    /// Garden-relative path to trace.
+    pub path: String,
+    /// Cap on how many recent edits to return (most-recent first). 0 / omitted
+    /// uses the daemon default.
+    #[serde(default)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileProvenanceReply {
+    /// The traced garden-relative path.
+    pub path: String,
+    /// Edits that changed this path's content, most recent first. Empty when
+    /// the path has never been committed. `edits[0]` is the last editor.
+    pub edits: Vec<ProvenanceEntry>,
+}
+
+/// One commit that changed the traced path's blob.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvenanceEntry {
+    /// The commit hash (hex).
+    pub hash: String,
+    /// The committing device's id (the "who").
+    pub author_device: String,
+    /// Unix seconds of the commit (the "when").
+    pub timestamp: i64,
+    /// The commit intent (the "what kind", e.g. `section_edited`, `memory_edit`).
+    pub intent: String,
 }
 
 // ---- M5a-4: network pairing (transport + trust ring) ------------------

@@ -12,12 +12,14 @@
 use softfig_vcs::Repo;
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
-    ListTreeArgs, ListTreeReply, ReadFileArgs, ReadFileReply, TreeEntry,
+    FileProvenanceArgs, FileProvenanceReply, ListTreeArgs, ListTreeReply, ProvenanceEntry,
+    ReadFileArgs, ReadFileReply, SectionVersion, TreeEntry,
 };
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::is_layer_b;
 
+use crate::actions::sections::edit;
 use crate::daemon::{Daemon, KeeperError};
 use crate::handlers::{
     path_to_repo_rel_string, require_unlocked, resolve_path_in_tree, validate_repo_path,
@@ -157,12 +159,84 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         content.push_str("\n[… truncated]");
     }
 
+    // Phase 3 CAS: surface the whole-file version + per-section versions so a
+    // caller can guard a follow-up edit (`replace_file` / the section verbs).
+    // Computed over the redacted content the daemon actually returns, so the
+    // version a caller reads is the version its edit will be checked against.
+    let version = edit::content_version(&content);
+    let sections = edit::section_versions(&content)
+        .into_iter()
+        .map(|(heading, version)| SectionVersion { heading, version })
+        .collect();
+
     Ok(serde_json::to_value(ReadFileReply {
         path: rel,
         content,
         sealed,
+        version,
+        sections,
     })
     .unwrap())
+}
+
+/// Default cap on the number of recent edits `file_provenance` returns.
+const PROVENANCE_DEFAULT_LIMIT: usize = 20;
+
+/// Phase 3 (§4d): provenance for a garden path — who/when last edited it + the
+/// recent edit history. A pure read over committed commit data: walk the chain
+/// tip→genesis and report each commit whose tree changed `path`'s blob. Every
+/// lookup hits the object DB, never the FUSE mount, upholding the M3a
+/// commit-from-memory invariant by construction.
+pub fn file_provenance(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: FileProvenanceArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("file_provenance args: {e}")))?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
+    let abs = validate_repo_path(&garden_root, &args.path).map_err(|m| (ErrorKind::BadArgs, m))?;
+    let rel = path_to_repo_rel_string(&garden_root, &abs)
+        .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))?;
+
+    let repo = inner.repo.as_ref().expect("unlocked");
+    let limit = if args.limit == 0 {
+        PROVENANCE_DEFAULT_LIMIT
+    } else {
+        args.limit
+    };
+
+    let tip = match repo.tip().map_err(|e| err_to_response(e.into()))? {
+        Some(h) => h,
+        None => {
+            return Ok(serde_json::to_value(FileProvenanceReply { path: rel, edits: vec![] }).unwrap())
+        }
+    };
+
+    // Linear history: in the tip→genesis walk, `rows[i+1]` is `rows[i]`'s
+    // parent, so a commit changed `rel` exactly when `rel`'s blob differs from
+    // its parent's (an appear / disappear / content change all count).
+    let rows = softfig_vcs::log::collect(repo.db(), tip).map_err(|e| err_to_response(e.into()))?;
+    let mut edits = Vec::new();
+    for (i, cur) in rows.iter().enumerate() {
+        if edits.len() >= limit {
+            break;
+        }
+        let cur_blob = resolve_path_in_tree(repo, &cur.root_tree, &rel)?;
+        let parent_blob = match rows.get(i + 1) {
+            Some(parent) => resolve_path_in_tree(repo, &parent.root_tree, &rel)?,
+            None => None,
+        };
+        if cur_blob != parent_blob {
+            edits.push(ProvenanceEntry {
+                hash: cur.hash.to_string(),
+                author_device: cur.author_device.clone(),
+                timestamp: cur.timestamp,
+                intent: cur.intent.clone(),
+            });
+        }
+    }
+
+    Ok(serde_json::to_value(FileProvenanceReply { path: rel, edits }).unwrap())
 }
 
 /// Walk to the tree hash for a directory path. Returns `None` if the path

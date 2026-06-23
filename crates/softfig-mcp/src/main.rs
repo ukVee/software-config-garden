@@ -17,8 +17,8 @@ use softfig_ipc::{
     self,
     verbs::{
         op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddSectionArgs, AddSliceArgs,
-        AppendToSectionArgs, ArchiveArgs, EditSectionArgs, LogBatonArgs, LogDecisionArgs,
-        LogIncidentArgs, PostMessageArgs, ReadInboxArgs, RefreshSnapshotArgs,
+        AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
+        LogDecisionArgs, LogIncidentArgs, PostMessageArgs, ReadInboxArgs, RefreshSnapshotArgs,
         ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
     },
     Request, Response,
@@ -208,6 +208,7 @@ fn tool_defs() -> Vec<Value> {
                     "path": { "type": "string", "description": "garden-relative markdown doc" },
                     "heading": { "type": "string", "description": "section heading text; '#' prefix optional" },
                     "body": { "type": "string", "description": "replacement markdown body (heading kept by daemon)" },
+                    "expected_version": { "type": "string", "description": "optional CAS guard: the section version you read (from read_file / a prior edit reply). The edit applies only if the section is unchanged, else Conflict. Omit for last-writer-wins." },
                 },
             },
         }),
@@ -224,6 +225,7 @@ fn tool_defs() -> Vec<Value> {
                     "path": { "type": "string", "description": "garden-relative markdown doc" },
                     "heading": { "type": "string", "description": "target section heading text; '#' prefix optional" },
                     "text": { "type": "string", "description": "new content to append (e.g. a list row)" },
+                    "expected_version": { "type": "string", "description": "optional CAS guard: the section version you read; applies only if unchanged, else Conflict. Omit for last-writer-wins." },
                 },
             },
         }),
@@ -450,6 +452,24 @@ fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "path": { "type": "string", "description": "garden-relative path to overwrite" },
                     "content": { "type": "string", "description": "verbatim file bytes (you write the whole file)" },
+                    "expected_version": { "type": "string", "description": "optional CAS guard: the whole-file version you read; the write applies only if the file is unchanged (and still exists), else Conflict. Omit for last-writer-wins / create." },
+                },
+            },
+        }),
+        json!({
+            "name": "file_provenance",
+            "description": "Who & when last edited a garden path, plus its recent edit history — \
+                            the contention-awareness query (spec §4d). Read-only, derived from \
+                            commit history: each entry is {hash, author_device, timestamp, intent} \
+                            for a commit that changed the path, most-recent-first (edits[0] is the \
+                            last editor). Use before editing a hot file to see if another writer \
+                            is active on it.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative path to trace" },
+                    "limit": { "type": "integer", "description": "max recent edits to return (default 20)" },
                 },
             },
         }),
@@ -537,6 +557,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: ReadInboxArgs = serde_json::from_value(args)?;
             (op::READ_INBOX, serde_json::to_value(a)?)
         }
+        "file_provenance" => {
+            let a: FileProvenanceArgs = serde_json::from_value(args)?;
+            (op::FILE_PROVENANCE, serde_json::to_value(a)?)
+        }
         other => anyhow::bail!("unknown tool {other:?}"),
     };
     Ok(pair)
@@ -570,6 +594,26 @@ fn summarize(name: &str, data: &Value) -> String {
             _ => "read_inbox: inbox empty".to_string(),
         };
     }
+    if name == "file_provenance" {
+        let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let edits = data.get("edits").and_then(|v| v.as_array());
+        return match edits {
+            Some(es) if !es.is_empty() => {
+                let lines: Vec<String> = es
+                    .iter()
+                    .map(|e| {
+                        let g = |k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+                        let ts = e.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let h = g("hash");
+                        let short = &h[..h.len().min(8)];
+                        format!("{short} [{}] {} @ {ts}", g("intent"), g("author_device"))
+                    })
+                    .collect();
+                format!("file_provenance {path}: {} edit(s)\n{}", es.len(), lines.join("\n"))
+            }
+            _ => format!("file_provenance {path}: no recorded edits"),
+        };
+    }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
         data.get("from").and_then(|v| v.as_str()),
@@ -578,7 +622,12 @@ fn summarize(name: &str, data: &Value) -> String {
         return format!("{name}: {from} -> {to}; commit {hash}");
     }
     if let Some(p) = data.get("path").and_then(|v| v.as_str()) {
-        return format!("{name}: wrote {p}; commit {hash}");
+        // CAS verbs also hand back the post-edit content version (feed it as the
+        // next `expected_version`); surface it when present.
+        return match data.get("version").and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => format!("{name}: wrote {p}; commit {hash}; version {v}"),
+            _ => format!("{name}: wrote {p}; commit {hash}"),
+        };
     }
     format!("{name}: commit {hash}")
 }
@@ -616,9 +665,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_nineteen() {
+    fn tools_list_has_twenty() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 19);
+        assert_eq!(defs.len(), 20);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -640,6 +689,7 @@ mod tests {
             "reorder_backlog_item",
             "post_message",
             "read_inbox",
+            "file_provenance",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -649,7 +699,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
     }
 
     #[test]
@@ -734,6 +784,11 @@ mod tests {
                 op::READ_INBOX,
             ),
             (
+                "file_provenance",
+                json!({ "path": "meta/conventions.md" }),
+                op::FILE_PROVENANCE,
+            ),
+            (
                 "replace_file",
                 json!({ "path": "p", "content": "c" }),
                 op::REPLACE_FILE,
@@ -773,5 +828,18 @@ mod tests {
         assert!(inbox.contains("1 unread"));
         assert!(inbox.contains("#2 [info] roudy -> @all: rebased"));
         assert!(summarize("read_inbox", &json!({ "messages": [] })).contains("inbox empty"));
+        // CAS verbs surface the post-edit version alongside the commit.
+        assert!(summarize("edit_section", &json!({ "path": "p", "hash": "h", "version": "deadbeef" }))
+            .contains("version deadbeef"));
+        // file_provenance renders its edit list (the MCP forwards only text).
+        let prov = summarize(
+            "file_provenance",
+            &json!({ "path": "meta/x.md", "edits": [
+                { "hash": "abcdef1234", "author_device": "tablet", "timestamp": 1782000000, "intent": "section_edited" },
+            ] }),
+        );
+        assert!(prov.contains("1 edit(s)"));
+        assert!(prov.contains("abcdef12 [section_edited] tablet"));
+        assert!(summarize("file_provenance", &json!({ "path": "p", "edits": [] })).contains("no recorded edits"));
     }
 }

@@ -218,6 +218,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::REFRESH_SNAPSHOT => crate::actions::refresh_snapshot(daemon, req.args),
         op::LIST_TREE => crate::reads::list_tree(daemon, req.args),
         op::READ_FILE => crate::reads::read_file(daemon, req.args),
+        op::FILE_PROVENANCE => crate::reads::file_provenance(daemon, req.args),
         op::PAIR_BEGIN => handlers::pair_begin(daemon, req.args),
         op::PAIR_CONFIRM => handlers::pair_confirm(daemon, req.args),
         op::PAIR_LIST => handlers::pair_list(daemon, req.args),

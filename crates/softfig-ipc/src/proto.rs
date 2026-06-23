@@ -141,6 +141,12 @@ pub enum ErrorKind {
     /// allow_relock` is not set in `keeper.toml`. The opt-in is the human's to
     /// grant; the loop must fall back to `BLOCKED_ON_HUMAN`.
     RelockDisabled,
+    /// Phase 3 (garden CAS): an edit verb carried an `expected_version` that no
+    /// longer matches the target's current content version — a concurrent
+    /// writer moved it first. Optimistic-concurrency stale-reject: the caller
+    /// should re-read the current content (+ version) and re-apply. No lock is
+    /// ever held, so a crashed agent strands nothing.
+    Conflict,
     /// Unknown / unhandled internal error.
     Internal,
 }

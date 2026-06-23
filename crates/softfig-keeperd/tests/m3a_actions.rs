@@ -674,6 +674,7 @@ fn edit_section_replaces_body_keeps_siblings() {
             path: "x.md".into(),
             heading: "Alpha".into(),
             body: "new alpha".into(),
+            expected_version: None,
         })
         .unwrap(),
     );
@@ -698,6 +699,7 @@ fn append_to_section_adds_row() {
             path: "refs.md".into(),
             heading: "## Cross-refs".into(),
             text: "- baz".into(),
+            expected_version: None,
         })
         .unwrap(),
     );

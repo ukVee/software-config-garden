@@ -517,9 +517,22 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // the watcher event + writes. Scoped so its borrow ends before the commit.
     {
         let wt = crate::actions::WorkTree::new(daemon, &inner);
+        // Phase 3 CAS: when the caller pinned an `expected_version`, the file
+        // must still exist with that whole-file version, else stale-reject.
+        // The read rides the worktree (no mount I/O under `inner`).
+        if let Some(want) = &args.expected_version {
+            let current = wt.read(&rel).map(|b| softfig_store::Hash::of(&b).to_hex());
+            if current.as_deref() != Some(want.as_str()) {
+                return Err((
+                    ErrorKind::Conflict,
+                    format!("stale: {rel} changed since version {want} — re-read and retry"),
+                ));
+            }
+        }
         wt.write(&rel, args.content.as_bytes())?;
     }
 
+    let version = softfig_store::Hash::of(args.content.as_bytes()).to_hex();
     let payload = serde_json::json!({ "path": args.path });
     let intent =
         Intent::new("memory_edit", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
@@ -531,6 +544,7 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     Ok(serde_json::to_value(ReplaceFileReply {
         path: args.path,
         hash: hash.to_string(),
+        version,
     })
     .unwrap())
 }

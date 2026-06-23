@@ -162,6 +162,7 @@ fn full_lifecycle() {
     let req = ReplaceFileArgs {
         path: "notes/added.md".into(),
         content: "new note from claude\n".into(),
+        expected_version: None,
     };
     let reply: ReplaceFileReply = serde_json::from_value(unwrap_ok(rpc(
         &socket,
@@ -226,6 +227,7 @@ fn rejects_traversal_in_replace_paths() {
         let req = ReplaceFileArgs {
             path: bad.into(),
             content: "x".into(),
+            expected_version: None,
         };
         let r = rpc(
             &socket,

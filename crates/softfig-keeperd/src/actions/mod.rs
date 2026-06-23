@@ -33,7 +33,7 @@ mod managed;
 mod migrate_config;
 mod numbering;
 mod refresh_snapshot;
-mod sections;
+pub(crate) mod sections;
 mod split;
 mod worktree;
 
