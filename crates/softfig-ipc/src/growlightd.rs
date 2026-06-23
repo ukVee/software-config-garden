@@ -54,6 +54,27 @@ pub mod op {
     /// message onto an agent's boundary-async inject lane — delivered at the
     /// agent's NEXT baton, never mid-iteration (spec §8).
     pub const INJECT_MESSAGE: &str = "inject_message";
+
+    // --- Coordinate family (spec §13 Coordinate / §4c leases). Agent-facing:
+    // these are the arbitrated shared-action verbs (spec §14, also reachable via
+    // MCP). growlightd grants/queues/denies; a granted restart is performed by
+    // the DAEMON, never by an agent.
+
+    /// `request_lease(`[`RequestLeaseArgs`]`) -> `[`LeaseReply`]. Request a lease
+    /// over a shared resource/action (spec §4c). Free → granted; held by another
+    /// → queued (FIFO); held by the requester → idempotently granted. A granted
+    /// lease over a thrash-flagged target clears that flag (§4d ladder rung 2).
+    pub const REQUEST_LEASE: &str = "request_lease";
+    /// `release_lease(`[`ReleaseLeaseArgs`]`) -> `[`LeaseReply`]. Release a lease
+    /// the caller holds; the head waiter (if any) is promoted to holder. A
+    /// release by a non-holder is refused.
+    pub const RELEASE_LEASE: &str = "release_lease";
+    /// `request_restart(`[`RequestRestartArgs`]`) -> `[`RestartReply`]. Ask
+    /// growlightd to restart another agent (spec §4c/§8). Arbitrated through a
+    /// restart lease over the target: granted → the DAEMON performs the kill
+    /// under the kill-safety discipline; already in flight → queued; targeting
+    /// the requester itself → denied (use `force_stop`).
+    pub const REQUEST_RESTART: &str = "request_restart";
 }
 
 /// Reply to `status`: the orchestrator's own state, the garden root it derived
@@ -313,6 +334,91 @@ pub struct InjectReply {
     pub queued: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Coordinate family (spec §4c leases / §13 Coordinate / §14 MCP). Args + the
+// shared `LeaseReply` for `request_lease`/`release_lease`, plus the restart
+// verb's args + reply. `state` is a documented string (matching
+// [`Event::LeaseChanged`]'s `state`) so a new outcome never needs a wire-enum
+// version bump.
+// ---------------------------------------------------------------------------
+
+/// Args for `request_lease`: the requesting agent and the lease key (the shared
+/// resource/action — for a contended garden section, the thrash target label
+/// `"path §heading"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLeaseArgs {
+    /// The requesting agent (work-stream) id.
+    pub agent: String,
+    /// The lease key naming the shared resource/action being arbitrated.
+    pub key: String,
+}
+
+/// Args for `release_lease`: the holder releasing the lease and the key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseLeaseArgs {
+    /// The agent releasing the lease (must be the current holder).
+    pub agent: String,
+    /// The lease key being released.
+    pub key: String,
+}
+
+/// Reply to `request_lease` / `release_lease`: the key, the resulting `state`,
+/// the holder after the call, and (when queued) the caller's 1-based wait slot.
+///
+/// `state` is one of `"granted"` (the caller now holds it), `"waiting"` (queued
+/// behind the holder), `"released"` (the caller released; `holder` is the
+/// promoted waiter or `None` if now free), or `"denied"` (refused — e.g. a
+/// release by a non-holder; `reason` explains).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseReply {
+    /// The lease key this reply concerns.
+    pub key: String,
+    /// Coarse outcome: `granted` | `waiting` | `released` | `denied`.
+    pub state: String,
+    /// The lease holder after the call (the caller on `granted`; the promoted
+    /// waiter or `None` on `released`; the existing holder on `waiting`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    /// The caller's 1-based slot in the wait queue, present only when `waiting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    /// Why the request was denied, present only when `state == "denied"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Args for `request_restart`: who is asking and which agent to restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestRestartArgs {
+    /// The agent requesting the restart.
+    pub requester: String,
+    /// The agent to restart (must differ from `requester` — self-restart is
+    /// denied; use `force_stop`).
+    pub target: String,
+}
+
+/// Reply to `request_restart`: the target, the outcome `state`, and whether the
+/// daemon actually killed a live child.
+///
+/// `state` is `"restarted"` (the restart lease was granted and the DAEMON
+/// performed the kill), `"queued"` (another restart of the same target is in
+/// flight — the caller waits), or `"denied"` (refused — e.g. a self-restart;
+/// `reason` explains).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartReply {
+    /// The agent the restart was requested for.
+    pub target: String,
+    /// Coarse outcome: `restarted` | `queued` | `denied`.
+    pub state: String,
+    /// Whether a live child was present and killed by the daemon. `false` when
+    /// queued/denied, and (in production today) when no agent is live behind the
+    /// target — the arbitration still ran.
+    pub performed: bool,
+    /// Why the request was denied, present only when `state == "denied"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +528,79 @@ mod tests {
             serde_json::from_str::<InjectReply>(&serde_json::to_string(&i).unwrap()).unwrap(),
             i
         );
+    }
+
+    #[test]
+    fn lease_args_round_trip() {
+        let req = RequestLeaseArgs {
+            agent: "a".into(),
+            key: "dock.rs §Layout".into(),
+        };
+        let back: RequestLeaseArgs =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back.agent, "a");
+        assert_eq!(back.key, "dock.rs §Layout");
+
+        let rr = RequestRestartArgs {
+            requester: "a".into(),
+            target: "b".into(),
+        };
+        let back: RequestRestartArgs =
+            serde_json::from_str(&serde_json::to_string(&rr).unwrap()).unwrap();
+        assert_eq!(back.requester, "a");
+        assert_eq!(back.target, "b");
+    }
+
+    #[test]
+    fn lease_reply_skips_absent_optionals_and_round_trips() {
+        // A granted reply carries a holder but no position/reason.
+        let granted = LeaseReply {
+            key: "k".into(),
+            state: "granted".into(),
+            holder: Some("a".into()),
+            position: None,
+            reason: None,
+        };
+        let s = serde_json::to_string(&granted).unwrap();
+        assert!(s.contains("\"state\":\"granted\""));
+        assert!(!s.contains("position"), "absent optionals are skipped: {s}");
+        assert!(!s.contains("reason"));
+        assert_eq!(serde_json::from_str::<LeaseReply>(&s).unwrap(), granted);
+
+        // A waiting reply carries holder + position.
+        let waiting = LeaseReply {
+            key: "k".into(),
+            state: "waiting".into(),
+            holder: Some("a".into()),
+            position: Some(2),
+            reason: None,
+        };
+        let back: LeaseReply =
+            serde_json::from_str(&serde_json::to_string(&waiting).unwrap()).unwrap();
+        assert_eq!(back, waiting);
+    }
+
+    #[test]
+    fn restart_reply_round_trips_with_and_without_a_reason() {
+        let restarted = RestartReply {
+            target: "b".into(),
+            state: "restarted".into(),
+            performed: true,
+            reason: None,
+        };
+        let s = serde_json::to_string(&restarted).unwrap();
+        assert!(!s.contains("reason"), "no reason on success: {s}");
+        assert_eq!(serde_json::from_str::<RestartReply>(&s).unwrap(), restarted);
+
+        let denied = RestartReply {
+            target: "b".into(),
+            state: "denied".into(),
+            performed: false,
+            reason: Some("an agent cannot restart itself".into()),
+        };
+        let back: RestartReply =
+            serde_json::from_str(&serde_json::to_string(&denied).unwrap()).unwrap();
+        assert_eq!(back, denied);
     }
 
     #[test]

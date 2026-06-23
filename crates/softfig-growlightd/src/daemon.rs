@@ -9,9 +9,12 @@ use std::thread::JoinHandle;
 
 use thiserror::Error;
 
+use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply};
+
 use crate::config::GrowlightdConfig;
 use crate::control::Control;
 use crate::hub::EventHub;
+use crate::leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
 use crate::state::State;
 
 #[derive(Debug, Error)]
@@ -34,6 +37,11 @@ pub struct DaemonInner {
     /// at safe handoff boundaries (spec §8 / §13 Control). Phase 1 holds no live
     /// agent — see [`crate::control`].
     pub control: Control,
+    /// Supervisor-arbitrated leases over dangerous shared actions (spec §4c):
+    /// the `request_lease`/`release_lease`/`request_restart` verbs grant/queue
+    /// over this table. Pure decision logic lives in [`crate::leases`]; the
+    /// daemon methods wire it thin (see [`Daemon::request_lease`]).
+    pub leases: LeaseTable,
     // Phase 6 (concurrency milestone) adds the agent registry here: the live
     // `claude -p` child handles + per-agent status, registered via
     // `control.attach_child`. Hard-stop teardown of those children rides the
@@ -48,6 +56,7 @@ impl DaemonInner {
             state: State::Running,
             config,
             control: Control::default(),
+            leases: LeaseTable::new(),
         }
     }
 }
@@ -60,6 +69,13 @@ pub struct Daemon {
     /// never has to take the daemon lock to publish — and so `publish` can't
     /// contend with anything holding `inner` (the hub has its own brief lock).
     pub hub: EventHub,
+    /// The §4d rung-2 thrash hook, invoked when a lease is granted over a
+    /// contended target. Lives *outside* `inner` (like `hub`) so it is called
+    /// without the daemon lock held — the production impl reaches keeperd over
+    /// the bus bridge and may block, so holding the mutex across it would
+    /// reintroduce the keeperd deadlock class (incident 20260622). `None` until
+    /// that bridge is wired (phase 6); a test installs a spy.
+    pub thrash_clear: Option<Arc<dyn ThrashClear>>,
 }
 
 impl Daemon {
@@ -67,7 +83,16 @@ impl Daemon {
         Self {
             inner: Arc::new(Mutex::new(DaemonInner::new(config))),
             hub: EventHub::new(),
+            thrash_clear: None,
         }
+    }
+
+    /// Install the §4d thrash-clear hook (builder-style). Phase 6 binds this to
+    /// keeperd's `ThrashDetector::clear_flag` over the bus bridge; tests pass a
+    /// spy to prove a granted lease over a flagged target clears that flag.
+    pub fn with_thrash_clear(mut self, hook: Arc<dyn ThrashClear>) -> Self {
+        self.thrash_clear = Some(hook);
+        self
     }
 
     /// Bind the socket and run the accept loop. Returns a handle that stays
@@ -145,6 +170,137 @@ impl Daemon {
     pub fn is_paused(&self) -> bool {
         self.inner.lock().unwrap().control.paused
     }
+
+    /// `request_lease` (spec §4c): arbitrate a lease over the shared resource
+    /// `key` for `agent`. Free → granted; held by another → queued (FIFO); held
+    /// by `agent` → idempotently granted. On a grant, any thrash flag keeper
+    /// raised on the target is cleared (the §4d ladder rung 2) — OUTSIDE the
+    /// daemon lock, since the hook may reach keeperd. Emits a `LeaseChanged`
+    /// event either way.
+    pub fn request_lease(&self, agent: &str, key: &str) -> LeaseReply {
+        // Decide under the lock; release it before any side effect (the hook may
+        // block on keeperd; the kill-safety lock-ordering lesson, §8).
+        let decision = self.inner.lock().unwrap().leases.request(key, agent);
+        match decision {
+            LeaseDecision::Granted => {
+                // §4d rung 2: a granted lease resolves the contention → clear the
+                // thrash flag. Done lock-free; no-op until the bridge is wired.
+                if let Some(hook) = &self.thrash_clear {
+                    hook.clear_flag(key);
+                }
+                self.hub.publish(Event::LeaseChanged {
+                    lease: key.to_string(),
+                    holder: Some(agent.to_string()),
+                    state: "granted".to_string(),
+                });
+                LeaseReply {
+                    key: key.to_string(),
+                    state: "granted".to_string(),
+                    holder: Some(agent.to_string()),
+                    position: None,
+                    reason: None,
+                }
+            }
+            LeaseDecision::Queued { position } => {
+                let holder = self.inner.lock().unwrap().leases.holder(key).map(str::to_string);
+                self.hub.publish(Event::LeaseChanged {
+                    lease: key.to_string(),
+                    holder: holder.clone(),
+                    state: "waiting".to_string(),
+                });
+                LeaseReply {
+                    key: key.to_string(),
+                    state: "waiting".to_string(),
+                    holder,
+                    position: Some(position),
+                    reason: None,
+                }
+            }
+        }
+    }
+
+    /// `release_lease` (spec §4c): release the lease `key` held by `agent`,
+    /// promoting the head waiter (if any) to holder. A release by a non-holder
+    /// is refused (`state == "denied"`). Emits a `LeaseChanged` on a real
+    /// release.
+    pub fn release_lease(&self, agent: &str, key: &str) -> LeaseReply {
+        let outcome = self.inner.lock().unwrap().leases.release(key, agent);
+        match outcome {
+            ReleaseOutcome::Released { next_holder } => {
+                self.hub.publish(Event::LeaseChanged {
+                    lease: key.to_string(),
+                    holder: next_holder.clone(),
+                    state: "released".to_string(),
+                });
+                LeaseReply {
+                    key: key.to_string(),
+                    state: "released".to_string(),
+                    holder: next_holder,
+                    position: None,
+                    reason: None,
+                }
+            }
+            ReleaseOutcome::NotHolder => LeaseReply {
+                key: key.to_string(),
+                state: "denied".to_string(),
+                holder: self.inner.lock().unwrap().leases.holder(key).map(str::to_string),
+                position: None,
+                reason: Some("only the lease holder may release it".to_string()),
+            },
+        }
+    }
+
+    /// `request_restart` (spec §4c/§8): `requester` asks growlightd to restart
+    /// `target`. Self-restart is denied (use `force_stop`). Otherwise the
+    /// restart is arbitrated through a lease over the target: granted → the
+    /// DAEMON performs the kill via [`Daemon::hard_kill_agent`] (the kill-safety
+    /// path — child taken under the lock, SIGKILL outside it); already in flight
+    /// → queued. Agents never kill each other — only the supervisor does.
+    pub fn request_restart(&self, requester: &str, target: &str) -> RestartReply {
+        if requester == target {
+            return RestartReply {
+                target: target.to_string(),
+                state: "denied".to_string(),
+                performed: false,
+                reason: Some("an agent cannot restart itself — use force_stop".to_string()),
+            };
+        }
+        let key = restart_key(target);
+        let decision = self.inner.lock().unwrap().leases.request(&key, requester);
+        match decision {
+            LeaseDecision::Granted => {
+                // DAEMON-executed restart, OUTSIDE the lock (hard_kill_agent
+                // enforces the take-under-lock / kill-outside ordering itself).
+                let performed = self.hard_kill_agent(target);
+                self.hub.publish(Event::LeaseChanged {
+                    lease: key,
+                    holder: Some(requester.to_string()),
+                    state: "granted".to_string(),
+                });
+                RestartReply {
+                    target: target.to_string(),
+                    state: "restarted".to_string(),
+                    performed,
+                    reason: None,
+                }
+            }
+            LeaseDecision::Queued { .. } => RestartReply {
+                target: target.to_string(),
+                state: "queued".to_string(),
+                performed: false,
+                reason: Some("a restart of this agent is already in flight".to_string()),
+            },
+        }
+    }
+}
+
+/// The lease key a restart is arbitrated under — namespaced so it never collides
+/// with a garden-target lease key. Held by the requester from grant until the
+/// restart settles (released via `release_lease`, or the agent's phase-6
+/// re-registration), so a concurrent second `request_restart` of the same target
+/// queues rather than double-killing.
+fn restart_key(target: &str) -> String {
+    format!("restart:{target}")
 }
 
 /// Handle to a running daemon. Owns the accept-thread join handle and the bound
@@ -281,5 +437,120 @@ mod tests {
             .queue_inject("a1", "ping".into());
         assert_eq!(daemon.drain_inject_lane("a1"), vec!["ping".to_string()]);
         assert!(daemon.drain_inject_lane("a1").is_empty());
+    }
+
+    /// A fake child that just records that it was killed — enough to prove the
+    /// restart was DAEMON-executed (the lock-safety is covered by `SpyChild`).
+    #[derive(Debug)]
+    struct RecordingChild {
+        killed: Arc<AtomicBool>,
+    }
+    impl AgentChild for RecordingChild {
+        fn kill(&self) {
+            self.killed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A spy thrash hook recording the keys it was asked to clear.
+    #[derive(Debug, Default)]
+    struct SpyThrashClear {
+        cleared: Mutex<Vec<String>>,
+    }
+    impl ThrashClear for SpyThrashClear {
+        fn clear_flag(&self, key: &str) -> bool {
+            self.cleared.lock().unwrap().push(key.to_string());
+            true
+        }
+    }
+
+    #[test]
+    fn request_restart_is_performed_by_the_daemon_not_the_caller() {
+        let daemon = test_daemon();
+        let killed = Arc::new(AtomicBool::new(false));
+        // The fleet (phase 6) would register the target's real child; here a fake.
+        daemon.inner.lock().unwrap().control.attach_child(
+            "b",
+            Box::new(RecordingChild {
+                killed: Arc::clone(&killed),
+            }),
+        );
+
+        let reply = daemon.request_restart("a", "b");
+        assert_eq!(reply.state, "restarted");
+        assert!(reply.performed, "a live child was present and killed");
+        assert!(killed.load(Ordering::SeqCst), "the DAEMON killed the target");
+        // The restart is in flight (lease held by the requester), so a second
+        // request for the same target queues rather than double-killing.
+        let again = daemon.request_restart("c", "b");
+        assert_eq!(again.state, "queued");
+        assert!(!again.performed);
+    }
+
+    #[test]
+    fn request_restart_of_self_is_denied() {
+        let daemon = test_daemon();
+        let reply = daemon.request_restart("a", "a");
+        assert_eq!(reply.state, "denied");
+        assert!(!reply.performed);
+        assert!(reply.reason.unwrap().contains("itself"));
+    }
+
+    #[test]
+    fn restart_with_no_live_child_still_arbitrates_but_kills_nothing() {
+        let daemon = test_daemon();
+        // No child registered for "b" (production today): the lease is granted and
+        // the restart is "performed" as a no-op kill — the arbitration still ran.
+        let reply = daemon.request_restart("a", "b");
+        assert_eq!(reply.state, "restarted");
+        assert!(!reply.performed, "nothing live to kill");
+    }
+
+    #[test]
+    fn a_granted_lease_clears_the_thrash_flag_a_queued_one_does_not() {
+        let spy = Arc::new(SpyThrashClear::default());
+        let daemon = test_daemon().with_thrash_clear(Arc::clone(&spy) as Arc<dyn ThrashClear>);
+        let key = "dock.rs §Layout";
+
+        // Grant → the §4d rung-2 hook fires for this target.
+        let granted = daemon.request_lease("a", key);
+        assert_eq!(granted.state, "granted");
+        assert_eq!(granted.holder.as_deref(), Some("a"));
+        assert_eq!(*spy.cleared.lock().unwrap(), vec![key.to_string()]);
+
+        // A second agent is queued, NOT granted — so the flag hook does not fire
+        // again (only the agent that won the lease resolves the contention).
+        let queued = daemon.request_lease("b", key);
+        assert_eq!(queued.state, "waiting");
+        assert_eq!(queued.position, Some(1));
+        assert_eq!(queued.holder.as_deref(), Some("a"), "the holder is reported");
+        assert_eq!(
+            spy.cleared.lock().unwrap().len(),
+            1,
+            "a queued request clears nothing new",
+        );
+    }
+
+    #[test]
+    fn release_through_the_daemon_promotes_the_waiter_then_frees_the_key() {
+        let daemon = test_daemon();
+        let key = "shared.rs";
+        assert_eq!(daemon.request_lease("a", key).state, "granted");
+        assert_eq!(daemon.request_lease("b", key).state, "waiting");
+
+        // a releases → b is promoted to holder.
+        let rel = daemon.release_lease("a", key);
+        assert_eq!(rel.state, "released");
+        assert_eq!(rel.holder.as_deref(), Some("b"));
+
+        // A non-holder release is denied and changes nothing.
+        let denied = daemon.release_lease("a", key);
+        assert_eq!(denied.state, "denied");
+        assert_eq!(denied.holder.as_deref(), Some("b"), "b still holds it");
+
+        // b releases the last claim → the key is free again.
+        let freed = daemon.release_lease("b", key);
+        assert_eq!(freed.state, "released");
+        assert_eq!(freed.holder, None);
+        assert!(!daemon.inner.lock().unwrap().leases.is_held(key));
     }
 }

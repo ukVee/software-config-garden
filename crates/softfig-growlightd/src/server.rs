@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use softfig_ipc::growlightd::{
     op, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply, PausedReply,
-    StopAfterSliceArgs, StopLevel, StopReply,
+    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, StopAfterSliceArgs, StopLevel,
+    StopReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
@@ -133,6 +134,11 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         op::STOP_AFTER_SLICE => write_one_shot(&mut stream, stop_after_slice(&daemon, &req)),
         op::FORCE_STOP => write_one_shot(&mut stream, force_stop(&daemon, &req)),
         op::INJECT_MESSAGE => write_one_shot(&mut stream, inject_message(&daemon, &req)),
+        // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
+        // One-shot; growlightd grants/queues/denies and (for a restart) acts.
+        op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
+        op::RELEASE_LEASE => write_one_shot(&mut stream, release_lease(&daemon, &req)),
+        op::REQUEST_RESTART => write_one_shot(&mut stream, request_restart(&daemon, &req)),
         // ack-before-teardown: flush the ack, THEN flip to Stopping, so the
         // client is guaranteed its reply before the accept loop winds down
         // (keeperd incident 20260622).
@@ -300,6 +306,59 @@ fn inject_message(daemon: &Daemon, req: &Request) -> Response {
             queued,
         },
         "inject_message",
+    )
+}
+
+/// `request_lease`: arbitrate a lease over a shared resource/action (spec §4c).
+/// growlightd grants/queues; a granted lease over a thrash-flagged target clears
+/// that flag (§4d). One-shot ack carrying the resulting state.
+fn request_lease(daemon: &Daemon, req: &Request) -> Response {
+    let args: RequestLeaseArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if args.agent.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "agent must be non-empty");
+    }
+    if args.key.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "key must be non-empty");
+    }
+    ok_reply(&daemon.request_lease(&args.agent, &args.key), "request_lease")
+}
+
+/// `release_lease`: release a held lease, promoting the head waiter (spec §4c).
+/// A release by a non-holder comes back `denied`. One-shot ack.
+fn release_lease(daemon: &Daemon, req: &Request) -> Response {
+    let args: ReleaseLeaseArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if args.agent.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "agent must be non-empty");
+    }
+    if args.key.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "key must be non-empty");
+    }
+    ok_reply(&daemon.release_lease(&args.agent, &args.key), "release_lease")
+}
+
+/// `request_restart`: ask growlightd to restart another agent (spec §4c/§8).
+/// Arbitrated through a restart lease; a granted restart is performed by the
+/// DAEMON via the kill-safety path. Self-restart is denied. One-shot ack.
+fn request_restart(daemon: &Daemon, req: &Request) -> Response {
+    let args: RequestRestartArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if args.requester.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "requester must be non-empty");
+    }
+    if args.target.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "target must be non-empty");
+    }
+    ok_reply(
+        &daemon.request_restart(&args.requester, &args.target),
+        "request_restart",
     )
 }
 
