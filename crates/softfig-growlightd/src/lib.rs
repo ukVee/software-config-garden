@@ -25,6 +25,7 @@ pub mod daemon;
 pub mod handshake;
 pub mod hub;
 pub mod peer;
+pub mod scheduler;
 pub mod server;
 pub mod state;
 
@@ -34,4 +35,7 @@ pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
+pub use scheduler::{
+    classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
+};
 pub use state::State;
