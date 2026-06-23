@@ -25,6 +25,7 @@ pub mod daemon;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
+pub mod notifications;
 pub mod peer;
 pub mod scheduler;
 pub mod server;
@@ -37,6 +38,7 @@ pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
 pub use leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
+pub use notifications::{Channel, NotifyEvent, NotifyPolicy, UsageLevel};
 pub use scheduler::{
     classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
 };
