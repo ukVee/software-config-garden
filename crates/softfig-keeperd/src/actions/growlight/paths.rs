@@ -89,6 +89,22 @@ pub fn baton_log_dir() -> String {
     format!("{PILLAR}/baton-log")
 }
 
+/// The coordination-bus channel's numbered message log (phase 2). Audit-tracked
+/// and committed like `baton-log/`, but — unlike it — **injectable** (the
+/// SessionStart hook reads an agent's inbox from here) and likewise **excluded
+/// from the `[[…]]` backlink graph** (see `actions::backlinks`). Numbered
+/// `NNN-<slug>.md` with a `.seq`, reusing [`super::super::numbering`].
+pub fn chat_messages_dir() -> String {
+    format!("{PILLAR}/chat/messages")
+}
+
+/// A single agent's unread cursor: a daemon-owned file holding the last message
+/// number that agent has consumed (like `.seq`, never read by Claude). Lives
+/// beside the messages so a cursor and the log it indexes migrate together.
+pub fn chat_cursor(agent: &str) -> String {
+    format!("{PILLAR}/chat/cursors/{agent}")
+}
+
 // ---- validators --------------------------------------------------------
 
 /// `milestone | task`.

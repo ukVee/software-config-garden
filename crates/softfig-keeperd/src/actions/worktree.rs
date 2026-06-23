@@ -161,3 +161,32 @@ impl<'a> WorkTree<'a> {
         }
     }
 }
+
+/// The minimal working-tree surface a `.seq`-numbered doc store needs: read a
+/// file, list a directory, test existence, stage a write. Implemented by
+/// [`WorkTree`] for live daemons and by an in-memory fake in unit tests, so the
+/// numbered-store machinery ([`super::numbering`] + the growlight chat store)
+/// can be exercised with no daemon/mount behind it. The four methods mirror the
+/// inherent [`WorkTree`] methods of the same name; generic store code binds to
+/// the trait, concrete daemon code keeps calling the inherent methods.
+pub trait Tree {
+    fn read_to_string(&self, rel: &str) -> Option<String>;
+    fn read_dir(&self, rel: &str) -> Vec<DirEntry>;
+    fn exists(&self, rel: &str) -> bool;
+    fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult;
+}
+
+impl Tree for WorkTree<'_> {
+    fn read_to_string(&self, rel: &str) -> Option<String> {
+        WorkTree::read_to_string(self, rel)
+    }
+    fn read_dir(&self, rel: &str) -> Vec<DirEntry> {
+        WorkTree::read_dir(self, rel)
+    }
+    fn exists(&self, rel: &str) -> bool {
+        WorkTree::exists(self, rel)
+    }
+    fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        WorkTree::write(self, rel, bytes)
+    }
+}

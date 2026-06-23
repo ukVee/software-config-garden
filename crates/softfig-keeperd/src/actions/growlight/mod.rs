@@ -18,6 +18,7 @@
 //! live only in the `queue` region of `growlight/backlog/CLAUDE.md`; item docs
 //! never carry status (the locked Phase-1 schema pick).
 
+mod chat;
 mod init;
 mod paths;
 mod queue;

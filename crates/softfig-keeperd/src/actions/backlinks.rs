@@ -131,10 +131,14 @@ fn walk(wt: &WorkTree, dir_rel: &str, out: &mut Vec<String>) {
             format!("{dir_rel}/{}", entry.name)
         };
         if entry.is_dir {
-            if rel == "journal/archive" || rel == "growlight/baton-log" {
-                // graveyard + the growlight audit log: never source nor target.
-                // The baton-log is append-only and "never injected", so its
-                // `[[…]]` mentions must not forge edges onto live item docs.
+            if rel == "journal/archive"
+                || rel == "growlight/baton-log"
+                || rel == "growlight/chat"
+            {
+                // graveyard + the growlight audit log + the coordination bus:
+                // never source nor target. The baton-log/chat are append-only,
+                // high-churn coordination, so their `[[…]]` mentions must not
+                // forge edges onto live item docs (chat is injected, not graphed).
                 continue;
             }
             walk(wt, &rel, out);
@@ -145,13 +149,16 @@ fn walk(wt: &WorkTree, dir_rel: &str, out: &mut Vec<String>) {
 }
 
 /// Whether `rel` is excluded from being a backlink target (the archive
-/// graveyard + the growlight baton-log). Mirrors the source-walk skip so an
-/// archived doc — or an audit-only baton entry — never grows a region.
+/// graveyard + the growlight baton-log + the coordination chat bus). Mirrors
+/// the source-walk skip so an archived doc — or an audit-only baton entry, or a
+/// chat message — never grows a region.
 fn is_excluded(rel: &str) -> bool {
     rel == "journal/archive"
         || rel.starts_with("journal/archive/")
         || rel == "growlight/baton-log"
         || rel.starts_with("growlight/baton-log/")
+        || rel == "growlight/chat"
+        || rel.starts_with("growlight/chat/")
 }
 
 // ---- pure reference core ----------------------------------------------

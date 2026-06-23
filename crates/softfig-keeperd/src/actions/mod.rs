@@ -49,7 +49,7 @@ pub use migrate_config::migrate_config;
 pub use refresh_snapshot::refresh_snapshot;
 pub use sections::{add_section, append_to_section, edit_section, set_reviewed};
 pub use split::migrate_split;
-pub(crate) use worktree::WorkTree;
+pub(crate) use worktree::{Tree, WorkTree};
 
 use std::path::Path;
 

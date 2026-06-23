@@ -12,22 +12,23 @@
 
 use softfig_ipc::ErrorKind;
 
-use super::{conventions, WorkTree};
+use super::{conventions, Tree};
 
 /// The next note number for accretive folder `dir_rel`: one past the larger of
 /// the `.seq` high-water mark and the highest live `NNN-*.md` file. Reads run
-/// through the [`WorkTree`] so a FUSE-mode commit never stats the mount.
-pub fn next_number(wt: &WorkTree, dir_rel: &str) -> u32 {
+/// through the [`Tree`] (a [`super::WorkTree`] in the daemon) so a FUSE-mode
+/// commit never stats the mount.
+pub fn next_number<T: Tree>(wt: &T, dir_rel: &str) -> u32 {
     read_seq(wt, dir_rel).max(highest_live_number(wt, dir_rel)) + 1
 }
 
-fn read_seq(wt: &WorkTree, dir_rel: &str) -> u32 {
+fn read_seq<T: Tree>(wt: &T, dir_rel: &str) -> u32 {
     wt.read_to_string(&format!("{dir_rel}/{}", conventions::SEQ_FILE))
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0)
 }
 
-fn highest_live_number(wt: &WorkTree, dir_rel: &str) -> u32 {
+fn highest_live_number<T: Tree>(wt: &T, dir_rel: &str) -> u32 {
     wt.read_dir(dir_rel)
         .iter()
         .filter_map(|e| conventions::parse_note_number(&e.name))
@@ -36,7 +37,7 @@ fn highest_live_number(wt: &WorkTree, dir_rel: &str) -> u32 {
 }
 
 /// Garden-relative path of the `NNN-*.md` doc numbered `id` in `dir_rel`.
-pub fn find_by_id(wt: &WorkTree, dir_rel: &str, id: u32) -> Option<String> {
+pub fn find_by_id<T: Tree>(wt: &T, dir_rel: &str, id: u32) -> Option<String> {
     let prefix = format!("{id:03}-");
     wt.read_dir(dir_rel).into_iter().find_map(|e| {
         (e.name.starts_with(&prefix) && e.name.ends_with(".md"))
@@ -51,8 +52,8 @@ pub fn find_by_id(wt: &WorkTree, dir_rel: &str, id: u32) -> Option<String> {
 /// way that happens is a corrupt `.seq` whose number squats a live slot —
 /// refuse rather than clobber). `note_rel` is the garden-relative path of the
 /// new doc (`dir_rel/filename`).
-pub fn write_numbered(
-    wt: &WorkTree,
+pub fn write_numbered<T: Tree>(
+    wt: &T,
     dir_rel: &str,
     number: u32,
     note_rel: &str,
