@@ -254,7 +254,7 @@ registering the MCP server in `~/.claude.json`:
 
 ```bash
 cargo build --release
-install -m0755 target/release/{softfig,softfig-keeperd,softfig-mcp,softfig-tui} ~/.local/bin/
+install -m0755 target/release/{softfig,softfig-keeperd,softfig-mcp,softfig-tui,softfig-growlightd} ~/.local/bin/
 ```
 
 **3. Scaffold the garden**

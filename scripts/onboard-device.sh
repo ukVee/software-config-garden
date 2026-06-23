@@ -17,7 +17,7 @@ set -euo pipefail
 
 BIN_DIR="${HOME}/.local/bin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARIES=(softfig softfig-keeperd softfig-mcp softfig-tui)
+BINARIES=(softfig softfig-keeperd softfig-mcp softfig-tui softfig-growlightd)
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m!!!\033[0m %s\n' "$*"; }
