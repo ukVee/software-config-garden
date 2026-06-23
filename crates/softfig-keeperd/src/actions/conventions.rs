@@ -324,6 +324,20 @@ pub fn today_hyphen() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The current UTC wall-clock as an RFC 3339 timestamp
+/// (`YYYY-MM-DDTHH:MM:SSZ`). Used to stamp coordination-bus messages; purely
+/// informational (bus order is by message number, never by `ts`).
+pub fn now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let sod = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -208,6 +208,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::SET_ITEM_STATUS => crate::actions::set_item_status(daemon, req.args),
         op::REORDER_BACKLOG_ITEM => crate::actions::reorder_backlog_item(daemon, req.args),
         op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
+        op::POST_MESSAGE => crate::actions::post_message(daemon, req.args),
+        op::READ_INBOX => crate::actions::read_inbox(daemon, req.args),
         op::RELOCK_MINT => handlers::relock_mint(daemon, req.args),
         op::RELOCK_REDEEM => handlers::relock_redeem(daemon, req.args),
         op::ARCHIVE => crate::actions::archive(daemon, req.args),

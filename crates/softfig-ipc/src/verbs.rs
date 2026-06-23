@@ -147,6 +147,15 @@ pub mod op {
     /// Idempotent retrofit; one `growlight_initialized` commit, or none if the
     /// pillar already exists. Mirrors `migrate split`.
     pub const GROWLIGHT_INIT: &str = "growlight_init";
+    /// growlight Phase 2: post a message to the coordination bus — append a
+    /// numbered message under `growlight/chat/messages/` addressed to an agent
+    /// slug, `@all`, or `@human`. The daemon numbers it + stamps the wall-clock
+    /// `ts`. Mirrors `log_baton`; one `chat_message_posted` commit.
+    pub const POST_MESSAGE: &str = "post_message";
+    /// growlight Phase 2: read an agent's unread bus inbox — its lane messages
+    /// numbered above its stored cursor, in order — and advance the cursor past
+    /// them. One `inbox_read` commit when the cursor moves; none if empty.
+    pub const READ_INBOX: &str = "read_inbox";
     /// Growlight relock: mint a one-time token wrapping the live KEK so an
     /// unattended daemon restart can resume this session. Requires Unlocked +
     /// `[growlight] allow_relock = true`. `persist=true` (cycle and relock-arm)
@@ -1131,4 +1140,65 @@ pub struct GrowlightInitReply {
     pub committed: bool,
     /// The resulting commit hash, or the current tip if nothing changed.
     pub hash: String,
+}
+
+// ---- growlight Phase 2: the coordination bus verbs ---------------------
+
+/// `post_message({from, to, kind, body}) -> {number, path, hash}`. Append a
+/// message to the coordination bus. `to` selects the recipient lane (an agent
+/// slug, `@all` to fan into every agent's lane, or `@human`); `kind` is one of
+/// the six bus tokens. The daemon assigns the number and stamps `ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostMessageArgs {
+    /// Sender: an agent slug, or `@human` (the human is a first-class member).
+    pub from: String,
+    /// Addressee: an agent slug, `@all` (every agent's lane), or `@human`.
+    pub to: String,
+    /// Message kind: `info | coord-request | lease-request | question | alert |
+    /// restart-request`. An unknown token is rejected.
+    pub kind: String,
+    /// The message text (non-empty).
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostMessageReply {
+    /// The message's monotonic number (its total-order position on the bus).
+    pub number: u32,
+    /// Garden-relative path the daemon wrote (`growlight/chat/messages/NNN-…`).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `read_inbox({agent}) -> {messages}`. The agent's unread lane messages since
+/// its cursor, in total order; delivering them advances the cursor past the
+/// last one (one `inbox_read` commit, or none when the inbox is empty).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadInboxArgs {
+    /// The reading agent's slug.
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadInboxReply {
+    /// Unread messages in total order (oldest first).
+    pub messages: Vec<ChatMessage>,
+}
+
+/// One coordination-bus message as it crosses the wire. `to`/`kind` are the
+/// wire-token forms (`@all`/`@human`/slug; `coord-request`; …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// The message's monotonic number (its total-order position).
+    pub number: u32,
+    /// Sender slug, or `@human`.
+    pub from: String,
+    /// Addressee wire form: an agent slug, `@all`, or `@human`.
+    pub to: String,
+    /// Kind wire token.
+    pub kind: String,
+    /// The message text.
+    pub body: String,
+    /// Daemon-stamped wall-clock timestamp (informational; order is by number).
+    pub ts: String,
 }

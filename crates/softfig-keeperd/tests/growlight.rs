@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, AddBacklogItemReply, AddSliceReply, GrowlightInitReply, LogBatonReply,
-    ReorderBacklogItemReply, SetItemStatusReply,
+    op, AddBacklogItemReply, AddSliceReply, GrowlightInitReply, LogBatonReply, PostMessageReply,
+    ReadInboxReply, ReorderBacklogItemReply, SetItemStatusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -707,5 +707,122 @@ fn baton_log_is_excluded_from_backlinks() {
     assert!(
         !milestone.contains("baton-log"),
         "baton-log must not appear as a backlink source"
+    );
+}
+
+// ---- coordination bus: post_message / read_inbox ----------------------
+
+fn post(fx: &Fixture, from: &str, to: &str, kind: &str, body: &str) -> PostMessageReply {
+    let resp = fx.call(
+        op::POST_MESSAGE,
+        serde_json::json!({ "from": from, "to": to, "kind": kind, "body": body }),
+    );
+    serde_json::from_value(ok_data(resp)).unwrap()
+}
+
+fn inbox(fx: &Fixture, agent: &str) -> ReadInboxReply {
+    let resp = fx.call(op::READ_INBOX, serde_json::json!({ "agent": agent }));
+    serde_json::from_value(ok_data(resp)).unwrap()
+}
+
+#[test]
+fn post_message_writes_numbered_doc_and_commits() {
+    let fx = Fixture::start();
+    let reply = post(&fx, "agent-a", "agent-b", "coord-request", "please rebase");
+    assert_eq!(reply.number, 1);
+    assert_eq!(reply.path, "growlight/chat/messages/001-agent-a-to-agent-b.md");
+
+    let doc = fx.read(&reply.path);
+    assert!(doc.contains("- from: `agent-a`"));
+    assert!(doc.contains("- to: `agent-b`"));
+    assert!(doc.contains("- kind: `coord-request`"));
+    assert!(doc.contains("please rebase"));
+    assert_eq!(fx.read("growlight/chat/messages/.seq"), "1\n");
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "chat_message_posted");
+    assert_eq!(payload["number"], 1);
+    assert_eq!(payload["to"], "agent-b");
+}
+
+#[test]
+fn two_agents_exchange_and_read_inbox_is_since_cursor() {
+    let fx = Fixture::start();
+    // A posts a direct message to B: B's inbox sees it, A's (the author) does not.
+    post(&fx, "agent-a", "agent-b", "info", "hi b");
+    let b = inbox(&fx, "agent-b");
+    assert_eq!(b.messages.len(), 1);
+    assert_eq!(b.messages[0].number, 1);
+    assert_eq!(b.messages[0].from, "agent-a");
+    assert_eq!(b.messages[0].to, "agent-b");
+    assert_eq!(b.messages[0].kind, "info");
+    assert_eq!(b.messages[0].body, "hi b");
+    assert!(!b.messages[0].ts.is_empty());
+    assert!(inbox(&fx, "agent-a").messages.is_empty());
+
+    // Reading advanced B's cursor: a re-read is empty until a new message lands.
+    assert!(inbox(&fx, "agent-b").messages.is_empty());
+    post(&fx, "agent-a", "agent-b", "info", "and again");
+    let b2 = inbox(&fx, "agent-b");
+    assert_eq!(b2.messages.len(), 1);
+    assert_eq!(b2.messages[0].number, 2);
+    assert_eq!(b2.messages[0].body, "and again");
+}
+
+#[test]
+fn at_all_reaches_every_agent_and_human_posts_are_readable() {
+    let fx = Fixture::start();
+    // An @all message fans into every other agent's lane.
+    post(&fx, "agent-a", "@all", "info", "standup in 5");
+    assert_eq!(inbox(&fx, "agent-b").messages.len(), 1);
+    assert_eq!(inbox(&fx, "agent-c").messages.len(), 1);
+    assert!(inbox(&fx, "agent-a").messages.is_empty()); // not the author's own post
+
+    // The human is a first-class member: a message FROM @human is readable.
+    post(&fx, "@human", "agent-b", "question", "what's the status?");
+    let b = inbox(&fx, "agent-b");
+    assert_eq!(b.messages.len(), 1);
+    assert_eq!(b.messages[0].from, "@human");
+    assert_eq!(b.messages[0].kind, "question");
+    assert_eq!(b.messages[0].body, "what's the status?");
+}
+
+#[test]
+fn empty_read_inbox_makes_no_commit() {
+    let fx = Fixture::start();
+    post(&fx, "agent-a", "@all", "info", "x");
+    let tip_before = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    // agent-a is the author, so its inbox is empty → no cursor write, no commit.
+    assert!(inbox(&fx, "agent-a").messages.is_empty());
+    let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    assert_eq!(tip_after, tip_before, "an empty read must not mint a commit");
+}
+
+#[test]
+fn post_message_rejects_unknown_kind_and_bad_sender() {
+    let fx = Fixture::start();
+    // An unknown kind token is rejected by the verb.
+    assert_eq!(
+        err_kind(fx.call(
+            op::POST_MESSAGE,
+            serde_json::json!({ "from": "agent-a", "to": "@all", "kind": "shout", "body": "x" }),
+        )),
+        ErrorKind::BadArgs
+    );
+    // A non-slug sender is rejected by the store's validation.
+    assert_eq!(
+        err_kind(fx.call(
+            op::POST_MESSAGE,
+            serde_json::json!({ "from": "Bad Sender", "to": "@all", "kind": "info", "body": "x" }),
+        )),
+        ErrorKind::InvalidSlug
+    );
+    // An empty body is rejected.
+    assert_eq!(
+        err_kind(fx.call(
+            op::POST_MESSAGE,
+            serde_json::json!({ "from": "agent-a", "to": "@all", "kind": "info", "body": "  " }),
+        )),
+        ErrorKind::BadArgs
     );
 }

@@ -18,8 +18,8 @@ use softfig_ipc::{
     verbs::{
         op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, EditSectionArgs, LogBatonArgs, LogDecisionArgs,
-        LogIncidentArgs, RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs,
-        ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
+        LogIncidentArgs, PostMessageArgs, ReadInboxArgs, RefreshSnapshotArgs,
+        ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
     },
     Request, Response,
 };
@@ -398,6 +398,41 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "post_message",
+            "description": "growlight: post a message to the coordination bus (the fleet's \
+                            human-visible groupchat). Appends a numbered message under \
+                            growlight/chat/messages/ addressed to an agent slug, @all (every \
+                            agent's lane), or @human. kind is one of info | coord-request | \
+                            lease-request | question | alert | restart-request. The daemon assigns \
+                            the number and stamps the timestamp. Async turn-boundary: post at \
+                            handoff, not mid-iteration.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["from", "to", "kind", "body"],
+                "properties": {
+                    "from": { "type": "string", "description": "sender: this agent's slug, or @human" },
+                    "to": { "type": "string", "description": "addressee: an agent slug, @all, or @human" },
+                    "kind": { "type": "string", "description": "info | coord-request | lease-request | question | alert | restart-request" },
+                    "body": { "type": "string", "description": "the message text (non-empty)" },
+                },
+            },
+        }),
+        json!({
+            "name": "read_inbox",
+            "description": "growlight: read an agent's unread coordination-bus inbox — its lane \
+                            messages (direct + @all, minus its own posts) numbered above its cursor, \
+                            oldest first — and advance the cursor past them so the next read returns \
+                            only newer messages. Read your inbox at boot. Returns a list of \
+                            {number, from, to, kind, body, ts}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["agent"],
+                "properties": {
+                    "agent": { "type": "string", "description": "the reading agent's slug" },
+                },
+            },
+        }),
+        json!({
             "name": "replace_file",
             "description": "BREAK-GLASS: overwrite a garden file with verbatim bytes — no \
                             convention stamping, so you hand-write the ENTIRE file (frontmatter, \
@@ -494,14 +529,47 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: ReorderBacklogItemArgs = serde_json::from_value(args)?;
             (op::REORDER_BACKLOG_ITEM, serde_json::to_value(a)?)
         }
+        "post_message" => {
+            let a: PostMessageArgs = serde_json::from_value(args)?;
+            (op::POST_MESSAGE, serde_json::to_value(a)?)
+        }
+        "read_inbox" => {
+            let a: ReadInboxArgs = serde_json::from_value(args)?;
+            (op::READ_INBOX, serde_json::to_value(a)?)
+        }
         other => anyhow::bail!("unknown tool {other:?}"),
     };
     Ok(pair)
 }
 
-/// Render a one-line human summary of a verb's success `data`. Handles
-/// every reply shape in the tool surface (path / from+to).
+/// Render a human summary of a verb's success `data`. Handles every reply
+/// shape in the tool surface (path / from+to / the `read_inbox` message list).
+/// The MCP forwards only this text to the caller, so `read_inbox` must render
+/// its messages here — that IS how an agent reads its inbox.
 fn summarize(name: &str, data: &Value) -> String {
+    if name == "read_inbox" {
+        let msgs = data.get("messages").and_then(|v| v.as_array());
+        return match msgs {
+            Some(ms) if !ms.is_empty() => {
+                let lines: Vec<String> = ms
+                    .iter()
+                    .map(|m| {
+                        let g = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+                        let n = m.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+                        format!(
+                            "#{n} [{}] {} -> {}: {}",
+                            g("kind"),
+                            g("from"),
+                            g("to"),
+                            g("body")
+                        )
+                    })
+                    .collect();
+                format!("read_inbox: {} unread\n{}", ms.len(), lines.join("\n"))
+            }
+            _ => "read_inbox: inbox empty".to_string(),
+        };
+    }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
         data.get("from").and_then(|v| v.as_str()),
@@ -548,9 +616,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_seventeen() {
+    fn tools_list_has_nineteen() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 17);
+        assert_eq!(defs.len(), 19);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -570,6 +638,8 @@ mod tests {
             "add_slice",
             "set_item_status",
             "reorder_backlog_item",
+            "post_message",
+            "read_inbox",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -579,7 +649,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 19);
     }
 
     #[test]
@@ -654,6 +724,16 @@ mod tests {
                 op::REORDER_BACKLOG_ITEM,
             ),
             (
+                "post_message",
+                json!({ "from": "roudy", "to": "@all", "kind": "info", "body": "hi" }),
+                op::POST_MESSAGE,
+            ),
+            (
+                "read_inbox",
+                json!({ "agent": "roudy" }),
+                op::READ_INBOX,
+            ),
+            (
                 "replace_file",
                 json!({ "path": "p", "content": "c" }),
                 op::REPLACE_FILE,
@@ -677,5 +757,21 @@ mod tests {
         assert!(summarize("archive", &json!({ "from": "a", "to": "b", "hash": "h" }))
             .contains("a -> b"));
         assert!(summarize("replace_file", &json!({ "path": "p", "hash": "h" })).contains("wrote p"));
+        // post_message reports the written message doc.
+        assert!(summarize(
+            "post_message",
+            &json!({ "number": 3, "path": "growlight/chat/messages/003-a-to-all.md", "hash": "h" })
+        )
+        .contains("wrote growlight/chat/messages/003-a-to-all.md"));
+        // read_inbox renders the messages themselves (the MCP forwards only text).
+        let inbox = summarize(
+            "read_inbox",
+            &json!({ "messages": [
+                { "number": 2, "from": "roudy", "to": "@all", "kind": "info", "body": "rebased" },
+            ] }),
+        );
+        assert!(inbox.contains("1 unread"));
+        assert!(inbox.contains("#2 [info] roudy -> @all: rebased"));
+        assert!(summarize("read_inbox", &json!({ "messages": [] })).contains("inbox empty"));
     }
 }

@@ -41,7 +41,8 @@ pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
 pub use growlight::{
-    add_backlog_item, add_slice, growlight_init, log_baton, reorder_backlog_item, set_item_status,
+    add_backlog_item, add_slice, growlight_init, log_baton, post_message, read_inbox,
+    reorder_backlog_item, set_item_status,
 };
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;

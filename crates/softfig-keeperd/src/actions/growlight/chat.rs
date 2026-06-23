@@ -21,8 +21,6 @@
 //! high-churn coordination, so a `[[ref]]` in a message must not forge a
 //! backlink edge onto a live item doc.
 
-#![allow(dead_code)] // store seam wired by slice 002 (post_message / read_inbox)
-
 use softfig_ipc::ErrorKind;
 
 use super::super::{conventions, numbering, Tree};
@@ -239,12 +237,7 @@ pub fn append<T: Tree>(tree: &T, draft: &Draft, ts: &str) -> StoreResult<Message
 
     let dir = paths::chat_messages_dir();
     let number = numbering::next_number(tree, &dir);
-    let slug = conventions::slugify(&format!(
-        "{}-to-{}",
-        sender_label(&draft.from),
-        draft.to.label()
-    ));
-    let rel = format!("{dir}/{}", conventions::note_filename(number, &slug));
+    let rel = message_rel(number, draft);
     let content = message_doc(number, draft, ts, &conventions::today_hyphen());
     numbering::write_numbered(tree, &dir, number, &rel, &content)?;
 
@@ -267,6 +260,19 @@ fn sender_label(from: &str) -> &str {
     }
 }
 
+/// The garden-relative path a message with this `number` and `draft` is stored
+/// at — the single source of truth for the message filename, shared by
+/// [`append`] (when it writes) and the `post_message` verb (to report `path`).
+pub fn message_rel(number: u32, draft: &Draft) -> String {
+    let dir = paths::chat_messages_dir();
+    let slug = conventions::slugify(&format!(
+        "{}-to-{}",
+        sender_label(&draft.from),
+        draft.to.label()
+    ));
+    format!("{dir}/{}", conventions::note_filename(number, &slug))
+}
+
 /// Every message in the channel, in total order (ascending `number`). Corrupt
 /// docs are skipped (see [`parse_message`]).
 pub fn all_messages<T: Tree>(tree: &T) -> Vec<Message> {
@@ -286,6 +292,10 @@ pub fn all_messages<T: Tree>(tree: &T) -> Vec<Message> {
 
 /// Every message in `agent`'s lane, in total order — direct messages to it and
 /// `@all` messages, minus its own posts.
+// The since-cursor `unread` is what the slice-002 verb reads; the full `lane`
+// view is exercised by the store tests and is the seam slice 003's subscribe
+// fan-out renders from.
+#[allow(dead_code)]
 pub fn lane<T: Tree>(tree: &T, agent: &str) -> Vec<Message> {
     all_messages(tree)
         .into_iter()

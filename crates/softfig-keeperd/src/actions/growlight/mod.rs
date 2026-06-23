@@ -27,9 +27,9 @@ pub use init::growlight_init;
 
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{
-    AddBacklogItemArgs, AddBacklogItemReply, AddSliceArgs, AddSliceReply, LogBatonArgs,
-    LogBatonReply, ReorderBacklogItemArgs, ReorderBacklogItemReply, SetItemStatusArgs,
-    SetItemStatusReply,
+    AddBacklogItemArgs, AddBacklogItemReply, AddSliceArgs, AddSliceReply, ChatMessage, LogBatonArgs,
+    LogBatonReply, PostMessageArgs, PostMessageReply, ReadInboxArgs, ReadInboxReply,
+    ReorderBacklogItemArgs, ReorderBacklogItemReply, SetItemStatusArgs, SetItemStatusReply,
 };
 use softfig_ipc::ErrorKind;
 
@@ -104,6 +104,97 @@ pub fn log_baton(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let hash = commit_now(&mut inner, intent)?;
 
     Ok(serde_json::to_value(LogBatonReply { path: note_rel, hash: hash.to_string() }).unwrap())
+}
+
+// ---- coordination bus: post_message / read_inbox ----------------------
+
+/// Append a message to the coordination bus. Mirrors `log_baton`: build the
+/// numbered doc through the `WorkTree`, then `commit_now` one
+/// `chat_message_posted` intent. The store ([`chat::append`]) validates the
+/// sender, the direct-recipient slug, and a non-empty body; here we map the
+/// wire `to`/`kind` strings to the store enums and reject an unknown `kind`.
+pub fn post_message(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: PostMessageArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("post_message args: {e}")))?;
+    let kind = chat::MessageKind::parse(&args.kind)
+        .ok_or((ErrorKind::BadArgs, format!("post_message: unknown kind {:?}", args.kind)))?;
+    let draft = chat::Draft {
+        from: args.from,
+        to: chat::Recipient::parse(&args.to),
+        kind,
+        body: args.body,
+    };
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let ts = conventions::now_rfc3339();
+    let (msg, note_rel) = {
+        let wt = WorkTree::new(daemon, &inner);
+        let msg = chat::append(&wt, &draft, &ts)?;
+        let note_rel = chat::message_rel(msg.number, &draft);
+        (msg, note_rel)
+    };
+
+    let payload = serde_json::json!({
+        "number": msg.number, "from": msg.from, "to": msg.to.to_wire(), "kind": msg.kind.as_wire(),
+    });
+    let intent = Intent::new("chat_message_posted", payload)
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    let hash = commit_now(&mut inner, intent)?;
+
+    Ok(serde_json::to_value(PostMessageReply {
+        number: msg.number,
+        path: note_rel,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+/// Read an agent's unread bus inbox (its lane messages since its cursor) and
+/// advance the cursor past them. The cursor write is the only mutation, and
+/// only when the inbox is non-empty — `unread` returns lane messages numbered
+/// strictly above the cursor, so a non-empty result always moves it. This
+/// is the boot-inbox seam slice 003's SessionStart inject renders from. The
+/// read-mints-a-commit fork is documented in the slice-001 Outcome; it is wired
+/// here as decided, not redesigned.
+pub fn read_inbox(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: ReadInboxArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("read_inbox args: {e}")))?;
+    conventions::validate_slug(&args.agent)?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (messages, advanced_to) = {
+        let wt = WorkTree::new(daemon, &inner);
+        let unread = chat::unread(&wt, &args.agent);
+        let advanced_to = unread.iter().map(|m| m.number).max();
+        if let Some(n) = advanced_to {
+            chat::advance_cursor(&wt, &args.agent, n)?;
+        }
+        let messages: Vec<ChatMessage> = unread
+            .into_iter()
+            .map(|m| ChatMessage {
+                number: m.number,
+                from: m.from,
+                to: m.to.to_wire(),
+                kind: m.kind.as_wire().to_string(),
+                body: m.body,
+                ts: m.ts,
+            })
+            .collect();
+        (messages, advanced_to)
+    };
+
+    if let Some(n) = advanced_to {
+        let payload = serde_json::json!({ "agent": args.agent, "through": n });
+        let intent = Intent::new("inbox_read", payload)
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+        commit_now(&mut inner, intent)?;
+    }
+
+    Ok(serde_json::to_value(ReadInboxReply { messages }).unwrap())
 }
 
 // ---- add_backlog_item --------------------------------------------------
