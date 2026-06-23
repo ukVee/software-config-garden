@@ -18,7 +18,9 @@
 //! live only in the `queue` region of `growlight/backlog/CLAUDE.md`; item docs
 //! never carry status (the locked Phase-1 schema pick).
 
-mod chat;
+// `pub(crate)` so the section-edit path (`actions::sections`) can post a
+// thrash nudge through the same store as `post_message` (spec §4d).
+pub(crate) mod chat;
 mod init;
 mod paths;
 mod queue;

@@ -338,6 +338,16 @@ pub fn now_rfc3339() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+/// The current Unix wall-clock in whole seconds. Feeds the thrash detector's
+/// window math; the detector itself takes an injected `now` so its tests never
+/// touch the real clock (this is only called on the live edit path).
+pub fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

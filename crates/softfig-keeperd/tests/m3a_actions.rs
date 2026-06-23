@@ -675,6 +675,7 @@ fn edit_section_replaces_body_keeps_siblings() {
             heading: "Alpha".into(),
             body: "new alpha".into(),
             expected_version: None,
+            editor: None,
         })
         .unwrap(),
     );
@@ -700,6 +701,7 @@ fn append_to_section_adds_row() {
             heading: "## Cross-refs".into(),
             text: "- baz".into(),
             expected_version: None,
+            editor: None,
         })
         .unwrap(),
     );

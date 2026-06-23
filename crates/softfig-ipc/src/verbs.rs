@@ -587,6 +587,12 @@ pub struct EditSectionArgs {
     /// unconditional last-writer-wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity, fed
+    /// to the daemon's ping-pong detector (spec §4d). Absent → a generic
+    /// `"anon"`, so a single-editor loop never self-trips; the concurrent fleet
+    /// (phase 6) passes real per-agent slugs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 /// `append_to_section({path, heading, text}) -> {path, hash}`. Add `text`
@@ -603,6 +609,10 @@ pub struct AppendToSectionArgs {
     /// caller read; see [`EditSectionArgs::expected_version`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity; see
+    /// [`EditSectionArgs::editor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 /// `set_reviewed({path}) -> {path, hash}`. Rewrite the doc's `Last

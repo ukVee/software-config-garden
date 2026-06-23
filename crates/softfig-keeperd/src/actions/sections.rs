@@ -37,6 +37,7 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::ErrorKind;
 
+use super::growlight::chat;
 use super::{commit_now, conventions, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{
@@ -87,7 +88,10 @@ pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         let version = edit::section_version(&new, &args.heading).unwrap_or_default();
         (new, version)
     };
-    write_and_commit(daemon, &mut inner, &rel, new, "section_edited", &args.heading, version)
+    let reply =
+        write_and_commit(daemon, &mut inner, &rel, new, "section_edited", &args.heading, version)?;
+    note_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
+    Ok(reply)
 }
 
 pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -110,7 +114,17 @@ pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
         let version = edit::section_version(&new, &args.heading).unwrap_or_default();
         (new, version)
     };
-    write_and_commit(daemon, &mut inner, &rel, new, "section_appended", &args.heading, version)
+    let reply = write_and_commit(
+        daemon,
+        &mut inner,
+        &rel,
+        new,
+        "section_appended",
+        &args.heading,
+        version,
+    )?;
+    note_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
+    Ok(reply)
 }
 
 pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -262,6 +276,63 @@ fn write_and_commit(
         version,
     })
     .unwrap())
+}
+
+/// After a section edit commits, feed `(target, editor)` into the daemon's
+/// ping-pong detector (spec §4d). On a trip — an A↔B alternation on the same
+/// `(path, heading)` within the window — post one `coord-request` nudge to the
+/// coordination bus ("settle `<target>`") from the system sender `growlightd`
+/// to `@all`, commit it (`chat_message_posted`), and flag the target for a
+/// lease. The lease GRANT + @human escalation are the next §4d rungs and land
+/// with the scheduler milestone (phase 4); here we only nudge + flag, leaving a
+/// clean hook (`inner.thrash` carries the lease flag).
+///
+/// Best-effort + side-channel: the underlying edit already committed and its
+/// reply is returned regardless, so a failed nudge never fails the edit. The
+/// caller still holds `inner`, so the nudge commit is serialized after the edit
+/// on the same lock. `editor` defaults to `"anon"` when absent — a lone editor
+/// can't alternate with itself, so the single-agent loop never trips.
+fn note_edit_for_thrash(
+    daemon: &Daemon,
+    inner: &mut DaemonInner,
+    rel: &str,
+    heading_arg: &str,
+    editor: Option<&str>,
+) {
+    let (_level, heading_text) = edit::parse_heading_arg(heading_arg);
+    let editor = editor.unwrap_or("anon");
+    let now = conventions::now_unix_secs();
+    let Some(trip) = inner.thrash.record(rel, Some(&heading_text), editor, now) else {
+        return;
+    };
+
+    let (a, b) = (
+        trip.editors.first().map(String::as_str).unwrap_or("?"),
+        trip.editors.get(1).map(String::as_str).unwrap_or("?"),
+    );
+    let draft = chat::Draft {
+        from: "growlightd".to_string(),
+        to: chat::Recipient::All,
+        kind: chat::MessageKind::CoordRequest,
+        body: format!(
+            "settle `{}` — `{a}` and `{b}` are editing it back and forth",
+            trip.target_label(),
+        ),
+    };
+    let ts = conventions::now_rfc3339();
+    let msg = {
+        let wt = WorkTree::new(daemon, inner);
+        match chat::append(&wt, &draft, &ts) {
+            Ok(m) => m,
+            Err(_) => return, // best-effort: the edit already landed
+        }
+    };
+    let payload = serde_json::json!({
+        "number": msg.number, "from": msg.from, "to": msg.to.to_wire(), "kind": msg.kind.as_wire(),
+    });
+    if let Ok(intent) = Intent::new("chat_message_posted", payload) {
+        let _ = commit_now(inner, intent);
+    }
 }
 
 fn section_err(rel: &str, heading: &str, e: edit::SectionError) -> (ErrorKind, String) {

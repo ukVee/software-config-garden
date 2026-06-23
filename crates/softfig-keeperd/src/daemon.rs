@@ -75,6 +75,12 @@ pub struct DaemonInner {
     /// the user's out-of-band SAS confirmation (`pair_confirm`). Each
     /// holds a live socket, so they are pruned + dropped on lock.
     pub pending_pairs: PendingPairs,
+    /// Phase 3 (slice 002): ping-pong contention detector (spec §4d). Fed one
+    /// `(target, editor)` per committed section edit; on an A↔B thrash it
+    /// returns a `Trip` so the edit path posts a single coordination-bus nudge
+    /// and flags the target for a lease. Lives here (under `inner`'s mutex) so
+    /// every serialized edit sees one consistent history.
+    pub thrash: crate::actions::ThrashDetector,
 }
 
 impl DaemonInner {
@@ -89,6 +95,7 @@ impl DaemonInner {
             last_reveal_at: None,
             net: None,
             pending_pairs: PendingPairs::default(),
+            thrash: crate::actions::ThrashDetector::new(),
         }
     }
 }

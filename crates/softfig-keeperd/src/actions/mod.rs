@@ -35,6 +35,7 @@ mod numbering;
 mod refresh_snapshot;
 pub(crate) mod sections;
 mod split;
+mod thrash;
 mod worktree;
 
 pub use add_note::{add_note, revise_note};
@@ -50,6 +51,7 @@ pub use migrate_config::migrate_config;
 pub use refresh_snapshot::refresh_snapshot;
 pub use sections::{add_section, append_to_section, edit_section, set_reviewed};
 pub use split::migrate_split;
+pub use thrash::ThrashDetector;
 pub(crate) use worktree::{Tree, WorkTree};
 
 use std::path::Path;
