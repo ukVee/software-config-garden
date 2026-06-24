@@ -374,6 +374,26 @@ impl Supervisor {
             .map_or(0, |s| s.consecutive_failures)
     }
 
+    /// Whether `agent` is registered with the supervisor at all — running OR
+    /// awaiting a re-roll. The drive loop gates a fresh [`Intent::Start`] on this:
+    /// an agent the supervisor already manages re-rolls via [`tick`](Self::tick),
+    /// it is never re-`start`ed (which would reset its crash streak / slot).
+    pub fn is_registered(&self, agent: &str) -> bool {
+        self.agents.contains_key(agent)
+    }
+
+    /// Retire `agent` from the fleet — drop its supervised state and hand back any
+    /// still-live child so the caller can kill it OUTSIDE the daemon lock (the
+    /// [`AgentChild`] contract, incident 20260622). The drive loop calls this to
+    /// honor a boundary stop (`stop_after_slice` / `stop_after_iteration`): once a
+    /// retiring agent reaches its boundary it must NOT be re-rolled, so it leaves
+    /// the supervised set entirely. Returns the live child if one was running (an
+    /// immediate stop), or `None` if the agent was unknown or already down (a
+    /// graceful boundary stop — the agent has already exited).
+    pub fn retire(&mut self, agent: &str) -> Option<Box<dyn AgentChild>> {
+        self.agents.remove(agent).and_then(|s| s.child)
+    }
+
     /// Register and start a brand-new agent ([`Intent::Start`]). The cap *and*
     /// budget/rate gate it; on admit the backend spawns it and it joins the
     /// fleet. A queue/refuse leaves it unregistered for the drive loop to retry.
@@ -933,5 +953,48 @@ mod tests {
         assert_eq!(b.delay(3), 20);
         assert_eq!(b.delay(7), 300, "5<<6 == 320 → capped at 300");
         assert_eq!(b.delay(1000), 300, "a long streak never overflows, pins at cap");
+    }
+
+    /// `is_registered` tracks membership across a crash (awaiting re-roll is still
+    /// registered) and a retire (gone).
+    #[test]
+    fn is_registered_tracks_membership_across_a_crash_and_retire() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        assert!(!s.is_registered("a1"), "unknown agent is not registered");
+
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert!(s.is_registered("a1") && s.is_running("a1"));
+
+        // A crashed agent awaiting its re-roll is still registered (the loop must
+        // not re-`start` it — `tick` rolls it).
+        s.poll("a1", AgentHealth::Exited { code: 1 }, 0);
+        assert!(!s.is_running("a1"));
+        assert!(s.is_registered("a1"), "awaiting a re-roll is still registered");
+
+        // Retire drops it entirely (no live child while awaiting a re-roll).
+        assert!(s.retire("a1").is_none());
+        assert!(!s.is_registered("a1"), "retired agent is gone");
+    }
+
+    /// `retire` hands back a running agent's live child for an outside-the-lock
+    /// kill, and retires an unknown/down agent to nothing.
+    #[test]
+    fn retire_returns_a_live_child_then_drops_the_agent() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert!(s.is_running("a1"));
+
+        // A running agent's retire yields its child (the loop kills it OUTSIDE the
+        // lock for an immediate stop).
+        let child = s.retire("a1").expect("a running agent yields its child");
+        child.kill();
+        assert_eq!(backend.kill_count(), 1, "the retired child was killed");
+        assert!(!s.is_registered("a1"), "retired agent left the fleet");
+
+        // A second retire (or an unknown agent) finds nothing.
+        assert!(s.retire("a1").is_none());
+        assert!(s.retire("ghost").is_none());
     }
 }
