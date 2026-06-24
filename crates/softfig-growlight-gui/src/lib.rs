@@ -7,6 +7,8 @@
 //! - [`App`] — the panel state model (fleet status, the per-agent thoughts feed,
 //!   the groupchat, the lease/roster, budgets, policy).
 //! - [`Message`] + [`update`] — the pure reducer, the tested heart.
+//! - [`selectors`] — pure derivations (filter/join/order) the panels walk: the
+//!   per-agent thoughts window, the roster⋈leases "who holds what", the fleet rows.
 //! - [`render`] — text-shaped panel content the deferred `view()` maps to widgets.
 //! - [`drive_messages`] — the bridge: run the shared reconnecting subscribe client
 //!   ([`softfig_growlightd_client`]) and hand each frame to the runtime as a
@@ -24,9 +26,14 @@
 //! [`render`] projections.
 
 pub mod render;
+pub mod selectors;
 pub mod state;
 pub mod update;
 
+pub use selectors::{
+    agent_thoughts, agents_with_thoughts, fleet_status_rows, who_holds_what, RosterEntry,
+    WhoHoldsWhat,
+};
 pub use state::{
     AgentRow, App, Budgets, ChatLine, ConnState, LeaseRow, ThoughtLine, MAX_CHAT, MAX_THOUGHTS,
 };
