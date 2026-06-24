@@ -43,7 +43,7 @@ pub use add_project::add_project;
 pub use archive::archive;
 pub use growlight::{
     add_backlog_item, add_queue, add_slice, growlight_init, log_baton, post_message, read_inbox,
-    reorder_backlog_item, set_item_status, tail_bus,
+    release_lease, reorder_backlog_item, request_lease, set_item_status, tail_bus,
 };
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;

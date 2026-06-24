@@ -187,6 +187,17 @@ pub mod op {
     /// token hex redeems an in-RAM token. Single-use: the blob is deleted on
     /// success.
     pub const RELOCK_REDEEM: &str = "relock_redeem";
+    /// growlight Phase 4 (coordination, spec §4c/§14): agent-facing
+    /// `request_lease` — ask the supervisor to arbitrate a lease over a shared
+    /// resource/action (the lease `key`). keeperd does not decide; it forwards
+    /// to growlightd (which owns the `LeaseTable`) and relays the `LeaseReply`.
+    /// The FIRST keeperd→growlightd call (the bus bridge is the other
+    /// direction). Commit-free — leases are ephemeral in-memory state.
+    pub const REQUEST_LEASE: &str = "request_lease";
+    /// growlight Phase 4 (coordination): agent-facing `release_lease` — release a
+    /// held lease, promoting the head waiter. Forwarded keeperd→growlightd like
+    /// [`REQUEST_LEASE`]; a release by a non-holder comes back `denied`.
+    pub const RELEASE_LEASE: &str = "release_lease";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

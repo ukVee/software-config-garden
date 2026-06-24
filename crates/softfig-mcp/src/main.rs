@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use softfig_ipc::{
     self,
+    growlightd::{ReleaseLeaseArgs, RequestLeaseArgs},
     verbs::{
         op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs, AddSectionArgs,
         AddSliceArgs,
@@ -457,6 +458,43 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "request_lease",
+            "description": "growlight: request a supervisor-arbitrated lease over a shared \
+                            resource/action (spec §4c). Dangerous shared work — a whole-file \
+                            rewrite, restarting another agent, a build touching a shared dep — \
+                            does NOT go through chat: you REQUEST a lease by an opaque key (for a \
+                            contended garden section, the thrash target label 'path §heading'), \
+                            and growlightd grants it, queues you behind the holder, or denies it. \
+                            Agents never act on each other directly. Re-requesting is idempotent. \
+                            Returns {key, state: granted|waiting|denied, holder, position}. \
+                            Requires growlightd running (the fleet orchestrator).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["agent", "key"],
+                "properties": {
+                    "agent": { "type": "string", "description": "this agent's (work-stream) id" },
+                    "key": { "type": "string", "description": "the lease key naming the shared resource/action (e.g. 'dock.rs §Layout')" },
+                },
+            },
+        }),
+        json!({
+            "name": "release_lease",
+            "description": "growlight: release a lease you hold (spec §4c), promoting the head \
+                            waiter (if any) to holder so the resource is handed on. A release by a \
+                            non-holder is refused (state: denied) and changes nothing. Returns \
+                            {key, state: released|denied, holder} where holder is the promoted \
+                            waiter, or null if the key is now free. Release as soon as the \
+                            dangerous action completes.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["agent", "key"],
+                "properties": {
+                    "agent": { "type": "string", "description": "this agent's id (must be the current holder)" },
+                    "key": { "type": "string", "description": "the lease key to release" },
+                },
+            },
+        }),
+        json!({
             "name": "replace_file",
             "description": "BREAK-GLASS: overwrite a garden file with verbatim bytes — no \
                             convention stamping, so you hand-write the ENTIRE file (frontmatter, \
@@ -587,6 +625,14 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: FileProvenanceArgs = serde_json::from_value(args)?;
             (op::FILE_PROVENANCE, serde_json::to_value(a)?)
         }
+        "request_lease" => {
+            let a: RequestLeaseArgs = serde_json::from_value(args)?;
+            (op::REQUEST_LEASE, serde_json::to_value(a)?)
+        }
+        "release_lease" => {
+            let a: ReleaseLeaseArgs = serde_json::from_value(args)?;
+            (op::RELEASE_LEASE, serde_json::to_value(a)?)
+        }
         other => anyhow::bail!("unknown tool {other:?}"),
     };
     Ok(pair)
@@ -640,6 +686,24 @@ fn summarize(name: &str, data: &Value) -> String {
             _ => format!("file_provenance {path}: no recorded edits"),
         };
     }
+    if name == "request_lease" || name == "release_lease" {
+        let g = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+        let key = g("key");
+        let state = g("state");
+        let mut detail = String::new();
+        if let Some(h) = data.get("holder").and_then(|v| v.as_str()) {
+            detail.push_str(&format!(" (holder {h})"));
+        } else if state == "released" {
+            detail.push_str(" (free)");
+        }
+        if let Some(p) = data.get("position").and_then(|v| v.as_u64()) {
+            detail.push_str(&format!(" [position {p}]"));
+        }
+        if let Some(r) = data.get("reason").and_then(|v| v.as_str()) {
+            detail.push_str(&format!(" — {r}"));
+        }
+        return format!("{name} {key}: {state}{detail}");
+    }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
         data.get("from").and_then(|v| v.as_str()),
@@ -691,9 +755,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_one() {
+    fn tools_list_has_twenty_three() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 21);
+        assert_eq!(defs.len(), 23);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -717,6 +781,8 @@ mod tests {
             "post_message",
             "read_inbox",
             "file_provenance",
+            "request_lease",
+            "release_lease",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -726,7 +792,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 23);
     }
 
     #[test]
@@ -821,6 +887,16 @@ mod tests {
                 op::FILE_PROVENANCE,
             ),
             (
+                "request_lease",
+                json!({ "agent": "roudy", "key": "dock.rs §Layout" }),
+                op::REQUEST_LEASE,
+            ),
+            (
+                "release_lease",
+                json!({ "agent": "roudy", "key": "dock.rs §Layout" }),
+                op::RELEASE_LEASE,
+            ),
+            (
                 "replace_file",
                 json!({ "path": "p", "content": "c" }),
                 op::REPLACE_FILE,
@@ -873,5 +949,26 @@ mod tests {
         assert!(prov.contains("1 edit(s)"));
         assert!(prov.contains("abcdef12 [section_edited] tablet"));
         assert!(summarize("file_provenance", &json!({ "path": "p", "edits": [] })).contains("no recorded edits"));
+        // lease replies render key + state + holder/position/reason (no commit hash).
+        assert_eq!(
+            summarize("request_lease", &json!({ "key": "dock.rs §Layout", "state": "granted", "holder": "a" })),
+            "request_lease dock.rs §Layout: granted (holder a)"
+        );
+        assert_eq!(
+            summarize("request_lease", &json!({ "key": "k", "state": "waiting", "holder": "a", "position": 2 })),
+            "request_lease k: waiting (holder a) [position 2]"
+        );
+        assert_eq!(
+            summarize("release_lease", &json!({ "key": "k", "state": "released" })),
+            "release_lease k: released (free)"
+        );
+        assert_eq!(
+            summarize("release_lease", &json!({ "key": "k", "state": "released", "holder": "b" })),
+            "release_lease k: released (holder b)"
+        );
+        assert_eq!(
+            summarize("release_lease", &json!({ "key": "k", "state": "denied", "reason": "only the lease holder may release it" })),
+            "release_lease k: denied — only the lease holder may release it"
+        );
     }
 }

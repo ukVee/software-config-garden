@@ -40,6 +40,11 @@ pub struct KeeperConfig {
     pub replica_root: Option<PathBuf>,
     /// Growlight loop policy from `[growlight]` — currently the relock opt-in.
     pub growlight: GrowlightConfig,
+    /// growlightd's listen socket, for the keeperd→growlightd hop the lease
+    /// verbs forward over (spec §4c). `None` → the default
+    /// [`softfig_ipc::growlightd_runtime_socket_path`]; overridable so tests
+    /// point keeperd at a growlightd bound on a tempdir socket.
+    pub growlightd_socket: Option<PathBuf>,
 }
 
 /// Growlight: autonomous-loop policy (`[growlight]`).
@@ -149,6 +154,7 @@ impl KeeperConfig {
             replica: ReplicaConfig::default(),
             replica_root: None,
             growlight: GrowlightConfig::default(),
+            growlightd_socket: None,
         }
     }
 
@@ -180,6 +186,7 @@ impl KeeperConfig {
             replica: cfg.replica.into(),
             replica_root: None,
             growlight: cfg.growlight.into(),
+            growlightd_socket: None,
         })
     }
 
@@ -204,6 +211,13 @@ impl KeeperConfig {
 
     pub fn with_socket(mut self, path: impl AsRef<Path>) -> Self {
         self.socket_path = path.as_ref().to_path_buf();
+        self
+    }
+
+    /// Point the keeperd→growlightd lease hop at a specific growlightd socket
+    /// (tests; production resolves the default).
+    pub fn with_growlightd_socket(mut self, path: impl AsRef<Path>) -> Self {
+        self.growlightd_socket = Some(path.as_ref().to_path_buf());
         self
     }
 

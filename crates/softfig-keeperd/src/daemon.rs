@@ -146,6 +146,19 @@ impl Daemon {
         self.inner.lock().unwrap().state
     }
 
+    /// growlightd's socket path for the keeperd→growlightd lease hop (spec §4c):
+    /// the configured override, else the default
+    /// [`softfig_ipc::growlightd_runtime_socket_path`].
+    pub fn growlightd_socket(&self) -> PathBuf {
+        self.inner
+            .lock()
+            .unwrap()
+            .config
+            .growlightd_socket
+            .clone()
+            .unwrap_or_else(softfig_ipc::growlightd_runtime_socket_path)
+    }
+
     /// The graceful teardown shared by every shutdown trigger — the IPC
     /// `shutdown` op (`softfig daemon stop`), a SIGTERM/SIGINT caught in
     /// `main`, and [`DaemonHandle`]'s explicit shutdown + `Drop`. Marks

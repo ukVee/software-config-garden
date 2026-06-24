@@ -48,3 +48,7 @@ tempfile = "3"
 # `pair_begin`. Production never forges — the vault supplies both halves.
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
+# wire-loose-ends slice 002: boot a real growlightd on a tempdir socket to drive
+# the keeperd→growlightd lease hop end to end (growlightd depends only on
+# softfig-ipc, so this dev edge is acyclic).
+softfig-growlightd.workspace = true

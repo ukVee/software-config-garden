@@ -1897,6 +1897,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "softfig-fuse",
+ "softfig-growlightd",
  "softfig-ipc",
  "softfig-net",
  "softfig-store",

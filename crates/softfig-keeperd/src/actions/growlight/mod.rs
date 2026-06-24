@@ -22,11 +22,13 @@
 // thrash nudge through the same store as `post_message` (spec §4d).
 pub(crate) mod chat;
 mod init;
+mod leases;
 mod paths;
 mod queue;
 mod queues;
 
 pub use init::growlight_init;
+pub use leases::{release_lease, request_lease};
 
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{
