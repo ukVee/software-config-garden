@@ -8,8 +8,11 @@
 //!   the groupchat, the lease/roster, budgets, policy).
 //! - [`Message`] + [`update`] — the pure reducer, the tested heart.
 //! - [`command`] — the control half: a [`Command`] gesture → the exact
-//!   [`WireRequest`] (post via keeperd, control verbs via growlightd) the deferred
-//!   live binding sends; plus the optimistic-post path in [`update`]/[`state`].
+//!   [`WireRequest`] (post via keeperd, control verbs via growlightd) the live
+//!   binding sends; plus the optimistic-post path in [`update`]/[`state`].
+//! - [`dispatch`] — the live one-shot *send*: route a built [`WireRequest`] to
+//!   its daemon socket and put it on the wire via the already-tested
+//!   [`softfig_ipc::call_reconnecting`] (the write mirror of [`drive_messages`]).
 //! - [`selectors`] — pure derivations (filter/join/order) the panels walk: the
 //!   per-agent thoughts window, the roster⋈leases "who holds what", the fleet rows.
 //! - [`render`] — text-shaped panel content the deferred `view()` maps to widgets.
@@ -29,12 +32,14 @@
 //! [`render`] projections.
 
 pub mod command;
+pub mod dispatch;
 pub mod render;
 pub mod selectors;
 pub mod state;
 pub mod update;
 
 pub use command::{Command, Daemon, WireRequest, HUMAN_SENDER};
+pub use dispatch::{dispatch, send, socket_for, ReconnectingTransport, Transport};
 pub use selectors::{
     agent_thoughts, agents_with_thoughts, fleet_status_rows, who_holds_what, RosterEntry,
     WhoHoldsWhat,
