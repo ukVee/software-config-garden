@@ -29,9 +29,12 @@
 //!    against a spy, its live binding deferred to the phase-6 drive loop.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use softfig_ipc::growlightd::Event;
+use softfig_ipc::verbs::{op, PostMessageArgs};
+use softfig_ipc::{call_reconnecting, Request, Response, RetryPolicy};
 
 use crate::hub::EventHub;
 use crate::notifications::{Channel, NotifyEvent, NotifyPolicy};
@@ -62,10 +65,13 @@ pub trait Notifier: Send + Sync + fmt::Debug {
 }
 
 /// The §4a committed-bus emission hook: post a fired alert to keeperd's
-/// `growlight/chat/` store as a `kind: alert` message. **Default-absent** — the
-/// bus bridge is one-way (growlightd pulls; no growlightd→keeperd post verb yet,
-/// LOCKED), so the live binding lands with the phase-6 drive loop, exactly like
-/// [`crate::leases::ThrashClear`]. Proven here against a spy.
+/// `growlight/chat/` store as a `kind: alert` message, so the groupchat *is* the
+/// durable alert history (not only the ephemeral `subscribe` stream). The bus
+/// bridge is one-way at the *pull* (growlightd tails keeperd's `tail_bus`); this
+/// is the matching *write* — growlightd reaching keeperd's existing
+/// `post_message` verb **as a client** ([`KeeperdBusEmit`], the live impl;
+/// `wire-loose-ends` slice 003). Stays a seam so the pure dispatcher is provable
+/// against a spy without a live keeperd.
 pub trait BusEmit: Send + Sync + fmt::Debug {
     /// Post `event` to the coordination bus as a `kind: alert` message.
     fn emit_alert(&self, event: &NotifyEvent);
@@ -194,6 +200,89 @@ impl Notifier for PhoneStub {
     fn deliver(&self, event: &NotifyEvent) {
         // No radio yet — record that the alert WOULD be sent, then return.
         self.delivered.lock().unwrap().push(event.summary());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Committed-bus emitter (wired live — growlightd → keeperd post).
+// ---------------------------------------------------------------------------
+
+/// The wire `to` address a fired alert is posted to on the committed bus —
+/// `@human` for the human-attention set (the events that stall the fleet or need
+/// a decision), `@all` otherwise. Mirrors [`GuiNotifier`]'s addressing in the
+/// committed bus' `@`-prefixed wire form (the form `post_message` parses).
+fn alert_to_addr(event: &NotifyEvent) -> &'static str {
+    if event.is_human_attention() {
+        "@human"
+    } else {
+        "@all"
+    }
+}
+
+/// Build keeperd's `post_message` args for a fired alert: from `growlightd`,
+/// `kind: alert`, body = the event summary, addressed by [`alert_to_addr`]. Pure
+/// (no I/O) so the addressing/kind/sender contract is unit-proven without a live
+/// keeperd; [`KeeperdBusEmit::emit_alert`] sends what it returns.
+fn alert_post_args(event: &NotifyEvent) -> PostMessageArgs {
+    PostMessageArgs {
+        from: ALERT_FROM.to_string(),
+        to: alert_to_addr(event).to_string(),
+        kind: ALERT_KIND.to_string(),
+        body: event.summary(),
+    }
+}
+
+/// Production [`BusEmit`]: posts a fired alert to keeperd's committed
+/// coordination bus (`growlight/chat/`) as a `kind: alert` message, via keeperd's
+/// existing `post_message` verb over its socket. growlightd is keeperd's *client*
+/// — the same JSON-Lines idiom as [`crate::bus::KeeperdBusSource`]'s `tail_bus`
+/// pull, run the other way as a **write** (the FIRST growlightd→keeperd write;
+/// LOCKED layering, keeperd never pushes). The post reuses
+/// [`call_reconnecting`](softfig_ipc::call_reconnecting) so a transient keeperd
+/// `cycle` is ridden out, mirroring the slice-002 keeperd→growlightd lease hop.
+///
+/// **Best-effort.** [`emit_alert`](BusEmit::emit_alert) returns `()`, so a post
+/// that fails to reach keeperd is logged to stderr and dropped — the alert
+/// already rode the live GUI [`Event::BusMessage`] stream and the dispatcher's
+/// §9 dedup means it will not re-fire, so a missed committed post never blocks
+/// the drive-loop tick or panics. The committed bus is the *durable history*,
+/// not the delivery path of record.
+#[derive(Debug, Clone)]
+pub struct KeeperdBusEmit {
+    /// keeperd's listen socket (the same socket the bus tailer pulls from).
+    keeperd_socket: PathBuf,
+}
+
+impl KeeperdBusEmit {
+    /// Bind the emitter to keeperd's socket (in production the same path the
+    /// [`crate::bus::KeeperdBusSource`] tailer reads).
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self { keeperd_socket }
+    }
+}
+
+impl BusEmit for KeeperdBusEmit {
+    fn emit_alert(&self, event: &NotifyEvent) {
+        let args = match serde_json::to_value(alert_post_args(event)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("growlightd: encode alert post_message args: {e}");
+                return;
+            }
+        };
+        let req = Request::new(op::POST_MESSAGE, args);
+        match call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default()) {
+            Ok(Response::Ok { .. }) => {}
+            // A daemon-side rejection (e.g. locked) is a successful round-trip;
+            // log it but never propagate — the alert is best-effort.
+            Ok(Response::Err { kind, error, .. }) => {
+                eprintln!("growlightd: keeperd rejected alert post ({kind:?}): {error}");
+            }
+            Err(e) => eprintln!(
+                "growlightd: alert post to keeperd at {} failed: {e}",
+                self.keeperd_socket.display()
+            ),
+        }
     }
 }
 
@@ -505,5 +594,26 @@ mod tests {
         d.set_bus_emit(Box::new(Arc::clone(&bus)));
         d.notify(&blocked("004"), 0);
         assert_eq!(bus.bodies(), vec!["`004` is blocked on a human decision".to_string()]);
+    }
+
+    /// The live committed-bus post args carry the alert contract: sender
+    /// `growlightd`, `kind: alert`, body = the event summary, and `@human`/`@all`
+    /// addressing by the human-attention set — the pure half of [`KeeperdBusEmit`]
+    /// (its socket send is proven over a real keeperd in the keeperd-crate e2e).
+    #[test]
+    fn alert_post_args_carry_sender_kind_and_human_attention_addressing() {
+        // A human-attention alert (blocked-on-human) is addressed @human.
+        let a = alert_post_args(&blocked("004"));
+        assert_eq!(a.from, ALERT_FROM);
+        assert_eq!(a.kind, ALERT_KIND);
+        assert_eq!(a.to, "@human");
+        assert_eq!(a.body, "`004` is blocked on a human decision");
+
+        // A routine (non-human-attention) alert broadcasts @all to every lane.
+        let s = alert_post_args(&slice_done());
+        assert_eq!(s.from, ALERT_FROM);
+        assert_eq!(s.kind, ALERT_KIND);
+        assert_eq!(s.to, "@all");
+        assert_eq!(s.body, "slice `001` complete");
     }
 }
