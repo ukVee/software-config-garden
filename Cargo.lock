@@ -1837,6 +1837,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-growlight-gui"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "softfig-growlightd-client",
+ "softfig-ipc",
+]
+
+[[package]]
 name = "softfig-growlightd"
 version = "0.1.0"
 dependencies = [

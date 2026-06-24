@@ -9,6 +9,7 @@ members = [
     "crates/softfig-keeperd",
     "crates/softfig-growlightd",
     "crates/softfig-growlightd-client",
+    "crates/softfig-growlight-gui",
     "crates/softfig-mcp",
     "crates/softfig-fuse",
     "crates/softfig-onboard",
@@ -31,6 +32,7 @@ softfig-vcs    = { path = "crates/softfig-vcs" }
 softfig-ipc     = { path = "crates/softfig-ipc" }
 softfig-growlightd = { path = "crates/softfig-growlightd" }
 softfig-growlightd-client = { path = "crates/softfig-growlightd-client" }
+softfig-growlight-gui = { path = "crates/softfig-growlight-gui" }
 softfig-onboard = { path = "crates/softfig-onboard" }
 softfig-deploy  = { path = "crates/softfig-deploy" }
 softfig-net     = { path = "crates/softfig-net" }

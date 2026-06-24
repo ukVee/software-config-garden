@@ -1,0 +1,15 @@
+[package]
+name = "softfig-growlight-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig growlight GUI view-model: the Elm-style app state + reducer + render-model over the growlightd IPC. The iced render binding is the deferred (§7b) live wiring."
+
+[dependencies]
+softfig-ipc.workspace = true
+softfig-growlightd-client.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
