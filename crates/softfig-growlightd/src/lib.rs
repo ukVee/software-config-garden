@@ -46,8 +46,8 @@ pub use config::{GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
-    spawn_drive_loop, AgentHealthSource, Assignment, BudgetSource, DriveLoop, FleetMember,
-    HeldStart, QueueSource, TickReport, DRIVE_POLL_MS,
+    spawn_drive_loop, AgentHealthSource, Assignment, BudgetSampleSource, DriveLoop, FleetMember,
+    HeldStart, PermissiveRate, QueueSource, RateSource, TickReport, DRIVE_POLL_MS,
 };
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
