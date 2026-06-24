@@ -54,6 +54,19 @@ pub mod op {
     /// message onto an agent's boundary-async inject lane — delivered at the
     /// agent's NEXT baton, never mid-iteration (spec §8).
     pub const INJECT_MESSAGE: &str = "inject_message";
+    /// `set_policy(`[`SetPolicyArgs`]`) -> `[`PolicySummary`]. Replace the active
+    /// per-device policy — the GUI tweak-knobs panel (budgets,
+    /// `max_concurrent_agents`, active queues; spec §11/§13 Control). The reply
+    /// echoes the applied [`PolicySummary`].
+    ///
+    /// **Wire contract only, for now.** The string + args live here so every
+    /// client (the iced GUI's knobs panel) is ready, but **the daemon handler
+    /// arrives with the admission governor (phase 6)**: today the policy is a
+    /// startup config field (`config.policy`), and the live surface a runtime
+    /// `set_policy` mutates is the governor's — which is the deferred phase-6
+    /// wiring. Until then growlightd answers `unknown op`. This mirrors the
+    /// bus/coordinate types defined here ahead of their producers.
+    pub const SET_POLICY: &str = "set_policy";
 
     // --- Coordinate family (spec §13 Coordinate / §4c leases). Agent-facing:
     // these are the arbitrated shared-action verbs (spec §14, also reachable via
@@ -304,6 +317,17 @@ pub struct InjectMessageArgs {
     pub message: String,
 }
 
+/// Args for `set_policy`: the full replacement [`PolicySummary`] the GUI
+/// tweak-knobs panel applies (spec §11/§13). The whole policy is sent (not a
+/// diff) so the wire op is idempotent and order-free; the reply echoes the
+/// applied [`PolicySummary`]. (The daemon handler is deferred to the
+/// admission-governor phase — see [`op::SET_POLICY`].)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPolicyArgs {
+    /// The policy to apply, replacing the running one.
+    pub policy: PolicySummary,
+}
+
 /// Reply to `pause` / `resume`: the resulting admission-gate state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PausedReply {
@@ -502,6 +526,23 @@ mod tests {
         let back: ForceStopArgs = serde_json::from_str(&s).unwrap();
         assert_eq!(back.agent, "loop-1");
         assert_eq!(back.level, StopLevel::HardKill);
+    }
+
+    #[test]
+    fn set_policy_args_round_trip_with_the_full_policy() {
+        let a = SetPolicyArgs {
+            policy: PolicySummary {
+                max_concurrent_agents: 3,
+                ctx_roll_pct: 50,
+                ctx_handoff_pct: 60,
+                session_5h_halt_pct: 85,
+                session_7d_halt_pct: 90,
+            },
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("\"max_concurrent_agents\":3"), "carries the knobs: {s}");
+        let back: SetPolicyArgs = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.policy, a.policy);
     }
 
     #[test]
