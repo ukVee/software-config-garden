@@ -38,8 +38,17 @@ pub mod selectors;
 pub mod state;
 pub mod update;
 
+/// The live iced render binding — window, event loop, `Subscription`, `view()`.
+/// Gated behind the off-by-default `gui` feature (the heavy, headless-unverifiable
+/// §7b piece) so the always-built view-model + reducer + dispatch stay window-free.
+#[cfg(feature = "gui")]
+pub mod runtime;
+
 pub use command::{Command, Daemon, WireRequest, HUMAN_SENDER};
-pub use dispatch::{dispatch, send, socket_for, ReconnectingTransport, Transport};
+pub use dispatch::{
+    dispatch, load_status, send, socket_for, status_request, ReconnectingTransport, StatusError,
+    Transport,
+};
 pub use selectors::{
     agent_thoughts, agents_with_thoughts, fleet_status_rows, who_holds_what, RosterEntry,
     WhoHoldsWhat,

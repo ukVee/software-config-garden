@@ -20,12 +20,14 @@
 
 use std::path::{Path, PathBuf};
 
+use softfig_ipc::growlightd::{op as gop, FleetStatusReply};
 use softfig_ipc::{
-    call_reconnecting, growlightd_runtime_socket_path, runtime_socket_path, ReconnectError,
-    Request, Response, RetryPolicy,
+    call_reconnecting, growlightd_runtime_socket_path, runtime_socket_path, ErrorKind,
+    ReconnectError, Request, Response, RetryPolicy,
 };
 
 use crate::command::{Daemon, WireRequest};
+use crate::update::Message;
 
 /// The socket a [`Daemon`] is dialed at. Pure over `$XDG_RUNTIME_DIR`
 /// resolution: keeperd and growlightd are separate processes binding distinct
@@ -85,6 +87,65 @@ pub fn dispatch(
 /// the live transport, so the frontend wires one call, not a client.
 pub fn send(req: &WireRequest) -> Result<Response, ReconnectError> {
     dispatch(&mut ReconnectingTransport, req)
+}
+
+/// The growlightd one-shot `status` request — the Observe verb (spec §13) the GUI
+/// fires at boot to seed the fleet roster/policy *before* the live `subscribe`
+/// stream takes over. Pure, like every other [`WireRequest`] builder.
+pub fn status_request() -> WireRequest {
+    WireRequest {
+        daemon: Daemon::Growlightd,
+        op: gop::STATUS,
+        args: serde_json::Value::Null,
+    }
+}
+
+/// Why a boot-time [`load_status`] failed: a transport drop, a daemon-side
+/// rejection, or a reply that didn't decode. The boot path treats any of these as
+/// "leave the model in its `Connecting` default and let the stream populate it".
+#[derive(Debug)]
+pub enum StatusError {
+    /// The round-trip failed at the transport (growlightd absent / restarting).
+    Transport(ReconnectError),
+    /// growlightd answered with an error response.
+    Daemon {
+        /// The machine-readable error category.
+        kind: ErrorKind,
+        /// The human-readable error message.
+        error: String,
+    },
+    /// The `Ok` reply did not decode as a [`FleetStatusReply`].
+    Decode(serde_json::Error),
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StatusError::Transport(e) => write!(f, "growlightd status transport error: {e}"),
+            StatusError::Daemon { kind, error } => {
+                write!(f, "growlightd status error ({kind:?}): {error}")
+            }
+            StatusError::Decode(e) => write!(f, "decoding the fleet status reply: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StatusError {}
+
+/// Fetch growlightd's fleet `status` over `transport` and fold it into a
+/// [`Message::StatusLoaded`] — the *read* mirror of a control [`dispatch`], kept
+/// pure over the same [`Transport`] seam so the boot load is provable with a fake
+/// (no daemon running). The deferred iced runtime runs this once at startup (over
+/// the live [`ReconnectingTransport`], off the UI thread) and feeds the resulting
+/// `Message` to the reducer.
+pub fn load_status(transport: &mut impl Transport) -> Result<Message, StatusError> {
+    let resp = dispatch(transport, &status_request()).map_err(StatusError::Transport)?;
+    match resp.into_result() {
+        Ok(data) => Ok(Message::StatusLoaded(
+            serde_json::from_value::<FleetStatusReply>(data).map_err(StatusError::Decode)?,
+        )),
+        Err((kind, error)) => Err(StatusError::Daemon { kind, error }),
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +240,76 @@ mod tests {
         assert_eq!(socket, growlightd_runtime_socket_path());
         assert_eq!(req.op, "set_policy");
         assert_eq!(req.args["policy"]["max_concurrent_agents"], 3);
+    }
+
+    #[test]
+    fn status_request_targets_growlightd_status_with_null_args() {
+        let r = status_request();
+        assert_eq!(r.daemon, Daemon::Growlightd);
+        assert_eq!(r.op, "status");
+        assert_eq!(r.args, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn load_status_decodes_the_fleet_reply_into_a_status_loaded_message() {
+        use softfig_ipc::growlightd::{AgentSummary, FleetStatusReply, PolicySummary};
+
+        let reply = FleetStatusReply {
+            state: "running".into(),
+            garden_root: "/g".into(),
+            protocol_version: 1,
+            policy: PolicySummary {
+                max_concurrent_agents: 2,
+                ctx_roll_pct: 50,
+                ctx_handoff_pct: 60,
+                session_5h_halt_pct: 85,
+                session_7d_halt_pct: 90,
+            },
+            paused: false,
+            agents: vec![AgentSummary {
+                id: "loop-1".into(),
+                status: "running".into(),
+            }],
+        };
+
+        /// A transport that answers the one `status` round-trip with a canned
+        /// reply, asserting it was dialed at growlightd's socket.
+        struct Replying(serde_json::Value);
+        impl Transport for Replying {
+            fn send(&mut self, socket: &Path, req: &Request) -> Result<Response, ReconnectError> {
+                assert_eq!(socket, growlightd_runtime_socket_path(), "status → growlightd");
+                assert_eq!(req.op, "status");
+                Ok(Response::ok(self.0.clone()))
+            }
+        }
+
+        let mut t = Replying(serde_json::to_value(&reply).unwrap());
+        match load_status(&mut t).unwrap() {
+            Message::StatusLoaded(got) => {
+                assert_eq!(got.state, "running");
+                assert_eq!(got.policy.max_concurrent_agents, 2);
+                assert_eq!(got.agents.len(), 1);
+                assert_eq!(got.agents[0].id, "loop-1");
+            }
+            other => panic!("expected StatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_status_surfaces_a_daemon_error_rather_than_a_status() {
+        struct Rejecting;
+        impl Transport for Rejecting {
+            fn send(&mut self, _: &Path, _: &Request) -> Result<Response, ReconnectError> {
+                Ok(Response::err(ErrorKind::Io, "boom"))
+            }
+        }
+        match load_status(&mut Rejecting) {
+            Err(StatusError::Daemon { kind, error }) => {
+                assert_eq!(kind, ErrorKind::Io);
+                assert_eq!(error, "boom");
+            }
+            other => panic!("expected a Daemon StatusError, got {other:?}"),
+        }
     }
 
     /// A daemon-side rejection is a *successful* round-trip — `dispatch` relays

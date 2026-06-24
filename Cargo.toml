@@ -107,6 +107,20 @@ prost-build = "0.14"
 # M5a-3 discovery: mDNS / DNS-SD with no async runtime dependency.
 mdns-sd = "0.20"
 
+# GUI — the growlight fleet console (spec §11). HEAVY NEW DEPENDENCY, FLAGGED for
+# human merge review. Pinned to 0.14.x. Pulled in ONLY behind the off-by-default
+# `gui` feature of `softfig-growlight-gui`, so `cargo check --workspace` never
+# compiles it; the literal window render is the §7b on-device deferred check.
+# wgpu renderer (the default/best-tested path; presents via the Vulkan/GL surface
+# on the Phosh tablet) + the winit `x11`/`wayland` shell backends + the tokio
+# executor. `default-features = false` deliberately drops the default `tiny-skia`
+# renderer, which pulls `softbuffer` (fails to compile headless: no display
+# backend → empty dispatch enums); the `x11`/`wayland` features must then be
+# re-added explicitly or winit errors "platform not supported". No software
+# fallback in this build — the tablet has Vulkan; a tiny-skia fallback can be
+# added once softbuffer builds in the target environment.
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tokio", "x11", "wayland"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

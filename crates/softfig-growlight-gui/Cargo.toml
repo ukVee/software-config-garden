@@ -11,6 +11,22 @@ description = "soft-fig growlight GUI view-model: the Elm-style app state + redu
 softfig-ipc.workspace = true
 softfig-growlightd-client.workspace = true
 serde_json.workspace = true
+# The iced runtime (window + event loop + renderer) is pulled in ONLY by the
+# `gui` feature — the heavy, headless-unverifiable live render binding (§7b).
+# Default builds (and `cargo check --workspace`) never compile it; the pure
+# view-model + reducer + dispatch + subscription bridge are always built/tested.
+iced = { workspace = true, optional = true }
+
+[features]
+# The live iced render binding: the app shell, the window, the `Subscription`
+# over the daemon stream, and `view()`. Off by default (FLAGGED). Build/run the
+# console with `--features gui`; the `growlight-gui` bin requires it.
+gui = ["dep:iced"]
+
+[[bin]]
+name = "growlight-gui"
+path = "src/bin/growlight-gui.rs"
+required-features = ["gui"]
 
 [dev-dependencies]
 serde_json.workspace = true
