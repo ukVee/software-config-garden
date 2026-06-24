@@ -35,6 +35,7 @@ pub mod scheduler;
 pub mod server;
 pub mod state;
 pub mod supervisor;
+pub mod thrash_bridge;
 pub mod usage;
 
 pub use admission::{
@@ -65,4 +66,5 @@ pub use supervisor::{
     AgentBackend, AgentHealth, AgentSpec, Backoff, PollOutcome, RerollOutcome, SpawnError,
     StartOutcome, Supervisor,
 };
+pub use thrash_bridge::{parse_target, KeeperThrashClear, TargetClear};
 pub use usage::{usage_alert_reached, UsageAggregator, UsageSample, USAGE_ALERT_PCT};
