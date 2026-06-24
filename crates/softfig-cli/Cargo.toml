@@ -16,6 +16,7 @@ softfig-vault.workspace = true
 softfig-store.workspace = true
 softfig-vcs.workspace = true
 softfig-ipc.workspace = true
+softfig-growlightd-client.workspace = true
 softfig-onboard.workspace = true
 softfig-deploy.workspace = true
 clap.workspace = true

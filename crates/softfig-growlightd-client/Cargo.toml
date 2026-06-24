@@ -1,0 +1,14 @@
+[package]
+name = "softfig-growlightd-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig growlightd client: a thin, reconnecting `subscribe` client over the growlightd IPC, shared by the CLI `watch` path and the iced GUI."
+
+[dependencies]
+softfig-ipc.workspace = true
+
+serde_json.workspace = true
+thiserror.workspace = true

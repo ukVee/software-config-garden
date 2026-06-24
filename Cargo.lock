@@ -1803,6 +1803,7 @@ dependencies = [
  "serde_json",
  "softfig-deploy",
  "softfig-growlightd",
+ "softfig-growlightd-client",
  "softfig-ipc",
  "softfig-onboard",
  "softfig-store",
@@ -1847,6 +1848,15 @@ dependencies = [
  "signal-hook",
  "softfig-ipc",
  "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "softfig-growlightd-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "softfig-ipc",
  "thiserror",
 ]
 

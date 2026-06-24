@@ -30,6 +30,8 @@ use softfig_ipc::{
     verbs::{GrowlightInitArgs, GrowlightInitReply, PostMessageArgs, PostMessageReply, StatusReply, op},
 };
 
+use softfig_growlightd_client::{decode_frame, Frame};
+
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
     AgentBackend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, IterationOutcome, IterationRequest,
@@ -1471,9 +1473,11 @@ fn send_subscribe(stream: &mut std::os::unix::net::UnixStream) -> Result<()> {
 
 /// Read newline-framed [`Event`] frames from `reader` and render each to `out`
 /// until EOF — the pure stream-rendering core of `watch`, so it's unit-tested
-/// with a scripted reader (no socket). A frame that fails to decode is noted and
-/// skipped, never fatal (forward-compatible with event variants this build
-/// predates — e.g. `BusMessage` before the bus exists).
+/// with a scripted reader (no socket). Decoding is delegated to the shared
+/// `softfig-growlightd-client` crate (the one tolerant-framing rule every
+/// frontend uses): a frame that fails to decode is noted and skipped, never
+/// fatal (forward-compatible with event variants this build predates — e.g.
+/// `BusMessage` before the bus exists).
 fn watch_stream(reader: &mut dyn BufRead, out: &mut dyn Write) -> Result<()> {
     let mut line = String::new();
     loop {
@@ -1482,13 +1486,10 @@ fn watch_stream(reader: &mut dyn BufRead, out: &mut dyn Write) -> Result<()> {
         if n == 0 {
             return Ok(()); // EOF: the daemon stopped or the connection closed.
         }
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Event>(trimmed) {
-            Ok(event) => writeln!(out, "{}", render_event(&event))?,
-            Err(e) => writeln!(out, "(unrecognized event frame: {e})")?,
+        match decode_frame(&line) {
+            Frame::Blank => continue,
+            Frame::Event(event) => writeln!(out, "{}", render_event(&event))?,
+            Frame::Undecodable(e) => writeln!(out, "(unrecognized event frame: {e})")?,
         }
     }
 }
