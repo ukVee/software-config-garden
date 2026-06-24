@@ -10,6 +10,13 @@ use std::path::PathBuf;
 
 use softfig_ipc::growlightd::PolicySummary;
 
+/// Defensive ceiling on the per-device concurrency cap a `set_policy` may set:
+/// generous (a beefy workstation runs many agents), but a value past it is a
+/// fat-fingered nonsense cap that would try to spawn a runaway fleet. The
+/// budget/rate rails still gate admission, but the cap itself should never be
+/// absurd — so `set_policy` *rejects* (not clamps) one over this.
+pub const MAX_CONCURRENT_AGENTS_CEILING: u32 = 64;
+
 /// Per-device orchestration policy (spec §7 budgets + §17 concurrency cap).
 ///
 /// Defaults mirror the single-agent loop's two budgets
@@ -53,6 +60,39 @@ impl Policy {
             session_5h_halt_pct: self.session_5h_halt_pct,
             session_7d_halt_pct: self.session_7d_halt_pct,
         }
+    }
+
+    /// Build a runtime policy from a wire [`PolicySummary`] (the `set_policy`
+    /// verb), validating every field is in a sane operating range. A nonsense
+    /// value is **rejected** with a clear message, never silently clamped, so a
+    /// GUI typo can't quietly disable the fleet (a cap of `0` admits nothing; a
+    /// `0`/over-`100` pct rail is meaningless). The mapping is otherwise the
+    /// inverse of [`summary`](Self::summary). This is pure validation — it adds
+    /// no new policy *semantics*, only the range guard `set_policy` needs.
+    pub fn from_summary(s: PolicySummary) -> Result<Self, String> {
+        if !(1..=MAX_CONCURRENT_AGENTS_CEILING).contains(&s.max_concurrent_agents) {
+            return Err(format!(
+                "max_concurrent_agents must be 1..={MAX_CONCURRENT_AGENTS_CEILING}, got {}",
+                s.max_concurrent_agents
+            ));
+        }
+        for (name, pct) in [
+            ("ctx_roll_pct", s.ctx_roll_pct),
+            ("ctx_handoff_pct", s.ctx_handoff_pct),
+            ("session_5h_halt_pct", s.session_5h_halt_pct),
+            ("session_7d_halt_pct", s.session_7d_halt_pct),
+        ] {
+            if !(1..=100).contains(&pct) {
+                return Err(format!("{name} must be 1..=100, got {pct}"));
+            }
+        }
+        Ok(Self {
+            max_concurrent_agents: s.max_concurrent_agents,
+            ctx_roll_pct: s.ctx_roll_pct,
+            ctx_handoff_pct: s.ctx_handoff_pct,
+            session_5h_halt_pct: s.session_5h_halt_pct,
+            session_7d_halt_pct: s.session_7d_halt_pct,
+        })
     }
 }
 
@@ -114,5 +154,52 @@ mod tests {
         let c = GrowlightdConfig::new("/run/g.sock".into(), "/garden".into());
         assert_eq!(c.policy, Policy::default());
         assert_eq!(c.garden_root, PathBuf::from("/garden"));
+    }
+
+    #[test]
+    fn from_summary_round_trips_a_valid_policy() {
+        // `from_summary` is the inverse of `summary` for any in-range policy.
+        let p = Policy {
+            max_concurrent_agents: 4,
+            ctx_roll_pct: 45,
+            ctx_handoff_pct: 55,
+            session_5h_halt_pct: 80,
+            session_7d_halt_pct: 88,
+        };
+        assert_eq!(Policy::from_summary(p.summary()), Ok(p));
+        // The default policy round-trips too.
+        let d = Policy::default();
+        assert_eq!(Policy::from_summary(d.summary()), Ok(d));
+    }
+
+    #[test]
+    fn from_summary_rejects_out_of_range_values() {
+        let base = Policy::default().summary();
+
+        // A zero cap admits nothing → rejected (not clamped).
+        let mut zero_cap = base;
+        zero_cap.max_concurrent_agents = 0;
+        assert!(Policy::from_summary(zero_cap).is_err(), "cap 0 rejected");
+
+        // A cap past the defensive ceiling is a runaway nonsense value.
+        let mut huge_cap = base;
+        huge_cap.max_concurrent_agents = MAX_CONCURRENT_AGENTS_CEILING + 1;
+        assert!(Policy::from_summary(huge_cap).is_err(), "over-ceiling cap rejected");
+        // Exactly at the ceiling is fine.
+        let mut at_ceiling = base;
+        at_ceiling.max_concurrent_agents = MAX_CONCURRENT_AGENTS_CEILING;
+        assert!(Policy::from_summary(at_ceiling).is_ok(), "the ceiling itself is valid");
+
+        // A 0 pct and an over-100 pct are both out of range, on every rail.
+        for set in [
+            |s: &mut PolicySummary| s.ctx_roll_pct = 0,
+            |s: &mut PolicySummary| s.ctx_handoff_pct = 101,
+            |s: &mut PolicySummary| s.session_5h_halt_pct = 200,
+            |s: &mut PolicySummary| s.session_7d_halt_pct = 0,
+        ] {
+            let mut bad = base;
+            set(&mut bad);
+            assert!(Policy::from_summary(bad).is_err(), "an out-of-range pct is rejected");
+        }
     }
 }

@@ -12,11 +12,12 @@ use std::time::Duration;
 
 use softfig_ipc::growlightd::{
     op, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply, PausedReply,
-    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, StopAfterSliceArgs, StopLevel,
-    StopReply,
+    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, SetPolicyArgs, StopAfterSliceArgs,
+    StopLevel, StopReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
+use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::state::State;
 
@@ -134,6 +135,7 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         op::STOP_AFTER_SLICE => write_one_shot(&mut stream, stop_after_slice(&daemon, &req)),
         op::FORCE_STOP => write_one_shot(&mut stream, force_stop(&daemon, &req)),
         op::INJECT_MESSAGE => write_one_shot(&mut stream, inject_message(&daemon, &req)),
+        op::SET_POLICY => write_one_shot(&mut stream, set_policy(&daemon, &req)),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
@@ -307,6 +309,26 @@ fn inject_message(daemon: &Daemon, req: &Request) -> Response {
         },
         "inject_message",
     )
+}
+
+/// `set_policy`: replace the runtime per-device policy (spec §11/§13 Control).
+/// The whole policy is sent (idempotent, order-free), each field is validated
+/// against its sane operating range, and a nonsense value is **rejected** with a
+/// clear `BadArgs` — never silently clamped — so a GUI typo can't quietly disable
+/// the fleet. On success the new policy is stored under the daemon lock (so
+/// `status` and the drive loop's next admission boundary both read it) and the
+/// applied [`softfig_ipc::growlightd::PolicySummary`] is echoed. One-shot.
+fn set_policy(daemon: &Daemon, req: &Request) -> Response {
+    let args: SetPolicyArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let policy = match Policy::from_summary(args.policy) {
+        Ok(p) => p,
+        Err(e) => return Response::err(ErrorKind::BadArgs, e),
+    };
+    daemon.set_policy(policy);
+    ok_reply(&policy.summary(), "set_policy")
 }
 
 /// `request_lease`: arbitrate a lease over a shared resource/action (spec §4c).

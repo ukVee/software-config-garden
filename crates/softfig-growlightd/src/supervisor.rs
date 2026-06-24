@@ -71,6 +71,7 @@ use std::path::PathBuf;
 use crate::admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
 };
+use crate::config::Policy;
 use crate::control::AgentChild;
 use crate::notifications::NotifyEvent;
 
@@ -360,6 +361,22 @@ impl Supervisor {
         self.agents.values().filter(|s| s.child.is_some()).count() as u32
     }
 
+    /// The admission governor's current per-device [`Policy`] — so the drive loop
+    /// only rebuilds the governor on a real `set_policy` change.
+    pub fn policy(&self) -> Policy {
+        self.governor.policy()
+    }
+
+    /// Replace the admission governor's per-device [`Policy`] at a safe boundary.
+    /// The drive loop pushes a live `set_policy` change in here before its next
+    /// admission decision, so the new cap/rails take effect at that boundary
+    /// without a restart. Re-decisions are pure, so swapping the configured policy
+    /// is all that is needed — in-flight agents are untouched; the change gates the
+    /// *next* start/roll.
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.governor = AdmissionGovernor::new(policy);
+    }
+
     /// Whether `agent` is registered and currently running.
     pub fn is_running(&self, agent: &str) -> bool {
         self.agents
@@ -528,7 +545,6 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Policy;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 

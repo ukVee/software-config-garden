@@ -234,6 +234,14 @@ impl AdmissionGovernor {
         self.policy.max_concurrent_agents
     }
 
+    /// The per-device [`Policy`] this governor enforces — so a live `set_policy`
+    /// change can be detected (a `Copy` compare) before the drive loop rebuilds
+    /// the governor. The decision logic itself stays a pure function of the
+    /// injected readings; only the *configured* policy is exposed here.
+    pub fn policy(&self) -> Policy {
+        self.policy
+    }
+
     /// Decide whether one agent may `intent` (start or roll) right now, given
     /// the current `fleet_size` (agents running), the shared `budget` reserves,
     /// and the per-minute `rate` state. See the module docs for the precedence:

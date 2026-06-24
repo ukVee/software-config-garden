@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use softfig_growlightd::{Daemon, GrowlightdConfig, Policy};
-use softfig_ipc::growlightd::{op, FleetStatusReply};
+use softfig_ipc::growlightd::{op, FleetStatusReply, PolicySummary, SetPolicyArgs};
 use softfig_ipc::{connect, Request};
 
 fn boot(socket: PathBuf, garden_root: PathBuf) -> softfig_growlightd::DaemonHandle {
@@ -22,6 +22,20 @@ fn call_status(socket: &std::path::Path) -> FleetStatusReply {
     let resp = softfig_ipc::call(&mut stream, &req).expect("status round-trip");
     let value = resp.into_result().expect("status ok");
     serde_json::from_value(value).expect("FleetStatusReply decodes")
+}
+
+/// Call `set_policy`, returning the echoed [`PolicySummary`] on success or the
+/// `(kind, message)` error the daemon refused with.
+fn call_set_policy(
+    socket: &std::path::Path,
+    policy: PolicySummary,
+) -> Result<PolicySummary, (softfig_ipc::ErrorKind, String)> {
+    let mut stream = connect(socket).expect("client connects");
+    let args = serde_json::to_value(SetPolicyArgs { policy }).unwrap();
+    let resp = softfig_ipc::call(&mut stream, &Request::new(op::SET_POLICY, args))
+        .expect("set_policy round-trip");
+    resp.into_result()
+        .map(|v| serde_json::from_value(v).expect("PolicySummary decodes"))
 }
 
 #[test]
@@ -71,6 +85,74 @@ fn unknown_op_is_bad_args_not_a_crash() {
     // Daemon is still alive and serving after a bad op.
     let reply = call_status(&socket);
     assert_eq!(reply.state, "running");
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn set_policy_updates_the_runtime_policy_and_status_reflects_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    let handle = boot(socket.clone(), dir.path().join("garden"));
+
+    // The daemon boots on the default policy.
+    assert_eq!(call_status(&socket).policy, Policy::default().summary());
+
+    // Apply a new runtime policy: a bigger cap + tighter rails. No more `unknown
+    // op` — the handler answers and echoes the applied policy.
+    let new = PolicySummary {
+        max_concurrent_agents: 4,
+        ctx_roll_pct: 45,
+        ctx_handoff_pct: 55,
+        session_5h_halt_pct: 80,
+        session_7d_halt_pct: 88,
+    };
+    let echoed = call_set_policy(&socket, new).expect("a valid policy is accepted");
+    assert_eq!(echoed, new, "the reply echoes the applied policy");
+
+    // `status` now reflects the new runtime policy (the single source of truth was
+    // updated under the daemon lock).
+    assert_eq!(
+        call_status(&socket).policy,
+        new,
+        "status reflects the new runtime policy",
+    );
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn set_policy_rejects_an_out_of_range_value_and_leaves_the_policy_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    let handle = boot(socket.clone(), dir.path().join("garden"));
+
+    // A cap of 0 admits nothing → rejected (not clamped) with BadArgs.
+    let mut bad = Policy::default().summary();
+    bad.max_concurrent_agents = 0;
+    let err = call_set_policy(&socket, bad).expect_err("a zero cap is rejected");
+    assert_eq!(err.0, softfig_ipc::ErrorKind::BadArgs);
+
+    // An over-100 pct rail is likewise rejected.
+    let mut bad2 = Policy::default().summary();
+    bad2.session_5h_halt_pct = 200;
+    assert!(
+        call_set_policy(&socket, bad2).is_err(),
+        "an over-100 budget rail is rejected",
+    );
+
+    // After both refusals the runtime policy is unchanged — the daemon never
+    // applied the nonsense values.
+    assert_eq!(
+        call_status(&socket).policy,
+        Policy::default().summary(),
+        "a rejected set_policy leaves the runtime policy unchanged",
+    );
+
+    // The daemon is still alive and serving after the bad ops.
+    assert_eq!(call_status(&socket).state, "running");
 
     handle.shutdown();
     handle.join().unwrap();

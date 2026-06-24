@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply};
 
-use crate::config::GrowlightdConfig;
+use crate::config::{GrowlightdConfig, Policy};
 use crate::control::Control;
 use crate::hub::EventHub;
 use crate::leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
@@ -107,6 +107,21 @@ impl Daemon {
 
     pub fn socket_path(&self) -> PathBuf {
         self.inner.lock().unwrap().config.socket_path.clone()
+    }
+
+    /// The current runtime per-device [`Policy`] — the single source of truth the
+    /// `set_policy` verb mutates, `status` echoes, and the drive loop refreshes
+    /// its admission governor from each tick. Brief-lock read (`Policy` is `Copy`).
+    pub fn policy(&self) -> Policy {
+        self.inner.lock().unwrap().config.policy
+    }
+
+    /// Replace the runtime per-device [`Policy`] (the `set_policy` verb). The
+    /// caller validates the value first ([`Policy::from_summary`]); this stores it
+    /// under the daemon lock so `status` and the drive loop's next admission
+    /// boundary both observe it (no restart).
+    pub fn set_policy(&self, policy: Policy) {
+        self.inner.lock().unwrap().config.policy = policy;
     }
 
     /// Graceful teardown shared by every shutdown trigger — the IPC `shutdown`

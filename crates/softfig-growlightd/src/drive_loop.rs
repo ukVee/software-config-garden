@@ -303,6 +303,17 @@ impl DriveLoop {
         let paused = self.daemon.is_paused();
         report.paused = paused;
 
+        // Refresh the admission policy from the runtime source of truth BEFORE any
+        // admission decision this tick: the daemon's `config.policy` is what the
+        // `set_policy` verb mutates, so re-reading it here makes a live policy
+        // change (a new cap / budget rail) take effect at THIS boundary — no
+        // restart (spec §11/§13 Control). Cheap: a brief daemon-lock read + a `Copy`
+        // compare, rebuilding the governor only on an actual change.
+        let policy = self.daemon.policy();
+        if self.supervisor.policy() != policy {
+            self.supervisor.set_policy(policy);
+        }
+
         // Clone the configured fleet up front so the per-agent passes can borrow the
         // supervisor / aggregator / lifecycle sets mutably without aliasing
         // `self.fleet`.
@@ -629,8 +640,14 @@ mod tests {
             rows.iter().map(|(i, s)| PartView::new(*i, s)).collect(),
         )
     }
-    fn daemon() -> Daemon {
-        Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
+    /// A daemon whose runtime policy matches the supervisor's governor — exactly
+    /// the production invariant (both derive from one `config.policy`). The drive
+    /// loop refreshes its governor from the daemon each tick, so they must start
+    /// consistent or the refresh would clobber a test's non-default policy.
+    fn daemon(policy: Policy) -> Daemon {
+        Daemon::new(
+            GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()).with_policy(policy),
+        )
     }
 
     /// Assemble a loop with the given fleet + policy over fresh seam fakes,
@@ -644,7 +661,7 @@ mod tests {
         snapshot: Vec<QueueView>,
         policy: Policy,
     ) -> (DriveLoop, Daemon, Arc<FakeFleet>, Probe) {
-        let d = daemon();
+        let d = daemon(policy);
         let backend = FakeFleet::new();
         let queues = FixedQueues::new(snapshot);
         let sup = Supervisor::with_backoff(
@@ -721,6 +738,49 @@ mod tests {
         let r2 = loop_.tick(1);
         assert!(r2.started.is_empty());
         assert_eq!(backend.spawn_count(), 2, "no duplicate spawn of running agents");
+    }
+
+    /// A live `set_policy` change to the runtime policy takes effect at the next
+    /// admission boundary: the loop refreshes its governor from the daemon's policy
+    /// each tick, so raising the cap admits a previously-capped start on the very
+    /// next tick — and lowering it later holds new starts — with no restart.
+    #[test]
+    fn a_runtime_policy_change_takes_effect_at_the_next_tick() {
+        let (mut loop_, d, backend, _probe) = make(
+            vec![member("a1", "qa"), member("a2", "qb"), member("a3", "qc")],
+            vec![
+                q("qa", &[("p1", "queued")]),
+                q("qb", &[("p2", "queued")]),
+                q("qc", &[("p3", "queued")]),
+            ],
+            Policy::default(), // cap 2
+        );
+
+        // Tick 0: cap 2 → a1, a2 start; a3 is queued behind the cap.
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.started.len(), 2);
+        assert_eq!(backend.spawns(), vec!["a1", "a2"]);
+
+        // Raise the cap to 3 at runtime — exactly what the `set_policy` verb writes.
+        d.set_policy(Policy {
+            max_concurrent_agents: 3,
+            ..Policy::default()
+        });
+
+        // The next tick reflects the new cap: a3 is now admitted (no restart).
+        let r1 = loop_.tick(1);
+        assert_eq!(
+            r1.started,
+            vec![Assignment {
+                agent: "a3".into(),
+                queue: "qc".into(),
+                part: "p3".into()
+            }],
+            "raising the cap admits the previously-queued start at the next boundary",
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a2", "a3"]);
+        // The governor now reports the live cap (the refresh rebuilt it).
+        assert_eq!(loop_.supervisor.policy().max_concurrent_agents, 3);
     }
 
     /// An exhausted shared budget refuses a start (not a slot wait): the fleet
