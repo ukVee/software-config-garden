@@ -60,9 +60,16 @@ pub fn thought_line(t: &ThoughtLine) -> String {
     format!("[{}] {} {}", t.agent, delta_kind_label(t.kind), t.text)
 }
 
-/// One groupchat line: `from→to [kind] body` (alerts marked with a bang).
+/// One groupchat line: `from→to [kind] body`. An optimistic (not-yet-echoed)
+/// human post is marked `…`; a confirmed alert is marked `!`.
 pub fn chat_line(c: &ChatLine) -> String {
-    let marker = if c.is_alert() { "!" } else { "" };
+    let marker = if c.pending {
+        "…"
+    } else if c.is_alert() {
+        "!"
+    } else {
+        ""
+    };
     format!("{}{}→{} [{}] {}", marker, c.from, c.to, c.kind, c.body)
 }
 
@@ -117,13 +124,12 @@ mod tests {
         };
         assert_eq!(thought_line(&t), "[loop-1] tool edit(x)");
 
-        let alert = ChatLine {
-            from: "loop-2".into(),
-            to: "human".into(),
-            kind: "alert".into(),
-            body: "blocked".into(),
-        };
+        let alert = ChatLine::confirmed("loop-2", "human", "alert", "blocked");
         assert_eq!(chat_line(&alert), "!loop-2→human [alert] blocked");
+
+        // An optimistic human post renders with the pending marker.
+        let pending = ChatLine::pending("human", "all", "info", "hi");
+        assert_eq!(chat_line(&pending), "…human→all [info] hi");
 
         let lease = LeaseRow {
             lease: "k".into(),

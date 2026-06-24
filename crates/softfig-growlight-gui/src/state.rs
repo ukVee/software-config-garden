@@ -52,6 +52,20 @@ pub struct ThoughtLine {
     pub text: String,
 }
 
+/// The sender form a human post shows as **on the bus** — the `@` sigil stripped
+/// from [`crate::command::HUMAN_SENDER`] (`@human`). The echoed
+/// [`softfig_ipc::growlightd::Event::BusMessage`] carries this form, so the
+/// optimistic chat line uses it to match the echo.
+pub const HUMAN_FROM: &str = "human";
+
+/// Strip a leading bus sigil (`@all` → `all`, `@human` → `human`); agent slugs
+/// pass through unchanged. The `post_message` args keep the sigil form (keeperd
+/// expects it); the echoed `BusMessage` and the optimistic chat line use this
+/// stripped form (spec §11).
+pub fn strip_sigil(addr: &str) -> &str {
+    addr.strip_prefix('@').unwrap_or(addr)
+}
+
 /// One line in the **groupchat** panel (a coordination-bus message). An alert is
 /// just `kind == "alert"` (spec §9), so the chat *is* the alert history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,12 +78,55 @@ pub struct ChatLine {
     pub kind: String,
     /// The message body.
     pub body: String,
+    /// `true` while this is an optimistic human post awaiting its bus echo (spec
+    /// §11 input box). Cleared when the echoed `BusMessage` reconciles it; an
+    /// incoming or reconciled line is always `false`.
+    pub pending: bool,
 }
 
 impl ChatLine {
+    /// A confirmed line — an incoming bus message, or a reconciled human post.
+    pub fn confirmed(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        kind: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            body: body.into(),
+            pending: false,
+        }
+    }
+
+    /// An optimistic, not-yet-echoed human post (rendered with a pending marker).
+    pub fn pending(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        kind: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            body: body.into(),
+            pending: true,
+        }
+    }
+
     /// Whether this line is an alert (spec §9 — rendered with emphasis).
     pub fn is_alert(&self) -> bool {
         self.kind == "alert"
+    }
+
+    /// Whether this line is the same logical message as `(from, to, kind, body)`
+    /// — used to reconcile an optimistic post against its echo, ignoring
+    /// [`ChatLine::pending`].
+    pub fn same_message(&self, from: &str, to: &str, kind: &str, body: &str) -> bool {
+        self.from == from && self.to == to && self.kind == kind && self.body == body
     }
 }
 
@@ -198,6 +255,34 @@ impl App {
         }
         self.chat.push_back(c);
     }
+
+    /// Push an optimistic human post: a `pending` [`ChatLine`] in the echo
+    /// address form ([`strip_sigil`], [`HUMAN_FROM`]) so the eventual
+    /// `BusMessage` echo can reconcile it (spec §11). The matching
+    /// `post_message` wire request is built+sent separately
+    /// ([`crate::command::Command::PostHuman`]).
+    pub fn push_human_post(&mut self, to: &str, kind: &str, body: &str) {
+        self.push_chat(ChatLine::pending(HUMAN_FROM, strip_sigil(to), kind, body));
+    }
+
+    /// Fold an incoming bus message. If it echoes the oldest matching optimistic
+    /// human post (same from/to/kind/body), reconcile that line — clear
+    /// `pending` — instead of appending a duplicate; otherwise append it as a
+    /// confirmed line. Only a `from == "human"` message can reconcile, so an
+    /// agent posting an identical body never clears the human's pending line.
+    pub fn reconcile_or_push_chat(&mut self, from: String, to: String, kind: String, body: String) {
+        if from == HUMAN_FROM {
+            if let Some(line) = self
+                .chat
+                .iter_mut()
+                .find(|l| l.pending && l.same_message(&from, &to, &kind, &body))
+            {
+                line.pending = false;
+                return;
+            }
+        }
+        self.push_chat(ChatLine::confirmed(from, to, kind, body));
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +348,23 @@ mod tests {
             app.thoughts.back().unwrap().text,
             format!("{}", MAX_THOUGHTS + 4)
         );
+    }
+
+    #[test]
+    fn strip_sigil_maps_bus_addrs_to_the_echo_form() {
+        assert_eq!(strip_sigil("@all"), "all");
+        assert_eq!(strip_sigil("@human"), "human");
+        assert_eq!(strip_sigil("loop-1"), "loop-1");
+    }
+
+    #[test]
+    fn human_post_is_pending_and_uses_the_echo_address_form() {
+        let mut app = App::default();
+        app.push_human_post("@all", "info", "hi");
+        let line = app.chat.back().unwrap();
+        assert!(line.pending, "optimistic line is pending");
+        assert_eq!(line.from, "human", "sigil-stripped sender");
+        assert_eq!(line.to, "all", "sigil-stripped recipient");
     }
 
     #[test]

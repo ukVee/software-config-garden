@@ -6,7 +6,7 @@
 use softfig_growlightd_client::ClientEvent;
 use softfig_ipc::growlightd::{Event, FleetStatusReply};
 
-use crate::state::{App, ChatLine, ConnState, ThoughtLine};
+use crate::state::{App, ConnState, ThoughtLine};
 
 /// A message the GUI runtime folds into the state. `Debug + Clone` is all an
 /// iced `Message` needs (a `FleetStatusReply` carries no `Eq`).
@@ -16,6 +16,12 @@ pub enum Message {
     StatusLoaded(FleetStatusReply),
     /// A frame from the reconnecting subscribe driver.
     Stream(ClientEvent),
+    /// The human submitted the input box (spec §11). Pushes an optimistic
+    /// `pending` chat line; the matching `post_message` wire request is built +
+    /// sent by the live binding via [`crate::command::Command::PostHuman`], and
+    /// the bus echo later reconciles the line. `to`/`kind` are wire-token forms
+    /// (`@all`/`@human`/slug; a bus kind token).
+    HumanPosted { to: String, kind: String, body: String },
 }
 
 impl From<ClientEvent> for Message {
@@ -30,6 +36,7 @@ pub fn update(app: &mut App, msg: Message) {
     match msg {
         Message::StatusLoaded(reply) => app.apply_status(reply),
         Message::Stream(ev) => apply_client_event(app, ev),
+        Message::HumanPosted { to, kind, body } => app.push_human_post(&to, &kind, &body),
     }
 }
 
@@ -90,17 +97,14 @@ fn apply_event(app: &mut App, e: Event) {
             holder,
             state,
         } => app.upsert_lease(lease, holder, state),
+        // An incoming bus message either reconciles the human's optimistic post
+        // (no duplicate) or appends as a confirmed line (spec §11 optimistic UI).
         Event::BusMessage {
             from,
             to,
             kind,
             body,
-        } => app.push_chat(ChatLine {
-            from,
-            to,
-            kind,
-            body,
-        }),
+        } => app.reconcile_or_push_chat(from, to, kind, body),
     }
 }
 
@@ -213,6 +217,54 @@ mod tests {
         assert!(!app.chat.front().unwrap().is_alert());
         assert!(app.chat.back().unwrap().is_alert());
         assert_eq!(app.chat.back().unwrap().to, "human");
+    }
+
+    #[test]
+    fn human_post_then_echo_reconciles_to_exactly_one_line() {
+        let mut app = App::default();
+        // Optimistic post addressed to @all.
+        update(
+            &mut app,
+            Message::HumanPosted {
+                to: "@all".into(),
+                kind: "info".into(),
+                body: "deploy starting".into(),
+            },
+        );
+        assert_eq!(app.chat.len(), 1);
+        assert!(app.chat.back().unwrap().pending, "optimistic line is pending");
+        assert_eq!(app.chat.back().unwrap().from, "human");
+        assert_eq!(app.chat.back().unwrap().to, "all", "echo address form");
+
+        // The bus echoes it back (from human, @-stripped addrs).
+        fold(
+            &mut app,
+            ClientEvent::Event(Event::bus_message("human", "all", "info", "deploy starting")),
+        );
+        assert_eq!(app.chat.len(), 1, "echo reconciles, does not duplicate");
+        assert!(!app.chat.back().unwrap().pending, "reconciled line is confirmed");
+    }
+
+    #[test]
+    fn an_agent_message_never_reconciles_a_pending_human_post() {
+        let mut app = App::default();
+        update(
+            &mut app,
+            Message::HumanPosted {
+                to: "@all".into(),
+                kind: "info".into(),
+                body: "hi".into(),
+            },
+        );
+        // An agent posts an identical body — must NOT clear the human's pending
+        // line (only a from:human echo reconciles).
+        fold(
+            &mut app,
+            ClientEvent::Event(Event::bus_message("loop-1", "all", "info", "hi")),
+        );
+        assert_eq!(app.chat.len(), 2);
+        assert!(app.chat.front().unwrap().pending, "human line still pending");
+        assert!(!app.chat.back().unwrap().pending);
     }
 
     #[test]

@@ -7,6 +7,9 @@
 //! - [`App`] — the panel state model (fleet status, the per-agent thoughts feed,
 //!   the groupchat, the lease/roster, budgets, policy).
 //! - [`Message`] + [`update`] — the pure reducer, the tested heart.
+//! - [`command`] — the control half: a [`Command`] gesture → the exact
+//!   [`WireRequest`] (post via keeperd, control verbs via growlightd) the deferred
+//!   live binding sends; plus the optimistic-post path in [`update`]/[`state`].
 //! - [`selectors`] — pure derivations (filter/join/order) the panels walk: the
 //!   per-agent thoughts window, the roster⋈leases "who holds what", the fleet rows.
 //! - [`render`] — text-shaped panel content the deferred `view()` maps to widgets.
@@ -25,17 +28,20 @@
 //! [`update`] from a `Subscription` fed by [`drive_messages`], and render the
 //! [`render`] projections.
 
+pub mod command;
 pub mod render;
 pub mod selectors;
 pub mod state;
 pub mod update;
 
+pub use command::{Command, Daemon, WireRequest, HUMAN_SENDER};
 pub use selectors::{
     agent_thoughts, agents_with_thoughts, fleet_status_rows, who_holds_what, RosterEntry,
     WhoHoldsWhat,
 };
 pub use state::{
-    AgentRow, App, Budgets, ChatLine, ConnState, LeaseRow, ThoughtLine, MAX_CHAT, MAX_THOUGHTS,
+    strip_sigil, AgentRow, App, Budgets, ChatLine, ConnState, LeaseRow, ThoughtLine, HUMAN_FROM,
+    MAX_CHAT, MAX_THOUGHTS,
 };
 pub use update::{update, Message};
 

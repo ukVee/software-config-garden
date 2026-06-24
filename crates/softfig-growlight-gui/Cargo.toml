@@ -10,6 +10,7 @@ description = "soft-fig growlight GUI view-model: the Elm-style app state + redu
 [dependencies]
 softfig-ipc.workspace = true
 softfig-growlightd-client.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
