@@ -290,7 +290,6 @@ impl Default for NotifyDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::UsageLevel;
     use std::sync::Arc;
 
     /// A recording [`LogSink`] — captures the lines the audit-log notifier wrote.
@@ -335,8 +334,12 @@ mod tests {
         }
     }
 
-    fn usage85() -> NotifyEvent {
-        NotifyEvent::Usage(UsageLevel::Pct85)
+    /// A low-priority event (gui/log only, never the phone) — for tests that
+    /// exercise the @all broadcast / no-phone delivery paths.
+    fn slice_done() -> NotifyEvent {
+        NotifyEvent::SliceComplete {
+            part: "001".to_string(),
+        }
     }
     fn blocked(item: &str) -> NotifyEvent {
         NotifyEvent::BlockedOnHuman {
@@ -356,17 +359,18 @@ mod tests {
         d.register(Box::new(GuiNotifier::new(hub)));
         d.register(Box::new(LogNotifier::new(Arc::clone(&spy))));
 
-        let chans = d.notify(&usage85(), 0);
+        let chans = d.notify(&slice_done(), 0);
         assert_eq!(chans, vec![Channel::Gui, Channel::Log]);
 
-        // GUI: a kind:"alert" bus message addressed @all (85% is not human-attn).
+        // GUI: a kind:"alert" bus message addressed @all (slice-complete is not
+        // human-attention).
         assert_eq!(
             sub.try_recv().unwrap(),
-            Event::bus_message(ALERT_FROM, "all", ALERT_KIND, "5h budget at 85%")
+            Event::bus_message(ALERT_FROM, "all", ALERT_KIND, "slice `001` complete")
         );
         assert!(sub.try_recv().is_err(), "exactly one GUI event");
         // Log: one durable audit line carrying the same summary.
-        assert_eq!(spy.lines(), vec!["growlightd alert: 5h budget at 85%".to_string()]);
+        assert_eq!(spy.lines(), vec!["growlightd alert: slice `001` complete".to_string()]);
     }
 
     /// A human-attention alert is additionally addressed `to: "human"` on the GUI
@@ -428,7 +432,7 @@ mod tests {
         }
         d.register(Box::new(PhoneRef(Arc::clone(&phone))));
 
-        let chans = d.notify(&usage85(), 0); // 85% → gui/log only
+        let chans = d.notify(&slice_done(), 0); // slice-complete → gui/log only
         assert_eq!(chans, vec![Channel::Gui, Channel::Log]);
         assert!(phone.delivered().is_empty(), "phone not selected for a low-priority event");
     }
@@ -448,13 +452,13 @@ mod tests {
         d.set_bus_emit(Box::new(Arc::clone(&bus)));
 
         // First fire delivers everywhere.
-        assert_eq!(d.notify(&usage85(), 0), vec![Channel::Gui, Channel::Log]);
+        assert_eq!(d.notify(&slice_done(), 0), vec![Channel::Gui, Channel::Log]);
         let _ = sub.try_recv().unwrap();
         assert_eq!(spy.lines().len(), 1);
         assert_eq!(bus.bodies().len(), 1);
 
         // Inside the cooldown → suppressed: nothing new anywhere.
-        assert!(d.notify(&usage85(), 50).is_empty(), "suppressed");
+        assert!(d.notify(&slice_done(), 50).is_empty(), "suppressed");
         assert!(sub.try_recv().is_err(), "no GUI event on a suppressed fire");
         assert_eq!(spy.lines().len(), 1, "no extra log line");
         assert_eq!(bus.bodies().len(), 1, "no extra bus post");
@@ -477,8 +481,8 @@ mod tests {
         assert_eq!(d.deregister(Channel::Log), 0, "deregister is idempotent");
         assert_eq!(d.notifier_count(Channel::Log), 0);
 
-        // A fresh identity (different usage level) fires: GUI delivers, log does not.
-        let chans = d.notify(&NotifyEvent::Usage(UsageLevel::Pct90), 0);
+        // A fresh identity fires: GUI delivers, the deregistered log does not.
+        let chans = d.notify(&NotifyEvent::Usage, 0);
         assert!(chans.contains(&Channel::Gui) && chans.contains(&Channel::Log));
         assert!(sub.try_recv().is_ok(), "GUI still receives");
         assert!(spy.lines().is_empty(), "the deregistered log channel receives nothing");

@@ -1,7 +1,9 @@
 //! Cross-agent **usage aggregation** (phase 6, slice 003) — fold every agent's
 //! reading of the **one shared** account budget pool into a single fleet-wide
-//! [`BudgetUsage`], and report which [`UsageLevel`] rungs that aggregate meets
-//! (spec-growlight-orchestrator §7 shared-pool budgets, §9 the 85/90/95 events).
+//! [`BudgetUsage`], and report whether that aggregate has reached the single
+//! near-exhaustion alert rung (spec-growlight-orchestrator §7 shared-pool
+//! budgets, §9 the one 97% event — refined 2026-06-23 from the old 85/90/95
+//! ladder: one late warning is enough, three rungs were noise).
 //!
 //! ## What this is (and isn't)
 //!
@@ -12,7 +14,8 @@
 //!
 //! 1. *Given each agent's latest reading of the shared pool, what is the one
 //!    fleet-wide reserve right now?* ([`UsageAggregator::aggregate`])
-//! 2. *Which 85/90/95 rungs does that aggregate meet?* ([`levels_reached`])
+//! 2. *Has that aggregate reached the [`USAGE_ALERT_PCT`] rung?*
+//!    ([`usage_alert_reached`])
 //!
 //! — and nothing else. The **live source** — populating per-agent samples from
 //! the keeperd budget handshake (`BudgetChanged { agent: Some(id), .. }`) and the
@@ -30,7 +33,7 @@
 //! meter (taken at its own cadence), so growlightd has to fold those readings
 //! back into the single number the meter actually represents. That fold is this
 //! module; its output feeds **both** the governor (admission on real fleet burn)
-//! and the dispatcher (the 85/90/95 alerts).
+//! and the dispatcher (the one 97% near-exhaustion alert).
 //!
 //! ## Why **max**, not sum or mean
 //!
@@ -50,12 +53,13 @@
 use std::collections::BTreeMap;
 
 use crate::admission::BudgetUsage;
-use crate::notifications::UsageLevel;
 
-/// The defined 5h usage rungs, ascending — the thresholds [`levels_reached`]
-/// tests the aggregate against. Mirrors [`UsageLevel`]'s three variants; each
-/// `pct()` is its threshold.
-const USAGE_RUNGS: [UsageLevel; 3] = [UsageLevel::Pct85, UsageLevel::Pct90, UsageLevel::Pct95];
+/// The single 5h near-exhaustion alert rung (spec §9, refined 2026-06-23). One
+/// late warning at 97% replaces the old 85/90/95 ladder — the sole threshold
+/// [`usage_alert_reached`] tests the fleet aggregate against, and the percentage
+/// the [`NotifyEvent::Usage`](crate::notifications::NotifyEvent::Usage) summary
+/// renders.
+pub const USAGE_ALERT_PCT: u8 = 97;
 
 /// One agent's most-recent reading of the **shared account-wide** budget pool.
 ///
@@ -82,31 +86,26 @@ impl UsageSample {
     }
 }
 
-/// Which [`UsageLevel`] rungs the shared pool's **5h** reserve currently meets,
-/// ascending. A pure threshold map: `>= 85 → [Pct85]`, `>= 90 → [Pct85, Pct90]`,
-/// `>= 95 → [Pct85, Pct90, Pct95]`.
+/// Whether the shared pool's **5h** reserve has reached the single
+/// [`USAGE_ALERT_PCT`] near-exhaustion rung — a pure threshold test
+/// (`>= 97`, inclusive). The 7d reserve never trips this 5h rung.
 ///
-/// Feed each returned rung to the [`NotifyDispatcher`](crate::notify_dispatch);
-/// its existing per-rung dedup ([`NotifyPolicy`](crate::notifications), keyed
-/// `usage:85|90|95`) makes each fire **exactly once** across the rising budget,
-/// so this stays a *stateless fact* — the "fired once" state belongs to the
-/// engine, not duplicated here (the pure-module discipline: consume the existing
-/// seam). A jump straight past several rungs reports all of them, and the engine
-/// still fires each once. The rungs are 5h-scoped, matching
-/// [`NotifyEvent::Usage`](crate::notifications::NotifyEvent::Usage)'s
-/// "5h budget at N%" summary.
-pub fn levels_reached(budget: BudgetUsage) -> Vec<UsageLevel> {
-    USAGE_RUNGS
-        .into_iter()
-        .filter(|rung| budget.session_5h_pct >= rung.pct())
-        .collect()
+/// When true, fire one [`NotifyEvent::Usage`](crate::notifications::NotifyEvent::Usage)
+/// at the [`NotifyDispatcher`](crate::notify_dispatch); its dedup
+/// ([`NotifyPolicy`](crate::notifications), keyed `usage`) makes that alert fire
+/// **exactly once** across the rising budget, so this stays a *stateless fact* —
+/// the "fired once" state belongs to the engine, not duplicated here (the
+/// pure-module discipline: consume the existing seam). The rung is 5h-scoped,
+/// matching the event's "5h budget at 97%" summary.
+pub fn usage_alert_reached(budget: BudgetUsage) -> bool {
+    budget.session_5h_pct >= USAGE_ALERT_PCT
 }
 
 /// The cross-agent usage aggregator: holds each agent's latest reading of the
 /// shared pool and folds them into one fleet-wide [`BudgetUsage`]. Pure — no
 /// clock, no I/O; the drive loop feeds it from the live `BudgetChanged{agent}`
 /// stream and reads [`aggregate_or_fresh`](Self::aggregate_or_fresh) /
-/// [`fleet_levels`](Self::fleet_levels) at each admission/notify boundary.
+/// [`fleet_alert`](Self::fleet_alert) at each admission/notify boundary.
 #[derive(Debug, Default)]
 pub struct UsageAggregator {
     /// The latest reading per agent (last-write-wins). Keyed for a deterministic
@@ -158,11 +157,14 @@ impl UsageAggregator {
         self.aggregate().unwrap_or(BudgetUsage::new(0, 0))
     }
 
-    /// The usage rungs the **current fleet aggregate** meets — [`levels_reached`]
-    /// over [`aggregate_or_fresh`](Self::aggregate_or_fresh). The drive loop
-    /// feeds these to its single [`NotifyDispatcher`](crate::notify_dispatch).
-    pub fn fleet_levels(&self) -> Vec<UsageLevel> {
-        levels_reached(self.aggregate_or_fresh())
+    /// Whether the **current fleet aggregate** has reached the single
+    /// near-exhaustion rung — [`usage_alert_reached`] over
+    /// [`aggregate_or_fresh`](Self::aggregate_or_fresh). When true, the drive
+    /// loop fires one [`NotifyEvent::Usage`](crate::notifications::NotifyEvent::Usage)
+    /// at its single [`NotifyDispatcher`](crate::notify_dispatch), whose dedup
+    /// makes it announce exactly once.
+    pub fn fleet_alert(&self) -> bool {
+        usage_alert_reached(self.aggregate_or_fresh())
     }
 }
 
@@ -200,7 +202,7 @@ mod tests {
         assert_eq!(agg.aggregate(), None);
         assert_eq!(agg.aggregate_or_fresh(), BudgetUsage::new(0, 0));
         assert_eq!(agg.agent_count(), 0);
-        assert!(agg.fleet_levels().is_empty());
+        assert!(!agg.fleet_alert(), "an empty fleet has not reached the rung");
     }
 
     /// The fold is the per-field MAX across agents — the freshest-vouchable view
@@ -250,74 +252,62 @@ mod tests {
         assert_eq!(agg.agent_count(), 1);
     }
 
-    /// `levels_reached` is a pure threshold map on the 5h reserve, at the
-    /// boundaries (>= is inclusive; 7d is irrelevant to the rungs).
+    /// `usage_alert_reached` is a pure threshold test on the 5h reserve at the
+    /// single 97% rung (>= is inclusive; 7d never trips it).
     #[test]
-    fn levels_reached_maps_thresholds_inclusively() {
-        let lvls = |five_h| levels_reached(BudgetUsage::new(five_h, 0));
-        assert!(lvls(84).is_empty(), "under the first rung");
-        assert_eq!(lvls(85), vec![UsageLevel::Pct85], "at 85");
-        assert_eq!(lvls(89), vec![UsageLevel::Pct85]);
-        assert_eq!(lvls(90), vec![UsageLevel::Pct85, UsageLevel::Pct90], "at 90");
-        assert_eq!(lvls(94), vec![UsageLevel::Pct85, UsageLevel::Pct90]);
-        assert_eq!(
-            lvls(95),
-            vec![UsageLevel::Pct85, UsageLevel::Pct90, UsageLevel::Pct95],
-            "at 95 all three"
-        );
-        assert_eq!(lvls(100).len(), 3, "saturated still just the three rungs");
-        // The 7d reserve never adds a 5h rung.
-        assert!(levels_reached(BudgetUsage::new(10, 99)).is_empty());
+    fn usage_alert_reached_at_97_inclusive() {
+        let hit = |five_h| usage_alert_reached(BudgetUsage::new(five_h, 0));
+        assert!(!hit(85), "the old first rung no longer alerts");
+        assert!(!hit(95), "the old top rung no longer alerts on its own");
+        assert!(!hit(96), "just under the rung");
+        assert!(hit(97), "at the rung (inclusive)");
+        assert!(hit(100), "saturated");
+        // The 7d reserve never trips the 5h rung.
+        assert!(!usage_alert_reached(BudgetUsage::new(10, 99)));
     }
 
-    /// The fleet aggregate gradually crossing 85 → 90 → 95 fires each alert
-    /// **exactly once** via the dispatcher's existing per-rung dedup.
+    /// The fleet aggregate crossing the single 97% rung fires **exactly one**
+    /// alert via the dispatcher's dedup — sub-97 readings fire nothing, and a
+    /// later still-over-97 sample never re-announces it.
     #[test]
-    fn crossing_85_90_95_fires_each_alert_exactly_once() {
+    fn the_fleet_alert_fires_once_when_the_pool_crosses_97() {
         let mut agg = UsageAggregator::new();
-        // A long cooldown so a repeat of a rung is always suppressed within the run.
+        // A long cooldown so a repeat is always suppressed within the run.
         let mut d = NotifyDispatcher::with_policy(NotifyPolicy::with_cooldown(1_000_000));
         let now = 1_000;
 
-        let mut fired: Vec<u8> = Vec::new();
-        // The shared pool burns up over successive samples (one agent suffices —
-        // the aggregate is the shared meter).
-        for five_h in [80u8, 86, 91, 96] {
+        let mut fires = 0;
+        // The shared pool burns up over successive samples; only the one that
+        // crosses 97 fires, and only once (one agent suffices — the aggregate is
+        // the shared meter).
+        for five_h in [80u8, 90, 96, 98, 99] {
             agg.observe(sample("a1", five_h, 5));
-            for level in agg.fleet_levels() {
-                if !d.notify(&NotifyEvent::Usage(level), now).is_empty() {
-                    fired.push(level.pct());
-                }
+            if agg.fleet_alert() && !d.notify(&NotifyEvent::Usage, now).is_empty() {
+                fires += 1;
             }
         }
-        // Each rung announced once, in order — never re-fired despite being
-        // "reached" on every later sample.
-        assert_eq!(fired, vec![85, 90, 95]);
+        assert_eq!(fires, 1, "exactly one alert across the whole rising burn");
     }
 
-    /// A jump straight past every rung announces all reached rungs once, then
-    /// never re-fires them.
+    /// A jump straight past the rung announces it once, then stays quiet.
     #[test]
-    fn a_jump_past_every_rung_fires_each_once_then_stays_quiet() {
+    fn a_jump_past_the_rung_fires_once_then_stays_quiet() {
         let mut agg = UsageAggregator::new();
         let mut d = NotifyDispatcher::with_policy(NotifyPolicy::with_cooldown(1_000_000));
-        agg.observe(sample("a1", 96, 5)); // 0 → 96 in one reading
+        agg.observe(sample("a1", 98, 5)); // 0 → 98 in one reading
 
-        let mut fired_now: Vec<u8> = Vec::new();
-        for level in agg.fleet_levels() {
-            if !d.notify(&NotifyEvent::Usage(level), 0).is_empty() {
-                fired_now.push(level.pct());
-            }
-        }
-        assert_eq!(fired_now, vec![85, 90, 95], "all reached rungs fire once");
-
-        // A later sample still at/over 95 re-reaches the same rungs but none fire.
-        agg.observe(sample("a1", 97, 5));
-        let any = agg
-            .fleet_levels()
-            .into_iter()
-            .any(|l| !d.notify(&NotifyEvent::Usage(l), 1).is_empty());
-        assert!(!any, "already-announced rungs stay quiet");
+        assert!(agg.fleet_alert());
+        assert!(
+            !d.notify(&NotifyEvent::Usage, 0).is_empty(),
+            "the reached rung fires once"
+        );
+        // A later sample still over 97 re-reaches the rung but does not re-fire.
+        agg.observe(sample("a1", 99, 5));
+        assert!(agg.fleet_alert());
+        assert!(
+            d.notify(&NotifyEvent::Usage, 1).is_empty(),
+            "the already-announced rung stays quiet"
+        );
     }
 
     /// The governor reads the fleet aggregate and refuses admission once the

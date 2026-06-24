@@ -25,18 +25,17 @@
 //! - **GUI and the audit log always fire** for every event — the groupchat is
 //!   the alert history (§4a), the log is the durable record.
 //! - **The phone additionally fires for the human-attention set** (§10): events
-//!   that stall the fleet or need a human decision — a budget threshold near the
-//!   halt rail (90/95), a `BLOCKED_ON_HUMAN` park, a drained queue, a crashed
-//!   agent. Routine progress (`slice-complete`), the first soft budget warning
-//!   (85), and self-healing coordination signals (`thrash-detected`,
-//!   `lease-denied` — the fleet's §4d ladder handles these before the human)
-//!   stay GUI/log only.
+//!   that stall the fleet or need a human decision — the single near-exhaustion
+//!   budget alert (97%, §7 refined 2026-06-23), a `BLOCKED_ON_HUMAN` park, a
+//!   drained queue, a crashed agent. Routine progress (`slice-complete`) and
+//!   self-healing coordination signals (`thrash-detected`, `lease-denied` — the
+//!   fleet's §4d ladder handles these before the human) stay GUI/log only.
 //! - **Per-event dedup/cooldown.** Each event has a stable identity key (its
 //!   class plus subject); a repeat of the *same* identity inside the cooldown is
-//!   suppressed (an empty channel set), so a sustained 85% does not re-fire every
+//!   suppressed (an empty channel set), so a sustained 97% does not re-fire every
 //!   iteration. Past the cooldown the same identity fires again (a reminder).
-//!   Distinct identities — a different usage level, a different blocked item, a
-//!   different crashed agent — are independent and never suppress each other.
+//!   Distinct identities — the usage alert, a different blocked item, a different
+//!   crashed agent — are independent and never suppress each other.
 
 use std::collections::HashMap;
 
@@ -60,37 +59,16 @@ pub enum Channel {
     Phone,
 }
 
-/// A 5-hour budget threshold crossing (§7). Three distinct levels, each its own
-/// dedup identity: crossing 85 fires once, then 90 fires once, then 95 once —
-/// the rising budget never re-spams a level it already announced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageLevel {
-    /// 85% — first soft warning (GUI/log only).
-    Pct85,
-    /// 90% — escalates to the phone (approaching the halt rail).
-    Pct90,
-    /// 95% — escalates to the phone (at the halt rail).
-    Pct95,
-}
-
-impl UsageLevel {
-    /// The percentage this level represents (for keys and summaries).
-    pub fn pct(self) -> u8 {
-        match self {
-            Self::Pct85 => 85,
-            Self::Pct90 => 90,
-            Self::Pct95 => 95,
-        }
-    }
-}
-
 /// An orchestrator event the policy engine routes (spec §9 event set). Variants
 /// that name a subject (an item, a queue, an agent, a target) carry it so two
 /// different subjects route and dedup independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyEvent {
-    /// The shared 5h budget crossed a threshold (§7).
-    Usage(UsageLevel),
+    /// The shared 5h budget reached the single near-exhaustion rung
+    /// ([`USAGE_ALERT_PCT`](crate::usage::USAGE_ALERT_PCT), §7 refined
+    /// 2026-06-23). One dedup identity — the rising budget announces it once, to
+    /// the phone (it is near the halt rail).
+    Usage,
     /// An item parked `BLOCKED_ON_HUMAN` (§6 pivot-on-block) — needs a human
     /// answer before it can proceed.
     BlockedOnHuman {
@@ -134,10 +112,10 @@ impl NotifyEvent {
     /// human decision; everything else is GUI/log only.
     pub fn is_human_attention(&self) -> bool {
         match self {
-            Self::Usage(level) => matches!(level, UsageLevel::Pct90 | UsageLevel::Pct95),
-            Self::BlockedOnHuman { .. } | Self::QueueEmpty { .. } | Self::AgentCrashed { .. } => {
-                true
-            }
+            Self::Usage
+            | Self::BlockedOnHuman { .. }
+            | Self::QueueEmpty { .. }
+            | Self::AgentCrashed { .. } => true,
             Self::SliceComplete { .. }
             | Self::ThrashDetected { .. }
             | Self::LeaseDenied { .. } => false,
@@ -161,7 +139,7 @@ impl NotifyEvent {
     /// keys never suppress each other.
     pub fn dedup_key(&self) -> String {
         match self {
-            Self::Usage(level) => format!("usage:{}", level.pct()),
+            Self::Usage => "usage".to_string(),
             Self::BlockedOnHuman { item } => format!("blocked:{item}"),
             Self::QueueEmpty { queue } => format!("queue-empty:{queue}"),
             Self::SliceComplete { part } => format!("slice-complete:{part}"),
@@ -176,7 +154,7 @@ impl NotifyEvent {
     /// formatting; lives on the event because the event owns its own meaning.
     pub fn summary(&self) -> String {
         match self {
-            Self::Usage(level) => format!("5h budget at {}%", level.pct()),
+            Self::Usage => format!("5h budget at {}%", crate::usage::USAGE_ALERT_PCT),
             Self::BlockedOnHuman { item } => {
                 format!("`{item}` is blocked on a human decision")
             }
@@ -252,9 +230,7 @@ mod tests {
     #[test]
     fn gui_and_log_always_fire_for_every_event() {
         let events = [
-            NotifyEvent::Usage(UsageLevel::Pct85),
-            NotifyEvent::Usage(UsageLevel::Pct90),
-            NotifyEvent::Usage(UsageLevel::Pct95),
+            NotifyEvent::Usage,
             blocked("004"),
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),
@@ -286,8 +262,7 @@ mod tests {
     fn human_attention_set_routes_to_phone_others_do_not() {
         // Human-attention: budget near the rail, blocked, drained, crashed.
         for e in [
-            NotifyEvent::Usage(UsageLevel::Pct90),
-            NotifyEvent::Usage(UsageLevel::Pct95),
+            NotifyEvent::Usage,
             blocked("004"),
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),
@@ -303,9 +278,8 @@ mod tests {
                 "{e:?} → phone+gui+log"
             );
         }
-        // Low-priority: first warning, progress, self-healing coordination.
+        // Low-priority: routine progress, self-healing coordination.
         for e in [
-            NotifyEvent::Usage(UsageLevel::Pct85),
             NotifyEvent::SliceComplete {
                 part: "001".to_string(),
             },
@@ -331,7 +305,11 @@ mod tests {
     #[test]
     fn cooldown_suppresses_a_repeat_then_re_fires() {
         let mut p = NotifyPolicy::with_cooldown(100);
-        let e = NotifyEvent::Usage(UsageLevel::Pct85);
+        // A low-priority event (gui/log only) isolates the cooldown mechanics from
+        // the human-attention routing.
+        let e = NotifyEvent::SliceComplete {
+            part: "001".to_string(),
+        };
         assert_eq!(p.decide(&e, 0), vec![Channel::Gui, Channel::Log], "first fire");
         // Inside the 100s window → suppressed.
         assert!(p.decide(&e, 50).is_empty(), "suppressed inside cooldown");
@@ -362,35 +340,25 @@ mod tests {
             .is_empty());
     }
 
-    /// The three usage levels are distinct identities: 85 firing once does not
-    /// suppress 90 or 95 — the rising budget still announces each rung.
+    /// The single usage alert fires once — to the phone (it is near the halt
+    /// rail) — then is suppressed within the cooldown (the §9 single-97% collapse).
     #[test]
-    fn each_usage_level_fires_independently() {
+    fn the_single_usage_alert_fires_once_then_is_suppressed() {
         let mut p = NotifyPolicy::with_cooldown(1000);
-        // 85 fires (gui/log), then is suppressed on repeat...
+        // First fire routes everywhere, phone included (near-exhaustion).
         assert_eq!(
-            p.decide(&NotifyEvent::Usage(UsageLevel::Pct85), 0),
-            vec![Channel::Gui, Channel::Log]
-        );
-        assert!(p.decide(&NotifyEvent::Usage(UsageLevel::Pct85), 1).is_empty());
-        // ...but 90 and 95 are independent identities and still fire, to phone.
-        assert_eq!(
-            p.decide(&NotifyEvent::Usage(UsageLevel::Pct90), 1),
+            p.decide(&NotifyEvent::Usage, 0),
             vec![Channel::Gui, Channel::Log, Channel::Phone]
         );
-        assert_eq!(
-            p.decide(&NotifyEvent::Usage(UsageLevel::Pct95), 1),
-            vec![Channel::Gui, Channel::Log, Channel::Phone]
-        );
+        // A repeat inside the cooldown is suppressed — no re-spam of a sustained 97%.
+        assert!(p.decide(&NotifyEvent::Usage, 1).is_empty());
+        assert!(p.decide(&NotifyEvent::Usage, 999).is_empty());
     }
 
     /// Dedup keys encode class + subject so the identity is stable and unique.
     #[test]
     fn dedup_keys_distinguish_class_and_subject() {
-        assert_eq!(
-            NotifyEvent::Usage(UsageLevel::Pct90).dedup_key(),
-            "usage:90"
-        );
+        assert_eq!(NotifyEvent::Usage.dedup_key(), "usage");
         assert_eq!(blocked("004").dedup_key(), "blocked:004");
         assert_ne!(blocked("004").dedup_key(), blocked("005").dedup_key());
         assert_eq!(
@@ -408,7 +376,7 @@ mod tests {
     #[test]
     fn every_event_summary_is_non_empty() {
         for e in [
-            NotifyEvent::Usage(UsageLevel::Pct95),
+            NotifyEvent::Usage,
             blocked("004"),
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),

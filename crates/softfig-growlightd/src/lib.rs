@@ -52,7 +52,7 @@ pub use drive_loop::{
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
 pub use leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
-pub use notifications::{Channel, NotifyEvent, NotifyPolicy, UsageLevel};
+pub use notifications::{Channel, NotifyEvent, NotifyPolicy};
 pub use notify_dispatch::{
     BusEmit, GuiNotifier, LogNotifier, LogSink, Notifier, NotifyDispatcher, PhoneStub, StderrLog,
     ALERT_FROM, ALERT_KIND,
@@ -65,4 +65,4 @@ pub use supervisor::{
     AgentBackend, AgentHealth, AgentSpec, Backoff, PollOutcome, RerollOutcome, SpawnError,
     StartOutcome, Supervisor,
 };
-pub use usage::{levels_reached, UsageAggregator, UsageSample};
+pub use usage::{usage_alert_reached, UsageAggregator, UsageSample, USAGE_ALERT_PCT};
