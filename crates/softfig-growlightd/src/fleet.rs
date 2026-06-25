@@ -27,10 +27,11 @@
 //!
 //! ## Scope of this slice
 //!
-//! Only the assembly + spawn + gate. The live [`QueueSource`] (slice 002), the
-//! real 5h/7d reserve (slice 005) and the live [`RateSource`] (slice 006) are
-//! still their deferred/permissive defaults here ([`DeferredQueues`] /
-//! [`PermissiveRate`]) — safe because the gate stays off until
+//! Assembly + spawn + gate, plus the live [`QueueSource`] (slice 002): the queue
+//! snapshot is now pulled from keeperd's per-queue managed regions
+//! ([`KeeperdQueueSource`]). The real 5h/7d reserve (slice 005) and the live
+//! [`RateSource`] (slice 006) are still their permissive defaults here
+//! ([`PermissiveRate`]) — safe because the gate stays off until
 //! `growlight-verify-merge` enables it on-device.
 
 use std::path::{Path, PathBuf};
@@ -44,9 +45,10 @@ use crate::admission::AdmissionGovernor;
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
-    spawn_drive_loop, DeferredQueues, DriveLoop, FleetMember, PermissiveRate, DRIVE_POLL_MS,
+    spawn_drive_loop, DriveLoop, FleetMember, PermissiveRate, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
+use crate::queue_source::KeeperdQueueSource;
 use crate::supervisor::{AgentSpec, Supervisor};
 
 /// The `claude` binary the backend shells when the config omits `claude_bin`.
@@ -171,10 +173,16 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
 /// stderr audit log) are registered on the owned dispatcher.
 ///
 /// Split out from [`spawn_fleet`] so the gate + assembly are unit-testable
-/// without spawning the 1s-cadence thread: an assembled loop can be `tick`ed
-/// in-process, and (because [`DeferredQueues`] yields an empty snapshot) that tick
-/// schedules nothing and never shells a real `claude`.
-pub fn assemble_fleet(daemon: &Daemon, fleet: &FleetConfig) -> Option<DriveLoop> {
+/// without spawning the 1s-cadence thread. `keeperd_socket` backs the live
+/// [`KeeperdQueueSource`] (slice 002): each tick pulls the per-queue managed
+/// regions from keeperd, fail-closed (a read error idles, never a scheduling
+/// failure), so a gated-on loop with keeperd unreachable simply schedules
+/// nothing rather than shelling a real `claude`.
+pub fn assemble_fleet(
+    daemon: &Daemon,
+    fleet: &FleetConfig,
+    keeperd_socket: &Path,
+) -> Option<DriveLoop> {
     if !fleet.enabled {
         return None;
     }
@@ -198,7 +206,7 @@ pub fn assemble_fleet(daemon: &Daemon, fleet: &FleetConfig) -> Option<DriveLoop>
         daemon.clone(),
         supervisor,
         Box::new(Arc::clone(&backend)), // health  — live ClaudeBackend (slice 001)
-        Box::new(DeferredQueues),       // queues  — slice 002 wires the live source
+        Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
         Box::new(PermissiveRate),       // rate    — slice 006 wires the live source
         dispatcher,
@@ -214,8 +222,9 @@ pub fn assemble_fleet(daemon: &Daemon, fleet: &FleetConfig) -> Option<DriveLoop>
 pub fn spawn_fleet(
     daemon: &Daemon,
     fleet: &FleetConfig,
+    keeperd_socket: &Path,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
-    match assemble_fleet(daemon, fleet) {
+    match assemble_fleet(daemon, fleet, keeperd_socket) {
         None => Ok(None),
         Some(drive) => Ok(Some(spawn_drive_loop(
             daemon.clone(),
@@ -238,11 +247,19 @@ mod tests {
         "[[growlight.fleet]]\nagent = \"a\"\nloop_settings = \"/l\"\nmcp_config = \"/m\"\n"
     }
 
+    /// A stand-in keeperd socket for the assembly tests. Gate-off assembly never
+    /// touches it (it returns before building the queue source); gate-on assembly
+    /// only stores the path (the live pull happens on `tick`, which these tests do
+    /// not call — the live source's read/parse paths are proven in `queue_source`).
+    fn keeperd_socket() -> &'static Path {
+        Path::new("/run/nonexistent-keeperd.sock")
+    }
+
     #[test]
     fn gate_off_assembles_nothing() {
         let d = daemon();
         assert!(
-            assemble_fleet(&d, &FleetConfig::disabled()).is_none(),
+            assemble_fleet(&d, &FleetConfig::disabled(), keeperd_socket()).is_none(),
             "the disabled default constructs no DriveLoop",
         );
         // An explicit `fleet_enabled = false` with a member present is still off —
@@ -255,26 +272,29 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.members.len(), 1, "members still parse while disarmed");
         assert!(
-            assemble_fleet(&d, &cfg).is_none(),
+            assemble_fleet(&d, &cfg, keeperd_socket()).is_none(),
             "gate off ⇒ no DriveLoop even with configured members",
         );
     }
 
     #[test]
-    fn gate_on_assembles_a_loop_that_ticks_idle_without_a_live_queue() {
+    fn gate_on_assembles_a_loop_over_the_live_keeperd_queue_source() {
         let d = daemon();
         let cfg = FleetConfig::from_keeper_toml(&format!(
             "[growlight]\nfleet_enabled = true\n{}",
             member_toml()
         ))
         .unwrap();
-        let mut drive = assemble_fleet(&d, &cfg).expect("gate on ⇒ Some(DriveLoop)");
-        // `DeferredQueues` yields an empty snapshot, so a tick schedules nothing
-        // and never shells a real `claude` — safe to run in-process.
-        let report = drive.tick(0);
-        assert!(report.started.is_empty(), "no live queue ⇒ no starts");
-        assert!(report.held_starts.is_empty());
-        assert!(!report.paused);
+        // Gate on ⇒ a live DriveLoop is assembled over the keeperd-backed
+        // QueueSource (slice 002). We deliberately do NOT `tick` here: a tick pulls
+        // the backlog doc over the socket (`call_reconnecting`, ~3s budget against a
+        // dead socket). The live source's fail-closed-idle-on-error path and the
+        // empty-snapshot-schedules-nothing path are unit-proven in `queue_source`
+        // and `drive_loop`, so assembly success is all this test needs to assert.
+        assert!(
+            assemble_fleet(&d, &cfg, keeperd_socket()).is_some(),
+            "gate on ⇒ Some(DriveLoop) over the live queue source",
+        );
     }
 
     #[test]

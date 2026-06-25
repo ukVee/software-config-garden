@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     // fails a poll and retries; it never brings growlightd down.
     let bus_tailer = spawn_bus_tailer(
         handle.daemon.clone(),
-        Box::new(KeeperdBusSource::new(keeperd_socket)),
+        Box::new(KeeperdBusSource::new(keeperd_socket.clone())),
         std::time::Duration::from_millis(BUS_POLL_MS),
     )?;
 
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     // Gate off ⇒ `None`, nothing constructed or spawned, so growlightd is
     // byte-identical to today (the on-device enablement is `growlight-verify-merge`).
     let fleet_config = load_fleet_config(&garden_root);
-    let drive_loop = spawn_fleet(&handle.daemon, &fleet_config)
+    let drive_loop = spawn_fleet(&handle.daemon, &fleet_config, &keeperd_socket)
         .context("spawning the live fleet drive loop")?;
     if drive_loop.is_some() {
         eprintln!(
