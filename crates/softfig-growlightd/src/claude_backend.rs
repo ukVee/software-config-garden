@@ -105,27 +105,66 @@ impl AgentHealthState {
     }
 }
 
-/// Shared per-agent cell holding the latest best-effort reading of the shared
-/// **account-wide** budget pool (the 5h/7d reserve) parsed from this agent's
-/// stream-json `result` line. The reader thread writes it; the drive loop reads
-/// it via [`ClaudeBackend::budget`] to feed the cross-agent
-/// [`crate::usage::UsageAggregator`]. Sibling to [`AgentHealthState`] — health
-/// (heartbeat/exit) and budget (reserve) are decoupled observations of one agent.
+/// Which rolling reserve window a `rate_limit_event` reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetWindow {
+    /// The 5h rolling account-wide reserve.
+    FiveHour,
+    /// The 7d rolling account-wide reserve.
+    SevenDay,
+}
+
+/// Shared per-agent cell holding the latest reading of the shared **account-wide**
+/// budget pool (the 5h/7d reserve), folded from this agent's stream-json
+/// `rate_limit_event` lines — the reliable headless source (spec §6/§7): headless
+/// `claude -p` reports a coarse per-window `status` on these events, not a
+/// percentage (see [`pump`] / [`rate_limit_window_for_line`]). A terminal `result`
+/// line carrying a `rate_limits` object is honored too, as an opportunistic bonus.
+/// The reader thread writes it; the drive loop reads it via [`ClaudeBackend::budget`]
+/// to feed the cross-agent [`crate::usage::UsageAggregator`]. Sibling to
+/// [`AgentHealthState`] — health (heartbeat/exit) and budget (reserve) are
+/// decoupled observations of one agent.
 #[derive(Debug, Default)]
 pub struct AgentBudgetState {
-    /// `None` until a `result` line carrying a parseable reserve arrives.
-    latest: Mutex<Option<BudgetUsage>>,
+    /// The two windows' latest reserve %, accumulated across the per-window events.
+    inner: Mutex<ReserveCell>,
+}
+
+/// Each window's latest reserve %, `None` until first reported. A `rate_limit_event`
+/// arrives **per window** (a separate line for `five_hour` / `seven_day`), so the
+/// cell accumulates them and derives the combined [`BudgetUsage`] on read.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReserveCell {
+    five_h_pct: Option<u8>,
+    seven_d_pct: Option<u8>,
 }
 
 impl AgentBudgetState {
-    /// Record this agent's latest shared-pool reserve reading.
-    fn record(&self, reserve: BudgetUsage) {
-        *self.latest.lock().unwrap() = Some(reserve);
+    /// Record one window's latest reserve % (from a `rate_limit_event`).
+    fn record_window(&self, window: BudgetWindow, pct: u8) {
+        let mut cell = self.inner.lock().unwrap();
+        match window {
+            BudgetWindow::FiveHour => cell.five_h_pct = Some(pct),
+            BudgetWindow::SevenDay => cell.seven_d_pct = Some(pct),
+        }
     }
 
-    /// The latest recorded reserve, or `None` if none has been parsed yet.
+    /// Record a full 5h/7d reserve at once — the opportunistic `result`-line bonus.
+    fn record_reserve(&self, reserve: BudgetUsage) {
+        let mut cell = self.inner.lock().unwrap();
+        cell.five_h_pct = Some(reserve.session_5h_pct);
+        cell.seven_d_pct = Some(reserve.session_7d_pct);
+    }
+
+    /// The latest combined reserve, or `None` until at least one window has
+    /// reported. A not-yet-seen window contributes 0 (it has shown no burn); the
+    /// aggregator's per-field max across agents fills it in once any agent reads it.
     fn observe(&self) -> Option<BudgetUsage> {
-        *self.latest.lock().unwrap()
+        let cell = *self.inner.lock().unwrap();
+        match (cell.five_h_pct, cell.seven_d_pct) {
+            (None, None) => None,
+            (five, seven) => Some(BudgetUsage::new(five.unwrap_or(0), seven.unwrap_or(0))),
+        }
     }
 }
 
@@ -198,10 +237,10 @@ pub struct AgentBudgetReading {
     /// Context-window occupancy % (`used / contextWindow`), when the result
     /// carries enough to compute it. Reliable in headless stream-json.
     pub ctx_pct: Option<u8>,
-    /// Best-effort account-wide 5h/7d reserve. **Wire-format-unconfirmed**: the
-    /// headless `result` event is NOT confirmed to carry the account-pool
-    /// rate-limit reserve (that surfaces via the statusLine `usage.json` today,
-    /// not stream-json), so this is `None` unless a future result embeds it.
+    /// Opportunistic account-wide 5h/7d reserve from a `rate_limits` object on the
+    /// `result` line, if the backend embeds one. The reliable headless source is
+    /// the per-window `rate_limit_event` (see [`rate_limit_window_for_line`]), so
+    /// this is the *bonus* path: `None` unless a `result` carries the object.
     pub reserve: Option<BudgetUsage>,
 }
 
@@ -211,10 +250,9 @@ pub struct AgentBudgetReading {
 ///
 /// The per-agent **context %** is computed from the reliable `usage` token counts
 /// over `modelUsage.<model>.contextWindow`. The account-wide **5h/7d reserve** is
-/// read best-effort from a `rate_limits` object mirroring `usage.json`'s
-/// documented shape IF present; the headless `result` event is not confirmed to
-/// carry it, so confirming the real wire source is §7b deferred (see the slice's
-/// `## Deferred verification`).
+/// read best-effort from a `rate_limits` object on the result IF present — the
+/// opportunistic bonus; the reliable headless source is the per-window
+/// `rate_limit_event` line, folded separately in [`pump`].
 fn budget_for_result_line(line: &str) -> Option<AgentBudgetReading> {
     let ev = serde_json::from_str::<Value>(line).ok()?;
     if ev.get("type").and_then(Value::as_str) != Some("result") {
@@ -255,19 +293,68 @@ fn ctx_pct_from_result(ev: &Value) -> Option<u8> {
     Some((occupancy.saturating_mul(100) / window).min(100) as u8)
 }
 
-/// Best-effort account-wide 5h/7d reserve from a `rate_limits` object mirroring
-/// `usage.json`'s `{five_hour,seven_day}.used_percentage` shape. `None` when the
-/// result carries no such object — the expected case today (see
-/// [`budget_for_result_line`]'s wire-format note).
+/// Map a rate-limit window's reported `status` + optional `used_percentage` to a
+/// single reserve %, mirroring the proven single-agent governor's rule
+/// (`softfig-cli`'s `growlight_backend` / `cmd_growlight::window_tripped`): the
+/// **status** is the reliable headless signal — `"allowed"` ⇒ 0, any other value
+/// (`"warning"` / `"rejected"`) ⇒ a saturated 100 so the window trips the §7 halt
+/// rail *and* the §9 near-exhaustion alert; a `used_percentage` is honored when a
+/// backend reports one. Their per-field **max** never under-counts the shared pool.
+/// `None` when the window carries neither signal — a missing reading is never read
+/// as a false 0 (drive-loop slice 001).
+fn window_pct(status: Option<&str>, used_percentage: Option<u8>) -> Option<u8> {
+    let status_pct = status.map(|s| if s == "allowed" { 0 } else { 100 });
+    let used = used_percentage.map(|p| p.min(100));
+    match (status_pct, used) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).max(b.unwrap_or(0))),
+    }
+}
+
+/// Parse a stream-json `rate_limit_event` line into the window + reserve % it
+/// reports — the reliable headless source of the account-wide 5h/7d reserve. A
+/// headless `claude -p` emits one of these per window carrying a coarse `status`
+/// (and a `resetsAt`), but no percentage (`growlight_backend`), so [`window_pct`]
+/// keys off the status. `None` for any other line, malformed JSON, an event with
+/// no `rate_limit_info`, or an unrecognized `rateLimitType`. Pure — a fixture
+/// drives it, no real spawn.
+fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8)> {
+    let ev = serde_json::from_str::<Value>(line).ok()?;
+    if ev.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+        return None;
+    }
+    let info = ev.get("rate_limit_info")?;
+    let window = match info.get("rateLimitType").and_then(Value::as_str)? {
+        "five_hour" => BudgetWindow::FiveHour,
+        "seven_day" => BudgetWindow::SevenDay,
+        _ => return None,
+    };
+    let status = info.get("status").and_then(Value::as_str);
+    let used = info
+        .get("used_percentage")
+        .and_then(Value::as_u64)
+        .map(|p| p.min(100) as u8);
+    window_pct(status, used).map(|pct| (window, pct))
+}
+
+/// Opportunistic account-wide 5h/7d reserve from a `rate_limits` object on a
+/// `result` line, reading each window's `status` (primary) + `used_percentage`
+/// through [`window_pct`]. `None` when the result carries no such object — the
+/// expected headless case (the reserve flows via `rate_limit_event` instead, see
+/// [`rate_limit_window_for_line`]); this is the documented bonus path.
 fn reserve_from_result(ev: &Value) -> Option<BudgetUsage> {
     let rl = ev.get("rate_limits")?;
-    let pct = |window: &str| {
-        rl.get(window)
-            .and_then(|w| w.get("used_percentage"))
-            .and_then(Value::as_u64)
-            .map(|p| p.min(100) as u8)
+    let win = |window: &str| {
+        rl.get(window).and_then(|w| {
+            let status = w.get("status").and_then(Value::as_str);
+            let used = w
+                .get("used_percentage")
+                .and_then(Value::as_u64)
+                .map(|p| p.min(100) as u8);
+            window_pct(status, used)
+        })
     };
-    match (pct("five_hour"), pct("seven_day")) {
+    match (win("five_hour"), win("seven_day")) {
         (None, None) => None,
         (five, seven) => Some(BudgetUsage::new(five.unwrap_or(0), seven.unwrap_or(0))),
     }
@@ -275,9 +362,10 @@ fn reserve_from_result(ev: &Value) -> Option<BudgetUsage> {
 
 /// Tail an agent's `claude -p --output-format stream-json` output to EOF,
 /// publishing each content block as an [`Event::AgentDelta`] on `hub`, bumping
-/// `health`'s heartbeat on every non-empty line, and recording the terminal
-/// `result` line's budget reading into `budget` (+ a per-agent context-gauge
-/// [`Event::BudgetChanged`] on `hub`). Pure over its `reader` / `now` seams: a
+/// `health`'s heartbeat on every non-empty line, folding each `rate_limit_event`
+/// line's account-wide reserve status into `budget` (the reliable headless §7
+/// source), and recording the terminal `result` line's context gauge (+ its
+/// opportunistic `rate_limits` reserve). Pure over its `reader` / `now` seams: a
 /// test drives it with a scripted fixture + fake clock, no real spawn.
 fn pump<R: BufRead>(
     reader: R,
@@ -296,18 +384,26 @@ fn pump<R: BufRead>(
         // Any line from the child is a sign of life → heartbeat, even if it
         // carries no renderable delta.
         health.touch(now());
+        // A `rate_limit_event` reports this agent's reading of the shared
+        // account-wide 5h/7d reserve as a coarse per-window status — the reliable
+        // headless source (spec §6/§7). Fold it into the budget cell the drive
+        // loop's UsageAggregator reads; a non-"allowed" window saturates it so the
+        // admission gate refuses (`window_pct`).
+        if let Some((window, pct)) = rate_limit_window_for_line(line) {
+            budget.record_window(window, pct);
+        }
         for (kind, text) in deltas_for_line(line) {
             hub.publish(Event::agent_delta(agent, kind, text));
         }
-        // The terminal `result` line carries this agent's usage reading: record
-        // its best-effort shared-pool reserve into the cell the drive loop's
-        // UsageAggregator reads, and publish the reliable per-agent context % as a
-        // `BudgetChanged{agent}` for the GUI gauges (spec §7/§12). The fleet-wide
-        // 5h/7d gauge (`agent: None`) is published by the drive loop once it has
-        // the cross-agent aggregate.
+        // The terminal `result` line carries this agent's context gauge; publish
+        // the reliable per-agent context % as a `BudgetChanged{agent}` for the GUI
+        // gauges (spec §7/§12), and fold any opportunistic `rate_limits` reserve
+        // into the budget cell as a bonus. The fleet-wide 5h/7d gauge (`agent:
+        // None`) is published by the drive loop once it has the cross-agent
+        // aggregate.
         if let Some(reading) = budget_for_result_line(line) {
             if let Some(reserve) = reading.reserve {
-                budget.record(reserve);
+                budget.record_reserve(reserve);
             }
             if let Some(ctx_pct) = reading.ctx_pct {
                 hub.publish(Event::BudgetChanged {
@@ -375,16 +471,16 @@ impl ClaudeBackend {
         self.agents.lock().unwrap().get(agent).map(|s| s.observe())
     }
 
-    /// `agent`'s latest best-effort reading of the shared account-wide budget pool
-    /// (5h/7d reserve), or `None` if it has not reported a parseable `result`
-    /// reserve yet. The drive loop folds these per-agent readings into the
-    /// cross-agent [`crate::usage::UsageAggregator`].
+    /// `agent`'s latest reading of the shared account-wide budget pool (5h/7d
+    /// reserve), or `None` if it has not reported a `rate_limit_event` (nor a
+    /// `result` carrying a `rate_limits` reserve) yet. The drive loop folds these
+    /// per-agent readings into the cross-agent [`crate::usage::UsageAggregator`].
     ///
-    /// ⚠️ The 5h/7d reserve is **wire-format-unconfirmed** in headless stream-json
-    /// (see [`budget_for_result_line`]): until the real source is confirmed
-    /// on-device this returns `None` in production, so the live aggregate stays
-    /// fresh. The seam + fold are proven over fakes; the live source is §7b
-    /// deferred.
+    /// The live source is the per-window stream-json `rate_limit_event` (the
+    /// headless §6/§7 signal — see [`rate_limit_window_for_line`]); the on-device
+    /// confirmation that a headless `claude -p` emits these events for a fleet
+    /// agent is this slice's `## Deferred verification` (no live `claude` in the
+    /// sandbox). A `None` here folds nothing, leaving the aggregate fresh.
     pub fn budget(&self, agent: &str) -> Option<BudgetUsage> {
         self.budgets
             .lock()
@@ -692,6 +788,140 @@ mod tests {
             budget_for_result_line(partial).unwrap().reserve,
             Some(BudgetUsage::new(97, 0))
         );
+
+        // A result whose `rate_limits` carries the headless `status` shape (no
+        // percentage) is read too: a non-"allowed" window saturates to 100.
+        let status_shaped = r#"{"type":"result","rate_limits":{"five_hour":{"status":"rejected"},"seven_day":{"status":"allowed"}}}"#;
+        assert_eq!(
+            budget_for_result_line(status_shaped).unwrap().reserve,
+            Some(BudgetUsage::new(100, 0))
+        );
+    }
+
+    #[test]
+    fn window_pct_keys_off_status_then_falls_back_to_used_percentage() {
+        // The reliable headless signal is the status: allowed ⇒ 0, anything else
+        // ⇒ a saturated 100 (mirrors the proven single-agent `window_tripped`).
+        assert_eq!(window_pct(Some("allowed"), None), Some(0));
+        assert_eq!(window_pct(Some("warning"), None), Some(100));
+        assert_eq!(window_pct(Some("rejected"), None), Some(100));
+        // A used_percentage is honored when present; the two take the safe max so
+        // a stale-low status can't mask a high percentage.
+        assert_eq!(window_pct(None, Some(42)), Some(42));
+        assert_eq!(window_pct(Some("allowed"), Some(73)), Some(73));
+        assert_eq!(window_pct(None, Some(255)), Some(100), "clamped to 100");
+        // Neither signal → nothing to record (never a false 0).
+        assert_eq!(window_pct(None, None), None);
+    }
+
+    #[test]
+    fn rate_limit_window_for_line_parses_the_headless_event_shape() {
+        // The real headless wire shape: a per-window `rate_limit_event` carrying a
+        // coarse status + reset (no percentage).
+        let five_rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected","resetsAt":1782367800}}"#;
+        assert_eq!(
+            rate_limit_window_for_line(five_rejected),
+            Some((BudgetWindow::FiveHour, 100))
+        );
+        let seven_allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#;
+        assert_eq!(
+            rate_limit_window_for_line(seven_allowed),
+            Some((BudgetWindow::SevenDay, 0))
+        );
+        // Non-events, malformed JSON, and an unrecognized window carry no reading.
+        assert!(rate_limit_window_for_line(r#"{"type":"result","result":"done"}"#).is_none());
+        assert!(rate_limit_window_for_line("not json").is_none());
+        assert!(rate_limit_window_for_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"yearly","status":"allowed"}}"#
+        )
+        .is_none());
+        // A rate_limit_event with no info is ignored, not a panic.
+        assert!(rate_limit_window_for_line(r#"{"type":"rate_limit_event"}"#).is_none());
+    }
+
+    #[test]
+    fn pump_folds_rate_limit_events_into_a_reserve_that_trips_the_gate() {
+        use crate::admission::{AdmissionDecision, AdmissionGovernor, Intent, RateState, RefuseReason};
+        use crate::config::Policy;
+        use crate::usage::usage_alert_reached;
+
+        let hub = EventHub::new();
+        let state = AgentHealthState::new(0);
+        let budget = AgentBudgetState::default();
+        let now = || 100;
+
+        // A headless run: the 5h window goes to `rejected` (pool exhausted) while
+        // the 7d window is still `allowed`, then the terminal result.
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init","model":"claude-opus-4-8"}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected","resetsAt":1782367800}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
+            "\n",
+        );
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &now);
+
+        // The non-"allowed" 5h status folded to a saturated 100; the allowed 7d to 0.
+        let reserve = budget.observe().expect("a reserve was folded from the events");
+        assert_eq!(reserve, BudgetUsage::new(100, 0));
+
+        // End-to-end: this reading trips the §9 fleet near-exhaustion rung AND
+        // makes the admission governor REFUSE a start on the 5h rail.
+        assert!(usage_alert_reached(reserve), "a rejected 5h window reaches the alert rung");
+        let g = AdmissionGovernor::new(Policy::default());
+        let rate = RateState {
+            tpm_used: 0,
+            rpm_used: 0,
+            tpm_limit: 1_000_000,
+            rpm_limit: 1_000,
+            tpm_per_agent: 1,
+            rpm_per_agent: 1,
+        };
+        assert_eq!(
+            g.decide(Intent::Start, 0, reserve, rate),
+            AdmissionDecision::Refuse {
+                reason: RefuseReason::Budget5h
+            },
+            "a tripped reserve refuses admission",
+        );
+    }
+
+    #[test]
+    fn an_all_allowed_reading_stays_below_the_rails_and_admits() {
+        use crate::admission::{AdmissionGovernor, Intent, RateState};
+        use crate::config::Policy;
+        use crate::usage::usage_alert_reached;
+
+        let hub = EventHub::new();
+        let state = AgentHealthState::new(0);
+        let budget = AgentBudgetState::default();
+        let now = || 0;
+
+        let stream = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"allowed","resetsAt":1782367800}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#,
+            "\n",
+        );
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &now);
+
+        // Both windows allowed → a fresh (0,0) reserve: no alert, admission admits.
+        let reserve = budget.observe().expect("an allowed reading still records (0,0)");
+        assert_eq!(reserve, BudgetUsage::new(0, 0));
+        assert!(!usage_alert_reached(reserve));
+        let g = AdmissionGovernor::new(Policy::default());
+        let rate = RateState {
+            tpm_used: 0,
+            rpm_used: 0,
+            tpm_limit: 1_000_000,
+            rpm_limit: 1_000,
+            tpm_per_agent: 1,
+            rpm_per_agent: 1,
+        };
+        assert!(g.decide(Intent::Start, 0, reserve, rate).is_admit());
     }
 
     #[test]

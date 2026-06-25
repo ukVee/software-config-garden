@@ -234,10 +234,11 @@ fn validate_agent_id(id: &str) -> Result<(), GenError> {
 ///
 /// Two deliberate divergences from the single-agent `growlight start` loop.json:
 /// (1) **no `statusLine`** — a headless `claude -p` agent has no status line; the
-/// drive loop reads its budget from the stream-json `result` line
-/// ([`crate::claude_backend`]), not a teed `usage.json`. (2) the SessionStart
-/// hook points at THIS agent's own `inject.sh`, so each work-stream boots from
-/// its own carried baton.
+/// drive loop reads its account-wide 5h/7d reserve from the stream-json
+/// `rate_limit_event` lines ([`crate::claude_backend`]), not a statusLine-teed
+/// `usage.json` (slice 005 confirmed the headless reserve rides the event stream,
+/// so no statusLine is needed). (2) the SessionStart hook points at THIS agent's
+/// own `inject.sh`, so each work-stream boots from its own carried baton.
 ///
 /// `Edit`/`Write` INTO the garden tree are DENIED (the MCP-only house rule made
 /// structural — `deny` overrides `allow`); `~/.claude/projects` is granted as an
