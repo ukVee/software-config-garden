@@ -109,6 +109,14 @@ impl Daemon {
         self.inner.lock().unwrap().config.socket_path.clone()
     }
 
+    /// The garden root growlightd serves — derived from the keeperd `status`
+    /// handshake at boot (never a literal). The fleet assembler reads it to anchor
+    /// each agent's pre-approval (the `Edit`/`Write` garden-deny rules + the
+    /// `protocol.md` the SessionStart hook injects). Brief-lock clone.
+    pub fn garden_root(&self) -> PathBuf {
+        self.inner.lock().unwrap().config.garden_root.clone()
+    }
+
     /// The current runtime per-device [`Policy`] — the single source of truth the
     /// `set_policy` verb mutates, `status` echoes, and the drive loop refreshes
     /// its admission governor from each tick. Brief-lock read (`Policy` is `Copy`).

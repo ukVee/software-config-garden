@@ -519,6 +519,32 @@ impl DriveLoop {
         for crash in &report.crashes {
             self.dispatcher.notify(crash, now);
         }
+        // A start or re-roll whose backend spawn FAILED is an operator alert, not a
+        // silent held-start: a fail-closed pre-approval generation failure (slice
+        // 004) — or any launch failure — means an agent could not be (re-)spawned
+        // and needs a human, exactly like a crash. Surfaced as `AgentCrashed` so it
+        // rides the §9 alert path; the dispatcher's per-event cooldown dedups a
+        // persistently-failing agent (one alert per window, not one per tick).
+        for held in &report.held_starts {
+            if let StartOutcome::SpawnFailed { .. } = held.outcome {
+                self.dispatcher.notify(
+                    &NotifyEvent::AgentCrashed {
+                        agent: held.agent.clone(),
+                    },
+                    now,
+                );
+            }
+        }
+        for reroll in &report.rerolls {
+            if let RerollOutcome::SpawnFailed { agent, .. } = reroll {
+                self.dispatcher.notify(
+                    &NotifyEvent::AgentCrashed {
+                        agent: agent.clone(),
+                    },
+                    now,
+                );
+            }
+        }
         for (_queue, part) in &report.parked {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: part.clone() }, now);
@@ -613,6 +639,10 @@ mod tests {
         kills: Arc<AtomicUsize>,
         health: Mutex<BTreeMap<String, AgentHealth>>,
         budgets: Mutex<BTreeMap<String, BudgetUsage>>,
+        /// When set, every `spawn` fails (models a fail-closed pre-approval
+        /// generation failure, slice 004 — `ClaudeBackend::spawn` returns
+        /// `SpawnError` before exec).
+        fail_spawn: AtomicBool,
     }
     impl FakeFleet {
         fn new() -> Arc<Self> {
@@ -620,6 +650,10 @@ mod tests {
         }
         fn set_health(&self, agent: &str, h: AgentHealth) {
             self.health.lock().unwrap().insert(agent.to_string(), h);
+        }
+        /// Force every subsequent `spawn` to fail (the fail-closed path).
+        fn set_fail_spawn(&self, fail: bool) {
+            self.fail_spawn.store(fail, Ordering::SeqCst);
         }
         /// Script `agent`'s latest reading of the shared pool (its budget cell).
         fn set_budget(&self, agent: &str, b: BudgetUsage) {
@@ -638,6 +672,12 @@ mod tests {
     impl AgentBackend for Arc<FakeFleet> {
         fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
+            if self.fail_spawn.load(Ordering::SeqCst) {
+                return Err(SpawnError(format!(
+                    "pre-approval generation failed for agent {}",
+                    spec.agent
+                )));
+            }
             Ok(Box::new(FakeChild {
                 kills: Arc::clone(&self.kills),
             }))
@@ -1474,6 +1514,41 @@ mod tests {
             r.held_starts[0].outcome,
         );
         assert_eq!(backend.spawn_count(), 0, "a failed claim spawns nothing");
+    }
+
+    /// A backend spawn failure (slice 004: a fail-closed pre-approval generation
+    /// failure surfaces as `SpawnError`) is fail-closed AND operator-visible — no
+    /// agent is registered, the start is held as `SpawnFailed`, and the loop
+    /// dispatches one `AgentCrashed` alert through its owned dispatcher (it was a
+    /// silent held-start before slice 004).
+    #[test]
+    fn a_spawn_failure_is_fail_closed_and_alerts_the_operator() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![FleetMember::unpinned(spec("a1"))],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        backend.set_fail_spawn(true);
+        let r = loop_.tick(0);
+
+        assert!(r.started.is_empty(), "a spawn failure never reports as started");
+        assert_eq!(backend.spawn_count(), 1, "the spawn was attempted (and failed)");
+        assert!(
+            matches!(
+                r.held_starts.as_slice(),
+                [HeldStart { outcome: StartOutcome::SpawnFailed { .. }, .. }]
+            ),
+            "the failed start is held SpawnFailed, got {:?}",
+            r.held_starts,
+        );
+        assert!(!loop_.supervisor.is_registered("a1"), "no doomed agent registered");
+        // Operator-visible: exactly one alert reached the GUI hub.
+        assert_eq!(probe.gui_alerts(), 1, "a spawn failure alerts the operator once");
+        assert!(
+            probe.log_lines().iter().any(|l| l.contains("a1")),
+            "the audit log records the failing agent: {:?}",
+            probe.log_lines(),
+        );
     }
 
     /// Two members mis-pinned to the SAME queue never double-assign its head: the

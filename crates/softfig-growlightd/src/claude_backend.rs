@@ -45,6 +45,7 @@ use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 use crate::admission::BudgetUsage;
 use crate::control::AgentChild;
 use crate::hub::EventHub;
+use crate::preapproval::PreApproval;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
 
 /// Sentinel in [`AgentHealthState::exit_code`] meaning "still running".
@@ -332,6 +333,11 @@ pub struct ClaudeBackend {
     bin: String,
     prompt: String,
     hub: EventHub,
+    /// Per-agent fail-closed pre-approval generator (§15, slice 004): each spawn
+    /// generates this agent's `loop.json`/`mcp.json` BEFORE exec, so a headless
+    /// session never errors out on a missing allow-rule. Generation failure ⇒ no
+    /// spawn (a `SpawnError`).
+    preapproval: PreApproval,
     /// Per-agent health cells, keyed by agent id; re-spawn (re-roll) replaces the
     /// agent's cell with a fresh one.
     agents: Mutex<BTreeMap<String, Arc<AgentHealthState>>>,
@@ -343,14 +349,20 @@ pub struct ClaudeBackend {
 
 impl ClaudeBackend {
     /// A backend launching `bin` (e.g. `"claude"`) with `prompt` as the per-agent
-    /// kick, publishing deltas to `hub`. The SessionStart hook in each agent's
-    /// `--settings` injects its protocol + baton; `prompt` is the generic turn
-    /// kick.
-    pub fn new(bin: impl Into<String>, prompt: impl Into<String>, hub: EventHub) -> Self {
+    /// kick, publishing deltas to `hub`, generating each agent's pre-approval via
+    /// `preapproval`. The SessionStart hook in each agent's generated `--settings`
+    /// injects its protocol + baton; `prompt` is the generic turn kick.
+    pub fn new(
+        bin: impl Into<String>,
+        prompt: impl Into<String>,
+        hub: EventHub,
+        preapproval: PreApproval,
+    ) -> Self {
         Self {
             bin: bin.into(),
             prompt: prompt.into(),
             hub,
+            preapproval,
             agents: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
         }
@@ -384,13 +396,28 @@ impl ClaudeBackend {
 
 impl AgentBackend for Arc<ClaudeBackend> {
     fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+        // §15 fail-closed pre-approval (slice 004): generate THIS agent's
+        // loop.json + mcp.json (full-toolset pre-approval + SessionStart hook)
+        // BEFORE exec. A headless `claude -p` errors out on the first un-approved
+        // tool, so an agent whose pre-approval can't be generated must NOT be
+        // spawned — the Err becomes a SpawnError the drive loop surfaces as an
+        // operator alert (never a spawned-but-doomed session). Regenerated every
+        // spawn, so a re-roll re-lays the current pre-approval. The generated
+        // paths are the spec's (derived identically at assembly); we shell the
+        // freshly-written ones.
+        let paths = self.preapproval.generate(&spec.agent).map_err(|e| {
+            SpawnError(format!(
+                "pre-approval generation failed for agent {}: {e}",
+                spec.agent
+            ))
+        })?;
         let mut child = Command::new(&self.bin)
             .arg("-p")
             .arg(&self.prompt)
             .arg("--settings")
-            .arg(&spec.loop_settings)
+            .arg(&paths.loop_settings)
             .arg("--mcp-config")
-            .arg(&spec.mcp_config)
+            .arg(&paths.mcp_config)
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
@@ -665,5 +692,33 @@ mod tests {
             budget_for_result_line(partial).unwrap().reserve,
             Some(BudgetUsage::new(97, 0))
         );
+    }
+
+    #[test]
+    fn spawn_fails_closed_when_pre_approval_cannot_be_generated() {
+        // A FILE where the agents dir should be → the per-agent dir can't be
+        // created → generation fails BEFORE `claude` is ever exec'd, so the spawn
+        // returns a SpawnError and NO agent is registered (no doomed headless
+        // session). This proves the fail-closed gate without a real `claude`.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let pre = PreApproval::new(
+            &blocker, // agents_dir is a FILE → create_dir_all under it fails
+            tmp.path().join("protocol.md"),
+            tmp.path().to_path_buf(),
+            std::path::PathBuf::from("softfig-mcp"),
+            tmp.path().join(".claude"),
+        );
+        let backend = Arc::new(ClaudeBackend::new("claude", "kick", EventHub::new(), pre));
+        let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
+
+        let err = backend.spawn(&spec).expect_err("generation failure ⇒ no spawn");
+        assert!(
+            err.0.contains("pre-approval generation failed"),
+            "fail-closed spawn error: {err}",
+        );
+        // Nothing was registered — the agent never entered the fleet.
+        assert!(backend.health("a1").is_none(), "no doomed agent registered");
     }
 }

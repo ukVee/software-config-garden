@@ -49,6 +49,7 @@ use crate::drive_loop::{
     spawn_drive_loop, DriveLoop, FleetMember, PermissiveRate, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
+use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
 use crate::supervisor::{AgentSpec, Supervisor};
 
@@ -60,7 +61,13 @@ pub const DEFAULT_CLAUDE_BIN: &str = "claude";
 /// this is the bare "go" the backend passes as `claude -p <prompt>`.
 pub const DEFAULT_PROMPT: &str = "Begin this growlight iteration. The operating protocol and your current baton have been injected above — boot per protocol step 1, execute NEXT ACTION as one coherent chunk, then hand off by rewriting the baton.";
 
-/// One configured fleet member as read from a `[[growlight.fleet]]` table.
+/// One configured fleet member as read from a `[[growlight.fleet]]` table. The
+/// human declares only the agent's id + (optional) pinned queue; growlightd OWNS
+/// the per-agent pre-approval paths — it GENERATES `loop.json`/`mcp.json` into the
+/// runtime namespace `$XDG_CONFIG_HOME/softfig/growlight/agents/<id>/` (slice 004,
+/// fail-closed) rather than letting the config name arbitrary paths (which could
+/// point at the harness-sensitive `~/.claude`). The `AgentSpec` paths are derived
+/// from `agent` at assembly via [`agent_paths`], not configured.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct FleetMemberConfig {
     /// The agent's bus address / work-stream id (the `@`-stripped name).
@@ -68,15 +75,15 @@ pub struct FleetMemberConfig {
     /// The queue this member is pinned to, or `None` for a fallback-only member.
     #[serde(default)]
     pub pin: Option<String>,
-    /// Per-agent pre-approved `loop.json` (settings + hooks).
-    pub loop_settings: PathBuf,
-    /// Per-agent `mcp.json` (the softfig-mcp attach config).
-    pub mcp_config: PathBuf,
 }
 
 impl FleetMemberConfig {
-    fn to_member(&self) -> FleetMember {
-        let spec = AgentSpec::new(&self.agent, &self.loop_settings, &self.mcp_config);
+    /// Build the runtime [`FleetMember`], deriving the `AgentSpec`'s pre-approval
+    /// paths under `agents_dir/<id>/` (the same scheme [`PreApproval::generate`]
+    /// writes, so the spec the backend shells and the generated files never drift).
+    fn to_member(&self, agents_dir: &Path) -> FleetMember {
+        let paths = agent_paths(agents_dir, &self.agent);
+        let spec = AgentSpec::new(&self.agent, paths.loop_settings, paths.mcp_config);
         match &self.pin {
             Some(pin) => FleetMember::pinned(spec, pin.clone()),
             None => FleetMember::unpinned(spec),
@@ -94,8 +101,10 @@ pub struct FleetConfig {
     pub bin: String,
     /// `[growlight] prompt` — the generic per-agent turn kick.
     pub prompt: String,
-    /// `[[growlight.fleet]]` members, in config order.
-    pub members: Vec<FleetMember>,
+    /// `[[growlight.fleet]]` members, in config order. Raw `{agent, pin}` — the
+    /// runtime `AgentSpec` paths are derived at [`assemble_fleet`] (they need the
+    /// runtime `agents_dir`, not known at parse).
+    pub members: Vec<FleetMemberConfig>,
 }
 
 impl FleetConfig {
@@ -136,7 +145,7 @@ impl FleetConfig {
             enabled: g.fleet_enabled,
             bin: g.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
             prompt: g.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
-            members: g.fleet.iter().map(FleetMemberConfig::to_member).collect(),
+            members: g.fleet,
         })
     }
 }
@@ -188,6 +197,23 @@ pub fn assemble_fleet(
         return None;
     }
     let hub = daemon.hub.clone();
+
+    // The §15 fail-closed pre-approval context (slice 004): growlightd generates
+    // each agent's loop.json/mcp.json into the runtime namespace
+    // `$XDG_CONFIG_HOME/softfig/growlight/agents/<id>/` at spawn (never under
+    // ~/.claude), anchored to THIS garden's protocol + deny rules. The same
+    // `agents_dir` derives the AgentSpec paths the backend shells, so the spec and
+    // the generated files can't drift.
+    let garden_root = daemon.garden_root();
+    let agents_dir = runtime_agents_dir();
+    let preapproval = PreApproval::new(
+        agents_dir.clone(),
+        garden_root.join(PILLAR).join("protocol.md"),
+        garden_root,
+        softfig_mcp_path(),
+        claude_dir(),
+    );
+
     // One backend, shared three ways (the `DriveLoop::new` contract): the
     // supervisor spawns through it, and health + budget are read off the SAME
     // cells it populates.
@@ -195,7 +221,13 @@ pub fn assemble_fleet(
         fleet.bin.clone(),
         fleet.prompt.clone(),
         hub.clone(),
+        preapproval,
     ));
+    let members: Vec<FleetMember> = fleet
+        .members
+        .iter()
+        .map(|m| m.to_member(&agents_dir))
+        .collect();
     let governor = AdmissionGovernor::new(daemon.policy());
     let supervisor = Supervisor::new(Box::new(Arc::clone(&backend)), governor);
 
@@ -212,9 +244,58 @@ pub fn assemble_fleet(
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
         Box::new(PermissiveRate),       // rate    — slice 006 wires the live source
         dispatcher,
-        fleet.members.clone(),
+        members,
     ))
 }
+
+/// The runtime per-agent namespace `$XDG_CONFIG_HOME/softfig/growlight/agents`
+/// (fallback `~/.config/...`) — the same churny-runtime space `softfig growlight
+/// start` owns, NOT the garden. Derived from the environment, never a literal
+/// (spec §3/§12). growlightd writes each agent's generated pre-approval under
+/// `agents/<id>/` here.
+fn runtime_agents_dir() -> PathBuf {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home_dir().join(".config"),
+    };
+    base.join("softfig").join(PILLAR).join("agents")
+}
+
+/// `~/.claude` — the harness-sensitive root the pre-approval generator refuses to
+/// write under (and whose `projects/` subtree it grants for claude-memory).
+fn claude_dir() -> PathBuf {
+    home_dir().join(".claude")
+}
+
+/// `$HOME`, or `/` as a last resort (the generator's fail-closed guard catches a
+/// nonsense derivation; a missing `$HOME` should never silently target the wrong
+/// tree).
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Resolve the `softfig-mcp` bridge binary `mcp.json` attaches: prefer the sibling
+/// of the running exe (a dev build points at its own freshly-built bridge, not a
+/// stale PATH copy), falling back to a bare `softfig-mcp` (PATH lookup by Claude
+/// Code's stdio launcher). Mirrors the single-agent `growlight start` resolver.
+fn softfig_mcp_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("softfig-mcp");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("softfig-mcp")
+}
+
+/// Garden-relative pillar name (matches the daemon-side `paths::PILLAR` + the
+/// single-agent launcher's constant).
+const PILLAR: &str = "growlight";
 
 /// Assemble (via [`assemble_fleet`]) and spawn the live drive-loop thread — iff
 /// the gate is on. Gate off ⇒ `Ok(None)`, nothing spawned. A thin wrapper over
@@ -246,7 +327,7 @@ mod tests {
     }
 
     fn member_toml() -> &'static str {
-        "[[growlight.fleet]]\nagent = \"a\"\nloop_settings = \"/l\"\nmcp_config = \"/m\"\n"
+        "[[growlight.fleet]]\nagent = \"a\"\n"
     }
 
     /// A stand-in keeperd socket for the assembly tests. Gate-off assembly never
@@ -301,6 +382,8 @@ mod tests {
 
     #[test]
     fn parses_a_growlight_fleet_table_into_members() {
+        // The human declares only `agent` (+ optional `pin`) — growlightd OWNS the
+        // pre-approval paths (slice 004), so the config no longer names them.
         let toml = r#"
 state_root = "/state"
 
@@ -313,13 +396,9 @@ prompt = "kick"
 [[growlight.fleet]]
 agent = "builder"
 pin = "queue:build"
-loop_settings = "/cfg/builder/loop.json"
-mcp_config = "/cfg/builder/mcp.json"
 
 [[growlight.fleet]]
 agent = "reviewer"
-loop_settings = "/cfg/reviewer/loop.json"
-mcp_config = "/cfg/reviewer/mcp.json"
 "#;
         let cfg = FleetConfig::from_keeper_toml(toml).expect("valid config");
         assert!(cfg.enabled);
@@ -328,17 +407,33 @@ mcp_config = "/cfg/reviewer/mcp.json"
         assert_eq!(
             cfg.members,
             vec![
+                FleetMemberConfig { agent: "builder".into(), pin: Some("queue:build".into()) },
+                FleetMemberConfig { agent: "reviewer".into(), pin: None },
+            ],
+            "the table parses a pinned + an unpinned member, in order",
+        );
+
+        // The runtime AgentSpec paths are DERIVED under the agents namespace (the
+        // same scheme PreApproval::generate writes), never read from the config.
+        let agents = Path::new("/cfg/agents");
+        assert_eq!(
+            cfg.members.iter().map(|m| m.to_member(agents)).collect::<Vec<_>>(),
+            vec![
                 FleetMember::pinned(
-                    AgentSpec::new("builder", "/cfg/builder/loop.json", "/cfg/builder/mcp.json"),
+                    AgentSpec::new(
+                        "builder",
+                        "/cfg/agents/builder/loop.json",
+                        "/cfg/agents/builder/mcp.json",
+                    ),
                     "queue:build",
                 ),
                 FleetMember::unpinned(AgentSpec::new(
                     "reviewer",
-                    "/cfg/reviewer/loop.json",
-                    "/cfg/reviewer/mcp.json",
+                    "/cfg/agents/reviewer/loop.json",
+                    "/cfg/agents/reviewer/mcp.json",
                 )),
             ],
-            "the table maps to a pinned + an unpinned member, in order",
+            "derived pre-approval paths land under agents/<id>/",
         );
     }
 

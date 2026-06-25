@@ -33,6 +33,7 @@ pub mod leases;
 pub mod notifications;
 pub mod notify_dispatch;
 pub mod peer;
+pub mod preapproval;
 pub mod queue_source;
 pub mod scheduler;
 pub mod server;
@@ -67,6 +68,7 @@ pub use notify_dispatch::{
     BusEmit, GuiNotifier, KeeperdBusEmit, LogNotifier, LogSink, Notifier, NotifyDispatcher,
     PhoneStub, StderrLog, ALERT_FROM, ALERT_KIND,
 };
+pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_QUEUE_NAME};
 pub use scheduler::{
     classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
