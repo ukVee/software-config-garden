@@ -154,11 +154,21 @@ pub struct ReplicaToml {
     pub host: bool,
 }
 
-/// `[growlight]` — autonomous-loop policy the daemon enforces. Currently just
-/// the relock opt-in; a deliberate, security-relevant toggle the human sets by
-/// hand (never the agent).
+/// `[growlight]` — the growlight policy table. keeperd owns exactly one key here,
+/// `allow_relock` (a deliberate, security-relevant toggle the human sets by hand,
+/// never the agent).
+///
+/// The `[growlight]` table is **shared with growlightd**, which reads its own live
+/// fleet keys from the very same table (`fleet_enabled`, `claude_bin`, `prompt`,
+/// `[[growlight.fleet]]` — see `softfig-growlightd`'s `fleet.rs`). So this struct
+/// must NOT `deny_unknown_fields`: it has to parse-and-ignore the fleet keys,
+/// exactly as growlightd's own parser already tolerates keeperd's `allow_relock`.
+/// Without this, arming the fleet (`fleet_enabled = true`) crash-loops keeperd on
+/// boot. Closed-world validation still applies at the top-level [`KeeperToml`], so
+/// a stray *top-level* key — or a misspelled table — still fails the boot; only
+/// the shared `[growlight]` table is open. A misspelled `allow_relock` is ignored
+/// and fails safe (relock stays off).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 pub struct GrowlightToml {
     /// Permit the relock token (resume an already-unlocked vault across an
     /// unattended daemon restart). Default `false` — the daemon refuses
@@ -344,6 +354,55 @@ mod tests {
         .unwrap();
         let back = KeeperToml::load(tmp.path()).unwrap();
         assert!(back.growlight.allow_relock, "explicit opt-in parses");
+    }
+
+    #[test]
+    fn growlight_tolerates_growlightd_fleet_keys_in_the_shared_table() {
+        // The `[growlight]` table is shared with growlightd, which reads
+        // `fleet_enabled`/`claude_bin`/`prompt`/`[[growlight.fleet]]` from it.
+        // keeperd must parse-and-ignore those (not crash-boot) while still
+        // honoring its own `allow_relock`. Regression for the post-merge
+        // crash-loop where arming the fleet wedged keeperd on boot.
+        let tmp = tempfile::tempdir().unwrap();
+        let softfig = tmp.path().join(".softfig");
+        fs::create_dir_all(&softfig).unwrap();
+        fs::write(
+            softfig.join(KEEPER_TOML),
+            "state_root = \"/s\"\n\n\
+             [growlight]\n\
+             allow_relock = true\n\
+             fleet_enabled = true\n\
+             claude_bin = \"/usr/bin/claude\"\n\
+             prompt = \"go\"\n\
+             [[growlight.fleet]]\n\
+             agent = \"v\"\n",
+        )
+        .unwrap();
+        let back = KeeperToml::load(tmp.path()).unwrap();
+        // keeperd's own key still parses; growlightd's fleet keys are ignored,
+        // not rejected.
+        assert!(
+            back.growlight.allow_relock,
+            "allow_relock honored alongside the fleet keys"
+        );
+    }
+
+    #[test]
+    fn top_level_unknown_key_still_crash_boots() {
+        // The shared-table relaxation is scoped to `[growlight]` only — the
+        // top-level pointer stays closed-world so a typo'd key still fails loud.
+        let tmp = tempfile::tempdir().unwrap();
+        let softfig = tmp.path().join(".softfig");
+        fs::create_dir_all(&softfig).unwrap();
+        fs::write(
+            softfig.join(KEEPER_TOML),
+            "state_root = \"/s\"\nbogus_top_level = true\n",
+        )
+        .unwrap();
+        assert!(
+            KeeperToml::load(tmp.path()).is_err(),
+            "a stray top-level key must still fail the boot"
+        );
     }
 
     #[test]
