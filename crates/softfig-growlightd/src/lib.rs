@@ -25,6 +25,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod drive_loop;
+pub mod fleet;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
@@ -47,8 +48,12 @@ pub use config::{GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
-    spawn_drive_loop, AgentHealthSource, Assignment, BudgetSampleSource, DriveLoop, FleetMember,
-    HeldStart, PermissiveRate, QueueSource, RateSource, TickReport, DRIVE_POLL_MS,
+    spawn_drive_loop, AgentHealthSource, Assignment, BudgetSampleSource, DeferredQueues, DriveLoop,
+    FleetMember, HeldStart, PermissiveRate, QueueSource, RateSource, TickReport, DRIVE_POLL_MS,
+};
+pub use fleet::{
+    assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig,
+    DEFAULT_CLAUDE_BIN, DEFAULT_PROMPT,
 };
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};

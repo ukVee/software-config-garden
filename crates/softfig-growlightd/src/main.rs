@@ -7,8 +7,8 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use softfig_growlightd::{
-    garden_root_via_keeperd, spawn_bus_tailer, Daemon, GrowlightdConfig, KeeperdBusSource, Policy,
-    BUS_POLL_MS,
+    garden_root_via_keeperd, load_fleet_config, spawn_bus_tailer, spawn_fleet, Daemon,
+    GrowlightdConfig, KeeperdBusSource, Policy, BUS_POLL_MS,
 };
 use softfig_ipc::{growlightd_runtime_socket_path, runtime_socket_path};
 
@@ -78,6 +78,20 @@ fn main() -> Result<()> {
         std::time::Duration::from_millis(BUS_POLL_MS),
     )?;
 
+    // Assemble + spawn the live fleet drive loop, but ONLY when the off-by-default
+    // `[growlight] fleet_enabled` gate in the plaintext keeper.toml pointer is on.
+    // Gate off ⇒ `None`, nothing constructed or spawned, so growlightd is
+    // byte-identical to today (the on-device enablement is `growlight-verify-merge`).
+    let fleet_config = load_fleet_config(&garden_root);
+    let drive_loop = spawn_fleet(&handle.daemon, &fleet_config)
+        .context("spawning the live fleet drive loop")?;
+    if drive_loop.is_some() {
+        eprintln!(
+            "softfig-growlightd: fleet ENABLED — drive loop running ({} member(s))",
+            fleet_config.members.len(),
+        );
+    }
+
     // SIGTERM / SIGINT run the same graceful teardown as the `shutdown` IPC op,
     // delivered through signal-hook's self-pipe so the teardown runs in normal
     // thread context. Once `request_shutdown` flips the daemon to `Stopping`,
@@ -94,7 +108,11 @@ fn main() -> Result<()> {
         })?;
 
     handle.join()?;
-    // The daemon is `Stopping` now; the tailer notices on its next tick and exits.
+    // The daemon is `Stopping` now; the tailer + drive loop each notice on their
+    // next tick and exit.
     let _ = bus_tailer.join();
+    if let Some(drive) = drive_loop {
+        let _ = drive.join();
+    }
     Ok(())
 }

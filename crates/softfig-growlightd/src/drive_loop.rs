@@ -129,6 +129,22 @@ impl RateSource for PermissiveRate {
     }
 }
 
+/// The default [`QueueSource`] until the live keeperd queue feed lands
+/// (`growlight-live-fleet` slice 002): an **empty** [`Snapshot`], so the
+/// scheduler picks nothing and a gated-on fleet stays idle. Fail-closed — a
+/// fleet assembled before its live queue source schedules zero work rather than
+/// guessing at parts. Mirrors [`PermissiveRate`]'s deferred-default shape; the
+/// live assembly ([`crate::fleet::assemble_fleet`]) wires this in until slice 002
+/// replaces it with the real per-queue managed-region pull.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeferredQueues;
+
+impl QueueSource for DeferredQueues {
+    fn snapshot(&self) -> Snapshot {
+        Snapshot::default()
+    }
+}
+
 /// The seam the loop reads per-agent [`AgentHealth`] through, to feed
 /// [`Supervisor::poll`]. Implemented over the live [`ClaudeBackend`] (slice 001),
 /// which tracks a heartbeat-or-exit cell per agent; a test scripts the health.
