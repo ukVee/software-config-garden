@@ -50,6 +50,48 @@ impl Default for Policy {
     }
 }
 
+/// Per-device **short-window rate limits** (spec §7 admission's second window):
+/// the account TPM/RPM ceilings plus the per-agent burst headroom the governor
+/// reserves before admitting one more agent ("request N× TPM for N agents").
+///
+/// These are deliberately **separate from [`Policy`]** (and off the wire
+/// [`PolicySummary`]): they are static per-device config, not a `set_policy`
+/// /GUI-tunable knob in this slice. Like slice-001's policy they are
+/// **defaults-only** today — a future `[growlight]`-style on-disk override
+/// threads them the same way `Policy` flows from keeperd. The live
+/// [`crate::drive_loop::LiveRate`] source pairs these limits with the fleet-wide
+/// rolling-minute *used* readings the backend meter observes.
+///
+/// The default ceilings are **conservative placeholders**: the real per-account
+/// TPM/RPM is not carried on the headless `rate_limit_event` wire (it reports
+/// only a coarse `status`), so confirming the device's true limits is this
+/// milestone's on-device `## Deferred verification`. The defaults satisfy the
+/// invariant `tpm_per_agent * max_concurrent_agents < tpm_limit` so a full
+/// default fleet (cap 2) is never spuriously refused at idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimits {
+    /// Account tokens-per-minute ceiling.
+    pub tpm_limit: u32,
+    /// Account requests-per-minute ceiling.
+    pub rpm_limit: u32,
+    /// Tokens-per-minute one fresh agent is expected to burst — the headroom that
+    /// must be free before it is admitted.
+    pub tpm_per_agent: u32,
+    /// Requests-per-minute one fresh agent is expected to burst.
+    pub rpm_per_agent: u32,
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        Self {
+            tpm_limit: 2_000_000,
+            rpm_limit: 1_000,
+            tpm_per_agent: 200_000,
+            rpm_per_agent: 50,
+        }
+    }
+}
+
 impl Policy {
     /// Project onto the wire summary echoed by `status`.
     pub fn summary(&self) -> PolicySummary {
@@ -107,6 +149,10 @@ pub struct GrowlightdConfig {
     pub garden_root: PathBuf,
     /// Per-device orchestration policy.
     pub policy: Policy,
+    /// Per-device short-window TPM/RPM limits feeding admission's second window
+    /// (spec §7). Static per-device config, defaults-only today (see
+    /// [`RateLimits`]); not part of the wire `set_policy`/`status` surface.
+    pub rate_limits: RateLimits,
 }
 
 impl GrowlightdConfig {
@@ -116,6 +162,7 @@ impl GrowlightdConfig {
             socket_path,
             garden_root,
             policy: Policy::default(),
+            rate_limits: RateLimits::default(),
         }
     }
 

@@ -132,6 +132,14 @@ impl Daemon {
         self.inner.lock().unwrap().config.policy = policy;
     }
 
+    /// The per-device short-window TPM/RPM limits (spec §7 admission's second
+    /// window). Static per-device config, read once by the fleet assembler to
+    /// build the live [`crate::drive_loop::LiveRate`] source — not a `set_policy`
+    /// /`status` wire knob in this slice. Brief-lock read (`RateLimits` is `Copy`).
+    pub fn rate_limits(&self) -> crate::config::RateLimits {
+        self.inner.lock().unwrap().config.rate_limits
+    }
+
     /// Graceful teardown shared by every shutdown trigger — the IPC `shutdown`
     /// op, a caught SIGTERM/SIGINT, and [`DaemonHandle`]'s `Drop`. Marks the
     /// daemon `Stopping`; the accept loop notices on its next poll and exits.

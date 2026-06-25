@@ -168,6 +168,86 @@ impl AgentBudgetState {
     }
 }
 
+/// The rolling window admission's TPM/RPM gate meters over: tokens/requests in
+/// the trailing minute (spec §7 "tokens/requests per minute"). One minute.
+const RATE_WINDOW_SECS: i64 = 60;
+
+/// One agent's timestamped token/request samples over the trailing
+/// [`RATE_WINDOW_SECS`], the live source of admission's short-window TPM/RPM gate
+/// (spec §7 second window). Sibling to [`AgentBudgetState`]: the reader thread
+/// appends one sample per terminal `result` line (its summed `usage` tokens +
+/// one request tick — the slice-005-confirmed token source), the drive loop reads
+/// the **fleet-wide** sum via [`ClaudeBackend::rate_used`]. Samples older than the
+/// window are pruned on every append and read, so the cell is self-bounding and a
+/// retired agent's burst ages out without an explicit forget.
+#[derive(Debug, Default)]
+pub struct AgentRateState {
+    /// Append-ordered samples; pruned to the trailing window on touch.
+    inner: Mutex<Vec<RateSample>>,
+}
+
+/// One observed turn: when it completed (`at`, unix secs) and the tokens it cost.
+/// A request tick is implicit (one sample == one completed `result` == one
+/// request).
+#[derive(Debug, Clone, Copy)]
+struct RateSample {
+    at: i64,
+    tokens: u64,
+}
+
+impl AgentRateState {
+    /// Record one completed turn's token cost at `at` (the reader's clock). Prunes
+    /// anything already outside the trailing window so the buffer can't grow
+    /// unbounded between reads.
+    fn record(&self, at: i64, tokens: u64) {
+        let mut v = self.inner.lock().unwrap();
+        v.push(RateSample { at, tokens });
+        let cutoff = at - RATE_WINDOW_SECS;
+        v.retain(|s| s.at > cutoff);
+    }
+
+    /// `(tokens, requests)` observed within the trailing `RATE_WINDOW_SECS` of
+    /// `now`. Prunes expired samples as it reads (the drive loop reads every tick,
+    /// so the buffer stays small). A retired agent's stale burst contributes 0
+    /// once it ages past the window.
+    fn window(&self, now: i64) -> (u64, u64) {
+        let cutoff = now - RATE_WINDOW_SECS;
+        let mut v = self.inner.lock().unwrap();
+        v.retain(|s| s.at > cutoff);
+        let tokens = v.iter().map(|s| s.tokens).sum();
+        (tokens, v.len() as u64)
+    }
+}
+
+/// Sum of the `usage` token fields on a stream-json `result` line — the per-turn
+/// token cost feeding the rolling TPM meter, and a one-request RPM tick. `None`
+/// for a non-`result` line or malformed JSON; `Some(0)` for a `result` with no
+/// (or an empty) `usage` object (the turn still counts as one request). Sums the
+/// same four fields [`ctx_pct_from_result`] uses for occupancy. Pure — a fixture
+/// drives it, no real spawn.
+fn result_usage_tokens(line: &str) -> Option<u64> {
+    let ev = serde_json::from_str::<Value>(line).ok()?;
+    if ev.get("type").and_then(Value::as_str) != Some("result") {
+        return None;
+    }
+    let tokens = ev
+        .get("usage")
+        .and_then(Value::as_object)
+        .map(|usage| {
+            [
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ]
+            .iter()
+            .filter_map(|k| usage.get(*k).and_then(Value::as_u64))
+            .sum()
+        })
+        .unwrap_or(0);
+    Some(tokens)
+}
+
 /// Translate one stream-json line into the content deltas it carries, in block
 /// order. Pure. Only `assistant` events carry content; a non-assistant line,
 /// malformed JSON, or an unrecognized block yields no deltas (the caller still
@@ -373,6 +453,7 @@ fn pump<R: BufRead>(
     hub: &EventHub,
     health: &AgentHealthState,
     budget: &AgentBudgetState,
+    rate: &AgentRateState,
     now: &dyn Fn() -> i64,
 ) {
     for line in reader.lines() {
@@ -381,9 +462,13 @@ fn pump<R: BufRead>(
         if line.is_empty() {
             continue;
         }
+        // Stamp this line's arrival once — reused for the heartbeat AND the rate
+        // meter so both share one clock reading (and the test clock advances once
+        // per line).
+        let at = now();
         // Any line from the child is a sign of life → heartbeat, even if it
         // carries no renderable delta.
-        health.touch(now());
+        health.touch(at);
         // A `rate_limit_event` reports this agent's reading of the shared
         // account-wide 5h/7d reserve as a coarse per-window status — the reliable
         // headless source (spec §6/§7). Fold it into the budget cell the drive
@@ -414,6 +499,12 @@ fn pump<R: BufRead>(
                 });
             }
         }
+        // The terminal `result` also closes one turn (one request) costing its
+        // summed `usage` tokens — fold it into this agent's rolling-minute meter so
+        // the drive loop's fleet-wide sum gates admission's TPM/RPM window (§7).
+        if let Some(tokens) = result_usage_tokens(line) {
+            rate.record(at, tokens);
+        }
     }
 }
 
@@ -441,6 +532,11 @@ pub struct ClaudeBackend {
     /// agent id; the drive loop folds these into its [`crate::usage::UsageAggregator`]
     /// via [`budget`](ClaudeBackend::budget). Re-spawn replaces the cell.
     budgets: Mutex<BTreeMap<String, Arc<AgentBudgetState>>>,
+    /// Per-agent rolling-minute rate meters, keyed by agent id; the live
+    /// [`crate::drive_loop::LiveRate`] source sums these fleet-wide via
+    /// [`rate_used`](ClaudeBackend::rate_used) to feed admission's TPM/RPM gate
+    /// (spec §7 second window). Re-spawn replaces the cell.
+    rates: Mutex<BTreeMap<String, Arc<AgentRateState>>>,
 }
 
 impl ClaudeBackend {
@@ -461,6 +557,7 @@ impl ClaudeBackend {
             preapproval,
             agents: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
+            rates: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -488,6 +585,32 @@ impl ClaudeBackend {
             .get(agent)
             .and_then(|s| s.observe())
     }
+
+    /// The **fleet-wide** rolling-minute `(tpm_used, rpm_used)` at `now`: the sum
+    /// across every agent's rate meter of the tokens/requests observed in the
+    /// trailing minute. Feeds the live [`crate::drive_loop::LiveRate`] source's
+    /// `used` fields, which the admission governor checks against the per-device
+    /// limits (spec §7). Saturating into `u32` so a hot fleet can never overflow
+    /// the `RateState` fields. A retired agent's cell lingers in the map but its
+    /// samples have aged out of the window, so it contributes 0 — the rolling
+    /// window is the forget.
+    pub fn rate_used(&self, now: i64) -> (u32, u32) {
+        sum_rate_windows(self.rates.lock().unwrap().values().map(|c| c.window(now)))
+    }
+}
+
+/// Fold each agent's `(tokens, requests)` trailing-minute window into the
+/// fleet-wide `(tpm_used, rpm_used)`, saturating into the `RateState`'s `u32`
+/// fields so a hot fleet can never overflow-panic. Pure — the fleet-wide summing
+/// the live [`crate::drive_loop::LiveRate`] gate depends on, proven directly.
+fn sum_rate_windows(per_agent: impl Iterator<Item = (u64, u64)>) -> (u32, u32) {
+    let (mut tokens, mut reqs) = (0u64, 0u64);
+    for (t, r) in per_agent {
+        tokens = tokens.saturating_add(t);
+        reqs = reqs.saturating_add(r);
+    }
+    let sat = |v: u64| v.min(u32::MAX as u64) as u32;
+    (sat(tokens), sat(reqs))
 }
 
 impl AgentBackend for Arc<ClaudeBackend> {
@@ -543,6 +666,12 @@ impl AgentBackend for Arc<ClaudeBackend> {
             .unwrap()
             .insert(spec.agent.clone(), Arc::clone(&budget));
 
+        let rate = Arc::new(AgentRateState::default());
+        self.rates
+            .lock()
+            .unwrap()
+            .insert(spec.agent.clone(), Arc::clone(&rate));
+
         // The child is shared with the reader thread for reaping. While the child
         // lives, the reader is blocked in `lines()` on stdout (it holds NO lock),
         // so `kill` can always take the lock to SIGKILL; the reader only locks the
@@ -554,6 +683,7 @@ impl AgentBackend for Arc<ClaudeBackend> {
         let agent = spec.agent.clone();
         let reader_state = Arc::clone(&state);
         let reader_budget = Arc::clone(&budget);
+        let reader_rate = Arc::clone(&rate);
         let reader_child = Arc::clone(&child);
         thread::spawn(move || {
             pump(
@@ -562,6 +692,7 @@ impl AgentBackend for Arc<ClaudeBackend> {
                 &hub,
                 &reader_state,
                 &reader_budget,
+                &reader_rate,
                 &|| unix_now(),
             );
             // stdout closed → the child is ending; reap it for the exit code.
@@ -668,12 +799,13 @@ mod tests {
         let sub = hub.subscribe();
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
 
         // A fake clock that ticks 10, 20, 30, … once per line read.
         let clock = AtomicI64::new(0);
         let now = || clock.fetch_add(10, Ordering::SeqCst) + 10;
 
-        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &now);
+        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &rate_meter, &now);
 
         // The four content deltas reach the hub in block order, tagged by kind.
         let expect = [
@@ -713,9 +845,10 @@ mod tests {
         let hub = EventHub::new();
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
         let now = || 100; // init line stamped at t=100, then nothing more
 
-        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &now);
+        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &rate_meter, &now);
 
         // No exit recorded → still Alive, but pinned at the stale init stamp.
         assert_eq!(state.observe(), AgentHealth::Alive { last_active: 100 });
@@ -848,6 +981,7 @@ mod tests {
         let hub = EventHub::new();
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
         let now = || 100;
 
         // A headless run: the 5h window goes to `rejected` (pool exhausted) while
@@ -862,7 +996,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
 
         // The non-"allowed" 5h status folded to a saturated 100; the allowed 7d to 0.
         let reserve = budget.observe().expect("a reserve was folded from the events");
@@ -898,6 +1032,7 @@ mod tests {
         let hub = EventHub::new();
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
         let now = || 0;
 
         let stream = concat!(
@@ -906,7 +1041,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
 
         // Both windows allowed → a fresh (0,0) reserve: no alert, admission admits.
         let reserve = budget.observe().expect("an allowed reading still records (0,0)");
@@ -922,6 +1057,153 @@ mod tests {
             rpm_per_agent: 1,
         };
         assert!(g.decide(Intent::Start, 0, reserve, rate).is_admit());
+    }
+
+    #[test]
+    fn result_usage_tokens_sums_the_usage_fields_and_ticks_every_result() {
+        // The four usage fields sum (same set ctx_pct uses).
+        let line = r#"{"type":"result","usage":{"input_tokens":50000,"output_tokens":30000,"cache_read_input_tokens":20000,"cache_creation_input_tokens":5000}}"#;
+        assert_eq!(result_usage_tokens(line), Some(105_000));
+        // A result with no usage object still counts as one request, 0 tokens.
+        assert_eq!(
+            result_usage_tokens(r#"{"type":"result","subtype":"success"}"#),
+            Some(0)
+        );
+        // A partial usage object sums only the present fields.
+        assert_eq!(
+            result_usage_tokens(r#"{"type":"result","usage":{"output_tokens":7}}"#),
+            Some(7)
+        );
+        // Non-result lines + malformed JSON carry no rate sample.
+        assert_eq!(
+            result_usage_tokens(r#"{"type":"assistant","usage":{"input_tokens":9}}"#),
+            None
+        );
+        assert_eq!(result_usage_tokens("not json"), None);
+    }
+
+    #[test]
+    fn agent_rate_meter_sums_within_the_minute_and_expires_old_samples() {
+        let m = AgentRateState::default();
+        // Two turns inside the same minute: tokens sum, two requests.
+        m.record(100, 40_000);
+        m.record(130, 60_000);
+        assert_eq!(m.window(150), (100_000, 2), "both samples within the minute");
+        // At now=180 the trailing minute is (120, 180]: the t=100 sample has aged
+        // out, only the t=130 one remains.
+        assert_eq!(m.window(180), (60_000, 1), "the t=100 sample expired");
+        // Long past both → empty.
+        assert_eq!(m.window(1000), (0, 0));
+    }
+
+    #[test]
+    fn sum_rate_windows_folds_agents_fleet_wide_and_saturates() {
+        // Two agents' trailing-minute windows sum into the fleet-wide reading.
+        assert_eq!(
+            sum_rate_windows([(30_000u64, 2u64), (50_000, 3)].into_iter()),
+            (80_000, 5)
+        );
+        // No agents → a fresh fleet reads zero (admits freely).
+        assert_eq!(sum_rate_windows(std::iter::empty()), (0, 0));
+        // A pathological over-u32 fleet sum saturates instead of overflow-panicking.
+        assert_eq!(
+            sum_rate_windows([(u32::MAX as u64, 1), (u32::MAX as u64, 1)].into_iter()),
+            (u32::MAX, 2)
+        );
+    }
+
+    #[test]
+    fn pump_meters_result_usage_into_a_rate_that_trips_the_tpm_gate() {
+        use crate::admission::{AdmissionDecision, AdmissionGovernor, Intent, RateState, RefuseReason};
+        use crate::config::{Policy, RateLimits};
+
+        let hub = EventHub::new();
+        let state = AgentHealthState::new(0);
+        let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
+        let now = || 1000; // every line stamped inside one minute
+
+        // A headless turn whose terminal result reports 90k tokens of usage.
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init","model":"claude-opus-4-8"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":80000,"output_tokens":10000},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
+            "\n",
+        );
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+
+        // The meter observed 90k tokens / 1 request in the trailing minute.
+        let (tpm_used, rpm_used) = rate_meter.window(1000);
+        assert_eq!((tpm_used, rpm_used), (90_000, 1));
+
+        // Build the fleet-wide RateState the live source pairs with the per-device
+        // limits. A helper so both halves of the proof use the metered `used`.
+        let g = AdmissionGovernor::new(Policy::default());
+        let with_limits = |limits: RateLimits| RateState {
+            tpm_used: tpm_used as u32,
+            rpm_used: rpm_used as u32,
+            tpm_limit: limits.tpm_limit,
+            rpm_limit: limits.rpm_limit,
+            tpm_per_agent: limits.tpm_per_agent,
+            rpm_per_agent: limits.rpm_per_agent,
+        };
+
+        // 90k used + a 20k per-agent burst > a 100k TPM limit → Refuse. Note the
+        // per-agent headroom is what tips it: 90k alone is under the limit, so this
+        // also proves the per-agent burst is honored on top of the fleet-wide used.
+        let tight = RateLimits {
+            tpm_limit: 100_000,
+            rpm_limit: 1_000,
+            tpm_per_agent: 20_000,
+            rpm_per_agent: 10,
+        };
+        assert_eq!(
+            g.decide(Intent::Start, 0, BudgetUsage::new(10, 5), with_limits(tight)),
+            AdmissionDecision::Refuse {
+                reason: RefuseReason::Tpm
+            },
+            "metered fleet TPM + per-agent headroom over the limit refuses",
+        );
+
+        // The SAME metered usage under the roomier default ceiling (2M) admits —
+        // the gate is driven by real data, not a permissive constant.
+        assert!(
+            g.decide(Intent::Start, 0, BudgetUsage::new(10, 5), with_limits(RateLimits::default()))
+                .is_admit(),
+            "the same 90k under a 2M ceiling admits",
+        );
+    }
+
+    #[test]
+    fn the_metered_request_count_trips_the_rpm_gate() {
+        use crate::admission::{AdmissionDecision, AdmissionGovernor, Intent, RateState, RefuseReason};
+        use crate::config::Policy;
+
+        // Three completed turns in the minute → 3 requests (token-cheap).
+        let m = AgentRateState::default();
+        for t in [10, 20, 30] {
+            m.record(t, 1);
+        }
+        let (tokens, reqs) = m.window(40);
+        assert_eq!((tokens, reqs), (3, 3));
+
+        // With an RPM limit of 4 and a per-agent burst of 2, 3 used + 2 > 4 → the
+        // request window refuses even though tokens are trivial.
+        let g = AdmissionGovernor::new(Policy::default());
+        let rate = RateState {
+            tpm_used: tokens as u32,
+            rpm_used: reqs as u32,
+            tpm_limit: 1_000_000,
+            rpm_limit: 4,
+            tpm_per_agent: 1,
+            rpm_per_agent: 2,
+        };
+        assert_eq!(
+            g.decide(Intent::Start, 0, BudgetUsage::new(10, 5), rate),
+            AdmissionDecision::Refuse {
+                reason: RefuseReason::Rpm
+            },
+        );
     }
 
     #[test]

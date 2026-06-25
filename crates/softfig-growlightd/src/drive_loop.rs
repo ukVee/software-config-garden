@@ -57,6 +57,7 @@ use std::time::Duration;
 
 use crate::admission::{BudgetUsage, RateState};
 use crate::claude_backend::ClaudeBackend;
+use crate::config::RateLimits;
 use crate::daemon::Daemon;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
@@ -121,23 +122,25 @@ impl BudgetSampleSource for Arc<ClaudeBackend> {
 }
 
 /// The seam the loop reads the per-minute **rate** (TPM/RPM) through, admission's
-/// second gate alongside the budget aggregate. The live feed (the keeperd rate
-/// handshake) is out of this slice — `growlight-wire-loose-ends` binds it; until
-/// then [`PermissiveRate`] grants headroom and a test injects a fixed rate.
+/// second gate alongside the budget aggregate. The loop is the clock authority —
+/// it passes the tick's `now` so the source can sum its **rolling** trailing
+/// minute (the meter samples and the read share one unix-seconds clock). The live
+/// feed is [`LiveRate`] over the backend's per-agent meters (`growlight-live-fleet`
+/// slice 006); [`PermissiveRate`] is the test/default seam that grants headroom.
 pub trait RateSource: Send + Sync + fmt::Debug {
-    /// The current rolling-minute rate reading.
-    fn rate(&self) -> RateState;
+    /// The rolling-minute rate reading as of `now` (unix seconds).
+    fn rate(&self, now: i64) -> RateState;
 }
 
-/// The default [`RateSource`] until the live rate feed lands: generous per-minute
-/// headroom so the rate gate never refuses. The budget aggregate and the
-/// per-device cap are the live gates this slice wires; the real rate feed is
-/// `growlight-wire-loose-ends`.
+/// The default/test [`RateSource`]: generous per-minute headroom so the rate gate
+/// never refuses. The production assembly wires [`LiveRate`] instead (slice 006);
+/// this stays as the `DriveLoop` default seam and the fixture a test injects when
+/// it wants the rate gate out of the way.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PermissiveRate;
 
 impl RateSource for PermissiveRate {
-    fn rate(&self) -> RateState {
+    fn rate(&self, _now: i64) -> RateState {
         RateState {
             tpm_used: 0,
             rpm_used: 0,
@@ -145,6 +148,43 @@ impl RateSource for PermissiveRate {
             rpm_limit: u32::MAX,
             tpm_per_agent: 0,
             rpm_per_agent: 0,
+        }
+    }
+}
+
+/// The live [`RateSource`] (slice 006): admission's second window from real data.
+/// Reads the **fleet-wide** rolling-minute `(tpm_used, rpm_used)` off the
+/// [`ClaudeBackend`]'s per-agent meters (each fed from its agents' `result`-line
+/// `usage` tokens + a request tick — see [`ClaudeBackend::rate_used`]) and pairs
+/// it with the per-device [`RateLimits`]. This is what replaces [`PermissiveRate`]
+/// in [`crate::fleet::assemble_fleet`], so the TPM/RPM burst gate actually gates
+/// (spec §7 "two windows, not one"; §15). Holds an `Arc` clone of the same backend
+/// the supervisor spawns through and the budget/health sources read — one backend,
+/// one set of cells.
+#[derive(Debug)]
+pub struct LiveRate {
+    backend: Arc<ClaudeBackend>,
+    limits: RateLimits,
+}
+
+impl LiveRate {
+    /// Build the live rate source over `backend`'s meters and the per-device
+    /// `limits` (the account TPM/RPM ceilings + per-agent burst headroom).
+    pub fn new(backend: Arc<ClaudeBackend>, limits: RateLimits) -> Self {
+        Self { backend, limits }
+    }
+}
+
+impl RateSource for LiveRate {
+    fn rate(&self, now: i64) -> RateState {
+        let (tpm_used, rpm_used) = self.backend.rate_used(now);
+        RateState {
+            tpm_used,
+            rpm_used,
+            tpm_limit: self.limits.tpm_limit,
+            rpm_limit: self.limits.rpm_limit,
+            tpm_per_agent: self.limits.tpm_per_agent,
+            rpm_per_agent: self.limits.rpm_per_agent,
         }
     }
 }
@@ -374,7 +414,7 @@ impl DriveLoop {
             }
         }
         let budget = self.aggregator.aggregate_or_fresh();
-        let rate = self.rate.rate();
+        let rate = self.rate.rate(now);
 
         // 1. Per-agent control + health pass (boundary semantics, spec §8).
         for member in &fleet {

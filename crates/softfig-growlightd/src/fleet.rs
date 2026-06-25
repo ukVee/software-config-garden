@@ -28,11 +28,13 @@
 //! ## Scope of this slice
 //!
 //! Assembly + spawn + gate, plus the live [`QueueSource`] (slice 002): the queue
-//! snapshot is now pulled from keeperd's per-queue managed regions
-//! ([`KeeperdQueueSource`]). The real 5h/7d reserve (slice 005) and the live
-//! [`RateSource`] (slice 006) are still their permissive defaults here
-//! ([`PermissiveRate`]) — safe because the gate stays off until
-//! `growlight-verify-merge` enables it on-device.
+//! snapshot is pulled from keeperd's per-queue managed regions
+//! ([`KeeperdQueueSource`]). Admission now gates on BOTH windows from real data —
+//! the live 5h/7d reserve (slice 005, off the backend's `rate_limit_event` fold)
+//! and the live TPM/RPM [`RateSource`] ([`LiveRate`] over the backend's
+//! rolling-minute meters, slice 006). `PermissiveRate` is gone from the
+//! production path; the fleet gate ([`crate::config`]'s `fleet_enabled`) still
+//! stays off until `growlight-verify-merge` enables it on-device.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +48,7 @@ use crate::claim::KeeperdPartClaimer;
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
-    spawn_drive_loop, DriveLoop, FleetMember, PermissiveRate, DRIVE_POLL_MS,
+    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::preapproval::{agent_paths, PreApproval};
@@ -242,7 +244,7 @@ pub fn assemble_fleet(
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)
         Box::new(KeeperdPartClaimer::new(keeperd_socket.to_path_buf())), // claimer — live (slice 003)
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
-        Box::new(PermissiveRate),       // rate    — slice 006 wires the live source
+        Box::new(LiveRate::new(Arc::clone(&backend), daemon.rate_limits())), // rate — live TPM/RPM meter (slice 006)
         dispatcher,
         members,
     ))
