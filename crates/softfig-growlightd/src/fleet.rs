@@ -42,6 +42,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::admission::AdmissionGovernor;
+use crate::claim::KeeperdPartClaimer;
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
@@ -207,6 +208,7 @@ pub fn assemble_fleet(
         supervisor,
         Box::new(Arc::clone(&backend)), // health  — live ClaudeBackend (slice 001)
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)
+        Box::new(KeeperdPartClaimer::new(keeperd_socket.to_path_buf())), // claimer — live (slice 003)
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
         Box::new(PermissiveRate),       // rate    — slice 006 wires the live source
         dispatcher,

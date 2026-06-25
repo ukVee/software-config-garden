@@ -128,6 +128,25 @@ impl Snapshot {
     pub fn queue(&self, name: &str) -> Option<&QueueView> {
         self.queues.iter().find(|q| q.name == name)
     }
+
+    /// Stamp `part` in `queue` as [`PartStatus::Active`] — the intra-tick claim
+    /// mark the drive loop applies to its *working copy* of the snapshot the
+    /// instant a part-claim succeeds, so a later member's [`pick`] in the SAME
+    /// tick sees the part already claimed: a fallback agent flows past the now
+    /// `active` head, and the queue is reduced to one claimed part. The
+    /// point-in-time snapshot alone cannot prevent two idle agents from both
+    /// resolving to the same `Ready` head within a tick (the fallback
+    /// double-assignment window); this closes the intra-tick half. The
+    /// cross-tick half is keeperd's committed `active` write (the claim itself),
+    /// surfaced by the next [`QueueSource::snapshot`](crate::drive_loop::QueueSource::snapshot).
+    /// A no-op when the queue or part is absent.
+    pub fn mark_claimed(&mut self, queue: &str, part: &str) {
+        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue) {
+            if let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
+                p.status = PartStatus::Active;
+            }
+        }
+    }
 }
 
 /// A queue's drainable state, reduced to its head workable part. Produced by
@@ -399,6 +418,38 @@ mod tests {
             q("other", &[("o1", "queued")]),
         ]);
         assert_eq!(pick_pinned(&snap, "mine"), Some(("mine".into(), "p1".into())));
+    }
+
+    #[test]
+    fn mark_claimed_makes_a_ready_head_read_as_claimed_for_fallback() {
+        // A free queue with a Ready head; a fallback agent would take it.
+        let mut snap = Snapshot::new(vec![
+            q("qa", &[("p1", "queued")]),
+            q("qb", &[("p2", "queued")]),
+        ]);
+        assert_eq!(pick(&snap, None), Some(("qa".into(), "p1".into())));
+
+        // Stamp qa/p1 claimed (the intra-tick mark) — fallback now flows past qa
+        // to the next unclaimed queue, never re-resolving to the claimed part.
+        snap.mark_claimed("qa", "p1");
+        assert_eq!(classify_queue(snap.queue("qa").unwrap()), QueueState::Active("p1".into()));
+        assert_eq!(
+            pick(&snap, None),
+            Some(("qb".into(), "p2".into())),
+            "a second fallback agent in the same tick picks a different queue",
+        );
+    }
+
+    #[test]
+    fn mark_claimed_is_a_no_op_for_an_absent_queue_or_part() {
+        let mut snap = Snapshot::new(vec![q("qa", &[("p1", "queued")])]);
+        snap.mark_claimed("ghost", "p1"); // unknown queue
+        snap.mark_claimed("qa", "nope"); // unknown part
+        assert_eq!(
+            classify_queue(snap.queue("qa").unwrap()),
+            QueueState::Ready("p1".into()),
+            "a mark against a missing queue/part changes nothing",
+        );
     }
 
     #[test]

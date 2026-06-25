@@ -248,6 +248,16 @@ pub enum StartOutcome {
         /// Which exhausted resource blocked the start.
         reason: RefuseReason,
     },
+    /// Admission cleared but the part-claim that gates the spawn could not be
+    /// made — keeperd refused the claim, was unreachable, or the write outcome
+    /// was ambiguous. **Fail-closed:** nothing spawned (no agent orphaned on an
+    /// unclaimed part) and nothing registered, so the drive loop retries the
+    /// claim next tick. The fallback double-assignment window stays closed: a
+    /// start that could not claim its part never runs on it.
+    ClaimFailed {
+        /// Why the claim could not be confirmed.
+        reason: String,
+    },
     /// Admission cleared but the backend launch itself failed.
     SpawnFailed {
         /// The backend's error text.
@@ -414,6 +424,10 @@ impl Supervisor {
     /// Register and start a brand-new agent ([`Intent::Start`]). The cap *and*
     /// budget/rate gate it; on admit the backend spawns it and it joins the
     /// fleet. A queue/refuse leaves it unregistered for the drive loop to retry.
+    ///
+    /// This is [`start_claiming`](Self::start_claiming) with a no-op claim — the
+    /// supervisor-internal / test entry point. The drive loop uses the claiming
+    /// form so the part is claimed before the spawn.
     pub fn start(
         &mut self,
         spec: AgentSpec,
@@ -421,24 +435,57 @@ impl Supervisor {
         rate: RateState,
         now: i64,
     ) -> StartOutcome {
+        self.start_claiming(spec, budget, rate, now, || Ok(()))
+    }
+
+    /// Like [`start`](Self::start), but interposes a `claim` step between
+    /// admission *admitting* and the backend *spawning*. The drive loop passes
+    /// its keeperd part-claim here (mark the picked part `active`); the ordering
+    /// is the whole point:
+    ///
+    /// - **admit → claim → spawn**, so a claim that returns `Err` aborts the
+    ///   start ([`StartOutcome::ClaimFailed`]) **before** any child is spawned —
+    ///   no agent is ever left running on an unclaimed part (fail-closed).
+    /// - the claim sits *after* admission, so a queued/refused start never even
+    ///   attempts the claim (no wasted keeperd write, no claim leaked onto a part
+    ///   no agent will run); and a failed claim consumes no per-device slot,
+    ///   because nothing is registered until the spawn succeeds.
+    ///
+    /// `claim` returns `Ok(())` when the part is now this agent's (keeperd's
+    /// idempotent already-`active` no-op counts), `Err(reason)` when it could not
+    /// be confirmed.
+    pub fn start_claiming<F>(
+        &mut self,
+        spec: AgentSpec,
+        budget: BudgetUsage,
+        rate: RateState,
+        now: i64,
+        claim: F,
+    ) -> StartOutcome
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
         let fleet = self.live_count();
         match self.governor.decide(Intent::Start, fleet, budget, rate) {
-            AdmissionDecision::Admit => match self.backend.spawn(&spec) {
-                Ok(child) => {
-                    self.agents.insert(
-                        spec.agent.clone(),
-                        Supervised {
-                            spec,
-                            child: Some(child),
-                            consecutive_failures: 0,
-                            not_before: now,
-                        },
-                    );
-                    StartOutcome::Started
-                }
-                Err(e) => StartOutcome::SpawnFailed {
-                    error: e.to_string(),
+            AdmissionDecision::Admit => match claim() {
+                Ok(()) => match self.backend.spawn(&spec) {
+                    Ok(child) => {
+                        self.agents.insert(
+                            spec.agent.clone(),
+                            Supervised {
+                                spec,
+                                child: Some(child),
+                                consecutive_failures: 0,
+                                not_before: now,
+                            },
+                        );
+                        StartOutcome::Started
+                    }
+                    Err(e) => StartOutcome::SpawnFailed {
+                        error: e.to_string(),
+                    },
                 },
+                Err(reason) => StartOutcome::ClaimFailed { reason },
             },
             AdmissionDecision::Queue { active, cap } => StartOutcome::Queued { active, cap },
             AdmissionDecision::Refuse { reason } => StartOutcome::Refused { reason },
@@ -689,6 +736,56 @@ mod tests {
             }
         );
         assert!(!s.is_running("a1"), "a failed start registers nothing");
+    }
+
+    /// The claim gate sits between admission and the spawn: a failed claim aborts
+    /// the start fail-closed (no spawn, nothing registered), a successful claim
+    /// spawns, and a non-admitted start never attempts the claim at all.
+    #[test]
+    fn the_claim_gate_orders_admit_then_claim_then_spawn() {
+        use std::sync::atomic::AtomicUsize;
+
+        // 1. Admitted but the claim fails → ClaimFailed, no spawn, not registered.
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let out = s.start_claiming(spec("a1"), fresh_budget(), fresh_rate(), 0, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Err("claim refused".to_string())
+        });
+        assert_eq!(
+            out,
+            StartOutcome::ClaimFailed {
+                reason: "claim refused".into()
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the claim was attempted");
+        assert_eq!(backend.spawn_count(), 0, "a failed claim never spawns");
+        assert!(!s.is_registered("a1"), "a failed claim registers nothing");
+
+        // 2. Admitted and the claim succeeds → spawned + registered.
+        let out = s.start_claiming(spec("a1"), fresh_budget(), fresh_rate(), 0, || Ok(()));
+        assert_eq!(out, StartOutcome::Started);
+        assert_eq!(backend.spawns(), vec!["a1"], "a confirmed claim spawns the agent");
+
+        // 3. A budget-refused start never reaches the claim (admit gates first).
+        let backend2 = FakeBackend::new();
+        let mut s2 = sup(Arc::clone(&backend2));
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&calls2);
+        let out = s2.start_claiming(spec("a1"), hot_budget(), fresh_rate(), 0, move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(
+            out,
+            StartOutcome::Refused {
+                reason: RefuseReason::Budget5h
+            }
+        );
+        assert_eq!(calls2.load(Ordering::SeqCst), 0, "a refused start never claims");
+        assert_eq!(backend2.spawn_count(), 0);
     }
 
     /// A healthy heartbeat leaves the agent running untouched — no kill, no spawn.

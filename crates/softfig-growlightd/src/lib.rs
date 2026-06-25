@@ -20,6 +20,7 @@
 
 pub mod admission;
 pub mod bus;
+pub mod claim;
 pub mod claude_backend;
 pub mod config;
 pub mod control;
@@ -44,13 +45,15 @@ pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
 };
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
+pub use claim::KeeperdPartClaimer;
 pub use claude_backend::{AgentHealthState, ClaudeBackend};
 pub use config::{GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
     spawn_drive_loop, AgentHealthSource, Assignment, BudgetSampleSource, DeferredQueues, DriveLoop,
-    FleetMember, HeldStart, PermissiveRate, QueueSource, RateSource, TickReport, DRIVE_POLL_MS,
+    FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource, RateSource, TickReport,
+    DRIVE_POLL_MS,
 };
 pub use fleet::{
     assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig,

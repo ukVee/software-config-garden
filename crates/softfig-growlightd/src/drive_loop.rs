@@ -81,6 +81,26 @@ pub trait QueueSource: Send + Sync + fmt::Debug {
     fn snapshot(&self) -> Snapshot;
 }
 
+/// The seam the loop **claims** a picked part through before spawning its agent
+/// — the WRITE counterpart to [`QueueSource`]'s read. Marking the part `active`
+/// in keeperd's queue table is what closes the fallback double-assignment window
+/// across ticks: once claimed, the next [`snapshot`](QueueSource::snapshot) shows
+/// the part `active`, so every other agent's fallback [`pick`] flows past it. The
+/// claim **gates** the spawn — it is issued between admission admitting and the
+/// backend spawning ([`Supervisor::start_claiming`](crate::supervisor::Supervisor::start_claiming))
+/// — so a claim that cannot be confirmed never leaves an agent running on an
+/// unclaimed part. The production impl is a `set_item_status(... active)` write
+/// over `call_reconnecting` ([`crate::claim::KeeperdPartClaimer`]); a test injects
+/// a scripted claim result.
+pub trait PartClaimer: Send + Sync + fmt::Debug {
+    /// Claim `(queue, part)` for the agent about to spawn — mark it `active` in
+    /// keeperd's queue table. `Ok(())` means the part is now ours (idempotent:
+    /// re-claiming a part this agent already holds `active` is a no-op success).
+    /// `Err(reason)` means the claim could NOT be confirmed (keeperd refused, was
+    /// unreachable, or the write was ambiguous) — the loop must NOT spawn on it.
+    fn claim(&self, queue: &str, part: &str) -> Result<(), String>;
+}
+
 /// The seam the loop reads each agent's latest reading of the **shared** account
 /// budget pool through, to fold into the loop's owned cross-agent
 /// [`UsageAggregator`]. The aggregate then gates admission and fires the §9 usage
@@ -253,6 +273,9 @@ pub struct DriveLoop {
     health: Box<dyn AgentHealthSource>,
     /// Where the multi-queue snapshot comes from.
     queues: Box<dyn QueueSource>,
+    /// How a picked part is claimed (`active`) before its agent spawns — the
+    /// write that closes the fallback double-assignment window cross-tick.
+    claimer: Box<dyn PartClaimer>,
     /// Per-agent shared-pool budget readings, folded into `aggregator` each tick.
     samples: Box<dyn BudgetSampleSource>,
     /// Per-minute rate readings — admission's second gate.
@@ -291,6 +314,7 @@ impl DriveLoop {
         supervisor: Supervisor,
         health: Box<dyn AgentHealthSource>,
         queues: Box<dyn QueueSource>,
+        claimer: Box<dyn PartClaimer>,
         samples: Box<dyn BudgetSampleSource>,
         rate: Box<dyn RateSource>,
         dispatcher: NotifyDispatcher,
@@ -301,6 +325,7 @@ impl DriveLoop {
             supervisor,
             health,
             queues,
+            claimer,
             samples,
             rate,
             aggregator: UsageAggregator::new(),
@@ -398,11 +423,21 @@ impl DriveLoop {
             report.rerolls = self.supervisor.tick(budget, rate, now);
         }
 
-        // 3. Schedule + admit + spawn. Read the snapshot once; surface parked
-        //    queues regardless of pause, then start fresh agents only when running.
-        let snapshot = self.queues.snapshot();
+        // 3. Schedule + claim + admit + spawn. Read the snapshot once into a
+        //    LOCAL working copy (`mut snapshot`): each successful claim stamps the
+        //    part `active` in THAT copy (`mark_claimed`) so a later member's `pick`
+        //    in the SAME tick flows past it — the intra-tick half of the
+        //    double-assignment fix. keeperd's committed `active` write (the claim
+        //    itself) is the cross-tick half: the next tick's snapshot shows the
+        //    part claimed, so every other agent's fallback skips it.
+        let mut snapshot = self.queues.snapshot();
         report.parked = parked(&snapshot);
         if !paused {
+            // Parts already claimed THIS tick — belt-and-suspenders so the SAME
+            // `(queue, part)` is never assigned twice in one tick even where
+            // marking the head `active` would otherwise read as a *resume* (two
+            // members mis-pinned to one queue): the second such member gets none.
+            let mut claimed_this_tick: BTreeSet<(String, String)> = BTreeSet::new();
             for member in &fleet {
                 let agent = &member.spec.agent;
                 // A stopping/stopped agent is never (re-)started; a registered one
@@ -416,12 +451,47 @@ impl DriveLoop {
                 let Some((queue, part)) = pick(&snapshot, member.pin.as_deref()) else {
                     continue; // nothing workable for this agent's pin right now
                 };
-                match self.supervisor.start(member.spec.clone(), budget, rate, now) {
-                    StartOutcome::Started => report.started.push(Assignment {
-                        agent: agent.clone(),
-                        queue,
-                        part,
-                    }),
+                // A part already claimed earlier this tick is taken — never
+                // double-assign it (the resume-collision guard).
+                if claimed_this_tick.contains(&(queue.clone(), part.clone())) {
+                    continue;
+                }
+                // Claim the part (mark it `active` in keeperd) BETWEEN admission
+                // and the spawn: a claim that cannot be confirmed aborts the start
+                // fail-closed, so no agent is ever left running on an unclaimed
+                // part. The claimer borrow is a disjoint field from `supervisor`.
+                let claimer = &self.claimer;
+                let outcome = self.supervisor.start_claiming(
+                    member.spec.clone(),
+                    budget,
+                    rate,
+                    now,
+                    || claimer.claim(&queue, &part),
+                );
+                match outcome {
+                    StartOutcome::Started => {
+                        snapshot.mark_claimed(&queue, &part);
+                        claimed_this_tick.insert((queue.clone(), part.clone()));
+                        report.started.push(Assignment {
+                            agent: agent.clone(),
+                            queue,
+                            part,
+                        });
+                    }
+                    // The claim landed (it precedes the spawn) even though the
+                    // spawn failed — keep the part excluded this tick so no peer
+                    // grabs the part keeperd now shows `active`; the agent retries
+                    // next tick via a re-pick of its (now `active`) part.
+                    outcome @ StartOutcome::SpawnFailed { .. } => {
+                        snapshot.mark_claimed(&queue, &part);
+                        claimed_this_tick.insert((queue, part));
+                        report.held_starts.push(HeldStart {
+                            agent: agent.clone(),
+                            outcome,
+                        });
+                    }
+                    // Queued / Refused (no claim attempted) or ClaimFailed (claim
+                    // refused, fail-closed): nothing claimed, nothing excluded.
                     outcome => report.held_starts.push(HeldStart {
                         agent: agent.clone(),
                         outcome,
@@ -519,7 +589,7 @@ mod tests {
     use crate::supervisor::{AgentBackend, Backoff, SpawnError};
     use softfig_ipc::growlightd::StopLevel;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// A fake live child that records how many times it was killed.
@@ -634,10 +704,52 @@ mod tests {
         fn new(qs: Vec<QueueView>) -> Arc<Self> {
             Arc::new(Self(Mutex::new(Snapshot::new(qs))))
         }
+        /// Mark a part `active` in the shared snapshot — models keeperd's
+        /// committed claim write, so the NEXT `snapshot()` shows it claimed (the
+        /// cross-tick half of the double-assignment fix).
+        fn mark_active(&self, queue: &str, part: &str) {
+            self.0.lock().unwrap().mark_claimed(queue, part);
+        }
     }
     impl QueueSource for Arc<FixedQueues> {
         fn snapshot(&self) -> Snapshot {
             self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A fake [`PartClaimer`]: records every claim, can be scripted to fail (the
+    /// fail-closed path), and on success marks the part `active` in the SAME
+    /// `FixedQueues` the loop reads — so a claim shows up on the next tick's
+    /// snapshot exactly as keeperd's committed write would (the cross-tick half).
+    #[derive(Debug)]
+    struct FakeClaimer {
+        claims: Mutex<Vec<(String, String)>>,
+        fail: AtomicBool,
+        committed: Arc<FixedQueues>,
+    }
+    impl FakeClaimer {
+        fn new(committed: Arc<FixedQueues>) -> Arc<Self> {
+            Arc::new(Self {
+                claims: Mutex::new(Vec::new()),
+                fail: AtomicBool::new(false),
+                committed,
+            })
+        }
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, Ordering::SeqCst);
+        }
+        fn claims(&self) -> Vec<(String, String)> {
+            self.claims.lock().unwrap().clone()
+        }
+    }
+    impl PartClaimer for Arc<FakeClaimer> {
+        fn claim(&self, queue: &str, part: &str) -> Result<(), String> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("claim refused".into());
+            }
+            self.claims.lock().unwrap().push((queue.to_string(), part.to_string()));
+            self.committed.mark_active(queue, part);
+            Ok(())
         }
     }
 
@@ -677,9 +789,24 @@ mod tests {
         snapshot: Vec<QueueView>,
         policy: Policy,
     ) -> (DriveLoop, Daemon, Arc<FakeFleet>, Probe) {
+        let (drive, d, backend, _claimer, probe) = make_claiming(fleet, snapshot, policy);
+        (drive, d, backend, probe)
+    }
+
+    /// Like [`make`], but also hands back the [`FakeClaimer`] so a slice-003 test
+    /// can inspect the recorded claims or script a claim failure. The claimer is
+    /// wired to the SAME [`FixedQueues`] the loop reads, so a successful claim
+    /// marks the part `active` in the shared snapshot (the cross-tick half) while
+    /// the loop's own `mark_claimed` is the intra-tick half.
+    fn make_claiming(
+        fleet: Vec<FleetMember>,
+        snapshot: Vec<QueueView>,
+        policy: Policy,
+    ) -> (DriveLoop, Daemon, Arc<FakeFleet>, Arc<FakeClaimer>, Probe) {
         let d = daemon(policy);
         let backend = FakeFleet::new();
         let queues = FixedQueues::new(snapshot);
+        let claimer = FakeClaimer::new(Arc::clone(&queues));
         let sup = Supervisor::with_backoff(
             Box::new(Arc::clone(&backend)),
             AdmissionGovernor::new(policy),
@@ -700,12 +827,13 @@ mod tests {
             sup,
             Box::new(Arc::clone(&backend)),
             Box::new(Arc::clone(&queues)),
+            Box::new(Arc::clone(&claimer)),
             Box::new(Arc::clone(&backend)),
             Box::new(PermissiveRate),
             dispatcher,
             fleet,
         );
-        (drive, d, backend, Probe { alerts, log })
+        (drive, d, backend, claimer, Probe { alerts, log })
     }
 
     /// The loop picks each member's pinned part, admits under the per-device cap,
@@ -1228,5 +1356,146 @@ mod tests {
         assert_eq!(lines.len(), 2, "exactly two distinct audit lines");
         assert!(lines.iter().any(|l| l.contains("blocked on a human")));
         assert!(lines.iter().any(|l| l.contains("crashed")));
+    }
+
+    // ---- slice 003: part-claim closes the double-assignment window ----------
+
+    /// Two idle unpinned members in one tick claim DIFFERENT parts — the
+    /// intra-tick fallback double-assignment window is closed: the first claim
+    /// stamps its part `active` in the working snapshot, so the second member's
+    /// `pick` flows past it to the next free queue.
+    #[test]
+    fn two_unpinned_members_in_one_tick_claim_different_parts() {
+        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a1")), FleetMember::unpinned(spec("a2"))],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            Policy::default(),
+        );
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.started,
+            vec![
+                Assignment { agent: "a1".into(), queue: "qa".into(), part: "p1".into() },
+                Assignment { agent: "a2".into(), queue: "qb".into(), part: "p2".into() },
+            ],
+            "each unpinned member claims a distinct (queue, part) — never the same",
+        );
+        assert_eq!(
+            claimer.claims(),
+            vec![("qa".into(), "p1".into()), ("qb".into(), "p2".into())],
+            "both parts were claimed in keeperd, in order, before spawning",
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a2"]);
+    }
+
+    /// With a single workable part, the first unpinned member claims it and the
+    /// second finds nothing — never a double-assignment of the same part.
+    #[test]
+    fn a_lone_part_is_claimed_once_and_the_second_member_gets_none() {
+        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a1")), FleetMember::unpinned(spec("a2"))],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a1".into(), queue: "qa".into(), part: "p1".into() }],
+            "only one member starts on the lone part",
+        );
+        assert!(r.held_starts.is_empty(), "the second member simply found nothing workable");
+        assert_eq!(claimer.claims(), vec![("qa".into(), "p1".into())], "claimed exactly once");
+        assert_eq!(backend.spawns(), vec!["a1"], "no second spawn on the same part");
+    }
+
+    /// Cross-tick: a part claimed in one tick (keeperd shows it `active` on the
+    /// next snapshot) is skipped by a later tick's pick. a1 claims qa/p1 under a
+    /// cap-1 fleet; once the cap lifts, a2 flows PAST the now-`active` qa to the
+    /// still-free qb rather than re-resolving to a1's claimed part.
+    #[test]
+    fn a_claimed_part_is_skipped_by_a_later_tick() {
+        let policy = Policy {
+            max_concurrent_agents: 1,
+            ..Policy::default()
+        };
+        let (mut loop_, d, backend, claimer, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a1")), FleetMember::unpinned(spec("a2"))],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            policy,
+        );
+
+        // Tick 0 (cap 1): a1 claims + starts on qa/p1; a2 is queued behind the cap
+        // (admission queues it before any claim, so a2 claims nothing yet).
+        let r0 = loop_.tick(0);
+        assert_eq!(
+            r0.started,
+            vec![Assignment { agent: "a1".into(), queue: "qa".into(), part: "p1".into() }],
+        );
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(claimer.claims(), vec![("qa".into(), "p1".into())], "only a1 claimed in tick 0");
+
+        // Lift the cap; the committed snapshot now shows qa/p1 `active` (a1's
+        // claim), so a2's fallback skips qa and takes the still-free qb.
+        d.set_policy(Policy {
+            max_concurrent_agents: 2,
+            ..Policy::default()
+        });
+        let r1 = loop_.tick(1);
+        assert_eq!(
+            r1.started,
+            vec![Assignment { agent: "a2".into(), queue: "qb".into(), part: "p2".into() }],
+            "a2 flows past the cross-tick-claimed qa/p1 to the free qb",
+        );
+        assert_eq!(
+            claimer.claims(),
+            vec![("qa".into(), "p1".into()), ("qb".into(), "p2".into())],
+            "a2 claimed qb/p2 — it never re-claimed a1's qa/p1",
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a2"]);
+    }
+
+    /// A claim failure is fail-closed: admission cleared but the part could not be
+    /// claimed, so the agent is NOT spawned (never left running on an unclaimed
+    /// part) and the start is held as `ClaimFailed`.
+    #[test]
+    fn a_failed_claim_is_fail_closed_and_never_spawns() {
+        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a1"))],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        claimer.set_fail(true);
+        let r = loop_.tick(0);
+        assert!(r.started.is_empty(), "a start whose claim failed never reports as started");
+        assert_eq!(r.held_starts.len(), 1);
+        assert!(
+            matches!(r.held_starts[0].outcome, StartOutcome::ClaimFailed { .. }),
+            "the held start records a fail-closed claim, got {:?}",
+            r.held_starts[0].outcome,
+        );
+        assert_eq!(backend.spawn_count(), 0, "a failed claim spawns nothing");
+    }
+
+    /// Two members mis-pinned to the SAME queue never double-assign its head: the
+    /// first claims it; the second — whose `pick` would otherwise read the now
+    /// `active` head as a *resume* — is excluded by the per-tick claimed set and
+    /// gets nothing. (Marking the head `active` alone is not enough here; the
+    /// per-tick claimed set is the belt-and-suspenders that closes the resume
+    /// collision.)
+    #[test]
+    fn two_members_pinned_to_one_queue_never_double_assign_its_head() {
+        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+            vec![member("a1", "qa"), member("a2", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a1".into(), queue: "qa".into(), part: "p1".into() }],
+            "only the first member claims and starts on the shared head",
+        );
+        assert_eq!(claimer.claims(), vec![("qa".into(), "p1".into())], "the head is claimed exactly once");
+        assert_eq!(backend.spawns(), vec!["a1"], "the mis-pinned peer does not also spawn on p1");
     }
 }
