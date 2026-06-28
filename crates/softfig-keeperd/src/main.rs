@@ -49,6 +49,10 @@ fn main() -> anyhow::Result<()> {
     if cli.no_watcher {
         config = config.without_watcher();
     }
+    // The real daemon manages the growlightd user unit (start on unlock when the
+    // in-garden gate is on, stop on terminal lock). Off by default so no
+    // library/test path shells `systemctl`; opted in only here. config-in-garden.
+    config = config.with_growlight_supervision(true);
 
     let daemon = Daemon::new(config);
     let handle = daemon.start()?;

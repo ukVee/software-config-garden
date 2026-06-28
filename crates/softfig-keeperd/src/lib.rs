@@ -16,6 +16,7 @@ pub mod classify;
 pub mod config;
 pub mod daemon;
 pub mod fuse_sink;
+pub mod growlight_unit;
 pub mod handlers;
 pub mod keeper_toml;
 pub mod layer_b;

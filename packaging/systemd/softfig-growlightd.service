@@ -1,0 +1,39 @@
+[Unit]
+Description=soft-fig multi-agent orchestrator daemon (growlight fleet)
+Documentation=https://github.com/ukv/software-config_garden
+# Ordering only: growlightd derives the garden root from keeperd's read-only
+# `status` handshake, so keeperd should come up first. Deliberately NOT
+# `Requires=`/`BindsTo=` — those would tie growlightd's life to "keeperd
+# running" and kill it on every `softfig daemon cycle` (a transient keeperd
+# bounce that growlightd is built to ride via its reconnecting IPC). keeperd
+# instead starts/stops this unit event-drivenly on the unlock/lock transitions.
+After=softfig-keeperd.service
+
+[Service]
+Type=simple
+# %h expands to the user's home; the daemon is a per-user installation. No
+# `--garden` flag: growlightd asks keeperd for the garden root, then reads its
+# fleet config from `<garden>/config/growlight.toml` through the mount.
+ExecStart=%h/.local/bin/softfig-growlightd
+# Crash-restart only. NOT `always`: a clean exit (keeperd asked systemd to stop
+# this unit on a terminal lock) must stay stopped, not respawn.
+Restart=on-failure
+RestartSec=2
+
+# Headless daemon — journal only.
+StandardOutput=journal
+StandardError=journal
+
+# DELIBERATELY no mount-namespacing / sandboxing. growlightd must see the FUSE
+# mount keeperd projects into the user's login session (it reads the backlog +
+# protocol through it and shells `claude -p` agents that touch the garden). Any
+# option that gives the unit a private mount namespace (ProtectSystem=,
+# PrivateTmp=, the Protect*= family, …) would hide that mount, so the fleet would
+# read an empty/locked garden. Same constraint, same reason as
+# softfig-keeperd.service — see its NOTE.
+
+# DELIBERATELY no [Install] section. This unit is never enabled / WantedBy any
+# target: systemd must NOT start it at boot. keeperd is the only thing that
+# starts it (`systemctl --user start softfig-growlightd` after an unlock when
+# `config/growlight.toml` `fleet_enabled` is true) and stops it (on a terminal
+# lock). See journal/decisions/decision-growlight-config-in-garden.md.

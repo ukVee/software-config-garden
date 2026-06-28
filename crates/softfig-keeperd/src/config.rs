@@ -45,6 +45,14 @@ pub struct KeeperConfig {
     /// [`softfig_ipc::growlightd_runtime_socket_path`]; overridable so tests
     /// point keeperd at a growlightd bound on a tempdir socket.
     pub growlightd_socket: Option<PathBuf>,
+    /// config-in-garden: when true, keeperd manages the
+    /// `softfig-growlightd.service` user unit — `systemctl --user start`s it on
+    /// unlock when the in-garden `config/growlight.toml` `fleet_enabled` gate is
+    /// on, and `stop`s it on a *terminal* lock (not a relock-cycle). Default
+    /// **false** so no library/test path ever shells `systemctl`; the real
+    /// `softfig-keeperd` binary opts in via [`with_growlight_supervision`] in
+    /// `main`. (`with_growlight_supervision`: KeeperConfig::with_growlight_supervision)
+    pub enable_growlight_supervision: bool,
 }
 
 /// Growlight: autonomous-loop policy (`[growlight]`).
@@ -155,6 +163,7 @@ impl KeeperConfig {
             replica_root: None,
             growlight: GrowlightConfig::default(),
             growlightd_socket: None,
+            enable_growlight_supervision: false,
         }
     }
 
@@ -187,6 +196,7 @@ impl KeeperConfig {
             replica_root: None,
             growlight: cfg.growlight.into(),
             growlightd_socket: None,
+            enable_growlight_supervision: false,
         })
     }
 
@@ -228,6 +238,14 @@ impl KeeperConfig {
 
     pub fn without_watcher(mut self) -> Self {
         self.enable_watcher = false;
+        self
+    }
+
+    /// Opt into managing the `softfig-growlightd.service` user unit (the real
+    /// `softfig-keeperd` binary; off everywhere else). See
+    /// [`enable_growlight_supervision`](Self::enable_growlight_supervision).
+    pub fn with_growlight_supervision(mut self, on: bool) -> Self {
+        self.enable_growlight_supervision = on;
         self
     }
 

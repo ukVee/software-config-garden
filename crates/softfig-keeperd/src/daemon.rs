@@ -196,7 +196,7 @@ impl Daemon {
         // releasing the lock holder so the teardown below — and the whole
         // process — can finish promptly. No-op when not FUSE-mounted.
         softfig_fuse::force_release_mount(&self.garden_root);
-        let (fuse, net) = {
+        let (fuse, net, supervise, resume_pending) = {
             let mut inner = self.inner.lock().unwrap();
             inner.state = State::Stopping;
             // Growlight: prune an *expired* relock blob, but never a live one — a
@@ -207,16 +207,28 @@ impl Daemon {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             crate::relock::prune_expired(inner.config.state_dir(), now);
+            // A still-armed (unexpired) blob after pruning means a `daemon cycle`/
+            // `relock` is pending — a *resume*, not a terminal lock. That decides
+            // whether the growlightd unit is stopped below (config-in-garden
+            // slice 2 / locked-decision 5): a resume leaves the fleet running to
+            // ride the bounce via its reconnecting IPC; a terminal lock stops it.
+            let resume_pending =
+                crate::relock::pending_expires_at(inner.config.state_dir(), now).is_some();
+            let supervise = inner.config.enable_growlight_supervision;
             let fuse = inner.fuse.take();
             let net = inner.net.take();
             inner.pending_pairs.clear();
             inner.session = None;
             inner.repo = None;
-            (fuse, net)
+            (fuse, net, supervise, resume_pending)
         };
         // Lock released — now run the potentially-blocking drops outside it.
         drop(fuse);
         drop(net);
+        // Terminal lock (no pending resume) ⇒ ask systemd to stop the growlightd
+        // user unit. Spawned without waiting so growlightd's graceful boundary
+        // exit never stalls keeperd's own teardown (the 2026-06-21/22 wedge class).
+        crate::growlight_unit::stop_on_terminal_lock(supervise, resume_pending);
     }
 
     /// Mark a path as "written by the daemon itself" — watcher events
