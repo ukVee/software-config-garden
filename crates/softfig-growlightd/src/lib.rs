@@ -36,6 +36,7 @@ pub mod notify_dispatch;
 pub mod peer;
 pub mod preapproval;
 pub mod queue_source;
+pub mod resume;
 pub mod scheduler;
 pub mod server;
 pub mod state;
@@ -73,6 +74,7 @@ pub use notify_dispatch::{
 };
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_QUEUE_NAME};
+pub use resume::{ItemResumer, KeeperdItemResumer, ResumeOutcome};
 pub use scheduler::{
     classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
 };

@@ -8,19 +8,69 @@
 //! the per-agent control map is addressable by id with nothing behind the key —
 //! exactly the phase-1 seam slice 004's e2e swaps a fake agent backend into.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use softfig_growlightd::{Daemon, GrowlightdConfig};
+use softfig_growlightd::{Daemon, GrowlightdConfig, ItemResumer, ResumeOutcome};
 use softfig_ipc::connect;
 use softfig_ipc::growlightd::{
-    op, FleetStatusReply, InjectReply, PausedReply, StopLevel, StopReply,
+    op, FleetStatusReply, InjectReply, PausedReply, ResumeItemReply, StopLevel, StopReply,
 };
-use softfig_ipc::Request;
+use softfig_ipc::{ErrorKind, Request};
 
 fn boot(socket: PathBuf, garden: PathBuf) -> softfig_growlightd::DaemonHandle {
     Daemon::new(GrowlightdConfig::new(socket, garden))
         .start()
         .expect("daemon boots")
+}
+
+/// Boot growlightd with a scripted item-resume hook installed (in production
+/// `main` installs the live `KeeperdItemResumer` over keeperd's socket; the e2e
+/// swaps a fake so the `resume_item` verb is driven without a live keeperd).
+fn boot_with_resumer(
+    socket: PathBuf,
+    garden: PathBuf,
+    resumer: Arc<dyn ItemResumer>,
+) -> softfig_growlightd::DaemonHandle {
+    Daemon::new(GrowlightdConfig::new(socket, garden))
+        .with_item_resumer(resumer)
+        .start()
+        .expect("daemon boots")
+}
+
+/// A fake `ItemResumer`: returns a scripted [`ResumeOutcome`] per item id
+/// (default [`ResumeOutcome::NotFound`]) and records every `(item, queue)` call so
+/// the test can assert the verb routed the args through.
+#[derive(Debug, Default)]
+struct ScriptedResumer {
+    outcomes: HashMap<String, ResumeOutcome>,
+    calls: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl ScriptedResumer {
+    fn with(outcomes: Vec<(&str, ResumeOutcome)>) -> Arc<Self> {
+        Arc::new(Self {
+            outcomes: outcomes.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+    fn calls(&self) -> Vec<(String, Option<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl ItemResumer for ScriptedResumer {
+    fn resume_item(&self, item: &str, queue: Option<&str>) -> ResumeOutcome {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((item.to_string(), queue.map(str::to_string)));
+        self.outcomes
+            .get(item)
+            .cloned()
+            .unwrap_or(ResumeOutcome::NotFound)
+    }
 }
 
 /// One-shot call: connect, send the verb, decode the `data` payload as `T`.
@@ -186,6 +236,118 @@ fn control_verbs_reject_an_empty_target_and_an_empty_message() {
 
     // Still serving after the rejections.
     assert_eq!(status(&socket).state, "running");
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn resume_item_unblocks_a_blocked_item_and_routes_the_queue_arg() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    let resumer = ScriptedResumer::with(vec![(
+        "019",
+        ResumeOutcome::Resumed { queue: "default".into() },
+    )]);
+    let handle = boot_with_resumer(
+        socket.clone(),
+        dir.path().join("garden"),
+        Arc::clone(&resumer) as Arc<dyn ItemResumer>,
+    );
+
+    // A blocked item flips to queued — the scheduler re-picks it (no retire).
+    let reply: ResumeItemReply = call_ok(
+        &socket,
+        op::RESUME_ITEM,
+        serde_json::json!({ "item": "019", "queue": "build" }),
+    );
+    assert!(reply.resumed, "a blocked item is un-blocked");
+    assert_eq!(reply.item, "019");
+    assert_eq!(reply.queue, "default");
+    assert_eq!(reply.status, "queued");
+
+    // The verb routed item + queue through to the hook (CLI/GUI → growlightd →
+    // keeperd path), preserving the disambiguating queue.
+    assert_eq!(
+        resumer.calls(),
+        vec![("019".to_string(), Some("build".to_string()))],
+    );
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn resume_item_is_idempotent_on_an_already_queued_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    let resumer = ScriptedResumer::with(vec![(
+        "t1",
+        ResumeOutcome::AlreadyQueued { queue: "default".into() },
+    )]);
+    let handle = boot_with_resumer(
+        socket.clone(),
+        dir.path().join("garden"),
+        resumer as Arc<dyn ItemResumer>,
+    );
+
+    // Already queued → a no-op success (resumed: false), not an error.
+    let reply: ResumeItemReply =
+        call_ok(&socket, op::RESUME_ITEM, serde_json::json!({ "item": "t1" }));
+    assert!(!reply.resumed, "an already-queued item is an idempotent no-op");
+    assert_eq!(reply.status, "queued");
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn resume_item_guards_a_non_blocked_item_and_an_empty_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    let resumer = ScriptedResumer::with(vec![(
+        "t1",
+        ResumeOutcome::NotBlocked { queue: "default".into(), status: "active".into() },
+    )]);
+    let handle = boot_with_resumer(
+        socket.clone(),
+        dir.path().join("garden"),
+        resumer as Arc<dyn ItemResumer>,
+    );
+
+    // The guard: only a blocked item un-blocks — a non-blocked one is a clear
+    // refusal (un-blocking a done/active item would corrupt it).
+    assert_eq!(
+        call_err(&socket, op::RESUME_ITEM, serde_json::json!({ "item": "t1" })),
+        ErrorKind::BadArgs,
+    );
+    // An unknown item (the scripted default) is NotFound.
+    assert_eq!(
+        call_err(&socket, op::RESUME_ITEM, serde_json::json!({ "item": "ghost" })),
+        ErrorKind::NotFound,
+    );
+    // An empty item is rejected server-side before the hook is consulted.
+    assert_eq!(
+        call_err(&socket, op::RESUME_ITEM, serde_json::json!({ "item": "" })),
+        ErrorKind::BadArgs,
+    );
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn resume_item_with_no_hook_installed_is_unreachable() {
+    // The default boot installs no resumer (no keeperd binding): the verb reports
+    // it as unavailable (an Io error), never a silent success.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    let handle = boot(socket.clone(), dir.path().join("garden"));
+
+    assert_eq!(
+        call_err(&socket, op::RESUME_ITEM, serde_json::json!({ "item": "019" })),
+        ErrorKind::Io,
+    );
 
     handle.shutdown();
     handle.join().unwrap();

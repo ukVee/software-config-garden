@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use softfig_ipc::growlightd::{
     op, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply, PausedReply,
-    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, SetPolicyArgs, StopAfterSliceArgs,
-    StopLevel, StopReply,
+    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply,
+    SetPolicyArgs, StopAfterSliceArgs, StopLevel, StopReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
 use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
+use crate::resume::ResumeOutcome;
 use crate::state::State;
 
 const ACCEPT_POLL_MS: u64 = 100;
@@ -136,6 +137,7 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         op::FORCE_STOP => write_one_shot(&mut stream, force_stop(&daemon, &req)),
         op::INJECT_MESSAGE => write_one_shot(&mut stream, inject_message(&daemon, &req)),
         op::SET_POLICY => write_one_shot(&mut stream, set_policy(&daemon, &req)),
+        op::RESUME_ITEM => write_one_shot(&mut stream, resume_item(&daemon, &req)),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
@@ -340,6 +342,71 @@ fn set_policy(daemon: &Daemon, req: &Request) -> Response {
     };
     daemon.set_policy(policy);
     ok_reply(&policy.summary(), "set_policy")
+}
+
+/// `resume_item`: un-block a human-parked backlog item (`blocked → queued`) so
+/// the scheduler re-picks it (fleet-member-model slice 004) — the inverse of the
+/// drive loop's item-park, and **distinct from `resume`** (the fleet-wide
+/// admission gate). growlightd reads the item's current status from keeperd and
+/// only un-blocks a currently-`blocked` item (the guard); the typed
+/// [`ResumeOutcome`] is mapped to an Ok [`ResumeItemReply`] (resumed, or an
+/// idempotent already-`queued` no-op) or a clear `Response::Err` (missing /
+/// non-blocked / ambiguous / keeperd unreachable). One-shot.
+fn resume_item(daemon: &Daemon, req: &Request) -> Response {
+    let args: ResumeItemArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if args.item.is_empty() {
+        return Response::err(ErrorKind::BadArgs, "item must be non-empty");
+    }
+    // An empty `queue` string is treated as "no queue" (resolve across all).
+    let queue = args.queue.as_deref().filter(|q| !q.is_empty());
+    match daemon.resume_item(&args.item, queue) {
+        // The two success shapes: the flip we performed, or an already-queued
+        // item (idempotent no-op). Both echo `status: "queued"`.
+        ResumeOutcome::Resumed { queue } => ok_reply(
+            &ResumeItemReply {
+                item: args.item,
+                queue,
+                status: "queued".to_string(),
+                resumed: true,
+            },
+            "resume_item",
+        ),
+        ResumeOutcome::AlreadyQueued { queue } => ok_reply(
+            &ResumeItemReply {
+                item: args.item,
+                queue,
+                status: "queued".to_string(),
+                resumed: false,
+            },
+            "resume_item",
+        ),
+        // The guard: only a blocked item un-blocks. A different status is a clear
+        // refusal (un-blocking a `done` item would corrupt it), not a silent no-op.
+        ResumeOutcome::NotBlocked { queue, status } => Response::err(
+            ErrorKind::BadArgs,
+            format!(
+                "item {:?} in queue {queue:?} is {status}, not blocked; \
+                 resume only un-blocks a blocked item",
+                args.item
+            ),
+        ),
+        ResumeOutcome::NotFound => Response::err(
+            ErrorKind::NotFound,
+            format!("no backlog item with id {:?} to resume", args.item),
+        ),
+        ResumeOutcome::Ambiguous { queues } => Response::err(
+            ErrorKind::BadArgs,
+            format!(
+                "item id {:?} exists in multiple queues ({}); pass --queue to disambiguate",
+                args.item,
+                queues.join(", ")
+            ),
+        ),
+        ResumeOutcome::Unreachable { reason } => Response::err(ErrorKind::Io, reason),
+    }
 }
 
 /// `request_lease`: arbitrate a lease over a shared resource/action (spec §4c).

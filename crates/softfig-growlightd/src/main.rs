@@ -6,9 +6,11 @@ use clap::Parser;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use std::sync::Arc;
+
 use softfig_growlightd::{
     garden_root_via_keeperd, load_fleet_config, spawn_bus_tailer, spawn_fleet, Daemon,
-    GrowlightdConfig, KeeperdBusSource, Policy, BUS_POLL_MS,
+    GrowlightdConfig, KeeperdBusSource, KeeperdItemResumer, Policy, BUS_POLL_MS,
 };
 use softfig_ipc::{growlightd_runtime_socket_path, runtime_socket_path};
 
@@ -57,7 +59,11 @@ fn main() -> Result<()> {
     }
     let config = GrowlightdConfig::new(socket, garden_root.clone()).with_policy(policy);
 
-    let daemon = Daemon::new(config);
+    // Install the live item-resume hook (the `resume_item` verb un-blocks a
+    // human-parked backlog item over keeperd's `set_item_status`) — bound to the
+    // same keeperd socket the queue source / claimer / parker use.
+    let daemon = Daemon::new(config)
+        .with_item_resumer(Arc::new(KeeperdItemResumer::new(keeperd_socket.clone())));
     let handle = daemon.start()?;
 
     eprintln!(

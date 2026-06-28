@@ -212,7 +212,9 @@ fn region_body(content: &str, tag: &str) -> Option<String> {
 /// Production reads keeperd's read-only `read_file` over [`call_reconnecting`];
 /// tests inject fixture markdown or a scripted error, so the parse + fail-closed
 /// path is proven without a live keeperd (the same split [`crate::bus`] uses).
-trait BacklogReader: Send + Sync + std::fmt::Debug {
+/// Also reused by [`crate::resume`]'s item-resume read (the guard that only
+/// un-blocks a currently-`blocked` item reads the same backlog doc).
+pub(crate) trait BacklogReader: Send + Sync + std::fmt::Debug {
     /// The current redacted content of the backlog doc, or a human error string
     /// when keeperd is unreachable / rejected the read.
     fn read_backlog(&self) -> Result<String, String>;
@@ -221,8 +223,16 @@ trait BacklogReader: Send + Sync + std::fmt::Debug {
 /// Production [`BacklogReader`]: `read_file(BACKLOG_DOC)` over keeperd's socket,
 /// reconnecting through a transient keeperd `cycle` (default [`RetryPolicy`]).
 #[derive(Debug, Clone)]
-struct KeeperdBacklogReader {
+pub(crate) struct KeeperdBacklogReader {
     keeperd_socket: PathBuf,
+}
+
+impl KeeperdBacklogReader {
+    /// Bind a backlog reader to keeperd's listen socket (the same path the queue
+    /// source / item-resume use).
+    pub(crate) fn new(keeperd_socket: PathBuf) -> Self {
+        Self { keeperd_socket }
+    }
 }
 
 impl BacklogReader for KeeperdBacklogReader {

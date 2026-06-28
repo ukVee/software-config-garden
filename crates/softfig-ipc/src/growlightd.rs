@@ -67,6 +67,16 @@ pub mod op {
     /// wiring. Until then growlightd answers `unknown op`. This mirrors the
     /// bus/coordinate types defined here ahead of their producers.
     pub const SET_POLICY: &str = "set_policy";
+    /// `resume_item(`[`ResumeItemArgs`]`) -> `[`ResumeItemReply`]. Un-block a
+    /// human-blocked backlog item (`blocked → queued`) so the scheduler re-picks
+    /// it — the inverse of the drive loop's item-park (fleet-member-model slice
+    /// 003). **Distinct from [`RESUME`]**, which clears the fleet-wide admission
+    /// gate; this acts on ONE queue item. growlightd reads the item's current
+    /// status from keeperd and only un-blocks a currently-`blocked` item (the
+    /// guard — a missing / non-blocked / ambiguous item comes back as an error),
+    /// then flips it via keeperd's `set_item_status` (reusing the `item_status_set`
+    /// commit intent; no new intent). One-shot.
+    pub const RESUME_ITEM: &str = "resume_item";
 
     // --- Coordinate family (spec §13 Coordinate / §4c leases). Agent-facing:
     // these are the arbitrated shared-action verbs (spec §14, also reachable via
@@ -382,6 +392,37 @@ pub struct InjectReply {
     pub queued: usize,
 }
 
+/// Args for `resume_item`: the backlog item to un-block, and an optional `queue`
+/// to disambiguate when the same id exists in more than one queue. Omit `queue`
+/// to let growlightd resolve the id across every queue (unique today) — an
+/// ambiguous id with no `queue` comes back as a `BadArgs` error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeItemArgs {
+    /// The blocked item's queue id (milestone slug or task `NNN`).
+    pub item: String,
+    /// Which queue the item lives in, or `None` to resolve it across all queues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+}
+
+/// Reply to `resume_item`: which item in which queue was un-blocked, its
+/// resulting status (always `"queued"`), and whether THIS call performed the
+/// flip (`resumed: true`) or the item was already `queued` — an idempotent no-op
+/// (`resumed: false`). A missing / non-blocked / ambiguous item is reported as a
+/// `Response::Err` (the guard), not this reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeItemReply {
+    /// The item the resume acted on.
+    pub item: String,
+    /// The queue the item was resolved in.
+    pub queue: String,
+    /// The item's status after the call — `"queued"`.
+    pub status: String,
+    /// `true` if this call flipped `blocked → queued`; `false` if it was already
+    /// `queued` (idempotent no-op).
+    pub resumed: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Coordinate family (spec §4c leases / §13 Coordinate / §14 MCP). Args + the
 // shared `LeaseReply` for `request_lease`/`release_lease`, plus the restart
@@ -593,6 +634,54 @@ mod tests {
             serde_json::from_str::<InjectReply>(&serde_json::to_string(&i).unwrap()).unwrap(),
             i
         );
+    }
+
+    #[test]
+    fn resume_item_args_round_trip_with_and_without_a_queue() {
+        // No queue: omitted on the wire (skip_serializing_if), decodes as None.
+        let a = ResumeItemArgs {
+            item: "019".into(),
+            queue: None,
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(!s.contains("queue"), "absent queue is skipped: {s}");
+        let back: ResumeItemArgs = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.item, "019");
+        assert_eq!(back.queue, None);
+
+        // With a queue: it disambiguates a cross-queue id.
+        let a = ResumeItemArgs {
+            item: "019".into(),
+            queue: Some("queue:build".into()),
+        };
+        let back: ResumeItemArgs =
+            serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(back.queue.as_deref(), Some("queue:build"));
+    }
+
+    #[test]
+    fn resume_item_reply_round_trips_performed_and_noop() {
+        let performed = ResumeItemReply {
+            item: "019".into(),
+            queue: "default".into(),
+            status: "queued".into(),
+            resumed: true,
+        };
+        assert_eq!(
+            serde_json::from_str::<ResumeItemReply>(&serde_json::to_string(&performed).unwrap())
+                .unwrap(),
+            performed,
+        );
+        // The idempotent no-op (already queued) carries resumed: false.
+        let noop = ResumeItemReply {
+            item: "019".into(),
+            queue: "default".into(),
+            status: "queued".into(),
+            resumed: false,
+        };
+        let back: ResumeItemReply =
+            serde_json::from_str(&serde_json::to_string(&noop).unwrap()).unwrap();
+        assert!(!back.resumed);
     }
 
     #[test]

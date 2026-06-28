@@ -80,11 +80,12 @@ fn classify_status_write(
 }
 
 /// Build + send a `set_item_status(part, status, queue)` request to keeperd and
-/// classify the reply. The single round-trip both [`KeeperdPartClaimer`] (the
-/// `active` claim) and [`KeeperdItemParker`] (the `blocked` item-park) issue —
+/// classify the reply. The single round-trip [`KeeperdPartClaimer`] (the `active`
+/// claim), [`KeeperdItemParker`] (the `blocked` item-park), and
+/// [`crate::resume::KeeperdItemResumer`] (the `queued` un-block) all issue —
 /// reusing [`call_reconnecting`] so a transient keeperd `cycle` is ridden out
 /// within the retry budget, exactly as the slice-002 read does.
-fn write_item_status(
+pub(crate) fn write_item_status(
     socket: &Path,
     what: &str,
     queue: &str,

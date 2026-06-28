@@ -25,8 +25,8 @@ use softfig_ipc::{
     ClientError, Request, growlightd_runtime_socket_path, runtime_socket_path,
     baton::{parse_baton, BatonDisposition, BatonView},
     growlightd::{
-        self, AgentDeltaKind, Event, FleetStatusReply, ForceStopArgs, PausedReply, StopLevel,
-        StopReply,
+        self, AgentDeltaKind, Event, FleetStatusReply, ForceStopArgs, PausedReply,
+        ResumeItemArgs, ResumeItemReply, StopLevel, StopReply,
     },
     verbs::{GrowlightInitArgs, GrowlightInitReply, PostMessageArgs, PostMessageReply, StatusReply, op},
 };
@@ -79,8 +79,12 @@ pub enum GrowlightCmd {
     /// agents until `resume`. Idempotent.
     Pause(ClientArgs),
 
-    /// Clear the fleet admission gate. Idempotent.
-    Resume(ClientArgs),
+    /// Clear the fleet admission gate (no `<item>`), OR un-block one parked
+    /// backlog item (`growlight resume <item>`): flip a `blocked` item back to
+    /// `queued` so the scheduler re-picks it — the inverse of the drive loop's
+    /// item-park (spec §6). The item form only acts on a currently-blocked item
+    /// (guarded); pass `--queue` if the same id lives in more than one queue.
+    Resume(ResumeArgs),
 
     /// Post a message to the coordination bus AS THE HUMAN (`from: @human`). The
     /// human is a first-class bus member (spec §4a): agents read it in their inbox
@@ -159,6 +163,25 @@ pub struct ClientArgs {
     /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
     #[arg(long)]
     pub socket: Option<PathBuf>,
+}
+
+/// Args for `resume`. With no `item` it clears the fleet-wide admission gate
+/// (the original meaning); with an `item` it un-blocks that one backlog item —
+/// two distinct growlightd verbs (`resume` vs `resume_item`) behind one CLI word,
+/// chosen by whether an item is named.
+#[derive(Args, Debug)]
+pub struct ResumeArgs {
+    /// Override the growlightd socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// A parked backlog item to un-block (`blocked → queued`). Omit to clear the
+    /// fleet admission gate instead.
+    pub item: Option<String>,
+    /// Which queue the item lives in — only needed to disambiguate the same id
+    /// across queues. Ignored when no `item` is given.
+    #[arg(long)]
+    pub queue: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1340,12 +1363,37 @@ fn client_pause(args: ClientArgs) -> Result<()> {
     Ok(())
 }
 
-fn client_resume(args: ClientArgs) -> Result<()> {
+fn client_resume(args: ResumeArgs) -> Result<()> {
     let socket = growlight_socket(args.socket);
-    let reply: PausedReply =
-        growlight_call(&socket, growlightd::op::RESUME, serde_json::Value::Null)?;
-    println!("fleet {}", gate_label(reply.paused));
-    Ok(())
+    match args.item {
+        // `growlight resume <item>` — un-block one parked backlog item. A distinct
+        // growlightd verb (`resume_item`) from the gate `resume` below; the guard
+        // (only un-blocks a blocked item) lives daemon-side, surfaced here as a
+        // clear error.
+        Some(item) => {
+            let reply: ResumeItemReply = growlight_call(
+                &socket,
+                growlightd::op::RESUME_ITEM,
+                serde_json::to_value(ResumeItemArgs {
+                    item,
+                    queue: args.queue,
+                })?,
+            )?;
+            if reply.resumed {
+                println!("resumed {} in queue {} (blocked → queued)", reply.item, reply.queue);
+            } else {
+                println!("{} is already queued in queue {} — nothing to do", reply.item, reply.queue);
+            }
+            Ok(())
+        }
+        // `growlight resume` — clear the fleet-wide admission gate (unchanged).
+        None => {
+            let reply: PausedReply =
+                growlight_call(&socket, growlightd::op::RESUME, serde_json::Value::Null)?;
+            println!("fleet {}", gate_label(reply.paused));
+            Ok(())
+        }
+    }
 }
 
 fn gate_label(paused: bool) -> &'static str {
@@ -2528,8 +2576,14 @@ mod tests {
             growlight_call(&socket, growlightd::op::RESUME, serde_json::Value::Null).unwrap();
         assert!(!r.paused);
         // Entry points dispatch cleanly (idempotent — re-pausing stays paused).
+        // The no-item `resume` keeps clearing the admission gate (back-compat).
         client_pause(ClientArgs { socket: Some(socket.clone()) }).unwrap();
-        client_resume(ClientArgs { socket: Some(socket.clone()) }).unwrap();
+        client_resume(ResumeArgs {
+            socket: Some(socket.clone()),
+            item: None,
+            queue: None,
+        })
+        .unwrap();
         handle.shutdown();
         handle.join().unwrap();
         fs::remove_dir_all(&dir).ok();

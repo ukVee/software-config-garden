@@ -15,6 +15,7 @@ use crate::config::{GrowlightdConfig, Policy};
 use crate::control::Control;
 use crate::hub::EventHub;
 use crate::leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
+use crate::resume::{ItemResumer, ResumeOutcome};
 use crate::state::State;
 
 #[derive(Debug, Error)]
@@ -83,6 +84,14 @@ pub struct Daemon {
     /// reintroduce the keeperd deadlock class (incident 20260622). `None` until
     /// that bridge is wired (phase 6); a test installs a spy.
     pub thrash_clear: Option<Arc<dyn ThrashClear>>,
+    /// The item-resume hook (`resume_item` verb, fleet-member-model slice 004):
+    /// reads keeperd's backlog, guards on the current status, and flips a blocked
+    /// item back to `queued`. Lives *outside* `inner` (like `thrash_clear`) so it
+    /// is called WITHOUT the daemon lock — it reaches keeperd over the socket and
+    /// may block, so holding the mutex across it would reintroduce the keeperd
+    /// deadlock class (incident 20260622). `None` until `main` installs the live
+    /// [`crate::resume::KeeperdItemResumer`]; a test installs a spy.
+    pub resumer: Option<Arc<dyn ItemResumer>>,
 }
 
 impl Daemon {
@@ -91,6 +100,7 @@ impl Daemon {
             inner: Arc::new(Mutex::new(DaemonInner::new(config))),
             hub: EventHub::new(),
             thrash_clear: None,
+            resumer: None,
         }
     }
 
@@ -99,6 +109,14 @@ impl Daemon {
     /// spy to prove a granted lease over a flagged target clears that flag.
     pub fn with_thrash_clear(mut self, hook: Arc<dyn ThrashClear>) -> Self {
         self.thrash_clear = Some(hook);
+        self
+    }
+
+    /// Install the item-resume hook (builder-style). `main` binds the live
+    /// [`crate::resume::KeeperdItemResumer`] over the keeperd socket; a test
+    /// installs a spy to drive the `resume_item` verb without a live keeperd.
+    pub fn with_item_resumer(mut self, hook: Arc<dyn ItemResumer>) -> Self {
+        self.resumer = Some(hook);
         self
     }
 
@@ -335,6 +353,24 @@ impl Daemon {
                 state: "queued".to_string(),
                 performed: false,
                 reason: Some("a restart of this agent is already in flight".to_string()),
+            },
+        }
+    }
+
+    /// `resume_item` (fleet-member-model slice 004): un-block a human-parked
+    /// backlog item (`blocked → queued`) so the scheduler re-picks it — the
+    /// inverse of the drive loop's item-park. Delegates to the installed
+    /// [`ItemResumer`] hook (the live [`crate::resume::KeeperdItemResumer`] reads
+    /// keeperd's backlog, guards on the current status, and writes `queued`),
+    /// called WITHOUT the daemon lock since it reaches keeperd and may block.
+    /// Returns the typed [`ResumeOutcome`]; the server maps it to the wire reply /
+    /// a guard error. With no hook installed (no keeperd binding) the un-park is
+    /// unavailable, reported as [`ResumeOutcome::Unreachable`].
+    pub fn resume_item(&self, item: &str, queue: Option<&str>) -> ResumeOutcome {
+        match &self.resumer {
+            Some(hook) => hook.resume_item(item, queue),
+            None => ResumeOutcome::Unreachable {
+                reason: "item-resume is not wired (growlightd has no keeperd binding)".to_string(),
             },
         }
     }
