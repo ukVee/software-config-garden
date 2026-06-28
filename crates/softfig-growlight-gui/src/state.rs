@@ -307,6 +307,8 @@ mod tests {
                 session_7d_halt_pct: 90,
             },
             paused: true,
+            fleet_enabled: false,
+            roster: Vec::new(),
             agents: vec![
                 AgentSummary {
                     id: "a".into(),

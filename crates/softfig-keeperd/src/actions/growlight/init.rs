@@ -35,6 +35,13 @@ const SESSION_POLICY_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../templates/growlight/session-policy.md"
 ));
+/// The commented default `config/growlight.toml` fleet config (config-in-garden):
+/// the SAME template onboard ships for fresh gardens, included so the
+/// retrofit-scaffold and the fresh-scaffold can't drift. Seeded gate-off.
+const GROWLIGHT_TOML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../templates/default-garden/config/growlight.toml"
+));
 
 // ---- nav-wiring content (spec §14) -------------------------------------
 
@@ -101,6 +108,17 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
         for (rel, content) in &pillar {
             create_if_absent(&wt, rel, content, &mut created, &mut skipped)?;
         }
+
+        // config-in-garden: the fleet config gate lives in `config/growlight.toml`
+        // (daemon config, NOT a pillar file), seeded commented-off so an existing
+        // garden gets the file the new growlightd reads through the mount. Onboard
+        // ships the same template for fresh gardens.
+        let growlight_toml = format!(
+            "{}/{}",
+            softfig_ipc::GARDEN_CONFIG_DIR,
+            softfig_ipc::GROWLIGHT_CONFIG_FILE
+        );
+        create_if_absent(&wt, &growlight_toml, GROWLIGHT_TOML, &mut created, &mut skipped)?;
 
         // §14 nav wiring — best-effort + idempotent. Each edit is skipped when
         // the doc is absent (a minimal garden), sealed, or already wired.

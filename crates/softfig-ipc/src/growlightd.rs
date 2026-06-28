@@ -108,10 +108,34 @@ pub struct FleetStatusReply {
     /// sent this field still parses — it reads back as `false` (not paused).
     #[serde(default)]
     pub paused: bool,
+    /// Whether the in-garden `config/growlight.toml` `fleet_enabled` gate is on
+    /// (config-in-garden milestone). Distinct from `paused`: `fleet_enabled` is
+    /// the config-level arm/disarm (off ⇒ growlightd assembled no drive loop at
+    /// all), `paused` is the runtime admission gate over an armed fleet. Additive
+    /// (`#[serde(default)]`) so a pre-field decoder reads it back as `false`.
+    #[serde(default)]
+    pub fleet_enabled: bool,
+    /// The configured roster from `config/growlight.toml` (`[[fleet]]` members),
+    /// in config order — surfaced so `growlight status` lists the fleet even when
+    /// the gate is off (the agents haven't spawned). Additive/defaulted for wire
+    /// back-compat. Distinct from `agents` (the *live* per-agent runtime state).
+    #[serde(default)]
+    pub roster: Vec<FleetMemberSummary>,
     /// Per-agent summaries. Empty in phase 1 — the fleet arrives with the
     /// scheduler/concurrency milestones.
     #[serde(default)]
     pub agents: Vec<AgentSummary>,
+}
+
+/// One configured roster member echoed in [`FleetStatusReply::roster`] — the
+/// agent id + its optional pinned queue, as declared in `config/growlight.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetMemberSummary {
+    /// The agent's work-stream id (the `@`-stripped name).
+    pub agent: String,
+    /// The queue this member is pinned to, or `None` for a fallback-only member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
 }
 
 /// Per-agent line in [`FleetStatusReply::agents`]. Intentionally minimal for
@@ -647,7 +671,9 @@ mod tests {
     #[test]
     fn fleet_status_paused_defaults_when_a_pre_control_client_omits_it() {
         // A decoder that predates the control family never sends `paused`; the
-        // additive `#[serde(default)]` must read it back as `false`.
+        // additive `#[serde(default)]` must read it back as `false`. The
+        // config-in-garden `fleet_enabled`/`roster` fields are likewise additive,
+        // so the SAME pre-field payload must still parse with both defaulted.
         let json = r#"{
             "state": "running",
             "garden_root": "/g",
@@ -662,6 +688,38 @@ mod tests {
         }"#;
         let reply: FleetStatusReply = serde_json::from_str(json).unwrap();
         assert!(!reply.paused, "missing paused decodes as not-paused");
+        assert!(!reply.fleet_enabled, "missing fleet_enabled decodes as off");
+        assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
+    }
+
+    #[test]
+    fn fleet_status_round_trips_gate_and_roster() {
+        let reply = FleetStatusReply {
+            state: "running".into(),
+            garden_root: "/g".into(),
+            protocol_version: 1,
+            policy: PolicySummary {
+                max_concurrent_agents: 2,
+                ctx_roll_pct: 50,
+                ctx_handoff_pct: 60,
+                session_5h_halt_pct: 85,
+                session_7d_halt_pct: 90,
+            },
+            paused: false,
+            fleet_enabled: true,
+            roster: vec![
+                FleetMemberSummary { agent: "builder".into(), pin: Some("queue:build".into()) },
+                FleetMemberSummary { agent: "reviewer".into(), pin: None },
+            ],
+            agents: Vec::new(),
+        };
+        let back: FleetStatusReply =
+            serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert!(back.fleet_enabled);
+        assert_eq!(back.roster.len(), 2);
+        assert_eq!(back.roster[0].agent, "builder");
+        assert_eq!(back.roster[0].pin.as_deref(), Some("queue:build"));
+        assert_eq!(back.roster[1].pin, None);
     }
 }

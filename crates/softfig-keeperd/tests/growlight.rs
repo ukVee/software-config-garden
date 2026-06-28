@@ -603,7 +603,8 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
 
     assert!(reply.committed);
-    // All seven pillar files are created on a fresh garden.
+    // All seven pillar files + the in-garden fleet config are created on a fresh
+    // garden.
     for rel in [
         "growlight/CLAUDE.md",
         "growlight/protocol.md",
@@ -612,9 +613,12 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
         "growlight/backlog/tasks/.seq",
         "growlight/baton-log/CLAUDE.md",
         "growlight/baton-log/.seq",
+        "config/growlight.toml",
     ] {
         assert!(reply.created.contains(&rel.to_string()), "missing {rel}");
     }
+    // config-in-garden: the fleet config is seeded gate-off.
+    assert!(fx.read("config/growlight.toml").contains("fleet_enabled = false"));
 
     // Routing doc maps its children; protocol + policy come from the templates.
     assert!(fx.read("growlight/CLAUDE.md").contains("## Children"));
@@ -645,8 +649,8 @@ fn growlight_init_is_idempotent_without_an_empty_commit() {
     assert!(!reply.committed, "re-run must not commit");
     assert!(reply.created.is_empty());
     assert_eq!(reply.hash, tip_before, "re-run returns the current tip");
-    // The seven pillar files are reported as kept, not recreated.
-    assert_eq!(reply.skipped.len(), 7);
+    // The seven pillar files + config/growlight.toml are reported kept, not recreated.
+    assert_eq!(reply.skipped.len(), 8);
 
     let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
     assert_eq!(tip_after, tip_before, "no new commit on a no-op init");

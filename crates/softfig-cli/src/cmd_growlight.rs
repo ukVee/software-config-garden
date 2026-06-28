@@ -1365,6 +1365,9 @@ fn print_fleet_status(r: &FleetStatusReply) {
     println!("state         {}", r.state);
     println!("garden        {}", r.garden_root);
     println!("protocol      v{}", r.protocol_version);
+    // The config-level arm/disarm gate (`config/growlight.toml fleet_enabled`),
+    // distinct from `paused` (the runtime admission gate over an armed fleet).
+    println!("fleet         {}", if r.fleet_enabled { "enabled" } else { "disabled" });
     println!("paused        {}", r.paused);
     println!(
         "policy        max_agents={} ctx_roll={}% ctx_handoff={}% 5h_halt={}% 7d_halt={}%",
@@ -1374,6 +1377,20 @@ fn print_fleet_status(r: &FleetStatusReply) {
         r.policy.session_5h_halt_pct,
         r.policy.session_7d_halt_pct,
     );
+    // The configured roster (from config/growlight.toml) — shown even when the
+    // gate is off and no agents have spawned, so the fleet is self-explaining.
+    if r.roster.is_empty() {
+        println!("roster        (none)");
+    } else {
+        println!("roster:");
+        for m in &r.roster {
+            match &m.pin {
+                Some(pin) => println!("  {:<16} pin={pin}", m.agent),
+                None => println!("  {:<16} (fallback)", m.agent),
+            }
+        }
+    }
+    // The live per-agent runtime state (empty until the fleet spawns agents).
     if r.agents.is_empty() {
         println!("agents        (none)");
     } else {

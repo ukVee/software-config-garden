@@ -47,6 +47,8 @@ fn plan_default_includes_skeleton_and_excludes_program_meta() {
     // Config-in-garden: every fresh garden is born with an editable in-garden
     // daemon config.
     assert!(plan.contains("config/keeper.toml"), "in-garden config scaffolded");
+    // config-in-garden: and the (gate-off) growlight fleet config.
+    assert!(plan.contains("config/growlight.toml"), "in-garden fleet config scaffolded");
 
     // At least one stub per always-on dir and a sampling of concept dirs.
     assert!(plan.contains("inbox/CLAUDE.md"));

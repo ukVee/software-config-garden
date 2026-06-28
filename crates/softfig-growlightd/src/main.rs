@@ -83,6 +83,9 @@ fn main() -> Result<()> {
     // the mount) is on. Gate off ⇒ `None`, nothing constructed or spawned, so
     // growlightd is byte-identical to today.
     let fleet_config = load_fleet_config(&garden_root);
+    // Record the gate + roster so `growlight status` reports the configured fleet
+    // even when it's disarmed (no drive loop spawned). config-in-garden slice 3.
+    handle.daemon.set_fleet_config(fleet_config.clone());
     let drive_loop = spawn_fleet(&handle.daemon, &fleet_config, &keeperd_socket)
         .context("spawning the live fleet drive loop")?;
     if drive_loop.is_some() {

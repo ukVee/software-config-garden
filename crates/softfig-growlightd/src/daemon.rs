@@ -42,6 +42,12 @@ pub struct DaemonInner {
     /// over this table. Pure decision logic lives in [`crate::leases`]; the
     /// daemon methods wire it thin (see [`Daemon::request_lease`]).
     pub leases: LeaseTable,
+    /// The fleet config loaded at boot from `config/growlight.toml` (gate +
+    /// roster). Stored regardless of the gate so `status` can report the
+    /// configured fleet even when it is disarmed (no drive loop assembled).
+    /// Defaults to [`FleetConfig::disabled`](crate::fleet::FleetConfig::disabled)
+    /// until `main` sets it via [`Daemon::set_fleet_config`].
+    pub fleet: crate::fleet::FleetConfig,
     // Phase 6 (concurrency milestone) adds the agent registry here: the live
     // `claude -p` child handles + per-agent status, registered via
     // `control.attach_child`. Hard-stop teardown of those children rides the
@@ -57,6 +63,7 @@ impl DaemonInner {
             config,
             control: Control::default(),
             leases: LeaseTable::new(),
+            fleet: crate::fleet::FleetConfig::disabled(),
         }
     }
 }
@@ -115,6 +122,14 @@ impl Daemon {
     /// `protocol.md` the SessionStart hook injects). Brief-lock clone.
     pub fn garden_root(&self) -> PathBuf {
         self.inner.lock().unwrap().config.garden_root.clone()
+    }
+
+    /// Record the fleet config loaded at boot so `status` can report the gate +
+    /// roster (config-in-garden slice 3). Set once in `main` after
+    /// [`load_fleet_config`](crate::fleet::load_fleet_config), before the drive
+    /// loop is spawned. Brief-lock store.
+    pub fn set_fleet_config(&self, fleet: crate::fleet::FleetConfig) {
+        self.inner.lock().unwrap().fleet = fleet;
     }
 
     /// The current runtime per-device [`Policy`] — the single source of truth the

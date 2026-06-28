@@ -199,12 +199,23 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
 /// and the admission-gate (`paused`) state.
 fn status(daemon: &Daemon) -> Response {
     let inner = daemon.inner.lock().unwrap();
+    let roster = inner
+        .fleet
+        .members
+        .iter()
+        .map(|m| softfig_ipc::growlightd::FleetMemberSummary {
+            agent: m.agent.clone(),
+            pin: m.pin.clone(),
+        })
+        .collect();
     let reply = FleetStatusReply {
         state: inner.state.label().to_string(),
         garden_root: inner.config.garden_root.display().to_string(),
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
         policy: inner.config.policy.summary(),
         paused: inner.control.paused,
+        fleet_enabled: inner.fleet.enabled,
+        roster,
         agents: Vec::new(),
     };
     ok_reply(&reply, "status")

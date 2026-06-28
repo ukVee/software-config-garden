@@ -266,6 +266,8 @@ mod tests {
                 session_7d_halt_pct: 90,
             },
             paused: false,
+            fleet_enabled: false,
+            roster: Vec::new(),
             agents: vec![AgentSummary {
                 id: "loop-1".into(),
                 status: "running".into(),

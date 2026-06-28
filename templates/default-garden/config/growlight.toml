@@ -1,0 +1,35 @@
+# soft-fig growlight fleet config.
+#
+# This file IS garden content: encrypted at rest, versioned by the VCS, carried
+# along by M5b backup, and read by growlightd *through* the FUSE mount. Edit it
+# here (directly through the mount, or via softfig-mcp) — keeperd re-reads the
+# gate each time it unlocks and starts/stops the `softfig-growlightd.service`
+# user unit to match; growlightd re-reads the full config when it (re)starts.
+#
+# It is the SOLE source of fleet config. The local `.softfig/keeper.toml`
+# bootstrap pointer keeps only `state_root` and the `[growlight] allow_relock`
+# security opt-in — no fleet keys.
+
+# The gate. false = the fleet is DISARMED: growlightd assembles no drive loop and
+# keeperd does not start its unit. Flip to true to arm the fleet on the next
+# unlock / `softfig daemon cycle`. (Runaway protection is the budget halts +
+# `growlight pause`, not human-presence-to-arm — see
+# journal/decisions/decision-growlight-config-in-garden.md.)
+fleet_enabled = false
+
+# The `claude` binary growlightd's backend shells. Defaults to `claude` on PATH.
+# claude_bin = "claude"
+
+# The generic per-agent turn kick passed as `claude -p <prompt>`. Defaults to the
+# built-in "begin this iteration" kick; the SessionStart hook injects the
+# protocol + baton regardless.
+# prompt = "..."
+
+# The roster: one [[fleet]] block per agent. `agent` is the work-stream id
+# (the @-stripped name); `pin` optionally binds it to one queue (omit for a
+# fallback-only member). growlightd OWNS each agent's pre-approval paths — the
+# config never names file paths.
+#
+# [[fleet]]
+# agent = "a"
+# # pin = "<queue-name>"
