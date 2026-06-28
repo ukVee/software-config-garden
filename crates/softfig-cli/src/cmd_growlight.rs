@@ -23,6 +23,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     ClientError, Request, growlightd_runtime_socket_path, runtime_socket_path,
+    baton::{parse_baton, BatonDisposition, BatonView},
     growlightd::{
         self, AgentDeltaKind, Event, FleetStatusReply, ForceStopArgs, PausedReply, StopLevel,
         StopReply,
@@ -386,17 +387,6 @@ const KICK_PROMPT: &str = "Begin this growlight iteration. The operating protoco
     current baton have been injected above — boot per protocol step 1, execute NEXT ACTION as one \
     coherent chunk, then hand off by rewriting the baton.";
 
-/// Baton statuses on which the orchestrator keeps driving (re-invokes a fresh
-/// iteration). ITEM_DEFERRED is a clean handoff like ITEM_COMPLETE — the agent
-/// parked an item whose only gap is a manual smoketest it can't run (protocol
-/// step 7) and moved on, so the loop drives the next item rather than stopping.
-/// HALTED_RATE_LIMIT pauses-and-resumes via the budget governor;
-/// BLOCKED_ON_HUMAN / QUEUE_EMPTY / STUCK, and any unrecognized or missing
-/// status, stop the loop. (The governor routing lives in [`decide_step`].)
-fn is_continue_status(status: &str) -> bool {
-    matches!(status, "IN_PROGRESS" | "ITEM_COMPLETE" | "ITEM_DEFERRED")
-}
-
 /// Trip the spin guard once the baton's NEXT ACTION repeats unchanged across
 /// this many consecutive iterations (protocol step 6) — the orchestrator's
 /// backstop for an agent that keeps reporting IN_PROGRESS without moving.
@@ -517,12 +507,17 @@ fn any_reset(usage: &UsageSnapshot) -> Option<(i64, &'static str)> {
 /// window has no reset time to wait for, so it's logged and the agent's baton
 /// status governs; the spin guard is the backstop if it makes no progress.
 fn decide_step(view: &BatonView, usage: &UsageSnapshot, stalled: bool) -> LoopStep {
-    match view.status.as_deref().unwrap_or("UNKNOWN") {
+    // The status vocabulary is shared with the fleet supervisor
+    // ([`softfig_ipc::baton`]); this single-agent driver layers its budget-governor
+    // pause + spin guard on top of that classification. The driver folds
+    // QueueEmpty/Stuck into one terminal stop (a one-shot session just ends),
+    // where the fleet tells them apart.
+    match view.classify() {
         // Agent halted on a rate limit → resume at the reset (governor pause),
         // never a terminal stop. Prefer an independently-tripped window, else the
         // soonest known reset; no reset time at all → can't time a resume, so
         // surface it as terminal rather than spin.
-        "HALTED_RATE_LIMIT" => pause_for(usage)
+        BatonDisposition::RateLimited => pause_for(usage)
             .or_else(|| {
                 any_reset(usage).map(|(reset_at, window)| PauseInfo {
                     reset_at,
@@ -535,12 +530,15 @@ fn decide_step(view: &BatonView, usage: &UsageSnapshot, stalled: bool) -> LoopSt
                 LoopStep::Stop(StopReason::Terminal("HALTED_RATE_LIMIT".to_string()))
             }),
         // Hard human block — surfaced distinctly, never worked around.
-        "BLOCKED_ON_HUMAN" => LoopStep::Stop(StopReason::BlockedOnHuman),
-        // Any other non-continue status (QUEUE_EMPTY, agent STUCK, unknown).
-        s if !is_continue_status(s) => LoopStep::Stop(StopReason::Terminal(s.to_string())),
+        BatonDisposition::BlockedOnHuman => LoopStep::Stop(StopReason::BlockedOnHuman),
+        // A drained queue and an agent STUCK/unknown both end this one-shot session.
+        BatonDisposition::QueueEmpty => {
+            LoopStep::Stop(StopReason::Terminal("QUEUE_EMPTY".to_string()))
+        }
+        BatonDisposition::Stuck(s) => LoopStep::Stop(StopReason::Terminal(s)),
         // Continue-status: stop if stalled, else pause if a window is over
         // reserve, else keep driving.
-        _ => {
+        BatonDisposition::Continue => {
             if stalled {
                 LoopStep::Stop(StopReason::SpinGuard)
             } else if let Some(p) = pause_for(usage) {
@@ -883,78 +881,6 @@ fn first_line_preview(text: &str, max: usize) -> String {
         out.push('…');
     }
     out
-}
-
-/// The fields the orchestrator reads back from the runtime baton each iteration:
-/// the terminal-status signal plus the progress signal (item / iteration /
-/// NEXT ACTION) the spin guard keys off.
-struct BatonView {
-    status: Option<String>,
-    item: Option<String>,
-    iteration: Option<u64>,
-    next_action: Option<String>,
-}
-
-/// Parse the runtime baton: `status` / `item` / `iteration` from the YAML
-/// frontmatter and the `# NEXT ACTION` section body. Pure; the orchestrator
-/// re-reads this after every iteration to decide whether to keep driving.
-fn parse_baton(baton: &str) -> BatonView {
-    let mut status = None;
-    let mut item = None;
-    let mut iteration = None;
-
-    let mut lines = baton.lines();
-    // Frontmatter opens with a `---` fence.
-    if lines.next().map(str::trim) == Some("---") {
-        for line in lines.by_ref() {
-            let line = line.trim();
-            if line == "---" {
-                break;
-            }
-            if let Some(v) = line.strip_prefix("status:") {
-                let v = v.trim();
-                if !v.is_empty() {
-                    status = Some(v.to_string());
-                }
-            } else if let Some(v) = line.strip_prefix("item:") {
-                let v = v.trim();
-                if !v.is_empty() && v != "null" {
-                    item = Some(v.to_string());
-                }
-            } else if let Some(v) = line.strip_prefix("iteration:") {
-                iteration = v.trim().parse::<u64>().ok();
-            }
-        }
-    }
-
-    BatonView {
-        status,
-        item,
-        iteration,
-        next_action: extract_section(baton, "# NEXT ACTION"),
-    }
-}
-
-/// Extract a top-level (`# `) section body from the baton — everything between
-/// `heading` and the next `# ` heading — trimmed. `None` if absent or empty.
-fn extract_section(baton: &str, heading: &str) -> Option<String> {
-    let mut body: Vec<&str> = Vec::new();
-    let mut in_section = false;
-    for line in baton.lines() {
-        if in_section {
-            if line.starts_with("# ") {
-                break;
-            }
-            body.push(line);
-        } else if line.trim() == heading {
-            in_section = true;
-        }
-    }
-    if !in_section {
-        return None;
-    }
-    let trimmed = body.join("\n").trim().to_string();
-    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// Ask the daemon where the garden is mounted (so injection paths are derived,
@@ -1979,32 +1905,6 @@ mod tests {
         assert_eq!(first_line_preview("abcdef", 3), "abc…"); // char limit
         // Multibyte: must not split a char (no panic) and counts by char.
         assert_eq!(first_line_preview("héllo", 2), "hé…");
-    }
-
-    #[test]
-    fn parse_baton_reads_frontmatter_and_the_next_action_section() {
-        let baton = "---\nloop: g\nstatus: QUEUE_EMPTY\nitem: full-auto-orchestrator\n\
-                     item_type: milestone\niteration: 4\n---\n# NEXT ACTION\ndo the thing\n\
-                     more detail\n\n# FINISH CRITERIA\nstatus: not-this\n";
-        let v = parse_baton(baton);
-        assert_eq!(v.status.as_deref(), Some("QUEUE_EMPTY"));
-        // `item:` must not be confused with `item_type:`.
-        assert_eq!(v.item.as_deref(), Some("full-auto-orchestrator"));
-        assert_eq!(v.iteration, Some(4));
-        // NEXT ACTION stops at the next `# ` heading and ignores the body's
-        // `status:` line.
-        assert_eq!(v.next_action.as_deref(), Some("do the thing\nmore detail"));
-
-        // No frontmatter fence → no fields.
-        let none = parse_baton("status: nope\n");
-        assert!(none.status.is_none());
-        assert!(none.next_action.is_none());
-
-        // `item: null` is treated as absent.
-        let nullish = parse_baton("---\nstatus: IN_PROGRESS\nitem: null\n---\n# NEXT ACTION\nx\n");
-        assert!(nullish.item.is_none());
-        assert_eq!(nullish.status.as_deref(), Some("IN_PROGRESS"));
-        assert_eq!(nullish.next_action.as_deref(), Some("x"));
     }
 
     /// A scripted backend (the §12 seam's test double) so the driver runs with

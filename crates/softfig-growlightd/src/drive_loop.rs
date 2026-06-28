@@ -222,6 +222,32 @@ impl AgentHealthSource for Arc<ClaudeBackend> {
     }
 }
 
+/// The seam the loop reads an EXITED agent's terminal baton status through, to
+/// feed [`Supervisor::poll`]'s retire-vs-park-vs-re-roll decision (the spin fix,
+/// [[decision-growlight-fleet-loop-spin]]). Slice 002 implements it over the
+/// per-member baton write-back (`agents/<id>/baton.md`); until then the live loop
+/// wires [`DeferredBatonStatus`] (always `None` → the historical clean-exit
+/// re-roll, so this slice ships with no behaviour change to a working member),
+/// and a test scripts the status.
+pub trait BatonStatusSource: Send + Sync + fmt::Debug {
+    /// `agent`'s terminal baton `status:` field as of its last exit, or `None`
+    /// when no baton was written/readable (the clean-exit re-roll fallback).
+    fn status(&self, agent: &str) -> Option<String>;
+}
+
+/// The deferred (slice 001) baton-status source: no per-member baton write-back
+/// exists yet, so every read is `None` and [`Supervisor::poll`] keeps the
+/// historical clean-exit behaviour (re-roll). Slice 002 replaces it in the live
+/// assembly with the real per-member reader. Mirrors [`DeferredQueues`].
+#[derive(Debug)]
+pub struct DeferredBatonStatus;
+
+impl BatonStatusSource for DeferredBatonStatus {
+    fn status(&self, _agent: &str) -> Option<String> {
+        None
+    }
+}
+
 /// One configured fleet member: the agent's spawn [`AgentSpec`] plus the
 /// work-stream it is **pinned** to (pinned-with-fallback, spec §6). An unpinned
 /// member (`pin: None`) goes straight to fallback.
@@ -311,6 +337,11 @@ pub struct DriveLoop {
     supervisor: Supervisor,
     /// Per-agent health probe (the live [`ClaudeBackend`] in production).
     health: Box<dyn AgentHealthSource>,
+    /// Reads an exited agent's terminal baton status — the source for
+    /// [`Supervisor::poll`]'s retire-vs-re-roll decision (the spin fix). Deferred
+    /// in slice 001 ([`DeferredBatonStatus`], always `None`); slice 002 wires the
+    /// real per-member reader.
+    baton: Box<dyn BatonStatusSource>,
     /// Where the multi-queue snapshot comes from.
     queues: Box<dyn QueueSource>,
     /// How a picked part is claimed (`active`) before its agent spawns — the
@@ -353,6 +384,7 @@ impl DriveLoop {
         daemon: Daemon,
         supervisor: Supervisor,
         health: Box<dyn AgentHealthSource>,
+        baton: Box<dyn BatonStatusSource>,
         queues: Box<dyn QueueSource>,
         claimer: Box<dyn PartClaimer>,
         samples: Box<dyn BudgetSampleSource>,
@@ -364,6 +396,7 @@ impl DriveLoop {
             daemon,
             supervisor,
             health,
+            baton,
             queues,
             claimer,
             samples,
@@ -434,9 +467,16 @@ impl DriveLoop {
             }
 
             // c. Health-driven lifecycle. No observation (never spawned, or already
-            //    retired) → nothing to poll.
+            //    retired) → nothing to poll. On an EXIT, read the agent's terminal
+            //    baton status so `poll` can retire/park/re-roll on it (the spin
+            //    fix) rather than re-roll on the exit code alone; a still-alive
+            //    agent has no terminal status to read.
             if let Some(health) = self.health.health(agent) {
-                match self.supervisor.poll(agent, health, now) {
+                let baton_status = match health {
+                    AgentHealth::Exited { .. } => self.baton.status(agent),
+                    AgentHealth::Alive { .. } => None,
+                };
+                match self.supervisor.poll(agent, health, baton_status.as_deref(), now) {
                     PollOutcome::Crashed { event, .. } => {
                         report.crashes.push(event);
                         // A retiring agent that crashes at its boundary stops here
@@ -446,8 +486,39 @@ impl DriveLoop {
                         }
                     }
                     PollOutcome::Rolling => {
-                        // Clean boundary exit: a retiring agent stops here instead
-                        // of re-rolling; otherwise `Supervisor::tick` rolls it below.
+                        // Clean boundary exit on a continue status (or no baton yet):
+                        // a retiring agent stops here instead of re-rolling;
+                        // otherwise `Supervisor::tick` rolls it below.
+                        if self.retiring.remove(agent) {
+                            self.retire(agent, &mut report);
+                        }
+                    }
+                    PollOutcome::Retired => {
+                        // QUEUE_EMPTY: the member retired itself to idle and is
+                        // already gone from the supervisor — the spin fix. If a
+                        // human also asked it to stop, it stops for good; otherwise
+                        // it stays eligible to RE-START when new queued work appears
+                        // (not in `stopped`), and the daemon idles in between.
+                        if self.retiring.remove(agent) {
+                            self.retire(agent, &mut report);
+                        } else {
+                            self.aggregator.forget(agent);
+                            report.retired.push(agent.clone());
+                        }
+                    }
+                    PollOutcome::Parked { event, .. } => {
+                        // STUCK / BLOCKED_ON_HUMAN: parked pending a human, with the
+                        // §9 alert. It stays registered+parked (neither re-rolled by
+                        // `tick` nor re-started by step 3) until a human clears it —
+                        // unless a boundary stop was also pending, which retires it.
+                        report.crashes.push(event);
+                        if self.retiring.remove(agent) {
+                            self.retire(agent, &mut report);
+                        }
+                    }
+                    PollOutcome::ParkedRateLimited => {
+                        // HALTED_RATE_LIMIT: parked until its window resets (slice
+                        // 003 re-arms it); no alert. A pending boundary stop retires.
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         }
@@ -679,6 +750,9 @@ mod tests {
         kills: Arc<AtomicUsize>,
         health: Mutex<BTreeMap<String, AgentHealth>>,
         budgets: Mutex<BTreeMap<String, BudgetUsage>>,
+        /// Scripted terminal baton status per agent (the per-member write-back the
+        /// live loop reads on exit — slice 002 wires the real reader).
+        baton: Mutex<BTreeMap<String, String>>,
         /// When set, every `spawn` fails (models a fail-closed pre-approval
         /// generation failure, slice 004 — `ClaudeBackend::spawn` returns
         /// `SpawnError` before exec).
@@ -690,6 +764,13 @@ mod tests {
         }
         fn set_health(&self, agent: &str, h: AgentHealth) {
             self.health.lock().unwrap().insert(agent.to_string(), h);
+        }
+        /// Script `agent`'s terminal baton status (read by the loop on its exit).
+        fn set_baton(&self, agent: &str, status: &str) {
+            self.baton
+                .lock()
+                .unwrap()
+                .insert(agent.to_string(), status.to_string());
         }
         /// Force every subsequent `spawn` to fail (the fail-closed path).
         fn set_fail_spawn(&self, fail: bool) {
@@ -731,6 +812,11 @@ mod tests {
     impl BudgetSampleSource for Arc<FakeFleet> {
         fn budget(&self, agent: &str) -> Option<BudgetUsage> {
             self.budgets.lock().unwrap().get(agent).copied()
+        }
+    }
+    impl BatonStatusSource for Arc<FakeFleet> {
+        fn status(&self, agent: &str) -> Option<String> {
+            self.baton.lock().unwrap().get(agent).cloned()
         }
     }
 
@@ -789,6 +875,12 @@ mod tests {
         /// cross-tick half of the double-assignment fix).
         fn mark_active(&self, queue: &str, part: &str) {
             self.0.lock().unwrap().mark_claimed(queue, part);
+        }
+        /// Replace the whole snapshot — models the queue tables moving on between
+        /// ticks (e.g. an agent marked its item `done` before reporting
+        /// QUEUE_EMPTY, so the next tick sees a drained queue).
+        fn set(&self, qs: Vec<QueueView>) {
+            *self.0.lock().unwrap() = Snapshot::new(qs);
         }
     }
     impl QueueSource for Arc<FixedQueues> {
@@ -869,7 +961,7 @@ mod tests {
         snapshot: Vec<QueueView>,
         policy: Policy,
     ) -> (DriveLoop, Daemon, Arc<FakeFleet>, Probe) {
-        let (drive, d, backend, _claimer, probe) = make_claiming(fleet, snapshot, policy);
+        let (drive, d, backend, _claimer, _queues, probe) = make_claiming(fleet, snapshot, policy);
         (drive, d, backend, probe)
     }
 
@@ -882,7 +974,7 @@ mod tests {
         fleet: Vec<FleetMember>,
         snapshot: Vec<QueueView>,
         policy: Policy,
-    ) -> (DriveLoop, Daemon, Arc<FakeFleet>, Arc<FakeClaimer>, Probe) {
+    ) -> (DriveLoop, Daemon, Arc<FakeFleet>, Arc<FakeClaimer>, Arc<FixedQueues>, Probe) {
         let d = daemon(policy);
         let backend = FakeFleet::new();
         let queues = FixedQueues::new(snapshot);
@@ -905,7 +997,8 @@ mod tests {
         let drive = DriveLoop::new(
             d.clone(),
             sup,
-            Box::new(Arc::clone(&backend)),
+            Box::new(Arc::clone(&backend)), // health
+            Box::new(Arc::clone(&backend)), // baton status — scripted via set_baton
             Box::new(Arc::clone(&queues)),
             Box::new(Arc::clone(&claimer)),
             Box::new(Arc::clone(&backend)),
@@ -913,7 +1006,7 @@ mod tests {
             dispatcher,
             fleet,
         );
-        (drive, d, backend, claimer, Probe { alerts, log })
+        (drive, d, backend, claimer, queues, Probe { alerts, log })
     }
 
     /// The loop picks each member's pinned part, admits under the per-device cap,
@@ -1154,6 +1247,80 @@ mod tests {
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"], "a1 was re-spawned");
+    }
+
+    /// THE SPIN FIX end-to-end ([[decision-growlight-fleet-loop-spin]]): a member
+    /// that exits clean with a `QUEUE_EMPTY` baton is retired to idle and NOT
+    /// re-rolled — no fresh `claude -p` against a drained queue — and the daemon
+    /// stays resident, re-starting a member only when new queued work appears.
+    #[test]
+    fn a_queue_empty_baton_retires_to_idle_then_re_starts_on_new_work() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        // Tick 0 starts a1 on p1 (claiming it `active`).
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // a1 finished its item and reported QUEUE_EMPTY: the queue is drained
+        // (p1 `done`) and the member exits clean with that terminal baton.
+        queues.set(vec![q("qa", &[("p1", "done")])]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "QUEUE_EMPTY");
+
+        let r = loop_.tick(1);
+        assert_eq!(r.retired, vec!["a1".to_string()], "the member retired to idle");
+        assert!(
+            r.rerolls.is_empty(),
+            "a QUEUE_EMPTY member is NOT re-rolled — the inverse of the old spin",
+        );
+        assert!(r.started.is_empty(), "nothing to start on a drained queue");
+        assert_eq!(backend.spawn_count(), 1, "NO fresh claude -p on the drained queue");
+
+        // The daemon stays resident and idle — a tick on the still-drained queue
+        // spawns nothing (zero agents running, no burn).
+        let r2 = loop_.tick(2);
+        assert!(r2.rerolls.is_empty() && r2.started.is_empty(), "idle: zero agents");
+        assert_eq!(backend.spawn_count(), 1, "still no spin while idle");
+
+        // New queued work appears → the loop re-starts a member.
+        queues.set(vec![q("qa", &[("p2", "queued")])]);
+        let r3 = loop_.tick(3);
+        assert_eq!(r3.started.len(), 1, "new queued work re-starts a member");
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "a1 re-started on the new part");
+    }
+
+    /// A `STUCK` baton parks the member (kept registered, not re-rolled, not
+    /// re-started) and surfaces the §9 `AgentCrashed` human alert through the
+    /// owned dispatcher.
+    #[test]
+    fn a_stuck_baton_parks_the_member_with_a_human_alert() {
+        let (mut loop_, _d, backend, _claimer, _queues, probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // start a1
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 exits clean but wrote a STUCK baton → park + a §9 human alert.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "STUCK");
+
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.crashes,
+            vec![NotifyEvent::AgentCrashed { agent: "a1".into() }],
+            "a stuck member surfaces the §9 AgentCrashed alert",
+        );
+        assert_eq!(probe.gui_alerts(), 1, "the alert was dispatched once");
+        assert!(r.rerolls.is_empty(), "a parked member is NOT re-rolled");
+        assert!(r.started.is_empty(), "a parked (still-registered) member is not re-started");
+        assert_eq!(backend.spawn_count(), 1, "no fresh spawn for a stuck member");
     }
 
     /// `pause` is the admission gate: a paused fleet starts nothing and re-rolls
@@ -1446,7 +1613,7 @@ mod tests {
     /// `pick` flows past it to the next free queue.
     #[test]
     fn two_unpinned_members_in_one_tick_claim_different_parts() {
-        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+        let (mut loop_, _d, backend, claimer, _queues, _probe) = make_claiming(
             vec![FleetMember::unpinned(spec("a1")), FleetMember::unpinned(spec("a2"))],
             vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
             Policy::default(),
@@ -1472,7 +1639,7 @@ mod tests {
     /// second finds nothing — never a double-assignment of the same part.
     #[test]
     fn a_lone_part_is_claimed_once_and_the_second_member_gets_none() {
-        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+        let (mut loop_, _d, backend, claimer, _queues, _probe) = make_claiming(
             vec![FleetMember::unpinned(spec("a1")), FleetMember::unpinned(spec("a2"))],
             vec![q("qa", &[("p1", "queued")])],
             Policy::default(),
@@ -1498,7 +1665,7 @@ mod tests {
             max_concurrent_agents: 1,
             ..Policy::default()
         };
-        let (mut loop_, d, backend, claimer, _probe) = make_claiming(
+        let (mut loop_, d, backend, claimer, _queues, _probe) = make_claiming(
             vec![FleetMember::unpinned(spec("a1")), FleetMember::unpinned(spec("a2"))],
             vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
             policy,
@@ -1539,7 +1706,7 @@ mod tests {
     /// part) and the start is held as `ClaimFailed`.
     #[test]
     fn a_failed_claim_is_fail_closed_and_never_spawns() {
-        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+        let (mut loop_, _d, backend, claimer, _queues, _probe) = make_claiming(
             vec![FleetMember::unpinned(spec("a1"))],
             vec![q("qa", &[("p1", "queued")])],
             Policy::default(),
@@ -1599,7 +1766,7 @@ mod tests {
     /// collision.)
     #[test]
     fn two_members_pinned_to_one_queue_never_double_assign_its_head() {
-        let (mut loop_, _d, backend, claimer, _probe) = make_claiming(
+        let (mut loop_, _d, backend, claimer, _queues, _probe) = make_claiming(
             vec![member("a1", "qa"), member("a2", "qa")],
             vec![q("qa", &[("p1", "queued")])],
             Policy::default(),

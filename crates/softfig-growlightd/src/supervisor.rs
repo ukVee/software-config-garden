@@ -48,9 +48,17 @@
 //!   for the caller to route. Repeated crashes grow the delay until it caps —
 //!   a wedged agent (e.g. a missing allow-rule that re-errors every spawn) backs
 //!   off instead of hot-looping.
-//! - **A clean exit rolls free.** Exit code 0 is a session that ended on its own
-//!   baton boundary; it re-rolls immediately (no backoff, no alert) and clears the
-//!   failure streak — the loop simply keeps the agent going.
+//! - **A clean exit reads the agent's baton, then decides.** Exit code 0 is a
+//!   session that ended on its own baton boundary; the supervisor reads that
+//!   baton's terminal status (the shared [`softfig_ipc::baton`] vocabulary) and
+//!   maps it — a continue status (or no baton yet) re-rolls immediately (no
+//!   backoff, no alert, streak cleared); `QUEUE_EMPTY` **retires** the member to
+//!   idle (it leaves the fleet, so it is never re-rolled — the empty-queue spin
+//!   fix, [[decision-growlight-fleet-loop-spin]]); `HALTED_RATE_LIMIT` **parks**
+//!   it until its window resets; an agent-written `STUCK` / `BLOCKED_ON_HUMAN` /
+//!   unrecognized status **parks** it and surfaces an [`NotifyEvent::AgentCrashed`]
+//!   human alert. Deciding re-roll-vs-retire purely on the exit code — without
+//!   this read — is what spun `claude -p` on a drained queue.
 //! - **A healthy agent is left alone.** An alive child with a recent heartbeat
 //!   produces no action and no spawn.
 //!
@@ -67,6 +75,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+
+use softfig_ipc::baton::{classify_status, BatonDisposition};
 
 use crate::admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
@@ -270,9 +280,27 @@ pub enum StartOutcome {
 pub enum PollOutcome {
     /// Alive with a recent heartbeat — left running, nothing scheduled.
     Healthy,
-    /// Exited cleanly — scheduled an immediate re-roll, cleared the failure
-    /// streak, no alert.
+    /// Exited cleanly on a continue status (or with no baton signal yet) —
+    /// scheduled an immediate re-roll, cleared the failure streak, no alert.
     Rolling,
+    /// Exited cleanly on a `QUEUE_EMPTY` baton — the member retired itself to
+    /// idle: dropped from the fleet so it is never re-rolled. The daemon stays
+    /// resident; when new queued work appears the drive loop re-starts a fresh
+    /// member (the empty-queue spin fix, [[decision-growlight-fleet-loop-spin]]).
+    Retired,
+    /// Exited cleanly on a `HALTED_RATE_LIMIT` baton — parked (kept in the fleet,
+    /// not re-rolled) until its rate window resets. No alert: a transient halt the
+    /// budget governor resumes (slice 003 wires the timed re-arm).
+    ParkedRateLimited,
+    /// Exited cleanly on a `STUCK` / `BLOCKED_ON_HUMAN` / unrecognized baton — the
+    /// loop can't safely continue, so the member is parked (kept, not re-rolled)
+    /// pending a human, and this §9 alert is surfaced for the caller to route.
+    Parked {
+        /// The [`NotifyEvent::AgentCrashed`] to dispatch (the agent needs a human).
+        event: NotifyEvent,
+        /// The raw terminal baton status that parked it (for the log/alert).
+        status: String,
+    },
     /// Crashed (errored exit or hung) — killed any live child, bumped the failure
     /// streak, scheduled a backoff re-roll, and surfaced this alert for the caller
     /// to route through the [`crate::notify_dispatch::NotifyDispatcher`].
@@ -329,6 +357,11 @@ struct Supervised {
     consecutive_failures: u32,
     /// Earliest Unix-seconds the next re-roll may spawn.
     not_before: i64,
+    /// Parked on a terminal baton (`HALTED_RATE_LIMIT` until reset, or a
+    /// `STUCK`/`BLOCKED_ON_HUMAN` pending a human) — kept in the fleet but skipped
+    /// by [`tick`](Supervisor::tick) so it is never re-rolled while parked. The
+    /// `QUEUE_EMPTY` case does not park; it retires (leaves the fleet entirely).
+    parked: bool,
 }
 
 /// The fleet supervisor: owns the spawn seam, the admission governor, and the
@@ -477,6 +510,7 @@ impl Supervisor {
                                 child: Some(child),
                                 consecutive_failures: 0,
                                 not_before: now,
+                                parked: false,
                             },
                         );
                         StartOutcome::Started
@@ -492,49 +526,121 @@ impl Supervisor {
         }
     }
 
-    /// Observe one supervised agent's `health` at `now`. Healthy → nothing; clean
-    /// exit → schedule an immediate re-roll (streak cleared); crash → kill any
-    /// live (hung) child, bump the streak, schedule a backoff re-roll, and return
-    /// the [`NotifyEvent::AgentCrashed`] alert.
-    pub fn poll(&mut self, agent: &str, health: AgentHealth, now: i64) -> PollOutcome {
-        // Copy the pure config out so the per-agent mutable borrow stands alone.
-        let backoff = self.backoff;
+    /// Observe one supervised agent's `health` at `now`, given the terminal
+    /// `baton_status` it wrote on exit (`None` if no baton was readable — the
+    /// historical clean-exit fallback). Healthy → nothing; crash → kill any live
+    /// (hung) child, bump the streak, backoff re-roll + alert; clean exit →
+    /// [`Self::on_clean_exit`] reads the baton and decides re-roll / retire / park.
+    ///
+    /// Reading the baton on a clean exit is the empty-queue spin fix: deciding on
+    /// the exit code alone re-rolled a `QUEUE_EMPTY` exit straight back into a
+    /// fresh `claude -p` ([[decision-growlight-fleet-loop-spin]]).
+    pub fn poll(
+        &mut self,
+        agent: &str,
+        health: AgentHealth,
+        baton_status: Option<&str>,
+        now: i64,
+    ) -> PollOutcome {
         let hang_secs = self.hang_secs;
-        let Some(sup) = self.agents.get_mut(agent) else {
+        if !self.agents.contains_key(agent) {
             return PollOutcome::Unknown;
-        };
+        }
         match classify(&health, hang_secs, now) {
             Verdict::Healthy => PollOutcome::Healthy,
-            Verdict::CleanExit => {
-                // Ended on its own boundary — drop the dead handle and roll fresh
-                // immediately, clearing the failure streak.
-                sup.child = None;
-                sup.consecutive_failures = 0;
-                sup.not_before = now;
-                PollOutcome::Rolling
+            Verdict::CleanExit => self.on_clean_exit(agent, baton_status, now),
+            Verdict::Crashed => self.on_crash(agent, health, now),
+        }
+    }
+
+    /// Handle a **crash** (errored exit or stale heartbeat): kill any live (hung)
+    /// child via the [`AgentChild`] contract (the drive loop runs `poll` off the
+    /// connection lock, so the kill-outside-the-lock invariant holds; an errored
+    /// exit is already gone, so its handle is just dropped), bump the failure
+    /// streak, schedule the backoff re-roll, and surface the [`NotifyEvent`] alert.
+    fn on_crash(&mut self, agent: &str, health: AgentHealth, now: i64) -> PollOutcome {
+        let backoff = self.backoff;
+        let sup = self.agents.get_mut(agent).expect("agent exists (checked in poll)");
+        let was_hung = matches!(health, AgentHealth::Alive { .. });
+        if let Some(child) = sup.child.take() {
+            if was_hung {
+                child.kill();
             }
-            Verdict::Crashed => {
-                // A hung child is still alive — terminate it via the AgentChild
-                // contract (the drive loop runs poll off the connection lock, so
-                // the kill-outside-the-lock invariant holds). An *errored exit* is
-                // already gone, so its handle is just dropped (no needless SIGKILL).
-                let was_hung = matches!(health, AgentHealth::Alive { .. });
-                if let Some(child) = sup.child.take() {
-                    if was_hung {
-                        child.kill();
-                    }
-                }
-                sup.consecutive_failures = sup.consecutive_failures.saturating_add(1);
-                let delay = backoff.delay(sup.consecutive_failures);
-                sup.not_before = now.saturating_add(delay);
-                PollOutcome::Crashed {
+        }
+        sup.consecutive_failures = sup.consecutive_failures.saturating_add(1);
+        sup.not_before = now.saturating_add(backoff.delay(sup.consecutive_failures));
+        PollOutcome::Crashed {
+            event: NotifyEvent::AgentCrashed {
+                agent: agent.to_string(),
+            },
+            failures: sup.consecutive_failures,
+            not_before: sup.not_before,
+        }
+    }
+
+    /// Decide what a clean (code-0) exit means by reading the agent's terminal
+    /// baton status — the spin fix. The shared [`softfig_ipc::baton`] vocabulary
+    /// classifies it; each disposition maps to a fleet lifecycle:
+    ///
+    /// - **Continue** (or `None` — no baton write-back yet, the slice-002
+    ///   precondition) → re-roll immediately, streak cleared (today's behaviour).
+    /// - **`QUEUE_EMPTY`** → **retire**: the member leaves the fleet entirely, so
+    ///   [`tick`](Self::tick) never re-rolls it. No spin on a drained queue.
+    /// - **`HALTED_RATE_LIMIT`** → **park** until its window resets (no alert).
+    /// - **`BLOCKED_ON_HUMAN` / `STUCK` / unrecognized** → **park** + an
+    ///   [`NotifyEvent::AgentCrashed`] human alert.
+    ///
+    /// A parked member keeps its slot but is skipped by `tick`; a retired one is
+    /// gone. Both stop the re-roll, which is what kept `claude -p` spinning.
+    fn on_clean_exit(&mut self, agent: &str, baton_status: Option<&str>, now: i64) -> PollOutcome {
+        // No baton signal → the historical clean-exit re-roll. Slice 002 wires the
+        // per-member write-back so a working member always supplies a status; until
+        // then (and for a brand-new member's first boundary) this is the fallback.
+        let Some(status) = baton_status else {
+            return self.roll(agent, now);
+        };
+        match classify_status(Some(status)) {
+            BatonDisposition::Continue => self.roll(agent, now),
+            BatonDisposition::QueueEmpty => {
+                // Retire to idle: drop the member so it is never re-rolled. The
+                // child already exited (clean), so there is nothing to kill.
+                self.agents.remove(agent);
+                PollOutcome::Retired
+            }
+            BatonDisposition::RateLimited => {
+                self.park(agent);
+                PollOutcome::ParkedRateLimited
+            }
+            BatonDisposition::BlockedOnHuman | BatonDisposition::Stuck(_) => {
+                self.park(agent);
+                PollOutcome::Parked {
                     event: NotifyEvent::AgentCrashed {
                         agent: agent.to_string(),
                     },
-                    failures: sup.consecutive_failures,
-                    not_before: sup.not_before,
+                    status: status.to_string(),
                 }
             }
+        }
+    }
+
+    /// Schedule an immediate re-roll for a cleanly-exited member: drop the dead
+    /// handle, clear the failure streak, and arm the roll for `now`.
+    fn roll(&mut self, agent: &str, now: i64) -> PollOutcome {
+        if let Some(sup) = self.agents.get_mut(agent) {
+            sup.child = None;
+            sup.consecutive_failures = 0;
+            sup.not_before = now;
+        }
+        PollOutcome::Rolling
+    }
+
+    /// Park a cleanly-exited member: drop the dead handle and flag it parked so
+    /// [`tick`](Self::tick) skips its re-roll. It keeps its slot (still registered)
+    /// until a human / the budget governor clears it.
+    fn park(&mut self, agent: &str) {
+        if let Some(sup) = self.agents.get_mut(agent) {
+            sup.child = None;
+            sup.parked = true;
         }
     }
 
@@ -547,7 +653,11 @@ impl Supervisor {
         let candidates: Vec<String> = self
             .agents
             .iter()
-            .filter(|(_, s)| s.child.is_none())
+            // A parked member (terminal baton: rate-limited / pending-human) keeps
+            // its slot but is NOT re-rolled — skipping it here is what stops the
+            // spin. Only a member awaiting a *re-roll* (down, not parked) is a
+            // candidate.
+            .filter(|(_, s)| s.child.is_none() && !s.parked)
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -797,7 +907,7 @@ mod tests {
 
         // Recent heartbeat (well inside the 100s hang window).
         assert_eq!(
-            s.poll("a1", AgentHealth::Alive { last_active: 950 }, 1000),
+            s.poll("a1", AgentHealth::Alive { last_active: 950 }, None, 1000),
             PollOutcome::Healthy
         );
         assert!(s.is_running("a1"));
@@ -816,7 +926,7 @@ mod tests {
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
 
         // A non-zero exit (the headless permission-prompt error) → crash.
-        let out = s.poll("a1", AgentHealth::Exited { code: 1 }, 0);
+        let out = s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0);
         assert_eq!(
             out,
             PollOutcome::Crashed {
@@ -857,7 +967,7 @@ mod tests {
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
 
         // Alive but the last delta was 100s ago == the hang window → hung crash.
-        let out = s.poll("a1", AgentHealth::Alive { last_active: 0 }, 100);
+        let out = s.poll("a1", AgentHealth::Alive { last_active: 0 }, None, 100);
         assert!(matches!(out, PollOutcome::Crashed { failures: 1, .. }));
         assert_eq!(backend.kill_count(), 1, "the hung child was terminated");
         assert!(!s.is_running("a1"));
@@ -867,7 +977,7 @@ mod tests {
         let mut s2 = sup(Arc::clone(&backend2));
         s2.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
         assert_eq!(
-            s2.poll("a1", AgentHealth::Alive { last_active: 0 }, 99),
+            s2.poll("a1", AgentHealth::Alive { last_active: 0 }, None, 99),
             PollOutcome::Healthy
         );
         assert_eq!(backend2.kill_count(), 0);
@@ -885,7 +995,7 @@ mod tests {
         let mut now = 0i64;
         for (i, &want) in expected.iter().enumerate() {
             // Observe a crash at `now`.
-            let out = s.poll("a1", AgentHealth::Exited { code: 1 }, now);
+            let out = s.poll("a1", AgentHealth::Exited { code: 1 }, None, now);
             let PollOutcome::Crashed {
                 failures,
                 not_before,
@@ -915,13 +1025,14 @@ mod tests {
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
 
         // Build up a failure streak first.
-        s.poll("a1", AgentHealth::Exited { code: 1 }, 0);
+        s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0);
         assert_eq!(s.failures("a1"), 1);
         s.tick(fresh_budget(), fresh_rate(), 2); // re-roll
 
-        // Now a clean exit at t=10: immediate re-roll, streak cleared, no alert.
+        // Now a clean exit at t=10 with no baton signal (the slice-002 precondition):
+        // immediate re-roll, streak cleared, no alert.
         assert_eq!(
-            s.poll("a1", AgentHealth::Exited { code: 0 }, 10),
+            s.poll("a1", AgentHealth::Exited { code: 0 }, None, 10),
             PollOutcome::Rolling
         );
         assert_eq!(s.failures("a1"), 0, "a clean run clears the streak");
@@ -939,7 +1050,7 @@ mod tests {
         let backend = FakeBackend::new();
         let mut s = sup(Arc::clone(&backend));
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
-        s.poll("a1", AgentHealth::Exited { code: 1 }, 0); // crash, not_before = 2
+        s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0); // crash, not_before = 2
 
         // Past the backoff window but the budget is hot → held on admission.
         assert_eq!(
@@ -967,7 +1078,7 @@ mod tests {
         let backend = FakeBackend::new();
         let mut s = sup(Arc::clone(&backend));
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0); // failures 0
-        s.poll("a1", AgentHealth::Exited { code: 1 }, 0); // failures 1, not_before 2
+        s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0); // failures 1, not_before 2
 
         // Backend now refuses to launch.
         backend.set_fail(true);
@@ -1005,7 +1116,7 @@ mod tests {
         let backend = FakeBackend::new();
         let mut s = sup(Arc::clone(&backend));
         assert_eq!(
-            s.poll("ghost", AgentHealth::Exited { code: 1 }, 0),
+            s.poll("ghost", AgentHealth::Exited { code: 1 }, None, 0),
             PollOutcome::Unknown
         );
         assert_eq!(backend.spawn_count(), 0);
@@ -1033,7 +1144,7 @@ mod tests {
         s.start(spec("tab"), fresh_budget(), fresh_rate(), 0);
 
         let PollOutcome::Crashed { event, .. } =
-            s.poll("tab", AgentHealth::Exited { code: 1 }, 0)
+            s.poll("tab", AgentHealth::Exited { code: 1 }, None, 0)
         else {
             panic!("expected a crash");
         };
@@ -1081,7 +1192,7 @@ mod tests {
 
         // A crashed agent awaiting its re-roll is still registered (the loop must
         // not re-`start` it — `tick` rolls it).
-        s.poll("a1", AgentHealth::Exited { code: 1 }, 0);
+        s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0);
         assert!(!s.is_running("a1"));
         assert!(s.is_registered("a1"), "awaiting a re-roll is still registered");
 
@@ -1109,5 +1220,118 @@ mod tests {
         // A second retire (or an unknown agent) finds nothing.
         assert!(s.retire("a1").is_none());
         assert!(s.retire("ghost").is_none());
+    }
+
+    /// THE SPIN FIX (slice 001, [[decision-growlight-fleet-loop-spin]]): a member
+    /// that exits cleanly on a `QUEUE_EMPTY` baton is RETIRED to idle — dropped
+    /// from the fleet — and is NOT re-rolled. The inverse of the old behaviour,
+    /// where a code-0 exit re-rolled unconditionally into a fresh `claude -p`.
+    #[test]
+    fn a_queue_empty_baton_retires_to_idle_and_is_not_re_rolled() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert_eq!(backend.spawn_count(), 1);
+
+        // Clean exit carrying a QUEUE_EMPTY baton → retire, not re-roll.
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("QUEUE_EMPTY"), 10),
+            PollOutcome::Retired
+        );
+        assert!(!s.is_registered("a1"), "a retired member left the fleet");
+        assert!(!s.is_running("a1"));
+
+        // The whole point: no re-roll. A tick well past any backoff spawns nothing.
+        assert!(
+            s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty(),
+            "a retired member is never a re-roll candidate"
+        );
+        assert_eq!(backend.spawn_count(), 1, "NO fresh claude -p on a drained queue");
+        assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
+    }
+
+    /// A `STUCK` baton parks the member (kept but not re-rolled) and surfaces the
+    /// §9 `AgentCrashed` human alert.
+    #[test]
+    fn a_stuck_baton_parks_with_an_alert_and_is_not_re_rolled() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("STUCK"), 10),
+            PollOutcome::Parked {
+                event: NotifyEvent::AgentCrashed { agent: "a1".into() },
+                status: "STUCK".into(),
+            }
+        );
+        // Parked = kept in the fleet (still registered) but never re-rolled.
+        assert!(s.is_registered("a1"), "a parked member keeps its slot");
+        assert!(!s.is_running("a1"));
+        assert!(
+            s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty(),
+            "a parked member is skipped by tick"
+        );
+        assert_eq!(backend.spawn_count(), 1, "no re-roll of a stuck member");
+    }
+
+    /// A `BLOCKED_ON_HUMAN` baton parks + alerts, exactly like `STUCK` (carries the
+    /// raw status for the alert/log).
+    #[test]
+    fn a_blocked_on_human_baton_parks_with_an_alert() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("BLOCKED_ON_HUMAN"), 10),
+            PollOutcome::Parked {
+                event: NotifyEvent::AgentCrashed { agent: "a1".into() },
+                status: "BLOCKED_ON_HUMAN".into(),
+            }
+        );
+        assert!(s.is_registered("a1"));
+        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty());
+    }
+
+    /// A `HALTED_RATE_LIMIT` baton parks WITHOUT an alert (a transient halt the
+    /// budget governor resumes) — and is not re-rolled while parked.
+    #[test]
+    fn a_rate_limited_baton_parks_without_an_alert() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("HALTED_RATE_LIMIT"), 10),
+            PollOutcome::ParkedRateLimited
+        );
+        assert!(s.is_registered("a1"), "a rate-parked member keeps its slot");
+        assert!(
+            s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty(),
+            "a rate-parked member is not re-rolled (slice 003 re-arms it on reset)"
+        );
+        assert_eq!(backend.spawn_count(), 1);
+    }
+
+    /// A continue-status baton (`IN_PROGRESS`) still re-rolls — the loop keeps the
+    /// member going, exactly as before the spin fix.
+    #[test]
+    fn a_continue_baton_still_re_rolls() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("IN_PROGRESS"), 10),
+            PollOutcome::Rolling
+        );
+        assert!(s.is_registered("a1"));
+        // No backoff after a clean exit → an immediate re-roll.
+        assert_eq!(
+            s.tick(fresh_budget(), fresh_rate(), 10),
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }]
+        );
+        assert_eq!(backend.spawn_count(), 2, "a continue baton re-rolls");
     }
 }

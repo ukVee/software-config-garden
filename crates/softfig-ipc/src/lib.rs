@@ -8,12 +8,14 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod baton;
 pub mod client;
 pub mod growlightd;
 pub mod proto;
 pub mod socket;
 pub mod verbs;
 
+pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};
 pub use client::{call, call_reconnecting, connect, ClientError, ReconnectError, RetryPolicy};
 pub use proto::{ErrorKind, Request, Response};
 pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};

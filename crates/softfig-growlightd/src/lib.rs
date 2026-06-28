@@ -52,9 +52,9 @@ pub use config::{GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
-    spawn_drive_loop, AgentHealthSource, Assignment, BudgetSampleSource, DeferredQueues, DriveLoop,
-    FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource, RateSource, TickReport,
-    DRIVE_POLL_MS,
+    spawn_drive_loop, AgentHealthSource, Assignment, BatonStatusSource, BudgetSampleSource,
+    DeferredBatonStatus, DeferredQueues, DriveLoop, FleetMember, HeldStart, PartClaimer,
+    PermissiveRate, QueueSource, RateSource, TickReport, DRIVE_POLL_MS,
 };
 pub use fleet::{
     assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig,

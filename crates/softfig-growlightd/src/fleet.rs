@@ -56,7 +56,7 @@ use crate::claim::KeeperdPartClaimer;
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
-    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, DRIVE_POLL_MS,
+    spawn_drive_loop, DeferredBatonStatus, DriveLoop, FleetMember, LiveRate, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::preapproval::{agent_paths, PreApproval};
@@ -248,6 +248,7 @@ pub fn assemble_fleet(
         daemon.clone(),
         supervisor,
         Box::new(Arc::clone(&backend)), // health  — live ClaudeBackend (slice 001)
+        Box::new(DeferredBatonStatus), // baton — deferred until fleet-loop-spin slice 002 wires the per-member reader
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)
         Box::new(KeeperdPartClaimer::new(keeperd_socket.to_path_buf())), // claimer — live (slice 003)
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
