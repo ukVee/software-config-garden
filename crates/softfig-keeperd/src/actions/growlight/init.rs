@@ -27,9 +27,18 @@ use crate::server::err_to_response;
 
 // ---- embedded templates (spec §11: "from embedded templates") ----------
 
-/// The fixed operating contract, injected into every loop session (spec §7).
+/// The fixed operating contract, injected into every single-agent loop session
+/// (spec §7).
 const PROTOCOL_MD: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/growlight/protocol.md"));
+/// The fleet-member variant of the contract — identical through step 6, step 7
+/// does NOT self-pull (the orchestrator owns the queue). growlightd injects this
+/// into every fleet member; the single-agent loop keeps [`PROTOCOL_MD`]
+/// (fleet-member-model slice 002).
+const PROTOCOL_FLEET_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../templates/growlight/protocol-fleet.md"
+));
 /// The editable two-budget policy (spec §8).
 const SESSION_POLICY_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -96,9 +105,10 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
         // never clobbered if the MCP verbs already seeded it). The numbered
         // folders get a `.seq` seed so their first entry counts from 001,
         // materializing the dir as a tracked entity at the same time.
-        let pillar: [(String, String); 7] = [
+        let pillar: [(String, String); 8] = [
             (paths::pillar_claude(), paths::pillar_claude_stub()),
             (paths::protocol_md(), PROTOCOL_MD.to_string()),
+            (paths::protocol_fleet_md(), PROTOCOL_FLEET_MD.to_string()),
             (paths::session_policy_md(), SESSION_POLICY_MD.to_string()),
             (paths::backlog_claude(), paths::backlog_claude_stub()),
             (format!("{}/.seq", paths::tasks_dir()), "0\n".to_string()),
@@ -244,6 +254,55 @@ fn current_tip(inner: &DaemonInner) -> Result<String, (ErrorKind, String)> {
         .map_err(|e| err_to_response(e.into()))?
         .map(|h| h.to_string())
         .unwrap_or_default())
+}
+
+// ---- embedded-template content guard -----------------------------------
+
+#[cfg(test)]
+mod template_tests {
+    use super::{PROTOCOL_FLEET_MD, PROTOCOL_MD};
+
+    /// The boundary between the shared steps (1–6) and the mode-specific
+    /// continuation (step 7). The two protocols are byte-identical before this
+    /// marker; only the continuation differs.
+    const STEP_7: &str = "7. QUEUE";
+
+    #[test]
+    fn fleet_and_single_agent_protocols_share_steps_1_through_6() {
+        let s = PROTOCOL_MD
+            .split_once(STEP_7)
+            .expect("single-agent protocol has a step 7")
+            .0;
+        let f = PROTOCOL_FLEET_MD
+            .split_once(STEP_7)
+            .expect("fleet protocol has a step 7")
+            .0;
+        // The whole intro + steps 1–6 are the SAME text — the drift guard: if a
+        // shared step is edited in one file, this fails until both are synced.
+        assert_eq!(s, f, "the shared protocol prefix must stay byte-identical");
+    }
+
+    #[test]
+    fn only_the_single_agent_step_7_self_pulls() {
+        let single_tail = &PROTOCOL_MD[PROTOCOL_MD.find(STEP_7).unwrap()..];
+        let fleet_tail = &PROTOCOL_FLEET_MD[PROTOCOL_FLEET_MD.find(STEP_7).unwrap()..];
+
+        // Single-agent (no orchestrator) self-pulls the next item.
+        assert!(
+            single_tail.contains("pull the next active backlog item"),
+            "single-agent step 7 self-pulls",
+        );
+
+        // Fleet member NEVER self-pulls — the orchestrator owns continuation.
+        assert!(
+            !fleet_tail.contains("pull the next"),
+            "fleet step 7 must NOT self-pull",
+        );
+        assert!(
+            fleet_tail.contains("orchestrator") && fleet_tail.contains("self-pull"),
+            "fleet step 7 names the orchestrator-owns-continuation contract",
+        );
+    }
 }
 
 // ---- pure nav-table editing -------------------------------------------

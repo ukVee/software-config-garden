@@ -603,11 +603,12 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
 
     assert!(reply.committed);
-    // All seven pillar files + the in-garden fleet config are created on a fresh
+    // All eight pillar files + the in-garden fleet config are created on a fresh
     // garden.
     for rel in [
         "growlight/CLAUDE.md",
         "growlight/protocol.md",
+        "growlight/protocol-fleet.md",
         "growlight/session-policy.md",
         "growlight/backlog/CLAUDE.md",
         "growlight/backlog/tasks/.seq",
@@ -625,6 +626,10 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     assert!(fx
         .read("growlight/protocol.md")
         .contains("SOFT-FIG GROWLIGHT — operating protocol"));
+    // The fleet variant ships too, with the no-self-pull step 7 (slice 002).
+    let fleet = fx.read("growlight/protocol-fleet.md");
+    assert!(fleet.contains("SOFT-FIG GROWLIGHT — operating protocol"));
+    assert!(!fleet.contains("pull the next"), "fleet protocol must not self-pull");
     assert!(fx
         .read("growlight/session-policy.md")
         .contains("## The two budgets"));
@@ -649,8 +654,8 @@ fn growlight_init_is_idempotent_without_an_empty_commit() {
     assert!(!reply.committed, "re-run must not commit");
     assert!(reply.created.is_empty());
     assert_eq!(reply.hash, tip_before, "re-run returns the current tip");
-    // The seven pillar files + config/growlight.toml are reported kept, not recreated.
-    assert_eq!(reply.skipped.len(), 8);
+    // The eight pillar files + config/growlight.toml are reported kept, not recreated.
+    assert_eq!(reply.skipped.len(), 9);
 
     let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
     assert_eq!(tip_after, tip_before, "no new commit on a no-op init");

@@ -223,7 +223,9 @@ pub fn assemble_fleet(
         .unwrap_or_else(|| PILLAR.to_string());
     let preapproval = PreApproval::new(
         agents_dir.clone(),
-        garden_root.join(PILLAR).join("protocol.md"),
+        // The FLEET variant (no self-pull) — every member growlightd spawns is a
+        // fleet member; the orchestrator owns continuation (slice 002).
+        fleet_protocol(&garden_root),
         garden_root,
         softfig_mcp_path(),
         claude_dir(),
@@ -323,6 +325,21 @@ fn softfig_mcp_path() -> PathBuf {
 /// single-agent launcher's constant).
 const PILLAR: &str = "growlight";
 
+/// The fleet-member protocol filename within the pillar. growlightd injects the
+/// fleet variant (no self-pull — the orchestrator owns the queue, slice 002),
+/// distinct from the single-agent `protocol.md` that `softfig growlight start`
+/// injects. growlightd only ever spawns fleet members, so this is the protocol
+/// every pre-approval it generates carries.
+const FLEET_PROTOCOL_FILE: &str = "protocol-fleet.md";
+
+/// The garden path to the fleet-member protocol the SessionStart hook injects.
+/// Pure + named so the fleet/single-agent split is a tested choice, not an inline
+/// literal: a fleet member injects `protocol-fleet.md`, NEVER the single-agent
+/// `protocol.md`.
+fn fleet_protocol(garden_root: &Path) -> PathBuf {
+    garden_root.join(PILLAR).join(FLEET_PROTOCOL_FILE)
+}
+
 /// Assemble (via [`assemble_fleet`]) and spawn the live drive-loop thread — iff
 /// the gate is on. Gate off ⇒ `Ok(None)`, nothing spawned. A thin wrapper over
 /// the already-proven [`spawn_drive_loop`], whose thread ticks until the daemon
@@ -369,6 +386,21 @@ mod tests {
     /// not call — the live source's read/parse paths are proven in `queue_source`).
     fn keeperd_socket() -> &'static Path {
         Path::new("/run/nonexistent-keeperd.sock")
+    }
+
+    #[test]
+    fn fleet_members_inject_the_no_self_pull_fleet_protocol() {
+        // growlightd only spawns fleet members, so the pre-approval protocol is the
+        // fleet variant (protocol-fleet.md) — never the single-agent protocol.md
+        // that `softfig growlight start` injects. This is the slice-002 split that
+        // closes the self-pull double-assignment race.
+        let p = fleet_protocol(Path::new("/garden"));
+        assert_eq!(p, Path::new("/garden/growlight/protocol-fleet.md"));
+        assert_ne!(
+            p.file_name().unwrap(),
+            "protocol.md",
+            "a fleet member must NOT inject the single-agent self-pull protocol",
+        );
     }
 
     #[test]

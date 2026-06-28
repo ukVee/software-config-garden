@@ -49,9 +49,19 @@ pub fn pillar_claude() -> String {
     format!("{PILLAR}/CLAUDE.md")
 }
 
-/// The injected operating contract (embedded-template-sourced).
+/// The injected operating contract (embedded-template-sourced) — the
+/// single-agent `--auto` variant (step 7 self-pulls the next item).
 pub fn protocol_md() -> String {
     format!("{PILLAR}/protocol.md")
+}
+
+/// The fleet-member operating contract (embedded-template-sourced) — identical
+/// to [`protocol_md`] through step 6, but step 7 does NOT self-pull: the
+/// orchestrator owns the queue and claims each member's next part
+/// (fleet-member-model slice 002). growlightd injects THIS variant into every
+/// fleet member's SessionStart hook; the single-agent loop keeps [`protocol_md`].
+pub fn protocol_fleet_md() -> String {
+    format!("{PILLAR}/protocol-fleet.md")
 }
 
 /// The editable two-budget policy (embedded-template-sourced).
@@ -212,8 +222,12 @@ pub fn pillar_claude_stub() -> String {
          `softfig growlight start`. Normal `claude` is untouched — growlight hooks load \
          only via the launcher's generated settings.\n\n\
          ## Children\n\n\
-         - `protocol.md` — the fixed operating contract, injected into every loop \
-         session (boot, budgets, work, handoff, stuck, queue). Don't edit casually.\n\
+         - `protocol.md` — the fixed operating contract, injected into every \
+         single-agent loop session (boot, budgets, work, handoff, stuck, queue). \
+         Don't edit casually.\n\
+         - `protocol-fleet.md` — the fleet-member variant of the protocol: identical \
+         through step 6, but step 7 does NOT self-pull (the orchestrator owns the \
+         queue and claims each member's next part). Injected into fleet members.\n\
          - `session-policy.md` — the two budget numbers + value-max strategy. Tune here.\n\
          - `backlog/` — the work queue: milestones (→ ordered slices) and standalone \
          tasks. Status + order live in the managed queue table in `backlog/CLAUDE.md`.\n\
@@ -309,6 +323,7 @@ mod tests {
     fn paths_are_lowercase_pillar_relative() {
         assert_eq!(pillar_claude(), "growlight/CLAUDE.md");
         assert_eq!(protocol_md(), "growlight/protocol.md");
+        assert_eq!(protocol_fleet_md(), "growlight/protocol-fleet.md");
         assert_eq!(session_policy_md(), "growlight/session-policy.md");
         assert_eq!(backlog_claude(), "growlight/backlog/CLAUDE.md");
         assert_eq!(baton_log_claude(), "growlight/baton-log/CLAUDE.md");
@@ -322,7 +337,7 @@ mod tests {
     fn routing_stubs_map_their_children() {
         let pillar = pillar_claude_stub();
         assert!(pillar.starts_with("# growlight/\n"));
-        for child in ["protocol.md", "session-policy.md", "backlog/", "baton-log/"] {
+        for child in ["protocol.md", "protocol-fleet.md", "session-policy.md", "backlog/", "baton-log/"] {
             assert!(pillar.contains(child), "pillar map missing {child}");
         }
         // Navigators carry no reviewed stamp.

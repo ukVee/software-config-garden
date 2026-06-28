@@ -106,6 +106,10 @@ impl BatonStatusSource for FsBatonStore {
 /// reads — growlightd does not embed them, matching the single-agent reseed where
 /// the agent fills them in on its first iteration).
 fn seed_baton(garden_name: &str, agent: &str, queue: &str, part: &str) -> String {
+    // The full status vocabulary, sourced from the single shared list so the seed
+    // can never drift from the classifier (cosmetic gap #3). A fleet member may
+    // legitimately write any of these.
+    let statuses = softfig_ipc::baton::STATUS_VOCABULARY.join(" / ");
     format!(
         "---\n\
          loop: {garden_name}\n\
@@ -121,8 +125,10 @@ fn seed_baton(garden_name: &str, agent: &str, queue: &str, part: &str) -> String
          Read its spec (the item doc under `growlight/backlog/`) and the protocol injected\n\
          above, reseed this baton from that spec (mission + finish criteria + the first\n\
          slice/step), then execute one coherent chunk of work. Hand off by rewriting THIS\n\
-         baton: set `status:` to a terminal value (`ITEM_COMPLETE` / `QUEUE_EMPTY` /\n\
-         `BLOCKED_ON_HUMAN`) when appropriate, else `IN_PROGRESS`.\n\n\
+         baton: set `status:` to the right value from the growlight baton vocabulary\n\
+         ({statuses}) — `IN_PROGRESS` carries the SAME part forward; at an item boundary\n\
+         (`ITEM_COMPLETE` / `ITEM_DEFERRED`) run `set_item_status` then EXIT and the\n\
+         orchestrator claims your next part (a fleet member never self-pulls).\n\n\
          # MISSION\n\
          Drive backlog item `{part}` to completion, handing off via this baton instead of\n\
          `/compact`.\n\n\
@@ -175,6 +181,21 @@ mod tests {
             view.next_action.is_some_and(|na| na.contains("001-foo") && na.contains("queue:build")),
             "NEXT ACTION names the assigned item + queue",
         );
+    }
+
+    #[test]
+    fn seed_next_action_enumerates_the_full_status_vocabulary() {
+        // Cosmetic gap #3: the seed lists EVERY status an agent may write, sourced
+        // from the shared `softfig-ipc` vocabulary so it can't drift.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a1", "default", "t1").expect("seeds");
+        let na = parse_baton(&fs::read_to_string(s.baton_path("a1")).unwrap())
+            .next_action
+            .expect("seed has a NEXT ACTION");
+        for status in softfig_ipc::baton::STATUS_VOCABULARY {
+            assert!(na.contains(status), "NEXT ACTION must list {status}");
+        }
     }
 
     #[test]

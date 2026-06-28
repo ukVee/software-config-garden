@@ -86,6 +86,26 @@ pub fn classify_status(status: Option<&str>) -> BatonDisposition {
     }
 }
 
+/// Every `status:` value a loop session may legitimately write in its handoff
+/// baton, in lifecycle order — the within-item continue, the two item boundaries,
+/// then the three stops/parks. This is the ONE source of truth for any doc,
+/// prompt, or seed that *enumerates* the vocabulary (the growlightd seed baton's
+/// NEXT ACTION builds its list from here), so the enumeration can never drift from
+/// [`classify_status`] — every entry is a status `classify_status` recognizes (the
+/// round-trip is asserted in the tests). `STUCK` is the *named* member of the
+/// catch-all [`BatonDisposition::Stuck`] bucket; an unrecognized status also
+/// classifies as `Stuck` but is not part of the vocabulary an agent is told to
+/// write.
+pub const STATUS_VOCABULARY: &[&str] = &[
+    "IN_PROGRESS",
+    "ITEM_COMPLETE",
+    "ITEM_DEFERRED",
+    "QUEUE_EMPTY",
+    "HALTED_RATE_LIMIT",
+    "BLOCKED_ON_HUMAN",
+    "STUCK",
+];
+
 /// The fields a reader pulls from the runtime baton each iteration: the
 /// terminal-status signal plus the progress signal (item / iteration / NEXT
 /// ACTION) the single-agent spin guard keys off.
@@ -235,5 +255,45 @@ mod tests {
         // The view method agrees with the free function.
         let v = parse_baton("---\nstatus: QUEUE_EMPTY\n---\n");
         assert_eq!(v.classify(), BatonDisposition::QueueEmpty);
+    }
+
+    #[test]
+    fn status_vocabulary_stays_in_step_with_the_classifier() {
+        // Every vocabulary entry is a status the classifier recognizes: only the
+        // named `STUCK` lands in the catch-all Stuck bucket; the rest map to a
+        // concrete disposition (an UNrecognized status would also be Stuck, but is
+        // not in the vocabulary). This is the anti-drift guard: a new status added
+        // here that the classifier doesn't recognize fails the loop below.
+        for &s in STATUS_VOCABULARY {
+            let d = classify_status(Some(s));
+            if s == "STUCK" {
+                assert_eq!(d, BatonDisposition::Stuck("STUCK".to_string()));
+            } else {
+                assert_ne!(d, BatonDisposition::Stuck(s.to_string()), "{s} must be recognized");
+            }
+        }
+
+        // And the vocabulary covers EVERY disposition variant at least once, so a
+        // new `BatonDisposition` can't be added without a status that yields it.
+        let mut seen_continue = false;
+        let mut seen_boundary = false;
+        let mut seen_queue_empty = false;
+        let mut seen_rate_limited = false;
+        let mut seen_blocked = false;
+        let mut seen_stuck = false;
+        for &s in STATUS_VOCABULARY {
+            match classify_status(Some(s)) {
+                BatonDisposition::Continue => seen_continue = true,
+                BatonDisposition::ItemBoundary => seen_boundary = true,
+                BatonDisposition::QueueEmpty => seen_queue_empty = true,
+                BatonDisposition::RateLimited => seen_rate_limited = true,
+                BatonDisposition::BlockedOnHuman => seen_blocked = true,
+                BatonDisposition::Stuck(_) => seen_stuck = true,
+            }
+        }
+        assert!(
+            seen_continue && seen_boundary && seen_queue_empty && seen_rate_limited && seen_blocked && seen_stuck,
+            "the vocabulary must cover every disposition variant",
+        );
     }
 }
