@@ -331,6 +331,13 @@ pub enum RerollOutcome {
         /// Earliest Unix-seconds the re-roll may spawn.
         not_before: i64,
     },
+    /// The member's queue has no workable part right now (the queue-gate) — held,
+    /// not re-rolled into an empty queue. It keeps its slot and is retried when
+    /// queued work reappears (the respawn half of the empty-queue spin fix).
+    HeldNoWork {
+        /// The held agent's id.
+        agent: String,
+    },
     /// A budget/rate rail refused the re-roll (the cap never gates a roll).
     HeldForAdmission {
         /// The held agent's id.
@@ -347,6 +354,26 @@ pub enum RerollOutcome {
     },
 }
 
+/// Why a cleanly-exited member is **parked** — kept in the fleet (it holds its
+/// concurrency slot) but not immediately re-rolled. The reason decides whether
+/// [`tick`](Supervisor::tick) may auto-resume it:
+///
+/// - [`RateLimited`](ParkReason::RateLimited) is a *transient* park: the member
+///   hit `HALTED_RATE_LIMIT`, so it stays a re-roll candidate but admission's rate
+///   /budget gate holds it every tick until the window recovers, at which point
+///   `tick` re-rolls it automatically (the timed re-arm — "work till the limit,
+///   then resume when it restores"). No human needed.
+/// - [`Human`](ParkReason::Human) is a *sticky* park: `STUCK` / `BLOCKED_ON_HUMAN`
+///   (or an unrecognized status) needs a person, so `tick` never re-rolls it on
+///   its own — it is excluded from the candidate set until a human clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkReason {
+    /// `HALTED_RATE_LIMIT` — auto-re-armed by `tick` once admission recovers.
+    RateLimited,
+    /// `STUCK` / `BLOCKED_ON_HUMAN` / unrecognized — never auto-re-armed.
+    Human,
+}
+
 /// One supervised agent's live state.
 #[derive(Debug)]
 struct Supervised {
@@ -357,11 +384,13 @@ struct Supervised {
     consecutive_failures: u32,
     /// Earliest Unix-seconds the next re-roll may spawn.
     not_before: i64,
-    /// Parked on a terminal baton (`HALTED_RATE_LIMIT` until reset, or a
-    /// `STUCK`/`BLOCKED_ON_HUMAN` pending a human) — kept in the fleet but skipped
-    /// by [`tick`](Supervisor::tick) so it is never re-rolled while parked. The
-    /// `QUEUE_EMPTY` case does not park; it retires (leaves the fleet entirely).
-    parked: bool,
+    /// Parked on a terminal baton — kept in the fleet (still holds its slot) but
+    /// handled per [`ParkReason`]: a `RateLimited` park stays a re-roll candidate
+    /// (admission holds it until its window recovers, then `tick` re-arms it); a
+    /// `Human` park is excluded from re-rolls until a person clears it. `None` is
+    /// the normal running / awaiting-re-roll state. The `QUEUE_EMPTY` case never
+    /// parks; it retires (leaves the fleet entirely).
+    park: Option<ParkReason>,
 }
 
 /// The fleet supervisor: owns the spawn seam, the admission governor, and the
@@ -399,9 +428,24 @@ impl Supervisor {
         }
     }
 
-    /// Agents with a live child right now (the fleet size admission gates on).
+    /// Agents with a live child right now (a real running `claude -p`).
     pub fn live_count(&self) -> u32 {
         self.agents.values().filter(|s| s.child.is_some()).count() as u32
+    }
+
+    /// **Committed** roster slots — every registered member, whether it is live,
+    /// awaiting a re-roll (down, inside a crash backoff), or parked. This, not
+    /// [`live_count`](Self::live_count), is what the per-device concurrency cap
+    /// gates a fresh [`Intent::Start`] on: a member that is momentarily down still
+    /// *owns* its slot (it will reclaim it on its next re-roll), so counting only
+    /// live children would let a fresh start fill that transiently-empty slot and
+    /// then overshoot the cap the instant the down member re-rolls. Counting
+    /// committed slots reserves them, so concurrency can never exceed the cap
+    /// regardless of the order claims/spawns/re-rolls interleave within a tick (the
+    /// atomic-`max_agents` invariant — fleet-loop-spin slice 003). A retired
+    /// (`QUEUE_EMPTY`) member has left `agents`, so it frees its slot.
+    pub fn committed_count(&self) -> u32 {
+        self.agents.len() as u32
     }
 
     /// The admission governor's current per-device [`Policy`] — so the drive loop
@@ -498,7 +542,11 @@ impl Supervisor {
     where
         F: FnOnce() -> Result<(), String>,
     {
-        let fleet = self.live_count();
+        // Gate the cap on COMMITTED slots, not just live children: a member that is
+        // momentarily down (awaiting a re-roll / inside a backoff) still owns its
+        // slot, so counting it here reserves that slot and keeps a fresh start from
+        // transiently overshooting the cap (the atomic-`max_agents` invariant).
+        let fleet = self.committed_count();
         match self.governor.decide(Intent::Start, fleet, budget, rate) {
             AdmissionDecision::Admit => match claim() {
                 Ok(()) => match self.backend.spawn(&spec) {
@@ -510,7 +558,7 @@ impl Supervisor {
                                 child: Some(child),
                                 consecutive_failures: 0,
                                 not_before: now,
-                                parked: false,
+                                park: None,
                             },
                         );
                         StartOutcome::Started
@@ -608,11 +656,13 @@ impl Supervisor {
                 PollOutcome::Retired
             }
             BatonDisposition::RateLimited => {
-                self.park(agent);
+                // Transient: keep it a re-roll candidate, but admission's rate gate
+                // holds it until the window recovers, when `tick` re-arms it.
+                self.park(agent, ParkReason::RateLimited);
                 PollOutcome::ParkedRateLimited
             }
             BatonDisposition::BlockedOnHuman | BatonDisposition::Stuck(_) => {
-                self.park(agent);
+                self.park(agent, ParkReason::Human);
                 PollOutcome::Parked {
                     event: NotifyEvent::AgentCrashed {
                         agent: agent.to_string(),
@@ -634,30 +684,52 @@ impl Supervisor {
         PollOutcome::Rolling
     }
 
-    /// Park a cleanly-exited member: drop the dead handle and flag it parked so
-    /// [`tick`](Self::tick) skips its re-roll. It keeps its slot (still registered)
-    /// until a human / the budget governor clears it.
-    fn park(&mut self, agent: &str) {
+    /// Park a cleanly-exited member with its [`ParkReason`]: drop the dead handle
+    /// and record why it parked. It keeps its slot (still registered). A `Human`
+    /// park is skipped by [`tick`](Self::tick) until a person clears it; a
+    /// `RateLimited` park stays a candidate that admission holds until its window
+    /// recovers (then `tick` re-arms it).
+    fn park(&mut self, agent: &str, reason: ParkReason) {
         if let Some(sup) = self.agents.get_mut(agent) {
             sup.child = None;
-            sup.parked = true;
+            sup.park = Some(reason);
         }
     }
 
     /// Perform any due re-rolls ([`Intent::Roll`]). For each registered agent with
-    /// no live child: held if still inside its backoff window; else admission-gated
-    /// (cap never gates a roll, budget/rate do); on admit the backend re-spawns it.
-    /// A failed re-spawn bumps the streak and backs off. Returns one outcome per
-    /// candidate; running agents produce nothing.
-    pub fn tick(&mut self, budget: BudgetUsage, rate: RateState, now: i64) -> Vec<RerollOutcome> {
+    /// no live child: held if still inside its backoff window; held if its queue has
+    /// no workable part (`workable(agent)` is `false` — the queue-gate, so a
+    /// clean-exit member is never re-rolled into an empty queue); else
+    /// admission-gated (cap never gates a roll, budget/rate do); on admit the
+    /// backend re-spawns it. A failed re-spawn bumps the streak and backs off.
+    /// Returns one outcome per candidate; running agents produce nothing.
+    ///
+    /// `workable` answers "does this agent have a pickable part right now?" — the
+    /// drive loop builds it from the same pinned-with-fallback [`crate::scheduler::pick`]
+    /// a fresh start uses, over this tick's queue snapshot. It is the belt-and-
+    /// suspenders to slice 001's terminal-status retire: even a member that exited
+    /// on a *continue* status is not respawned if its queue has since drained.
+    ///
+    /// A [`ParkReason::RateLimited`] member IS a candidate: admission's rate/budget
+    /// gate holds it (a [`RerollOutcome::HeldForAdmission`]) every tick until its
+    /// window recovers, at which point this re-roll re-arms it and clears the park
+    /// — the timed re-arm. A [`ParkReason::Human`] member is excluded entirely
+    /// (only a person resumes it).
+    pub fn tick(
+        &mut self,
+        budget: BudgetUsage,
+        rate: RateState,
+        now: i64,
+        workable: &dyn Fn(&str) -> bool,
+    ) -> Vec<RerollOutcome> {
         let candidates: Vec<String> = self
             .agents
             .iter()
-            // A parked member (terminal baton: rate-limited / pending-human) keeps
-            // its slot but is NOT re-rolled — skipping it here is what stops the
-            // spin. Only a member awaiting a *re-roll* (down, not parked) is a
-            // candidate.
-            .filter(|(_, s)| s.child.is_none() && !s.parked)
+            // Down members only (a live child is left running). A `Human` park is
+            // skipped until a person clears it; a `RateLimited` park stays a
+            // candidate so admission can re-arm it when its window recovers. Not
+            // re-rolling a `Human`-parked member is what stops the spin.
+            .filter(|(_, s)| s.child.is_none() && !matches!(s.park, Some(ParkReason::Human)))
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -668,8 +740,16 @@ impl Supervisor {
                 out.push(RerollOutcome::HeldForBackoff { agent, not_before });
                 continue;
             }
+            // Queue-gate: never re-roll a member whose queue has no workable part —
+            // that is the respawn-into-an-empty-queue half of the spin. It stays
+            // registered (slot reserved) and is retried when work reappears.
+            if !workable(&agent) {
+                out.push(RerollOutcome::HeldNoWork { agent });
+                continue;
+            }
             // A roll keeps the agent's slot — the cap never gates it — but the
-            // shared budget/rate rails still do.
+            // shared budget/rate rails still do (and hold a rate-limited park here
+            // until its window recovers).
             let fleet = self.live_count();
             let decision = self.governor.decide(Intent::Roll, fleet, budget, rate);
             if !decision.is_admit() {
@@ -681,6 +761,8 @@ impl Supervisor {
                 Ok(child) => {
                     let sup = self.agents.get_mut(&agent).expect("candidate exists");
                     sup.child = Some(child);
+                    // Re-armed: a successful re-roll clears any rate-limit park.
+                    sup.park = None;
                     out.push(RerollOutcome::Rerolled { agent });
                 }
                 Err(e) => {
@@ -773,6 +855,22 @@ mod tests {
             tpm_per_agent: 20_000,
             rpm_per_agent: 10,
         }
+    }
+
+    /// A rate window with no headroom — admission refuses a roll (the agent's
+    /// share would cross the per-minute limit). Models "still rate-limited".
+    fn hot_rate() -> RateState {
+        RateState {
+            tpm_used: 90_000, // 90k + 20k/agent > 100k limit → would exceed
+            ..fresh_rate()
+        }
+    }
+
+    /// The default queue-gate for the re-roll tests: every agent always has
+    /// workable work, so `tick` behaves as it did before the queue-gate. Tests
+    /// that exercise the gate pass their own predicate.
+    fn any_work(_: &str) -> bool {
+        true
     }
 
     fn spec(id: &str) -> AgentSpec {
@@ -914,7 +1012,7 @@ mod tests {
         assert_eq!(backend.spawn_count(), 1, "no re-spawn for a healthy agent");
         assert_eq!(backend.kill_count(), 0, "no kill for a healthy agent");
         // tick has no candidate (the child is live).
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1000).is_empty());
+        assert!(s.tick(fresh_budget(), fresh_rate(), 1000, &any_work).is_empty());
     }
 
     /// An errored exit is detected as a crash, alerts, and re-rolls only after the
@@ -942,7 +1040,7 @@ mod tests {
 
         // Inside the backoff window → held, no re-spawn.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 1),
+            s.tick(fresh_budget(), fresh_rate(), 1, &any_work),
             vec![RerollOutcome::HeldForBackoff {
                 agent: "a1".into(),
                 not_before: 2
@@ -952,7 +1050,7 @@ mod tests {
 
         // At the backoff boundary → admission admits the roll → re-spawn.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 2),
+            s.tick(fresh_budget(), fresh_rate(), 2, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
@@ -1010,7 +1108,7 @@ mod tests {
             // Advance to the boundary and let it re-roll for the next crash.
             now = not_before;
             assert_eq!(
-                s.tick(fresh_budget(), fresh_rate(), now),
+                s.tick(fresh_budget(), fresh_rate(), now, &any_work),
                 vec![RerollOutcome::Rerolled { agent: "a1".into() }]
             );
         }
@@ -1027,7 +1125,7 @@ mod tests {
         // Build up a failure streak first.
         s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0);
         assert_eq!(s.failures("a1"), 1);
-        s.tick(fresh_budget(), fresh_rate(), 2); // re-roll
+        s.tick(fresh_budget(), fresh_rate(), 2, &any_work); // re-roll
 
         // Now a clean exit at t=10 with no baton signal (the slice-002 precondition):
         // immediate re-roll, streak cleared, no alert.
@@ -1037,7 +1135,7 @@ mod tests {
         );
         assert_eq!(s.failures("a1"), 0, "a clean run clears the streak");
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10),
+            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
             "no backoff wait after a clean exit"
         );
@@ -1054,7 +1152,7 @@ mod tests {
 
         // Past the backoff window but the budget is hot → held on admission.
         assert_eq!(
-            s.tick(hot_budget(), fresh_rate(), 5),
+            s.tick(hot_budget(), fresh_rate(), 5, &any_work),
             vec![RerollOutcome::HeldForAdmission {
                 agent: "a1".into(),
                 decision: AdmissionDecision::Refuse {
@@ -1066,7 +1164,7 @@ mod tests {
 
         // Budget recovers → the roll is admitted (the cap is irrelevant to a roll).
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 6),
+            s.tick(fresh_budget(), fresh_rate(), 6, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert!(s.is_running("a1"));
@@ -1082,7 +1180,7 @@ mod tests {
 
         // Backend now refuses to launch.
         backend.set_fail(true);
-        let out = s.tick(fresh_budget(), fresh_rate(), 2);
+        let out = s.tick(fresh_budget(), fresh_rate(), 2, &any_work);
         assert_eq!(
             out,
             vec![RerollOutcome::SpawnFailed {
@@ -1095,7 +1193,7 @@ mod tests {
 
         // Still held inside the grown backoff (delay(2) == 4 → not_before 6).
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 5),
+            s.tick(fresh_budget(), fresh_rate(), 5, &any_work),
             vec![RerollOutcome::HeldForBackoff {
                 agent: "a1".into(),
                 not_before: 6
@@ -1105,7 +1203,7 @@ mod tests {
         // Backend recovers → the retry re-rolls.
         backend.set_fail(false);
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 6),
+            s.tick(fresh_budget(), fresh_rate(), 6, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
     }
@@ -1243,7 +1341,7 @@ mod tests {
 
         // The whole point: no re-roll. A tick well past any backoff spawns nothing.
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty(),
+            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a retired member is never a re-roll candidate"
         );
         assert_eq!(backend.spawn_count(), 1, "NO fresh claude -p on a drained queue");
@@ -1269,7 +1367,7 @@ mod tests {
         assert!(s.is_registered("a1"), "a parked member keeps its slot");
         assert!(!s.is_running("a1"));
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty(),
+            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a parked member is skipped by tick"
         );
         assert_eq!(backend.spawn_count(), 1, "no re-roll of a stuck member");
@@ -1291,27 +1389,114 @@ mod tests {
             }
         );
         assert!(s.is_registered("a1"));
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty());
+        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
     }
 
-    /// A `HALTED_RATE_LIMIT` baton parks WITHOUT an alert (a transient halt the
-    /// budget governor resumes) — and is not re-rolled while parked.
+    /// A `HALTED_RATE_LIMIT` baton parks WITHOUT an alert (a transient halt), is
+    /// held by admission while the window is still hot, and is **auto-re-armed** by
+    /// `tick` the moment the rate window recovers — no human, no restart. This is
+    /// the "work till the limit, then resume when it restores" behaviour (slice
+    /// 003's timed re-arm).
     #[test]
-    fn a_rate_limited_baton_parks_without_an_alert() {
+    fn a_rate_limited_baton_parks_then_re_arms_when_the_window_recovers() {
         let backend = FakeBackend::new();
         let mut s = sup(Arc::clone(&backend));
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
 
+        // The rate-limit baton parks it without an alert, slot kept.
         assert_eq!(
             s.poll("a1", AgentHealth::Exited { code: 0 }, Some("HALTED_RATE_LIMIT"), 10),
             PollOutcome::ParkedRateLimited
         );
         assert!(s.is_registered("a1"), "a rate-parked member keeps its slot");
+        assert!(!s.is_running("a1"));
+
+        // While the window is still hot, the re-arm is HELD by admission — no
+        // respawn (it does not spin against the limit).
+        let held = s.tick(hot_budget(), hot_rate(), 1_000, &any_work);
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000).is_empty(),
-            "a rate-parked member is not re-rolled (slice 003 re-arms it on reset)"
+            matches!(held.as_slice(), [RerollOutcome::HeldForAdmission { agent, .. }] if agent == "a1"),
+            "a rate-parked member is held, not re-rolled, while the window is hot: {held:?}",
         );
-        assert_eq!(backend.spawn_count(), 1);
+        assert_eq!(backend.spawn_count(), 1, "no respawn while still throttled");
+
+        // The window recovers → tick re-arms it (re-rolls) and clears the park.
+        let armed = s.tick(fresh_budget(), fresh_rate(), 2_000, &any_work);
+        assert_eq!(
+            armed,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "the rate-parked member is auto-re-armed once the window recovers",
+        );
+        assert!(s.is_running("a1"), "re-armed → running again");
+        assert_eq!(backend.spawn_count(), 2);
+    }
+
+    /// The queue-gate: a clean-exit member awaiting a re-roll is NOT re-rolled when
+    /// its queue has no workable part (`workable` is false) — it is held and keeps
+    /// its slot, so it never respawns `claude -p` into a drained queue (the respawn
+    /// half of the empty-queue spin fix). When work reappears it re-rolls.
+    #[test]
+    fn the_re_roll_is_queue_gated_no_workable_part_holds() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        // A continue-status clean exit arms a re-roll (child down, registered).
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("IN_PROGRESS"), 10),
+            PollOutcome::Rolling
+        );
+
+        // Queue empty for this agent → held, not re-rolled.
+        let no_work = |_: &str| false;
+        let held = s.tick(fresh_budget(), fresh_rate(), 20, &no_work);
+        assert_eq!(
+            held,
+            vec![RerollOutcome::HeldNoWork { agent: "a1".into() }],
+            "no workable part ⇒ the re-roll is held, not spawned",
+        );
+        assert_eq!(backend.spawn_count(), 1, "no respawn into an empty queue");
+        assert!(s.is_registered("a1"), "the member keeps its slot");
+
+        // Work reappears → it re-rolls.
+        let armed = s.tick(fresh_budget(), fresh_rate(), 21, &any_work);
+        assert_eq!(armed, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawn_count(), 2);
+    }
+
+    /// Atomic `max_agents`: a fresh start is gated on the COMMITTED roster, not just
+    /// live children, so a slot reserved by a member that is momentarily down
+    /// (here: inside a crash backoff) cannot be transiently filled by a fresh start
+    /// and then overshot when the down member re-rolls. With cap 1, while a1 backs
+    /// off, a2 is Queued — never two concurrent.
+    #[test]
+    fn a_fresh_start_never_overshoots_the_cap_while_a_member_is_down() {
+        let backend = FakeBackend::new();
+        // Cap 1: at most one concurrent agent.
+        let policy = Policy {
+            max_concurrent_agents: 1,
+            ..Policy::default()
+        };
+        let mut s = Supervisor::with_backoff(
+            Box::new(Arc::clone(&backend)),
+            AdmissionGovernor::new(policy),
+            Backoff { base_secs: 10, cap_secs: 100 },
+            100,
+        );
+        // a1 starts and then crashes → down, registered, inside its backoff window.
+        assert_eq!(s.start(spec("a1"), fresh_budget(), fresh_rate(), 0), StartOutcome::Started);
+        s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0); // crash → not_before = 10
+        assert!(!s.is_running("a1"), "a1 is down, awaiting its backoff re-roll");
+        assert_eq!(s.committed_count(), 1, "a1 still OWNS its slot while down");
+
+        // A fresh a2 must be QUEUED — the committed cap is full even though no
+        // child is live right now. (With the old live_count gate this admitted a2,
+        // and a1's later re-roll then made TWO concurrent against cap 1.)
+        assert_eq!(
+            s.start(spec("a2"), fresh_budget(), fresh_rate(), 1),
+            StartOutcome::Queued { active: 1, cap: 1 },
+            "a slot reserved by a down member is not stolen by a fresh start",
+        );
+        assert_eq!(s.committed_count(), 1, "a2 was not registered");
     }
 
     /// A continue-status baton (`IN_PROGRESS`) still re-rolls — the loop keeps the
@@ -1329,7 +1514,7 @@ mod tests {
         assert!(s.is_registered("a1"));
         // No backoff after a clean exit → an immediate re-roll.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10),
+            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "a continue baton re-rolls");

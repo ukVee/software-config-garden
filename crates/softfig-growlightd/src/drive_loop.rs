@@ -568,21 +568,42 @@ impl DriveLoop {
             }
         }
 
-        // 2. Re-roll due agents ([`Intent::Roll`]). `pause` is the admission gate
-        //    (spec §8): a paused fleet attempts no rolls (and no starts, below).
-        if !paused {
-            report.rerolls = self.supervisor.tick(budget, rate, now);
-        }
-
-        // 3. Schedule + claim + admit + spawn. Read the snapshot once into a
-        //    LOCAL working copy (`mut snapshot`): each successful claim stamps the
-        //    part `active` in THAT copy (`mark_claimed`) so a later member's `pick`
-        //    in the SAME tick flows past it — the intra-tick half of the
-        //    double-assignment fix. keeperd's committed `active` write (the claim
-        //    itself) is the cross-tick half: the next tick's snapshot shows the
-        //    part claimed, so every other agent's fallback skips it.
+        // Read this tick's queue snapshot ONCE, before the re-roll: BOTH the
+        // re-roll's queue-gate (step 2) and the fresh-start claim (step 3) consult
+        // it, so they share one consistent view. Step 3 mutates a working copy
+        // (`mark_claimed`) as it claims; step 2 only reads it through `workable`.
         let mut snapshot = self.queues.snapshot();
         report.parked = parked(&snapshot);
+
+        // 2. Re-roll due agents ([`Intent::Roll`]). `pause` is the admission gate
+        //    (spec §8): a paused fleet attempts no rolls (and no starts, below).
+        //    The re-roll is ALSO queue-gated — a member is re-rolled only if its
+        //    pinned-with-fallback `pick` still yields a workable part, so a clean
+        //    exit is never respawned into a drained queue (belt-and-suspenders to
+        //    slice 001's terminal-status retire).
+        if !paused {
+            // Map each configured member to its pin so the queue-gate can ask "is
+            // there workable work for this agent?" via the same `pick` a fresh
+            // start uses. A member not in the configured fleet (shouldn't happen)
+            // is treated as having no work, so it is never blindly re-rolled.
+            let pins: std::collections::BTreeMap<&str, Option<&str>> = fleet
+                .iter()
+                .map(|m| (m.spec.agent.as_str(), m.pin.as_deref()))
+                .collect();
+            let snap = &snapshot;
+            let workable = |agent: &str| -> bool {
+                pins.get(agent).is_some_and(|pin| pick(snap, *pin).is_some())
+            };
+            report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
+        }
+
+        // 3. Schedule + claim + admit + spawn over the snapshot read above. Each
+        //    successful claim stamps the part `active` in the LOCAL working copy
+        //    (`mark_claimed`) so a later member's `pick` in the SAME tick flows
+        //    past it — the intra-tick half of the double-assignment fix. keeperd's
+        //    committed `active` write (the claim itself) is the cross-tick half:
+        //    the next tick's snapshot shows the part claimed, so every other
+        //    agent's fallback skips it.
         if !paused {
             // Parts already claimed THIS tick — belt-and-suspenders so the SAME
             // `(queue, part)` is never assigned twice in one tick even where
@@ -1445,6 +1466,127 @@ mod tests {
             "resume releases the re-roll",
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
+    }
+
+    /// Slice-003 (a): `pause` gates EVERY spawn path. A member that FINISHES on a
+    /// clean boundary (which would otherwise re-roll immediately) spawns nothing for
+    /// as long as the fleet is paused — across repeated ticks — then resuming
+    /// releases exactly one respawn. This is the smoke's "pause didn't stop the
+    /// spawns" regression, in its sharpest form (a clean finish, not a crash).
+    #[test]
+    fn paused_a_finished_member_never_respawns_until_resume() {
+        let (mut loop_, d, backend, _claimer, _queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued"), ("p2", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a1 starts on p1
+        assert_eq!(backend.spawn_count(), 1);
+
+        // Pause, THEN a1 finishes a slice on a continue boundary (it would re-roll).
+        d.inner.lock().unwrap().control.pause();
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+
+        // Many ticks while paused → not a single respawn (every spawn path gated).
+        for now in 1..=5 {
+            let r = loop_.tick(now);
+            assert!(r.paused, "tick {now} reports the paused gate");
+            assert!(
+                r.rerolls.is_empty() && r.started.is_empty(),
+                "tick {now}: paused fleet (re-)spawns nothing",
+            );
+        }
+        assert_eq!(backend.spawn_count(), 1, "paused: zero spawns across 5 ticks");
+
+        // Resume → the held re-roll finally fires (exactly once).
+        d.inner.lock().unwrap().control.resume();
+        let r = loop_.tick(6);
+        assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawn_count(), 2, "resume releases exactly one respawn");
+    }
+
+    /// Slice-003 (c): atomic `max_agents` at the loop level. With cap 1, while one
+    /// member is down inside its crash backoff (it still OWNS its slot), a second
+    /// member's fresh start stays QUEUED — concurrency never transiently exceeds the
+    /// cap, even though no child is live at the instant the start is considered.
+    /// (With the old live-child gate the start was admitted into the momentarily
+    /// empty slot, then the backing-off member re-rolled → TWO concurrent vs cap 1.)
+    #[test]
+    fn concurrency_never_exceeds_the_cap_while_a_member_backs_off() {
+        let policy = Policy {
+            max_concurrent_agents: 1,
+            ..Policy::default()
+        };
+        let (mut loop_, _d, backend, _claimer, _queues, _probe) = make_claiming(
+            vec![member("a1", "qa"), member("a2", "qb")],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            policy,
+        );
+
+        // Tick 0: only a1 starts (cap 1); a2 is held behind the cap.
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.started.len(), 1, "one start under cap 1");
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // a1 crashes → down, registered, inside its backoff window.
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        let r1 = loop_.tick(1);
+        assert!(
+            matches!(r1.rerolls.as_slice(), [RerollOutcome::HeldForBackoff { .. }]),
+            "a1 is down, held inside its backoff: {:?}",
+            r1.rerolls,
+        );
+        // a2 must STILL be queued — the down member's slot is reserved, not stolen.
+        assert!(
+            r1.started.is_empty(),
+            "a fresh start cannot fill the slot a backing-off member still owns",
+        );
+        assert!(
+            r1.held_starts
+                .iter()
+                .any(|h| h.agent == "a2" && matches!(h.outcome, StartOutcome::Queued { .. })),
+            "a2 stays queued behind the committed cap: {:?}",
+            r1.held_starts,
+        );
+        assert_eq!(backend.spawn_count(), 1, "never two concurrent against cap 1");
+    }
+
+    /// Slice-003 (2): the re-roll's queue-gate at the loop level. A member that
+    /// exits on a CONTINUE status but whose queue has since DRAINED is held
+    /// (`HeldNoWork`), not respawned into an empty queue — the belt-and-suspenders
+    /// to slice 001's `QUEUE_EMPTY` retire. When queued work reappears it re-rolls.
+    #[test]
+    fn a_continue_exit_into_a_drained_queue_is_held_not_re_rolled() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a1 starts on p1
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 exits on a CONTINUE status, but its queue drained in the meantime
+        // (the item finished `done`, nothing else queued).
+        queues.set(vec![q("qa", &[("p1", "done")])]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.rerolls,
+            vec![RerollOutcome::HeldNoWork { agent: "a1".into() }],
+            "a continue-status exit into a drained queue is held, not respawned",
+        );
+        assert_eq!(backend.spawn_count(), 1, "no fresh claude -p into an empty queue");
+
+        // New queued work appears → it re-rolls.
+        queues.set(vec![q("qa", &[("p2", "queued")])]);
+        let r2 = loop_.tick(2);
+        assert_eq!(r2.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawn_count(), 2, "work reappears → the member re-rolls");
     }
 
     /// An immediate-stop (force_stop hard kill) retiring agent that is still alive
