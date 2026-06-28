@@ -60,16 +60,18 @@ pub fn fleet_enabled(garden_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// On an unlock/resume: `systemctl --user start softfig-growlightd` iff the
-/// in-garden gate is on. Idempotent (systemd no-ops an already-active unit, so a
-/// relock resume re-firing this is harmless). A disabled gate ensures the unit is
-/// *not* started (we never `stop` here — a live-disable takes effect at the next
-/// cycle via the lock-side stop; see the decision doc's locked-decision 6).
+/// On an unlock/resume: bring the growlightd unit into line with the in-garden
+/// `fleet_enabled` gate — **start** it if the gate is on, **ensure it is stopped**
+/// if the gate is off. The stop half is what makes a *live disable* take effect:
+/// flip `fleet_enabled` true→false, and the next unlock/`daemon cycle` re-reads
+/// the gate here and stops the unit (locked-decision 6). Idempotent in both
+/// directions (systemd no-ops an already-active start / already-stopped stop), so
+/// a relock resume re-firing this is harmless.
 ///
 /// No-op unless supervision is enabled in the config — so only the real keeperd
 /// binary ever shells `systemctl`. Best-effort: a `systemctl` failure is logged,
 /// never fatal to the unlock.
-pub fn start_if_enabled(daemon: &Daemon) {
+pub fn apply_fleet_gate(daemon: &Daemon) {
     let (supervise, garden_root) = {
         let inner = daemon.inner.lock().unwrap();
         (
@@ -80,19 +82,76 @@ pub fn start_if_enabled(daemon: &Daemon) {
     if !supervise {
         return;
     }
-    if !fleet_enabled(&garden_root) {
-        return; // gate off ⇒ leave the fleet down
+    // `unit_is_active` is only consulted on the gate-off path (lazy), so a normal
+    // gate-on unlock doesn't pay for it.
+    match gate_action(fleet_enabled(&garden_root), unit_is_active) {
+        GateAction::Start => start_unit(),
+        GateAction::Stop => {
+            eprintln!("keeperd: fleet disabled — stopping {GROWLIGHTD_UNIT}");
+            spawn_stop();
+        }
+        GateAction::Noop => {}
     }
-    // `start` is fast (Type=simple); wait for it so we can log a real failure.
+}
+
+/// What [`apply_fleet_gate`] does, factored pure for testing.
+#[derive(Debug, PartialEq, Eq)]
+enum GateAction {
+    /// Gate on ⇒ start (idempotent if already active).
+    Start,
+    /// Gate off but the unit is still up ⇒ a live disable: stop it.
+    Stop,
+    /// Gate off and already down (the common disabled-fleet unlock) ⇒ nothing.
+    Noop,
+}
+
+/// Decide the gate action. `is_active` is a thunk so the (subprocess) liveness
+/// check is taken **only** on the gate-off branch — a gate-on unlock never runs it.
+fn gate_action(gate_on: bool, is_active: impl FnOnce() -> bool) -> GateAction {
+    if gate_on {
+        GateAction::Start
+    } else if is_active() {
+        GateAction::Stop
+    } else {
+        GateAction::Noop
+    }
+}
+
+/// `systemctl --user start softfig-growlightd` — fast (Type=simple), so we wait
+/// for it and log a real failure. Idempotent (systemd no-ops an active unit).
+fn start_unit() {
     match Command::new("systemctl")
         .args(["--user", "start", GROWLIGHTD_UNIT])
         .status()
     {
-        Ok(s) if s.success() => {
-            eprintln!("keeperd: fleet enabled — started {GROWLIGHTD_UNIT}");
-        }
+        Ok(s) if s.success() => eprintln!("keeperd: fleet enabled — started {GROWLIGHTD_UNIT}"),
         Ok(s) => eprintln!("keeperd: `systemctl --user start {GROWLIGHTD_UNIT}` exited {s}"),
         Err(e) => eprintln!("keeperd: could not start {GROWLIGHTD_UNIT} ({e})"),
+    }
+}
+
+/// `systemctl --user is-active --quiet <unit>` → true iff the unit is active.
+/// Lets the gate-off path skip a pointless stop on the common disabled-fleet
+/// unlock.
+fn unit_is_active() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", GROWLIGHTD_UNIT])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Spawn `systemctl --user stop <unit>` **without waiting**. `stop` blocks until
+/// the unit's graceful boundary exit (up to its `TimeoutStopSec`); that must
+/// never stall the caller — neither keeperd's own teardown (the 2026-06-21/22
+/// wedge class) nor a live unlock. systemd drives growlightd's graceful stop
+/// independently while the caller returns at once.
+fn spawn_stop() {
+    if let Err(e) = Command::new("systemctl")
+        .args(["--user", "stop", GROWLIGHTD_UNIT])
+        .spawn()
+    {
+        eprintln!("keeperd: could not stop {GROWLIGHTD_UNIT} ({e})");
     }
 }
 
@@ -101,26 +160,16 @@ pub fn start_if_enabled(daemon: &Daemon) {
 /// / `relock`) is a *resume*: leave growlightd running so it rides the keeperd
 /// bounce (locked-decision 5).
 ///
-/// `resume_pending` is computed by the caller while it still holds `inner`
-/// (it already inspects the relock blob there), so this function stays
-/// lock-free. Fire-and-forget: `systemctl --user stop` blocks until the unit's
-/// graceful boundary exit (up to its `TimeoutStopSec`), which must NOT stall
-/// keeperd's own teardown (the 2026-06-21/22 wedge class), so we **spawn without
-/// waiting** — systemd drives growlightd's graceful stop independently while
-/// keeperd's teardown returns at once.
+/// `resume_pending` is computed by the caller while it still holds `inner` (it
+/// already inspects the relock blob there), so this function stays lock-free.
 ///
 /// No-op unless supervision is enabled — only the real keeperd binary shells out.
 pub fn stop_on_terminal_lock(supervise: bool, resume_pending: bool) {
     if !supervise || resume_pending {
         return; // disabled, or a cycle is pending (resume) ⇒ leave it running
     }
-    match Command::new("systemctl")
-        .args(["--user", "stop", GROWLIGHTD_UNIT])
-        .spawn()
-    {
-        Ok(_) => eprintln!("keeperd: terminal lock — stopping {GROWLIGHTD_UNIT}"),
-        Err(e) => eprintln!("keeperd: could not stop {GROWLIGHTD_UNIT} ({e})"),
-    }
+    eprintln!("keeperd: terminal lock — stopping {GROWLIGHTD_UNIT}");
+    spawn_stop();
 }
 
 #[cfg(test)]
@@ -174,6 +223,25 @@ mod tests {
              [[fleet]]\nagent = \"a\"\npin = \"q\"\n",
         );
         assert!(fleet_enabled(dir.path()));
+    }
+
+    #[test]
+    fn gate_action_matrix() {
+        use std::cell::Cell;
+        // Gate on ⇒ Start, and the liveness thunk is NEVER consulted (no wasted
+        // subprocess on the common gate-on unlock).
+        let consulted = Cell::new(false);
+        let a = gate_action(true, || {
+            consulted.set(true);
+            true
+        });
+        assert_eq!(a, GateAction::Start);
+        assert!(!consulted.get(), "gate-on must not check liveness");
+
+        // Gate off + unit up ⇒ Stop (the live-disable path this fixes).
+        assert_eq!(gate_action(false, || true), GateAction::Stop);
+        // Gate off + unit already down ⇒ Noop (common disabled-fleet unlock).
+        assert_eq!(gate_action(false, || false), GateAction::Noop);
     }
 
     #[test]

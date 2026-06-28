@@ -94,7 +94,7 @@ pub fn unlock(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     drop(inner);
     apply_garden_config(daemon);
     start_net_if_enabled(daemon);
-    crate::growlight_unit::start_if_enabled(daemon);
+    crate::growlight_unit::apply_fleet_gate(daemon);
 
     Ok(serde_json::to_value(UnlockReply {
         state: State::Unlocked.label().to_string(),
@@ -361,9 +361,10 @@ pub fn relock_redeem(daemon: &Daemon, args: serde_json::Value) -> HandlerResult 
     drop(inner);
     apply_garden_config(daemon);
     start_net_if_enabled(daemon);
-    // Resume re-fires the idempotent start so a fleet that was (correctly) left
-    // running across the cycle is re-confirmed, and one that wasn't yet up arms now.
-    crate::growlight_unit::start_if_enabled(daemon);
+    // Resume re-applies the gate: a fleet left running across the cycle is
+    // re-confirmed (idempotent start), one not yet up arms now, and one whose gate
+    // was flipped off between cycles is stopped (live disable, locked-decision 6).
+    crate::growlight_unit::apply_fleet_gate(daemon);
 
     // Single-use: remove the blob + any persisted token now that it redeemed.
     crate::relock::remove_artifacts(&state_dir);
