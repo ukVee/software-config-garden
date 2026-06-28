@@ -16,25 +16,45 @@
 //! `journal/decisions/decision-growlight-fleet-loop-spin.md`: the fleet missing
 //! this read was the empty-queue spin.
 
-/// Baton statuses on which a loop keeps driving (re-invokes / re-rolls a fresh
-/// iteration). `ITEM_DEFERRED` is a clean handoff like `ITEM_COMPLETE` — the agent
-/// parked an item whose only gap is a manual smoketest it can't run (protocol
-/// step 7) and moved on, so the loop drives the next item rather than stopping.
+/// Whether `status` is a **within-item** continue — the agent handed off
+/// mid-part and the SAME part is still its work (`IN_PROGRESS`). This is the only
+/// status that re-rolls the same part with the curated baton carried forward.
+/// `ITEM_COMPLETE` / `ITEM_DEFERRED` are NOT within-item continues — they are
+/// item *boundaries* ([`BatonDisposition::ItemBoundary`]): the part is
+/// finished/deferred, so the fleet releases the member's slot and the
+/// orchestrator claims its next part (a member never self-pulls). The
+/// single-agent `--auto` driver, which has no orchestrator, keeps driving on both
+/// a continue and a boundary (it self-pulls the next item) — see
+/// [`BatonDisposition`].
 pub fn is_continue_status(status: &str) -> bool {
-    matches!(status, "IN_PROGRESS" | "ITEM_COMPLETE" | "ITEM_DEFERRED")
+    matches!(status, "IN_PROGRESS")
 }
 
 /// How a baton's terminal-status field classifies, independent of the budget
 /// governor and spin guard each reader layers on top. This is the shared
-/// "continue / terminal" decision both the single-agent driver and the fleet
-/// supervisor key off (the slice-001 spin fix). Each reader maps it to its own
-/// lifecycle: the `--auto` driver folds `QueueEmpty`/`Stuck` into a single
-/// terminal stop, while the fleet distinguishes them (retire-to-idle vs
-/// park-pending-human).
+/// "continue / boundary / terminal" decision both the single-agent driver and the
+/// fleet supervisor key off. Each reader maps it to its own lifecycle: the
+/// `--auto` driver folds `QueueEmpty`/`Stuck` into a single terminal stop and
+/// keeps driving on both `Continue` and `ItemBoundary` (it self-pulls the next
+/// item), while the fleet tells them apart — `Continue` re-rolls the SAME part,
+/// `ItemBoundary` releases the slot so the orchestrator claims the next part (the
+/// fleet-member-model fix), `QueueEmpty` retires to idle, a rate-limit parks, and
+/// a human-block/stuck parks pending a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatonDisposition {
-    /// `IN_PROGRESS` / `ITEM_COMPLETE` / `ITEM_DEFERRED` — keep driving.
+    /// `IN_PROGRESS` — a **within-item** handoff: the agent paused mid-part and
+    /// the same part is still its work. The fleet re-rolls the SAME part with the
+    /// member's curated baton carried forward (no re-claim, no re-seed); the
+    /// single-agent driver keeps driving.
     Continue,
+    /// `ITEM_COMPLETE` / `ITEM_DEFERRED` — an **item boundary**: the agent finished
+    /// or deferred its part (it already wrote `set_item_status`), so its current
+    /// part is done. The fleet **releases the member's slot** (drops it from the
+    /// supervisor) and the orchestrator claims + seeds its NEXT part through the
+    /// same double-assignment-safe handshake a fresh start uses — the member never
+    /// self-pulls. The single-agent `--auto` driver, which has no orchestrator,
+    /// treats this exactly like [`Continue`] and self-pulls the next item.
+    ItemBoundary,
     /// `QUEUE_EMPTY` — the queue is drained. Clean: the single-agent loop stops;
     /// the fleet retires the member to idle (no alert). The daemon stays resident
     /// and re-starts a member when new queued work appears.
@@ -60,6 +80,7 @@ pub fn classify_status(status: Option<&str>) -> BatonDisposition {
         "HALTED_RATE_LIMIT" => BatonDisposition::RateLimited,
         "BLOCKED_ON_HUMAN" => BatonDisposition::BlockedOnHuman,
         "QUEUE_EMPTY" => BatonDisposition::QueueEmpty,
+        "ITEM_COMPLETE" | "ITEM_DEFERRED" => BatonDisposition::ItemBoundary,
         s if is_continue_status(s) => BatonDisposition::Continue,
         s => BatonDisposition::Stuck(s.to_string()),
     }
@@ -183,9 +204,14 @@ mod tests {
 
     #[test]
     fn classify_maps_each_status_to_its_disposition() {
-        // Continue statuses.
-        for s in ["IN_PROGRESS", "ITEM_COMPLETE", "ITEM_DEFERRED"] {
-            assert_eq!(classify_status(Some(s)), BatonDisposition::Continue, "{s}");
+        // IN_PROGRESS is the only within-item continue (re-roll the SAME part).
+        assert_eq!(classify_status(Some("IN_PROGRESS")), BatonDisposition::Continue);
+        assert!(is_continue_status("IN_PROGRESS"));
+        // ITEM_COMPLETE / ITEM_DEFERRED are item BOUNDARIES, not within-item
+        // continues — the fleet releases the slot, it does not re-roll the part.
+        for s in ["ITEM_COMPLETE", "ITEM_DEFERRED"] {
+            assert_eq!(classify_status(Some(s)), BatonDisposition::ItemBoundary, "{s}");
+            assert!(!is_continue_status(s), "{s} is a boundary, not a within-item continue");
         }
         // The distinct terminal/park statuses the fleet must tell apart.
         assert_eq!(classify_status(Some("QUEUE_EMPTY")), BatonDisposition::QueueEmpty);

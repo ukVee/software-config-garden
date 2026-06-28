@@ -51,14 +51,19 @@
 //! - **A clean exit reads the agent's baton, then decides.** Exit code 0 is a
 //!   session that ended on its own baton boundary; the supervisor reads that
 //!   baton's terminal status (the shared [`softfig_ipc::baton`] vocabulary) and
-//!   maps it — a continue status (or no baton yet) re-rolls immediately (no
-//!   backoff, no alert, streak cleared); `QUEUE_EMPTY` **retires** the member to
-//!   idle (it leaves the fleet, so it is never re-rolled — the empty-queue spin
-//!   fix, [[decision-growlight-fleet-loop-spin]]); `HALTED_RATE_LIMIT` **parks**
-//!   it until its window resets; an agent-written `STUCK` / `BLOCKED_ON_HUMAN` /
-//!   unrecognized status **parks** it and surfaces an [`NotifyEvent::AgentCrashed`]
-//!   human alert. Deciding re-roll-vs-retire purely on the exit code — without
-//!   this read — is what spun `claude -p` on a drained queue.
+//!   maps it — a within-item continue (`IN_PROGRESS`, or no baton yet) re-rolls
+//!   the SAME part immediately (no backoff, no alert, streak cleared); an item
+//!   boundary (`ITEM_COMPLETE` / `ITEM_DEFERRED`) **releases the member's slot**
+//!   (it leaves the fleet, exactly like a retire) so the drive loop re-claims +
+//!   re-seeds its next part through the same handshake a fresh start uses — the
+//!   member never self-pulls (the fleet-member-model fix); `QUEUE_EMPTY`
+//!   **retires** the member to idle (it leaves the fleet, so it is never
+//!   re-rolled — the empty-queue spin fix, [[decision-growlight-fleet-loop-spin]]);
+//!   `HALTED_RATE_LIMIT` **parks** it until its window resets; an agent-written
+//!   `STUCK` / `BLOCKED_ON_HUMAN` / unrecognized status **parks** it and surfaces
+//!   an [`NotifyEvent::AgentCrashed`] human alert. Deciding re-roll-vs-retire
+//!   purely on the exit code — without this read — is what spun `claude -p` on a
+//!   drained queue.
 //! - **A healthy agent is left alone.** An alive child with a recent heartbeat
 //!   produces no action and no spawn.
 //!
@@ -288,6 +293,16 @@ pub enum PollOutcome {
     /// resident; when new queued work appears the drive loop re-starts a fresh
     /// member (the empty-queue spin fix, [[decision-growlight-fleet-loop-spin]]).
     Retired,
+    /// Exited cleanly on an `ITEM_COMPLETE` / `ITEM_DEFERRED` baton — the member
+    /// finished/deferred its current part and **released its slot**: dropped from
+    /// the fleet, exactly like [`Retired`](PollOutcome::Retired), EXCEPT the queue
+    /// still has work, so the drive loop's step-3 scheduler re-claims + re-seeds it
+    /// onto its NEXT workable part this same tick (the orchestrator owns
+    /// continuation; the member never self-pulls — the fleet-member-model fix). A
+    /// distinct outcome from `Retired` only so the caller can log an item boundary
+    /// apart from a drained queue; the lifecycle effect (release, re-pickable) is
+    /// identical.
+    Completed,
     /// Exited cleanly on a `HALTED_RATE_LIMIT` baton — parked (kept in the fleet,
     /// not re-rolled) until its rate window resets. No alert: a transient halt the
     /// budget governor resumes (slice 003 wires the timed re-arm).
@@ -630,16 +645,20 @@ impl Supervisor {
     /// baton status — the spin fix. The shared [`softfig_ipc::baton`] vocabulary
     /// classifies it; each disposition maps to a fleet lifecycle:
     ///
-    /// - **Continue** (or `None` — no baton write-back yet, the slice-002
-    ///   precondition) → re-roll immediately, streak cleared (today's behaviour).
+    /// - **Continue** (`IN_PROGRESS`, or `None` — no baton write-back yet) →
+    ///   re-roll immediately, SAME part, streak cleared (the within-item handoff).
+    /// - **ItemBoundary** (`ITEM_COMPLETE` / `ITEM_DEFERRED`) → **release to idle**:
+    ///   the member leaves the fleet (its slot freed), exactly like a retire, so the
+    ///   drive loop re-claims + re-seeds its NEXT part through the fresh-start
+    ///   handshake — the member never self-pulls (the fleet-member-model fix).
     /// - **`QUEUE_EMPTY`** → **retire**: the member leaves the fleet entirely, so
     ///   [`tick`](Self::tick) never re-rolls it. No spin on a drained queue.
     /// - **`HALTED_RATE_LIMIT`** → **park** until its window resets (no alert).
     /// - **`BLOCKED_ON_HUMAN` / `STUCK` / unrecognized** → **park** + an
     ///   [`NotifyEvent::AgentCrashed`] human alert.
     ///
-    /// A parked member keeps its slot but is skipped by `tick`; a retired one is
-    /// gone. Both stop the re-roll, which is what kept `claude -p` spinning.
+    /// A parked member keeps its slot but is skipped by `tick`; a released/retired
+    /// one is gone. All stop the re-roll, which is what kept `claude -p` spinning.
     fn on_clean_exit(&mut self, agent: &str, baton_status: Option<&str>, now: i64) -> PollOutcome {
         // No baton signal → the historical clean-exit re-roll. Slice 002 wires the
         // per-member write-back so a working member always supplies a status; until
@@ -649,6 +668,17 @@ impl Supervisor {
         };
         match classify_status(Some(status)) {
             BatonDisposition::Continue => self.roll(agent, now),
+            BatonDisposition::ItemBoundary => {
+                // Item boundary: the member already wrote `set_item_status <part>
+                // done|deferred`, so its part is finished. Release its slot — drop
+                // it from the fleet, exactly like the QUEUE_EMPTY retire — and the
+                // drive loop's step-3 scheduler re-claims + re-seeds it onto its
+                // next workable part this same tick (the orchestrator owns
+                // continuation; no member self-pull). The child already exited
+                // clean, so there is nothing to kill.
+                self.agents.remove(agent);
+                PollOutcome::Completed
+            }
             BatonDisposition::QueueEmpty => {
                 // Retire to idle: drop the member so it is never re-rolled. The
                 // child already exited (clean), so there is nothing to kill.
@@ -1518,5 +1548,51 @@ mod tests {
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "a continue baton re-rolls");
+    }
+
+    /// THE FLEET-MEMBER-MODEL FIX (slice 001): a member that exits cleanly on an
+    /// `ITEM_COMPLETE` baton RELEASES its slot — dropped from the fleet, exactly
+    /// like a retire — and is NOT re-rolled by the supervisor. Continuation is the
+    /// drive loop's job (re-claim its next part through the fresh-start handshake,
+    /// proven in the drive_loop tests); here we prove the supervisor releases the
+    /// member and never self-rolls the same finished part.
+    #[test]
+    fn an_item_complete_baton_releases_to_idle_and_is_not_re_rolled() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert_eq!(backend.spawn_count(), 1);
+
+        // Clean exit carrying an ITEM_COMPLETE baton → release to idle, not re-roll.
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("ITEM_COMPLETE"), 10),
+            PollOutcome::Completed
+        );
+        assert!(!s.is_registered("a1"), "a released member left the fleet (slot freed)");
+        assert!(!s.is_running("a1"));
+
+        // The supervisor never re-rolls it — the finished part is not re-run.
+        assert!(
+            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
+            "a released member is not a re-roll candidate",
+        );
+        assert_eq!(backend.spawn_count(), 1, "no supervisor self-roll on an item boundary");
+        assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
+    }
+
+    /// `ITEM_DEFERRED` releases to idle identically to `ITEM_COMPLETE` — both are
+    /// item boundaries (the member's part is done with, slot freed).
+    #[test]
+    fn an_item_deferred_baton_also_releases_to_idle() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("ITEM_DEFERRED"), 10),
+            PollOutcome::Completed
+        );
+        assert!(!s.is_registered("a1"), "ITEM_DEFERRED also frees the slot");
+        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert_eq!(backend.spawn_count(), 1, "no self-roll on a deferred boundary");
     }
 }

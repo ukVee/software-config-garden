@@ -344,6 +344,14 @@ pub struct TickReport {
     pub crashes: Vec<NotifyEvent>,
     /// Agents retired this tick (a boundary stop was honored).
     pub retired: Vec<String>,
+    /// Agents that finished/deferred their current part this tick on an
+    /// `ITEM_COMPLETE` / `ITEM_DEFERRED` baton and **released their slot** (the
+    /// item boundary). Unlike [`retired`](TickReport::retired) — a permanent stop
+    /// or a drained-queue idle — a completed member is immediately re-pickable:
+    /// step 3 this same tick re-claims + re-seeds it onto its next workable part
+    /// (the orchestrator owns continuation, not the member). Recorded distinctly so
+    /// the caller can log an item boundary apart from a retire.
+    pub completed: Vec<String>,
     /// Boundary-async messages drained from inject lanes, per agent.
     pub injected: Vec<(String, Vec<String>)>,
     /// Parked (blocked-head) queues, surfaced for the §9 alert hook every tick —
@@ -544,6 +552,22 @@ impl DriveLoop {
                         } else {
                             self.aggregator.forget(agent);
                             report.retired.push(agent.clone());
+                        }
+                    }
+                    PollOutcome::Completed => {
+                        // ITEM_COMPLETE / ITEM_DEFERRED: the member finished or
+                        // deferred its part and released its slot (already gone from
+                        // the supervisor), like the QUEUE_EMPTY idle-retire EXCEPT
+                        // the queue still has work — so step 3 below re-claims +
+                        // re-seeds it onto its next workable part THIS tick (the
+                        // orchestrator owns continuation; no member self-pull). A
+                        // pending boundary stop instead retires it for good (it must
+                        // not re-pick).
+                        if self.retiring.remove(agent) {
+                            self.retire(agent, &mut report);
+                        } else {
+                            self.aggregator.forget(agent);
+                            report.completed.push(agent.clone());
                         }
                     }
                     PollOutcome::Parked { event, .. } => {
@@ -2118,5 +2142,142 @@ mod tests {
             ],
             "the re-start (a fresh start) re-seeded with the new part",
         );
+    }
+
+    /// SLICE 001 — the headline: a member that exits on an `ITEM_COMPLETE` baton
+    /// RELEASES its slot and the orchestrator re-claims its NEXT part the SAME tick
+    /// (re-pick + re-seed + re-claim through the fresh-start handshake), with no
+    /// member self-pull. Contrast `a_re_start_after_retire_re_seeds_the_new_part`
+    /// (QUEUE_EMPTY → drained → idle until new work appears): here the queue still
+    /// has work, so continuation happens immediately, in one tick.
+    #[test]
+    fn an_item_complete_exit_re_claims_the_next_part_the_same_tick() {
+        let (mut loop_, _d, backend, claimer, queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued"), ("p2", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a1 starts on p1 (claimed `active`, seeded)
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(backend.seeds(), vec![("a1".into(), "qa".into(), "p1".into())]);
+
+        // a1 completed p1 (wrote `set_item_status p1 done`) and exited ITEM_COMPLETE.
+        // The next snapshot shows p1 done, p2 still queued.
+        queues.set(vec![q("qa", &[("p1", "done"), ("p2", "queued")])]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "ITEM_COMPLETE");
+
+        let r = loop_.tick(1);
+        assert_eq!(r.completed, vec!["a1".to_string()], "the member released its slot");
+        assert!(
+            r.rerolls.is_empty(),
+            "a completed member is NOT re-rolled — no same-part carry-forward",
+        );
+        assert_eq!(
+            r.started,
+            vec![Assignment {
+                agent: "a1".into(),
+                queue: "qa".into(),
+                part: "p2".into()
+            }],
+            "the orchestrator re-claimed the member's NEXT part the same tick",
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "re-spawned on the new part");
+        assert_eq!(
+            backend.seeds(),
+            vec![
+                ("a1".into(), "qa".into(), "p1".into()),
+                ("a1".into(), "qa".into(), "p2".into()),
+            ],
+            "the re-claim re-seeded with the NEW part (a fresh start, not a re-roll carry)",
+        );
+        assert_eq!(
+            claimer.claims(),
+            vec![("qa".into(), "p1".into()), ("qa".into(), "p2".into())],
+            "p1 claimed at tick 0, p2 re-claimed through the same handshake at tick 1",
+        );
+    }
+
+    /// SLICE 001 finish criterion: TWO members that exit `ITEM_COMPLETE` in ONE
+    /// tick never claim the same next part — continuation flows through the same
+    /// `claimed_this_tick` + `mark_claimed` + claim handshake a fresh start uses, so
+    /// the double-assignment window the old member-self-pull bypassed stays closed
+    /// (intra-tick and cross-tick).
+    #[test]
+    fn two_members_completing_in_one_tick_never_claim_the_same_next_part() {
+        // Two queues so both unpinned members start on distinct parts at tick 0
+        // (two members drawing ONE queue is the resume-collision case — only one
+        // would start; see `two_unpinned_members_in_one_tick_claim_different_parts`).
+        let (mut loop_, _d, backend, claimer, queues, _probe) = make_claiming(
+            vec![
+                FleetMember::unpinned(spec("a1")),
+                FleetMember::unpinned(spec("a2")),
+            ],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            Policy::default(), // cap 2
+        );
+
+        loop_.tick(0); // a1 → qa/p1, a2 → qb/p2 (distinct parts, proven elsewhere)
+        assert_eq!(backend.spawn_count(), 2, "both members started on their own part");
+
+        // Both finish in the same window; across BOTH queues only ONE next part
+        // (qa/p3) remains workable (qb is drained).
+        queues.set(vec![
+            q("qa", &[("p1", "done"), ("p3", "queued")]),
+            q("qb", &[("p2", "done")]),
+        ]);
+        for a in ["a1", "a2"] {
+            backend.set_health(a, AgentHealth::Exited { code: 0 });
+            backend.set_baton(a, "ITEM_COMPLETE");
+        }
+
+        let r = loop_.tick(1);
+        assert_eq!(r.completed.len(), 2, "both members released their slots");
+        assert_eq!(
+            r.started.len(),
+            1,
+            "exactly ONE member re-claims the lone next part — no double-assign",
+        );
+        assert_eq!(r.started[0].part, "p3");
+        assert_eq!(
+            claimer.claims().iter().filter(|(_, p)| p == "p3").count(),
+            1,
+            "the next part was claimed exactly once across the whole run",
+        );
+        assert_eq!(backend.spawn_count(), 3, "one re-spawn on p3, not two");
+    }
+
+    /// SLICE 001: a member that completes its LAST part (`ITEM_COMPLETE` into a now-
+    /// drained queue) releases to idle with its slot freed and is NOT re-claimed —
+    /// step 3 finds no workable part. New work later re-starts it as a fresh start.
+    #[test]
+    fn an_item_complete_into_a_drained_queue_releases_and_idles() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a1 on p1
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 completed its only part → ITEM_COMPLETE into a now-drained queue.
+        queues.set(vec![q("qa", &[("p1", "done")])]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "ITEM_COMPLETE");
+
+        let r = loop_.tick(1);
+        assert_eq!(r.completed, vec!["a1".to_string()], "released its slot");
+        assert!(r.started.is_empty(), "no next part → idle, slot freed (not re-claimed)");
+        assert!(r.rerolls.is_empty());
+        assert_eq!(backend.spawn_count(), 1, "no respawn into a drained queue");
+
+        // New queued work → a fresh re-start, which re-seeds the new part.
+        queues.set(vec![q("qa", &[("p2", "queued")])]);
+        backend.set_health("a1", AgentHealth::Alive { last_active: 2 });
+        let r2 = loop_.tick(2);
+        assert_eq!(r2.started.len(), 1, "new work re-starts the released member");
+        assert_eq!(backend.spawns(), vec!["a1", "a1"]);
     }
 }

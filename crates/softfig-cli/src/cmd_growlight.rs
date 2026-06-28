@@ -536,9 +536,14 @@ fn decide_step(view: &BatonView, usage: &UsageSnapshot, stalled: bool) -> LoopSt
             LoopStep::Stop(StopReason::Terminal("QUEUE_EMPTY".to_string()))
         }
         BatonDisposition::Stuck(s) => LoopStep::Stop(StopReason::Terminal(s)),
-        // Continue-status: stop if stalled, else pause if a window is over
-        // reserve, else keep driving.
-        BatonDisposition::Continue => {
+        // A within-item continue (`IN_PROGRESS`) or an item boundary
+        // (`ITEM_COMPLETE` / `ITEM_DEFERRED`): the single-agent driver has no
+        // orchestrator, so on a boundary it self-pulls the next item exactly as it
+        // keeps driving within an item — both keep going. (The fleet, which DOES
+        // have an orchestrator, tells these apart: a boundary releases the member's
+        // slot for the orchestrator to re-claim.) Stop if stalled, else pause if a
+        // window is over reserve, else keep driving.
+        BatonDisposition::Continue | BatonDisposition::ItemBoundary => {
             if stalled {
                 LoopStep::Stop(StopReason::SpinGuard)
             } else if let Some(p) = pause_for(usage) {
@@ -2088,7 +2093,8 @@ mod tests {
     fn loop_drains_a_multi_iteration_backlog_to_queue_empty() {
         let (dir, loop_path, mcp, baton, usage) = loop_paths("drain");
         // Fresh process per iteration: each call writes a different baton, the
-        // last one terminal. ITEM_COMPLETE is a continue-status.
+        // last one terminal. ITEM_COMPLETE is an item boundary the single-agent
+        // driver self-pulls past (keeps driving), so the loop runs on to the next.
         let backend = ScriptedBackend::new(
             &baton,
             vec![
