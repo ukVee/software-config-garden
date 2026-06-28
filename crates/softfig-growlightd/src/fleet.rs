@@ -53,7 +53,7 @@ use softfig_ipc as ipc;
 
 use crate::admission::AdmissionGovernor;
 use crate::baton_store::FsBatonStore;
-use crate::claim::KeeperdPartClaimer;
+use crate::claim::{KeeperdItemParker, KeeperdPartClaimer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{spawn_drive_loop, DriveLoop, FleetMember, LiveRate, DRIVE_POLL_MS};
@@ -269,6 +269,7 @@ pub fn assemble_fleet(
         Box::new(baton_store), // seeder — fresh-start baton seed (fleet-loop-spin slice 002)
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)
         Box::new(KeeperdPartClaimer::new(keeperd_socket.to_path_buf())), // claimer — live (slice 003)
+        Box::new(KeeperdItemParker::new(keeperd_socket.to_path_buf())), // parker — live item-park (fleet-member-model slice 003)
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
         Box::new(LiveRate::new(Arc::clone(&backend), daemon.rate_limits())), // rate — live TPM/RPM meter (slice 006)
         dispatcher,

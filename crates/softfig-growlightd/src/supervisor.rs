@@ -303,17 +303,25 @@ pub enum PollOutcome {
     /// apart from a drained queue; the lifecycle effect (release, re-pickable) is
     /// identical.
     Completed,
-    /// Exited cleanly on a `HALTED_RATE_LIMIT` baton — parked (kept in the fleet,
-    /// not re-rolled) until its rate window resets. No alert: a transient halt the
-    /// budget governor resumes (slice 003 wires the timed re-arm).
+    /// Exited cleanly on a `HALTED_RATE_LIMIT` baton — the member is brought down
+    /// (its child cleared) but kept in the fleet, so [`tick`](Supervisor::tick)
+    /// re-rolls it the moment admission's rate gate recovers (the timed re-arm —
+    /// "work till the limit, then resume when it restores"). No alert: a transient
+    /// halt the budget governor resumes; the rate gate itself, not a flag, holds it
+    /// until its window resets.
     ParkedRateLimited,
     /// Exited cleanly on a `STUCK` / `BLOCKED_ON_HUMAN` / unrecognized baton — the
-    /// loop can't safely continue, so the member is parked (kept, not re-rolled)
-    /// pending a human, and this §9 alert is surfaced for the caller to route.
-    Parked {
-        /// The [`NotifyEvent::AgentCrashed`] to dispatch (the agent needs a human).
-        event: NotifyEvent,
-        /// The raw terminal baton status that parked it (for the log/alert).
+    /// member can't progress on its current part without a human, so it is
+    /// **released to idle** (dropped from the fleet, slot freed — exactly like an
+    /// item-boundary release / `QUEUE_EMPTY` retire), NOT sticky-parked on its slot.
+    /// The drive loop **item-parks** the member's current part (marks it `blocked`
+    /// in keeperd), so the freed member pivots past it to other workable work
+    /// (pivot-on-block, spec §6) and the human is alerted via the parked-head set —
+    /// the item, not the agent, is what the alert names. The raw status is carried
+    /// for the log (the item-park / pivot is the drive loop's job; the supervisor
+    /// only releases + names the block).
+    Blocked {
+        /// The raw terminal baton status that blocked the member (for the log).
         status: String,
     },
     /// Crashed (errored exit or hung) — killed any live child, bumped the failure
@@ -369,26 +377,6 @@ pub enum RerollOutcome {
     },
 }
 
-/// Why a cleanly-exited member is **parked** — kept in the fleet (it holds its
-/// concurrency slot) but not immediately re-rolled. The reason decides whether
-/// [`tick`](Supervisor::tick) may auto-resume it:
-///
-/// - [`RateLimited`](ParkReason::RateLimited) is a *transient* park: the member
-///   hit `HALTED_RATE_LIMIT`, so it stays a re-roll candidate but admission's rate
-///   /budget gate holds it every tick until the window recovers, at which point
-///   `tick` re-rolls it automatically (the timed re-arm — "work till the limit,
-///   then resume when it restores"). No human needed.
-/// - [`Human`](ParkReason::Human) is a *sticky* park: `STUCK` / `BLOCKED_ON_HUMAN`
-///   (or an unrecognized status) needs a person, so `tick` never re-rolls it on
-///   its own — it is excluded from the candidate set until a human clears it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParkReason {
-    /// `HALTED_RATE_LIMIT` — auto-re-armed by `tick` once admission recovers.
-    RateLimited,
-    /// `STUCK` / `BLOCKED_ON_HUMAN` / unrecognized — never auto-re-armed.
-    Human,
-}
-
 /// One supervised agent's live state.
 #[derive(Debug)]
 struct Supervised {
@@ -399,13 +387,6 @@ struct Supervised {
     consecutive_failures: u32,
     /// Earliest Unix-seconds the next re-roll may spawn.
     not_before: i64,
-    /// Parked on a terminal baton — kept in the fleet (still holds its slot) but
-    /// handled per [`ParkReason`]: a `RateLimited` park stays a re-roll candidate
-    /// (admission holds it until its window recovers, then `tick` re-arms it); a
-    /// `Human` park is excluded from re-rolls until a person clears it. `None` is
-    /// the normal running / awaiting-re-roll state. The `QUEUE_EMPTY` case never
-    /// parks; it retires (leaves the fleet entirely).
-    park: Option<ParkReason>,
 }
 
 /// The fleet supervisor: owns the spawn seam, the admission governor, and the
@@ -573,7 +554,6 @@ impl Supervisor {
                                 child: Some(child),
                                 consecutive_failures: 0,
                                 not_before: now,
-                                park: None,
                             },
                         );
                         StartOutcome::Started
@@ -653,12 +633,17 @@ impl Supervisor {
     ///   handshake — the member never self-pulls (the fleet-member-model fix).
     /// - **`QUEUE_EMPTY`** → **retire**: the member leaves the fleet entirely, so
     ///   [`tick`](Self::tick) never re-rolls it. No spin on a drained queue.
-    /// - **`HALTED_RATE_LIMIT`** → **park** until its window resets (no alert).
-    /// - **`BLOCKED_ON_HUMAN` / `STUCK` / unrecognized** → **park** + an
-    ///   [`NotifyEvent::AgentCrashed`] human alert.
+    /// - **`HALTED_RATE_LIMIT`** → bring the member down but keep it in the fleet, so
+    ///   `tick` re-rolls it once admission's rate gate recovers (no alert).
+    /// - **`BLOCKED_ON_HUMAN` / `STUCK` / unrecognized** → **release to idle**: the
+    ///   member leaves the fleet (its slot freed), exactly like an item boundary, so
+    ///   it does NOT sit on its slot waiting for a person. The drive loop item-parks
+    ///   its current part (`blocked`) so the freed member pivots to other work and
+    ///   the human is alerted via the parked-head set ([`PollOutcome::Blocked`]).
     ///
-    /// A parked member keeps its slot but is skipped by `tick`; a released/retired
-    /// one is gone. All stop the re-roll, which is what kept `claude -p` spinning.
+    /// A released/retired member is gone (its slot freed); a rate-limited one is
+    /// down-but-registered (re-rolled when its window recovers). All stop the
+    /// blind re-roll, which is what kept `claude -p` spinning.
     fn on_clean_exit(&mut self, agent: &str, baton_status: Option<&str>, now: i64) -> PollOutcome {
         // No baton signal → the historical clean-exit re-roll. Slice 002 wires the
         // per-member write-back so a working member always supplies a status; until
@@ -686,17 +671,25 @@ impl Supervisor {
                 PollOutcome::Retired
             }
             BatonDisposition::RateLimited => {
-                // Transient: keep it a re-roll candidate, but admission's rate gate
-                // holds it until the window recovers, when `tick` re-arms it.
-                self.park(agent, ParkReason::RateLimited);
+                // Transient halt: bring the member down (clear its child) but keep
+                // it registered, so it stays a re-roll candidate. Admission's rate
+                // gate — not a sticky flag — holds it every `tick` until its window
+                // recovers, at which point `tick` re-rolls it (the timed re-arm).
+                if let Some(sup) = self.agents.get_mut(agent) {
+                    sup.child = None;
+                }
                 PollOutcome::ParkedRateLimited
             }
             BatonDisposition::BlockedOnHuman | BatonDisposition::Stuck(_) => {
-                self.park(agent, ParkReason::Human);
-                PollOutcome::Parked {
-                    event: NotifyEvent::AgentCrashed {
-                        agent: agent.to_string(),
-                    },
+                // The member can't progress on this part without a human. Item-park,
+                // not member-park (the fleet-member-model fix): RELEASE it to idle —
+                // drop it from the fleet, exactly like an item-boundary release — so
+                // it does not sit on its slot. The drive loop marks its current part
+                // `blocked` (the item-park write seam) so the freed member pivots to
+                // other work and the human is alerted on the *item*. The child
+                // already exited clean, so there is nothing to kill.
+                self.agents.remove(agent);
+                PollOutcome::Blocked {
                     status: status.to_string(),
                 }
             }
@@ -714,18 +707,6 @@ impl Supervisor {
         PollOutcome::Rolling
     }
 
-    /// Park a cleanly-exited member with its [`ParkReason`]: drop the dead handle
-    /// and record why it parked. It keeps its slot (still registered). A `Human`
-    /// park is skipped by [`tick`](Self::tick) until a person clears it; a
-    /// `RateLimited` park stays a candidate that admission holds until its window
-    /// recovers (then `tick` re-arms it).
-    fn park(&mut self, agent: &str, reason: ParkReason) {
-        if let Some(sup) = self.agents.get_mut(agent) {
-            sup.child = None;
-            sup.park = Some(reason);
-        }
-    }
-
     /// Perform any due re-rolls ([`Intent::Roll`]). For each registered agent with
     /// no live child: held if still inside its backoff window; held if its queue has
     /// no workable part (`workable(agent)` is `false` — the queue-gate, so a
@@ -740,11 +721,13 @@ impl Supervisor {
     /// suspenders to slice 001's terminal-status retire: even a member that exited
     /// on a *continue* status is not respawned if its queue has since drained.
     ///
-    /// A [`ParkReason::RateLimited`] member IS a candidate: admission's rate/budget
-    /// gate holds it (a [`RerollOutcome::HeldForAdmission`]) every tick until its
-    /// window recovers, at which point this re-roll re-arms it and clears the park
-    /// — the timed re-arm. A [`ParkReason::Human`] member is excluded entirely
-    /// (only a person resumes it).
+    /// A rate-limited member (down on a `HALTED_RATE_LIMIT` exit but still
+    /// registered) IS a candidate: admission's rate/budget gate holds it (a
+    /// [`RerollOutcome::HeldForAdmission`]) every tick until its window recovers, at
+    /// which point this re-roll re-arms it — the timed re-arm. A member that needed
+    /// a human (`BLOCKED_ON_HUMAN` / `STUCK`) was already *released* on its exit
+    /// (it left the fleet), so it never reaches here — its part is item-parked and a
+    /// fresh start re-picks the fleet's next workable work (pivot-on-block).
     pub fn tick(
         &mut self,
         budget: BudgetUsage,
@@ -755,11 +738,12 @@ impl Supervisor {
         let candidates: Vec<String> = self
             .agents
             .iter()
-            // Down members only (a live child is left running). A `Human` park is
-            // skipped until a person clears it; a `RateLimited` park stays a
-            // candidate so admission can re-arm it when its window recovers. Not
-            // re-rolling a `Human`-parked member is what stops the spin.
-            .filter(|(_, s)| s.child.is_none() && !matches!(s.park, Some(ParkReason::Human)))
+            // Down members only (a live child is left running). Every down member is
+            // a re-roll candidate now that a human-block releases instead of
+            // sticky-parking: a `HALTED_RATE_LIMIT` member is held here by admission
+            // until its rate window recovers (then re-rolled); a crashed member is
+            // held by its backoff. Nothing parks on its slot.
+            .filter(|(_, s)| s.child.is_none())
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -778,7 +762,7 @@ impl Supervisor {
                 continue;
             }
             // A roll keeps the agent's slot — the cap never gates it — but the
-            // shared budget/rate rails still do (and hold a rate-limited park here
+            // shared budget/rate rails still do (and hold a rate-limited member here
             // until its window recovers).
             let fleet = self.live_count();
             let decision = self.governor.decide(Intent::Roll, fleet, budget, rate);
@@ -791,8 +775,6 @@ impl Supervisor {
                 Ok(child) => {
                     let sup = self.agents.get_mut(&agent).expect("candidate exists");
                     sup.child = Some(child);
-                    // Re-armed: a successful re-roll clears any rate-limit park.
-                    sup.park = None;
                     out.push(RerollOutcome::Rerolled { agent });
                 }
                 Err(e) => {
@@ -1378,48 +1360,67 @@ mod tests {
         assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
     }
 
-    /// A `STUCK` baton parks the member (kept but not re-rolled) and surfaces the
-    /// §9 `AgentCrashed` human alert.
+    /// A `STUCK` baton **releases** the member to idle (slot freed, not sticky-
+    /// parked) and names the block via [`PollOutcome::Blocked`] — the drive loop
+    /// item-parks the part + alerts the human. A released member is never re-rolled.
     #[test]
-    fn a_stuck_baton_parks_with_an_alert_and_is_not_re_rolled() {
+    fn a_stuck_baton_releases_the_member_to_idle() {
         let backend = FakeBackend::new();
         let mut s = sup(Arc::clone(&backend));
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
 
         assert_eq!(
             s.poll("a1", AgentHealth::Exited { code: 0 }, Some("STUCK"), 10),
-            PollOutcome::Parked {
-                event: NotifyEvent::AgentCrashed { agent: "a1".into() },
+            PollOutcome::Blocked {
                 status: "STUCK".into(),
             }
         );
-        // Parked = kept in the fleet (still registered) but never re-rolled.
-        assert!(s.is_registered("a1"), "a parked member keeps its slot");
-        assert!(!s.is_running("a1"));
+        // Released = gone from the fleet (slot freed), exactly like an item boundary
+        // — NOT sticky-parked on its slot. The freed slot lets a fresh start re-pick.
+        assert!(!s.is_registered("a1"), "a blocked member releases its slot");
+        assert_eq!(s.committed_count(), 0, "the slot is freed for a pivot");
         assert!(
             s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
-            "a parked member is skipped by tick"
+            "a released member has nothing to re-roll"
         );
-        assert_eq!(backend.spawn_count(), 1, "no re-roll of a stuck member");
+        assert_eq!(backend.spawn_count(), 1, "no re-roll of a released member");
+        assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
     }
 
-    /// A `BLOCKED_ON_HUMAN` baton parks + alerts, exactly like `STUCK` (carries the
-    /// raw status for the alert/log).
+    /// A `BLOCKED_ON_HUMAN` baton releases the member, exactly like `STUCK` (carries
+    /// the raw status for the log).
     #[test]
-    fn a_blocked_on_human_baton_parks_with_an_alert() {
+    fn a_blocked_on_human_baton_releases_the_member_to_idle() {
         let backend = FakeBackend::new();
         let mut s = sup(Arc::clone(&backend));
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
 
         assert_eq!(
             s.poll("a1", AgentHealth::Exited { code: 0 }, Some("BLOCKED_ON_HUMAN"), 10),
-            PollOutcome::Parked {
-                event: NotifyEvent::AgentCrashed { agent: "a1".into() },
+            PollOutcome::Blocked {
                 status: "BLOCKED_ON_HUMAN".into(),
             }
         );
-        assert!(s.is_registered("a1"));
+        assert!(!s.is_registered("a1"), "a blocked member releases its slot");
         assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+    }
+
+    /// An unrecognized terminal status is a `Stuck(_)` disposition — it releases the
+    /// member to idle too (conservative: an unknown status needs a human), never a
+    /// blind re-roll.
+    #[test]
+    fn an_unrecognized_baton_status_releases_the_member() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(
+            s.poll("a1", AgentHealth::Exited { code: 0 }, Some("WAT_IS_THIS"), 10),
+            PollOutcome::Blocked {
+                status: "WAT_IS_THIS".into(),
+            }
+        );
+        assert!(!s.is_registered("a1"));
     }
 
     /// A `HALTED_RATE_LIMIT` baton parks WITHOUT an alert (a transient halt), is

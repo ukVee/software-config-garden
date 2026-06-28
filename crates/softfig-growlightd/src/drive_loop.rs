@@ -102,6 +102,30 @@ pub trait PartClaimer: Send + Sync + fmt::Debug {
     fn claim(&self, queue: &str, part: &str) -> Result<(), String>;
 }
 
+/// The seam the loop **item-parks** a part through when its member exits
+/// `BLOCKED_ON_HUMAN` / `STUCK` — the WRITE that records the block on the ITEM
+/// rather than by sticking the member on its slot. The sibling of
+/// [`PartClaimer`]: a claim writes `active` *before* a spawn; this writes
+/// `blocked` *after* a human-block exit. Marking the part `blocked` in keeperd's
+/// queue table is what makes the next [`snapshot`](QueueSource::snapshot)'s
+/// [`classify_queue`](crate::scheduler::classify_queue) park that queue, so the
+/// just-released member's [`pick`] pivots past it to other workable work
+/// (pivot-on-block, spec §6) and the blocked head surfaces to the §9 alert. Unlike
+/// a claim it does NOT gate anything — the member has already exited and been
+/// released — so it is **fail-soft**: a write that cannot be confirmed leaves the
+/// part `active`, and the next tick retries the block when the freed member
+/// re-resolves to (and re-blocks) that still-`active` part. The production impl is
+/// a `set_item_status(... blocked)` write over `call_reconnecting`
+/// ([`crate::claim::KeeperdItemParker`]); a test scripts the result.
+pub trait ItemParker: Send + Sync + fmt::Debug {
+    /// Mark `(queue, part)` `blocked` in keeperd's queue table. `Ok(())` means the
+    /// block landed (idempotent: re-blocking an already-`blocked` part is a no-op
+    /// success). `Err(reason)` means it could not be confirmed — fail-soft: the
+    /// member is already released, the local snapshot is item-parked regardless (so
+    /// this tick still pivots + alerts), and the next tick retries.
+    fn park_item(&self, queue: &str, part: &str) -> Result<(), String>;
+}
+
 /// The seam the loop reads each agent's latest reading of the **shared** account
 /// budget pool through, to fold into the loop's owned cross-agent
 /// [`UsageAggregator`]. The aggregate then gates admission and fires the §9 usage
@@ -352,6 +376,14 @@ pub struct TickReport {
     /// (the orchestrator owns continuation, not the member). Recorded distinctly so
     /// the caller can log an item boundary apart from a retire.
     pub completed: Vec<String>,
+    /// Members **released on a human-block** this tick (`BLOCKED_ON_HUMAN` / `STUCK`):
+    /// each left the fleet (slot freed) and had its current part item-parked —
+    /// marked `blocked` in keeperd — so the freed member pivots past it to other work
+    /// (pivot-on-block) and the human is alerted via [`parked`](TickReport::parked).
+    /// Carries the `(agent, queue, part)` so the caller can log which item was
+    /// parked. Distinct from a crash (no kill, no backoff) and from a retire (the
+    /// member is immediately re-pickable in step 3 onto a *different* part).
+    pub blocked: Vec<Assignment>,
     /// Boundary-async messages drained from inject lanes, per agent.
     pub injected: Vec<(String, Vec<String>)>,
     /// Parked (blocked-head) queues, surfaced for the §9 alert hook every tick —
@@ -393,6 +425,11 @@ pub struct DriveLoop {
     /// How a picked part is claimed (`active`) before its agent spawns — the
     /// write that closes the fallback double-assignment window cross-tick.
     claimer: Box<dyn PartClaimer>,
+    /// How a member's current part is item-parked (`blocked`) when it exits on a
+    /// human-block (`BLOCKED_ON_HUMAN` / `STUCK`) — the write that records the
+    /// block on the ITEM so the freed member pivots past it (the sibling of
+    /// `claimer`).
+    parker: Box<dyn ItemParker>,
     /// Per-agent shared-pool budget readings, folded into `aggregator` each tick.
     samples: Box<dyn BudgetSampleSource>,
     /// Per-minute rate readings — admission's second gate.
@@ -415,6 +452,13 @@ pub struct DriveLoop {
     retiring: BTreeSet<String>,
     /// Agents that have retired on a boundary stop — never re-started this run.
     stopped: BTreeSet<String>,
+    /// Each running member's current `(queue, part)` assignment, recorded on its
+    /// fresh start (step 3) and carried across re-rolls (a re-roll stays on the same
+    /// part). Read when a member exits on a human-block so the loop knows which item
+    /// to park (`blocked`); cleared when the member leaves the fleet. The supervisor
+    /// owns lifecycle (it knows the agent, not its part); the loop owns the
+    /// assignment (it did the claim), so the part lookup lives here.
+    assignments: std::collections::BTreeMap<String, (String, String)>,
 }
 
 impl DriveLoop {
@@ -424,7 +468,9 @@ impl DriveLoop {
     /// [`UsageAggregator`] starts empty (a fresh fleet has burned nothing); the
     /// `dispatcher` arrives with its channels already registered (in production a
     /// [`crate::notify_dispatch::GuiNotifier`] over the daemon hub + a
-    /// [`crate::notify_dispatch::LogNotifier`]).
+    /// [`crate::notify_dispatch::LogNotifier`]). The `claimer` (`active` write) and
+    /// `parker` (`blocked` write) are keeperd siblings — in production both ride the
+    /// same socket ([`crate::claim`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         daemon: Daemon,
@@ -434,6 +480,7 @@ impl DriveLoop {
         seeder: Box<dyn BatonSeeder>,
         queues: Box<dyn QueueSource>,
         claimer: Box<dyn PartClaimer>,
+        parker: Box<dyn ItemParker>,
         samples: Box<dyn BudgetSampleSource>,
         rate: Box<dyn RateSource>,
         dispatcher: NotifyDispatcher,
@@ -447,6 +494,7 @@ impl DriveLoop {
             seeder,
             queues,
             claimer,
+            parker,
             samples,
             rate,
             aggregator: UsageAggregator::new(),
@@ -454,6 +502,7 @@ impl DriveLoop {
             fleet,
             retiring: BTreeSet::new(),
             stopped: BTreeSet::new(),
+            assignments: std::collections::BTreeMap::new(),
         }
     }
 
@@ -496,6 +545,13 @@ impl DriveLoop {
         }
         let budget = self.aggregator.aggregate_or_fresh();
         let rate = self.rate.rate(now);
+
+        // Parts item-parked this tick (a member exited on a human-block): collected
+        // in the health pass and applied to the snapshot below (`mark_blocked`), the
+        // intra-tick half of the item-park — so this tick's parked-head alert AND the
+        // freed member's pivot both see the block. keeperd's committed `blocked`
+        // write (the `parker` call in the health pass) is the cross-tick half.
+        let mut to_block: Vec<(String, String)> = Vec::new();
 
         // 1. Per-agent control + health pass (boundary semantics, spec §8).
         for member in &fleet {
@@ -547,6 +603,7 @@ impl DriveLoop {
                         // human also asked it to stop, it stops for good; otherwise
                         // it stays eligible to RE-START when new queued work appears
                         // (not in `stopped`), and the daemon idles in between.
+                        self.assignments.remove(agent);
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         } else {
@@ -562,7 +619,9 @@ impl DriveLoop {
                         // re-seeds it onto its next workable part THIS tick (the
                         // orchestrator owns continuation; no member self-pull). A
                         // pending boundary stop instead retires it for good (it must
-                        // not re-pick).
+                        // not re-pick). Drop the finished assignment; step 3 records
+                        // the next one if it re-picks.
+                        self.assignments.remove(agent);
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         } else {
@@ -570,19 +629,43 @@ impl DriveLoop {
                             report.completed.push(agent.clone());
                         }
                     }
-                    PollOutcome::Parked { event, .. } => {
-                        // STUCK / BLOCKED_ON_HUMAN: parked pending a human, with the
-                        // §9 alert. It stays registered+parked (neither re-rolled by
-                        // `tick` nor re-started by step 3) until a human clears it —
-                        // unless a boundary stop was also pending, which retires it.
-                        report.crashes.push(event);
+                    PollOutcome::Blocked { .. } => {
+                        // STUCK / BLOCKED_ON_HUMAN: the member is RELEASED to idle
+                        // (already gone from the supervisor, slot freed — like an
+                        // item-boundary release), NOT sticky-parked on its slot. Its
+                        // current part is ITEM-PARKED — marked `blocked` in keeperd
+                        // (the write seam) and in this tick's snapshot (`mark_blocked`
+                        // below) — so the freed member pivots past it to other work in
+                        // step 3 (pivot-on-block) and the human is alerted on the ITEM
+                        // via the parked-head set. A pending boundary stop instead
+                        // retires it for good. Fail-soft: a `parker` error still
+                        // releases + locally item-parks (this tick pivots + alerts);
+                        // the part lingers `active` in keeperd and is re-blocked when
+                        // the pinned member next cycles back to it. The slot is never
+                        // stuck — that is the whole fix.
+                        self.aggregator.forget(agent);
+                        if let Some((queue, part)) = self.assignments.remove(agent) {
+                            if let Err(_e) = self.parker.park_item(&queue, &part) {
+                                // Fail-soft (see the arm comment): the member is
+                                // already released and the local item-park below still
+                                // pivots + alerts this tick; the keeperd write is
+                                // re-attempted when the member next resolves to it.
+                            }
+                            to_block.push((queue.clone(), part.clone()));
+                            report.blocked.push(Assignment {
+                                agent: agent.clone(),
+                                queue,
+                                part,
+                            });
+                        }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         }
                     }
                     PollOutcome::ParkedRateLimited => {
-                        // HALTED_RATE_LIMIT: parked until its window resets (slice
-                        // 003 re-arms it); no alert. A pending boundary stop retires.
+                        // HALTED_RATE_LIMIT: the member is down-but-registered, held
+                        // by admission's rate gate and re-rolled by `Supervisor::tick`
+                        // once its window resets; no alert. A boundary stop retires.
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         }
@@ -597,6 +680,14 @@ impl DriveLoop {
         // it, so they share one consistent view. Step 3 mutates a working copy
         // (`mark_claimed`) as it claims; step 2 only reads it through `workable`.
         let mut snapshot = self.queues.snapshot();
+        // Apply this tick's item-parks to the working snapshot BEFORE the parked-head
+        // alert and the re-roll/start picks read it, so the block is seen this tick
+        // regardless of snapshot freshness (the intra-tick half — `mark_claimed`'s
+        // sibling): the parked head surfaces to the §9 alert, and the just-released
+        // member's `pick` pivots past its own item-parked part to other work.
+        for (queue, part) in &to_block {
+            snapshot.mark_blocked(queue, part);
+        }
         report.parked = parked(&snapshot);
 
         // 2. Re-roll due agents ([`Intent::Roll`]). `pause` is the admission gate
@@ -679,6 +770,12 @@ impl DriveLoop {
                     StartOutcome::Started => {
                         snapshot.mark_claimed(&queue, &part);
                         claimed_this_tick.insert((queue.clone(), part.clone()));
+                        // Record the assignment so a later human-block exit knows
+                        // which item to park (the part lookup the supervisor can't
+                        // do). A re-roll keeps the member on the same part, so this
+                        // is overwritten only on its next fresh start.
+                        self.assignments
+                            .insert(agent.clone(), (queue.clone(), part.clone()));
                         report.started.push(Assignment {
                             agent: agent.clone(),
                             queue,
@@ -768,8 +865,10 @@ impl DriveLoop {
         if let Some(child) = self.supervisor.retire(agent) {
             child.kill();
         }
-        // Drop its budget reading so a departed agent can't pin the fleet aggregate.
+        // Drop its budget reading so a departed agent can't pin the fleet aggregate,
+        // and its assignment so a stale part is never item-parked later.
         self.aggregator.forget(agent);
+        self.assignments.remove(agent);
         self.stopped.insert(agent.to_string());
         report.retired.push(agent.to_string());
     }
@@ -818,7 +917,7 @@ mod tests {
     use crate::hub::EventHub;
     use crate::notifications::NotifyPolicy;
     use crate::notify_dispatch::{GuiNotifier, LogNotifier, LogSink};
-    use crate::scheduler::{PartView, QueueView};
+    use crate::scheduler::{classify_queue, PartView, QueueState, QueueView};
     use crate::supervisor::{AgentBackend, Backoff, SpawnError};
     use softfig_ipc::growlightd::StopLevel;
     use std::collections::BTreeMap;
@@ -993,6 +1092,12 @@ mod tests {
         fn new(qs: Vec<QueueView>) -> Arc<Self> {
             Arc::new(Self(Mutex::new(Snapshot::new(qs))))
         }
+        /// Mark a part `blocked` in the shared snapshot — models keeperd's
+        /// committed item-park write, so the NEXT `snapshot()` shows it blocked (the
+        /// cross-tick half of pivot-on-block).
+        fn mark_blocked(&self, queue: &str, part: &str) {
+            self.0.lock().unwrap().mark_blocked(queue, part);
+        }
         /// Mark a part `active` in the shared snapshot — models keeperd's
         /// committed claim write, so the NEXT `snapshot()` shows it claimed (the
         /// cross-tick half of the double-assignment fix).
@@ -1048,6 +1153,43 @@ mod tests {
         }
     }
 
+    /// A fake [`ItemParker`]: records every item-park, can be scripted to fail (the
+    /// fail-soft path), and on success marks the part `blocked` in the SAME
+    /// `FixedQueues` the loop reads — so the block shows up on the next tick's
+    /// snapshot exactly as keeperd's committed `blocked` write would (the cross-tick
+    /// half), mirroring [`FakeClaimer`].
+    #[derive(Debug)]
+    struct FakeParker {
+        parks: Mutex<Vec<(String, String)>>,
+        fail: AtomicBool,
+        committed: Arc<FixedQueues>,
+    }
+    impl FakeParker {
+        fn new(committed: Arc<FixedQueues>) -> Arc<Self> {
+            Arc::new(Self {
+                parks: Mutex::new(Vec::new()),
+                fail: AtomicBool::new(false),
+                committed,
+            })
+        }
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, Ordering::SeqCst);
+        }
+        fn parks(&self) -> Vec<(String, String)> {
+            self.parks.lock().unwrap().clone()
+        }
+    }
+    impl ItemParker for Arc<FakeParker> {
+        fn park_item(&self, queue: &str, part: &str) -> Result<(), String> {
+            self.parks.lock().unwrap().push((queue.to_string(), part.to_string()));
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("block refused".into());
+            }
+            self.committed.mark_blocked(queue, part);
+            Ok(())
+        }
+    }
+
     fn hot_budget() -> BudgetUsage {
         BudgetUsage::new(90, 5) // over the 85 5h halt
     }
@@ -1088,20 +1230,47 @@ mod tests {
         (drive, d, backend, probe)
     }
 
-    /// Like [`make`], but also hands back the [`FakeClaimer`] so a slice-003 test
-    /// can inspect the recorded claims or script a claim failure. The claimer is
-    /// wired to the SAME [`FixedQueues`] the loop reads, so a successful claim
-    /// marks the part `active` in the shared snapshot (the cross-tick half) while
-    /// the loop's own `mark_claimed` is the intra-tick half.
+    /// Like [`make`], but also hands back the [`FakeClaimer`] so a test can inspect
+    /// the recorded claims or script a claim failure. The claimer is wired to the
+    /// SAME [`FixedQueues`] the loop reads, so a successful claim marks the part
+    /// `active` in the shared snapshot (the cross-tick half) while the loop's own
+    /// `mark_claimed` is the intra-tick half. A thin wrapper over [`make_full`] that
+    /// drops the parker handle (most tests don't poke item-parking).
     fn make_claiming(
         fleet: Vec<FleetMember>,
         snapshot: Vec<QueueView>,
         policy: Policy,
     ) -> (DriveLoop, Daemon, Arc<FakeFleet>, Arc<FakeClaimer>, Arc<FixedQueues>, Probe) {
+        let (drive, d, backend, claimer, _parker, queues, probe) =
+            make_full(fleet, snapshot, policy);
+        (drive, d, backend, claimer, queues, probe)
+    }
+
+    /// The full builder: like [`make_claiming`] but ALSO hands back the
+    /// [`FakeParker`] so a slice-003 item-park test can inspect the recorded
+    /// `blocked` writes or script a fail-soft failure. The parker is wired to the
+    /// SAME [`FixedQueues`] the loop reads, so a successful item-park marks the part
+    /// `blocked` in the shared snapshot (the cross-tick half) while the loop's own
+    /// `mark_blocked` is the intra-tick half — mirroring the claimer.
+    #[allow(clippy::type_complexity)]
+    fn make_full(
+        fleet: Vec<FleetMember>,
+        snapshot: Vec<QueueView>,
+        policy: Policy,
+    ) -> (
+        DriveLoop,
+        Daemon,
+        Arc<FakeFleet>,
+        Arc<FakeClaimer>,
+        Arc<FakeParker>,
+        Arc<FixedQueues>,
+        Probe,
+    ) {
         let d = daemon(policy);
         let backend = FakeFleet::new();
         let queues = FixedQueues::new(snapshot);
         let claimer = FakeClaimer::new(Arc::clone(&queues));
+        let parker = FakeParker::new(Arc::clone(&queues));
         let sup = Supervisor::with_backoff(
             Box::new(Arc::clone(&backend)),
             AdmissionGovernor::new(policy),
@@ -1125,12 +1294,13 @@ mod tests {
             Box::new(Arc::clone(&backend)), // seeder — records seeds, scriptable failure
             Box::new(Arc::clone(&queues)),
             Box::new(Arc::clone(&claimer)),
+            Box::new(Arc::clone(&parker)),
             Box::new(Arc::clone(&backend)),
             Box::new(PermissiveRate),
             dispatcher,
             fleet,
         );
-        (drive, d, backend, claimer, queues, Probe { alerts, log })
+        (drive, d, backend, claimer, parker, queues, Probe { alerts, log })
     }
 
     /// The loop picks each member's pinned part, admits under the per-device cap,
@@ -1417,34 +1587,103 @@ mod tests {
         assert_eq!(backend.spawns(), vec!["a1", "a1"], "a1 re-started on the new part");
     }
 
-    /// A `STUCK` baton parks the member (kept registered, not re-rolled, not
-    /// re-started) and surfaces the §9 `AgentCrashed` human alert through the
-    /// owned dispatcher.
+    /// SLICE 003 — the headline: a `STUCK` / `BLOCKED_ON_HUMAN` member is RELEASED
+    /// to idle (not sticky-parked on its slot), its current part is **item-parked**
+    /// (`blocked` in keeperd), the human is alerted on the ITEM, and the freed member
+    /// **pivots** the same tick onto a different queue's work (pivot-on-block).
     #[test]
-    fn a_stuck_baton_parks_the_member_with_a_human_alert() {
-        let (mut loop_, _d, backend, _claimer, _queues, probe) = make_claiming(
+    fn a_stuck_member_is_released_item_parked_and_pivots() {
+        let (mut loop_, _d, backend, _claimer, parker, queues, probe) = make_full(
             vec![member("a1", "qa")],
-            vec![q("qa", &[("p1", "queued")])],
+            vec![
+                q("qa", &[("p1", "queued")]), // a1's pinned work
+                q("qb", &[("o1", "queued")]), // the pivot target
+            ],
             Policy::default(),
         );
 
-        loop_.tick(0); // start a1
+        loop_.tick(0); // a1 starts on its pinned qa/p1 (claimed active)
         assert_eq!(backend.spawn_count(), 1);
 
-        // a1 exits clean but wrote a STUCK baton → park + a §9 human alert.
+        // a1 exits clean but wrote a STUCK baton → release + item-park p1 + pivot.
         backend.set_health("a1", AgentHealth::Exited { code: 0 });
         backend.set_baton("a1", "STUCK");
 
         let r = loop_.tick(1);
+
+        // The part is item-parked — both in keeperd (the write seam) and surfaced.
         assert_eq!(
-            r.crashes,
-            vec![NotifyEvent::AgentCrashed { agent: "a1".into() }],
-            "a stuck member surfaces the §9 AgentCrashed alert",
+            parker.parks(),
+            vec![("qa".into(), "p1".into())],
+            "the member's current part is marked blocked in keeperd",
         );
-        assert_eq!(probe.gui_alerts(), 1, "the alert was dispatched once");
-        assert!(r.rerolls.is_empty(), "a parked member is NOT re-rolled");
-        assert!(r.started.is_empty(), "a parked (still-registered) member is not re-started");
-        assert_eq!(backend.spawn_count(), 1, "no fresh spawn for a stuck member");
+        assert_eq!(
+            r.blocked,
+            vec![Assignment { agent: "a1".into(), queue: "qa".into(), part: "p1".into() }],
+            "the release-on-block is reported with its item",
+        );
+        assert_eq!(
+            r.parked,
+            vec![("qa".into(), "p1".into())],
+            "the item-parked head is surfaced for the §9 alert this tick",
+        );
+        assert_eq!(probe.gui_alerts(), 1, "the human is alerted on the item, once");
+        assert!(r.crashes.is_empty(), "a human-block is not a crash");
+
+        // The freed member pivots onto the other queue's work the same tick.
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a1".into(), queue: "qb".into(), part: "o1".into() }],
+            "the released member pivots past its blocked part to qb (pivot-on-block)",
+        );
+        assert!(r.rerolls.is_empty(), "a released member re-starts, it is not re-rolled");
+        assert_eq!(backend.spawn_count(), 2, "the pivot is a fresh spawn");
+
+        // keeperd now holds p1 `blocked` (committed by the parker) — so a later
+        // snapshot keeps pivoting past it until a human clears it (slice 004).
+        assert_eq!(
+            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            QueueState::Blocked("p1".into()),
+        );
+    }
+
+    /// Fail-soft: if the keeperd item-park WRITE can't be confirmed, the member is
+    /// STILL released and STILL pivots this tick (the local snapshot mark drives the
+    /// pivot + alert); only the cross-tick `blocked` commit is missing, so keeperd's
+    /// part lingers `active` until the pinned member cycles back and re-blocks it.
+    /// The slot is never stuck — that is the whole fix.
+    #[test]
+    fn a_failed_item_park_still_releases_and_pivots() {
+        let (mut loop_, _d, backend, _claimer, parker, queues, probe) = make_full(
+            vec![member("a1", "qa")],
+            vec![
+                q("qa", &[("p1", "queued")]),
+                q("qb", &[("o1", "queued")]),
+            ],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a1 starts on qa/p1
+        parker.set_fail(true); // keeperd refuses / is unreachable for the block write
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+
+        let r = loop_.tick(1);
+        assert_eq!(parker.parks(), vec![("qa".into(), "p1".into())], "the write was attempted");
+        assert_eq!(probe.gui_alerts(), 1, "the human is still alerted this tick");
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a1".into(), queue: "qb".into(), part: "o1".into() }],
+            "the member still pivots locally even though the block write failed",
+        );
+        // keeperd's qa/p1 was NOT committed blocked (the write failed) — it lingers
+        // `active`, to be re-blocked when the member next resolves to it. No sticky slot.
+        assert_eq!(
+            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            QueueState::Active("p1".into()),
+            "the uncommitted block left the part active in keeperd (fail-soft)",
+        );
     }
 
     /// `pause` is the admission gate: a paused fleet starts nothing and re-rolls

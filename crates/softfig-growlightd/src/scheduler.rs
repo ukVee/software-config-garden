@@ -147,6 +147,26 @@ impl Snapshot {
             }
         }
     }
+
+    /// Stamp `part` in `queue` as [`PartStatus::Blocked`] — the intra-tick
+    /// **item-park** mark the drive loop applies to its *working copy* the instant a
+    /// member exits `BLOCKED_ON_HUMAN` / `STUCK`, the sibling of [`mark_claimed`].
+    /// Recording the block on the working snapshot makes BOTH this tick's
+    /// parked-head alert ([`parked`]) AND the freed member's [`pick`] see it
+    /// immediately: the member pivots past its own now-blocked part to other
+    /// workable work this same tick (pivot-on-block), without waiting for the next
+    /// snapshot. The cross-tick half is keeperd's committed `blocked` write (the
+    /// item-park itself), surfaced by the next
+    /// [`QueueSource::snapshot`](crate::drive_loop::QueueSource::snapshot) — exactly
+    /// the read/write split [`mark_claimed`] uses for claims. A no-op when the queue
+    /// or part is absent.
+    pub fn mark_blocked(&mut self, queue: &str, part: &str) {
+        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue) {
+            if let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
+                p.status = PartStatus::Blocked;
+            }
+        }
+    }
 }
 
 /// A queue's drainable state, reduced to its head workable part. Produced by
@@ -437,6 +457,43 @@ mod tests {
             pick(&snap, None),
             Some(("qb".into(), "p2".into())),
             "a second fallback agent in the same tick picks a different queue",
+        );
+    }
+
+    #[test]
+    fn mark_blocked_parks_a_head_so_a_pivot_skips_it() {
+        // A pinned queue whose head an agent is resuming (`active`); item-park it
+        // (the member exited BLOCKED_ON_HUMAN) and the pinned pick pivots to the
+        // fallback queue while the blocked head is surfaced for the alert.
+        let mut snap = Snapshot::new(vec![
+            q("mine", &[("p1", "active")]),
+            q("other", &[("o1", "queued")]),
+        ]);
+        assert_eq!(pick_pinned(&snap, "mine"), Some(("mine".into(), "p1".into())));
+
+        snap.mark_blocked("mine", "p1");
+        assert_eq!(classify_queue(snap.queue("mine").unwrap()), QueueState::Blocked("p1".into()));
+        assert_eq!(
+            pick_pinned(&snap, "mine"),
+            Some(("other".into(), "o1".into())),
+            "the freed member pivots past its own item-parked part",
+        );
+        assert_eq!(
+            parked(&snap),
+            vec![("mine".into(), "p1".into())],
+            "the item-parked head is surfaced for the §9 alert",
+        );
+    }
+
+    #[test]
+    fn mark_blocked_is_a_no_op_for_an_absent_queue_or_part() {
+        let mut snap = Snapshot::new(vec![q("qa", &[("p1", "queued")])]);
+        snap.mark_blocked("ghost", "p1"); // unknown queue
+        snap.mark_blocked("qa", "nope"); // unknown part
+        assert_eq!(
+            classify_queue(snap.queue("qa").unwrap()),
+            QueueState::Ready("p1".into()),
+            "a block against a missing queue/part changes nothing",
         );
     }
 
