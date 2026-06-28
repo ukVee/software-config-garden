@@ -5,18 +5,25 @@
 //! `spawn_drive_loop` / `ClaudeBackend::new` were never called outside tests. This
 //! module is the one place that constructs a *live* [`DriveLoop`] over a real
 //! [`ClaudeBackend`] and spawns it — **only** when the off-by-default
-//! `[growlight] fleet_enabled` gate is on.
+//! `fleet_enabled` gate is on.
 //!
-//! ## The gate lives off the agent-writable surface
+//! ## The gate lives in the mount-visible in-garden config
 //!
-//! The fleet config is read from the **plaintext** keeper.toml bootstrap pointer
-//! (`<garden_root>/.softfig/keeper.toml`), the same file that already holds
-//! `state_root` + `[growlight] allow_relock` — deliberately *not* the in-garden
-//! `config/keeper.toml` (config-in-garden Slice 1). `fleet_enabled` is a
-//! live-capability switch, so the loop must not be able to self-enable the fleet
-//! by committing to its own garden: arming it is a human edit to a file the agents
-//! can't author. We read only the `[growlight]` table; every other keeperd-owned
-//! key is ignored.
+//! The fleet config is read from the in-garden `config/growlight.toml`
+//! (`<garden_root>/config/growlight.toml`), served *through* the FUSE mount —
+//! the same way growlightd already reads `protocol.md` and the backlog. This is
+//! the bug-fix at the heart of the `growlight-config-in-garden` milestone: the
+//! config previously lived in the `.softfig/keeper.toml` bootstrap pointer, but
+//! the FUSE mount keeperd projects over the garden root *shadows* `.softfig/`
+//! while unlocked, so growlightd's post-mount read always hit ENOENT and the
+//! fleet could never arm on a running garden. The in-garden config is
+//! mount-visible, encrypted-at-rest, versioned, M5b-synced, and editable live
+//! (softfig-mcp or through the mount) — no lock/unmount dance to arm it.
+//!
+//! The gate is intentionally **agent-writable** now (it rides garden content):
+//! the old "a human must be present to arm" property is deliberately dropped in
+//! favour of the budget halts + `pause` as the runaway protection. See
+//! `journal/decisions/decision-growlight-config-in-garden.md`.
 //!
 //! ## Fail-closed
 //!
@@ -42,6 +49,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde::Deserialize;
+use softfig_ipc as ipc;
 
 use crate::admission::AdmissionGovernor;
 use crate::claim::KeeperdPartClaimer;
@@ -63,7 +71,7 @@ pub const DEFAULT_CLAUDE_BIN: &str = "claude";
 /// this is the bare "go" the backend passes as `claude -p <prompt>`.
 pub const DEFAULT_PROMPT: &str = "Begin this growlight iteration. The operating protocol and your current baton have been injected above — boot per protocol step 1, execute NEXT ACTION as one coherent chunk, then hand off by rewriting the baton.";
 
-/// One configured fleet member as read from a `[[growlight.fleet]]` table. The
+/// One configured fleet member as read from a `[[fleet]]` table. The
 /// human declares only the agent's id + (optional) pinned queue; growlightd OWNS
 /// the per-agent pre-approval paths — it GENERATES `loop.json`/`mcp.json` into the
 /// runtime namespace `$XDG_CONFIG_HOME/softfig/growlight/agents/<id>/` (slice 004,
@@ -93,19 +101,20 @@ impl FleetMemberConfig {
     }
 }
 
-/// The parsed `[growlight]` fleet config: the off-by-default `enabled` gate, the
-/// shared-backend `bin`/`prompt`, and the configured `members`.
+/// The parsed `config/growlight.toml` fleet config: the off-by-default `enabled`
+/// gate, the shared-backend `bin`/`prompt`, and the configured `members`. The
+/// keys are top-level (this is a dedicated file, not a table inside a shared one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetConfig {
-    /// `[growlight] fleet_enabled` — off by default; the live-capability gate.
+    /// `fleet_enabled` — off by default; the live-capability gate.
     pub enabled: bool,
-    /// `[growlight] claude_bin` — the backend's `claude` binary.
+    /// `claude_bin` — the backend's `claude` binary.
     pub bin: String,
-    /// `[growlight] prompt` — the generic per-agent turn kick.
+    /// `prompt` — the generic per-agent turn kick.
     pub prompt: String,
-    /// `[[growlight.fleet]]` members, in config order. Raw `{agent, pin}` — the
-    /// runtime `AgentSpec` paths are derived at [`assemble_fleet`] (they need the
-    /// runtime `agents_dir`, not known at parse).
+    /// `[[fleet]]` members, in config order. Raw `{agent, pin}` — the runtime
+    /// `AgentSpec` paths are derived at [`assemble_fleet`] (they need the runtime
+    /// `agents_dir`, not known at parse).
     pub members: Vec<FleetMemberConfig>,
 }
 
@@ -121,17 +130,13 @@ impl FleetConfig {
         }
     }
 
-    /// Parse the `[growlight]` table out of a keeper.toml document, reading ONLY
-    /// that table (every other keeperd-owned key is ignored). A document with no
-    /// `[growlight]` table yields [`disabled`](Self::disabled); an out-of-shape
-    /// `[growlight]` table is an `Err` the loader treats as fail-closed.
-    pub fn from_keeper_toml(s: &str) -> Result<Self, String> {
+    /// Parse a `config/growlight.toml` document (top-level keys + `[[fleet]]`
+    /// members). An empty document yields [`disabled`](Self::disabled) (every
+    /// field defaults); an out-of-shape document is an `Err` the loader treats as
+    /// fail-closed (a config problem can never *enable* the fleet).
+    pub fn from_growlight_toml(s: &str) -> Result<Self, String> {
         #[derive(Deserialize)]
         struct Doc {
-            growlight: Option<RawGrowlight>,
-        }
-        #[derive(Deserialize)]
-        struct RawGrowlight {
             #[serde(default)]
             fleet_enabled: bool,
             claude_bin: Option<String>,
@@ -139,35 +144,37 @@ impl FleetConfig {
             #[serde(default)]
             fleet: Vec<FleetMemberConfig>,
         }
-        let doc: Doc = toml::from_str(s).map_err(|e| format!("parse keeper.toml: {e}"))?;
-        let Some(g) = doc.growlight else {
-            return Ok(Self::disabled());
-        };
+        let doc: Doc =
+            toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
         Ok(Self {
-            enabled: g.fleet_enabled,
-            bin: g.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
-            prompt: g.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
-            members: g.fleet,
+            enabled: doc.fleet_enabled,
+            bin: doc.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
+            prompt: doc.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
+            members: doc.fleet,
         })
     }
 }
 
-/// Load the fleet config from the plaintext keeper.toml bootstrap pointer at
-/// `<garden_root>/.softfig/keeper.toml`, fail-closed. An absent file, an
-/// unreadable one, or an out-of-shape `[growlight]` table all yield
-/// [`FleetConfig::disabled`] (with a stderr warning for the malformed case) — so
-/// a config problem can never *enable* the fleet.
+/// Load the fleet config from the in-garden `config/growlight.toml`, read
+/// *through the FUSE mount* (the same client-side plain read growlightd uses for
+/// `protocol.md`/the backlog — never the FUSE-shadowed `.softfig/` pointer that
+/// caused the mount-shadow bug). Fail-closed: an absent file, an unreadable one,
+/// or a malformed document all yield [`FleetConfig::disabled`] (with a stderr
+/// warning for the malformed case), so a config problem can never *enable* the
+/// fleet.
 pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
-    let path = garden_root.join(".softfig").join("keeper.toml");
+    let path = garden_root
+        .join(ipc::GARDEN_CONFIG_DIR)
+        .join(ipc::GROWLIGHT_CONFIG_FILE);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(_) => return FleetConfig::disabled(), // absent/unreadable pointer ⇒ no fleet
+        Err(_) => return FleetConfig::disabled(), // absent/unreadable ⇒ no fleet
     };
-    match FleetConfig::from_keeper_toml(&raw) {
+    match FleetConfig::from_growlight_toml(&raw) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!(
-                "softfig-growlightd: ignoring malformed [growlight] fleet config at {} ({e}); fleet stays OFF",
+                "softfig-growlightd: ignoring malformed fleet config at {} ({e}); fleet stays OFF",
                 path.display()
             );
             FleetConfig::disabled()
@@ -329,7 +336,14 @@ mod tests {
     }
 
     fn member_toml() -> &'static str {
-        "[[growlight.fleet]]\nagent = \"a\"\n"
+        "[[fleet]]\nagent = \"a\"\n"
+    }
+
+    /// Write `<dir>/config/growlight.toml` with `body`, returning the garden root.
+    fn write_config(dir: &Path, body: &str) {
+        let cd = dir.join(ipc::GARDEN_CONFIG_DIR);
+        std::fs::create_dir_all(&cd).unwrap();
+        std::fs::write(cd.join(ipc::GROWLIGHT_CONFIG_FILE), body).unwrap();
     }
 
     /// A stand-in keeperd socket for the assembly tests. Gate-off assembly never
@@ -349,8 +363,8 @@ mod tests {
         );
         // An explicit `fleet_enabled = false` with a member present is still off —
         // a configured-but-disarmed fleet spawns nothing.
-        let cfg = FleetConfig::from_keeper_toml(&format!(
-            "[growlight]\nfleet_enabled = false\n{}",
+        let cfg = FleetConfig::from_growlight_toml(&format!(
+            "fleet_enabled = false\n{}",
             member_toml()
         ))
         .unwrap();
@@ -365,8 +379,8 @@ mod tests {
     #[test]
     fn gate_on_assembles_a_loop_over_the_live_keeperd_queue_source() {
         let d = daemon();
-        let cfg = FleetConfig::from_keeper_toml(&format!(
-            "[growlight]\nfleet_enabled = true\n{}",
+        let cfg = FleetConfig::from_growlight_toml(&format!(
+            "fleet_enabled = true\n{}",
             member_toml()
         ))
         .unwrap();
@@ -385,24 +399,22 @@ mod tests {
     #[test]
     fn parses_a_growlight_fleet_table_into_members() {
         // The human declares only `agent` (+ optional `pin`) — growlightd OWNS the
-        // pre-approval paths (slice 004), so the config no longer names them.
+        // pre-approval paths (slice 004), so the config no longer names them. The
+        // keys are top-level: this is a dedicated `config/growlight.toml`, not a
+        // table inside a shared file.
         let toml = r#"
-state_root = "/state"
-
-[growlight]
-allow_relock = false
 fleet_enabled = true
 claude_bin = "/usr/bin/claude"
 prompt = "kick"
 
-[[growlight.fleet]]
+[[fleet]]
 agent = "builder"
 pin = "queue:build"
 
-[[growlight.fleet]]
+[[fleet]]
 agent = "reviewer"
 "#;
-        let cfg = FleetConfig::from_keeper_toml(toml).expect("valid config");
+        let cfg = FleetConfig::from_growlight_toml(toml).expect("valid config");
         assert!(cfg.enabled);
         assert_eq!(cfg.bin, "/usr/bin/claude");
         assert_eq!(cfg.prompt, "kick");
@@ -440,14 +452,19 @@ agent = "reviewer"
     }
 
     #[test]
-    fn no_growlight_table_is_the_disabled_default() {
-        let cfg = FleetConfig::from_keeper_toml("state_root = \"/state\"\n").unwrap();
-        assert_eq!(cfg, FleetConfig::disabled());
+    fn an_empty_config_is_the_disabled_default() {
+        // An empty (or comment-only) config file — every field defaults — is the
+        // off-by-default fleet, identical to `disabled()`.
+        assert_eq!(FleetConfig::from_growlight_toml("").unwrap(), FleetConfig::disabled());
+        assert_eq!(
+            FleetConfig::from_growlight_toml("# just a comment\n").unwrap(),
+            FleetConfig::disabled()
+        );
     }
 
     #[test]
     fn bin_and_prompt_default_when_omitted() {
-        let cfg = FleetConfig::from_keeper_toml("[growlight]\nfleet_enabled = true\n").unwrap();
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\n").unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.bin, DEFAULT_CLAUDE_BIN);
         assert_eq!(cfg.prompt, DEFAULT_PROMPT);
@@ -455,40 +472,32 @@ agent = "reviewer"
     }
 
     #[test]
-    fn a_malformed_growlight_table_is_an_error() {
+    fn a_malformed_config_is_an_error() {
         // `fleet_enabled` as a string, not a bool — the loader treats Err as
         // fail-closed, so this never enables the fleet.
-        let r = FleetConfig::from_keeper_toml("[growlight]\nfleet_enabled = \"yes\"\n");
-        assert!(r.is_err(), "an out-of-shape table is rejected, not silently on");
+        let r = FleetConfig::from_growlight_toml("fleet_enabled = \"yes\"\n");
+        assert!(r.is_err(), "an out-of-shape config is rejected, not silently on");
     }
 
     #[test]
-    fn load_is_disabled_when_the_pointer_is_absent() {
+    fn load_is_disabled_when_the_config_is_absent() {
         let dir = tempfile::tempdir().unwrap();
-        // No `.softfig/keeper.toml` under the garden root.
+        // No `config/growlight.toml` under the garden root.
         assert_eq!(load_fleet_config(dir.path()), FleetConfig::disabled());
     }
 
     #[test]
-    fn load_is_disabled_when_the_pointer_is_malformed() {
+    fn load_is_disabled_when_the_config_is_malformed() {
         let dir = tempfile::tempdir().unwrap();
-        let sd = dir.path().join(".softfig");
-        std::fs::create_dir_all(&sd).unwrap();
-        std::fs::write(sd.join("keeper.toml"), "[growlight]\nfleet_enabled = 3\n").unwrap();
-        // A broken table fails closed, not on.
+        write_config(dir.path(), "fleet_enabled = 3\n");
+        // A broken config fails closed, not on.
         assert_eq!(load_fleet_config(dir.path()), FleetConfig::disabled());
     }
 
     #[test]
-    fn load_reads_an_armed_pointer() {
+    fn load_reads_an_armed_config() {
         let dir = tempfile::tempdir().unwrap();
-        let sd = dir.path().join(".softfig");
-        std::fs::create_dir_all(&sd).unwrap();
-        std::fs::write(
-            sd.join("keeper.toml"),
-            format!("state_root = \"/s\"\n[growlight]\nfleet_enabled = true\n{}", member_toml()),
-        )
-        .unwrap();
+        write_config(dir.path(), &format!("fleet_enabled = true\n{}", member_toml()));
         let cfg = load_fleet_config(dir.path());
         assert!(cfg.enabled);
         assert_eq!(cfg.members.len(), 1);

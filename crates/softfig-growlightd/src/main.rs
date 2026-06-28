@@ -79,9 +79,9 @@ fn main() -> Result<()> {
     )?;
 
     // Assemble + spawn the live fleet drive loop, but ONLY when the off-by-default
-    // `[growlight] fleet_enabled` gate in the plaintext keeper.toml pointer is on.
-    // Gate off ⇒ `None`, nothing constructed or spawned, so growlightd is
-    // byte-identical to today (the on-device enablement is `growlight-verify-merge`).
+    // `fleet_enabled` gate in the in-garden `config/growlight.toml` (read through
+    // the mount) is on. Gate off ⇒ `None`, nothing constructed or spawned, so
+    // growlightd is byte-identical to today.
     let fleet_config = load_fleet_config(&garden_root);
     let drive_loop = spawn_fleet(&handle.daemon, &fleet_config, &keeperd_socket)
         .context("spawning the live fleet drive loop")?;
