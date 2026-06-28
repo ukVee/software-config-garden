@@ -248,6 +248,38 @@ impl BatonStatusSource for DeferredBatonStatus {
     }
 }
 
+/// The seam the loop **seeds** a fresh member's per-member baton through, so an
+/// assigned agent boots WITH its baton (`agents/<id>/baton.md`) instead of the
+/// `(no baton yet)` `inject.sh` fallback — the WRITE counterpart to
+/// [`BatonStatusSource`]'s read. The loop calls it on a **fresh start only** (the
+/// step-3 spawn of an un-registered member, where the claimed `(queue, part)` is
+/// known), BEFORE the part claim and the backend spawn, so the file exists when
+/// the child's SessionStart hook cats it. A **re-roll** never re-seeds — the
+/// member's own write-back from the prior iteration is what carries forward (the
+/// curated state across iterations). The live impl is
+/// [`crate::baton_store::FsBatonStore`] over the runtime `agents/` namespace; a
+/// test records or scripts the seed.
+pub trait BatonSeeder: Send + Sync + fmt::Debug {
+    /// Seed `agent`'s baton from the claimed `(queue, part)`. `Ok(())` means the
+    /// baton is laid down (the agent will boot with it); `Err(reason)` aborts the
+    /// spawn fail-closed (a member booting stateless is the bug this slice fixes) —
+    /// the drive loop holds the start and retries next tick.
+    fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<(), String>;
+}
+
+/// The deferred [`BatonSeeder`] for the disabled/test seam: seeding is a no-op
+/// success, so a loop assembled without the live store behaves as before (a member
+/// boots `(no baton yet)`). The live assembly wires [`crate::baton_store::FsBatonStore`]
+/// instead. Mirrors [`DeferredBatonStatus`].
+#[derive(Debug)]
+pub struct DeferredBatonSeeder;
+
+impl BatonSeeder for DeferredBatonSeeder {
+    fn seed(&self, _agent: &str, _queue: &str, _part: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// One configured fleet member: the agent's spawn [`AgentSpec`] plus the
 /// work-stream it is **pinned** to (pinned-with-fallback, spec §6). An unpinned
 /// member (`pin: None`) goes straight to fallback.
@@ -340,8 +372,14 @@ pub struct DriveLoop {
     /// Reads an exited agent's terminal baton status — the source for
     /// [`Supervisor::poll`]'s retire-vs-re-roll decision (the spin fix). Deferred
     /// in slice 001 ([`DeferredBatonStatus`], always `None`); slice 002 wires the
-    /// real per-member reader.
+    /// real per-member reader ([`crate::baton_store::FsBatonStore`]).
     baton: Box<dyn BatonStatusSource>,
+    /// Seeds a fresh member's per-member baton from its claimed `(queue, part)`
+    /// (slice 002), so an assigned agent boots with its baton rather than
+    /// `(no baton yet)`. Invoked on a fresh start only — a re-roll carries the
+    /// member's own write-back forward (the same [`crate::baton_store::FsBatonStore`]
+    /// the `baton` reader reads, in the live assembly).
+    seeder: Box<dyn BatonSeeder>,
     /// Where the multi-queue snapshot comes from.
     queues: Box<dyn QueueSource>,
     /// How a picked part is claimed (`active`) before its agent spawns — the
@@ -385,6 +423,7 @@ impl DriveLoop {
         supervisor: Supervisor,
         health: Box<dyn AgentHealthSource>,
         baton: Box<dyn BatonStatusSource>,
+        seeder: Box<dyn BatonSeeder>,
         queues: Box<dyn QueueSource>,
         claimer: Box<dyn PartClaimer>,
         samples: Box<dyn BudgetSampleSource>,
@@ -397,6 +436,7 @@ impl DriveLoop {
             supervisor,
             health,
             baton,
+            seeder,
             queues,
             claimer,
             samples,
@@ -567,17 +607,28 @@ impl DriveLoop {
                 if claimed_this_tick.contains(&(queue.clone(), part.clone())) {
                     continue;
                 }
-                // Claim the part (mark it `active` in keeperd) BETWEEN admission
-                // and the spawn: a claim that cannot be confirmed aborts the start
-                // fail-closed, so no agent is ever left running on an unclaimed
-                // part. The claimer borrow is a disjoint field from `supervisor`.
+                // Seed the per-member baton, then claim the part (mark it `active`
+                // in keeperd), both BETWEEN admission and the spawn (slice 002 +
+                // 001). Order is deliberate: the local seed write comes FIRST so a
+                // seed failure aborts the start before the keeperd claim — a claim
+                // that landed before a later seed failure would orphan an `active`
+                // part. The seed is fresh-start only (this step-3 path); a re-roll
+                // re-spawns through `Supervisor::tick` without re-seeding, carrying
+                // the member's own write-back forward. Either step's `Err` aborts
+                // fail-closed ([`StartOutcome::ClaimFailed`]): nothing spawned, no
+                // agent left running on an unclaimed part, retried next tick. The
+                // claimer/seeder borrows are disjoint fields from `supervisor`.
                 let claimer = &self.claimer;
+                let seeder = &self.seeder;
                 let outcome = self.supervisor.start_claiming(
                     member.spec.clone(),
                     budget,
                     rate,
                     now,
-                    || claimer.claim(&queue, &part),
+                    || {
+                        seeder.seed(agent, &queue, &part)?;
+                        claimer.claim(&queue, &part)
+                    },
                 );
                 match outcome {
                     StartOutcome::Started => {
@@ -751,12 +802,19 @@ mod tests {
         health: Mutex<BTreeMap<String, AgentHealth>>,
         budgets: Mutex<BTreeMap<String, BudgetUsage>>,
         /// Scripted terminal baton status per agent (the per-member write-back the
-        /// live loop reads on exit — slice 002 wires the real reader).
+        /// live loop reads on exit — slice 002's real reader is `FsBatonStore`).
         baton: Mutex<BTreeMap<String, String>>,
+        /// Recorded per-member baton seeds `(agent, queue, part)` — the slice-002
+        /// seed the loop writes on a FRESH start. A test asserts a fresh start
+        /// seeds and a re-roll does not (carry-across-iterations).
+        seeds: Mutex<Vec<(String, String, String)>>,
         /// When set, every `spawn` fails (models a fail-closed pre-approval
         /// generation failure, slice 004 — `ClaudeBackend::spawn` returns
         /// `SpawnError` before exec).
         fail_spawn: AtomicBool,
+        /// When set, every `seed` fails (the fail-closed seed path — a member that
+        /// can't be given its baton is not spawned).
+        fail_seed: AtomicBool,
     }
     impl FakeFleet {
         fn new() -> Arc<Self> {
@@ -775,6 +833,14 @@ mod tests {
         /// Force every subsequent `spawn` to fail (the fail-closed path).
         fn set_fail_spawn(&self, fail: bool) {
             self.fail_spawn.store(fail, Ordering::SeqCst);
+        }
+        /// Force every subsequent `seed` to fail (the fail-closed seed path).
+        fn set_fail_seed(&self, fail: bool) {
+            self.fail_seed.store(fail, Ordering::SeqCst);
+        }
+        /// The recorded `(agent, queue, part)` seeds, in call order.
+        fn seeds(&self) -> Vec<(String, String, String)> {
+            self.seeds.lock().unwrap().clone()
         }
         /// Script `agent`'s latest reading of the shared pool (its budget cell).
         fn set_budget(&self, agent: &str, b: BudgetUsage) {
@@ -817,6 +883,18 @@ mod tests {
     impl BatonStatusSource for Arc<FakeFleet> {
         fn status(&self, agent: &str) -> Option<String> {
             self.baton.lock().unwrap().get(agent).cloned()
+        }
+    }
+    impl BatonSeeder for Arc<FakeFleet> {
+        fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<(), String> {
+            if self.fail_seed.load(Ordering::SeqCst) {
+                return Err("seed refused".into());
+            }
+            self.seeds
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), queue.to_string(), part.to_string()));
+            Ok(())
         }
     }
 
@@ -999,6 +1077,7 @@ mod tests {
             sup,
             Box::new(Arc::clone(&backend)), // health
             Box::new(Arc::clone(&backend)), // baton status — scripted via set_baton
+            Box::new(Arc::clone(&backend)), // seeder — records seeds, scriptable failure
             Box::new(Arc::clone(&queues)),
             Box::new(Arc::clone(&claimer)),
             Box::new(Arc::clone(&backend)),
@@ -1779,5 +1858,123 @@ mod tests {
         );
         assert_eq!(claimer.claims(), vec![("qa".into(), "p1".into())], "the head is claimed exactly once");
         assert_eq!(backend.spawns(), vec!["a1"], "the mis-pinned peer does not also spawn on p1");
+    }
+
+    /// SLICE 002: a fresh start seeds the member's per-member baton from the claimed
+    /// `(queue, part)` — so the agent boots WITH its baton, not `(no baton yet)`.
+    #[test]
+    fn a_fresh_start_seeds_the_per_member_baton_from_the_claimed_part() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        let r = loop_.tick(0);
+        assert_eq!(r.started.len(), 1, "the member starts on its pinned part");
+        assert_eq!(
+            backend.seeds(),
+            vec![("a1".to_string(), "qa".to_string(), "p1".to_string())],
+            "the fresh start seeded the per-member baton, reflecting the claimed (queue, part)",
+        );
+    }
+
+    /// SLICE 002: a re-roll does NOT re-seed — the member carries its own baton
+    /// write-back across iterations (the curated-state contract). Only the fresh
+    /// start seeds; the continue-status re-roll re-spawns through `Supervisor::tick`,
+    /// which never reaches the step-3 seed.
+    #[test]
+    fn a_re_roll_carries_state_forward_without_re_seeding() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // fresh start → one seed
+        assert_eq!(backend.seeds().len(), 1, "the fresh start seeded once");
+
+        // a1 exits clean on a continue baton (IN_PROGRESS) → an immediate re-roll.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        let r = loop_.tick(1);
+
+        assert_eq!(
+            r.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "a continue baton re-rolls the member",
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "the member re-spawned");
+        assert_eq!(
+            backend.seeds().len(),
+            1,
+            "the re-roll did NOT re-seed — the member's own write-back carries forward",
+        );
+    }
+
+    /// SLICE 002 fail-closed: if the per-member baton can't be seeded, the start is
+    /// aborted before the keeperd claim (seed-before-claim ordering) — nothing
+    /// spawned, nothing claimed (no orphaned `active` part), held as `ClaimFailed`,
+    /// retried next tick. A member booting stateless is the bug this slice fixes.
+    #[test]
+    fn a_seed_failure_is_fail_closed_before_the_claim() {
+        let (mut loop_, _d, backend, claimer, _queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        backend.set_fail_seed(true);
+
+        let r = loop_.tick(0);
+        assert!(r.started.is_empty(), "a start whose seed failed never reports as started");
+        assert!(
+            matches!(
+                r.held_starts.as_slice(),
+                [HeldStart { outcome: StartOutcome::ClaimFailed { .. }, .. }]
+            ),
+            "the held start records a fail-closed seed (as ClaimFailed), got {:?}",
+            r.held_starts,
+        );
+        assert_eq!(backend.spawn_count(), 0, "a failed seed spawns nothing");
+        assert!(
+            claimer.claims().is_empty(),
+            "the seed runs BEFORE the claim, so a seed failure never claims the part (no orphan)",
+        );
+    }
+
+    /// SLICE 001+002 end-to-end: a fresh start seeds, the agent drains the queue and
+    /// reports QUEUE_EMPTY, the loop reads that back and retires the member; when new
+    /// work appears the re-start seeds AGAIN with the NEW part (a retired member is a
+    /// fresh start, not a re-roll).
+    #[test]
+    fn a_re_start_after_retire_re_seeds_the_new_part() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // start a1 on p1, seeding it
+        assert_eq!(backend.seeds(), vec![("a1".into(), "qa".into(), "p1".into())]);
+
+        // a1 drained the queue → QUEUE_EMPTY → retire to idle (not re-rolled).
+        queues.set(vec![q("qa", &[("p1", "done")])]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "QUEUE_EMPTY");
+        assert_eq!(loop_.tick(1).retired, vec!["a1".to_string()], "the member retired");
+
+        // New queued work → a fresh start, which re-seeds with the NEW part.
+        queues.set(vec![q("qa", &[("p2", "queued")])]);
+        backend.set_health("a1", AgentHealth::Alive { last_active: 2 });
+        let r = loop_.tick(2);
+        assert_eq!(r.started.len(), 1, "new work re-starts the member");
+        assert_eq!(
+            backend.seeds(),
+            vec![
+                ("a1".into(), "qa".into(), "p1".into()),
+                ("a1".into(), "qa".into(), "p2".into()),
+            ],
+            "the re-start (a fresh start) re-seeded with the new part",
+        );
     }
 }

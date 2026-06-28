@@ -52,12 +52,11 @@ use serde::Deserialize;
 use softfig_ipc as ipc;
 
 use crate::admission::AdmissionGovernor;
+use crate::baton_store::FsBatonStore;
 use crate::claim::KeeperdPartClaimer;
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
-use crate::drive_loop::{
-    spawn_drive_loop, DeferredBatonStatus, DriveLoop, FleetMember, LiveRate, DRIVE_POLL_MS,
-};
+use crate::drive_loop::{spawn_drive_loop, DriveLoop, FleetMember, LiveRate, DRIVE_POLL_MS};
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
@@ -215,6 +214,13 @@ pub fn assemble_fleet(
     // the generated files can't drift.
     let garden_root = daemon.garden_root();
     let agents_dir = runtime_agents_dir();
+    // The garden's directory name — a cosmetic `loop:` tag in the seed baton,
+    // matching the single-agent baton's frontmatter. Derived before `garden_root`
+    // is moved into the pre-approval context below.
+    let garden_name = garden_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| PILLAR.to_string());
     let preapproval = PreApproval::new(
         agents_dir.clone(),
         garden_root.join(PILLAR).join("protocol.md"),
@@ -222,6 +228,15 @@ pub fn assemble_fleet(
         softfig_mcp_path(),
         claude_dir(),
     );
+
+    // One per-member baton store over the SAME runtime `agents/` namespace the
+    // pre-approval generator writes each agent's `loop.json` into (and `inject.sh`
+    // cats `baton.md` from). It is BOTH the seeder (the fresh-start baton write, so
+    // a member boots with its baton, not `(no baton yet)`) AND the
+    // `BatonStatusSource` slice 001 reads on exit — one store cloned into both
+    // boxes, so the file the seeder writes and the file the reader parses can never
+    // drift. `FsBatonStore` is a cheap `Clone` (two paths + a name), so no `Arc`.
+    let baton_store = FsBatonStore::new(agents_dir.clone(), garden_name);
 
     // One backend, shared three ways (the `DriveLoop::new` contract): the
     // supervisor spawns through it, and health + budget are read off the SAME
@@ -248,7 +263,8 @@ pub fn assemble_fleet(
         daemon.clone(),
         supervisor,
         Box::new(Arc::clone(&backend)), // health  — live ClaudeBackend (slice 001)
-        Box::new(DeferredBatonStatus), // baton — deferred until fleet-loop-spin slice 002 wires the per-member reader
+        Box::new(baton_store.clone()), // baton  — live per-member read-back (fleet-loop-spin slice 002)
+        Box::new(baton_store), // seeder — fresh-start baton seed (fleet-loop-spin slice 002)
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)
         Box::new(KeeperdPartClaimer::new(keeperd_socket.to_path_buf())), // claimer — live (slice 003)
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)

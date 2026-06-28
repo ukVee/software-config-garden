@@ -19,6 +19,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod admission;
+pub mod baton_store;
 pub mod bus;
 pub mod claim;
 pub mod claude_backend;
@@ -45,6 +46,7 @@ pub mod usage;
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
 };
+pub use baton_store::FsBatonStore;
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
 pub use claude_backend::{AgentHealthState, ClaudeBackend};
@@ -52,9 +54,10 @@ pub use config::{GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
-    spawn_drive_loop, AgentHealthSource, Assignment, BatonStatusSource, BudgetSampleSource,
-    DeferredBatonStatus, DeferredQueues, DriveLoop, FleetMember, HeldStart, PartClaimer,
-    PermissiveRate, QueueSource, RateSource, TickReport, DRIVE_POLL_MS,
+    spawn_drive_loop, AgentHealthSource, Assignment, BatonSeeder, BatonStatusSource,
+    BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus, DeferredQueues, DriveLoop,
+    FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource, RateSource, TickReport,
+    DRIVE_POLL_MS,
 };
 pub use fleet::{
     assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig,
