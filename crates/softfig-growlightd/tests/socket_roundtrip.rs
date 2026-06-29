@@ -174,8 +174,12 @@ fn call_set_resources(
         .map(|v| serde_json::from_value(v).expect("SetResourcesReply decodes"))
 }
 
+/// slice 011: this proves the NEXT-SPAWN + `status` path on a DISARMED fleet — NOT
+/// the live `set-property` push. With no running scopes there is nothing to
+/// `set-property` on, so the genuine live push (a property landing on a running
+/// agent's cgroup) is the on-device §7b check, never this test. The name says so.
 #[test]
-fn set_resources_updates_the_live_caps_and_status_reflects_it() {
+fn set_resources_updates_the_next_spawn_default_and_status_disarmed() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("growlightd.sock");
     // No fleet config set ⇒ disarmed, empty roster ⇒ no live `set-property` shells
