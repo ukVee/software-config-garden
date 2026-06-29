@@ -243,6 +243,20 @@ mod tests {
     }
 
     #[test]
+    fn set_resources_dispatches_to_growlightd_with_the_touched_knobs() {
+        let (socket, req) = dispatched(Command::SetResources {
+            build_jobs: Some(1),
+            memory_high: Some("3G".into()),
+            cpu_weight: None,
+        });
+        assert_eq!(socket, growlightd_runtime_socket_path());
+        assert_eq!(req.op, "set_resources");
+        assert_eq!(req.args["build_jobs"], 1);
+        assert_eq!(req.args["memory_high"], "3G");
+        assert!(req.args.get("cpu_weight").is_none(), "untouched knob omitted");
+    }
+
+    #[test]
     fn status_request_targets_growlightd_status_with_null_args() {
         let r = status_request();
         assert_eq!(r.daemon, Daemon::Growlightd);
@@ -265,6 +279,7 @@ mod tests {
                 session_5h_halt_pct: 85,
                 session_7d_halt_pct: 90,
             },
+            build_caps: Default::default(),
             paused: false,
             fleet_enabled: false,
             roster: Vec::new(),

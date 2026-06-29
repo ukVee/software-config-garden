@@ -53,6 +53,7 @@ use softfig_ipc as ipc;
 
 use crate::admission::AdmissionGovernor;
 use crate::baton_store::FsBatonStore;
+use crate::config::BuildCaps;
 use crate::claim::{KeeperdItemParker, KeeperdPartClaimer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
@@ -115,6 +116,11 @@ pub struct FleetConfig {
     /// `AgentSpec` paths are derived at [`assemble_fleet`] (they need the runtime
     /// `agents_dir`, not known at parse).
     pub members: Vec<FleetMemberConfig>,
+    /// `[build_caps]` — the GENTLE per-agent build-resource throttle applied to
+    /// each agent's transient scope (slice 002). A missing table ⇒
+    /// [`BuildCaps::default`] (conservative for the 7.7 GB tablet). Threaded into
+    /// the backend so [`crate::claude_backend::ClaudeBackend`] caps every spawn.
+    pub build_caps: BuildCaps,
 }
 
 impl FleetConfig {
@@ -126,6 +132,7 @@ impl FleetConfig {
             bin: DEFAULT_CLAUDE_BIN.to_string(),
             prompt: DEFAULT_PROMPT.to_string(),
             members: Vec::new(),
+            build_caps: BuildCaps::default(),
         }
     }
 
@@ -142,6 +149,8 @@ impl FleetConfig {
             prompt: Option<String>,
             #[serde(default)]
             fleet: Vec<FleetMemberConfig>,
+            #[serde(default)]
+            build_caps: BuildCaps,
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
@@ -150,6 +159,7 @@ impl FleetConfig {
             bin: doc.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
             prompt: doc.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
             members: doc.fleet,
+            build_caps: doc.build_caps,
         })
     }
 }
@@ -248,6 +258,13 @@ pub fn assemble_fleet(
         fleet.prompt.clone(),
         hub.clone(),
         preapproval,
+        // The GENTLE per-agent build throttle (slice 002): every spawn's scope is
+        // capped to slow — never kill — a building agent. Shared by Arc with the
+        // daemon (peer-isolation slice 003) so `set_resources` adjusts the
+        // next-spawn throttle live; the daemon's cell was seeded from
+        // `fleet.build_caps` at `set_fleet_config`, so the backend reads the
+        // configured value (and any subsequent live change) off this same cell.
+        Arc::clone(&daemon.build_caps),
     ));
     let members: Vec<FleetMember> = fleet
         .members
@@ -519,6 +536,49 @@ agent = "reviewer"
         assert_eq!(cfg.bin, DEFAULT_CLAUDE_BIN);
         assert_eq!(cfg.prompt, DEFAULT_PROMPT);
         assert!(cfg.members.is_empty());
+    }
+
+    #[test]
+    fn build_caps_default_when_absent_and_parse_when_present() {
+        // No `[build_caps]` table ⇒ the conservative 7.7 GB-tablet defaults.
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\n").unwrap();
+        assert_eq!(cfg.build_caps, BuildCaps::default());
+
+        // A full `[build_caps]` table parses every field through.
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[build_caps]\n",
+            "cargo_build_jobs = 4\n",
+            "memory_high = \"5G\"\n",
+            "cpu_weight = 80\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.build_caps,
+            BuildCaps {
+                cargo_build_jobs: Some(4),
+                memory_high: Some("5G".to_string()),
+                cpu_weight: Some(80),
+            }
+        );
+
+        // A PARTIAL `[build_caps]` table fills the unset fields from the defaults
+        // (container `#[serde(default)]`), so a human can override just one knob.
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[build_caps]\n",
+            "memory_high = \"6G\"\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.build_caps,
+            BuildCaps {
+                cargo_build_jobs: Some(2),
+                memory_high: Some("6G".to_string()),
+                cpu_weight: Some(50),
+            },
+            "an unset field falls back to the conservative default",
+        );
     }
 
     #[test]

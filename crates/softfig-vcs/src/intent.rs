@@ -35,6 +35,7 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "item_status_set",
     "backlog_item_reordered",
     "growlight_initialized",
+    "growlight_resources_set",
     "chat_message_posted",
     "inbox_read",
     "config_migrated",
@@ -101,6 +102,7 @@ const KNOWN_INTENTS_LIST: &str =
      section_edited, section_appended, reviewed_stamped, archive_move, \
      project_added, project_archived, baton_logged, backlog_item_added, \
      queue_added, slice_added, item_status_set, backlog_item_reordered, growlight_initialized, \
+     growlight_resources_set, \
      chat_message_posted, inbox_read, \
      config_migrated, \
      peers_changed, schema_change, rollback, vault_seal, vault_reveal";

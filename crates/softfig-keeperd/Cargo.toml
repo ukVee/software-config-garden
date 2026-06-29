@@ -26,6 +26,9 @@ thiserror.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 toml.workspace = true
+# growlight peer-isolation slice 003 — surgical `[build_caps]` edit in
+# config/growlight.toml (preserve comments + the rest of the fleet config).
+toml_edit.workspace = true
 
 notify.workspace = true
 notify-debouncer-full.workspace = true

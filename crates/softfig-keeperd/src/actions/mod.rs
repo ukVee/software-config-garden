@@ -42,8 +42,9 @@ pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
 pub use growlight::{
-    add_backlog_item, add_queue, add_slice, growlight_init, log_baton, post_message, read_inbox,
-    release_lease, reorder_backlog_item, request_lease, set_item_status, tail_bus, HolderStore,
+    add_backlog_item, add_queue, add_slice, growlight_init, growlight_set_resources, log_baton,
+    post_message, read_inbox, release_lease, reorder_backlog_item, request_lease, set_item_status,
+    tail_bus, HolderStore,
 };
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;

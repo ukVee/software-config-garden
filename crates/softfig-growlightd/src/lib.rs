@@ -34,6 +34,7 @@ pub mod leases;
 pub mod notifications;
 pub mod notify_dispatch;
 pub mod peer;
+pub mod persist;
 pub mod preapproval;
 pub mod queue_source;
 pub mod resume;
@@ -51,7 +52,7 @@ pub use baton_store::FsBatonStore;
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
 pub use claude_backend::{AgentHealthState, ClaudeBackend};
-pub use config::{GrowlightdConfig, Policy};
+pub use config::{BuildCaps, GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
@@ -72,6 +73,7 @@ pub use notify_dispatch::{
     BusEmit, GuiNotifier, KeeperdBusEmit, LogNotifier, LogSink, Notifier, NotifyDispatcher,
     PhoneStub, StderrLog, ALERT_FROM, ALERT_KIND,
 };
+pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_QUEUE_NAME};
 pub use resume::{ItemResumer, KeeperdItemResumer, ResumeOutcome};

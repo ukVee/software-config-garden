@@ -33,9 +33,9 @@ use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::widget::{button, column, row, scrollable, text, text_input};
 use iced::{Element, Length, Subscription, Task};
 
-use softfig_ipc::growlightd::StopLevel;
+use softfig_ipc::growlightd::{SetResourcesReply, StopLevel};
 
-use crate::command::{Command, Daemon};
+use crate::command::{Command, Daemon, WireRequest};
 use crate::dispatch::{load_status, send, socket_for, ReconnectingTransport};
 use crate::selectors::{agent_thoughts, agents_with_thoughts, fleet_status_rows, who_holds_what};
 use crate::state::App;
@@ -66,6 +66,11 @@ pub struct GuiState {
     compose_to: String,
     /// The post kind token (`note`/`info`/`alert`/…).
     compose_kind: String,
+    /// The resources panel's `MemoryHigh` edit box (a systemd memory value, e.g.
+    /// `3G`); presentation-local, like the compose box. Sent + cleared on "set
+    /// mem". The numeric knobs (build jobs / cpu weight) nudge directly off the
+    /// model, so they need no local field.
+    resources_memory: String,
     /// The agent whose thoughts the per-agent panel shows; `None` falls back to
     /// the first agent that has produced thoughts.
     selected_agent: Option<String>,
@@ -79,6 +84,7 @@ impl Default for GuiState {
             // Sensible compose defaults so a bare "type + Enter" broadcasts a note.
             compose_to: "@all".to_string(),
             compose_kind: "note".to_string(),
+            resources_memory: String::new(),
             selected_agent: None,
         }
     }
@@ -108,6 +114,11 @@ pub enum GuiMessage {
     ComposeToChanged(String),
     /// The kind token changed.
     ComposeKindChanged(String),
+    /// The resources panel's `MemoryHigh` edit box changed.
+    ResourcesMemoryChanged(String),
+    /// Apply the resources panel's `MemoryHigh` edit box: dispatch a partial
+    /// `set_resources` (memory only) and clear the box. A blank box is a no-op.
+    SetMemoryHigh,
     /// Submit the input box: fold the optimistic `pending` chat line AND dispatch
     /// the matching `post_message` (same `to`/`kind`/`body`), then clear the box.
     Submit,
@@ -174,6 +185,11 @@ fn update(state: &mut GuiState, message: GuiMessage) -> Task<GuiMessage> {
             state.compose_kind = s;
             Task::none()
         }
+        GuiMessage::ResourcesMemoryChanged(s) => {
+            state.resources_memory = s;
+            Task::none()
+        }
+        GuiMessage::SetMemoryHigh => set_memory_high(state),
         GuiMessage::SelectAgent(agent) => {
             state.selected_agent = Some(agent);
             Task::none()
@@ -208,6 +224,24 @@ fn submit(state: &mut GuiState) -> Task<GuiMessage> {
     dispatch_command(Command::PostHuman { to, kind, body })
 }
 
+/// Apply the resources panel's `MemoryHigh` edit box: dispatch a partial
+/// `set_resources` carrying only the new memory throttle (the numeric knobs nudge
+/// separately) and clear the box. A blank box is a no-op — the same guard shape as
+/// [`submit`]. The reply folds back through [`dispatch_command`] so the panel
+/// reflects the merge.
+fn set_memory_high(state: &mut GuiState) -> Task<GuiMessage> {
+    let mem = state.resources_memory.trim().to_string();
+    if mem.is_empty() {
+        return Task::none();
+    }
+    state.resources_memory.clear();
+    dispatch_command(Command::SetResources {
+        build_jobs: None,
+        memory_high: Some(mem),
+        cpu_weight: None,
+    })
+}
+
 /// The trimmed field, or `fallback` if it is blank.
 fn non_empty_or(field: &str, fallback: &str) -> String {
     let t = field.trim();
@@ -220,22 +254,51 @@ fn non_empty_or(field: &str, fallback: &str) -> String {
 
 /// Turn a control [`Command`] into its [`crate::command::WireRequest`] and send it
 /// off the UI thread via the tested one-shot [`send`]. Shared by the control
-/// widgets and the human-post [`submit`] path. Dispatch failures are logged, not
-/// modelled — the real effect is observed back on the live stream.
+/// widgets, the human-post [`submit`] path, and the resources panel. A
+/// `set_resources` gesture folds its now-vs-next-spawn reply back into the model
+/// (the live stream carries no caps event); every other gesture is fire-and-forget
+/// — its effect is observed back on the live stream, so dispatch failures are
+/// logged, not modelled.
 fn dispatch_command(cmd: Command) -> Task<GuiMessage> {
+    let fold_reply = matches!(cmd, Command::SetResources { .. });
     match cmd.to_request() {
         Ok(req) => Task::perform(
-            perform_blocking(move || send(&req).map(|_| ()).map_err(|e| e.to_string())),
-            |result| {
-                if let Err(e) = result {
-                    eprintln!("growlight-gui: control dispatch failed: {e}");
-                }
-                GuiMessage::Done
-            },
+            perform_blocking(move || run_control(&req, fold_reply)),
+            |outcome| outcome,
         ),
         Err(e) => {
             eprintln!("growlight-gui: could not build the control request: {e}");
             Task::none()
+        }
+    }
+}
+
+/// Send a built control [`WireRequest`] over the tested one-shot [`send`] and map
+/// the round-trip to the message to fold. When `fold_reply` is set (a
+/// `set_resources` gesture) a successful reply is decoded into
+/// [`Message::ResourcesApplied`] so the resources panel reflects the merge;
+/// everything else (and every transport/daemon error) resolves to
+/// [`GuiMessage::Done`], its real effect arriving on the live stream. Runs on the
+/// blocking worker, never the UI thread.
+fn run_control(req: &WireRequest, fold_reply: bool) -> GuiMessage {
+    match send(req) {
+        Ok(resp) if fold_reply => match resp.into_result() {
+            Ok(data) => match serde_json::from_value::<SetResourcesReply>(data) {
+                Ok(reply) => GuiMessage::Reduce(Message::ResourcesApplied(reply)),
+                Err(e) => {
+                    eprintln!("growlight-gui: set_resources reply did not decode: {e}");
+                    GuiMessage::Done
+                }
+            },
+            Err((kind, error)) => {
+                eprintln!("growlight-gui: set_resources rejected ({kind:?}): {error}");
+                GuiMessage::Done
+            }
+        },
+        Ok(_) => GuiMessage::Done,
+        Err(e) => {
+            eprintln!("growlight-gui: control dispatch failed: {e}");
+            GuiMessage::Done
         }
     }
 }
@@ -442,6 +505,7 @@ fn control_column(state: &GuiState) -> Element<'_, GuiMessage> {
         chat_panel(&state.app),
         compose_box(state),
         controls(state),
+        resources_controls(state),
     ]
     .spacing(12)
     .width(Length::Fill)
@@ -512,6 +576,79 @@ fn controls(state: &GuiState) -> Element<'_, GuiMessage> {
     col.into()
 }
 
+/// The **resources knobs** (peer-isolation slice 003): the GENTLE per-agent
+/// build-cap throttle. Shows the active caps, ∓ nudges for the numeric knobs
+/// (`CARGO_BUILD_JOBS`, `CPUWeight`), and a `MemoryHigh` edit box — each a partial
+/// `set_resources`. The cap line + the now-vs-next-spawn outcome render the folded
+/// reply. The ∓ rows only show once `status` has seeded the caps (the nudge is
+/// relative to the current value); the memory box is always available.
+fn resources_controls(state: &GuiState) -> Element<'_, GuiMessage> {
+    let mut col = column![text("resources")].spacing(6);
+
+    if let Some(caps) = &state.app.build_caps {
+        col = col.push(text(crate::render::build_caps_line(caps)));
+
+        // CARGO_BUILD_JOBS ∓ (a parallel-rustc ceiling; floored at 1).
+        let jobs = caps.cargo_build_jobs.unwrap_or(1);
+        col = col.push(
+            row![
+                text(format!("build jobs: {jobs}")),
+                button(text("-")).on_press(set_resources_jobs(jobs.saturating_sub(1).max(1))),
+                button(text("+")).on_press(set_resources_jobs(jobs.saturating_add(1))),
+            ]
+            .spacing(6),
+        );
+
+        // CPUWeight ∓ (the deprioritizing weight, clamped to systemd's 1..=10000).
+        let cpu = caps.cpu_weight.unwrap_or(100);
+        col = col.push(
+            row![
+                text(format!("cpu weight: {cpu}")),
+                button(text("-")).on_press(set_resources_cpu(cpu.saturating_sub(10).max(1))),
+                button(text("+")).on_press(set_resources_cpu(cpu.saturating_add(10).min(10000))),
+            ]
+            .spacing(6),
+        );
+    }
+
+    // MemoryHigh edit box (a free-form systemd memory value — no ∓ nudge).
+    col = col.push(
+        row![
+            text_input("e.g. 3G", &state.resources_memory)
+                .on_input(GuiMessage::ResourcesMemoryChanged)
+                .on_submit(GuiMessage::SetMemoryHigh)
+                .width(Length::Fixed(90.0)),
+            button(text("set mem")).on_press(GuiMessage::SetMemoryHigh),
+        ]
+        .spacing(6),
+    );
+
+    // The now-vs-next-spawn feedback, once a set_resources reply has landed.
+    if let Some(outcome) = &state.app.last_resources_outcome {
+        col = col.push(text(crate::render::resources_outcome_line(outcome)));
+    }
+
+    col.into()
+}
+
+/// A `set_resources` gesture touching only `CARGO_BUILD_JOBS` (the ∓ nudge).
+fn set_resources_jobs(build_jobs: u32) -> GuiMessage {
+    GuiMessage::Control(Command::SetResources {
+        build_jobs: Some(build_jobs),
+        memory_high: None,
+        cpu_weight: None,
+    })
+}
+
+/// A `set_resources` gesture touching only `CPUWeight` (the ∓ nudge).
+fn set_resources_cpu(cpu_weight: u32) -> GuiMessage {
+    GuiMessage::Control(Command::SetResources {
+        build_jobs: None,
+        memory_high: None,
+        cpu_weight: Some(cpu_weight),
+    })
+}
+
 /// Launch the growlight fleet console: a window driving the pure reducer from the
 /// live `subscribe` subscription, with the control widgets dispatching over the
 /// reconnecting transport. The window itself is the §7b on-device deferred check.
@@ -525,8 +662,8 @@ pub fn run() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ChatLine, ConnState, ThoughtLine};
-    use softfig_ipc::growlightd::{AgentDeltaKind, PolicySummary};
+    use crate::state::{ChatLine, ConnState, ResourcesOutcome, ThoughtLine};
+    use softfig_ipc::growlightd::{AgentDeltaKind, BuildCapsSummary, PolicySummary};
 
     fn policy() -> PolicySummary {
         PolicySummary {
@@ -546,6 +683,16 @@ mod tests {
             state_label: "running".into(),
             conn: ConnState::Connected,
             policy: Some(policy()),
+            build_caps: Some(BuildCapsSummary {
+                cargo_build_jobs: Some(2),
+                memory_high: Some("3G".into()),
+                cpu_weight: Some(50),
+            }),
+            last_resources_outcome: Some(ResourcesOutcome {
+                applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
+                next_spawn: vec!["CARGO_BUILD_JOBS".into()],
+                scopes_targeted: vec!["growlight-agent-loop-1.scope".into()],
+            }),
             ..Default::default()
         };
         app.touch_agent("loop-1");
@@ -608,10 +755,23 @@ mod tests {
         assert_eq!(s.compose_to, "loop-1");
         let _ = update(&mut s, GuiMessage::ComposeKindChanged("alert".into()));
         assert_eq!(s.compose_kind, "alert");
+        let _ = update(&mut s, GuiMessage::ResourcesMemoryChanged("3G".into()));
+        assert_eq!(s.resources_memory, "3G");
         let _ = update(&mut s, GuiMessage::SelectAgent("loop-2".into()));
         assert_eq!(s.selected_agent.as_deref(), Some("loop-2"));
         // None of these touch the reducer-owned chat/roster state.
         assert!(s.app.chat.is_empty());
+    }
+
+    #[test]
+    fn set_memory_high_with_a_blank_box_is_a_no_op() {
+        // Like the blank-submit guard, the live dispatch is deliberately NOT
+        // exercised (a real send would hit a live growlightd on the dev box). Only
+        // the blank-box guard is new: a blank memory box dispatches nothing and
+        // leaves the box untouched.
+        let mut s = GuiState::default(); // resources_memory is blank
+        let _ = update(&mut s, GuiMessage::SetMemoryHigh);
+        assert!(s.resources_memory.is_empty());
     }
 
     #[test]

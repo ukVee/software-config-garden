@@ -22,7 +22,9 @@
 
 use serde_json::Value;
 
-use softfig_ipc::growlightd::{op as gop, ForceStopArgs, PolicySummary, SetPolicyArgs, StopLevel};
+use softfig_ipc::growlightd::{
+    op as gop, ForceStopArgs, PolicySummary, SetPolicyArgs, SetResourcesArgs, StopLevel,
+};
 use softfig_ipc::verbs::{op as kop, PostMessageArgs};
 
 /// The sender every human bus post carries — the human is a first-class member,
@@ -84,6 +86,22 @@ pub enum Command {
         /// The full replacement policy.
         policy: PolicySummary,
     },
+    /// Adjust the GENTLE per-agent build-resource caps (growlightd `set_resources`,
+    /// peer-isolation slice 003). A **partial** update: a `Some` field sets that
+    /// knob, `None` leaves the current value untouched. All three knobs are SOFT
+    /// throttles — there is no hard-cap field, so the gesture can only ever slow a
+    /// build, never abort it (throttle-not-kill, by construction).
+    SetResources {
+        /// New `CARGO_BUILD_JOBS` (≥ 1), or `None` to leave it. Takes effect at the
+        /// next spawn.
+        build_jobs: Option<u32>,
+        /// New `MemoryHigh` SOFT throttle (a systemd memory value), or `None`.
+        /// Applied to running scopes immediately.
+        memory_high: Option<String>,
+        /// New `CPUWeight` (1..=10000), or `None`. Applied to running scopes
+        /// immediately.
+        cpu_weight: Option<u32>,
+    },
 }
 
 impl Command {
@@ -126,6 +144,19 @@ impl Command {
                 daemon: Daemon::Growlightd,
                 op: gop::SET_POLICY,
                 args: serde_json::to_value(SetPolicyArgs { policy: *policy })?,
+            },
+            Command::SetResources {
+                build_jobs,
+                memory_high,
+                cpu_weight,
+            } => WireRequest {
+                daemon: Daemon::Growlightd,
+                op: gop::SET_RESOURCES,
+                args: serde_json::to_value(SetResourcesArgs {
+                    build_jobs: *build_jobs,
+                    memory_high: memory_high.clone(),
+                    cpu_weight: *cpu_weight,
+                })?,
             },
         })
     }
@@ -207,5 +238,23 @@ mod tests {
         assert_eq!(req.op, "set_policy");
         assert_eq!(req.args["policy"]["max_concurrent_agents"], 3);
         assert_eq!(req.args["policy"]["ctx_roll_pct"], 50);
+    }
+
+    #[test]
+    fn set_resources_carries_only_the_touched_knobs_to_growlightd() {
+        let req = Command::SetResources {
+            build_jobs: None,
+            memory_high: Some("3G".into()),
+            cpu_weight: Some(50),
+        }
+        .to_request()
+        .unwrap();
+        assert_eq!(req.daemon, Daemon::Growlightd);
+        assert_eq!(req.op, "set_resources");
+        // The untouched knob is omitted on the wire (partial update); the touched
+        // ones carry their values.
+        assert!(req.args.get("build_jobs").is_none(), "untouched knob omitted");
+        assert_eq!(req.args["memory_high"], "3G");
+        assert_eq!(req.args["cpu_weight"], 50);
     }
 }
