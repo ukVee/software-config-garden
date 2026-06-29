@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, AddBacklogItemReply, AddQueueReply, AddSliceReply, GrowlightInitReply, LogBatonReply,
-    PostMessageReply, ReadInboxReply, ReorderBacklogItemReply, SetItemStatusReply, TailBusReply,
+    op, AddBacklogItemReply, AddQueueReply, AddSliceReply, GrowlightInitReply,
+    GrowlightSetResourcesReply, LogBatonReply, PostMessageReply, ReadInboxReply,
+    ReorderBacklogItemReply, SetItemStatusReply, TailBusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -1213,4 +1214,74 @@ fn passing_a_queue_scopes_status_resolution() {
         serde_json::json!({ "id": "m-x", "status": "done", "queue": "softfig" }),
     );
     assert!(matches!(right, Response::Ok { .. }));
+}
+
+// ---- growlight_set_resources: the keeperd persist handler glue (slice 010) ----
+
+/// End-to-end over a live unlocked daemon (slice 010 — the pure `apply_build_caps`
+/// is unit-tested, but the handler glue — WorkTree read, the idempotent no-commit
+/// guard, the `growlight_resources_set` commit — was not): a first persist writes
+/// `[build_caps]` and commits; an identical re-persist mints no commit; a changed
+/// value commits again; and the surrounding fleet config + comments survive.
+#[test]
+fn growlight_set_resources_writes_the_table_commits_and_is_idempotent() {
+    let fx = Fixture::start();
+    // `growlight init` seeds config/growlight.toml (no `[build_caps]` table yet).
+    fx.call(op::GROWLIGHT_INIT, serde_json::json!({}));
+
+    // (a) First persist → committed, with a fresh `[build_caps]` table.
+    let resp = fx.call(
+        op::GROWLIGHT_SET_RESOURCES,
+        serde_json::json!({ "cargo_build_jobs": 4, "memory_high": "5G", "cpu_weight": 80 }),
+    );
+    let reply: GrowlightSetResourcesReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.committed, "a first persist commits");
+    assert_eq!(reply.path, "config/growlight.toml");
+    let cfg = fx.read("config/growlight.toml");
+    assert!(cfg.contains("[build_caps]"));
+    assert!(cfg.contains("cargo_build_jobs = 4"));
+    assert!(cfg.contains("memory_high = \"5G\""));
+    assert!(cfg.contains("cpu_weight = 80"));
+    // The surrounding fleet config + its heavy comments are byte-preserved.
+    assert!(cfg.contains("fleet_enabled = false"), "fleet gate preserved");
+    assert!(cfg.contains("# soft-fig growlight fleet config."), "header comment preserved");
+    // The commit carries the `growlight_resources_set` intent (note the verb-last
+    // spelling — slice 008).
+    let (intent, _) = fx.tip_intent();
+    assert_eq!(intent, "growlight_resources_set");
+
+    // (b) Re-persist the SAME caps → idempotent no-commit: committed=false and the
+    // tip is unchanged (the (a) commit hash).
+    let resp = fx.call(
+        op::GROWLIGHT_SET_RESOURCES,
+        serde_json::json!({ "cargo_build_jobs": 4, "memory_high": "5G", "cpu_weight": 80 }),
+    );
+    let reply2: GrowlightSetResourcesReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(!reply2.committed, "an identical re-persist mints no commit");
+    assert_eq!(reply2.hash, reply.hash, "the tip is unchanged on the idempotent no-op");
+
+    // (c) A different value commits again, updating the key in place.
+    let resp = fx.call(
+        op::GROWLIGHT_SET_RESOURCES,
+        serde_json::json!({ "cargo_build_jobs": 2, "memory_high": "5G", "cpu_weight": 80 }),
+    );
+    let reply3: GrowlightSetResourcesReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply3.committed, "a changed value commits");
+    assert_ne!(reply3.hash, reply.hash, "a new commit advances the tip");
+    let cfg = fx.read("config/growlight.toml");
+    assert!(cfg.contains("cargo_build_jobs = 2"));
+    assert!(!cfg.contains("cargo_build_jobs = 4"), "the old value is gone");
+}
+
+/// The absent-config branch: `growlight_set_resources` on a garden that never ran
+/// `growlight init` (no config/growlight.toml) is a clean `NotFound`, not a panic
+/// or a stray commit (slice 010).
+#[test]
+fn growlight_set_resources_is_not_found_when_the_config_is_absent() {
+    let fx = Fixture::start(); // no growlight init ⇒ config/growlight.toml absent
+    let resp = fx.call(
+        op::GROWLIGHT_SET_RESOURCES,
+        serde_json::json!({ "cargo_build_jobs": 4 }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotFound);
 }
