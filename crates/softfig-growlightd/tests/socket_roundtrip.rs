@@ -198,11 +198,18 @@ fn set_resources_updates_the_live_caps_and_status_reflects_it() {
     assert_eq!(reply.build_caps.memory_high.as_deref(), Some("6G"));
     assert_eq!(reply.build_caps.cpu_weight, Some(70));
     assert_eq!(reply.build_caps.cargo_build_jobs, Some(2), "untouched knob kept");
-    // Disarmed fleet ⇒ no running scopes ⇒ nothing applied live; the env-only
-    // CARGO_BUILD_JOBS is reported as next-spawn.
+    // Disarmed fleet ⇒ no running scopes ⇒ nothing applied live; the surface is
+    // shaped from the DELTA (slice 004), so the two CHANGED live props fall to
+    // next-spawn and the UNTOUCHED build_jobs reports NOTHING (the old code wrongly
+    // reported CARGO_BUILD_JOBS off the always-Some merged caps).
     assert!(reply.scopes_targeted.is_empty(), "no running scopes to push to");
+    assert_eq!(reply.scopes_applied, 0, "no scope took the update");
     assert!(reply.applied_live.is_empty(), "nothing live with no scopes");
-    assert_eq!(reply.next_spawn, vec!["CARGO_BUILD_JOBS".to_string()]);
+    assert_eq!(
+        reply.next_spawn,
+        vec!["MemoryHigh".to_string(), "CPUWeight".to_string()],
+        "the two changed live props fall to next-spawn; untouched build_jobs is silent",
+    );
 
     // `status` now reflects the new live default (what the next spawn throttles with).
     let after = call_status(&socket).build_caps;

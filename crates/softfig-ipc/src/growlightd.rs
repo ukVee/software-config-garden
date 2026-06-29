@@ -431,27 +431,39 @@ pub struct SetResourcesArgs {
 }
 
 /// Reply to `set_resources`: the caps after the merge, plus the now-vs-next-spawn
-/// surface (slice 003). `applied_live` names the scope properties pushed to every
-/// running agent scope immediately (a subset of `{"MemoryHigh","CPUWeight"}`);
-/// `next_spawn` names the caps that only take effect at the next spawn (the env
-/// var `"CARGO_BUILD_JOBS"`); `scopes_targeted` lists the agent scope units the
-/// live `set-property` was attempted on (best-effort — a not-yet-running scope is
-/// a harmless miss).
+/// surface (slice 003; reporting corrected in hardening slice 004). The surface is
+/// derived from the operator's **delta** (the knobs actually sent) and the **real**
+/// live push outcome, NOT the full merged caps or the configured roster:
+/// `applied_live` names the changed scope properties that landed on ≥1 running
+/// scope (a subset of `{"MemoryHigh","CPUWeight"}`); `next_spawn` names the changed
+/// caps that take effect only at the next spawn (`"CARGO_BUILD_JOBS"`, plus
+/// `MemoryHigh`/`CPUWeight` when no running scope took them); `scopes_targeted`
+/// lists the genuinely RUNNING agent scope units the live `set-property` was
+/// attempted on (N), and `scopes_applied` is how many of those actually took it (M)
+/// — the CLI renders `applied on M of N scope(s)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetResourcesReply {
     /// The build-resource caps after applying the partial update.
     pub build_caps: BuildCapsSummary,
-    /// Scope properties applied LIVE to running scopes now (subset of
-    /// `MemoryHigh` / `CPUWeight`), in a stable order.
+    /// The changed scope properties that landed LIVE on ≥1 running scope (subset of
+    /// `MemoryHigh` / `CPUWeight`), in a stable order. Empty when the operator didn't
+    /// change a live prop, or when no running scope took the push.
     #[serde(default)]
     pub applied_live: Vec<String>,
-    /// Caps that take effect only at the NEXT spawn (`CARGO_BUILD_JOBS`).
+    /// The changed caps that take effect only at the NEXT spawn: `CARGO_BUILD_JOBS`
+    /// (always, when `build_jobs` changed) and any changed `MemoryHigh`/`CPUWeight`
+    /// no running scope took (e.g. a disarmed fleet).
     #[serde(default)]
     pub next_spawn: Vec<String>,
-    /// The agent scope units the live `set-property` was attempted on (empty when
-    /// no agents are running, or when only `build_jobs` changed).
+    /// The genuinely RUNNING agent scope units the live `set-property` was attempted
+    /// on (N). Empty when no agents are running. (No longer the configured roster.)
     #[serde(default)]
     pub scopes_targeted: Vec<String>,
+    /// How many of `scopes_targeted` the live `set-property` actually succeeded on
+    /// (M ≤ N) — distinguishes full success, partial success, and "targeted but all
+    /// failed" (N > 0, M == 0) from "no scopes targeted" (N == 0).
+    #[serde(default)]
+    pub scopes_applied: usize,
 }
 
 /// Reply to `pause` / `resume`: the resulting admission-gate state.
@@ -747,7 +759,8 @@ mod tests {
             },
             applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
-            scopes_targeted: vec!["growlight-agent-builder.scope".into()],
+            scopes_targeted: vec!["growlight-agent-builder-1.scope".into()],
+            scopes_applied: 1,
         };
         let back: SetResourcesReply =
             serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();

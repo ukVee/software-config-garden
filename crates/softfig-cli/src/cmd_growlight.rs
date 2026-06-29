@@ -1527,13 +1527,25 @@ fn render_build_caps(c: &BuildCapsSummary) -> String {
 /// Pure (returns the text) so it is unit-tested without a daemon.
 fn render_set_resources_reply(r: &SetResourcesReply) -> String {
     let mut out = render_build_caps(&r.build_caps);
+    let targeted = r.scopes_targeted.len();
     if r.applied_live.is_empty() {
-        out.push_str("applied live  (none — no running agent scopes)\n");
+        // Distinguish "no running scopes" from "targeted N but none took it" — never
+        // assert a cause we can't know (slice 003/004). A nothing-changed-live (only
+        // build_jobs) also lands here with no scopes targeted.
+        if targeted == 0 {
+            out.push_str("applied live  (none — no running agent scopes)\n");
+        } else {
+            out.push_str(&format!(
+                "applied live  (none — 0 of {targeted} scope(s) took the update): {}\n",
+                r.scopes_targeted.join(", "),
+            ));
+        }
     } else {
         out.push_str(&format!(
-            "applied live  {} on {} scope(s): {}\n",
+            "applied live  {} on {} of {} scope(s): {}\n",
             r.applied_live.join(", "),
-            r.scopes_targeted.len(),
+            r.scopes_applied,
+            targeted,
             r.scopes_targeted.join(", "),
         ));
     }
@@ -2008,19 +2020,37 @@ mod tests {
             applied_live: vec![],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
             scopes_targeted: vec![],
+            scopes_applied: 0,
         });
-        assert!(disarmed.contains("applied live  (none"));
+        assert!(disarmed.contains("applied live  (none — no running agent scopes)"));
         assert!(disarmed.contains("next spawn    CARGO_BUILD_JOBS"));
 
-        // With running scopes: the live props + the scopes they were pushed to.
+        // With running scopes: the live props + applied M of N targeted (slice 004).
         let live = render_set_resources_reply(&SetResourcesReply {
             build_caps: BuildCapsSummary::default(),
             applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
             next_spawn: vec![],
-            scopes_targeted: vec!["growlight-agent-builder.scope".into()],
+            scopes_targeted: vec![
+                "growlight-agent-builder-3.scope".into(),
+                "growlight-agent-reviewer-4.scope".into(),
+            ],
+            scopes_applied: 2,
         });
-        assert!(live.contains("applied live  MemoryHigh, CPUWeight on 1 scope(s)"));
-        assert!(live.contains("growlight-agent-builder.scope"));
+        assert!(live.contains("applied live  MemoryHigh, CPUWeight on 2 of 2 scope(s)"));
+        assert!(live.contains("growlight-agent-builder-3.scope"));
+
+        // Targeted but NONE took it (slice 003/004): distinct from "no scopes".
+        let all_failed = render_set_resources_reply(&SetResourcesReply {
+            build_caps: BuildCapsSummary::default(),
+            applied_live: vec![],
+            next_spawn: vec!["MemoryHigh".into()],
+            scopes_targeted: vec!["growlight-agent-builder-3.scope".into()],
+            scopes_applied: 0,
+        });
+        assert!(
+            all_failed.contains("0 of 1 scope(s) took the update"),
+            "targeted-but-all-failed renders distinctly from no-scopes: {all_failed}",
+        );
     }
 
     #[test]

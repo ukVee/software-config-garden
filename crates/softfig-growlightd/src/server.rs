@@ -384,24 +384,13 @@ fn set_resources(daemon: &Daemon, req: &Request) -> Response {
         .filter(|unit| apply_set_property(unit, &new))
         .count();
 
-    // The live-applicable props present in the new caps (the ones a running scope's
-    // `set-property` carried). Reported as `applied_live` only when at least one
-    // scope actually took the update — otherwise they fall to the next spawn.
-    let mut live_props = Vec::new();
-    if new.memory_high.is_some() {
-        live_props.push("MemoryHigh".to_string());
-    }
-    if new.cpu_weight.is_some() {
-        live_props.push("CPUWeight".to_string());
-    }
-    let applied_live = if live_succeeded > 0 { live_props } else { Vec::new() };
-
-    // `CARGO_BUILD_JOBS` is an env var on the scope, never a live scope property —
-    // it always takes effect only at the next spawn.
-    let mut next_spawn = Vec::new();
-    if new.cargo_build_jobs.is_some() {
-        next_spawn.push("CARGO_BUILD_JOBS".to_string());
-    }
+    // Shape the now-vs-next-spawn surface from the operator's DELTA (`args`, the
+    // knobs they actually sent) + the REAL live outcome (`live_succeeded`), not the
+    // full merged caps (slice 004): a build-jobs-only change must not report
+    // MemoryHigh/CPUWeight it never touched, and a memory-only change must not report
+    // CARGO_BUILD_JOBS. A changed live prop lands in `applied_live` only when a
+    // running scope took it; otherwise it falls to `next_spawn`.
+    let (applied_live, next_spawn) = shape_set_resources_effects(&args, live_succeeded);
 
     // Persist the new default into `config/growlight.toml` via keeperd so it
     // survives a daemon restart (peer-isolation slice 003a-persist). Best-effort +
@@ -423,10 +412,49 @@ fn set_resources(daemon: &Daemon, req: &Request) -> Response {
             build_caps: new.summary(),
             applied_live,
             next_spawn,
+            scopes_applied: live_succeeded,
             scopes_targeted,
         },
         "set_resources",
     )
+}
+
+/// Shape the now-vs-next-spawn surface of a `set_resources` reply PURELY from the
+/// operator's delta (`args` — the knobs they actually sent) and the live push
+/// outcome (`live_applied` = how many running scopes took it) — slice 004. So a
+/// build-jobs-only change never reports MemoryHigh/CPUWeight, and a memory-only
+/// change never reports CARGO_BUILD_JOBS. Returns `(applied_live, next_spawn)`.
+///
+/// - `CARGO_BUILD_JOBS` is an env var ⇒ always NEXT-spawn (when `build_jobs` changed).
+/// - `MemoryHigh` / `CPUWeight` are scope properties ⇒ applied LIVE when changed AND
+///   at least one running scope took the push; otherwise (no scope took it — a
+///   disarmed fleet, or a push that failed everywhere) they fall to next-spawn.
+///
+/// Pure (no shell-out, no daemon), so the reporting branches are unit-tested
+/// directly — and slice 003's "targeted but all failed" reporting rides on it.
+pub(crate) fn shape_set_resources_effects(
+    args: &SetResourcesArgs,
+    live_applied: usize,
+) -> (Vec<String>, Vec<String>) {
+    let mut applied_live = Vec::new();
+    let mut next_spawn = Vec::new();
+    if args.build_jobs.is_some() {
+        next_spawn.push("CARGO_BUILD_JOBS".to_string());
+    }
+    let landed = live_applied > 0;
+    for (changed, name) in [
+        (args.memory_high.is_some(), "MemoryHigh"),
+        (args.cpu_weight.is_some(), "CPUWeight"),
+    ] {
+        if changed {
+            if landed {
+                applied_live.push(name.to_string());
+            } else {
+                next_spawn.push(name.to_string());
+            }
+        }
+    }
+    (applied_live, next_spawn)
 }
 
 /// `resume_item`: un-block a human-parked backlog item (`blocked → queued`) so
@@ -564,4 +592,54 @@ fn parse_args<T: serde::de::DeserializeOwned>(
 ) -> std::result::Result<T, Response> {
     serde_json::from_value(req.args.clone())
         .map_err(|e| Response::err(ErrorKind::BadArgs, format!("decode args: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_resources_effects_are_shaped_from_the_delta_not_the_merged_caps() {
+        // build-jobs-only change: ONLY CARGO_BUILD_JOBS is next-spawn — never
+        // MemoryHigh/CPUWeight the operator didn't touch (slice 004, the bug was
+        // reporting off the always-Some merged caps).
+        let jobs_only = SetResourcesArgs { build_jobs: Some(4), ..Default::default() };
+        assert_eq!(
+            shape_set_resources_effects(&jobs_only, 2),
+            (vec![], vec!["CARGO_BUILD_JOBS".to_string()]),
+            "a build-jobs-only change reports only CARGO_BUILD_JOBS",
+        );
+
+        // memory-only change WITH a scope that took it → applied_live=[MemoryHigh],
+        // and crucially next_spawn is empty (no spurious CARGO_BUILD_JOBS).
+        let mem_only = SetResourcesArgs { memory_high: Some("6G".into()), ..Default::default() };
+        assert_eq!(
+            shape_set_resources_effects(&mem_only, 1),
+            (vec!["MemoryHigh".to_string()], vec![]),
+            "a memory-only change applied live reports only MemoryHigh",
+        );
+
+        // memory-only change with NO running scope taking it (disarmed / all-failed)
+        // → it falls to next-spawn, not applied_live.
+        assert_eq!(
+            shape_set_resources_effects(&mem_only, 0),
+            (vec![], vec!["MemoryHigh".to_string()]),
+            "a live prop no scope took falls to next-spawn",
+        );
+
+        // All three set, live scopes took the props: MemoryHigh+CPUWeight live,
+        // CARGO_BUILD_JOBS next-spawn.
+        let all = SetResourcesArgs {
+            build_jobs: Some(4),
+            memory_high: Some("6G".into()),
+            cpu_weight: Some(70),
+        };
+        assert_eq!(
+            shape_set_resources_effects(&all, 3),
+            (
+                vec!["MemoryHigh".to_string(), "CPUWeight".to_string()],
+                vec!["CARGO_BUILD_JOBS".to_string()],
+            ),
+        );
+    }
 }

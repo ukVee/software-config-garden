@@ -395,6 +395,7 @@ mod tests {
             applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
             next_spawn: vec!["CARGO_BUILD_JOBS".into()],
             scopes_targeted: vec!["growlight-agent-loop-1.scope".into()],
+            scopes_applied: 1,
         });
 
         let caps = app.build_caps.clone().unwrap();
