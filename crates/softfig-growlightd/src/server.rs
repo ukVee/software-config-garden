@@ -608,6 +608,81 @@ fn parse_args<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BuildCaps, GrowlightdConfig};
+    use crate::persist::ResourcePersister;
+    use std::sync::{Arc, Mutex};
+
+    /// A spy [`ResourcePersister`] (slice 009): records every `persist` call's caps
+    /// and returns a configurable result, so the `set_resources` swallow path
+    /// (invariant 5) is proven without a live keeperd.
+    #[derive(Debug)]
+    struct SpyPersister {
+        fail: bool,
+        calls: Mutex<Vec<BuildCaps>>,
+    }
+    impl SpyPersister {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self { fail, calls: Mutex::new(Vec::new()) })
+        }
+    }
+    impl ResourcePersister for SpyPersister {
+        fn persist(&self, caps: &BuildCaps) -> std::result::Result<(), String> {
+            self.calls.lock().unwrap().push(caps.clone());
+            if self.fail {
+                Err("spy: keeperd unreachable".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn test_daemon_with(persister: Arc<SpyPersister>) -> Daemon {
+        Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
+            .with_resource_persister(persister)
+    }
+
+    fn call_set_resources(daemon: &Daemon, args: SetResourcesArgs) -> Response {
+        let req = Request::new(op::SET_RESOURCES, serde_json::to_value(args).unwrap());
+        set_resources(daemon, &req)
+    }
+
+    #[test]
+    fn a_persist_failure_is_logged_and_swallowed_not_failing_the_verb() {
+        // Invariant 5 (slice 009): a keeperd persist that errors must NOT fail the
+        // live `set_resources` — the running fleet already took the new caps. The
+        // spy returns Err; the verb still returns Ok and the attempt was recorded.
+        let spy = SpyPersister::new(true);
+        let daemon = test_daemon_with(Arc::clone(&spy));
+        let resp = call_set_resources(
+            &daemon,
+            SetResourcesArgs { build_jobs: Some(4), ..Default::default() },
+        );
+        assert!(
+            matches!(resp, Response::Ok { .. }),
+            "a persist Err is swallowed — the verb still succeeds: {resp:?}",
+        );
+        assert_eq!(spy.calls.lock().unwrap().len(), 1, "the persist was attempted once");
+        // The live default still took the change despite the failed persist.
+        assert_eq!(daemon.build_caps().cargo_build_jobs, Some(4));
+    }
+
+    #[test]
+    fn a_successful_persist_is_invoked_once_with_the_merged_caps() {
+        // The mirror case: an Ok spy is called exactly once, with the FULL merged
+        // caps (the partial update folded onto the live defaults).
+        let spy = SpyPersister::new(false);
+        let daemon = test_daemon_with(Arc::clone(&spy));
+        let resp = call_set_resources(
+            &daemon,
+            SetResourcesArgs { build_jobs: Some(4), ..Default::default() },
+        );
+        assert!(matches!(resp, Response::Ok { .. }));
+        let calls = spy.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "persist invoked exactly once");
+        assert_eq!(calls[0].cargo_build_jobs, Some(4), "the changed knob");
+        assert_eq!(calls[0].memory_high.as_deref(), Some("3G"), "the merged (untouched) default");
+        assert_eq!(calls[0].cpu_weight, Some(50), "the merged (untouched) default");
+    }
 
     #[test]
     fn set_resources_effects_are_shaped_from_the_delta_not_the_merged_caps() {
