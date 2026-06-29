@@ -538,8 +538,13 @@ pub struct ClaudeBackend {
     /// into every spawn's transient scope: a low `CARGO_BUILD_JOBS` + a SOFT
     /// `MemoryHigh` + a deprioritizing `CPUWeight`. They THROTTLE a building agent,
     /// never kill it (no `MemoryMax` / tight `TasksMax`). Defaults are conservative
-    /// for the 7.7 GB tablet; slice 003 makes them live-adjustable.
-    build_caps: BuildCaps,
+    /// for the 7.7 GB tablet.
+    ///
+    /// **Live (slice 003):** held behind a shared `Arc<Mutex<…>>` the daemon also
+    /// holds, so the `set_resources` verb adjusts the throttle the NEXT spawn uses
+    /// without a restart — [`spawn`](AgentBackend::spawn) reads the *current* caps
+    /// off this cell each time, never a value baked in at construction.
+    build_caps: Arc<Mutex<BuildCaps>>,
     /// Per-agent health cells, keyed by agent id; re-spawn (re-roll) replaces the
     /// agent's cell with a fresh one.
     agents: Mutex<BTreeMap<String, Arc<AgentHealthState>>>,
@@ -564,7 +569,7 @@ impl ClaudeBackend {
         prompt: impl Into<String>,
         hub: EventHub,
         preapproval: PreApproval,
-        build_caps: BuildCaps,
+        build_caps: Arc<Mutex<BuildCaps>>,
     ) -> Self {
         Self {
             bin: bin.into(),
@@ -650,8 +655,10 @@ fn scope_base_name(agent: &str) -> String {
 }
 
 /// The full transient-scope unit name (with the `.scope` suffix) — what
-/// `systemctl --user kill` targets to take down the whole agent cgroup.
-fn scope_unit(agent: &str) -> String {
+/// `systemctl --user kill` targets to take down the whole agent cgroup, and what
+/// the live `set_resources` `set-property` (slice 003) addresses. `pub(crate)` so
+/// the daemon can derive an agent's scope name from its roster id.
+pub(crate) fn scope_unit(agent: &str) -> String {
     format!("{}.scope", scope_base_name(agent))
 }
 
@@ -749,6 +756,64 @@ fn scope_kill_argv(unit: &str) -> Vec<String> {
     ]
 }
 
+/// Build the `systemctl --user set-property --runtime <unit> …` argv that pushes
+/// the **LIVE-applicable** GENTLE caps onto a RUNNING agent scope (peer-isolation
+/// slice 003). Only the two *scope properties* are emitted — a `MemoryHigh` SOFT
+/// throttle and a deprioritizing `CPUWeight`; `CARGO_BUILD_JOBS` is an **env var**,
+/// not a scope property, so it is DELIBERATELY never here (it takes effect at the
+/// next spawn, not live). `--runtime` keeps the change transient (it dies with the
+/// scope, never persisted to a drop-in).
+///
+/// Returns `None` when neither live property is set — there is nothing to push, so
+/// the caller shells nothing (an empty `set-property` would be a pointless call).
+/// Pure: the argv shape is unit-asserted without a real `systemctl`. Stays
+/// throttle-not-kill by construction — there is no `MemoryMax` arg to emit.
+pub(crate) fn set_property_argv(
+    unit: &str,
+    memory_high: Option<&str>,
+    cpu_weight: Option<u32>,
+) -> Option<Vec<String>> {
+    let mut props = Vec::new();
+    if let Some(high) = memory_high {
+        props.push(format!("MemoryHigh={high}"));
+    }
+    if let Some(weight) = cpu_weight {
+        props.push(format!("CPUWeight={weight}"));
+    }
+    if props.is_empty() {
+        return None; // nothing live to apply
+    }
+    let mut argv = vec![
+        "--user".to_string(),
+        "set-property".to_string(),
+        "--runtime".to_string(),
+        unit.to_string(),
+    ];
+    argv.extend(props);
+    Some(argv)
+}
+
+/// Best-effort: push the live `MemoryHigh`/`CPUWeight` of `caps` onto the running
+/// scope `unit` via `systemctl --user set-property --runtime` (slice 003). Returns
+/// `true` only if a `set-property` actually ran and succeeded. A scope that isn't
+/// running, or a `systemctl` that isn't reachable, just fails — harmless: the
+/// next-spawn caps (the shared cell) are already updated, so the agent picks up the
+/// new throttle when it (re-)spawns. Must be called OUTSIDE the daemon lock (it
+/// shells a subprocess that may block — the kill-safety lock-ordering discipline).
+pub(crate) fn apply_set_property(unit: &str, caps: &BuildCaps) -> bool {
+    let Some(argv) = set_property_argv(unit, caps.memory_high.as_deref(), caps.cpu_weight) else {
+        return false; // only CARGO_BUILD_JOBS changed → nothing live to push
+    };
+    Command::new("systemctl")
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 impl AgentBackend for Arc<ClaudeBackend> {
     fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
         // §15 fail-closed pre-approval (slice 004): generate THIS agent's
@@ -772,13 +837,18 @@ impl AgentBackend for Arc<ClaudeBackend> {
         // `--scope` inherits our stdio, so the stdout pipe below still tails the
         // child's stream-json directly. A missing/failed `systemd-run` fails the
         // spawn closed (no isolation ⇒ no spawn) — the safe direction.
+        // Read the CURRENT caps off the shared cell (slice 003): a `set_resources`
+        // since the last spawn is picked up here — the next-spawn half of the
+        // now-vs-next-spawn surface. Cloned out so the brief lock is released
+        // before the (blocking) spawn.
+        let caps = self.build_caps.lock().unwrap().clone();
         let argv = scoped_spawn_argv(
             &self.bin,
             &self.prompt,
             &paths.loop_settings,
             &paths.mcp_config,
             &spec.agent,
-            &self.build_caps,
+            &caps,
         );
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
@@ -1391,7 +1461,7 @@ mod tests {
             "kick",
             EventHub::new(),
             pre,
-            BuildCaps::default(),
+            Arc::new(Mutex::new(BuildCaps::default())),
         ));
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
@@ -1531,5 +1601,48 @@ mod tests {
                 "growlight-agent-a1.scope".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn set_property_argv_emits_only_the_live_scope_properties() {
+        let unit = "growlight-agent-a1.scope";
+
+        // Both live properties → a `--runtime set-property` carrying MemoryHigh +
+        // CPUWeight, in a stable order. CARGO_BUILD_JOBS is NEVER here (it is an env
+        // var, applied at next spawn — the now-vs-next-spawn split).
+        assert_eq!(
+            set_property_argv(unit, Some("3G"), Some(50)),
+            Some(vec![
+                "--user".to_string(),
+                "set-property".to_string(),
+                "--runtime".to_string(),
+                unit.to_string(),
+                "MemoryHigh=3G".to_string(),
+                "CPUWeight=50".to_string(),
+            ]),
+        );
+        assert!(
+            !set_property_argv(unit, Some("3G"), Some(50))
+                .unwrap()
+                .iter()
+                .any(|a| a.contains("CARGO_BUILD_JOBS") || a.contains("MemoryMax")),
+            "live set-property never carries the env var nor a hard MemoryMax cap",
+        );
+
+        // Only one property set → only that one is pushed.
+        assert_eq!(
+            set_property_argv(unit, None, Some(80)),
+            Some(vec![
+                "--user".to_string(),
+                "set-property".to_string(),
+                "--runtime".to_string(),
+                unit.to_string(),
+                "CPUWeight=80".to_string(),
+            ]),
+        );
+
+        // Neither live property → None (nothing to push; the caller shells nothing).
+        // This is the build-jobs-only change: a live `set-property` would be empty.
+        assert_eq!(set_property_argv(unit, None, None), None);
     }
 }

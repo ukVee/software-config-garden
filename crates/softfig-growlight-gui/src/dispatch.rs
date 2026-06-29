@@ -265,6 +265,7 @@ mod tests {
                 session_5h_halt_pct: 85,
                 session_7d_halt_pct: 90,
             },
+            build_caps: Default::default(),
             paused: false,
             fleet_enabled: false,
             roster: Vec::new(),

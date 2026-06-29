@@ -9,9 +9,9 @@ use std::thread::JoinHandle;
 
 use thiserror::Error;
 
-use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply};
+use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply, SetResourcesArgs};
 
-use crate::config::{GrowlightdConfig, Policy};
+use crate::config::{BuildCaps, GrowlightdConfig, Policy};
 use crate::control::Control;
 use crate::hub::EventHub;
 use crate::leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
@@ -92,6 +92,14 @@ pub struct Daemon {
     /// deadlock class (incident 20260622). `None` until `main` installs the live
     /// [`crate::resume::KeeperdItemResumer`]; a test installs a spy.
     pub resumer: Option<Arc<dyn ItemResumer>>,
+    /// The live GENTLE per-agent build-resource caps (peer-isolation slice 003) the
+    /// NEXT spawned agent's scope is throttled with. Shared *by `Arc`* with the
+    /// [`crate::claude_backend::ClaudeBackend`] (which reads it at each spawn), so
+    /// the `set_resources` verb adjusts the throttle without a restart. Lives
+    /// *outside* `inner` (like `hub`) so a spawn reads it without contending on the
+    /// daemon lock. Seeded from the loaded fleet config via
+    /// [`set_fleet_config`](Daemon::set_fleet_config).
+    pub build_caps: Arc<Mutex<BuildCaps>>,
 }
 
 impl Daemon {
@@ -101,6 +109,7 @@ impl Daemon {
             hub: EventHub::new(),
             thrash_clear: None,
             resumer: None,
+            build_caps: Arc::new(Mutex::new(BuildCaps::default())),
         }
     }
 
@@ -147,6 +156,11 @@ impl Daemon {
     /// [`load_fleet_config`](crate::fleet::load_fleet_config), before the drive
     /// loop is spawned. Brief-lock store.
     pub fn set_fleet_config(&self, fleet: crate::fleet::FleetConfig) {
+        // Seed the live build-caps cell from the config's `[build_caps]` so `status`
+        // reports the configured throttle even while disarmed, and a gate-on
+        // assembly shares this same value with the backend (peer-isolation slice
+        // 003). Done before the cell is moved into the backend at `assemble_fleet`.
+        *self.build_caps.lock().unwrap() = fleet.build_caps.clone();
         self.inner.lock().unwrap().fleet = fleet;
     }
 
@@ -163,6 +177,50 @@ impl Daemon {
     /// boundary both observe it (no restart).
     pub fn set_policy(&self, policy: Policy) {
         self.inner.lock().unwrap().config.policy = policy;
+    }
+
+    /// The current live GENTLE build-resource caps — what the NEXT spawn throttles
+    /// with, echoed by `status` and the `set_resources` reply. Brief-lock clone.
+    pub fn build_caps(&self) -> BuildCaps {
+        self.build_caps.lock().unwrap().clone()
+    }
+
+    /// Apply a partial [`SetResourcesArgs`] update to the live build-resource caps
+    /// (the `set_resources` verb, slice 003): merge the provided knobs onto the
+    /// current caps, validate every set value against its sane range
+    /// ([`BuildCaps::with_update`] — reject, never clamp), and store the result so
+    /// the NEXT spawn uses it. Returns the merged [`BuildCaps`] (the next-spawn
+    /// default) on success, or the validation message on a nonsense value.
+    ///
+    /// This updates only the next-spawn default; pushing the live `MemoryHigh`/
+    /// `CPUWeight` onto already-running scopes is the caller's job (it shells
+    /// `systemctl set-property` OUTSIDE the daemon lock — see
+    /// [`roster_scope_units`](Daemon::roster_scope_units)).
+    pub fn apply_resources(
+        &self,
+        args: &SetResourcesArgs,
+    ) -> std::result::Result<BuildCaps, String> {
+        let mut cell = self.build_caps.lock().unwrap();
+        let merged = cell.with_update(args)?;
+        *cell = merged.clone();
+        Ok(merged)
+    }
+
+    /// The transient-scope unit names of every CONFIGURED roster member —
+    /// `growlight-agent-<id>.scope` — the candidate set the live `set_resources`
+    /// `set-property` is attempted on (peer-isolation slice 003). Best-effort: a
+    /// member whose scope isn't currently running is a harmless miss, and a
+    /// disarmed fleet (empty roster) yields an empty list (nothing to push live).
+    /// Brief-lock read of the roster; the caller shells `systemctl` OUTSIDE the lock.
+    pub fn roster_scope_units(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .fleet
+            .members
+            .iter()
+            .map(|m| crate::claude_backend::scope_unit(&m.agent))
+            .collect()
     }
 
     /// The per-device short-window TPM/RPM limits (spec §7 admission's second
@@ -609,6 +667,55 @@ mod tests {
             spy.cleared.lock().unwrap().len(),
             1,
             "a queued request clears nothing new",
+        );
+    }
+
+    #[test]
+    fn apply_resources_merges_validates_and_stores_the_live_caps() {
+        use softfig_ipc::growlightd::SetResourcesArgs;
+        let daemon = test_daemon();
+        // Seeded with the conservative defaults.
+        assert_eq!(daemon.build_caps(), BuildCaps::default());
+
+        // A partial update merges onto the live caps + becomes the next-spawn default.
+        let merged = daemon
+            .apply_resources(&SetResourcesArgs {
+                memory_high: Some("6G".into()),
+                ..Default::default()
+            })
+            .expect("a valid update");
+        assert_eq!(merged.memory_high.as_deref(), Some("6G"));
+        assert_eq!(merged.cargo_build_jobs, Some(2), "untouched knob kept");
+        assert_eq!(daemon.build_caps(), merged, "stored as the live default");
+
+        // A nonsense value is rejected AND leaves the live caps unchanged.
+        let before = daemon.build_caps();
+        assert!(daemon
+            .apply_resources(&SetResourcesArgs { cpu_weight: Some(0), ..Default::default() })
+            .is_err());
+        assert_eq!(daemon.build_caps(), before, "a rejected update changes nothing");
+    }
+
+    #[test]
+    fn roster_scope_units_are_empty_when_disarmed_and_named_per_member() {
+        use crate::fleet::{FleetConfig, FleetMemberConfig};
+        let daemon = test_daemon();
+        // Disarmed default ⇒ no roster ⇒ nothing live to push.
+        assert!(daemon.roster_scope_units().is_empty());
+
+        // With a configured roster, each member maps to its transient scope unit.
+        let mut fleet = FleetConfig::disabled();
+        fleet.members = vec![
+            FleetMemberConfig { agent: "builder".into(), pin: None },
+            FleetMemberConfig { agent: "reviewer".into(), pin: None },
+        ];
+        daemon.set_fleet_config(fleet);
+        assert_eq!(
+            daemon.roster_scope_units(),
+            vec![
+                "growlight-agent-builder.scope".to_string(),
+                "growlight-agent-reviewer.scope".to_string(),
+            ],
         );
     }
 

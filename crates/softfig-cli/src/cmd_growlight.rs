@@ -25,8 +25,9 @@ use softfig_ipc::{
     ClientError, Request, growlightd_runtime_socket_path, runtime_socket_path,
     baton::{parse_baton, BatonDisposition, BatonView},
     growlightd::{
-        self, AgentDeltaKind, Event, FleetStatusReply, ForceStopArgs, PausedReply,
-        ResumeItemArgs, ResumeItemReply, StopLevel, StopReply,
+        self, AgentDeltaKind, BuildCapsSummary, Event, FleetStatusReply, ForceStopArgs,
+        PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
+        StopLevel, StopReply,
     },
     verbs::{GrowlightInitArgs, GrowlightInitReply, PostMessageArgs, PostMessageReply, StatusReply, op},
 };
@@ -91,6 +92,52 @@ pub enum GrowlightCmd {
     /// at their next boot, and `growlight watch` shows it live. Routes to keeperd
     /// (which owns the bus store), unlike the growlightd client verbs above.
     Say(SayArgs),
+
+    /// Inspect or adjust the GENTLE per-agent build-resource caps LIVE
+    /// (peer-isolation slice 003): the SOFT throttle (`CARGO_BUILD_JOBS` /
+    /// `MemoryHigh` / `CPUWeight`) each agent's transient scope is capped with. A
+    /// live `set` adjusts a running fleet without a daemon restart and stays
+    /// throttle-not-kill (no hard `MemoryMax` cap).
+    Resources(ResourcesArgs),
+}
+
+/// `growlight resources {show, set}` — the live build-resource-cap surface.
+#[derive(Args, Debug)]
+pub struct ResourcesArgs {
+    #[command(subcommand)]
+    pub cmd: ResourcesCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ResourcesCmd {
+    /// Show the current build-resource caps — the live default the NEXT spawned
+    /// agent's scope is throttled with — plus the roster scopes a live `set` would
+    /// reconcile.
+    Show(ClientArgs),
+
+    /// Adjust the caps LIVE. Each omitted flag keeps its current value (a partial
+    /// update). `--memory-high`/`--cpu-weight` apply to running scopes immediately;
+    /// `--build-jobs` (`CARGO_BUILD_JOBS`) takes effect at the next spawn. There is
+    /// no hard-cap flag — a change can only slow a build, never abort it.
+    Set(ResourcesSetArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ResourcesSetArgs {
+    /// Override the growlightd socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// New `CARGO_BUILD_JOBS` (parallel-`rustc` ceiling; ≥ 1). Next spawn only.
+    #[arg(long)]
+    pub build_jobs: Option<u32>,
+    /// New `MemoryHigh` SOFT throttle (a systemd memory value, e.g. `4G` / `70%`).
+    /// Applied to running scopes immediately.
+    #[arg(long)]
+    pub memory_high: Option<String>,
+    /// New `CPUWeight` (1..=10000). Applied to running scopes immediately.
+    #[arg(long)]
+    pub cpu_weight: Option<u32>,
 }
 
 #[derive(Args, Debug)]
@@ -227,6 +274,7 @@ pub fn run(cmd: GrowlightCmd) -> Result<()> {
         GrowlightCmd::Pause(args) => client_pause(args),
         GrowlightCmd::Resume(args) => client_resume(args),
         GrowlightCmd::Say(args) => client_say(args),
+        GrowlightCmd::Resources(args) => client_resources(args),
     }
 }
 
@@ -1400,6 +1448,101 @@ fn gate_label(paused: bool) -> &'static str {
     if paused { "paused" } else { "resumed" }
 }
 
+fn client_resources(args: ResourcesArgs) -> Result<()> {
+    match args.cmd {
+        // `resources show` — the live default caps (off `status`) + the roster
+        // scopes a live `set` reconciles. (Per-scope LIVE values via `systemctl
+        // show` are an on-device read deferred to the §7b verify.)
+        ResourcesCmd::Show(a) => {
+            let socket = growlight_socket(a.socket);
+            let reply: FleetStatusReply =
+                growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null)?;
+            print!("{}", render_build_caps(&reply.build_caps));
+            if reply.roster.is_empty() {
+                println!("scopes        (none — fleet disarmed)");
+            } else {
+                let scopes: Vec<String> = reply
+                    .roster
+                    .iter()
+                    .map(|m| format!("growlight-agent-{}.scope", m.agent))
+                    .collect();
+                println!("scopes        {}", scopes.join(", "));
+            }
+            Ok(())
+        }
+        // `resources set` — adjust the caps live. The all-empty case is refused
+        // here (a no-op `set` is almost certainly a mistake) before any daemon call.
+        ResourcesCmd::Set(a) => {
+            let socket = growlight_socket(a.socket);
+            let set_args = build_set_resources_args(a.build_jobs, a.memory_high, a.cpu_weight)?;
+            let reply: SetResourcesReply = growlight_call(
+                &socket,
+                growlightd::op::SET_RESOURCES,
+                serde_json::to_value(set_args)?,
+            )?;
+            print!("{}", render_set_resources_reply(&reply));
+            Ok(())
+        }
+    }
+}
+
+/// Build the `set_resources` wire args from the CLI flags, refusing the all-empty
+/// case (nothing to set is almost certainly a mistake). Pure — unit-tested.
+fn build_set_resources_args(
+    build_jobs: Option<u32>,
+    memory_high: Option<String>,
+    cpu_weight: Option<u32>,
+) -> Result<SetResourcesArgs> {
+    if build_jobs.is_none() && memory_high.is_none() && cpu_weight.is_none() {
+        return Err(anyhow!(
+            "nothing to set — pass at least one of --build-jobs / --memory-high / --cpu-weight"
+        ));
+    }
+    Ok(SetResourcesArgs {
+        build_jobs,
+        memory_high,
+        cpu_weight,
+    })
+}
+
+/// Render the live build-resource caps for the terminal. Pure (returns the text)
+/// so it is unit-tested without a daemon.
+fn render_build_caps(c: &BuildCapsSummary) -> String {
+    let jobs = c
+        .cargo_build_jobs
+        .map(|j| j.to_string())
+        .unwrap_or_else(|| "(unset)".to_string());
+    let weight = c
+        .cpu_weight
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| "(unset)".to_string());
+    let mem = c.memory_high.as_deref().unwrap_or("(unset)");
+    format!(
+        "build caps    (live default — the next spawn's throttle)\n  \
+         cargo_build_jobs  {jobs}\n  memory_high       {mem}\n  cpu_weight        {weight}\n",
+    )
+}
+
+/// Render a `set_resources` reply: the new caps + the now-vs-next-spawn surface.
+/// Pure (returns the text) so it is unit-tested without a daemon.
+fn render_set_resources_reply(r: &SetResourcesReply) -> String {
+    let mut out = render_build_caps(&r.build_caps);
+    if r.applied_live.is_empty() {
+        out.push_str("applied live  (none — no running agent scopes)\n");
+    } else {
+        out.push_str(&format!(
+            "applied live  {} on {} scope(s): {}\n",
+            r.applied_live.join(", "),
+            r.scopes_targeted.len(),
+            r.scopes_targeted.join(", "),
+        ));
+    }
+    if !r.next_spawn.is_empty() {
+        out.push_str(&format!("next spawn    {}\n", r.next_spawn.join(", ")));
+    }
+    out
+}
+
 fn client_stop(args: StopArgs) -> Result<()> {
     let socket = growlight_socket(args.socket);
     let force = ForceStopArgs {
@@ -1826,6 +1969,58 @@ mod tests {
         ] {
             assert!(b.contains(section), "baton missing section {section}");
         }
+    }
+
+    #[test]
+    fn build_set_resources_args_refuses_an_empty_update() {
+        // Every flag omitted ⇒ a no-op set is rejected before any daemon call.
+        assert!(build_set_resources_args(None, None, None).is_err());
+        // Any single flag present ⇒ a partial update is built, the rest left None.
+        let args = build_set_resources_args(None, Some("4G".into()), None)
+            .expect("one knob is enough");
+        assert_eq!(args.memory_high.as_deref(), Some("4G"));
+        assert_eq!(args.build_jobs, None);
+        assert_eq!(args.cpu_weight, None);
+    }
+
+    #[test]
+    fn render_build_caps_shows_unset_knobs_explicitly() {
+        let text = render_build_caps(&BuildCapsSummary {
+            cargo_build_jobs: Some(2),
+            memory_high: Some("3G".into()),
+            cpu_weight: None,
+        });
+        assert!(text.contains("cargo_build_jobs  2"));
+        assert!(text.contains("memory_high       3G"));
+        assert!(text.contains("cpu_weight        (unset)"), "an unset knob reads (unset): {text}");
+    }
+
+    #[test]
+    fn render_set_resources_reply_surfaces_now_vs_next_spawn() {
+        // No running scopes: applied-live is the explicit (none) line; build-jobs is
+        // reported as next-spawn.
+        let disarmed = render_set_resources_reply(&SetResourcesReply {
+            build_caps: BuildCapsSummary {
+                cargo_build_jobs: Some(2),
+                memory_high: Some("6G".into()),
+                cpu_weight: Some(70),
+            },
+            applied_live: vec![],
+            next_spawn: vec!["CARGO_BUILD_JOBS".into()],
+            scopes_targeted: vec![],
+        });
+        assert!(disarmed.contains("applied live  (none"));
+        assert!(disarmed.contains("next spawn    CARGO_BUILD_JOBS"));
+
+        // With running scopes: the live props + the scopes they were pushed to.
+        let live = render_set_resources_reply(&SetResourcesReply {
+            build_caps: BuildCapsSummary::default(),
+            applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
+            next_spawn: vec![],
+            scopes_targeted: vec!["growlight-agent-builder.scope".into()],
+        });
+        assert!(live.contains("applied live  MemoryHigh, CPUWeight on 1 scope(s)"));
+        assert!(live.contains("growlight-agent-builder.scope"));
     }
 
     #[test]

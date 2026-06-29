@@ -51,7 +51,7 @@ pub use baton_store::FsBatonStore;
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
 pub use claude_backend::{AgentHealthState, ClaudeBackend};
-pub use config::{GrowlightdConfig, Policy};
+pub use config::{BuildCaps, GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{

@@ -13,10 +13,11 @@ use std::time::Duration;
 use softfig_ipc::growlightd::{
     op, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply, PausedReply,
     ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply,
-    SetPolicyArgs, StopAfterSliceArgs, StopLevel, StopReply,
+    SetPolicyArgs, SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
+use crate::claude_backend::apply_set_property;
 use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::resume::ResumeOutcome;
@@ -137,6 +138,7 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         op::FORCE_STOP => write_one_shot(&mut stream, force_stop(&daemon, &req)),
         op::INJECT_MESSAGE => write_one_shot(&mut stream, inject_message(&daemon, &req)),
         op::SET_POLICY => write_one_shot(&mut stream, set_policy(&daemon, &req)),
+        op::SET_RESOURCES => write_one_shot(&mut stream, set_resources(&daemon, &req)),
         op::RESUME_ITEM => write_one_shot(&mut stream, resume_item(&daemon, &req)),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
@@ -215,6 +217,7 @@ fn status(daemon: &Daemon) -> Response {
         garden_root: inner.config.garden_root.display().to_string(),
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
         policy: inner.config.policy.summary(),
+        build_caps: daemon.build_caps().summary(),
         paused: inner.control.paused,
         fleet_enabled: inner.fleet.enabled,
         roster,
@@ -342,6 +345,73 @@ fn set_policy(daemon: &Daemon, req: &Request) -> Response {
     };
     daemon.set_policy(policy);
     ok_reply(&policy.summary(), "set_policy")
+}
+
+/// `set_resources`: adjust the GENTLE per-agent build-resource caps LIVE
+/// (peer-isolation slice 003). A **partial** update — each omitted knob keeps its
+/// current value. Every set value is validated against its sane range and a
+/// nonsense value is **rejected** with a clear `BadArgs`, never clamped
+/// ([`crate::config::BuildCaps::with_update`]); the args carry no hard-cap knob, so
+/// the change is throttle-not-kill by construction.
+///
+/// Two effects, surfaced in the reply (the now-vs-next-spawn distinction):
+/// 1. the merged caps become the live default the NEXT spawn throttles with
+///    (stored on the shared cell the backend reads), and
+/// 2. the live scope properties (`MemoryHigh`/`CPUWeight`) are pushed onto every
+///    RUNNING agent scope immediately via `systemctl --user set-property
+///    --runtime` — best-effort, OUTSIDE the daemon lock (the kill-safety
+///    lock-ordering discipline). `CARGO_BUILD_JOBS` is an env var, so it is
+///    reported under `next_spawn`, never pushed live.
+fn set_resources(daemon: &Daemon, req: &Request) -> Response {
+    let args: SetResourcesArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Validate + merge + store the next-spawn default. A nonsense value is rejected
+    // here and the live caps are left unchanged.
+    let new = match daemon.apply_resources(&args) {
+        Ok(caps) => caps,
+        Err(e) => return Response::err(ErrorKind::BadArgs, e),
+    };
+
+    // Push the live scope properties onto every running agent scope (best-effort).
+    // We hold NO daemon lock here, so each `systemctl set-property` subprocess runs
+    // outside the lock (incident 20260622 lock-ordering). A scope that isn't running
+    // is a harmless miss; a disarmed fleet (empty roster) targets nothing.
+    let scopes_targeted = daemon.roster_scope_units();
+    let live_succeeded = scopes_targeted
+        .iter()
+        .filter(|unit| apply_set_property(unit, &new))
+        .count();
+
+    // The live-applicable props present in the new caps (the ones a running scope's
+    // `set-property` carried). Reported as `applied_live` only when at least one
+    // scope actually took the update — otherwise they fall to the next spawn.
+    let mut live_props = Vec::new();
+    if new.memory_high.is_some() {
+        live_props.push("MemoryHigh".to_string());
+    }
+    if new.cpu_weight.is_some() {
+        live_props.push("CPUWeight".to_string());
+    }
+    let applied_live = if live_succeeded > 0 { live_props } else { Vec::new() };
+
+    // `CARGO_BUILD_JOBS` is an env var on the scope, never a live scope property —
+    // it always takes effect only at the next spawn.
+    let mut next_spawn = Vec::new();
+    if new.cargo_build_jobs.is_some() {
+        next_spawn.push("CARGO_BUILD_JOBS".to_string());
+    }
+
+    ok_reply(
+        &SetResourcesReply {
+            build_caps: new.summary(),
+            applied_live,
+            next_spawn,
+            scopes_targeted,
+        },
+        "set_resources",
+    )
 }
 
 /// `resume_item`: un-block a human-parked backlog item (`blocked → queued`) so

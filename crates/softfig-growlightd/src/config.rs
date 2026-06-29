@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use softfig_ipc::growlightd::PolicySummary;
+use softfig_ipc::growlightd::{BuildCapsSummary, PolicySummary, SetResourcesArgs};
 
 /// Defensive ceiling on the per-device concurrency cap a `set_policy` may set:
 /// generous (a beefy workstation runs many agents), but a value past it is a
@@ -136,6 +136,71 @@ impl Default for BuildCaps {
     }
 }
 
+/// systemd's valid `CPUWeight` range (inclusive). A value outside it is a
+/// fat-fingered nonsense weight `set_resources` **rejects** (not clamps), like
+/// [`Policy::from_summary`] guards the policy rails.
+pub const CPU_WEIGHT_MIN: u32 = 1;
+pub const CPU_WEIGHT_MAX: u32 = 10_000;
+
+impl BuildCaps {
+    /// Project onto the wire [`BuildCapsSummary`] echoed by `status` /
+    /// `set_resources`.
+    pub fn summary(&self) -> BuildCapsSummary {
+        BuildCapsSummary {
+            cargo_build_jobs: self.cargo_build_jobs,
+            memory_high: self.memory_high.clone(),
+            cpu_weight: self.cpu_weight,
+        }
+    }
+
+    /// Apply a **partial** [`SetResourcesArgs`] update (the `set_resources` verb,
+    /// slice 003): each `Some` knob overwrites this cap, each `None` leaves the
+    /// current value untouched (the merge is onto `self`, never a full replace).
+    ///
+    /// Every value being set is **validated against its sane operating range** and
+    /// a nonsense value is **rejected** with a clear message — never silently
+    /// clamped — so a GUI/CLI typo can't quietly disable the throttle. The guard
+    /// is the inverse spirit of [`Policy::from_summary`]:
+    /// - `build_jobs` must be ≥ 1 (a `0` parallel-`rustc` cap would stall the build);
+    /// - `cpu_weight` must be [`CPU_WEIGHT_MIN`]..=[`CPU_WEIGHT_MAX`] (systemd's range);
+    /// - `memory_high` must be a non-empty value (systemd validates the rest live).
+    ///
+    /// **Throttle, not kill.** There is no hard-cap knob to validate — the args
+    /// carry only the three SOFT throttles, so a merged [`BuildCaps`] can only ever
+    /// slow a build, never abort it (no `MemoryMax`, no tight `TasksMax`). That
+    /// invariant is structural; this method just range-guards the soft values.
+    pub fn with_update(&self, args: &SetResourcesArgs) -> Result<BuildCaps, String> {
+        if let Some(jobs) = args.build_jobs {
+            if jobs < 1 {
+                return Err("build_jobs must be >= 1 (a 0 parallel-rustc cap stalls the build)".into());
+            }
+        }
+        if let Some(weight) = args.cpu_weight {
+            if !(CPU_WEIGHT_MIN..=CPU_WEIGHT_MAX).contains(&weight) {
+                return Err(format!(
+                    "cpu_weight must be {CPU_WEIGHT_MIN}..={CPU_WEIGHT_MAX}, got {weight}"
+                ));
+            }
+        }
+        if let Some(high) = &args.memory_high {
+            if high.trim().is_empty() {
+                return Err("memory_high must be a non-empty systemd memory value".into());
+            }
+        }
+        let mut merged = self.clone();
+        if let Some(jobs) = args.build_jobs {
+            merged.cargo_build_jobs = Some(jobs);
+        }
+        if let Some(high) = &args.memory_high {
+            merged.memory_high = Some(high.clone());
+        }
+        if let Some(weight) = args.cpu_weight {
+            merged.cpu_weight = Some(weight);
+        }
+        Ok(merged)
+    }
+}
+
 impl Policy {
     /// Project onto the wire summary echoed by `status`.
     pub fn summary(&self) -> PolicySummary {
@@ -239,6 +304,104 @@ mod tests {
         assert_eq!(c.cargo_build_jobs, Some(2), "few parallel rustc → lower peak RAM");
         assert_eq!(c.memory_high.as_deref(), Some("3G"), "SOFT throttle, not a hard cap");
         assert_eq!(c.cpu_weight, Some(50), "deprioritized vs growlightd (default 100)");
+    }
+
+    #[test]
+    fn build_caps_summary_projects_every_knob() {
+        let s = BuildCaps::default().summary();
+        assert_eq!(s.cargo_build_jobs, Some(2));
+        assert_eq!(s.memory_high.as_deref(), Some("3G"));
+        assert_eq!(s.cpu_weight, Some(50));
+    }
+
+    #[test]
+    fn with_update_merges_only_the_set_knobs() {
+        // A partial update touches only the named knob; the rest keep their value.
+        let base = BuildCaps::default();
+        let merged = base
+            .with_update(&SetResourcesArgs {
+                build_jobs: None,
+                memory_high: Some("6G".into()),
+                cpu_weight: None,
+            })
+            .expect("a valid partial update");
+        assert_eq!(
+            merged,
+            BuildCaps {
+                cargo_build_jobs: Some(2), // untouched
+                memory_high: Some("6G".to_string()), // set
+                cpu_weight: Some(50), // untouched
+            },
+        );
+
+        // An all-None update is an idempotent no-op (returns the caps unchanged).
+        assert_eq!(
+            base.with_update(&SetResourcesArgs::default()).unwrap(),
+            base,
+        );
+
+        // Every knob at once.
+        let all = base
+            .with_update(&SetResourcesArgs {
+                build_jobs: Some(4),
+                memory_high: Some("5G".into()),
+                cpu_weight: Some(80),
+            })
+            .unwrap();
+        assert_eq!(
+            all,
+            BuildCaps {
+                cargo_build_jobs: Some(4),
+                memory_high: Some("5G".to_string()),
+                cpu_weight: Some(80),
+            },
+        );
+    }
+
+    #[test]
+    fn with_update_rejects_out_of_range_soft_values_and_has_no_hard_cap_knob() {
+        let base = BuildCaps::default();
+
+        // build_jobs = 0 would stall the build → rejected (not clamped to 1).
+        assert!(
+            base.with_update(&SetResourcesArgs { build_jobs: Some(0), ..Default::default() })
+                .is_err(),
+            "a 0 parallel-rustc cap is rejected",
+        );
+
+        // cpu_weight outside systemd's 1..=10000 → rejected on both ends.
+        assert!(base
+            .with_update(&SetResourcesArgs { cpu_weight: Some(0), ..Default::default() })
+            .is_err());
+        assert!(base
+            .with_update(&SetResourcesArgs {
+                cpu_weight: Some(CPU_WEIGHT_MAX + 1),
+                ..Default::default()
+            })
+            .is_err());
+        // The bounds themselves are valid.
+        assert!(base
+            .with_update(&SetResourcesArgs { cpu_weight: Some(CPU_WEIGHT_MIN), ..Default::default() })
+            .is_ok());
+        assert!(base
+            .with_update(&SetResourcesArgs { cpu_weight: Some(CPU_WEIGHT_MAX), ..Default::default() })
+            .is_ok());
+
+        // An empty / whitespace memory_high is rejected (never a silent unset).
+        assert!(base
+            .with_update(&SetResourcesArgs { memory_high: Some("".into()), ..Default::default() })
+            .is_err());
+        assert!(base
+            .with_update(&SetResourcesArgs { memory_high: Some("  ".into()), ..Default::default() })
+            .is_err());
+
+        // Throttle-not-kill is STRUCTURAL: the only memory knob is the SOFT
+        // `memory_high` — there is no field through which a `MemoryMax` OOM-kill cap
+        // could be requested. A merged caps therefore can only ever slow a build.
+        let merged = base
+            .with_update(&SetResourcesArgs { memory_high: Some("2G".into()), ..Default::default() })
+            .unwrap();
+        assert_eq!(merged.memory_high.as_deref(), Some("2G"), "sets MemoryHigh, never MemoryMax");
     }
 
     #[test]

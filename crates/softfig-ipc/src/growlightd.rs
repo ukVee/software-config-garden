@@ -67,6 +67,26 @@ pub mod op {
     /// wiring. Until then growlightd answers `unknown op`. This mirrors the
     /// bus/coordinate types defined here ahead of their producers.
     pub const SET_POLICY: &str = "set_policy";
+    /// `set_resources(`[`SetResourcesArgs`]`) -> `[`SetResourcesReply`]. Adjust the
+    /// GENTLE per-agent build-resource caps LIVE (peer-isolation slice 003): the
+    /// human tunes a running fleet's throttle without editing a file + cycling the
+    /// daemon. A **partial** update — each omitted knob leaves the current value
+    /// untouched (the merge is onto the live caps, never a full replace).
+    ///
+    /// **Throttle, not kill (locked decision, human direction 2026-06-28).** The
+    /// args carry ONLY the three SOFT knobs (`build_jobs` / `memory_high` /
+    /// `cpu_weight`); there is deliberately **no** hard-cap knob on the wire — a
+    /// `MemoryMax`-style OOM-kill cap is structurally unreachable, and an
+    /// out-of-range soft value is **rejected** (not clamped), like
+    /// [`SetPolicyArgs`]. So a live change can only ever slow a build, never abort
+    /// the one an agent is blocked on.
+    ///
+    /// **Now vs next-spawn.** `memory_high`/`cpu_weight` are scope properties
+    /// applied to every RUNNING agent scope immediately
+    /// (`systemctl --user set-property --runtime …`); `build_jobs`
+    /// (`CARGO_BUILD_JOBS`) is an env var, so it only affects the NEXT spawn. The
+    /// reply names which caps took effect now vs at next spawn.
+    pub const SET_RESOURCES: &str = "set_resources";
     /// `resume_item(`[`ResumeItemArgs`]`) -> `[`ResumeItemReply`]. Un-block a
     /// human-blocked backlog item (`blocked → queued`) so the scheduler re-picks
     /// it — the inverse of the drive loop's item-park (fleet-member-model slice
@@ -113,6 +133,13 @@ pub struct FleetStatusReply {
     pub protocol_version: u8,
     /// The active per-device policy (budget thresholds + concurrency cap).
     pub policy: PolicySummary,
+    /// The GENTLE per-agent build-resource caps the next spawned agent's scope is
+    /// throttled with (peer-isolation slice 002/003) — the live default
+    /// `set_resources` mutates. Surfaced so `growlight resources show` (and
+    /// `status`) can report the current throttle. Additive (`#[serde(default)]`)
+    /// so a pre-field decoder reads it back as all-`None`.
+    #[serde(default)]
+    pub build_caps: BuildCapsSummary,
     /// Whether the fleet admission gate is engaged (`pause`/`resume`, spec §8).
     /// Additive (`#[serde(default)]`) so a pre-control client/decoder that never
     /// sent this field still parses — it reads back as `false` (not paused).
@@ -360,6 +387,71 @@ pub struct InjectMessageArgs {
 pub struct SetPolicyArgs {
     /// The policy to apply, replacing the running one.
     pub policy: PolicySummary,
+}
+
+/// The wire projection of the GENTLE per-agent build-resource caps (peer-isolation
+/// slice 002/003): the SOFT throttle applied to each agent's transient systemd
+/// scope. Echoed by `status` (the live default) and `set_resources` (the value
+/// after a change). Each field is `Option` because any single cap may be left
+/// unset (`None` ⇒ that systemd property / env var is simply not set on the
+/// scope). There is deliberately **no** hard-cap field — the throttle-not-kill
+/// invariant is structural.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildCapsSummary {
+    /// `CARGO_BUILD_JOBS` — the parallel-`rustc` ceiling (env var ⇒ next spawn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_build_jobs: Option<u32>,
+    /// `MemoryHigh` — the SOFT memory throttle (a systemd memory value, e.g.
+    /// `"3G"`). Applied live to running scopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_high: Option<String>,
+    /// `CPUWeight` — the deprioritizing CPU weight (1..=10000). Applied live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_weight: Option<u32>,
+}
+
+/// Args for `set_resources`: a **partial** adjustment of the live build-resource
+/// caps (peer-isolation slice 003). Each field is `Option`: `Some` sets that knob,
+/// `None` leaves the current value untouched (the merge is onto the live caps).
+/// The three knobs are all SOFT throttles — there is no hard-cap knob, so the
+/// verb cannot express an OOM-kill cap (throttle-not-kill, by construction). An
+/// out-of-range value is rejected by the daemon, never clamped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetResourcesArgs {
+    /// New `CARGO_BUILD_JOBS` (must be ≥ 1). Env var ⇒ takes effect at NEXT spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_jobs: Option<u32>,
+    /// New `MemoryHigh` SOFT throttle (a non-empty systemd memory value). Applied
+    /// to every running agent scope immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_high: Option<String>,
+    /// New `CPUWeight` (must be 1..=10000). Applied to running scopes immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_weight: Option<u32>,
+}
+
+/// Reply to `set_resources`: the caps after the merge, plus the now-vs-next-spawn
+/// surface (slice 003). `applied_live` names the scope properties pushed to every
+/// running agent scope immediately (a subset of `{"MemoryHigh","CPUWeight"}`);
+/// `next_spawn` names the caps that only take effect at the next spawn (the env
+/// var `"CARGO_BUILD_JOBS"`); `scopes_targeted` lists the agent scope units the
+/// live `set-property` was attempted on (best-effort — a not-yet-running scope is
+/// a harmless miss).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetResourcesReply {
+    /// The build-resource caps after applying the partial update.
+    pub build_caps: BuildCapsSummary,
+    /// Scope properties applied LIVE to running scopes now (subset of
+    /// `MemoryHigh` / `CPUWeight`), in a stable order.
+    #[serde(default)]
+    pub applied_live: Vec<String>,
+    /// Caps that take effect only at the NEXT spawn (`CARGO_BUILD_JOBS`).
+    #[serde(default)]
+    pub next_spawn: Vec<String>,
+    /// The agent scope units the live `set-property` was attempted on (empty when
+    /// no agents are running, or when only `build_jobs` changed).
+    #[serde(default)]
+    pub scopes_targeted: Vec<String>,
 }
 
 /// Reply to `pause` / `resume`: the resulting admission-gate state.
@@ -611,6 +703,58 @@ mod tests {
     }
 
     #[test]
+    fn set_resources_args_omit_untouched_knobs_on_the_wire() {
+        // A partial update carrying only memory_high: the other two knobs are
+        // omitted (skip_serializing_if), so the daemon's merge leaves them alone.
+        let a = SetResourcesArgs {
+            build_jobs: None,
+            memory_high: Some("4G".into()),
+            cpu_weight: None,
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("\"memory_high\":\"4G\""), "carries the set knob: {s}");
+        assert!(!s.contains("build_jobs"), "an untouched knob is omitted: {s}");
+        assert!(!s.contains("cpu_weight"), "an untouched knob is omitted: {s}");
+        let back: SetResourcesArgs = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.memory_high.as_deref(), Some("4G"));
+        assert_eq!(back.build_jobs, None);
+        assert_eq!(back.cpu_weight, None);
+
+        // The all-None default is the empty object (a no-op update).
+        assert_eq!(serde_json::to_string(&SetResourcesArgs::default()).unwrap(), "{}");
+    }
+
+    #[test]
+    fn build_caps_summary_skips_unset_knobs() {
+        let s = BuildCapsSummary {
+            cargo_build_jobs: Some(2),
+            memory_high: None,
+            cpu_weight: Some(50),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"cargo_build_jobs\":2"));
+        assert!(!json.contains("memory_high"), "an unset cap is omitted: {json}");
+        assert_eq!(serde_json::from_str::<BuildCapsSummary>(&json).unwrap(), s);
+    }
+
+    #[test]
+    fn set_resources_reply_round_trips_the_now_vs_next_spawn_surface() {
+        let reply = SetResourcesReply {
+            build_caps: BuildCapsSummary {
+                cargo_build_jobs: Some(4),
+                memory_high: Some("5G".into()),
+                cpu_weight: Some(60),
+            },
+            applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
+            next_spawn: vec!["CARGO_BUILD_JOBS".into()],
+            scopes_targeted: vec!["growlight-agent-builder.scope".into()],
+        };
+        let back: SetResourcesReply =
+            serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert_eq!(back, reply);
+    }
+
+    #[test]
     fn control_replies_round_trip() {
         let p = PausedReply { paused: true };
         assert_eq!(
@@ -780,6 +924,11 @@ mod tests {
         assert!(!reply.fleet_enabled, "missing fleet_enabled decodes as off");
         assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
+        assert_eq!(
+            reply.build_caps,
+            BuildCapsSummary::default(),
+            "missing build_caps decodes as all-None",
+        );
     }
 
     #[test]
@@ -795,6 +944,7 @@ mod tests {
                 session_5h_halt_pct: 85,
                 session_7d_halt_pct: 90,
             },
+            build_caps: BuildCapsSummary::default(),
             paused: false,
             fleet_enabled: true,
             roster: vec![

@@ -7,8 +7,10 @@
 
 use std::path::PathBuf;
 
-use softfig_growlightd::{Daemon, GrowlightdConfig, Policy};
-use softfig_ipc::growlightd::{op, FleetStatusReply, PolicySummary, SetPolicyArgs};
+use softfig_growlightd::{BuildCaps, Daemon, GrowlightdConfig, Policy};
+use softfig_ipc::growlightd::{
+    op, FleetStatusReply, PolicySummary, SetPolicyArgs, SetResourcesArgs, SetResourcesReply,
+};
 use softfig_ipc::{connect, Request};
 
 fn boot(socket: PathBuf, garden_root: PathBuf) -> softfig_growlightd::DaemonHandle {
@@ -152,6 +154,96 @@ fn set_policy_rejects_an_out_of_range_value_and_leaves_the_policy_unchanged() {
     );
 
     // The daemon is still alive and serving after the bad ops.
+    assert_eq!(call_status(&socket).state, "running");
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+/// Call `set_resources`, returning the reply on success or the `(kind, message)`
+/// the daemon refused with.
+fn call_set_resources(
+    socket: &std::path::Path,
+    args: SetResourcesArgs,
+) -> Result<SetResourcesReply, (softfig_ipc::ErrorKind, String)> {
+    let mut stream = connect(socket).expect("client connects");
+    let args = serde_json::to_value(args).unwrap();
+    let resp = softfig_ipc::call(&mut stream, &Request::new(op::SET_RESOURCES, args))
+        .expect("set_resources round-trip");
+    resp.into_result()
+        .map(|v| serde_json::from_value(v).expect("SetResourcesReply decodes"))
+}
+
+#[test]
+fn set_resources_updates_the_live_caps_and_status_reflects_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    // No fleet config set ⇒ disarmed, empty roster ⇒ no live `set-property` shells
+    // out (so this test never touches a real `systemctl`).
+    let handle = boot(socket.clone(), dir.path().join("garden"));
+
+    // The daemon boots on the conservative default caps.
+    assert_eq!(call_status(&socket).build_caps, BuildCaps::default().summary());
+
+    // A partial update: bump MemoryHigh + CPUWeight, leave build_jobs untouched.
+    let reply = call_set_resources(
+        &socket,
+        SetResourcesArgs {
+            build_jobs: None,
+            memory_high: Some("6G".into()),
+            cpu_weight: Some(70),
+        },
+    )
+    .expect("a valid update is accepted");
+    assert_eq!(reply.build_caps.memory_high.as_deref(), Some("6G"));
+    assert_eq!(reply.build_caps.cpu_weight, Some(70));
+    assert_eq!(reply.build_caps.cargo_build_jobs, Some(2), "untouched knob kept");
+    // Disarmed fleet ⇒ no running scopes ⇒ nothing applied live; the env-only
+    // CARGO_BUILD_JOBS is reported as next-spawn.
+    assert!(reply.scopes_targeted.is_empty(), "no running scopes to push to");
+    assert!(reply.applied_live.is_empty(), "nothing live with no scopes");
+    assert_eq!(reply.next_spawn, vec!["CARGO_BUILD_JOBS".to_string()]);
+
+    // `status` now reflects the new live default (what the next spawn throttles with).
+    let after = call_status(&socket).build_caps;
+    assert_eq!(after.memory_high.as_deref(), Some("6G"));
+    assert_eq!(after.cpu_weight, Some(70));
+
+    handle.shutdown();
+    handle.join().unwrap();
+}
+
+#[test]
+fn set_resources_rejects_a_hard_cap_style_value_and_leaves_the_caps_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("growlightd.sock");
+    let handle = boot(socket.clone(), dir.path().join("garden"));
+
+    // A 0 parallel-rustc cap (would stall the build) is rejected, not clamped.
+    let err = call_set_resources(
+        &socket,
+        SetResourcesArgs { build_jobs: Some(0), ..Default::default() },
+    )
+    .expect_err("a 0 build_jobs is rejected");
+    assert_eq!(err.0, softfig_ipc::ErrorKind::BadArgs);
+
+    // An out-of-range CPUWeight is likewise rejected.
+    assert!(
+        call_set_resources(
+            &socket,
+            SetResourcesArgs { cpu_weight: Some(50_000), ..Default::default() },
+        )
+        .is_err(),
+        "an out-of-range cpu_weight is rejected",
+    );
+
+    // After both refusals the live caps are unchanged (the daemon never applied the
+    // nonsense values) — the throttle-not-kill invariant holds.
+    assert_eq!(
+        call_status(&socket).build_caps,
+        BuildCaps::default().summary(),
+        "a rejected set_resources leaves the live caps unchanged",
+    );
     assert_eq!(call_status(&socket).state, "running");
 
     handle.shutdown();

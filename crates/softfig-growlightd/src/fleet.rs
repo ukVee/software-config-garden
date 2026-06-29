@@ -259,8 +259,12 @@ pub fn assemble_fleet(
         hub.clone(),
         preapproval,
         // The GENTLE per-agent build throttle (slice 002): every spawn's scope is
-        // capped to slow — never kill — a building agent.
-        fleet.build_caps.clone(),
+        // capped to slow — never kill — a building agent. Shared by Arc with the
+        // daemon (peer-isolation slice 003) so `set_resources` adjusts the
+        // next-spawn throttle live; the daemon's cell was seeded from
+        // `fleet.build_caps` at `set_fleet_config`, so the backend reads the
+        // configured value (and any subsequent live change) off this same cell.
+        Arc::clone(&daemon.build_caps),
     ));
     let members: Vec<FleetMember> = fleet
         .members
