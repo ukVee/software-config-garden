@@ -6,7 +6,10 @@
 
 use std::collections::VecDeque;
 
-use softfig_ipc::growlightd::{AgentDeltaKind, AgentSummary, FleetStatusReply, PolicySummary};
+use softfig_ipc::growlightd::{
+    AgentDeltaKind, AgentSummary, BuildCapsSummary, FleetStatusReply, PolicySummary,
+    SetResourcesReply,
+};
 
 /// Cap on the per-agent thoughts feed so a long-lived GUI never grows unbounded;
 /// the oldest line is dropped past this.
@@ -143,6 +146,23 @@ pub struct Budgets {
     pub session_7d_pct: Option<u8>,
 }
 
+/// The now-vs-next-spawn outcome of a `set_resources` adjustment (peer-isolation
+/// slice 003): which scope properties were applied LIVE to running scopes, which
+/// caps wait for the NEXT spawn, and the running agent scopes the live
+/// `set-property` targeted. The non-cap fields of a wire
+/// [`SetResourcesReply`](softfig_ipc::growlightd::SetResourcesReply), kept so the
+/// resources panel can render "what just happened" without re-deriving it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResourcesOutcome {
+    /// Scope properties pushed to running scopes immediately (a subset of
+    /// `MemoryHigh` / `CPUWeight`).
+    pub applied_live: Vec<String>,
+    /// Caps that take effect only at the next spawn (`CARGO_BUILD_JOBS`).
+    pub next_spawn: Vec<String>,
+    /// The running agent scope units the live `set-property` was attempted on.
+    pub scopes_targeted: Vec<String>,
+}
+
 /// One row in the lease/roster "who holds what" panel (spec §4c).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRow {
@@ -165,6 +185,13 @@ pub struct App {
     pub garden_root: String,
     /// The active per-device policy (the tweak-knobs panel edits this later).
     pub policy: Option<PolicySummary>,
+    /// The active GENTLE per-agent build-resource caps (the throttle), from the
+    /// last `status` and refreshed by a `set_resources` reply. `None` until the
+    /// first `status` lands; the resources panel edits these.
+    pub build_caps: Option<BuildCapsSummary>,
+    /// The latest `set_resources` now-vs-next-spawn outcome — the resources
+    /// panel's feedback line. `None` until a `set_resources` reply lands.
+    pub last_resources_outcome: Option<ResourcesOutcome>,
     /// Whether the fleet admission gate is engaged.
     pub paused: bool,
     /// The fleet roster.
@@ -188,6 +215,7 @@ impl App {
         self.state_label = r.state;
         self.garden_root = r.garden_root;
         self.policy = Some(r.policy);
+        self.build_caps = Some(r.build_caps);
         self.paused = r.paused;
         for AgentSummary { id, status } in r.agents {
             match self.agents.iter_mut().find(|row| row.id == id) {
@@ -199,6 +227,19 @@ impl App {
                 }),
             }
         }
+    }
+
+    /// Fold a `set_resources` reply: refresh the active build-resource caps and
+    /// record the now-vs-next-spawn outcome for the resources panel's feedback
+    /// line. The live `subscribe` stream carries no caps event, so this reply is
+    /// how the panel reflects an adjustment until the next `status` refresh.
+    pub fn apply_resources(&mut self, reply: SetResourcesReply) {
+        self.build_caps = Some(reply.build_caps);
+        self.last_resources_outcome = Some(ResourcesOutcome {
+            applied_live: reply.applied_live,
+            next_spawn: reply.next_spawn,
+            scopes_targeted: reply.scopes_targeted,
+        });
     }
 
     /// Ensure an agent has a roster row (a delta from an agent the roster hasn't
@@ -306,7 +347,11 @@ mod tests {
                 session_5h_halt_pct: 85,
                 session_7d_halt_pct: 90,
             },
-            build_caps: Default::default(),
+            build_caps: BuildCapsSummary {
+                cargo_build_jobs: Some(2),
+                memory_high: Some("3G".into()),
+                cpu_weight: None,
+            },
             paused: true,
             fleet_enabled: false,
             roster: Vec::new(),
@@ -327,11 +372,38 @@ mod tests {
         assert_eq!(app.garden_root, "/g");
         assert!(app.paused);
         assert_eq!(app.policy.unwrap().max_concurrent_agents, 2);
+        // The build-resource caps land in the model for the resources panel.
+        let caps = app.build_caps.clone().unwrap();
+        assert_eq!(caps.cargo_build_jobs, Some(2));
+        assert_eq!(caps.memory_high.as_deref(), Some("3G"));
         // "a" kept its ctx; "b" was added.
         let a = app.agents.iter().find(|r| r.id == "a").unwrap();
         assert_eq!(a.ctx_pct, Some(30), "status merge preserves learned ctx");
         assert_eq!(a.status, "running");
         assert!(app.agents.iter().any(|r| r.id == "b"));
+    }
+
+    #[test]
+    fn apply_resources_refreshes_caps_and_records_the_outcome() {
+        let mut app = App::default();
+        app.apply_resources(SetResourcesReply {
+            build_caps: BuildCapsSummary {
+                cargo_build_jobs: Some(1),
+                memory_high: Some("2G".into()),
+                cpu_weight: Some(50),
+            },
+            applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
+            next_spawn: vec!["CARGO_BUILD_JOBS".into()],
+            scopes_targeted: vec!["growlight-agent-loop-1.scope".into()],
+        });
+
+        let caps = app.build_caps.clone().unwrap();
+        assert_eq!(caps.memory_high.as_deref(), Some("2G"));
+        assert_eq!(caps.cpu_weight, Some(50));
+        let outcome = app.last_resources_outcome.clone().unwrap();
+        assert_eq!(outcome.applied_live, vec!["MemoryHigh", "CPUWeight"]);
+        assert_eq!(outcome.next_spawn, vec!["CARGO_BUILD_JOBS"]);
+        assert_eq!(outcome.scopes_targeted, vec!["growlight-agent-loop-1.scope"]);
     }
 
     #[test]

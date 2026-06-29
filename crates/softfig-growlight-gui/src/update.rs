@@ -4,7 +4,7 @@
 //! the reducer + the decoder/reconnect that produced the events).
 
 use softfig_growlightd_client::ClientEvent;
-use softfig_ipc::growlightd::{Event, FleetStatusReply};
+use softfig_ipc::growlightd::{Event, FleetStatusReply, SetResourcesReply};
 
 use crate::state::{App, ConnState, ThoughtLine};
 
@@ -14,6 +14,11 @@ use crate::state::{App, ConnState, ThoughtLine};
 pub enum Message {
     /// The fleet `status` one-shot landed (initial load or a manual refresh).
     StatusLoaded(FleetStatusReply),
+    /// A `set_resources` reply landed (the resources panel adjusted the build
+    /// caps): refresh the active caps and the now-vs-next-spawn outcome line. The
+    /// live `subscribe` stream carries no caps event, so this reply is how the
+    /// panel reflects the change (the *write* mirror of [`Message::StatusLoaded`]).
+    ResourcesApplied(SetResourcesReply),
     /// A frame from the reconnecting subscribe driver.
     Stream(ClientEvent),
     /// The human submitted the input box (spec §11). Pushes an optimistic
@@ -35,6 +40,7 @@ impl From<ClientEvent> for Message {
 pub fn update(app: &mut App, msg: Message) {
     match msg {
         Message::StatusLoaded(reply) => app.apply_status(reply),
+        Message::ResourcesApplied(reply) => app.apply_resources(reply),
         Message::Stream(ev) => apply_client_event(app, ev),
         Message::HumanPosted { to, kind, body } => app.push_human_post(&to, &kind, &body),
     }
@@ -265,6 +271,32 @@ mod tests {
         assert_eq!(app.chat.len(), 2);
         assert!(app.chat.front().unwrap().pending, "human line still pending");
         assert!(!app.chat.back().unwrap().pending);
+    }
+
+    #[test]
+    fn resources_applied_folds_the_caps_and_outcome_into_the_model() {
+        use softfig_ipc::growlightd::BuildCapsSummary;
+        let mut app = App::default();
+        update(
+            &mut app,
+            Message::ResourcesApplied(SetResourcesReply {
+                build_caps: BuildCapsSummary {
+                    cargo_build_jobs: Some(2),
+                    memory_high: Some("3G".into()),
+                    cpu_weight: Some(50),
+                },
+                applied_live: vec!["MemoryHigh".into()],
+                next_spawn: vec!["CARGO_BUILD_JOBS".into()],
+                scopes_targeted: vec!["growlight-agent-loop-1.scope".into()],
+            }),
+        );
+        assert_eq!(
+            app.build_caps.as_ref().unwrap().memory_high.as_deref(),
+            Some("3G")
+        );
+        let outcome = app.last_resources_outcome.unwrap();
+        assert_eq!(outcome.applied_live, vec!["MemoryHigh"]);
+        assert_eq!(outcome.next_spawn, vec!["CARGO_BUILD_JOBS"]);
     }
 
     #[test]

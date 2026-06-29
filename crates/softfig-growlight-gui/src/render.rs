@@ -4,9 +4,9 @@
 //! the §7b deferred work is only turning these strings into iced `Element`s and
 //! showing a window.
 
-use softfig_ipc::growlightd::AgentDeltaKind;
+use softfig_ipc::growlightd::{AgentDeltaKind, BuildCapsSummary};
 
-use crate::state::{App, ChatLine, ConnState, LeaseRow, ThoughtLine};
+use crate::state::{App, ChatLine, ConnState, LeaseRow, ResourcesOutcome, ThoughtLine};
 
 /// A short tag for a thought fragment's kind.
 pub fn delta_kind_label(kind: AgentDeltaKind) -> &'static str {
@@ -73,6 +73,40 @@ pub fn chat_line(c: &ChatLine) -> String {
     format!("{}{}→{} [{}] {}", marker, c.from, c.to, c.kind, c.body)
 }
 
+/// One line summarizing the active GENTLE per-agent build-resource caps (the
+/// throttle, peer-isolation slice 002/003): `caps: jobs N · mem V · cpu W`, with
+/// `unset` for a knob left at the systemd/env default.
+pub fn build_caps_line(caps: &BuildCapsSummary) -> String {
+    let jobs = caps
+        .cargo_build_jobs
+        .map_or_else(|| "unset".to_string(), |j| j.to_string());
+    let mem = caps.memory_high.clone().unwrap_or_else(|| "unset".to_string());
+    let cpu = caps
+        .cpu_weight
+        .map_or_else(|| "unset".to_string(), |c| c.to_string());
+    format!("caps: jobs {jobs} · mem {mem} · cpu {cpu}")
+}
+
+/// The `set_resources` now-vs-next-spawn feedback line (slice 003): which scope
+/// properties were applied LIVE, which caps wait for the NEXT spawn, and the
+/// running scopes the live `set-property` targeted. An empty sub-list renders as
+/// `-`.
+pub fn resources_outcome_line(outcome: &ResourcesOutcome) -> String {
+    let join = |v: &[String]| {
+        if v.is_empty() {
+            "-".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    format!(
+        "applied live: {} · next spawn: {} · scopes: {}",
+        join(&outcome.applied_live),
+        join(&outcome.next_spawn),
+        join(&outcome.scopes_targeted),
+    )
+}
+
 /// One roster/lease line: `lease state (holder)`.
 pub fn lease_line(l: &LeaseRow) -> String {
     format!(
@@ -137,5 +171,36 @@ mod tests {
             state: "released".into(),
         };
         assert_eq!(lease_line(&lease), "k released (holder -)");
+    }
+
+    #[test]
+    fn build_caps_line_renders_set_and_unset_knobs() {
+        let caps = BuildCapsSummary {
+            cargo_build_jobs: Some(2),
+            memory_high: Some("3G".into()),
+            cpu_weight: Some(50),
+        };
+        assert_eq!(build_caps_line(&caps), "caps: jobs 2 · mem 3G · cpu 50");
+        assert_eq!(
+            build_caps_line(&BuildCapsSummary::default()),
+            "caps: jobs unset · mem unset · cpu unset"
+        );
+    }
+
+    #[test]
+    fn resources_outcome_line_renders_now_vs_next_spawn() {
+        let outcome = ResourcesOutcome {
+            applied_live: vec!["MemoryHigh".into(), "CPUWeight".into()],
+            next_spawn: vec!["CARGO_BUILD_JOBS".into()],
+            scopes_targeted: vec!["growlight-agent-loop-1.scope".into()],
+        };
+        assert_eq!(
+            resources_outcome_line(&outcome),
+            "applied live: MemoryHigh, CPUWeight · next spawn: CARGO_BUILD_JOBS · scopes: growlight-agent-loop-1.scope"
+        );
+        assert_eq!(
+            resources_outcome_line(&ResourcesOutcome::default()),
+            "applied live: - · next spawn: - · scopes: -"
+        );
     }
 }

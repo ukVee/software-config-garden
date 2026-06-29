@@ -54,8 +54,8 @@ pub use selectors::{
     WhoHoldsWhat,
 };
 pub use state::{
-    strip_sigil, AgentRow, App, Budgets, ChatLine, ConnState, LeaseRow, ThoughtLine, HUMAN_FROM,
-    MAX_CHAT, MAX_THOUGHTS,
+    strip_sigil, AgentRow, App, Budgets, ChatLine, ConnState, LeaseRow, ResourcesOutcome,
+    ThoughtLine, HUMAN_FROM, MAX_CHAT, MAX_THOUGHTS,
 };
 pub use update::{update, Message};
 
