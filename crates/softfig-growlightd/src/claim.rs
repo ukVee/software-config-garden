@@ -91,11 +91,13 @@ pub(crate) fn write_item_status(
     queue: &str,
     part: &str,
     status: &str,
+    holder: Option<&str>,
 ) -> Result<(), String> {
     let args = serde_json::to_value(SetItemStatusArgs {
         id: part.to_string(),
         status: status.to_string(),
         queue: Some(queue.to_string()),
+        holder: holder.map(|h| h.to_string()),
     })
     .map_err(|e| format!("encode set_item_status args: {e}"))?;
     let req = Request::new(op::SET_ITEM_STATUS, args);
@@ -124,8 +126,8 @@ impl KeeperdPartClaimer {
 }
 
 impl PartClaimer for KeeperdPartClaimer {
-    fn claim(&self, queue: &str, part: &str) -> Result<(), String> {
-        write_item_status(&self.keeperd_socket, "claim", queue, part, CLAIM_STATUS)
+    fn claim(&self, queue: &str, part: &str, holder: &str) -> Result<(), String> {
+        write_item_status(&self.keeperd_socket, "claim", queue, part, CLAIM_STATUS, Some(holder))
     }
 }
 
@@ -152,7 +154,9 @@ impl KeeperdItemParker {
 
 impl ItemParker for KeeperdItemParker {
     fn park_item(&self, queue: &str, part: &str) -> Result<(), String> {
-        write_item_status(&self.keeperd_socket, "block", queue, part, BLOCK_STATUS)
+        // An item-park flips the part out of `active`; it carries no holder (the
+        // CAS guards writes TO `active` only).
+        write_item_status(&self.keeperd_socket, "block", queue, part, BLOCK_STATUS, None)
     }
 }
 

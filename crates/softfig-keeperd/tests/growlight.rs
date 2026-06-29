@@ -95,6 +95,29 @@ impl Fixture {
         }
     }
 
+    /// Cycle the daemon on the SAME garden + socket: shut the current one down
+    /// and start a fresh `Daemon` over the persisted garden, then re-unlock. The
+    /// committed queue table survives (on-disk), but every in-memory `DaemonInner`
+    /// field — including the holder-identity store — is reconstructed empty, so
+    /// this exercises the cross-`daemon cycle` first-claim-wins path.
+    fn restart(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+            let _ = handle.join();
+        }
+        let config = KeeperConfig::new(&self.garden)
+            .without_watcher()
+            .with_socket(&self.socket);
+        let handle = Daemon::new(config).start().unwrap();
+        wait_for_socket(&self.socket);
+        let resp = send(
+            &self.socket,
+            &Request::new(op::UNLOCK, serde_json::json!({ "passphrase": PASS_STR })),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "re-unlock: {resp:?}");
+        self.handle = Some(handle);
+    }
+
     fn call(&self, op_name: &str, args: serde_json::Value) -> Response {
         send(&self.socket, &Request::new(op_name, args))
     }
@@ -452,6 +475,137 @@ fn set_item_status_without_backlog_is_not_found() {
         err_kind(fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "active" }))),
         ErrorKind::NotFound
     );
+}
+
+// ---- set_item_status: holder-identity CAS (milestone #40) -------------
+
+/// (a) A claim of a part already `active` under a DIFFERENT holder is refused
+/// (fail-closed `BadArgs`); (b) the SAME holder re-claiming stays an idempotent
+/// `Ok` with no new commit (the load-bearing SpawnFailed-retry / resume path).
+#[test]
+fn active_claim_refuses_a_different_holder_but_not_the_same_one() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    // agent-a claims the part (queued → active), recording the holder.
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-a" })
+        ),
+        Response::Ok { .. }
+    ));
+    // (a) A DIFFERENT holder claiming the already-active part is refused.
+    let denied = fx.call(
+        op::SET_ITEM_STATUS,
+        serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-b" }),
+    );
+    assert_eq!(err_kind(denied), ErrorKind::BadArgs);
+    // (b) agent-a re-claiming its own part is an idempotent Ok — no new commit.
+    let tip_before = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
+    let resp = fx.call(
+        op::SET_ITEM_STATUS,
+        serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-a" }),
+    );
+    let reply: SetItemStatusReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.hash, tip_before, "same-holder re-claim mints no commit");
+    assert_eq!(
+        Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string(),
+        tip_before
+    );
+}
+
+/// (c) An unknown/unrecorded holder claiming an already-`active` part wins
+/// (first-claim-wins) — the post-`daemon cycle` resume case. Activating WITHOUT
+/// a holder leaves the holder map empty (exactly the state a cycled daemon
+/// starts in); the first holdered claim then records the holder.
+#[test]
+fn an_unknown_holder_claim_of_an_active_part_wins_first() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    // Active, no holder → CAS untracked, holder map stays empty.
+    assert!(matches!(
+        fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "active" })),
+        Response::Ok { .. }
+    ));
+    // The first holdered claim of the already-active part is granted + recorded.
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "resumer" })
+        ),
+        Response::Ok { .. }
+    ));
+    // ...so a different agent is now refused (the resumer owns it).
+    assert_eq!(
+        err_kind(fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "intruder" })
+        )),
+        ErrorKind::BadArgs
+    );
+}
+
+/// The in-memory holder store is reset on every daemon start, so a part left
+/// `active` across a real `daemon cycle` records no holder — a different agent
+/// re-claims it (first-claim-wins), never a permanent refusal.
+#[test]
+fn the_holder_map_is_reset_across_a_daemon_cycle() {
+    let mut fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-a" })
+        ),
+        Response::Ok { .. }
+    ));
+    // Before the cycle, a different agent is refused.
+    assert_eq!(
+        err_kind(fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-b" })
+        )),
+        ErrorKind::BadArgs
+    );
+    // Cycle the daemon on the same garden: the row stays `active` (persisted),
+    // but the holder map starts empty.
+    fx.restart();
+    assert!(
+        fx.backlog().contains("| 1 | m5b | milestone | Backup | active |"),
+        "the active row survives the cycle"
+    );
+    // agent-b now wins — unknown holder after the reset → first claim.
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-b" })
+        ),
+        Response::Ok { .. }
+    ));
+}
+
+/// When a part leaves `active` (blocked → queued), its holder is dropped, so a
+/// re-activation by a *different* agent is a fresh first-claim — the holder gate
+/// only applies for the lifetime of the active claim.
+#[test]
+fn leaving_active_drops_the_holder() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    fx.call(
+        op::SET_ITEM_STATUS,
+        serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-a" }),
+    );
+    // Park then resume (active → blocked → queued), each dropping the holder.
+    fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "blocked" }));
+    fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "queued" }));
+    // A different agent now claims it active — granted (the part was freed).
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "agent-b" })
+        ),
+        Response::Ok { .. }
+    ));
 }
 
 // ---- reorder_backlog_item ---------------------------------------------

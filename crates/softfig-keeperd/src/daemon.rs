@@ -81,6 +81,17 @@ pub struct DaemonInner {
     /// and flags the target for a lease. Lives here (under `inner`'s mutex) so
     /// every serialized edit sees one consistent history.
     pub thrash: crate::actions::ThrashDetector,
+    /// Milestone #40: the holder-identity store behind the `set_item_status`
+    /// active-claim CAS. Maps a backlog part `(region_tag, id)` to the agent
+    /// that holds it `active`, so a claim of an already-`active` part by a
+    /// *different* agent is refused while the same holder's re-claim stays
+    /// idempotent (the durable defense-in-depth behind growlightd's own
+    /// `assignments` dedup). **In-memory by design:** it is reset to empty on
+    /// every daemon start, so a `daemon cycle` that leaves a part `active` with
+    /// no live fleet records no holder — the rightful resumer's first claim
+    /// wins, never a permanent refusal. Cleared per part when it leaves
+    /// `active`. See [`crate::actions::growlight`].
+    pub holders: crate::actions::HolderStore,
 }
 
 impl DaemonInner {
@@ -96,6 +107,7 @@ impl DaemonInner {
             net: None,
             pending_pairs: PendingPairs::default(),
             thrash: crate::actions::ThrashDetector::new(),
+            holders: crate::actions::HolderStore::new(),
         }
     }
 }

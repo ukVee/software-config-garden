@@ -194,7 +194,9 @@ struct KeeperdStatusWriter {
 
 impl StatusWriter for KeeperdStatusWriter {
     fn write_status(&self, queue: &str, item: &str, status: &str) -> Result<(), String> {
-        write_item_status(&self.keeperd_socket, "resume", queue, item, status)
+        // Resume writes `queued` (un-park); it carries no holder (the CAS guards
+        // writes TO `active` only).
+        write_item_status(&self.keeperd_socket, "resume", queue, item, status, None)
     }
 }
 

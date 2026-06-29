@@ -1228,9 +1228,12 @@ pub struct AddSliceReply {
     pub hash: String,
 }
 
-/// `set_item_status({id, status}) -> {id, status, path, hash}`. Flip a
+/// `set_item_status({id, status, holder?}) -> {id, status, path, hash}`. Flip a
 /// backlog item's status cell in the authoritative queue table. Setting
-/// `active` is refused when a different item is already `active`.
+/// `active` is refused when a different item in the same queue is already
+/// `active`, and (the holder-identity CAS) when the part is already `active`
+/// under a *different* `holder` — a fleet member never double-claims a part a
+/// live peer holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetItemStatusArgs {
     /// The item's queue id (milestone slug or task `NNN`).
@@ -1241,6 +1244,13 @@ pub struct SetItemStatusArgs {
     /// queues (unique today); pass it to disambiguate a cross-queue collision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+    /// The claiming agent's id, for the holder-identity compare-and-swap on an
+    /// `active` claim (milestone #40). When set, keeperd records this agent as
+    /// the part's holder and refuses a later `active` claim from a *different*
+    /// agent; the same holder's re-claim stays idempotent. `None` (the CLI/MCP
+    /// default) opts out of the CAS — back-compat, unchanged behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

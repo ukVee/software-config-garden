@@ -94,12 +94,16 @@ pub trait QueueSource: Send + Sync + fmt::Debug {
 /// over `call_reconnecting` ([`crate::claim::KeeperdPartClaimer`]); a test injects
 /// a scripted claim result.
 pub trait PartClaimer: Send + Sync + fmt::Debug {
-    /// Claim `(queue, part)` for the agent about to spawn — mark it `active` in
-    /// keeperd's queue table. `Ok(())` means the part is now ours (idempotent:
+    /// Claim `(queue, part)` for `holder` (the agent about to spawn) — mark it
+    /// `active` in keeperd's queue table, stamped with the claimant's id so
+    /// keeperd's holder-identity CAS refuses a later claim of the same part by a
+    /// *different* agent (milestone #40, defense-in-depth behind the loop's own
+    /// `assignments` dedup). `Ok(())` means the part is now ours (idempotent:
     /// re-claiming a part this agent already holds `active` is a no-op success).
-    /// `Err(reason)` means the claim could NOT be confirmed (keeperd refused, was
-    /// unreachable, or the write was ambiguous) — the loop must NOT spawn on it.
-    fn claim(&self, queue: &str, part: &str) -> Result<(), String>;
+    /// `Err(reason)` means the claim could NOT be confirmed (keeperd refused —
+    /// another part is active OR the part is held by a different agent — was
+    /// unreachable, or the write was ambiguous): the loop must NOT spawn on it.
+    fn claim(&self, queue: &str, part: &str, holder: &str) -> Result<(), String>;
 }
 
 /// The seam the loop **item-parks** a part through when its member exits
@@ -775,7 +779,7 @@ impl DriveLoop {
                     now,
                     || {
                         seeder.seed(agent, &queue, &part)?;
-                        claimer.claim(&queue, &part)
+                        claimer.claim(&queue, &part, agent)
                     },
                 );
                 match outcome {
@@ -1136,6 +1140,9 @@ mod tests {
     #[derive(Debug)]
     struct FakeClaimer {
         claims: Mutex<Vec<(String, String)>>,
+        /// Per-claim holder id (the agent the loop stamped the claim with), in
+        /// claim order — proves the member id is plumbed to keeperd's CAS.
+        holders: Mutex<Vec<String>>,
         fail: AtomicBool,
         committed: Arc<FixedQueues>,
     }
@@ -1143,6 +1150,7 @@ mod tests {
         fn new(committed: Arc<FixedQueues>) -> Arc<Self> {
             Arc::new(Self {
                 claims: Mutex::new(Vec::new()),
+                holders: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(false),
                 committed,
             })
@@ -1153,13 +1161,17 @@ mod tests {
         fn claims(&self) -> Vec<(String, String)> {
             self.claims.lock().unwrap().clone()
         }
+        fn holders(&self) -> Vec<String> {
+            self.holders.lock().unwrap().clone()
+        }
     }
     impl PartClaimer for Arc<FakeClaimer> {
-        fn claim(&self, queue: &str, part: &str) -> Result<(), String> {
+        fn claim(&self, queue: &str, part: &str, holder: &str) -> Result<(), String> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err("claim refused".into());
             }
             self.claims.lock().unwrap().push((queue.to_string(), part.to_string()));
+            self.holders.lock().unwrap().push(holder.to_string());
             self.committed.mark_active(queue, part);
             Ok(())
         }
@@ -2127,6 +2139,14 @@ mod tests {
             claimer.claims(),
             vec![("qa".into(), "p1".into()), ("qb".into(), "p2".into())],
             "both parts were claimed in keeperd, in order, before spawning",
+        );
+        // Each claim is stamped with the claiming member's agent id, so keeperd's
+        // holder-identity CAS (milestone #40) can refuse a different agent's claim
+        // of the same part.
+        assert_eq!(
+            claimer.holders(),
+            vec!["a1".to_string(), "a2".to_string()],
+            "the claim carries the member's agent id as the holder",
         );
         assert_eq!(backend.spawns(), vec!["a1", "a2"]);
     }

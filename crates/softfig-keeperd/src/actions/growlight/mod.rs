@@ -21,12 +21,14 @@
 // `pub(crate)` so the section-edit path (`actions::sections`) can post a
 // thrash nudge through the same store as `post_message` (spec §4d).
 pub(crate) mod chat;
+mod holders;
 mod init;
 mod leases;
 mod paths;
 mod queue;
 mod queues;
 
+pub use holders::{ClaimGate, HolderStore};
 pub use init::growlight_init;
 pub use leases::{release_lease, request_lease};
 
@@ -459,7 +461,23 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
     require_unlocked(&inner)?;
 
     let rel = paths::backlog_claude();
-    {
+
+    // What the holder-identity CAS computed inside the `WorkTree` block, applied
+    // to the in-memory holder store *after* the block — recording the holder
+    // needs `&mut inner`, and the block borrows `&inner` for `wt` (which must be
+    // dropped before the trailing `&mut inner` commit).
+    enum HolderOp {
+        /// A granted `active` claim — record this agent as the part's holder.
+        Record(String),
+        /// The part is leaving `active` — drop any recorded holder.
+        Clear,
+        /// No holder change (an untracked, no-claimant write).
+        Leave,
+    }
+
+    // (wrote?, part key, holder-map update). `wrote == false` is the idempotent
+    // no-op (return the current tip, no commit); `true` means the tree changed.
+    let (wrote, key, holder_op): (bool, holders::PartKey, HolderOp) = {
         let wt = WorkTree::new(daemon, &inner);
         if !wt.exists(&rel) {
             return Err((ErrorKind::NotFound, format!("{rel}: no backlog yet")));
@@ -477,49 +495,95 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             .position(|r| r.id == args.id)
             .ok_or((ErrorKind::NotFound, format!("no backlog item with id {:?}", args.id)))?;
 
-        // Idempotent re-set: no tree change, so return the current tip rather
-        // than minting an empty commit.
-        if rows[idx].status == args.status {
-            let tip = inner
-                .repo
-                .as_ref()
-                .expect("unlocked")
-                .tip()
-                .map_err(|e| err_to_response(e.into()))?
-                .map(|h| h.to_string())
-                .unwrap_or_default();
-            return Ok(serde_json::to_value(SetItemStatusReply {
-                id: args.id,
-                status: args.status,
-                path: rel,
-                hash: tip,
-            })
-            .unwrap());
-        }
+        let key: holders::PartKey = (tag.clone(), args.id.clone());
 
-        // Single-active invariant, now *per queue*: only one item may be
-        // `active` within a given queue at a time. Scoping it to the resolved
-        // region is exactly what lets the fleet run one active part per queue
-        // concurrently; a default-only garden keeps the old global behaviour.
-        if args.status == "active" {
-            if let Some(other) = rows
-                .iter()
-                .enumerate()
-                .find(|(i, r)| *i != idx && r.status == "active")
-            {
-                return Err((
-                    ErrorKind::BadArgs,
-                    format!(
-                        "item {:?} is already active; set it done/blocked first",
-                        other.1.id
-                    ),
-                ));
+        // Holder-identity CAS (milestone #40): only the write TO `active` is
+        // gated. A claim of a part already `active` under a *different* holder is
+        // refused here — fail-closed, before any tree change — so a fleet member
+        // never double-claims a part a live peer holds. A granted claim records
+        // the holder after the block (covers a fresh claim, the same holder's
+        // idempotent re-claim, and the unknown-holder post-`daemon cycle` resume
+        // where first-claim-wins). A non-active write drops any holder, so a
+        // later re-activation is a fresh first-claim.
+        let holder_op = if args.status == "active" {
+            match inner.holders.gate(&key, args.holder.as_deref()) {
+                ClaimGate::Deny(h) => {
+                    return Err((
+                        ErrorKind::BadArgs,
+                        format!(
+                            "item {:?} is already claimed by agent {h:?}; \
+                             a different agent cannot claim it while it is active",
+                            args.id
+                        ),
+                    ));
+                }
+                ClaimGate::Grant => {
+                    HolderOp::Record(args.holder.clone().expect("Grant implies a claimant id"))
+                }
+                ClaimGate::Untracked => HolderOp::Leave,
             }
-        }
-        rows[idx].status = args.status.clone();
+        } else {
+            HolderOp::Clear
+        };
 
-        let new = managed::upsert(&content, &tag, &queue::render(&rows));
-        wt.write(&rel, new.as_bytes())?;
+        // Idempotent re-set: no tree change. Return the current tip rather than
+        // minting an empty commit — but the holder op still applies (a post-cycle
+        // first claim of an already-`active` part records its holder with no
+        // commit).
+        if rows[idx].status == args.status {
+            (false, key, holder_op)
+        } else {
+            // Single-active invariant, now *per queue*: only one item may be
+            // `active` within a given queue at a time. Scoping it to the resolved
+            // region is exactly what lets the fleet run one active part per queue
+            // concurrently; a default-only garden keeps the old global behaviour.
+            if args.status == "active" {
+                if let Some(other) = rows
+                    .iter()
+                    .enumerate()
+                    .find(|(i, r)| *i != idx && r.status == "active")
+                {
+                    return Err((
+                        ErrorKind::BadArgs,
+                        format!(
+                            "item {:?} is already active; set it done/blocked first",
+                            other.1.id
+                        ),
+                    ));
+                }
+            }
+            rows[idx].status = args.status.clone();
+
+            let new = managed::upsert(&content, &tag, &queue::render(&rows));
+            wt.write(&rel, new.as_bytes())?;
+            (true, key, holder_op)
+        }
+    };
+
+    // Apply the holder-map update now that `wt` is dropped and `inner` is
+    // mutable again.
+    match holder_op {
+        HolderOp::Record(holder) => inner.holders.record(key, &holder),
+        HolderOp::Clear => inner.holders.clear(&key),
+        HolderOp::Leave => {}
+    }
+
+    if !wrote {
+        let tip = inner
+            .repo
+            .as_ref()
+            .expect("unlocked")
+            .tip()
+            .map_err(|e| err_to_response(e.into()))?
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        return Ok(serde_json::to_value(SetItemStatusReply {
+            id: args.id,
+            status: args.status,
+            path: rel,
+            hash: tip,
+        })
+        .unwrap());
     }
 
     let payload = serde_json::json!({ "id": args.id, "status": args.status });
