@@ -287,6 +287,7 @@ mod tests {
                 id: "loop-1".into(),
                 status: "running".into(),
             }],
+            live_scopes: Vec::new(),
         };
 
         /// A transport that answers the one `status` round-trip with a canned

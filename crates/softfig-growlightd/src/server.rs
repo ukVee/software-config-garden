@@ -222,6 +222,9 @@ fn status(daemon: &Daemon) -> Response {
         fleet_enabled: inner.fleet.enabled,
         roster,
         agents: Vec::new(),
+        // The genuinely-running scope units (slice 006) — independent leaf lock,
+        // like build_caps above; never reconstructed CLI-side.
+        live_scopes: daemon.live_scope_units(),
     };
     ok_reply(&reply, "status")
 }

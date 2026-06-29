@@ -162,6 +162,14 @@ pub struct FleetStatusReply {
     /// scheduler/concurrency milestones.
     #[serde(default)]
     pub agents: Vec<AgentSummary>,
+    /// The transient-scope unit names of every CURRENTLY-RUNNING agent —
+    /// generation-suffixed `growlight-agent-<id>-<gen>.scope` (peer-isolation
+    /// hardening slice 002/006). Surfaced so `growlight resources show` prints the
+    /// REAL running units instead of reconstructing a name (which the per-spawn
+    /// generation made impossible). Empty when no agents are running. Additive
+    /// (`#[serde(default)]`) for wire back-compat.
+    #[serde(default)]
+    pub live_scopes: Vec<String>,
 }
 
 /// One configured roster member echoed in [`FleetStatusReply::roster`] — the
@@ -965,6 +973,7 @@ mod tests {
                 FleetMemberSummary { agent: "reviewer".into(), pin: None },
             ],
             agents: Vec::new(),
+            live_scopes: vec!["growlight-agent-builder-1.scope".into()],
         };
         let back: FleetStatusReply =
             serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
@@ -973,5 +982,6 @@ mod tests {
         assert_eq!(back.roster[0].agent, "builder");
         assert_eq!(back.roster[0].pin.as_deref(), Some("queue:build"));
         assert_eq!(back.roster[1].pin, None);
+        assert_eq!(back.live_scopes, vec!["growlight-agent-builder-1.scope".to_string()]);
     }
 }

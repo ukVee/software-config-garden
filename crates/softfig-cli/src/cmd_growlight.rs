@@ -1450,24 +1450,16 @@ fn gate_label(paused: bool) -> &'static str {
 
 fn client_resources(args: ResourcesArgs) -> Result<()> {
     match args.cmd {
-        // `resources show` — the live default caps (off `status`) + the roster
-        // scopes a live `set` reconciles. (Per-scope LIVE values via `systemctl
-        // show` are an on-device read deferred to the §7b verify.)
+        // `resources show` — the live default caps (off `status`) + the RUNNING
+        // scope units a live `set` reconciles, taken verbatim from `status`
+        // (`live_scopes`) — never reconstructed CLI-side, since slice 002 made the
+        // unit name carry a per-spawn generation. (Per-scope LIVE values via
+        // `systemctl show` are an on-device read deferred to the §7b verify.)
         ResourcesCmd::Show(a) => {
             let socket = growlight_socket(a.socket);
             let reply: FleetStatusReply =
                 growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null)?;
-            print!("{}", render_build_caps(&reply.build_caps));
-            if reply.roster.is_empty() {
-                println!("scopes        (none — fleet disarmed)");
-            } else {
-                let scopes: Vec<String> = reply
-                    .roster
-                    .iter()
-                    .map(|m| format!("growlight-agent-{}.scope", m.agent))
-                    .collect();
-                println!("scopes        {}", scopes.join(", "));
-            }
+            print!("{}", render_resources_show(&reply));
             Ok(())
         }
         // `resources set` — adjust the caps live. The all-empty case is refused
@@ -1521,6 +1513,25 @@ fn render_build_caps(c: &BuildCapsSummary) -> String {
         "build caps    (live default — the next spawn's throttle)\n  \
          cargo_build_jobs  {jobs}\n  memory_high       {mem}\n  cpu_weight        {weight}\n",
     )
+}
+
+/// Render `resources show`: the live default caps + the genuinely-running scope
+/// units (`status.live_scopes`, verbatim — not reconstructed CLI-side, slice 006).
+/// Pure (returns the text) so it is unit-tested without a daemon.
+fn render_resources_show(reply: &FleetStatusReply) -> String {
+    let mut out = render_build_caps(&reply.build_caps);
+    if reply.live_scopes.is_empty() {
+        // No running scopes: distinguish a disarmed fleet from an armed-but-idle one
+        // so the operator isn't misled (the roster is configured, nothing spawned).
+        if reply.fleet_enabled {
+            out.push_str("scopes        (none running)\n");
+        } else {
+            out.push_str("scopes        (none — fleet disarmed)\n");
+        }
+    } else {
+        out.push_str(&format!("scopes        {}\n", reply.live_scopes.join(", ")));
+    }
+    out
 }
 
 /// Render a `set_resources` reply: the new caps + the now-vs-next-spawn surface.
@@ -2051,6 +2062,45 @@ mod tests {
             all_failed.contains("0 of 1 scope(s) took the update"),
             "targeted-but-all-failed renders distinctly from no-scopes: {all_failed}",
         );
+    }
+
+    /// slice 006: `resources show` prints the daemon's `live_scopes` VERBATIM (the
+    /// generation-suffixed running units), never a CLI-reconstructed name, and
+    /// distinguishes disarmed from armed-but-idle.
+    #[test]
+    fn render_resources_show_prints_the_running_units_verbatim() {
+        let base = |enabled: bool, live: Vec<String>| FleetStatusReply {
+            state: "running".into(),
+            garden_root: "/g".into(),
+            protocol_version: 1,
+            policy: growlightd::PolicySummary {
+                max_concurrent_agents: 2,
+                ctx_roll_pct: 50,
+                ctx_handoff_pct: 60,
+                session_5h_halt_pct: 85,
+                session_7d_halt_pct: 90,
+            },
+            build_caps: BuildCapsSummary::default(),
+            paused: false,
+            fleet_enabled: enabled,
+            roster: Vec::new(),
+            agents: Vec::new(),
+            live_scopes: live,
+        };
+
+        // Running scopes: the exact gen-suffixed unit names, verbatim.
+        let running = render_resources_show(&base(
+            true,
+            vec![
+                "growlight-agent-a-5.scope".into(),
+                "growlight-agent-b-6.scope".into(),
+            ],
+        ));
+        assert!(running.contains("growlight-agent-a-5.scope, growlight-agent-b-6.scope"));
+
+        // Armed but nothing running vs disarmed read differently.
+        assert!(render_resources_show(&base(true, vec![])).contains("scopes        (none running)"));
+        assert!(render_resources_show(&base(false, vec![])).contains("(none — fleet disarmed)"));
     }
 
     #[test]

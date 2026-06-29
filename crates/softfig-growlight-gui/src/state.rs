@@ -365,6 +365,7 @@ mod tests {
                     status: "idle".into(),
                 },
             ],
+            live_scopes: Vec::new(),
         };
         app.apply_status(reply);
 
