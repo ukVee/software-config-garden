@@ -26,9 +26,11 @@ mod leases;
 mod paths;
 mod queue;
 mod queues;
+mod set_resources;
 
 pub use init::growlight_init;
 pub use leases::{release_lease, request_lease};
+pub use set_resources::growlight_set_resources;
 
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{

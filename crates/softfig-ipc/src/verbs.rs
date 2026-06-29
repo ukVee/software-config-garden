@@ -157,6 +157,14 @@ pub mod op {
     /// Idempotent retrofit; one `growlight_initialized` commit, or none if the
     /// pillar already exists. Mirrors `migrate split`.
     pub const GROWLIGHT_INIT: &str = "growlight_init";
+    /// growlight peer-isolation slice 003: persist the live GENTLE build-resource
+    /// caps default into the in-garden `config/growlight.toml` `[build_caps]`
+    /// table. A daemon-mediated, surgical `toml_edit` update (the table is
+    /// created if absent; comments + the rest of the fleet config preserved);
+    /// one `growlight_resources_set` commit, or none if the caps are unchanged.
+    /// keeperd↔growlightd only (growlightd calls it best-effort after a live
+    /// `set_resources`), never an agent-facing MCP verb.
+    pub const GROWLIGHT_SET_RESOURCES: &str = "growlight_set_resources";
     /// growlight Phase 2: post a message to the coordination bus — append a
     /// numbered message under `growlight/chat/messages/` addressed to an agent
     /// slug, `@all`, or `@human`. The daemon numbers it + stamps the wall-clock
@@ -1301,6 +1309,39 @@ pub struct GrowlightInitReply {
     pub committed: bool,
     /// The resulting commit hash, or the current tip if nothing changed.
     pub hash: String,
+}
+
+/// `growlight_set_resources({cargo_build_jobs?, memory_high?, cpu_weight?}) ->
+/// {committed, hash, path}`. Persist the live build-resource caps default into
+/// `config/growlight.toml` `[build_caps]` (peer-isolation slice 003). Each field
+/// is the FULL desired state of that key: `Some` writes it, `None` removes it
+/// from the table. Surgical (`toml_edit`) — the comments + `fleet_enabled` /
+/// `claude_bin` / `prompt` / `[[fleet]]` are preserved, and the table is created
+/// if absent. There is deliberately **no** hard-cap field (throttle-not-kill).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GrowlightSetResourcesArgs {
+    /// `CARGO_BUILD_JOBS` to persist (the parallel-`rustc` ceiling). `None` ⇒ the
+    /// key is removed from `[build_caps]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_build_jobs: Option<u32>,
+    /// `MemoryHigh` SOFT throttle to persist (a systemd memory value, e.g. `"3G"`).
+    /// `None` ⇒ removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_high: Option<String>,
+    /// `CPUWeight` to persist (1..=10000). `None` ⇒ removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_weight: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrowlightSetResourcesReply {
+    /// False when the surgery produced byte-identical content (an idempotent
+    /// re-persist of the current caps) — no commit was minted.
+    pub committed: bool,
+    /// The resulting commit hash, or the current tip if nothing changed.
+    pub hash: String,
+    /// The garden-relative config path written (`config/growlight.toml`).
+    pub path: String,
 }
 
 // ---- growlight Phase 2: the coordination bus verbs ---------------------

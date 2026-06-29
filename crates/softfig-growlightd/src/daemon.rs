@@ -15,6 +15,7 @@ use crate::config::{BuildCaps, GrowlightdConfig, Policy};
 use crate::control::Control;
 use crate::hub::EventHub;
 use crate::leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
+use crate::persist::ResourcePersister;
 use crate::resume::{ItemResumer, ResumeOutcome};
 use crate::state::State;
 
@@ -92,6 +93,16 @@ pub struct Daemon {
     /// deadlock class (incident 20260622). `None` until `main` installs the live
     /// [`crate::resume::KeeperdItemResumer`]; a test installs a spy.
     pub resumer: Option<Arc<dyn ItemResumer>>,
+    /// The build-cap persist hook (peer-isolation slice 003a-persist): after a
+    /// live `set_resources`, write the new caps default into the in-garden
+    /// `config/growlight.toml` `[build_caps]` via keeperd so it survives a restart.
+    /// Lives *outside* `inner` (like `resumer`) so it is called WITHOUT the daemon
+    /// lock — it reaches keeperd over the socket and may block, so holding the
+    /// mutex across it would reintroduce the keeperd deadlock class (incident
+    /// 20260622). `None` until `main` installs the live
+    /// [`crate::persist::KeeperdResourcePersister`]; a test installs a spy, and a
+    /// `None` simply skips the persist (the live adjust still succeeds).
+    pub persister: Option<Arc<dyn ResourcePersister>>,
     /// The live GENTLE per-agent build-resource caps (peer-isolation slice 003) the
     /// NEXT spawned agent's scope is throttled with. Shared *by `Arc`* with the
     /// [`crate::claude_backend::ClaudeBackend`] (which reads it at each spawn), so
@@ -109,6 +120,7 @@ impl Daemon {
             hub: EventHub::new(),
             thrash_clear: None,
             resumer: None,
+            persister: None,
             build_caps: Arc::new(Mutex::new(BuildCaps::default())),
         }
     }
@@ -126,6 +138,16 @@ impl Daemon {
     /// installs a spy to drive the `resume_item` verb without a live keeperd.
     pub fn with_item_resumer(mut self, hook: Arc<dyn ItemResumer>) -> Self {
         self.resumer = Some(hook);
+        self
+    }
+
+    /// Install the build-cap persist hook (builder-style). `main` binds the live
+    /// [`crate::persist::KeeperdResourcePersister`] over the keeperd socket so a
+    /// live `set_resources` is written back to `config/growlight.toml`; a test
+    /// installs a spy (or none, to skip the persist) to drive the verb without a
+    /// live keeperd.
+    pub fn with_resource_persister(mut self, hook: Arc<dyn ResourcePersister>) -> Self {
+        self.persister = Some(hook);
         self
     }
 

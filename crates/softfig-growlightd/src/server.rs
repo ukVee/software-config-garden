@@ -403,6 +403,21 @@ fn set_resources(daemon: &Daemon, req: &Request) -> Response {
         next_spawn.push("CARGO_BUILD_JOBS".to_string());
     }
 
+    // Persist the new default into `config/growlight.toml` via keeperd so it
+    // survives a daemon restart (peer-isolation slice 003a-persist). Best-effort +
+    // OUTSIDE the daemon lock (we hold none here, the kill-safety lock-ordering
+    // discipline): the running fleet has already taken the new caps, so a persist
+    // failure must NOT fail the verb — we log it and carry on. A `None` hook (a
+    // test, or no keeperd socket) skips the persist entirely.
+    if let Some(persister) = daemon.persister.as_ref() {
+        if let Err(e) = persister.persist(&new) {
+            eprintln!(
+                "growlightd set_resources: persist to config/growlight.toml failed \
+                 (live adjust kept): {e}"
+            );
+        }
+    }
+
     ok_reply(
         &SetResourcesReply {
             build_caps: new.summary(),
