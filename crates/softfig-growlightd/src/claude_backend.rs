@@ -51,6 +51,7 @@ use serde_json::Value;
 use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 
 use crate::admission::BudgetUsage;
+use crate::config::BuildCaps;
 use crate::control::AgentChild;
 use crate::hub::EventHub;
 use crate::preapproval::PreApproval;
@@ -533,6 +534,12 @@ pub struct ClaudeBackend {
     /// session never errors out on a missing allow-rule. Generation failure ⇒ no
     /// spawn (a `SpawnError`).
     preapproval: PreApproval,
+    /// The GENTLE per-agent build-resource caps (peer-isolation slice 002) spliced
+    /// into every spawn's transient scope: a low `CARGO_BUILD_JOBS` + a SOFT
+    /// `MemoryHigh` + a deprioritizing `CPUWeight`. They THROTTLE a building agent,
+    /// never kill it (no `MemoryMax` / tight `TasksMax`). Defaults are conservative
+    /// for the 7.7 GB tablet; slice 003 makes them live-adjustable.
+    build_caps: BuildCaps,
     /// Per-agent health cells, keyed by agent id; re-spawn (re-roll) replaces the
     /// agent's cell with a fresh one.
     agents: Mutex<BTreeMap<String, Arc<AgentHealthState>>>,
@@ -557,12 +564,14 @@ impl ClaudeBackend {
         prompt: impl Into<String>,
         hub: EventHub,
         preapproval: PreApproval,
+        build_caps: BuildCaps,
     ) -> Self {
         Self {
             bin: bin.into(),
             prompt: prompt.into(),
             hub,
             preapproval,
+            build_caps,
             agents: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
             rates: Mutex::new(BTreeMap::new()),
@@ -646,6 +655,31 @@ fn scope_unit(agent: &str) -> String {
     format!("{}.scope", scope_base_name(agent))
 }
 
+/// Build the `systemd-run` cap flags (the scope options BEFORE the `--`) that
+/// GENTLY throttle an agent's build subtree without ever aborting it
+/// (peer-isolation slice 002; human direction 2026-06-28): a low
+/// `CARGO_BUILD_JOBS` env (fewer parallel `rustc` → lower peak RAM), a SOFT
+/// `--property=MemoryHigh` (the kernel throttles + reclaims past it, never
+/// OOM-kills), and a deprioritizing `--property=CPUWeight`. Deliberately NEVER
+/// `MemoryMax` (the hard OOM-kill cap) nor a tight `TasksMax` (a `fork` EAGAIN) —
+/// either would crash the `cargo build`/`test` the agent is blocked on. Each cap
+/// is emitted only when configured (`None` ⇒ omitted), so an all-`None`
+/// [`BuildCaps`] yields the un-throttled slice-001 argv. Pure: the flag shape is
+/// unit-asserted without a real `systemd-run`.
+fn build_cap_args(caps: &BuildCaps) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if let Some(jobs) = caps.cargo_build_jobs {
+        args.push(format!("--setenv=CARGO_BUILD_JOBS={jobs}").into());
+    }
+    if let Some(high) = &caps.memory_high {
+        args.push(format!("--property=MemoryHigh={high}").into());
+    }
+    if let Some(weight) = caps.cpu_weight {
+        args.push(format!("--property=CPUWeight={weight}").into());
+    }
+    args
+}
+
 /// Build the full argv (program first) for launching `agent`'s
 /// `claude -p --output-format stream-json` child **inside its own transient
 /// systemd user scope**, so the child's whole `claude → cargo → rustc` process
@@ -654,13 +688,16 @@ fn scope_unit(agent: &str) -> String {
 /// service cgroup peaked at 4.6 GB → EAGAIN → growlightd caught a SIGTERM and,
 /// being crash-restart-only, stayed down).
 ///
-/// `systemd-run --user --scope --collect --unit=growlight-agent-<id>`:
+/// `systemd-run --user --scope --collect --unit=growlight-agent-<id> <caps> --`:
 /// - `--scope` (not `--service`) runs the command synchronously as our child,
 ///   inheriting our stdin/stdout/stderr — so the existing stream-json stdout
 ///   tail still reads `claude`'s output directly (the wrapper must not eat it).
 /// - `--collect` garbage-collects the scope on exit, leaving no residue.
 /// - `--unit=` names it per-agent so a kill / re-roll / on-device cgroup check
 ///   can address exactly this agent's scope.
+/// - `<caps>` are the slice-002 GENTLE build throttle ([`build_cap_args`]):
+///   scope options (so they apply before the command runs) that only SLOW a
+///   build, never kill it.
 ///
 /// Pure: a unit test asserts the wrapping shape without a real `systemd-run`
 /// (the on-device `/proc/<pid>/cgroup` check is this slice's deferred §7b run).
@@ -670,14 +707,20 @@ fn scoped_spawn_argv(
     loop_settings: &Path,
     mcp_config: &Path,
     agent: &str,
+    caps: &BuildCaps,
 ) -> Vec<OsString> {
-    vec![
+    let mut argv: Vec<OsString> = vec![
         "systemd-run".into(),
         "--user".into(),
         "--scope".into(),
         "--collect".into(),
         format!("--unit={}", scope_base_name(agent)).into(),
-        "--".into(),
+    ];
+    // The GENTLE per-agent build throttle (slice 002) — `systemd-run` scope
+    // options, so they MUST precede the `--` separator and the command.
+    argv.extend(build_cap_args(caps));
+    argv.push("--".into());
+    argv.extend([
         bin.into(),
         "-p".into(),
         prompt.into(),
@@ -688,7 +731,8 @@ fn scoped_spawn_argv(
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
-    ]
+    ]);
+    argv
 }
 
 /// Build the `systemctl` argv that SIGKILLs an agent's whole transient scope —
@@ -734,6 +778,7 @@ impl AgentBackend for Arc<ClaudeBackend> {
             &paths.loop_settings,
             &paths.mcp_config,
             &spec.agent,
+            &self.build_caps,
         );
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
@@ -1341,7 +1386,13 @@ mod tests {
             std::path::PathBuf::from("softfig-mcp"),
             tmp.path().join(".claude"),
         );
-        let backend = Arc::new(ClaudeBackend::new("claude", "kick", EventHub::new(), pre));
+        let backend = Arc::new(ClaudeBackend::new(
+            "claude",
+            "kick",
+            EventHub::new(),
+            pre,
+            BuildCaps::default(),
+        ));
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
         let err = backend.spawn(&spec).expect_err("generation failure ⇒ no spawn");
@@ -1354,13 +1405,54 @@ mod tests {
     }
 
     #[test]
+    fn build_cap_args_emits_only_the_configured_gentle_caps() {
+        // The default caps render as the three GENTLE flags, in order: a low
+        // CARGO_BUILD_JOBS env + a SOFT MemoryHigh + a deprioritizing CPUWeight.
+        assert_eq!(
+            build_cap_args(&BuildCaps::default()),
+            vec![
+                OsString::from("--setenv=CARGO_BUILD_JOBS=2"),
+                OsString::from("--property=MemoryHigh=3G"),
+                OsString::from("--property=CPUWeight=50"),
+            ]
+        );
+        // None of them is ever a HARD kill cap (the throttle-not-kill contract).
+        assert!(
+            !build_cap_args(&BuildCaps::default())
+                .iter()
+                .any(|a| a.to_string_lossy().contains("MemoryMax")
+                    || a.to_string_lossy().contains("TasksMax")),
+            "caps must THROTTLE, never KILL: no MemoryMax/TasksMax",
+        );
+        // An all-None BuildCaps emits NO flags → the un-throttled slice-001 argv.
+        let none = BuildCaps {
+            cargo_build_jobs: None,
+            memory_high: None,
+            cpu_weight: None,
+        };
+        assert!(build_cap_args(&none).is_empty());
+        // A partial cap emits only what's set.
+        let partial = BuildCaps {
+            cargo_build_jobs: None,
+            memory_high: Some("70%".to_string()),
+            cpu_weight: None,
+        };
+        assert_eq!(
+            build_cap_args(&partial),
+            vec![OsString::from("--property=MemoryHigh=70%")]
+        );
+    }
+
+    #[test]
     fn scoped_spawn_argv_wraps_the_claude_invocation_in_a_transient_user_scope() {
+        let caps = BuildCaps::default();
         let argv = scoped_spawn_argv(
             "claude",
             "kick",
             Path::new("/run/agents/a1/loop.json"),
             Path::new("/run/agents/a1/mcp.json"),
             "a1",
+            &caps,
         );
         // The paths here are valid UTF-8, so render for readable assertions.
         let s: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -1374,13 +1466,28 @@ mod tests {
         assert!(s.contains(&"--collect".to_string()));
         assert!(s.contains(&"--unit=growlight-agent-a1".to_string()));
 
-        // Everything after the `--` separator is the ORIGINAL `claude -p`
-        // stream-json invocation, unchanged — the wrapper adds the scope and
-        // touches nothing about the command itself.
         let sep = s
             .iter()
             .position(|a| a == "--")
             .expect("a `--` separates the scope wrapper from the command");
+
+        // The GENTLE build caps (slice 002) are `systemd-run` scope options, so
+        // they sit BEFORE the `--`: a low CARGO_BUILD_JOBS + a SOFT MemoryHigh + a
+        // deprioritizing CPUWeight. Never a hard kill cap (MemoryMax/TasksMax).
+        let scope_opts = &s[..sep];
+        assert!(scope_opts.contains(&"--setenv=CARGO_BUILD_JOBS=2".to_string()));
+        assert!(scope_opts.contains(&"--property=MemoryHigh=3G".to_string()));
+        assert!(scope_opts.contains(&"--property=CPUWeight=50".to_string()));
+        assert!(
+            !scope_opts
+                .iter()
+                .any(|a| a.contains("MemoryMax") || a.contains("TasksMax")),
+            "the caps throttle, never kill: no MemoryMax/TasksMax",
+        );
+
+        // Everything after the `--` separator is the ORIGINAL `claude -p`
+        // stream-json invocation, unchanged — the wrapper adds the scope + caps and
+        // touches nothing about the command itself.
         assert_eq!(
             &s[sep + 1..],
             &[

@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use serde::Deserialize;
 use softfig_ipc::growlightd::PolicySummary;
 
 /// Defensive ceiling on the per-device concurrency cap a `set_policy` may set:
@@ -88,6 +89,49 @@ impl Default for RateLimits {
             rpm_limit: 1_000,
             tpm_per_agent: 200_000,
             rpm_per_agent: 50,
+        }
+    }
+}
+
+/// Per-agent **build-resource caps** applied to each agent's transient systemd
+/// scope (peer-isolation slice 002). These THROTTLE a building agent — they
+/// never abort the build (incident growlightd-resource-down-build; human
+/// direction 2026-06-28): a headless `claude -p` runs `cargo build`/`test` as a
+/// *blocking* tool call and simply waits for it, so a SLOWER build is just a
+/// longer wait, not a failure. The caps may only slow a build, never kill it.
+///
+/// Defaults are conservative for the Surface Go 3 (7.7 GB): a low parallel-`rustc`
+/// cap, a SOFT `MemoryHigh` (the kernel throttles + reclaims past it, never
+/// OOM-kills), and a deprioritizing `CPUWeight`. Deliberately NEVER `MemoryMax`
+/// (the hard OOM-kill cap) and NEVER a tight `TasksMax` (a `fork` EAGAIN) — both
+/// would abort the build the agent is blocked on. Parsed from the in-garden
+/// `config/growlight.toml` `[build_caps]` table (a missing table ⇒ these
+/// defaults; a partial table fills the rest from them). Live runtime adjustment
+/// via the CLI + GUI is slice 003.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BuildCaps {
+    /// `CARGO_BUILD_JOBS` set on the scope — the parallel-`rustc` ceiling. Low
+    /// (default 2) ⇒ fewer concurrent `rustc` ⇒ lower peak RAM; cargo serializes
+    /// the rest gracefully, so this only slows the build. `None` leaves it unset.
+    pub cargo_build_jobs: Option<u32>,
+    /// `MemoryHigh` SOFT throttle, as a systemd memory value (bytes, or a suffix
+    /// like `"3G"` / `"70%"`). Past it the kernel throttles + reclaims the scope,
+    /// so the build slows under pressure but is NOT OOM-killed — deliberately NOT
+    /// `MemoryMax` (which would abort it). `None` leaves it unset.
+    pub memory_high: Option<String>,
+    /// `CPUWeight` (1..=10000, systemd default 100) — a lower weight deprioritizes
+    /// the agent against growlightd + the rest of the box, keeping the tablet
+    /// responsive. Only slows the build. `None` leaves it unset.
+    pub cpu_weight: Option<u32>,
+}
+
+impl Default for BuildCaps {
+    fn default() -> Self {
+        Self {
+            cargo_build_jobs: Some(2),
+            memory_high: Some("3G".to_string()),
+            cpu_weight: Some(50),
         }
     }
 }
@@ -185,6 +229,16 @@ mod tests {
         assert_eq!(p.ctx_handoff_pct, 60);
         assert_eq!(p.session_5h_halt_pct, 85);
         assert_eq!(p.session_7d_halt_pct, 90);
+    }
+
+    #[test]
+    fn build_caps_defaults_are_conservative_and_gentle() {
+        // Conservative for the 7.7 GB tablet: a low parallel-rustc cap + a SOFT
+        // MemoryHigh + a deprioritizing CPUWeight — every one a THROTTLE.
+        let c = BuildCaps::default();
+        assert_eq!(c.cargo_build_jobs, Some(2), "few parallel rustc → lower peak RAM");
+        assert_eq!(c.memory_high.as_deref(), Some("3G"), "SOFT throttle, not a hard cap");
+        assert_eq!(c.cpu_weight, Some(50), "deprioritized vs growlightd (default 100)");
     }
 
     #[test]
