@@ -142,6 +142,64 @@ impl Default for BuildCaps {
 pub const CPU_WEIGHT_MIN: u32 = 1;
 pub const CPU_WEIGHT_MAX: u32 = 10_000;
 
+/// Does `value` parse as a systemd `MemoryHigh=` value, closely enough that any
+/// value accepted here `systemd-run` will also accept? (slice 001, the HIGH:
+/// `memory-high-validated-nonempty-only-poisons-config-and-fail-closes-spawn`.)
+///
+/// Before this guard, `with_update` accepted any non-empty `memory_high` and
+/// deferred to systemd's *live* check — which is best-effort-swallowed, so a
+/// typo like `3GB` (systemd wants `3G`) was persisted + committed first, then
+/// fail-closed every later spawn and **survived restart**. One typo durably
+/// bricked fleet spawning with no user-facing error. Validating here refuses the
+/// bad value at the verb boundary so it can never be stored, persisted, or reach
+/// a spawn — reject-not-clamp at the source.
+///
+/// Mirrors systemd's `parse_size(., 1024)` grammar (`src/basic/parse-util.c`):
+/// - `infinity` (no limit), or
+/// - a percentage `N%` / `N.N%` (`config_parse_memory_limit`'s permyriad path), or
+/// - one or more `<digits><unit?>` groups (systemd sums `4G512M`), where a unit
+///   is a single 1024-base suffix `K`/`M`/`G`/`T`/`P`/`E` or the byte suffix `B`;
+///   a bare number is bytes.
+///
+/// Rejects empty/whitespace, embedded or surrounding spaces, unknown units, and
+/// doubled suffixes like `3GB` (the trailing `B` has no preceding number — the
+/// exact systemd rejection this slice guards against). Stricter on whitespace
+/// than systemd by design: we never store a value with surrounding spaces.
+pub fn is_valid_memory_high(value: &str) -> bool {
+    if value == "infinity" {
+        return true;
+    }
+    if let Some(pct) = value.strip_suffix('%') {
+        // `N%` or `N.N%` — at least one digit before the dot, digits after if present.
+        let mut parts = pct.splitn(2, '.');
+        let int = parts.next().unwrap_or("");
+        let frac = parts.next();
+        return !int.is_empty()
+            && int.bytes().all(|b| b.is_ascii_digit())
+            && frac.is_none_or(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()));
+    }
+    // One or more `<digits><single-suffix?>` groups (systemd `parse_size`).
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    let mut groups = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            // A suffix with no preceding number — e.g. the `B` left after `3G` in `3GB`,
+            // a leading space, or junk like `banana`.
+            return false;
+        }
+        if i < bytes.len() && matches!(bytes[i], b'K' | b'M' | b'G' | b'T' | b'P' | b'E' | b'B') {
+            i += 1;
+        }
+        groups += 1;
+    }
+    groups >= 1
+}
+
 impl BuildCaps {
     /// Project onto the wire [`BuildCapsSummary`] echoed by `status` /
     /// `set_resources`.
@@ -163,7 +221,10 @@ impl BuildCaps {
     /// is the inverse spirit of [`Policy::from_summary`]:
     /// - `build_jobs` must be ≥ 1 (a `0` parallel-`rustc` cap would stall the build);
     /// - `cpu_weight` must be [`CPU_WEIGHT_MIN`]..=[`CPU_WEIGHT_MAX`] (systemd's range);
-    /// - `memory_high` must be a non-empty value (systemd validates the rest live).
+    /// - `memory_high` must parse as a systemd `MemoryHigh=` value
+    ///   ([`is_valid_memory_high`]) — a typo like `3GB` is rejected HERE, never
+    ///   deferred to a swallowed live check that would poison the config and
+    ///   fail-close every later spawn (slice 001).
     ///
     /// **Throttle, not kill.** There is no hard-cap knob to validate — the args
     /// carry only the three SOFT throttles, so a merged [`BuildCaps`] can only ever
@@ -183,8 +244,12 @@ impl BuildCaps {
             }
         }
         if let Some(high) = &args.memory_high {
-            if high.trim().is_empty() {
-                return Err("memory_high must be a non-empty systemd memory value".into());
+            if !is_valid_memory_high(high) {
+                return Err(format!(
+                    "memory_high {high:?} is not a valid systemd MemoryHigh value \
+                     (want bytes, a 1024-base suffix like 3G/512M, a percentage like 70%, \
+                     or infinity)"
+                ));
             }
         }
         let mut merged = self.clone();
@@ -402,6 +467,35 @@ mod tests {
             .with_update(&SetResourcesArgs { memory_high: Some("2G".into()), ..Default::default() })
             .unwrap();
         assert_eq!(merged.memory_high.as_deref(), Some("2G"), "sets MemoryHigh, never MemoryMax");
+    }
+
+    #[test]
+    fn with_update_validates_the_memory_high_systemd_grammar() {
+        // slice 001 (HIGH): a value `with_update` accepts, `systemd-run` must also
+        // accept — so a typo can never be stored/persisted/committed nor fail-close a
+        // later spawn. The accept/reject set mirrors systemd `parse_size(., 1024)`.
+        let base = BuildCaps::default();
+        let ok = |v: &str| {
+            base.with_update(&SetResourcesArgs { memory_high: Some(v.into()), ..Default::default() })
+        };
+
+        for good in ["3G", "512M", "70%", "1500000000", "infinity"] {
+            assert!(ok(good).is_ok(), "{good:?} is a valid systemd MemoryHigh value");
+        }
+        for bad in ["3GB", "banana", "3 G", "", "  "] {
+            assert!(ok(bad).is_err(), "{bad:?} is NOT a valid systemd MemoryHigh value");
+        }
+
+        // Direct grammar coverage of the edges (chained groups, byte suffix, decimal %).
+        assert!(is_valid_memory_high("4G512M"), "systemd sums chained groups");
+        assert!(is_valid_memory_high("4096B"), "bare byte suffix is valid");
+        assert!(is_valid_memory_high("70%"));
+        assert!(is_valid_memory_high("70.5%"), "permyriad decimal percentage");
+        assert!(!is_valid_memory_high("3Gi"), "no IEC i-variant in systemd parse_size");
+        assert!(!is_valid_memory_high(" 3G"), "no surrounding whitespace");
+        assert!(!is_valid_memory_high("3G "), "no trailing whitespace");
+        assert!(!is_valid_memory_high("%"), "a bare percent sign is not a percentage");
+        assert!(!is_valid_memory_high("G"), "a bare unit is not a value");
     }
 
     #[test]

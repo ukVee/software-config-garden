@@ -237,7 +237,17 @@ fn set_resources_rejects_a_hard_cap_style_value_and_leaves_the_caps_unchanged() 
         "an out-of-range cpu_weight is rejected",
     );
 
-    // After both refusals the live caps are unchanged (the daemon never applied the
+    // slice 001 (HIGH): a malformed memory_high (systemd wants `3G`, not `3GB`) is
+    // refused at the verb boundary with BadArgs — never stored/persisted/committed,
+    // so it can't poison the config and fail-close every later spawn.
+    let err = call_set_resources(
+        &socket,
+        SetResourcesArgs { memory_high: Some("3GB".into()), ..Default::default() },
+    )
+    .expect_err("a malformed memory_high is rejected");
+    assert_eq!(err.0, softfig_ipc::ErrorKind::BadArgs);
+
+    // After all refusals the live caps are unchanged (the daemon never applied the
     // nonsense values) — the throttle-not-kill invariant holds.
     assert_eq!(
         call_status(&socket).build_caps,
