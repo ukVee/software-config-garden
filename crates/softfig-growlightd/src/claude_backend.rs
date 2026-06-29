@@ -5,7 +5,13 @@
 //! [`ClaudeBackend`] shells `claude -p --output-format stream-json --verbose` per
 //! agent, each with its per-agent pre-approval `--settings`/`--mcp-config` (the
 //! §15 must-have: a headless agent **errors out** on a missing allow-rule, it does
-//! not pause — so each agent must pre-approve its full toolset). A detached reader
+//! not pause — so each agent must pre-approve its full toolset). Each child is
+//! launched inside its **own transient systemd user scope**
+//! (`systemd-run --user --scope --collect --unit=growlight-agent-<id>`, see
+//! [`scoped_spawn_argv`]) so the agent's whole `claude → cargo → rustc` tree is in
+//! a cgroup separate from `softfig-growlightd.service` — a building agent can no
+//! longer self-DoS the orchestrator (incident growlightd-resource-down-build,
+//! 2026-06-28). A detached reader
 //! thread tails the child's stream-json output, publishing every assistant /
 //! thinking / tool-call content block as an [`Event::AgentDelta`] on the shared
 //! [`EventHub`] so `growlight watch` and the GUI render the live "what's it
@@ -33,7 +39,9 @@
 //! real `claude` is ever spawned in tests (the §7b on-device run is the human's).
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -613,6 +621,90 @@ fn sum_rate_windows(per_agent: impl Iterator<Item = (u64, u64)>) -> (u32, u32) {
     (sat(tokens), sat(reqs))
 }
 
+/// The transient-scope base unit name for `agent`: `growlight-agent-<id>`,
+/// sanitized to the systemd unit-name charset (anything outside `[A-Za-z0-9_-]`
+/// becomes `-`). Agent ids are lowercase slugs already, so this is normally a
+/// no-op; the sanitize is a defensive belt so an exotic id can never produce an
+/// invalid `--unit=` (which would fail the whole spawn).
+fn scope_base_name(agent: &str) -> String {
+    let safe: String = agent
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("growlight-agent-{safe}")
+}
+
+/// The full transient-scope unit name (with the `.scope` suffix) — what
+/// `systemctl --user kill` targets to take down the whole agent cgroup.
+fn scope_unit(agent: &str) -> String {
+    format!("{}.scope", scope_base_name(agent))
+}
+
+/// Build the full argv (program first) for launching `agent`'s
+/// `claude -p --output-format stream-json` child **inside its own transient
+/// systemd user scope**, so the child's whole `claude → cargo → rustc` process
+/// tree lives in a cgroup SEPARATE from `softfig-growlightd.service` (incident
+/// growlightd-resource-down-build, 2026-06-28: a building agent in the shared
+/// service cgroup peaked at 4.6 GB → EAGAIN → growlightd caught a SIGTERM and,
+/// being crash-restart-only, stayed down).
+///
+/// `systemd-run --user --scope --collect --unit=growlight-agent-<id>`:
+/// - `--scope` (not `--service`) runs the command synchronously as our child,
+///   inheriting our stdin/stdout/stderr — so the existing stream-json stdout
+///   tail still reads `claude`'s output directly (the wrapper must not eat it).
+/// - `--collect` garbage-collects the scope on exit, leaving no residue.
+/// - `--unit=` names it per-agent so a kill / re-roll / on-device cgroup check
+///   can address exactly this agent's scope.
+///
+/// Pure: a unit test asserts the wrapping shape without a real `systemd-run`
+/// (the on-device `/proc/<pid>/cgroup` check is this slice's deferred §7b run).
+fn scoped_spawn_argv(
+    bin: &str,
+    prompt: &str,
+    loop_settings: &Path,
+    mcp_config: &Path,
+    agent: &str,
+) -> Vec<OsString> {
+    vec![
+        "systemd-run".into(),
+        "--user".into(),
+        "--scope".into(),
+        "--collect".into(),
+        format!("--unit={}", scope_base_name(agent)).into(),
+        "--".into(),
+        bin.into(),
+        "-p".into(),
+        prompt.into(),
+        "--settings".into(),
+        loop_settings.as_os_str().to_os_string(),
+        "--mcp-config".into(),
+        mcp_config.as_os_str().to_os_string(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+    ]
+}
+
+/// Build the `systemctl` argv that SIGKILLs an agent's whole transient scope —
+/// every pid in the cgroup, so a `cargo`/`rustc` build subtree dies with the
+/// agent. We kill the SCOPE, not just the `systemd-run` controller process: the
+/// controller alone would leave the build subtree orphaned inside the scope.
+/// Pure so the kill shape is unit-proven without a real scope.
+fn scope_kill_argv(unit: &str) -> Vec<String> {
+    vec![
+        "--user".to_string(),
+        "kill".to_string(),
+        "--signal=SIGKILL".to_string(),
+        unit.to_string(),
+    ]
+}
+
 impl AgentBackend for Arc<ClaudeBackend> {
     fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
         // §15 fail-closed pre-approval (slice 004): generate THIS agent's
@@ -630,16 +722,21 @@ impl AgentBackend for Arc<ClaudeBackend> {
                 spec.agent
             ))
         })?;
-        let mut child = Command::new(&self.bin)
-            .arg("-p")
-            .arg(&self.prompt)
-            .arg("--settings")
-            .arg(&paths.loop_settings)
-            .arg("--mcp-config")
-            .arg(&paths.mcp_config)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
+        // Launch wrapped in a per-agent transient systemd user scope so the
+        // child's whole `claude → cargo → rustc` tree is in its OWN cgroup, not
+        // `softfig-growlightd.service`'s (incident growlightd-resource-down-build).
+        // `--scope` inherits our stdio, so the stdout pipe below still tails the
+        // child's stream-json directly. A missing/failed `systemd-run` fails the
+        // spawn closed (no isolation ⇒ no spawn) — the safe direction.
+        let argv = scoped_spawn_argv(
+            &self.bin,
+            &self.prompt,
+            &paths.loop_settings,
+            &paths.mcp_config,
+            &spec.agent,
+        );
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             // stderr is discarded, not piped: an unread stderr pipe can fill and
@@ -647,7 +744,12 @@ impl AgentBackend for Arc<ClaudeBackend> {
             // as a non-zero exit → crash classification + alert.
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| SpawnError(format!("failed to launch `{} -p`: {e}", self.bin)))?;
+            .map_err(|e| {
+                SpawnError(format!(
+                    "failed to launch `{} -p` in a transient scope (systemd-run): {e}",
+                    self.bin
+                ))
+            })?;
 
         let stdout = child
             .stdout
@@ -706,22 +808,39 @@ impl AgentBackend for Arc<ClaudeBackend> {
             reader_state.record_exit(code);
         });
 
-        Ok(Box::new(ClaudeChild { child }))
+        Ok(Box::new(ClaudeChild {
+            child,
+            scope_unit: scope_unit(&spec.agent),
+        }))
     }
 }
 
 /// The killable handle for a live `claude -p` child (the [`AgentChild`] contract).
-/// `kill` SIGKILLs the process best-effort OUTSIDE the daemon lock; killing closes
-/// stdout, so the reader thread reaps the child and records its exit.
+/// The child runs inside a per-agent transient scope (`scope_unit`), so `kill`
+/// SIGKILLs the whole SCOPE cgroup — not just the `systemd-run` controller — best
+/// effort and OUTSIDE the daemon lock; that takes down any `cargo`/`rustc` build
+/// subtree too. The processes dying closes stdout, so the reader thread reaps and
+/// records the exit; the `--collect` scope is then GC'd once empty.
 #[derive(Debug)]
 struct ClaudeChild {
     child: Arc<Mutex<Child>>,
+    scope_unit: String,
 }
 
 impl AgentChild for ClaudeChild {
     fn kill(&self) {
-        // Best-effort: an already-exited child returns Err, which is fine. We do
-        // NOT wait() here — the reader thread reaps on the resulting stdout EOF.
+        // Kill the SCOPE first: `systemctl --user kill` reaches every pid in the
+        // agent's cgroup, so the build subtree dies with the agent (the controller
+        // alone would orphan it). Best-effort — a never-started or already-gone
+        // scope just errors, which is fine.
+        let _ = Command::new("systemctl")
+            .args(scope_kill_argv(&self.scope_unit))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // Then reap the `systemd-run` controller handle directly (already-exited
+        // ⇒ Err, fine). We do NOT wait() — the reader thread reaps on stdout EOF.
         // Called outside the daemon lock (incident 20260622).
         let _ = self.child.lock().unwrap().kill();
     }
@@ -1232,5 +1351,78 @@ mod tests {
         );
         // Nothing was registered — the agent never entered the fleet.
         assert!(backend.health("a1").is_none(), "no doomed agent registered");
+    }
+
+    #[test]
+    fn scoped_spawn_argv_wraps_the_claude_invocation_in_a_transient_user_scope() {
+        let argv = scoped_spawn_argv(
+            "claude",
+            "kick",
+            Path::new("/run/agents/a1/loop.json"),
+            Path::new("/run/agents/a1/mcp.json"),
+            "a1",
+        );
+        // The paths here are valid UTF-8, so render for readable assertions.
+        let s: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+
+        // The controller is `systemd-run` in the USER manager, a `--scope` (so it
+        // inherits our stdio for the stream-json tail, not a detached `--service`),
+        // `--collect` (no residue), named per-agent.
+        assert_eq!(s[0], "systemd-run");
+        assert!(s.contains(&"--user".to_string()));
+        assert!(s.contains(&"--scope".to_string()));
+        assert!(s.contains(&"--collect".to_string()));
+        assert!(s.contains(&"--unit=growlight-agent-a1".to_string()));
+
+        // Everything after the `--` separator is the ORIGINAL `claude -p`
+        // stream-json invocation, unchanged — the wrapper adds the scope and
+        // touches nothing about the command itself.
+        let sep = s
+            .iter()
+            .position(|a| a == "--")
+            .expect("a `--` separates the scope wrapper from the command");
+        assert_eq!(
+            &s[sep + 1..],
+            &[
+                "claude",
+                "-p",
+                "kick",
+                "--settings",
+                "/run/agents/a1/loop.json",
+                "--mcp-config",
+                "/run/agents/a1/mcp.json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_unit_name_is_per_agent_and_sanitized() {
+        assert_eq!(scope_base_name("a"), "growlight-agent-a");
+        assert_eq!(scope_unit("a"), "growlight-agent-a.scope");
+        // A slug carrying chars outside the systemd unit-name set is sanitized to
+        // `-` so the `--unit=` can never be rejected (which would fail the spawn).
+        assert_eq!(
+            scope_base_name("two agents/x"),
+            "growlight-agent-two-agents-x"
+        );
+        assert_eq!(scope_unit("two agents/x"), "growlight-agent-two-agents-x.scope");
+    }
+
+    #[test]
+    fn scope_kill_argv_sigkills_the_whole_scope_cgroup() {
+        // Killing the SCOPE (not just the controller) reaches every pid in the
+        // agent's cgroup, so a build subtree dies with the agent.
+        assert_eq!(
+            scope_kill_argv("growlight-agent-a1.scope"),
+            vec![
+                "--user".to_string(),
+                "kill".to_string(),
+                "--signal=SIGKILL".to_string(),
+                "growlight-agent-a1.scope".to_string(),
+            ]
+        );
     }
 }
