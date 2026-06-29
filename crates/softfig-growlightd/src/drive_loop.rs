@@ -720,11 +720,22 @@ impl DriveLoop {
         //    the next tick's snapshot shows the part claimed, so every other
         //    agent's fallback skips it.
         if !paused {
-            // Parts already claimed THIS tick — belt-and-suspenders so the SAME
-            // `(queue, part)` is never assigned twice in one tick even where
-            // marking the head `active` would otherwise read as a *resume* (two
-            // members mis-pinned to one queue): the second such member gets none.
-            let mut claimed_this_tick: BTreeSet<(String, String)> = BTreeSet::new();
+            // Parts already SPOKEN FOR — excluded before a fresh start so the SAME
+            // `(queue, part)` is never assigned twice. SEEDED from the LIVE
+            // `assignments` (every part a registered member already holds, recorded on
+            // its fresh start and carried across re-rolls), so the cross-tick
+            // pinned-resume hole is closed (milestone `fleet-resume-double-claim`): a
+            // member PINNED to a queue whose head a live peer claimed last tick would
+            // otherwise re-resolve to that now-`active` head (`scheduler.rs:228` resume
+            // path, which fallback's `active`-skip does NOT cover) and double-claim it,
+            // since keeperd's claim of an already-`active` part is idempotent-`Ok`.
+            // Each this-tick claim is then inserted as before — the same-tick
+            // belt-and-suspenders for two members mis-pinned to one queue, where
+            // marking the head `active` would otherwise read as a *resume*. A fresh
+            // loop after a daemon restart has an empty `assignments`, so the rightful
+            // resumer still claims (resume-after-restart preserved).
+            let mut spoken_for: BTreeSet<(String, String)> =
+                self.assignments.values().cloned().collect();
             for member in &fleet {
                 let agent = &member.spec.agent;
                 // A stopping/stopped agent is never (re-)started; a registered one
@@ -738,9 +749,10 @@ impl DriveLoop {
                 let Some((queue, part)) = pick(&snapshot, member.pin.as_deref()) else {
                     continue; // nothing workable for this agent's pin right now
                 };
-                // A part already claimed earlier this tick is taken — never
-                // double-assign it (the resume-collision guard).
-                if claimed_this_tick.contains(&(queue.clone(), part.clone())) {
+                // A part already spoken for — held by a live member (cross-tick) or
+                // claimed earlier this tick — is taken; never double-assign it (the
+                // resume-collision guard, now cross-tick as well as same-tick).
+                if spoken_for.contains(&(queue.clone(), part.clone())) {
                     continue;
                 }
                 // Seed the per-member baton, then claim the part (mark it `active`
@@ -769,7 +781,7 @@ impl DriveLoop {
                 match outcome {
                     StartOutcome::Started => {
                         snapshot.mark_claimed(&queue, &part);
-                        claimed_this_tick.insert((queue.clone(), part.clone()));
+                        spoken_for.insert((queue.clone(), part.clone()));
                         // Record the assignment so a later human-block exit knows
                         // which item to park (the part lookup the supervisor can't
                         // do). A re-roll keeps the member on the same part, so this
@@ -788,7 +800,7 @@ impl DriveLoop {
                     // next tick via a re-pick of its (now `active`) part.
                     outcome @ StartOutcome::SpawnFailed { .. } => {
                         snapshot.mark_claimed(&queue, &part);
-                        claimed_this_tick.insert((queue, part));
+                        spoken_for.insert((queue, part));
                         report.held_starts.push(HeldStart {
                             agent: agent.clone(),
                             outcome,
@@ -2185,6 +2197,60 @@ mod tests {
         assert_eq!(backend.spawns(), vec!["a1", "a2"]);
     }
 
+    /// Cross-tick PINNED resume — the §7b double-claim (milestone
+    /// `fleet-resume-double-claim`). The gap `a_claimed_part_is_skipped_by_a_later_tick`
+    /// MISSES: its peer is UNPINNED, and fallback skips an `active` head
+    /// (`scheduler.rs:240`). Here a fallback member `a` claims `qb/p` at tick N and a
+    /// member `b` PINNED to `qb` is excluded that tick by `spoken_for`. At tick
+    /// N+1 `qb/p` is `active` (a's committed claim) and a PINNED `pick` RESUMES an
+    /// `active` head (`scheduler.rs:228`) rather than skipping it — so without seeding
+    /// the per-pass dedup set from the LIVE `assignments`, `b` re-resolves to the part
+    /// `a` still holds and double-claims it (keeperd's active-claim is idempotent-`Ok`,
+    /// `claim.rs:67`). The fleet must yield AT MOST ONE assignment/spawn/claim across
+    /// both ticks. (Fails before the loop-layer fix; slice 002 adds keeperd's durable
+    /// holder-CAS behind it.)
+    #[test]
+    fn a_pinned_member_does_not_resume_a_part_a_live_peer_holds() {
+        // Fleet order: the fallback member `a` is scheduled before the pinned `b`, so
+        // `a` claims qb/p at tick N and `b` is the one excluded by `spoken_for`.
+        let (mut loop_, _d, backend, claimer, _queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a")), member("b", "qb")],
+            vec![q("qb", &[("p", "queued")])],
+            Policy::default(), // cap 2 — both eligible at tick N; b is held by the dedup, not the cap
+        );
+
+        // Tick N: `a` (fallback) claims + starts on qb/p; `b` (pinned qb) picks the
+        // same head but it is already claimed THIS tick, so b is excluded and starts
+        // nothing — the same-tick guard, already proven.
+        let rn = loop_.tick(0);
+        assert_eq!(
+            rn.started,
+            vec![Assignment { agent: "a".into(), queue: "qb".into(), part: "p".into() }],
+            "tick N: only the fallback member claims the shared head",
+        );
+        assert_eq!(backend.spawns(), vec!["a"]);
+        assert_eq!(claimer.claims(), vec![("qb".into(), "p".into())], "qb/p claimed once at tick N");
+
+        // `a` keeps running — its claim left qb/p `active` on the committed snapshot.
+        backend.set_health("a", AgentHealth::Alive { last_active: 0 });
+
+        // Tick N+1: qb/p is now `active`. A PINNED `pick` RESUMES an active head, so
+        // without the cross-tick dedup `b` re-resolves to qb/p and double-claims it.
+        let rn1 = loop_.tick(1);
+        assert!(
+            rn1.started.is_empty(),
+            "tick N+1: the pinned member must NOT resume the part its live peer holds, got {:?}",
+            rn1.started,
+        );
+        assert_eq!(backend.spawn_count(), 1, "exactly one spawn across both ticks (no double-assign)");
+        assert_eq!(
+            claimer.claims(),
+            vec![("qb".into(), "p".into())],
+            "qb/p claimed exactly once across both ticks — b never re-claimed a's part",
+        );
+        assert!(!loop_.supervisor.is_registered("b"), "b never spawned, so it is not registered");
+    }
+
     /// A claim failure is fail-closed: admission cleared but the part could not be
     /// claimed, so the agent is NOT spawned (never left running on an unclaimed
     /// part) and the start is held as `ClaimFailed`.
@@ -2440,7 +2506,7 @@ mod tests {
 
     /// SLICE 001 finish criterion: TWO members that exit `ITEM_COMPLETE` in ONE
     /// tick never claim the same next part — continuation flows through the same
-    /// `claimed_this_tick` + `mark_claimed` + claim handshake a fresh start uses, so
+    /// `spoken_for` + `mark_claimed` + claim handshake a fresh start uses, so
     /// the double-assignment window the old member-self-pull bypassed stays closed
     /// (intra-tick and cross-tick).
     #[test]
