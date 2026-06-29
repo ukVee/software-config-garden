@@ -164,6 +164,12 @@ pub mod op {
     /// one `growlight_resources_set` commit, or none if the caps are unchanged.
     /// keeperd↔growlightd only (growlightd calls it best-effort after a live
     /// `set_resources`), never an agent-facing MCP verb.
+    ///
+    /// Naming (slice 008, all intentional — NOT a cross-wire): this keeperd op is
+    /// `growlight_set_resources`, but its commit *intent* is spelled
+    /// `growlight_resources_set` (verb-last); and it is distinct from growlightd's
+    /// own client-facing `set_resources` verb ([`crate::growlightd::op::SET_RESOURCES`])
+    /// — growlightd handles the live push, then calls THIS to persist.
     pub const GROWLIGHT_SET_RESOURCES: &str = "growlight_set_resources";
     /// growlight Phase 2: post a message to the coordination bus — append a
     /// numbered message under `growlight/chat/messages/` addressed to an agent
@@ -1328,6 +1334,15 @@ pub struct GrowlightInitReply {
 /// from the table. Surgical (`toml_edit`) — the comments + `fleet_enabled` /
 /// `claude_bin` / `prompt` / `[[fleet]]` are preserved, and the table is created
 /// if absent. There is deliberately **no** hard-cap field (throttle-not-kill).
+///
+/// **`None` semantics differ from the live [`crate::growlightd::SetResourcesArgs`]**
+/// (slice 008, intentional): here `None` = *remove the key* (the persisted table
+/// mirrors the desired caps exactly); in the live args `None` = *leave untouched*
+/// (a partial merge). They never cross because growlightd always sends the FULL
+/// merged caps (every field `Some`) to this verb — so in practice the remove branch
+/// is unreachable, and even a removed key would be refilled on reload from
+/// `BuildCaps`'s all-`Some` default (`FleetConfig`'s `#[serde(default)]`): a cap can
+/// never actually become runtime-unset (by design — there is always a throttle).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GrowlightSetResourcesArgs {
     /// `CARGO_BUILD_JOBS` to persist (the parallel-`rustc` ceiling). `None` ⇒ the

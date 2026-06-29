@@ -372,6 +372,14 @@ fn set_resources(daemon: &Daemon, req: &Request) -> Response {
     };
     // Validate + merge + store the next-spawn default. A nonsense value is rejected
     // here and the live caps are left unchanged.
+    //
+    // Benign concurrent-set race (slice 008, acknowledged not locked): apply (cell
+    // update) then the live push below are not one atomic unit, and the server runs
+    // a thread per connection, so two clients (CLI + GUI) can interleave — the cell
+    // may end as caps-B while a running scope's `set-property` landed caps-A, until
+    // the next (re)spawn re-reads the cell. Soft-throttle-only and self-healing, so
+    // we deliberately do NOT hold a lock across the subprocess push (that would
+    // reintroduce the keeperd deadlock class, incident 20260622); lock-ordering wins.
     let new = match daemon.apply_resources(&args) {
         Ok(caps) => caps,
         Err(e) => return Response::err(ErrorKind::BadArgs, e),

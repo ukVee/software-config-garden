@@ -424,6 +424,11 @@ pub struct BuildCapsSummary {
 /// The three knobs are all SOFT throttles — there is no hard-cap knob, so the
 /// verb cannot express an OOM-kill cap (throttle-not-kill, by construction). An
 /// out-of-range value is rejected by the daemon, never clamped.
+///
+/// Note (slice 008): `None` here = *leave untouched* — the OPPOSITE of the persist
+/// [`crate::verbs::GrowlightSetResourcesArgs`], where `None` = *remove the key*.
+/// They never cross: growlightd applies this partial live merge, then persists the
+/// FULL merged caps (all `Some`) through that other verb.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetResourcesArgs {
     /// New `CARGO_BUILD_JOBS` (must be ≥ 1). Env var ⇒ takes effect at NEXT spawn.

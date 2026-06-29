@@ -98,6 +98,9 @@ pub fn growlight_set_resources(daemon: &Daemon, args: serde_json::Value) -> Hand
         "memory_high": args.memory_high,
         "cpu_weight": args.cpu_weight,
     });
+    // The intent is spelled `growlight_resources_set` (verb-last) while the IPC op
+    // is `growlight_set_resources` — the inversion is intentional, not a cross-wire
+    // (slice 008; see softfig_ipc::verbs::op::GROWLIGHT_SET_RESOURCES).
     let intent = Intent::new("growlight_resources_set", payload)
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let hash = commit_now(&mut inner, intent)?;
@@ -153,6 +156,13 @@ fn apply_build_caps(current: &str, caps: &GrowlightSetResourcesArgs) -> Result<S
 /// Set `key` to `item` when `Some`, or remove it when `None` — the per-knob
 /// upsert that lets the persisted table mirror the live caps exactly (an unset
 /// cap leaves no stale key behind).
+///
+/// Note (slice 008): the `None`/remove branch is **unreachable in practice** today
+/// — growlightd always persists the FULL merged caps (every field `Some`), and even
+/// a removed key would be refilled on reload by `FleetConfig`'s all-`Some`
+/// `BuildCaps` default. It's kept (and unit-tested) so the surgery faithfully
+/// mirrors whatever args it's given, but no current caller produces a `None`, and a
+/// cap can never become runtime-unset by design (there is always a throttle).
 fn set_or_remove(table: &mut Table, key: &str, item: Option<Item>) {
     match item {
         Some(it) => {
