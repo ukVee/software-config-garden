@@ -50,7 +50,9 @@ pub fn pillar_claude() -> String {
 }
 
 /// The injected operating contract (embedded-template-sourced) — the
-/// single-agent `--auto` variant (step 7 self-pulls the next item).
+/// single-agent self-pull variant (step 7 self-pulls the next item), injected by
+/// the semi-auto interactive `growlight start` loop (autonomous runs use the
+/// fleet variant — [`protocol_fleet_md`]).
 pub fn protocol_md() -> String {
     format!("{PILLAR}/protocol.md")
 }

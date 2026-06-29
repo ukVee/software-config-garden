@@ -374,8 +374,9 @@ fn ctx_pct_from_result(ev: &Value) -> Option<u8> {
 }
 
 /// Map a rate-limit window's reported `status` + optional `used_percentage` to a
-/// single reserve %, mirroring the proven single-agent governor's rule
-/// (`softfig-cli`'s `growlight_backend` / `cmd_growlight::window_tripped`): the
+/// single reserve %, mirroring the proven single-agent governor's rule (carried
+/// over from the now-retired standalone `--auto` `window_tripped` — growlightd is
+/// the single autonomous control plane now): the
 /// **status** is the reliable headless signal — `"allowed"` ⇒ 0, any other value
 /// (`"warning"` / `"rejected"`) ⇒ a saturated 100 so the window trips the §7 halt
 /// rail *and* the §9 near-exhaustion alert; a `used_percentage` is honored when a
@@ -394,7 +395,7 @@ fn window_pct(status: Option<&str>, used_percentage: Option<u8>) -> Option<u8> {
 /// Parse a stream-json `rate_limit_event` line into the window + reserve % it
 /// reports — the reliable headless source of the account-wide 5h/7d reserve. A
 /// headless `claude -p` emits one of these per window carrying a coarse `status`
-/// (and a `resetsAt`), but no percentage (`growlight_backend`), so [`window_pct`]
+/// (and a `resetsAt`), but no percentage, so [`window_pct`]
 /// keys off the status. `None` for any other line, malformed JSON, an event with
 /// no `rate_limit_info`, or an unrecognized `rateLimitType`. Pure — a fixture
 /// drives it, no real spawn.

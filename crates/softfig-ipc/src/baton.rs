@@ -1,16 +1,16 @@
 //! The growlight **baton** — the curated handoff a loop session writes at its
 //! boundary — and its terminal-status vocabulary.
 //!
-//! Two readers consume a baton's `status:` field to decide whether to keep the
-//! loop going:
+//! growlightd — the autonomous control plane (`softfig-growlightd`) — reads a
+//! baton's `status:` field at each member's handoff to retire/park/re-roll the
+//! member that wrote it. A single-agent autonomous run is just a growlightd
+//! **fleet-of-one**, so this one reader serves both the fleet and the
+//! single-agent path; the standalone `--auto` driver that used to be the
+//! separate single-agent reader was retired (milestone
+//! growlightd-single-control-plane).
 //!
-//! - the single-agent `--auto` orchestrator (`softfig-cli`'s `cmd_growlight`),
-//!   which stops the one-shot session on a terminal status; and
-//! - the **fleet** supervisor (`softfig-growlightd`), which retires/parks/re-rolls
-//!   the member that wrote it.
-//!
-//! Both crates depend on `softfig-ipc`, so the parse + the classification live
-//! here as the ONE shared implementation — there is exactly one status vocabulary
+//! The parse + the classification live here in `softfig-ipc` as the ONE shared
+//! implementation — there is exactly one status vocabulary
 //! and one frontmatter parser, never a re-derived copy that can drift
 //! (`feedback_no_patchwork_fixes`). See
 //! `journal/decisions/decision-growlight-fleet-loop-spin.md`: the fleet missing
@@ -22,42 +22,35 @@
 /// `ITEM_COMPLETE` / `ITEM_DEFERRED` are NOT within-item continues — they are
 /// item *boundaries* ([`BatonDisposition::ItemBoundary`]): the part is
 /// finished/deferred, so the fleet releases the member's slot and the
-/// orchestrator claims its next part (a member never self-pulls). The
-/// single-agent `--auto` driver, which has no orchestrator, keeps driving on both
-/// a continue and a boundary (it self-pulls the next item) — see
+/// orchestrator claims its next part (a member never self-pulls) — see
 /// [`BatonDisposition`].
 pub fn is_continue_status(status: &str) -> bool {
     matches!(status, "IN_PROGRESS")
 }
 
 /// How a baton's terminal-status field classifies, independent of the budget
-/// governor and spin guard each reader layers on top. This is the shared
-/// "continue / boundary / terminal" decision both the single-agent driver and the
-/// fleet supervisor key off. Each reader maps it to its own lifecycle: the
-/// `--auto` driver folds `QueueEmpty`/`Stuck` into a single terminal stop and
-/// keeps driving on both `Continue` and `ItemBoundary` (it self-pulls the next
-/// item), while the fleet tells them apart — `Continue` re-rolls the SAME part,
-/// `ItemBoundary` releases the slot so the orchestrator claims the next part (the
-/// fleet-member-model fix), `QueueEmpty` retires to idle, a rate-limit parks, and
-/// a human-block/stuck parks pending a human.
+/// governor and spin guard the reader layers on top. This is the shared
+/// "continue / boundary / terminal" decision growlightd keys off and maps to a
+/// member's lifecycle: `Continue` re-rolls the SAME part, `ItemBoundary` releases
+/// the slot so the orchestrator claims the next part (the fleet-member-model fix),
+/// `QueueEmpty` retires to idle, a rate-limit parks, and a human-block/stuck parks
+/// pending a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatonDisposition {
     /// `IN_PROGRESS` — a **within-item** handoff: the agent paused mid-part and
     /// the same part is still its work. The fleet re-rolls the SAME part with the
-    /// member's curated baton carried forward (no re-claim, no re-seed); the
-    /// single-agent driver keeps driving.
+    /// member's curated baton carried forward (no re-claim, no re-seed).
     Continue,
     /// `ITEM_COMPLETE` / `ITEM_DEFERRED` — an **item boundary**: the agent finished
     /// or deferred its part (it already wrote `set_item_status`), so its current
     /// part is done. The fleet **releases the member's slot** (drops it from the
     /// supervisor) and the orchestrator claims + seeds its NEXT part through the
     /// same double-assignment-safe handshake a fresh start uses — the member never
-    /// self-pulls. The single-agent `--auto` driver, which has no orchestrator,
-    /// treats this exactly like [`Continue`] and self-pulls the next item.
+    /// self-pulls.
     ItemBoundary,
-    /// `QUEUE_EMPTY` — the queue is drained. Clean: the single-agent loop stops;
-    /// the fleet retires the member to idle (no alert). The daemon stays resident
-    /// and re-starts a member when new queued work appears.
+    /// `QUEUE_EMPTY` — the queue is drained. Clean: the fleet retires the member to
+    /// idle (no alert). The daemon stays resident and re-starts a member when new
+    /// queued work appears.
     QueueEmpty,
     /// `HALTED_RATE_LIMIT` — the agent halted on a rate window; resume at its
     /// reset (a governor pause / a parked member), never a hard stop.

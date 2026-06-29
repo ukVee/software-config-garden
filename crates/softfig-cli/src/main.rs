@@ -10,7 +10,6 @@ mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
 mod cmd_vault;
-mod growlight_backend;
 
 #[derive(Parser, Debug)]
 #[command(name = "softfig", version, about = "soft-fig: garden tool", long_about = None)]

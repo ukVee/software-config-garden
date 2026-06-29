@@ -168,7 +168,7 @@ pub trait Connector {
 }
 
 /// Injected backoff wait, so the reconnect loop is testable without real sleeps
-/// (mirrors the `growlight_backend::Clock` seam).
+/// (the same injected-clock seam the retired standalone `--auto` driver used).
 pub trait Sleeper {
     /// Block for `dur` (a no-op in tests, which record the request instead).
     fn sleep(&mut self, dur: Duration);
