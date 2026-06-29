@@ -378,7 +378,7 @@ fn set_resources(daemon: &Daemon, req: &Request) -> Response {
     // We hold NO daemon lock here, so each `systemctl set-property` subprocess runs
     // outside the lock (incident 20260622 lock-ordering). A scope that isn't running
     // is a harmless miss; a disarmed fleet (empty roster) targets nothing.
-    let scopes_targeted = daemon.roster_scope_units();
+    let scopes_targeted = daemon.live_scope_units();
     let live_succeeded = scopes_targeted
         .iter()
         .filter(|unit| apply_set_property(unit, &new))

@@ -265,6 +265,11 @@ pub fn assemble_fleet(
         // `fleet.build_caps` at `set_fleet_config`, so the backend reads the
         // configured value (and any subsequent live change) off this same cell.
         Arc::clone(&daemon.build_caps),
+        // The live agent→running-scope registry (peer-isolation hardening slice
+        // 002): each spawn records its generation-suffixed `.scope` unit here so
+        // `set_resources` pushes onto the actually-running scopes. Shared by Arc
+        // with the daemon, like `build_caps`.
+        Arc::clone(&daemon.live_scopes),
     ));
     let members: Vec<FleetMember> = fleet
         .members

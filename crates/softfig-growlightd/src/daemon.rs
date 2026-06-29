@@ -3,6 +3,7 @@
 //! keeperd `Daemon`/`DaemonHandle` split: the accept loop hands `Arc`-shared
 //! clones to each connection handler.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -111,6 +112,15 @@ pub struct Daemon {
     /// daemon lock. Seeded from the loaded fleet config via
     /// [`set_fleet_config`](Daemon::set_fleet_config).
     pub build_caps: Arc<Mutex<BuildCaps>>,
+    /// The live agent→running-scope-unit registry (slice 002), shared *by `Arc`*
+    /// with the [`crate::claude_backend::ClaudeBackend`]: a spawn records its
+    /// generation-suffixed `.scope` unit here, the reader thread removes it on
+    /// exit. `set_resources` reads it ([`live_scope_units`](Daemon::live_scope_units))
+    /// to push live `set-property` onto exactly the *running* scopes — never a
+    /// re-derived roster name (which a unique per-spawn unit would no longer match).
+    /// Lives *outside* `inner` (like `build_caps`) so a spawn records without
+    /// contending on the daemon lock. Empty on a disarmed fleet.
+    pub live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl Daemon {
@@ -122,6 +132,7 @@ impl Daemon {
             resumer: None,
             persister: None,
             build_caps: Arc::new(Mutex::new(BuildCaps::default())),
+            live_scopes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -228,21 +239,16 @@ impl Daemon {
         Ok(merged)
     }
 
-    /// The transient-scope unit names of every CONFIGURED roster member —
-    /// `growlight-agent-<id>.scope` — the candidate set the live `set_resources`
-    /// `set-property` is attempted on (peer-isolation slice 003). Best-effort: a
-    /// member whose scope isn't currently running is a harmless miss, and a
-    /// disarmed fleet (empty roster) yields an empty list (nothing to push live).
-    /// Brief-lock read of the roster; the caller shells `systemctl` OUTSIDE the lock.
-    pub fn roster_scope_units(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .fleet
-            .members
-            .iter()
-            .map(|m| crate::claude_backend::scope_unit(&m.agent))
-            .collect()
+    /// The transient-scope unit names of every CURRENTLY-RUNNING agent — the
+    /// generation-suffixed `growlight-agent-<id>-<gen>.scope` each live spawn
+    /// recorded in the shared registry (slice 002). This is the candidate set the
+    /// live `set_resources` `set-property` is pushed onto. Replaces the old
+    /// roster-derived names, which a unique per-spawn unit would no longer match:
+    /// a member whose scope isn't running has no entry (no wasted push), and a
+    /// disarmed fleet yields an empty list. Brief-lock clone of the registry; the
+    /// caller shells `systemctl` OUTSIDE the lock.
+    pub fn live_scope_units(&self) -> Vec<String> {
+        self.live_scopes.lock().unwrap().values().cloned().collect()
     }
 
     /// The per-device short-window TPM/RPM limits (spec §7 admission's second
@@ -719,24 +725,27 @@ mod tests {
     }
 
     #[test]
-    fn roster_scope_units_are_empty_when_disarmed_and_named_per_member() {
-        use crate::fleet::{FleetConfig, FleetMemberConfig};
+    fn live_scope_units_reflect_the_running_registry_not_the_roster() {
         let daemon = test_daemon();
-        // Disarmed default ⇒ no roster ⇒ nothing live to push.
-        assert!(daemon.roster_scope_units().is_empty());
+        // Nothing running ⇒ nothing live to push (slice 002 — the candidate set is
+        // the actually-running scopes, not the configured roster).
+        assert!(daemon.live_scope_units().is_empty());
 
-        // With a configured roster, each member maps to its transient scope unit.
-        let mut fleet = FleetConfig::disabled();
-        fleet.members = vec![
-            FleetMemberConfig { agent: "builder".into(), pin: None },
-            FleetMemberConfig { agent: "reviewer".into(), pin: None },
-        ];
-        daemon.set_fleet_config(fleet);
+        // A live spawn records its generation-suffixed scope unit; `set_resources`
+        // pushes onto exactly these. (The backend does this on spawn; here we drive
+        // the shared registry directly, no real `claude`.)
+        {
+            let mut scopes = daemon.live_scopes.lock().unwrap();
+            scopes.insert("builder".into(), "growlight-agent-builder-3.scope".into());
+            scopes.insert("reviewer".into(), "growlight-agent-reviewer-4.scope".into());
+        }
+        let mut units = daemon.live_scope_units();
+        units.sort();
         assert_eq!(
-            daemon.roster_scope_units(),
+            units,
             vec![
-                "growlight-agent-builder.scope".to_string(),
-                "growlight-agent-reviewer.scope".to_string(),
+                "growlight-agent-builder-3.scope".to_string(),
+                "growlight-agent-reviewer-4.scope".to_string(),
             ],
         );
     }

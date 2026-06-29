@@ -43,7 +43,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -557,6 +557,17 @@ pub struct ClaudeBackend {
     /// [`rate_used`](ClaudeBackend::rate_used) to feed admission's TPM/RPM gate
     /// (spec §7 second window). Re-spawn replaces the cell.
     rates: Mutex<BTreeMap<String, Arc<AgentRateState>>>,
+    /// Monotonic per-spawn generation (slice 002): each spawn bumps it so the
+    /// transient-scope `--unit=` name (`growlight-agent-<id>-<gen>`) is unique,
+    /// closing the re-roll-vs-GC name-reuse race structurally.
+    scope_gen: AtomicU64,
+    /// The live agent→running-scope-unit registry (slice 002), shared by `Arc`
+    /// with the daemon so `set_resources` addresses the *actually-running* scope
+    /// units (whose names now carry a generation), not a re-derived roster name.
+    /// A spawn records `agent → growlight-agent-<id>-<gen>.scope`; the reader
+    /// thread removes it on exit (guarded by unit, so a re-roll's newer entry is
+    /// never clobbered). An entry is the live, current scope for that agent.
+    live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl ClaudeBackend {
@@ -570,6 +581,7 @@ impl ClaudeBackend {
         hub: EventHub,
         preapproval: PreApproval,
         build_caps: Arc<Mutex<BuildCaps>>,
+        live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
     ) -> Self {
         Self {
             bin: bin.into(),
@@ -580,6 +592,8 @@ impl ClaudeBackend {
             agents: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
             rates: Mutex::new(BTreeMap::new()),
+            scope_gen: AtomicU64::new(0),
+            live_scopes,
         }
     }
 
@@ -654,12 +668,19 @@ fn scope_base_name(agent: &str) -> String {
     format!("growlight-agent-{safe}")
 }
 
-/// The full transient-scope unit name (with the `.scope` suffix) — what
-/// `systemctl --user kill` targets to take down the whole agent cgroup, and what
-/// the live `set_resources` `set-property` (slice 003) addresses. `pub(crate)` so
-/// the daemon can derive an agent's scope name from its roster id.
-pub(crate) fn scope_unit(agent: &str) -> String {
-    format!("{}.scope", scope_base_name(agent))
+/// The transient-scope base unit name for THIS spawn of `agent`, with a unique
+/// per-spawn `generation` suffix: `growlight-agent-<id>-<gen>` (peer-isolation
+/// hardening slice 002, `scope-name-reuse-race-on-reroll`).
+///
+/// The bare per-agent name ([`scope_base_name`]) is a pure function of the id, so
+/// a clean within-item handoff (`Supervisor::roll` ⇒ no-backoff re-spawn ≤1s
+/// later) reused it while systemd's async GC of the just-exited `--collect` scope
+/// might not have finished — `systemd-run --unit=<same>` then fails *"unit already
+/// exists"*, recorded as a non-zero exit ⇒ a spurious `AgentCrashed` + a backoff.
+/// A monotonic generation makes every spawn's unit name distinct, so the
+/// name-reuse window is closed structurally rather than papered over with a retry.
+fn scope_base_name_gen(agent: &str, generation: u64) -> String {
+    format!("{}-{generation}", scope_base_name(agent))
 }
 
 /// Build the `systemd-run` cap flags (the scope options BEFORE the `--`) that
@@ -695,13 +716,14 @@ fn build_cap_args(caps: &BuildCaps) -> Vec<OsString> {
 /// service cgroup peaked at 4.6 GB → EAGAIN → growlightd caught a SIGTERM and,
 /// being crash-restart-only, stayed down).
 ///
-/// `systemd-run --user --scope --collect --unit=growlight-agent-<id> <caps> --`:
+/// `systemd-run --user --scope --collect --unit=growlight-agent-<id>-<gen> <caps> --`:
 /// - `--scope` (not `--service`) runs the command synchronously as our child,
 ///   inheriting our stdin/stdout/stderr — so the existing stream-json stdout
 ///   tail still reads `claude`'s output directly (the wrapper must not eat it).
 /// - `--collect` garbage-collects the scope on exit, leaving no residue.
-/// - `--unit=` names it per-agent so a kill / re-roll / on-device cgroup check
-///   can address exactly this agent's scope.
+/// - `--unit=` names it per-spawn (a unique generation suffix, slice 002) so a
+///   kill / re-roll / on-device cgroup check can address exactly this spawn's
+///   scope, and a no-backoff re-roll never collides with the GC of the prior one.
 /// - `<caps>` are the slice-002 GENTLE build throttle ([`build_cap_args`]):
 ///   scope options (so they apply before the command runs) that only SLOW a
 ///   build, never kill it.
@@ -713,7 +735,7 @@ fn scoped_spawn_argv(
     prompt: &str,
     loop_settings: &Path,
     mcp_config: &Path,
-    agent: &str,
+    scope_base: &str,
     caps: &BuildCaps,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
@@ -721,7 +743,7 @@ fn scoped_spawn_argv(
         "--user".into(),
         "--scope".into(),
         "--collect".into(),
-        format!("--unit={}", scope_base_name(agent)).into(),
+        format!("--unit={scope_base}").into(),
     ];
     // The GENTLE per-agent build throttle (slice 002) — `systemd-run` scope
     // options, so they MUST precede the `--` separator and the command.
@@ -842,12 +864,19 @@ impl AgentBackend for Arc<ClaudeBackend> {
         // now-vs-next-spawn surface. Cloned out so the brief lock is released
         // before the (blocking) spawn.
         let caps = self.build_caps.lock().unwrap().clone();
+        // Unique per-spawn scope unit (slice 002): a monotonic generation suffix so a
+        // no-backoff within-item re-roll never reuses a name systemd may not have
+        // GC'd yet. The full `.scope` unit is stored on the child (kill addresses it)
+        // and recorded in the shared live-scope registry (set_resources targets it).
+        let generation = self.scope_gen.fetch_add(1, Ordering::Relaxed);
+        let scope_base = scope_base_name_gen(&spec.agent, generation);
+        let scope_unit = format!("{scope_base}.scope");
         let argv = scoped_spawn_argv(
             &self.bin,
             &self.prompt,
             &paths.loop_settings,
             &paths.mcp_config,
-            &spec.agent,
+            &scope_base,
             &caps,
         );
         let mut child = Command::new(&argv[0])
@@ -889,6 +918,15 @@ impl AgentBackend for Arc<ClaudeBackend> {
             .unwrap()
             .insert(spec.agent.clone(), Arc::clone(&rate));
 
+        // Record this spawn's running scope (slice 002), overwriting any prior
+        // generation for the agent — `set_resources` pushes its live `set-property`
+        // onto exactly the running units, and the reader thread below drops this
+        // entry on exit (guarded by unit, so a re-roll's newer entry survives).
+        self.live_scopes
+            .lock()
+            .unwrap()
+            .insert(spec.agent.clone(), scope_unit.clone());
+
         // The child is shared with the reader thread for reaping. While the child
         // lives, the reader is blocked in `lines()` on stdout (it holds NO lock),
         // so `kill` can always take the lock to SIGKILL; the reader only locks the
@@ -902,6 +940,8 @@ impl AgentBackend for Arc<ClaudeBackend> {
         let reader_budget = Arc::clone(&budget);
         let reader_rate = Arc::clone(&rate);
         let reader_child = Arc::clone(&child);
+        let reader_live_scopes = Arc::clone(&self.live_scopes);
+        let reader_scope_unit = scope_unit.clone();
         thread::spawn(move || {
             pump(
                 BufReader::new(stdout),
@@ -921,11 +961,18 @@ impl AgentBackend for Arc<ClaudeBackend> {
                 .and_then(|s| s.code())
                 .unwrap_or(UNKNOWN_EXIT);
             reader_state.record_exit(code);
+            // Drop this spawn's live-scope entry — but only if it is still THIS
+            // generation's unit: a re-roll may already have recorded a newer one for
+            // the same agent, which must survive (slice 002).
+            let mut scopes = reader_live_scopes.lock().unwrap();
+            if scopes.get(&agent).map(String::as_str) == Some(reader_scope_unit.as_str()) {
+                scopes.remove(&agent);
+            }
         });
 
         Ok(Box::new(ClaudeChild {
             child,
-            scope_unit: scope_unit(&spec.agent),
+            scope_unit,
         }))
     }
 }
@@ -1462,6 +1509,7 @@ mod tests {
             EventHub::new(),
             pre,
             Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
         ));
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
@@ -1521,7 +1569,7 @@ mod tests {
             "kick",
             Path::new("/run/agents/a1/loop.json"),
             Path::new("/run/agents/a1/mcp.json"),
-            "a1",
+            &scope_base_name_gen("a1", 7),
             &caps,
         );
         // The paths here are valid UTF-8, so render for readable assertions.
@@ -1534,7 +1582,7 @@ mod tests {
         assert!(s.contains(&"--user".to_string()));
         assert!(s.contains(&"--scope".to_string()));
         assert!(s.contains(&"--collect".to_string()));
-        assert!(s.contains(&"--unit=growlight-agent-a1".to_string()));
+        assert!(s.contains(&"--unit=growlight-agent-a1-7".to_string()));
 
         let sep = s
             .iter()
@@ -1576,16 +1624,30 @@ mod tests {
     }
 
     #[test]
-    fn scope_unit_name_is_per_agent_and_sanitized() {
+    fn scope_base_name_is_per_agent_and_sanitized() {
         assert_eq!(scope_base_name("a"), "growlight-agent-a");
-        assert_eq!(scope_unit("a"), "growlight-agent-a.scope");
         // A slug carrying chars outside the systemd unit-name set is sanitized to
         // `-` so the `--unit=` can never be rejected (which would fail the spawn).
         assert_eq!(
             scope_base_name("two agents/x"),
             "growlight-agent-two-agents-x"
         );
-        assert_eq!(scope_unit("two agents/x"), "growlight-agent-two-agents-x.scope");
+    }
+
+    #[test]
+    fn scope_base_name_gen_is_unique_per_spawn_generation() {
+        // slice 002: the per-spawn generation suffix makes the scope unit name
+        // distinct on every spawn, so a no-backoff within-item re-roll never reuses
+        // a name systemd may not have GC'd yet (the spurious-crash race).
+        assert_eq!(scope_base_name_gen("a", 0), "growlight-agent-a-0");
+        assert_eq!(scope_base_name_gen("a", 1), "growlight-agent-a-1");
+        assert_ne!(
+            scope_base_name_gen("a", 0),
+            scope_base_name_gen("a", 1),
+            "two generations of the same agent never collide",
+        );
+        // The agent portion is still sanitized (the defensive belt under the suffix).
+        assert_eq!(scope_base_name_gen("two agents/x", 3), "growlight-agent-two-agents-x-3");
     }
 
     #[test]
