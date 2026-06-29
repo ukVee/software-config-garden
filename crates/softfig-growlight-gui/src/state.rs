@@ -242,6 +242,31 @@ impl App {
         });
     }
 
+    /// Optimistically advance the live caps on a `set_resources` nudge BEFORE the
+    /// reply lands (slice 007, `gui-nudge-lost-update-under-rapid-clicks`): the ∓
+    /// buttons compute their target from the model, but the dispatch is async, so
+    /// two fast clicks both read the same base and one increment is lost. Advancing
+    /// the local cap here means the next click reads the just-applied value;
+    /// [`apply_resources`] reconciles authoritatively when the reply folds back.
+    /// Only the provided (`Some`) knobs move — a `None` leaves its knob untouched.
+    pub fn apply_optimistic_resources(
+        &mut self,
+        build_jobs: Option<u32>,
+        memory_high: Option<String>,
+        cpu_weight: Option<u32>,
+    ) {
+        let caps = self.build_caps.get_or_insert_with(BuildCapsSummary::default);
+        if let Some(jobs) = build_jobs {
+            caps.cargo_build_jobs = Some(jobs);
+        }
+        if let Some(mem) = memory_high {
+            caps.memory_high = Some(mem);
+        }
+        if let Some(weight) = cpu_weight {
+            caps.cpu_weight = Some(weight);
+        }
+    }
+
     /// Ensure an agent has a roster row (a delta from an agent the roster hasn't
     /// seen yet registers it as "running").
     pub fn touch_agent(&mut self, id: &str) {
@@ -406,6 +431,44 @@ mod tests {
         assert_eq!(outcome.applied_live, vec!["MemoryHigh", "CPUWeight"]);
         assert_eq!(outcome.next_spawn, vec!["CARGO_BUILD_JOBS"]);
         assert_eq!(outcome.scopes_targeted, vec!["growlight-agent-loop-1.scope"]);
+    }
+
+    #[test]
+    fn rapid_jobs_nudges_do_not_lose_an_increment() {
+        // slice 007: the ∓ buttons compute their target from build_caps, but the
+        // dispatch is async. Without the optimistic advance, two fast +clicks both
+        // read the same base (2) and one increment is lost (you wanted 4, got 3).
+        let mut app = App::default();
+        app.apply_resources(SetResourcesReply {
+            build_caps: BuildCapsSummary {
+                cargo_build_jobs: Some(2),
+                memory_high: Some("3G".into()),
+                cpu_weight: Some(50),
+            },
+            applied_live: vec![],
+            next_spawn: vec![],
+            scopes_targeted: vec![],
+            scopes_applied: 0,
+        });
+
+        // First +nudge: the view reads jobs=2, dispatches +1=3; the runtime
+        // optimistically applies it before the reply lands.
+        let base1 = app.build_caps.as_ref().unwrap().cargo_build_jobs.unwrap_or(1);
+        app.apply_optimistic_resources(Some(base1 + 1), None, None);
+
+        // Second fast +nudge BEFORE any reply: it re-reads the model and must see 3,
+        // not the stale 2 — so it dispatches 4.
+        let base2 = app.build_caps.as_ref().unwrap().cargo_build_jobs.unwrap_or(1);
+        assert_eq!(base2, 3, "the second nudge reads the first nudge's optimistic value");
+        app.apply_optimistic_resources(Some(base2 + 1), None, None);
+
+        assert_eq!(
+            app.build_caps.as_ref().unwrap().cargo_build_jobs,
+            Some(4),
+            "two +nudges from base 2 reach 4 — no lost increment",
+        );
+        // The optimistic advance touched only the nudged knob.
+        assert_eq!(app.build_caps.as_ref().unwrap().memory_high.as_deref(), Some("3G"));
     }
 
     #[test]

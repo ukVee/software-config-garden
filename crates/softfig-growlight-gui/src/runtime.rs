@@ -172,7 +172,18 @@ fn update(state: &mut GuiState, message: GuiMessage) -> Task<GuiMessage> {
             reduce(&mut state.app, msg);
             Task::none()
         }
-        GuiMessage::Control(cmd) => dispatch_command(cmd),
+        GuiMessage::Control(cmd) => {
+            // Optimistically advance the local caps on a SetResources nudge (slice
+            // 007) BEFORE dispatching, so a rapid second ∓ click reads the
+            // just-applied value instead of the stale round-tripped model — no lost
+            // increment. The reply reconciles authoritatively via apply_resources.
+            if let Command::SetResources { build_jobs, memory_high, cpu_weight } = &cmd {
+                state
+                    .app
+                    .apply_optimistic_resources(*build_jobs, memory_high.clone(), *cpu_weight);
+            }
+            dispatch_command(cmd)
+        }
         GuiMessage::ComposeChanged(s) => {
             state.compose = s;
             Task::none()
