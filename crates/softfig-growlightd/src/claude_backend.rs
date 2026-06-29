@@ -817,23 +817,49 @@ pub(crate) fn set_property_argv(
 
 /// Best-effort: push the live `MemoryHigh`/`CPUWeight` of `caps` onto the running
 /// scope `unit` via `systemctl --user set-property --runtime` (slice 003). Returns
-/// `true` only if a `set-property` actually ran and succeeded. A scope that isn't
-/// running, or a `systemctl` that isn't reachable, just fails — harmless: the
-/// next-spawn caps (the shared cell) are already updated, so the agent picks up the
-/// new throttle when it (re-)spawns. Must be called OUTSIDE the daemon lock (it
-/// shells a subprocess that may block — the kill-safety lock-ordering discipline).
+/// `true` only if a `set-property` actually ran and succeeded.
+///
+/// **Invariant 5: a failed live push is LOGGED and swallowed, never failing the
+/// verb** (hardening slice 003 — the code previously swallowed *without* logging,
+/// then the reply misreported it as "no scopes"). A push the running scope REJECTS
+/// (a bad value, a permission error, a transient `systemctl`) is logged with the
+/// failing unit + systemd's stderr and returns `false` — the next-spawn caps (the
+/// shared cell) already carry the change, so the agent picks up the new throttle
+/// when it (re-)spawns. The reply distinguishes this "targeted but failed" outcome
+/// from "no scopes targeted" via the M-of-N counts (slice 004). The `None` argv
+/// (nothing live to push — only `CARGO_BUILD_JOBS` would change) is NOT a failure
+/// and is not logged. Must be called OUTSIDE the daemon lock (it shells a
+/// subprocess that may block — the kill-safety lock-ordering discipline).
 pub(crate) fn apply_set_property(unit: &str, caps: &BuildCaps) -> bool {
     let Some(argv) = set_property_argv(unit, caps.memory_high.as_deref(), caps.cpu_weight) else {
-        return false; // only CARGO_BUILD_JOBS changed → nothing live to push
+        return false; // only CARGO_BUILD_JOBS changed → nothing live to push (not a failure)
     };
-    Command::new("systemctl")
+    match Command::new("systemctl")
         .args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            // Invariant 5: log + swallow (the persist path at server.rs already logs;
+            // this matches it). The next-spawn caps still took the change.
+            eprintln!(
+                "growlightd set_resources: live set-property on {unit} failed (exit {:?}): {}; \
+                 next-spawn caps still updated",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "growlightd set_resources: could not run systemctl set-property on {unit} ({e}); \
+                 next-spawn caps still updated"
+            );
+            false
+        }
+    }
 }
 
 impl AgentBackend for Arc<ClaudeBackend> {
