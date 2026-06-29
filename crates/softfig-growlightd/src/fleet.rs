@@ -154,6 +154,15 @@ impl FleetConfig {
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
+        // Reject-not-clamp at the config boundary (hardening slice 005): the agent id
+        // becomes the systemd scope unit (`growlight-agent-<id>`) and the key into
+        // every per-agent map, but it comes straight from the user-edited
+        // `[[fleet]]` table. `scope_base_name` sanitizes non-slug chars MANY-TO-ONE
+        // (`build.a`/`build-a`/`build/a` all collapse), and a duplicate `agent` shares
+        // a name — silently colliding scopes (cross-talk on set-property/kill, the
+        // second member fail-closed-never-spawns). Validate here so a valid config
+        // never exercises that lossy path; fail-closed (load treats Err as disabled).
+        validate_fleet_member_ids(&doc.fleet)?;
         Ok(Self {
             enabled: doc.fleet_enabled,
             bin: doc.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
@@ -162,6 +171,36 @@ impl FleetConfig {
             build_caps: doc.build_caps,
         })
     }
+}
+
+/// Reject a `[[fleet]]` roster whose agent ids aren't canonical slugs or aren't
+/// unique (hardening slice 005, `scope-name-collision-from-sanitize`). A valid id
+/// is non-empty and `[a-z0-9-]` only — the same charset the scope unit name is
+/// built from, so it survives `scope_base_name` UNCHANGED (no lossy many-to-one
+/// `-` mapping). Duplicates are rejected because two members would share a scope
+/// unit AND a per-agent map key. Fail-closed: any violation is an `Err` the loader
+/// turns into a disabled fleet.
+fn validate_fleet_member_ids(members: &[FleetMemberConfig]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for m in members {
+        let id = &m.agent;
+        let is_slug = !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !is_slug {
+            return Err(format!(
+                "fleet agent id {id:?} is not a valid slug — use lowercase letters, \
+                 digits, and '-' only (non-empty)"
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(format!(
+                "duplicate fleet agent id {id:?} — each [[fleet]] member needs a unique id"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Load the fleet config from the in-garden `config/growlight.toml`, read
@@ -616,5 +655,46 @@ agent = "reviewer"
         let cfg = load_fleet_config(dir.path());
         assert!(cfg.enabled);
         assert_eq!(cfg.members.len(), 1);
+    }
+
+    #[test]
+    fn non_slug_fleet_agent_ids_are_rejected_at_config_load() {
+        // slice 005 (reject-not-clamp): an id that scope_base_name would sanitize
+        // many-to-one is refused at load, not silently collapsed into a colliding
+        // scope unit. A `.`, `/`, an empty id, or UPPERCASE each fail closed.
+        for bad in ["build.a", "build/a", "", "UPPER", "has space", "under_score"] {
+            let toml = format!("fleet_enabled = true\n[[fleet]]\nagent = \"{bad}\"\n");
+            assert!(
+                FleetConfig::from_growlight_toml(&toml).is_err(),
+                "agent id {bad:?} is not a valid slug and must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_fleet_agent_ids_are_rejected_at_config_load() {
+        // Two members with the same id would share one scope unit AND one per-agent
+        // map key — refused, not silently merged.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\n",
+            "[[fleet]]\nagent = \"a\"\n",
+        );
+        assert!(
+            FleetConfig::from_growlight_toml(toml).is_err(),
+            "a duplicate agent id is rejected",
+        );
+    }
+
+    #[test]
+    fn a_clean_slug_roster_is_accepted() {
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\n",
+            "[[fleet]]\nagent = \"builder-2\"\n",
+            "[[fleet]]\nagent = \"reviewer3\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).expect("a clean slug roster is valid");
+        assert_eq!(cfg.members.len(), 3);
     }
 }
