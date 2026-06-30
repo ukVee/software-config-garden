@@ -142,6 +142,14 @@ impl Default for BuildCaps {
 pub const CPU_WEIGHT_MIN: u32 = 1;
 pub const CPU_WEIGHT_MAX: u32 = 10_000;
 
+/// Defensive ceiling on `CARGO_BUILD_JOBS` a `set_resources` may set: comfortably
+/// above any real core count (the Surface Go 3 has 2), but a value past it is a
+/// fat-fingered nonsense cap that invites a `rustc` fork-storm — the opposite
+/// failure mode from a `0` cap (which stalls). Like [`CPU_WEIGHT_MAX`] it is
+/// **rejected**, not clamped, so the reject-not-clamp invariant bounds `build_jobs`
+/// on BOTH ends (audit slice 006).
+pub const BUILD_JOBS_MAX: u32 = 64;
+
 /// Does `value` parse as a systemd `MemoryHigh=` value, closely enough that any
 /// value accepted here `systemd-run` will also accept? (slice 001, the HIGH:
 /// `memory-high-validated-nonempty-only-poisons-config-and-fail-closes-spawn`.)
@@ -219,7 +227,8 @@ impl BuildCaps {
     /// a nonsense value is **rejected** with a clear message — never silently
     /// clamped — so a GUI/CLI typo can't quietly disable the throttle. The guard
     /// is the inverse spirit of [`Policy::from_summary`]:
-    /// - `build_jobs` must be ≥ 1 (a `0` parallel-`rustc` cap would stall the build);
+    /// - `build_jobs` must be `1..=`[`BUILD_JOBS_MAX`] (a `0` cap would stall the
+    ///   build; an over-large cap invites a `rustc` fork-storm on a low-RAM device);
     /// - `cpu_weight` must be [`CPU_WEIGHT_MIN`]..=[`CPU_WEIGHT_MAX`] (systemd's range);
     /// - `memory_high` must parse as a systemd `MemoryHigh=` value
     ///   ([`is_valid_memory_high`]) — a typo like `3GB` is rejected HERE, never
@@ -234,6 +243,12 @@ impl BuildCaps {
         if let Some(jobs) = args.build_jobs {
             if jobs < 1 {
                 return Err("build_jobs must be >= 1 (a 0 parallel-rustc cap stalls the build)".into());
+            }
+            if jobs > BUILD_JOBS_MAX {
+                return Err(format!(
+                    "build_jobs must be 1..={BUILD_JOBS_MAX}, got {jobs} \
+                     (an over-large cap invites a rustc fork-storm that harms a low-RAM device)"
+                ));
             }
         }
         if let Some(weight) = args.cpu_weight {
@@ -432,6 +447,31 @@ mod tests {
             base.with_update(&SetResourcesArgs { build_jobs: Some(0), ..Default::default() })
                 .is_err(),
             "a 0 parallel-rustc cap is rejected",
+        );
+
+        // build_jobs past the fork-storm ceiling → rejected on the upper end (not
+        // clamped down), with a clear message naming the bound (audit slice 006).
+        let over = base
+            .with_update(&SetResourcesArgs {
+                build_jobs: Some(BUILD_JOBS_MAX + 1),
+                ..Default::default()
+            })
+            .expect_err("an over-large build_jobs is rejected");
+        assert!(
+            over.contains(&BUILD_JOBS_MAX.to_string()),
+            "the rejection names the ceiling: {over:?}",
+        );
+        // Both build_jobs bounds are themselves valid (the floor 1 and the ceiling).
+        assert!(base
+            .with_update(&SetResourcesArgs { build_jobs: Some(1), ..Default::default() })
+            .is_ok());
+        assert!(
+            base.with_update(&SetResourcesArgs {
+                build_jobs: Some(BUILD_JOBS_MAX),
+                ..Default::default()
+            })
+            .is_ok(),
+            "the ceiling itself is a valid build_jobs",
         );
 
         // cpu_weight outside systemd's 1..=10000 → rejected on both ends.

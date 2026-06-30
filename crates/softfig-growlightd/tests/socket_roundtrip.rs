@@ -258,6 +258,16 @@ fn set_resources_rejects_a_hard_cap_style_value_and_leaves_the_caps_unchanged() 
     .expect_err("a malformed memory_high is rejected");
     assert_eq!(err.0, softfig_ipc::ErrorKind::BadArgs);
 
+    // audit slice 006: an over-large build_jobs (a `rustc` fork-storm that would harm
+    // the low-RAM tablet) is refused at the verb boundary with BadArgs — the upper end
+    // of the same reject-not-clamp guard as the `0` cap above.
+    let err = call_set_resources(
+        &socket,
+        SetResourcesArgs { build_jobs: Some(9999), ..Default::default() },
+    )
+    .expect_err("an over-large build_jobs is rejected");
+    assert_eq!(err.0, softfig_ipc::ErrorKind::BadArgs);
+
     // After all refusals the live caps are unchanged (the daemon never applied the
     // nonsense values) — the throttle-not-kill invariant holds.
     assert_eq!(
