@@ -351,8 +351,9 @@ impl SharedState {
     /// Stage a rename into the overlay. Handles a single file and a directory
     /// (every live file descendant is re-keyed). Each moved file's bytes are
     /// materialized into the overlay so the move survives the
-    /// overlay-clears-on-commit rotation — mirroring the kernel `rename`
-    /// handler, extended to whole subtrees.
+    /// overlay-clears-on-commit rotation. This is the single dir-aware rename
+    /// implementation: the kernel `rename` handler delegates here too, so a
+    /// human-facing `mv dir newdir` re-keys the subtree instead of dropping it.
     pub(crate) fn stage_rename(&self, from: &Path, to: &Path) -> Result<()> {
         let movers: Vec<PathBuf> = self
             .live_file_paths()
@@ -850,8 +851,14 @@ impl Filesystem for FuseFs {
         if self.path_kind(&path) != Some(EntryKind::Dir) {
             return reply.error(libc::ENOENT);
         }
-        // Recursive rmdir not supported (POSIX rmdir requires empty);
-        // assume empty per kernel ABI.
+        // FUSE does NOT guarantee the directory is empty before calling us, so
+        // POSIX requires the filesystem itself to reject a non-empty rmdir with
+        // ENOTEMPTY. Enforce it from the live (overlay ∪ tip) view — without
+        // this check, marking a populated dir removed orphans its whole subtree
+        // exactly like the directory-rename bug did.
+        if !self.state.read_dir_entries(&path).is_empty() {
+            return reply.error(libc::ENOTEMPTY);
+        }
         {
             let mut inner = self.state.inner.lock().unwrap();
             inner.overlay.mark_removed(path.clone());
@@ -868,7 +875,7 @@ impl Filesystem for FuseFs {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
         let from_parent = match self.path_of(parent) {
@@ -887,15 +894,25 @@ impl Filesystem for FuseFs {
         if self.path_kind(&from).is_none() {
             return reply.error(libc::ENOENT);
         }
-        // Materialize the source bytes so the rename survives the
-        // overlay-clears-on-commit semantics.
-        let bytes = self.read_bytes(&from).unwrap_or_default();
-        let mode = self.mode_of_path(&from).unwrap_or(0o100644);
-        {
-            let mut inner = self.state.inner.lock().unwrap();
-            inner.overlay.mark_removed(from.clone());
-            inner.overlay.insert_file(to.clone(), bytes, mode);
-            inner.inodes.rename(&from, &to);
+        // renameat2 flags — previously ignored. RENAME_EXCHANGE (atomic swap)
+        // is not implemented; reject it rather than silently doing a one-way
+        // move. RENAME_NOREPLACE must fail if the destination exists.
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            return reply.error(libc::ENOSYS);
+        }
+        if flags & libc::RENAME_NOREPLACE != 0 && self.path_kind(&to).is_some() {
+            return reply.error(libc::EEXIST);
+        }
+        // Delegate to the one dir-aware staging path the MCP-verb rename also
+        // uses: it re-keys every live descendant under the new prefix (and
+        // materializes each moved file's plaintext into the overlay so the move
+        // survives the overlay-clears-on-commit rotation). A lone file is the
+        // degenerate single-mover case. The old inline logic was file-only — it
+        // read a directory as empty bytes and minted a 0-byte file at `to`,
+        // silently dropping the subtree from the next commit.
+        if let Err(e) = self.state.stage_rename(&from, &to) {
+            eprintln!("keeperd: fuse: rename staging failed: {e}");
+            return reply.error(libc::EIO);
         }
         let from_rel = path_to_repo_rel(&from);
         let to_rel = path_to_repo_rel(&to);

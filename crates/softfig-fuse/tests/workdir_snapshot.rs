@@ -12,11 +12,12 @@
 //! Needs a working `/dev/fuse`; skipped with a note when it is absent
 //! (CI sandboxes, containers without the device).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use softfig_fuse::{DirtyEventSink, FuseMount};
+use softfig_fuse::{DirtyEventSink, FuseMount, MountHandle};
 use softfig_store::{ObjectStore, StorePaths};
 use softfig_vault::{params::VaultParams, Vault};
 use softfig_vcs::{walk, Repo, TreeNode, WalkSnapshot};
@@ -56,6 +57,45 @@ fn top_level_names(snap: &WalkSnapshot) -> Vec<String> {
         TreeNode::Dir(children) => children.keys().cloned().collect(),
         TreeNode::File { .. } => panic!("snapshot root is always a Dir"),
     }
+}
+
+/// Flatten a snapshot to `repo/relative/path -> content`, so a test can
+/// assert on the surviving file set after a directory-shaped op. A path that
+/// resolves to a directory simply doesn't appear (only leaf files are keyed),
+/// which is exactly what lets us catch the "directory became a 0-byte file"
+/// corruption — a corrupted `renamed` would show up here as a key.
+fn files_of(snap: &WalkSnapshot) -> BTreeMap<String, Vec<u8>> {
+    fn rec(prefix: &str, node: &TreeNode, out: &mut BTreeMap<String, Vec<u8>>) {
+        match node {
+            TreeNode::Dir(children) => {
+                for (name, child) in children {
+                    let path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    rec(&path, child, out);
+                }
+            }
+            TreeNode::File { content, .. } => {
+                out.insert(prefix.to_string(), content.clone());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    rec("", &snap.root, &mut out);
+    out
+}
+
+/// Vault-init + genesis-commit + mount, mirroring the inline setup the parity
+/// test uses. The genesis content is whatever was staged under `staging`
+/// before the call.
+fn mount_genesis(state: &Path, staging: &Path, mount: &Path) -> MountHandle {
+    let (_vault, session, _recovery) =
+        Vault::init_with_params(state, PASS, fast_params()).expect("vault init");
+    let (_repo, _genesis) =
+        Repo::create_fresh(mount, state, staging, &session).expect("create_fresh");
+    FuseMount::mount(mount, state, Arc::new(session), Arc::new(NoopSink)).expect("mount")
 }
 
 #[test]
@@ -153,6 +193,128 @@ fn workdir_snapshot_matches_a_live_walk_of_the_mount() {
             "{absent} should be gone or ignored: {names:?}"
         );
     }
+
+    handle.unmount();
+}
+
+/// Regression for the HIGH data-loss finding `kernel-rename-directory-data-loss`
+/// (audit slice 002). A human-facing `mv dir newdir` through the kernel must
+/// re-key every descendant under the new prefix, not materialize a 0-byte file
+/// and silently drop the subtree from the next commit.
+///
+/// Before the fix this fails: `renamed` is a 0-byte regular file and
+/// `renamed/a.md` / `renamed/sub/b.md` are absent from the snapshot.
+#[test]
+fn kernel_rename_of_a_directory_preserves_the_whole_subtree() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping dir-rename data-loss test: /dev/fuse unavailable in this environment");
+        return;
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+
+    // A directory with a file at its top and one nested a level deeper, plus an
+    // unrelated sibling that must stay put.
+    write(staging.path(), "docs/a.md", b"alpha");
+    write(staging.path(), "docs/sub/b.md", b"beta");
+    write(staging.path(), "keep.md", b"unrelated");
+
+    let handle = mount_genesis(state.path(), staging.path(), mount.path());
+    let m = mount.path();
+
+    // The human-facing kernel op: `mv docs renamed`.
+    fs::rename(m.join("docs"), m.join("renamed")).expect("rename a directory through the kernel");
+
+    let snapshot = handle.workdir_snapshot().expect("workdir_snapshot");
+    let files = files_of(&snapshot);
+
+    // The subtree survives, byte-for-byte, under the new prefix...
+    assert_eq!(
+        files.get("renamed/a.md").map(Vec::as_slice),
+        Some(b"alpha".as_ref()),
+        "top-level file must move with its directory: {:?}",
+        files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        files.get("renamed/sub/b.md").map(Vec::as_slice),
+        Some(b"beta".as_ref()),
+        "nested file must move with its directory: {:?}",
+        files.keys().collect::<Vec<_>>()
+    );
+    // ...nothing lingers under the old prefix...
+    assert!(
+        !files.keys().any(|k| k == "docs" || k.starts_with("docs/")),
+        "the old directory prefix must be gone: {:?}",
+        files.keys().collect::<Vec<_>>()
+    );
+    // ...the destination is a directory, never the 0-byte file the bug minted...
+    assert!(
+        !files.contains_key("renamed"),
+        "`renamed` must be a directory, not a 0-byte regular file"
+    );
+    // ...and the unrelated sibling is untouched.
+    assert_eq!(
+        files.get("keep.md").map(Vec::as_slice),
+        Some(b"unrelated".as_ref())
+    );
+
+    // The in-memory reconstruction must still match a real walk back through
+    // the mount — the live tree and what we'd commit agree.
+    let walked = walk(m).expect("walk mount");
+    assert_eq!(
+        snapshot, walked,
+        "in-memory (tip ∪ overlay) reconstruction must match a live walk after a dir rename"
+    );
+
+    handle.unmount();
+}
+
+/// Regression for the second half of audit slice 002: FUSE does not guarantee
+/// the directory is empty before calling `rmdir`, so the filesystem must return
+/// ENOTEMPTY rather than orphaning the contents by marking the dir removed.
+///
+/// Before the fix this fails: `remove_dir` succeeds and `full/keepme.md`
+/// vanishes from the snapshot.
+#[test]
+fn kernel_rmdir_of_a_nonempty_directory_is_refused() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping rmdir ENOTEMPTY test: /dev/fuse unavailable in this environment");
+        return;
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+
+    write(staging.path(), "full/keepme.md", b"data");
+    write(staging.path(), "solo.md", b"x");
+
+    let handle = mount_genesis(state.path(), staging.path(), mount.path());
+    let m = mount.path();
+
+    // rmdir on a populated directory must fail with ENOTEMPTY.
+    let err = fs::remove_dir(m.join("full")).expect_err("rmdir of a non-empty dir must fail");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOTEMPTY),
+        "expected ENOTEMPTY, got {err:?}"
+    );
+
+    // The contents must still be present and intact after the refusal.
+    let snapshot = handle.workdir_snapshot().expect("workdir_snapshot");
+    let files = files_of(&snapshot);
+    assert_eq!(
+        files.get("full/keepme.md").map(Vec::as_slice),
+        Some(b"data".as_ref()),
+        "a refused rmdir must not orphan the directory's contents: {:?}",
+        files.keys().collect::<Vec<_>>()
+    );
+
+    // An empty directory, by contrast, removes cleanly.
+    fs::create_dir(m.join("empty")).expect("mkdir");
+    fs::remove_dir(m.join("empty")).expect("rmdir of an empty dir must succeed");
 
     handle.unmount();
 }
