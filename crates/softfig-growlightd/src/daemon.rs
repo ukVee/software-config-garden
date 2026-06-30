@@ -13,7 +13,7 @@ use thiserror::Error;
 use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply, SetResourcesArgs};
 
 use crate::config::{BuildCaps, GrowlightdConfig, Policy};
-use crate::control::Control;
+use crate::control::{Control, LiveKill};
 use crate::hub::EventHub;
 use crate::leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
 use crate::persist::ResourcePersister;
@@ -51,12 +51,11 @@ pub struct DaemonInner {
     /// Defaults to [`FleetConfig::disabled`](crate::fleet::FleetConfig::disabled)
     /// until `main` sets it via [`Daemon::set_fleet_config`].
     pub fleet: crate::fleet::FleetConfig,
-    // Phase 6 (concurrency milestone) adds the agent registry here: the live
-    // `claude -p` child handles + per-agent status, registered via
-    // `control.attach_child`. Hard-stop teardown of those children rides the
-    // same kill-safety discipline as keeperd's FUSE/commit path (spec §8) — a
-    // clean per-agent SIGKILL is safe because each agent's keeperd writes
-    // already commit from an in-memory snapshot, never mid-walk.
+    // The live `claude -p` child *kill* handles do NOT live here under the daemon
+    // lock — they are in [`Daemon::kill_handles`], a registry the backend shares
+    // by `Arc` and fills on every spawn, so the hard-kill path never has to take
+    // `inner`. A clean per-agent SIGKILL is safe because each agent's keeperd
+    // writes commit from an in-memory snapshot, never mid-walk (spec §8).
 }
 
 impl DaemonInner {
@@ -121,6 +120,23 @@ pub struct Daemon {
     /// Lives *outside* `inner` (like `build_caps`) so a spawn records without
     /// contending on the daemon lock. Empty on a disarmed fleet.
     pub live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
+    /// The live agent→kill-handle registry (audit slice 005) — the registry the
+    /// running fleet actually populates, and the one `force_stop --hard-kill` /
+    /// `request_restart` reach. Shared *by `Arc`* with the
+    /// [`crate::claude_backend::ClaudeBackend`]: each spawn records its
+    /// [`LiveKill`] here (keyed by agent, latest re-roll wins), the per-agent
+    /// reader thread removes it on exit (guarded by the entry's `scope_token`, so
+    /// a re-roll's newer handle is never clobbered), and
+    /// [`hard_kill_agent`](Daemon::hard_kill_agent) takes the handle OUT under
+    /// this registry's lock and `kill`s it OUTSIDE the lock. Lives *outside*
+    /// `inner` (like `live_scopes`) so the kill path never contends on the daemon
+    /// lock. Empty on a disarmed fleet.
+    ///
+    /// This replaces the old per-agent handle on `Control`, which only the unit
+    /// tests ever filled — so for every real supervised agent the hard kill was a
+    /// silent no-op (the audit-005 finding). The handles now live where the live
+    /// backend writes them.
+    pub kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
 }
 
 impl Daemon {
@@ -133,6 +149,7 @@ impl Daemon {
             persister: None,
             build_caps: Arc::new(Mutex::new(BuildCaps::default())),
             live_scopes: Arc::new(Mutex::new(BTreeMap::new())),
+            kill_handles: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -263,11 +280,12 @@ impl Daemon {
     /// op, a caught SIGTERM/SIGINT, and [`DaemonHandle`]'s `Drop`. Marks the
     /// daemon `Stopping`; the accept loop notices on its next poll and exits.
     ///
-    /// Phase 6 hooks fleet teardown in here: take the child handles out under
-    /// the lock, release it, then SIGKILL them outside the lock (never hold the
-    /// mutex across a blocking child wait — the lock-ordering lesson from
-    /// keeperd's `request_shutdown`). The hard-kill is safe per spec §8 because
-    /// each agent's garden writes commit from an in-memory snapshot. Idempotent.
+    /// Full fleet teardown-on-shutdown (drain [`kill_handles`](Daemon::kill_handles)
+    /// and SIGKILL each child OUTSIDE the registry lock — never hold a mutex across
+    /// a blocking child wait, the lock-ordering lesson from keeperd's
+    /// `request_shutdown`) is a separate deferred finding; this method only flips
+    /// the state. The per-agent SIGKILL is safe per spec §8 because each agent's
+    /// garden writes commit from an in-memory snapshot. Idempotent.
     pub fn request_shutdown(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.state = State::Stopping;
@@ -276,25 +294,33 @@ impl Daemon {
     /// Hard-kill one agent (`force_stop` `hard_kill` / the urgent
     /// interrupt-and-reroll, spec §8) under the kill-safety discipline.
     ///
+    /// Routes at [`kill_handles`](Daemon::kill_handles) — the registry the live
+    /// fleet's backend fills on every spawn — NOT the old `Control` map, which
+    /// only tests ever filled (so every real agent's kill silently no-op'd; the
+    /// audit-005 finding).
+    ///
     /// The ordering is the load-bearing contract (keeperd incident 20260622): the
-    /// child handle is taken OUT of the control map **under** the daemon lock,
-    /// the lock is released, and only THEN is the (potentially blocking) kill run
-    /// — never while holding the mutex. The same lesson behind keeperd's
+    /// handle is taken OUT of the registry **under** its lock, the lock is
+    /// released, and only THEN is the (potentially blocking) kill run — never
+    /// while holding the mutex. The same lesson behind keeperd's
     /// `force_release_mount` and commit-from-memory. The kill is safe per spec §8
     /// because each agent's garden writes commit from an in-memory snapshot, so a
     /// SIGKILL can never corrupt the garden mid-commit.
     ///
-    /// Returns `true` if a live child was present and killed. Phase 1 has no real
-    /// children, so this is `false` in production — but the safety *structure* is
-    /// in place and proven against a fake child in this crate's tests.
+    /// Returns `true` iff a live child was present and killed — the `performed`
+    /// signal callers report (a `false` is a NO-OP kill: no live agent behind the
+    /// id, or it had already exited). Taking the handle out means a second
+    /// hard-kill of the same agent no-ops.
     pub fn hard_kill_agent(&self, agent: &str) -> bool {
-        // Take the handle out UNDER the lock; the guard is a temporary that drops
-        // at the end of this statement, so the lock is released before `kill`.
-        let child = self.inner.lock().unwrap().control.take_child(agent);
+        // Take the handle out UNDER the registry lock; the guard is a temporary
+        // that drops at the end of this statement, so the lock is released before
+        // `kill`. Note: this lock is `kill_handles`, never `inner` — the kill path
+        // never contends on the daemon lock.
+        let entry = self.kill_handles.lock().unwrap().remove(agent);
         // OUTSIDE the lock: run the (possibly blocking) kill.
-        match child {
-            Some(child) => {
-                child.kill();
+        match entry {
+            Some(entry) => {
+                entry.child.kill();
                 true
             }
             None => false,
@@ -404,8 +430,11 @@ impl Daemon {
     /// `target`. Self-restart is denied (use `force_stop`). Otherwise the
     /// restart is arbitrated through a lease over the target: granted → the
     /// DAEMON performs the kill via [`Daemon::hard_kill_agent`] (the kill-safety
-    /// path — child taken under the lock, SIGKILL outside it); already in flight
-    /// → queued. Agents never kill each other — only the supervisor does.
+    /// path — child taken under the lock, SIGKILL outside it) and then RELEASES
+    /// the lease, so a later restart of the same target is admitted again (the
+    /// restart is repeatable, not one-shot); a truly-concurrent second restart
+    /// still in flight → queued. Agents never kill each other — only the
+    /// supervisor does.
     pub fn request_restart(&self, requester: &str, target: &str) -> RestartReply {
         if requester == target {
             return RestartReply {
@@ -422,6 +451,13 @@ impl Daemon {
                 // DAEMON-executed restart, OUTSIDE the lock (hard_kill_agent
                 // enforces the take-under-lock / kill-outside ordering itself).
                 let performed = self.hard_kill_agent(target);
+                // Release the restart lease now that the kill is issued — the
+                // restart has settled (the supervisor re-rolls the freed slot).
+                // Without this the lease is never released, so a later restart of
+                // the same target would queue forever: supervised restart was
+                // one-shot per target (the audit-005 follow-up). Brief lock; the
+                // publish below stays lock-free.
+                self.inner.lock().unwrap().leases.release(&key, requester);
                 self.hub.publish(Event::LeaseChanged {
                     lease: key,
                     holder: Some(requester.to_string()),
@@ -463,10 +499,11 @@ impl Daemon {
 }
 
 /// The lease key a restart is arbitrated under — namespaced so it never collides
-/// with a garden-target lease key. Held by the requester from grant until the
-/// restart settles (released via `release_lease`, or the agent's phase-6
-/// re-registration), so a concurrent second `request_restart` of the same target
-/// queues rather than double-killing.
+/// with a garden-target lease key. Held by the requester only across the kill and
+/// released immediately after (within [`Daemon::request_restart`]), so a
+/// *truly-concurrent* second `request_restart` of the same target queues rather
+/// than double-killing, while a *later* restart is admitted again (repeatable,
+/// not one-shot).
 fn restart_key(target: &str) -> String {
     format!("restart:{target}")
 }
@@ -513,7 +550,7 @@ impl Drop for DaemonHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::AgentChild;
+    use crate::control::{AgentChild, LiveKill};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Weak;
 
@@ -521,23 +558,24 @@ mod tests {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
     }
 
-    /// A fake agent child that, when killed, checks whether the daemon lock was
-    /// free at the moment of the kill — the safety contract `hard_kill_agent`
-    /// must uphold (take the handle under the lock, kill OUTSIDE it).
+    /// A fake agent child that, when killed, checks whether the kill-registry lock
+    /// was free at the moment of the kill — the safety contract `hard_kill_agent`
+    /// must uphold (take the handle out under the lock, kill OUTSIDE it).
     #[derive(Debug)]
     struct SpyChild {
-        inner: Weak<Mutex<DaemonInner>>,
+        registry: Weak<Mutex<BTreeMap<String, LiveKill>>>,
         killed: Arc<AtomicBool>,
         killed_lock_free: Arc<AtomicBool>,
     }
 
     impl AgentChild for SpyChild {
         fn kill(&self) {
-            // `try_lock` succeeds only if no one holds the daemon lock. A
-            // non-reentrant std `Mutex` returns `WouldBlock` if THIS thread still
-            // held it — which is exactly the violation we want to catch.
+            // `try_lock` succeeds only if no one holds the kill-registry lock (the
+            // lock the handle was taken out under). A non-reentrant std `Mutex`
+            // returns `WouldBlock` if THIS thread still held it — exactly the
+            // violation we want to catch.
             let lock_free = self
-                .inner
+                .registry
                 .upgrade()
                 .map(|m| m.try_lock().is_ok())
                 .unwrap_or(true);
@@ -552,24 +590,28 @@ mod tests {
         let killed = Arc::new(AtomicBool::new(false));
         let killed_lock_free = Arc::new(AtomicBool::new(false));
 
-        // Plant a spy child for "a1" (the phase-6 fleet would register a real one).
-        daemon.inner.lock().unwrap().control.attach_child(
-            "a1",
-            Box::new(SpyChild {
-                inner: Arc::downgrade(&daemon.inner),
-                killed: Arc::clone(&killed),
-                killed_lock_free: Arc::clone(&killed_lock_free),
-            }),
+        // Register a spy child in the LIVE kill registry (what the backend does on
+        // spawn) — NOT the old test-only control path.
+        daemon.kill_handles.lock().unwrap().insert(
+            "a1".to_string(),
+            LiveKill::new(
+                "growlight-agent-a1-1.scope",
+                Box::new(SpyChild {
+                    registry: Arc::downgrade(&daemon.kill_handles),
+                    killed: Arc::clone(&killed),
+                    killed_lock_free: Arc::clone(&killed_lock_free),
+                }),
+            ),
         );
 
         assert!(daemon.hard_kill_agent("a1"), "a live child was present + killed");
         assert!(killed.load(Ordering::SeqCst), "the child was actually killed");
         assert!(
             killed_lock_free.load(Ordering::SeqCst),
-            "the kill ran OUTSIDE the daemon lock (kill-safety contract)",
+            "the kill ran OUTSIDE the registry lock (kill-safety contract)",
         );
 
-        // The handle is gone now — a second hard-kill finds nothing.
+        // The handle is gone now — a second hard-kill finds nothing (non-success).
         assert!(!daemon.hard_kill_agent("a1"), "child only killed once");
     }
 
@@ -577,6 +619,92 @@ mod tests {
     fn hard_kill_on_an_agent_with_no_child_is_a_safe_no_op() {
         let daemon = test_daemon();
         assert!(!daemon.hard_kill_agent("nobody"), "nothing to kill, no panic");
+    }
+
+    /// The strongest proof: a child spawned through the SUPERVISOR (via a backend
+    /// that registers its kill handle in the daemon-shared registry, exactly like
+    /// the live [`crate::claude_backend::ClaudeBackend`]) is reachable + killed by
+    /// `hard_kill_agent` — the registry the live fleet uses, not the dead control
+    /// path.
+    #[test]
+    fn hard_kill_reaches_a_supervised_agents_live_child() {
+        use crate::admission::{AdmissionGovernor, BudgetUsage, RateState};
+        use crate::config::Policy;
+        use crate::supervisor::{AgentBackend, AgentSpec, SpawnError, StartOutcome, Supervisor};
+
+        /// A backend mirroring `ClaudeBackend`: every spawn records a kill handle
+        /// in the daemon-shared registry (and hands the supervisor its own). The
+        /// registry's handle flips `registry_killed` when killed.
+        #[derive(Debug)]
+        struct RegisteringBackend {
+            kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
+            registry_killed: Arc<AtomicBool>,
+        }
+        impl AgentBackend for RegisteringBackend {
+            fn spawn(
+                &self,
+                spec: &AgentSpec,
+            ) -> std::result::Result<Box<dyn AgentChild>, SpawnError> {
+                self.kill_handles.lock().unwrap().insert(
+                    spec.agent.clone(),
+                    LiveKill::new(
+                        format!("growlight-agent-{}-1.scope", spec.agent),
+                        Box::new(RecordingChild {
+                            killed: Arc::clone(&self.registry_killed),
+                        }),
+                    ),
+                );
+                // The supervisor's own handle (its retire/crash path); a separate
+                // flag is unnecessary — this test only hard-kills.
+                Ok(Box::new(RecordingChild {
+                    killed: Arc::new(AtomicBool::new(false)),
+                }))
+            }
+        }
+
+        let daemon = test_daemon();
+        let registry_killed = Arc::new(AtomicBool::new(false));
+        let backend = RegisteringBackend {
+            kill_handles: Arc::clone(&daemon.kill_handles),
+            registry_killed: Arc::clone(&registry_killed),
+        };
+        let mut supervisor =
+            Supervisor::new(Box::new(backend), AdmissionGovernor::new(Policy::default()));
+        let rate = RateState {
+            tpm_used: 0,
+            rpm_used: 0,
+            tpm_limit: 100_000,
+            rpm_limit: 100,
+            tpm_per_agent: 20_000,
+            rpm_per_agent: 10,
+        };
+
+        // Spawn through the supervisor → the backend registers the kill handle in
+        // the daemon's live registry.
+        assert_eq!(
+            supervisor.start(
+                AgentSpec::new("a1", "/cfg/a1/loop.json", "/cfg/a1/mcp.json"),
+                BudgetUsage::new(10, 5),
+                rate,
+                0,
+            ),
+            StartOutcome::Started,
+        );
+        assert!(supervisor.is_running("a1"));
+
+        // The emergency lever reaches the SUPERVISED agent's child.
+        assert!(
+            daemon.hard_kill_agent("a1"),
+            "the live supervised child is reachable + killed",
+        );
+        assert!(
+            registry_killed.load(Ordering::SeqCst),
+            "the supervised agent's child was actually killed",
+        );
+        assert!(
+            !daemon.hard_kill_agent("a1"),
+            "the handle was taken out — a second kill no-ops",
+        );
     }
 
     #[test]
@@ -632,26 +760,34 @@ mod tests {
     }
 
     #[test]
-    fn request_restart_is_performed_by_the_daemon_not_the_caller() {
+    fn request_restart_is_performed_by_the_daemon_and_releases_its_lease() {
         let daemon = test_daemon();
         let killed = Arc::new(AtomicBool::new(false));
-        // The fleet (phase 6) would register the target's real child; here a fake.
-        daemon.inner.lock().unwrap().control.attach_child(
-            "b",
-            Box::new(RecordingChild {
-                killed: Arc::clone(&killed),
-            }),
+        // The live backend registers the target's real child in the kill registry
+        // on spawn; here a fake stands in.
+        daemon.kill_handles.lock().unwrap().insert(
+            "b".to_string(),
+            LiveKill::new(
+                "growlight-agent-b-1.scope",
+                Box::new(RecordingChild {
+                    killed: Arc::clone(&killed),
+                }),
+            ),
         );
 
         let reply = daemon.request_restart("a", "b");
         assert_eq!(reply.state, "restarted");
         assert!(reply.performed, "a live child was present and killed");
         assert!(killed.load(Ordering::SeqCst), "the DAEMON killed the target");
-        // The restart is in flight (lease held by the requester), so a second
-        // request for the same target queues rather than double-killing.
+
+        // The restart lease is RELEASED after the kill, so a later restart of the
+        // same target is admitted again (not one-shot per target). The child was
+        // already taken out + killed, so this second restart kills nothing
+        // (performed=false) — but it is ADMITTED ("restarted"), not "queued",
+        // which is the lease-release proof.
         let again = daemon.request_restart("c", "b");
-        assert_eq!(again.state, "queued");
-        assert!(!again.performed);
+        assert_eq!(again.state, "restarted", "the lease was released → repeatable");
+        assert!(!again.performed, "nothing live to kill the second time");
     }
 
     #[test]

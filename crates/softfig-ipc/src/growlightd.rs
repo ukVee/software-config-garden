@@ -497,6 +497,16 @@ pub struct StopReply {
     /// `true` if it acted now (`hard_kill`); `false` if it recorded a boundary
     /// intent the drive loop honours at the next handoff.
     pub immediate: bool,
+    /// Whether the stop actually terminated a live child. For an immediate
+    /// `hard_kill` this is `true` iff a running agent was found and killed —
+    /// `false` reports a NO-OP kill (no live agent behind the id), so the
+    /// operator is never told a runaway was killed when nothing was. Always
+    /// `false` for a boundary stop (`after_slice` / `after_iteration`), which
+    /// records an intent and terminates nothing now. `#[serde(default)]` so an
+    /// older daemon's reply (no field) decodes as "not performed" across a
+    /// `daemon cycle` version skew.
+    #[serde(default)]
+    pub performed: bool,
 }
 
 /// Reply to `inject_message`: the agent and its inject-lane depth after the
@@ -791,6 +801,7 @@ mod tests {
             agent: "a1".into(),
             level: StopLevel::AfterSlice,
             immediate: false,
+            performed: false,
         };
         assert_eq!(
             serde_json::from_str::<StopReply>(&serde_json::to_string(&s).unwrap()).unwrap(),

@@ -116,13 +116,17 @@ fn request_restart_is_arbitrated_and_self_restart_is_denied() {
     assert_eq!(r.state, "restarted");
     assert!(!r.performed, "no live child to kill in this phase");
 
-    // A concurrent second restart of the same target queues (no double-kill).
+    // The restart lease is released after the kill, so a LATER restart of the same
+    // target is admitted again (repeatable, not one-shot per target — the
+    // audit-005 follow-up). These calls are sequential, so the first has already
+    // released by now; the second is granted, not queued.
     let r: RestartReply = call_ok(
         &socket,
         op::REQUEST_RESTART,
         serde_json::json!({ "requester": "c", "target": "b" }),
     );
-    assert_eq!(r.state, "queued");
+    assert_eq!(r.state, "restarted", "the lease was released → repeatable");
+    assert!(!r.performed, "still no live child to kill");
 
     handle.shutdown();
     handle.join().unwrap();

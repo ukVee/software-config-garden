@@ -309,6 +309,11 @@ pub fn assemble_fleet(
         // `set_resources` pushes onto the actually-running scopes. Shared by Arc
         // with the daemon, like `build_caps`.
         Arc::clone(&daemon.live_scopes),
+        // The live agent→kill-handle registry (audit slice 005): each spawn
+        // records its kill handle here so `force_stop --hard-kill` /
+        // `request_restart` reach the running agent. Shared by Arc with the
+        // daemon (it owns the registry `hard_kill_agent` drains), like `live_scopes`.
+        Arc::clone(&daemon.kill_handles),
     ));
     let members: Vec<FleetMember> = fleet
         .members

@@ -1,11 +1,7 @@
 //! Control intent — the fleet/agent state the control verbs (`pause`,
 //! `resume`, `stop_after_slice`, `force_stop`, `inject_message`) set and the
-//! future drive loop reads at safe handoff boundaries (spec §8 / §13 Control).
-//!
-//! Phase 1 has **no live agent** behind any of this: the per-agent map is
-//! addressable by id, but the fleet registry (the real `claude -p` children)
-//! arrives in phase 6. So this slice models control purely as *intent* a
-//! scripted/future drive loop observes:
+//! drive loop reads at safe handoff boundaries (spec §8 / §13 Control). This
+//! models the *boundary* control state:
 //!
 //! - `paused` is a fleet-wide admission-gate placeholder — flipped now, read by
 //!   the scheduler later.
@@ -17,13 +13,23 @@
 //!   native mid-session injection (spec §8), so a queued message is invisible
 //!   until the boundary drain — exactly the timing the tests assert.
 //!
-//! The one thing here that *can* act immediately is the hard kill. Its
+//! The one control action that acts *immediately* is the hard kill — but the
+//! live children it targets are NOT held here. A running fleet's kill handles
+//! live in the daemon's [`crate::daemon::Daemon::kill_handles`] registry, which
+//! the live backend ([`crate::claude_backend::ClaudeBackend`]) populates on
+//! every spawn (mirroring `live_scopes`) and the per-agent reader thread drains
+//! on exit — so `force_stop --hard-kill` / `request_restart` reach the agents
+//! the supervisor is actually running. (An earlier design parked a per-agent
+//! child handle in `Control`, but only tests ever filled it, so for every real
+//! agent the kill was a silent no-op — the audit-005 finding. The handle moved
+//! to the daemon registry the fleet truly uses.)
+//!
+//! This module still owns the kill *abstractions* that registry stores: the
+//! [`AgentChild`] handle trait and the [`LiveKill`] registry entry. The kill's
 //! safety contract lives in [`crate::daemon::Daemon::hard_kill_agent`]: the
-//! child handle ([`AgentChild`]) comes OUT under the daemon lock via
-//! [`Control::take_child`], then [`AgentChild::kill`] runs OUTSIDE the lock —
-//! the keeperd `force_release_mount` / commit-from-memory discipline (incident
-//! 20260622). The trait exists now so that ordering is structured and testable
-//! against a fake child before any real one exists.
+//! handle comes OUT under the registry lock, then [`AgentChild::kill`] runs
+//! OUTSIDE the lock — the keeperd `force_release_mount` / commit-from-memory
+//! discipline (incident 20260622).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -32,16 +38,53 @@ use softfig_ipc::growlightd::StopLevel;
 
 /// A live agent's forcibly-killable process handle.
 ///
-/// Phase 6 implements this over a real `claude -p` child (a SIGKILL + reap).
-/// Phase 1 attaches none in production; the trait is here so the hard-kill
-/// *safety contract* is wired and provable now.
+/// Implemented over a real `claude -p` child by
+/// [`crate::claude_backend::ClaudeChild`] (a scope-cgroup SIGKILL + controller
+/// reap). The live backend stores one in the daemon's
+/// [`crate::daemon::Daemon::kill_handles`] registry on every spawn, so the
+/// hard-kill path reaches the agent the supervisor is actually running.
 ///
-/// `kill` MUST be invoked with no daemon lock held — it may block (a real
+/// `kill` MUST be invoked with no registry lock held — it may block (a real
 /// SIGKILL waits on the child to reap), and holding the mutex across that is the
-/// exact deadlock keeperd hit on the FUSE/commit path (incident 20260622).
+/// exact deadlock keeperd hit on the FUSE/commit path (incident 20260622). It
+/// takes `&self` and is idempotent / best-effort, so an already-exited child (or
+/// a second kill) is a harmless no-op.
 pub trait AgentChild: Send + fmt::Debug {
-    /// Forcibly terminate the child. Called OUTSIDE the daemon lock.
+    /// Forcibly terminate the child. Called OUTSIDE the registry lock.
     fn kill(&self);
+}
+
+/// One live agent's entry in the daemon's hard-kill registry
+/// ([`crate::daemon::Daemon::kill_handles`]): its forcibly-killable
+/// [`AgentChild`] handle plus the unique per-spawn `scope_token` that guards
+/// stale removal.
+///
+/// The registry is keyed by agent id, and a re-roll **overwrites** the entry
+/// (latest spawn wins — a hard kill always targets the agent's *current* child).
+/// The exiting child's reader thread removes its own entry only while the stored
+/// `scope_token` still matches its generation, so a re-roll's newer handle is
+/// never clobbered by an older generation's late exit — the same guard
+/// `live_scopes` already uses (the token IS the `.scope` unit in production).
+#[derive(Debug)]
+pub struct LiveKill {
+    /// The unique per-spawn token (the `.scope` unit name in production) that
+    /// guards stale removal: the reader removes its entry only if this still
+    /// matches, so a re-roll's newer handle survives an older one's late exit.
+    pub scope_token: String,
+    /// The forcibly-killable handle. Taken OUT of the registry under its lock by
+    /// [`crate::daemon::Daemon::hard_kill_agent`], then `kill`ed OUTSIDE the lock.
+    pub child: Box<dyn AgentChild>,
+}
+
+impl LiveKill {
+    /// A registry entry pairing `child` with the `scope_token` that guards its
+    /// stale removal.
+    pub fn new(scope_token: impl Into<String>, child: Box<dyn AgentChild>) -> Self {
+        Self {
+            scope_token: scope_token.into(),
+            child,
+        }
+    }
 }
 
 /// Per-agent control intent. Phase 1: no live agent stands behind a key — these
@@ -57,10 +100,6 @@ pub struct AgentControl {
     /// Boundary-async inject lane (FIFO): messages delivered at the agent's
     /// next baton, never mid-iteration (spec §8).
     inject_lane: VecDeque<String>,
-    /// The live child handle, once the fleet (phase 6) has spawned one. Phase 1:
-    /// always `None` in production; a test attaches a fake to exercise the
-    /// hard-kill safety contract.
-    child: Option<Box<dyn AgentChild>>,
 }
 
 /// growlightd's control state: the fleet admission gate plus per-agent intent.
@@ -111,12 +150,6 @@ impl Control {
         lane.len()
     }
 
-    /// Attach a live child handle for `agent` (phase 6 fleet registration — and
-    /// the seam a test uses to plant a fake child for the hard-kill test).
-    pub fn attach_child(&mut self, agent: &str, child: Box<dyn AgentChild>) {
-        self.agents.entry(agent.to_string()).or_default().child = Some(child);
-    }
-
     // --- Drive-loop boundary accessors. These are what a handoff boundary
     // calls; they read-and-clear, so an intent is honoured exactly once. ---
 
@@ -137,13 +170,6 @@ impl Control {
             Some(a) => a.inject_lane.drain(..).collect(),
             None => Vec::new(),
         }
-    }
-
-    /// Take `agent`'s live child handle OUT of the map. Called UNDER the daemon
-    /// lock by the hard-kill path; the caller then kills it OUTSIDE the lock.
-    /// Returns `None` if the agent has no live child (phase-1 default).
-    pub fn take_child(&mut self, agent: &str) -> Option<Box<dyn AgentChild>> {
-        self.agents.get_mut(agent).and_then(|a| a.child.take())
     }
 }
 
@@ -208,19 +234,33 @@ mod tests {
         let mut c = Control::default();
         assert!(c.drain_inject_lane("ghost").is_empty());
         assert_eq!(c.take_pending_stop("ghost"), None);
-        assert!(c.take_child("ghost").is_none());
     }
 
     #[test]
-    fn take_child_removes_the_handle() {
+    fn live_kill_pairs_a_child_with_its_stale_removal_token() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
         #[derive(Debug)]
-        struct Noop;
-        impl AgentChild for Noop {
-            fn kill(&self) {}
+        struct Noop {
+            killed: Arc<AtomicBool>,
         }
-        let mut c = Control::default();
-        c.attach_child("a1", Box::new(Noop));
-        assert!(c.take_child("a1").is_some(), "the planted child comes out");
-        assert!(c.take_child("a1").is_none(), "and only once");
+        impl AgentChild for Noop {
+            fn kill(&self) {
+                self.killed.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let killed = Arc::new(AtomicBool::new(false));
+        let entry = LiveKill::new(
+            "growlight-agent-a1-3.scope",
+            Box::new(Noop {
+                killed: Arc::clone(&killed),
+            }),
+        );
+        assert_eq!(entry.scope_token, "growlight-agent-a1-3.scope");
+        // The handle the daemon's hard-kill path takes out + kills.
+        entry.child.kill();
+        assert!(killed.load(Ordering::SeqCst));
     }
 }

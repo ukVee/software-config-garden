@@ -52,7 +52,7 @@ use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 
 use crate::admission::BudgetUsage;
 use crate::config::BuildCaps;
-use crate::control::AgentChild;
+use crate::control::{AgentChild, LiveKill};
 use crate::hub::EventHub;
 use crate::preapproval::PreApproval;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
@@ -568,6 +568,16 @@ pub struct ClaudeBackend {
     /// thread removes it on exit (guarded by unit, so a re-roll's newer entry is
     /// never clobbered). An entry is the live, current scope for that agent.
     live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
+    /// The live agent→kill-handle registry (audit slice 005), shared by `Arc`
+    /// with the daemon so `force_stop --hard-kill` / `request_restart` reach the
+    /// agent the supervisor is actually running. Each spawn records a
+    /// [`LiveKill`] here (its [`ClaudeChild`] handle + the `.scope` token);
+    /// [`Daemon::hard_kill_agent`](crate::daemon::Daemon::hard_kill_agent) takes
+    /// the handle out under this registry's lock and `kill`s it OUTSIDE the lock.
+    /// The reader thread removes the entry on exit, guarded by the scope token so
+    /// a re-roll's newer handle is never clobbered — the exact lifecycle of
+    /// `live_scopes`, carrying the kill handle alongside the scope name.
+    kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
 }
 
 impl ClaudeBackend {
@@ -582,6 +592,7 @@ impl ClaudeBackend {
         preapproval: PreApproval,
         build_caps: Arc<Mutex<BuildCaps>>,
         live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
+        kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
     ) -> Self {
         Self {
             bin: bin.into(),
@@ -594,6 +605,7 @@ impl ClaudeBackend {
             rates: Mutex::new(BTreeMap::new()),
             scope_gen: AtomicU64::new(0),
             live_scopes,
+            kill_handles,
         }
     }
 
@@ -960,6 +972,26 @@ impl AgentBackend for Arc<ClaudeBackend> {
         // promptly and there is no kill/reap deadlock.
         let child = Arc::new(Mutex::new(child));
 
+        // Register this spawn's kill handle in the daemon-shared registry (audit
+        // slice 005), so `force_stop --hard-kill` / `request_restart` reach this
+        // running agent — the registry the live fleet actually populates. It
+        // shares the SAME controller handle + scope as the handle returned to the
+        // supervisor below (killing via either is idempotent/best-effort, since
+        // `ClaudeChild::kill` is a no-op on an already-gone scope/child). Keyed by
+        // agent, so a re-roll OVERWRITES it: a hard-kill always targets the
+        // agent's current child. The reader thread removes it on exit, guarded by
+        // the scope token (like `live_scopes`).
+        self.kill_handles.lock().unwrap().insert(
+            spec.agent.clone(),
+            LiveKill::new(
+                scope_unit.clone(),
+                Box::new(ClaudeChild {
+                    child: Arc::clone(&child),
+                    scope_unit: scope_unit.clone(),
+                }),
+            ),
+        );
+
         let hub = self.hub.clone();
         let agent = spec.agent.clone();
         let reader_state = Arc::clone(&state);
@@ -967,6 +999,7 @@ impl AgentBackend for Arc<ClaudeBackend> {
         let reader_rate = Arc::clone(&rate);
         let reader_child = Arc::clone(&child);
         let reader_live_scopes = Arc::clone(&self.live_scopes);
+        let reader_kill_handles = Arc::clone(&self.kill_handles);
         let reader_scope_unit = scope_unit.clone();
         thread::spawn(move || {
             pump(
@@ -993,6 +1026,18 @@ impl AgentBackend for Arc<ClaudeBackend> {
             let mut scopes = reader_live_scopes.lock().unwrap();
             if scopes.get(&agent).map(String::as_str) == Some(reader_scope_unit.as_str()) {
                 scopes.remove(&agent);
+            }
+            drop(scopes);
+            // Drop this spawn's kill handle too (audit slice 005), under the SAME
+            // scope-token guard so a re-roll's newer handle survives this older
+            // generation's late exit. A hard-kill may already have taken it out
+            // (then this is a no-op); either way the entry never outlives the
+            // process. Sequential lock, never nested with `live_scopes`.
+            let mut handles = reader_kill_handles.lock().unwrap();
+            if handles.get(&agent).map(|k| k.scope_token.as_str())
+                == Some(reader_scope_unit.as_str())
+            {
+                handles.remove(&agent);
             }
         });
 
@@ -1536,6 +1581,7 @@ mod tests {
             pre,
             Arc::new(Mutex::new(BuildCaps::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
         ));
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
@@ -1544,8 +1590,13 @@ mod tests {
             err.0.contains("pre-approval generation failed"),
             "fail-closed spawn error: {err}",
         );
-        // Nothing was registered — the agent never entered the fleet.
+        // Nothing was registered — the agent never entered the fleet (no kill
+        // handle, no health cell).
         assert!(backend.health("a1").is_none(), "no doomed agent registered");
+        assert!(
+            backend.kill_handles.lock().unwrap().is_empty(),
+            "a fail-closed spawn registers no kill handle",
+        );
     }
 
     #[test]

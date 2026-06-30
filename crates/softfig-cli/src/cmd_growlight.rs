@@ -1574,13 +1574,20 @@ fn client_stop(args: StopArgs) -> Result<()> {
     };
     let reply: StopReply =
         growlight_call(&socket, growlightd::op::FORCE_STOP, serde_json::to_value(force)?)?;
+    // For an immediate hard-kill, report whether a live agent was actually
+    // terminated (`performed`) — a no-op kill (nothing running behind the id) must
+    // NOT read as success (the audit-005 false-success fix). A boundary stop only
+    // records an intent.
+    let outcome = if !reply.immediate {
+        "recorded for the next boundary"
+    } else if reply.performed {
+        "applied now — killed a live agent"
+    } else {
+        "no-op — no live agent to kill"
+    };
     println!(
         "stop {}: agent {} ({})",
-        if reply.immediate {
-            "applied now"
-        } else {
-            "recorded for the next boundary"
-        },
+        outcome,
         reply.agent,
         stop_level_label(reply.level),
     );
@@ -2885,7 +2892,9 @@ mod tests {
             handle.daemon.take_pending_stop("loop-1"),
             Some(StopLevel::AfterIteration)
         );
-        // hard-kill acts immediately (no live child in phase 1, but reports it).
+        // hard-kill acts immediately. No live agent is registered in this booted
+        // daemon, so it kills nothing and honestly reports `performed=false` — a
+        // no-op kill must never read as success (the audit-005 fix).
         let r: StopReply = growlight_call(
             &socket,
             growlightd::op::FORCE_STOP,
@@ -2897,6 +2906,7 @@ mod tests {
         )
         .unwrap();
         assert!(r.immediate, "hard-kill is the immediate escape hatch");
+        assert!(!r.performed, "no live agent was running, so nothing was killed");
         // The subcommand entry point maps the clap arg → wire level and records it.
         client_stop(StopArgs {
             socket: Some(socket.clone()),

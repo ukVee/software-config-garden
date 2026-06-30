@@ -263,6 +263,8 @@ fn stop_after_slice(daemon: &Daemon, req: &Request) -> Response {
             agent: args.agent,
             level: StopLevel::AfterSlice,
             immediate: false,
+            // A boundary intent terminates nothing now.
+            performed: false,
         },
         "stop_after_slice",
     )
@@ -280,9 +282,13 @@ fn force_stop(daemon: &Daemon, req: &Request) -> Response {
     if args.agent.is_empty() {
         return Response::err(ErrorKind::BadArgs, "agent must be non-empty");
     }
-    if args.level.is_immediate() {
-        // hard_kill: interrupt now, OUTSIDE the lock (the function enforces it).
-        daemon.hard_kill_agent(&args.agent);
+    // `hard_kill` interrupts now and reports whether it actually terminated a live
+    // child (`performed`), so a no-op kill (no live agent behind the id) is never
+    // reported as success — the audit-005 false-success fix. A boundary stop only
+    // records an intent (terminates nothing now), so it never "performs".
+    let performed = if args.level.is_immediate() {
+        // OUTSIDE the lock (the function enforces it).
+        daemon.hard_kill_agent(&args.agent)
     } else {
         daemon
             .inner
@@ -290,12 +296,14 @@ fn force_stop(daemon: &Daemon, req: &Request) -> Response {
             .unwrap()
             .control
             .request_stop(&args.agent, args.level);
-    }
+        false
+    };
     ok_reply(
         &StopReply {
             agent: args.agent,
             level: args.level,
             immediate: args.level.is_immediate(),
+            performed,
         },
         "force_stop",
     )
