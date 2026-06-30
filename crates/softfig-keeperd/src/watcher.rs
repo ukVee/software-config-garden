@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use softfig_vcs::{ignore::Ignore, Intent};
+use softfig_vcs::{ignore, Intent};
 
 use crate::classify::{self, DirtySet};
 use crate::daemon::{Daemon, DaemonInner, SUPPRESS_WINDOW_MS};
@@ -286,17 +286,30 @@ impl DirtySetAccumulator {
         }
     }
 
-    /// True if the path should be buffered (not VCS-ignored — `.softfig`,
-    /// `.claude`, the garden's `.softfigignore` entries — and not currently in
-    /// the daemon's self-write suppression map).
+    /// True if the path should be buffered: not VCS-ignored and not currently
+    /// in the daemon's self-write suppression map.
     ///
-    /// The ignore set is loaded fresh on each call so an edit to
-    /// `.softfigignore` takes effect on the next event without a daemon
-    /// restart; the file is tiny and reads are cheap. `walk()` re-enforces it
-    /// authoritatively at commit time regardless.
+    /// The ignore test here is the **pure built-in predicate**
+    /// (`softfig_vcs::ignore::is_ignored` — `.softfig`, `.claude`) and reads
+    /// nothing from disk. It must not read disk: in FUSE mode `self.garden_root`
+    /// IS the mount this code runs against, and the fuser worker thread calls
+    /// the dirty-set sink synchronously, so an `Ignore::load` of
+    /// `<root>/.softfigignore` would issue a read whose kernel LOOKUP only the
+    /// same blocked worker can service — the self-walk-under-mount reentrant
+    /// deadlock (audit slice 003; the `.softfigignore` feature reintroduced it
+    /// and it is reverted here).
+    ///
+    /// The push-time filter is only an optimization. The user-overridable
+    /// `.softfigignore` set is still enforced authoritatively at commit time
+    /// from in-memory state — `workdir_snapshot`/`inmem_ignore` (FUSE) and
+    /// `walk()` (direct) build the full `Ignore` and re-apply it — so a
+    /// user-ignored path is never committed; it just isn't dropped quite this
+    /// early. Restoring early user-entry filtering without a mount read (a
+    /// cached in-memory `Ignore`, refreshed only when `.softfigignore` itself
+    /// changes) is deferred to task 005.
     fn accept(&self, rel: &str) -> bool {
         let p = Path::new(rel);
-        if Ignore::load(&self.garden_root).is_ignored(p) {
+        if ignore::is_ignored(p) {
             return false;
         }
         if self.is_self_write(&self.garden_root.join(rel)) {
@@ -533,6 +546,55 @@ fn repo_relative(abs: &Path, garden_root: &Path, watch_root: &Path) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::KeeperConfig;
+    use softfig_vcs::ignore::Ignore;
+
+    /// Build a bare accumulator whose `garden_root` is `root`. Only `accept`
+    /// is exercised, which touches `garden_root` + the (empty) suppress map —
+    /// never `inner` — so a default `DaemonInner` is enough.
+    fn accumulator_rooted_at(root: &Path) -> Arc<DirtySetAccumulator> {
+        let inner = Arc::new(Mutex::new(DaemonInner::new(KeeperConfig::new(root))));
+        let suppress = Arc::new(Mutex::new(HashMap::new()));
+        DirtySetAccumulator::new(inner, suppress, root.to_path_buf())
+    }
+
+    #[test]
+    fn accept_uses_the_builtin_predicate_without_reading_softfigignore() {
+        // Audit slice 003: in FUSE mode `garden_root` IS the mount the fuser
+        // worker serves, so `accept` must never `std::fs`-read `.softfigignore`
+        // back through it (a reentrant kernel LOOKUP the same blocked worker
+        // would have to service — the self-walk-under-mount deadlock). Proof
+        // that no read happens: point `garden_root` at a real dir that *does*
+        // contain a `.softfigignore` listing `scratch`, then assert a
+        // `scratch/...` path is still ACCEPTED at push time. If `accept` read
+        // the file the path would be filtered; that it is not proves the disk
+        // file is not consulted here (commit-time `inmem_ignore` still excludes
+        // it from the snapshot).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".softfigignore"), "scratch\n").unwrap();
+        let acc = accumulator_rooted_at(dir.path());
+
+        // Built-in, un-ignorable names are filtered with no disk read.
+        assert!(!acc.accept(".softfig/objects/aa/bb"));
+        assert!(!acc.accept(".claude/settings.local.json"));
+        // The on-disk `.softfigignore` is NOT consulted on the hot path: a
+        // user-listed name is accepted here (and dropped later, at commit).
+        assert!(acc.accept("scratch/notes.md"));
+        // Ordinary garden content is accepted.
+        assert!(acc.accept("journal/decisions/decision-x.md"));
+    }
+
+    #[test]
+    fn accept_does_not_depend_on_garden_root_existing_on_disk() {
+        // The classification is purely in-memory, so it works even when
+        // `garden_root` does not exist on disk at all — there is no path under
+        // which `accept` issues a filesystem read of the (FUSE) mount.
+        let acc = accumulator_rooted_at(Path::new("/nonexistent/softfig-garden-xyz"));
+        assert!(!acc.accept(".softfig"));
+        assert!(!acc.accept(".claude/settings.local.json"));
+        assert!(acc.accept("a.md"));
+        assert!(acc.accept("scratch/notes.md"));
+    }
 
     #[test]
     fn ignored_paths_are_filtered() {
