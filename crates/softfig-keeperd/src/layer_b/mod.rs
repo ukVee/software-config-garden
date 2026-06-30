@@ -33,7 +33,7 @@ use std::sync::{Arc, RwLock};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
-use softfig_vcs::{BlobEncryptor, Intent, Repo};
+use softfig_vcs::{BlobEncryptor, Intent, Repo, WalkSnapshot};
 use softfig_fuse::SealedQuery;
 use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::{is_layer_b, VaultSession};
@@ -429,10 +429,22 @@ pub fn commit_with_regions(
     Ok(hash)
 }
 
-/// M2c — watcher classifier sub-rule. Walk `paths` (repo-relative,
-/// relative to `garden_root`) looking for inline `<vault id="…">`
-/// regions whose ids are present in the current file but absent from
-/// the same path's prior-tip plaintext (snapshot in `prior_snap`).
+/// M2c — watcher classifier sub-rule. For each repo-relative path in
+/// `paths`, read its **current working-tree plaintext from `current`**
+/// (the same in-memory snapshot the commit will encrypt) and look for
+/// inline `<vault id="…">` regions whose ids are present now but absent
+/// from the same path's prior-tip plaintext (`prior_snap`).
+///
+/// Sourcing the current bytes from `current` rather than
+/// `fs::read(garden_root.join(rel))` is load-bearing: in FUSE mode the
+/// garden root is the mount this daemon serves, so reading it back —
+/// under the daemon's `inner` lock, on the flush path — is the
+/// 2026-06-21 mount-read deadlock class, and the bytes the kernel
+/// returns are the reader-*redacted* view (`[encrypted]`/`[sealed:…]`),
+/// not the plaintext the commit encrypts. The snapshot carries the true
+/// plaintext (`workdir_snapshot` decrypts tip blobs; the overlay holds
+/// raw editor writes), so a new id inside a file that *also* has a
+/// sealed region is detected against the truth, never a projection.
 ///
 /// Returns a single batched `vault_seal` [`Intent`] covering every
 /// affected path + every newly-introduced id when at least one new
@@ -444,7 +456,7 @@ pub fn commit_with_regions(
 /// audit for plaintext exposure, not re-encryption.
 pub fn promote_manual_edit_for_new_ids(
     paths: &[String],
-    garden_root: &Path,
+    current: &WalkSnapshot,
     session: &VaultSession,
     prior_snap: &PriorTipSnapshot,
 ) -> Option<Intent> {
@@ -454,10 +466,11 @@ pub fn promote_manual_edit_for_new_ids(
     let mut new_ids: BTreeSet<String> = BTreeSet::new();
 
     for rel in paths {
-        let abs = garden_root.join(rel);
-        let Ok(content) = fs::read(&abs) else { continue };
+        let Some(content) = current.file_content(Path::new(rel)) else {
+            continue;
+        };
         let parser = regions::parser_for(rel);
-        let current_spans = regions::parse(parser, &content, session, rel).ok()?;
+        let current_spans = regions::parse(parser, content, session, rel).ok()?;
         if current_spans.is_empty() {
             continue;
         }
@@ -651,12 +664,53 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use softfig_vault::{params::VaultParams, Vault};
+
     fn write_file(p: &Path, body: &str) {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         let mut f = std::fs::File::create(p).unwrap();
         f.write_all(body.as_bytes()).unwrap();
+    }
+
+    /// Cheap-KDF vault so the test isn't dominated by Argon2 (mirrors the
+    /// `regions` test harness).
+    fn fresh_session() -> VaultSession {
+        let mut params = VaultParams::default();
+        params.argon2.m_cost = 8;
+        params.argon2.t_cost = 1;
+        params.argon2.p_cost = 1;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_v, session, _r) =
+            Vault::init_with_params(tmp.path(), b"test-pass", params).unwrap();
+        // The session owns no file handles post-unlock; leak the tempdir so it
+        // outlives the call without a borrow.
+        std::mem::forget(tmp);
+        session
+    }
+
+    fn snapshot_with(rel: &str, content: &[u8]) -> WalkSnapshot {
+        let mut snap = WalkSnapshot::empty();
+        snap.insert_file(Path::new(rel), 0o644, content.to_vec()).unwrap();
+        snap
+    }
+
+    fn prior_with(rel: &str, content: &[u8]) -> PriorTipSnapshot {
+        PriorTipSnapshot {
+            plaintext_by_path: HashMap::from([(rel.to_string(), content.to_vec())]),
+        }
+    }
+
+    fn ids_of(intent: &Intent) -> Vec<String> {
+        intent.payload()["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
     }
 
     #[test]
@@ -722,5 +776,73 @@ mod tests {
         file.store(state_dir).unwrap();
         let back = SealedPathsFile::load(state_dir).unwrap();
         assert_eq!(back.paths, file.paths);
+    }
+
+    #[test]
+    fn promotion_detects_a_new_id_in_a_file_that_also_has_a_sealed_region() {
+        // Slice 004: promotion sources each path's current bytes from the
+        // in-memory snapshot — never an `fs::read` of the garden (= the FUSE
+        // mount this daemon serves, read under `inner`). Nothing is written to
+        // disk here; the old `fs::read(garden_root.join(rel))` path would find
+        // no file and promote nothing, so this is red on the pre-fix code.
+        //
+        // The snapshot also carries TRUE working-tree plaintext, not the
+        // reader-redacted FUSE view: `alpha` is a *real* sealed (ciphertext)
+        // region — through the mount its body would project as the `[encrypted]`
+        // placeholder (see `regions::render_read_view`), but the snapshot holds
+        // the genuine base64 ciphertext. The freshly-typed `beta` is detected
+        // against that truth.
+        let session = fresh_session();
+        let alpha_ct = session
+            .encrypt_layer_b_region("notes.md", "alpha", b"first-secret")
+            .unwrap();
+        let alpha_b64 = B64.encode(&alpha_ct);
+
+        let current = format!(
+            "intro\n\n<vault id=\"alpha\">{alpha_b64}</vault>\n\n<vault id=\"beta\">brand-new</vault>\n"
+        );
+        // Prior tip: the sealed `alpha` region only — `beta` did not exist yet.
+        let prior = format!("intro\n\n<vault id=\"alpha\">{alpha_b64}</vault>\n");
+
+        let snapshot = snapshot_with("notes.md", current.as_bytes());
+        let prior_snap = prior_with("notes.md", prior.as_bytes());
+
+        let intent = promote_manual_edit_for_new_ids(
+            &["notes.md".to_string()],
+            &snapshot,
+            &session,
+            &prior_snap,
+        )
+        .expect("a new id in a file that also has a sealed region must promote");
+
+        assert_eq!(intent.name(), "vault_seal");
+        // Only the new id fires; the pre-existing sealed `alpha` does not re-seal.
+        assert_eq!(ids_of(&intent), vec!["beta".to_string()]);
+        let paths: Vec<String> = intent.payload()["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(paths, vec!["notes.md".to_string()]);
+    }
+
+    #[test]
+    fn promotion_is_none_with_no_new_id_and_skips_paths_absent_from_the_snapshot() {
+        // Identical ids in prior + current ⇒ nothing to seal. And a path that is
+        // not in the snapshot is silently skipped — there is no `fs::read`
+        // fallback that could re-enter the mount.
+        let session = fresh_session();
+        let content = b"<vault id=\"alpha\">x</vault>\n";
+        let snapshot = snapshot_with("notes.md", content);
+        let prior_snap = prior_with("notes.md", content);
+
+        let promoted = promote_manual_edit_for_new_ids(
+            &["notes.md".to_string(), "not-in-snapshot.md".to_string()],
+            &snapshot,
+            &session,
+            &prior_snap,
+        );
+        assert!(promoted.is_none());
     }
 }

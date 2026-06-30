@@ -218,21 +218,32 @@ impl DirtySetAccumulator {
             None => return,
         };
         let hook = inner.layer_b.clone();
-        // In FUSE mode commit from the in-memory (tip ∪ overlay) snapshot, not
-        // by walking `garden_root` (= the mount this daemon serves) — the
-        // 2026-06-21 commit-path deadlock. Captured before borrowing `repo`
-        // (disjoint `DaemonInner` field) and before the commit clears the
-        // overlay. Manual editor writes already live in the overlay (kernel →
-        // FUSE write handler), so the flush just snapshots them.
-        let fuse_snapshot = match inner.fuse.as_ref() {
+        // One in-memory working-tree snapshot drives BOTH id-promotion and the
+        // commit — neither reads `garden_root` back through the filesystem. In
+        // FUSE mode `garden_root` is the mount this daemon serves, so walking or
+        // `fs::read`-ing it here (under `inner`, on the flush path) is the
+        // 2026-06-21 mount-read deadlock, and the kernel would hand back the
+        // reader-redacted view, not plaintext; `workdir_snapshot` reconstructs
+        // the tip∪overlay plaintext from the FUSE state instead (editor writes
+        // already live in the overlay). In direct mode `garden_root` is a real
+        // dir, so a plain `walk` is safe — and one snapshot reused for promotion
+        // + commit replaces the former read-per-path + a second walk in
+        // `commit_workdir`. Captured before borrowing `repo` (disjoint field).
+        let snapshot = match inner.fuse.as_ref() {
             Some(mount) => match mount.workdir_snapshot() {
-                Ok(s) => Some(s),
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("keeperd: watcher: workdir snapshot failed: {e}");
                     return;
                 }
             },
-            None => None,
+            None => match softfig_vcs::walk(&garden_root) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("keeperd: watcher: workdir walk failed: {e}");
+                    return;
+                }
+            },
         };
         let repo = match inner.repo.as_mut() {
             Some(r) => r,
@@ -255,7 +266,7 @@ impl DirtySetAccumulator {
             let touched_paths: Vec<String> = dirty.all_paths();
             crate::layer_b::promote_manual_edit_for_new_ids(
                 &touched_paths,
-                &garden_root,
+                &snapshot,
                 &session,
                 &prior_snap,
             )
@@ -276,10 +287,7 @@ impl DirtySetAccumulator {
         };
 
         hook.install_prior_tip(prior_snap);
-        let result = match fuse_snapshot {
-            Some(snapshot) => repo.commit_snapshot(&session, snapshot, intent),
-            None => repo.commit_workdir(&session, intent),
-        };
+        let result = repo.commit_snapshot(&session, snapshot, intent);
         hook.clear_prior_tip();
         if let Err(e) = result {
             eprintln!("keeperd: watcher: commit failed: {e}");

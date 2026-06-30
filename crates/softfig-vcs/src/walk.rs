@@ -83,6 +83,29 @@ impl WalkSnapshot {
         prune_empty_dirs(self.root_children_mut());
     }
 
+    /// The file content at a repo-relative path, or `None` when the path is
+    /// absent or resolves to a directory. The in-memory, plaintext counterpart
+    /// to a `std::fs::read(garden_root.join(rel))`: a consumer reads a path's
+    /// current working-tree plaintext straight from the snapshot the commit
+    /// will use, rather than reading the garden back through the filesystem —
+    /// which in FUSE mode is the mount the daemon serves (the mount-read
+    /// deadlock class). Components resolve exactly as [`Self::insert_file`]
+    /// stored them, so a lookup never drifts from an insert.
+    pub fn file_content(&self, rel: &Path) -> Option<&[u8]> {
+        let components = path_components(rel).ok()?;
+        let mut node = &self.root;
+        for comp in &components {
+            let TreeNode::Dir(children) = node else {
+                return None;
+            };
+            node = children.get(comp.as_str())?;
+        }
+        match node {
+            TreeNode::File { content, .. } => Some(content),
+            TreeNode::Dir(_) => None,
+        }
+    }
+
     fn root_children_mut(&mut self) -> &mut BTreeMap<String, TreeNode> {
         match &mut self.root {
             TreeNode::Dir(children) => children,
@@ -262,6 +285,24 @@ mod tests {
         // ...but unlisted content and the (tracked) ignore file itself remain.
         assert!(tl.contains_key("a.md"));
         assert!(tl.contains_key(IGNORE_FILE));
+    }
+
+    #[test]
+    fn file_content_reads_nested_paths_from_the_snapshot() {
+        // The in-memory plaintext lookup the daemon uses instead of an
+        // fs::read(garden_root.join(rel)) of the mount it serves.
+        let mut snap = WalkSnapshot::empty();
+        snap.insert_file(Path::new("a.md"), 0o644, b"top".to_vec()).unwrap();
+        snap.insert_file(Path::new("d/nested.md"), 0o644, b"deep".to_vec())
+            .unwrap();
+
+        assert_eq!(snap.file_content(Path::new("a.md")), Some(&b"top"[..]));
+        assert_eq!(snap.file_content(Path::new("d/nested.md")), Some(&b"deep"[..]));
+        // A directory node and an absent path both yield None (no panic).
+        assert_eq!(snap.file_content(Path::new("d")), None);
+        assert_eq!(snap.file_content(Path::new("missing.md")), None);
+        assert_eq!(snap.file_content(Path::new("a.md/x")), None);
+        assert_eq!(snap.file_content(Path::new("")), None);
     }
 
     #[test]
