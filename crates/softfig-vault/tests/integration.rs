@@ -159,6 +159,94 @@ fn rotate_key_keeps_old_blobs_readable() {
     assert_eq!(session.decrypt_blob(&new).unwrap(), b"after rotation");
 }
 
+/// Regression — HIGH silent data-loss (audit slice 001). A Layer B subkey
+/// is HKDF'd off the master-key bytes, so it is generation-specific. The
+/// read path must decrypt under the generation that *sealed* the blob (its
+/// embedded master id), not whichever generation is active after a
+/// `rotate-key`. Before the fix, `decrypt_layer_b`/`decrypt_layer_b_region`
+/// derived the subkey from `masters.active()`, so every file and inline
+/// `<vault>` region sealed before a rotation became permanently
+/// unreadable (`AuthFailed`) even though the old key is still on disk —
+/// while Layer A (`decrypt_blob`) read the embedded id and survived. This
+/// asserts both layers now reach parity across a rotation.
+#[test]
+fn rotate_key_keeps_layer_b_sealed_secrets_readable() {
+    use softfig_vault::layer_b::{read_master_id, LAYER_B_MARKER};
+
+    let (_tmp, vault) = fresh_vault();
+    let mut session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    let path = "secrets/api.toml";
+    let region_id = "token";
+    let file_pt = b"api_key = \"hunter2\"\n";
+    let region_pt = b"super-secret-region-value";
+
+    // Seal a whole-file blob AND an inline region under generation 1,
+    // plus a Layer A blob to assert cross-layer parity below.
+    let file_ct = session.encrypt_layer_b(path, file_pt).expect("seal file");
+    let region_ct = session
+        .encrypt_layer_b_region(path, region_id, region_pt)
+        .expect("seal region");
+    let layer_a_ct = session.encrypt_blob(b"layer-a survivor").expect("seal layer a");
+
+    // Sanity: both Layer B blobs carry the marker and the sealing
+    // generation id (1) — the very bytes the read path must honor.
+    assert_eq!(file_ct[0], LAYER_B_MARKER);
+    assert_eq!(read_master_id(&file_ct).unwrap(), 1);
+    assert_eq!(read_master_id(&region_ct).unwrap(), 1);
+
+    // Rotate to generation 2; generation 1 is kept on disk.
+    let new_id = session.rotate_master_key().expect("rotate");
+    assert_eq!(new_id, 2);
+    assert_eq!(session.active_master_key_id(), 2);
+    assert_eq!(session.known_master_key_ids(), vec![1, 2]);
+
+    // The proof: all three reveal after the rotation. Pre-fix, the two
+    // Layer B reveals returned AuthFailed (the bug); Layer A always
+    // worked — so passing all three together locks Layer A/B parity.
+    assert_eq!(
+        session.decrypt_layer_b(path, &file_ct).expect("reveal file after rotate"),
+        file_pt
+    );
+    assert_eq!(
+        session
+            .decrypt_layer_b_region(path, region_id, &region_ct)
+            .expect("reveal region after rotate"),
+        region_pt
+    );
+    assert_eq!(
+        session.decrypt_blob(&layer_a_ct).expect("reveal layer a after rotate"),
+        b"layer-a survivor"
+    );
+
+    // A blob freshly sealed under gen 2 also round-trips (encrypt still
+    // uses the active generation, and the read path selects gen 2).
+    let after_ct = session
+        .encrypt_layer_b(path, b"sealed after rotate")
+        .expect("seal under gen2");
+    assert_eq!(read_master_id(&after_ct).unwrap(), 2);
+    assert_eq!(
+        session.decrypt_layer_b(path, &after_ct).expect("reveal gen2 file"),
+        b"sealed after rotate"
+    );
+
+    // Survives a re-unlock: generation 1 was persisted to disk, so the
+    // old-generation reveal still works on a fresh session.
+    drop(session);
+    let session = vault.unlock(PASSPHRASE).expect("re-unlock");
+    assert_eq!(session.active_master_key_id(), 2);
+    assert_eq!(
+        session.decrypt_layer_b(path, &file_ct).expect("reveal file after re-unlock"),
+        file_pt
+    );
+    assert_eq!(
+        session
+            .decrypt_layer_b_region(path, region_id, &region_ct)
+            .expect("reveal region after re-unlock"),
+        region_pt
+    );
+}
+
 #[test]
 fn recover_replaces_passphrase_without_disturbing_blobs() {
     let (tmp, vault, recovery) = fresh_vault_with_recovery();

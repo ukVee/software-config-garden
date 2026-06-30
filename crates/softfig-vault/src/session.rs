@@ -58,8 +58,18 @@ impl VaultSession {
     }
 
     /// Decrypt a Layer B blob_file using the subkey derived for `path`.
+    ///
+    /// The subkey is HKDF'd off the master-key bytes, so it is
+    /// generation-specific: the blob must be decrypted under the
+    /// generation that *sealed* it, not whichever is active now. That id
+    /// is embedded in the blob ([`layer_b::read_master_id`]), so a file
+    /// sealed before a [`Self::rotate_master_key`] still reveals
+    /// afterwards — mirroring Layer A's [`crate::blob::decrypt_blob`].
+    /// (Encrypt stays on `active()`: new seals use the current
+    /// generation.)
     pub fn decrypt_layer_b(&self, path: &str, blob_file: &[u8]) -> Result<Vec<u8>> {
-        let m = self.masters.active()?;
+        let id = layer_b::read_master_id(blob_file)?;
+        let m = self.masters.get(id)?;
         let key = layer_b::derive_subkey(m, path.as_bytes());
         layer_b::decrypt(blob_file, &key)
     }
@@ -88,14 +98,18 @@ impl VaultSession {
     }
 
     /// Decrypt an inline-`<vault>`-region blob_file under the subkey
-    /// derived for `(path, id)`.
+    /// derived for `(path, id)`. Like [`Self::decrypt_layer_b`], the
+    /// subkey is derived from the generation that *sealed* the region
+    /// (the embedded master id), so inline regions also survive a
+    /// [`Self::rotate_master_key`].
     pub fn decrypt_layer_b_region(
         &self,
         path: &str,
         id: &str,
         blob_file: &[u8],
     ) -> Result<Vec<u8>> {
-        let m = self.masters.active()?;
+        let gen_id = layer_b::read_master_id(blob_file)?;
+        let m = self.masters.get(gen_id)?;
         let key = layer_b::derive_region_subkey(m, path, id);
         layer_b::decrypt(blob_file, &key)
     }

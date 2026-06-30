@@ -152,6 +152,23 @@ pub fn is_layer_b(blob_file: &[u8]) -> bool {
     blob_file.first().copied() == Some(LAYER_B_MARKER)
 }
 
+/// Read the embedded master-key generation id from a Layer B blob_file
+/// *without* decrypting it. The read path needs this because a Layer B
+/// subkey is HKDF'd off the master-key bytes and is therefore
+/// generation-specific: a blob must be decrypted under the generation
+/// that *sealed* it, not whichever generation happens to be active now.
+/// The id is written at seal time by [`encrypt`] and is preserved across
+/// `rotate-key`, exactly as Layer A embeds its id for
+/// [`crate::blob::decrypt_blob`] to look up. Returns `MalformedBlob` if
+/// the marker byte or the varint is missing or truncated.
+pub fn read_master_id(blob_file: &[u8]) -> Result<u32> {
+    if blob_file.first().copied() != Some(LAYER_B_MARKER) {
+        return Err(VaultError::MalformedBlob);
+    }
+    let (id, _rest) = read_varint(&blob_file[1..]).ok_or(VaultError::MalformedBlob)?;
+    Ok(id)
+}
+
 fn derive_nonce(key: &LayerBKey, plaintext: &[u8]) -> [u8; AEAD_NONCE_LEN] {
     let mut hasher = blake3::Hasher::new_keyed(key.expose());
     hasher.update(plaintext);
@@ -268,5 +285,27 @@ mod tests {
             decrypt(&bogus, &key),
             Err(VaultError::MalformedBlob)
         ));
+    }
+
+    #[test]
+    fn read_master_id_recovers_the_sealing_generation() {
+        let m = fixed_master();
+        let key = derive_subkey(&m, b"secrets/foo.toml");
+        // Seal under a multi-byte varint id to exercise the LEB128 path,
+        // not just the single-byte case.
+        let ct = encrypt(300, b"x", &key).unwrap();
+        assert_eq!(read_master_id(&ct).unwrap(), 300);
+
+        // A blob missing the marker, or truncated before the varint
+        // completes, is malformed — never a silent zero.
+        assert!(matches!(
+            read_master_id(&[0x01, 0x00]),
+            Err(VaultError::MalformedBlob)
+        ));
+        assert!(matches!(
+            read_master_id(&[LAYER_B_MARKER]),
+            Err(VaultError::MalformedBlob)
+        ));
+        assert!(matches!(read_master_id(&[]), Err(VaultError::MalformedBlob)));
     }
 }
