@@ -294,15 +294,7 @@ impl SharedState {
     /// Kind of the working-tree entry at `rel` (overlay precedence), or `None`
     /// if absent / overlay-removed.
     fn entry_kind(&self, rel: &Path) -> Option<EntryKind> {
-        let inner = self.inner.lock().unwrap();
-        if let Some(entry) = inner.overlay.get(rel) {
-            return match entry {
-                OverlayEntry::File { .. } => Some(EntryKind::Blob),
-                OverlayEntry::Dir { .. } => Some(EntryKind::Dir),
-                OverlayEntry::Removed => None,
-            };
-        }
-        inner.view.get(rel).map(|e| e.kind)
+        entry_kind_of(&self.inner.lock().unwrap(), rel)
     }
 
     /// One-level children of `dir` (repo-relative; `""` = root) as
@@ -349,51 +341,99 @@ impl SharedState {
     }
 
     /// Stage a rename into the overlay. Handles a single file and a directory
-    /// (every live file descendant is re-keyed). Each moved file's bytes are
-    /// materialized into the overlay so the move survives the
-    /// overlay-clears-on-commit rotation. This is the single dir-aware rename
-    /// implementation: the kernel `rename` handler delegates here too, so a
-    /// human-facing `mv dir newdir` re-keys the subtree instead of dropping it.
+    /// (every live descendant — files re-keyed with their bytes, sub-directories
+    /// moved as overlay markers). Each moved file's bytes are materialized into
+    /// the overlay so the move survives the overlay-clears-on-commit rotation.
+    /// This is the single dir-aware rename implementation: the kernel `rename`
+    /// handler delegates here too, so a human-facing `mv dir newdir` re-keys the
+    /// subtree instead of dropping it.
+    ///
+    /// Two passes for atomicity. Pass 1 reads every moving file's bytes up front
+    /// and returns on the FIRST read error with the overlay byte-for-byte
+    /// untouched — a mid-rename store/decrypt failure can never leave a
+    /// half-renamed subtree for the next debounce to commit. Pass 2 takes `inner`
+    /// once and applies every mutation with no fallible read between them.
+    ///
+    /// The source directory itself (and every emptied sub-directory) is marked
+    /// `Removed`, so it does not linger in the live view; and an empty-directory
+    /// rename re-creates the directory at the destination, so `mv` of a dir with
+    /// no files is a real move rather than a silent no-op.
     pub(crate) fn stage_rename(&self, from: &Path, to: &Path) -> Result<()> {
-        let movers: Vec<PathBuf> = self
-            .live_file_paths()
-            .into_iter()
-            .filter(|p| p == from || p.starts_with(from))
-            .collect();
-        for src in movers {
-            let suffix = src.strip_prefix(from).unwrap_or(Path::new(""));
-            let dst = if suffix.as_os_str().is_empty() {
-                to.to_path_buf()
-            } else {
-                to.join(suffix)
-            };
-            let content = self.read_workfile(&src)?.unwrap_or_default();
-            let mut inner = self.inner.lock().unwrap();
-            let mode = current_mode(&inner, &src).unwrap_or(0o100644);
+        let (file_movers, dir_movers) = self.rename_movers(from);
+
+        // Pass 1 — fallible, no mutation. Read modes under one short lock, then
+        // each moving file's bytes lock-free; the first read error aborts here.
+        let (file_modes, dir_plan): (Vec<u32>, Vec<(PathBuf, PathBuf, u32)>) = {
+            let inner = self.inner.lock().unwrap();
+            let modes = file_movers
+                .iter()
+                .map(|src| current_mode(&inner, src).unwrap_or(0o100644))
+                .collect();
+            let dirs = dir_movers
+                .iter()
+                .map(|src| {
+                    (
+                        src.clone(),
+                        remap(from, to, src),
+                        current_mode(&inner, src).unwrap_or(0o040755),
+                    )
+                })
+                .collect();
+            (modes, dirs)
+        };
+        let mut file_plan: Vec<(PathBuf, PathBuf, Vec<u8>, u32)> =
+            Vec::with_capacity(file_movers.len());
+        for (src, mode) in file_movers.iter().zip(file_modes) {
+            let content = self.read_workfile(src)?.unwrap_or_default();
+            file_plan.push((src.clone(), remap(from, to, src), content, mode));
+        }
+
+        // Pass 2 — infallible, one lock. No fallible read between mutations, so
+        // the overlay only ever transitions from fully-old to fully-new.
+        let mut inner = self.inner.lock().unwrap();
+        for (src, dst, content, mode) in file_plan {
             inner.overlay.mark_removed(src.clone());
             ensure_overlay_dirs(&mut inner, &dst);
             inner.overlay.insert_file(dst.clone(), content, mode);
             inner.inodes.rename(&src, &dst);
         }
+        for (src, dst, mode) in dir_plan {
+            inner.overlay.mark_removed(src.clone());
+            inner.overlay.insert_dir(dst.clone(), mode);
+            inner.inodes.rename(&src, &dst);
+        }
         Ok(())
     }
 
-    /// Every live (overlay ∪ tip, removals honored) regular-file repo-relative
-    /// path. Backs [`Self::stage_rename`]'s directory case. No ignore filtering
-    /// — `.softfig`/`.claude` are absent from both the tip tree and the overlay.
-    fn live_file_paths(&self) -> Vec<PathBuf> {
+    /// Partition every live entry under `from` (inclusive) into regular-file
+    /// paths (to re-key with their bytes) and directory paths (to move as overlay
+    /// markers), honoring overlay precedence and `Removed`. A lone file yields
+    /// one file mover and no dirs; a directory yields itself plus every live
+    /// descendant. Recording directories — not just files, as the former
+    /// files-only enumeration did — is what lets an emptied source dir disappear
+    /// and an empty-dir rename actually move. No ignore filtering —
+    /// `.softfig`/`.claude` are absent from both the tip tree and the overlay.
+    fn rename_movers(&self, from: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let inner = self.inner.lock().unwrap();
-        let mut out = Vec::new();
-        collect_live(&inner, Path::new(""), &mut out);
-        out
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        match entry_kind_of(&inner, from) {
+            Some(EntryKind::Blob) => files.push(from.to_path_buf()),
+            Some(EntryKind::Dir) => {
+                dirs.push(from.to_path_buf());
+                collect_live_entries(&inner, from, &mut files, &mut dirs);
+            }
+            None => {}
+        }
+        (files, dirs)
     }
 }
 
 /// Ensure overlay `Dir` markers exist for every ancestor directory of `file`
 /// that isn't already present (overlay entry or committed tip dir), mirroring
 /// the `create_dir_all` → kernel `mkdir` chain the old `std::fs` action-write
-/// path triggered. Without this, `collect_files` / `collect_live` — which
-/// descend *only* through known `Dir` entries — would never reach a file staged
+/// path triggered. Without this, `collect_files` / `collect_live_entries` —
+/// which descend *only* through known `Dir` entries — would never reach a file staged
 /// under a not-yet-existing directory, silently dropping it from the commit
 /// snapshot. The dir mode is cosmetic (the snapshot derives dir nodes from the
 /// files' ancestry, not from these markers).
@@ -424,18 +464,55 @@ fn current_mode(inner: &Inner, path: &Path) -> Option<u32> {
     inner.view.get(path).map(|e| e.mode)
 }
 
-/// Recursively collect live file paths under `dir` from the (tip ∪ overlay)
-/// state, mirroring [`collect_files`]'s precedence (overlay wins; a `Removed`
-/// marker hides the tip copy) without the ignore filter or content.
-fn collect_live(inner: &Inner, dir: &Path, out: &mut Vec<PathBuf>) {
+/// Kind of the working-tree entry at `rel` from a locked [`Inner`] (overlay
+/// precedence; a `Removed` marker ⇒ `None`). The lock-holding analogue of
+/// [`SharedState::entry_kind`], so [`SharedState::rename_movers`] can classify a
+/// path without re-acquiring `inner`.
+fn entry_kind_of(inner: &Inner, rel: &Path) -> Option<EntryKind> {
+    if let Some(entry) = inner.overlay.get(rel) {
+        return match entry {
+            OverlayEntry::File { .. } => Some(EntryKind::Blob),
+            OverlayEntry::Dir { .. } => Some(EntryKind::Dir),
+            OverlayEntry::Removed => None,
+        };
+    }
+    inner.view.get(rel).map(|e| e.kind)
+}
+
+/// Map a source path under `from` to its destination under `to`, preserving the
+/// sub-path suffix (`from` itself maps to `to`). Backs [`SharedState::stage_rename`].
+fn remap(from: &Path, to: &Path, src: &Path) -> PathBuf {
+    let suffix = src.strip_prefix(from).unwrap_or(Path::new(""));
+    if suffix.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(suffix)
+    }
+}
+
+/// Recursively collect live entries under `dir` (exclusive of `dir` itself),
+/// appending regular-file paths to `files` and sub-directory paths to `dirs`,
+/// mirroring [`collect_files`]'s precedence (overlay wins; a `Removed` marker
+/// hides the tip copy) without the ignore filter or content. The entry-kind
+/// analogue of the former files-only enumeration; backs
+/// [`SharedState::rename_movers`].
+fn collect_live_entries(
+    inner: &Inner,
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    dirs: &mut Vec<PathBuf>,
+) {
     for (path, entry) in inner.overlay.iter() {
         if path.parent() != Some(dir) {
             continue;
         }
         match entry {
             OverlayEntry::Removed => {}
-            OverlayEntry::File { .. } => out.push(path.to_path_buf()),
-            OverlayEntry::Dir { .. } => collect_live(inner, path, out),
+            OverlayEntry::File { .. } => files.push(path.to_path_buf()),
+            OverlayEntry::Dir { .. } => {
+                dirs.push(path.to_path_buf());
+                collect_live_entries(inner, path, files, dirs);
+            }
         }
     }
     for (path, entry) in inner.view.children(dir) {
@@ -443,8 +520,11 @@ fn collect_live(inner: &Inner, dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         match entry.kind {
-            EntryKind::Blob => out.push(path.to_path_buf()),
-            EntryKind::Dir => collect_live(inner, path, out),
+            EntryKind::Blob => files.push(path.to_path_buf()),
+            EntryKind::Dir => {
+                dirs.push(path.to_path_buf());
+                collect_live_entries(inner, path, files, dirs);
+            }
         }
     }
 }

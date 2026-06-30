@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use softfig_fuse::{DirtyEventSink, FuseMount, MountHandle};
 use softfig_store::{ObjectStore, StorePaths};
@@ -23,6 +23,15 @@ use softfig_vault::{params::VaultParams, Vault};
 use softfig_vcs::{walk, Repo, TreeNode, WalkSnapshot};
 
 const PASS: &[u8] = b"correct horse battery staple";
+
+/// Serializes the FUSE mount/unmount lifecycle across the tests in this binary.
+/// `cargo test` runs tests on parallel threads, and concurrent fusermount3
+/// mount/unmount against `/dev/fuse` races in restricted sandboxes ("Operation
+/// not permitted" / "Permission denied" on the mountpoint) — a pre-existing
+/// flake the parity suite already hit before the dir-rename regressions below
+/// were added. Each mount test holds this lock for its whole lifetime; it is
+/// poison-tolerant so one failing test does not cascade into the rest.
+static MOUNT_GUARD: Mutex<()> = Mutex::new(());
 
 /// Minimum-cost Argon2 so vault init stays well under a second.
 fn fast_params() -> VaultParams {
@@ -104,6 +113,7 @@ fn workdir_snapshot_matches_a_live_walk_of_the_mount() {
         eprintln!("skipping workdir_snapshot parity: /dev/fuse unavailable in this environment");
         return;
     }
+    let _mount_guard = MOUNT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
 
     let state = tempfile::tempdir().unwrap(); // .softfig + vault live here
     let staging = tempfile::tempdir().unwrap(); // genesis working-tree content
@@ -210,6 +220,7 @@ fn kernel_rename_of_a_directory_preserves_the_whole_subtree() {
         eprintln!("skipping dir-rename data-loss test: /dev/fuse unavailable in this environment");
         return;
     }
+    let _mount_guard = MOUNT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
 
     let state = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
@@ -283,6 +294,7 @@ fn kernel_rmdir_of_a_nonempty_directory_is_refused() {
         eprintln!("skipping rmdir ENOTEMPTY test: /dev/fuse unavailable in this environment");
         return;
     }
+    let _mount_guard = MOUNT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
 
     let state = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
@@ -315,6 +327,183 @@ fn kernel_rmdir_of_a_nonempty_directory_is_refused() {
     // An empty directory, by contrast, removes cleanly.
     fs::create_dir(m.join("empty")).expect("mkdir");
     fs::remove_dir(m.join("empty")).expect("rmdir of an empty dir must succeed");
+
+    handle.unmount();
+}
+
+/// Regression for `audit-hardening-regressions` slice 001, hole #2 of audit
+/// slice 002's `stage_rename`: the rename re-keyed only *file* descendants and
+/// never the directory markers, so the emptied source dir lingered in the live
+/// view. Asserted through `read_dir_entries` (the one-level live view), which —
+/// unlike `files_of` / a `walk` — does NOT prune empty directories, so the
+/// leftover source dir is observable (the slice-002 test catches neither this
+/// nor the empty-dir no-op below).
+#[test]
+fn dir_rename_leaves_no_empty_source_dir_in_the_live_view() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping dir-rename leftover-source-dir test: /dev/fuse unavailable");
+        return;
+    }
+    let _mount_guard = MOUNT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let state = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+
+    write(staging.path(), "docs/a.md", b"alpha");
+    write(staging.path(), "docs/sub/b.md", b"beta");
+    write(staging.path(), "keep.md", b"unrelated");
+
+    let handle = mount_genesis(state.path(), staging.path(), mount.path());
+    let m = mount.path();
+
+    fs::rename(m.join("docs"), m.join("renamed")).expect("rename a directory through the kernel");
+
+    // The emptied source dir must not linger; the destination dir and the
+    // unrelated sibling must be present.
+    let root: Vec<String> = handle
+        .read_dir_entries("")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !root.iter().any(|n| n == "docs"),
+        "the emptied source directory must not linger in the live view: {root:?}"
+    );
+    assert!(
+        root.iter().any(|n| n == "renamed"),
+        "the destination directory must appear: {root:?}"
+    );
+    assert!(
+        root.iter().any(|n| n == "keep.md"),
+        "the unrelated sibling must remain: {root:?}"
+    );
+
+    // The re-keyed subtree is reachable under the new prefix (dirs included)...
+    assert!(handle.path_is_dir("renamed"), "renamed must be a directory");
+    assert!(handle.path_is_dir("renamed/sub"), "the nested dir must move too");
+    assert_eq!(
+        handle.read_workfile("renamed/a.md").unwrap().as_deref(),
+        Some(b"alpha".as_ref())
+    );
+    assert_eq!(
+        handle.read_workfile("renamed/sub/b.md").unwrap().as_deref(),
+        Some(b"beta".as_ref())
+    );
+    // ...and nothing — file or directory — remains reachable under the old one.
+    assert!(!handle.path_exists("docs"), "the source dir must be gone");
+    assert!(!handle.path_exists("docs/a.md"), "the source file must be gone");
+    assert!(!handle.path_exists("docs/sub"), "the source subdir must be gone");
+
+    handle.unmount();
+}
+
+/// Regression for `audit-hardening-regressions` slice 001, the empty-directory
+/// half of hole #2: a `mv emptydir newname` enumerated zero file movers, so the
+/// old loop ran zero iterations and returned `Ok` while nothing moved — a silent
+/// no-op the kernel reported as success. The dir-aware rename must move the
+/// marker so the destination appears and the source disappears.
+#[test]
+fn empty_dir_rename_is_not_a_silent_no_op() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping empty-dir rename test: /dev/fuse unavailable");
+        return;
+    }
+    let _mount_guard = MOUNT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let state = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+
+    write(staging.path(), "keep.md", b"x"); // a non-empty genesis
+    let handle = mount_genesis(state.path(), staging.path(), mount.path());
+    let m = mount.path();
+
+    fs::create_dir(m.join("foo")).expect("mkdir an empty dir");
+    fs::rename(m.join("foo"), m.join("bar")).expect("rename the empty dir through the kernel");
+
+    let root: Vec<String> = handle
+        .read_dir_entries("")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !root.iter().any(|n| n == "foo"),
+        "the renamed-away empty source dir must disappear: {root:?}"
+    );
+    assert!(
+        root.iter().any(|n| n == "bar"),
+        "the empty dir must appear at its destination, not be silently dropped: {root:?}"
+    );
+    assert!(handle.path_is_dir("bar"), "the destination must be a directory");
+    assert!(!handle.path_exists("foo"), "the source must be gone");
+
+    handle.unmount();
+}
+
+/// Regression for `audit-hardening-regressions` slice 001, hole #1 of audit
+/// slice 002: `stage_rename` read each mover's bytes *inside* the mutation loop,
+/// so a read failure on a later mover left earlier movers already re-keyed in the
+/// overlay — a half-renamed subtree the next debounce would commit. The two-pass
+/// fix reads every mover up front and aborts with the overlay untouched.
+///
+/// `docs/a.md` is staged into the overlay (so it reads from memory and is
+/// enumerated before the tip blob `docs/b.md`); the object store is then dropped
+/// so reading `docs/b.md` fails. The old in-loop code re-keyed `a.md` before
+/// hitting `b.md`'s failing read; the fix must leave nothing moved.
+#[test]
+fn dir_rename_aborts_with_no_partial_mutation_on_a_read_failure() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping rename-atomicity test: /dev/fuse unavailable");
+        return;
+    }
+    let _mount_guard = MOUNT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let state = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+
+    write(staging.path(), "docs/b.md", b"beta");
+    write(staging.path(), "keep.md", b"unrelated");
+    let handle = mount_genesis(state.path(), staging.path(), mount.path());
+
+    handle.stage_write("docs/a.md", b"alpha".to_vec());
+
+    // Make every committed object unreadable, so reading the tip blob `docs/b.md`
+    // fails while the overlay file `docs/a.md` still reads from memory.
+    let objects = StorePaths::with_state_root(mount.path(), state.path()).objects_dir();
+    fs::remove_dir_all(&objects).expect("drop the object store to force a read failure");
+
+    let result = handle.stage_rename("docs", "renamed");
+    assert!(
+        result.is_err(),
+        "a mover read failure must surface as an error, got {result:?}"
+    );
+
+    // Nothing partially moved: no destination staged, the readable mover is still
+    // at its original path, and the source dir still lists both files.
+    assert!(
+        !handle.path_exists("renamed"),
+        "no destination subtree may be staged after an aborted rename"
+    );
+    assert!(
+        !handle.path_exists("renamed/a.md"),
+        "the readable mover must NOT have been re-keyed"
+    );
+    assert_eq!(
+        handle.read_workfile("docs/a.md").unwrap().as_deref(),
+        Some(b"alpha".as_ref()),
+        "the overlay mover must remain byte-for-byte at its original path"
+    );
+    let docs: Vec<String> = handle
+        .read_dir_entries("docs")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        docs.iter().any(|n| n == "a.md") && docs.iter().any(|n| n == "b.md"),
+        "the source directory must still list both files: {docs:?}"
+    );
 
     handle.unmount();
 }
