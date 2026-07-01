@@ -15,7 +15,7 @@ use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply, SetResourcesArgs}
 use crate::config::{BuildCaps, GrowlightdConfig, Policy};
 use crate::control::{Control, LiveKill};
 use crate::hub::EventHub;
-use crate::leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
+use crate::leases::{DrainOutcome, LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
 use crate::persist::ResourcePersister;
 use crate::resume::{ItemResumer, ResumeOutcome};
 use crate::state::State;
@@ -430,8 +430,9 @@ impl Daemon {
     /// `target`. Self-restart is denied (use `force_stop`). Otherwise the
     /// restart is arbitrated through a lease over the target: granted → the
     /// DAEMON performs the kill via [`Daemon::hard_kill_agent`] (the kill-safety
-    /// path — child taken under the lock, SIGKILL outside it) and then RELEASES
-    /// the lease, so a later restart of the same target is admitted again (the
+    /// path — child taken under the lock, SIGKILL outside it) and then DRAINS the
+    /// lease (an *action* lease is removed outright, never handed to a queued
+    /// waiter), so a later restart of the same target is admitted again (the
     /// restart is repeatable, not one-shot); a truly-concurrent second restart
     /// still in flight → queued. Agents never kill each other — only the
     /// supervisor does.
@@ -451,17 +452,31 @@ impl Daemon {
                 // DAEMON-executed restart, OUTSIDE the lock (hard_kill_agent
                 // enforces the take-under-lock / kill-outside ordering itself).
                 let performed = self.hard_kill_agent(target);
-                // Release the restart lease now that the kill is issued — the
-                // restart has settled (the supervisor re-rolls the freed slot).
-                // Without this the lease is never released, so a later restart of
-                // the same target would queue forever: supervised restart was
-                // one-shot per target (the audit-005 follow-up). Brief lock; the
-                // publish below stays lock-free.
-                self.inner.lock().unwrap().leases.release(&key, requester);
+                // DRAIN the restart lease now that the kill is issued. A restart
+                // lease models an IN-FLIGHT ACTION, not a poll-wait queue: a
+                // truly-concurrent second restart of this target got a `Queued`
+                // reply and walked away with no poll/retry contract, so it must
+                // NOT be promoted to holder. The generic `release` (promote the
+                // head waiter) would strand `restart:<target>` under that phantom
+                // holder forever — every later restart then queuing indefinitely,
+                // the exact one-shot-per-target failure this path exists to retire
+                // (audit slice 005 discarded the outcome and used `release`, which
+                // only masked it when no waiter was queued). `drain` removes the
+                // entry outright; the requester just held the lease, so the drain
+                // always succeeds. Brief lock; the publish below stays lock-free.
+                let drained = self.inner.lock().unwrap().leases.drain(&key, requester);
+                debug_assert!(
+                    matches!(drained, DrainOutcome::Drained { .. }),
+                    "the requester just held the restart lease, so its drain must succeed",
+                );
+                // Mirror `release_lease`'s event shape: an action lease drained on
+                // completion is `"released"` with NO holder — never the old
+                // misleading `"granted"`/holder=requester (which matched neither
+                // the released nor the promoted reality).
                 self.hub.publish(Event::LeaseChanged {
                     lease: key,
-                    holder: Some(requester.to_string()),
-                    state: "granted".to_string(),
+                    holder: None,
+                    state: "released".to_string(),
                 });
                 RestartReply {
                     target: target.to_string(),
@@ -500,7 +515,8 @@ impl Daemon {
 
 /// The lease key a restart is arbitrated under — namespaced so it never collides
 /// with a garden-target lease key. Held by the requester only across the kill and
-/// released immediately after (within [`Daemon::request_restart`]), so a
+/// DRAINED immediately after (within [`Daemon::request_restart`] — an action
+/// lease is removed outright, never promoted to a queued waiter), so a
 /// *truly-concurrent* second `request_restart` of the same target queues rather
 /// than double-killing, while a *later* restart is admitted again (repeatable,
 /// not one-shot).
@@ -759,9 +775,20 @@ mod tests {
         }
     }
 
+    /// Audit-hardening slice 003 regression: a restart lease is an IN-FLIGHT
+    /// ACTION lease, so on completion it must be DRAINED (the key freed), never
+    /// handed to a queued waiter. We reproduce the exact concurrent interleaving
+    /// deterministically — A's restart of "b" is in flight (A holds `restart:b`)
+    /// with a second, truly-concurrent restart (C) queued behind it — then drive
+    /// A to completion and require the key to be FREE (not stranded under a
+    /// phantom holder) AND the published event to be `"released"` (holder `None`),
+    /// not the old misleading `"granted"`. The prior test never queued a waiter,
+    /// so the buggy `release` (promote-head-waiter) passed it while leaking the
+    /// lease under concurrency.
     #[test]
-    fn request_restart_is_performed_by_the_daemon_and_releases_its_lease() {
+    fn request_restart_drains_its_lease_and_publishes_released_under_a_queued_waiter() {
         let daemon = test_daemon();
+        let events = daemon.hub.subscribe();
         let killed = Arc::new(AtomicBool::new(false));
         // The live backend registers the target's real child in the kill registry
         // on spawn; here a fake stands in.
@@ -775,19 +802,62 @@ mod tests {
             ),
         );
 
+        // Seed the exact mid-flight state a true concurrent race produces: A's
+        // restart of "b" is in flight (A holds `restart:b`), and a second restart
+        // by C arrived while it was in flight → C is QUEUED and walked away with
+        // only a `"queued"` reply (no poll/retry contract, nobody to promote to).
+        let key = restart_key("b");
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            assert_eq!(inner.leases.request(&key, "a"), LeaseDecision::Granted);
+            assert_eq!(
+                inner.leases.request(&key, "c"),
+                LeaseDecision::Queued { position: 1 },
+            );
+        }
+
+        // A completes its restart: it re-acquires idempotently (A is the holder),
+        // the DAEMON kills the target, and the lease must DRAIN — NOT promote C.
         let reply = daemon.request_restart("a", "b");
         assert_eq!(reply.state, "restarted");
         assert!(reply.performed, "a live child was present and killed");
         assert!(killed.load(Ordering::SeqCst), "the DAEMON killed the target");
 
-        // The restart lease is RELEASED after the kill, so a later restart of the
-        // same target is admitted again (not one-shot per target). The child was
-        // already taken out + killed, so this second restart kills nothing
-        // (performed=false) — but it is ADMITTED ("restarted"), not "queued",
-        // which is the lease-release proof.
-        let again = daemon.request_restart("c", "b");
-        assert_eq!(again.state, "restarted", "the lease was released → repeatable");
-        assert!(!again.performed, "nothing live to kill the second time");
+        // THE FIX: the key is FREE. The buggy `release` would have promoted C to a
+        // phantom holder (C already left), stranding `restart:b` forever.
+        assert!(
+            !daemon.inner.lock().unwrap().leases.is_held(&key),
+            "the restart lease was drained, not handed to the queued waiter",
+        );
+
+        // Event-stream assertion: A's completion published `"released"` + holder
+        // None (mirroring `release_lease`), NOT the old `"granted"`/holder=A.
+        match events.try_recv().expect("request_restart published a LeaseChanged") {
+            Event::LeaseChanged { lease, holder, state } => {
+                assert_eq!(lease, key);
+                assert_eq!(state, "released", "an action lease drains → released, not granted");
+                assert_eq!(holder, None, "drained → no holder (never a promoted phantom)");
+            }
+            other => panic!("expected a LeaseChanged event, got {other:?}"),
+        }
+
+        // Repeatable, not one-shot-per-target: a LATER restart of "b" is ADMITTED
+        // ("restarted"), never "queued forever". Re-register a child so the
+        // arbitration has a live target to kill.
+        let killed_again = Arc::new(AtomicBool::new(false));
+        daemon.kill_handles.lock().unwrap().insert(
+            "b".to_string(),
+            LiveKill::new(
+                "growlight-agent-b-2.scope",
+                Box::new(RecordingChild {
+                    killed: Arc::clone(&killed_again),
+                }),
+            ),
+        );
+        let again = daemon.request_restart("d", "b");
+        assert_eq!(again.state, "restarted", "the lease was drained → repeatable");
+        assert!(again.performed, "the re-registered child was killed");
+        assert!(killed_again.load(Ordering::SeqCst), "the later restart killed the fresh child");
     }
 
     #[test]

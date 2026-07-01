@@ -84,6 +84,22 @@ pub enum ReleaseOutcome {
     NotHolder,
 }
 
+/// The outcome of a [`LeaseTable::drain`] — the teardown for an **action lease**
+/// (one that models a completed in-flight action, e.g. a restart), which removes
+/// the key outright instead of handing it down the FIFO. Distinct from
+/// [`ReleaseOutcome`] precisely because a drain never promotes a waiter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The holder drained the lease: the key is now free and these FIFO waiters
+    /// (if any) were **discarded without promotion**. An action lease has no
+    /// poll/retry contract — a queued requester already got its
+    /// [`LeaseDecision::Queued`] reply and walked away — so promoting one would
+    /// strand the key under a phantom holder forever.
+    Drained { discarded: Vec<String> },
+    /// The caller was not the current holder — nothing changed.
+    NotHolder,
+}
+
 /// One arbitrated lease: its current holder plus the FIFO queue of agents
 /// waiting for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +170,28 @@ impl LeaseTable {
                 }
             },
             _ => ReleaseOutcome::NotHolder,
+        }
+    }
+
+    /// Drain the **action lease** `key` held by `agent`: remove the entry
+    /// outright and return any FIFO waiters, **without** promoting one to holder.
+    ///
+    /// Unlike [`LeaseTable::release`] — the poll-wait path that hands the lease
+    /// down the FIFO to the head waiter — a restart lease models an *in-flight
+    /// action*: a queued requester already received its [`LeaseDecision::Queued`]
+    /// reply and left with **no poll/retry contract**, so promoting it here would
+    /// strand `key` under a phantom holder forever (every later restart of that
+    /// target then queuing indefinitely). A drain by a non-holder is a no-op
+    /// ([`DrainOutcome::NotHolder`]).
+    pub fn drain(&mut self, key: &str, agent: &str) -> DrainOutcome {
+        let is_holder = self.held.get(key).map(|l| l.holder == agent).unwrap_or(false);
+        if is_holder {
+            let lease = self.held.remove(key).expect("holder implies the key is present");
+            DrainOutcome::Drained {
+                discarded: lease.waiters.into(),
+            }
+        } else {
+            DrainOutcome::NotHolder
         }
     }
 
@@ -295,5 +333,50 @@ mod tests {
             ReleaseOutcome::Released { next_holder: None }
         );
         assert!(!t.is_held(KEY));
+    }
+
+    #[test]
+    fn drain_removes_the_action_lease_and_discards_waiters_without_promotion() {
+        // A restart-style action lease: the holder drains on completion and the
+        // queued waiters are DISCARDED, never promoted (they had no poll/retry
+        // contract — they already got their `Queued` reply and left).
+        let mut t = LeaseTable::new();
+        t.request(KEY, "a");
+        t.request(KEY, "b");
+        t.request(KEY, "c");
+        assert_eq!(
+            t.drain(KEY, "a"),
+            DrainOutcome::Drained {
+                discarded: vec!["b".to_string(), "c".to_string()],
+            },
+        );
+        // The key is FREE — no phantom holder promoted from the queue (the exact
+        // regression: the generic `release` would have handed it to "b").
+        assert!(!t.is_held(KEY), "drain removes the entry outright");
+        assert_eq!(t.holder(KEY), None);
+        assert_eq!(t.waiter_count(KEY), 0);
+        // And it can be re-acquired fresh — the action is repeatable, not one-shot.
+        assert_eq!(t.request(KEY, "z"), LeaseDecision::Granted);
+    }
+
+    #[test]
+    fn drain_with_no_waiters_frees_the_key() {
+        let mut t = LeaseTable::new();
+        t.request(KEY, "a");
+        assert_eq!(t.drain(KEY, "a"), DrainOutcome::Drained { discarded: vec![] });
+        assert!(!t.is_held(KEY));
+    }
+
+    #[test]
+    fn a_non_holder_cannot_drain_the_lease() {
+        let mut t = LeaseTable::new();
+        t.request(KEY, "a");
+        t.request(KEY, "b");
+        // b is only a waiter; it cannot drain a's action lease.
+        assert_eq!(t.drain(KEY, "b"), DrainOutcome::NotHolder);
+        assert_eq!(t.holder(KEY), Some("a"), "the holder is untouched");
+        assert_eq!(t.waiter_count(KEY), 1, "the waiter is untouched");
+        // Draining an unheld key is also a no-op.
+        assert_eq!(t.drain("never-held", "a"), DrainOutcome::NotHolder);
     }
 }
