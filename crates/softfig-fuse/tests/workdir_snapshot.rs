@@ -207,6 +207,52 @@ fn workdir_snapshot_matches_a_live_walk_of_the_mount() {
     handle.unmount();
 }
 
+/// Audit slice 002 (the no-op-commit-churn fix): the keeperd watcher's dirty-set
+/// `accept()` filter caches the exclusion set from [`MountHandle::inmem_ignore`]
+/// so it can drop user-`.softfigignore`'d paths on the fuser worker thread
+/// *without* `std::fs`-reading the mount it serves (the slice-003 reentrant
+/// deadlock). This proves the seam it caches from: `inmem_ignore` reflects the
+/// committed-tip `.softfigignore`, and — crucially for "takes effect on the next
+/// save" — an *uncommitted* overlay edit too, since the FUSE write handler
+/// updates the overlay before the sink fires. No read goes back through the mount.
+#[test]
+fn inmem_ignore_reflects_the_softfigignore_including_an_uncommitted_overlay_edit() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping inmem_ignore: /dev/fuse unavailable in this environment");
+        return;
+    }
+    let _mount_guard = MOUNT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let state = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+
+    // Genesis tip excludes `scratch`.
+    write(staging.path(), "a.md", b"genesis");
+    write(staging.path(), ".softfigignore", b"scratch\n");
+    let handle = mount_genesis(state.path(), staging.path(), mount.path());
+
+    // From the committed tip: built-ins (`.softfig`, `.claude`) ∪ `scratch`.
+    let ig = handle.inmem_ignore().expect("inmem_ignore from tip");
+    assert!(ig.is_ignored(Path::new("scratch/junk.md")));
+    assert!(ig.is_ignored(Path::new(".softfig/objects/aa/bb"))); // built-in
+    assert!(ig.is_ignored(Path::new(".claude/settings.local.json"))); // built-in
+    assert!(!ig.is_ignored(Path::new("journal/decisions/d.md")));
+    assert!(!ig.is_ignored(Path::new("notes/n.md"))); // not yet listed
+
+    // Edit `.softfigignore` through the mount to also exclude `notes`. The write
+    // lands in the overlay; `inmem_ignore` takes overlay precedence, so the new
+    // rule is in force *before* any commit — the exact freshness the watcher's
+    // accept cache relies on, reconstructed with no read back through the mount.
+    fs::write(mount.path().join(".softfigignore"), b"scratch\nnotes\n").unwrap();
+    let ig2 = handle.inmem_ignore().expect("inmem_ignore from overlay");
+    assert!(ig2.is_ignored(Path::new("notes/n.md")));
+    assert!(ig2.is_ignored(Path::new("scratch/junk.md")));
+    assert!(!ig2.is_ignored(Path::new("journal/decisions/d.md")));
+
+    handle.unmount();
+}
+
 /// Regression for the HIGH data-loss finding `kernel-rename-directory-data-loss`
 /// (audit slice 002). A human-facing `mv dir newdir` through the kernel must
 /// re-key every descendant under the new prefix, not materialize a 0-byte file

@@ -147,6 +147,22 @@ impl MountHandle {
         self.state.workdir_snapshot()
     }
 
+    /// The exclusion set (built-in defaults ∪ the user `.softfigignore`) in
+    /// force for this garden, reconstructed from the FUSE driver's in-memory
+    /// state (overlay precedence, else the committed tip blob) — never read
+    /// back through the mount it serves.
+    ///
+    /// The keeperd watcher caches the result so its dirty-set `accept()` filter
+    /// can drop user-ignored paths *on the fuser worker thread* without a
+    /// `std::fs`-read of `<mount>/.softfigignore`, whose kernel LOOKUP only the
+    /// same blocked worker could service — the self-walk-under-mount reentrant
+    /// deadlock (audit slice 003). The daemon refreshes its cache from here
+    /// whenever `.softfigignore` changes; the edit is already in the overlay
+    /// before the `DirtyEventSink` fires, so the returned set reflects it.
+    pub fn inmem_ignore(&self) -> Result<softfig_vcs::ignore::Ignore> {
+        self.state.inmem_ignore()
+    }
+
     // ===== Overlay-staging + in-memory queries (slice 3b) =====
     //
     // The daemon's M3a write verbs route their working-tree reads and writes

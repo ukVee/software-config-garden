@@ -14,14 +14,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use softfig_vcs::{ignore, Intent};
+use softfig_vcs::ignore::{Ignore, IGNORE_FILE};
+use softfig_vcs::Intent;
 
 use crate::classify::{self, DirtySet};
 use crate::daemon::{Daemon, DaemonInner, SUPPRESS_WINDOW_MS};
@@ -85,7 +87,9 @@ impl Buffer {
 /// classification is non-empty) committed via `commit_workdir`.
 ///
 /// Filters applied at push time:
-/// - `.softfig/` paths (daemon-internal state).
+/// - VCS-ignored paths — the built-in set (`.softfig`, `.claude`) ∪ the
+///   user's `.softfigignore` entries, via the cached in-memory [`Ignore`]
+///   below (never a mount read; see [`Self::accept`]).
 /// - Paths the daemon has marked as self-writes (per the 500 ms
 ///   suppress map keyed off the user-visible garden root).
 ///
@@ -101,6 +105,16 @@ pub struct DirtySetAccumulator {
     /// joins against this path either way).
     garden_root: PathBuf,
     buffer: Mutex<Buffer>,
+    /// Cached exclusion set (built-in defaults ∪ the user `.softfigignore`)
+    /// consulted by [`Self::accept`] on the fuser worker thread. Rebuilt from
+    /// the daemon's *in-memory* state by [`Self::refresh_ignore`] whenever
+    /// `.softfigignore` changes — **never** a `std::fs`-read of the mount
+    /// (audit slice-003 reentrant deadlock). A leaf lock: only ever held alone.
+    cached_ignore: RwLock<Ignore>,
+    /// Set when `.softfigignore` is observed to change (and once at startup so
+    /// a pre-existing file is honored from the first event). The next
+    /// [`Self::push`] rebuilds `cached_ignore` before filtering, then clears it.
+    ignore_dirty: AtomicBool,
 }
 
 impl DirtySetAccumulator {
@@ -114,6 +128,11 @@ impl DirtySetAccumulator {
             suppress,
             garden_root,
             buffer: Mutex::new(Buffer::default()),
+            // Built-ins until the first refresh; `ignore_dirty` starts true so
+            // the first push rebuilds from state (honoring a pre-existing
+            // `.softfigignore`) before any path is filtered.
+            cached_ignore: RwLock::new(Ignore::builtin()),
+            ignore_dirty: AtomicBool::new(true),
         })
     }
 
@@ -125,6 +144,18 @@ impl DirtySetAccumulator {
     /// (false = filtered for `.softfig/` or suppress map; for renames,
     /// only false when both sides are filtered).
     pub fn push(&self, ev: DirtyEvent) -> bool {
+        // Rebuild the cached ignore set if a prior push saw `.softfigignore`
+        // change (or on first use) — from the daemon's in-memory state, never a
+        // read of the mount. Done before taking the buffer lock so the refresh
+        // (which briefly takes `inner`) never nests under `buffer`.
+        self.ensure_ignore_fresh();
+        // Flag a rebuild if THIS event touches `.softfigignore`: the edit is
+        // already in the FUSE overlay (the write handler updates it before
+        // firing the sink), so the next push's `ensure_ignore_fresh` reflects it
+        // ("takes effect on the next save").
+        if event_touches_ignore_file(&ev) {
+            self.ignore_dirty.store(true, Ordering::Release);
+        }
         let mut buf = self.buffer.lock().unwrap();
         match ev {
             DirtyEvent::Created(p) => {
@@ -297,33 +328,70 @@ impl DirtySetAccumulator {
     /// True if the path should be buffered: not VCS-ignored and not currently
     /// in the daemon's self-write suppression map.
     ///
-    /// The ignore test here is the **pure built-in predicate**
-    /// (`softfig_vcs::ignore::is_ignored` — `.softfig`, `.claude`) and reads
-    /// nothing from disk. It must not read disk: in FUSE mode `self.garden_root`
-    /// IS the mount this code runs against, and the fuser worker thread calls
-    /// the dirty-set sink synchronously, so an `Ignore::load` of
-    /// `<root>/.softfigignore` would issue a read whose kernel LOOKUP only the
-    /// same blocked worker can service — the self-walk-under-mount reentrant
-    /// deadlock (audit slice 003; the `.softfigignore` feature reintroduced it
-    /// and it is reverted here).
+    /// The ignore test consults the cached [`Ignore`] — the built-in defaults
+    /// (`.softfig`, `.claude`) ∪ the user's `.softfigignore` — and reads
+    /// **nothing from disk**. It must not read disk: in FUSE mode
+    /// `self.garden_root` IS the mount this code runs against, and the fuser
+    /// worker thread calls the dirty-set sink synchronously, so an
+    /// `Ignore::load` of `<root>/.softfigignore` would issue a read whose kernel
+    /// LOOKUP only the same blocked worker can service — the
+    /// self-walk-under-mount reentrant deadlock (audit slice 003).
     ///
-    /// The push-time filter is only an optimization. The user-overridable
-    /// `.softfigignore` set is still enforced authoritatively at commit time
-    /// from in-memory state — `workdir_snapshot`/`inmem_ignore` (FUSE) and
-    /// `walk()` (direct) build the full `Ignore` and re-apply it — so a
-    /// user-ignored path is never committed; it just isn't dropped quite this
-    /// early. Restoring early user-entry filtering without a mount read (a
-    /// cached in-memory `Ignore`, refreshed only when `.softfigignore` itself
-    /// changes) is deferred to task 005.
+    /// Audit slice 002 restores the early *user*-ignore filtering that slice 003
+    /// had to drop: [`Self::refresh_ignore`] rebuilds `cached_ignore` from the
+    /// daemon's in-memory state (the FUSE overlay∪tip via
+    /// [`MountHandle::inmem_ignore`], or a direct-mode real-dir load) whenever
+    /// `.softfigignore` changes — never a mount read. So a user-ignored path
+    /// never enters the dirty set, and no `manual_edit` commit is minted whose
+    /// payload names a file its own diff excludes (the no-op-commit churn).
+    /// Commit-time enforcement from in-memory state remains the backstop.
     fn accept(&self, rel: &str) -> bool {
         let p = Path::new(rel);
-        if ignore::is_ignored(p) {
+        if self.cached_ignore.read().unwrap().is_ignored(p) {
             return false;
         }
         if self.is_self_write(&self.garden_root.join(rel)) {
             return false;
         }
         true
+    }
+
+    /// Rebuild [`Self::cached_ignore`] if a prior push flagged a
+    /// `.softfigignore` change (or on first use). Claims the flag with a `swap`
+    /// so a change racing the rebuild re-flags rather than being lost: the next
+    /// call rebuilds again.
+    fn ensure_ignore_fresh(&self) {
+        if self.ignore_dirty.swap(false, Ordering::AcqRel) {
+            self.refresh_ignore();
+        }
+    }
+
+    /// Rebuild the cached exclusion set from the daemon's **in-memory** view:
+    /// the FUSE overlay∪tip snapshot ([`MountHandle::inmem_ignore`]), or — in
+    /// direct mode, where `garden_root` is a real dir and not a mount — a plain
+    /// [`Ignore::load`] (the same source the flush path's `walk` reads). NEVER a
+    /// read of the FUSE mount: in FUSE mode this runs on the fuser worker thread
+    /// (via `push` ← the sink), so a `std::fs`-read of `<mount>/.softfigignore`
+    /// would deadlock on the same worker (audit slice 003). Lock order
+    /// `inner → fuse.SharedState.inner` matches `flush`; no buffer lock is held.
+    fn refresh_ignore(&self) {
+        let rebuilt = {
+            let inner = self.inner.lock().unwrap();
+            match inner.fuse.as_ref() {
+                Some(mount) => match mount.inmem_ignore() {
+                    Ok(ig) => ig,
+                    Err(e) => {
+                        // Keep the prior cache; commit-time enforcement still
+                        // excludes the path. Don't re-flag (a persistent decrypt
+                        // error must not hot-loop the `inner` lock every push).
+                        eprintln!("keeperd: watcher: in-memory ignore refresh failed: {e}");
+                        return;
+                    }
+                },
+                None => Ignore::load(&inner.config.garden_root),
+            }
+        };
+        *self.cached_ignore.write().unwrap() = rebuilt;
     }
 
     fn is_self_write(&self, path: &Path) -> bool {
@@ -532,6 +600,18 @@ pub fn spawn_with_target(daemon: Daemon, watch_target: PathBuf) -> std::thread::
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
+/// True if a dirty event touches the garden's `.softfigignore` (either side of
+/// a rename). Used to flag a rebuild of the cached ignore set.
+fn event_touches_ignore_file(ev: &DirtyEvent) -> bool {
+    let is_ignore_file = |p: &str| p == IGNORE_FILE;
+    match ev {
+        DirtyEvent::Created(p) | DirtyEvent::Modified(p) | DirtyEvent::Removed(p) => {
+            is_ignore_file(p)
+        }
+        DirtyEvent::Renamed { from, to } => is_ignore_file(from) || is_ignore_file(to),
+    }
+}
+
 /// Strip the canonical watch root and return a repo-relative path string,
 /// or `None` if the absolute path is outside the root.
 fn repo_relative(abs: &Path, garden_root: &Path, watch_root: &Path) -> Option<String> {
@@ -555,11 +635,12 @@ fn repo_relative(abs: &Path, garden_root: &Path, watch_root: &Path) -> Option<St
 mod tests {
     use super::*;
     use crate::config::KeeperConfig;
-    use softfig_vcs::ignore::Ignore;
 
-    /// Build a bare accumulator whose `garden_root` is `root`. Only `accept`
-    /// is exercised, which touches `garden_root` + the (empty) suppress map —
-    /// never `inner` — so a default `DaemonInner` is enough.
+    /// Build a bare accumulator whose `garden_root` is `root`. A default
+    /// `DaemonInner` (`fuse: None`, state `Locked`) is enough: `accept` touches
+    /// only `cached_ignore` + the (empty) suppress map, and a `push`-driven
+    /// `refresh_ignore` takes the direct-mode `Ignore::load(garden_root)` branch
+    /// (no FUSE mount to reconstruct from).
     fn accumulator_rooted_at(root: &Path) -> Arc<DirtySetAccumulator> {
         let inner = Arc::new(Mutex::new(DaemonInner::new(KeeperConfig::new(root))));
         let suppress = Arc::new(Mutex::new(HashMap::new()));
@@ -602,6 +683,77 @@ mod tests {
         assert!(!acc.accept(".claude/settings.local.json"));
         assert!(acc.accept("a.md"));
         assert!(acc.accept("scratch/notes.md"));
+    }
+
+    #[test]
+    fn a_user_ignored_path_is_dropped_once_the_cache_is_loaded() {
+        // Audit slice 002, criterion (a): with `.softfigignore` listing
+        // `scratch`, a `scratch/...` write is filtered *before* it enters the
+        // dirty set — closing the no-op-commit churn at the accept gate. (Direct
+        // mode exercises the refresh wiring: `fuse: None` → `Ignore::load` of the
+        // real dir. In FUSE mode the same set comes from the in-memory
+        // overlay∪tip via `MountHandle::inmem_ignore`; that is the on-device
+        // "doesn't hang" smoke, not runnable headlessly.)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".softfigignore"), "scratch\n").unwrap();
+        let acc = accumulator_rooted_at(dir.path());
+
+        // A bare `accept` (no push) still sees only the built-ins — the
+        // slice-003 posture that the hot path itself never reads disk.
+        assert!(acc.accept("scratch/x.md"));
+
+        // The first push refreshes the cache from state (ignore_dirty starts
+        // true), so the user-ignored path is NOT buffered.
+        assert!(!acc.push(DirtyEvent::Modified("scratch/x.md".to_string())));
+        // Built-ins are never lost when user entries are layered on.
+        assert!(!acc.accept(".softfig/objects/aa/bb"));
+        assert!(!acc.accept(".claude/settings.local.json"));
+        // A non-ignored sibling is still tracked (criterion c).
+        assert!(acc.push(DirtyEvent::Modified("journal/decisions/d.md".to_string())));
+    }
+
+    #[test]
+    fn editing_softfigignore_takes_effect_on_the_next_push() {
+        // Audit slice 002, criterion (b): adding an entry to `.softfigignore`
+        // filters the newly-ignored path on the next save. The refresh is driven
+        // off the `.softfigignore` change itself, and the accept hot path never
+        // reads disk (proven by the slice-003 reentrancy tests above).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".softfigignore"), "# nothing yet\n").unwrap();
+        let acc = accumulator_rooted_at(dir.path());
+
+        // `scratch` is tracked while it isn't listed.
+        assert!(acc.push(DirtyEvent::Modified("scratch/x.md".to_string())));
+
+        // User adds `scratch` and saves `.softfigignore`.
+        std::fs::write(dir.path().join(".softfigignore"), "scratch\n").unwrap();
+        // The save of `.softfigignore` is itself tracked and flags a rebuild.
+        assert!(acc.push(DirtyEvent::Modified(".softfigignore".to_string())));
+
+        // The next save of `scratch/x` is now filtered.
+        assert!(!acc.push(DirtyEvent::Modified("scratch/x.md".to_string())));
+    }
+
+    #[test]
+    fn event_touches_ignore_file_flags_only_the_ignore_file() {
+        assert!(event_touches_ignore_file(&DirtyEvent::Modified(
+            ".softfigignore".to_string()
+        )));
+        assert!(event_touches_ignore_file(&DirtyEvent::Removed(
+            ".softfigignore".to_string()
+        )));
+        // A rename into or out of `.softfigignore` counts on either side.
+        assert!(event_touches_ignore_file(&DirtyEvent::Renamed {
+            from: "journal/archive/old-ignore".to_string(),
+            to: ".softfigignore".to_string(),
+        }));
+        // Nested or similarly-named paths do not.
+        assert!(!event_touches_ignore_file(&DirtyEvent::Modified(
+            "docs/.softfigignore".to_string()
+        )));
+        assert!(!event_touches_ignore_file(&DirtyEvent::Modified(
+            "a.md".to_string()
+        )));
     }
 
     #[test]

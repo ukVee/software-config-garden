@@ -194,7 +194,11 @@ impl SharedState {
     /// `.softfigignore` (overlay precedence, else the committed tip blob)
     /// so reconstruction never `std::fs`-reads it back through the mount.
     /// Absent/removed/dir-shaped ⇒ the built-in defaults only.
-    fn inmem_ignore(&self) -> Result<Ignore> {
+    ///
+    /// `pub(crate)` so [`MountHandle::inmem_ignore`] can hand the keeperd
+    /// watcher this same in-memory set for its `accept()` push-time filter —
+    /// never a `std::fs`-read of the mount (audit slice-003 reentrancy).
+    pub(crate) fn inmem_ignore(&self) -> Result<Ignore> {
         let blob = {
             let inner = self.inner.lock().unwrap();
             let path = Path::new(IGNORE_FILE);
