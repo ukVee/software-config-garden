@@ -32,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -377,6 +377,9 @@ pub struct NetRuntime {
     /// surfaces it as the pick-list.
     discovery_cache: Arc<Mutex<HashMap<String, DiscoveredEntry>>>,
     stop: Arc<AtomicBool>,
+    /// Wakes the replica push loop on each local commit (slice 1 event-driven
+    /// push). Signalled by the daemon's commit drivers via [`Self::signal_commit`].
+    replica_signal: Arc<ReplicaSignal>,
     threads: Vec<JoinHandle<()>>,
     /// The mDNS daemon handle + the registered fullname, retained to
     /// unregister + shut down on drop.
@@ -496,18 +499,34 @@ impl NetRuntime {
 
         // M5b: the owner-side replica push loop. Outbound-only, so it runs even
         // if the inbound listener failed to bind; it no-ops when this device has
-        // granted no hosts (empty push_to).
-        threads.push(spawn_replica_loop(daemon.clone(), local.clone(), stop.clone()));
+        // granted no hosts (empty push_to). Slice 1: woken event-driven on each
+        // local commit via `replica_signal`, with the interval as the fallback.
+        let replica_signal = Arc::new(ReplicaSignal::default());
+        threads.push(spawn_replica_loop(
+            daemon.clone(),
+            local.clone(),
+            stop.clone(),
+            replica_signal.clone(),
+        ));
 
         Self {
             ring,
             discovery_cache,
             stop,
+            replica_signal,
             threads,
             mdns,
             listen_addr,
             relay_listen,
         }
+    }
+
+    /// Wake the replica push loop after a local commit advanced the tip, so the
+    /// owner pushes to online granted hosts immediately instead of waiting on the
+    /// next reconcile tick. Called by the daemon's commit drivers; cheap + never
+    /// blocks (the actual push runs on the replica thread, off the caller).
+    pub fn signal_commit(&self) {
+        self.replica_signal.signal_commit();
     }
 
     /// Look up an endpoint for `fingerprint` (full or unique prefix) from the
@@ -553,6 +572,9 @@ impl NetRuntime {
 impl Drop for NetRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Wake the replica loop out of its condvar wait so it observes `stop`
+        // promptly instead of parking up to a full reconcile interval.
+        self.replica_signal.signal_stop();
         if let Some((svc, fullname)) = self.mdns.take() {
             let _ = svc.unregister(&fullname);
             let _ = svc.shutdown();
@@ -873,36 +895,90 @@ fn start_relay(
 
 // --- M5b owner-side replica push loop ---------------------------------------
 
-/// The owner's replica reconcile loop. Every [`REPLICA_RECONCILE_INTERVAL`] it
-/// re-pushes this device's chain to each granted host that has a known endpoint.
-/// Outbound-only; quiet when nothing is granted or no host is reachable.
+/// Wakes the owner-side replica push loop the instant a local commit advances the
+/// tip, so replication fires **event-driven** rather than on the ~20s reconcile
+/// poll (M5b-hardening slice 1). The keeper authors every commit, so the daemon's
+/// commit drivers ([`crate::actions::commit_now`] + the watcher flush) signal this
+/// on each successful tip advance. The periodic reconcile stays as the offline
+/// catch-up fallback — a host offline at commit time still converges on a later
+/// tick, so no commit-time queue is needed.
+#[derive(Default)]
+struct ReplicaSignal {
+    state: Mutex<ReplicaSignalState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct ReplicaSignalState {
+    /// A tip-advancing commit landed since the loop last drained the flag.
+    commit: bool,
+    /// The runtime is shutting down: wake and exit without a final reconcile.
+    stop: bool,
+}
+
+impl ReplicaSignal {
+    /// Note a local commit and wake the push loop out of its interval sleep.
+    fn signal_commit(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.commit = true;
+        self.cv.notify_all();
+    }
+
+    /// Wake the push loop for shutdown so it exits promptly instead of parking
+    /// until the reconcile interval elapses.
+    fn signal_stop(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.stop = true;
+        self.cv.notify_all();
+    }
+
+    /// Block up to `dur` waiting for a commit signal. Returns `true` if a commit
+    /// woke it (draining the flag), `false` on timeout or shutdown. The mutex is
+    /// released while parked and never held across the caller's reconcile.
+    fn wait_for_commit(&self, dur: Duration) -> bool {
+        let mut s = self.state.lock().unwrap();
+        let deadline = Instant::now() + dur;
+        loop {
+            if s.stop {
+                return false;
+            }
+            if s.commit {
+                s.commit = false;
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, _timeout) = self.cv.wait_timeout(s, deadline - now).unwrap();
+            s = guard;
+        }
+    }
+}
+
+/// The owner's replica push loop. It reconciles immediately on each local commit
+/// (woken via [`ReplicaSignal`]) and otherwise every [`REPLICA_RECONCILE_INTERVAL`]
+/// as the offline catch-up fallback, re-pushing this device's chain to each
+/// granted host that has a known endpoint. Outbound-only; quiet when nothing is
+/// granted or no host is reachable.
 fn spawn_replica_loop(
     daemon: Daemon,
     local: LocalDevice,
     stop: Arc<AtomicBool>,
+    signal: Arc<ReplicaSignal>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("keeperd-net-replica".into())
         .spawn(move || {
-            sleep_with_stop(&stop, REPLICA_INITIAL_DELAY);
+            // Short settle so unlock finishes wiring before the first push; an
+            // early commit during the settle brings the reconcile forward.
+            signal.wait_for_commit(REPLICA_INITIAL_DELAY);
             while !stop.load(Ordering::SeqCst) {
                 reconcile_replicas(&daemon, &local);
-                sleep_with_stop(&stop, REPLICA_RECONCILE_INTERVAL);
+                signal.wait_for_commit(REPLICA_RECONCILE_INTERVAL);
             }
         })
         .expect("spawn net replica thread")
-}
-
-/// Sleep up to `dur`, waking early (within [`POLL_MS`]) if `stop` is set, so a
-/// lock/shutdown stops the loop promptly.
-fn sleep_with_stop(stop: &Arc<AtomicBool>, dur: Duration) {
-    let deadline = Instant::now() + dur;
-    while Instant::now() < deadline {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(POLL_MS));
-    }
 }
 
 /// One reconcile pass: snapshot the signed announce + per-host grants under the
@@ -1138,6 +1214,83 @@ mod tests {
         assert_eq!(
             names,
             vec![None, Some("apple".into()), Some("banana".into())]
+        );
+    }
+
+    // --- slice 1: event-driven replica push signal ---------------------------
+
+    /// A commit signalled while the push loop is parked must cut its interval
+    /// sleep short — the whole point of slice 1 (push fires event-driven, not on
+    /// the ~20s reconcile poll).
+    #[test]
+    fn replica_signal_commit_wakes_before_the_reconcile_interval() {
+        let signal = Arc::new(ReplicaSignal::default());
+        let waiter = {
+            let signal = signal.clone();
+            thread::spawn(move || {
+                let start = Instant::now();
+                // Park for a full reconcile interval; a commit must cut it short.
+                let woke = signal.wait_for_commit(REPLICA_RECONCILE_INTERVAL);
+                (woke, start.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_millis(50)); // let the waiter park
+        signal.signal_commit();
+        let (woke, elapsed) = waiter.join().unwrap();
+        assert!(woke, "commit signal should wake the parked push loop");
+        assert!(
+            elapsed < REPLICA_RECONCILE_INTERVAL / 2,
+            "woke after {elapsed:?} — not event-driven"
+        );
+    }
+
+    /// Without a commit the wait falls back to the interval (the offline
+    /// catch-up path) and reports a timeout, not a spurious wake.
+    #[test]
+    fn replica_signal_falls_back_to_the_interval_without_a_commit() {
+        let signal = ReplicaSignal::default();
+        let start = Instant::now();
+        let woke = signal.wait_for_commit(Duration::from_millis(80));
+        assert!(!woke, "no commit → should time out, not wake");
+        assert!(start.elapsed() >= Duration::from_millis(70));
+    }
+
+    /// A commit signalled just before the loop parks must not be lost, and the
+    /// flag drains so the next wait times out normally.
+    #[test]
+    fn replica_signal_commit_before_wait_is_not_lost() {
+        let signal = ReplicaSignal::default();
+        signal.signal_commit();
+        assert!(
+            signal.wait_for_commit(Duration::from_millis(0)),
+            "a commit set before waiting must still wake"
+        );
+        assert!(
+            !signal.wait_for_commit(Duration::from_millis(20)),
+            "the flag should have drained on the first wait"
+        );
+    }
+
+    /// Shutdown wakes a parked loop promptly (returns `false`, not a commit), so
+    /// `NetRuntime::drop` doesn't block on a full interval before joining.
+    #[test]
+    fn replica_signal_stop_wakes_the_waiter_for_shutdown() {
+        let signal = Arc::new(ReplicaSignal::default());
+        let waiter = {
+            let signal = signal.clone();
+            thread::spawn(move || {
+                let start = Instant::now();
+                let woke = signal.wait_for_commit(REPLICA_RECONCILE_INTERVAL);
+                (woke, start.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        signal.signal_stop();
+        let (woke, elapsed) = waiter.join().unwrap();
+        assert!(!woke, "stop wakes the waiter but is not a commit");
+        assert!(
+            elapsed < REPLICA_RECONCILE_INTERVAL / 2,
+            "stop should wake promptly, took {elapsed:?}"
         );
     }
 }

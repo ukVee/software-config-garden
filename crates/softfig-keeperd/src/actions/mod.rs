@@ -104,12 +104,21 @@ pub(crate) fn commit_now(
         None => None,
     };
     let hook = inner.layer_b.clone();
-    let session = inner.session.as_ref().expect("unlocked");
-    let repo = inner.repo.as_mut().expect("unlocked");
-    let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
-    match fuse_snapshot {
-        Some(snapshot) => repo.commit_snapshot(session, snapshot, intent),
-        None => repo.commit_workdir(session, intent),
+    let hash = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_mut().expect("unlocked");
+        let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
+        match fuse_snapshot {
+            Some(snapshot) => repo.commit_snapshot(session, snapshot, intent),
+            None => repo.commit_workdir(session, intent),
+        }
+        .map_err(|e| err_to_response(e.into()))?
+    };
+    // Slice 1 (M5b-hardening): a tip-advancing commit landed — wake the replica
+    // push loop so it pushes to online granted hosts now, instead of on the next
+    // ~20s reconcile tick. No-op when net is down or nothing is granted.
+    if let Some(net) = inner.net.as_ref() {
+        net.signal_commit();
     }
-    .map_err(|e| err_to_response(e.into()))
+    Ok(hash)
 }

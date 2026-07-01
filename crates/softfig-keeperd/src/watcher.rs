@@ -320,8 +320,16 @@ impl DirtySetAccumulator {
         hook.install_prior_tip(prior_snap);
         let result = repo.commit_snapshot(&session, snapshot, intent);
         hook.clear_prior_tip();
-        if let Err(e) = result {
-            eprintln!("keeperd: watcher: commit failed: {e}");
+        match result {
+            Ok(_) => {
+                // Slice 1 (M5b-hardening): an auto-commit advanced the tip — wake
+                // the replica push loop so backups fire event-driven, not on the
+                // ~20s reconcile poll. No-op when net is down / nothing granted.
+                if let Some(net) = inner.net.as_ref() {
+                    net.signal_commit();
+                }
+            }
+            Err(e) => eprintln!("keeperd: watcher: commit failed: {e}"),
         }
     }
 
