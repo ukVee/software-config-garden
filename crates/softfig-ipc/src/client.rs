@@ -38,12 +38,40 @@ impl ClientError {
     }
 }
 
-/// Connect to the daemon socket. Sets a generous read/write timeout so a
-/// hung daemon surfaces as `Io` rather than wedging the caller.
+/// The one-shot request/response timeout: long enough that a healthy daemon
+/// always replies inside it, short enough that a hung daemon surfaces as `Io`
+/// rather than wedging the caller.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connect to the daemon socket for a one-shot request/response verb. Sets a
+/// generous read/write timeout so a hung daemon surfaces as `Io` rather than
+/// wedging the caller.
+///
+/// Do NOT use this for a long-lived streaming verb (e.g. growlightd's
+/// `subscribe`/`watch`): the read timeout fires whenever the stream is idle for
+/// its duration, surfacing an EAGAIN/`WouldBlock` (os error 11) as a fatal read
+/// error. Use [`connect_stream`] for those.
 pub fn connect(path: &Path) -> Result<UnixStream, ClientError> {
     let stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(CALL_TIMEOUT))?;
+    stream.set_write_timeout(Some(CALL_TIMEOUT))?;
+    Ok(stream)
+}
+
+/// Connect to the daemon socket for a long-lived **streaming** verb (growlightd's
+/// `subscribe`/`watch`, spec §13 Observe). Unlike [`connect`], the read side has
+/// **no** timeout: a subscribe reader must block indefinitely for the next event
+/// frame, and the stream ends only on EOF (the daemon stopped / closed the
+/// connection) or the caller's interrupt (Ctrl-C) — the verb's contract. A read
+/// timeout here would turn an idle stream (no events for the timeout window) into
+/// a spurious `WouldBlock`/EAGAIN (os error 11) and kill the stream. The write
+/// side keeps the bounded [`CALL_TIMEOUT`] so the initial `subscribe` request
+/// write can't wedge on a daemon that isn't reading.
+pub fn connect_stream(path: &Path) -> Result<UnixStream, ClientError> {
+    let stream = UnixStream::connect(path)?;
+    // Leave the read timeout unset (blocking) — the stream blocks for the next
+    // frame. Only bound the write, for the one request we send up front.
+    stream.set_write_timeout(Some(CALL_TIMEOUT))?;
     Ok(stream)
 }
 
@@ -220,5 +248,65 @@ pub fn call_reconnecting(
                 backoff = (backoff * 2).min(policy.max_backoff);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A unique, self-cleaning socket path under the temp dir — no external dep,
+    /// no clock/rng (unavailable), just pid + a per-run counter.
+    struct SocketPath(PathBuf);
+
+    impl SocketPath {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "softfig-ipc-test-{tag}-{}-{n}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&p);
+            Self(p)
+        }
+    }
+
+    impl Drop for SocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // Regression: the one-shot `connect` bounds the read side so a hung daemon
+    // can't wedge a caller — the timeout that is *wrong* for a stream.
+    #[test]
+    fn connect_bounds_both_read_and_write() {
+        let path = SocketPath::new("call");
+        let _listener = UnixListener::bind(&path.0).unwrap();
+        let stream = connect(&path.0).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), Some(CALL_TIMEOUT));
+        assert_eq!(stream.write_timeout().unwrap(), Some(CALL_TIMEOUT));
+    }
+
+    // Regression for the `growlight watch` EAGAIN: a subscribe stream must NOT
+    // carry a read timeout. With one, an idle daemon (no events for the timeout
+    // window) makes the reader return `WouldBlock`/EAGAIN (os error 11), which
+    // the watch loop surfaces as a fatal error. `connect_stream` leaves the read
+    // side blocking so it waits for the next event instead — the write side stays
+    // bounded for the one-shot subscribe request.
+    #[test]
+    fn connect_stream_leaves_the_read_side_blocking() {
+        let path = SocketPath::new("stream");
+        let _listener = UnixListener::bind(&path.0).unwrap();
+        let stream = connect_stream(&path.0).unwrap();
+        assert_eq!(
+            stream.read_timeout().unwrap(),
+            None,
+            "a streaming read must block for the next frame, never time out into EAGAIN",
+        );
+        assert_eq!(stream.write_timeout().unwrap(), Some(CALL_TIMEOUT));
     }
 }

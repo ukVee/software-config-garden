@@ -1609,7 +1609,11 @@ fn stop_level_label(level: StopLevel) -> &'static str {
 /// `tests/subscribe_stream.rs`.
 fn client_watch(args: ClientArgs) -> Result<()> {
     let socket = growlight_socket(args.socket);
-    let mut stream = softfig_ipc::connect(&socket).map_err(|e| {
+    // `subscribe` is a long-lived stream: connect WITHOUT a read timeout so an
+    // idle daemon (no events) blocks for the next frame instead of the read
+    // timing out into a fatal EAGAIN (os error 11). Ctrl-C / EOF are the only
+    // exits — the verb's contract. (One-shot verbs use `softfig_ipc::connect`.)
+    let mut stream = softfig_ipc::connect_stream(&socket).map_err(|e| {
         if e.is_daemon_absent() {
             anyhow!(
                 "no growlightd listening at {} — is the orchestrator daemon running?",
