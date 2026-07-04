@@ -90,6 +90,14 @@ pub enum NotifyEvent {
     AgentCrashed {
         /// The crashed agent's name.
         agent: String,
+        /// The tail of the crashed agent's stderr (crash-diagnostics slice 001):
+        /// the last few in-memory ring-buffer lines (oldest→newest), so the alert
+        /// carries a *reason* (e.g. a lost-connection error) — not just a non-zero
+        /// exit. Empty when the agent emitted no stderr, or the child never ran (a
+        /// spawn failure). NOT part of the dedup identity — [`dedup_key`](Self::dedup_key)
+        /// keys on the agent alone, so a re-crash with different stderr still dedups
+        /// per cooldown window.
+        stderr_tail: Vec<String>,
     },
     /// The thrash detector tripped on a contended target (§4d rung 1).
     ThrashDetected {
@@ -107,6 +115,28 @@ pub enum NotifyEvent {
 }
 
 impl NotifyEvent {
+    /// An [`AgentCrashed`](Self::AgentCrashed) with no stderr tail yet. The
+    /// supervisor builds it this way (it has no backend to read stderr from); the
+    /// drive loop enriches it via [`with_stderr_tail`](Self::with_stderr_tail)
+    /// before dispatch. Also the right shape for a *spawn* failure — the child never
+    /// ran, so there is no stderr to carry.
+    pub fn agent_crashed(agent: impl Into<String>) -> Self {
+        Self::AgentCrashed {
+            agent: agent.into(),
+            stderr_tail: Vec::new(),
+        }
+    }
+
+    /// Attach a crashed agent's stderr tail (crash-diagnostics slice 001), returning
+    /// the enriched event. A no-op on any non-[`AgentCrashed`](Self::AgentCrashed)
+    /// event, so the drive loop can call it uniformly on whatever `poll` returned.
+    pub fn with_stderr_tail(mut self, tail: Vec<String>) -> Self {
+        if let Self::AgentCrashed { stderr_tail, .. } = &mut self {
+            *stderr_tail = tail;
+        }
+        self
+    }
+
     /// Whether this event belongs to the human-attention set — the events that
     /// additionally route to the phone (§9/§10). These stall the fleet or need a
     /// human decision; everything else is GUI/log only.
@@ -143,7 +173,7 @@ impl NotifyEvent {
             Self::BlockedOnHuman { item } => format!("blocked:{item}"),
             Self::QueueEmpty { queue } => format!("queue-empty:{queue}"),
             Self::SliceComplete { part } => format!("slice-complete:{part}"),
-            Self::AgentCrashed { agent } => format!("agent-crashed:{agent}"),
+            Self::AgentCrashed { agent, .. } => format!("agent-crashed:{agent}"),
             Self::ThrashDetected { target } => format!("thrash:{target}"),
             Self::LeaseDenied { key, agent } => format!("lease-denied:{key}:{agent}"),
         }
@@ -160,7 +190,16 @@ impl NotifyEvent {
             }
             Self::QueueEmpty { queue } => format!("queue `{queue}` is empty — no workable part"),
             Self::SliceComplete { part } => format!("slice `{part}` complete"),
-            Self::AgentCrashed { agent } => format!("agent `{agent}` crashed"),
+            Self::AgentCrashed { agent, stderr_tail } => {
+                if stderr_tail.is_empty() {
+                    format!("agent `{agent}` crashed")
+                } else {
+                    // The tail rides the one-line alert body so `growlight watch`
+                    // and the log show the crash *reason*; lines joined with a
+                    // visible separator (the ring already bounds it).
+                    format!("agent `{agent}` crashed: {}", stderr_tail.join(" ⏎ "))
+                }
+            }
             Self::ThrashDetected { target } => format!("thrash detected on {target}"),
             Self::LeaseDenied { key, agent } => {
                 format!("lease `{key}` denied to `{agent}`")
@@ -238,9 +277,7 @@ mod tests {
             NotifyEvent::SliceComplete {
                 part: "001".to_string(),
             },
-            NotifyEvent::AgentCrashed {
-                agent: "tab".to_string(),
-            },
+            NotifyEvent::agent_crashed("tab"),
             NotifyEvent::ThrashDetected {
                 target: "dock.rs §Layout".to_string(),
             },
@@ -267,9 +304,7 @@ mod tests {
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),
             },
-            NotifyEvent::AgentCrashed {
-                agent: "tab".to_string(),
-            },
+            NotifyEvent::agent_crashed("tab"),
         ] {
             assert!(e.is_human_attention(), "{e:?} is human-attention");
             assert_eq!(
@@ -332,9 +367,7 @@ mod tests {
         // A wholly different class at the same instant fires.
         assert!(!p
             .decide(
-                &NotifyEvent::AgentCrashed {
-                    agent: "tab".to_string()
-                },
+                &NotifyEvent::agent_crashed("tab"),
                 1
             )
             .is_empty());
@@ -384,9 +417,7 @@ mod tests {
             NotifyEvent::SliceComplete {
                 part: "001".to_string(),
             },
-            NotifyEvent::AgentCrashed {
-                agent: "tab".to_string(),
-            },
+            NotifyEvent::agent_crashed("tab"),
             NotifyEvent::ThrashDetected {
                 target: "dock.rs §Layout".to_string(),
             },
@@ -397,5 +428,31 @@ mod tests {
         ] {
             assert!(!e.summary().is_empty(), "{e:?} has a summary");
         }
+    }
+
+    /// The crash alert carries the stderr tail (crash-diagnostics slice 001): a
+    /// bare crash reads plainly, an enriched one renders the reason into the
+    /// one-line body `watch`/the log show. Enrichment never changes the dedup
+    /// identity, so a re-crash with new stderr still suppresses within a window.
+    #[test]
+    fn agent_crashed_summary_carries_the_stderr_tail_without_changing_dedup() {
+        let bare = NotifyEvent::agent_crashed("a");
+        assert_eq!(bare.summary(), "agent `a` crashed");
+
+        let enriched = NotifyEvent::agent_crashed("a")
+            .with_stderr_tail(vec!["API error: Connection reset".to_string()]);
+        assert_eq!(
+            enriched.summary(),
+            "agent `a` crashed: API error: Connection reset"
+        );
+
+        // Same subject → same dedup key regardless of the tail.
+        assert_eq!(bare.dedup_key(), enriched.dedup_key());
+
+        // `with_stderr_tail` is a no-op on a non-crash event.
+        assert_eq!(
+            NotifyEvent::Usage.with_stderr_tail(vec!["x".to_string()]),
+            NotifyEvent::Usage
+        );
     }
 }

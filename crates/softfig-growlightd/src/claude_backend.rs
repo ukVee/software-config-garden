@@ -38,7 +38,7 @@
 //! ([`pump`]), so it is unit-proven with a scripted fixture and a fake clock — no
 //! real `claude` is ever spawned in tests (the §7b on-device run is the human's).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -66,6 +66,16 @@ const UNKNOWN_EXIT: i32 = -1;
 /// Cap on a rendered tool-call argument string, so one giant `input` can't flood
 /// the event stream / GUI.
 const TOOL_RENDER_MAX_CHARS: usize = 200;
+/// How many trailing stderr lines each agent's crash-diagnostics ring buffer
+/// retains (slice 001). Bounded so a chatty child can't grow the in-memory buffer
+/// without limit; the oldest line drops once the ring is full.
+const STDERR_RING_MAX_LINES: usize = 50;
+/// Per-line cap (chars) on a retained stderr line, so one pathological line can't
+/// bloat the ring. Char-truncated (never mid-codepoint), like [`render_tool_use`].
+const STDERR_LINE_MAX_CHARS: usize = 512;
+/// How many trailing stderr lines the `AgentCrashed` alert carries (the tail
+/// surfaced to the human) — a subset of what the ring retains.
+const STDERR_ALERT_TAIL_LINES: usize = 10;
 
 /// Shared, lock-free observation of one live agent: the Unix-seconds heartbeat
 /// (bumped on every stream-json line) and the exit code once the child ends. The
@@ -225,6 +235,72 @@ impl AgentRateState {
         v.retain(|s| s.at > cutoff);
         let tokens = v.iter().map(|s| s.tokens).sum();
         (tokens, v.len() as u64)
+    }
+}
+
+/// Shared per-agent ring buffer of the child's most recent stderr lines
+/// (crash-diagnostics slice 001). growlightd launches the peer with **piped**
+/// stderr and a reader thread ([`drain_stderr`]) tails it into this bounded
+/// [`VecDeque`] (oldest dropped past [`STDERR_RING_MAX_LINES`]), so a crash carries
+/// a *reason* — not just a non-zero exit code, the gap that made the 2026-07-01
+/// wifi crash loop only inferable. Sibling to [`AgentHealthState`] /
+/// [`AgentBudgetState`]: one more decoupled observation of a live agent, held in
+/// the backend's per-agent registry and read via [`ClaudeBackend::stderr_tail`]
+/// when the supervisor classifies a crash.
+///
+/// **Intentionally in-memory + ephemeral** (SSD-wear, Surface Go 3): the buffer is
+/// lost on a growlightd restart; the crash *alert* carries the diagnostic forward,
+/// never a persisted `stderr.log`.
+#[derive(Debug, Default)]
+pub struct AgentStderrState {
+    inner: Mutex<VecDeque<String>>,
+}
+
+impl AgentStderrState {
+    /// Append one drained stderr line, char-truncated to [`STDERR_LINE_MAX_CHARS`],
+    /// dropping the oldest once the ring exceeds [`STDERR_RING_MAX_LINES`]. Called
+    /// once per non-empty line by the reader thread.
+    fn push_line(&self, line: &str) {
+        let line = if line.chars().count() > STDERR_LINE_MAX_CHARS {
+            let mut t: String = line.chars().take(STDERR_LINE_MAX_CHARS).collect();
+            t.push('…');
+            t
+        } else {
+            line.to_string()
+        };
+        let mut buf = self.inner.lock().unwrap();
+        buf.push_back(line);
+        while buf.len() > STDERR_RING_MAX_LINES {
+            buf.pop_front();
+        }
+    }
+
+    /// The last `n` retained lines (oldest→newest) — the crash-alert tail. At most
+    /// [`STDERR_RING_MAX_LINES`] are retained; `n` caps what the alert carries.
+    fn tail(&self, n: usize) -> Vec<String> {
+        let buf = self.inner.lock().unwrap();
+        let start = buf.len().saturating_sub(n);
+        buf.iter().skip(start).cloned().collect()
+    }
+}
+
+/// Drain an agent's piped stderr to EOF, appending each non-empty line into the
+/// bounded [`AgentStderrState`] ring (crash-diagnostics slice 001). The SAME
+/// deadlock-safe shape [`pump`] uses on stdout: a blocked `lines()` reader holds NO
+/// lock, so an actively-drained pipe never fills — the deadlock the old
+/// `Stdio::null()` comment warned of applies only to an *unread* pipe, not a
+/// drained one. Trailing whitespace is trimmed (leading indentation kept, so a
+/// stack trace stays readable); a blank line carries no diagnostic and is skipped.
+/// Pure over its `reader` seam: a test drives it with a scripted fixture and
+/// asserts the ring bound (oldest-dropped), no real spawn.
+fn drain_stderr<R: BufRead>(reader: R, buf: &AgentStderrState) {
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        buf.push_line(line);
     }
 }
 
@@ -557,6 +633,13 @@ pub struct ClaudeBackend {
     /// [`rate_used`](ClaudeBackend::rate_used) to feed admission's TPM/RPM gate
     /// (spec §7 second window). Re-spawn replaces the cell.
     rates: Mutex<BTreeMap<String, Arc<AgentRateState>>>,
+    /// Per-agent stderr ring buffers (crash-diagnostics slice 001), keyed by agent
+    /// id; the reader thread drains the child's piped stderr into the agent's cell,
+    /// and [`stderr_tail`](ClaudeBackend::stderr_tail) reads the tail when the drive
+    /// loop enriches an `AgentCrashed` alert. Re-spawn (re-roll) replaces the cell,
+    /// so the tail is always the CURRENT generation's — the same lifecycle as
+    /// `agents`/`budgets`/`rates`. In-memory + ephemeral by design (no `stderr.log`).
+    stderrs: Mutex<BTreeMap<String, Arc<AgentStderrState>>>,
     /// Monotonic per-spawn generation (slice 002): each spawn bumps it so the
     /// transient-scope `--unit=` name (`growlight-agent-<id>-<gen>`) is unique,
     /// closing the re-roll-vs-GC name-reuse race structurally.
@@ -603,6 +686,7 @@ impl ClaudeBackend {
             agents: Mutex::new(BTreeMap::new()),
             budgets: Mutex::new(BTreeMap::new()),
             rates: Mutex::new(BTreeMap::new()),
+            stderrs: Mutex::new(BTreeMap::new()),
             scope_gen: AtomicU64::new(0),
             live_scopes,
             kill_handles,
@@ -644,6 +728,20 @@ impl ClaudeBackend {
     /// window is the forget.
     pub fn rate_used(&self, now: i64) -> (u32, u32) {
         sum_rate_windows(self.rates.lock().unwrap().values().map(|c| c.window(now)))
+    }
+
+    /// `agent`'s most recent stderr lines (up to [`STDERR_ALERT_TAIL_LINES`],
+    /// oldest→newest), or an empty vec if it was never spawned or has emitted no
+    /// stderr (crash-diagnostics slice 001). The drive loop reads this to enrich an
+    /// `AgentCrashed` alert with the crash reason. Ephemeral: a growlightd restart
+    /// loses the buffer — the alert, not a file, carries the diagnostic forward.
+    pub fn stderr_tail(&self, agent: &str) -> Vec<String> {
+        self.stderrs
+            .lock()
+            .unwrap()
+            .get(agent)
+            .map(|s| s.tail(STDERR_ALERT_TAIL_LINES))
+            .unwrap_or_default()
     }
 }
 
@@ -921,10 +1019,13 @@ impl AgentBackend for Arc<ClaudeBackend> {
             .args(&argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            // stderr is discarded, not piped: an unread stderr pipe can fill and
-            // deadlock the child, and a headless permission error already surfaces
-            // as a non-zero exit → crash classification + alert.
-            .stderr(Stdio::null())
+            // stderr is PIPED and drained into a bounded in-memory ring
+            // (crash-diagnostics slice 001), so a crash carries its reason — not just
+            // a non-zero exit (the gap that left the 2026-07-01 wifi crash loop only
+            // inferable). The old deadlock worry (an *unread* pipe fills and blocks
+            // the child) does not apply: the reader thread below drains it
+            // continuously, the exact deadlock-safe shape the stdout `pump` uses.
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
                 SpawnError(format!(
@@ -937,6 +1038,10 @@ impl AgentBackend for Arc<ClaudeBackend> {
             .stdout
             .take()
             .ok_or_else(|| SpawnError("child stdout was not captured".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| SpawnError("child stderr was not captured".into()))?;
 
         let state = Arc::new(AgentHealthState::new(unix_now()));
         self.agents
@@ -955,6 +1060,15 @@ impl AgentBackend for Arc<ClaudeBackend> {
             .lock()
             .unwrap()
             .insert(spec.agent.clone(), Arc::clone(&rate));
+
+        // Fresh stderr ring for this spawn (crash-diagnostics slice 001),
+        // overwriting any prior generation's — so `stderr_tail` always reads the
+        // CURRENT child's reason. Drained by the dedicated reader thread below.
+        let stderr_ring = Arc::new(AgentStderrState::default());
+        self.stderrs
+            .lock()
+            .unwrap()
+            .insert(spec.agent.clone(), Arc::clone(&stderr_ring));
 
         // Record this spawn's running scope (slice 002), overwriting any prior
         // generation for the agent — `set_resources` pushes its live `set-property`
@@ -991,6 +1105,16 @@ impl AgentBackend for Arc<ClaudeBackend> {
                 }),
             ),
         );
+
+        // Drain the child's stderr into its bounded in-memory ring (crash
+        // diagnostics slice 001) — a second detached reader, the same deadlock-safe
+        // shape as the stdout pump: a blocked `lines()` reader holds no lock, so the
+        // actively-drained pipe never fills. The ring is dropped when the agent's
+        // `stderrs` entry is replaced on its next re-roll; the crash tail is read
+        // into the alert before then.
+        thread::spawn(move || {
+            drain_stderr(BufReader::new(stderr), &stderr_ring);
+        });
 
         let hub = self.hub.clone();
         let agent = spec.agent.clone();
@@ -1129,6 +1253,50 @@ mod tests {
         assert!(
             deltas_for_line(r#"{"type":"assistant","message":{"content":[]}}"#).is_empty()
         );
+    }
+
+    #[test]
+    fn drain_stderr_rings_the_tail_and_drops_the_oldest() {
+        // More lines than the ring holds: the oldest must fall off, the newest stay.
+        let total = STDERR_RING_MAX_LINES + 5;
+        let script: String = (0..total).map(|i| format!("line {i}\n")).collect();
+        let ring = AgentStderrState::default();
+        drain_stderr(Cursor::new(script), &ring);
+
+        // Bounded: only the last STDERR_RING_MAX_LINES survive (oldest dropped).
+        let all = ring.tail(usize::MAX);
+        assert_eq!(all.len(), STDERR_RING_MAX_LINES, "ring is bounded");
+        assert_eq!(all.first().unwrap(), &format!("line {}", total - STDERR_RING_MAX_LINES));
+        assert_eq!(all.last().unwrap(), &format!("line {}", total - 1));
+
+        // The alert tail is the last N, oldest→newest.
+        let tail = ring.tail(3);
+        assert_eq!(
+            tail,
+            vec![
+                format!("line {}", total - 3),
+                format!("line {}", total - 2),
+                format!("line {}", total - 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn drain_stderr_skips_blank_lines_and_truncates_a_giant_line() {
+        let mut script = String::from("real error: connection reset\n");
+        script.push('\n'); // a blank line — no diagnostic, skipped
+        script.push_str("   \n"); // whitespace-only — also skipped
+        script.push_str(&"x".repeat(STDERR_LINE_MAX_CHARS + 50));
+        script.push('\n');
+        let ring = AgentStderrState::default();
+        drain_stderr(Cursor::new(script), &ring);
+
+        let tail = ring.tail(usize::MAX);
+        assert_eq!(tail.len(), 2, "the two blank lines are dropped");
+        assert_eq!(tail[0], "real error: connection reset");
+        // The over-long line is char-truncated with an ellipsis, never panicking.
+        assert_eq!(tail[1].chars().count(), STDERR_LINE_MAX_CHARS + 1);
+        assert!(tail[1].ends_with('…'));
     }
 
     #[test]

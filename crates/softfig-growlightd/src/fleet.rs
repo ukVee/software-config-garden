@@ -289,9 +289,9 @@ pub fn assemble_fleet(
     // drift. `FsBatonStore` is a cheap `Clone` (two paths + a name), so no `Arc`.
     let baton_store = FsBatonStore::new(agents_dir.clone(), garden_name);
 
-    // One backend, shared three ways (the `DriveLoop::new` contract): the
-    // supervisor spawns through it, and health + budget are read off the SAME
-    // cells it populates.
+    // One backend, shared many ways (the `DriveLoop::new` contract): the
+    // supervisor spawns through it, and health + stderr + budget + rate are read
+    // off the SAME per-agent cells it populates.
     let backend = Arc::new(ClaudeBackend::new(
         fleet.bin.clone(),
         fleet.prompt.clone(),
@@ -331,6 +331,7 @@ pub fn assemble_fleet(
         daemon.clone(),
         supervisor,
         Box::new(Arc::clone(&backend)), // health  — live ClaudeBackend (slice 001)
+        Box::new(Arc::clone(&backend)), // stderr — live in-memory ring (crash-diagnostics slice 001)
         Box::new(baton_store.clone()), // baton  — live per-member read-back (fleet-loop-spin slice 002)
         Box::new(baton_store), // seeder — fresh-start baton seed (fleet-loop-spin slice 002)
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)

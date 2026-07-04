@@ -613,9 +613,10 @@ impl Supervisor {
         sup.consecutive_failures = sup.consecutive_failures.saturating_add(1);
         sup.not_before = now.saturating_add(backoff.delay(sup.consecutive_failures));
         PollOutcome::Crashed {
-            event: NotifyEvent::AgentCrashed {
-                agent: agent.to_string(),
-            },
+            // Built without a stderr tail — the supervisor has no backend to read it
+            // from; the drive loop enriches this alert with the crashed agent's
+            // in-memory stderr ring before dispatch (crash-diagnostics slice 001).
+            event: NotifyEvent::agent_crashed(agent),
             failures: sup.consecutive_failures,
             not_before: sup.not_before,
         }
@@ -1040,9 +1041,7 @@ mod tests {
         assert_eq!(
             out,
             PollOutcome::Crashed {
-                event: NotifyEvent::AgentCrashed {
-                    agent: "a1".into()
-                },
+                event: NotifyEvent::agent_crashed("a1"),
                 failures: 1,
                 not_before: 2, // base backoff
             }

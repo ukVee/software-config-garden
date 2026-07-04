@@ -250,6 +250,25 @@ impl AgentHealthSource for Arc<ClaudeBackend> {
     }
 }
 
+/// The seam the loop reads a crashed agent's **stderr tail** through, to enrich an
+/// [`NotifyEvent::AgentCrashed`] with the crash *reason* (crash-diagnostics slice
+/// 001). Implemented over the live [`ClaudeBackend`]'s bounded per-agent in-memory
+/// ring buffer; a test scripts the tail. Read ONLY when [`Supervisor::poll`]
+/// classifies a crash, so a healthy tick pays nothing. The tail is ephemeral (lost
+/// on a growlightd restart) — the alert, not a file, carries it forward.
+pub trait AgentStderrSource: Send + Sync + fmt::Debug {
+    /// `agent`'s most recent stderr lines (oldest→newest), or empty if it was never
+    /// spawned / emitted nothing.
+    fn stderr_tail(&self, agent: &str) -> Vec<String>;
+}
+
+impl AgentStderrSource for Arc<ClaudeBackend> {
+    fn stderr_tail(&self, agent: &str) -> Vec<String> {
+        // Disambiguate from this trait method: call the inherent one.
+        self.as_ref().stderr_tail(agent)
+    }
+}
+
 /// The seam the loop reads an EXITED agent's terminal baton status through, to
 /// feed [`Supervisor::poll`]'s retire-vs-park-vs-re-roll decision (the spin fix,
 /// [[decision-growlight-fleet-loop-spin]]). Slice 002 implements it over the
@@ -413,6 +432,10 @@ pub struct DriveLoop {
     supervisor: Supervisor,
     /// Per-agent health probe (the live [`ClaudeBackend`] in production).
     health: Box<dyn AgentHealthSource>,
+    /// Per-agent stderr-tail probe (crash-diagnostics slice 001): read only when a
+    /// `poll` classifies a crash, to enrich the [`NotifyEvent::AgentCrashed`] alert
+    /// with the reason. The live [`ClaudeBackend`]'s in-memory ring in production.
+    stderr: Box<dyn AgentStderrSource>,
     /// Reads an exited agent's terminal baton status — the source for
     /// [`Supervisor::poll`]'s retire-vs-re-roll decision (the spin fix). Deferred
     /// in slice 001 ([`DeferredBatonStatus`], always `None`); slice 002 wires the
@@ -480,6 +503,7 @@ impl DriveLoop {
         daemon: Daemon,
         supervisor: Supervisor,
         health: Box<dyn AgentHealthSource>,
+        stderr: Box<dyn AgentStderrSource>,
         baton: Box<dyn BatonStatusSource>,
         seeder: Box<dyn BatonSeeder>,
         queues: Box<dyn QueueSource>,
@@ -494,6 +518,7 @@ impl DriveLoop {
             daemon,
             supervisor,
             health,
+            stderr,
             baton,
             seeder,
             queues,
@@ -586,6 +611,13 @@ impl DriveLoop {
                 };
                 match self.supervisor.poll(agent, health, baton_status.as_deref(), now) {
                     PollOutcome::Crashed { event, .. } => {
+                        // Enrich the alert with the crashed agent's stderr tail
+                        // (crash-diagnostics slice 001): the supervisor built the
+                        // event without a reason (it has no backend); we read the
+                        // in-memory ring off the backend here, before the event is
+                        // dispatched, so the human sees *why* it crashed. Read once,
+                        // only on a crash — a healthy tick never touches stderr.
+                        let event = event.with_stderr_tail(self.stderr.stderr_tail(agent));
                         report.crashes.push(event);
                         // A retiring agent that crashes at its boundary stops here
                         // rather than re-rolling.
@@ -847,22 +879,16 @@ impl DriveLoop {
         // persistently-failing agent (one alert per window, not one per tick).
         for held in &report.held_starts {
             if let StartOutcome::SpawnFailed { .. } = held.outcome {
-                self.dispatcher.notify(
-                    &NotifyEvent::AgentCrashed {
-                        agent: held.agent.clone(),
-                    },
-                    now,
-                );
+                // A spawn failure: the child never ran, so there is no stderr tail —
+                // the bare `agent_crashed` shape (crash-diagnostics slice 001).
+                self.dispatcher
+                    .notify(&NotifyEvent::agent_crashed(held.agent.clone()), now);
             }
         }
         for reroll in &report.rerolls {
             if let RerollOutcome::SpawnFailed { agent, .. } = reroll {
-                self.dispatcher.notify(
-                    &NotifyEvent::AgentCrashed {
-                        agent: agent.clone(),
-                    },
-                    now,
-                );
+                self.dispatcher
+                    .notify(&NotifyEvent::agent_crashed(agent.clone()), now);
             }
         }
         for (_queue, part) in &report.parked {
@@ -960,6 +986,9 @@ mod tests {
         spawns: Mutex<Vec<String>>,
         kills: Arc<AtomicUsize>,
         health: Mutex<BTreeMap<String, AgentHealth>>,
+        /// Scripted stderr tail per agent (the live loop reads it off the backend's
+        /// ring to enrich a crash alert — crash-diagnostics slice 001).
+        stderr: Mutex<BTreeMap<String, Vec<String>>>,
         budgets: Mutex<BTreeMap<String, BudgetUsage>>,
         /// Scripted terminal baton status per agent (the per-member write-back the
         /// live loop reads on exit — slice 002's real reader is `FsBatonStore`).
@@ -982,6 +1011,13 @@ mod tests {
         }
         fn set_health(&self, agent: &str, h: AgentHealth) {
             self.health.lock().unwrap().insert(agent.to_string(), h);
+        }
+        /// Script `agent`'s stderr tail (what the loop reads to enrich a crash alert).
+        fn set_stderr(&self, agent: &str, lines: &[&str]) {
+            self.stderr.lock().unwrap().insert(
+                agent.to_string(),
+                lines.iter().map(|s| s.to_string()).collect(),
+            );
         }
         /// Script `agent`'s terminal baton status (read by the loop on its exit).
         fn set_baton(&self, agent: &str, status: &str) {
@@ -1033,6 +1069,11 @@ mod tests {
     impl AgentHealthSource for Arc<FakeFleet> {
         fn health(&self, agent: &str) -> Option<AgentHealth> {
             self.health.lock().unwrap().get(agent).copied()
+        }
+    }
+    impl AgentStderrSource for Arc<FakeFleet> {
+        fn stderr_tail(&self, agent: &str) -> Vec<String> {
+            self.stderr.lock().unwrap().get(agent).cloned().unwrap_or_default()
         }
     }
     impl BudgetSampleSource for Arc<FakeFleet> {
@@ -1314,6 +1355,7 @@ mod tests {
             d.clone(),
             sup,
             Box::new(Arc::clone(&backend)), // health
+            Box::new(Arc::clone(&backend)), // stderr tail — scripted via set_stderr
             Box::new(Arc::clone(&backend)), // baton status — scripted via set_baton
             Box::new(Arc::clone(&backend)), // seeder — records seeds, scriptable failure
             Box::new(Arc::clone(&queues)),
@@ -1538,13 +1580,16 @@ mod tests {
         loop_.tick(0);
         assert_eq!(backend.spawns(), vec!["a1"]);
 
-        // a1 errors out → crash classification.
+        // a1 errors out → crash classification. Its stderr ring holds the reason
+        // (crash-diagnostics slice 001), so the surfaced alert must carry it.
         backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_stderr("a1", &["API Error: Connection reset by peer"]);
         let r = loop_.tick(0);
         assert_eq!(
             r.crashes,
-            vec![NotifyEvent::AgentCrashed { agent: "a1".into() }],
-            "the crash surfaces an alert for the dispatcher (slice 003)",
+            vec![NotifyEvent::agent_crashed("a1")
+                .with_stderr_tail(vec!["API Error: Connection reset by peer".to_string()])],
+            "the crash surfaces an alert carrying the stderr tail (crash-diagnostics slice 001)",
         );
         assert_eq!(
             r.rerolls,
@@ -1897,7 +1942,7 @@ mod tests {
 
         assert_eq!(r.retired, vec!["a1".to_string()]);
         assert!(
-            r.crashes.contains(&NotifyEvent::AgentCrashed { agent: "a1".into() }),
+            r.crashes.contains(&NotifyEvent::agent_crashed("a1")),
             "the hung agent also surfaces a crash alert",
         );
         // The supervisor's poll kills the hung child once; retire finds it already
@@ -2099,10 +2144,7 @@ mod tests {
         // `p1` re-surfaces this tick but its alert is suppressed by the dedup.
         backend.set_health("a1", AgentHealth::Exited { code: 1 });
         let r1 = loop_.tick(1);
-        assert_eq!(
-            r1.crashes,
-            vec![NotifyEvent::AgentCrashed { agent: "a1".into() }]
-        );
+        assert_eq!(r1.crashes, vec![NotifyEvent::agent_crashed("a1")]);
 
         // Two distinct alerts fired across the two ticks (blocked p1 + crashed a1),
         // each exactly once.
