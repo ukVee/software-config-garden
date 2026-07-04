@@ -217,6 +217,109 @@ impl RateSource for LiveRate {
     }
 }
 
+/// The seam the loop probes network reachability through BEFORE it spawns a
+/// headless `claude -p` (network-failsafe slice 001). A peer launched with no
+/// route to the API errors out instantly on its first request; the supervisor then
+/// misreads that as a crash — punitive backoff + a false `AgentCrashed` page — so a
+/// flaky link becomes a crash loop that makes no progress and pages the human (the
+/// 2026-07-01 m5b-hardening incident). The gate turns "offline at spawn" into a
+/// HOLD instead: no spawn, no backoff, no crash count, and the ~1s tick cadence
+/// retries until the link returns.
+///
+/// It is an *optimisation* layered over slice 002's mid-session backstop, not a
+/// lock — a drop that kills a peer mid-session is unpreventable here, and a probe
+/// that cannot tell **fails open** (see [`online`](Connectivity::online)). The live
+/// impl ([`RouteConnectivity`]) reads the kernel routing table (is a default route
+/// present), never a network round-trip, so probing it every tick is cheap.
+/// [`AssumeOnline`] is the default/test seam (always online → spawns proceed as
+/// before); a test injects a fake to exercise the offline HOLD.
+pub trait Connectivity: Send + Sync + fmt::Debug {
+    /// `true` when the device has a route to spawn a peer over; `false` HOLDS this
+    /// tick's spawns (steps 2 + 3). A probe that cannot determine the state returns
+    /// `true` (**fail-open**): a false "online" costs at most one spawn that slice
+    /// 002 reclassifies as a transient network exit (no penalty), whereas a false
+    /// "offline" would wedge a healthy fleet — so the safe default is to let the
+    /// spawn through and lean on the mid-session backstop.
+    fn online(&self) -> bool;
+}
+
+/// The default/test [`Connectivity`] seam: always online, so a loop assembled
+/// without a live probe spawns exactly as before (the pre-failsafe behaviour). The
+/// production assembly wires [`RouteConnectivity`] instead; this stays the
+/// `DriveLoop` default seam and the fixture a test injects for the online path.
+/// Mirrors [`PermissiveRate`]'s deferred-default shape.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AssumeOnline;
+
+impl Connectivity for AssumeOnline {
+    fn online(&self) -> bool {
+        true
+    }
+}
+
+/// The live [`Connectivity`] probe (network-failsafe slice 001): "is there a
+/// default route" read straight from the kernel routing table — `/proc/net/route`
+/// (IPv4) plus `/proc/net/ipv6_route` (IPv6) — with NO network round-trip, so the
+/// per-tick cost is a couple of small `/proc` reads. A default route present is the
+/// signal the link is up enough to reach the API; when wifi drops, the route
+/// disappears and the gate holds the spawn. It does not detect a route-up /
+/// internet-down captive-portal case — that is slice 002's mid-session job; the
+/// pre-spawn gate targets the common "wifi is simply off" case. Reads **fail open**
+/// (a missing/unreadable `/proc` returns online) per the trait contract.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RouteConnectivity;
+
+impl Connectivity for RouteConnectivity {
+    fn online(&self) -> bool {
+        has_default_route()
+    }
+}
+
+/// `true` if the kernel has a usable default route on any interface (IPv4 or IPv6).
+/// **Fail-open**: if neither routing table can be read, assume online — never wedge
+/// the fleet on a probe failure. The per-table parse is a pure function of the file
+/// body ([`v4_has_default`] / [`v6_has_default`]), unit-tested over `/proc`
+/// fixtures.
+fn has_default_route() -> bool {
+    let v4 = std::fs::read_to_string("/proc/net/route").ok();
+    let v6 = std::fs::read_to_string("/proc/net/ipv6_route").ok();
+    if v4.is_none() && v6.is_none() {
+        return true; // cannot probe → fail open, do not hold the fleet
+    }
+    v4.as_deref().is_some_and(v4_has_default) || v6.as_deref().is_some_and(v6_has_default)
+}
+
+/// Parse an IPv4 `/proc/net/route` body: `true` if any row is an UP default route
+/// (Destination `00000000` with the `RTF_UP` flag set). Columns are whitespace-
+/// separated — `Iface Destination Gateway Flags …`; the header line has a non-hex
+/// Destination and so is skipped by the `00000000` match. Pure over the body.
+fn v4_has_default(body: &str) -> bool {
+    body.lines().any(|line| {
+        let mut cols = line.split_whitespace();
+        let _iface = cols.next();
+        let dest = cols.next(); // col 1: destination network, hex
+        let _gateway = cols.next(); // col 2
+        let flags = cols.next(); // col 3: RTF_* flags, hex
+        dest == Some("00000000")
+            && flags
+                .and_then(|f| u32::from_str_radix(f, 16).ok())
+                .is_some_and(|f| f & 0x1 != 0) // RTF_UP
+    })
+}
+
+/// Parse an IPv6 `/proc/net/ipv6_route` body: `true` if any row is an UP default
+/// route — destination `::/0` (all-zero 32-hex network with prefix-length `00`)
+/// with the `RTF_UP` flag set (column 8, hex). Pure over the body.
+fn v6_has_default(body: &str) -> bool {
+    body.lines().any(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        cols.len() >= 9
+            && cols[0] == "00000000000000000000000000000000"
+            && cols[1] == "00"
+            && u32::from_str_radix(cols[8], 16).is_ok_and(|f| f & 0x1 != 0) // RTF_UP
+    })
+}
+
 /// The default [`QueueSource`] until the live keeperd queue feed lands
 /// (`growlight-live-fleet` slice 002): an **empty** [`Snapshot`], so the
 /// scheduler picks nothing and a gated-on fleet stays idle. Fail-closed — a
@@ -414,6 +517,15 @@ pub struct TickReport {
     pub parked: Vec<(String, String)>,
     /// Whether admission was gated by `pause` this tick (no starts/rolls attempted).
     pub paused: bool,
+    /// Whether the pre-spawn connectivity gate HELD this tick's spawns because the
+    /// device is offline (network-failsafe slice 001): steps 2 (re-roll) + 3
+    /// (fresh start) were skipped — no spawn, no backoff, no crash count — and the
+    /// next tick re-probes. Distinct from `paused` (a human/policy stop): this is a
+    /// "waiting for the link to return" hold. Slice 003 turns this signal into the
+    /// visible member state + the sustained-offline alert; slice 001 only proves
+    /// the spawn is held. Health/control (step 1) still ran — exits and boundary
+    /// stops are observed regardless.
+    pub waiting_for_connectivity: bool,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -461,6 +573,13 @@ pub struct DriveLoop {
     samples: Box<dyn BudgetSampleSource>,
     /// Per-minute rate readings — admission's second gate.
     rate: Box<dyn RateSource>,
+    /// Pre-spawn network reachability probe (network-failsafe slice 001). Read once
+    /// per tick (when not paused): offline → HOLD every spawn this tick — no re-roll,
+    /// no fresh start, no backoff, no crash — rather than launch a headless `claude
+    /// -p` into an instant crash. The live [`RouteConnectivity`] (a cheap kernel
+    /// routing-table read) in production; [`AssumeOnline`] by default and in tests
+    /// that don't exercise the gate.
+    connectivity: Box<dyn Connectivity>,
     /// The cross-agent usage aggregate (owned): refreshed from `samples` each tick,
     /// it feeds admission (gate on real fleet burn) and the single §9 usage alert
     /// ([`UsageAggregator::fleet_alert`]).
@@ -511,6 +630,7 @@ impl DriveLoop {
         parker: Box<dyn ItemParker>,
         samples: Box<dyn BudgetSampleSource>,
         rate: Box<dyn RateSource>,
+        connectivity: Box<dyn Connectivity>,
         dispatcher: NotifyDispatcher,
         fleet: Vec<FleetMember>,
     ) -> Self {
@@ -526,6 +646,7 @@ impl DriveLoop {
             parker,
             samples,
             rate,
+            connectivity,
             aggregator: UsageAggregator::new(),
             dispatcher,
             fleet,
@@ -542,6 +663,23 @@ impl DriveLoop {
         let mut report = TickReport::default();
         let paused = self.daemon.is_paused();
         report.paused = paused;
+
+        // Connectivity gate (network-failsafe slice 001). Probe the link BEFORE any
+        // spawn: a headless `claude -p` launched offline errors out on its first API
+        // request and the supervisor misreads it as a crash (punitive backoff + a
+        // false `AgentCrashed` page) — so a flaky link becomes a crash loop. Offline
+        // → HOLD every spawn this tick: steps 2 (re-roll) + 3 (fresh start) below are
+        // gated on `!offline`, so no spawn is issued, no backoff accrues, and no
+        // crash is counted. Distinct from `paused` (a human/policy admission stop)
+        // and from a crash re-roll; the ~1s tick cadence is the retry (the next tick
+        // re-probes; spawns resume the moment the link returns). Only meaningful when
+        // not paused (a paused fleet attempts nothing regardless), and the live probe
+        // is a cheap local `/proc` read, so probing every tick is fine. Health +
+        // control (step 1) still run offline — exits and boundary stops are still
+        // observed; only the spawn is held. A mid-session drop (the link dies while a
+        // peer runs, unpreventable here) is slice 002's non-punitive re-classify.
+        let offline = !paused && !self.connectivity.online();
+        report.waiting_for_connectivity = offline;
 
         // Refresh the admission policy from the runtime source of truth BEFORE any
         // admission decision this tick: the daemon's `config.policy` is what the
@@ -732,7 +870,12 @@ impl DriveLoop {
         //    pinned-with-fallback `pick` still yields a workable part, so a clean
         //    exit is never respawned into a drained queue (belt-and-suspenders to
         //    slice 001's terminal-status retire).
-        if !paused {
+        //    ALSO connectivity-gated (`!offline`): a re-roll re-spawns a `claude -p`,
+        //    so an offline re-roll would instant-crash exactly like a fresh start —
+        //    the 2026-07-01 crash-loop path. Held here means no re-spawn, no backoff,
+        //    no crash; the member stays down (its `not_before` is absolute, so
+        //    skipping `Supervisor::tick` strands nothing) and re-rolls once online.
+        if !paused && !offline {
             // Map each configured member to its pin so the queue-gate can ask "is
             // there workable work for this agent?" via the same `pick` a fresh
             // start uses. A member not in the configured fleet (shouldn't happen)
@@ -755,7 +898,11 @@ impl DriveLoop {
         //    committed `active` write (the claim itself) is the cross-tick half:
         //    the next tick's snapshot shows the part claimed, so every other
         //    agent's fallback skips it.
-        if !paused {
+        //    Connectivity-gated (`!offline`) like the re-roll: the pre-spawn HOLD —
+        //    an offline fresh start is exactly the "spawn a headless `claude -p` with
+        //    no route" instant-crash this milestone exists to prevent, so it is held
+        //    (no claim, no spawn, no backoff) and retried next tick once online.
+        if !paused && !offline {
             // Parts already SPOKEN FOR — excluded before a fresh start so the SAME
             // `(queue, part)` is never assigned twice. SEEDED from the LIVE
             // `assignments` (every part a registered member already holds, recorded on
@@ -1004,6 +1151,10 @@ mod tests {
         /// When set, every `seed` fails (the fail-closed seed path — a member that
         /// can't be given its baton is not spawned).
         fail_seed: AtomicBool,
+        /// When set, the [`Connectivity`] probe reports **offline** (the pre-spawn
+        /// HOLD path, network-failsafe slice 001). Defaults to `false` = online, so a
+        /// loop built by `make_*` spawns exactly as before unless a test toggles it.
+        offline: AtomicBool,
     }
     impl FakeFleet {
         fn new() -> Arc<Self> {
@@ -1033,6 +1184,11 @@ mod tests {
         /// Force every subsequent `seed` to fail (the fail-closed seed path).
         fn set_fail_seed(&self, fail: bool) {
             self.fail_seed.store(fail, Ordering::SeqCst);
+        }
+        /// Toggle the connectivity probe offline (`true`) / online (`false`) — the
+        /// pre-spawn HOLD gate (network-failsafe slice 001).
+        fn set_offline(&self, offline: bool) {
+            self.offline.store(offline, Ordering::SeqCst);
         }
         /// The recorded `(agent, queue, part)` seeds, in call order.
         fn seeds(&self) -> Vec<(String, String, String)> {
@@ -1096,6 +1252,11 @@ mod tests {
                 .unwrap()
                 .push((agent.to_string(), queue.to_string(), part.to_string()));
             Ok(())
+        }
+    }
+    impl Connectivity for Arc<FakeFleet> {
+        fn online(&self) -> bool {
+            !self.offline.load(Ordering::SeqCst)
         }
     }
 
@@ -1363,10 +1524,146 @@ mod tests {
             Box::new(Arc::clone(&parker)),
             Box::new(Arc::clone(&backend)),
             Box::new(PermissiveRate),
+            Box::new(Arc::clone(&backend)), // connectivity — scripted via set_offline (default online)
             dispatcher,
             fleet,
         );
         (drive, d, backend, claimer, parker, queues, Probe { alerts, log })
+    }
+
+    /// SLICE 001 — offline at a FRESH START: the pre-spawn connectivity gate HOLDS
+    /// the start (no spawn, no claim, no crash, no alert) and flags
+    /// `waiting_for_connectivity`; when the link returns the next tick spawns
+    /// cleanly, with NO backoff (the spawn was never attempted, so no failure streak
+    /// accrued) — the whole point of the failsafe.
+    #[test]
+    fn offline_holds_the_fresh_start_then_resumes_when_the_link_returns() {
+        let (mut loop_, _d, backend, claimer, _queues, probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        backend.set_offline(true);
+        let r = loop_.tick(0);
+        assert!(r.waiting_for_connectivity, "the tick reports the offline HOLD");
+        assert!(r.started.is_empty(), "no start issued while offline");
+        assert!(backend.spawns().is_empty(), "no `claude -p` spawned while offline");
+        assert!(claimer.claims().is_empty(), "no part claimed while offline");
+        assert!(r.crashes.is_empty(), "an offline hold is NOT a crash");
+        assert_eq!(probe.gui_alerts(), 0, "a blip pages nobody");
+
+        // The link returns: the held start now proceeds, cleanly and exactly once.
+        backend.set_offline(false);
+        let r2 = loop_.tick(1);
+        assert!(!r2.waiting_for_connectivity);
+        assert_eq!(
+            r2.started,
+            vec![Assignment {
+                agent: "a1".into(),
+                queue: "qa".into(),
+                part: "p1".into(),
+            }],
+            "the spawn proceeds the moment the link returns",
+        );
+        assert_eq!(backend.spawns(), vec!["a1"], "exactly one spawn, on reconnect");
+        assert_eq!(
+            claimer.claims(),
+            vec![("qa".into(), "p1".into())],
+            "the part is claimed only on the real start, never during the hold",
+        );
+    }
+
+    /// SLICE 001 — offline holds the RE-ROLL too (the ACTUAL 2026-07-01 crash-loop
+    /// path: a running member's session dies and would re-roll into an instant crash
+    /// while the link is down). A member that exited clean and is due to re-roll is
+    /// NOT re-spawned while offline — no re-roll, no backoff, no crash — and re-rolls
+    /// on the same part once the link returns.
+    #[test]
+    fn offline_holds_a_reroll_then_resumes_when_the_link_returns() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        // tick 0: a1 starts on p1 (online).
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"], "a1 starts online");
+
+        // a1 exits clean on a continue baton → a down re-roll candidate. Offline now
+        // HOLDS the re-spawn (step 2): no re-roll, no crash — just the waiting flag.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_offline(true);
+        let r1 = loop_.tick(1);
+        assert!(r1.waiting_for_connectivity);
+        assert!(r1.rerolls.is_empty(), "no re-roll attempted while offline");
+        assert!(r1.crashes.is_empty(), "a held re-roll is NOT a crash");
+        assert_eq!(backend.spawn_count(), 1, "no re-spawn while offline");
+
+        // The link returns → it re-rolls on the same part, no backoff delay.
+        backend.set_offline(false);
+        let r2 = loop_.tick(2);
+        assert!(!r2.waiting_for_connectivity);
+        assert_eq!(
+            r2.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "re-rolls the moment the link returns",
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "re-rolled on reconnect");
+    }
+
+    /// SLICE 001 — the pure IPv4 routing-table parser [`v4_has_default`] over
+    /// `/proc/net/route` fixtures: an UP default route reads online; a header-only,
+    /// non-default-only, or down (no `RTF_UP`) table reads offline.
+    #[test]
+    fn v4_route_table_default_detection() {
+        let with_default = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+wlan0\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
+wlan0\t0000A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0";
+        assert!(v4_has_default(with_default), "an UP default route is online");
+
+        let header_only =
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT";
+        assert!(!v4_has_default(header_only), "no routes → offline");
+
+        let no_default = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth0\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0";
+        assert!(!v4_has_default(no_default), "a non-default route only → offline");
+
+        let down_default = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+wlan0\t00000000\t0100A8C0\t0002\t0\t0\t600\t00000000\t0\t0\t0";
+        assert!(
+            !v4_has_default(down_default),
+            "a default route without RTF_UP → offline",
+        );
+    }
+
+    /// SLICE 001 — the pure IPv6 routing-table parser [`v6_has_default`] over
+    /// `/proc/net/ipv6_route` fixtures: an UP `::/0` route reads online; loopback +
+    /// link-local only, or a `::/0` without `RTF_UP`, reads offline.
+    #[test]
+    fn v6_route_table_default_detection() {
+        let with_default = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 wlan0";
+        assert!(v6_has_default(with_default), "an UP ::/0 route is online");
+
+        let loopback_and_ll = "\
+00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000001 00000000 80200001 lo
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000000 00000000 00000001 wlan0";
+        assert!(
+            !v6_has_default(loopback_and_ll),
+            "loopback + link-local only → offline",
+        );
+
+        let down_default = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000000 wlan0";
+        assert!(
+            !v6_has_default(down_default),
+            "a ::/0 route without RTF_UP → offline",
+        );
     }
 
     /// The loop picks each member's pinned part, admits under the per-device cap,

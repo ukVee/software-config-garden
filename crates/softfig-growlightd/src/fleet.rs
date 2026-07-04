@@ -57,7 +57,9 @@ use crate::config::BuildCaps;
 use crate::claim::{KeeperdItemParker, KeeperdPartClaimer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
-use crate::drive_loop::{spawn_drive_loop, DriveLoop, FleetMember, LiveRate, DRIVE_POLL_MS};
+use crate::drive_loop::{
+    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RouteConnectivity, DRIVE_POLL_MS,
+};
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
@@ -339,6 +341,7 @@ pub fn assemble_fleet(
         Box::new(KeeperdItemParker::new(keeperd_socket.to_path_buf())), // parker — live item-park (fleet-member-model slice 003)
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
         Box::new(LiveRate::new(Arc::clone(&backend), daemon.rate_limits())), // rate — live TPM/RPM meter (slice 006)
+        Box::new(RouteConnectivity), // connectivity — live kernel routing-table probe (network-failsafe slice 001)
         dispatcher,
         members,
     ))
