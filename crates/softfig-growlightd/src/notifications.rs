@@ -112,6 +112,20 @@ pub enum NotifyEvent {
         /// The agent that was denied.
         agent: String,
     },
+    /// The device has been offline past the sustained-outage threshold
+    /// (network-failsafe slice 003): the pre-spawn connectivity gate is holding the
+    /// fleet's spawns. A blip never reaches here (it clears before the threshold); a
+    /// sustained outage pages the human ONCE (human-attention), the deliberate
+    /// inverse of the 2026-07-01 crash-loop that paged every ~30min. `secs` (how
+    /// long offline) rides the body but is NOT part of the dedup identity.
+    NetworkOffline {
+        /// Seconds the device had been offline when the alert fired.
+        secs: i64,
+    },
+    /// The device's link returned after a [`NetworkOffline`](Self::NetworkOffline)
+    /// alert (network-failsafe slice 003): the fleet's spawns resume. Info only (NOT
+    /// human-attention) — it clears the outage on `growlight watch` / the log.
+    NetworkRecovered,
 }
 
 impl NotifyEvent {
@@ -145,10 +159,12 @@ impl NotifyEvent {
             Self::Usage
             | Self::BlockedOnHuman { .. }
             | Self::QueueEmpty { .. }
-            | Self::AgentCrashed { .. } => true,
+            | Self::AgentCrashed { .. }
+            | Self::NetworkOffline { .. } => true,
             Self::SliceComplete { .. }
             | Self::ThrashDetected { .. }
-            | Self::LeaseDenied { .. } => false,
+            | Self::LeaseDenied { .. }
+            | Self::NetworkRecovered => false,
         }
     }
 
@@ -176,6 +192,9 @@ impl NotifyEvent {
             Self::AgentCrashed { agent, .. } => format!("agent-crashed:{agent}"),
             Self::ThrashDetected { target } => format!("thrash:{target}"),
             Self::LeaseDenied { key, agent } => format!("lease-denied:{key}:{agent}"),
+            // Class-only identities (no subject): one outage / one recovery at a time.
+            Self::NetworkOffline { .. } => "network-offline".to_string(),
+            Self::NetworkRecovered => "network-recovered".to_string(),
         }
     }
 
@@ -204,6 +223,10 @@ impl NotifyEvent {
             Self::LeaseDenied { key, agent } => {
                 format!("lease `{key}` denied to `{agent}`")
             }
+            Self::NetworkOffline { secs } => {
+                format!("network offline for {secs}s — fleet spawns held")
+            }
+            Self::NetworkRecovered => "network recovered — fleet spawns resumed".to_string(),
         }
     }
 }
@@ -291,6 +314,46 @@ mod tests {
             assert!(chans.contains(&Channel::Gui), "{e:?} → GUI");
             assert!(chans.contains(&Channel::Log), "{e:?} → Log");
         }
+    }
+
+    /// SLICE 003 — the connectivity events route correctly: a sustained
+    /// `NetworkOffline` is human-attention (pages Phone+GUI+Log), a `NetworkRecovered`
+    /// is info only (GUI+Log, no page), and each carries a distinct class-only dedup
+    /// identity so a repeat inside the cooldown dedups to one.
+    #[test]
+    fn connectivity_events_route_and_dedup_by_class() {
+        assert!(NotifyEvent::NetworkOffline { secs: 300 }.is_human_attention());
+        assert_eq!(
+            NotifyEvent::NetworkOffline { secs: 300 }.channels(),
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+        );
+        assert!(!NotifyEvent::NetworkRecovered.is_human_attention());
+        assert_eq!(
+            NotifyEvent::NetworkRecovered.channels(),
+            vec![Channel::Gui, Channel::Log],
+        );
+        // `secs` is not part of the identity — two outages share one dedup key.
+        assert_eq!(
+            NotifyEvent::NetworkOffline { secs: 1 }.dedup_key(),
+            "network-offline",
+        );
+        assert_eq!(
+            NotifyEvent::NetworkOffline { secs: 999 }.dedup_key(),
+            "network-offline",
+        );
+        assert_eq!(NotifyEvent::NetworkRecovered.dedup_key(), "network-recovered");
+
+        // A repeat of the same identity inside the cooldown is suppressed.
+        let mut policy = NotifyPolicy::with_cooldown(100);
+        assert!(!policy
+            .decide(&NotifyEvent::NetworkOffline { secs: 300 }, 0)
+            .is_empty());
+        assert!(
+            policy
+                .decide(&NotifyEvent::NetworkOffline { secs: 360 }, 50)
+                .is_empty(),
+            "the same identity within the cooldown is deduped",
+        );
     }
 
     /// The human-attention set routes to Phone+GUI+Log; everything else is

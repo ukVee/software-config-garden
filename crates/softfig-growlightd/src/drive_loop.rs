@@ -73,6 +73,16 @@ use crate::usage::{UsageAggregator, UsageSample};
 /// is not a hot path (mirrors [`crate::bus::BUS_POLL_MS`]).
 pub const DRIVE_POLL_MS: u64 = 1_000;
 
+/// How long the device must stay offline before the sustained-outage alert pages the
+/// human (network-failsafe slice 003). Below this, an offline stretch is a BLIP: the
+/// pre-spawn gate holds spawns quietly and NOTHING pages — the whole point (the
+/// 2026-07-01 crash loop paged every ~30min). Past it, exactly one
+/// [`NotifyEvent::NetworkOffline`](crate::notifications::NotifyEvent::NetworkOffline)
+/// fires, cleared by a `NetworkRecovered` on reconnect. A few minutes: long enough to
+/// ride out a normal wifi hiccup, short enough that a real outage still reaches the
+/// human.
+pub const OFFLINE_ALERT_THRESHOLD_SECS: i64 = 180;
+
 /// The seam the loop reads the current multi-queue [`Snapshot`] through. The
 /// production impl pulls keeperd's per-queue managed regions (the `queue` /
 /// `queue:<name>` item tables) — deferred to `growlight-wire-loose-ends`; a test
@@ -678,6 +688,15 @@ pub struct DriveLoop {
     /// owns lifecycle (it knows the agent, not its part); the loop owns the
     /// assignment (it did the claim), so the part lookup lives here.
     assignments: std::collections::BTreeMap<String, (String, String)>,
+    /// When the pre-spawn connectivity gate first held THIS outage (its first offline
+    /// tick's `now`), or `None` while online/paused (network-failsafe slice 003).
+    /// Drives the sustained-offline alert threshold — a blip clears it before
+    /// [`OFFLINE_ALERT_THRESHOLD_SECS`] (no page); a sustained outage crosses it.
+    offline_since: Option<i64>,
+    /// Whether the sustained-offline page has already fired for the CURRENT outage, so
+    /// it pages EXACTLY ONCE (not every tick past the threshold) and re-arms only after
+    /// a reconnect (network-failsafe slice 003).
+    offline_alerted: bool,
 }
 
 impl DriveLoop {
@@ -727,6 +746,8 @@ impl DriveLoop {
             stopped: BTreeSet::new(),
             reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
+            offline_since: None,
+            offline_alerted: false,
         }
     }
 
@@ -1187,6 +1208,33 @@ impl DriveLoop {
         }
         if self.aggregator.fleet_alert() {
             self.dispatcher.notify(&NotifyEvent::Usage, now);
+        }
+        // Sustained-offline alert policy (network-failsafe slice 003). A blip stays
+        // QUIET — the pre-spawn gate holds spawns but NOTHING pages while offline is
+        // shorter than the threshold (the whole point: the 2026-07-01 loop paged every
+        // ~30min). A SUSTAINED outage pages the human EXACTLY ONCE past
+        // `OFFLINE_ALERT_THRESHOLD_SECS`, and the state clears on reconnect — so a
+        // later outage pages again and `growlight watch` shows the recovery. The event
+        // stream (GUI hub + log + bus) is the surface: a distinct per-agent "waiting"
+        // status field in `growlight status` waits on the deferred live per-agent
+        // status surface (see the milestone's deferred verification).
+        if report.waiting_for_connectivity {
+            let since = *self.offline_since.get_or_insert(now);
+            if !self.offline_alerted && now.saturating_sub(since) >= OFFLINE_ALERT_THRESHOLD_SECS {
+                let secs = now.saturating_sub(since);
+                self.dispatcher
+                    .notify(&NotifyEvent::NetworkOffline { secs }, now);
+                self.offline_alerted = true;
+            }
+        } else if self.offline_since.take().is_some() {
+            // Reconnected (or paused): the outage is over (the `.take()` clears its
+            // start). If we had paged, announce recovery so `watch`/the log show it
+            // cleared and re-arm for a future outage; a blip that never paged clears
+            // silently.
+            if self.offline_alerted {
+                self.dispatcher.notify(&NotifyEvent::NetworkRecovered, now);
+                self.offline_alerted = false;
+            }
         }
     }
 
@@ -1910,6 +1958,54 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // The signature match is case-insensitive and specific to the connection layer.
         assert!(stderr_matches_network_signature(&["ECONNRESET".to_string()]));
         assert!(!stderr_matches_network_signature(&["clean shutdown".to_string()]));
+    }
+
+    /// SLICE 003 — a connectivity BLIP stays quiet: offline for less than the
+    /// sustained-outage threshold pages NOBODY (the whole point — the 2026-07-01 loop
+    /// paged every ~30min), even though the pre-spawn gate holds spawns; and its
+    /// recovery clears silently since it never paged.
+    #[test]
+    fn a_connectivity_blip_pages_nobody() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        backend.set_offline(true);
+        loop_.tick(0); // offline_since = 0
+        loop_.tick(30);
+        loop_.tick(60); // still well under the threshold
+        backend.set_offline(false);
+        loop_.tick(90); // reconnect before the threshold → silent clear
+        assert_eq!(probe.gui_alerts(), 0, "a blip and its recovery page nobody");
+        assert!(probe.log_lines().is_empty(), "and log nothing");
+    }
+
+    /// SLICE 003 — a SUSTAINED outage pages the human EXACTLY ONCE past the threshold
+    /// (not every tick), and a `NetworkRecovered` clears it on reconnect — the quiet-
+    /// on-blip / alert-once-on-outage policy the milestone requires.
+    #[test]
+    fn a_sustained_outage_pages_once_then_clears_on_reconnect() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        backend.set_offline(true);
+        loop_.tick(0); // offline_since = 0
+        loop_.tick(OFFLINE_ALERT_THRESHOLD_SECS - 1); // still under → quiet
+        assert_eq!(probe.gui_alerts(), 0, "under the threshold stays quiet");
+
+        // Cross the threshold and stay offline several ticks: exactly one page.
+        loop_.tick(OFFLINE_ALERT_THRESHOLD_SECS);
+        loop_.tick(OFFLINE_ALERT_THRESHOLD_SECS + 60);
+        loop_.tick(OFFLINE_ALERT_THRESHOLD_SECS + 120);
+        assert_eq!(probe.gui_alerts(), 1, "a sustained outage pages exactly once, not per tick");
+
+        // Reconnect emits exactly one recovery event (the clear), so `watch` sees it.
+        backend.set_offline(false);
+        loop_.tick(OFFLINE_ALERT_THRESHOLD_SECS + 150);
+        assert_eq!(probe.gui_alerts(), 1, "reconnect emits one recovery event");
     }
 
     /// The loop picks each member's pinned part, admits under the per-device cap,
