@@ -878,8 +878,10 @@ fn scoped_spawn_argv(
 /// every pid in the cgroup, so a `cargo`/`rustc` build subtree dies with the
 /// agent. We kill the SCOPE, not just the `systemd-run` controller process: the
 /// controller alone would leave the build subtree orphaned inside the scope.
-/// Pure so the kill shape is unit-proven without a real scope.
-fn scope_kill_argv(unit: &str) -> Vec<String> {
+/// Pure so the kill shape is unit-proven without a real scope. Shared with the
+/// boot reconciler ([`crate::reconcile`]), which SIGKILLs stray scopes left by a
+/// prior growlightd generation with the exact same kill shape.
+pub(crate) fn scope_kill_argv(unit: &str) -> Vec<String> {
     vec![
         "--user".to_string(),
         "kill".to_string(),

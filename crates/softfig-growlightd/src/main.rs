@@ -9,9 +9,9 @@ use signal_hook::iterator::Signals;
 use std::sync::Arc;
 
 use softfig_growlightd::{
-    garden_root_via_keeperd, load_fleet_config, spawn_bus_tailer, spawn_fleet, Daemon,
-    GrowlightdConfig, KeeperdBusSource, KeeperdItemResumer, KeeperdResourcePersister, Policy,
-    BUS_POLL_MS,
+    garden_root_via_keeperd, load_fleet_config, reconcile_on_boot, spawn_bus_tailer, spawn_fleet,
+    Daemon, GrowlightdConfig, KeeperdBusSource, KeeperdItemResumer, KeeperdResourcePersister,
+    Policy, BUS_POLL_MS,
 };
 use softfig_ipc::{growlightd_runtime_socket_path, runtime_socket_path};
 
@@ -96,6 +96,18 @@ fn main() -> Result<()> {
     // Record the gate + roster so `growlight status` reports the configured fleet
     // even when it's disarmed (no drive loop spawned). config-in-garden slice 3.
     handle.daemon.set_fleet_config(fleet_config.clone());
+
+    // Boot reconcile — ONLY when the fleet is armed, and BEFORE `spawn_fleet` starts
+    // the drive loop's first claim tick (crash-diagnostics slice 002). It runs
+    // synchronously here, so the reset always completes before the loop's first
+    // `pick()`. Two steps: SIGKILL stray `growlight-agent-*.scope` units from a prior
+    // generation, then reset every orphaned-`active` item (no live holder exists
+    // post-restart) to `queued` so the scheduler can re-pick it. Gate off ⇒ skipped,
+    // so growlightd stays byte-identical to today when disarmed.
+    if fleet_config.enabled {
+        reconcile_on_boot(&keeperd_socket);
+    }
+
     let drive_loop = spawn_fleet(&handle.daemon, &fleet_config, &keeperd_socket)
         .context("spawning the live fleet drive loop")?;
     if drive_loop.is_some() {

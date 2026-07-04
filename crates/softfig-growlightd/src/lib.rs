@@ -37,6 +37,7 @@ pub mod peer;
 pub mod persist;
 pub mod preapproval;
 pub mod queue_source;
+pub mod reconcile;
 pub mod resume;
 pub mod scheduler;
 pub mod server;
@@ -76,6 +77,7 @@ pub use notify_dispatch::{
 pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_QUEUE_NAME};
+pub use reconcile::{reconcile_on_boot, ReconcileReport};
 pub use resume::{ItemResumer, KeeperdItemResumer, ResumeOutcome};
 pub use scheduler::{
     classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
