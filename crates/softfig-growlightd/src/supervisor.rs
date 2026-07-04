@@ -335,6 +335,17 @@ pub enum PollOutcome {
         /// Earliest Unix-seconds a re-roll may spawn.
         not_before: i64,
     },
+    /// A non-zero exit the network classifier attributed to a TRANSIENT network
+    /// death (network-failsafe slice 002): the peer lost its API connection mid-
+    /// session (link dropped / DNS / TLS / connection reset) rather than genuinely
+    /// crashing. Treated as a soft **reconnect**, NOT a crash — any hung child is
+    /// killed, but the failure streak is NOT bumped, NO punitive backoff is
+    /// scheduled (the member is immediately re-rollable), and NO `AgentCrashed`
+    /// alert fires. The member stays down-but-registered so
+    /// [`tick`](Supervisor::tick) re-rolls it off its baton; the pre-spawn
+    /// connectivity gate (slice 001) paces that re-spawn while the link is still
+    /// down, so there is no spin — the false-crash-loop fix.
+    Reconnecting,
     /// The agent was never started (unknown id) — ignored.
     Unknown,
 }
@@ -585,6 +596,29 @@ impl Supervisor {
         baton_status: Option<&str>,
         now: i64,
     ) -> PollOutcome {
+        // Default the network classifier to "never a network exit" — the pre-slice-
+        // 002 behaviour, where every non-zero exit is a genuine crash. The drive loop
+        // uses `poll_with_network` to feed the real classifier off the stderr ring +
+        // a connectivity probe; the supervisor's own tests exercise this default.
+        self.poll_with_network(agent, health, baton_status, now, || false)
+    }
+
+    /// Like [`poll`](Self::poll), but with a `network_exit` predicate — evaluated
+    /// ONLY when a crash verdict is reached (so a healthy tick pays nothing) — that
+    /// decides whether a non-zero exit is a TRANSIENT network death
+    /// ([`PollOutcome::Reconnecting`]: re-roll, no streak/backoff/alert) rather than a
+    /// genuine crash ([`PollOutcome::Crashed`], unchanged). The drive loop builds it
+    /// from the peer's in-memory stderr tail + a connectivity probe (network-failsafe
+    /// slice 002); a genuine hang or a non-network exit yields `false` and the
+    /// historical crash path is bit-for-bit unchanged.
+    pub fn poll_with_network<F: FnOnce() -> bool>(
+        &mut self,
+        agent: &str,
+        health: AgentHealth,
+        baton_status: Option<&str>,
+        now: i64,
+        network_exit: F,
+    ) -> PollOutcome {
         let hang_secs = self.hang_secs;
         if !self.agents.contains_key(agent) {
             return PollOutcome::Unknown;
@@ -592,7 +626,13 @@ impl Supervisor {
         match classify(&health, hang_secs, now) {
             Verdict::Healthy => PollOutcome::Healthy,
             Verdict::CleanExit => self.on_clean_exit(agent, baton_status, now),
-            Verdict::Crashed => self.on_crash(agent, health, now),
+            Verdict::Crashed => {
+                if network_exit() {
+                    self.on_network_exit(agent, health, now)
+                } else {
+                    self.on_crash(agent, health, now)
+                }
+            }
         }
     }
 
@@ -620,6 +660,34 @@ impl Supervisor {
             failures: sup.consecutive_failures,
             not_before: sup.not_before,
         }
+    }
+
+    /// Handle a **transient network exit** (network-failsafe slice 002): a non-zero
+    /// exit the classifier attributed to a lost API connection, not a genuine crash.
+    /// Kill any live (hung) child, then — unlike [`on_crash`](Self::on_crash) — do
+    /// NOT bump the failure streak, do NOT schedule a punitive backoff, and do NOT
+    /// surface an alert. The member is left down-but-registered and immediately
+    /// re-rollable (`not_before = now`); [`tick`](Self::tick) re-rolls it off its
+    /// baton, and the pre-spawn connectivity gate (slice 001) holds that re-spawn
+    /// while the link is still down — so a flaky link reconnects off the baton
+    /// instead of crash-looping with punitive backoff + a false page.
+    fn on_network_exit(&mut self, agent: &str, health: AgentHealth, now: i64) -> PollOutcome {
+        let sup = self
+            .agents
+            .get_mut(agent)
+            .expect("agent exists (checked in poll)");
+        let was_hung = matches!(health, AgentHealth::Alive { .. });
+        if let Some(child) = sup.child.take() {
+            if was_hung {
+                child.kill();
+            }
+        }
+        // Transient: the failure streak is left untouched (a network blip is not a
+        // failure, so it neither counts nor resets a real streak), and the member is
+        // immediately re-rollable — no punitive backoff. The connectivity gate paces
+        // the actual re-spawn while offline.
+        sup.not_before = now;
+        PollOutcome::Reconnecting
     }
 
     /// Decide what a clean (code-0) exit means by reading the agent's terminal
@@ -1229,6 +1297,30 @@ mod tests {
             PollOutcome::Unknown
         );
         assert_eq!(backend.spawn_count(), 0);
+    }
+
+    /// SLICE 002 — `poll_with_network` routes a non-zero exit to a soft RECONNECT
+    /// (no streak bump, no backoff, no alert) when the predicate says "network", and
+    /// to the historical CRASH path (streak + backoff + alert) when it says "genuine".
+    #[test]
+    fn poll_with_network_reconnects_a_network_exit_without_backoff() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend)); // base 2, cap 8
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        // A network-classified non-zero exit → Reconnecting, no streak bump, no alert.
+        let out = s.poll_with_network("a1", AgentHealth::Exited { code: 1 }, None, 0, || true);
+        assert_eq!(out, PollOutcome::Reconnecting);
+        assert_eq!(s.failures("a1"), 0, "a network exit bumps no failure streak");
+        assert!(s.is_registered("a1"), "the member stays registered for its re-roll");
+
+        // A genuine (non-network) exit still crashes with backoff — the unchanged path.
+        let out2 = s.poll_with_network("a1", AgentHealth::Exited { code: 1 }, None, 0, || false);
+        let PollOutcome::Crashed { failures, not_before, .. } = out2 else {
+            panic!("expected a crash, got {out2:?}");
+        };
+        assert_eq!(failures, 1, "a genuine crash bumps the streak");
+        assert_eq!(not_before, 2, "and schedules the backoff (base 2)");
     }
 
     /// The crash alert a `poll` returns routes through the phase-5 dispatcher to

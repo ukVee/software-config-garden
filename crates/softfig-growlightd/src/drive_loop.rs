@@ -320,6 +320,63 @@ fn v6_has_default(body: &str) -> bool {
     })
 }
 
+/// The network-error needles a peer's stderr tail is matched against to recognise a
+/// TRANSIENT API-connection death (network-failsafe slice 002). Case-insensitive
+/// substring match, curated to connection-LAYER failures a headless `claude -p`
+/// prints when the link drops (reset / refused / timeout / DNS / TLS / unreachable),
+/// NOT application errors — a 4xx/5xx body or a Rust panic is a genuine failure, not
+/// a blip, so it must NOT appear here (that would mask a real crash as a reconnect).
+const NETWORK_ERROR_NEEDLES: &[&str] = &[
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "connection error",
+    "connection timed out",
+    "error sending request",
+    "network is unreachable",
+    "no route to host",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "dns error",
+    "failed to lookup address",
+    "tls handshake",
+    "broken pipe",
+    "socket hang up",
+    "econnreset",
+    "econnrefused",
+    "etimedout",
+    "enotfound",
+    "eai_again",
+    "fetch failed",
+    "request timed out",
+];
+
+/// `true` if any line of a peer's stderr `tail` matches a [`NETWORK_ERROR_NEEDLES`]
+/// signature (case-insensitive). Pure over the tail.
+fn stderr_matches_network_signature(tail: &[String]) -> bool {
+    tail.iter().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        NETWORK_ERROR_NEEDLES
+            .iter()
+            .any(|needle| lower.contains(needle))
+    })
+}
+
+/// The pure network-exit classifier (network-failsafe slice 002): does a non-zero
+/// peer exit look like a TRANSIENT network death — reconnect off the baton with no
+/// streak/backoff/alert — rather than a genuine crash? `true` when the device is
+/// **offline at exit** (the link died and has not recovered) OR the stderr `tail`
+/// carries a network-error signature (a blip that may already have recovered by the
+/// time we poll — connectivity is racy across a flap, so the signature corroborates
+/// it). A genuine crash is online AND shows no network signature → `false`, so the
+/// historical crash path (backoff + `AgentCrashed`) is unchanged. The caller
+/// restricts this to an actual `Exited` non-zero code — a hung child is never
+/// reclassified. Pure `(tail, connectivity) → bool`, provable without a real network
+/// or a real `claude`.
+fn is_transient_network_exit(stderr_tail: &[String], online_at_exit: bool) -> bool {
+    !online_at_exit || stderr_matches_network_signature(stderr_tail)
+}
+
 /// The default [`QueueSource`] until the live keeperd queue feed lands
 /// (`growlight-live-fleet` slice 002): an **empty** [`Snapshot`], so the
 /// scheduler picks nothing and a gated-on fleet stays idle. Fail-closed — a
@@ -492,6 +549,13 @@ pub struct TickReport {
     pub rerolls: Vec<RerollOutcome>,
     /// Crash alerts surfaced by [`Supervisor::poll`] (slice 003 dispatches these).
     pub crashes: Vec<NotifyEvent>,
+    /// Members whose non-zero exit this tick was classified a TRANSIENT network death
+    /// (network-failsafe slice 002) and re-rolled off the baton instead of crashing:
+    /// NO `AgentCrashed` alert, NO backoff, NO failure-streak bump. Recorded distinct
+    /// from [`crashes`](TickReport::crashes) so the caller logs a soft reconnect apart
+    /// from a real crash; the member stays registered and step 2 re-rolls it (paced by
+    /// the connectivity gate while offline).
+    pub reconnecting: Vec<String>,
     /// Agents retired this tick (a boundary stop was honored).
     pub retired: Vec<String>,
     /// Agents that finished/deferred their current part this tick on an
@@ -598,6 +662,15 @@ pub struct DriveLoop {
     retiring: BTreeSet<String>,
     /// Agents that have retired on a boundary stop — never re-started this run.
     stopped: BTreeSet<String>,
+    /// Members whose last non-zero exit was classified a TRANSIENT network death and
+    /// are awaiting a reconnect re-roll (network-failsafe slice 002). A down member is
+    /// re-observed with the SAME stale exit each tick until it re-rolls, so this latch
+    /// keeps the classifier from escalating that repeat into a false crash when
+    /// connectivity flaps back before step 2 re-rolls it. Set on a `Reconnecting`
+    /// poll, cleared when the member re-rolls (a `Rerolled` outcome) or on any other
+    /// disposition — so a session that genuinely re-crashes after reconnecting is
+    /// classified fresh.
+    reconnecting: BTreeSet<String>,
     /// Each running member's current `(queue, part)` assignment, recorded on its
     /// fresh start (step 3) and carried across re-rolls (a re-roll stays on the same
     /// part). Read when a member exits on a human-block so the loop knows which item
@@ -652,6 +725,7 @@ impl DriveLoop {
             fleet,
             retiring: BTreeSet::new(),
             stopped: BTreeSet::new(),
+            reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
         }
     }
@@ -747,7 +821,50 @@ impl DriveLoop {
                     AgentHealth::Exited { .. } => self.baton.status(agent),
                     AgentHealth::Alive { .. } => None,
                 };
-                match self.supervisor.poll(agent, health, baton_status.as_deref(), now) {
+                // Network-exit classifier (slice 002): `poll_with_network` evaluates
+                // it ONLY on a crash verdict (so a healthy tick reads no stderr). A
+                // non-zero EXIT whose in-memory stderr tail carries a network-error
+                // signature, OR that exited while the device is offline, is a
+                // transient network death → reconnect, not crash; a hung child or a
+                // non-network exit stays a genuine crash. `stderr` + `connectivity`
+                // are disjoint fields from `&mut supervisor`, scoped to this block so
+                // their borrows release before the `&mut self` match arms below.
+                let outcome = {
+                    let stderr = &self.stderr;
+                    let connectivity = &self.connectivity;
+                    let reconnecting = &self.reconnecting;
+                    let network_exit = || {
+                        matches!(health, AgentHealth::Exited { .. })
+                            // Latch: a down member is re-observed with the SAME stale
+                            // exit every tick until it re-rolls (spawn resets the cell
+                            // to Alive). A member already deemed reconnecting must not
+                            // be escalated into a false crash if connectivity flaps back
+                            // before step 2 re-rolls it — it is the same pending network
+                            // death, not a new crash. Cleared on re-roll (after step 2),
+                            // so a session that genuinely re-crashes after reconnecting
+                            // is classified fresh.
+                            && (reconnecting.contains(agent)
+                                || is_transient_network_exit(
+                                    &stderr.stderr_tail(agent),
+                                    connectivity.online(),
+                                ))
+                    };
+                    self.supervisor.poll_with_network(
+                        agent,
+                        health,
+                        baton_status.as_deref(),
+                        now,
+                        network_exit,
+                    )
+                };
+                // Maintain the reconnect latch (slice 002): any non-reconnect
+                // disposition clears it (the member re-rolled, exited clean, or
+                // genuinely crashed — a fresh slate); the Reconnecting arm re-sets it
+                // below. The classifier above already read the pre-clear value.
+                if !matches!(outcome, PollOutcome::Reconnecting) {
+                    self.reconnecting.remove(agent);
+                }
+                match outcome {
                     PollOutcome::Crashed { event, .. } => {
                         // Enrich the alert with the crashed agent's stderr tail
                         // (crash-diagnostics slice 001): the supervisor built the
@@ -761,6 +878,24 @@ impl DriveLoop {
                         // rather than re-rolling.
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
+                        }
+                    }
+                    PollOutcome::Reconnecting => {
+                        // Transient network exit (slice 002): the member lost its API
+                        // connection mid-session and is re-rolled off its baton — NO
+                        // `AgentCrashed` alert (nothing pushed to `report.crashes`), NO
+                        // backoff, NO streak bump. Like `Rolling` but from a non-zero
+                        // exit the classifier attributed to the network; the member
+                        // stays down+registered so step 2 re-rolls it (held by the
+                        // connectivity gate while the link is still down). A retiring
+                        // agent stops here instead of reconnecting; its assignment is
+                        // untouched (it re-rolls on the SAME part).
+                        if self.retiring.remove(agent) {
+                            self.reconnecting.remove(agent);
+                            self.retire(agent, &mut report);
+                        } else {
+                            self.reconnecting.insert(agent.clone());
+                            report.reconnecting.push(agent.clone());
                         }
                     }
                     PollOutcome::Rolling => {
@@ -889,6 +1024,14 @@ impl DriveLoop {
                 pins.get(agent).is_some_and(|pin| pick(snap, *pin).is_some())
             };
             report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
+            // A member that re-rolled has consumed its pending-reconnect latch (slice
+            // 002): the fresh session's next exit is a NEW event to classify anew, so a
+            // genuine re-crash after a reconnect is never masked by a stale latch.
+            for outcome in &report.rerolls {
+                if let RerollOutcome::Rerolled { agent } = outcome {
+                    self.reconnecting.remove(agent);
+                }
+            }
         }
 
         // 3. Schedule + claim + admit + spawn over the snapshot read above. Each
@@ -1666,6 +1809,109 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// SLICE 002 — a mid-session network death (the peer's stderr tail carries a
+    /// connection-error signature while online) is classified TRANSIENT: the member
+    /// re-rolls off its baton with NO `AgentCrashed` alert, NO backoff, NO streak
+    /// bump — the false-crash-loop fix. Online, so it re-rolls the same tick.
+    #[test]
+    fn a_mid_session_network_exit_reconnects_without_a_crash_alert() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"], "a1 starts");
+
+        // The link blips: a1 exits non-zero with an API connection-error tail while
+        // still (just) online. Slice 002 reads that as a transient reconnect.
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_stderr(
+            "a1",
+            &["API Error: Connection error (connection reset by peer)"],
+        );
+        let r = loop_.tick(1);
+        assert_eq!(r.reconnecting, vec!["a1".to_string()], "a network exit reconnects");
+        assert!(r.crashes.is_empty(), "NO AgentCrashed alert for a network blip");
+        assert_eq!(probe.gui_alerts(), 0, "nobody is paged for a reconnect");
+        // Re-rolled off the baton the SAME tick (online) — no backoff delay.
+        assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "reconnected off the baton");
+    }
+
+    /// SLICE 002 — an exit with NO network signature but OFFLINE at exit is still
+    /// transient (the connectivity signal), and the reconnect LATCH keeps the SAME
+    /// stale exit — re-polled after the link returns before step 2 re-rolls it — from
+    /// escalating into a false crash. Slice 001's gate + slice 002's latch compose:
+    /// no page, resume on reconnect.
+    #[test]
+    fn an_offline_exit_reconnects_and_the_latch_prevents_a_false_crash_on_return() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // The link drops: a1 exits non-zero with NO stderr signature, offline. The
+        // connectivity signal alone marks it transient; the slice-001 gate then holds
+        // the re-roll while still offline.
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_offline(true);
+        let r1 = loop_.tick(1);
+        assert_eq!(
+            r1.reconnecting,
+            vec!["a1".to_string()],
+            "an offline exit is a reconnect, not a crash",
+        );
+        assert!(r1.crashes.is_empty(), "no crash alert");
+        assert!(r1.waiting_for_connectivity, "the gate holds the re-roll while offline");
+        assert_eq!(backend.spawn_count(), 1, "no re-spawn while offline");
+
+        // The link returns. step 1 RE-POLLS the same stale exit — now online, with no
+        // signature — which WITHOUT the latch would classify a false crash. The latch
+        // keeps it a reconnect, and step 2 re-rolls it off the baton.
+        backend.set_offline(false);
+        let r2 = loop_.tick(2);
+        assert!(r2.crashes.is_empty(), "the latch prevents a false crash on reconnect");
+        assert_eq!(probe.gui_alerts(), 0, "still nobody paged");
+        assert_eq!(r2.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "resumed on reconnect");
+    }
+
+    /// SLICE 002 — the pure network-exit classifier over fixtures (network vs genuine
+    /// crash), the provable core the drive loop feeds `poll_with_network`.
+    #[test]
+    fn network_exit_classifier_distinguishes_network_from_a_genuine_crash() {
+        // Online + a connection-error signature → transient (a blip that recovered).
+        assert!(is_transient_network_exit(
+            &["API Error: Connection reset by peer".to_string()],
+            true,
+        ));
+        // Online + a DNS signature → transient.
+        assert!(is_transient_network_exit(
+            &["error sending request: dns error: failed to lookup address".to_string()],
+            true,
+        ));
+        // Offline at exit, no signature at all → transient (the connectivity signal).
+        assert!(is_transient_network_exit(&[], false));
+        // Online + a genuine crash (a panic, no network signature) → NOT transient.
+        assert!(!is_transient_network_exit(
+            &["thread 'main' panicked at src/main.rs:12:5: index out of bounds".to_string()],
+            true,
+        ));
+        // Online + an application error (a 500, no connection-layer signature) → NOT
+        // transient: a real failure must still crash, not silently reconnect-loop.
+        assert!(!is_transient_network_exit(
+            &["API Error: 500 Internal Server Error".to_string()],
+            true,
+        ));
+        // The signature match is case-insensitive and specific to the connection layer.
+        assert!(stderr_matches_network_signature(&["ECONNRESET".to_string()]));
+        assert!(!stderr_matches_network_signature(&["clean shutdown".to_string()]));
+    }
+
     /// The loop picks each member's pinned part, admits under the per-device cap,
     /// and queues the over-cap start.
     #[test]
@@ -1877,15 +2123,17 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         loop_.tick(0);
         assert_eq!(backend.spawns(), vec!["a1"]);
 
-        // a1 errors out → crash classification. Its stderr ring holds the reason
+        // a1 errors out → crash classification. A GENUINE crash (a panic — no
+        // network signature, and online), so network-failsafe slice 002 does NOT
+        // reclassify it as a transient reconnect; its stderr ring holds the reason
         // (crash-diagnostics slice 001), so the surfaced alert must carry it.
         backend.set_health("a1", AgentHealth::Exited { code: 1 });
-        backend.set_stderr("a1", &["API Error: Connection reset by peer"]);
+        backend.set_stderr("a1", &["thread 'main' panicked at src/main.rs:12:5: boom"]);
         let r = loop_.tick(0);
         assert_eq!(
             r.crashes,
             vec![NotifyEvent::agent_crashed("a1")
-                .with_stderr_tail(vec!["API Error: Connection reset by peer".to_string()])],
+                .with_stderr_tail(vec!["thread 'main' panicked at src/main.rs:12:5: boom".to_string()])],
             "the crash surfaces an alert carrying the stderr tail (crash-diagnostics slice 001)",
         );
         assert_eq!(
