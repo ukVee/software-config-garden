@@ -231,6 +231,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::REPLICA_GRANT => handlers::replica_grant(daemon, req.args),
         op::REPLICA_REVOKE => handlers::replica_revoke(daemon, req.args),
         op::REPLICA_STATUS => handlers::replica_status(daemon, req.args),
+        op::DEPLOY_PLAN => crate::deploy::deploy_plan(daemon, req.args),
+        op::DEPLOY_APPLY => crate::deploy::deploy_apply(daemon, req.args),
         op::SHUTDOWN => handlers::shutdown(daemon, req.args),
         other => Err((
             ErrorKind::BadArgs,

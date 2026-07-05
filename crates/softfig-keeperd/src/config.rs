@@ -38,6 +38,13 @@ pub struct KeeperConfig {
     /// `~/.local/share/softfig/peers/`. Overridable so tests mirror into a
     /// tempdir instead of the real data home.
     pub replica_root: Option<PathBuf>,
+    /// M4 deploy: the `$HOME` boundary the deploy verbs resolve targets against.
+    /// `None` → `$HOME`. Overridable so tests deploy into a tempdir instead of
+    /// the real home. (`softfig-deploy` rejects targets outside this root.)
+    pub deploy_home: Option<PathBuf>,
+    /// M4 deploy: the persistent plaintext deploy-cache root. `None` → the XDG
+    /// default `~/.local/share/softfig/deployed/`. Overridable for tests.
+    pub deploy_cache_root: Option<PathBuf>,
     /// Growlight loop policy from `[growlight]` — currently the relock opt-in.
     pub growlight: GrowlightConfig,
     /// growlightd's listen socket, for the keeperd→growlightd hop the lease
@@ -161,6 +168,8 @@ impl KeeperConfig {
             relay: RelayConfig::default(),
             replica: ReplicaConfig::default(),
             replica_root: None,
+            deploy_home: None,
+            deploy_cache_root: None,
             growlight: GrowlightConfig::default(),
             growlightd_socket: None,
             enable_growlight_supervision: false,
@@ -194,6 +203,8 @@ impl KeeperConfig {
             relay: cfg.relay.into(),
             replica: cfg.replica.into(),
             replica_root: None,
+            deploy_home: None,
+            deploy_cache_root: None,
             growlight: cfg.growlight.into(),
             growlightd_socket: None,
             enable_growlight_supervision: false,
@@ -269,6 +280,20 @@ impl KeeperConfig {
         self
     }
 
+    /// M4 deploy: override the `$HOME` boundary the deploy verbs resolve targets
+    /// against (tests deploy into a tempdir home).
+    pub fn with_deploy_home(mut self, home: impl AsRef<Path>) -> Self {
+        self.deploy_home = Some(home.as_ref().to_path_buf());
+        self
+    }
+
+    /// M4 deploy: override the deploy-cache root (tests keep the cache out of the
+    /// real data home).
+    pub fn with_deploy_cache_root(mut self, root: impl AsRef<Path>) -> Self {
+        self.deploy_cache_root = Some(root.as_ref().to_path_buf());
+        self
+    }
+
     /// M5b: make this device a backup host (`[replica] host = true`).
     pub fn as_replica_host(mut self, host: bool) -> Self {
         self.replica.host = host;
@@ -295,6 +320,31 @@ impl KeeperConfig {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| PathBuf::from("."));
         base.join("softfig").join("peers")
+    }
+
+    /// M4 deploy: the `$HOME` boundary the deploy verbs resolve targets against —
+    /// the configured override, else `$HOME`. `None` only in a degenerate
+    /// environment where neither is set (the deploy verbs then error out).
+    pub fn deploy_home(&self) -> Option<PathBuf> {
+        self.deploy_home
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+    }
+
+    /// M4 deploy: the persistent plaintext deploy-cache root — the configured
+    /// override, else `$XDG_DATA_HOME/softfig/deployed` (falling back to
+    /// `~/.local/share/softfig/deployed`). Mirrors the CLI's `default_cache_root`
+    /// and [`replica_root`](Self::replica_root).
+    pub fn deploy_cache_root(&self) -> PathBuf {
+        if let Some(root) = &self.deploy_cache_root {
+            return root.clone();
+        }
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("softfig").join("deployed")
     }
 
     /// Directory containing the on-disk `.softfig/`. Equals

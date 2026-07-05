@@ -15,6 +15,7 @@ pub mod actions;
 pub mod classify;
 pub mod config;
 pub mod daemon;
+pub mod deploy;
 pub mod fuse_sink;
 pub mod growlight_unit;
 pub mod handlers;

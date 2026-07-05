@@ -212,6 +212,18 @@ pub mod op {
     /// held lease, promoting the head waiter. Forwarded keeperd→growlightd like
     /// [`REQUEST_LEASE`]; a release by a non-holder comes back `denied`.
     pub const RELEASE_LEASE: &str = "release_lease";
+    /// M4 deploy (TUI Deploy tab): compute the deploy plan — a read-only diff of
+    /// `config/deploy.toml` against the live filesystem. The daemon runs
+    /// `softfig-deploy`'s `plan` against the unlocked garden mount so a frontend
+    /// (the TUI) never touches the filesystem itself. Require Unlocked; no
+    /// mutation, no commit. Mirrors `softfig deploy --dry-run`.
+    pub const DEPLOY_PLAN: &str = "deploy_plan";
+    /// M4 deploy (TUI Deploy tab): materialize the plan onto the filesystem
+    /// (deploy-cache + targets) via `softfig-deploy`'s `apply`, returning the
+    /// `Report`. `force` backs up a conflicting target to `<target>.softfig-bak`.
+    /// Require Unlocked. A native-FS op, not a VCS event (M4a defers that) — so
+    /// no commit. Mirrors `softfig deploy [--force]`.
+    pub const DEPLOY_APPLY: &str = "deploy_apply";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1445,4 +1457,77 @@ pub struct TailBusArgs {
 pub struct TailBusReply {
     /// Matching messages in total order (ascending number).
     pub messages: Vec<ChatMessage>,
+}
+
+// ---- M4 deploy (TUI Deploy tab) ---------------------------------------
+
+/// `deploy_plan({}) -> DeployPlanReply`. Read-only — the daemon runs
+/// `softfig-deploy`'s `plan` against the unlocked garden mount and returns a
+/// metadata-only projection (no source bytes cross the boundary).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployPlanArgs {}
+
+/// `deploy_apply({force}) -> DeployApplyReply`. Materialize the plan onto the
+/// filesystem (deploy-cache + targets).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployApplyArgs {
+    /// Back up a conflicting target to `<target>.softfig-bak` and overwrite it
+    /// instead of refusing (mirrors `softfig deploy --force`).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What `apply` would do with one dot — the wire projection of
+/// `softfig_deploy::Action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployAction {
+    /// Target absent → create the cache file + symlink.
+    CreateSymlink,
+    /// Target is ours but stale → refresh it.
+    ReplaceManaged,
+    /// `method = "copy"`, target absent → write the stamped copy.
+    CopyStamped,
+    /// Target already matches the desired state → nothing to do.
+    SkipUnchanged,
+    /// Target exists and is not ours → refused unless `force`.
+    Conflict,
+}
+
+/// One planned dot as surfaced to the Deploy tab. Metadata only — the source
+/// bytes never cross IPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployPlanEntry {
+    /// The dot's name (its `config/deploy.toml` key).
+    pub name: String,
+    pub action: DeployAction,
+    /// Resolved absolute target path (for display).
+    pub target: String,
+    /// Human reason, set only when `action == Conflict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployPlanReply {
+    /// Planned dots in stable (name) order.
+    pub entries: Vec<DeployPlanEntry>,
+    /// True when any entry is a `Conflict` — `apply` would refuse it without
+    /// `force`.
+    pub has_conflicts: bool,
+}
+
+/// The wire projection of `softfig_deploy::Report` — what `apply` actually did,
+/// by category. Each vec holds dot names (conflicts carry their reason inline).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployApplyReply {
+    pub created: Vec<String>,
+    pub replaced: Vec<String>,
+    pub copied: Vec<String>,
+    pub skipped: Vec<String>,
+    /// Conflicts that were refused (no `force`), with their reasons.
+    pub conflicts: Vec<String>,
+    /// Conflicts overridden with `force` (target backed up first).
+    pub forced: Vec<String>,
+    pub warnings: Vec<String>,
 }

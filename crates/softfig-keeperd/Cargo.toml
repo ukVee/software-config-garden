@@ -18,6 +18,9 @@ softfig-vcs.workspace = true
 softfig-ipc.workspace = true
 softfig-fuse = { path = "../softfig-fuse" }
 softfig-net.workspace = true
+# M4 deploy verbs (deploy_plan/deploy_apply) — the daemon runs softfig-deploy's
+# plan/apply on the TUI's behalf so the frontend never touches the FS itself.
+softfig-deploy.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
