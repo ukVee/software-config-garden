@@ -47,7 +47,7 @@ use crate::error::{NetError, Result};
 use crate::proto::{
     frame, CommitData, Frame, ObjectData, ReplicaGrant, TipAnnounce, TreeData,
 };
-use crate::transport::NoiseSession;
+use crate::transport::{NoiseReader, NoiseSession, NoiseWriter, SplitIo};
 
 /// Domain-separation prefix for the [`TipAnnounce`] signature. Versioned and
 /// distinct from every other context the identity key signs (commits, the
@@ -202,15 +202,33 @@ pub struct ServeSummary {
     pub objects_served: u64,
 }
 
-/// Drive a pull as the **sink** (host). Asks for the tip, verifies the announce,
-/// walks back to the fast-forward base (rejecting forks/rollbacks), then applies
-/// the missing commits oldest-first — fetching each commit's trees + ciphertext
-/// objects it lacks — and advances the mirror tip. Sends `ReplicaDone` when
-/// finished so the source can close.
-pub fn pull_replication<S: Read + Write>(
+/// What a pull negotiation ([`negotiate_pull`]) resolved to: what, if anything,
+/// the mirror must backfill. Computed identically for the sequential and
+/// full-duplex drivers so they agree on the fast-forward / fork decision
+/// bit-for-bit.
+enum Plan {
+    /// The mirror already holds the announced tip — nothing to fetch.
+    UpToDate,
+    /// The owner has no commits to mirror.
+    Empty,
+    /// The commits missing from the mirror (newest .. oldest) plus the tip to
+    /// advance to once they (and their trees/objects) are stored.
+    Backfill {
+        missing: Vec<CommitData>,
+        announced_tip: [u8; 32],
+        height: u64,
+    },
+}
+
+/// Phase 1 (ask for the tip + verify the signed announce) and phase 2 (walk
+/// back from the announced tip to the fast-forward base, verifying each commit
+/// and rejecting forks/rollbacks). Shared by [`pull_replication`] and
+/// [`pull_replication_pipelined`]. It stores nothing and sends no `ReplicaDone`,
+/// so the caller owns storage + session teardown.
+fn negotiate_pull<S: Read + Write>(
     session: &mut NoiseSession<S>,
     sink: &mut dyn ReplicaSink,
-) -> Result<PullSummary> {
+) -> Result<Plan> {
     // 1. Ask for the tip + verify the signed announce.
     session.send_frame(&Frame::get_tip())?;
     let ann = expect_tip_announce(session.recv_frame()?)?;
@@ -221,17 +239,12 @@ pub fn pull_replication<S: Read + Write>(
     }
     if ann.tip_hash.is_empty() {
         // Owner has no commits — nothing to mirror.
-        session.send_frame(&Frame::replica_done())?;
-        return Ok(PullSummary::default());
+        return Ok(Plan::Empty);
     }
     let announced_tip = to_hash32(&ann.tip_hash)?;
 
     if sink.stored_tip() == Some(announced_tip) {
-        session.send_frame(&Frame::replica_done())?;
-        return Ok(PullSummary {
-            up_to_date: true,
-            ..Default::default()
-        });
+        return Ok(Plan::UpToDate);
     }
 
     // 2. Walk back from the announced tip, verifying each commit, until we reach
@@ -272,6 +285,46 @@ pub fn pull_replication<S: Read + Write>(
         }
     }
 
+    Ok(Plan::Backfill {
+        missing,
+        announced_tip,
+        height: ann.height,
+    })
+}
+
+/// Drive a pull as the **sink** (host). Asks for the tip, verifies the announce,
+/// walks back to the fast-forward base (rejecting forks/rollbacks), then applies
+/// the missing commits oldest-first — fetching each commit's trees + ciphertext
+/// objects it lacks — and advances the mirror tip. Sends `ReplicaDone` when
+/// finished so the source can close.
+///
+/// This is the **sequential** driver: one strict request→response→request
+/// round-trip per object. It works over any `Read + Write` stream, including the
+/// relay tunnel. LAN-direct callers use [`pull_replication_pipelined`] for the
+/// same result with a full-duplex, windowed transfer.
+pub fn pull_replication<S: Read + Write>(
+    session: &mut NoiseSession<S>,
+    sink: &mut dyn ReplicaSink,
+) -> Result<PullSummary> {
+    let (missing, announced_tip, height) = match negotiate_pull(session, sink)? {
+        Plan::Empty => {
+            session.send_frame(&Frame::replica_done())?;
+            return Ok(PullSummary::default());
+        }
+        Plan::UpToDate => {
+            session.send_frame(&Frame::replica_done())?;
+            return Ok(PullSummary {
+                up_to_date: true,
+                ..Default::default()
+            });
+        }
+        Plan::Backfill {
+            missing,
+            announced_tip,
+            height,
+        } => (missing, announced_tip, height),
+    };
+
     // 3. Apply oldest -> newest: each commit's trees + objects, then the row.
     let mut summary = PullSummary::default();
     for c in missing.iter().rev() {
@@ -280,7 +333,7 @@ pub fn pull_replication<S: Read + Write>(
         sink.store_commit(c)?;
         summary.commits += 1;
     }
-    sink.advance_tip(&announced_tip, ann.height)?;
+    sink.advance_tip(&announced_tip, height)?;
     session.send_frame(&Frame::replica_done())?;
     summary.new_tip = Some(announced_tip);
     Ok(summary)
@@ -317,6 +370,279 @@ fn ensure_tree<S: Read + Write>(
     }
     sink.store_tree(&tree)?;
     summary.trees += 1;
+    Ok(())
+}
+
+// --- Full-duplex pipelined backfill ----------------------------------------
+
+/// Number of replication requests kept in flight on the full-duplex backfill
+/// path. Bounds the unstored bytes buffered in transit while keeping the pipe
+/// full enough to hide the per-object round-trip latency the sequential driver
+/// pays on every fetch.
+const PIPELINE_WINDOW: usize = 32;
+
+/// One outstanding request on the pipelined path, matched to its response by the
+/// source's strict FIFO serve order (response N answers request N).
+#[derive(Clone, Copy)]
+enum Want {
+    Tree([u8; 32]),
+    Object([u8; 32]),
+}
+
+/// A message to the request-writer thread on the full-duplex path. The frame is
+/// boxed so the common `Send` variant doesn't bloat every queued message to the
+/// size of a full `Frame`.
+enum WriterMsg {
+    /// Send this request frame.
+    Send(Box<Frame>),
+    /// All requests are sent — emit the terminal `ReplicaDone` and stop.
+    Finish,
+}
+
+/// Full-duplex counterpart of [`pull_replication`] for a stream that can
+/// [`split`](NoiseSession::split) into independent read/write halves (a
+/// LAN-direct `TcpStream`). It runs the same phase-1/2 negotiation, then
+/// backfills by **streaming** `GetTree`/`GetObject` requests over a bounded
+/// in-flight window ([`PIPELINE_WINDOW`]) while a reader thread concurrently
+/// drains the responses — instead of the sequential driver's one strict
+/// request→response→request round-trip per object.
+///
+/// **Verification and storage are identical to [`pull_replication`]:** every
+/// commit is Ed25519-verified against the ring identity + owner binding, every
+/// tree/object content-address is checked, objects and subtrees are stored
+/// **before** the tree that references them (so a stored tree still implies its
+/// whole subtree is present), commits apply **oldest→newest**, the mirror tip
+/// advances **only at the very end**, and a fork/rollback is rejected before any
+/// change. Both drivers therefore produce the same [`PullSummary`] and the same
+/// mirror bytes — this is a throughput change only.
+///
+/// The relay path can't use this: its `RelayStream` tunnels a single multiplexed
+/// session that isn't full-duplex-splittable, so it stays on [`pull_replication`].
+pub fn pull_replication_pipelined<S>(
+    mut session: NoiseSession<S>,
+    sink: &mut dyn ReplicaSink,
+) -> Result<PullSummary>
+where
+    S: Read + Write + SplitIo,
+{
+    let (missing, announced_tip, height) = match negotiate_pull(&mut session, sink)? {
+        Plan::Empty => {
+            session.send_frame(&Frame::replica_done())?;
+            return Ok(PullSummary::default());
+        }
+        Plan::UpToDate => {
+            session.send_frame(&Frame::replica_done())?;
+            return Ok(PullSummary {
+                up_to_date: true,
+                ..Default::default()
+            });
+        }
+        Plan::Backfill {
+            missing,
+            announced_tip,
+            height,
+        } => (missing, announced_tip, height),
+    };
+
+    // Split the session: the writer half streams requests off the main thread so
+    // draining responses never blocks behind a full socket send buffer (the
+    // deadlock a single-thread driver would hit if it sent a whole window before
+    // reading). Responses come back in strict request order (the source serves
+    // sequentially), so a FIFO queue matches each to its request.
+    let (mut reader, writer) = session.split()?;
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<WriterMsg>();
+
+    std::thread::scope(|scope| -> Result<PullSummary> {
+        let writer_thread = scope.spawn(move || run_request_writer(writer, req_rx));
+
+        let result = drive_backfill(&mut reader, sink, &missing, announced_tip, height, &req_tx);
+
+        // Always release the writer (send ReplicaDone) and reclaim it, so a
+        // main-thread error can't strand the thread. Surface the main error
+        // first; the writer's own error only matters on the success path.
+        let _ = req_tx.send(WriterMsg::Finish);
+        drop(req_tx);
+        let writer_result = writer_thread
+            .join()
+            .map_err(|_| NetError::Protocol("replication writer thread panicked"))?;
+        let summary = result?;
+        writer_result?;
+        Ok(summary)
+    })
+}
+
+/// The full-duplex backfill loop. Seeds the request frontier with the missing
+/// commits' root trees, then keeps [`PIPELINE_WINDOW`] requests in flight —
+/// storing each object as it arrives and expanding each tree's missing children
+/// into the frontier — until the frontier and the in-flight queue both drain.
+/// Trees are buffered and stored **post-order** afterward (their objects and
+/// subtrees are all present by then); commits apply oldest→newest; the tip
+/// advances last — the exact order [`pull_replication`] applies.
+fn drive_backfill<R: Read>(
+    reader: &mut NoiseReader<R>,
+    sink: &mut dyn ReplicaSink,
+    missing: &[CommitData],
+    announced_tip: [u8; 32],
+    height: u64,
+    req_tx: &std::sync::mpsc::Sender<WriterMsg>,
+) -> Result<PullSummary> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut summary = PullSummary::default();
+    let mut frontier: VecDeque<Want> = VecDeque::new();
+    let mut outstanding: VecDeque<Want> = VecDeque::new();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut trees: HashMap<[u8; 32], TreeData> = HashMap::new();
+
+    // Seed: every missing commit's root tree the mirror lacks. Dedup so a tree
+    // shared across commits is requested only once.
+    for c in missing {
+        let root = to_hash32(&c.root_tree)?;
+        if seen.insert(root) && !sink.has_tree(&root) {
+            frontier.push_back(Want::Tree(root));
+        }
+    }
+
+    let send = |w: Want| -> Result<()> {
+        let frame = match w {
+            Want::Tree(h) => Frame::get_tree(h.to_vec()),
+            Want::Object(h) => Frame::get_object(h.to_vec()),
+        };
+        req_tx
+            .send(WriterMsg::Send(Box::new(frame)))
+            .map_err(|_| NetError::Protocol("replication writer thread ended early"))
+    };
+
+    loop {
+        // Keep the pipe full: dispatch from the frontier up to the window.
+        while outstanding.len() < PIPELINE_WINDOW {
+            match frontier.pop_front() {
+                Some(w) => {
+                    send(w)?;
+                    outstanding.push_back(w);
+                }
+                None => break,
+            }
+        }
+        let Some(want) = outstanding.pop_front() else {
+            break; // frontier + in-flight both empty: backfill complete
+        };
+        let resp = reader.recv_frame()?;
+        match (want, resp.kind) {
+            (Want::Tree(hash), Some(frame::Kind::TreeData(t))) => {
+                if !t.found {
+                    return Err(NetError::Protocol("source is missing a requested tree"));
+                }
+                if to_hash32(&t.hash)? != hash {
+                    return Err(NetError::Protocol("tree_data hash does not match request"));
+                }
+                // Discover the tree's missing children; dedup against what we've
+                // already scheduled this run and what the mirror already holds.
+                for entry in &t.entries {
+                    let target = to_hash32(&entry.target)?;
+                    let child = match entry.kind.as_str() {
+                        "tree" => {
+                            if sink.has_tree(&target) {
+                                continue;
+                            }
+                            Want::Tree(target)
+                        }
+                        "blob" => {
+                            if sink.has_object(&target) {
+                                continue;
+                            }
+                            Want::Object(target)
+                        }
+                        _ => return Err(NetError::Protocol("tree entry has unknown kind")),
+                    };
+                    if seen.insert(target) {
+                        frontier.push_back(child);
+                    }
+                }
+                trees.insert(hash, t);
+            }
+            (Want::Object(hash), Some(frame::Kind::ObjectData(o))) => {
+                if !o.found {
+                    return Err(NetError::Protocol("source is missing a requested object"));
+                }
+                if to_hash32(&o.hash)? != hash {
+                    return Err(NetError::Protocol("object_data hash does not match request"));
+                }
+                sink.store_object(&hash, &o.payload)?;
+                summary.objects += 1;
+            }
+            _ => {
+                return Err(NetError::Protocol(
+                    "replication response did not match the outstanding request",
+                ))
+            }
+        }
+    }
+
+    // Every object and subtree is now stored/buffered. Store trees post-order
+    // (subtree before the tree that references it), then commits oldest→newest,
+    // then advance the tip.
+    let mut stored: HashSet<[u8; 32]> = HashSet::new();
+    for c in missing {
+        let root = to_hash32(&c.root_tree)?;
+        store_tree_postorder(sink, &trees, &root, &mut stored, &mut summary)?;
+    }
+    for c in missing.iter().rev() {
+        sink.store_commit(c)?;
+        summary.commits += 1;
+    }
+    sink.advance_tip(&announced_tip, height)?;
+    summary.new_tip = Some(announced_tip);
+    Ok(summary)
+}
+
+/// Store the subtree rooted at `hash` post-order (descendants first) from the
+/// trees buffered during the pipelined fetch — the same invariant
+/// [`ensure_tree`] preserves, so a stored tree still implies its whole subtree
+/// is present. A tree already in the mirror (or already stored this pass)
+/// short-circuits.
+fn store_tree_postorder(
+    sink: &mut dyn ReplicaSink,
+    trees: &std::collections::HashMap<[u8; 32], TreeData>,
+    hash: &[u8; 32],
+    stored: &mut std::collections::HashSet<[u8; 32]>,
+    summary: &mut PullSummary,
+) -> Result<()> {
+    if stored.contains(hash) || sink.has_tree(hash) {
+        return Ok(());
+    }
+    let tree = trees
+        .get(hash)
+        .ok_or(NetError::Protocol("post-order store: a needed tree was not fetched"))?;
+    for entry in &tree.entries {
+        if entry.kind.as_str() == "tree" {
+            let child = to_hash32(&entry.target)?;
+            store_tree_postorder(sink, trees, &child, stored, summary)?;
+        }
+    }
+    sink.store_tree(tree)?;
+    stored.insert(*hash);
+    summary.trees += 1;
+    Ok(())
+}
+
+/// The request-writer half of the full-duplex path: serialize request sends off
+/// the main thread, then emit the terminal `ReplicaDone` on [`WriterMsg::Finish`].
+fn run_request_writer<W: Write>(
+    mut writer: NoiseWriter<W>,
+    rx: std::sync::mpsc::Receiver<WriterMsg>,
+) -> Result<()> {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            WriterMsg::Send(frame) => writer.send_frame(&frame)?,
+            WriterMsg::Finish => {
+                writer.send_frame(&Frame::replica_done())?;
+                return Ok(());
+            }
+        }
+    }
+    // The sender was dropped without Finish (the main thread aborted on an
+    // error). Nothing more to send; the closing socket lets the source see EOF.
     Ok(())
 }
 
@@ -489,35 +815,30 @@ mod tests {
     }
 
     impl Chain {
-        /// Append a commit with a single blob whose content is `body`. Returns
-        /// the new commit hash.
-        fn commit(&mut self, body: &[u8]) -> [u8; 32] {
-            let cipher = body.to_vec(); // "ciphertext" stand-in
-            let blob = h(&cipher);
-            self.objects.insert(blob, cipher);
-            let entries = vec![TreeEntryMsg {
-                name: "file".into(),
-                kind: "blob".into(),
-                mode: 0o100644,
-                target: blob.to_vec(),
-            }];
-            let troot = h(&canonical_tree_bytes(&entries));
+        /// Insert a tree (keyed by its canonical address) and return that hash.
+        fn add_tree(&mut self, entries: Vec<TreeEntryMsg>) -> [u8; 32] {
+            let hash = h(&canonical_tree_bytes(&entries));
             self.trees.insert(
-                troot,
+                hash,
                 TreeData {
                     found: true,
-                    hash: troot.to_vec(),
+                    hash: hash.to_vec(),
                     entries,
                 },
             );
+            hash
+        }
+
+        /// Seal a commit over `root_tree`, chaining off the current tip. `tag`
+        /// disambiguates the commit hash; the signature is a stub.
+        fn seal_commit(&mut self, root_tree: [u8; 32], tag: &[u8]) -> [u8; 32] {
             let parent = self.tip;
-            // Commit hash: just hash the parent+root+body; signature is a stub.
             let mut pre = Vec::new();
             if let Some(p) = parent {
                 pre.extend_from_slice(&p);
             }
-            pre.extend_from_slice(&troot);
-            pre.extend_from_slice(body);
+            pre.extend_from_slice(&root_tree);
+            pre.extend_from_slice(tag);
             let ch = h(&pre);
             self.commits.insert(
                 ch,
@@ -525,7 +846,7 @@ mod tests {
                     found: true,
                     hash: ch.to_vec(),
                     parent: parent.map(|p| p.to_vec()).unwrap_or_default(),
-                    root_tree: troot.to_vec(),
+                    root_tree: root_tree.to_vec(),
                     author_device: "owner".into(),
                     author_pubkey: vec![0u8; 32],
                     timestamp: 0,
@@ -538,6 +859,49 @@ mod tests {
             self.tip = Some(ch);
             self.height += 1;
             ch
+        }
+
+        /// A blob entry named `name` whose content is `body`, registering the
+        /// object.
+        fn blob_entry(&mut self, name: &str, body: Vec<u8>) -> TreeEntryMsg {
+            let blob = h(&body);
+            self.objects.insert(blob, body);
+            TreeEntryMsg {
+                name: name.into(),
+                kind: "blob".into(),
+                mode: 0o100644,
+                target: blob.to_vec(),
+            }
+        }
+
+        /// Append a commit with a single blob whose content is `body`. Returns
+        /// the new commit hash.
+        fn commit(&mut self, body: &[u8]) -> [u8; 32] {
+            let entry = self.blob_entry("file", body.to_vec());
+            let troot = self.add_tree(vec![entry]);
+            self.seal_commit(troot, body)
+        }
+
+        /// Append a commit whose root tree fans out to `width` blobs plus a
+        /// nested subtree of another `width` blobs — enough to exceed the
+        /// pipeline window and to exercise post-order subtree storage.
+        fn commit_wide(&mut self, tag: &str, width: usize) -> [u8; 32] {
+            let sub_entries: Vec<TreeEntryMsg> = (0..width)
+                .map(|i| self.blob_entry(&format!("s{i}"), format!("{tag}-sub-{i}").into_bytes()))
+                .collect();
+            let sub_hash = self.add_tree(sub_entries);
+
+            let mut entries: Vec<TreeEntryMsg> = (0..width)
+                .map(|i| self.blob_entry(&format!("f{i}"), format!("{tag}-root-{i}").into_bytes()))
+                .collect();
+            entries.push(TreeEntryMsg {
+                name: "dir".into(),
+                kind: "tree".into(),
+                mode: 0o40000,
+                target: sub_hash.to_vec(),
+            });
+            let troot = self.add_tree(entries);
+            self.seal_commit(troot, tag.as_bytes())
         }
     }
 
@@ -801,5 +1165,146 @@ mod tests {
             grant_signing_bytes(b"x", b"y", 0),
             tipannounce_signing_bytes(b"x", b"y", 0)
         );
+    }
+
+    // --- Full-duplex pipelined driver ------------------------------------
+
+    /// Same as [`run`] but drives the full-duplex pipelined sink over the split
+    /// session. Both drivers must produce identical results over the same
+    /// chain + mirror.
+    fn run_pipelined(chain: Chain, mut sink: MockSink) -> (Result<PullSummary>, MockSink) {
+        let (a, b) = UnixStream::pair().unwrap();
+        let src = MockSource { chain };
+        let server = thread::spawn(move || {
+            let mut s = xx_responder(b, &[2u8; 32], &hello("owner")).unwrap();
+            let _ = serve_replication(&mut s, &src);
+        });
+        let client = xx_initiator(a, &[1u8; 32], &hello("host")).unwrap();
+        // `pull_replication_pipelined` consumes the session; its split halves
+        // drop here, closing the socket so the server's serve loop sees EOF and
+        // returns even when the pull aborted mid-exchange without a ReplicaDone.
+        let result = pull_replication_pipelined(client, &mut sink);
+        server.join().unwrap();
+        (result, sink)
+    }
+
+    #[test]
+    fn pipelined_full_backfill_matches_the_sequential_driver() {
+        let mut chain = Chain::default();
+        chain.commit(b"alpha");
+        chain.commit(b"beta");
+        let tip = chain.commit(b"gamma");
+
+        let (seq_res, seq_sink) = run(
+            chain.clone(),
+            MockSink {
+                announce_ok: true,
+                ..Default::default()
+            },
+        );
+        let (pipe_res, pipe_sink) = run_pipelined(
+            chain.clone(),
+            MockSink {
+                announce_ok: true,
+                ..Default::default()
+            },
+        );
+
+        let seq_sum = seq_res.unwrap();
+        let pipe_sum = pipe_res.unwrap();
+        // Identical PullSummary and identical mirror state, byte for byte.
+        assert_eq!(seq_sum, pipe_sum);
+        assert_eq!(pipe_sum.new_tip, Some(tip));
+        assert_eq!(seq_sink.commits, pipe_sink.commits);
+        assert_eq!(seq_sink.trees, pipe_sink.trees);
+        assert_eq!(seq_sink.objects, pipe_sink.objects);
+        assert_eq!(pipe_sink.stored_tip(), Some(tip));
+    }
+
+    #[test]
+    fn pipelined_many_object_backfill_exercises_the_window() {
+        // A commit whose tree fans out well past PIPELINE_WINDOW, plus a nested
+        // subtree, so the pipeline keeps a full in-flight window and still
+        // stores subtrees post-order before the tree that references them.
+        let width = PIPELINE_WINDOW * 2 + 5;
+        let mut chain = Chain::default();
+        chain.commit(b"genesis");
+        let tip = chain.commit_wide("wide", width);
+
+        let (res, sink) = run_pipelined(
+            chain.clone(),
+            MockSink {
+                announce_ok: true,
+                ..Default::default()
+            },
+        );
+        let summary = res.unwrap();
+
+        assert_eq!(summary.new_tip, Some(tip));
+        assert_eq!(sink.stored_tip(), Some(tip));
+        assert_eq!(summary.commits, 2);
+        // Every distinct object + tree the owner holds is mirrored, and the
+        // summary counts equal what was actually stored (full dedup).
+        assert_eq!(sink.objects, chain.objects);
+        assert_eq!(sink.trees, chain.trees);
+        assert_eq!(summary.objects as usize, chain.objects.len());
+        assert_eq!(summary.trees as usize, chain.trees.len());
+    }
+
+    #[test]
+    fn pipelined_fast_forward_only_fetches_new_commits() {
+        let mut chain = Chain::default();
+        chain.commit(b"alpha");
+        let tip1 = chain.tip.unwrap();
+
+        let mut sink = MockSink {
+            announce_ok: true,
+            tip: Some(tip1),
+            ..Default::default()
+        };
+        let c1 = chain.commits.get(&tip1).unwrap().clone();
+        sink.commits.insert(tip1, c1.clone());
+        let troot = to_hash32(&c1.root_tree).unwrap();
+        sink.trees
+            .insert(troot, chain.trees.get(&troot).unwrap().clone());
+        for (k, v) in &chain.objects {
+            sink.objects.insert(*k, v.clone());
+        }
+
+        chain.commit(b"beta");
+        let tip3 = chain.commit(b"gamma");
+
+        let (res, sink) = run_pipelined(chain, sink);
+        let summary = res.unwrap();
+        assert_eq!(summary.commits, 2, "only the two new commits are fetched");
+        assert_eq!(sink.stored_tip(), Some(tip3));
+    }
+
+    #[test]
+    fn pipelined_divergent_chain_is_rejected_as_a_fork() {
+        // The fork is caught in negotiation (before the session is split), so
+        // the mirror is left untouched — same as the sequential driver.
+        let mut chain_a = Chain::default();
+        chain_a.commit(b"alpha");
+        let tip_a = chain_a.tip.unwrap();
+
+        let mut sink = MockSink {
+            announce_ok: true,
+            tip: Some(tip_a),
+            ..Default::default()
+        };
+        sink.commits
+            .insert(tip_a, chain_a.commits.get(&tip_a).unwrap().clone());
+
+        let mut chain_b = Chain::default();
+        chain_b.commit(b"bravo");
+        chain_b.commit(b"charlie");
+
+        let (res, sink) = run_pipelined(chain_b, sink);
+        assert!(
+            matches!(res, Err(NetError::Protocol(_))),
+            "a forked chain must be rejected"
+        );
+        assert_eq!(sink.stored_tip(), Some(tip_a), "mirror tip unchanged");
     }
 }

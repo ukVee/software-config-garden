@@ -33,8 +33,8 @@ use softfig_net::proto::{HelloPayload, TipAnnounce};
 use softfig_net::ring::{ring_path, Ring, RingEntry};
 use softfig_net::transport::{xx_initiator, xx_responder};
 use softfig_net::{
-    pull_replication, serve_replication, tipannounce_signing_bytes, NetError, PullSummary,
-    ReplicaSink,
+    pull_replication, pull_replication_pipelined, serve_replication, tipannounce_signing_bytes,
+    NetError, PullSummary, ReplicaSink,
 };
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
 use softfig_vault::{params::VaultParams, Vault, VaultSession};
@@ -91,13 +91,56 @@ impl Owner {
         let intent = Intent::new("manual_edit", json!({ "path": rel })).unwrap();
         self.repo.commit_workdir(&self.session, intent).unwrap()
     }
+
+    /// Write `n` distinct files under `dir/` and commit them in ONE commit,
+    /// producing a subtree that fans out past the pipeline window. Returns the
+    /// new tip hash.
+    fn commit_many(&mut self, dir: &str, n: usize) -> Hash {
+        let base = self.garden.join(dir);
+        std::fs::create_dir_all(&base).unwrap();
+        for i in 0..n {
+            std::fs::write(base.join(format!("f{i:03}.md")), format!("content-{i}")).unwrap();
+        }
+        let intent = Intent::new("manual_edit", json!({ "dir": dir })).unwrap();
+        self.repo.commit_workdir(&self.session, intent).unwrap()
+    }
+}
+
+/// Which pull driver [`replicate_with`] exercises.
+#[derive(Clone, Copy)]
+enum Driver {
+    /// Strict request→response per object ([`pull_replication`]).
+    Sequential,
+    /// Full-duplex windowed backfill ([`pull_replication_pipelined`]).
+    Pipelined,
+}
+
+/// Run one serve/pull round over a real loopback Noise session with the
+/// **sequential** driver. Thin wrapper over [`replicate_with`].
+fn replicate_once(
+    garden: &Path,
+    owner_transport: [u8; 32],
+    owner_device_id: [u8; 32],
+    announce: TipAnnounce,
+    mirror: &mut MirrorStore,
+) -> Result<PullSummary, NetError> {
+    replicate_with(
+        Driver::Sequential,
+        garden,
+        owner_transport,
+        owner_device_id,
+        announce,
+        mirror,
+    )
 }
 
 /// Run one serve/pull round over a real loopback Noise session: the owner
 /// (responder) serves a fresh read-only `Repo` handle while the host (initiator)
-/// drives the pull into `mirror`. Returns the pull result. Closes the client
-/// before joining so a mid-exchange abort can't deadlock the unbuffered socket.
-fn replicate_once(
+/// drives the pull into `mirror` with `driver`. Returns the pull result. The
+/// client session is dropped/consumed before joining so a mid-exchange abort
+/// can't deadlock the unbuffered socket.
+fn replicate_with(
+    driver: Driver,
     garden: &Path,
     owner_transport: [u8; 32],
     owner_device_id: [u8; 32],
@@ -124,8 +167,16 @@ fn replicate_once(
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let hello = HelloPayload::new(b"host-device".to_vec(), "host");
     let mut session = xx_initiator(stream, &[9u8; 32], &hello).unwrap();
-    let result = pull_replication(&mut session, mirror);
-    drop(session);
+    let result = match driver {
+        Driver::Sequential => {
+            let r = pull_replication(&mut session, mirror);
+            drop(session); // let the owner's serve loop see EOF on abort
+            r
+        }
+        // The pipelined driver consumes the session (it splits it); its halves
+        // drop at the end, closing the socket for the same EOF-on-abort effect.
+        Driver::Pipelined => pull_replication_pipelined(session, mirror),
+    };
     owner_thread.join().unwrap();
     result
 }
@@ -317,6 +368,180 @@ fn announce_from_wrong_owner_is_rejected() {
     );
     assert!(result.is_err(), "a chain not signed by the expected owner must be rejected");
     assert!(mirror.stored_tip().is_none(), "nothing stored");
+}
+
+// --- Full-duplex pipelined driver, end-to-end over a real Repo/store --------
+
+#[test]
+fn pipelined_full_backfill_then_fsck_clean() {
+    let mut owner = new_owner();
+    owner.commit_file("a.md", "alpha");
+    owner.commit_file("dir/b.md", "beta");
+    let tip = owner.commit_file("dir/c.md", "gamma");
+
+    let chain_id = owner.repo.repo_id().unwrap().into_bytes();
+    let announce = build_announce(&owner.repo, &owner.session).unwrap();
+
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut mirror =
+        MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+
+    let summary = replicate_with(
+        Driver::Pipelined,
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        announce,
+        &mut mirror,
+    )
+    .unwrap();
+
+    assert_eq!(summary.commits, 4);
+    assert_eq!(summary.new_tip, Some(*tip.as_bytes()));
+    drop(mirror);
+
+    assert_eq!(mirror_tip(replica_root.path(), &owner.device_id), Some(tip));
+    let report = fsck_mirror(replica_root.path(), &owner.device_id);
+    assert!(report.ok(), "mirror not fsck-clean: {:?}", report.problems);
+    assert_eq!(report.commits_checked, 4);
+    assert!(report.objects_checked >= 3, "got {}", report.objects_checked);
+}
+
+#[test]
+fn pipelined_many_object_backfill_exercises_the_window_fsck_clean() {
+    // One commit whose subtree fans out past PIPELINE_WINDOW (32), so the
+    // pipelined driver keeps a full in-flight window and still stores the
+    // subtree post-order before the root that references it.
+    let n = 40;
+    let mut owner = new_owner();
+    let tip = owner.commit_many("wide", n);
+
+    let chain_id = owner.repo.repo_id().unwrap().into_bytes();
+    let announce = build_announce(&owner.repo, &owner.session).unwrap();
+
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut mirror =
+        MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+
+    let summary = replicate_with(
+        Driver::Pipelined,
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        announce,
+        &mut mirror,
+    )
+    .unwrap();
+    assert_eq!(summary.new_tip, Some(*tip.as_bytes()));
+    drop(mirror);
+
+    assert_eq!(mirror_tip(replica_root.path(), &owner.device_id), Some(tip));
+    let report = fsck_mirror(replica_root.path(), &owner.device_id);
+    assert!(report.ok(), "mirror not fsck-clean: {:?}", report.problems);
+    assert!(
+        report.objects_checked >= n,
+        "expected >= {n} objects, got {}",
+        report.objects_checked
+    );
+}
+
+#[test]
+fn pipelined_incremental_fast_forward_fetches_only_new_commits() {
+    let mut owner = new_owner();
+    owner.commit_file("a.md", "alpha");
+    let chain_id = owner.repo.repo_id().unwrap().into_bytes();
+
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut mirror =
+        MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+
+    let announce1 = build_announce(&owner.repo, &owner.session).unwrap();
+    let s1 = replicate_with(
+        Driver::Pipelined,
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        announce1,
+        &mut mirror,
+    )
+    .unwrap();
+    assert_eq!(s1.commits, 2);
+
+    owner.commit_file("b.md", "beta");
+    let tip = owner.commit_file("c.md", "gamma");
+    let announce2 = build_announce(&owner.repo, &owner.session).unwrap();
+    let s2 = replicate_with(
+        Driver::Pipelined,
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        announce2,
+        &mut mirror,
+    )
+    .unwrap();
+    assert_eq!(s2.commits, 2, "only the two new commits are fetched");
+    assert_eq!(s2.new_tip, Some(*tip.as_bytes()));
+    drop(mirror);
+
+    assert_eq!(mirror_tip(replica_root.path(), &owner.device_id), Some(tip));
+    assert!(fsck_mirror(replica_root.path(), &owner.device_id).ok());
+}
+
+#[test]
+fn pipelined_rollback_announce_is_rejected_and_mirror_unchanged() {
+    let mut owner = new_owner();
+    let tip_a = owner.commit_file("a.md", "alpha");
+    let tip_b = owner.commit_file("b.md", "beta");
+    let chain_id = owner.repo.repo_id().unwrap().into_bytes();
+
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut mirror =
+        MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+
+    let announce_b = build_announce(&owner.repo, &owner.session).unwrap();
+    replicate_with(
+        Driver::Pipelined,
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        announce_b,
+        &mut mirror,
+    )
+    .unwrap();
+    assert_eq!(mirror.stored_tip(), Some(*tip_b.as_bytes()));
+
+    // Announce an OLDER tip (A) — a rollback. The fast-forward-only check in
+    // negotiation must reject it before the session is split; the mirror stays
+    // at B.
+    let height_a = 2;
+    let rollback = TipAnnounce {
+        chain_id: chain_id.clone(),
+        tip_hash: tip_a.as_bytes().to_vec(),
+        height: height_a,
+        signature: owner
+            .session
+            .sign(&tipannounce_signing_bytes(&chain_id, tip_a.as_bytes(), height_a))
+            .to_bytes()
+            .to_vec(),
+    };
+    let result = replicate_with(
+        Driver::Pipelined,
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        rollback,
+        &mut mirror,
+    );
+    assert!(result.is_err(), "rollback must be rejected");
+    assert_eq!(
+        mirror.stored_tip(),
+        Some(*tip_b.as_bytes()),
+        "mirror tip must be left at B, never force-updated"
+    );
 }
 
 // --- Owner-side IPC surface (grant / revoke / status) -----------------------

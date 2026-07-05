@@ -48,8 +48,8 @@ use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
-    pull_replication, serve_replication, static_attestation_message, verify_grant, NetError,
-    ServeSummary,
+    pull_replication_pipelined, serve_replication, static_attestation_message, verify_grant,
+    NetError, ServeSummary,
 };
 use softfig_store::Hash;
 use softfig_vault::VaultSession;
@@ -709,7 +709,7 @@ fn serve_replica_ingest(
     local: &LocalDevice,
     owner: &RingEntry,
     grant: ReplicaGrant,
-    mut session: NoiseSession<TcpStream>,
+    session: NoiseSession<TcpStream>,
 ) {
     let (host_enabled, replica_root) = {
         let inner = daemon.inner.lock().unwrap();
@@ -738,7 +738,11 @@ fn serve_replica_ingest(
             return;
         }
     };
-    match pull_replication(&mut session, &mut mirror) {
+    // LAN-direct sessions are full-duplex-splittable, so use the pipelined
+    // driver (streamed requests over a bounded in-flight window). It verifies +
+    // stores identically to the sequential driver; the relay ingest path, whose
+    // `RelayStream` can't split, stays on `pull_replication`.
+    match pull_replication_pipelined(session, &mut mirror) {
         Ok(summary) => {
             if summary.commits > 0 {
                 eprintln!(
@@ -1237,6 +1241,9 @@ fn primary_local_ip() -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The relay host-leg test drives the sequential driver directly (a
+    // `RelayStream` can't split); production LAN ingest uses the pipelined one.
+    use softfig_net::pull_replication;
 
     fn id_bytes(seed: u8) -> [u8; 32] {
         [seed; 32]

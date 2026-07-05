@@ -61,8 +61,9 @@ pub use proto::{
 };
 pub use relay::{relay_accept, relay_connect, Relay, RelayStream};
 pub use replica::{
-    grant_signing_bytes, pull_replication, serve_replication, tipannounce_signing_bytes,
-    verify_grant, verify_tipannounce, PullSummary, ReplicaSink, ReplicaSource, ServeSummary,
+    grant_signing_bytes, pull_replication, pull_replication_pipelined, serve_replication,
+    tipannounce_signing_bytes, verify_grant, verify_tipannounce, PullSummary, ReplicaSink,
+    ReplicaSource, ServeSummary,
 };
 pub use ring::{ring_path, Ring, RingEntry};
 pub use sas::Sas;
