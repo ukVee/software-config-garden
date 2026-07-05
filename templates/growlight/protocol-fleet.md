@@ -19,7 +19,10 @@ protocol is fixed; the baton changes each iteration.
    remaining 5h window; don't leave a started window idle.
 
 3. WORK. Execute NEXT ACTION as one coherent chunk. Obey all standing feedback
-   (garden edits only via softfig-mcp; commit code on main after each unit;
+   (garden edits only via softfig-mcp; commit code on the active item's branch
+   per its `## Branch policy` when it declares one — a stacked feature branch,
+   never main, and the loop NEVER merges it (the human reviews + merges the
+   stack); commit on main only when the item declares no branch policy;
    root-cause fixes, no patchwork; refresh garden+project docs when a milestone
    verifies). When a milestone verifies, also keep your own claude-memory
    pointers under `~/.claude/projects/<garden>/memory/` in sync — you may
@@ -48,7 +51,8 @@ protocol is fixed; the baton changes each iteration.
 5. HANDOFF. (a) Rewrite the baton: collapse finished work to one-liners +
    pointers; make NEXT ACTION runnable; update FINISH CRITERIA; bump
    updated/status/ctx_pct/session_5h_pct. (b) log_baton one entry. (c) Persist
-   durable outcomes: garden via softfig-mcp, code via git commit on main. Then
+   durable outcomes: garden via softfig-mcp, code via git commit on the item's
+   branch (per its `## Branch policy`; main only if it declares none). Then
    semi -> tell the user "handoff ready - /clear"; auto -> exit for the orchestrator.
 
 6. STUCK. If NEXT ACTION is materially unchanged across 2+ iterations with no
