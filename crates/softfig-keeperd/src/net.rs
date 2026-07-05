@@ -43,7 +43,8 @@ use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 use softfig_net::proto::{frame, Frame, ReplicaGrant, TipAnnounce};
-use softfig_net::relay::Relay;
+use softfig_net::connect::{plan_routes, Route};
+use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
@@ -88,6 +89,12 @@ const REPLICA_INITIAL_DELAY: Duration = Duration::from_secs(2);
 
 /// Per-attempt dial timeout for an outbound replication push.
 const PUSH_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read/write timeout on an outbound replication push once connected — bounds a
+/// stalled peer (or a stalled relay leg) without blocking the reconcile thread
+/// forever. Applied to the socket, so on the relay route it bounds the outer
+/// device↔relay leg the inner `RelayStream` rides on.
+const PUSH_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 // --- Discovery cache (Slice A pick-list) ------------------------------------
 
@@ -1009,11 +1016,18 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
             let wt = WorkTree::new(daemon, &inner);
             load_ring(&wt, &state_dir).unwrap_or_default()
         };
+        // Slice 2: the client-side relay dial target (`[relay] endpoint` +
+        // `static_key`), if configured. Its presence makes a host with no LAN
+        // endpoint still reachable — `plan_routes` appends a relay fallback.
+        let relay_client = relay_client_config(&inner.config);
+        let relay_available = relay_client.is_some();
         let mut targets: Vec<(RingEntry, ReplicaGrant)> = Vec::new();
         for fp in &ledger.push_to {
             if let Some(host) = ring.peers().iter().find(|p| &p.fingerprint() == fp) {
-                if host.endpoints.is_empty() {
-                    continue; // not currently reachable; caught up on a later tick
+                if plan_routes(host, relay_available).is_empty() {
+                    // No LAN endpoint and no relay — unreachable this tick; the
+                    // reconcile loop catches it up once a route appears.
+                    continue;
                 }
                 let grant = replica::mint_grant(&host.device_id, &announce.chain_id, session);
                 targets.push((host.clone(), grant));
@@ -1021,12 +1035,20 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
         }
         let garden_root = inner.config.garden_root.clone();
         let state_root = inner.config.state_root.clone();
-        (announce, garden_root, state_root, targets)
+        (announce, garden_root, state_root, targets, relay_client)
     };
-    let (announce, garden_root, state_root, targets) = snapshot;
+    let (announce, garden_root, state_root, targets, relay_client) = snapshot;
 
     for (host, grant) in targets {
-        match push_to_host(local, &host, &announce, &grant, &garden_root, state_root.as_deref()) {
+        match push_to_host(
+            local,
+            &host,
+            &announce,
+            &grant,
+            &garden_root,
+            state_root.as_deref(),
+            relay_client.as_ref(),
+        ) {
             Ok(summary) if summary.commits_served > 0 => eprintln!(
                 "keeperd: net: pushed chain to {}: served {} commits",
                 host.fingerprint(),
@@ -1041,11 +1063,28 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
     }
 }
 
-/// Push this device's chain to one host: dial a known endpoint, run the Noise
-/// `IK` handshake (keyed by the host's stored transport static), present the
-/// signed grant, then serve the chain while the host pulls + verifies +
-/// fast-forwards. Tries each endpoint until one connects. v1 is LAN-direct only;
-/// relayed off-LAN push is a follow-up (the relay forward is M5a infrastructure).
+/// Parse the client-side relay dial target from `[relay] endpoint` +
+/// `static_key` into a `(host:port, 32-byte X25519 static)` pair. `None` when
+/// either is unset or the key is not 32 hex bytes — the push then has no relay
+/// fallback (LAN-direct only), never a hard error. (`[relay] enabled` is the
+/// unrelated *hosting* switch; this reads only the client dial fields.)
+fn relay_client_config(config: &KeeperConfig) -> Option<(String, [u8; 32])> {
+    let endpoint = config.relay.endpoint.clone()?;
+    let key_hex = config.relay.static_key.as_ref()?;
+    let key: [u8; 32] = hex::decode(key_hex.trim()).ok()?.as_slice().try_into().ok()?;
+    Some((endpoint, key))
+}
+
+/// Push this device's chain to one host, preferring a LAN-direct dial and
+/// falling back to the zero-trust relay when the host has no LAN-reachable
+/// endpoint (or every LAN dial fails). [`plan_routes`] orders the attempts:
+/// each known endpoint as a [`Route::Direct`], then a [`Route::Relay`] iff a
+/// client relay is configured. On each route we run the Noise `IK` handshake
+/// keyed by the host's stored transport static — end-to-end even over the relay,
+/// which only forwards opaque `RelayData` and stays blind — present the signed
+/// grant, then serve the chain while the host pulls + verifies + fast-forwards.
+/// A dial/handshake/grant failure falls through to the next route; once serving
+/// begins the result is returned (a mid-serve error is not retried elsewhere).
 fn push_to_host(
     local: &LocalDevice,
     host: &RingEntry,
@@ -1053,46 +1092,111 @@ fn push_to_host(
     grant: &ReplicaGrant,
     garden_root: &std::path::Path,
     state_root: Option<&std::path::Path>,
+    relay_client: Option<&(String, [u8; 32])>,
 ) -> Result<ServeSummary, String> {
-    let mut last_err = "no known endpoint".to_string();
-    for endpoint in &host.endpoints {
-        let addr = match endpoint.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            Some(a) => a,
-            None => {
-                last_err = format!("could not resolve {endpoint}");
-                continue;
-            }
-        };
-        let stream = match TcpStream::connect_timeout(&addr, PUSH_DIAL_TIMEOUT) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = format!("connect {endpoint}: {e}");
-                continue;
-            }
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-        let mut session =
-            match ik_initiator(stream, &local.transport_secret, &host.transport_pubkey, &local.hello())
-            {
-                Ok(s) => s,
+    let routes = plan_routes(host, relay_client.is_some());
+    if routes.is_empty() {
+        return Err("no route to host (no LAN endpoint, no relay)".to_string());
+    }
+    let mut last_err = "no route to host".to_string();
+    for route in &routes {
+        match route {
+            Route::Direct(endpoint) => match dial_direct(local, host, endpoint) {
+                Ok(mut session) => {
+                    if let Err(e) = session.send_frame(&Frame::replica_grant(grant.clone())) {
+                        last_err = format!("send grant (direct {endpoint}): {e}");
+                        continue;
+                    }
+                    return serve_chain(&mut session, announce, garden_root, state_root);
+                }
                 Err(e) => {
-                    last_err = format!("IK handshake {endpoint}: {e}");
+                    last_err = e;
                     continue;
                 }
-            };
-        if let Err(e) = session.send_frame(&Frame::replica_grant(grant.clone())) {
-            last_err = format!("send grant {endpoint}: {e}");
-            continue;
+            },
+            Route::Relay => {
+                // `plan_routes` only emits `Relay` when `relay_client.is_some()`.
+                let (relay_endpoint, relay_static) =
+                    relay_client.expect("relay route planned without a relay client");
+                match dial_relay(local, host, relay_endpoint, relay_static) {
+                    Ok(mut session) => {
+                        if let Err(e) = session.send_frame(&Frame::replica_grant(grant.clone())) {
+                            last_err = format!("send grant (relay {relay_endpoint}): {e}");
+                            continue;
+                        }
+                        return serve_chain(&mut session, announce, garden_root, state_root);
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
+                }
+            }
         }
-        let repo = match Repo::open_with(garden_root, state_root) {
-            Ok(r) => r,
-            Err(e) => return Err(format!("open repo: {e}")),
-        };
-        let source = RepoSource::new(repo, announce.clone());
-        return serve_replication(&mut session, &source).map_err(|e| e.to_string());
     }
     Err(last_err)
+}
+
+/// Dial a host's LAN endpoint and run the Noise `IK` initiator handshake keyed
+/// by the host's stored transport static. Resolve/connect/handshake failures are
+/// returned as a message so the caller can fall through to the next route.
+fn dial_direct(
+    local: &LocalDevice,
+    host: &RingEntry,
+    endpoint: &str,
+) -> Result<NoiseSession<TcpStream>, String> {
+    let addr = endpoint
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(|| format!("could not resolve {endpoint}"))?;
+    let stream = TcpStream::connect_timeout(&addr, PUSH_DIAL_TIMEOUT)
+        .map_err(|e| format!("connect {endpoint}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(PUSH_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PUSH_IO_TIMEOUT));
+    ik_initiator(stream, &local.transport_secret, &host.transport_pubkey, &local.hello())
+        .map_err(|e| format!("IK handshake {endpoint}: {e}"))
+}
+
+/// Dial the configured relay and run [`relay_connect`]: the outer IK to the
+/// relay, then the **inner** end-to-end IK to `host` tunnelled over a
+/// [`RelayStream`] of blind `RelayData` frames. The returned session is the
+/// end-to-end one (keyed by the host's static, verified by the host) — the relay
+/// holds none of its keys. Used only as the LAN-fallback route, so failures are
+/// returned as a message.
+fn dial_relay(
+    local: &LocalDevice,
+    host: &RingEntry,
+    relay_endpoint: &str,
+    relay_static: &[u8; 32],
+) -> Result<NoiseSession<RelayStream<TcpStream>>, String> {
+    let addr = relay_endpoint
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(|| format!("could not resolve relay {relay_endpoint}"))?;
+    let stream = TcpStream::connect_timeout(&addr, PUSH_DIAL_TIMEOUT)
+        .map_err(|e| format!("connect relay {relay_endpoint}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(PUSH_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PUSH_IO_TIMEOUT));
+    relay_connect(stream, relay_static, local, &host.device_id, &host.transport_pubkey)
+        .map_err(|e| format!("relay connect to {} via {relay_endpoint}: {e}", host.fingerprint()))
+}
+
+/// Serve this device's chain over an established (direct or relayed) session:
+/// open a fresh read-only `Repo` handle, wrap it as a [`RepoSource`] with the
+/// signed announce, and drive [`serve_replication`] while the host pulls +
+/// verifies + fast-forwards. Generic over the stream so the same drive runs on
+/// a LAN `TcpStream` or a relayed `RelayStream`.
+fn serve_chain<S: std::io::Read + std::io::Write>(
+    session: &mut NoiseSession<S>,
+    announce: &TipAnnounce,
+    garden_root: &std::path::Path,
+    state_root: Option<&std::path::Path>,
+) -> Result<ServeSummary, String> {
+    let repo = Repo::open_with(garden_root, state_root).map_err(|e| format!("open repo: {e}"))?;
+    let source = RepoSource::new(repo, announce.clone());
+    serve_replication(session, &source).map_err(|e| e.to_string())
 }
 
 /// Announce on the LAN, returning the registered fullname (empty on failure).
@@ -1292,5 +1396,226 @@ mod tests {
             elapsed < REPLICA_RECONCILE_INTERVAL / 2,
             "stop should wake promptly, took {elapsed:?}"
         );
+    }
+
+    // --- Slice 2: relayed off-LAN push -------------------------------------
+
+    /// A synthetic transport device (Ed25519 id + X25519 static + self-
+    /// attestation) plus the ring row a peer stores for it — mirrors the
+    /// `relay_tcp.rs` harness. Its ring row has no LAN endpoint.
+    fn transport_device(id_seed: u8, tk_seed: u8, name: &str) -> (LocalDevice, RingEntry) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let id = SigningKey::from_bytes(&[id_seed; 32]);
+        let transport_secret = [tk_seed; 32];
+        let transport_pubkey =
+            x25519_dalek::x25519(transport_secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let attestation = id
+            .sign(&static_attestation_message(&transport_pubkey))
+            .to_bytes();
+        let local = LocalDevice {
+            transport_secret,
+            device_id: id.verifying_key().to_bytes(),
+            device_name: name.into(),
+            static_attestation: attestation,
+        };
+        let entry = RingEntry {
+            device_id: local.device_id,
+            name: name.into(),
+            transport_pubkey,
+            endpoints: vec![],
+            attestation,
+            paired_at: 1,
+        };
+        (local, entry)
+    }
+
+    /// The ring row a peer stores for a `LocalDevice` (e.g. an owner built from a
+    /// real vault session) — its attested transport static, no LAN endpoint.
+    fn ring_entry_for(local: &LocalDevice) -> RingEntry {
+        let transport_pubkey =
+            x25519_dalek::x25519(local.transport_secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+        RingEntry {
+            device_id: local.device_id,
+            name: local.device_name.clone(),
+            transport_pubkey,
+            endpoints: vec![],
+            attestation: local.static_attestation,
+            paired_at: 1,
+        }
+    }
+
+    #[test]
+    fn relay_client_config_parses_only_a_complete_hex_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = KeeperConfig::new(tmp.path());
+        // Unset by default → no relay fallback.
+        assert!(relay_client_config(&cfg).is_none());
+        // Endpoint alone is incomplete (no key).
+        cfg.relay.endpoint = Some("relay.example:9301".into());
+        assert!(relay_client_config(&cfg).is_none());
+        // A key that is not 32 bytes is rejected.
+        cfg.relay.static_key = Some("abcd".into());
+        assert!(relay_client_config(&cfg).is_none());
+        // A full 32-byte hex key parses into a dial target.
+        let key = [7u8; 32];
+        cfg.relay.static_key = Some(hex::encode(key));
+        assert_eq!(
+            relay_client_config(&cfg),
+            Some(("relay.example:9301".to_string(), key))
+        );
+    }
+
+    /// End-to-end: an owner whose granted host has **no LAN endpoint** pushes its
+    /// signed chain through the blind relay (the `push_to_host` relay-fallback
+    /// route), and the host mirrors it fast-forward-only + fsck-clean. Proves the
+    /// relay leg carries a full backfill without changing the verified-mirror
+    /// semantics; the relay only ever forwards opaque `RelayData` (its `splice`
+    /// forwards nothing else — see `relay_tcp.rs`).
+    #[test]
+    fn push_to_host_falls_back_to_the_relay_when_no_lan_endpoint() {
+        use softfig_store::{Db, ObjectStore, StorePaths};
+        use softfig_vault::{params::VaultParams, Vault};
+
+        // --- Owner: a real garden (vault + signed chain). ---
+        let owner_tmp = tempfile::tempdir().unwrap();
+        let garden = owner_tmp.path().to_path_buf();
+        let mut params = VaultParams::default();
+        params.argon2.m_cost = 8;
+        params.argon2.t_cost = 1;
+        params.argon2.p_cost = 1;
+        let (_v, session, _r) =
+            Vault::init_with_params(&garden, b"correct horse battery staple", params).unwrap();
+        let (mut repo, _genesis) = Repo::init(&garden, &session).unwrap();
+
+        let mut commit = |rel: &str, body: &str| -> Hash {
+            let p = garden.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, body).unwrap();
+            let intent = Intent::new("manual_edit", serde_json::json!({ "path": rel })).unwrap();
+            repo.commit_workdir(&session, intent).unwrap()
+        };
+        commit("a.md", "alpha");
+        commit("dir/b.md", "beta");
+        let tip = commit("dir/c.md", "gamma");
+
+        let announce = replica::build_announce(&repo, &session).unwrap();
+        let owner_ld = build_local_device(&session, "owner".into());
+        let owner_entry = ring_entry_for(&owner_ld);
+
+        // --- Host: a synthetic backup device, no LAN endpoint → relay-only. ---
+        let (host_ld, host_entry) = transport_device(3, 4, "host");
+        let grant = replica::mint_grant(&host_entry.device_id, &announce.chain_id, &session);
+
+        // --- Relay: blind, ring-authorized (owner + host are members). ---
+        let (relay_ld, _relay_entry) = transport_device(100, 101, "relay");
+        let relay_static =
+            x25519_dalek::x25519(relay_ld.transport_secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let mut ring = Ring::default();
+        ring.upsert(owner_entry);
+        ring.upsert(host_entry.clone());
+        let relay = Relay::new(&relay_ld, ring);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_addr = listener.local_addr().unwrap().to_string();
+        {
+            let relay = Arc::clone(&relay);
+            thread::spawn(move || {
+                let _ = softfig_net::relay::run(relay, listener);
+            });
+        }
+
+        // --- Host leg: register at the relay, then mirror the pushed chain
+        //     exactly as `serve_replica_ingest` does (verify grant, then pull). ---
+        let replica_root = tempfile::tempdir().unwrap();
+        let replica_root_path = replica_root.path().to_path_buf();
+        let owner_device_id = owner_ld.device_id;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let host_thread = {
+            let relay_addr = relay_addr.clone();
+            thread::spawn(move || {
+                let conn = TcpStream::connect(&relay_addr).expect("host connect relay");
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(15)));
+                let _ = conn.set_write_timeout(Some(Duration::from_secs(15)));
+                let mut session = match softfig_net::relay::relay_accept(conn, &relay_static, &host_ld)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("relay_accept: {e}")));
+                        return;
+                    }
+                };
+                let grant = match session.recv_frame().map(|f| f.kind) {
+                    Ok(Some(frame::Kind::ReplicaGrant(g))) => g,
+                    other => {
+                        let _ = tx.send(Err(format!("first frame not a grant: {other:?}")));
+                        return;
+                    }
+                };
+                if !verify_grant(&grant, &owner_device_id, &host_ld.device_id) {
+                    let _ = tx.send(Err("grant did not verify".into()));
+                    return;
+                }
+                let mut mirror = MirrorStore::open_or_create(
+                    &replica_root_path,
+                    &owner_device_id,
+                    "owner",
+                    &grant.chain_id,
+                )
+                .unwrap();
+                let result = pull_replication(&mut session, &mut mirror).map_err(|e| e.to_string());
+                drop(mirror);
+                let _ = tx.send(result);
+            })
+        };
+
+        // Don't push until the host has parked at the relay.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !relay.is_registered(&host_entry.device_id) {
+            assert!(Instant::now() < deadline, "host never registered at the relay");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // --- Owner push: host has no LAN endpoint, so `push_to_host` must take
+        //     the relay route and serve the whole chain end-to-end. ---
+        let relay_client = (relay_addr, relay_static);
+        let served = push_to_host(
+            &owner_ld,
+            &host_entry,
+            &announce,
+            &grant,
+            &garden,
+            None,
+            Some(&relay_client),
+        )
+        .expect("relayed push should succeed over the relay route");
+        assert!(
+            served.commits_served > 0,
+            "owner served commits over the relay, got {}",
+            served.commits_served
+        );
+
+        // Host mirrored the whole chain (genesis + 3 content commits) over relay.
+        let pull = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("host result")
+            .expect("host pull over the relay");
+        assert_eq!(pull.commits, 4, "genesis + three content commits");
+        assert_eq!(pull.new_tip, Some(*tip.as_bytes()));
+        host_thread.join().unwrap();
+
+        // Fast-forward-only + fsck-clean: the relayed transport didn't change the
+        // verified-mirror semantics.
+        let dir = replica::mirror_dir(replica_root.path(), &owner_ld.device_id);
+        let paths = StorePaths::with_state_root(&dir, &dir);
+        let db = Db::open(&paths).unwrap();
+        let objects = ObjectStore::new(paths);
+        let report = softfig_vcs::fsck(&db, &objects).unwrap();
+        assert!(
+            report.ok(),
+            "relayed mirror not fsck-clean: {:?}",
+            report.problems
+        );
+        assert_eq!(report.commits_checked, 4);
     }
 }
