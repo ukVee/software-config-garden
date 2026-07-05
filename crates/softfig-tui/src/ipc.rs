@@ -36,6 +36,12 @@ pub enum Tag {
     PairConfirm,
     /// M5a: remove a peer from the ring (`pair_remove`).
     PairRemove,
+    /// M5b: backup health for this device's chain (`replica_status`).
+    ReplicaStatus,
+    /// M5b: grant a paired host permission to back me up (`replica_grant`).
+    ReplicaGrant,
+    /// M5b: revoke a host's backup grant (`replica_revoke`).
+    ReplicaRevoke,
 }
 
 #[derive(Debug)]

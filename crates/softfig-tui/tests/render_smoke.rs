@@ -104,6 +104,65 @@ fn renders_peers_frame() {
 }
 
 #[test]
+fn renders_backup_frame() {
+    use softfig_ipc::HostedChain;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Backup;
+    app.replica_host = true;
+    app.replica_push_to = vec!["1".repeat(64)];
+    app.hosted = vec![HostedChain {
+        fingerprint: "2".repeat(64),
+        name: Some("tablet".into()),
+        tip: Some("deadbeefcafe".into()),
+        height: 7,
+        objects: 21,
+        bytes: 8192,
+        last_sync: Some(1_700_000_000),
+    }];
+    app.backup_loaded = true;
+    app.backup_rows = vec![
+        softfig_tui::app::BackupRow::PushTo(0),
+        softfig_tui::app::BackupRow::Hosted(0),
+    ];
+    // Select the hosted chain so the detail pane shows the mirror stats.
+    app.backup_selected = 1;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Backup"), "backup tab missing:\n{rendered}");
+    assert!(rendered.contains("hosts me"), "push_to row missing");
+    assert!(rendered.contains("I host"), "hosted row missing");
+    assert!(rendered.contains("tablet"), "hosted owner name missing");
+    assert!(rendered.contains("hosted chain"), "detail header missing");
+    assert!(rendered.contains("height"), "mirror stats missing");
+}
+
+#[test]
+fn renders_grant_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Backup;
+    app.overlay = softfig_tui::app::Overlay::ReplicaGrant {
+        fingerprint: "abc123".into(),
+        error: None,
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("grant backup host"), "overlay title missing:\n{rendered}");
+    assert!(rendered.contains("abc123"), "typed fingerprint missing");
+    assert!(rendered.contains("Enter grant"), "grant hint missing");
+}
+
+#[test]
 fn renders_pair_confirm_overlay() {
     let mut app = App::new();
     app.locked = false;

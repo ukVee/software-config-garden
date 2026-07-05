@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{short_fp, App, Overlay, PairField, PeerRow, View};
+use crate::app::{short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
 
@@ -57,6 +57,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
             name,
             error,
         } => render_unpair(f, fingerprint, name, error.as_deref(), area),
+        Overlay::ReplicaGrant { fingerprint, error } => {
+            render_replica_grant(f, fingerprint, error.as_deref(), area)
+        }
+        Overlay::ReplicaRevoke {
+            fingerprint,
+            name,
+            error,
+        } => render_replica_revoke(f, fingerprint, name.as_deref(), error.as_deref(), area),
         Overlay::Help => render_help(f, area),
     }
 }
@@ -86,6 +94,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         tab("2:History", app.view == View::History),
         tab("3:Vault", app.view == View::Vault),
         tab("4:Peers", app.view == View::Peers),
+        tab("5:Backup", app.view == View::Backup),
         Span::raw("  "),
         Span::styled(format!("[{state}] tip:{tip}"), dim),
     ]);
@@ -114,6 +123,10 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
         View::Peers => {
             render_peers(f, app, cols[0]);
             render_peers_detail(f, app, cols[1]);
+        }
+        View::Backup => {
+            render_backup(f, app, cols[0]);
+            render_backup_detail(f, app, cols[1]);
         }
     }
 }
@@ -370,6 +383,131 @@ fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+fn render_backup(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.backup_rows.is_empty() {
+        vec![ListItem::new("(no backup grants — g to grant a paired host)")]
+    } else {
+        app.backup_rows
+            .iter()
+            .map(|row| match row {
+                BackupRow::PushTo(i) => {
+                    let fp = &app.replica_push_to[*i];
+                    let label = app.peer_name_for(fp).unwrap_or_else(|| short_fp(fp));
+                    ListItem::new(Line::styled(
+                        format!("⬆ {label}  hosts me"),
+                        Style::default().fg(Color::Cyan),
+                    ))
+                }
+                BackupRow::Hosted(i) => {
+                    let c = &app.hosted[*i];
+                    let label = c.name.as_deref().unwrap_or_else(|| short_fp(&c.fingerprint));
+                    ListItem::new(Line::styled(
+                        format!("⬇ {label}  I host  (h{})", c.height),
+                        Style::default().fg(Color::Green),
+                    ))
+                }
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !app.backup_rows.is_empty() {
+        st.select(Some(app.backup_selected.min(app.backup_rows.len() - 1)));
+    }
+    let title = format!(
+        "backup — {} host me · {} I host · host:{}",
+        app.replica_push_to.len(),
+        app.hosted.len(),
+        if app.replica_host { "on" } else { "off" },
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_backup_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    match app.selected_backup_row() {
+        Some(BackupRow::PushTo(i)) => {
+            let fp = &app.replica_push_to[i];
+            lines.push(Line::styled(
+                "host — backs up my chain",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ));
+            if let Some(name) = app.peer_name_for(fp) {
+                lines.push(Line::raw(format!("  name:        {name}")));
+            }
+            lines.push(Line::raw(format!("  fingerprint: {fp}")));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  I push my signed ciphertext here; this host verifies + stores",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  D revoke this grant (the host keeps what it already holds)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Some(BackupRow::Hosted(i)) => {
+            let c = &app.hosted[i];
+            lines.push(Line::styled(
+                "hosted chain — opaque mirror",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Green),
+            ));
+            if let Some(name) = &c.name {
+                lines.push(Line::raw(format!("  owner:       {name}")));
+            }
+            lines.push(Line::raw(format!("  fingerprint: {}", c.fingerprint)));
+            let tip = c.tip.as_deref().unwrap_or("(nothing synced yet)");
+            lines.push(Line::raw(format!("  tip:         {tip}")));
+            lines.push(Line::raw(format!("  height:      {}", c.height)));
+            lines.push(Line::raw(format!("  objects:     {}", c.objects)));
+            lines.push(Line::raw(format!("  bytes:       {}", c.bytes)));
+            let last = c
+                .last_sync
+                .map(|t| format!("{t} (unix)"))
+                .unwrap_or_else(|| "never".into());
+            lines.push(Line::raw(format!("  last sync:   {last}")));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  ciphertext only — I verify + store it but cannot read it",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        None => {
+            lines.push(Line::styled(
+                "no backup grants",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(format!(
+                "  this device {} host peer chains",
+                if app.replica_host {
+                    "does"
+                } else {
+                    "does not"
+                },
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  g grant a paired device to back up this chain",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "g grant · D revoke · r refresh",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("backup detail"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
 fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
@@ -609,6 +747,80 @@ fn render_unpair(f: &mut Frame, fingerprint: &str, name: &str, error: Option<&st
     f.render_widget(p, rect);
 }
 
+fn render_replica_grant(f: &mut Frame, fingerprint: &str, error: Option<&str>, area: Rect) {
+    let rect = centered_rect(75, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                "fingerprint: ",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(fingerprint.to_string()),
+        ]),
+        Line::styled(
+            "  (a paired device's id — full or a unique prefix)",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+        Line::raw("Grant this device permission to back up my chain (ciphertext only)."),
+        Line::raw(""),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::styled(
+        "Enter grant · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("grant backup host"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+fn render_replica_revoke(
+    f: &mut Frame,
+    fingerprint: &str,
+    name: Option<&str>,
+    error: Option<&str>,
+    area: Rect,
+) {
+    let rect = centered_rect(70, 40, area);
+    f.render_widget(Clear, rect);
+    let who = name.unwrap_or("this host");
+    let mut lines: Vec<Line> = vec![
+        Line::raw(format!("Stop backing up my chain to {who}?")),
+        Line::raw(format!("  {fingerprint}")),
+        Line::raw(""),
+        Line::styled(
+            "It keeps any ciphertext already pushed; only future pushes stop.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "y revoke · n / Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("revoke backup host"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
 fn render_form(f: &mut Frame, form: &ActionForm, area: Rect) {
     let rect = centered_rect(80, 70, area);
     f.render_widget(Clear, rect);
@@ -668,7 +880,7 @@ fn render_help(f: &mut Frame, area: Rect) {
     let body = "\
 soft-fig TUI — keys
 
-  1 / 2 / 3 / 4  switch Browse / History / Vault / Peers
+  1 2 3 4 5    switch Browse / History / Vault / Peers / Backup
   j k ↑ ↓      move selection
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
@@ -681,7 +893,8 @@ soft-fig TUI — keys
   x            reveal selected sealed file
   c            copy last reveal's value to clipboard
   p            pair a device (peers view)
-  D            unpair selected device (peers view)
+  D            unpair / revoke selected (peers / backup view)
+  g            grant a backup host (backup view)
   r            refresh view
   u            unlock (when locked)
   :            command palette
@@ -690,13 +903,17 @@ soft-fig TUI — keys
 
 command palette runs actions: log_decision, log_incident,
 archive, add_project, refresh_snapshot, propose, seal, unseal,
-and pair / unpair / peers
+pair / unpair / peers, and backup / grant / revoke
 
 vault: reveal writes plaintext to a 0600 temp file and never
 shows it in this TUI; c pipes that file straight to wl-copy
 
 peers: pairing rides the Noise XX handshake; compare the SAS
 short code on both devices before confirming (defeats a MITM)
+
+backup (M5b): grant a paired host to store this device's chain
+as verified ciphertext it cannot decrypt; revoke stops future
+pushes; chains I host for others show as read-only mirrors
 
 any key closes this help";
     let p = Paragraph::new(body)

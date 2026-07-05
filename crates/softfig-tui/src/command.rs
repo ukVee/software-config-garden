@@ -13,6 +13,12 @@ pub enum Command {
     Pair,
     /// Unpair the selected ring member (`pair_remove`).
     Unpair,
+    /// Switch to the Backup tab (M5b `replica_status`).
+    Backup,
+    /// Open the "grant a host" overlay (`replica_grant`).
+    Grant,
+    /// Revoke the selected host's backup grant (`replica_revoke`).
+    Revoke,
     Reload,
     Unlock,
     Quit,
@@ -31,6 +37,9 @@ pub fn parse_command(input: &str) -> Command {
         "reveal" | "x" => Command::Reveal,
         "pair" => Command::Pair,
         "unpair" => Command::Unpair,
+        "backup" => Command::Backup,
+        "grant" => Command::Grant,
+        "revoke" => Command::Revoke,
         "reload" | "r" => Command::Reload,
         "unlock" => Command::Unlock,
         "quit" | "q" => Command::Quit,
@@ -49,8 +58,8 @@ pub fn parse_command(input: &str) -> Command {
 /// Names offered in the palette hint line.
 pub fn command_hints() -> String {
     let mut names = vec![
-        "browse", "history", "vault", "peers", "reveal", "pair", "unpair", "reload", "unlock",
-        "quit", "help",
+        "browse", "history", "vault", "peers", "reveal", "pair", "unpair", "backup", "grant",
+        "revoke", "reload", "unlock", "quit", "help",
     ];
     for k in ActionKind::ALL {
         names.push(k.command_name());

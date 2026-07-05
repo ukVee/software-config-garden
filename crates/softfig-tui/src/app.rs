@@ -9,9 +9,10 @@ use std::path::Path;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
 use softfig_ipc::{
-    DiscoverListReply, DiscoveredDevice, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
-    PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ShowReply, StatusReply,
-    VaultListSealedReply, VaultRevealReply,
+    DiscoverListReply, DiscoveredDevice, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
+    PairListReply, PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply,
+    ReplicaRevokeReply, ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply,
+    VaultRevealReply,
 };
 
 use crate::clip;
@@ -26,6 +27,7 @@ pub enum View {
     History,
     Vault,
     Peers,
+    Backup,
 }
 
 /// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
@@ -40,6 +42,18 @@ pub enum PeerRow {
     Pending(usize),
     /// Index into [`App::discovered`].
     Discovered(usize),
+}
+
+/// One navigable row in the Backup view (M5b `replica_status`). The tab splits
+/// the owner's backup posture into two lists flattened into one selection: the
+/// hosts that back *me* up (`push_to` grants) first, then the peer chains *I*
+/// host as a backup for others (`hosted`). `j`/`k` move over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupRow {
+    /// Index into [`App::replica_push_to`] — a host I've granted to back me up.
+    PushTo(usize),
+    /// Index into [`App::hosted`] — a peer chain I mirror (opaque ciphertext).
+    Hosted(usize),
 }
 
 /// Which field the `pair_begin` overlay is editing.
@@ -80,6 +94,21 @@ pub enum Overlay {
     Unpair {
         fingerprint: String,
         name: String,
+        error: Option<String>,
+    },
+    /// M5b: grant a paired ring member permission to back up this device's
+    /// chain (`replica_grant`). A single fingerprint field, mirroring
+    /// `PairBegin` — client-validated non-empty, daemon-authoritative on
+    /// whether it names a paired member.
+    ReplicaGrant {
+        fingerprint: String,
+        error: Option<String>,
+    },
+    /// M5b: confirm revoking a host's backup grant (`replica_revoke`). The host
+    /// keeps any ciphertext already pushed; only future pushes stop.
+    ReplicaRevoke {
+        fingerprint: String,
+        name: Option<String>,
         error: Option<String>,
     },
     Help,
@@ -134,6 +163,19 @@ pub struct App {
     pub peer_rows: Vec<PeerRow>,
     pub peers_selected: usize,
     pub peers_loaded: bool,
+    /// M5b Backup tab (`replica_status`): whether this device hosts backups.
+    pub replica_host: bool,
+    /// Device-id fingerprints this device pushes its chain to (the hosts that
+    /// back *me* up — the `push_to` allow-list).
+    pub replica_push_to: Vec<String>,
+    /// Per-peer mirror stats for chains *I* host for others (empty unless
+    /// `replica_host`). Opaque ciphertext metadata only.
+    pub hosted: Vec<HostedChain>,
+    /// Flattened selection model over `replica_push_to` ++ `hosted`, rebuilt on
+    /// each `replica_status` reply.
+    pub backup_rows: Vec<BackupRow>,
+    pub backup_selected: usize,
+    pub backup_loaded: bool,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -171,6 +213,12 @@ impl App {
             peer_rows: Vec::new(),
             peers_selected: 0,
             peers_loaded: false,
+            replica_host: false,
+            replica_push_to: Vec::new(),
+            hosted: Vec::new(),
+            backup_rows: Vec::new(),
+            backup_selected: 0,
+            backup_loaded: false,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -213,6 +261,10 @@ impl App {
         ipc.send("discover_list", json!({}), Tag::DiscoverList);
     }
 
+    fn load_backup(&self, ipc: &mut IpcClient) {
+        ipc.send("replica_status", json!({}), Tag::ReplicaStatus);
+    }
+
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
     fn refresh_view(&self, ipc: &mut IpcClient) {
@@ -228,6 +280,9 @@ impl App {
         }
         if self.peers_loaded {
             self.load_peers(ipc);
+        }
+        if self.backup_loaded {
+            self.load_backup(ipc);
         }
     }
 
@@ -259,6 +314,36 @@ impl App {
 
     pub fn selected_peer_row(&self) -> Option<PeerRow> {
         self.peer_rows.get(self.peers_selected).copied()
+    }
+
+    /// Rebuild the Backup view's flattened selection list — hosts that back me
+    /// up (`push_to`) first, then peer chains I host (`hosted`) — and clamp the
+    /// selection into range.
+    fn rebuild_backup_rows(&mut self) {
+        let mut rows = Vec::with_capacity(self.replica_push_to.len() + self.hosted.len());
+        for i in 0..self.replica_push_to.len() {
+            rows.push(BackupRow::PushTo(i));
+        }
+        for i in 0..self.hosted.len() {
+            rows.push(BackupRow::Hosted(i));
+        }
+        self.backup_rows = rows;
+        if self.backup_selected >= self.backup_rows.len() {
+            self.backup_selected = self.backup_rows.len().saturating_sub(1);
+        }
+    }
+
+    pub fn selected_backup_row(&self) -> Option<BackupRow> {
+        self.backup_rows.get(self.backup_selected).copied()
+    }
+
+    /// The advertised name for a push_to host, if it's a loaded ring member.
+    /// A display nicety — `push_to` carries only fingerprints.
+    pub fn peer_name_for(&self, fingerprint: &str) -> Option<&str> {
+        self.peers
+            .iter()
+            .find(|p| p.fingerprint == fingerprint)
+            .map(|p| p.name.as_str())
     }
 
     // ---- reply handling ----
@@ -488,6 +573,56 @@ impl App {
                     }
                 }
             },
+            Tag::ReplicaStatus => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<ReplicaStatusReply>(v) {
+                        self.replica_host = r.host;
+                        self.replica_push_to = r.push_to;
+                        self.hosted = r.hosted;
+                        self.backup_loaded = true;
+                        self.rebuild_backup_rows();
+                    }
+                }
+                Err((_, m)) => self.status = format!("replica status: {m}"),
+            },
+            Tag::ReplicaGrant => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<ReplicaGrantReply>(v) {
+                        Ok(r) if r.granted => format!("granted backup to {}", short_fp(&r.fingerprint)),
+                        Ok(r) => format!("already granted ({})", short_fp(&r.fingerprint)),
+                        Err(_) => "granted".into(),
+                    };
+                    self.overlay = Overlay::None;
+                    self.load_backup(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("grant failed ({kind:?}): {m}");
+                    if let Overlay::ReplicaGrant { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
+            Tag::ReplicaRevoke => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<ReplicaRevokeReply>(v) {
+                        Ok(r) if r.revoked => format!("revoked backup from {}", short_fp(&r.fingerprint)),
+                        Ok(r) => format!("no change ({} not a host)", short_fp(&r.fingerprint)),
+                        Err(_) => "revoked".into(),
+                    };
+                    self.overlay = Overlay::None;
+                    self.load_backup(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("revoke failed ({kind:?}): {m}");
+                    if let Overlay::ReplicaRevoke { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
         }
     }
 
@@ -503,6 +638,8 @@ impl App {
             Overlay::PairBegin { .. } => self.handle_key_pair_begin(key, ipc),
             Overlay::PairConfirm { .. } => self.handle_key_pair_confirm(key, ipc),
             Overlay::Unpair { .. } => self.handle_key_unpair(key, ipc),
+            Overlay::ReplicaGrant { .. } => self.handle_key_replica_grant(key, ipc),
+            Overlay::ReplicaRevoke { .. } => self.handle_key_replica_revoke(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -555,10 +692,18 @@ impl App {
                     self.load_peers(ipc);
                 }
             }
+            KeyCode::Char('5') => {
+                self.view = View::Backup;
+                if !self.backup_loaded && !self.locked {
+                    self.load_backup(ipc);
+                }
+            }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
             KeyCode::Char('p') if self.view == View::Peers => self.pair_selected(ipc),
             KeyCode::Char('D') if self.view == View::Peers => self.start_unpair(),
+            KeyCode::Char('g') if self.view == View::Backup => self.open_grant(),
+            KeyCode::Char('D') if self.view == View::Backup => self.start_revoke(),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
@@ -616,6 +761,9 @@ impl App {
             View::Peers => {
                 self.peers_selected = self.peers_selected.saturating_sub(1);
             }
+            View::Backup => {
+                self.backup_selected = self.backup_selected.saturating_sub(1);
+            }
         }
     }
 
@@ -635,6 +783,11 @@ impl App {
             View::Peers => {
                 if self.peers_selected + 1 < self.peer_rows.len() {
                     self.peers_selected += 1;
+                }
+            }
+            View::Backup => {
+                if self.backup_selected + 1 < self.backup_rows.len() {
+                    self.backup_selected += 1;
                 }
             }
         }
@@ -670,7 +823,18 @@ impl App {
             // overlay; a discovered device initiates pairing; a settled ring
             // member is a no-op (its details already show in the right pane).
             View::Peers => self.activate_selected_peer(ipc),
+            // Backup rows are read-only detail; grant/revoke are explicit
+            // actions (g / D / palette), never a stray Enter.
+            View::Backup => self.hint_backup_actions(),
         }
+    }
+
+    fn hint_backup_actions(&mut self) {
+        self.status = match self.selected_backup_row() {
+            Some(BackupRow::PushTo(_)) => "g grant a host · D revoke selected".into(),
+            Some(BackupRow::Hosted(_)) => "this is a chain I host (read-only mirror)".into(),
+            None => "g grant a paired device to back up this chain".into(),
+        };
     }
 
     fn collapse_selected(&mut self) {
@@ -734,6 +898,20 @@ impl App {
                 self.view = View::Peers;
                 self.start_unpair();
             }
+            Command::Backup => {
+                self.view = View::Backup;
+                if !self.locked {
+                    self.load_backup(ipc);
+                }
+            }
+            Command::Grant => {
+                self.view = View::Backup;
+                self.open_grant();
+            }
+            Command::Revoke => {
+                self.view = View::Backup;
+                self.start_revoke();
+            }
             Command::Reload if !self.locked => self.refresh_view(ipc),
             Command::Reload => {}
             Command::Unlock => {
@@ -791,7 +969,7 @@ impl App {
                 .selected_row()
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
-            View::History | View::Peers => None,
+            View::History | View::Peers | View::Backup => None,
         };
         match target {
             Some(path) => {
@@ -1023,6 +1201,94 @@ impl App {
                 let fp = fingerprint.clone();
                 self.status = "unpairing…".into();
                 ipc.send("pair_remove", json!({ "fingerprint": fp }), Tag::PairRemove);
+            }
+            _ => {}
+        }
+    }
+
+    // ---- replica backup grants (M5b) ----
+
+    /// Open the "grant a host" overlay (owner side of `replica_grant`).
+    fn open_grant(&mut self) {
+        if self.locked {
+            self.status = "locked — unlock before granting backup".into();
+            return;
+        }
+        self.overlay = Overlay::ReplicaGrant {
+            fingerprint: String::new(),
+            error: None,
+        };
+    }
+
+    /// `D` / `:revoke` on the Backup tab: if a host (`push_to`) row is selected,
+    /// open the revoke-confirm overlay. A hosted-chain row cannot be revoked
+    /// (it's a mirror I keep, not a grant I made).
+    fn start_revoke(&mut self) {
+        match self.selected_backup_row() {
+            Some(BackupRow::PushTo(i)) => {
+                if let Some(fp) = self.replica_push_to.get(i) {
+                    let name = self.peer_name_for(fp).map(str::to_string);
+                    self.overlay = Overlay::ReplicaRevoke {
+                        fingerprint: fp.clone(),
+                        name,
+                        error: None,
+                    };
+                }
+            }
+            _ => self.status = "select a granted host to revoke".into(),
+        }
+    }
+
+    fn handle_key_replica_grant(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::ReplicaGrant { fingerprint, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Backspace => {
+                fingerprint.pop();
+            }
+            KeyCode::Char(c) => fingerprint.push(c),
+            KeyCode::Enter => self.submit_grant(ipc),
+            _ => {}
+        }
+    }
+
+    fn submit_grant(&mut self, ipc: &mut IpcClient) {
+        let Overlay::ReplicaGrant { fingerprint, error } = &mut self.overlay else {
+            return;
+        };
+        let fp = fingerprint.trim().to_string();
+        if fp.is_empty() {
+            *error = Some("fingerprint must not be empty".into());
+            return;
+        }
+        *error = None;
+        self.status = "granting backup…".into();
+        ipc.send(
+            "replica_grant",
+            json!({ "fingerprint": fp }),
+            Tag::ReplicaGrant,
+        );
+    }
+
+    fn handle_key_replica_revoke(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::ReplicaRevoke { fingerprint, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = Overlay::None;
+                self.status = "revoke cancelled".into();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let fp = fingerprint.clone();
+                self.status = "revoking backup…".into();
+                ipc.send(
+                    "replica_revoke",
+                    json!({ "fingerprint": fp }),
+                    Tag::ReplicaRevoke,
+                );
             }
             _ => {}
         }
@@ -1525,5 +1791,130 @@ mod tests {
             Overlay::Reveal { path, .. } => assert_eq!(path, "secrets/api-keys.toml"),
             other => panic!("expected reveal overlay, got {other:?}"),
         }
+    }
+
+    // ---- M5b Backup tab ----
+
+    fn hosted_chain(fp: &str, name: &str, height: u64) -> HostedChain {
+        HostedChain {
+            fingerprint: fp.into(),
+            name: Some(name.into()),
+            tip: Some("deadbeef".into()),
+            height,
+            objects: height * 3,
+            bytes: height * 1024,
+            last_sync: Some(1_700_000_000),
+        }
+    }
+
+    #[test]
+    fn replica_status_populates_and_flattens() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::ReplicaStatus,
+                result: Ok(serde_json::to_value(softfig_ipc::ReplicaStatusReply {
+                    host: true,
+                    push_to: vec!["11".repeat(32)],
+                    hosted: vec![hosted_chain(&"22".repeat(32), "tablet", 4)],
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert!(app.backup_loaded);
+        assert!(app.replica_host);
+        assert_eq!(app.replica_push_to.len(), 1);
+        assert_eq!(app.hosted.len(), 1);
+        // Hosts-that-back-me first, then chains-I-host.
+        assert_eq!(
+            app.backup_rows,
+            vec![BackupRow::PushTo(0), BackupRow::Hosted(0)]
+        );
+    }
+
+    #[test]
+    fn grant_requires_a_fingerprint() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::ReplicaGrant {
+            fingerprint: "   ".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.submit_grant(&mut ipc);
+        match &app.overlay {
+            Overlay::ReplicaGrant { error, .. } => {
+                assert!(error.as_deref().unwrap().contains("fingerprint"));
+            }
+            other => panic!("expected ReplicaGrant still open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoke_targets_a_granted_host_only() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Backup;
+        app.replica_push_to = vec!["11".repeat(32)];
+        app.hosted = vec![hosted_chain(&"22".repeat(32), "tablet", 4)];
+        app.rebuild_backup_rows();
+
+        // Row 0 is a granted host → revoke opens the confirm on its fingerprint.
+        app.backup_selected = 0;
+        app.start_revoke();
+        match &app.overlay {
+            Overlay::ReplicaRevoke { fingerprint, .. } => {
+                assert_eq!(fingerprint, &"11".repeat(32));
+            }
+            other => panic!("expected ReplicaRevoke, got {other:?}"),
+        }
+
+        // Row 1 is a chain I host → cannot be revoked (it's a mirror, not a grant).
+        app.overlay = Overlay::None;
+        app.backup_selected = 1;
+        app.start_revoke();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("granted host"));
+    }
+
+    #[test]
+    fn grant_reply_closes_overlay_and_reloads() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::ReplicaGrant {
+            fingerprint: "11".repeat(32),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::ReplicaGrant,
+                result: Ok(serde_json::to_value(ReplicaGrantReply {
+                    fingerprint: "11".repeat(32),
+                    granted: true,
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("granted"), "status was {:?}", app.status);
+    }
+
+    #[test]
+    fn five_key_switches_to_backup() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Backup);
     }
 }
