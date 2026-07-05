@@ -574,15 +574,16 @@ impl App {
                 }
             },
             Tag::ReplicaStatus => match reply.result {
-                Ok(v) => {
-                    if let Ok(r) = serde_json::from_value::<ReplicaStatusReply>(v) {
+                Ok(v) => match serde_json::from_value::<ReplicaStatusReply>(v) {
+                    Ok(r) => {
                         self.replica_host = r.host;
                         self.replica_push_to = r.push_to;
                         self.hosted = r.hosted;
                         self.backup_loaded = true;
                         self.rebuild_backup_rows();
                     }
-                }
+                    Err(e) => self.status = format!("replica status: malformed reply: {e}"),
+                },
                 Err((_, m)) => self.status = format!("replica status: {m}"),
             },
             Tag::ReplicaGrant => match reply.result {
@@ -1224,6 +1225,10 @@ impl App {
     /// open the revoke-confirm overlay. A hosted-chain row cannot be revoked
     /// (it's a mirror I keep, not a grant I made).
     fn start_revoke(&mut self) {
+        if self.locked {
+            self.status = "locked — unlock before revoking backup".into();
+            return;
+        }
         match self.selected_backup_row() {
             Some(BackupRow::PushTo(i)) => {
                 if let Some(fp) = self.replica_push_to.get(i) {
@@ -1879,6 +1884,21 @@ mod tests {
         app.start_revoke();
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("granted host"));
+    }
+
+    #[test]
+    fn revoke_is_blocked_when_locked() {
+        // Stale rows from before a re-lock must not open the revoke confirm
+        // (mirrors `open_grant`'s locked guard; the daemon would reject it too).
+        let mut app = App::new();
+        app.locked = true;
+        app.view = View::Backup;
+        app.replica_push_to = vec!["11".repeat(32)];
+        app.rebuild_backup_rows();
+        app.backup_selected = 0;
+        app.start_revoke();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("locked"));
     }
 
     #[test]
