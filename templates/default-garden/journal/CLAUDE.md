@@ -2,7 +2,7 @@
 
 Time-ordered records: decisions, incidents, and the archive.
 
-Distinct from per-folder `notes.md` (domain-specific running observations). Journal entries are *garden-wide* and worth a chronological view.
+Distinct from per-folder `notes/` (domain-specific running observations). Journal entries are *garden-wide* and worth a chronological view.
 
 ## Children
 

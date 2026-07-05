@@ -7,7 +7,7 @@ Read this dir before changing how the garden is structured. Don't read it for ev
 ## Children
 
 - `conventions.md` — the rule book. How files are named, when to write a `Last reviewed:` header, the source-of-truth + commentary rule, archive-don't-delete, the boundary rule. **Read this first.**
-- `reserved-filenames.md` — authoritative list of reserved names (`CLAUDE.md`, `instructions.md`, `notes.md`, `last_updated.md`, `refs.md`, `troubleshooting.md`) and their purposes. Don't reuse them for anything else.
+- `reserved-filenames.md` — authoritative list of reserved names (`CLAUDE.md`, `instructions.md`, `notes/`, `last_updated.md`, `refs.md`, `troubleshooting/`) and their purposes. Don't reuse them for anything else.
 
 ## How to behave here
 

@@ -19,7 +19,7 @@ Things that are no longer current go to `journal/archive/<slug>/`, not the trash
 - Freeform-semantic when a folder holds many like-kind items (one file per package, one per ssid, one per service).
 - Time-prefixed for time-sensitive files:
   - `incident-YYYYMMDD-<slug>.md`
-  - `decision-<slug>.md` (date is in the first line, not the filename, since decisions are referenced by name)
+  - `decision-<slug>.md` (date is in frontmatter or the first line, not the filename, since decisions are referenced by name)
   - Journal entries: `journal/<bucket>/YYYY-MM-DD-<slug>.md`
 
 ## Concept folders vs snapshots folders
@@ -39,6 +39,19 @@ Every meaningful directory has a `CLAUDE.md` that:
 4. Cross-references domains that touch this one.
 
 Sub-`CLAUDE.md` files are NOT auto-loaded. The top garden `CLAUDE.md` and per-section `CLAUDE.md` files must explicitly tell claude when to read which sub-`CLAUDE.md`.
+
+## Config sources vs environment commentary
+
+When a domain has both a **config source** (a file rendered/managed elsewhere) and an **environment** (the resulting behavior at runtime), they live in different dirs:
+
+- The config source belongs wherever it is actually rendered from — usually your dotfile manager's source tree.
+- The commentary on the resulting environment belongs in the matching concept folder.
+
+Examples:
+- `services/` documents daemons; the dotfile source tree holds the unit files.
+- `shell/` documents the shell environment (aliases, functions, prompt, env); the dotfile source holds the rc files.
+
+Keep the `dotfiles/` stub (if you add one) about the rendering pipeline itself, not about any specific tool's environment. Don't grow it into a catch-all.
 
 ## Boundary rule
 
@@ -67,3 +80,35 @@ If a file would need a real secret (API key, ssh private key contents), don't pu
 - Region-level: wrap the secret in an inline `<vault id="some-name">SECRET</vault>` tag; on read through the mount it shows `<vault id="some-name">[encrypted]</vault>`.
 
 Reveals are user-initiated (`softfig reveal`) and never expose plaintext to Claude.
+
+## Small files: numbered note folders
+
+The two **accretive** reserved files are **folders**, not monolithic files: `notes/` and `troubleshooting/` hold single-fact docs named `NNN-slug.md` (e.g. `services/<daemon>/notes/001-startup-quirk.md`). Narrative whole-read docs stay monolithic: `CLAUDE.md`, `instructions.md`, `refs.md`.
+
+- **Per-folder numbering.** Monotonic `+1`, never reused, 3-digit zero-pad (`001`). The number is a creation-order stamp — highest present = newest. Each accretive folder is an independent sequence with its own daemon-owned `.seq` high-water mark (never hand-edited). Archiving a note leaves a gap; numbers are never renumbered.
+- **Immutable address.** A note's filename, slug, number, and title are fixed for life. To "rename," archive the note and add a new one. This is what keeps `[[…]]` cross-references stable.
+- **Cross-references** use `[[NNN-slug]]` or `[[path]]`. The daemon maintains a backlink section and per-folder index tables in **managed regions** (fenced, daemon-owned) — never hand-edit inside those markers.
+
+**All garden mutations go through soft-fig's MCP verbs** — never raw `mv`/`sed`/editor writes. The daemon owns every mechanical field (dates, numbers, headers, filenames, index tables, backlinks, and the commit), so you emit only the irreducible new content. North-star rule: *the unit of change equals the unit of output.* Verb surface:
+
+- Notes: `add_note`, `revise_note` (body-only), `archive`.
+- Any markdown doc: `add_section`, `edit_section`, `append_to_section`.
+- Whole-doc: `set_reviewed` (date bump), `replace_file` (break-glass — verbatim bytes, no stamping, discouraged).
+- Kind-specific: `log_decision`, `log_incident`, `add_project`, `refresh_snapshot`.
+
+## Excluding paths from the VCS (`.softfigignore`)
+
+The garden VCS excludes `.softfig` (VCS state) and `.claude` (agent scratch) by default. To exclude **additional** top-level paths, add their names to a `.softfigignore` file at the garden root — one name per line, `#` comments and blank lines ignored, a single trailing `/` tolerated. v1 matches top-level names only (like the built-ins); the built-ins themselves can't be un-ignored.
+
+The file is itself tracked (so the ignore set versions + replicates with the garden) and is read fresh on each commit/event — an edit takes effect with no daemon restart. See `reserved-filenames.md` ("VCS ignore file").
+
+## Never put data or values in section headings
+
+Headings are **immutable addresses**, not content. The section verbs (`edit_section`, `append_to_section`) address a section by its heading text and *keep the heading line* — there is no "rename heading" verb, and a note's title is fixed for life (see "Small files" above). So any **mutable value** baked into a heading goes stale the moment it changes and can only be corrected with a whole-file `replace_file` break-glass.
+
+Keep values — percentages, versions, dates, counts, prices, sizes, absolute paths, anything that can change — in the **body**, never the heading. Write headings as stable *topics*:
+
+- Bad: `## Volume: 30% baseline` → wrong after a retune, un-renameable.
+- Good: `## Volume: baseline + toggle`, with "0.20 (20%)" in the body.
+
+If a value needs to be visible at a glance, put it in the first body line, not the heading. This keeps every heading a durable anchor for `edit_section` and `[[…]]` cross-references.

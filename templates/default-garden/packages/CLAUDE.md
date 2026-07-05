@@ -8,7 +8,7 @@ A concept folder here holds **stable knowledge**: how to use the tool, quirks sp
 
 - "How do I use <tool>?" → `packages/<tool>/instructions.md`.
 - "What's installed?" → `snapshots/packages/<tool>/`.
-- "Why is <package> pinned / what broke?" → `packages/<tool>/notes.md`.
+- "Why is <package> pinned / what broke?" → `packages/<tool>/notes/`.
 - Create a new `packages/<tool>/` when a new package manager is adopted, and a matching `snapshots/packages/<tool>/` for its list.
 
 ## Cross-refs
