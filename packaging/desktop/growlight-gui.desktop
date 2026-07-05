@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=growlight
+GenericName=soft-fig growlight console
+Comment=Fleet console for the soft-fig growlight orchestrator
+# Source of truth: ~/projects/software-config_garden/packaging/desktop/
+# Absolute binary path goes into the INSTALLED copy only: sliver-dock (the
+# launcher) is a systemd user service whose PATH excludes ~/.local/bin, and a
+# .desktop Exec has no ~ / %h expansion. See this dir's README.
+Exec=growlight-gui
+Icon=utilities-system-monitor
+Terminal=false
+StartupWMClass=growlight-gui
+Categories=Utility;
+Keywords=softfig;growlight;fleet;orchestrator;console;

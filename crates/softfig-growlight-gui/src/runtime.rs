@@ -666,8 +666,26 @@ fn set_resources_cpu(cpu_weight: u32) -> GuiMessage {
 pub fn run() -> iced::Result {
     iced::application(boot, update, view)
         .title("soft-fig growlight")
+        .window(window_settings())
         .subscription(subscription)
         .run()
+}
+
+/// Pin the Wayland `app_id` (X11 `WM_CLASS`) to `growlight-gui` — the basename
+/// of the `.desktop` launcher and the `StartupWMClass` it declares. iced leaves
+/// `application_id` empty by default, and a dock keys its running-app set on the
+/// toplevel's app-id (sliver-dock: `drag.rs::set_running_apps`), so without this
+/// the live window can't be associated with the pinned launcher entry — the icon
+/// would neither hide-when-running nor focus-on-tap. Matching the `.desktop`
+/// basename is the freedesktop-recommended value for this field.
+fn window_settings() -> iced::window::Settings {
+    iced::window::Settings {
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: "growlight-gui".to_string(),
+            ..iced::window::settings::PlatformSpecific::default()
+        },
+        ..iced::window::Settings::default()
+    }
 }
 
 #[cfg(test)]
