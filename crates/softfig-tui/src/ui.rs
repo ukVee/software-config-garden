@@ -11,6 +11,7 @@ use ratatui::Frame;
 use crate::app::{short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
+use softfig_ipc::DeployAction;
 
 fn sel_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
@@ -65,6 +66,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             name,
             error,
         } => render_replica_revoke(f, fingerprint, name.as_deref(), error.as_deref(), area),
+        Overlay::DeployForce { error } => render_deploy_force(f, error.as_deref(), area),
         Overlay::Help => render_help(f, area),
     }
 }
@@ -95,6 +97,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         tab("3:Vault", app.view == View::Vault),
         tab("4:Peers", app.view == View::Peers),
         tab("5:Backup", app.view == View::Backup),
+        tab("6:Deploy", app.view == View::Deploy),
         Span::raw("  "),
         Span::styled(format!("[{state}] tip:{tip}"), dim),
     ]);
@@ -127,6 +130,10 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
         View::Backup => {
             render_backup(f, app, cols[0]);
             render_backup_detail(f, app, cols[1]);
+        }
+        View::Deploy => {
+            render_deploy(f, app, cols[0]);
+            render_deploy_detail(f, app, cols[1]);
         }
     }
 }
@@ -508,6 +515,129 @@ fn render_backup_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+/// A deploy action's compact verb + display colour (green create, yellow
+/// replace, dim skip, red conflict) — shared by the list + detail panes.
+fn deploy_action_style(a: DeployAction) -> (&'static str, Color) {
+    match a {
+        DeployAction::CreateSymlink => ("symlink", Color::Green),
+        DeployAction::ReplaceManaged => ("replace", Color::Yellow),
+        DeployAction::CopyStamped => ("copy", Color::Green),
+        DeployAction::SkipUnchanged => ("skip", Color::DarkGray),
+        DeployAction::Conflict => ("CONFLICT", Color::Red),
+    }
+}
+
+fn render_deploy(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.deploy_entries.is_empty() {
+        vec![ListItem::new("(no dots in config/deploy.toml)")]
+    } else {
+        app.deploy_entries
+            .iter()
+            .map(|e| {
+                let (verb, color) = deploy_action_style(e.action);
+                ListItem::new(Line::styled(
+                    format!("{verb:>8}  {}", e.name),
+                    Style::default().fg(color),
+                ))
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !app.deploy_entries.is_empty() {
+        st.select(Some(app.deploy_selected.min(app.deploy_entries.len() - 1)));
+    }
+    let title = format!(
+        "deploy — {} dot(s){}",
+        app.deploy_entries.len(),
+        if app.deploy_has_conflicts {
+            " · conflicts!"
+        } else {
+            ""
+        },
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_deploy_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    match app.selected_deploy_entry() {
+        Some(e) => {
+            let (verb, color) = deploy_action_style(e.action);
+            lines.push(Line::styled(
+                format!("{}  —  {verb}", e.name),
+                Style::default().add_modifier(Modifier::BOLD).fg(color),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(format!("  target: {}", e.target)));
+            if let Some(reason) = &e.conflict_reason {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("  conflict: {reason}"),
+                    Style::default().fg(Color::Red),
+                ));
+                lines.push(Line::styled(
+                    "  a leaves it alone · F backs it up (.softfig-bak) + overwrites",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+        None => {
+            lines.push(Line::styled(
+                "nothing to deploy",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  config/deploy.toml has no dots (or the garden is locked)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "a apply · F force · r refresh",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("deploy detail"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
+    let rect = centered_rect(70, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::raw("Force-apply the deploy plan?"),
+        Line::raw(""),
+        Line::styled(
+            "Each conflicting target is moved to <target>.softfig-bak, then overwritten.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "y force · n / Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("force deploy"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
 fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
@@ -880,7 +1010,7 @@ fn render_help(f: &mut Frame, area: Rect) {
     let body = "\
 soft-fig TUI — keys
 
-  1 2 3 4 5    switch Browse / History / Vault / Peers / Backup
+  1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
   j k ↑ ↓      move selection
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
@@ -895,6 +1025,7 @@ soft-fig TUI — keys
   p            pair a device (peers view)
   D            unpair / revoke selected (peers / backup view)
   g            grant a backup host (backup view)
+  a F          apply / force-apply deploy plan (deploy view)
   r            refresh view
   u            unlock (when locked)
   :            command palette
@@ -903,7 +1034,7 @@ soft-fig TUI — keys
 
 command palette runs actions: log_decision, log_incident,
 archive, add_project, refresh_snapshot, propose, seal, unseal,
-pair / unpair / peers, and backup / grant / revoke
+pair / unpair / peers, backup / grant / revoke, deploy / apply
 
 vault: reveal writes plaintext to a 0600 temp file and never
 shows it in this TUI; c pipes that file straight to wl-copy

@@ -9,10 +9,10 @@ use std::path::Path;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
 use softfig_ipc::{
-    DiscoverListReply, DiscoveredDevice, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
-    PairListReply, PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply,
-    ReplicaRevokeReply, ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply,
-    VaultRevealReply,
+    DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
+    HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply, PairPeer,
+    PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
+    ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
 };
 
 use crate::clip;
@@ -28,6 +28,7 @@ pub enum View {
     Vault,
     Peers,
     Backup,
+    Deploy,
 }
 
 /// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
@@ -111,6 +112,12 @@ pub enum Overlay {
         name: Option<String>,
         error: Option<String>,
     },
+    /// M4: confirm a `--force` deploy apply — back up each conflicting target to
+    /// `<target>.softfig-bak` and overwrite it. Gates the destructive path
+    /// behind an explicit y/n (a plain `a` apply never forces).
+    DeployForce {
+        error: Option<String>,
+    },
     Help,
 }
 
@@ -176,6 +183,12 @@ pub struct App {
     pub backup_rows: Vec<BackupRow>,
     pub backup_selected: usize,
     pub backup_loaded: bool,
+    /// M4 Deploy tab (`deploy_plan`): the current plan's per-dot entries.
+    pub deploy_entries: Vec<DeployPlanEntry>,
+    /// True when some entry is a `Conflict` — apply refuses it without force.
+    pub deploy_has_conflicts: bool,
+    pub deploy_selected: usize,
+    pub deploy_loaded: bool,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -219,6 +232,10 @@ impl App {
             backup_rows: Vec::new(),
             backup_selected: 0,
             backup_loaded: false,
+            deploy_entries: Vec::new(),
+            deploy_has_conflicts: false,
+            deploy_selected: 0,
+            deploy_loaded: false,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -265,6 +282,12 @@ impl App {
         ipc.send("replica_status", json!({}), Tag::ReplicaStatus);
     }
 
+    /// M4: (re)compute the deploy plan (read-only). The reply repopulates the
+    /// Deploy tab's entry list.
+    fn load_deploy(&self, ipc: &mut IpcClient) {
+        ipc.send("deploy_plan", json!({}), Tag::DeployPlan);
+    }
+
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
     fn refresh_view(&self, ipc: &mut IpcClient) {
@@ -283,6 +306,9 @@ impl App {
         }
         if self.backup_loaded {
             self.load_backup(ipc);
+        }
+        if self.deploy_loaded {
+            self.load_deploy(ipc);
         }
     }
 
@@ -335,6 +361,10 @@ impl App {
 
     pub fn selected_backup_row(&self) -> Option<BackupRow> {
         self.backup_rows.get(self.backup_selected).copied()
+    }
+
+    pub fn selected_deploy_entry(&self) -> Option<&DeployPlanEntry> {
+        self.deploy_entries.get(self.deploy_selected)
     }
 
     /// The advertised name for a push_to host, if it's a loaded ring member.
@@ -624,6 +654,40 @@ impl App {
                     }
                 }
             },
+            Tag::DeployPlan => match reply.result {
+                Ok(v) => match serde_json::from_value::<DeployPlanReply>(v) {
+                    Ok(r) => {
+                        self.deploy_entries = r.entries;
+                        self.deploy_has_conflicts = r.has_conflicts;
+                        self.deploy_loaded = true;
+                        if self.deploy_selected >= self.deploy_entries.len() {
+                            self.deploy_selected = self.deploy_entries.len().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => self.status = format!("deploy plan: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("deploy plan: {m}"),
+            },
+            Tag::DeployApply => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<DeployApplyReply>(v) {
+                        Ok(r) => deploy_summary(&r),
+                        Err(e) => format!("deploy: malformed reply: {e}"),
+                    };
+                    // Close the force-confirm overlay if it was open, then re-plan
+                    // so the tab reflects the new on-disk state.
+                    self.overlay = Overlay::None;
+                    self.load_deploy(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("apply failed ({kind:?}): {m}");
+                    if let Overlay::DeployForce { error } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
         }
     }
 
@@ -641,6 +705,7 @@ impl App {
             Overlay::Unpair { .. } => self.handle_key_unpair(key, ipc),
             Overlay::ReplicaGrant { .. } => self.handle_key_replica_grant(key, ipc),
             Overlay::ReplicaRevoke { .. } => self.handle_key_replica_revoke(key, ipc),
+            Overlay::DeployForce { .. } => self.handle_key_deploy_force(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -699,12 +764,20 @@ impl App {
                     self.load_backup(ipc);
                 }
             }
+            KeyCode::Char('6') => {
+                self.view = View::Deploy;
+                if !self.deploy_loaded && !self.locked {
+                    self.load_deploy(ipc);
+                }
+            }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
             KeyCode::Char('p') if self.view == View::Peers => self.pair_selected(ipc),
             KeyCode::Char('D') if self.view == View::Peers => self.start_unpair(),
             KeyCode::Char('g') if self.view == View::Backup => self.open_grant(),
             KeyCode::Char('D') if self.view == View::Backup => self.start_revoke(),
+            KeyCode::Char('a') if self.view == View::Deploy => self.apply_deploy(ipc, false),
+            KeyCode::Char('F') if self.view == View::Deploy => self.start_force_apply(),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
@@ -765,6 +838,9 @@ impl App {
             View::Backup => {
                 self.backup_selected = self.backup_selected.saturating_sub(1);
             }
+            View::Deploy => {
+                self.deploy_selected = self.deploy_selected.saturating_sub(1);
+            }
         }
     }
 
@@ -789,6 +865,11 @@ impl App {
             View::Backup => {
                 if self.backup_selected + 1 < self.backup_rows.len() {
                     self.backup_selected += 1;
+                }
+            }
+            View::Deploy => {
+                if self.deploy_selected + 1 < self.deploy_entries.len() {
+                    self.deploy_selected += 1;
                 }
             }
         }
@@ -827,6 +908,9 @@ impl App {
             // Backup rows are read-only detail; grant/revoke are explicit
             // actions (g / D / palette), never a stray Enter.
             View::Backup => self.hint_backup_actions(),
+            // Deploy entries are read-only detail; apply is an explicit action
+            // (a / F / palette), never a stray Enter.
+            View::Deploy => self.hint_deploy_actions(),
         }
     }
 
@@ -913,6 +997,16 @@ impl App {
                 self.view = View::Backup;
                 self.start_revoke();
             }
+            Command::Deploy => {
+                self.view = View::Deploy;
+                if !self.locked {
+                    self.load_deploy(ipc);
+                }
+            }
+            Command::Apply => {
+                self.view = View::Deploy;
+                self.apply_deploy(ipc, false);
+            }
             Command::Reload if !self.locked => self.refresh_view(ipc),
             Command::Reload => {}
             Command::Unlock => {
@@ -970,7 +1064,7 @@ impl App {
                 .selected_row()
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
-            View::History | View::Peers | View::Backup => None,
+            View::History | View::Peers | View::Backup | View::Deploy => None,
         };
         match target {
             Some(path) => {
@@ -1299,6 +1393,53 @@ impl App {
         }
     }
 
+    // ---- M4 Deploy tab ----
+
+    /// `a` / `:apply` — apply the current deploy plan. `force = false` refuses
+    /// conflicting targets (they come back in the report's `conflicts`); `force
+    /// = true` (only reached via the confirm overlay) backs each up first.
+    fn apply_deploy(&mut self, ipc: &mut IpcClient, force: bool) {
+        if self.locked {
+            self.status = "locked — unlock before deploying".into();
+            return;
+        }
+        self.status = if force { "applying (force)…" } else { "applying…" }.into();
+        ipc.send("deploy_apply", json!({ "force": force }), Tag::DeployApply);
+    }
+
+    /// `F` — open the confirm for a destructive `--force` apply. Kept behind a
+    /// y/n prompt because force backs up + overwrites unmanaged targets.
+    fn start_force_apply(&mut self) {
+        if self.locked {
+            self.status = "locked — unlock before deploying".into();
+            return;
+        }
+        self.overlay = Overlay::DeployForce { error: None };
+    }
+
+    fn handle_key_deploy_force(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = Overlay::None;
+                self.status = "force apply cancelled".into();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.apply_deploy(ipc, true);
+            }
+            _ => {}
+        }
+    }
+
+    fn hint_deploy_actions(&mut self) {
+        self.status = match self.selected_deploy_entry() {
+            Some(e) if e.action == DeployAction::Conflict => {
+                "conflict — a skips it · F force (backs up + overwrites)".into()
+            }
+            Some(_) => "a apply · F force · r refresh".into(),
+            None => "no dots in config/deploy.toml".into(),
+        };
+    }
+
     fn handle_key_form(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         // Ctrl-S submits regardless of focused field.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -1337,6 +1478,24 @@ impl App {
 
 fn short_hash(h: &str) -> String {
     h.chars().take(10).collect()
+}
+
+/// One-line summary of a deploy `Report` for the status bar. Names the counts
+/// that happened and, when some target conflicted (no `--force`), flags that
+/// `F` will force.
+fn deploy_summary(r: &DeployApplyReply) -> String {
+    let mut s = format!(
+        "deployed: {} created, {} replaced, {} copied, {} skipped, {} forced",
+        r.created.len(),
+        r.replaced.len(),
+        r.copied.len(),
+        r.skipped.len(),
+        r.forced.len(),
+    );
+    if !r.conflicts.is_empty() {
+        s.push_str(&format!(" · {} conflicted (F to force)", r.conflicts.len()));
+    }
+    s
 }
 
 /// First 16 hex chars of a device-id / transport fingerprint for compact
@@ -1936,5 +2095,152 @@ mod tests {
             &mut ipc,
         );
         assert_eq!(app.view, View::Backup);
+    }
+
+    // ---- M4 Deploy tab ----
+
+    fn plan_entry(name: &str, action: DeployAction, reason: Option<&str>) -> DeployPlanEntry {
+        DeployPlanEntry {
+            name: name.into(),
+            action,
+            target: format!("/home/u/.{name}"),
+            conflict_reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn deploy_plan_populates_then_clamps_on_shrink() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::DeployPlan,
+                result: Ok(serde_json::to_value(DeployPlanReply {
+                    entries: vec![
+                        plan_entry("bashrc", DeployAction::CreateSymlink, None),
+                        plan_entry("vimrc", DeployAction::Conflict, Some("existing file")),
+                    ],
+                    has_conflicts: true,
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert!(app.deploy_loaded);
+        assert_eq!(app.deploy_entries.len(), 2);
+        assert!(app.deploy_has_conflicts);
+
+        // Select the last row, then a smaller plan arrives → selection clamps.
+        app.deploy_selected = 1;
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::DeployPlan,
+                result: Ok(serde_json::to_value(DeployPlanReply {
+                    entries: vec![plan_entry("bashrc", DeployAction::SkipUnchanged, None)],
+                    has_conflicts: false,
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.deploy_entries.len(), 1);
+        assert_eq!(app.deploy_selected, 0);
+        assert!(!app.deploy_has_conflicts);
+    }
+
+    #[test]
+    fn force_apply_confirm_opens_and_cancels() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Deploy;
+        app.start_force_apply();
+        assert!(matches!(app.overlay, Overlay::DeployForce { .. }));
+
+        let mut ipc = dummy_ipc();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("cancel"));
+    }
+
+    #[test]
+    fn force_apply_blocked_when_locked() {
+        // A stale Deploy view after a re-lock must not open the force confirm.
+        let mut app = App::new();
+        app.locked = true;
+        app.view = View::Deploy;
+        app.start_force_apply();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("locked"));
+    }
+
+    #[test]
+    fn deploy_apply_reply_summarizes_and_closes_force() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::DeployForce { error: None };
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::DeployApply,
+                result: Ok(serde_json::to_value(DeployApplyReply {
+                    created: vec!["bashrc".into()],
+                    replaced: vec![],
+                    copied: vec![],
+                    skipped: vec!["gitconfig".into()],
+                    conflicts: vec![],
+                    forced: vec!["vimrc".into()],
+                    warnings: vec![],
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("1 created"), "status was {:?}", app.status);
+        assert!(app.status.contains("1 forced"), "status was {:?}", app.status);
+    }
+
+    #[test]
+    fn deploy_summary_flags_conflicts() {
+        let r = DeployApplyReply {
+            created: vec![],
+            replaced: vec![],
+            copied: vec![],
+            skipped: vec![],
+            conflicts: vec!["vimrc (existing file)".into()],
+            forced: vec![],
+            warnings: vec![],
+        };
+        let s = deploy_summary(&r);
+        assert!(s.contains("1 conflicted"), "summary was {s:?}");
+        assert!(s.contains("F to force"), "summary was {s:?}");
+    }
+
+    #[test]
+    fn apply_blocked_when_locked() {
+        let mut app = App::new();
+        app.locked = true;
+        let mut ipc = dummy_ipc();
+        app.apply_deploy(&mut ipc, false);
+        assert!(app.status.contains("locked"));
+    }
+
+    #[test]
+    fn six_key_switches_to_deploy() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Deploy);
     }
 }

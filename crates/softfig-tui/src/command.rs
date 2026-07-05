@@ -19,6 +19,10 @@ pub enum Command {
     Grant,
     /// Revoke the selected host's backup grant (`replica_revoke`).
     Revoke,
+    /// Switch to the Deploy tab (M4 `deploy_plan`).
+    Deploy,
+    /// Apply the current deploy plan (`deploy_apply`, no force).
+    Apply,
     Reload,
     Unlock,
     Quit,
@@ -40,6 +44,8 @@ pub fn parse_command(input: &str) -> Command {
         "backup" => Command::Backup,
         "grant" => Command::Grant,
         "revoke" => Command::Revoke,
+        "deploy" => Command::Deploy,
+        "apply" => Command::Apply,
         "reload" | "r" => Command::Reload,
         "unlock" => Command::Unlock,
         "quit" | "q" => Command::Quit,
@@ -59,7 +65,7 @@ pub fn parse_command(input: &str) -> Command {
 pub fn command_hints() -> String {
     let mut names = vec![
         "browse", "history", "vault", "peers", "reveal", "pair", "unpair", "backup", "grant",
-        "revoke", "reload", "unlock", "quit", "help",
+        "revoke", "deploy", "apply", "reload", "unlock", "quit", "help",
     ];
     for k in ActionKind::ALL {
         names.push(k.command_name());
@@ -111,6 +117,14 @@ mod tests {
         assert_eq!(parse_command("unpair"), Command::Unpair);
         assert!(command_hints().contains("pair"));
         assert!(command_hints().contains("peers"));
+    }
+
+    #[test]
+    fn deploy_commands() {
+        assert_eq!(parse_command("deploy"), Command::Deploy);
+        assert_eq!(parse_command("apply"), Command::Apply);
+        assert!(command_hints().contains("deploy"));
+        assert!(command_hints().contains("apply"));
     }
 
     #[test]

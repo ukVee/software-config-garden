@@ -42,6 +42,10 @@ pub enum Tag {
     ReplicaGrant,
     /// M5b: revoke a host's backup grant (`replica_revoke`).
     ReplicaRevoke,
+    /// M4: the deploy plan (read-only diff) for the Deploy tab (`deploy_plan`).
+    DeployPlan,
+    /// M4: apply the deploy plan (`deploy_apply`); reply carries the `Report`.
+    DeployApply,
 }
 
 #[derive(Debug)]

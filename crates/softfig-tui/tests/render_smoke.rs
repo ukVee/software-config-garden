@@ -226,3 +226,58 @@ fn renders_help_overlay() {
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("command palette"), "help text missing");
 }
+
+#[test]
+fn renders_deploy_frame() {
+    use softfig_ipc::{DeployAction, DeployPlanEntry};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Deploy;
+    app.deploy_loaded = true;
+    app.deploy_entries = vec![
+        DeployPlanEntry {
+            name: "bashrc".into(),
+            action: DeployAction::CreateSymlink,
+            target: "/home/u/.bashrc".into(),
+            conflict_reason: None,
+        },
+        DeployPlanEntry {
+            name: "vimrc".into(),
+            action: DeployAction::Conflict,
+            target: "/home/u/.vimrc".into(),
+            conflict_reason: Some("target is an existing file".into()),
+        },
+    ];
+    app.deploy_has_conflicts = true;
+    // Select the conflicting entry so the detail pane shows its reason.
+    app.deploy_selected = 1;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Deploy"), "deploy tab missing:\n{rendered}");
+    assert!(rendered.contains("bashrc"), "symlink dot missing");
+    assert!(rendered.contains("CONFLICT"), "conflict row missing");
+    assert!(rendered.contains("existing file"), "conflict reason missing");
+    assert!(rendered.contains("a apply"), "apply hint missing");
+}
+
+#[test]
+fn renders_deploy_force_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Deploy;
+    app.overlay = softfig_tui::app::Overlay::DeployForce { error: None };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("force deploy"), "overlay title missing:\n{rendered}");
+    assert!(rendered.contains("softfig-bak"), "backup explanation missing");
+    assert!(rendered.contains("y force"), "confirm hint missing");
+}
