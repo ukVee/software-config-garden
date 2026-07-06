@@ -36,9 +36,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Overlay::None => {}
         Overlay::Palette(buf) => render_palette(f, buf, area),
         Overlay::Unlock { buf, error } => render_unlock(f, buf, error.as_deref(), area),
-        Overlay::Reveal { path, buf, error } => {
-            render_reveal(f, path, buf, error.as_deref(), area)
-        }
+        Overlay::Reveal {
+            path,
+            buf,
+            error,
+            id,
+        } => render_reveal(f, path, id.as_deref(), buf, error.as_deref(), area),
+        Overlay::RevealRegion {
+            path,
+            ids,
+            selected,
+        } => render_reveal_region(f, path, ids, *selected, area),
         Overlay::Form(form) => render_form(f, form, area),
         Overlay::PairBegin {
             fingerprint,
@@ -654,7 +662,7 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     let offset = app.preview_scroll.min(max);
     app.preview_scroll = offset;
 
-    let title = if total > inner_h {
+    let mut title = if total > inner_h {
         let pct = if max == 0 {
             100
         } else {
@@ -664,6 +672,13 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.preview_title.clone()
     };
+    // M2c: flag inline `<vault id=…>` regions so the user knows `x` opens the
+    // per-region reveal picker for this file.
+    if !app.regions.is_empty() {
+        let n = app.regions.len();
+        let plural = if n == 1 { "region" } else { "regions" };
+        title.push_str(&format!("  · {n} vault {plural} (x)"));
+    }
 
     let p = text
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -731,12 +746,24 @@ fn render_unlock(f: &mut Frame, buf: &str, error: Option<&str>, area: Rect) {
     f.render_widget(p, rect);
 }
 
-fn render_reveal(f: &mut Frame, path: &str, buf: &str, error: Option<&str>, area: Rect) {
+fn render_reveal(
+    f: &mut Frame,
+    path: &str,
+    id: Option<&str>,
+    buf: &str,
+    error: Option<&str>,
+    area: Rect,
+) {
     let rect = centered_rect(70, 35, area);
     f.render_widget(Clear, rect);
     let masked: String = "*".repeat(buf.chars().count());
+    // Name the exact target: a single inline region (M2c) vs. the whole file (M2b).
+    let target = match id {
+        Some(id) => format!("region <{id}> of {path}"),
+        None => path.to_string(),
+    };
     let mut body = format!(
-        "reveal {path}\n\nmaster password: {masked}\n\nEnter reveal · Esc cancel\n\n\
+        "reveal {target}\n\nmaster password: {masked}\n\nEnter reveal · Esc cancel\n\n\
          plaintext is written to a 0600 temp file — never shown here"
     );
     if let Some(e) = error {
@@ -744,6 +771,38 @@ fn render_reveal(f: &mut Frame, path: &str, buf: &str, error: Option<&str>, area
     }
     let p = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title("reveal secret"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// M2c: the inline-region picker. Lists the file's `<vault id=…>` region ids;
+/// `Enter` on the highlighted one advances to the masked-password prompt.
+fn render_reveal_region(f: &mut Frame, path: &str, ids: &[String], selected: usize, area: Rect) {
+    let rect = centered_rect(70, 45, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(format!("inline vault regions in {path}")));
+    lines.push(Line::raw(""));
+    for (i, id) in ids.iter().enumerate() {
+        let marker = if i == selected { "› " } else { "  " };
+        let style = if i == selected {
+            sel_style()
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(format!("{marker}<{id}>"), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "j/k select · Enter reveal region · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("reveal — pick a region"),
+        )
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
 }
@@ -1020,7 +1079,8 @@ soft-fig TUI — keys
     ^d ^u      half-page down / up
     ^f ^b      full-page down / up   PgDn/PgUp same
     g G        top / bottom
-  x            reveal selected sealed file
+  x            reveal selected sealed file; on a file with inline
+               <vault id=…> regions, pick one region to reveal
   c            copy last reveal's value to clipboard
   p            pair a device (peers view)
   D            unpair / revoke selected (peers / backup view)

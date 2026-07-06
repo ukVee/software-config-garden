@@ -69,8 +69,24 @@ pub enum Overlay {
     None,
     Palette(String),
     Unlock { buf: String, error: Option<String> },
-    /// Masked master-password prompt for `vault_reveal` against `path`.
-    Reveal { path: String, buf: String, error: Option<String> },
+    /// Masked master-password prompt for `vault_reveal` against `path`. When
+    /// `id` is `Some`, the reveal targets a single inline `<vault id="…">`
+    /// region (M2c); `None` reveals the whole Layer-B-sealed file (M2b).
+    Reveal {
+        path: String,
+        buf: String,
+        error: Option<String>,
+        id: Option<String>,
+    },
+    /// M2c: inline-region picker. The selected file carries one or more
+    /// `<vault id="…">[encrypted]</vault>` regions (parsed from its `read_file`
+    /// projection); pick one and `Enter` advances to the masked-password
+    /// [`Overlay::Reveal`] carrying that region `id`.
+    RevealRegion {
+        path: String,
+        ids: Vec<String>,
+        selected: usize,
+    },
     Form(ActionForm),
     /// Initiate a pairing: collect the peer fingerprint + optional endpoint,
     /// then run `pair_begin`. Stays open until the SAS comes back (then it is
@@ -161,6 +177,11 @@ pub struct App {
     pub vault_selected: usize,
     pub vault_loaded: bool,
     pub reveal: Option<RevealInfo>,
+    /// M2c: inline `<vault id="…">` region ids parsed from the currently-opened
+    /// file's daemon projection, plus the path they belong to. Drives the
+    /// per-region reveal picker; empty when the open file carries no regions.
+    pub regions: Vec<String>,
+    pub regions_path: Option<String>,
     pub peers: Vec<PairPeer>,
     pub pending: Vec<PendingPairing>,
     /// Nearby unpaired devices discovered over mDNS (`discover_list`).
@@ -220,6 +241,8 @@ impl App {
             vault_selected: 0,
             vault_loaded: false,
             reveal: None,
+            regions: Vec::new(),
+            regions_path: None,
             peers: Vec::new(),
             pending: Vec::new(),
             discovered: Vec::new(),
@@ -429,6 +452,10 @@ impl App {
             Tag::ReadFile { path } => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
+                        // M2c: surface the file's inline `<vault id=…>` regions so
+                        // `x`/Enter offers the per-region reveal picker.
+                        self.regions = parse_vault_region_ids(&r.content);
+                        self.regions_path = Some(path.clone());
                         self.preview = r.content;
                         self.preview_title = if r.sealed {
                             format!("{path}  [sealed]")
@@ -699,6 +726,7 @@ impl App {
             Overlay::Palette(_) => self.handle_key_palette(key, ipc),
             Overlay::Unlock { .. } => self.handle_key_unlock(key, ipc),
             Overlay::Reveal { .. } => self.handle_key_reveal(key, ipc),
+            Overlay::RevealRegion { .. } => self.handle_key_reveal_region(key, ipc),
             Overlay::Form(_) => self.handle_key_form(key, ipc),
             Overlay::PairBegin { .. } => self.handle_key_pair_begin(key, ipc),
             Overlay::PairConfirm { .. } => self.handle_key_pair_confirm(key, ipc),
@@ -1067,19 +1095,68 @@ impl App {
             View::History | View::Peers | View::Backup | View::Deploy => None,
         };
         match target {
+            // M2c: if the reveal target is the currently-open file and it
+            // carries inline `<vault id=…>` regions, pick a region first;
+            // otherwise fall through to the whole-file (M2b) reveal prompt.
+            Some(path)
+                if self.regions_path.as_deref() == Some(path.as_str())
+                    && !self.regions.is_empty() =>
+            {
+                self.overlay = Overlay::RevealRegion {
+                    path,
+                    ids: self.regions.clone(),
+                    selected: 0,
+                };
+            }
             Some(path) => {
                 self.overlay = Overlay::Reveal {
                     path,
                     buf: String::new(),
                     error: None,
+                    id: None,
                 }
             }
             None => self.status = "select a sealed file to reveal".into(),
         }
     }
 
+    /// Region picker keys (M2c): move over the `<vault id=…>` ids and `Enter`
+    /// advances to the masked-password prompt for the chosen region.
+    fn handle_key_reveal_region(&mut self, key: KeyEvent, _ipc: &mut IpcClient) {
+        let Overlay::RevealRegion {
+            path,
+            ids,
+            selected,
+        } = &mut self.overlay
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('j') | KeyCode::Down if *selected + 1 < ids.len() => {
+                *selected += 1;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let id = ids.get(*selected).cloned();
+                let path = path.clone();
+                if let Some(id) = id {
+                    self.overlay = Overlay::Reveal {
+                        path,
+                        buf: String::new(),
+                        error: None,
+                        id: Some(id),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key_reveal(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
-        let Overlay::Reveal { path, buf, .. } = &mut self.overlay else {
+        let Overlay::Reveal { path, buf, id, .. } = &mut self.overlay else {
             return;
         };
         match key.code {
@@ -1091,12 +1168,13 @@ impl App {
             KeyCode::Enter => {
                 let path = path.clone();
                 let pass = buf.clone();
-                ipc.send(
-                    "vault_reveal",
-                    json!({ "path": path, "master_password": pass }),
-                    Tag::Reveal { path: path.clone() },
-                );
-                self.status = format!("revealing {path}…");
+                let id = id.clone();
+                let args = vault_reveal_args(&path, &pass, id.as_deref());
+                ipc.send("vault_reveal", args, Tag::Reveal { path: path.clone() });
+                self.status = match &id {
+                    Some(id) => format!("revealing {path} <{id}>…"),
+                    None => format!("revealing {path}…"),
+                };
             }
             _ => {}
         }
@@ -1480,6 +1558,72 @@ fn short_hash(h: &str) -> String {
     h.chars().take(10).collect()
 }
 
+/// Build the `vault_reveal` IPC args. `id` is threaded in only when `Some`, so
+/// a whole-file (M2b) reveal's payload stays byte-identical to the pre-M2c
+/// caller (matching the `skip_serializing_if = "Option::is_none"` on the verb).
+fn vault_reveal_args(path: &str, master_password: &str, id: Option<&str>) -> Value {
+    let mut args = json!({ "path": path, "master_password": master_password });
+    if let Some(id) = id {
+        args["id"] = json!(id);
+    }
+    args
+}
+
+/// M2c: parse the inline `<vault id="…">` region ids out of a file's daemon
+/// projection (a `read_file` reply). The daemon renders each encrypted region
+/// as `<vault id="…">[encrypted]</vault>`; this pulls the ids in document order,
+/// de-duplicated (a repeated id reveals the same region). Tolerates single- or
+/// double-quoted ids and extra whitespace/attributes inside the opening tag.
+pub fn parse_vault_region_ids(content: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = content;
+    while let Some(pos) = rest.find("<vault") {
+        rest = &rest[pos + "<vault".len()..];
+        // Scope the `id=` search to this opening tag (up to its closing `>`).
+        let Some(tag_end) = rest.find('>') else { break };
+        if let Some(id) = extract_id_attr(&rest[..tag_end]) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        rest = &rest[tag_end + 1..];
+    }
+    ids
+}
+
+/// Pull the `id="…"` (or `id='…'`) attribute value out of a `<vault …>` opening
+/// tag's inner text. Requires `id` to be a whole attribute name (not a suffix of
+/// e.g. `valid`) so an unrelated attribute can't be mistaken for the region id.
+fn extract_id_attr(tag: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = tag[i..].find("id") {
+        let start = i + rel;
+        let name_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let mut j = start + 2;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if name_ok && bytes.get(j) == Some(&b'=') {
+            let mut k = j + 1;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            match bytes.get(k) {
+                Some(&q) if q == b'"' || q == b'\'' => {
+                    let after = &tag[k + 1..];
+                    if let Some(end) = after.find(q as char) {
+                        return Some(after[..end].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        i = start + 2;
+    }
+    None
+}
+
 /// One-line summary of a deploy `Report` for the status bar. Names the counts
 /// that happened and, when some target conflicted (no `--force`), flags that
 /// `F` will force.
@@ -1621,6 +1765,7 @@ mod tests {
             path: "secrets/api-keys.toml".into(),
             buf: "pw".into(),
             error: None,
+            id: None,
         };
         let mut ipc = dummy_ipc();
         app.apply_reply(
@@ -1640,6 +1785,150 @@ mod tests {
         assert_eq!(info.temp_path, "/run/user/1000/softfig-reveal-abc.toml");
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("press c to copy"));
+    }
+
+    // ---- M2c: inline-region reveal (slice 003) ----
+
+    #[test]
+    fn parse_region_ids_from_projection() {
+        // The daemon projects each encrypted region as `[encrypted]`; the ids
+        // come out in document order, de-duplicated.
+        let content = "\
+host = \"db\"
+password = <vault id=\"db-pw\">[encrypted]</vault>
+token = <vault id='api-token'>[encrypted]</vault>
+backup = <vault id=\"db-pw\">[encrypted]</vault>
+";
+        assert_eq!(
+            parse_vault_region_ids(content),
+            vec!["db-pw".to_string(), "api-token".to_string()],
+        );
+    }
+
+    #[test]
+    fn parse_region_ids_ignores_non_id_attrs_and_plain_text() {
+        // A file with no `<vault>` tags → nothing; an unrelated attribute whose
+        // name merely ends in "id" must not be mistaken for the region id.
+        assert!(parse_vault_region_ids("just prose, no secrets").is_empty());
+        assert_eq!(
+            parse_vault_region_ids("<vault valid=\"no\" id=\"real\">[encrypted]</vault>"),
+            vec!["real".to_string()],
+        );
+    }
+
+    #[test]
+    fn vault_reveal_args_include_id_only_when_present() {
+        // Whole-file (M2b) reveal: no `id` key at all, byte-identical to the
+        // pre-M2c payload.
+        let whole = vault_reveal_args("secrets/db.toml", "pw", None);
+        assert_eq!(whole["path"], json!("secrets/db.toml"));
+        assert_eq!(whole["master_password"], json!("pw"));
+        assert!(whole.get("id").is_none());
+        // Per-region (M2c) reveal: the chosen id rides along.
+        let region = vault_reveal_args("secrets/db.toml", "pw", Some("db-pw"));
+        assert_eq!(region["id"], json!("db-pw"));
+    }
+
+    #[test]
+    fn region_bearing_file_opens_the_picker_then_carries_the_id() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Browse;
+        app.tree.set_children(
+            "",
+            vec![softfig_ipc::TreeEntry {
+                name: "db.toml".into(),
+                path: "config/db.toml".into(),
+                is_dir: false,
+            }],
+        );
+        let mut ipc = dummy_ipc();
+
+        // Opening the file parses its inline regions off the read_file reply.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::ReadFile {
+                    path: "config/db.toml".into(),
+                },
+                result: Ok(json!({
+                    "path": "config/db.toml",
+                    "content": "pw = <vault id=\"db-pw\">[encrypted]</vault>\n\
+                                tok = <vault id=\"api\">[encrypted]</vault>\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.regions, vec!["db-pw".to_string(), "api".to_string()]);
+        assert_eq!(app.regions_path.as_deref(), Some("config/db.toml"));
+
+        // `x` on a region-bearing file opens the region picker, not the
+        // whole-file password prompt.
+        app.start_reveal(&mut ipc);
+        match &app.overlay {
+            Overlay::RevealRegion { path, ids, selected } => {
+                assert_eq!(path, "config/db.toml");
+                assert_eq!(ids, &vec!["db-pw".to_string(), "api".to_string()]);
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected region picker, got {other:?}"),
+        }
+
+        // Move to the second region and confirm — the masked-password prompt
+        // now carries that region's id.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ipc);
+        match &app.overlay {
+            Overlay::Reveal { path, id, .. } => {
+                assert_eq!(path, "config/db.toml");
+                assert_eq!(id.as_deref(), Some("api"));
+            }
+            other => panic!("expected reveal prompt with id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_file_reveal_skips_the_picker() {
+        // A file with no inline regions falls through to the whole-file prompt.
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Browse;
+        app.tree.set_children(
+            "",
+            vec![softfig_ipc::TreeEntry {
+                name: "notes.md".into(),
+                path: "notes.md".into(),
+                is_dir: false,
+            }],
+        );
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::ReadFile {
+                    path: "notes.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes.md",
+                    "content": "no secrets here\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.regions.is_empty());
+        app.start_reveal(&mut ipc);
+        match &app.overlay {
+            Overlay::Reveal { path, id, .. } => {
+                assert_eq!(path, "notes.md");
+                assert!(id.is_none());
+            }
+            other => panic!("expected whole-file reveal prompt, got {other:?}"),
+        }
     }
 
     #[test]

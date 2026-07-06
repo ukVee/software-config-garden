@@ -214,6 +214,72 @@ fn renders_scrolled_preview() {
 }
 
 #[test]
+fn renders_region_picker_overlay() {
+    // M2c: the inline `<vault id=…>` region picker lists the ids and its keys.
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Browse;
+    app.overlay = softfig_tui::app::Overlay::RevealRegion {
+        path: "config/db.toml".into(),
+        ids: vec!["db-pw".into(), "api-token".into()],
+        selected: 1,
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("pick a region"), "picker title missing:\n{rendered}");
+    assert!(rendered.contains("config/db.toml"), "file path missing");
+    assert!(rendered.contains("db-pw"), "region id missing");
+    assert!(rendered.contains("api-token"), "second region id missing");
+    assert!(rendered.contains("Enter reveal region"), "picker hint missing");
+}
+
+#[test]
+fn renders_region_reveal_prompt() {
+    // The masked-password prompt for a single region names the region target.
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = softfig_tui::app::Overlay::Reveal {
+        path: "config/db.toml".into(),
+        buf: "pw".into(),
+        error: None,
+        id: Some("db-pw".into()),
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("reveal secret"), "reveal title missing:\n{rendered}");
+    assert!(rendered.contains("region <db-pw>"), "region target missing");
+    assert!(rendered.contains("config/db.toml"), "file path missing");
+}
+
+#[test]
+fn renders_preview_region_hint() {
+    // A previewed file with inline regions flags them in the pane title.
+    let mut app = App::new();
+    app.locked = false;
+    app.tree
+        .set_children("", vec![entry("db.toml", false)]);
+    app.preview = "pw = <vault id=\"db-pw\">[encrypted]</vault>\n".into();
+    app.preview_title = "config/db.toml".into();
+    app.regions = vec!["db-pw".into()];
+    app.regions_path = Some("config/db.toml".into());
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("vault region"), "region hint missing:\n{rendered}");
+}
+
+#[test]
 fn renders_help_overlay() {
     let mut app = App::new();
     app.locked = false;
