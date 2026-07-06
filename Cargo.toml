@@ -81,7 +81,7 @@ anyhow = "1"
 # Daemon / watcher
 notify = "6"
 notify-debouncer-full = "0.3"
-signal-hook = "0.3"
+signal-hook = { version = "0.3", features = ["extended-siginfo"] } # extended-siginfo: growlightd logs a SIGTERM sender (task 032)
 libc = "0.2"
 
 # Layer B sealed-paths glob matching (M2b)

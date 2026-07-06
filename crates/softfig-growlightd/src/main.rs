@@ -4,7 +4,8 @@ use std::thread;
 use anyhow::{Context, Result};
 use clap::Parser;
 use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
+use signal_hook::iterator::exfiltrator::WithOrigin;
+use signal_hook::iterator::SignalsInfo;
 
 use std::sync::Arc;
 
@@ -121,13 +122,27 @@ fn main() -> Result<()> {
     // delivered through signal-hook's self-pipe so the teardown runs in normal
     // thread context. Once `request_shutdown` flips the daemon to `Stopping`,
     // the accept loop exits on its next poll and `handle.join()` returns.
+    // `WithOrigin` captures the sender's pid/uid (SA_SIGINFO) so an unexplained
+    // stop names its sender in the journal (task 032, the 2026-07-05/06 phantom
+    // StopUnit): si_pid = the user manager means a systemd StopUnit job (go find
+    // its D-Bus caller); any other pid is a direct kill and names the culprit
+    // outright (the sender may have exited by read time — correlate by uid/time).
     let shutdown_daemon = handle.daemon.clone();
-    let mut signals = Signals::new([SIGTERM, SIGINT])?;
+    let mut signals = SignalsInfo::<WithOrigin>::new([SIGTERM, SIGINT])?;
     thread::Builder::new()
         .name("growlightd-signal".into())
         .spawn(move || {
-            if let Some(sig) = signals.forever().next() {
-                eprintln!("softfig-growlightd: caught signal {sig}; shutting down");
+            if let Some(origin) = signals.forever().next() {
+                match origin.process {
+                    Some(p) => eprintln!(
+                        "softfig-growlightd: caught signal {} from pid {} (uid {}); shutting down",
+                        origin.signal, p.pid, p.uid,
+                    ),
+                    None => eprintln!(
+                        "softfig-growlightd: caught signal {} (sender unknown); shutting down",
+                        origin.signal,
+                    ),
+                }
                 shutdown_daemon.request_shutdown();
             }
         })?;
