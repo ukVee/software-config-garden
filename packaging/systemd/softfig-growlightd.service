@@ -20,6 +20,19 @@ ExecStart=%h/.local/bin/softfig-growlightd
 Restart=on-failure
 RestartSec=2
 
+# Survive an OOM event in our cgroup. Without this the unit inherits the host's
+# `DefaultOOMPolicy` (which is `stop` on this system): if systemd-oomd or the
+# kernel OOM-kills ANY process in growlightd's cgroup, systemd would *cleanly
+# stop* the whole unit — and because that counts as a clean stop, not a failure,
+# `Restart=on-failure` never brings it back, so the fleet silently stays down
+# with no restart and no log of why (incident growlightd-resource-down-build,
+# 2026-06-28). Peers now run in their OWN transient scopes, so growlightd's cgroup
+# should rarely be the OOM victim; and if growlightd itself is ever OOM-killed
+# that is a genuine crash `Restart=on-failure` should handle — never a reason to
+# silently park the supervisor. `continue` keeps growlightd running through an OOM
+# in its cgroup instead of stopping the unit.
+OOMPolicy=continue
+
 # Headless daemon — journal only.
 StandardOutput=journal
 StandardError=journal
