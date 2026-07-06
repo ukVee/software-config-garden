@@ -75,6 +75,20 @@ impl FsBatonStore {
 impl BatonSeeder for FsBatonStore {
     fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<(), String> {
         let path = self.baton_path(agent);
+        // A fresh start on the SAME item keeps the member's own baton: after a
+        // growlightd restart the boot reaper resets the orphaned-`active` item to
+        // `queued`, so the loop resumes it through this fresh-start path — but the
+        // baton on disk is the member's curated write-back from its last
+        // iteration (branch, done criteria, next step), which is exactly the
+        // carry-forward a re-roll would have preserved. Overwriting it with the
+        // generic template would throw that context away on every daemon bounce
+        // (the task-032 phantom stops made bounces a live concern). A baton for a
+        // DIFFERENT item (or none, or unparseable) seeds fresh as before.
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if parse_baton(&existing).item.as_deref() == Some(part) {
+                return Ok(());
+            }
+        }
         // The agent dir is created by the pre-approval generator on spawn, but the
         // seed is written BEFORE that spawn (so the SessionStart hook finds a
         // baton), so create it here too — idempotent with `generate`'s create.
@@ -196,6 +210,34 @@ mod tests {
         for status in softfig_ipc::baton::STATUS_VOCABULARY {
             assert!(na.contains(status), "NEXT ACTION must list {status}");
         }
+    }
+
+    #[test]
+    fn a_same_item_seed_keeps_the_members_own_baton() {
+        // The restart-resume path: growlightd bounces, the boot reaper resets the
+        // orphaned-`active` item to `queued`, and the loop fresh-starts the member
+        // on the SAME item — through `seed`. The baton on disk is the member's
+        // curated write-back from its last iteration; a same-item seed must keep
+        // it (it IS the carry-forward), while a different-item seed replaces it.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a1", "default", "020").expect("seeds");
+
+        let curated = "---\nstatus: IN_PROGRESS\nitem: 020\n---\n\
+                       # NEXT ACTION\nslice B on branch feat/020 — design is locked.\n";
+        fs::write(s.baton_path("a1"), curated).unwrap();
+
+        s.seed("a1", "default", "020").expect("same-item re-seed is a keep");
+        let kept = fs::read_to_string(s.baton_path("a1")).unwrap();
+        assert_eq!(kept, curated, "a same-item seed preserves the curated baton");
+
+        s.seed("a1", "default", "021").expect("new-item seed writes fresh");
+        let fresh = parse_baton(&fs::read_to_string(s.baton_path("a1")).unwrap());
+        assert_eq!(
+            fresh.item.as_deref(),
+            Some("021"),
+            "a different-item seed replaces the stale baton",
+        );
     }
 
     #[test]
