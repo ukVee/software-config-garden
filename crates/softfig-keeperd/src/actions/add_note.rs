@@ -1,11 +1,13 @@
-//! `add_note` / `revise_note` — Slice 1 of the small-files redesign.
+//! `add_note` / `revise_note` — Slice 1 of the small-files redesign — plus
+//! the shared accretive-write core (`add_numbered_doc`) that `add_code_review`
+//! (task 020) reuses with its own [`DocGenre`].
 //!
-//! Accretive notes live as numbered single-docs `NNN-slug.md` inside a
-//! `notes/` or `troubleshooting/` folder. The daemon owns every mechanical
-//! field: it assigns `NNN` from the folder's `.seq` high-water mark, stamps
-//! the `# <title>` header + `> Last reviewed:` line, and names the file —
-//! the caller emits only irreducible new content (slug + body, optional
-//! title). See `meta/spec-small-files.md`.
+//! Accretive docs live as numbered single-docs `NNN-slug.md` inside a
+//! reserved accretive folder (`notes/`, `troubleshooting/`, `code-reviews/`).
+//! The daemon owns every mechanical field: it assigns `NNN` from the folder's
+//! `.seq` high-water mark, stamps the `# <title>` header + `> Last reviewed:`
+//! line, and names the file — the caller emits only irreducible new content
+//! (slug + body, optional title). See `meta/spec-small-files.md`.
 //!
 //! Numbering is per-folder, monotonic `+1`, never reused. The `.seq` file
 //! is the source of truth so archiving the newest note can't hand its
@@ -25,11 +27,31 @@ use crate::handlers::{
     path_to_repo_rel_string, require_unlocked, validate_repo_path, HandlerResult,
 };
 
-pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
-    let args: AddNoteArgs = serde_json::from_value(args)
-        .map_err(|e| (ErrorKind::BadArgs, format!("add_note args: {e}")))?;
-    conventions::validate_slug(&args.slug)?;
-    if args.body.trim().is_empty() {
+/// The genre-specific knobs of the shared accretive-write core: which
+/// reserved folder basenames the verb may write into (and the label its
+/// gate error uses), the VCS intent it mints, and the header stamper.
+/// `add_note` and `add_code_review` (task 020) differ only in these.
+pub(super) struct DocGenre {
+    pub allowed: &'static [&'static str],
+    pub label: &'static str,
+    pub intent: &'static str,
+    pub doc: fn(title: &str, date_hyphen: &str, body: &str) -> String,
+}
+
+/// The shared accretive-write core: validate, gate `dir` on the genre's
+/// allowed basenames, assign the next `.seq` number, stamp + write the doc,
+/// refresh the parent index + backlinks, and mint one genre-intent commit.
+/// Returns the garden-relative path written + the commit hash.
+pub(super) fn add_numbered_doc(
+    daemon: &Daemon,
+    dir: &str,
+    slug: &str,
+    title: Option<&str>,
+    body: &str,
+    genre: &DocGenre,
+) -> Result<(String, String), (ErrorKind, String)> {
+    conventions::validate_slug(slug)?;
+    if body.trim().is_empty() {
         return Err((ErrorKind::BadArgs, "body must be non-empty".into()));
     }
 
@@ -37,22 +59,23 @@ pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     require_unlocked(&inner)?;
     let garden_root = inner.config.garden_root.clone();
 
-    let dir_abs = validate_repo_path(&garden_root, &args.dir).map_err(|m| (ErrorKind::BadArgs, m))?;
+    let dir_abs = validate_repo_path(&garden_root, dir).map_err(|m| (ErrorKind::BadArgs, m))?;
     let dir_rel = path_to_repo_rel_string(&garden_root, &dir_abs)
         .ok_or((ErrorKind::BadArgs, "dir outside garden root".into()))?;
-    if !conventions::is_accretive_dir(&dir_rel) {
+    if !conventions::dir_basename_in(&dir_rel, genre.allowed) {
         return Err((
             ErrorKind::NotAccretiveDir,
             format!(
-                "{dir_rel}: notes live only in an accretive folder ({})",
-                conventions::ACCRETIVE_FOLDERS.join(" / ")
+                "{dir_rel}: {} live only in an accretive folder ({})",
+                genre.label,
+                genre.allowed.join(" / ")
             ),
         ));
     }
 
     let (note_rel, number) = {
         let wt = WorkTree::new(daemon, &inner);
-        // The concept dir must already exist — `add_note` materializes the
+        // The concept dir must already exist — the add verbs materialize the
         // accretive folder on demand, but won't fabricate an arbitrary tree.
         let parent_rel = Path::new(&dir_rel).parent().and_then(|p| p.to_str()).unwrap_or("");
         if !wt.is_dir(parent_rel) {
@@ -63,35 +86,54 @@ pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         }
 
         let number = numbering::next_number(&wt, &dir_rel);
-        let filename = conventions::note_filename(number, &args.slug);
+        let filename = conventions::note_filename(number, slug);
         let note_rel = format!("{dir_rel}/{filename}");
 
-        let title = args.title.as_deref().unwrap_or(&args.slug);
-        let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
+        let content = (genre.doc)(
+            title.unwrap_or(slug),
+            &conventions::today_hyphen(),
+            body,
+        );
 
-        // Bump the high-water mark in the same commit as the new note.
+        // Bump the high-water mark in the same commit as the new doc.
         numbering::write_numbered(&wt, &dir_rel, number, &note_rel, &content)?;
 
         // Slice 4: refresh this folder's index table in the parent CLAUDE.md,
-        // folded into the same commit (best-effort — never blocks the note).
+        // folded into the same commit (best-effort — never blocks the doc).
         super::index::refresh_folder_index(&wt, &inner, &dir_rel);
-        // Slice 5: a new note may carry `[[…]]` refs and may itself satisfy a
+        // Slice 5: a new doc may carry `[[…]]` refs and may itself satisfy a
         // previously-dangling ref, so recompute the backlink graph.
         super::backlinks::refresh_all(&wt, &inner);
         (note_rel, number)
     };
 
-    let payload = serde_json::json!({ "dir": dir_rel, "slug": args.slug, "number": number });
+    let payload = serde_json::json!({ "dir": dir_rel, "slug": slug, "number": number });
     let intent =
-        Intent::new("note_added", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+        Intent::new(genre.intent, payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let inner = &mut *inner;
     let hash = commit_now(inner, intent)?;
 
-    Ok(serde_json::to_value(AddNoteReply {
-        path: note_rel,
-        hash: hash.to_string(),
-    })
-    .unwrap())
+    Ok((note_rel, hash.to_string()))
+}
+
+pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: AddNoteArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("add_note args: {e}")))?;
+    const GENRE: DocGenre = DocGenre {
+        allowed: &conventions::NOTE_FOLDERS,
+        label: "notes",
+        intent: "note_added",
+        doc: conventions::note_doc,
+    };
+    let (path, hash) = add_numbered_doc(
+        daemon,
+        &args.dir,
+        &args.slug,
+        args.title.as_deref(),
+        &args.body,
+        &GENRE,
+    )?;
+    Ok(serde_json::to_value(AddNoteReply { path, hash }).unwrap())
 }
 
 pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {

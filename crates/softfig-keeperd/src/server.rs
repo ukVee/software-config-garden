@@ -198,6 +198,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::LOG_INCIDENT => crate::actions::log_incident(daemon, req.args),
         op::ADD_NOTE => crate::actions::add_note(daemon, req.args),
         op::REVISE_NOTE => crate::actions::revise_note(daemon, req.args),
+        op::ADD_CODE_REVIEW => crate::actions::add_code_review(daemon, req.args),
         op::ADD_SECTION => crate::actions::add_section(daemon, req.args),
         op::EDIT_SECTION => crate::actions::edit_section(daemon, req.args),
         op::APPEND_TO_SECTION => crate::actions::append_to_section(daemon, req.args),

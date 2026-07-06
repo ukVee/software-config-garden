@@ -20,6 +20,7 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "incident_logged",
     "note_added",
     "note_revised",
+    "code_review_added",
     "monolith_split",
     "section_added",
     "section_edited",

@@ -17,10 +17,23 @@ pub const PROJECT_NAME_MAX: usize = 64;
 /// mark. Never read or written by Claude — see `meta/spec-small-files.md`.
 pub const SEQ_FILE: &str = ".seq";
 
-/// Reserved-name folders that hold numbered single-doc notes (Slice 1 of
-/// the small-files redesign). The basename of an `add_note`/`revise_note`
-/// `dir` must be one of these.
-pub const ACCRETIVE_FOLDERS: [&str; 2] = ["notes", "troubleshooting"];
+/// Reserved-name folders that hold numbered single-doc entries (Slice 1 of
+/// the small-files redesign; `code-reviews` added by task 020). The basename
+/// of a `revise_note` `dir` must be one of these; the add verbs gate on the
+/// genre subsets below.
+pub const ACCRETIVE_FOLDERS: [&str; 3] = ["notes", "troubleshooting", "code-reviews"];
+
+/// The note-genre accretive folders `add_note` may write into. A code review
+/// is a distinct genre — `add_code_review` owns `code-reviews/` — so the two
+/// add verbs stay out of each other's folders even though `revise_note`,
+/// numbering, indexes, and backlinks treat all of [`ACCRETIVE_FOLDERS`]
+/// uniformly.
+pub const NOTE_FOLDERS: [&str; 2] = ["notes", "troubleshooting"];
+
+/// The code-review-genre accretive folders `add_code_review` may write into
+/// (task 020). Primary home `projects/<project>/code-reviews/`; the name is
+/// reserved garden-wide, so any concept dir may hold one.
+pub const CODE_REVIEW_FOLDERS: [&str; 1] = ["code-reviews"];
 
 // ---- path templates ---------------------------------------------------
 
@@ -41,13 +54,20 @@ pub fn project_dir(name: &str) -> String {
 /// as `notes/.seq`), not a `notes.md` monolith — see [`is_accretive_dir`].
 pub const PROJECT_STUBS: [&str; 3] = ["CLAUDE.md", "instructions.md", "refs.md"];
 
-/// Whether `dir_rel`'s basename names an accretive note folder. `add_note`
-/// and `revise_note` only operate on these.
+/// Whether `dir_rel`'s basename names an accretive folder. `revise_note`
+/// and the shared numbering/index/backlink machinery operate on all of
+/// these; the add verbs gate on their genre subset via [`dir_basename_in`].
 pub fn is_accretive_dir(dir_rel: &str) -> bool {
+    dir_basename_in(dir_rel, &ACCRETIVE_FOLDERS)
+}
+
+/// Whether `dir_rel`'s basename is one of `allowed` — the genre gate the
+/// add verbs apply on top of the accretive-folder machinery.
+pub fn dir_basename_in(dir_rel: &str, allowed: &[&str]) -> bool {
     Path::new(dir_rel)
         .file_name()
         .and_then(|s| s.to_str())
-        .map(|name| ACCRETIVE_FOLDERS.contains(&name))
+        .map(|name| allowed.contains(&name))
         .unwrap_or(false)
 }
 
@@ -405,10 +425,25 @@ mod tests {
         assert!(is_accretive_dir("services/waydroid/notes"));
         assert!(is_accretive_dir("notes"));
         assert!(is_accretive_dir("input/controllers/troubleshooting"));
+        assert!(is_accretive_dir("projects/demo/code-reviews"));
         assert!(!is_accretive_dir("services/waydroid"));
         assert!(!is_accretive_dir("notes.md"));
         assert!(!is_accretive_dir("journal/decisions"));
         assert!(!is_accretive_dir(""));
+    }
+
+    /// The genre subsets partition the accretive set — every genre folder is
+    /// accretive, and the two add-verb gates never overlap.
+    #[test]
+    fn genre_folders_partition_accretive_set() {
+        for name in NOTE_FOLDERS.iter().chain(CODE_REVIEW_FOLDERS.iter()) {
+            assert!(ACCRETIVE_FOLDERS.contains(name), "{name} not accretive");
+        }
+        assert_eq!(
+            NOTE_FOLDERS.len() + CODE_REVIEW_FOLDERS.len(),
+            ACCRETIVE_FOLDERS.len()
+        );
+        assert!(!NOTE_FOLDERS.iter().any(|n| CODE_REVIEW_FOLDERS.contains(n)));
     }
 
     #[test]

@@ -17,8 +17,8 @@ use softfig_ipc::{
     self,
     growlightd::{ReleaseLeaseArgs, RequestLeaseArgs},
     verbs::{
-        op, AddBacklogItemArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs, AddSectionArgs,
-        AddSliceArgs,
+        op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
+        AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
         LogDecisionArgs, LogIncidentArgs, PostMessageArgs, ReadInboxArgs, RefreshSnapshotArgs,
         ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
@@ -191,6 +191,28 @@ fn tool_defs() -> Vec<Value> {
                     "dir": { "type": "string", "description": "the note's accretive folder" },
                     "id": { "type": "integer", "description": "the note's number (the NNN in its filename)" },
                     "body": { "type": "string", "description": "the replacement markdown body" },
+                },
+            },
+        }),
+        json!({
+            "name": "add_code_review",
+            "description": "Record a code review as a durable numbered record in a code-reviews/ \
+                            folder (primary home projects/<project>/code-reviews/). Same machinery \
+                            as add_note: the daemon assigns NNN from the folder's .seq counter, \
+                            writes dir/NNN-slug.md, and stamps the '# <title>' header + '> Last \
+                            reviewed:' line. The body should follow the review template \
+                            (journal/decisions/decision-softfig-code-review-records.md): a \
+                            reviewer+scope line, then '## Verdict', '## Garden-standards \
+                            adherence', '## Spec adherence', '## Gaps (not defects)', \
+                            '## Deferred verification'.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["dir", "slug", "body"],
+                "properties": {
+                    "dir": { "type": "string", "description": "garden-relative code-reviews/ folder, e.g. projects/software-config_garden/code-reviews" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+, 1-64; the terse filename address (immutable). Don't repeat a 'code-review-' prefix — the folder carries that semantic" },
+                    "title": { "type": "string", "description": "header title; defaults to slug" },
+                    "body": { "type": "string", "description": "markdown review body below the header, following the review template" },
                 },
             },
         }),
@@ -561,6 +583,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: ReviseNoteArgs = serde_json::from_value(args)?;
             (op::REVISE_NOTE, serde_json::to_value(a)?)
         }
+        "add_code_review" => {
+            let a: AddCodeReviewArgs = serde_json::from_value(args)?;
+            (op::ADD_CODE_REVIEW, serde_json::to_value(a)?)
+        }
         "edit_section" => {
             let a: EditSectionArgs = serde_json::from_value(args)?;
             (op::EDIT_SECTION, serde_json::to_value(a)?)
@@ -755,9 +781,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_three() {
+    fn tools_list_has_twenty_four() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 23);
+        assert_eq!(defs.len(), 24);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -765,6 +791,7 @@ mod tests {
             "log_incident",
             "add_note",
             "revise_note",
+            "add_code_review",
             "edit_section",
             "append_to_section",
             "add_section",
@@ -792,7 +819,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 24);
     }
 
     #[test]
@@ -817,6 +844,11 @@ mod tests {
                 "revise_note",
                 json!({ "dir": "services/waydroid/notes", "id": 3, "body": "b" }),
                 op::REVISE_NOTE,
+            ),
+            (
+                "add_code_review",
+                json!({ "dir": "projects/demo/code-reviews", "slug": "fleet-loop-spin", "body": "b" }),
+                op::ADD_CODE_REVIEW,
             ),
             (
                 "edit_section",

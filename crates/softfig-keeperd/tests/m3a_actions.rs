@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use softfig_vcs::Repo;
 use softfig_ipc::verbs::{
-    op, AddNoteArgs, AddNoteReply, AddProjectArgs, AddProjectReply, AddSectionArgs,
+    op, AddCodeReviewArgs, AddCodeReviewReply, AddNoteArgs, AddNoteReply, AddProjectArgs,
+    AddProjectReply, AddSectionArgs,
     AppendToSectionArgs, ArchiveArgs, ArchiveReply, DocEditReply, EditSectionArgs,
     LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, MigrateConfigReply,
     MigrateSplitReply,
@@ -600,6 +601,100 @@ fn add_note_rejects_missing_parent_dir() {
         serde_json::json!({ "dir": "nope/notes", "slug": "x", "body": "b" }),
     );
     assert_eq!(err_kind(resp), ErrorKind::NotFound);
+}
+
+// ---- add_code_review (task 020) ----------------------------------------
+
+#[test]
+fn add_code_review_happy_assigns_001_and_seq() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    let resp = fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::to_value(AddCodeReviewArgs {
+            dir: "projects/demo/code-reviews".into(),
+            slug: "fleet-loop-spin".into(),
+            title: Some("Code review: fleet-loop-spin".into()),
+            body: "## Verdict\n\nPass, no defects.".into(),
+        })
+        .unwrap(),
+    );
+    let reply: AddCodeReviewReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "projects/demo/code-reviews/001-fleet-loop-spin.md");
+
+    let content = std::fs::read_to_string(fx.garden.join(&reply.path)).unwrap();
+    assert!(content.starts_with("# Code review: fleet-loop-spin\n"), "header: {content:?}");
+    assert!(content.contains(&format!("> Last reviewed: {}\n", conventions::today_hyphen())));
+    assert!(content.contains("Pass, no defects."));
+
+    // `.seq` high-water mark bumped to 1 — an independent sequence.
+    assert_eq!(
+        std::fs::read_to_string(fx.garden.join("projects/demo/code-reviews/.seq")).unwrap(),
+        "1\n"
+    );
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "code_review_added");
+    assert_eq!(payload["number"], 1);
+    assert_eq!(payload["slug"], "fleet-loop-spin");
+    assert_eq!(payload["dir"], "projects/demo/code-reviews");
+}
+
+/// `code-reviews/` numbers independently of a sibling `notes/` — each
+/// accretive folder is its own sequence.
+#[test]
+fn add_code_review_numbers_independently_of_notes() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "projects/demo/notes", "slug": "one", "body": "a" }),
+    );
+    let resp = fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "slug": "first", "body": "b" }),
+    );
+    let reply: AddCodeReviewReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "projects/demo/code-reviews/001-first.md");
+}
+
+/// The genre gates are mutual: `add_code_review` refuses a `notes/` dir and
+/// `add_note` refuses a `code-reviews/` dir — a review is a distinct genre.
+#[test]
+fn add_verbs_gate_on_their_genre_folder() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    let resp = fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::json!({ "dir": "projects/demo/notes", "slug": "x", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotAccretiveDir);
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "slug": "x", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotAccretiveDir);
+}
+
+/// `revise_note` treats `code-reviews/` as accretive — a review body can be
+/// revised in place (re-stamped reviewed date), same contract as notes.
+#[test]
+fn revise_note_works_on_code_reviews() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "slug": "first", "body": "old" }),
+    );
+    let resp = fx.call(
+        op::REVISE_NOTE,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "id": 1, "body": "new verdict" }),
+    );
+    let reply: ReviseNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    let content = std::fs::read_to_string(fx.garden.join(&reply.path)).unwrap();
+    assert!(content.starts_with("# first\n"));
+    assert!(content.contains("new verdict"));
+    assert!(!content.contains("old"));
 }
 
 #[test]

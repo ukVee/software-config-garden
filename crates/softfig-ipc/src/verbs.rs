@@ -58,6 +58,12 @@ pub mod op {
     /// note in place, re-stamping the reviewed date. Title, slug, and
     /// number are immutable; commit `note_revised`.
     pub const REVISE_NOTE: &str = "revise_note";
+    /// Task 020 (code-review records): append a numbered code-review record
+    /// `NNN-slug.md` to a `code-reviews/` accretive folder (primary home
+    /// `projects/<project>/code-reviews/`). Same daemon-stamped machinery as
+    /// `add_note` (`.seq` numbering, header + reviewed line, parent index +
+    /// backlinks); commit `code_review_added`.
+    pub const ADD_CODE_REVIEW: &str = "add_code_review";
     /// M3a: move a tracked path under `journal/archive/<name>/`, commit
     /// `archive_move`.
     pub const ARCHIVE: &str = "archive";
@@ -589,6 +595,38 @@ pub struct ReviseNoteArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviseNoteReply {
+    pub path: String,
+    pub hash: String,
+}
+
+// ---- task 020: code-review records --------------------------------------
+
+/// `add_code_review({dir, slug, title?, body}) -> {path, hash}`.
+///
+/// The code-review sibling of `add_note`: `dir` is the garden-relative path
+/// of an accretive folder whose basename must be `code-reviews` (primary
+/// home `projects/<project>/code-reviews/`). The daemon assigns the next
+/// number from the folder's `.seq` high-water mark, writes `dir/NNN-slug.md`,
+/// and stamps the `# <title>` header + `> Last reviewed:` line. The body is
+/// the caller's review markdown (see the review template in the garden's
+/// code-review-records decision file); the daemon never parses it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddCodeReviewArgs {
+    /// Garden-relative `code-reviews/` folder, e.g.
+    /// `projects/software-config_garden/code-reviews`.
+    pub dir: String,
+    /// `[a-z0-9-]+`, length 1–64. The terse filename address; immutable.
+    pub slug: String,
+    /// Human title used in the `# <title>` header. Defaults to the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Markdown review body written below the daemon-stamped header.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddCodeReviewReply {
+    /// Garden-relative path the daemon wrote (`dir/NNN-slug.md`).
     pub path: String,
     pub hash: String,
 }
