@@ -61,7 +61,7 @@ use crate::config::RateLimits;
 use crate::daemon::Daemon;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
-use crate::scheduler::{parked, pick, Snapshot};
+use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
 use crate::state::State;
 use crate::supervisor::{
     AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome, Supervisor,
@@ -1023,7 +1023,9 @@ impl DriveLoop {
         // 2. Re-roll due agents ([`Intent::Roll`]). `pause` is the admission gate
         //    (spec §8): a paused fleet attempts no rolls (and no starts, below).
         //    The re-roll is ALSO queue-gated — a member is re-rolled only if its
-        //    pinned-with-fallback `pick` still yields a workable part, so a clean
+        //    OWN recorded assignment still stands (its part is its queue's
+        //    head-active row: the mid-item carry-forward) or its
+        //    pinned-with-fallback `pick` yields a workable part, so a clean
         //    exit is never respawned into a drained queue (belt-and-suspenders to
         //    slice 001's terminal-status retire).
         //    ALSO connectivity-gated (`!offline`): a re-roll re-spawns a `claude -p`,
@@ -1041,8 +1043,25 @@ impl DriveLoop {
                 .map(|m| (m.spec.agent.as_str(), m.pin.as_deref()))
                 .collect();
             let snap = &snapshot;
+            let assignments = &self.assignments;
             let workable = |agent: &str| -> bool {
-                pins.get(agent).is_some_and(|pin| pick(snap, *pin).is_some())
+                // A down member's OWN in-progress part is workable — for itself.
+                // Its claim marked the part `active`, and `pick`'s fallback
+                // deliberately skips `active` heads (they are someone's work —
+                // here, its own), so an unpinned member (or a pinned one whose
+                // fallback pick landed in another queue) would otherwise read as
+                // "no work" and be held `HeldNoWork` every tick, stranding the
+                // item `active` with no agent forever (the 2026-07-06 stall,
+                // task 033). The loop recorded the assignment at claim time;
+                // the part still standing as its queue's head-active row is
+                // exactly the "resume own part" right `pick` gives a pinned
+                // member over its pinned queue.
+                let resumes_own = assignments.get(agent).is_some_and(|(queue, part)| {
+                    snap.queue(queue).is_some_and(|q| {
+                        matches!(classify_queue(q), QueueState::Active(head) if head == *part)
+                    })
+                });
+                resumes_own || pins.get(agent).is_some_and(|pin| pick(snap, *pin).is_some())
             };
             report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
             // A member that re-rolled has consumed its pending-reconnect latch (slice
@@ -1254,10 +1273,105 @@ impl DriveLoop {
     }
 }
 
+/// The drive loop's journal voice (task 033's diagnosability half): render one
+/// terse line per fleet lifecycle event so a silent stall is debuggable from the
+/// systemd journal — before this, growlightd logged nothing after "drive loop
+/// running", so a fleet that stopped spawning left no trace of why. One-shot
+/// events (a start, a re-roll, an exit disposition) log every occurrence; HELD
+/// states recur every tick by design (the ~1s cadence is their retry), so they
+/// log only on ENTRY — keyed `(agent, kind)`, re-armed when the hold clears — a
+/// stalled fleet writes one line, not one per second. Crash-shaped events
+/// (`AgentCrashed`, spawn failures) already reach the journal through the §9
+/// dispatcher's stderr [`crate::notify_dispatch::LogNotifier`], so they are NOT
+/// duplicated here. Pure over the report (returns the lines); the live thread
+/// prints them, so the dedup is provable without capturing stderr.
+#[derive(Debug, Default)]
+struct TickLogger {
+    /// The held `(agent, kind)` states seen last tick — a hold logs only when its
+    /// key enters this set.
+    held: BTreeSet<(String, &'static str)>,
+    /// Whether the connectivity HOLD was on last tick (its enter/exit edges log).
+    offline: bool,
+}
+
+impl TickLogger {
+    /// The journal lines this tick's `report` earns, updating the edge state.
+    fn lines(&mut self, r: &TickReport) -> Vec<String> {
+        let mut out = Vec::new();
+        for a in &r.started {
+            out.push(format!("fleet: started {} on {}/{}", a.agent, a.queue, a.part));
+        }
+        let mut held_now: BTreeSet<(String, &'static str)> = BTreeSet::new();
+        for roll in &r.rerolls {
+            match roll {
+                RerollOutcome::Rerolled { agent } => {
+                    out.push(format!("fleet: re-rolled {agent} (fresh session, same part)"));
+                }
+                // Alerted through the dispatcher (`AgentCrashed`) — no duplicate.
+                RerollOutcome::SpawnFailed { .. } => {}
+                RerollOutcome::HeldForBackoff { agent, .. } => {
+                    held_now.insert((agent.clone(), "crash backoff"));
+                }
+                RerollOutcome::HeldNoWork { agent } => {
+                    held_now.insert((agent.clone(), "no workable part"));
+                }
+                RerollOutcome::HeldForAdmission { agent, .. } => {
+                    held_now.insert((agent.clone(), "admission budget/rate"));
+                }
+            }
+        }
+        for held in &r.held_starts {
+            let kind = match held.outcome {
+                StartOutcome::Queued { .. } => "agent cap",
+                StartOutcome::Refused { .. } => "admission budget/rate",
+                StartOutcome::ClaimFailed { .. } => "part claim failed",
+                // `Started` never lands in `held_starts`; a spawn failure is
+                // alerted through the dispatcher — no duplicate.
+                StartOutcome::Started | StartOutcome::SpawnFailed { .. } => continue,
+            };
+            held_now.insert((held.agent.clone(), kind));
+        }
+        for (agent, kind) in held_now.difference(&self.held) {
+            out.push(format!("fleet: holding {agent} ({kind})"));
+        }
+        self.held = held_now;
+        for agent in &r.retired {
+            out.push(format!("fleet: retired {agent} to idle"));
+        }
+        for agent in &r.completed {
+            out.push(format!(
+                "fleet: {agent} finished its part (item boundary; slot released)"
+            ));
+        }
+        for a in &r.blocked {
+            out.push(format!(
+                "fleet: {} blocked on human — item-parked {}/{}",
+                a.agent, a.queue, a.part
+            ));
+        }
+        for agent in &r.reconnecting {
+            out.push(format!(
+                "fleet: {agent} hit a transient network exit (will re-roll)"
+            ));
+        }
+        if r.waiting_for_connectivity != self.offline {
+            self.offline = r.waiting_for_connectivity;
+            out.push(if self.offline {
+                "fleet: offline — holding spawns until the link returns".to_string()
+            } else {
+                "fleet: connectivity hold cleared — spawns resume".to_string()
+            });
+        }
+        out
+    }
+}
+
 /// Spawn the daemon-owned drive-loop thread: tick the loop every `interval` until
 /// the daemon enters [`State::Stopping`], mirroring [`crate::bus::spawn_bus_tailer`].
 /// The live thread reads the wall clock for `now`; the pure [`DriveLoop::tick`]
-/// stays time-injected so it is unit-proven against fakes.
+/// stays time-injected so it is unit-proven against fakes. Each tick's report is
+/// narrated to stderr (→ the systemd journal) through a [`TickLogger`], so member
+/// spawns/exits/holds are diagnosable after the fact (task 033).
 ///
 /// Construction of a *live* `DriveLoop` (a real [`ClaudeBackend`] behind both
 /// [`AgentHealthSource`] and [`BudgetSampleSource`], the keeperd [`QueueSource`],
@@ -1271,8 +1385,12 @@ pub fn spawn_drive_loop(
     thread::Builder::new()
         .name("growlightd-drive-loop".into())
         .spawn(move || {
+            let mut logger = TickLogger::default();
             while daemon.state() != State::Stopping {
-                drive.tick(unix_now());
+                let report = drive.tick(unix_now());
+                for line in logger.lines(&report) {
+                    eprintln!("softfig-growlightd: {line}");
+                }
                 thread::sleep(interval);
             }
         })
@@ -2560,6 +2678,180 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r2 = loop_.tick(2);
         assert_eq!(r2.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
         assert_eq!(backend.spawn_count(), 2, "work reappears → the member re-rolls");
+    }
+
+    /// Task-033 regression (the 2026-07-06 stall): a fleet-of-one UNPINNED member
+    /// exits clean on a CONTINUE status (`IN_PROGRESS` — same part carries
+    /// forward, the member exits for the orchestrator) while its own part is the
+    /// queue's `active` head — its own claim. Fallback `pick` deliberately skips
+    /// `active` heads (anti-starvation for OTHER agents), so without the
+    /// own-assignment check the queue-gate reads "no work" and holds the member
+    /// `HeldNoWork` every tick forever: the item stays `active`, `agents (none)`,
+    /// the fleet is not self-sustaining. The member must re-roll onto its own
+    /// in-progress part instead.
+    #[test]
+    fn an_unpinned_member_resumes_its_own_active_part_after_a_continue_exit() {
+        let (mut loop_, _d, backend, _claimer, _queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a1"))],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a1 claims p1 (`active` in the shared snapshot) and starts
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 exits clean mid-item; p1 is still `active` (its own claim), nothing
+        // else queued anywhere.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "the member re-rolls onto its own in-progress part, not HeldNoWork",
+        );
+        assert_eq!(backend.spawn_count(), 2, "the fleet keeps driving the item");
+
+        // And it keeps sustaining across further iterations on the same part.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            r2.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "iteration after iteration, no manual nudge",
+        );
+        assert_eq!(backend.spawn_count(), 3);
+    }
+
+    /// The pinned flavour of the same hole: a member pinned to a DRAINED queue
+    /// whose fallback pick landed it in ANOTHER queue — its pin yields nothing and
+    /// fallback skips its own now-`active` part, so only the recorded assignment
+    /// makes it workable again after a continue exit.
+    #[test]
+    fn a_pinned_member_resumes_its_own_fallback_part_after_a_continue_exit() {
+        let (mut loop_, _d, backend, _claimer, _queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[]), q("qb", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // pin qa is empty → fallback claims qb/p1
+        assert_eq!(backend.spawn_count(), 1);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "the fallback part it holds is its own workable work",
+        );
+        assert_eq!(backend.spawn_count(), 2);
+    }
+
+    /// Task-033 diagnosability: one-shot lifecycle events narrate every
+    /// occurrence, while a HELD state (re-observed every ~1s tick by design) logs
+    /// only on its ENTRY edge and re-arms after it clears — a stalled fleet writes
+    /// one journal line, not one per second.
+    #[test]
+    fn tick_logger_narrates_one_shots_and_dedups_held_states() {
+        let mut logger = TickLogger::default();
+
+        let started = TickReport {
+            started: vec![Assignment {
+                agent: "a".into(),
+                queue: "default".into(),
+                part: "020".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&started),
+            vec!["fleet: started a on default/020".to_string()],
+        );
+
+        // The stall shape: held (no workable part) tick after tick → one line.
+        let held = TickReport {
+            rerolls: vec![RerollOutcome::HeldNoWork { agent: "a".into() }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&held),
+            vec!["fleet: holding a (no workable part)".to_string()],
+            "the hold logs on entry",
+        );
+        assert!(
+            logger.lines(&held).is_empty() && logger.lines(&held).is_empty(),
+            "a persisting hold does not repeat",
+        );
+
+        // The hold clears (a re-roll fires) → narrated; a LATER hold re-logs.
+        let rolled = TickReport {
+            rerolls: vec![RerollOutcome::Rerolled { agent: "a".into() }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&rolled),
+            vec!["fleet: re-rolled a (fresh session, same part)".to_string()],
+        );
+        assert_eq!(
+            logger.lines(&held),
+            vec!["fleet: holding a (no workable part)".to_string()],
+            "the edge re-arms once the hold clears",
+        );
+    }
+
+    /// Task-033 diagnosability: exit dispositions and the connectivity hold edge
+    /// narrate; crash-shaped events (dispatcher-alerted) are not duplicated.
+    #[test]
+    fn tick_logger_narrates_exits_and_connectivity_edges() {
+        let mut logger = TickLogger::default();
+
+        let boundary = TickReport {
+            completed: vec!["a".into()],
+            retired: vec!["b".into()],
+            blocked: vec![Assignment {
+                agent: "c".into(),
+                queue: "default".into(),
+                part: "021".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&boundary),
+            vec![
+                "fleet: retired b to idle".to_string(),
+                "fleet: a finished its part (item boundary; slot released)".to_string(),
+                "fleet: c blocked on human — item-parked default/021".to_string(),
+            ],
+        );
+
+        // Offline edge: enter once, silent while it persists, exit once.
+        let offline = TickReport {
+            waiting_for_connectivity: true,
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&offline),
+            vec!["fleet: offline — holding spawns until the link returns".to_string()],
+        );
+        assert!(logger.lines(&offline).is_empty(), "no per-tick offline spam");
+        assert_eq!(
+            logger.lines(&TickReport::default()),
+            vec!["fleet: connectivity hold cleared — spawns resume".to_string()],
+        );
+
+        // A re-roll spawn failure rides the §9 dispatcher alert — no line here.
+        let failed = TickReport {
+            rerolls: vec![RerollOutcome::SpawnFailed {
+                agent: "a".into(),
+                error: "boom".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert!(logger.lines(&failed).is_empty());
     }
 
     /// An immediate-stop (force_stop hard kill) retiring agent that is still alive

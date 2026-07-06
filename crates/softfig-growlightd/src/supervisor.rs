@@ -784,11 +784,15 @@ impl Supervisor {
     /// backend re-spawns it. A failed re-spawn bumps the streak and backs off.
     /// Returns one outcome per candidate; running agents produce nothing.
     ///
-    /// `workable` answers "does this agent have a pickable part right now?" — the
-    /// drive loop builds it from the same pinned-with-fallback [`crate::scheduler::pick`]
-    /// a fresh start uses, over this tick's queue snapshot. It is the belt-and-
-    /// suspenders to slice 001's terminal-status retire: even a member that exited
-    /// on a *continue* status is not respawned if its queue has since drained.
+    /// `workable` answers "does this agent have a workable part right now?" — the
+    /// drive loop builds it over this tick's queue snapshot from the member's own
+    /// recorded assignment (its part still standing head-`active` is the mid-item
+    /// carry-forward it re-rolls onto — fallback `pick` alone would skip its own
+    /// claim and strand it, the 2026-07-06 stall) plus the same
+    /// pinned-with-fallback [`crate::scheduler::pick`] a fresh start uses. It is
+    /// the belt-and-suspenders to slice 001's terminal-status retire: even a
+    /// member that exited on a *continue* status is not respawned if its queue
+    /// has since drained.
     ///
     /// A rate-limited member (down on a `HALTED_RATE_LIMIT` exit but still
     /// registered) IS a candidate: admission's rate/budget gate holds it (a
