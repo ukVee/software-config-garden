@@ -35,6 +35,28 @@ use crate::daemon::Daemon;
 /// The growlightd systemd **user** unit keeperd manages.
 pub const GROWLIGHTD_UNIT: &str = "softfig-growlightd.service";
 
+/// Env var the softfig-keeperd **unit file** sets to mark an instance as the
+/// systemd-deployed keeperd. Supervision must mean "the deployed instance", not
+/// "the keeperd binary": integration tests spawn this very binary
+/// (`CARGO_BIN_EXE_softfig-keeperd`), and when `main` opted in unconditionally,
+/// every test-keeperd teardown ran a real `systemctl --user stop
+/// {GROWLIGHTD_UNIT}` on the host — invisibly killing a live fleet ~10 min into
+/// any agent run that reached `cargo test --workspace`
+/// (incident-20260706-growlightd-fleet-liveness-2bugs, Bug A). Only the unit
+/// file exports it, so a test-spawned keeperd is inert by construction.
+pub const SUPERVISE_ENV: &str = "SOFTFIG_SUPERVISE_GROWLIGHTD";
+
+/// True iff [`SUPERVISE_ENV`] is set to a non-empty, non-`"0"` value in this
+/// process's environment.
+pub fn supervision_from_env() -> bool {
+    supervision_from(std::env::var_os(SUPERVISE_ENV))
+}
+
+/// [`supervision_from_env`], factored pure for testing.
+fn supervision_from(v: Option<std::ffi::OsString>) -> bool {
+    matches!(v, Some(s) if !s.is_empty() && s != *"0")
+}
+
 /// Read just the `fleet_enabled` gate from `<garden_root>/config/growlight.toml`,
 /// through the mount (FUSE serves it — the same plain, lock-free, no-mount-walk
 /// read [`apply_garden_config`](crate::handlers) uses for `config/keeper.toml`).
@@ -242,6 +264,19 @@ mod tests {
         assert_eq!(gate_action(false, || true), GateAction::Stop);
         // Gate off + unit already down ⇒ Noop (common disabled-fleet unlock).
         assert_eq!(gate_action(false, || false), GateAction::Noop);
+    }
+
+    #[test]
+    fn supervision_env_gate_requires_a_truthy_value() {
+        use std::ffi::OsString;
+        // Unset (every library/test spawn, incl. CARGO_BIN_EXE integration
+        // fixtures) ⇒ off — the Bug-A regression shape.
+        assert!(!supervision_from(None));
+        // Explicitly disabled / empty ⇒ off.
+        assert!(!supervision_from(Some(OsString::from("0"))));
+        assert!(!supervision_from(Some(OsString::from(""))));
+        // The unit file's `Environment={SUPERVISE_ENV}=1` ⇒ on.
+        assert!(supervision_from(Some(OsString::from("1"))));
     }
 
     #[test]

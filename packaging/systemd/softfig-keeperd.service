@@ -12,6 +12,14 @@ ExecStart=%h/.local/bin/softfig-keeperd --garden %h/soft-fig_garden
 Restart=always
 RestartSec=2
 
+# Marks THIS instance as the systemd-deployed keeperd — the only one allowed to
+# manage the softfig-growlightd unit (start on unlock, stop on terminal lock).
+# The env — not a hardcoded binary default — is the opt-in: keeperd integration
+# tests spawn the same binary, and without this gate every test teardown issued
+# a real `systemctl --user stop softfig-growlightd`, invisibly parking a live
+# fleet (incident-20260706-growlightd-fleet-liveness-2bugs, Bug A).
+Environment=SOFTFIG_SUPERVISE_GROWLIGHTD=1
+
 # Headless daemon — no stdout chatter into the journal beyond errors.
 StandardOutput=journal
 StandardError=journal

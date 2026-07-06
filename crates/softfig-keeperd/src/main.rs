@@ -50,9 +50,14 @@ fn main() -> anyhow::Result<()> {
         config = config.without_watcher();
     }
     // The real daemon manages the growlightd user unit (start on unlock when the
-    // in-garden gate is on, stop on terminal lock). Off by default so no
-    // library/test path shells `systemctl`; opted in only here. config-in-garden.
-    config = config.with_growlight_supervision(true);
+    // in-garden gate is on, stop on terminal lock). Gated on the env var only the
+    // unit file exports — NOT opted in unconditionally here: integration tests
+    // spawn this binary (CARGO_BIN_EXE), and a hardcoded opt-in made every
+    // test-keeperd teardown stop the host's real growlightd unit
+    // (incident-20260706, Bug A). See growlight_unit::SUPERVISE_ENV.
+    if softfig_keeperd::growlight_unit::supervision_from_env() {
+        config = config.with_growlight_supervision(true);
+    }
 
     let daemon = Daemon::new(config);
     let handle = daemon.start()?;
