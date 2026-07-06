@@ -347,3 +347,68 @@ fn renders_deploy_force_overlay() {
     assert!(rendered.contains("softfig-bak"), "backup explanation missing");
     assert!(rendered.contains("y force"), "confirm hint missing");
 }
+
+#[test]
+fn renders_growlight_frame_when_enabled() {
+    use softfig_tui::app::GrowlightRow;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight_queue = vec![
+        GrowlightRow {
+            num: "1".into(),
+            id: "m5b-hardening".into(),
+            kind: "milestone".into(),
+            title: "M5b replication hardening".into(),
+            status: "done".into(),
+        },
+        GrowlightRow {
+            num: "2".into(),
+            id: "tui-modernize".into(),
+            kind: "milestone".into(),
+            title: "Modernize the TUI".into(),
+            status: "active".into(),
+        },
+    ];
+    app.growlight_selected = 1;
+    app.growlight_baton_title = Some("103-tui-modernize-003.md".into());
+    app.growlight_baton = Some("shipped slice 003 — inline-region reveal".into());
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("7:Growlight"), "growlight tab missing:\n{rendered}");
+    assert!(rendered.contains("tui-modernize"), "queue item missing");
+    assert!(rendered.contains("active"), "status missing");
+    assert!(
+        rendered.contains("active: tui-modernize"),
+        "active-item line missing"
+    );
+    assert!(rendered.contains("latest baton"), "baton panel missing");
+    assert!(rendered.contains("shipped slice 003"), "baton body missing");
+}
+
+#[test]
+fn growlight_tab_absent_when_disabled() {
+    // The load-bearing requirement: when growlight is not enabled the tab does
+    // not appear at all — no tab, no empty pane, no error.
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(false);
+    app.view = softfig_tui::app::View::Browse;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("6:Deploy"), "other tabs should still render");
+    assert!(
+        !rendered.contains("Growlight"),
+        "growlight tab must be absent when disabled:\n{rendered}"
+    );
+}

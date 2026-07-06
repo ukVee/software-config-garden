@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
+use crate::app::{short_fp, App, BackupRow, GrowlightRow, Overlay, PairField, PeerRow, View};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
@@ -98,7 +98,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .as_deref()
         .map(|h| h.chars().take(10).collect::<String>())
         .unwrap_or_else(|| "—".into());
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("softfig-tui ", Style::default().add_modifier(Modifier::BOLD)),
         tab("1:Browse", app.view == View::Browse),
         tab("2:History", app.view == View::History),
@@ -106,10 +106,15 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         tab("4:Peers", app.view == View::Peers),
         tab("5:Backup", app.view == View::Backup),
         tab("6:Deploy", app.view == View::Deploy),
-        Span::raw("  "),
-        Span::styled(format!("[{state}] tip:{tip}"), dim),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ];
+    // The Growlight tab appears ONLY when growlight is enabled on this garden —
+    // no tab, no empty pane, no error otherwise (the load-bearing gate).
+    if app.growlight_enabled == Some(true) {
+        spans.push(tab("7:Growlight", app.view == View::Growlight));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(format!("[{state}] tip:{tip}"), dim));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
@@ -142,6 +147,10 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
         View::Deploy => {
             render_deploy(f, app, cols[0]);
             render_deploy_detail(f, app, cols[1]);
+        }
+        View::Growlight => {
+            render_growlight(f, app, cols[0]);
+            render_growlight_detail(f, app, cols[1]);
         }
     }
 }
@@ -616,6 +625,101 @@ fn render_deploy_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+/// A backlog item's status colour — active stands out, done recedes, blocked is
+/// loud. Shared by the queue list + the detail pane's active line.
+fn growlight_status_color(status: &str) -> Color {
+    match status {
+        "active" => Color::Cyan,
+        "done" => Color::DarkGray,
+        "blocked" => Color::Red,
+        "deferred" => Color::Yellow,
+        _ => Color::Gray, // queued / unknown
+    }
+}
+
+/// Left pane of the read-only Growlight section: the backlog queue in drain
+/// order, each row `<status>  <id>` coloured by status, the active item bold.
+fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.growlight_queue.is_empty() {
+        vec![ListItem::new("(queue empty or not loaded)")]
+    } else {
+        app.growlight_queue
+            .iter()
+            .map(|r: &GrowlightRow| {
+                let color = growlight_status_color(&r.status);
+                let mut style = Style::default().fg(color);
+                if r.status == "active" {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                ListItem::new(Line::styled(format!("{:>8}  {}", r.status, r.id), style))
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !app.growlight_queue.is_empty() {
+        st.select(Some(app.growlight_selected.min(app.growlight_queue.len() - 1)));
+    }
+    let title = format!("growlight — {} item(s)", app.growlight_queue.len());
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+/// Right pane of the Growlight section: the active item, the selected item's
+/// title, and the latest baton (the loop's most recent handoff state). All
+/// read-only — this section never controls the loop.
+fn render_growlight_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    match app.growlight_active_item() {
+        Some(a) => lines.push(Line::styled(
+            format!("active: {} — {}", a.id, a.title),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
+        )),
+        None => lines.push(Line::styled(
+            "active: (none — queue idle)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    }
+
+    if let Some(sel) = app.selected_growlight_row() {
+        lines.push(Line::styled(
+            format!("selected: [{}] {} — {}", sel.status, sel.id, sel.title),
+            Style::default().fg(growlight_status_color(&sel.status)),
+        ));
+    }
+
+    lines.push(Line::raw(""));
+    let baton_title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
+    lines.push(Line::styled(
+        format!("latest baton — {baton_title}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    match &app.growlight_baton {
+        Some(body) => {
+            for l in body.lines() {
+                lines.push(Line::raw(l.to_string()));
+            }
+        }
+        None => lines.push(Line::styled(
+            "  (no baton-log entries)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("growlight detail (read-only)"),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
 fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
     let rect = centered_rect(70, 40, area);
     f.render_widget(Clear, rect);
@@ -1070,6 +1174,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 soft-fig TUI — keys
 
   1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
+  7            growlight (read-only; only when growlight is enabled)
   j k ↑ ↓      move selection
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)

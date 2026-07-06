@@ -29,6 +29,21 @@ pub enum View {
     Peers,
     Backup,
     Deploy,
+    /// Read-only growlight section (the autonomous work-loop at a glance). Only
+    /// reachable when growlight is enabled on this garden (`growlight_enabled ==
+    /// Some(true)`); the tab is absent otherwise.
+    Growlight,
+}
+
+/// One row of the growlight backlog queue table, parsed from the managed
+/// `<!-- softfig:queue -->` region of `growlight/backlog/CLAUDE.md`. Read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrowlightRow {
+    pub num: String,
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub status: String,
 }
 
 /// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
@@ -210,6 +225,23 @@ pub struct App {
     pub deploy_has_conflicts: bool,
     pub deploy_selected: usize,
     pub deploy_loaded: bool,
+    /// growlight enablement (load-bearing gate): `None` until probed, `Some(true)`
+    /// when `config/growlight.toml` exists, `Some(false)` otherwise. The Growlight
+    /// tab is rendered/reachable **only** when `Some(true)` — no tab, no empty
+    /// pane, no error when growlight isn't set up on this garden.
+    pub growlight_enabled: Option<bool>,
+    /// Whether the enablement probe has been sent (dedup: `status` refreshes tick
+    /// repeatedly, so probe at most once per session).
+    growlight_probed: bool,
+    /// The backlog queue rows (drain order + statuses), parsed read-only from
+    /// `growlight/backlog/CLAUDE.md`.
+    pub growlight_queue: Vec<GrowlightRow>,
+    pub growlight_selected: usize,
+    /// The latest baton-log entry (title + body) — the loop's most recent handoff
+    /// state, read from the highest-numbered `growlight/baton-log/NNN-*.md`.
+    pub growlight_baton_title: Option<String>,
+    pub growlight_baton: Option<String>,
+    pub growlight_loaded: bool,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -259,6 +291,13 @@ impl App {
             deploy_has_conflicts: false,
             deploy_selected: 0,
             deploy_loaded: false,
+            growlight_enabled: None,
+            growlight_probed: false,
+            growlight_queue: Vec::new(),
+            growlight_selected: 0,
+            growlight_baton_title: None,
+            growlight_baton: None,
+            growlight_loaded: false,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -311,6 +350,33 @@ impl App {
         ipc.send("deploy_plan", json!({}), Tag::DeployPlan);
     }
 
+    /// growlight enablement probe. Lists `config/` (a daemon read verb) so the
+    /// reply can decide whether growlight is set up on this garden — detected via
+    /// the presence of `config/growlight.toml`, **without** assuming the
+    /// `growlight/` pillar exists. Sent at most once per session (unlock-gated).
+    fn probe_growlight(&mut self, ipc: &mut IpcClient) {
+        if self.growlight_probed || self.locked {
+            return;
+        }
+        self.growlight_probed = true;
+        ipc.send("list_tree", json!({ "path": "config" }), Tag::GrowlightProbe);
+    }
+
+    /// growlight: (re)load the read-only section — the backlog queue table plus a
+    /// listing of the baton-log (whose reply triggers the latest-entry read).
+    fn load_growlight(&self, ipc: &mut IpcClient) {
+        ipc.send(
+            "read_file",
+            json!({ "path": "growlight/backlog/CLAUDE.md" }),
+            Tag::GrowlightQueue,
+        );
+        ipc.send(
+            "list_tree",
+            json!({ "path": "growlight/baton-log" }),
+            Tag::GrowlightBatonList,
+        );
+    }
+
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
     fn refresh_view(&self, ipc: &mut IpcClient) {
@@ -332,6 +398,9 @@ impl App {
         }
         if self.deploy_loaded {
             self.load_deploy(ipc);
+        }
+        if self.growlight_loaded {
+            self.load_growlight(ipc);
         }
     }
 
@@ -399,6 +468,19 @@ impl App {
             .map(|p| p.name.as_str())
     }
 
+    /// The one `active` backlog item, if any (the loop runs ≤1 active at a time).
+    pub fn growlight_active_item(&self) -> Option<&GrowlightRow> {
+        self.growlight_queue.iter().find(|r| r.status == "active")
+    }
+
+    pub fn selected_growlight_row(&self) -> Option<&GrowlightRow> {
+        self.growlight_queue.get(self.growlight_selected)
+    }
+
+    fn hint_growlight_readonly(&mut self) {
+        self.status = "growlight is a read-only view (queue · active item · latest baton)".into();
+    }
+
     // ---- reply handling ----
 
     pub fn apply_reply(&mut self, reply: Reply, ipc: &mut IpcClient) {
@@ -412,6 +494,9 @@ impl App {
                         self.garden_root = s.garden_root;
                         if !self.locked && (was_locked || !self.tree.is_loaded("")) {
                             self.load_dir(ipc, "");
+                        }
+                        if !self.locked {
+                            self.probe_growlight(ipc);
                         }
                         if self.locked {
                             self.status = "locked — press u to unlock".into();
@@ -428,6 +513,7 @@ impl App {
                     self.overlay = Overlay::None;
                     self.status = "unlocked".into();
                     self.load_dir(ipc, "");
+                    self.probe_growlight(ipc);
                     ipc.send("status", json!({}), Tag::Status);
                 }
                 Err((_, m)) => {
@@ -715,6 +801,56 @@ impl App {
                     }
                 }
             },
+            // growlight enablement probe: `config/growlight.toml` present ⇒ the
+            // section is enabled. A missing `config/` (Err) ⇒ disabled — degrade
+            // silently, never surface an error (the tab simply won't appear).
+            Tag::GrowlightProbe => {
+                let enabled = match reply.result {
+                    Ok(v) => serde_json::from_value::<softfig_ipc::ListTreeReply>(v)
+                        .map(|r| config_has_growlight(&r.entries))
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+                self.growlight_enabled = Some(enabled);
+            }
+            Tag::GrowlightQueue => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
+                        self.growlight_queue = parse_growlight_queue(&r.content);
+                        self.growlight_loaded = true;
+                        if self.growlight_selected >= self.growlight_queue.len() {
+                            self.growlight_selected =
+                                self.growlight_queue.len().saturating_sub(1);
+                        }
+                    }
+                }
+                Err((_, m)) => self.status = format!("growlight queue: {m}"),
+            },
+            Tag::GrowlightBatonList => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                        if let Some(path) = latest_baton_path(&r.entries) {
+                            ipc.send(
+                                "read_file",
+                                json!({ "path": path }),
+                                Tag::GrowlightBaton { path },
+                            );
+                        }
+                    }
+                }
+                Err((_, m)) => self.status = format!("growlight baton-log: {m}"),
+            },
+            Tag::GrowlightBaton { path } => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
+                        self.growlight_baton_title = Some(
+                            path.rsplit('/').next().unwrap_or(&path).to_string(),
+                        );
+                        self.growlight_baton = Some(r.content);
+                    }
+                }
+                Err((_, m)) => self.status = format!("growlight baton: {m}"),
+            },
         }
     }
 
@@ -798,6 +934,14 @@ impl App {
                     self.load_deploy(ipc);
                 }
             }
+            // Only reachable when growlight is enabled — the tab is absent
+            // otherwise, so `7` is inert on a garden without growlight.
+            KeyCode::Char('7') if self.growlight_enabled == Some(true) => {
+                self.view = View::Growlight;
+                if !self.growlight_loaded && !self.locked {
+                    self.load_growlight(ipc);
+                }
+            }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
             KeyCode::Char('p') if self.view == View::Peers => self.pair_selected(ipc),
@@ -869,6 +1013,9 @@ impl App {
             View::Deploy => {
                 self.deploy_selected = self.deploy_selected.saturating_sub(1);
             }
+            View::Growlight => {
+                self.growlight_selected = self.growlight_selected.saturating_sub(1);
+            }
         }
     }
 
@@ -898,6 +1045,11 @@ impl App {
             View::Deploy => {
                 if self.deploy_selected + 1 < self.deploy_entries.len() {
                     self.deploy_selected += 1;
+                }
+            }
+            View::Growlight => {
+                if self.growlight_selected + 1 < self.growlight_queue.len() {
+                    self.growlight_selected += 1;
                 }
             }
         }
@@ -939,6 +1091,8 @@ impl App {
             // Deploy entries are read-only detail; apply is an explicit action
             // (a / F / palette), never a stray Enter.
             View::Deploy => self.hint_deploy_actions(),
+            // Growlight is a read-only glance — Enter is a no-op hint.
+            View::Growlight => self.hint_growlight_readonly(),
         }
     }
 
@@ -1092,7 +1246,7 @@ impl App {
                 .selected_row()
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
-            View::History | View::Peers | View::Backup | View::Deploy => None,
+            View::History | View::Peers | View::Backup | View::Deploy | View::Growlight => None,
         };
         match target {
             // M2c: if the reveal target is the currently-open file and it
@@ -1622,6 +1776,69 @@ fn extract_id_attr(tag: &str) -> Option<String> {
         i = start + 2;
     }
     None
+}
+
+/// growlight enablement signal: is `config/growlight.toml` present among the
+/// `config/` listing? This is the lean gate — growlight is "enabled" on a garden
+/// exactly when its fleet config exists, detected without assuming the
+/// `growlight/` pillar dir exists.
+pub fn config_has_growlight(entries: &[softfig_ipc::TreeEntry]) -> bool {
+    entries
+        .iter()
+        .any(|e| !e.is_dir && e.name == "growlight.toml")
+}
+
+/// Parse the managed backlog queue table out of `growlight/backlog/CLAUDE.md`.
+/// Only the default queue is read — the region between `<!-- softfig:queue -->`
+/// and `<!-- /softfig:queue -->`; per-queue tables (`softfig:queue:<name>`) are
+/// ignored. The markdown header + `|---|` separator rows are skipped.
+pub fn parse_growlight_queue(md: &str) -> Vec<GrowlightRow> {
+    let mut rows = Vec::new();
+    let mut in_region = false;
+    for line in md.lines() {
+        let t = line.trim();
+        if t == "<!-- softfig:queue -->" {
+            in_region = true;
+            continue;
+        }
+        if t == "<!-- /softfig:queue -->" {
+            break;
+        }
+        if !in_region || !t.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = t.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len() < 5 {
+            continue;
+        }
+        // Skip the header row (`| # | id | … |`) and the `|---|` separator.
+        if cells[0] == "#" || cells[0].chars().all(|c| c == '-' || c == ':') {
+            continue;
+        }
+        rows.push(GrowlightRow {
+            num: cells[0].to_string(),
+            id: cells[1].to_string(),
+            kind: cells[2].to_string(),
+            title: cells[3].to_string(),
+            status: cells[4].to_string(),
+        });
+    }
+    rows
+}
+
+/// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
+/// `list_tree growlight/baton-log` reply. Non-numeric entries (e.g. `CLAUDE.md`)
+/// and directories are ignored; returns the entry's repo-relative path.
+pub fn latest_baton_path(entries: &[softfig_ipc::TreeEntry]) -> Option<String> {
+    entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .filter_map(|e| {
+            let num: u64 = e.name.split('-').next()?.parse().ok()?;
+            Some((num, e.path.clone()))
+        })
+        .max_by_key(|(num, _)| *num)
+        .map(|(_, path)| path)
 }
 
 /// One-line summary of a deploy `Report` for the status bar. Names the counts
@@ -2531,5 +2748,233 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
             &mut ipc,
         );
         assert_eq!(app.view, View::Deploy);
+    }
+
+    // ---- slice 004: read-only growlight section ----
+
+    fn tree_entry(name: &str, path: &str, is_dir: bool) -> softfig_ipc::TreeEntry {
+        softfig_ipc::TreeEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir,
+        }
+    }
+
+    const SAMPLE_QUEUE: &str = "\
+# growlight/backlog/
+
+## Queue
+
+<!-- softfig:queue -->
+
+| # | id | type | title | status |
+|---|----|------|-------|--------|
+| 1 | growlightd-crash-diagnostics | milestone | crash diag | done |
+| 2 | tui-modernize | milestone | Modernize the TUI | active |
+| 3 | 020 | task | code-review records | queued |
+
+<!-- /softfig:queue -->
+
+## Queue: smoke-a
+
+<!-- softfig:queue:smoke-a -->
+
+| # | id | type | title | status |
+|---|----|------|-------|--------|
+| 1 | 021 | task | smoke marker | done |
+
+<!-- /softfig:queue:smoke-a -->
+";
+
+    #[test]
+    fn parse_queue_skips_header_separator_and_other_queues() {
+        let rows = parse_growlight_queue(SAMPLE_QUEUE);
+        // Only the DEFAULT queue's three rows — the smoke-a queue is ignored,
+        // and the header + `|---|` separator never appear.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, "growlightd-crash-diagnostics");
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[1].id, "tui-modernize");
+        assert_eq!(rows[1].kind, "milestone");
+        assert_eq!(rows[1].title, "Modernize the TUI");
+        assert_eq!(rows[1].status, "active");
+        assert_eq!(rows[2].id, "020");
+        assert!(rows.iter().all(|r| r.id != "021"), "leaked smoke-a queue");
+    }
+
+    #[test]
+    fn config_growlight_signal() {
+        // Present ⇒ enabled; a directory named the same, or absence ⇒ not.
+        assert!(config_has_growlight(&[
+            tree_entry("keeper.toml", "config/keeper.toml", false),
+            tree_entry("growlight.toml", "config/growlight.toml", false),
+        ]));
+        assert!(!config_has_growlight(&[tree_entry(
+            "keeper.toml",
+            "config/keeper.toml",
+            false
+        )]));
+        assert!(!config_has_growlight(&[tree_entry(
+            "growlight.toml",
+            "config/growlight.toml",
+            true // a dir, not the file
+        )]));
+    }
+
+    #[test]
+    fn latest_baton_picks_highest_numbered_entry() {
+        let entries = vec![
+            tree_entry("CLAUDE.md", "growlight/baton-log/CLAUDE.md", false),
+            tree_entry(
+                "101-tui-modernize-001.md",
+                "growlight/baton-log/101-tui-modernize-001.md",
+                false,
+            ),
+            tree_entry(
+                "103-tui-modernize-003.md",
+                "growlight/baton-log/103-tui-modernize-003.md",
+                false,
+            ),
+            tree_entry(
+                "102-tui-modernize-002.md",
+                "growlight/baton-log/102-tui-modernize-002.md",
+                false,
+            ),
+        ];
+        assert_eq!(
+            latest_baton_path(&entries).as_deref(),
+            Some("growlight/baton-log/103-tui-modernize-003.md")
+        );
+        // No numbered entries ⇒ nothing to show.
+        assert_eq!(
+            latest_baton_path(&[tree_entry("CLAUDE.md", "x/CLAUDE.md", false)]),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_reply_gates_enablement_present() {
+        let mut app = App::new();
+        assert_eq!(app.growlight_enabled, None); // unprobed
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightProbe,
+                result: Ok(json!({
+                    "entries": [
+                        {"name": "keeper.toml", "path": "config/keeper.toml", "is_dir": false},
+                        {"name": "growlight.toml", "path": "config/growlight.toml", "is_dir": false},
+                    ]
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_enabled, Some(true));
+    }
+
+    #[test]
+    fn probe_reply_disables_when_absent_or_errored() {
+        let mut ipc = dummy_ipc();
+
+        // config/ present but no growlight.toml ⇒ disabled.
+        let mut app = App::new();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightProbe,
+                result: Ok(json!({
+                    "entries": [
+                        {"name": "keeper.toml", "path": "config/keeper.toml", "is_dir": false},
+                    ]
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_enabled, Some(false));
+
+        // config/ missing entirely (Err) ⇒ disabled, silently (no error surfaced).
+        let mut app2 = App::new();
+        app2.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightProbe,
+                result: Err((softfig_ipc::ErrorKind::Internal, "no such path".into())),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app2.growlight_enabled, Some(false));
+    }
+
+    #[test]
+    fn growlight_tab_key_inert_until_enabled() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        // Not yet enabled: `7` must NOT switch views (tab absent).
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_ne!(app.view, View::Growlight);
+
+        // Enabled: `7` switches to the growlight view.
+        app.growlight_enabled = Some(true);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Growlight);
+    }
+
+    #[test]
+    fn queue_reply_populates_and_finds_active_item() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "path": "growlight/backlog/CLAUDE.md",
+                    "content": SAMPLE_QUEUE,
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight_loaded);
+        assert_eq!(app.growlight_queue.len(), 3);
+        assert_eq!(
+            app.growlight_active_item().map(|r| r.id.as_str()),
+            Some("tui-modernize")
+        );
+    }
+
+    #[test]
+    fn baton_reply_records_title_and_body() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightBaton {
+                    path: "growlight/baton-log/103-tui-modernize-003.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "growlight/baton-log/103-tui-modernize-003.md",
+                    "content": "# baton tui-modernize #3\n\nshipped slice 003",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_baton_title.as_deref(),
+            Some("103-tui-modernize-003.md")
+        );
+        assert!(app.growlight_baton.unwrap().contains("shipped slice 003"));
     }
 }
