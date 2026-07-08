@@ -3580,4 +3580,86 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(r2.started.len(), 1, "new work re-starts the released member");
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
     }
+
+    /// TASK 042 repro — the incident: a fleet-of-ONE **unpinned** (fallback)
+    /// member completes item X (`ITEM_COMPLETE`, X→`done`) with item Y still
+    /// `queued` behind it in the SAME (default) queue. It must re-claim Y + spawn.
+    /// (The `an_item_complete_exit_re_claims_the_next_part_the_same_tick` sibling
+    /// covers only a PINNED member, which resolves through `pick`'s step-1 own-queue
+    /// path; an unpinned member resolves through the step-2 fallback scan — the exact
+    /// path the 2026-07-07 fleet-of-one stall rode.)
+    #[test]
+    fn fleet_of_one_unpinned_completes_and_continues_to_next_queued_head() {
+        let (mut loop_, _d, backend, claimer, queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a"))],
+            vec![q("default", &[("x", "queued"), ("y", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a starts on x (claimed `active`, seeded)
+        assert_eq!(backend.spawns(), vec!["a"], "the sole member starts on the head");
+
+        // a completed x (`set_item_status x done`) and exited ITEM_COMPLETE; the
+        // next snapshot shows x done, y still queued behind it.
+        queues.set(vec![q("default", &[("x", "done"), ("y", "queued")])]);
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+
+        let r = loop_.tick(1);
+        assert_eq!(r.completed, vec!["a".to_string()], "the member released its slot");
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a".into(), queue: "default".into(), part: "y".into() }],
+            "the fleet-of-one auto-advances to the next queued head (no manual restart)",
+        );
+        assert_eq!(backend.spawns(), vec!["a", "a"], "re-spawned on the next item");
+        assert_eq!(
+            claimer.claims(),
+            vec![("default".into(), "x".into()), ("default".into(), "y".into())],
+            "x claimed tick 0, y re-claimed the same handshake tick 1",
+        );
+    }
+
+    /// TASK 042 repro — the cross-tick latch: the exit is observed a tick BEFORE the
+    /// member's own `done` write lands in the drive loop's committed-tip snapshot
+    /// (`read_file` reads the tip; a set_item_status commit + the ~1s tick can race).
+    /// At the exit tick the head still reads `active`, so the fallback `pick` skips it
+    /// (single-active-per-queue anti-starvation) and holds; the very next tick, once
+    /// the `done` write lands, it MUST re-claim the freed head. The health cell stays
+    /// latched `Exited` across the gap (a real backend only clears it on re-spawn), so
+    /// the second-tick poll sees the member already gone (`PollOutcome::Unknown`) and
+    /// the re-start must come from step 3, not a re-poll.
+    #[test]
+    fn fleet_of_one_unpinned_recovers_when_the_done_write_lands_a_tick_late() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a"))],
+            vec![q("default", &[("x", "queued"), ("y", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a on x (x now `active` in the shared snapshot)
+        assert_eq!(backend.spawns(), vec!["a"]);
+
+        // Exit observed, but x's `done` write hasn't landed yet — the snapshot still
+        // shows x `active`, y queued behind it.
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        let r1 = loop_.tick(1);
+        assert_eq!(r1.completed, vec!["a".to_string()], "the member released its slot");
+        assert!(
+            r1.started.is_empty(),
+            "the head still reads `active` (done not landed), so the fallback holds",
+        );
+
+        // The `done` write lands: x done, y queued. The latched-Exited member is gone
+        // from the supervisor, so this re-start comes from step 3.
+        queues.set(vec![q("default", &[("x", "done"), ("y", "queued")])]);
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            r2.started,
+            vec![Assignment { agent: "a".into(), queue: "default".into(), part: "y".into() }],
+            "once the freed head is visible the fleet-of-one auto-advances — no stall",
+        );
+        assert_eq!(backend.spawns(), vec!["a", "a"], "re-spawned on the next item");
+    }
 }
