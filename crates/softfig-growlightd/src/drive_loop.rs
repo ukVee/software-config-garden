@@ -546,6 +546,36 @@ pub struct HeldStart {
     pub outcome: StartOutcome,
 }
 
+/// A member whose FRESH start was skipped in step 3 BEFORE admission — no workable
+/// part to pick, or the part it picked was already spoken for. Distinct from a
+/// [`HeldStart`] (which reached admission and was refused/queued): a `HeldFresh`
+/// never even attempted a claim. Recorded so the drive loop's journal voice can
+/// name a held fleet member (task 042) — before this these two `continue`s were
+/// SILENT, so a held fleet-of-one left no trace (the 2026-07-07 4h stall).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldFresh {
+    /// The agent held out of a fresh start this tick.
+    pub agent: String,
+    /// Why (`no workable part` / `part already claimed`) — the `held (…)` reason.
+    pub reason: &'static str,
+}
+
+/// A member EXIT this tick as the drive loop classified it: the terminal baton
+/// status growlightd OBSERVED (from `agents/<id>/baton.md`, or the legacy-path
+/// misroute fallback — see [`crate::baton_store`]) and the lifecycle disposition it
+/// drove. Recorded on every classified exit so the health-pass is diagnosable from
+/// the journal (task 042): a stale or misrouted baton — growlightd reading a status
+/// the member never intended — is visible as a line, not a silent stall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitDisposition {
+    /// The exiting agent.
+    pub agent: String,
+    /// The baton status growlightd read on the exit (`None` = missing/unreadable).
+    pub baton_status: Option<String>,
+    /// The one-word disposition it drove (`rolling` / `completed` / `retired` / …).
+    pub disposition: &'static str,
+}
+
 /// Everything one [`DriveLoop::tick`] did, for the caller (the live thread, or a
 /// test) to inspect and — in slice 003 — route through the single notification
 /// dispatcher.
@@ -555,6 +585,11 @@ pub struct TickReport {
     pub started: Vec<Assignment>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
+    /// Fresh starts SKIPPED in step 3 before admission — no workable part, or the
+    /// part was already spoken for (task 042's diagnosability half). Narrated as a
+    /// hold so a held fleet member names itself in the journal instead of stalling
+    /// silently; edge-deduped by the [`TickLogger`] like any other hold.
+    pub held_fresh: Vec<HeldFresh>,
     /// Re-roll outcomes from [`Supervisor::tick`] (rerolled / held / failed).
     pub rerolls: Vec<RerollOutcome>,
     /// Crash alerts surfaced by [`Supervisor::poll`] (slice 003 dispatches these).
@@ -584,6 +619,11 @@ pub struct TickReport {
     /// parked. Distinct from a crash (no kill, no backoff) and from a retire (the
     /// member is immediately re-pickable in step 3 onto a *different* part).
     pub blocked: Vec<Assignment>,
+    /// Every classified member EXIT this tick with the baton status growlightd
+    /// observed and the disposition it drove — the health-pass diagnostic (task
+    /// 042). One journal line per exit (edge-deduped by the [`TickLogger`]), so a
+    /// misread/misrouted baton is visible where a silent stall used to be.
+    pub exit_dispositions: Vec<ExitDisposition>,
     /// Boundary-async messages drained from inject lanes, per agent.
     pub injected: Vec<(String, Vec<String>)>,
     /// Parked (blocked-head) queues, surfaced for the §9 alert hook every tick —
@@ -878,6 +918,22 @@ impl DriveLoop {
                         network_exit,
                     )
                 };
+                // Health-pass diagnostic (task 042): record what baton status this
+                // EXIT was classified against and the disposition it drove, so a
+                // stale/misrouted baton is visible in the journal (before this, a
+                // misclassified exit stalled the fleet silently). Only real exits are
+                // recorded — a still-registered `Healthy`/`Unknown` observation (e.g.
+                // the cross-tick latched-`Exited` re-poll of an already-gone member)
+                // is not an exit event, so it is skipped to keep the log clean.
+                if matches!(health, AgentHealth::Exited { .. })
+                    && !matches!(outcome, PollOutcome::Healthy | PollOutcome::Unknown)
+                {
+                    report.exit_dispositions.push(ExitDisposition {
+                        agent: agent.clone(),
+                        baton_status: baton_status.clone(),
+                        disposition: exit_disposition_label(&outcome),
+                    });
+                }
                 // Maintain the reconnect latch (slice 002): any non-reconnect
                 // disposition clears it (the member re-rolled, exited clean, or
                 // genuinely crashed — a fresh slate); the Reconnecting arm re-sets it
@@ -1113,12 +1169,25 @@ impl DriveLoop {
                     continue;
                 }
                 let Some((queue, part)) = pick(&snapshot, member.pin.as_deref()) else {
-                    continue; // nothing workable for this agent's pin right now
+                    // Nothing workable for this agent's pin right now. Before task 042
+                    // this `continue` was SILENT, so a held fleet-of-one (e.g. a
+                    // completed member whose next queued head has not yet surfaced)
+                    // left no journal trace — the 2026-07-07 4h stall. Narrate it as a
+                    // hold, edge-deduped like the re-roll `HeldNoWork`.
+                    report.held_fresh.push(HeldFresh {
+                        agent: agent.clone(),
+                        reason: "no workable part",
+                    });
+                    continue;
                 };
                 // A part already spoken for — held by a live member (cross-tick) or
                 // claimed earlier this tick — is taken; never double-assign it (the
                 // resume-collision guard, now cross-tick as well as same-tick).
                 if spoken_for.contains(&(queue.clone(), part.clone())) {
+                    report.held_fresh.push(HeldFresh {
+                        agent: agent.clone(),
+                        reason: "part already claimed",
+                    });
                     continue;
                 }
                 // Seed the per-member baton, then claim the part (mark it `active`
@@ -1273,6 +1342,23 @@ impl DriveLoop {
     }
 }
 
+/// The one-word disposition label for an exit poll's [`PollOutcome`] — the
+/// health-pass journal line (task 042). Exhaustive so a new outcome variant forces
+/// a label choice rather than silently reading as an unclassified exit.
+fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
+    match outcome {
+        PollOutcome::Crashed { .. } => "crashed",
+        PollOutcome::Reconnecting => "reconnecting (transient network)",
+        PollOutcome::Rolling => "rolling (continue status)",
+        PollOutcome::Retired => "retired (queue drained)",
+        PollOutcome::Completed => "completed (item boundary)",
+        PollOutcome::Blocked { .. } => "blocked on human",
+        PollOutcome::ParkedRateLimited => "held (rate-limited)",
+        PollOutcome::Healthy => "healthy",
+        PollOutcome::Unknown => "unknown",
+    }
+}
+
 /// The drive loop's journal voice (task 033's diagnosability half): render one
 /// terse line per fleet lifecycle event so a silent stall is debuggable from the
 /// systemd journal — before this, growlightd logged nothing after "drive loop
@@ -1290,6 +1376,11 @@ struct TickLogger {
     /// The held `(agent, kind)` states seen last tick — a hold logs only when its
     /// key enters this set.
     held: BTreeSet<(String, &'static str)>,
+    /// Agents whose EXIT was narrated last tick — an exit disposition (task 042)
+    /// logs only on its ENTRY edge, so a member re-observed `Exited` every tick
+    /// until it re-rolls/retires (e.g. a rate-limited hold) writes one line, not one
+    /// per second. Re-armed once the agent is no longer in an exit state.
+    exits: BTreeSet<String>,
     /// Whether the connectivity HOLD was on last tick (its enter/exit edges log).
     offline: bool,
 }
@@ -1331,10 +1422,34 @@ impl TickLogger {
             };
             held_now.insert((held.agent.clone(), kind));
         }
+        // Step-3 fresh-start holds (task 042): a member with no workable part, or
+        // whose part was already claimed, joins the same edge-deduped hold set — so a
+        // held fleet-of-one narrates once on entry, mirroring the re-roll `HeldNoWork`.
+        for hf in &r.held_fresh {
+            held_now.insert((hf.agent.clone(), hf.reason));
+        }
         for (agent, kind) in held_now.difference(&self.held) {
             out.push(format!("fleet: holding {agent} ({kind})"));
         }
         self.held = held_now;
+        // Exit dispositions (task 042 health pass): what baton status each exit was
+        // classified against and the disposition it drove — logged once on the entry
+        // edge so a stale/misrouted baton is visible where a silent stall used to be.
+        let mut exits_now: BTreeSet<String> = BTreeSet::new();
+        for ed in &r.exit_dispositions {
+            exits_now.insert(ed.agent.clone());
+        }
+        for ed in &r.exit_dispositions {
+            if !self.exits.contains(&ed.agent) {
+                out.push(format!(
+                    "fleet: {} exited — baton {} -> {}",
+                    ed.agent,
+                    ed.baton_status.as_deref().unwrap_or("(none)"),
+                    ed.disposition,
+                ));
+            }
+        }
+        self.exits = exits_now;
         for agent in &r.retired {
             out.push(format!("fleet: retired {agent} to idle"));
         }
@@ -2854,6 +2969,86 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(logger.lines(&failed).is_empty());
     }
 
+    /// TASK 042 diagnosability: a fresh-start HOLD (no workable part / part already
+    /// claimed) narrates on its entry edge and dedups like any other hold, and each
+    /// EXIT narrates its observed baton status + disposition once — so a held
+    /// fleet-of-one and a stale/misrouted baton are both visible in the journal
+    /// where a silent stall used to be.
+    #[test]
+    fn tick_logger_narrates_held_fresh_and_exit_dispositions() {
+        let mut logger = TickLogger::default();
+
+        // A completed exit that could not be re-placed this tick (the next head is
+        // not visible yet): the exit disposition AND the fresh-start hold both narrate.
+        let held_and_exited = TickReport {
+            completed: vec!["a".into()],
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "completed (item boundary)",
+            }],
+            held_fresh: vec![HeldFresh {
+                agent: "a".into(),
+                reason: "no workable part",
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&held_and_exited),
+            vec![
+                "fleet: holding a (no workable part)".to_string(),
+                "fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string(),
+                "fleet: a finished its part (item boundary; slot released)".to_string(),
+            ],
+        );
+
+        // The hold persists (still no head) AND the member is re-observed exited
+        // (latched) — neither repeats: one line per second is the stall bug this fixes.
+        let still_held = TickReport {
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "unknown",
+            }],
+            held_fresh: vec![HeldFresh {
+                agent: "a".into(),
+                reason: "no workable part",
+            }],
+            ..TickReport::default()
+        };
+        assert!(
+            logger.lines(&still_held).is_empty(),
+            "a persisting hold + a latched exit do not repeat",
+        );
+
+        // Both edges re-arm once the member starts (leaves the hold + exit states).
+        let started = TickReport {
+            started: vec![Assignment {
+                agent: "a".into(),
+                queue: "default".into(),
+                part: "y".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&started),
+            vec!["fleet: started a on default/y".to_string()],
+        );
+        // A NEW exit re-logs (the edge re-armed).
+        let re_exit = TickReport {
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: None,
+                disposition: "rolling (continue status)",
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&re_exit),
+            vec!["fleet: a exited — baton (none) -> rolling (continue status)".to_string()],
+        );
+    }
+
     /// An immediate-stop (force_stop hard kill) retiring agent that is still alive
     /// at its boundary crash is killed via the returned child, outside any lock.
     #[test]
@@ -3661,5 +3856,58 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "once the freed head is visible the fleet-of-one auto-advances — no stall",
         );
         assert_eq!(backend.spawns(), vec!["a", "a"], "re-spawned on the next item");
+    }
+
+    /// TASK 042 finish-criterion 5 (the diagnosability half), end to end: when a
+    /// fleet-of-one completes but its next head is not yet visible, the tick both
+    /// RECORDS the fresh-start hold + the exit disposition AND narrates them — so the
+    /// 2026-07-07 stall (a held fleet-of-one that logged nothing for 4h) is now
+    /// diagnosable from the journal. Rides the same cross-tick-latch shape as
+    /// `fleet_of_one_unpinned_recovers_when_the_done_write_lands_a_tick_late`.
+    #[test]
+    fn a_held_fleet_of_one_records_and_narrates_the_hold_and_exit_disposition() {
+        let (mut loop_, _d, backend, _claimer, _queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a"))],
+            vec![q("default", &[("x", "queued"), ("y", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a starts on x (x `active`)
+
+        // a completed x and exited ITEM_COMPLETE, but its `done` write has not landed
+        // — the head still reads `active`, so step 3's fallback pick finds no workable
+        // part and holds. Before task 042 that hold was SILENT.
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        let r = loop_.tick(1);
+
+        assert_eq!(
+            r.exit_dispositions,
+            vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "completed (item boundary)",
+            }],
+            "the exit records the observed baton status + disposition (health pass)",
+        );
+        assert_eq!(
+            r.held_fresh,
+            vec![HeldFresh { agent: "a".into(), reason: "no workable part" }],
+            "the fresh-start hold is recorded, not skipped silently",
+        );
+
+        // And it is NARRATED — a held fleet-of-one now names itself in the journal.
+        let mut logger = TickLogger::default();
+        let lines = logger.lines(&r);
+        assert!(
+            lines.contains(&"fleet: holding a (no workable part)".to_string()),
+            "the held fleet-of-one is narrated: {lines:?}",
+        );
+        assert!(
+            lines.contains(
+                &"fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string()
+            ),
+            "the exit disposition is narrated with the observed baton status: {lines:?}",
+        );
     }
 }
