@@ -1381,6 +1381,15 @@ struct TickLogger {
     /// until it re-rolls/retires (e.g. a rate-limited hold) writes one line, not one
     /// per second. Re-armed once the agent is no longer in an exit state.
     exits: BTreeSet<String>,
+    /// Agents whose transient-network-exit disposition was narrated last tick — the
+    /// "hit a transient network exit" line logs only on its ENTRY edge (task 034),
+    /// the reconnect twin of `exits`. A latched member is re-observed with the SAME
+    /// stale exit every tick while the connectivity hold gates its re-roll, so it
+    /// re-populates `reconnecting` per tick — a HELD state, not a fresh occurrence.
+    /// Without this edge it re-narrated ~1/tick (642 lines across the 2026-07-06
+    /// wifi-drop). Re-armed once the member leaves the latch (re-rolled / exited
+    /// clean / genuinely crashed), so a genuinely NEW network exit narrates again.
+    reconnecting: BTreeSet<String>,
     /// Whether the connectivity HOLD was on last tick (its enter/exit edges log).
     offline: bool,
 }
@@ -1464,11 +1473,23 @@ impl TickLogger {
                 a.agent, a.queue, a.part
             ));
         }
+        // Transient network exits (network-failsafe slice 002): a latched member
+        // whose re-roll is gated by the connectivity hold is re-classified
+        // `Reconnecting` every tick — a HELD state, not a fresh occurrence — so it
+        // narrates once on its entry edge and dedups like the exit dispositions
+        // above (task 034). A genuinely new network exit re-arms the edge and re-logs.
+        let mut reconnecting_now: BTreeSet<String> = BTreeSet::new();
         for agent in &r.reconnecting {
-            out.push(format!(
-                "fleet: {agent} hit a transient network exit (will re-roll)"
-            ));
+            reconnecting_now.insert(agent.clone());
         }
+        for agent in &r.reconnecting {
+            if !self.reconnecting.contains(agent) {
+                out.push(format!(
+                    "fleet: {agent} hit a transient network exit (will re-roll)"
+                ));
+            }
+        }
+        self.reconnecting = reconnecting_now;
         if r.waiting_for_connectivity != self.offline {
             self.offline = r.waiting_for_connectivity;
             out.push(if self.offline {
@@ -3046,6 +3067,54 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(
             logger.lines(&re_exit),
             vec!["fleet: a exited — baton (none) -> rolling (continue status)".to_string()],
+        );
+    }
+
+    /// TASK 034: a LATCHED transient network exit — a member re-observed `Exited`
+    /// every tick while the connectivity hold gates its re-roll re-populates
+    /// `reconnecting` per tick — narrates once on its ENTRY edge, not once per tick
+    /// (the 2026-07-06 wifi-drop logged this line 642 times in ~40 min). Once the
+    /// member leaves the latch (re-rolls), the edge re-arms so a genuinely NEW
+    /// network exit narrates again.
+    #[test]
+    fn tick_logger_edge_dedups_a_latched_network_exit() {
+        let mut logger = TickLogger::default();
+
+        // Entry edge: the transient network exit narrates once.
+        let reconnect = TickReport {
+            reconnecting: vec!["a".into()],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&reconnect),
+            vec!["fleet: a hit a transient network exit (will re-roll)".to_string()],
+        );
+
+        // Latched: the offline gate holds the re-roll, so the member is re-classified
+        // `Reconnecting` every tick — across many ticks the line must NOT repeat.
+        for _ in 0..100 {
+            assert!(
+                logger.lines(&reconnect).is_empty(),
+                "a latched network exit does not re-narrate while spawns are held",
+            );
+        }
+
+        // The member re-rolls (leaves the latch): this tick carries no reconnecting
+        // entry, so the edge re-arms. The re-roll narration itself is unchanged.
+        let rerolled = TickReport {
+            rerolls: vec![RerollOutcome::Rerolled { agent: "a".into() }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&rerolled),
+            vec!["fleet: re-rolled a (fresh session, same part)".to_string()],
+        );
+
+        // A genuinely NEW network exit re-logs (the edge re-armed).
+        assert_eq!(
+            logger.lines(&reconnect),
+            vec!["fleet: a hit a transient network exit (will re-roll)".to_string()],
+            "a genuinely new network exit narrates after the latch cleared",
         );
     }
 
