@@ -13,7 +13,9 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::Args;
-use softfig_deploy::{apply, plan, ApplyOptions, DeployConfig, DeployError, DeployPaths, Plan};
+use softfig_deploy::{
+    apply, plan, ApplyOptions, DeployConfig, DeployError, DeployPaths, FsSource, Plan,
+};
 
 #[derive(Args, Debug)]
 pub struct DeployArgs {
@@ -44,6 +46,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
     };
     let paths = DeployPaths {
         config_dir: garden_root.join("config"),
+        garden_root,
         home,
         cache_root,
     };
@@ -57,7 +60,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
         other => anyhow!(other),
     })?;
 
-    let plan = plan(&config, &paths)?;
+    let plan = plan(&config, &paths, &FsSource::new(&paths))?;
     print_plan(&plan);
 
     if args.dry_run {

@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{DeployConfig, Method};
+use crate::source::{SourceEntry, SourceReader};
 use crate::stamp;
 use crate::{DeployError, DeployPaths, Result};
 
@@ -31,8 +32,11 @@ pub enum Action {
 pub struct PlannedEntry {
     pub name: String,
     pub method: Method,
-    /// Absolute path under `config/source/`.
-    pub source_abs: PathBuf,
+    /// The source's plaintext bytes, captured at plan time from the
+    /// [`SourceReader`]. `apply` re-materializes exactly these — it never reads
+    /// the source again (which, for a FUSE-mode daemon, would be a self-read of
+    /// the very mount it serves).
+    pub source_bytes: Vec<u8>,
     /// The dot's `source` string (for the copy stamp's provenance line).
     pub source_rel: String,
     /// Resolved absolute target path.
@@ -56,35 +60,37 @@ impl Plan {
     }
 }
 
-/// Compute the plan. Reads the filesystem; does not mutate it.
-pub fn plan(config: &DeployConfig, paths: &DeployPaths) -> Result<Plan> {
+/// Compute the plan. Reads each dot's source through `source` (never `std::fs`
+/// directly — see [`crate::source`]) and stats targets/caches on the real
+/// filesystem; mutates nothing.
+pub fn plan(config: &DeployConfig, paths: &DeployPaths, source: &dyn SourceReader) -> Result<Plan> {
     let source_dir = paths.source_dir();
     let mut entries = Vec::with_capacity(config.dots.len());
 
     for (name, dot) in &config.dots {
         validate_name(name)?;
 
-        let source_abs = source_dir.join(&dot.source);
-        match std::fs::symlink_metadata(&source_abs) {
-            Ok(md) if md.file_type().is_dir() => {
+        // Display-only absolute path for the not-found / directory errors; the
+        // bytes themselves come from `source`, never a mount `fs::read`.
+        let source_abs = || source_dir.join(&dot.source);
+        let src_bytes = match source.read_source(&dot.source)? {
+            SourceEntry::Directory => {
                 return Err(DeployError::DirectorySource {
                     name: name.clone(),
-                    path: source_abs,
+                    path: source_abs(),
                 });
             }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            SourceEntry::Missing => {
                 return Err(DeployError::SourceNotFound {
                     name: name.clone(),
-                    path: source_abs,
+                    path: source_abs(),
                 });
             }
-            Err(e) => return Err(e.into()),
-        }
+            SourceEntry::File(bytes) => bytes,
+        };
 
-        let target_abs = resolve_target(&paths.home, &dot.target, name)?;
+        let target_abs = resolve_target(&paths.home, &paths.garden_root, &dot.target, name)?;
         let cache_abs = paths.cache_root.join(name);
-        let src_bytes = std::fs::read(&source_abs)?;
 
         let (action, conflict_reason) =
             decide(dot.method, &target_abs, &cache_abs, &src_bytes, &dot.source)?;
@@ -92,7 +98,7 @@ pub fn plan(config: &DeployConfig, paths: &DeployPaths) -> Result<Plan> {
         entries.push(PlannedEntry {
             name: name.clone(),
             method: dot.method,
-            source_abs,
+            source_bytes: src_bytes,
             source_rel: dot.source.clone(),
             target_abs,
             cache_abs,
@@ -105,8 +111,10 @@ pub fn plan(config: &DeployConfig, paths: &DeployPaths) -> Result<Plan> {
 }
 
 /// Resolve + validate a dot's target into an absolute path. Rejects `..`
-/// traversal and (M4a) absolute targets outside `$HOME`.
-fn resolve_target(home: &Path, target: &str, name: &str) -> Result<PathBuf> {
+/// traversal, (M4a) absolute targets outside `$HOME`, and any target that
+/// resolves **inside `garden_root`** (a self-write of the garden mount / an
+/// uncommitted garden mutation — deploy writes real dotfiles, never the garden).
+fn resolve_target(home: &Path, garden_root: &Path, target: &str, name: &str) -> Result<PathBuf> {
     let invalid = |reason: &str| DeployError::InvalidTarget {
         name: name.to_string(),
         target: target.to_string(),
@@ -120,16 +128,22 @@ fn resolve_target(home: &Path, target: &str, name: &str) -> Result<PathBuf> {
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(invalid("`..` is not allowed in a target"));
     }
-    if p.is_absolute() {
+    let resolved = if p.is_absolute() {
         if !p.starts_with(home) {
             return Err(invalid(
                 "absolute targets outside $HOME are deferred to the /etc slice",
             ));
         }
-        Ok(p.to_path_buf())
+        p.to_path_buf()
     } else {
-        Ok(home.join(p))
+        home.join(p)
+    };
+    if resolved.starts_with(garden_root) {
+        return Err(invalid(
+            "target resolves inside the garden — deploying into the garden mount is refused",
+        ));
     }
+    Ok(resolved)
 }
 
 /// Dot names key the flat deploy-cache, so they must be safe filename

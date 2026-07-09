@@ -43,6 +43,7 @@ use std::path::PathBuf;
 mod apply;
 mod config;
 mod plan;
+mod source;
 mod stamp;
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ mod tests;
 pub use apply::{apply, ApplyOptions, Report};
 pub use config::{DeployConfig, Dot, Method};
 pub use plan::{plan, Action, Plan, PlannedEntry};
+pub use source::{FsSource, MemSource, SourceEntry, SourceReader};
 
 /// Everything that can go wrong before/while computing or applying a deploy.
 #[derive(Debug, thiserror::Error)]
@@ -86,13 +88,15 @@ pub enum DeployError {
 
 pub type Result<T> = std::result::Result<T, DeployError>;
 
-/// Resolved roots a deploy run operates against. `config_dir` is
-/// `<garden_root>/config` (holds `deploy.toml` + `source/`, read through the
-/// FUSE plaintext view); `home` is the `$HOME` boundary relative targets
-/// resolve against and absolute targets may not escape; `cache_root` is the
-/// persistent plaintext deploy-cache base.
+/// Resolved roots a deploy run operates against. `garden_root` is the garden
+/// mount root — **no target may resolve inside it** (a self-write of the garden
+/// / an uncommitted mutation); `config_dir` is `<garden_root>/config` (holds
+/// `deploy.toml` + `source/`, read through the FUSE plaintext view); `home` is
+/// the `$HOME` boundary relative targets resolve against and absolute targets
+/// may not escape; `cache_root` is the persistent plaintext deploy-cache base.
 #[derive(Debug, Clone)]
 pub struct DeployPaths {
+    pub garden_root: PathBuf,
     pub config_dir: PathBuf,
     pub home: PathBuf,
     pub cache_root: PathBuf,
