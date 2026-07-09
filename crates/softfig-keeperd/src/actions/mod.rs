@@ -48,6 +48,10 @@ pub use growlight::{
     post_message, read_inbox, release_lease, reorder_backlog_item, request_lease, set_item_status,
     tail_bus, HolderStore,
 };
+// Crate-internal helpers behind the `growlight_queue` read verb (020 slice 002):
+// the queue-grammar parser + the backlog-doc path. `pub(crate)`, so they can't
+// ride the `pub use` above.
+pub(crate) use growlight::{default_queue_rows, growlight_backlog_claude};
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;
 pub use migrate_config::migrate_config;

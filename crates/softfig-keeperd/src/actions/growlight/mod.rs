@@ -37,11 +37,38 @@ pub use set_resources::growlight_set_resources;
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{
     AddBacklogItemArgs, AddBacklogItemReply, AddQueueArgs, AddQueueReply, AddSliceArgs,
-    AddSliceReply, ChatMessage, LogBatonArgs, LogBatonReply, PostMessageArgs, PostMessageReply,
-    ReadInboxArgs, ReadInboxReply, ReorderBacklogItemArgs, ReorderBacklogItemReply,
-    SetItemStatusArgs, SetItemStatusReply, TailBusArgs, TailBusReply,
+    AddSliceReply, ChatMessage, GrowlightQueueRow, LogBatonArgs, LogBatonReply, PostMessageArgs,
+    PostMessageReply, ReadInboxArgs, ReadInboxReply, ReorderBacklogItemArgs,
+    ReorderBacklogItemReply, SetItemStatusArgs, SetItemStatusReply, TailBusArgs, TailBusReply,
 };
 use softfig_ipc::ErrorKind;
+
+/// Parse the DEFAULT backlog queue's rows out of `growlight/backlog/CLAUDE.md`
+/// content with the authoritative table parser ([`queue::parse`], which owns
+/// the `\|` cell escape) and map them to the wire row a frontend renders. The
+/// single source of truth for the queue grammar: the read verb
+/// (`reads::growlight_queue`, 020 slice 002 / finding #5) calls this so the TUI
+/// never re-splits the managed table and mis-handles a piped title. Returns
+/// empty when the `queue` region is absent (fresh garden, nothing enqueued).
+pub(crate) fn default_queue_rows(backlog_claude_content: &str) -> Vec<GrowlightQueueRow> {
+    managed::region_body(backlog_claude_content, paths::QUEUE_TAG)
+        .map(|b| queue::parse(&b))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| GrowlightQueueRow {
+            id: r.id,
+            title: r.title,
+            status: r.status,
+        })
+        .collect()
+}
+
+/// The repo-relative path of the backlog routing doc (`growlight/backlog/
+/// CLAUDE.md`) that hosts the authoritative queue table. Exposed so the read
+/// verb can fetch its content without duplicating the path vocab.
+pub(crate) fn growlight_backlog_claude() -> String {
+    paths::backlog_claude()
+}
 
 use super::{commit_now, conventions, managed, numbering, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
@@ -821,6 +848,44 @@ mod tests {
             title: id.into(),
             status: "queued".into(),
         }
+    }
+
+    /// 020 slice 002 / finding #5: `default_queue_rows` (what the read verb
+    /// ships to the TUI) must return the DEFAULT queue only, round-trip a title
+    /// carrying a literal `|` through the `\|` cell escape, and preserve the
+    /// `active` status so the frontend finds the active item.
+    #[test]
+    fn default_queue_rows_round_trips_pipe_and_scopes_to_default_queue() {
+        let mut active = row("tui-modernize");
+        active.item_type = "milestone".into();
+        active.title = "Modernize | the TUI".into();
+        active.status = "active".into();
+        let drows = vec![row("growlightd-crash-diagnostics"), active, row("020")];
+
+        // Built through the same region + render machinery the handlers use, so
+        // the `|` is escaped on write exactly as production writes it. A named
+        // queue in the same doc must not leak into the default view.
+        let content = managed::upsert(
+            &paths::backlog_claude_stub(),
+            paths::QUEUE_TAG,
+            &queue::render(&drows),
+        );
+        let content = managed::upsert(
+            &content,
+            &format!("{}:smoke-a", paths::QUEUE_TAG),
+            &queue::render(&[row("021")]),
+        );
+
+        let out = super::default_queue_rows(&content);
+        assert_eq!(out.len(), 3, "only the default queue's rows");
+        assert!(out.iter().all(|r| r.id != "021"), "named queue leaked");
+        let found = out
+            .iter()
+            .find(|r| r.status == "active")
+            .expect("active row found");
+        assert_eq!(found.id, "tui-modernize");
+        // The piped title survives un-garbled — the core of finding #5.
+        assert_eq!(found.title, "Modernize | the TUI");
     }
 
     /// A backlog doc whose default queue holds `default_ids` and whose named

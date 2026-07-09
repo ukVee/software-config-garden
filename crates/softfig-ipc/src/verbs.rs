@@ -85,6 +85,13 @@ pub mod op {
     /// (author_device, timestamp, intent) by walking the chain and diffing the
     /// path's blob across each commit. Read-only; never touches the mount.
     pub const FILE_PROVENANCE: &str = "file_provenance";
+    /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
+    /// parsed daemon-side by the authoritative queue-table parser that owns the
+    /// `\|` cell escape — so a frontend renders rows directly instead of
+    /// re-splitting the managed `<!-- softfig:queue -->` table (which mis-handles
+    /// a piped title and loses the active item). Only the default queue is
+    /// returned. Read-only; require Unlocked.
+    pub const GROWLIGHT_QUEUE: &str = "growlight_queue";
     /// M5a-4: begin pairing as the initiator — TCP-connect to the target
     /// device, run the Noise `XX` handshake + attestation, and park the
     /// pending pairing awaiting SAS confirmation. Returns the SAS to compare.
@@ -851,6 +858,26 @@ pub struct SectionVersion {
     pub heading: String,
     /// The section's content version (heading line + body).
     pub version: String,
+}
+
+/// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default
+/// backlog queue parsed daemon-side with the authoritative table parser that
+/// owns the `\|` cell escape, so a frontend renders structured rows and never
+/// re-splits the managed `<!-- softfig:queue -->` table itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrowlightQueueReply {
+    pub rows: Vec<GrowlightQueueRow>,
+}
+
+/// One backlog item's authoritative queue state, as served over the wire: its
+/// id, title, and status. A title carrying a literal `|` round-trips intact
+/// (the daemon un-escapes the `\|` cell escape); the frontend never
+/// string-parses the table, so the active item is always found.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrowlightQueueRow {
+    pub id: String,
+    pub title: String,
+    pub status: String,
 }
 
 // ---- Phase 3 (garden CAS §4d): file provenance ------------------------

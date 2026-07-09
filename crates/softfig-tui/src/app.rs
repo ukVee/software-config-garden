@@ -10,8 +10,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use serde_json::{json, Value};
 use softfig_ipc::{
     DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
-    HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply, PairPeer,
-    PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
+    GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
+    PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
     ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
 };
 
@@ -35,16 +35,12 @@ pub enum View {
     Growlight,
 }
 
-/// One row of the growlight backlog queue table, parsed from the managed
-/// `<!-- softfig:queue -->` region of `growlight/backlog/CLAUDE.md`. Read-only.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrowlightRow {
-    pub num: String,
-    pub id: String,
-    pub kind: String,
-    pub title: String,
-    pub status: String,
-}
+/// One row of the growlight backlog queue. Served as a structured row over the
+/// wire by the daemon's authoritative queue-table parser (020 slice 002,
+/// finding #5) — the TUI no longer re-parses the managed
+/// `<!-- softfig:queue -->` table itself, so a piped `|` in a title round-trips
+/// and the active item is always found. Read-only.
+pub type GrowlightRow = softfig_ipc::GrowlightQueueRow;
 
 /// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
 /// confirmation, or a nearby device discovered over mDNS (Slice A pick-list).
@@ -232,8 +228,8 @@ pub struct App {
     /// error when growlight isn't set up/armed on this garden. Refreshed every
     /// status tick, so it can't go stale mid-session.
     pub growlight_enabled: Option<bool>,
-    /// The backlog queue rows (drain order + statuses), parsed read-only from
-    /// `growlight/backlog/CLAUDE.md`.
+    /// The backlog queue rows (drain order + statuses), served read-only as
+    /// structured rows by the daemon's `growlight_queue` verb.
     pub growlight_queue: Vec<GrowlightRow>,
     pub growlight_selected: usize,
     /// The latest baton-log entry (title + body) — the loop's most recent handoff
@@ -351,11 +347,7 @@ impl App {
     /// growlight: (re)load the read-only section — the backlog queue table plus a
     /// listing of the baton-log (whose reply triggers the latest-entry read).
     fn load_growlight(&self, ipc: &mut IpcClient) {
-        ipc.send(
-            "read_file",
-            json!({ "path": "growlight/backlog/CLAUDE.md" }),
-            Tag::GrowlightQueue,
-        );
+        ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
         ipc.send(
             "list_tree",
             json!({ "path": "growlight/baton-log" }),
@@ -792,8 +784,8 @@ impl App {
             },
             Tag::GrowlightQueue => match reply.result {
                 Ok(v) => {
-                    if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
-                        self.growlight_queue = parse_growlight_queue(&r.content);
+                    if let Ok(r) = serde_json::from_value::<GrowlightQueueReply>(v) {
+                        self.growlight_queue = r.rows;
                         self.growlight_loaded = true;
                         if self.growlight_selected >= self.growlight_queue.len() {
                             self.growlight_selected =
@@ -1755,44 +1747,6 @@ fn extract_id_attr(tag: &str) -> Option<String> {
     None
 }
 
-/// Parse the managed backlog queue table out of `growlight/backlog/CLAUDE.md`.
-/// Only the default queue is read — the region between `<!-- softfig:queue -->`
-/// and `<!-- /softfig:queue -->`; per-queue tables (`softfig:queue:<name>`) are
-/// ignored. The markdown header + `|---|` separator rows are skipped.
-pub fn parse_growlight_queue(md: &str) -> Vec<GrowlightRow> {
-    let mut rows = Vec::new();
-    let mut in_region = false;
-    for line in md.lines() {
-        let t = line.trim();
-        if t == "<!-- softfig:queue -->" {
-            in_region = true;
-            continue;
-        }
-        if t == "<!-- /softfig:queue -->" {
-            break;
-        }
-        if !in_region || !t.starts_with('|') {
-            continue;
-        }
-        let cells: Vec<&str> = t.trim_matches('|').split('|').map(str::trim).collect();
-        if cells.len() < 5 {
-            continue;
-        }
-        // Skip the header row (`| # | id | … |`) and the `|---|` separator.
-        if cells[0] == "#" || cells[0].chars().all(|c| c == '-' || c == ':') {
-            continue;
-        }
-        rows.push(GrowlightRow {
-            num: cells[0].to_string(),
-            id: cells[1].to_string(),
-            kind: cells[2].to_string(),
-            title: cells[3].to_string(),
-            status: cells[4].to_string(),
-        });
-    }
-    rows
-}
-
 /// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
 /// `list_tree growlight/baton-log` reply. Non-numeric entries (e.g. `CLAUDE.md`)
 /// and directories are ignored; returns the entry's repo-relative path.
@@ -2727,47 +2681,10 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
         }
     }
 
-    const SAMPLE_QUEUE: &str = "\
-# growlight/backlog/
-
-## Queue
-
-<!-- softfig:queue -->
-
-| # | id | type | title | status |
-|---|----|------|-------|--------|
-| 1 | growlightd-crash-diagnostics | milestone | crash diag | done |
-| 2 | tui-modernize | milestone | Modernize the TUI | active |
-| 3 | 020 | task | code-review records | queued |
-
-<!-- /softfig:queue -->
-
-## Queue: smoke-a
-
-<!-- softfig:queue:smoke-a -->
-
-| # | id | type | title | status |
-|---|----|------|-------|--------|
-| 1 | 021 | task | smoke marker | done |
-
-<!-- /softfig:queue:smoke-a -->
-";
-
-    #[test]
-    fn parse_queue_skips_header_separator_and_other_queues() {
-        let rows = parse_growlight_queue(SAMPLE_QUEUE);
-        // Only the DEFAULT queue's three rows — the smoke-a queue is ignored,
-        // and the header + `|---|` separator never appear.
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].id, "growlightd-crash-diagnostics");
-        assert_eq!(rows[0].status, "done");
-        assert_eq!(rows[1].id, "tui-modernize");
-        assert_eq!(rows[1].kind, "milestone");
-        assert_eq!(rows[1].title, "Modernize the TUI");
-        assert_eq!(rows[1].status, "active");
-        assert_eq!(rows[2].id, "020");
-        assert!(rows.iter().all(|r| r.id != "021"), "leaked smoke-a queue");
-    }
+    // The daemon now owns the queue-table grammar (`\|` un-escape, default-queue
+    // scoping); that parse is tested in `softfig-keeperd`'s `default_queue_rows`.
+    // The TUI just consumes the structured rows over the wire — see
+    // `queue_reply_populates_and_finds_active_item`.
 
     #[test]
     fn latest_baton_picks_highest_numbered_entry() {
@@ -2875,24 +2792,29 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
         let mut app = App::new();
         app.locked = false;
         let mut ipc = dummy_ipc();
+        // Structured rows straight off the wire (`growlight_queue` reply). A
+        // title carrying a literal `|` arrives intact — the daemon un-escaped
+        // the `\|` cell escape, so the TUI never mis-splits it (finding #5).
         app.apply_reply(
             Reply {
                 id: 1,
                 tag: Tag::GrowlightQueue,
                 result: Ok(json!({
-                    "path": "growlight/backlog/CLAUDE.md",
-                    "content": SAMPLE_QUEUE,
-                    "sealed": false,
+                    "rows": [
+                        { "id": "growlightd-crash-diagnostics", "title": "crash diag", "status": "done" },
+                        { "id": "tui-modernize", "title": "Modernize | the TUI", "status": "active" },
+                        { "id": "020", "title": "code-review records", "status": "queued" },
+                    ],
                 })),
             },
             &mut ipc,
         );
         assert!(app.growlight_loaded);
         assert_eq!(app.growlight_queue.len(), 3);
-        assert_eq!(
-            app.growlight_active_item().map(|r| r.id.as_str()),
-            Some("tui-modernize")
-        );
+        let active = app.growlight_active_item().expect("active item found");
+        assert_eq!(active.id, "tui-modernize");
+        // The piped title round-trips through the wire, not garbled.
+        assert_eq!(active.title, "Modernize | the TUI");
     }
 
     #[test]

@@ -46,7 +46,8 @@ pub enum Tag {
     DeployPlan,
     /// M4: apply the deploy plan (`deploy_apply`); reply carries the `Report`.
     DeployApply,
-    /// growlight: the backlog queue table (`read_file growlight/backlog/CLAUDE.md`).
+    /// growlight: the backlog queue as daemon-parsed structured rows
+    /// (`growlight_queue`) — no client re-parse of the managed table.
     GrowlightQueue,
     /// growlight: list the baton-log dir (`list_tree growlight/baton-log`) to
     /// find the highest-numbered entry (the latest handoff).

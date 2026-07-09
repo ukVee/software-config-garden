@@ -358,16 +358,12 @@ fn renders_growlight_frame_when_enabled() {
     app.view = softfig_tui::app::View::Growlight;
     app.growlight_queue = vec![
         GrowlightRow {
-            num: "1".into(),
             id: "m5b-hardening".into(),
-            kind: "milestone".into(),
             title: "M5b replication hardening".into(),
             status: "done".into(),
         },
         GrowlightRow {
-            num: "2".into(),
             id: "tui-modernize".into(),
-            kind: "milestone".into(),
             title: "Modernize the TUI".into(),
             status: "active".into(),
         },
