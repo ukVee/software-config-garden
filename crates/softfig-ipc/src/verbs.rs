@@ -248,6 +248,13 @@ pub struct StatusReply {
     /// Unix seconds at which the armed relock token expires, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relock_expires_at: Option<i64>,
+    /// Daemon-owned growlight gate: the fail-closed `fleet_enabled()` value the
+    /// keeperd already owns, surfaced so a client never re-derives it from
+    /// file-presence and disagrees. Refreshes on every status tick.
+    /// `#[serde(default)]` keeps older daemons/clients wire-compatible
+    /// (an absent field ⇒ `false`, i.e. no tab — the fail-closed default).
+    #[serde(default)]
+    pub growlight_enabled: bool,
 }
 
 // ---- growlight relock token -------------------------------------------

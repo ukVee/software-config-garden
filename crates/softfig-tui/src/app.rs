@@ -225,14 +225,13 @@ pub struct App {
     pub deploy_has_conflicts: bool,
     pub deploy_selected: usize,
     pub deploy_loaded: bool,
-    /// growlight enablement (load-bearing gate): `None` until probed, `Some(true)`
-    /// when `config/growlight.toml` exists, `Some(false)` otherwise. The Growlight
-    /// tab is rendered/reachable **only** when `Some(true)` — no tab, no empty
-    /// pane, no error when growlight isn't set up on this garden.
+    /// growlight enablement (load-bearing gate): `None` until the first status
+    /// reply, then the daemon-owned `growlight_enabled` bit (its fail-closed
+    /// `fleet_enabled()`), forced `Some(false)` while locked. The Growlight tab is
+    /// rendered/reachable **only** when `Some(true)` — no tab, no empty pane, no
+    /// error when growlight isn't set up/armed on this garden. Refreshed every
+    /// status tick, so it can't go stale mid-session.
     pub growlight_enabled: Option<bool>,
-    /// Whether the enablement probe has been sent (dedup: `status` refreshes tick
-    /// repeatedly, so probe at most once per session).
-    growlight_probed: bool,
     /// The backlog queue rows (drain order + statuses), parsed read-only from
     /// `growlight/backlog/CLAUDE.md`.
     pub growlight_queue: Vec<GrowlightRow>,
@@ -292,7 +291,6 @@ impl App {
             deploy_selected: 0,
             deploy_loaded: false,
             growlight_enabled: None,
-            growlight_probed: false,
             growlight_queue: Vec::new(),
             growlight_selected: 0,
             growlight_baton_title: None,
@@ -348,18 +346,6 @@ impl App {
     /// Deploy tab's entry list.
     fn load_deploy(&self, ipc: &mut IpcClient) {
         ipc.send("deploy_plan", json!({}), Tag::DeployPlan);
-    }
-
-    /// growlight enablement probe. Lists `config/` (a daemon read verb) so the
-    /// reply can decide whether growlight is set up on this garden — detected via
-    /// the presence of `config/growlight.toml`, **without** assuming the
-    /// `growlight/` pillar exists. Sent at most once per session (unlock-gated).
-    fn probe_growlight(&mut self, ipc: &mut IpcClient) {
-        if self.growlight_probed || self.locked {
-            return;
-        }
-        self.growlight_probed = true;
-        ipc.send("list_tree", json!({ "path": "config" }), Tag::GrowlightProbe);
     }
 
     /// growlight: (re)load the read-only section — the backlog queue table plus a
@@ -492,11 +478,13 @@ impl App {
                         self.locked = s.state != "unlocked";
                         self.tip = s.tip;
                         self.garden_root = s.garden_root;
+                        // Daemon-owned growlight gate, refreshed every tick — the
+                        // client never re-derives it (so it can't disagree). Force
+                        // it off while locked: the section can't load, and the
+                        // daemon fail-closes anyway when the mount is down.
+                        self.growlight_enabled = Some(!self.locked && s.growlight_enabled);
                         if !self.locked && (was_locked || !self.tree.is_loaded("")) {
                             self.load_dir(ipc, "");
-                        }
-                        if !self.locked {
-                            self.probe_growlight(ipc);
                         }
                         if self.locked {
                             self.status = "locked — press u to unlock".into();
@@ -513,7 +501,8 @@ impl App {
                     self.overlay = Overlay::None;
                     self.status = "unlocked".into();
                     self.load_dir(ipc, "");
-                    self.probe_growlight(ipc);
+                    // The status reply we request next carries the daemon-owned
+                    // growlight_enabled bit — no separate probe needed.
                     ipc.send("status", json!({}), Tag::Status);
                 }
                 Err((_, m)) => {
@@ -801,18 +790,6 @@ impl App {
                     }
                 }
             },
-            // growlight enablement probe: `config/growlight.toml` present ⇒ the
-            // section is enabled. A missing `config/` (Err) ⇒ disabled — degrade
-            // silently, never surface an error (the tab simply won't appear).
-            Tag::GrowlightProbe => {
-                let enabled = match reply.result {
-                    Ok(v) => serde_json::from_value::<softfig_ipc::ListTreeReply>(v)
-                        .map(|r| config_has_growlight(&r.entries))
-                        .unwrap_or(false),
-                    Err(_) => false,
-                };
-                self.growlight_enabled = Some(enabled);
-            }
             Tag::GrowlightQueue => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
@@ -1776,16 +1753,6 @@ fn extract_id_attr(tag: &str) -> Option<String> {
         i = start + 2;
     }
     None
-}
-
-/// growlight enablement signal: is `config/growlight.toml` present among the
-/// `config/` listing? This is the lean gate — growlight is "enabled" on a garden
-/// exactly when its fleet config exists, detected without assuming the
-/// `growlight/` pillar dir exists.
-pub fn config_has_growlight(entries: &[softfig_ipc::TreeEntry]) -> bool {
-    entries
-        .iter()
-        .any(|e| !e.is_dir && e.name == "growlight.toml")
 }
 
 /// Parse the managed backlog queue table out of `growlight/backlog/CLAUDE.md`.
@@ -2803,25 +2770,6 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
     }
 
     #[test]
-    fn config_growlight_signal() {
-        // Present ⇒ enabled; a directory named the same, or absence ⇒ not.
-        assert!(config_has_growlight(&[
-            tree_entry("keeper.toml", "config/keeper.toml", false),
-            tree_entry("growlight.toml", "config/growlight.toml", false),
-        ]));
-        assert!(!config_has_growlight(&[tree_entry(
-            "keeper.toml",
-            "config/keeper.toml",
-            false
-        )]));
-        assert!(!config_has_growlight(&[tree_entry(
-            "growlight.toml",
-            "config/growlight.toml",
-            true // a dir, not the file
-        )]));
-    }
-
-    #[test]
     fn latest_baton_picks_highest_numbered_entry() {
         let entries = vec![
             tree_entry("CLAUDE.md", "growlight/baton-log/CLAUDE.md", false),
@@ -2852,58 +2800,53 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
         );
     }
 
-    #[test]
-    fn probe_reply_gates_enablement_present() {
-        let mut app = App::new();
-        assert_eq!(app.growlight_enabled, None); // unprobed
-        let mut ipc = dummy_ipc();
-        app.apply_reply(
-            Reply {
-                id: 1,
-                tag: Tag::GrowlightProbe,
-                result: Ok(json!({
-                    "entries": [
-                        {"name": "keeper.toml", "path": "config/keeper.toml", "is_dir": false},
-                        {"name": "growlight.toml", "path": "config/growlight.toml", "is_dir": false},
-                    ]
-                })),
-            },
-            &mut ipc,
-        );
-        assert_eq!(app.growlight_enabled, Some(true));
+    /// Build a `Tag::Status` reply carrying the daemon-owned growlight gate.
+    fn status_reply(state: &str, growlight_enabled: bool) -> Reply {
+        Reply {
+            id: 1,
+            tag: Tag::Status,
+            result: Ok(serde_json::to_value(StatusReply {
+                state: state.into(),
+                tip: None,
+                garden_root: "/g".into(),
+                protocol_version: softfig_ipc::PROTOCOL_VERSION,
+                relock_pending: false,
+                relock_expires_at: None,
+                growlight_enabled,
+            })
+            .unwrap()),
+        }
     }
 
     #[test]
-    fn probe_reply_disables_when_absent_or_errored() {
+    fn status_reply_carries_growlight_gate() {
         let mut ipc = dummy_ipc();
 
-        // config/ present but no growlight.toml ⇒ disabled.
+        // Unlocked + daemon says enabled ⇒ the tab is gated on.
         let mut app = App::new();
-        app.apply_reply(
-            Reply {
-                id: 1,
-                tag: Tag::GrowlightProbe,
-                result: Ok(json!({
-                    "entries": [
-                        {"name": "keeper.toml", "path": "config/keeper.toml", "is_dir": false},
-                    ]
-                })),
-            },
-            &mut ipc,
-        );
-        assert_eq!(app.growlight_enabled, Some(false));
+        assert_eq!(app.growlight_enabled, None); // no status yet
+        app.apply_reply(status_reply("unlocked", true), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(true));
 
-        // config/ missing entirely (Err) ⇒ disabled, silently (no error surfaced).
+        // Unlocked + daemon says disabled (fresh garden: toml present, fleet off)
+        // ⇒ gated off, silently (no tab, no load attempt, no error splat).
         let mut app2 = App::new();
-        app2.apply_reply(
-            Reply {
-                id: 2,
-                tag: Tag::GrowlightProbe,
-                result: Err((softfig_ipc::ErrorKind::Internal, "no such path".into())),
-            },
-            &mut ipc,
-        );
+        app2.apply_reply(status_reply("unlocked", false), &mut ipc);
         assert_eq!(app2.growlight_enabled, Some(false));
+        assert!(!app2.growlight_loaded);
+    }
+
+    #[test]
+    fn status_reply_forces_growlight_off_when_locked() {
+        let mut ipc = dummy_ipc();
+        let mut app = App::new();
+        // Even if the daemon reports enabled, a locked session shows no tab —
+        // the section can't load while locked.
+        app.apply_reply(status_reply("locked", true), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(false));
+        // Unlock refreshes it back on from the same daemon bit.
+        app.apply_reply(status_reply("unlocked", true), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(true));
     }
 
     #[test]

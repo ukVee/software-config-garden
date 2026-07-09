@@ -46,10 +46,6 @@ pub enum Tag {
     DeployPlan,
     /// M4: apply the deploy plan (`deploy_apply`); reply carries the `Report`.
     DeployApply,
-    /// growlight: enablement probe (`list_tree config`) — the reply's entries
-    /// decide whether the read-only Growlight section is shown at all (present
-    /// iff `config/growlight.toml` exists). No tab, no pane, no error otherwise.
-    GrowlightProbe,
     /// growlight: the backlog queue table (`read_file growlight/backlog/CLAUDE.md`).
     GrowlightQueue,
     /// growlight: list the baton-log dir (`list_tree growlight/baton-log`) to
