@@ -36,7 +36,7 @@
 //! rewrites the baton at its handoff, protocol step 5).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use softfig_ipc::baton::parse_baton;
 
@@ -96,7 +96,7 @@ impl BatonSeeder for FsBatonStore {
             fs::create_dir_all(dir)
                 .map_err(|e| format!("create agent dir {}: {e}", dir.display()))?;
         }
-        let body = seed_baton(&self.garden_name, agent, queue, part);
+        let body = seed_baton(&self.garden_name, agent, queue, part, &path);
         fs::write(&path, body).map_err(|e| format!("write baton {}: {e}", path.display()))
     }
 }
@@ -119,11 +119,18 @@ impl BatonStatusSource for FsBatonStore {
 /// baton out from (mission + finish criteria live in the item doc, which the agent
 /// reads — growlightd does not embed them, matching the single-agent reseed where
 /// the agent fills them in on its first iteration).
-fn seed_baton(garden_name: &str, agent: &str, queue: &str, part: &str) -> String {
+fn seed_baton(garden_name: &str, agent: &str, queue: &str, part: &str, baton_path: &Path) -> String {
     // The full status vocabulary, sourced from the single shared list so the seed
     // can never drift from the classifier (cosmetic gap #3). A fleet member may
     // legitimately write any of these.
     let statuses = softfig_ipc::baton::STATUS_VOCABULARY.join(" / ");
+    // The absolute per-member baton path, stamped into BOTH a `baton-path:`
+    // frontmatter field and a prose "YOUR BATON FILE" anchor so the member knows
+    // deterministically which file to rewrite at handoff — it can never guess the
+    // legacy single-agent root `baton.md` and silently misroute its terminal
+    // status (task 035). This is the WRITE-side root cure that makes 042's
+    // read-side legacy fallback belt-and-suspenders.
+    let baton_path = baton_path.display().to_string();
     format!(
         "---\n\
          loop: {garden_name}\n\
@@ -133,13 +140,17 @@ fn seed_baton(garden_name: &str, agent: &str, queue: &str, part: &str) -> String
          item: {part}\n\
          queue: {queue}\n\
          iteration: 0\n\
+         baton-path: {baton_path}\n\
          ---\n\n\
+         > YOUR BATON FILE — rewrite THIS exact path at every handoff: {baton_path}\n\n\
          # NEXT ACTION\n\
          You are fleet member `{agent}`, assigned backlog item `{part}` on queue `{queue}`.\n\
          Read its spec (the item doc under `growlight/backlog/`) and the protocol injected\n\
          above, reseed this baton from that spec (mission + finish criteria + the first\n\
-         slice/step), then execute one coherent chunk of work. Hand off by rewriting THIS\n\
-         baton: set `status:` to the right value from the growlight baton vocabulary\n\
+         slice/step), then execute one coherent chunk of work. Hand off by rewriting your\n\
+         baton at the path in `baton-path:` / the 'YOUR BATON FILE' anchor above (your\n\
+         per-member `agents/<id>/baton.md` — NEVER the legacy root `baton.md`): set\n\
+         `status:` to the right value from the growlight baton vocabulary\n\
          ({statuses}) — `IN_PROGRESS` carries the SAME part forward; at an item boundary\n\
          (`ITEM_COMPLETE` / `ITEM_DEFERRED`) run `set_item_status` then EXIT and the\n\
          orchestrator claims your next part (a fleet member never self-pulls).\n\n\
@@ -210,6 +221,52 @@ mod tests {
         for status in softfig_ipc::baton::STATUS_VOCABULARY {
             assert!(na.contains(status), "NEXT ACTION must list {status}");
         }
+    }
+
+    #[test]
+    fn seed_stamps_the_per_member_baton_path() {
+        // 035 write-side determinism: the member must be told its OWN absolute
+        // baton path — in the `baton-path:` frontmatter AND a prose "YOUR BATON
+        // FILE" anchor — so it can never guess the legacy single-agent root
+        // `baton.md` and silently misroute its terminal status. Guards finish
+        // criteria #1/#3 (042 owns the read-side fallback; this is the write cure).
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a", "default", "035").expect("seeds");
+
+        let abs = s.baton_path("a").to_str().unwrap().to_string();
+        assert!(abs.ends_with("/agents/a/baton.md"), "sanity: per-member baton path");
+
+        let raw = fs::read_to_string(s.baton_path("a")).unwrap();
+        assert!(
+            raw.contains(&format!("baton-path: {abs}")),
+            "seed stamps the absolute baton path in a `baton-path:` frontmatter field",
+        );
+        assert!(
+            raw.contains(&format!(
+                "YOUR BATON FILE — rewrite THIS exact path at every handoff: {abs}"
+            )),
+            "seed stamps the absolute baton path in a prose anchor near the top of the body",
+        );
+        assert!(
+            raw.contains("NEVER the legacy root `baton.md`"),
+            "the NEXT ACTION steers the member away from the legacy root baton.md",
+        );
+        // The old, path-less "rewriting THIS baton" phrasing is what let a member
+        // guess the legacy location — it must be gone.
+        assert!(
+            !raw.contains("rewriting THIS"),
+            "seed no longer uses the ambiguous path-less 'rewriting THIS baton' phrasing",
+        );
+
+        // The path stamped in the baton is exactly the file `inject.sh` cats and
+        // the reader parses — the same-file-no-drift invariant the whole store rests
+        // on — so a member that rewrites `baton-path:` writes the file growlightd reads.
+        assert_eq!(
+            abs,
+            s.baton_path("a").to_str().unwrap(),
+            "the stamped path is the store's own baton_path (no drift)",
+        );
     }
 
     #[test]
