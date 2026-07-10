@@ -20,10 +20,15 @@ pub mod ignore;
 pub mod intent;
 pub mod log;
 pub mod repo;
+pub mod shared_config;
 pub mod tree;
 pub mod walk;
 
 pub use chain::{Chain, ChainId, ChainKind, ChainRegistry, DEVICE_CHAIN_ID};
+pub use shared_config::{
+    validate_share_add, LocalToggles, ShareValidationError, SharedSubtreeEntry,
+    SharedSubtreesConfig, LOCAL_TOGGLES_FILE, MACHINE_DIRS, SHARED_SUBTREES_FILE,
+};
 pub use commit::{verify_commit, CanonicalCommit};
 pub use error::{CoreError, Result};
 pub use fsck::{run as fsck, run_chain as fsck_chain, FsckReport};

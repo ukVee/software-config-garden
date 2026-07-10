@@ -148,15 +148,17 @@ fn establish_session_locked(
     let fuse_handle = if inner.config.is_fuse_mode() && inner.config.enable_fuse {
         let sink = crate::fuse_sink::AccumulatorSink::spawn(daemon.accumulator.clone());
         let sealed_q: Arc<dyn SealedQuery> = hook.clone();
+        // M5c slice 003 — derive the union-mount registry from the in-garden
+        // allow-list (`config/shared-subtrees.toml` + local toggle sidecar).
+        // Absent/empty ⇒ device_only ⇒ byte-identical to today.
+        let registry = load_chain_registry(&repo, &session_arc, &state_dir);
         match softfig_fuse::FuseMount::mount_with(
             &garden_root,
             &state_dir,
             session_arc.clone(),
             sink,
             Some(sealed_q),
-            // M5c slice 002 — device-only until slice 003 derives the registry
-            // from `config/shared-subtrees.toml`. Byte-identical to today.
-            softfig_vcs::ChainRegistry::device_only(),
+            registry,
         ) {
             Ok(handle) => {
                 softfig_fuse::FuseMount::install_tip_callback(&mut repo, &handle);
@@ -662,14 +664,20 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
             let sink =
                 crate::fuse_sink::AccumulatorSink::spawn(daemon.accumulator.clone());
             let sealed_q: Arc<dyn SealedQuery> = inner.layer_b.clone();
+            // M5c slice 003 — config-derived registry (see `load_chain_registry`).
+            // Absent repo/config ⇒ default() = device_only ⇒ byte-identical.
+            let registry = inner
+                .repo
+                .as_ref()
+                .map(|r| load_chain_registry(r, &session, &state_dir))
+                .unwrap_or_default();
             match softfig_fuse::FuseMount::mount_with(
                 &garden_root,
                 &state_dir,
                 session,
                 sink,
                 Some(sealed_q),
-                // M5c slice 002 — device-only until slice 003 (config-derived).
-                softfig_vcs::ChainRegistry::device_only(),
+                registry,
             ) {
                 Ok(handle) => {
                     if let Some(repo) = inner.repo.as_mut() {
@@ -1442,6 +1450,80 @@ fn normalize_fingerprint(s: &str) -> std::result::Result<String, (ErrorKind, Str
 /// Walk a tree's nested rows looking for the blob hash at
 /// `repo_relative`. Returns `None` if the path doesn't exist or names
 /// a directory.
+/// Build the live [`softfig_vcs::ChainRegistry`] from the in-garden
+/// shared-subtree allow-list (M5c slice 003). Two sources, deliberately split:
+/// the **committed** membership (`config/shared-subtrees.toml`) is read from the
+/// device chain's tip tree — the registry is needed *before* the FUSE mount
+/// exists, so unlike `config/keeper.toml`/`config/peers.toml` (read through the
+/// mount) it comes straight from the encrypted store; the per-device
+/// enable/disable state merges in from the never-committed
+/// `.softfig/shared-subtrees-local.toml` sidecar. Any absent file — or a
+/// decode/parse failure, logged and treated as sharing-off — falls back to an
+/// empty allow-list, i.e. [`softfig_vcs::ChainRegistry::device_only`]
+/// (byte-identical to today).
+pub(crate) fn load_chain_registry(
+    repo: &Repo,
+    session: &softfig_vault::VaultSession,
+    state_dir: &Path,
+) -> softfig_vcs::ChainRegistry {
+    let membership = read_committed_shared_subtrees(repo, session).unwrap_or_default();
+    let local = load_local_toggles(state_dir);
+    softfig_vcs::ChainRegistry::from_shared_config(&membership, &local)
+}
+
+/// Read + decrypt + parse the committed `config/shared-subtrees.toml` from the
+/// device chain tip. `None` when there are no commits yet or the file is absent;
+/// a present-but-broken file logs and yields `None` (fail-safe = sharing off).
+fn read_committed_shared_subtrees(
+    repo: &Repo,
+    session: &softfig_vault::VaultSession,
+) -> Option<softfig_vcs::SharedSubtreesConfig> {
+    let rel = format!(
+        "{}/{}",
+        crate::keeper_toml::CONFIG_DIR,
+        softfig_vcs::SHARED_SUBTREES_FILE
+    );
+    let tip = repo.tip().ok()??;
+    let row = repo.db().get_commit(&tip).ok()?;
+    let blob = resolve_path_in_tree(repo, &row.root_tree, &rel).ok()??;
+    let cipher = repo.objects().get(&blob).ok()?;
+    // The config lives under `config/`, not a sealed path, but decode either
+    // layer defensively so a future seal can't silently break the router.
+    let plain = if softfig_vault::is_layer_b(&cipher) {
+        session.decrypt_layer_b(&rel, &cipher).ok()?
+    } else {
+        session.decrypt_blob(&cipher).ok()?
+    };
+    let text = String::from_utf8(plain).ok()?;
+    match softfig_vcs::SharedSubtreesConfig::from_toml_str(&text) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            eprintln!("keeperd: {rel} parse failed ({e}); shared subtrees off");
+            None
+        }
+    }
+}
+
+/// Load the per-device local-toggle sidecar (`.softfig/shared-subtrees-local.toml`,
+/// never committed — same `.softfig/` home as the peers endpoint cache). Absent
+/// ⇒ nothing disabled; present-but-broken logs and yields defaults.
+fn load_local_toggles(state_dir: &Path) -> softfig_vcs::LocalToggles {
+    let path = state_dir
+        .join(".softfig")
+        .join(softfig_vcs::LOCAL_TOGGLES_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => softfig_vcs::LocalToggles::from_toml_str(&raw).unwrap_or_else(|e| {
+            eprintln!(
+                "keeperd: {} parse failed ({e}); no local toggles",
+                path.display()
+            );
+            softfig_vcs::LocalToggles::default()
+        }),
+        // Absent sidecar is the common case (nothing disabled).
+        Err(_) => softfig_vcs::LocalToggles::default(),
+    }
+}
+
 pub(crate) fn resolve_path_in_tree(
     repo: &Repo,
     root_tree: &Hash,
