@@ -11,9 +11,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod chain;
 pub mod commit;
 pub mod error;
 pub mod fsck;
+pub mod gc;
 pub mod ignore;
 pub mod intent;
 pub mod log;
@@ -21,9 +23,11 @@ pub mod repo;
 pub mod tree;
 pub mod walk;
 
+pub use chain::{Chain, ChainId, ChainKind, ChainRegistry, DEVICE_CHAIN_ID};
 pub use commit::{verify_commit, CanonicalCommit};
 pub use error::{CoreError, Result};
-pub use fsck::{run as fsck, FsckReport};
+pub use fsck::{run as fsck, run_chain as fsck_chain, FsckReport};
+pub use gc::{gc, live_blobs, reachable_from, GcReport, Reachable};
 pub use ignore::{is_ignored, Ignore, IGNORE_FILE, IGNORED_TOP_LEVEL};
 pub use intent::{Intent, KNOWN_INTENTS};
 pub use log::{collect as log_collect, LogIter};

@@ -9,6 +9,7 @@ use softfig_store::{
 };
 use softfig_vault::{Vault, VaultSession};
 
+use crate::chain::ChainRegistry;
 use crate::commit::CanonicalCommit;
 use crate::error::{CoreError, Result};
 use crate::intent::Intent;
@@ -118,6 +119,7 @@ impl Repo {
         let commit_hash = write_commit_tx(
             &mut db,
             session,
+            TIP_REF,
             None,
             &blueprint,
             intent,
@@ -176,7 +178,7 @@ impl Repo {
         let blueprint = tree::build(&objects, session, &snapshot.root)?;
 
         let intent = Intent::init("garden initialized");
-        let commit_hash = write_commit_tx(&mut db, session, None, &blueprint, intent, now)?;
+        let commit_hash = write_commit_tx(&mut db, session, TIP_REF, None, &blueprint, intent, now)?;
 
         Ok((
             Self {
@@ -220,9 +222,16 @@ impl Repo {
             .ok_or_else(|| CoreError::RepoMissing(self.paths.softfig_dir()))
     }
 
-    /// Current `tip` commit, if any.
+    /// Current device-chain `tip` commit, if any.
     pub fn tip(&self) -> Result<Option<Hash>> {
-        Ok(self.db.try_get_ref(TIP_REF)?)
+        self.tip_of(TIP_REF)
+    }
+
+    /// Current tip of an arbitrary chain ref, if set. The device chain is
+    /// [`TIP_REF`]; a shared chain (m5c) is a different ref sharing this same
+    /// `Db`/`ObjectStore`. An unset ref (a chain with no commits yet) is `None`.
+    pub fn tip_of(&self, ref_name: &str) -> Result<Option<Hash>> {
+        Ok(self.db.try_get_ref(ref_name)?)
     }
 
     /// Install (or replace) the tip-changed callback. Fired after a
@@ -274,7 +283,25 @@ impl Repo {
         snapshot: WalkSnapshot,
         intent: Intent,
     ) -> Result<Hash> {
-        let parent = self.tip()?;
+        self.commit_snapshot_to(TIP_REF, session, snapshot, intent)
+    }
+
+    /// Commit a pre-built `snapshot` against the tip of an arbitrary chain
+    /// `ref_name`, advancing that ref only. `commit_snapshot` is the device-chain
+    /// (`TIP_REF`) case; a shared chain (m5c) routes here with its own ref so a
+    /// write lands on exactly the owning chain and never the device chain's ref.
+    ///
+    /// The `tip_changed` callback (the FUSE stat-cache invalidation, single-slot
+    /// today) fires only for the device chain in m5c; slice 002 makes it
+    /// per-chain so a shared chain gets its own invalidation.
+    pub fn commit_snapshot_to(
+        &mut self,
+        ref_name: &str,
+        session: &VaultSession,
+        snapshot: WalkSnapshot,
+        intent: Intent,
+    ) -> Result<Hash> {
+        let parent = self.tip_of(ref_name)?;
         let default_enc = LayerAEncryptor;
         let encryptor: &dyn BlobEncryptor = match self.blob_encryptor.as_ref() {
             Some(enc) => enc.as_ref(),
@@ -282,11 +309,42 @@ impl Repo {
         };
         let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor)?;
         let now = unix_seconds();
-        let hash = write_commit_tx(&mut self.db, session, parent, &blueprint, intent, now)?;
-        if let Some(cb) = &self.tip_changed {
-            cb(&hash);
+        let hash = write_commit_tx(&mut self.db, session, ref_name, parent, &blueprint, intent, now)?;
+        if ref_name == TIP_REF {
+            if let Some(cb) = &self.tip_changed {
+                cb(&hash);
+            }
         }
         Ok(hash)
+    }
+
+    /// The tips of every enabled chain in `registry` (device + enabled shared),
+    /// skipping any chain with no commits yet. This is the live set gc must
+    /// retain and per-chain fsck iterates — deriving it from the registry keeps
+    /// gc safe by construction (no chain's objects are ever collected because
+    /// another chain was gc'd).
+    pub fn live_tips(&self, registry: &ChainRegistry) -> Result<Vec<Hash>> {
+        let mut tips = Vec::new();
+        for chain in registry.enabled_chains() {
+            if let Some(t) = self.tip_of(&chain.ref_name)? {
+                tips.push(t);
+            }
+        }
+        Ok(tips)
+    }
+
+    /// Per-chain fsck over the chain tracked by `ref_name` (see
+    /// [`crate::fsck::run_chain`]).
+    pub fn fsck_chain(&self, ref_name: &str) -> Result<crate::fsck::FsckReport> {
+        crate::fsck::run_chain(&self.db, &self.objects, self.tip_of(ref_name)?)
+    }
+
+    /// Collect loose objects unreachable from any enabled chain in `registry`
+    /// (see [`crate::gc::gc`]). Safe across chains: the retained set is the union
+    /// of every enabled chain's reachable blobs.
+    pub fn gc(&self, registry: &ChainRegistry) -> Result<crate::gc::GcReport> {
+        let tips = self.live_tips(registry)?;
+        crate::gc::gc(&self.db, &self.objects, &tips)
     }
 }
 
@@ -295,6 +353,7 @@ impl Repo {
 fn write_commit_tx(
     db: &mut Db,
     session: &VaultSession,
+    ref_name: &str,
     parent: Option<Hash>,
     blueprint: &Blueprint,
     intent: Intent,
@@ -344,7 +403,7 @@ fn write_commit_tx(
             put_tree(conn, tree_hash, entries)?;
         }
         put_commit(conn, &row)?;
-        set_ref(conn, TIP_REF, &hash)?;
+        set_ref(conn, ref_name, &hash)?;
         Ok(())
     })?;
 

@@ -86,6 +86,18 @@ impl ObjectStore {
         self.paths.object_path(hash).exists()
     }
 
+    /// Remove a loose object by hash. Used by `softfig-vcs`'s gc to collect
+    /// a blob unreachable from every live chain tip. Idempotent: a missing
+    /// object is not an error (already gone / never written).
+    pub fn remove(&self, hash: &Hash) -> Result<()> {
+        let path = self.paths.object_path(hash);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Iterate every object on disk, yielding `(declared_hash, bytes_on_disk)`.
     /// `declared_hash` is parsed from the filename, *not* re-hashed — fsck
     /// uses this to detect mismatches.

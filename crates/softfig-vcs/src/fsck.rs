@@ -23,6 +23,7 @@ use softfig_store::{Db, Hash, ObjectStore, TreeEntryKind};
 
 use crate::commit::{verify_commit, CanonicalCommit};
 use crate::error::Result;
+use crate::gc::reachable_from;
 use crate::tree::canonical_tree_bytes;
 
 #[derive(Debug, Default)]
@@ -148,6 +149,107 @@ pub fn run(db: &Db, objects: &ObjectStore) -> Result<FsckReport> {
     for h in &on_disk {
         if !referenced_blobs.contains(h) {
             report.orphan_objects.push(*h);
+        }
+    }
+
+    Ok(report)
+}
+
+/// Per-chain fsck: verify integrity of everything reachable from a single
+/// chain's tip (`meta/spec-sync.md` "A garden is a composition of chains" — each
+/// chain is fsck'd from its own tip). Unlike [`run`], which sweeps the whole
+/// store, this restricts to the chain's object closure, so an unrelated chain's
+/// objects neither pad the counts nor mask a problem. `tip = None` (an empty
+/// chain) is trivially clean.
+///
+/// Checks, over the reachable closure: each commit's declared hash +
+/// signature + `root_tree` existence; each tree's canonical hash + that its
+/// subtree/blob targets exist (blobs on disk, hashing back to their address).
+/// Orphan detection is a whole-store notion and stays with [`run`].
+pub fn run_chain(db: &Db, objects: &ObjectStore, tip: Option<Hash>) -> Result<FsckReport> {
+    let mut report = FsckReport::default();
+    let Some(tip) = tip else {
+        return Ok(report);
+    };
+    let reach = reachable_from(db, tip)?;
+
+    for ch in &reach.commits {
+        report.commits_checked += 1;
+        let c = db.get_commit(ch)?;
+        let payload_value: serde_json::Value = match serde_json::from_str(&c.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                report
+                    .problems
+                    .push(format!("commit {}: payload not valid json: {e}", c.hash));
+                continue;
+            }
+        };
+        let canon = CanonicalCommit {
+            parent: c.parent,
+            root_tree: c.root_tree,
+            author_device: &c.author_device,
+            author_pubkey: c.author_pubkey,
+            timestamp: c.timestamp,
+            intent: &c.intent,
+            payload: &payload_value,
+            master_key_id: c.master_key_id,
+        };
+        if let Err(e) = verify_commit(&canon, c.hash, &c.signature) {
+            report.problems.push(format!("commit {}: {e}", c.hash));
+        }
+        if let Some(p) = c.parent {
+            if !reach.commits.contains(&p) {
+                report
+                    .problems
+                    .push(format!("commit {}: parent {} unreachable", c.hash, p));
+            }
+        }
+        if !reach.trees.contains(&c.root_tree) {
+            report.problems.push(format!(
+                "commit {}: root_tree {} unreachable",
+                c.hash, c.root_tree
+            ));
+        }
+    }
+
+    for th in &reach.trees {
+        report.trees_checked += 1;
+        let entries = db.get_tree(th)?;
+        let derived = Hash::of(&canonical_tree_bytes(&entries)?);
+        if derived != *th {
+            report
+                .problems
+                .push(format!("tree {th}: derived hash {derived} mismatch"));
+        }
+        for e in &entries {
+            match e.kind {
+                TreeEntryKind::Tree => {
+                    if !reach.trees.contains(&e.target) {
+                        report.problems.push(format!(
+                            "tree {th}: entry {} -> tree {} unreachable",
+                            e.name, e.target
+                        ));
+                    }
+                }
+                TreeEntryKind::Blob => {
+                    if !objects.contains(&e.target) {
+                        report.problems.push(format!(
+                            "tree {th}: entry {} -> blob {} missing",
+                            e.name, e.target
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Each reachable blob must be present and hash back to its address.
+    for blob in &reach.blobs {
+        report.objects_checked += 1;
+        match objects.get(blob) {
+            Ok(_) => {}
+            Err(e) => report.problems.push(format!("blob {blob}: {e}")),
         }
     }
 
