@@ -1517,16 +1517,17 @@ impl TickLogger {
         // `Reconnecting` every tick — a HELD state, not a fresh occurrence — so it
         // narrates once on its entry edge and dedups like the exit dispositions
         // above (task 034). A genuinely new network exit re-arms the edge and re-logs.
+        // One pass: dedup against last tick's latch (`self.reconnecting`) while
+        // rebuilding this tick's set. The check reads the OLD set, so folding the
+        // insert in is behavior-identical to the two split passes it replaces.
         let mut reconnecting_now: BTreeSet<String> = BTreeSet::new();
-        for agent in &r.reconnecting {
-            reconnecting_now.insert(agent.clone());
-        }
         for agent in &r.reconnecting {
             if !self.reconnecting.contains(agent) {
                 out.push(format!(
                     "fleet: {agent} hit a transient network exit (will re-roll)"
                 ));
             }
+            reconnecting_now.insert(agent.clone());
         }
         self.reconnecting = reconnecting_now;
         if r.waiting_for_connectivity != self.offline {
@@ -3200,15 +3201,28 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             );
         }
 
-        // The member re-rolls (leaves the latch): this tick carries no reconnecting
-        // entry, so the edge re-arms. The re-roll narration itself is unchanged.
+        // The re-roll tick, in the shape production ACTUALLY emits: step-1's health
+        // poll re-pushes the still-`Exited` member into `reconnecting` BEFORE step-2
+        // re-rolls it, so a real re-roll tick carries BOTH `reconnecting:[a]` AND the
+        // `Rerolled` outcome. The reconnect line stays silent (still latched — no new
+        // entry edge); only the re-roll narrates. The edge does NOT re-arm on this
+        // tick — the member is still present in `reconnecting`.
         let rerolled = TickReport {
+            reconnecting: vec!["a".into()],
             rerolls: vec![RerollOutcome::Rerolled { agent: "a".into() }],
             ..TickReport::default()
         };
         assert_eq!(
             logger.lines(&rerolled),
             vec!["fleet: re-rolled a (fresh session, same part)".to_string()],
+            "the re-roll narrates but the still-latched reconnect line stays silent",
+        );
+
+        // The fresh session is first observed `Alive` the NEXT tick: no reconnecting
+        // entry, so THIS is where the edge actually re-arms. Nothing to narrate.
+        assert!(
+            logger.lines(&TickReport::default()).is_empty(),
+            "the empty post-re-roll tick re-arms the edge with no narration",
         );
 
         // A genuinely NEW network exit re-logs (the edge re-armed).
