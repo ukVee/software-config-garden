@@ -677,7 +677,11 @@ fn add_verbs_gate_on_their_genre_folder() {
 }
 
 /// `revise_note` treats `code-reviews/` as accretive — a review body can be
-/// revised in place (re-stamped reviewed date), same contract as notes.
+/// revised in place (re-stamped reviewed date), same contract as notes. The
+/// revise commit carries the *code-review* revise intent (finding #10): the
+/// genre owns its revise intent, so a review revision is provenance-labeled
+/// `code_review_revised`, symmetric with its `code_review_added` creation —
+/// not the note path's hardcoded `note_revised`.
 #[test]
 fn revise_note_works_on_code_reviews() {
     let fx = Fixture::start();
@@ -695,6 +699,11 @@ fn revise_note_works_on_code_reviews() {
     assert!(content.starts_with("# first\n"));
     assert!(content.contains("new verdict"));
     assert!(!content.contains("old"));
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "code_review_revised");
+    assert_eq!(payload["id"], 1);
+    assert_eq!(payload["dir"], "projects/demo/code-reviews");
 }
 
 #[test]

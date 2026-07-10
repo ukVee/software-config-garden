@@ -29,13 +29,50 @@ use crate::handlers::{
 
 /// The genre-specific knobs of the shared accretive-write core: which
 /// reserved folder basenames the verb may write into (and the label its
-/// gate error uses), the VCS intent it mints, and the header stamper.
-/// `add_note` and `add_code_review` (task 020) differ only in these.
+/// gate error uses), the VCS intents it mints on add *and* revise, and the
+/// header stamper. `add_note` and `add_code_review` (task 020) differ only in
+/// these. Carrying `revise_intent` alongside `add_intent` keeps the two paths
+/// symmetric: `revise_note` derives the genre from the doc's folder and mints
+/// that genre's revise intent, so a code-review revision commits
+/// `code_review_revised` (not a hardcoded `note_revised`), and every future
+/// genre gets correct revise provenance for free.
 pub(super) struct DocGenre {
     pub allowed: &'static [&'static str],
     pub label: &'static str,
-    pub intent: &'static str,
+    pub add_intent: &'static str,
+    pub revise_intent: &'static str,
     pub doc: fn(title: &str, date_hyphen: &str, body: &str) -> String,
+}
+
+/// The registered accretive genres. `add_note`/`add_code_review` bind one each
+/// on the write path; `revise_note` walks this list to find the genre that owns
+/// a folder (via [`conventions::dir_basename_in`]) so it mints that genre's
+/// revise intent. Add a new genre here and both paths pick it up.
+pub(super) const NOTE_GENRE: DocGenre = DocGenre {
+    allowed: &conventions::NOTE_FOLDERS,
+    label: "notes",
+    add_intent: "note_added",
+    revise_intent: "note_revised",
+    doc: conventions::note_doc,
+};
+
+pub(super) const CODE_REVIEW_GENRE: DocGenre = DocGenre {
+    allowed: &conventions::CODE_REVIEW_FOLDERS,
+    label: "code reviews",
+    add_intent: "code_review_added",
+    revise_intent: "code_review_revised",
+    doc: conventions::note_doc,
+};
+
+const GENRES: &[&DocGenre] = &[&NOTE_GENRE, &CODE_REVIEW_GENRE];
+
+/// Find the registered genre whose allowed folders own `dir_rel`'s basename —
+/// the revise path's counterpart to the add verbs' explicit genre binding.
+fn genre_for_dir(dir_rel: &str) -> Option<&'static DocGenre> {
+    GENRES
+        .iter()
+        .copied()
+        .find(|g| conventions::dir_basename_in(dir_rel, g.allowed))
 }
 
 /// The shared accretive-write core: validate, gate `dir` on the genre's
@@ -109,7 +146,7 @@ pub(super) fn add_numbered_doc(
 
     let payload = serde_json::json!({ "dir": dir_rel, "slug": slug, "number": number });
     let intent =
-        Intent::new(genre.intent, payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+        Intent::new(genre.add_intent, payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let inner = &mut *inner;
     let hash = commit_now(inner, intent)?;
 
@@ -119,19 +156,13 @@ pub(super) fn add_numbered_doc(
 pub fn add_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: AddNoteArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("add_note args: {e}")))?;
-    const GENRE: DocGenre = DocGenre {
-        allowed: &conventions::NOTE_FOLDERS,
-        label: "notes",
-        intent: "note_added",
-        doc: conventions::note_doc,
-    };
     let (path, hash) = add_numbered_doc(
         daemon,
         &args.dir,
         &args.slug,
         args.title.as_deref(),
         &args.body,
-        &GENRE,
+        &NOTE_GENRE,
     )?;
     Ok(serde_json::to_value(AddNoteReply { path, hash }).unwrap())
 }
@@ -150,12 +181,13 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let dir_abs = validate_repo_path(&garden_root, &args.dir).map_err(|m| (ErrorKind::BadArgs, m))?;
     let dir_rel = path_to_repo_rel_string(&garden_root, &dir_abs)
         .ok_or((ErrorKind::BadArgs, "dir outside garden root".into()))?;
-    if !conventions::is_accretive_dir(&dir_rel) {
-        return Err((
-            ErrorKind::NotAccretiveDir,
-            format!("{dir_rel}: not an accretive note folder"),
-        ));
-    }
+    // Derive the genre from the folder (same allowed-folders logic the add
+    // path gates on) so the revise commit mints this genre's revise intent —
+    // not a hardcoded `note_revised` for every accretive folder.
+    let genre = genre_for_dir(&dir_rel).ok_or((
+        ErrorKind::NotAccretiveDir,
+        format!("{dir_rel}: not an accretive note folder"),
+    ))?;
 
     let note_rel = {
         let wt = WorkTree::new(daemon, &inner);
@@ -175,7 +207,7 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             .unwrap_or("note.md");
         let title = conventions::note_title(&existing)
             .unwrap_or_else(|| conventions::slug_from_note_name(filename));
-        let content = conventions::note_doc(&title, &conventions::today_hyphen(), &args.body);
+        let content = (genre.doc)(&title, &conventions::today_hyphen(), &args.body);
 
         wt.write(&note_rel, content.as_bytes())?;
 
@@ -190,8 +222,8 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     };
 
     let payload = serde_json::json!({ "dir": dir_rel, "id": args.id });
-    let intent =
-        Intent::new("note_revised", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    let intent = Intent::new(genre.revise_intent, payload)
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let inner = &mut *inner;
     let hash = commit_now(inner, intent)?;
 

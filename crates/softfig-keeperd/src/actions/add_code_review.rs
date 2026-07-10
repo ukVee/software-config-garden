@@ -14,27 +14,20 @@
 use softfig_ipc::verbs::{AddCodeReviewArgs, AddCodeReviewReply};
 use softfig_ipc::ErrorKind;
 
-use super::add_note::{add_numbered_doc, DocGenre};
-use super::conventions;
+use super::add_note::{add_numbered_doc, CODE_REVIEW_GENRE};
 use crate::daemon::Daemon;
 use crate::handlers::HandlerResult;
 
 pub fn add_code_review(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: AddCodeReviewArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("add_code_review args: {e}")))?;
-    const GENRE: DocGenre = DocGenre {
-        allowed: &conventions::CODE_REVIEW_FOLDERS,
-        label: "code reviews",
-        intent: "code_review_added",
-        doc: conventions::note_doc,
-    };
     let (path, hash) = add_numbered_doc(
         daemon,
         &args.dir,
         &args.slug,
         args.title.as_deref(),
         &args.body,
-        &GENRE,
+        &CODE_REVIEW_GENRE,
     )?;
     Ok(serde_json::to_value(AddCodeReviewReply { path, hash }).unwrap())
 }
