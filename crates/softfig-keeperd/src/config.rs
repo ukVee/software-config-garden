@@ -307,19 +307,14 @@ impl KeeperConfig {
     }
 
     /// M5b: the root dir holding per-peer ciphertext mirrors. The configured
-    /// override, else `$XDG_DATA_HOME/softfig/peers` (falling back to
-    /// `~/.local/share/softfig/peers`, then a relative `softfig/peers` if even
-    /// `$HOME` is unset — the last only happens in a degenerate environment).
+    /// override, else `<xdg-data-home>/softfig/peers` — resolving the base
+    /// through the shared [`softfig_deploy::xdg_data_home`] so the daemon's
+    /// deploy-cache and replica roots share one XDG-resolution policy (absolute
+    /// `$XDG_DATA_HOME`, else `$HOME/.local/share`, else a relative `.`).
     pub fn replica_root(&self) -> PathBuf {
-        if let Some(root) = &self.replica_root {
-            return root.clone();
-        }
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("softfig").join("peers")
+        self.replica_root
+            .clone()
+            .unwrap_or_else(|| softfig_deploy::xdg_data_home().join("softfig").join("peers"))
     }
 
     /// M4 deploy: the `$HOME` boundary the deploy verbs resolve targets against —
@@ -332,19 +327,15 @@ impl KeeperConfig {
     }
 
     /// M4 deploy: the persistent plaintext deploy-cache root — the configured
-    /// override, else `$XDG_DATA_HOME/softfig/deployed` (falling back to
-    /// `~/.local/share/softfig/deployed`). Mirrors the CLI's `default_cache_root`
-    /// and [`replica_root`](Self::replica_root).
+    /// override, else the shared [`softfig_deploy::default_cache_root`]. Both
+    /// this daemon path and the `softfig deploy` CLI resolve the default through
+    /// that one helper, so the two frontends can never diverge — a divergent
+    /// root would make each classify the other's managed symlinks as a Conflict
+    /// and a force-apply could clobber healthy symlinks.
     pub fn deploy_cache_root(&self) -> PathBuf {
-        if let Some(root) = &self.deploy_cache_root {
-            return root.clone();
-        }
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("softfig").join("deployed")
+        self.deploy_cache_root
+            .clone()
+            .unwrap_or_else(softfig_deploy::default_cache_root)
     }
 
     /// Directory containing the on-disk `.softfig/`. Equals
@@ -430,5 +421,30 @@ mod tests {
         assert_eq!(cfg.socket_path, Path::new("/run/sock"));
         assert!(cfg.growlight.allow_relock, "allow_relock stays from pointer");
         assert_eq!(cfg.replica_root.as_deref(), Some(Path::new("/peers")));
+    }
+
+    #[test]
+    fn deploy_cache_root_defaults_to_shared_helper() {
+        // No configured override → the daemon resolves the SAME default the
+        // `softfig deploy` CLI does (both call `softfig_deploy::default_cache_root`),
+        // so a relative $XDG_DATA_HOME can't make the two frontends classify each
+        // other's managed symlinks as Conflict. (Slice 005.)
+        let cfg = KeeperConfig::new("/garden");
+        assert_eq!(cfg.deploy_cache_root(), softfig_deploy::default_cache_root());
+    }
+
+    #[test]
+    fn replica_root_default_shares_the_xdg_base_policy() {
+        let cfg = KeeperConfig::new("/garden");
+        assert_eq!(
+            cfg.replica_root(),
+            softfig_deploy::xdg_data_home().join("softfig").join("peers")
+        );
+    }
+
+    #[test]
+    fn configured_cache_root_override_wins_over_default() {
+        let cfg = KeeperConfig::new("/garden").with_deploy_cache_root("/custom/cache");
+        assert_eq!(cfg.deploy_cache_root(), Path::new("/custom/cache"));
     }
 }

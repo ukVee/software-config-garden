@@ -264,3 +264,47 @@ fn unsafe_dot_name_is_rejected() {
     let err = plan(&fx.load(), &fx.paths).unwrap_err();
     assert!(matches!(err, DeployError::InvalidName(_)), "got {err:?}");
 }
+
+// --- cache-root resolution (slice 005: one policy both frontends share) ---
+
+#[test]
+fn resolve_data_base_prefers_absolute_xdg() {
+    use std::ffi::OsStr;
+    let base = resolve_data_base(Some(OsStr::new("/xdg/data")), Some(OsStr::new("/home/u")));
+    assert_eq!(base, PathBuf::from("/xdg/data"));
+}
+
+#[test]
+fn resolve_data_base_rejects_relative_xdg_and_falls_back_to_home() {
+    use std::ffi::OsStr;
+    // The bug this slice closes: a *relative* $XDG_DATA_HOME made the CLI
+    // (accepted any non-empty value) and the daemon (filtered on is_absolute)
+    // resolve DIFFERENT cache roots. Unified policy = reject relative, fall
+    // back to $HOME/.local/share, so both frontends land on the same root.
+    let base = resolve_data_base(
+        Some(OsStr::new("relative/data")),
+        Some(OsStr::new("/home/u")),
+    );
+    assert_eq!(base, PathBuf::from("/home/u/.local/share"));
+}
+
+#[test]
+fn resolve_data_base_empty_xdg_falls_back_to_home() {
+    use std::ffi::OsStr;
+    let base = resolve_data_base(Some(OsStr::new("")), Some(OsStr::new("/home/u")));
+    assert_eq!(base, PathBuf::from("/home/u/.local/share"));
+}
+
+#[test]
+fn resolve_data_base_no_home_is_relative_dot() {
+    let base = resolve_data_base(None, None);
+    assert_eq!(base, PathBuf::from("."));
+}
+
+#[test]
+fn default_cache_root_composes_off_the_base() {
+    // Read-only over process env: whatever the base resolves to, the deploy
+    // cache root is always `<base>/softfig/deployed`.
+    assert_eq!(default_cache_root(), xdg_data_home().join("softfig").join("deployed"));
+    assert!(default_cache_root().ends_with("softfig/deployed"));
+}

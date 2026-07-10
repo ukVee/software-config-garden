@@ -38,10 +38,9 @@ pub fn run(args: DeployArgs) -> Result<()> {
     let garden_root = args
         .garden_root
         .unwrap_or_else(|| home.join("soft-fig_garden"));
-    let cache_root = match args.cache_root {
-        Some(p) => p,
-        None => default_cache_root(&home)?,
-    };
+    let cache_root = args
+        .cache_root
+        .unwrap_or_else(softfig_deploy::default_cache_root);
     let paths = DeployPaths {
         config_dir: garden_root.join("config"),
         home,
@@ -127,12 +126,4 @@ fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("$HOME not set"))
-}
-
-fn default_cache_root(home: &std::path::Path) -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_DATA_HOME") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => home.join(".local/share"),
-    };
-    Ok(base.join("softfig").join("deployed"))
 }

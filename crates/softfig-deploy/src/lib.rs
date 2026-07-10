@@ -38,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 mod apply;
@@ -107,4 +108,44 @@ impl DeployPaths {
     pub fn source_dir(&self) -> PathBuf {
         self.config_dir.join("source")
     }
+}
+
+/// The XDG data base directory — `$XDG_DATA_HOME` when set to an **absolute**
+/// path, else `$HOME/.local/share`, else a relative `.` in the degenerate case
+/// where neither is usable.
+///
+/// A **relative** `$XDG_DATA_HOME` is rejected (the XDG Base Directory spec
+/// requires the value be an absolute path) and falls through to
+/// `$HOME/.local/share`. This is the single home for that policy: the daemon's
+/// deploy-cache + replica roots and the `softfig deploy` CLI all resolve their
+/// base through here, so they can never diverge (see [`default_cache_root`]).
+pub fn xdg_data_home() -> PathBuf {
+    resolve_data_base(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Pure resolution core for [`xdg_data_home`], taking the two env values
+/// explicitly so it is unit-testable without mutating process-global env.
+fn resolve_data_base(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
+    xdg_data_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The default persistent plaintext deploy-cache root —
+/// `<xdg-data-home>/softfig/deployed` (see [`xdg_data_home`] for the base).
+///
+/// **Both** deploy frontends — the daemon's `KeeperConfig::deploy_cache_root`
+/// and the `softfig deploy` CLI — resolve their default through this one
+/// helper, so the two can never resolve divergent roots. A divergence would
+/// make each frontend classify the other's managed symlinks as
+/// [`Action::Conflict`] (`plan::decide` keys managed-ness on exact
+/// symlink-dest equality), and a `--force` apply would then clobber a healthy
+/// peer-managed symlink.
+pub fn default_cache_root() -> PathBuf {
+    xdg_data_home().join("softfig").join("deployed")
 }
