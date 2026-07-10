@@ -46,8 +46,8 @@ fn renders_vault_frame() {
     app.locked = false;
     app.view = softfig_tui::app::View::Vault;
     app.vault_globs = vec!["secrets/**".into()];
-    app.vault_files = vec!["secrets/api-keys.toml".into()];
-    app.vault_loaded = true;
+    app.vault.items = vec!["secrets/api-keys.toml".into()];
+    app.vault.loaded = true;
     app.reveal = Some(softfig_tui::app::RevealInfo {
         path: "secrets/api-keys.toml".into(),
         temp_path: "/run/user/1000/softfig-reveal-abc.toml".into(),
@@ -85,8 +85,8 @@ fn renders_peers_frame() {
         fingerprint: "2".repeat(64),
         name: "laptop".into(),
     }];
-    app.peers_loaded = true;
-    app.peer_rows = vec![
+    app.peer_list.loaded = true;
+    app.peer_list.items = vec![
         softfig_tui::app::PeerRow::Peer(0),
         softfig_tui::app::PeerRow::Pending(0),
     ];
@@ -121,13 +121,13 @@ fn renders_backup_frame() {
         bytes: 8192,
         last_sync: Some(1_700_000_000),
     }];
-    app.backup_loaded = true;
-    app.backup_rows = vec![
+    app.backup.loaded = true;
+    app.backup.items = vec![
         softfig_tui::app::BackupRow::PushTo(0),
         softfig_tui::app::BackupRow::Hosted(0),
     ];
     // Select the hosted chain so the detail pane shows the mirror stats.
-    app.backup_selected = 1;
+    app.backup.selected = 1;
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -300,8 +300,8 @@ fn renders_deploy_frame() {
     let mut app = App::new();
     app.locked = false;
     app.view = softfig_tui::app::View::Deploy;
-    app.deploy_loaded = true;
-    app.deploy_entries = vec![
+    app.deploy.loaded = true;
+    app.deploy.items = vec![
         DeployPlanEntry {
             name: "bashrc".into(),
             action: DeployAction::CreateSymlink,
@@ -315,9 +315,10 @@ fn renders_deploy_frame() {
             conflict_reason: Some("target is an existing file".into()),
         },
     ];
-    app.deploy_has_conflicts = true;
+    // `deploy_has_conflicts()` is now derived from the entries (the `vimrc`
+    // Conflict above), so the "conflicts!" title still renders.
     // Select the conflicting entry so the detail pane shows its reason.
-    app.deploy_selected = 1;
+    app.deploy.selected = 1;
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -356,7 +357,7 @@ fn renders_growlight_frame_when_enabled() {
     app.locked = false;
     app.growlight_enabled = Some(true);
     app.view = softfig_tui::app::View::Growlight;
-    app.growlight_queue = vec![
+    app.growlight.items = vec![
         GrowlightRow {
             id: "m5b-hardening".into(),
             title: "M5b replication hardening".into(),
@@ -368,7 +369,7 @@ fn renders_growlight_frame_when_enabled() {
             status: "active".into(),
         },
     ];
-    app.growlight_selected = 1;
+    app.growlight.selected = 1;
     app.growlight_baton_title = Some("103-tui-modernize-003.md".into());
     app.growlight_baton = Some("shipped slice 003 — inline-region reveal".into());
 

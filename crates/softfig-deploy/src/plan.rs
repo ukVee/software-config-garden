@@ -26,6 +26,20 @@ pub enum Action {
     Conflict,
 }
 
+impl Action {
+    /// The compact verb rendered for this action. Kept in sync with
+    /// `softfig_ipc::DeployAction::verb` (the wire projection).
+    pub const fn verb(&self) -> &'static str {
+        match self {
+            Action::CreateSymlink => "symlink",
+            Action::ReplaceManaged => "replace",
+            Action::CopyStamped => "copy",
+            Action::SkipUnchanged => "skip",
+            Action::Conflict => "CONFLICT",
+        }
+    }
+}
+
 /// One fully-resolved planned dot.
 #[derive(Debug, Clone)]
 pub struct PlannedEntry {

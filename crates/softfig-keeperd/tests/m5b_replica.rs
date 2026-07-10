@@ -37,18 +37,13 @@ use softfig_net::{
     NetError, PullSummary, ReplicaSink,
 };
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
-use softfig_vault::{params::VaultParams, Vault, VaultSession};
+use softfig_vault::{Vault, VaultSession};
 use softfig_vcs::{Intent, Repo};
 
-const PASS: &str = "correct horse battery staple";
+mod common;
+use common::fast_params;
 
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
+const PASS: &str = "correct horse battery staple";
 
 // --- Loopback replication helpers -------------------------------------------
 

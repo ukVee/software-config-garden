@@ -209,17 +209,18 @@ fn render_history(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_vault(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.vault_files.is_empty() {
+    let items: Vec<ListItem> = if app.vault.items.is_empty() {
         vec![ListItem::new("(no sealed files — :seal a pattern to start)")]
     } else {
-        app.vault_files
+        app.vault
+            .items
             .iter()
             .map(|p| ListItem::new(format!("🔒 {p}")))
             .collect()
     };
     let mut st = ListState::default();
-    if !app.vault_files.is_empty() {
-        st.select(Some(app.vault_selected.min(app.vault_files.len() - 1)));
+    if !app.vault.items.is_empty() {
+        st.select(Some(app.vault.selected.min(app.vault.items.len() - 1)));
     }
     let list = List::new(items)
         .block(
@@ -273,10 +274,11 @@ fn render_vault_detail(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_peers(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.peer_rows.is_empty() {
+    let items: Vec<ListItem> = if app.peer_list.items.is_empty() {
         vec![ListItem::new("(no paired devices — p to pair)")]
     } else {
-        app.peer_rows
+        app.peer_list
+            .items
             .iter()
             .map(|row| match row {
                 PeerRow::Peer(i) => {
@@ -302,8 +304,8 @@ fn render_peers(f: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut st = ListState::default();
-    if !app.peer_rows.is_empty() {
-        st.select(Some(app.peers_selected.min(app.peer_rows.len() - 1)));
+    if !app.peer_list.items.is_empty() {
+        st.select(Some(app.peer_list.selected.min(app.peer_list.items.len() - 1)));
     }
     let title = format!(
         "peers — {} paired · {} pending · {} nearby",
@@ -408,10 +410,11 @@ fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_backup(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.backup_rows.is_empty() {
+    let items: Vec<ListItem> = if app.backup.items.is_empty() {
         vec![ListItem::new("(no backup grants — g to grant a paired host)")]
     } else {
-        app.backup_rows
+        app.backup
+            .items
             .iter()
             .map(|row| match row {
                 BackupRow::PushTo(i) => {
@@ -434,8 +437,8 @@ fn render_backup(f: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut st = ListState::default();
-    if !app.backup_rows.is_empty() {
-        st.select(Some(app.backup_selected.min(app.backup_rows.len() - 1)));
+    if !app.backup.items.is_empty() {
+        st.select(Some(app.backup.selected.min(app.backup.items.len() - 1)));
     }
     let title = format!(
         "backup — {} host me · {} I host · host:{}",
@@ -535,20 +538,24 @@ fn render_backup_detail(f: &mut Frame, app: &App, area: Rect) {
 /// A deploy action's compact verb + display colour (green create, yellow
 /// replace, dim skip, red conflict) — shared by the list + detail panes.
 fn deploy_action_style(a: DeployAction) -> (&'static str, Color) {
-    match a {
-        DeployAction::CreateSymlink => ("symlink", Color::Green),
-        DeployAction::ReplaceManaged => ("replace", Color::Yellow),
-        DeployAction::CopyStamped => ("copy", Color::Green),
-        DeployAction::SkipUnchanged => ("skip", Color::DarkGray),
-        DeployAction::Conflict => ("CONFLICT", Color::Red),
-    }
+    // The verb string is shared with the CLI via the wire enum's `verb()`;
+    // only the colour is a TUI concern, so it stays local here.
+    let color = match a {
+        DeployAction::CreateSymlink => Color::Green,
+        DeployAction::ReplaceManaged => Color::Yellow,
+        DeployAction::CopyStamped => Color::Green,
+        DeployAction::SkipUnchanged => Color::DarkGray,
+        DeployAction::Conflict => Color::Red,
+    };
+    (a.verb(), color)
 }
 
 fn render_deploy(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.deploy_entries.is_empty() {
+    let items: Vec<ListItem> = if app.deploy.items.is_empty() {
         vec![ListItem::new("(no dots in config/deploy.toml)")]
     } else {
-        app.deploy_entries
+        app.deploy
+            .items
             .iter()
             .map(|e| {
                 let (verb, color) = deploy_action_style(e.action);
@@ -560,13 +567,13 @@ fn render_deploy(f: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut st = ListState::default();
-    if !app.deploy_entries.is_empty() {
-        st.select(Some(app.deploy_selected.min(app.deploy_entries.len() - 1)));
+    if !app.deploy.items.is_empty() {
+        st.select(Some(app.deploy.selected.min(app.deploy.items.len() - 1)));
     }
     let title = format!(
         "deploy — {} dot(s){}",
-        app.deploy_entries.len(),
-        if app.deploy_has_conflicts {
+        app.deploy.items.len(),
+        if app.deploy_has_conflicts() {
             " · conflicts!"
         } else {
             ""
@@ -640,10 +647,11 @@ fn growlight_status_color(status: &str) -> Color {
 /// Left pane of the read-only Growlight section: the backlog queue in drain
 /// order, each row `<status>  <id>` coloured by status, the active item bold.
 fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.growlight_queue.is_empty() {
+    let items: Vec<ListItem> = if app.growlight.items.is_empty() {
         vec![ListItem::new("(queue empty or not loaded)")]
     } else {
-        app.growlight_queue
+        app.growlight
+            .items
             .iter()
             .map(|r: &GrowlightRow| {
                 let color = growlight_status_color(&r.status);
@@ -656,10 +664,10 @@ fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut st = ListState::default();
-    if !app.growlight_queue.is_empty() {
-        st.select(Some(app.growlight_selected.min(app.growlight_queue.len() - 1)));
+    if !app.growlight.items.is_empty() {
+        st.select(Some(app.growlight.selected.min(app.growlight.items.len() - 1)));
     }
-    let title = format!("growlight — {} item(s)", app.growlight_queue.len());
+    let title = format!("growlight — {} item(s)", app.growlight.items.len());
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
@@ -701,7 +709,7 @@ fn render_growlight_detail(f: &mut Frame, app: &App, area: Rect) {
     match &app.growlight_baton {
         Some(body) => {
             for l in body.lines() {
-                lines.push(Line::raw(l.to_string()));
+                lines.push(Line::raw(l));
             }
         }
         None => lines.push(Line::styled(

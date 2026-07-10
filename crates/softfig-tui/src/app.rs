@@ -19,6 +19,7 @@ use crate::clip;
 use crate::command::{parse_command, Command};
 use crate::forms::{ActionForm, ActionKind};
 use crate::ipc::{IpcClient, Reply, Tag};
+use crate::listpane::ListPane;
 use crate::tree::TreeModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,9 +185,7 @@ pub struct App {
     pub history: Vec<HistoryLine>,
     pub history_selected: usize,
     pub vault_globs: Vec<String>,
-    pub vault_files: Vec<String>,
-    pub vault_selected: usize,
-    pub vault_loaded: bool,
+    pub vault: ListPane<String>,
     pub reveal: Option<RevealInfo>,
     /// M2c: inline `<vault id="…">` region ids parsed from the currently-opened
     /// file's daemon projection, plus the path they belong to. Drives the
@@ -199,9 +198,7 @@ pub struct App {
     pub discovered: Vec<DiscoveredDevice>,
     /// Flattened selection model over `peers` ++ `pending` ++ `discovered`,
     /// rebuilt on each `pair_list` / `discover_list` reply.
-    pub peer_rows: Vec<PeerRow>,
-    pub peers_selected: usize,
-    pub peers_loaded: bool,
+    pub peer_list: ListPane<PeerRow>,
     /// M5b Backup tab (`replica_status`): whether this device hosts backups.
     pub replica_host: bool,
     /// Device-id fingerprints this device pushes its chain to (the hosts that
@@ -212,15 +209,9 @@ pub struct App {
     pub hosted: Vec<HostedChain>,
     /// Flattened selection model over `replica_push_to` ++ `hosted`, rebuilt on
     /// each `replica_status` reply.
-    pub backup_rows: Vec<BackupRow>,
-    pub backup_selected: usize,
-    pub backup_loaded: bool,
+    pub backup: ListPane<BackupRow>,
     /// M4 Deploy tab (`deploy_plan`): the current plan's per-dot entries.
-    pub deploy_entries: Vec<DeployPlanEntry>,
-    /// True when some entry is a `Conflict` — apply refuses it without force.
-    pub deploy_has_conflicts: bool,
-    pub deploy_selected: usize,
-    pub deploy_loaded: bool,
+    pub deploy: ListPane<DeployPlanEntry>,
     /// Set when a write lands while the Deploy tab is hidden. `deploy_plan` is a
     /// full daemon-side dot diff (re-read `deploy.toml`, `symlink_metadata`+read
     /// per dot, stat+read every target/cache) — expensive eMMC I/O nobody is
@@ -237,13 +228,11 @@ pub struct App {
     pub growlight_enabled: Option<bool>,
     /// The backlog queue rows (drain order + statuses), served read-only as
     /// structured rows by the daemon's `growlight_queue` verb.
-    pub growlight_queue: Vec<GrowlightRow>,
-    pub growlight_selected: usize,
+    pub growlight: ListPane<GrowlightRow>,
     /// The latest baton-log entry (title + body) — the loop's most recent handoff
     /// state, read from the highest-numbered `growlight/baton-log/NNN-*.md`.
     pub growlight_baton_title: Option<String>,
     pub growlight_baton: Option<String>,
-    pub growlight_loaded: bool,
     /// Set when a write lands while the Growlight tab is hidden. `load_growlight`
     /// is three IPC round-trips (`growlight_queue` + a `list_tree` of the
     /// unboundedly-growing baton-log + the latest-entry `read_file`) — too much
@@ -277,35 +266,24 @@ impl App {
             history: Vec::new(),
             history_selected: 0,
             vault_globs: Vec::new(),
-            vault_files: Vec::new(),
-            vault_selected: 0,
-            vault_loaded: false,
+            vault: ListPane::new(),
             reveal: None,
             regions: Vec::new(),
             regions_path: None,
             peers: Vec::new(),
             pending: Vec::new(),
             discovered: Vec::new(),
-            peer_rows: Vec::new(),
-            peers_selected: 0,
-            peers_loaded: false,
+            peer_list: ListPane::new(),
             replica_host: false,
             replica_push_to: Vec::new(),
             hosted: Vec::new(),
-            backup_rows: Vec::new(),
-            backup_selected: 0,
-            backup_loaded: false,
-            deploy_entries: Vec::new(),
-            deploy_has_conflicts: false,
-            deploy_selected: 0,
-            deploy_loaded: false,
+            backup: ListPane::new(),
+            deploy: ListPane::new(),
             deploy_stale: false,
             growlight_enabled: None,
-            growlight_queue: Vec::new(),
-            growlight_selected: 0,
+            growlight: ListPane::new(),
             growlight_baton_title: None,
             growlight_baton: None,
-            growlight_loaded: false,
             growlight_stale: false,
             overlay: Overlay::None,
             status: "starting…".into(),
@@ -380,13 +358,13 @@ impl App {
         if self.view == View::History {
             self.load_history(ipc);
         }
-        if self.vault_loaded {
+        if self.vault.loaded {
             self.load_vault(ipc);
         }
-        if self.peers_loaded {
+        if self.peer_list.loaded {
             self.load_peers(ipc);
         }
-        if self.backup_loaded {
+        if self.backup.loaded {
             self.load_backup(ipc);
         }
         // Deploy + Growlight are the expensive loads (a full daemon-side dot
@@ -394,14 +372,14 @@ impl App {
         // the active view like History is: a write that lands while they're
         // hidden marks them stale to lazily re-fetch on entry, instead of
         // refiring eMMC I/O for a tab nobody is looking at (020 slice 006).
-        if self.deploy_loaded {
+        if self.deploy.loaded {
             if self.view == View::Deploy {
                 self.load_deploy(ipc);
             } else {
                 self.deploy_stale = true;
             }
         }
-        if self.growlight_loaded {
+        if self.growlight.loaded {
             if self.view == View::Growlight {
                 self.load_growlight(ipc);
             } else {
@@ -430,14 +408,12 @@ impl App {
                 rows.push(PeerRow::Discovered(i));
             }
         }
-        self.peer_rows = rows;
-        if self.peers_selected >= self.peer_rows.len() {
-            self.peers_selected = self.peer_rows.len().saturating_sub(1);
-        }
+        self.peer_list.items = rows;
+        self.peer_list.clamp();
     }
 
     pub fn selected_peer_row(&self) -> Option<PeerRow> {
-        self.peer_rows.get(self.peers_selected).copied()
+        self.peer_list.selected().copied()
     }
 
     /// Rebuild the Backup view's flattened selection list — hosts that back me
@@ -451,18 +427,27 @@ impl App {
         for i in 0..self.hosted.len() {
             rows.push(BackupRow::Hosted(i));
         }
-        self.backup_rows = rows;
-        if self.backup_selected >= self.backup_rows.len() {
-            self.backup_selected = self.backup_rows.len().saturating_sub(1);
-        }
+        self.backup.items = rows;
+        self.backup.clamp();
     }
 
     pub fn selected_backup_row(&self) -> Option<BackupRow> {
-        self.backup_rows.get(self.backup_selected).copied()
+        self.backup.selected().copied()
     }
 
     pub fn selected_deploy_entry(&self) -> Option<&DeployPlanEntry> {
-        self.deploy_entries.get(self.deploy_selected)
+        self.deploy.selected()
+    }
+
+    /// True when some entry is a `Conflict` — apply refuses it without force.
+    /// Derived from the plan entries rather than stored: the daemon sets
+    /// `DeployPlanReply.has_conflicts = plan.has_conflicts()` and maps
+    /// `Action::Conflict → DeployAction::Conflict` 1:1, so this is equivalent.
+    pub fn deploy_has_conflicts(&self) -> bool {
+        self.deploy
+            .items
+            .iter()
+            .any(|e| e.action == DeployAction::Conflict)
     }
 
     /// The advertised name for a push_to host, if it's a loaded ring member.
@@ -476,11 +461,11 @@ impl App {
 
     /// The one `active` backlog item, if any (the loop runs ≤1 active at a time).
     pub fn growlight_active_item(&self) -> Option<&GrowlightRow> {
-        self.growlight_queue.iter().find(|r| r.status == "active")
+        self.growlight.items.iter().find(|r| r.status == "active")
     }
 
     pub fn selected_growlight_row(&self) -> Option<&GrowlightRow> {
-        self.growlight_queue.get(self.growlight_selected)
+        self.growlight.selected()
     }
 
     fn hint_growlight_readonly(&mut self) {
@@ -613,11 +598,7 @@ impl App {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<VaultListSealedReply>(v) {
                         self.vault_globs = r.globs;
-                        self.vault_files = r.matching_files;
-                        self.vault_loaded = true;
-                        if self.vault_selected >= self.vault_files.len() {
-                            self.vault_selected = self.vault_files.len().saturating_sub(1);
-                        }
+                        self.vault.set_items(r.matching_files);
                     }
                 }
                 Err((_, m)) => self.status = format!("vault list: {m}"),
@@ -651,7 +632,7 @@ impl App {
                     if let Ok(r) = serde_json::from_value::<PairListReply>(v) {
                         self.peers = r.peers;
                         self.pending = r.pending;
-                        self.peers_loaded = true;
+                        self.peer_list.loaded = true;
                         self.rebuild_peer_rows();
                     }
                 }
@@ -734,7 +715,7 @@ impl App {
                         self.replica_host = r.host;
                         self.replica_push_to = r.push_to;
                         self.hosted = r.hosted;
-                        self.backup_loaded = true;
+                        self.backup.loaded = true;
                         self.rebuild_backup_rows();
                     }
                     Err(e) => self.status = format!("replica status: malformed reply: {e}"),
@@ -782,12 +763,7 @@ impl App {
             Tag::DeployPlan => match reply.result {
                 Ok(v) => match serde_json::from_value::<DeployPlanReply>(v) {
                     Ok(r) => {
-                        self.deploy_entries = r.entries;
-                        self.deploy_has_conflicts = r.has_conflicts;
-                        self.deploy_loaded = true;
-                        if self.deploy_selected >= self.deploy_entries.len() {
-                            self.deploy_selected = self.deploy_entries.len().saturating_sub(1);
-                        }
+                        self.deploy.set_items(r.entries);
                     }
                     Err(e) => self.status = format!("deploy plan: malformed reply: {e}"),
                 },
@@ -823,12 +799,7 @@ impl App {
             Tag::GrowlightQueue => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<GrowlightQueueReply>(v) {
-                        self.growlight_queue = r.rows;
-                        self.growlight_loaded = true;
-                        if self.growlight_selected >= self.growlight_queue.len() {
-                            self.growlight_selected =
-                                self.growlight_queue.len().saturating_sub(1);
-                        }
+                        self.growlight.set_items(r.rows);
                     }
                 }
                 Err((_, m)) => self.status = format!("growlight queue: {m}"),
@@ -919,19 +890,19 @@ impl App {
             }
             KeyCode::Char('3') => {
                 self.view = View::Vault;
-                if !self.vault_loaded && !self.locked {
+                if !self.vault.loaded && !self.locked {
                     self.load_vault(ipc);
                 }
             }
             KeyCode::Char('4') => {
                 self.view = View::Peers;
-                if !self.peers_loaded && !self.locked {
+                if !self.peer_list.loaded && !self.locked {
                     self.load_peers(ipc);
                 }
             }
             KeyCode::Char('5') => {
                 self.view = View::Backup;
-                if !self.backup_loaded && !self.locked {
+                if !self.backup.loaded && !self.locked {
                     self.load_backup(ipc);
                 }
             }
@@ -940,7 +911,7 @@ impl App {
                 // Re-fetch on first entry, or when a write marked the tab stale
                 // while it was hidden (020 slice 006); consume the mark so we
                 // don't re-fetch again until the next hidden write.
-                if (!self.deploy_loaded || self.deploy_stale) && !self.locked {
+                if (!self.deploy.loaded || self.deploy_stale) && !self.locked {
                     self.deploy_stale = false;
                     self.load_deploy(ipc);
                 }
@@ -949,7 +920,7 @@ impl App {
             // otherwise, so `7` is inert on a garden without growlight.
             KeyCode::Char('7') if self.growlight_enabled == Some(true) => {
                 self.view = View::Growlight;
-                if (!self.growlight_loaded || self.growlight_stale) && !self.locked {
+                if (!self.growlight.loaded || self.growlight_stale) && !self.locked {
                     self.growlight_stale = false;
                     self.load_growlight(ipc);
                 }
@@ -1013,21 +984,11 @@ impl App {
             View::History => {
                 self.history_selected = self.history_selected.saturating_sub(1);
             }
-            View::Vault => {
-                self.vault_selected = self.vault_selected.saturating_sub(1);
-            }
-            View::Peers => {
-                self.peers_selected = self.peers_selected.saturating_sub(1);
-            }
-            View::Backup => {
-                self.backup_selected = self.backup_selected.saturating_sub(1);
-            }
-            View::Deploy => {
-                self.deploy_selected = self.deploy_selected.saturating_sub(1);
-            }
-            View::Growlight => {
-                self.growlight_selected = self.growlight_selected.saturating_sub(1);
-            }
+            View::Vault => self.vault.up(),
+            View::Peers => self.peer_list.up(),
+            View::Backup => self.backup.up(),
+            View::Deploy => self.deploy.up(),
+            View::Growlight => self.growlight.up(),
         }
     }
 
@@ -1039,31 +1000,11 @@ impl App {
                     self.history_selected += 1;
                 }
             }
-            View::Vault => {
-                if self.vault_selected + 1 < self.vault_files.len() {
-                    self.vault_selected += 1;
-                }
-            }
-            View::Peers => {
-                if self.peers_selected + 1 < self.peer_rows.len() {
-                    self.peers_selected += 1;
-                }
-            }
-            View::Backup => {
-                if self.backup_selected + 1 < self.backup_rows.len() {
-                    self.backup_selected += 1;
-                }
-            }
-            View::Deploy => {
-                if self.deploy_selected + 1 < self.deploy_entries.len() {
-                    self.deploy_selected += 1;
-                }
-            }
-            View::Growlight => {
-                if self.growlight_selected + 1 < self.growlight_queue.len() {
-                    self.growlight_selected += 1;
-                }
-            }
+            View::Vault => self.vault.down(),
+            View::Peers => self.peer_list.down(),
+            View::Backup => self.backup.down(),
+            View::Deploy => self.deploy.down(),
+            View::Growlight => self.growlight.down(),
         }
     }
 
@@ -1252,7 +1193,7 @@ impl App {
             return;
         }
         let target = match self.view {
-            View::Vault => self.vault_files.get(self.vault_selected).cloned(),
+            View::Vault => self.vault.selected().cloned(),
             View::Browse => self
                 .tree
                 .selected_row()
@@ -1878,9 +1819,9 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.vault_loaded);
+        assert!(app.vault.loaded);
         assert_eq!(app.vault_globs, vec!["secrets/**".to_string()]);
-        assert_eq!(app.vault_files.len(), 2);
+        assert_eq!(app.vault.items.len(), 2);
     }
 
     #[test]
@@ -2150,12 +2091,12 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.peers_loaded);
+        assert!(app.peer_list.loaded);
         assert_eq!(app.peers.len(), 1);
         assert_eq!(app.pending.len(), 1);
         // Peers first, then pending.
         assert_eq!(
-            app.peer_rows,
+            app.peer_list.items,
             vec![PeerRow::Peer(0), PeerRow::Pending(0)]
         );
     }
@@ -2206,12 +2147,12 @@ mod tests {
         let mut ipc = dummy_ipc();
 
         // Row 0 is the settled peer → activating does not open a confirm.
-        app.peers_selected = 0;
+        app.peer_list.selected = 0;
         app.activate(&mut ipc);
         assert!(matches!(app.overlay, Overlay::None));
 
         // Row 1 is the pending pairing → activating opens the SAS confirm.
-        app.peers_selected = 1;
+        app.peer_list.selected = 1;
         app.activate(&mut ipc);
         match &app.overlay {
             Overlay::PairConfirm { name, sas, .. } => {
@@ -2231,7 +2172,7 @@ mod tests {
         app.pending = vec![pending("laptop", &"22".repeat(32), "123 456")];
         app.rebuild_peer_rows();
 
-        app.peers_selected = 0; // a ring member
+        app.peer_list.selected = 0; // a ring member
         app.start_unpair();
         match &app.overlay {
             Overlay::Unpair { name, fingerprint, .. } => {
@@ -2242,7 +2183,7 @@ mod tests {
         }
 
         app.overlay = Overlay::None;
-        app.peers_selected = 1; // the pending row → cannot unpair
+        app.peer_list.selected = 1; // the pending row → cannot unpair
         app.start_unpair();
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("paired device"));
@@ -2289,7 +2230,7 @@ mod tests {
         ];
         app.rebuild_peer_rows();
         assert_eq!(
-            app.peer_rows,
+            app.peer_list.items,
             vec![
                 PeerRow::Peer(0),
                 PeerRow::Pending(0),
@@ -2305,7 +2246,7 @@ mod tests {
         app.view = View::Peers;
         app.discovered = vec![discovered(Some("desktop"), &"33".repeat(32), Some("10.0.0.3:9100"))];
         app.rebuild_peer_rows();
-        app.peers_selected = 0; // the lone discovered row
+        app.peer_list.selected = 0; // the lone discovered row
         let mut ipc = dummy_ipc();
 
         app.pair_selected(&mut ipc);
@@ -2322,7 +2263,7 @@ mod tests {
         app.view = View::Peers;
         app.peers = vec![peer("tablet", &"11".repeat(32))];
         app.rebuild_peer_rows();
-        app.peers_selected = 0; // a ring member, not discovered
+        app.peer_list.selected = 0; // a ring member, not discovered
         let mut ipc = dummy_ipc();
 
         app.pair_selected(&mut ipc);
@@ -2342,7 +2283,7 @@ mod tests {
         app.start_reveal(&mut ipc);
         assert!(matches!(app.overlay, Overlay::None));
 
-        app.vault_files = vec!["secrets/api-keys.toml".into()];
+        app.vault.items = vec!["secrets/api-keys.toml".into()];
         app.start_reveal(&mut ipc);
         match &app.overlay {
             Overlay::Reveal { path, .. } => assert_eq!(path, "secrets/api-keys.toml"),
@@ -2382,13 +2323,13 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.backup_loaded);
+        assert!(app.backup.loaded);
         assert!(app.replica_host);
         assert_eq!(app.replica_push_to.len(), 1);
         assert_eq!(app.hosted.len(), 1);
         // Hosts-that-back-me first, then chains-I-host.
         assert_eq!(
-            app.backup_rows,
+            app.backup.items,
             vec![BackupRow::PushTo(0), BackupRow::Hosted(0)]
         );
     }
@@ -2421,7 +2362,7 @@ mod tests {
         app.rebuild_backup_rows();
 
         // Row 0 is a granted host → revoke opens the confirm on its fingerprint.
-        app.backup_selected = 0;
+        app.backup.selected = 0;
         app.start_revoke();
         match &app.overlay {
             Overlay::ReplicaRevoke { fingerprint, .. } => {
@@ -2432,7 +2373,7 @@ mod tests {
 
         // Row 1 is a chain I host → cannot be revoked (it's a mirror, not a grant).
         app.overlay = Overlay::None;
-        app.backup_selected = 1;
+        app.backup.selected = 1;
         app.start_revoke();
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("granted host"));
@@ -2447,7 +2388,7 @@ mod tests {
         app.view = View::Backup;
         app.replica_push_to = vec!["11".repeat(32)];
         app.rebuild_backup_rows();
-        app.backup_selected = 0;
+        app.backup.selected = 0;
         app.start_revoke();
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("locked"));
@@ -2521,12 +2462,12 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.deploy_loaded);
-        assert_eq!(app.deploy_entries.len(), 2);
-        assert!(app.deploy_has_conflicts);
+        assert!(app.deploy.loaded);
+        assert_eq!(app.deploy.items.len(), 2);
+        assert!(app.deploy_has_conflicts());
 
         // Select the last row, then a smaller plan arrives → selection clamps.
-        app.deploy_selected = 1;
+        app.deploy.selected = 1;
         app.apply_reply(
             Reply {
                 id: 2,
@@ -2539,9 +2480,9 @@ mod tests {
             },
             &mut ipc,
         );
-        assert_eq!(app.deploy_entries.len(), 1);
-        assert_eq!(app.deploy_selected, 0);
-        assert!(!app.deploy_has_conflicts);
+        assert_eq!(app.deploy.items.len(), 1);
+        assert_eq!(app.deploy.selected, 0);
+        assert!(!app.deploy_has_conflicts());
     }
 
     // ---- 020 slice 006: refresh_view gates the expensive tab loads on view ----
@@ -2557,8 +2498,8 @@ mod tests {
         app.growlight_enabled = Some(true);
         // Both expensive tabs were visited once (load-once flags set); the user
         // is now looking at Browse.
-        app.deploy_loaded = true;
-        app.growlight_loaded = true;
+        app.deploy.loaded = true;
+        app.growlight.loaded = true;
         app.view = View::Browse;
         let mut ipc = dummy_ipc();
 
@@ -2605,7 +2546,7 @@ mod tests {
     fn refresh_view_refetches_active_expensive_tab_without_marking_stale() {
         let mut app = App::new();
         app.locked = false;
-        app.deploy_loaded = true;
+        app.deploy.loaded = true;
         app.view = View::Deploy;
         let mut ipc = dummy_ipc();
         app.apply_reply(
@@ -2842,7 +2783,7 @@ mod tests {
         let mut app2 = App::new();
         app2.apply_reply(status_reply("unlocked", false), &mut ipc);
         assert_eq!(app2.growlight_enabled, Some(false));
-        assert!(!app2.growlight_loaded);
+        assert!(!app2.growlight.loaded);
     }
 
     #[test]
@@ -2901,8 +2842,8 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.growlight_loaded);
-        assert_eq!(app.growlight_queue.len(), 3);
+        assert!(app.growlight.loaded);
+        assert_eq!(app.growlight.items.len(), 3);
         let active = app.growlight_active_item().expect("active item found");
         assert_eq!(active.id, "tui-modernize");
         // The piped title round-trips through the wire, not garbled.

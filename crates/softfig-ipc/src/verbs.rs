@@ -1576,6 +1576,21 @@ pub enum DeployAction {
     Conflict,
 }
 
+impl DeployAction {
+    /// The compact verb rendered for this action. Must mirror
+    /// `softfig_deploy::Action::verb` (the impl-side enum in the deploy crate;
+    /// no crate dependency couples them, so the two stay in sync by hand).
+    pub const fn verb(&self) -> &'static str {
+        match self {
+            DeployAction::CreateSymlink => "symlink",
+            DeployAction::ReplaceManaged => "replace",
+            DeployAction::CopyStamped => "copy",
+            DeployAction::SkipUnchanged => "skip",
+            DeployAction::Conflict => "CONFLICT",
+        }
+    }
+}
+
 /// One planned dot as surfaced to the Deploy tab. Metadata only — the source
 /// bytes never cross IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]

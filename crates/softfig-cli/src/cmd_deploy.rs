@@ -77,20 +77,13 @@ pub fn run(args: DeployArgs) -> Result<()> {
 }
 
 fn print_plan(plan: &Plan) {
-    use softfig_deploy::Action;
     if plan.entries.is_empty() {
         println!("No dots in config/deploy.toml.");
         return;
     }
     println!("Plan ({} dot(s)):", plan.entries.len());
     for e in &plan.entries {
-        let verb = match e.action {
-            Action::CreateSymlink => "symlink",
-            Action::ReplaceManaged => "replace",
-            Action::CopyStamped => "copy",
-            Action::SkipUnchanged => "skip",
-            Action::Conflict => "CONFLICT",
-        };
+        let verb = e.action.verb();
         let extra = e
             .conflict_reason
             .as_deref()
