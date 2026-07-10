@@ -249,27 +249,60 @@ impl DirtySetAccumulator {
             None => return,
         };
         let hook = inner.layer_b.clone();
-        // One in-memory working-tree snapshot drives BOTH id-promotion and the
-        // commit — neither reads `garden_root` back through the filesystem. In
-        // FUSE mode `garden_root` is the mount this daemon serves, so walking or
+        // In-memory working-tree snapshot(s) drive id-promotion + the commit —
+        // never reading `garden_root` back through the filesystem. In FUSE mode
+        // `garden_root` is the mount this daemon serves, so walking or
         // `fs::read`-ing it here (under `inner`, on the flush path) is the
         // 2026-06-21 mount-read deadlock, and the kernel would hand back the
-        // reader-redacted view, not plaintext; `workdir_snapshot` reconstructs
-        // the tip∪overlay plaintext from the FUSE state instead (editor writes
+        // reader-redacted view, not plaintext; the FUSE driver reconstructs the
+        // tip∪overlay plaintext from its own state instead (editor writes
         // already live in the overlay). In direct mode `garden_root` is a real
-        // dir, so a plain `walk` is safe — and one snapshot reused for promotion
-        // + commit replaces the former read-per-path + a second walk in
-        // `commit_workdir`. Captured before borrowing `repo` (disjoint field).
-        let snapshot = match inner.fuse.as_ref() {
-            Some(mount) => match mount.workdir_snapshot() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("keeperd: watcher: workdir snapshot failed: {e}");
-                    return;
+        // dir, so a plain `walk` is safe. Captured before borrowing `repo`.
+        //
+        // M5c slice 002 — the FUSE mount is a **union** over its chains, so the
+        // commit routes per owning chain: the touched paths pick which chains
+        // this flush advances (a shared-only write must not move the device
+        // ref), the device chain keeps the Layer-B promotion path, and each
+        // shared chain (m5c: a plaintext local chain) gets a plain commit to its
+        // own ref. `device_only` ⇒ every path routes to the device chain, so a
+        // single device commit fires exactly as before.
+        let touched_paths: Vec<String> = dirty.all_paths();
+        let (device_snapshot, shared_snapshots): (
+            Option<softfig_vcs::WalkSnapshot>,
+            Vec<(String, softfig_vcs::WalkSnapshot)>,
+        ) = match inner.fuse.as_ref() {
+            Some(mount) => {
+                let registry = mount.registry();
+                let mut affected: Vec<String> = Vec::new();
+                for p in &touched_paths {
+                    let r = registry.owning_chain(std::path::Path::new(p)).ref_name.clone();
+                    if !affected.contains(&r) {
+                        affected.push(r);
+                    }
                 }
-            },
+                let snaps = match mount.chain_snapshots() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("keeperd: watcher: chain snapshots failed: {e}");
+                        return;
+                    }
+                };
+                let mut device = None;
+                let mut shared = Vec::new();
+                for (ref_name, snap) in snaps {
+                    if !affected.contains(&ref_name) {
+                        continue;
+                    }
+                    if ref_name == softfig_vcs::TIP_REF {
+                        device = Some(snap);
+                    } else {
+                        shared.push((ref_name, snap));
+                    }
+                }
+                (device, shared)
+            }
             None => match softfig_vcs::walk(&garden_root) {
-                Ok(s) => s,
+                Ok(s) => (Some(s), Vec::new()),
                 Err(e) => {
                     eprintln!("keeperd: watcher: workdir walk failed: {e}");
                     return;
@@ -280,56 +313,74 @@ impl DirtySetAccumulator {
             Some(r) => r,
             None => return,
         };
+        let mut committed = false;
 
-        // Prior-tip snapshot is needed twice: once to decide whether a
-        // `manual_edit` should be promoted to `vault_seal`, and once
-        // to back the region encoder's placeholder preservation. Build
-        // it once and reuse.
-        let prior_snap = match crate::layer_b::build_prior_tip_snapshot(repo, &session) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("keeperd: watcher: prior-tip snapshot failed: {e}");
-                return;
+        // Device chain — the Layer-B-aware commit path (prior-tip snapshot for
+        // manual_edit → vault_seal promotion + region placeholder preservation).
+        // Skipped when this flush touched no device-owned path.
+        if let Some(snapshot) = device_snapshot {
+            let prior_snap = match crate::layer_b::build_prior_tip_snapshot(repo, &session) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("keeperd: watcher: prior-tip snapshot failed: {e}");
+                    return;
+                }
+            };
+            let promoted = if classified.intent == "manual_edit" {
+                crate::layer_b::promote_manual_edit_for_new_ids(
+                    &touched_paths,
+                    &snapshot,
+                    &session,
+                    &prior_snap,
+                )
+            } else {
+                None
+            };
+            let intent = if let Some(p) = promoted {
+                p
+            } else {
+                match Intent::new(&classified.intent, classified.payload.clone()) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("keeperd: watcher: invalid auto-classified intent: {e}");
+                        return;
+                    }
+                }
+            };
+            hook.install_prior_tip(prior_snap);
+            let result = repo.commit_snapshot(&session, snapshot, intent);
+            hook.clear_prior_tip();
+            match result {
+                Ok(_) => committed = true,
+                Err(e) => eprintln!("keeperd: watcher: commit failed: {e}"),
             }
-        };
+        }
 
-        let promoted = if classified.intent == "manual_edit" {
-            let touched_paths: Vec<String> = dirty.all_paths();
-            crate::layer_b::promote_manual_edit_for_new_ids(
-                &touched_paths,
-                &snapshot,
-                &session,
-                &prior_snap,
-            )
-        } else {
-            None
-        };
-
-        let intent = if let Some(p) = promoted {
-            p
-        } else {
-            match Intent::new(&classified.intent, classified.payload) {
+        // Shared chains — a plain per-ref commit (m5c has no shared-content
+        // crypto, so no Layer-B promotion). Each advances only its own ref.
+        for (ref_name, snap) in shared_snapshots {
+            let intent = match Intent::new(&classified.intent, classified.payload.clone()) {
                 Ok(i) => i,
                 Err(e) => {
                     eprintln!("keeperd: watcher: invalid auto-classified intent: {e}");
-                    return;
+                    continue;
+                }
+            };
+            match repo.commit_snapshot_to(&ref_name, &session, snap, intent) {
+                Ok(_) => committed = true,
+                Err(e) => {
+                    eprintln!("keeperd: watcher: shared-chain commit to {ref_name} failed: {e}")
                 }
             }
-        };
+        }
 
-        hook.install_prior_tip(prior_snap);
-        let result = repo.commit_snapshot(&session, snapshot, intent);
-        hook.clear_prior_tip();
-        match result {
-            Ok(_) => {
-                // Slice 1 (M5b-hardening): an auto-commit advanced the tip — wake
-                // the replica push loop so backups fire event-driven, not on the
-                // ~20s reconcile poll. No-op when net is down / nothing granted.
-                if let Some(net) = inner.net.as_ref() {
-                    net.signal_commit();
-                }
+        // Slice 1 (M5b-hardening): an auto-commit advanced a tip — wake the
+        // replica push loop so backups fire event-driven, not on the ~20s
+        // reconcile poll. No-op when net is down / nothing granted.
+        if committed {
+            if let Some(net) = inner.net.as_ref() {
+                net.signal_commit();
             }
-            Err(e) => eprintln!("keeperd: watcher: commit failed: {e}"),
         }
     }
 

@@ -18,11 +18,14 @@ use crate::walk::{self, WalkSnapshot};
 
 pub const TIP_REF: &str = "tip";
 
-/// Subscriber called after a successful `commit_workdir` advances the tip.
-/// One slot per repo for v1; M2a wires the FUSE driver here so it can
-/// drop its stat cache and broadcast inval_inode notifications. If a
-/// second consumer ever shows up (sync push?), promote to a Vec.
-pub type TipChangedCallback = Box<dyn Fn(&Hash) + Send + Sync>;
+/// Subscriber called after a successful commit advances a chain's ref. It
+/// receives the `ref_name` that moved and the new tip hash, so a consumer can
+/// invalidate **per chain** (M5c slice 002 union mount): the device chain
+/// (`TIP_REF`) and each shared chain fire the same slot, distinguished by
+/// `ref_name`. M2a wires the FUSE driver here so it can drop its stat cache and
+/// broadcast inval_inode notifications. One slot per repo for v1; if a second
+/// consumer ever shows up (sync push?), promote to a Vec.
+pub type TipChangedCallback = Box<dyn Fn(&str, &Hash) + Send + Sync>;
 
 /// A garden's VCS repository. Holds the path layout, an opened sqlite
 /// connection, and the object store. Does not hold a `VaultSession` —
@@ -239,7 +242,7 @@ impl Repo {
     /// driver here.
     pub fn set_tip_changed_callback<F>(&mut self, cb: F)
     where
-        F: Fn(&Hash) + Send + Sync + 'static,
+        F: Fn(&str, &Hash) + Send + Sync + 'static,
     {
         self.tip_changed = Some(Box::new(cb));
     }
@@ -291,9 +294,9 @@ impl Repo {
     /// (`TIP_REF`) case; a shared chain (m5c) routes here with its own ref so a
     /// write lands on exactly the owning chain and never the device chain's ref.
     ///
-    /// The `tip_changed` callback (the FUSE stat-cache invalidation, single-slot
-    /// today) fires only for the device chain in m5c; slice 002 makes it
-    /// per-chain so a shared chain gets its own invalidation.
+    /// The `tip_changed` callback (the FUSE stat-cache invalidation) fires for
+    /// **whichever** ref this commit advanced, carrying `ref_name` so the FUSE
+    /// driver can recompose the union view and invalidate per chain.
     pub fn commit_snapshot_to(
         &mut self,
         ref_name: &str,
@@ -310,10 +313,8 @@ impl Repo {
         let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor)?;
         let now = unix_seconds();
         let hash = write_commit_tx(&mut self.db, session, ref_name, parent, &blueprint, intent, now)?;
-        if ref_name == TIP_REF {
-            if let Some(cb) = &self.tip_changed {
-                cb(&hash);
-            }
+        if let Some(cb) = &self.tip_changed {
+            cb(ref_name, &hash);
         }
         Ok(hash)
     }

@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::repo::TIP_REF;
+use crate::walk::WalkSnapshot;
 
 /// A chain's stable identifier. The device chain uses [`DEVICE_CHAIN_ID`]; a
 /// shared chain's id is assigned when it is added (slice 003).
@@ -160,6 +161,43 @@ impl ChainRegistry {
     /// per-chain fsck and for gc (whose live blobs are the union across these).
     pub fn enabled_chains(&self) -> impl Iterator<Item = &Chain> {
         std::iter::once(&self.device).chain(self.shared.iter().filter(|c| c.enabled))
+    }
+
+    /// Route a unified (garden-root-relative) working-tree snapshot into one
+    /// snapshot per **enabled** chain — the union-mount write router (M5c slice
+    /// 002). Every file is placed by [`Self::owning_chain`]:
+    ///
+    /// * the **device** chain keeps only device-owned paths (garden-root-relative)
+    ///   — the carve-out that keeps a shared chain's content out of the device
+    ///   chain's ref (and thus out of the M5b replica, slice 004);
+    /// * each **shared** chain gets its subtree with the mount prefix **stripped**,
+    ///   so the chain's committed tree is self-contained + mount-relative, exactly
+    ///   as a `walk(mount_point)` would produce.
+    ///
+    /// Returns `(ref_name, snapshot)` for every enabled chain, including any that
+    /// own nothing (an empty snapshot). A **`device_only`** registry routes every
+    /// path to the device chain unchanged, so the single returned snapshot is
+    /// byte-identical to `unified` — the additive, off-by-default guarantee.
+    pub fn split_snapshot(&self, unified: &WalkSnapshot) -> Vec<(String, WalkSnapshot)> {
+        let mut snaps: Vec<(String, WalkSnapshot)> = self
+            .enabled_chains()
+            .map(|c| (c.ref_name.clone(), WalkSnapshot::empty()))
+            .collect();
+        for (path, mode, content) in unified.files() {
+            let chain = self.owning_chain(&path);
+            let rel = match &chain.mount_path {
+                Some(mount) => path.strip_prefix(mount).unwrap_or(&path).to_path_buf(),
+                None => path.clone(),
+            };
+            if let Some((_, snap)) = snaps.iter_mut().find(|(r, _)| *r == chain.ref_name) {
+                // `path` came from a UTF-8 snapshot, so re-inserting can't fail.
+                let _ = snap.insert_file(&rel, mode, content.to_vec());
+            }
+        }
+        for (_, snap) in snaps.iter_mut() {
+            snap.prune_empty_dirs();
+        }
+        snaps
     }
 }
 

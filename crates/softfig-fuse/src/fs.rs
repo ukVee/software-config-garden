@@ -17,7 +17,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use softfig_vcs::{Ignore, Repo, WalkSnapshot, IGNORE_FILE};
+use softfig_vcs::{ChainRegistry, Ignore, Repo, WalkSnapshot, IGNORE_FILE, TIP_REF};
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
 use softfig_vault::{is_layer_b, VaultSession};
 
@@ -50,6 +50,10 @@ pub(crate) struct SharedState {
     pub(crate) inner: Mutex<Inner>,
     sink: Arc<dyn DirtyEventSink>,
     sealed: Option<Arc<dyn SealedQuery>>,
+    /// M5c slice 002 — the chain composition this mount serves. Reads compose
+    /// the union across its enabled chains; commits route each path to its
+    /// owning chain. Default [`ChainRegistry::device_only`] ⇒ today's behavior.
+    registry: ChainRegistry,
     /// M2c — cache of post-`redact_regions` bytes keyed by
     /// repo-relative path. Invalidated on `tip_changed` (broadcast).
     /// Per the M2c open-question 5 lean, unbounded for v1 (same policy
@@ -75,32 +79,24 @@ pub(crate) struct Inner {
 
 impl SharedState {
     pub(crate) fn rotate_tip(&self) {
-        let new_tip = {
-            let db = self.db.lock().unwrap();
-            db.try_get_ref(softfig_vcs::TIP_REF).ok().flatten()
-        };
         // M2c — drop the redacted-content cache on every tip change;
         // the new tip may have introduced/removed/re-encrypted vault
         // regions, and the cache key (path) doesn't encode tip hash.
         self.redacted_cache.lock().unwrap().clear();
-        let mut inner = self.inner.lock().unwrap();
-        inner.tip = new_tip;
-        inner.view = match inner.tip {
-            Some(h) => {
-                let db = self.db.lock().unwrap();
-                let row = match db.get_commit(&h) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        inner.overlay.clear();
-                        return;
-                    }
-                };
-                drop(db);
-                let db = self.db.lock().unwrap();
-                TreeView::build(&db, &row.root_tree).unwrap_or_else(|_| TreeView::empty())
-            }
-            None => TreeView::empty(),
+        // M5c slice 002 — recompose the whole union view from every enabled
+        // chain's ref (device tip is kept for reference). Recompose-all on any
+        // chain's tip-change is a safe superset of per-chain invalidation; the
+        // caller already knows which ref moved and can scope this later.
+        let (device_tip, view) = {
+            let db = self.db.lock().unwrap();
+            let device_tip = db.try_get_ref(TIP_REF).ok().flatten();
+            let view =
+                TreeView::build_union(&db, &self.registry).unwrap_or_else(|_| TreeView::empty());
+            (device_tip, view)
         };
+        let mut inner = self.inner.lock().unwrap();
+        inner.tip = device_tip;
+        inner.view = view;
         // Re-intern every path so freshly-introduced tip entries have
         // inodes ready for kernel lookups.
         for p in inner.view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
@@ -141,7 +137,12 @@ impl SharedState {
     /// (Disk) daemon commits, NOT a `walk(mount_point)` (which would read
     /// the reader-facing `[sealed:…]` placeholder); in M2a, with nothing
     /// sealed, the two coincide and walk-parity holds.
-    pub(crate) fn workdir_snapshot(&self) -> Result<WalkSnapshot> {
+    ///
+    /// M5c slice 002 — this is the **unified** tree (every enabled chain
+    /// composed). The commit path never commits it whole; it is split by
+    /// [`ChainRegistry::split_snapshot`] into per-chain snapshots
+    /// ([`Self::chain_snapshots`] / [`Self::workdir_snapshot`]).
+    pub(crate) fn unified_snapshot(&self) -> Result<WalkSnapshot> {
         // The in-memory `.softfigignore` (overlay precedence, else the tip
         // blob) drives the same top-level exclusion `walk` applies —
         // loaded from our own state, never via a mount read that would
@@ -188,6 +189,38 @@ impl SharedState {
         // symmetry with `walk` and robustness if that ever changes.
         snapshot.prune_empty_dirs();
         Ok(snapshot)
+    }
+
+    /// The **device** chain's commit snapshot: the unified working tree carved
+    /// to device-owned paths (M5c slice 002 isolation pin). Byte-identical to
+    /// [`Self::unified_snapshot`] under a `device_only` registry — the input the
+    /// keeperd commit path feeds to `commit_snapshot`/`commit_snapshot_to(TIP_REF)`.
+    pub(crate) fn workdir_snapshot(&self) -> Result<WalkSnapshot> {
+        let unified = self.unified_snapshot()?;
+        Ok(self
+            .registry
+            .split_snapshot(&unified)
+            .into_iter()
+            .find(|(r, _)| r == TIP_REF)
+            .map(|(_, s)| s)
+            .unwrap_or_else(WalkSnapshot::empty))
+    }
+
+    /// One commit snapshot per enabled chain (device carve-out + shared
+    /// prefix-strip), each ready for `commit_snapshot_to(ref, …)` — the
+    /// load-bearing write router. A write under a shared mount lands only in
+    /// that chain's snapshot, never the device chain's, so it can never advance
+    /// the wrong ref.
+    pub(crate) fn chain_snapshots(&self) -> Result<Vec<(String, WalkSnapshot)>> {
+        let unified = self.unified_snapshot()?;
+        Ok(self.registry.split_snapshot(&unified))
+    }
+
+    /// A clone of the chain registry this mount serves — the keeperd commit path
+    /// routes each dirty path through [`ChainRegistry::owning_chain`] to decide
+    /// which chains a flush must commit.
+    pub(crate) fn registry(&self) -> ChainRegistry {
+        self.registry.clone()
     }
 
     /// The exclusion set in force for this garden, read from the in-memory
@@ -594,7 +627,14 @@ impl FuseMount {
         session: Arc<VaultSession>,
         sink: Arc<dyn DirtyEventSink>,
     ) -> Result<MountHandle> {
-        Self::mount_with(garden_root, state_root, session, sink, None)
+        Self::mount_with(
+            garden_root,
+            state_root,
+            session,
+            sink,
+            None,
+            ChainRegistry::device_only(),
+        )
     }
 
     /// Like [`Self::mount`] but accepts an optional [`SealedQuery`] adapter
@@ -608,19 +648,16 @@ impl FuseMount {
         session: Arc<VaultSession>,
         sink: Arc<dyn DirtyEventSink>,
         sealed: Option<Arc<dyn SealedQuery>>,
+        registry: ChainRegistry,
     ) -> Result<MountHandle> {
         let paths = StorePaths::with_state_root(garden_root, state_root);
         let db = Db::open(&paths)?;
         let objects = ObjectStore::new(paths.clone());
 
-        let tip = db.try_get_ref(softfig_vcs::TIP_REF)?;
-        let view = match tip {
-            Some(h) => {
-                let row = db.get_commit(&h)?;
-                TreeView::build(&db, &row.root_tree)?
-            }
-            None => TreeView::empty(),
-        };
+        // M5c slice 002 — compose the initial view across every enabled chain.
+        // `device_only` yields exactly the device tip's tree (today's behavior).
+        let tip = db.try_get_ref(TIP_REF)?;
+        let view = TreeView::build_union(&db, &registry)?;
 
         let mut inodes = InodeMap::new();
         for p in view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
@@ -639,6 +676,7 @@ impl FuseMount {
             }),
             sink,
             sealed,
+            registry,
             redacted_cache: Mutex::new(HashMap::new()),
         });
 
@@ -680,7 +718,7 @@ impl FuseMount {
     /// state alive past unmount.
     pub fn install_tip_callback(repo: &mut Repo, handle: &MountHandle) {
         let state = Arc::downgrade(&handle.state);
-        repo.set_tip_changed_callback(move |_hash: &Hash| {
+        repo.set_tip_changed_callback(move |_ref_name: &str, _hash: &Hash| {
             if let Some(s) = state.upgrade() {
                 s.rotate_tip();
             }

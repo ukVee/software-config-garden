@@ -147,6 +147,24 @@ impl MountHandle {
         self.state.workdir_snapshot()
     }
 
+    /// M5c slice 002 — one commit snapshot per enabled chain (`(ref_name,
+    /// snapshot)`), routed by the mount's [`softfig_vcs::ChainRegistry`]: the
+    /// device chain carved to device-owned paths, each shared chain's subtree
+    /// with the mount prefix stripped. The keeperd commit path commits each
+    /// affected chain's snapshot to its own ref, so a write under a shared mount
+    /// never advances the device ref. `device_only` ⇒ a single `(TIP_REF, …)`
+    /// snapshot equal to [`Self::workdir_snapshot`].
+    pub fn chain_snapshots(&self) -> Result<Vec<(String, softfig_vcs::WalkSnapshot)>> {
+        self.state.chain_snapshots()
+    }
+
+    /// A clone of the chain registry this mount serves, for the commit path to
+    /// route dirty paths ([`softfig_vcs::ChainRegistry::owning_chain`]) to the
+    /// set of chains a flush must commit.
+    pub fn registry(&self) -> softfig_vcs::ChainRegistry {
+        self.state.registry()
+    }
+
     /// The exclusion set (built-in defaults ∪ the user `.softfigignore`) in
     /// force for this garden, reconstructed from the FUSE driver's in-memory
     /// state (overlay precedence, else the committed tip blob) — never read

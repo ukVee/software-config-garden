@@ -33,4 +33,4 @@ pub use intent::{Intent, KNOWN_INTENTS};
 pub use log::{collect as log_collect, LogIter};
 pub use repo::{Repo, TipChangedCallback, TIP_REF};
 pub use tree::{canonical_tree_bytes, BlobEncryptor, Blueprint, LayerAEncryptor};
-pub use walk::{walk, TreeNode, WalkSnapshot};
+pub use walk::{walk, walk_filtered, TreeNode, WalkSnapshot};

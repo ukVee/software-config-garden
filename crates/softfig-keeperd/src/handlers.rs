@@ -154,6 +154,9 @@ fn establish_session_locked(
             session_arc.clone(),
             sink,
             Some(sealed_q),
+            // M5c slice 002 — device-only until slice 003 derives the registry
+            // from `config/shared-subtrees.toml`. Byte-identical to today.
+            softfig_vcs::ChainRegistry::device_only(),
         ) {
             Ok(handle) => {
                 softfig_fuse::FuseMount::install_tip_callback(&mut repo, &handle);
@@ -665,6 +668,8 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
                 session,
                 sink,
                 Some(sealed_q),
+                // M5c slice 002 — device-only until slice 003 (config-derived).
+                softfig_vcs::ChainRegistry::device_only(),
             ) {
                 Ok(handle) => {
                     if let Some(repo) = inner.repo.as_mut() {
