@@ -57,7 +57,7 @@ pub use config::{BuildCaps, GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
-    spawn_drive_loop, AgentHealthSource, Assignment, BatonSeeder, BatonStatusSource,
+    spawn_drive_loop, AgentHealthSource, Assignment, BatonRead, BatonSeeder, BatonStatusSource,
     BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus, DeferredQueues, DriveLoop,
     FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource, RateSource, TickReport,
     DRIVE_POLL_MS,

@@ -447,9 +447,30 @@ impl AgentStderrSource for Arc<ClaudeBackend> {
 /// re-roll, so this slice ships with no behaviour change to a working member),
 /// and a test scripts the status.
 pub trait BatonStatusSource: Send + Sync + fmt::Debug {
-    /// `agent`'s terminal baton `status:` field as of its last exit, or `None`
-    /// when no baton was written/readable (the clean-exit re-roll fallback).
-    fn status(&self, agent: &str) -> Option<String>;
+    /// Read `agent`'s terminal baton for the retire-vs-re-roll decision: its
+    /// `status:` field as of its last exit (`None` when no baton was
+    /// written/readable — the clean-exit re-roll fallback), plus a diagnostic when
+    /// the read fell back to the misrouted legacy single-agent path (task 042/035).
+    fn status(&self, agent: &str) -> BatonRead;
+}
+
+/// The result of reading an exited member's terminal baton
+/// ([`BatonStatusSource::status`]): the `status:` the drive loop classifies on, plus
+/// an optional misroute diagnostic the loop routes through the tick log's exit
+/// entry-edge dedup instead of the store logging it per-call. A member latched
+/// `Exited` (rate-limited / reconnecting) is re-read every ~1s tick, so a per-call
+/// warning re-fired every second for the whole hold (task 042); routing it through
+/// the SAME edge as the exit disposition makes it warn ONCE and re-arm on re-roll.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatonRead {
+    /// The frontmatter `status:` growlightd read (`None` = missing/unreadable →
+    /// clean-exit re-roll).
+    pub status: Option<String>,
+    /// `Some((legacy_path, per_member_path))` (display strings) when the status was
+    /// read from the misrouted legacy single-agent baton instead of the per-member
+    /// file — the diagnostic routed through the exit entry-edge. `None` on the normal
+    /// per-member read.
+    pub misroute: Option<(String, String)>,
 }
 
 /// The deferred (slice 001) baton-status source: no per-member baton write-back
@@ -460,8 +481,8 @@ pub trait BatonStatusSource: Send + Sync + fmt::Debug {
 pub struct DeferredBatonStatus;
 
 impl BatonStatusSource for DeferredBatonStatus {
-    fn status(&self, _agent: &str) -> Option<String> {
-        None
+    fn status(&self, _agent: &str) -> BatonRead {
+        BatonRead::default()
     }
 }
 
@@ -574,6 +595,11 @@ pub struct ExitDisposition {
     pub baton_status: Option<String>,
     /// The one-word disposition it drove (`rolling` / `completed` / `retired` / …).
     pub disposition: &'static str,
+    /// `Some((legacy_path, per_member_path))` when the terminal status was read from
+    /// the misrouted legacy single-agent baton (task 042/035) instead of the
+    /// per-member file — routed onto the exit's entry edge so the misroute warns ONCE
+    /// per exit, not once per latched re-read tick. `None` on the normal read.
+    pub misrouted: Option<(String, String)>,
 }
 
 /// Everything one [`DriveLoop::tick`] did, for the caller (the live thread, or a
@@ -878,10 +904,11 @@ impl DriveLoop {
             //    fix) rather than re-roll on the exit code alone; a still-alive
             //    agent has no terminal status to read.
             if let Some(health) = self.health.health(agent) {
-                let baton_status = match health {
+                let baton_read = match health {
                     AgentHealth::Exited { .. } => self.baton.status(agent),
-                    AgentHealth::Alive { .. } => None,
+                    AgentHealth::Alive { .. } => BatonRead::default(),
                 };
+                let baton_status = baton_read.status.clone();
                 // Network-exit classifier (slice 002): `poll_with_network` evaluates
                 // it ONLY on a crash verdict (so a healthy tick reads no stderr). A
                 // non-zero EXIT whose in-memory stderr tail carries a network-error
@@ -932,6 +959,7 @@ impl DriveLoop {
                         agent: agent.clone(),
                         baton_status: baton_status.clone(),
                         disposition: exit_disposition_label(&outcome),
+                        misrouted: baton_read.misroute.clone(),
                     });
                 }
                 // Maintain the reconnect latch (slice 002): any non-reconnect
@@ -1456,6 +1484,17 @@ impl TickLogger {
                     ed.baton_status.as_deref().unwrap_or("(none)"),
                     ed.disposition,
                 ));
+                // Misroute diagnostic (task 042/035): the terminal status was read
+                // from the misrouted legacy single-agent baton, not the per-member
+                // file. Rides the exit's SAME entry edge — a member latched `Exited`
+                // and re-read every tick warns once, and re-arms when it re-rolls.
+                if let Some((legacy, per_member)) = &ed.misrouted {
+                    out.push(format!(
+                        "fleet: {} baton misrouted to the legacy single-agent path {legacy} \
+                         (task 035) — honored over the stale per-member {per_member}",
+                        ed.agent,
+                    ));
+                }
             }
         }
         self.exits = exits_now;
@@ -1683,8 +1722,11 @@ mod tests {
         }
     }
     impl BatonStatusSource for Arc<FakeFleet> {
-        fn status(&self, agent: &str) -> Option<String> {
-            self.baton.lock().unwrap().get(agent).cloned()
+        fn status(&self, agent: &str) -> BatonRead {
+            BatonRead {
+                status: self.baton.lock().unwrap().get(agent).cloned(),
+                misroute: None,
+            }
         }
     }
     impl BatonSeeder for Arc<FakeFleet> {
@@ -3007,6 +3049,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 agent: "a".into(),
                 baton_status: Some("ITEM_COMPLETE".into()),
                 disposition: "completed (item boundary)",
+                misrouted: None,
             }],
             held_fresh: vec![HeldFresh {
                 agent: "a".into(),
@@ -3030,6 +3073,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 agent: "a".into(),
                 baton_status: Some("ITEM_COMPLETE".into()),
                 disposition: "unknown",
+                misrouted: None,
             }],
             held_fresh: vec![HeldFresh {
                 agent: "a".into(),
@@ -3061,12 +3105,69 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 agent: "a".into(),
                 baton_status: None,
                 disposition: "rolling (continue status)",
+                misrouted: None,
             }],
             ..TickReport::default()
         };
         assert_eq!(
             logger.lines(&re_exit),
             vec!["fleet: a exited — baton (none) -> rolling (continue status)".to_string()],
+        );
+    }
+
+    /// TASK 042: a member that misrouted its terminal baton to the legacy
+    /// single-agent path is re-read every tick while latched `Exited` (rate-limited /
+    /// reconnecting). The misroute diagnostic rides the exit's SAME entry edge — it
+    /// warns ONCE per exit (not once per ~1s tick, the eMMC/log churn this fixes) and
+    /// re-arms when the member re-rolls, so a genuinely new misroute warns again.
+    #[test]
+    fn tick_logger_edge_dedups_the_misroute_warning_with_the_exit() {
+        let mut logger = TickLogger::default();
+        let misrouted = || TickReport {
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "completed (item boundary)",
+                misrouted: Some(("/g/baton.md".into(), "/g/agents/a/baton.md".into())),
+            }],
+            ..TickReport::default()
+        };
+
+        // Entry edge: the exit line AND the misroute line both narrate, once.
+        assert_eq!(
+            logger.lines(&misrouted()),
+            vec![
+                "fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string(),
+                "fleet: a baton misrouted to the legacy single-agent path /g/baton.md \
+                 (task 035) — honored over the stale per-member /g/agents/a/baton.md"
+                    .to_string(),
+            ],
+        );
+        // Latched re-read (same exit, same misroute) every tick → nothing repeats.
+        assert!(
+            logger.lines(&misrouted()).is_empty(),
+            "a latched misrouted exit does not re-warn per tick",
+        );
+
+        // The member re-rolls (leaves the exit state) → the edge re-arms.
+        let started = TickReport {
+            started: vec![Assignment {
+                agent: "a".into(),
+                queue: "default".into(),
+                part: "y".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(logger.lines(&started), vec!["fleet: started a on default/y".to_string()]);
+        // A NEW misrouted exit re-warns (both lines) — the edge re-armed.
+        assert_eq!(
+            logger.lines(&misrouted()),
+            vec![
+                "fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string(),
+                "fleet: a baton misrouted to the legacy single-agent path /g/baton.md \
+                 (task 035) — honored over the stale per-member /g/agents/a/baton.md"
+                    .to_string(),
+            ],
         );
     }
 
@@ -3956,6 +4057,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 agent: "a".into(),
                 baton_status: Some("ITEM_COMPLETE".into()),
                 disposition: "completed (item boundary)",
+                misrouted: None,
             }],
             "the exit records the observed baton status + disposition (health pass)",
         );
