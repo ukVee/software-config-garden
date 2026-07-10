@@ -221,6 +221,13 @@ pub struct App {
     pub deploy_has_conflicts: bool,
     pub deploy_selected: usize,
     pub deploy_loaded: bool,
+    /// Set when a write lands while the Deploy tab is hidden. `deploy_plan` is a
+    /// full daemon-side dot diff (re-read `deploy.toml`, `symlink_metadata`+read
+    /// per dot, stat+read every target/cache) — expensive eMMC I/O nobody is
+    /// looking at if refired for a hidden tab. Instead of eagerly re-fetching in
+    /// `refresh_view`, the tab is marked stale and lazily re-fetches on entry
+    /// (020 slice 006 — mirrors how History is view-gated).
+    pub deploy_stale: bool,
     /// growlight enablement (load-bearing gate): `None` until the first status
     /// reply, then the daemon-owned `growlight_enabled` bit (its fail-closed
     /// `fleet_enabled()`), forced `Some(false)` while locked. The Growlight tab is
@@ -237,6 +244,12 @@ pub struct App {
     pub growlight_baton_title: Option<String>,
     pub growlight_baton: Option<String>,
     pub growlight_loaded: bool,
+    /// Set when a write lands while the Growlight tab is hidden. `load_growlight`
+    /// is three IPC round-trips (`growlight_queue` + a `list_tree` of the
+    /// unboundedly-growing baton-log + the latest-entry `read_file`) — too much
+    /// to refire for a tab nobody is viewing. Marked stale here, lazily
+    /// re-fetched on entry (020 slice 006, like `deploy_stale`).
+    pub growlight_stale: bool,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -286,12 +299,14 @@ impl App {
             deploy_has_conflicts: false,
             deploy_selected: 0,
             deploy_loaded: false,
+            deploy_stale: false,
             growlight_enabled: None,
             growlight_queue: Vec::new(),
             growlight_selected: 0,
             growlight_baton_title: None,
             growlight_baton: None,
             growlight_loaded: false,
+            growlight_stale: false,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -357,7 +372,7 @@ impl App {
 
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
-    fn refresh_view(&self, ipc: &mut IpcClient) {
+    fn refresh_view(&mut self, ipc: &mut IpcClient) {
         for dir in self.tree.loaded_dirs() {
             self.load_dir(ipc, &dir);
         }
@@ -374,11 +389,24 @@ impl App {
         if self.backup_loaded {
             self.load_backup(ipc);
         }
+        // Deploy + Growlight are the expensive loads (a full daemon-side dot
+        // diff; a 3-round-trip read over the unbounded baton-log). Gate them on
+        // the active view like History is: a write that lands while they're
+        // hidden marks them stale to lazily re-fetch on entry, instead of
+        // refiring eMMC I/O for a tab nobody is looking at (020 slice 006).
         if self.deploy_loaded {
-            self.load_deploy(ipc);
+            if self.view == View::Deploy {
+                self.load_deploy(ipc);
+            } else {
+                self.deploy_stale = true;
+            }
         }
         if self.growlight_loaded {
-            self.load_growlight(ipc);
+            if self.view == View::Growlight {
+                self.load_growlight(ipc);
+            } else {
+                self.growlight_stale = true;
+            }
         }
     }
 
@@ -909,7 +937,11 @@ impl App {
             }
             KeyCode::Char('6') => {
                 self.view = View::Deploy;
-                if !self.deploy_loaded && !self.locked {
+                // Re-fetch on first entry, or when a write marked the tab stale
+                // while it was hidden (020 slice 006); consume the mark so we
+                // don't re-fetch again until the next hidden write.
+                if (!self.deploy_loaded || self.deploy_stale) && !self.locked {
+                    self.deploy_stale = false;
                     self.load_deploy(ipc);
                 }
             }
@@ -917,7 +949,8 @@ impl App {
             // otherwise, so `7` is inert on a garden without growlight.
             KeyCode::Char('7') if self.growlight_enabled == Some(true) => {
                 self.view = View::Growlight;
-                if !self.growlight_loaded && !self.locked {
+                if (!self.growlight_loaded || self.growlight_stale) && !self.locked {
+                    self.growlight_stale = false;
                     self.load_growlight(ipc);
                 }
             }
@@ -2509,6 +2542,83 @@ mod tests {
         assert_eq!(app.deploy_entries.len(), 1);
         assert_eq!(app.deploy_selected, 0);
         assert!(!app.deploy_has_conflicts);
+    }
+
+    // ---- 020 slice 006: refresh_view gates the expensive tab loads on view ----
+
+    /// A write while viewing a non-Deploy/non-Growlight tab must NOT refire the
+    /// expensive Deploy/Growlight loads (a full daemon-side dot diff; a
+    /// 3-round-trip read over the unbounded baton-log). Instead it marks them
+    /// stale so they lazily re-fetch when the user next opens them.
+    #[test]
+    fn refresh_view_marks_hidden_expensive_tabs_stale_then_entry_refetches() {
+        let mut app = App::new();
+        app.locked = false;
+        app.growlight_enabled = Some(true);
+        // Both expensive tabs were visited once (load-once flags set); the user
+        // is now looking at Browse.
+        app.deploy_loaded = true;
+        app.growlight_loaded = true;
+        app.view = View::Browse;
+        let mut ipc = dummy_ipc();
+
+        // A write lands — any tab's action reply funnels through refresh_view.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::Action {
+                    title: "log_decision".into(),
+                },
+                result: Ok(json!({ "path": "journal/x.md" })),
+            },
+            &mut ipc,
+        );
+        // Hidden → marked stale, not eagerly re-fetched.
+        assert!(app.deploy_stale, "hidden Deploy tab marked stale");
+        assert!(app.growlight_stale, "hidden Growlight tab marked stale");
+
+        // Entering Deploy consumes the mark (a re-fetch is issued).
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Deploy);
+        assert!(!app.deploy_stale, "entering Deploy re-fetches + clears stale");
+        // Growlight is still hidden → still stale.
+        assert!(app.growlight_stale);
+
+        // Entering Growlight consumes its mark too.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Growlight);
+        assert!(
+            !app.growlight_stale,
+            "entering Growlight re-fetches + clears stale"
+        );
+    }
+
+    /// A write while the expensive tab IS active re-fetches it in place and
+    /// never marks it stale — staleness is only for hidden tabs.
+    #[test]
+    fn refresh_view_refetches_active_expensive_tab_without_marking_stale() {
+        let mut app = App::new();
+        app.locked = false;
+        app.deploy_loaded = true;
+        app.view = View::Deploy;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::Action {
+                    title: "deploy".into(),
+                },
+                result: Ok(json!({ "path": "x" })),
+            },
+            &mut ipc,
+        );
+        assert!(!app.deploy_stale, "active Deploy tab re-fetches, stays fresh");
     }
 
     #[test]
