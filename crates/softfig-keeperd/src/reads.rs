@@ -104,7 +104,7 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let rel = path_to_repo_rel_string(&garden_root, &abs)
         .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))?;
 
-    let (mut content, sealed) = read_committed_file(&inner, &rel)?;
+    let (mut content, sealed, region_ids) = read_committed_file(&inner, &rel)?;
     if content.len() > READ_FILE_MAX {
         let mut end = READ_FILE_MAX;
         while !content.is_char_boundary(end) {
@@ -130,6 +130,7 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         sealed,
         version,
         sections,
+        region_ids,
     })
     .unwrap())
 }
@@ -138,14 +139,19 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 /// tree, no size cap. Whole-file-sealed paths surface as `[sealed:<path>]` and
 /// inline `<vault id="…">` regions as `[encrypted]` — the same projection the
 /// FUSE read path applies, so a caller never receives sealed plaintext. Returns
-/// `(content, sealed)`. `read_file` layers its own truncation + CAS on top;
-/// structured readers (e.g. [`growlight_queue`]) parse the full body. `rel`
-/// must already be a validated repo-relative path; the caller holds `inner`
-/// locked and has checked `require_unlocked` (so `session`/`repo` are present).
+/// `(content, sealed, region_ids)` — `region_ids` being the file's sealed inline
+/// `<vault id="…">` region ids, computed daemon-side with the authoritative
+/// grammar ([`LayerBHook::region_ids`](crate::layer_b::LayerBHook::region_ids))
+/// over the decrypted Layer-A bytes so a frontend never re-parses the projected
+/// content. `read_file` layers its own truncation + CAS on top; structured
+/// readers (e.g. [`growlight_queue`]) parse the full body and ignore the ids.
+/// `rel` must already be a validated repo-relative path; the caller holds
+/// `inner` locked and has checked `require_unlocked` (so `session`/`repo` are
+/// present).
 fn read_committed_file(
     inner: &crate::daemon::DaemonInner,
     rel: &str,
-) -> Result<(String, bool), (ErrorKind, String)> {
+) -> Result<(String, bool, Vec<String>), (ErrorKind, String)> {
     let hook = inner.layer_b.clone();
     let session = inner.session.as_ref().expect("unlocked").clone();
     let repo = inner.repo.as_ref().expect("unlocked");
@@ -168,10 +174,10 @@ fn read_committed_file(
         .map_err(|e| err_to_response(KeeperError::Store(e)))?;
 
     let sealed = hook.snapshot().is_sealed(rel);
-    let bytes: Vec<u8> = if sealed {
+    let (bytes, region_ids): (Vec<u8>, Vec<String>) = if sealed {
         // Whole-file sealed: project the FUSE placeholder. Never decrypt
-        // and return the plaintext of a sealed file.
-        format!("[sealed:{rel}]\n").into_bytes()
+        // and return the plaintext of a sealed file. No inline regions.
+        (format!("[sealed:{rel}]\n").into_bytes(), Vec::new())
     } else {
         let layer_a = if is_layer_b(&cipher) {
             session
@@ -182,9 +188,13 @@ fn read_committed_file(
                 .decrypt_blob(&cipher)
                 .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?
         };
+        // Collect the sealed region ids from the same authoritative grammar
+        // the redaction uses, BEFORE `redact_regions` consumes the plaintext
+        // (the projected `[encrypted]` bodies would classify as Plaintext).
+        let region_ids = hook.region_ids(rel, &layer_a);
         // Same inline-region redaction the FUSE read path applies
         // (`[encrypted]` bodies; `[malformed vault tag …]` on parse fail).
-        hook.redact_regions(rel, layer_a)
+        (hook.redact_regions(rel, layer_a), region_ids)
     };
 
     let raw_len = bytes.len();
@@ -192,7 +202,7 @@ fn read_committed_file(
         Ok(s) => s,
         Err(_) => format!("[binary file: {raw_len} bytes]"),
     };
-    Ok((content, sealed))
+    Ok((content, sealed, region_ids))
 }
 
 /// 020 slice 002 (finding #5): serve the default backlog queue as structured
@@ -207,7 +217,7 @@ pub fn growlight_queue(daemon: &Daemon, _args: serde_json::Value) -> HandlerResu
 
     let rel = crate::actions::growlight_backlog_claude();
     let content = match read_committed_file(&inner, &rel) {
-        Ok((c, _sealed)) => c,
+        Ok((c, _sealed, _region_ids)) => c,
         Err((ErrorKind::NotFound, _)) => String::new(),
         Err(e) => return Err(e),
     };

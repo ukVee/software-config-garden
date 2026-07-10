@@ -819,8 +819,8 @@ pub struct TreeEntry {
     pub is_dir: bool,
 }
 
-/// `read_file({path}) -> {path, content, sealed}`. Returns the file's
-/// daemon-redacted content from the committed tip tree.
+/// `read_file({path}) -> {path, content, sealed, version, sections, region_ids}`.
+/// Returns the file's daemon-redacted content from the committed tip tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileArgs {
     pub path: String,
@@ -847,6 +847,16 @@ pub struct ReadFileReply {
     /// sealed / non-markdown / sectionless content.
     #[serde(default)]
     pub sections: Vec<SectionVersion>,
+    /// M2c (020 slice 003): the ids of the file's inline `<vault id="…">`
+    /// *sealed* regions — those projected as `[encrypted]` and revealable via
+    /// `vault_reveal --id`. Computed daemon-side with the authoritative region
+    /// grammar (`layer_b/regions.rs`), in document order; a frontend consumes
+    /// these directly instead of re-parsing the projected content (which can't
+    /// tell a real region from an inline-code `<vault>` mention). Empty for
+    /// sealed / non-region / malformed content. `#[serde(default)]` keeps older
+    /// clients/daemons wire-compatible.
+    #[serde(default)]
+    pub region_ids: Vec<String>,
 }
 
 /// One addressable section's CAS handle: its heading text + current content

@@ -198,6 +198,7 @@ fn read_file_plaintext() {
     assert_eq!(r.path, "meta/conventions.md");
     assert!(!r.sealed);
     assert!(r.content.contains("rule one"));
+    assert!(r.region_ids.is_empty(), "no regions: {:?}", r.region_ids);
 }
 
 #[test]
@@ -215,6 +216,8 @@ fn read_file_whole_file_sealed_projects_placeholder() {
         !r.content.contains("TOPSECRET"),
         "sealed plaintext leaked: {r:?}"
     );
+    // A whole-file seal is not an inline-region file — no per-region ids.
+    assert!(r.region_ids.is_empty(), "region_ids: {:?}", r.region_ids);
 }
 
 #[test]
@@ -235,6 +238,39 @@ fn read_file_inline_region_projects_encrypted() {
         r.content
     );
     assert!(r.content.contains("before") && r.content.contains("after"));
+    // 020 slice 003: the daemon computes the sealed region id with its
+    // authoritative grammar and carries it on the reply — the TUI reads this
+    // instead of re-parsing the projected `[encrypted]` prose.
+    assert_eq!(r.region_ids, vec!["tok".to_string()], "reply: {r:?}");
+}
+
+/// 020 slice 003 regression (finding #6): an inline-code `<vault>` mention is
+/// documentation, not a region — the daemon's markdown grammar masks it, so the
+/// reply must carry ZERO region_ids (and never redact the prose to `[encrypted]`).
+/// The old client `parse_vault_region_ids` matched such prose and conjured a
+/// phantom region whose picker entry failed at the daemon.
+#[test]
+fn read_file_inline_code_mention_has_no_region_ids() {
+    let fx = Fixture::start(true);
+    fx.write_file(
+        "meta/vault-howto.md",
+        "Wrap a secret inline as `<vault id=\"example\">…</vault>` to seal it.\n",
+    );
+
+    let r = read(&fx, "meta/vault-howto.md");
+    assert!(!r.sealed);
+    assert!(
+        r.region_ids.is_empty(),
+        "inline-code mention must yield no regions: {:?}",
+        r.region_ids
+    );
+    // The prose round-trips verbatim — it was never treated as a real region.
+    assert!(
+        r.content.contains("<vault id=\"example\">"),
+        "documentation mention should survive unredacted: {:?}",
+        r.content
+    );
+    assert!(!r.content.contains("[encrypted]"), "content: {:?}", r.content);
 }
 
 #[test]

@@ -519,9 +519,12 @@ impl App {
             Tag::ReadFile { path } => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
-                        // M2c: surface the file's inline `<vault id=…>` regions so
-                        // `x`/Enter offers the per-region reveal picker.
-                        self.regions = parse_vault_region_ids(&r.content);
+                        // M2c: the daemon computes the file's sealed inline
+                        // `<vault id=…>` region ids with its authoritative grammar
+                        // (020 slice 003) — consume them directly so `x`/Enter
+                        // offers the per-region reveal picker only for real regions,
+                        // never a phantom from an inline-code `<vault>` mention.
+                        self.regions = r.region_ids;
                         self.regions_path = Some(path.clone());
                         self.preview = r.content;
                         self.preview_title = if r.sealed {
@@ -1692,61 +1695,6 @@ fn vault_reveal_args(path: &str, master_password: &str, id: Option<&str>) -> Val
     args
 }
 
-/// M2c: parse the inline `<vault id="…">` region ids out of a file's daemon
-/// projection (a `read_file` reply). The daemon renders each encrypted region
-/// as `<vault id="…">[encrypted]</vault>`; this pulls the ids in document order,
-/// de-duplicated (a repeated id reveals the same region). Tolerates single- or
-/// double-quoted ids and extra whitespace/attributes inside the opening tag.
-pub fn parse_vault_region_ids(content: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut rest = content;
-    while let Some(pos) = rest.find("<vault") {
-        rest = &rest[pos + "<vault".len()..];
-        // Scope the `id=` search to this opening tag (up to its closing `>`).
-        let Some(tag_end) = rest.find('>') else { break };
-        if let Some(id) = extract_id_attr(&rest[..tag_end]) {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        rest = &rest[tag_end + 1..];
-    }
-    ids
-}
-
-/// Pull the `id="…"` (or `id='…'`) attribute value out of a `<vault …>` opening
-/// tag's inner text. Requires `id` to be a whole attribute name (not a suffix of
-/// e.g. `valid`) so an unrelated attribute can't be mistaken for the region id.
-fn extract_id_attr(tag: &str) -> Option<String> {
-    let bytes = tag.as_bytes();
-    let mut i = 0;
-    while let Some(rel) = tag[i..].find("id") {
-        let start = i + rel;
-        let name_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
-        let mut j = start + 2;
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        if name_ok && bytes.get(j) == Some(&b'=') {
-            let mut k = j + 1;
-            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            match bytes.get(k) {
-                Some(&q) if q == b'"' || q == b'\'' => {
-                    let after = &tag[k + 1..];
-                    if let Some(end) = after.find(q as char) {
-                        return Some(after[..end].to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-        i = start + 2;
-    }
-    None
-}
-
 /// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
 /// `list_tree growlight/baton-log` reply. Non-numeric entries (e.g. `CLAUDE.md`)
 /// and directories are ignored; returns the entry's repo-relative path.
@@ -1926,33 +1874,9 @@ mod tests {
     }
 
     // ---- M2c: inline-region reveal (slice 003) ----
-
-    #[test]
-    fn parse_region_ids_from_projection() {
-        // The daemon projects each encrypted region as `[encrypted]`; the ids
-        // come out in document order, de-duplicated.
-        let content = "\
-host = \"db\"
-password = <vault id=\"db-pw\">[encrypted]</vault>
-token = <vault id='api-token'>[encrypted]</vault>
-backup = <vault id=\"db-pw\">[encrypted]</vault>
-";
-        assert_eq!(
-            parse_vault_region_ids(content),
-            vec!["db-pw".to_string(), "api-token".to_string()],
-        );
-    }
-
-    #[test]
-    fn parse_region_ids_ignores_non_id_attrs_and_plain_text() {
-        // A file with no `<vault>` tags → nothing; an unrelated attribute whose
-        // name merely ends in "id" must not be mistaken for the region id.
-        assert!(parse_vault_region_ids("just prose, no secrets").is_empty());
-        assert_eq!(
-            parse_vault_region_ids("<vault valid=\"no\" id=\"real\">[encrypted]</vault>"),
-            vec!["real".to_string()],
-        );
-    }
+    // Region-id parsing now lives in the daemon (authoritative grammar); the
+    // client just consumes `ReadFileReply.region_ids`. The daemon-side
+    // computation is covered by keeperd's `m3b_reads` integration test.
 
     #[test]
     fn vault_reveal_args_include_id_only_when_present() {
@@ -1982,7 +1906,8 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
         );
         let mut ipc = dummy_ipc();
 
-        // Opening the file parses its inline regions off the read_file reply.
+        // Opening the file takes its inline region ids straight off the
+        // daemon-computed `region_ids` in the read_file reply.
         app.apply_reply(
             Reply {
                 id: 1,
@@ -1994,6 +1919,7 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
                     "content": "pw = <vault id=\"db-pw\">[encrypted]</vault>\n\
                                 tok = <vault id=\"api\">[encrypted]</vault>\n",
                     "sealed": false,
+                    "region_ids": ["db-pw", "api"],
                 })),
             },
             &mut ipc,
