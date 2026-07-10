@@ -8,9 +8,11 @@
 //! the daemon — which owns the unlocked session + mount — run `softfig-deploy`'s
 //! existing `plan`/`apply` on the TUI's behalf and return a metadata-only
 //! projection of the `Plan` / `Report`. No deploy-engine change: this is a pure
-//! wrapper. Both require Unlocked — when locked, the FUSE mount (and thus the
-//! config path) is gone, surfacing as a `NotFound` "is the garden unlocked?"
-//! hint, exactly like the CLI.
+//! wrapper. Both require Unlocked and reject a locked garden up front with
+//! `VaultLocked` (via `require_unlocked`, before any config read — asserted by
+//! `deploy_refuses_when_locked`). The `NotFound` "is the garden unlocked?" hint
+//! is the *unlocked-but-config-absent* case: the FUSE mount is up but
+//! `config/deploy.toml` isn't there yet — same hint the CLI prints.
 
 use softfig_deploy::{apply, plan, Action, ApplyOptions, DeployConfig, DeployError, DeployPaths};
 use softfig_ipc::verbs::{

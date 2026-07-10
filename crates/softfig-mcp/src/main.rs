@@ -523,6 +523,7 @@ fn tool_defs() -> Vec<Value> {
                             dates, headers, and all). Expensive and discouraged. Prefer the \
                             structural verbs, which stamp conventions and cost you only the new \
                             content: add_note/revise_note (notes), \
+                            add_code_review (code reviews), \
                             add_section/edit_section/append_to_section (any markdown doc), \
                             set_reviewed (date bumps), log_decision/log_incident/archive/\
                             add_project/refresh_snapshot (their kinds). Reach for replace_file \

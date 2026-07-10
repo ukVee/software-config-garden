@@ -797,16 +797,15 @@ impl App {
                 }
             },
             Tag::GrowlightQueue => match reply.result {
-                Ok(v) => {
-                    if let Ok(r) = serde_json::from_value::<GrowlightQueueReply>(v) {
-                        self.growlight.set_items(r.rows);
-                    }
-                }
+                Ok(v) => match serde_json::from_value::<GrowlightQueueReply>(v) {
+                    Ok(r) => self.growlight.set_items(r.rows),
+                    Err(e) => self.status = format!("growlight queue: malformed reply: {e}"),
+                },
                 Err((_, m)) => self.status = format!("growlight queue: {m}"),
             },
             Tag::GrowlightBatonList => match reply.result {
-                Ok(v) => {
-                    if let Ok(r) = serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                    Ok(r) => {
                         if let Some(path) = latest_baton_path(&r.entries) {
                             ipc.send(
                                 "read_file",
@@ -815,18 +814,19 @@ impl App {
                             );
                         }
                     }
-                }
+                    Err(e) => self.status = format!("growlight baton-log: malformed reply: {e}"),
+                },
                 Err((_, m)) => self.status = format!("growlight baton-log: {m}"),
             },
             Tag::GrowlightBaton { path } => match reply.result {
-                Ok(v) => {
-                    if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
-                        self.growlight_baton_title = Some(
-                            path.rsplit('/').next().unwrap_or(&path).to_string(),
-                        );
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => {
+                        self.growlight_baton_title =
+                            Some(path.rsplit('/').next().unwrap_or(&path).to_string());
                         self.growlight_baton = Some(r.content);
                     }
-                }
+                    Err(e) => self.status = format!("growlight baton: malformed reply: {e}"),
+                },
                 Err((_, m)) => self.status = format!("growlight baton: {m}"),
             },
         }
@@ -1139,6 +1139,14 @@ impl App {
                 }
             }
             Command::Apply => {
+                // `:apply` is the deliberate "apply now" verb (mirrors the `a`
+                // key), distinct from `:deploy` which only previews. Applying
+                // straight from the palette without a preview step is
+                // intentional and safe: this is a *non-force* apply, so the
+                // daemon re-plans from the freshest on-disk state and refuses
+                // every conflict (backing up nothing, overwriting no unmanaged
+                // target), and the DeployApply Ok handler re-runs `load_deploy`
+                // so the resulting plan is shown immediately after.
                 self.view = View::Deploy;
                 self.apply_deploy(ipc, false);
             }
