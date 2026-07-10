@@ -771,9 +771,16 @@ impl App {
                         Ok(r) => deploy_summary(&r),
                         Err(e) => format!("deploy: malformed reply: {e}"),
                     };
-                    // Close the force-confirm overlay if it was open, then re-plan
-                    // so the tab reflects the new on-disk state.
-                    self.overlay = Overlay::None;
+                    // Close the force-confirm overlay only if it still owns the
+                    // screen, matching the specific overlay the way the Err branch
+                    // below does. A slow in-flight apply must not force-close a
+                    // `:` palette or Unlock prompt the user opened meanwhile —
+                    // that would drop the remaining keystrokes into normal mode
+                    // (a stray `q` quits, an `a` re-fires apply). Then re-plan so
+                    // the tab reflects the new on-disk state.
+                    if matches!(self.overlay, Overlay::DeployForce { .. }) {
+                        self.overlay = Overlay::None;
+                    }
                     self.load_deploy(ipc);
                 }
                 Err((kind, m)) => {
@@ -2558,6 +2565,55 @@ mod tests {
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("1 created"), "status was {:?}", app.status);
         assert!(app.status.contains("1 forced"), "status was {:?}", app.status);
+    }
+
+    #[test]
+    fn deploy_apply_reply_leaves_unrelated_overlay_open() {
+        // Finding #7: a slow apply's Ok reply must not force-close a `:` palette
+        // or Unlock prompt the user opened while it was in flight — only the
+        // deploy-force overlay it owns. Otherwise the remaining keystrokes land
+        // in normal mode (a stray `q` quits, an `a` re-fires apply).
+        let ok_reply = || Reply {
+            id: 1,
+            tag: Tag::DeployApply,
+            result: Ok(serde_json::to_value(DeployApplyReply {
+                created: vec!["bashrc".into()],
+                replaced: vec![],
+                copied: vec![],
+                skipped: vec![],
+                conflicts: vec![],
+                forced: vec![],
+                warnings: vec![],
+            })
+            .unwrap()),
+        };
+
+        // Palette open meanwhile → stays open.
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::Palette("apply".into());
+        let mut ipc = dummy_ipc();
+        app.apply_reply(ok_reply(), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::Palette(_)),
+            "palette was closed by an in-flight apply reply: {:?}",
+            app.overlay
+        );
+
+        // Unlock passphrase prompt open meanwhile → stays open.
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::Unlock {
+            buf: "hunter2".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.apply_reply(ok_reply(), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::Unlock { .. }),
+            "unlock prompt was closed by an in-flight apply reply: {:?}",
+            app.overlay
+        );
     }
 
     #[test]
