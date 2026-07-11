@@ -116,7 +116,9 @@ fn map_deploy_err(e: DeployError) -> (ErrorKind, String) {
         | DeployError::SourceNotFound { .. }
         | DeployError::DirectorySource { .. }
         | DeployError::InvalidName(_)
-        | DeployError::InvalidTarget { .. } => (ErrorKind::BadArgs, e.to_string()),
+        | DeployError::InvalidTarget { .. }
+        | DeployError::InvalidSource { .. }
+        | DeployError::CacheRootInsideGarden(_) => (ErrorKind::BadArgs, e.to_string()),
         DeployError::Io(_) => (ErrorKind::Io, e.to_string()),
     }
 }
@@ -133,6 +135,10 @@ fn project_action(a: Action) -> DeployAction {
 
 /// `deploy_plan` — read-only diff. Never mutates the filesystem, never commits.
 pub fn deploy_plan(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    // Deploy gate first, `inner` second (the daemon-wide lock order for the
+    // deploy verbs): a plan issued while an apply is in flight waits for it
+    // and diffs the settled state instead of a torn mid-apply one.
+    let _gate = daemon.deploy_gate.lock().unwrap();
     let inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let (paths, config, source) = snapshot_deploy_inputs(daemon, &inner)?;
@@ -162,10 +168,22 @@ pub fn deploy_plan(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
 
 /// `deploy_apply` — materialize the plan (deploy-cache + targets). Mutates the
 /// filesystem; a native-FS op, so no VCS commit (M4a defers deploy-as-VCS-event).
+///
+/// Recomputes the plan itself rather than trusting a previously returned
+/// `deploy_plan` (there is no cross-verb plan etag yet — a recorded follow-up):
+/// the target/cache state may have changed since the client planned, and the
+/// [`Daemon::deploy_gate`] only serializes deploys against *each other*, not
+/// against arbitrary filesystem writers.
 pub fn deploy_apply(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: DeployApplyArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("deploy_apply args: {e}")))?;
 
+    // Hold the deploy gate across the whole plan+apply (acquired before
+    // `inner`, the deploy verbs' lock order): concurrent applies serialize, so
+    // two forced applies can never interleave the conflict-backup dance (the
+    // second would rename the first's fresh symlink over `<target>.softfig-bak`,
+    // destroying the only backup of the user's original file).
+    let _gate = daemon.deploy_gate.lock().unwrap();
     let inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let (paths, config, source) = snapshot_deploy_inputs(daemon, &inner)?;

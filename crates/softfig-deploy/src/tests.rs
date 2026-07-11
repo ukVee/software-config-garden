@@ -350,6 +350,148 @@ sneaky = { source = "x", target = "garden/config/source/evil" }
     assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
 }
 
+// ---- canonicalization-based garden refusal (036 review follow-up) ----
+//
+// The lexical `starts_with` refusal had two symlink escapes (record 017,
+// finding 1): a symlinked *parent* smuggling the write into the garden, and
+// unresolved symlink components in the configured roots (`/home → /var/home`)
+// silently disarming the comparison. `resolve_target` now canonicalizes the
+// target's parent chain and compares against the canonical garden root.
+
+#[test]
+fn symlink_parent_into_garden_is_refused() {
+    // `~/.config/foo` is a symlink to a dir inside the garden: the target
+    // string never mentions the garden, but apply's create_dir_all + tempfile
+    // + rename all operate *through* the parent — a garden write.
+    let fx = Fixture::new();
+    fx.write_source("x", b"x\n");
+    let inside = fx.paths.garden_root.join("smuggle");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(fx.paths.home.join(".config")).unwrap();
+    std::os::unix::fs::symlink(&inside, fx.paths.home.join(".config/foo")).unwrap();
+    fx.write_config(
+        r#"[dots]
+x = { source = "x", target = ".config/foo/bar" }
+"#,
+    );
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
+    assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
+    assert!(!inside.join("bar").exists(), "nothing written into the garden");
+}
+
+#[test]
+fn benign_symlink_parent_outside_garden_still_deploys() {
+    // A symlinked parent that resolves *outside* the garden is legitimate
+    // (e.g. ~/.config on another disk) — the canonical check must not refuse it.
+    let fx = Fixture::new();
+    fx.write_source("x", b"payload\n");
+    let elsewhere = fx.paths.home.join("real-config");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fx.paths.home.join(".config")).unwrap();
+    fx.write_config(
+        r#"[dots]
+x = { source = "x", target = ".config/app.conf" }
+"#,
+    );
+    let p = plan(&fx.load(), &fx.paths, &fx.source()).unwrap();
+    assert_eq!(p.entries[0].action, Action::CreateSymlink);
+    apply(&p, &fx.paths, &ApplyOptions::default()).unwrap();
+    assert_eq!(
+        std::fs::read(elsewhere.join("app.conf")).unwrap(),
+        b"payload\n",
+        "deployed through the benign symlinked parent"
+    );
+}
+
+#[test]
+fn direct_target_symlink_stays_a_conflict_not_an_error() {
+    // The final component is deliberately left unresolved: apply *replaces* a
+    // target symlink atomically, never follows it, so a symlink target keeps
+    // its Conflict semantics — whether it points outside or inside the garden.
+    let fx = Fixture::new();
+    fx.write_source("x", b"x\n");
+    std::fs::write(fx.paths.home.join("other"), b"other\n").unwrap();
+    std::os::unix::fs::symlink(fx.paths.home.join("other"), fx.target(".out")).unwrap();
+    let garden_file = fx.paths.garden_root.join("gfile");
+    std::fs::write(&garden_file, b"garden\n").unwrap();
+    std::os::unix::fs::symlink(&garden_file, fx.target(".in")).unwrap();
+    fx.write_config(
+        r#"[dots]
+a = { source = "x", target = ".out" }
+b = { source = "x", target = ".in" }
+"#,
+    );
+    let p = plan(&fx.load(), &fx.paths, &fx.source()).unwrap();
+    assert!(p.entries.iter().all(|e| e.action == Action::Conflict), "{:?}", p.entries);
+
+    // Forcing replaces the symlinks themselves; the garden file is untouched.
+    apply(&p, &fx.paths, &ApplyOptions { force: true }).unwrap();
+    assert_eq!(std::fs::read(&garden_file).unwrap(), b"garden\n");
+    assert_eq!(std::fs::read(fx.paths.home.join("other")).unwrap(), b"other\n");
+}
+
+#[test]
+fn unresolved_root_symlink_components_still_refuse_garden_targets() {
+    // `/home → /var/home` systems: the deploy $HOME is spelled through a
+    // symlink while garden_root is configured canonically. The lexical
+    // comparison never fired here; the canonical one must.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let real_home = root.join("varhome/u");
+    let garden_root = real_home.join("garden");
+    std::fs::create_dir_all(garden_root.join("config/source")).unwrap();
+    std::os::unix::fs::symlink(root.join("varhome"), root.join("home")).unwrap();
+    let paths = DeployPaths {
+        garden_root: garden_root.clone(),
+        config_dir: garden_root.join("config"),
+        home: root.join("home/u"), // the symlinked spelling
+        cache_root: root.join("cache"),
+    };
+    std::fs::write(paths.source_dir().join("x"), b"x\n").unwrap();
+    let cfg = DeployConfig::parse(
+        r#"[dots]
+x = { source = "x", target = "garden/evil" }
+"#,
+    )
+    .unwrap();
+    let err = plan(&cfg, &paths, &FsSource::new(&paths)).unwrap_err();
+    assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
+}
+
+#[test]
+fn cache_root_inside_garden_is_rejected() {
+    // Review follow-up finding 3: a configured deploy-cache inside the garden
+    // would make every symlink dot a garden write (and dangle on lock).
+    let fx = Fixture::new();
+    fx.write_source("x", b"x\n");
+    fx.write_config(
+        r#"[dots]
+x = { source = "x", target = ".x" }
+"#,
+    );
+    let mut paths = fx.paths.clone();
+    paths.cache_root = paths.garden_root.join("cache");
+    let err = plan(&fx.load(), &paths, &FsSource::new(&paths)).unwrap_err();
+    assert!(matches!(err, DeployError::CacheRootInsideGarden(_)), "got {err:?}");
+}
+
+#[test]
+fn source_traversal_and_absolute_sources_are_rejected() {
+    // Review follow-up finding 5: `source` is an address under config/source/
+    // (and, in daemon mode, the working-tree read key) — `..` or an absolute
+    // path could read + deploy an arbitrary garden or host file.
+    let fx = Fixture::new();
+    for src in ["../deploy.toml", "/etc/passwd", ""] {
+        fx.write_config(&format!(
+            r#"[dots]
+x = {{ source = {src:?}, target = ".x" }}
+"#
+        ));
+        let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
+        assert!(matches!(err, DeployError::InvalidSource { .. }), "{src:?}: got {err:?}");
+    }
+}
+
 #[test]
 fn mem_source_classifies_directory_and_missing() {
     let fx = Fixture::new();

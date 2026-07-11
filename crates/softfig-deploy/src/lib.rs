@@ -23,6 +23,14 @@
 //! with a `# managed by softfig` stamp so a re-deploy can tell its own file
 //! from a hand-edited one.
 //!
+//! **Sealed sources deploy as plaintext — by design.** A Layer-B-sealed
+//! source under `config/source/` is decrypted for the deploy: the real
+//! plaintext (never a `[sealed:…]` placeholder) lands in the deploy-cache
+//! and the target, both of which are ordinary owner-only (`0600`) files
+//! outside the vault. Deploying a sealed source is a deliberate
+//! declassification — point the dot at a throwaway target if that's not
+//! what you want.
+//!
 //! ## M4a scope (deliberately thin)
 //!
 //! * `$HOME` targets only — absolute targets outside `$HOME` are rejected
@@ -82,6 +90,18 @@ pub enum DeployError {
         target: String,
         reason: String,
     },
+    #[error(
+        "dot {name:?}: invalid source {source_rel:?}: sources are relative paths under \
+         config/source/ (no absolute paths, no `..`)"
+    )]
+    // `source_rel`, not `source` — thiserror reserves a `source` field for the
+    // underlying-cause chain.
+    InvalidSource { name: String, source_rel: String },
+    #[error(
+        "deploy cache root {0} resolves inside the garden — the cache must live \
+         outside the garden mount (it would dangle on lock and mutate the garden)"
+    )]
+    CacheRootInsideGarden(PathBuf),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

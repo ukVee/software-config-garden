@@ -293,6 +293,51 @@ sneaky = { source = "s", target = "garden/config/source/evil" }
     );
 }
 
+// ---- deploy serialization (036 review follow-up, finding 2) ----------
+
+#[test]
+fn concurrent_forced_applies_preserve_the_original_backup() {
+    // The verbs drop `inner` before their blocking work (the 036 deadlock
+    // fix), so without the daemon's deploy gate two concurrent
+    // `deploy_apply {force:true}` on the same Conflict target could
+    // interleave the backup dance: B renames A's fresh symlink over
+    // `<target>.softfig-bak`, destroying the only backup of the user's
+    // original file. With the gate the applies serialize — the loser plans
+    // against the settled state (SkipUnchanged) and the original bytes
+    // survive in the backup, every run.
+    let fx = Fixture::start(true);
+    fx.write_config(
+        r#"[dots]
+bashrc = { source = "bashrc", target = ".bashrc" }
+"#,
+    );
+    fx.write_source("bashrc", b"managed\n");
+    std::fs::write(fx.target(".bashrc"), b"user-original\n").unwrap();
+
+    let socket = fx.socket.clone();
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            let socket = socket.clone();
+            s.spawn(move || {
+                let resp = send(
+                    &socket,
+                    &Request::new(op::DEPLOY_APPLY, serde_json::json!({ "force": true })),
+                );
+                assert!(matches!(resp, Response::Ok { .. }), "apply: {resp:?}");
+            });
+        }
+    });
+
+    assert_eq!(
+        std::fs::read(fx.target(".bashrc.softfig-bak")).unwrap(),
+        b"user-original\n",
+        "the user's original bytes survive as the backup"
+    );
+    let md = std::fs::symlink_metadata(fx.target(".bashrc")).unwrap();
+    assert!(md.file_type().is_symlink(), "target is the managed symlink");
+    assert_eq!(std::fs::read(fx.target(".bashrc")).unwrap(), b"managed\n");
+}
+
 #[test]
 fn deploy_refuses_when_locked() {
     let fx = Fixture::start(false); // do NOT unlock
