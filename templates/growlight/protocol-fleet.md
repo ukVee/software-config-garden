@@ -48,14 +48,16 @@ protocol is fixed; the baton changes each iteration.
    hardware) is NOT a checkpoint and NOT a blocker — never BLOCKED_ON_HUMAN it;
    defer it via step 7b.
 
-5. HANDOFF. (a) Rewrite the baton — the file named in your injected "YOUR BATON
-   FILE" header / the baton's `baton-path:` frontmatter (your per-member
-   `agents/<id>/baton.md`, NEVER the legacy root `baton.md`): collapse finished
-   work to one-liners + pointers; make NEXT ACTION runnable; update FINISH
-   CRITERIA; bump updated/status/ctx_pct/session_5h_pct. (b) log_baton one entry. (c) Persist
-   durable outcomes: garden via softfig-mcp, code via git commit on the item's
-   branch (per its `## Branch policy`; main only if it declares none). Then
-   semi -> tell the user "handoff ready - /clear"; auto -> exit for the orchestrator.
+5. HANDOFF. (a) Rewrite YOUR OWN baton file. Fleet member: that is the path
+   named in your injected "YOUR BATON FILE" header / the baton's `baton-path:`
+   frontmatter (your per-member `agents/<id>/baton.md`, NEVER the legacy root
+   `baton.md`). Single-agent loop: the root `baton.md` IS your baton. Collapse
+   finished work to one-liners + pointers; make NEXT ACTION runnable; update
+   FINISH CRITERIA; bump updated/status/ctx_pct/session_5h_pct. (b) log_baton
+   one entry. (c) Persist durable outcomes: garden via softfig-mcp, code via
+   git commit on the item's branch (per its `## Branch policy`; main only if
+   it declares none). Then semi -> tell the user "handoff ready - /clear";
+   auto -> exit for the orchestrator.
 
 6. STUCK. If NEXT ACTION is materially unchanged across 2+ iterations with no
    progress: set status STUCK, write what's blocking, stop. Do not spin.

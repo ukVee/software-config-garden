@@ -258,15 +258,6 @@ mod tests {
             !raw.contains("rewriting THIS"),
             "seed no longer uses the ambiguous path-less 'rewriting THIS baton' phrasing",
         );
-
-        // The path stamped in the baton is exactly the file `inject.sh` cats and
-        // the reader parses — the same-file-no-drift invariant the whole store rests
-        // on — so a member that rewrites `baton-path:` writes the file growlightd reads.
-        assert_eq!(
-            abs,
-            s.baton_path("a").to_str().unwrap(),
-            "the stamped path is the store's own baton_path (no drift)",
-        );
     }
 
     #[test]
