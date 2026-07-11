@@ -38,7 +38,7 @@ use softfig_net::{
 };
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
 use softfig_vault::{params::VaultParams, Vault, VaultSession};
-use softfig_vcs::{Intent, Repo};
+use softfig_vcs::{reachable_from, walk, Intent, Repo};
 
 const PASS: &str = "correct horse battery staple";
 
@@ -103,6 +103,19 @@ impl Owner {
         }
         let intent = Intent::new("manual_edit", json!({ "dir": dir })).unwrap();
         self.repo.commit_workdir(&self.session, intent).unwrap()
+    }
+
+    /// Commit `body` as a single file to a **shared chain**'s own ref (m5c),
+    /// from an out-of-garden staging dir so the shared content never touches the
+    /// device working tree. Advances `ref_name` only — the device tip stays put.
+    /// Returns the new tip of that chain.
+    fn commit_to_chain(&mut self, ref_name: &str, filename: &str, body: &str) -> Hash {
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::write(stage.path().join(filename), body).unwrap();
+        let snapshot = walk::walk(stage.path()).unwrap();
+        self.repo
+            .commit_snapshot_to(ref_name, &self.session, snapshot, Intent::init("shared chain advance"))
+            .unwrap()
     }
 }
 
@@ -542,6 +555,105 @@ fn pipelined_rollback_announce_is_rejected_and_mirror_unchanged() {
         Some(*tip_b.as_bytes()),
         "mirror tip must be left at B, never force-updated"
     );
+}
+
+// --- M5c slice 004: replica isolation — the mirror gets the DEVICE ref only ---
+
+/// The adversarial end-to-end isolation proof (user requirement #2): an owner
+/// with a device chain **and** a shared chain runs a real M5b replica push to a
+/// backup host; the resulting mirror holds **exactly** the device chain's
+/// closure — the shared chain's commit, ref, and ciphertext blob are all
+/// **absent**. Enforced by construction: `build_announce` announces
+/// `repo.tip()` = the device `TIP_REF`, so the sink's fast-forward walk can only
+/// ever reach the device tip's object graph. A shared chain is a separate source
+/// (its own replication is m5d/m5e), never folded into the device backup.
+#[test]
+fn device_chain_replica_excludes_a_shared_chain() {
+    const SHARED_REF: &str = "chain/journals";
+
+    let mut owner = new_owner();
+    // Device chain: genesis + two device commits.
+    owner.commit_file("a.md", "alpha");
+    let dev_tip = owner.commit_file("dir/b.md", "beta");
+
+    // A shared chain on its OWN ref, carrying content unique to it — the blob
+    // that must never reach a backup mirror.
+    let shared_tip = owner.commit_to_chain(SHARED_REF, "secret.md", "SHARED-SUBTREE-SECRET");
+    assert_eq!(
+        owner.repo.tip().unwrap(),
+        Some(dev_tip),
+        "a shared-chain write must not move the device ref"
+    );
+
+    // The shared chain owns a ciphertext blob the device tip never references.
+    let dev_blobs = reachable_from(owner.repo.db(), dev_tip).unwrap().blobs;
+    let shared_blobs = reachable_from(owner.repo.db(), shared_tip).unwrap().blobs;
+    let shared_exclusive: Vec<Hash> = shared_blobs.difference(&dev_blobs).copied().collect();
+    assert!(
+        !shared_exclusive.is_empty(),
+        "the shared chain must own an exclusive blob"
+    );
+
+    // Push to a backup host over a real Noise serve/pull session.
+    let chain_id = owner.repo.repo_id().unwrap().into_bytes();
+    let announce = build_announce(&owner.repo, &owner.session).unwrap();
+    // The announce ships the DEVICE tip, never the shared tip.
+    assert_eq!(
+        announce.tip_hash,
+        dev_tip.as_bytes().to_vec(),
+        "build_announce must announce the device tip only"
+    );
+
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut mirror =
+        MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+    let summary = replicate_once(
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        announce,
+        &mut mirror,
+    )
+    .unwrap();
+    assert_eq!(summary.new_tip, Some(*dev_tip.as_bytes()));
+    drop(mirror);
+
+    // Inspect the mirror on disk: it holds EXACTLY the device chain's closure.
+    let dir = mirror_dir(replica_root.path(), &owner.device_id);
+    let paths = StorePaths::with_state_root(&dir, &dir);
+    let db = Db::open(&paths).unwrap();
+    let objects = ObjectStore::new(paths);
+
+    // (1) The mirror's only ref is the device tip; it never learned the shared ref.
+    assert_eq!(db.try_get_ref("tip").unwrap(), Some(dev_tip));
+    assert_eq!(
+        db.try_get_ref(SHARED_REF).unwrap(),
+        None,
+        "the mirror must not hold the shared chain's ref"
+    );
+
+    // (2) The shared chain's commit is absent from the mirror.
+    assert!(
+        !db.commit_exists(&shared_tip).unwrap(),
+        "the shared commit must not reach the mirror"
+    );
+
+    // (3) The shared chain's exclusive ciphertext blob(s) never entered the mirror.
+    for h in &shared_exclusive {
+        assert!(
+            !objects.contains(h),
+            "shared blob {h} leaked into the backup mirror"
+        );
+    }
+
+    // (4) Positive control: every device-tip blob DID reach the mirror, and the
+    //     mirror is fsck-clean and scoped to the device closure only.
+    for h in &dev_blobs {
+        assert!(objects.contains(h), "device blob {h} must be in the mirror");
+    }
+    let report = softfig_vcs::fsck(&db, &objects).unwrap();
+    assert!(report.ok(), "mirror not fsck-clean: {:?}", report.problems);
 }
 
 // --- Owner-side IPC surface (grant / revoke / status) -----------------------

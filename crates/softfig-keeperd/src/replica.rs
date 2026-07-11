@@ -158,6 +158,17 @@ pub fn mint_grant(
 /// signature binds `chain_id ‖ tip ‖ height` (see
 /// [`tipannounce_signing_bytes`]); the host verifies it against the owner's
 /// identity key.
+///
+/// **Replica isolation invariant (m5c slice 004, user requirement #2):** this
+/// announces `repo.tip()` = the **device chain** (`TIP_REF`) only — never
+/// `db.all_refs()`. Because the sink's fast-forward walk can only reach the
+/// object graph of the announced tip, a shared chain (a separate ref) is
+/// **structurally excluded** from every per-peer backup mirror. Do not change
+/// this to announce all refs: a shared chain replicates only to its own
+/// `S`-audience (m5d/m5e), never folded into the device backup. Enforced by
+/// construction here + regression-tested in `tests/m5b_replica.rs`
+/// (`device_chain_replica_excludes_a_shared_chain`) and `softfig-vcs`'s
+/// `tests/replica_isolation.rs`.
 pub fn build_announce(repo: &Repo, session: &VaultSession) -> NetResult<TipAnnounce> {
     let chain_id = repo.repo_id().map_err(neterr)?.into_bytes();
     let (tip_hash, height) = match repo.tip().map_err(neterr)? {

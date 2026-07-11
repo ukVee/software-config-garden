@@ -326,3 +326,61 @@ fn remove_unshares_and_is_idempotent() {
     .unwrap();
     assert!(!reply.removed);
 }
+
+// ---- replica isolation: lifecycle never touches the device-chain grants ----
+
+/// M5c slice 004 (user requirement #2): the shared-subtree lifecycle and the
+/// M5b device-chain replica grants (`replica.toml` `push_to`) are **independent
+/// config surfaces**. add/remove (ring membership) and enable/disable (local
+/// toggle) must leave the grant ledger byte-unchanged — a shared subtree can
+/// never redirect, add to, or drop a device-chain backup target. Trivially true
+/// today (no lifecycle handler touches the `GrantLedger`), pinned so a future
+/// edit can't silently regress it.
+#[test]
+fn lifecycle_ops_never_touch_the_replica_grant_ledger() {
+    use softfig_keeperd::replica::{replica_ledger_path, GrantLedger};
+
+    let fx = Fixture::start();
+
+    // Seed a non-empty owner-side push_to ledger (the device-chain backup hosts).
+    // For an M1c-compat garden the store dir is the garden root, so this lands at
+    // `<garden>/.softfig/replica.toml`.
+    let mut ledger = GrantLedger::default();
+    assert!(ledger.grant(&"ab".repeat(32)));
+    assert!(ledger.grant(&"cd".repeat(32)));
+    ledger.save(&fx.garden).unwrap();
+    let ledger_path = replica_ledger_path(&fx.garden);
+    let before = std::fs::read(&ledger_path).expect("seeded replica.toml exists");
+
+    let assert_unchanged = |after_what: &str| {
+        assert_eq!(
+            std::fs::read(&ledger_path).unwrap(),
+            before,
+            "{after_what} must leave replica.toml push_to byte-unchanged"
+        );
+    };
+
+    // add = ring membership + a `shared_subtrees_changed` commit.
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    assert_unchanged("add");
+
+    // disable / enable = a local sidecar toggle (ceremony-free).
+    fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
+    assert_unchanged("disable");
+    fx.toggle(op::SHARED_SUBTREE_ENABLE, "journals");
+    assert_unchanged("enable");
+
+    // remove = ring membership + a `shared_subtrees_changed` commit.
+    let reply: SharedSubtreeRemoveReply = serde_json::from_value(ok_data(fx.call(
+        op::SHARED_SUBTREE_REMOVE,
+        serde_json::to_value(SharedSubtreeRemoveArgs { id: "journals".into() }).unwrap(),
+    )))
+    .unwrap();
+    assert!(reply.removed);
+    assert_unchanged("remove");
+
+    // And the ledger still round-trips to the exact seeded grants — the two
+    // surfaces never crossed.
+    let reloaded = GrantLedger::load(&fx.garden).unwrap();
+    assert_eq!(reloaded.push_to, vec!["ab".repeat(32), "cd".repeat(32)]);
+}
