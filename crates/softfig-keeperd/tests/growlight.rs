@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use softfig_ipc::verbs::{
     op, AddBacklogItemReply, AddQueueReply, AddSliceReply, GrowlightInitReply,
     GrowlightSetResourcesReply, LogBatonReply, PostMessageReply, ReadInboxReply,
-    ReorderBacklogItemReply, SetItemStatusReply, TailBusReply,
+    ReorderBacklogItemReply, SetItemStatusReply, StatusReply, TailBusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -1236,4 +1236,45 @@ fn growlight_set_resources_is_not_found_when_the_config_is_absent() {
         serde_json::json!({ "cargo_build_jobs": 4 }),
     );
     assert_eq!(err_kind(resp), ErrorKind::NotFound);
+}
+
+/// 020 slice 013: a REAL daemon's `status` reply carries the daemon-owned
+/// `growlight_enabled` bit end to end — record 015 flagged that the gate had
+/// unit coverage only, never through a live daemon's dispatch. The probed shape
+/// is the exact fresh-garden disagreement the bit exists for: `config/
+/// growlight.toml` PRESENT but the gate off, where client-side file-presence
+/// probing used to say "enabled".
+#[test]
+fn status_reply_carries_the_fail_closed_growlight_gate() {
+    let fx = Fixture::start();
+
+    // Fresh garden: no config/growlight.toml at all ⇒ fail-closed false.
+    let s: StatusReply =
+        serde_json::from_value(ok_data(fx.call(op::STATUS, serde_json::json!({})))).unwrap();
+    assert!(!s.growlight_enabled, "no toml ⇒ gate off");
+
+    // toml-present / gate-off: file presence says "yes", the gate says "no".
+    std::fs::create_dir_all(fx.garden.join("config")).unwrap();
+    std::fs::write(
+        fx.garden.join("config/growlight.toml"),
+        "fleet_enabled = false\n",
+    )
+    .unwrap();
+    let s: StatusReply =
+        serde_json::from_value(ok_data(fx.call(op::STATUS, serde_json::json!({})))).unwrap();
+    assert!(
+        !s.growlight_enabled,
+        "toml-present/gate-off garden must surface growlight_enabled = false"
+    );
+
+    // Arming the gate flips the very next status reply — the verb re-reads the
+    // gate every call (refreshes every status tick, no daemon-side caching).
+    std::fs::write(
+        fx.garden.join("config/growlight.toml"),
+        "fleet_enabled = true\n",
+    )
+    .unwrap();
+    let s: StatusReply =
+        serde_json::from_value(ok_data(fx.call(op::STATUS, serde_json::json!({})))).unwrap();
+    assert!(s.growlight_enabled, "armed gate reads true through status");
 }

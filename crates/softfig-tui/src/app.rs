@@ -488,6 +488,12 @@ impl App {
                         // it off while locked: the section can't load, and the
                         // daemon fail-closes anyway when the mount is down.
                         self.growlight_enabled = Some(!self.locked && s.growlight_enabled);
+                        // The gate can flip off mid-session (config edit, lock):
+                        // the tab header disappears, so don't leave the view
+                        // stranded on a section that is no longer reachable.
+                        if self.growlight_enabled != Some(true) && self.view == View::Growlight {
+                            self.view = View::Browse;
+                        }
                         if !self.locked && (was_locked || !self.tree.is_loaded("")) {
                             self.load_dir(ipc, "");
                         }
@@ -2792,6 +2798,34 @@ mod tests {
         app2.apply_reply(status_reply("unlocked", false), &mut ipc);
         assert_eq!(app2.growlight_enabled, Some(false));
         assert!(!app2.growlight.loaded);
+    }
+
+    #[test]
+    fn growlight_view_snaps_to_browse_when_the_gate_flips_off() {
+        let mut ipc = dummy_ipc();
+        let mut app = App::new();
+        app.apply_reply(status_reply("unlocked", true), &mut ipc);
+        app.view = View::Growlight;
+
+        // The gate flips off mid-session: the tab header disappears, so the
+        // active view must not stay stranded on the unreachable section.
+        app.apply_reply(status_reply("unlocked", false), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(false));
+        assert_eq!(app.view, View::Browse);
+
+        // Same snap when the flip comes from locking rather than the config.
+        let mut app2 = App::new();
+        app2.apply_reply(status_reply("unlocked", true), &mut ipc);
+        app2.view = View::Growlight;
+        app2.apply_reply(status_reply("locked", true), &mut ipc);
+        assert_eq!(app2.view, View::Browse);
+
+        // A gate-on tick never disturbs the current view.
+        let mut app3 = App::new();
+        app3.apply_reply(status_reply("unlocked", true), &mut ipc);
+        app3.view = View::Growlight;
+        app3.apply_reply(status_reply("unlocked", true), &mut ipc);
+        assert_eq!(app3.view, View::Growlight);
     }
 
     #[test]
