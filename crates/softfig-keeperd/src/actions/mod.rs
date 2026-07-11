@@ -124,3 +124,32 @@ pub(crate) fn commit_now(
     }
     Ok(hash)
 }
+
+/// Commit a pre-built `snapshot` to an arbitrary chain `ref_name` under a fresh
+/// [`PriorTipGuard`] — the M5c slice 003 path for creating a shared chain's
+/// genesis ref (an empty snapshot on a not-yet-existing ref, so the union mount
+/// can compose it). Mirrors [`commit_now`] but targets `ref_name` with a
+/// caller-supplied snapshot instead of the device chain's FUSE workdir snapshot,
+/// so it never self-reads the mount. The caller holds the inner lock and has
+/// verified the vault is unlocked.
+pub(crate) fn commit_snapshot_to_now(
+    inner: &mut DaemonInner,
+    ref_name: &str,
+    snapshot: softfig_vcs::WalkSnapshot,
+    intent: Intent,
+) -> Result<Hash, (ErrorKind, String)> {
+    let hook = inner.layer_b.clone();
+    let hash = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_mut().expect("unlocked");
+        let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
+        repo.commit_snapshot_to(ref_name, session, snapshot, intent)
+            .map_err(|e| err_to_response(e.into()))?
+    };
+    // A genesis on a shared ref never advances the device tip, so the device-only
+    // replica push loop no-ops; wake it anyway for parity with `commit_now`.
+    if let Some(net) = inner.net.as_ref() {
+        net.signal_commit();
+    }
+    Ok(hash)
+}

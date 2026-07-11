@@ -113,6 +113,27 @@ pub mod op {
     /// host, and per-peer mirror stats for chains it hosts. Read-only; never a
     /// document browser (peer-doc reading is the deferred M5b-view slice).
     pub const REPLICA_STATUS: &str = "replica_status";
+    /// M5c slice 003: register a new shared subtree — validate the mount path,
+    /// append the membership row to `config/shared-subtrees.toml`, create the
+    /// chain's genesis ref so the union mount can compose it, and live-recompose.
+    /// Commit `shared_subtrees_changed`. The collaborative key ceremony is the
+    /// stubbed m5d hook (no real `S` is wired here).
+    pub const SHARED_SUBTREE_ADD: &str = "shared_subtree_add";
+    /// M5c slice 003: un-share a subtree — drop its membership row + commit
+    /// `shared_subtrees_changed` + live-recompose. Leaves the chain ref/objects
+    /// in place (gc reclaims them later).
+    pub const SHARED_SUBTREE_REMOVE: &str = "shared_subtree_remove";
+    /// M5c slice 003: re-enable a subtree on THIS device — clear its id from the
+    /// never-committed `.softfig/shared-subtrees-local.toml` sidecar + live-
+    /// recompose. No commit, no ceremony, no membership change.
+    pub const SHARED_SUBTREE_ENABLE: &str = "shared_subtree_enable";
+    /// M5c slice 003: disable a subtree on THIS device — add its id to the local
+    /// sidecar + live-recompose (its subtree falls back to the device chain). No
+    /// commit, no ceremony, no membership change — the headline "easy on/off".
+    pub const SHARED_SUBTREE_DISABLE: &str = "shared_subtree_disable";
+    /// M5c slice 003: list every shared-subtree member with its per-device
+    /// enabled state. Read-only.
+    pub const SHARED_SUBTREE_LIST: &str = "shared_subtree_list";
     /// Slice 2 (small-files): append a brand-new heading-addressed section
     /// to the end of any markdown doc. The heading must not already exist;
     /// commit `section_added`.
@@ -1083,6 +1104,82 @@ pub struct HostedChain {
     /// Unix seconds of the last successful sync, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<i64>,
+}
+
+// ---- M5c slice 003: shared-subtree lifecycle -------------------------------
+
+/// `shared_subtree_add({mount_path, id?}) -> {id, mount_path, ref_name}`. Register
+/// a new shared subtree (ring membership); the daemon validates the mount path,
+/// assigns an id (derived from `mount_path` when omitted), and creates the chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeAddArgs {
+    /// Garden-relative mount prefix to share, `/`-separated (e.g. `projects/journals`).
+    pub mount_path: String,
+    /// Stable id for the share; when absent the daemon derives one from
+    /// `mount_path`'s last component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeAddReply {
+    /// The id assigned to the new share.
+    pub id: String,
+    /// The garden-relative mount prefix that was registered.
+    pub mount_path: String,
+    /// The `refs`-table ref holding the new chain's tip (`chain/<id>`).
+    pub ref_name: String,
+}
+
+/// `shared_subtree_remove({id}) -> {id, removed}`. Drop a share's membership row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeRemoveArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeRemoveReply {
+    pub id: String,
+    /// False when no member had this id (idempotent no-op).
+    pub removed: bool,
+}
+
+/// `shared_subtree_enable`/`disable({id}) -> {id, enabled, changed}`. Flip the
+/// per-device local toggle only — never the committed membership or `key_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeToggleArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeToggleReply {
+    pub id: String,
+    /// The resulting per-device state (`true` = enabled on this device).
+    pub enabled: bool,
+    /// False when the toggle was already in this state (idempotent no-op).
+    pub changed: bool,
+}
+
+/// `shared_subtree_list({}) -> {subtrees}`. Every member + its per-device state.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SharedSubtreeListArgs {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeListReply {
+    pub subtrees: Vec<SharedSubtreeInfo>,
+}
+
+/// One shared-subtree member as surfaced to `softfig shared-subtree list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeInfo {
+    pub id: String,
+    pub mount_path: String,
+    pub ref_name: String,
+    /// Per-device enabled state (`!local.is_disabled(id)`).
+    pub enabled: bool,
+    /// The collaborative key id — a placeholder (`None`) until m5d.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 /// `migrate split [--apply]` — one-time monolith → numbered-notes splitter.

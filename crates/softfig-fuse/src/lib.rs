@@ -165,6 +165,15 @@ impl MountHandle {
         self.state.registry()
     }
 
+    /// M5c slice 003 — hot-swap the chain registry this mount serves and
+    /// recompose the union view live. The keeperd shared-subtree lifecycle verbs
+    /// call this after an add/remove membership commit or an enable/disable local
+    /// toggle, so the mounted garden reflects the new composition immediately with
+    /// no remount (a remount would tear down + drop the pending write overlay).
+    pub fn set_registry(&self, registry: softfig_vcs::ChainRegistry) {
+        self.state.set_registry(registry);
+    }
+
     /// The exclusion set (built-in defaults ∪ the user `.softfigignore`) in
     /// force for this garden, reconstructed from the FUSE driver's in-memory
     /// state (overlay precedence, else the committed tip blob) — never read

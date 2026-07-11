@@ -17,7 +17,10 @@ use softfig_ipc::verbs::{
     PairRemoveReply, PendingPairing, RelockMintArgs, RelockMintReply, RelockRedeemArgs,
     RelockRedeemReply, ReplaceFileArgs, ReplaceFileReply,
     ReplicaGrantArgs, ReplicaGrantReply, ReplicaRevokeArgs, ReplicaRevokeReply,
-    ReplicaStatusReply, ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
+    ReplicaStatusReply, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeInfo,
+    SharedSubtreeListReply, SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply,
+    SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
+    ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
     UnlockReply, VaultListSealedReply, VaultRevealArgs, VaultRevealReply,
     VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
 };
@@ -1522,6 +1525,314 @@ fn load_local_toggles(state_dir: &Path) -> softfig_vcs::LocalToggles {
         // Absent sidecar is the common case (nothing disabled).
         Err(_) => softfig_vcs::LocalToggles::default(),
     }
+}
+
+// ---- M5c slice 003: shared-subtree lifecycle -------------------------------
+//
+// Two control axes, deliberately split ([[decision-softfig-shared-subtrees-impl]]
+// pick 3): `add`/`remove` edit the committed, ring-membership file
+// `config/shared-subtrees.toml` (the collaborative key ceremony is the stubbed
+// m5d hook — no real `S` is wired here); `enable`/`disable` flip ONLY the
+// never-committed `.softfig/shared-subtrees-local.toml` sidecar, so the on/off
+// toggle is provably ceremony-free (no membership/key_id/commit side-effect).
+// After any change the mount's registry is hot-swapped so the union view
+// recomposes live (a no-op in non-FUSE mode; re-derived at the next mount).
+
+/// Repo-relative path of the committed membership file (`config/shared-subtrees.toml`).
+fn shared_subtrees_rel() -> String {
+    format!(
+        "{}/{}",
+        crate::keeper_toml::CONFIG_DIR,
+        softfig_vcs::SHARED_SUBTREES_FILE
+    )
+}
+
+/// Persist the per-device local-toggle sidecar (never committed; lives in the
+/// state dir's `.softfig/`, next to the peers endpoint cache).
+fn save_local_toggles(
+    state_dir: &Path,
+    local: &softfig_vcs::LocalToggles,
+) -> std::result::Result<(), (ErrorKind, String)> {
+    let dir = state_dir.join(".softfig");
+    std::fs::create_dir_all(&dir).map_err(|e| (ErrorKind::Io, format!("create .softfig: {e}")))?;
+    let path = dir.join(softfig_vcs::LOCAL_TOGGLES_FILE);
+    let toml = local
+        .to_toml()
+        .map_err(|e| (ErrorKind::Internal, format!("serialize local toggles: {e}")))?;
+    std::fs::write(&path, toml).map_err(|e| (ErrorKind::Io, format!("write {}: {e}", path.display())))
+}
+
+/// Validate an explicit share id: 1–64 chars of `[a-z0-9-]` (the slug charset,
+/// safe as both a `chain/<id>` ref component and a config key), and not the
+/// reserved device-chain id.
+fn validate_share_id(raw: &str) -> std::result::Result<String, (ErrorKind, String)> {
+    let id = raw.trim();
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && id != softfig_vcs::DEVICE_CHAIN_ID;
+    if ok {
+        Ok(id.to_string())
+    } else {
+        Err((
+            ErrorKind::BadArgs,
+            format!("invalid share id {raw:?}: expect 1–64 chars of [a-z0-9-], not the reserved device id"),
+        ))
+    }
+}
+
+/// Derive a default share id from a mount path's last component (slugified).
+fn derive_share_id(mount_path: &str) -> std::result::Result<String, (ErrorKind, String)> {
+    let last = mount_path.rsplit('/').find(|c| !c.is_empty()).unwrap_or("");
+    let slug: String = last
+        .chars()
+        .map(|c| {
+            let l = c.to_ascii_lowercase();
+            if l.is_ascii_lowercase() || l.is_ascii_digit() {
+                l
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    validate_share_id(&slug).map_err(|_| {
+        (
+            ErrorKind::BadArgs,
+            format!("could not derive a share id from {mount_path:?}; pass an explicit id"),
+        )
+    })
+}
+
+/// Normalize a mount-path argument to a clean `/`-joined garden-relative prefix
+/// (no leading/trailing slash, no `.`), rejecting the obviously-bad shapes early;
+/// [`softfig_vcs::validate_share_add`] remains the authority for the machine-dir
+/// denylist + disjointness.
+fn normalize_mount_path(raw: &str) -> std::result::Result<String, (ErrorKind, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("mount_path {raw:?} must be a non-empty garden-relative path"),
+        ));
+    }
+    let comps: Vec<&str> = trimmed
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if comps.is_empty() || comps.contains(&"..") {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("mount_path {raw:?} is not a clean garden-relative path"),
+        ));
+    }
+    Ok(comps.join("/"))
+}
+
+/// Rebuild the live chain registry from the committed membership + local sidecar
+/// and hot-swap it into the FUSE mount (if any) so the union view recomposes
+/// live. A no-op in non-FUSE (Disk / M1c-compat) mode — the registry is
+/// re-derived from the same two sources at the next mount there.
+fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_dir: &Path) {
+    let registry = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        load_chain_registry(repo, session, state_dir)
+    };
+    if let Some(mount) = inner.fuse.as_ref() {
+        mount.set_registry(registry);
+    }
+}
+
+pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: SharedSubtreeAddArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("shared_subtree_add args: {e}")))?;
+    let mount_path = normalize_mount_path(&args.mount_path)?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    // Current committed membership from the device tip (absent ⇒ empty).
+    let mut membership = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        read_committed_shared_subtrees(repo, session).unwrap_or_default()
+    };
+
+    // Reject a machine dir + any overlap with an existing share (v1 = disjoint).
+    softfig_vcs::validate_share_add(&membership, &mount_path)
+        .map_err(|e| (ErrorKind::BadArgs, e.to_string()))?;
+
+    let id = match args.id {
+        Some(raw) => validate_share_id(&raw)?,
+        None => derive_share_id(&mount_path)?,
+    };
+    if membership.contains(&id) {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("shared subtree id {id:?} already exists"),
+        ));
+    }
+    let ref_name = format!("chain/{id}");
+
+    // Append the membership row (`key_id` stays `None` — the collaborative key S
+    // is the stubbed m5d hook) and stage the config edit through the WorkTree.
+    membership.subtrees.push(softfig_vcs::SharedSubtreeEntry {
+        id: id.clone(),
+        mount_path: mount_path.clone(),
+        ref_name: ref_name.clone(),
+        key_id: None,
+    });
+    let toml = membership
+        .to_toml()
+        .map_err(|e| (ErrorKind::Internal, format!("serialize shared-subtrees: {e}")))?;
+    {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        wt.write(&shared_subtrees_rel(), toml.as_bytes())?;
+    }
+    let payload = serde_json::json!({ "summary": format!("add shared subtree {id}") });
+    let intent = Intent::new("shared_subtrees_changed", payload)
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    crate::actions::commit_now(&mut inner, intent)?;
+
+    // Create the chain's genesis ref (empty tree) so the union mount can compose
+    // it. "add ⇒ chain exists + mounted"; no key ceremony here (that is m5d).
+    let genesis = Intent::init(format!("shared subtree {id} created"));
+    crate::actions::commit_snapshot_to_now(
+        &mut inner,
+        &ref_name,
+        softfig_vcs::WalkSnapshot::empty(),
+        genesis,
+    )?;
+
+    refresh_mount_registry(&inner, &state_dir);
+
+    Ok(serde_json::to_value(SharedSubtreeAddReply {
+        id,
+        mount_path,
+        ref_name,
+    })
+    .unwrap())
+}
+
+pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: SharedSubtreeRemoveArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("shared_subtree_remove args: {e}")))?;
+    let id = args.id.trim().to_string();
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    let mut membership = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        read_committed_shared_subtrees(repo, session).unwrap_or_default()
+    };
+    let before = membership.subtrees.len();
+    membership.subtrees.retain(|s| s.id != id);
+    let removed = membership.subtrees.len() != before;
+
+    if removed {
+        // Un-share = drop the membership row + commit. The chain ref/objects are
+        // left in place (gc reclaims them later); this only stops composing it.
+        let toml = membership
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, format!("serialize shared-subtrees: {e}")))?;
+        {
+            let wt = crate::actions::WorkTree::new(daemon, &inner);
+            wt.write(&shared_subtrees_rel(), toml.as_bytes())?;
+        }
+        let payload = serde_json::json!({ "summary": format!("remove shared subtree {id}") });
+        let intent = Intent::new("shared_subtrees_changed", payload)
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+        crate::actions::commit_now(&mut inner, intent)?;
+        refresh_mount_registry(&inner, &state_dir);
+    }
+
+    Ok(serde_json::to_value(SharedSubtreeRemoveReply { id, removed }).unwrap())
+}
+
+pub fn shared_subtree_enable(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    toggle_shared_subtree(daemon, args, false)
+}
+
+pub fn shared_subtree_disable(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    toggle_shared_subtree(daemon, args, true)
+}
+
+/// The shared body of `enable`/`disable`: flip ONLY the never-committed local
+/// sidecar (no membership change, no commit, no ceremony), then live-recompose.
+fn toggle_shared_subtree(daemon: &Daemon, args: serde_json::Value, disable: bool) -> HandlerResult {
+    let args: SharedSubtreeToggleArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("shared_subtree toggle args: {e}")))?;
+    let id = args.id.trim().to_string();
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    // Only a real member may be toggled, so a typo can't seed a phantom disable.
+    let is_member = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        read_committed_shared_subtrees(repo, session)
+            .unwrap_or_default()
+            .contains(&id)
+    };
+    if !is_member {
+        return Err((ErrorKind::NotFound, format!("no shared subtree with id {id:?}")));
+    }
+
+    let mut local = load_local_toggles(&state_dir);
+    let changed = if disable {
+        local.disable(&id)
+    } else {
+        local.enable(&id)
+    };
+    if changed {
+        save_local_toggles(&state_dir, &local)?;
+        refresh_mount_registry(&inner, &state_dir);
+    }
+
+    Ok(serde_json::to_value(SharedSubtreeToggleReply {
+        id,
+        enabled: !disable,
+        changed,
+    })
+    .unwrap())
+}
+
+pub fn shared_subtree_list(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    let membership = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        read_committed_shared_subtrees(repo, session).unwrap_or_default()
+    };
+    let local = load_local_toggles(&state_dir);
+    let subtrees = membership
+        .subtrees
+        .into_iter()
+        .map(|e| {
+            let enabled = !local.is_disabled(&e.id);
+            SharedSubtreeInfo {
+                id: e.id,
+                mount_path: e.mount_path,
+                ref_name: e.ref_name,
+                enabled,
+                key_id: e.key_id,
+            }
+        })
+        .collect();
+
+    Ok(serde_json::to_value(SharedSubtreeListReply { subtrees }).unwrap())
 }
 
 pub(crate) fn resolve_path_in_tree(

@@ -53,7 +53,9 @@ pub(crate) struct SharedState {
     /// M5c slice 002 — the chain composition this mount serves. Reads compose
     /// the union across its enabled chains; commits route each path to its
     /// owning chain. Default [`ChainRegistry::device_only`] ⇒ today's behavior.
-    registry: ChainRegistry,
+    /// Behind a `Mutex` so the M5c slice 003 lifecycle verbs can hot-swap it
+    /// (add/remove/enable/disable) via [`Self::set_registry`] without a remount.
+    registry: Mutex<ChainRegistry>,
     /// M2c — cache of post-`redact_regions` bytes keyed by
     /// repo-relative path. Invalidated on `tip_changed` (broadcast).
     /// Per the M2c open-question 5 lean, unbounded for v1 (same policy
@@ -89,9 +91,11 @@ impl SharedState {
         // caller already knows which ref moved and can scope this later.
         let (device_tip, view) = {
             let db = self.db.lock().unwrap();
+            // Lock order is always db → registry (the only site holding both).
+            let registry = self.registry.lock().unwrap();
             let device_tip = db.try_get_ref(TIP_REF).ok().flatten();
             let view =
-                TreeView::build_union(&db, &self.registry).unwrap_or_else(|_| TreeView::empty());
+                TreeView::build_union(&db, &registry).unwrap_or_else(|_| TreeView::empty());
             (device_tip, view)
         };
         let mut inner = self.inner.lock().unwrap();
@@ -199,6 +203,8 @@ impl SharedState {
         let unified = self.unified_snapshot()?;
         Ok(self
             .registry
+            .lock()
+            .unwrap()
             .split_snapshot(&unified)
             .into_iter()
             .find(|(r, _)| r == TIP_REF)
@@ -213,14 +219,27 @@ impl SharedState {
     /// the wrong ref.
     pub(crate) fn chain_snapshots(&self) -> Result<Vec<(String, WalkSnapshot)>> {
         let unified = self.unified_snapshot()?;
-        Ok(self.registry.split_snapshot(&unified))
+        Ok(self.registry.lock().unwrap().split_snapshot(&unified))
     }
 
     /// A clone of the chain registry this mount serves — the keeperd commit path
     /// routes each dirty path through [`ChainRegistry::owning_chain`] to decide
     /// which chains a flush must commit.
     pub(crate) fn registry(&self) -> ChainRegistry {
-        self.registry.clone()
+        self.registry.lock().unwrap().clone()
+    }
+
+    /// M5c slice 003 — hot-swap the chain registry this mount serves, then
+    /// recompose the whole union view from it. The keeperd lifecycle verbs call
+    /// this after flipping the local enable/disable sidecar or committing an
+    /// add/remove membership change, so the mount reflects the new composition
+    /// live — no remount (which would drop the pending write overlay).
+    pub(crate) fn set_registry(&self, registry: ChainRegistry) {
+        // Swap under the registry lock; the temporary guard is released at the
+        // end of this statement, before `rotate_tip` re-locks it (std `Mutex`
+        // is not reentrant).
+        *self.registry.lock().unwrap() = registry;
+        self.rotate_tip();
     }
 
     /// The exclusion set in force for this garden, read from the in-memory
@@ -676,7 +695,7 @@ impl FuseMount {
             }),
             sink,
             sealed,
-            registry,
+            registry: Mutex::new(registry),
             redacted_cache: Mutex::new(HashMap::new()),
         });
 
