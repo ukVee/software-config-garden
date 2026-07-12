@@ -3,9 +3,10 @@
 //! Reads materialize the union (tree-at-tip ∪ overlay). Writes update
 //! the overlay and push a `DirtyEvent` into the daemon via the
 //! [`DirtyEventSink`] callbacks. Commit lifecycle is owned by the
-//! daemon — when its `DirtySetAccumulator` flushes, `commit_workdir`
-//! walks our mount, reads our overlay+tip view, and (on success)
-//! invokes the tip-changed callback which clears the overlay.
+//! daemon — when its `DirtySetAccumulator` flushes, it commits our
+//! in-memory snapshot per owning chain, and each commit's tip-changed
+//! callback rotates the view, absorbing exactly the overlay entries
+//! that commit captured (slice 006 absorption invariant).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -77,10 +78,28 @@ pub(crate) struct Inner {
     pub(crate) tip: Option<Hash>,
     pub(crate) view: TreeView,
     pub(crate) overlay: Overlay,
+    /// The overlay generation captured by the most recent commit-input
+    /// snapshot ([`SharedState::unified_snapshot`]). A rotation absorbs
+    /// overlay entries up to this generation only — anything staged after
+    /// the snapshot was not in the commit and must survive (slice 006).
+    pub(crate) snapshot_gen: u64,
 }
 
 impl SharedState {
-    pub(crate) fn rotate_tip(&self) {
+    /// Recompose the union view after a ref advanced (`advanced =
+    /// Some(ref_name)`, fired by the repo's `tip_changed` callback) or after
+    /// a registry hot-swap (`advanced = None`, no commit happened).
+    ///
+    /// **Absorption invariant (M5c slice 006):** the rotation clears exactly
+    /// the overlay entries the new composition absorbed — those owned by the
+    /// chain whose ref advanced AND staged at-or-before the generation the
+    /// commit's snapshot captured. A registry swap absorbs nothing, so it
+    /// clears nothing. Other chains' staged writes and post-snapshot racers
+    /// always survive. (The old unconditional `overlay.clear()` was correct
+    /// only while every rotation followed a commit of the whole overlay —
+    /// multi-ref broke that: the confirmed data-loss family of the 2026-07-11
+    /// interim review, findings 1/2/3/12.)
+    pub(crate) fn rotate_tip(&self, advanced: Option<&str>) {
         // M2c — drop the redacted-content cache on every tip change;
         // the new tip may have introduced/removed/re-encrypted vault
         // regions, and the cache key (path) doesn't encode tip hash.
@@ -89,14 +108,24 @@ impl SharedState {
         // chain's ref (device tip is kept for reference). Recompose-all on any
         // chain's tip-change is a safe superset of per-chain invalidation; the
         // caller already knows which ref moved and can scope this later.
-        let (device_tip, view) = {
+        let (device_tip, view, registry) = {
             let db = self.db.lock().unwrap();
             // Lock order is always db → registry (the only site holding both).
             let registry = self.registry.lock().unwrap();
             let device_tip = db.try_get_ref(TIP_REF).ok().flatten();
-            let view =
-                TreeView::build_union(&db, &registry).unwrap_or_else(|_| TreeView::empty());
-            (device_tip, view)
+            let view = match TreeView::build_union(&db, &registry) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A failed recompose must not tear down the working state:
+                    // keep serving the previous view AND the overlay (a
+                    // collapsed-to-empty view + cleared overlay would present
+                    // an empty garden and drop pending writes — finding 12).
+                    // The next successful rotation recomposes.
+                    eprintln!("softfig-fuse: union recompose failed, keeping previous view: {e}");
+                    return;
+                }
+            };
+            (device_tip, view, registry.clone())
         };
         let mut inner = self.inner.lock().unwrap();
         inner.tip = device_tip;
@@ -106,7 +135,12 @@ impl SharedState {
         for p in inner.view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
             inner.inodes.intern(&p);
         }
-        inner.overlay.clear();
+        if let Some(ref_name) = advanced {
+            let cutoff = inner.snapshot_gen;
+            inner
+                .overlay
+                .remove_absorbed(cutoff, |p| registry.owning_chain(p).ref_name == ref_name);
+        }
     }
 
     /// Reconstruct the current working tree — the committed tip-view
@@ -161,7 +195,12 @@ impl SharedState {
         // only their hash so the bulk decrypt runs lock-free below.
         let mut files: Vec<(PathBuf, u32, ContentSource)> = Vec::new();
         {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
+            // Slice 006 — stamp the overlay generation this commit input
+            // captures, under the same lock the entries are collected, so the
+            // post-commit rotation absorbs exactly the entries snapshotted
+            // here and nothing staged after.
+            inner.snapshot_gen = inner.overlay.generation();
             collect_files(&inner, &ignore, Path::new(""), &mut files);
         }
 
@@ -233,13 +272,42 @@ impl SharedState {
     /// recompose the whole union view from it. The keeperd lifecycle verbs call
     /// this after flipping the local enable/disable sidecar or committing an
     /// add/remove membership change, so the mount reflects the new composition
-    /// live — no remount (which would drop the pending write overlay).
+    /// live — no remount (which would drop the pending write overlay). The
+    /// recompose itself preserves the overlay too: no commit happens here, so
+    /// the rotation runs with `advanced = None` and absorbs nothing (slice 006
+    /// — before that fix this path cleared the whole overlay, review finding 2).
     pub(crate) fn set_registry(&self, registry: ChainRegistry) {
         // Swap under the registry lock; the temporary guard is released at the
         // end of this statement, before `rotate_tip` re-locks it (std `Mutex`
         // is not reentrant).
         *self.registry.lock().unwrap() = registry;
-        self.rotate_tip();
+        self.rotate_tip(None);
+    }
+
+    /// The refs of every chain that owns at least one staged overlay file or
+    /// removal — the chains the next commit must advance for the overlay to be
+    /// fully absorbed. `Dir` markers alone don't count (empty directories are
+    /// not versioned, so there is nothing to commit). The keeperd action-verb
+    /// commit path uses this to route a staged write under a shared mount to
+    /// the owning chain's ref instead of silently dropping it via the device
+    /// carve-out (slice 006 fix for review finding 1).
+    pub(crate) fn pending_chain_refs(&self) -> Vec<String> {
+        // Lock order at this second dual-hold site is inner → registry; no
+        // path acquires them in the opposite order (rotate_tip's db → registry
+        // pair is released before it takes inner).
+        let inner = self.inner.lock().unwrap();
+        let registry = self.registry.lock().unwrap();
+        let mut refs: Vec<String> = Vec::new();
+        for (path, entry) in inner.overlay.iter() {
+            if matches!(entry, OverlayEntry::Dir { .. }) {
+                continue;
+            }
+            let r = &registry.owning_chain(path).ref_name;
+            if !refs.contains(r) {
+                refs.push(r.clone());
+            }
+        }
+        refs
     }
 
     /// The exclusion set in force for this garden, read from the in-memory
@@ -669,35 +737,7 @@ impl FuseMount {
         sealed: Option<Arc<dyn SealedQuery>>,
         registry: ChainRegistry,
     ) -> Result<MountHandle> {
-        let paths = StorePaths::with_state_root(garden_root, state_root);
-        let db = Db::open(&paths)?;
-        let objects = ObjectStore::new(paths.clone());
-
-        // M5c slice 002 — compose the initial view across every enabled chain.
-        // `device_only` yields exactly the device tip's tree (today's behavior).
-        let tip = db.try_get_ref(TIP_REF)?;
-        let view = TreeView::build_union(&db, &registry)?;
-
-        let mut inodes = InodeMap::new();
-        for p in view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
-            inodes.intern(&p);
-        }
-
-        let state = Arc::new(SharedState {
-            db: Mutex::new(db),
-            objects,
-            session,
-            inner: Mutex::new(Inner {
-                inodes,
-                tip,
-                view,
-                overlay: Overlay::new(),
-            }),
-            sink,
-            sealed,
-            registry: Mutex::new(registry),
-            redacted_cache: Mutex::new(HashMap::new()),
-        });
+        let state = Self::build_state(garden_root, state_root, session, sink, sealed, registry)?;
 
         let fs = FuseFs {
             state: state.clone(),
@@ -731,15 +771,83 @@ impl FuseMount {
         })
     }
 
+    /// Build the shared in-memory state [`Self::mount_with`] wraps a kernel
+    /// mount around: store handles, the composed union view, and the write
+    /// overlay. Factored out so [`Self::attach_unmounted`] can serve the same
+    /// state headlessly.
+    fn build_state(
+        garden_root: &Path,
+        state_root: &Path,
+        session: Arc<VaultSession>,
+        sink: Arc<dyn DirtyEventSink>,
+        sealed: Option<Arc<dyn SealedQuery>>,
+        registry: ChainRegistry,
+    ) -> Result<Arc<SharedState>> {
+        let paths = StorePaths::with_state_root(garden_root, state_root);
+        let db = Db::open(&paths)?;
+        let objects = ObjectStore::new(paths.clone());
+
+        // M5c slice 002 — compose the initial view across every enabled chain.
+        // `device_only` yields exactly the device tip's tree (today's behavior).
+        let tip = db.try_get_ref(TIP_REF)?;
+        let view = TreeView::build_union(&db, &registry)?;
+
+        let mut inodes = InodeMap::new();
+        for p in view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
+            inodes.intern(&p);
+        }
+
+        Ok(Arc::new(SharedState {
+            db: Mutex::new(db),
+            objects,
+            session,
+            inner: Mutex::new(Inner {
+                inodes,
+                tip,
+                view,
+                overlay: Overlay::new(),
+                snapshot_gen: 0,
+            }),
+            sink,
+            sealed,
+            registry: Mutex::new(registry),
+            redacted_cache: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// Headless test seam: the full [`MountHandle`] state machine — overlay
+    /// staging, union view, snapshot/rotation/absorption, registry hot-swap —
+    /// with **no kernel mount** behind it. Lets the overlay-lifecycle and
+    /// commit-routing invariants (slice 006) be regression-tested where
+    /// `/dev/fuse` is unavailable; every in-memory code path is the production
+    /// one, only the fuser session is absent ([`MountHandle::unmount`] is a
+    /// no-op). Not for daemons: a real garden must use [`Self::mount_with`].
+    #[doc(hidden)]
+    pub fn attach_unmounted(
+        garden_root: &Path,
+        state_root: &Path,
+        session: Arc<VaultSession>,
+        sink: Arc<dyn DirtyEventSink>,
+        sealed: Option<Arc<dyn SealedQuery>>,
+        registry: ChainRegistry,
+    ) -> Result<MountHandle> {
+        let state = Self::build_state(garden_root, state_root, session, sink, sealed, registry)?;
+        Ok(MountHandle {
+            background: Mutex::new(None),
+            state,
+            mount_point: garden_root.to_path_buf(),
+        })
+    }
+
     /// Convenience for the daemon: register `MountHandle::on_tip_changed`
     /// as the repo's tip-changed callback. The closure captures a
     /// `Weak<SharedState>` so dropping the handle doesn't keep the FS
     /// state alive past unmount.
     pub fn install_tip_callback(repo: &mut Repo, handle: &MountHandle) {
         let state = Arc::downgrade(&handle.state);
-        repo.set_tip_changed_callback(move |_ref_name: &str, _hash: &Hash| {
+        repo.set_tip_changed_callback(move |ref_name: &str, _hash: &Hash| {
             if let Some(s) = state.upgrade() {
-                s.rotate_tip();
+                s.rotate_tip(Some(ref_name));
             }
         });
     }

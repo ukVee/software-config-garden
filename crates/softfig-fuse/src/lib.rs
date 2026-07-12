@@ -124,12 +124,23 @@ impl MountHandle {
         &self.mount_point
     }
 
-    /// Called by `commit_workdir`'s registered tip-changed hook. Drops
-    /// the in-memory write overlay (now subsumed by the new tip),
-    /// rebuilds the tree-at-tip cache from the new tip, and broadcasts
-    /// `inval_inode` so kernel page cache stops returning stale data.
-    pub fn on_tip_changed(&self) {
-        self.state.rotate_tip();
+    /// Called by `commit_workdir`'s registered tip-changed hook with the ref
+    /// the commit advanced. Rebuilds the union view from every chain's tip and
+    /// drops exactly the overlay entries that commit absorbed — the advanced
+    /// chain's entries up to the last snapshotted generation; other chains'
+    /// staged writes and post-snapshot racers survive (slice 006 absorption
+    /// invariant).
+    pub fn on_tip_changed(&self, advanced_ref: &str) {
+        self.state.rotate_tip(Some(advanced_ref));
+    }
+
+    /// The refs of every chain owning at least one staged overlay write or
+    /// removal — the chains a commit must advance for the pending overlay to
+    /// be fully absorbed. The keeperd action-verb commit path routes through
+    /// this so a staged write under a shared mount commits to the owning
+    /// chain instead of vanishing via the device carve-out (slice 006).
+    pub fn pending_chain_refs(&self) -> Vec<String> {
+        self.state.pending_chain_refs()
     }
 
     /// Reconstruct the current working tree (committed tip-view ∪ pending

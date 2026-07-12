@@ -267,6 +267,10 @@ impl DirtySetAccumulator {
         // own ref. `device_only` ⇒ every path routes to the device chain, so a
         // single device commit fires exactly as before.
         let touched_paths: Vec<String> = dirty.all_paths();
+        // Kept for the partial-failure path: a failed chain's touched paths are
+        // re-queued (the FUSE overlay retains their bytes — slice 006 — so the
+        // next flush retries the commit instead of the write being dropped).
+        let mut chain_router: Option<softfig_vcs::ChainRegistry> = None;
         let (device_snapshot, shared_snapshots): (
             Option<softfig_vcs::WalkSnapshot>,
             Vec<(String, softfig_vcs::WalkSnapshot)>,
@@ -280,10 +284,12 @@ impl DirtySetAccumulator {
                         affected.push(r);
                     }
                 }
+                chain_router = Some(registry);
                 let snaps = match mount.chain_snapshots() {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("keeperd: watcher: chain snapshots failed: {e}");
+                        self.requeue(touched_paths);
                         return;
                     }
                 };
@@ -305,6 +311,7 @@ impl DirtySetAccumulator {
                 Ok(s) => (Some(s), Vec::new()),
                 Err(e) => {
                     eprintln!("keeperd: watcher: workdir walk failed: {e}");
+                    self.requeue(touched_paths);
                     return;
                 }
             },
@@ -314,6 +321,7 @@ impl DirtySetAccumulator {
             None => return,
         };
         let mut committed = false;
+        let mut failed_refs: Vec<String> = Vec::new();
 
         // Device chain — the Layer-B-aware commit path (prior-tip snapshot for
         // manual_edit → vault_seal promotion + region placeholder preservation).
@@ -323,6 +331,7 @@ impl DirtySetAccumulator {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("keeperd: watcher: prior-tip snapshot failed: {e}");
+                    self.requeue(touched_paths);
                     return;
                 }
             };
@@ -343,6 +352,7 @@ impl DirtySetAccumulator {
                     Ok(i) => i,
                     Err(e) => {
                         eprintln!("keeperd: watcher: invalid auto-classified intent: {e}");
+                        self.requeue(touched_paths);
                         return;
                     }
                 }
@@ -352,7 +362,10 @@ impl DirtySetAccumulator {
             hook.clear_prior_tip();
             match result {
                 Ok(_) => committed = true,
-                Err(e) => eprintln!("keeperd: watcher: commit failed: {e}"),
+                Err(e) => {
+                    eprintln!("keeperd: watcher: commit failed: {e}");
+                    failed_refs.push(softfig_vcs::TIP_REF.to_string());
+                }
             }
         }
 
@@ -363,15 +376,37 @@ impl DirtySetAccumulator {
                 Ok(i) => i,
                 Err(e) => {
                     eprintln!("keeperd: watcher: invalid auto-classified intent: {e}");
+                    failed_refs.push(ref_name);
                     continue;
                 }
             };
             match repo.commit_snapshot_to(&ref_name, &session, snap, intent) {
                 Ok(_) => committed = true,
                 Err(e) => {
-                    eprintln!("keeperd: watcher: shared-chain commit to {ref_name} failed: {e}")
+                    eprintln!("keeperd: watcher: shared-chain commit to {ref_name} failed: {e}");
+                    failed_refs.push(ref_name);
                 }
             }
+        }
+
+        // Partial failure (slice 006, review finding 3): a failed chain's
+        // writes are still in the FUSE overlay (the sibling's rotation absorbs
+        // only its own chain's entries), so re-queue that chain's touched
+        // paths — the next flush rebuilds the snapshot from the overlay and
+        // retries the commit. Nothing is dropped.
+        if !failed_refs.is_empty() {
+            let retry: Vec<String> = match &chain_router {
+                Some(router) => touched_paths
+                    .iter()
+                    .filter(|p| {
+                        failed_refs
+                            .contains(&router.owning_chain(std::path::Path::new(p)).ref_name)
+                    })
+                    .cloned()
+                    .collect(),
+                None => touched_paths.clone(),
+            };
+            self.requeue(retry);
         }
 
         // Slice 1 (M5b-hardening): an auto-commit advanced a tip — wake the
@@ -381,6 +416,24 @@ impl DirtySetAccumulator {
             if let Some(net) = inner.net.as_ref() {
                 net.signal_commit();
             }
+        }
+    }
+
+    /// Put `paths` back into the dirty buffer (as modifications) after a
+    /// failed commit attempt, so the next flush retries them. The write bytes
+    /// themselves are safe meanwhile — a FUSE overlay retains everything a
+    /// rotation didn't absorb (slice 006) and a direct-mode working tree is
+    /// the disk itself; this only re-arms the *trigger* that `flush` consumed
+    /// with its `mem::take`.
+    fn requeue(&self, paths: impl IntoIterator<Item = String>) {
+        let mut buf = self.buffer.lock().unwrap();
+        let mut n = 0usize;
+        for p in paths {
+            buf.modified.insert(p);
+            n += 1;
+        }
+        if n > 0 {
+            eprintln!("keeperd: watcher: re-queued {n} path(s) for the next flush");
         }
     }
 
