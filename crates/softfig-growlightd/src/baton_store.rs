@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use softfig_ipc::baton::parse_baton;
 
-use crate::drive_loop::{BatonSeeder, BatonStatusSource};
+use crate::drive_loop::{BatonRead, BatonSeeder, BatonStatusSource};
 use crate::preapproval::agent_paths;
 
 /// The filesystem-backed per-member baton store over the runtime `agents/`
@@ -69,6 +69,20 @@ impl FsBatonStore {
     /// seeder writes, `inject.sh` cats, and the reader parses.
     fn baton_path(&self, agent: &str) -> PathBuf {
         agent_paths(&self.agents_dir, agent).baton
+    }
+
+    /// The LEGACY single-agent baton path — `<growlight>/baton.md`, one level ABOVE
+    /// the per-agent `agents/` namespace. A fleet member that follows the
+    /// single-agent protocol's "rewrite THIS baton" WITHOUT knowing its per-member
+    /// file writes HERE by mistake (task 035), so growlightd's read of the
+    /// per-member path finds only the stale spawn seed and misclassifies the exit —
+    /// the 2026-07-07 `ITEM_COMPLETE`-into-a-stall bug (task 042). Read as a
+    /// fresher-wins fallback (+ a misroute diagnostic the caller routes through the
+    /// tick log's exit entry-edge, so a latched member warns once — not once per
+    /// tick) so a misrouting member's terminal status is still honored until task 035
+    /// makes the member write the right file.
+    fn legacy_baton_path(&self) -> Option<PathBuf> {
+        self.agents_dir.parent().map(|p| p.join("baton.md"))
     }
 }
 
@@ -102,11 +116,121 @@ impl BatonSeeder for FsBatonStore {
 }
 
 impl BatonStatusSource for FsBatonStore {
-    fn status(&self, agent: &str) -> Option<String> {
+    fn status(&self, agent: &str) -> BatonRead {
+        let per_member_path = self.baton_path(agent);
+        let per_member_raw = fs::read_to_string(&per_member_path).ok();
+
+        // Misroute fallback (task 042 / 035). A fleet member that rewrote its baton
+        // to the LEGACY single-agent path instead of its per-member file left the
+        // per-member baton as the stale spawn seed; reading THAT would misclassify
+        // the exit (the 2026-07-07 `ITEM_COMPLETE` stall — the member finished but
+        // growlightd read `IN_PROGRESS` from the seed). Honor the legacy baton over
+        // the stale seed ONLY when every guard holds, so the fallback fires on an
+        // ACTUAL misroute and never lets a stray single-agent baton shadow a live
+        // member's real status:
+        //   - stamped for THIS agent (`agent:` frontmatter) — one member's misroute
+        //     is never read as another's;
+        //   - carries a `status:` — a truncated legacy baton (frontmatter but no
+        //     status) falls THROUGH to the per-member file instead of forcing a
+        //     re-roll (hardening (b));
+        //   - FRESHER than the per-member file — the member's most recent write
+        //     landed on the legacy path (in normal operation the per-member write is
+        //     always the fresher of the two);
+        //   - does not CONTRADICT the per-member seed's `item:` — a real misroute
+        //     writes the member's CURRENT item to the wrong path, so when BOTH
+        //     sides name an item they must agree; a genuinely-stale single-agent
+        //     baton for OTHER work names a different item and must not shadow,
+        //     even if fresher (hardening (a) — correctness stops resting on the
+        //     mtime invariant alone). An item ABSENT on either side is
+        //     match-UNKNOWN, not a mismatch (task 044): the fleet protocol's
+        //     step-7 "SHORT terminal baton (status ITEM_COMPLETE + one line)"
+        //     legitimately omits `item:`, and that terminal handoff is exactly
+        //     the misrouted write this fallback exists to honor — treating the
+        //     omission as a mismatch silently read the stale seed's IN_PROGRESS
+        //     and relapsed the 042 stall. The agent-stamp + freshness checks
+        //     above stay the load-bearing guards in the unknown case.
+        // The misroute is RETURNED as a diagnostic (not logged here): the drive loop
+        // routes it through the tick log's exit entry-edge dedup, so a member latched
+        // `Exited` and re-read every ~1s tick warns ONCE, not once per tick (task
+        // 042; the eMMC/log-churn fix). The real fix (the member writes its own path
+        // deterministically) is task 035; this keeps the fleet self-sustaining until
+        // that lands.
+        if let Some(legacy_path) = self.legacy_baton_path() {
+            if let Ok(legacy_raw) = fs::read_to_string(&legacy_path) {
+                let legacy = parse_baton(&legacy_raw);
+                // Hardening (a): the seed `item:` to cross-check against (absent when
+                // the per-member file is missing/unparseable → the guard is
+                // inapplicable and defers to the agent-stamp + fresher checks).
+                let seed_item = per_member_raw
+                    .as_deref()
+                    .and_then(|raw| parse_baton(raw).item);
+                // Reject only a POSITIVE mismatch (both sides name an item and they
+                // differ); either side silent → match-unknown, defer to the guards
+                // above (see the block comment — task 044).
+                let item_matches = match (seed_item.as_deref(), legacy.item.as_deref()) {
+                    (Some(seed), Some(legacy_item)) => seed == legacy_item,
+                    _ => true,
+                };
+                if frontmatter_agent(&legacy_raw).as_deref() == Some(agent)
+                    && legacy.status.is_some()
+                    && legacy_is_fresher(&legacy_path, &per_member_path)
+                    && item_matches
+                {
+                    return BatonRead {
+                        status: legacy.status,
+                        misroute: Some((
+                            legacy_path.display().to_string(),
+                            per_member_path.display().to_string(),
+                        )),
+                    };
+                }
+            }
+        }
+
         // A missing/unreadable baton is the clean-exit fallback (None → re-roll),
         // identical to the deferred source slice 001 shipped against.
-        let raw = fs::read_to_string(self.baton_path(agent)).ok()?;
-        parse_baton(&raw).status
+        BatonRead {
+            status: per_member_raw.as_deref().and_then(|raw| parse_baton(raw).status),
+            misroute: None,
+        }
+    }
+}
+
+/// The `agent:` frontmatter field of a baton, if present — used to confirm a
+/// legacy-path write belongs to the agent being polled before falling back to it,
+/// so one member's misroute can never be read as another member's status. Kept
+/// local (the shared [`parse_baton`] intentionally does not surface `agent:`,
+/// which single-agent batons omit).
+fn frontmatter_agent(baton: &str) -> Option<String> {
+    let mut lines = baton.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(v) = line.strip_prefix("agent:") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Whether `legacy` was modified strictly AFTER `per_member` — the misroute signal
+/// (the member's most recent baton write landed on the legacy path). A
+/// missing/unreadable per-member file counts as older than any existing legacy
+/// write; an unreadable legacy mtime never wins (no fallback).
+fn legacy_is_fresher(legacy: &Path, per_member: &Path) -> bool {
+    let mtime = |p: &Path| fs::metadata(p).and_then(|md| md.modified()).ok();
+    match (mtime(legacy), mtime(per_member)) {
+        (Some(l), Some(pm)) => l > pm,
+        (Some(_), None) => true,
+        _ => false,
     }
 }
 
@@ -185,13 +309,13 @@ mod tests {
 
         // No baton yet → the clean-exit fallback (None → re-roll), exactly like the
         // deferred source slice 001 shipped against.
-        assert_eq!(s.status("builder"), None, "no baton yet reads as None");
+        assert_eq!(s.status("builder").status, None, "no baton yet reads as None");
 
         // Seed it: the member boots WITH a baton (no `(no baton yet)`), and the
         // reader reads back the seed's IN_PROGRESS continue status.
         s.seed("builder", "queue:build", "001-foo").expect("seeds");
         assert_eq!(
-            s.status("builder").as_deref(),
+            s.status("builder").status.as_deref(),
             Some("IN_PROGRESS"),
             "a seeded member reads back its continue status",
         );
@@ -300,7 +424,7 @@ mod tests {
             "---\nstatus: QUEUE_EMPTY\nitem: t1\niteration: 3\n---\n# NEXT ACTION\ndrained\n";
         fs::write(s.baton_path("a1"), rewritten).unwrap();
         assert_eq!(
-            s.status("a1").as_deref(),
+            s.status("a1").status.as_deref(),
             Some("QUEUE_EMPTY"),
             "the read-back is the agent's own terminal status, not the seed",
         );
@@ -341,5 +465,202 @@ mod tests {
         fs::write(&blocker, b"x").unwrap();
         let s = Arc::new(FsBatonStore::new(&blocker, "garden"));
         assert!(s.seed("a1", "default", "t1").is_err(), "an un-creatable dir fails closed");
+    }
+
+    /// The legacy single-agent baton lives one level ABOVE the `agents/` namespace.
+    fn legacy_path(dir: &Path) -> PathBuf {
+        dir.join("baton.md")
+    }
+    /// Stamp a file's mtime deterministically so the fresher-wins comparison is not
+    /// at the mercy of filesystem timestamp resolution.
+    fn set_mtime(path: &Path, secs: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// TASK 042 / 035 — the misroute fallback. A fleet member that rewrote its
+    /// terminal baton to the LEGACY single-agent path (the 2026-07-07 stall) left
+    /// its per-member file as the stale spawn seed. When the legacy baton is fresher
+    /// AND stamped for this agent, the store honors it — so growlightd reads the
+    /// member's real `ITEM_COMPLETE` instead of the seed's `IN_PROGRESS` and the
+    /// fleet-of-one continues.
+    #[test]
+    fn a_fresher_legacy_baton_stamped_for_this_agent_is_honored_over_the_stale_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+
+        // The per-member file is the stale spawn seed (IN_PROGRESS).
+        s.seed("a", "default", "020").expect("seeds");
+        assert_eq!(s.status("a").status.as_deref(), Some("IN_PROGRESS"), "seed reads IN_PROGRESS");
+
+        // The member wrote its REAL terminal handoff to the legacy path instead.
+        let legacy = legacy_path(tmp.path());
+        std::fs::write(
+            &legacy,
+            "---\nmode: fleet\nagent: a\nstatus: ITEM_COMPLETE\nitem: 020\niteration: 4\n---\n# NEXT ACTION\ndone\n",
+        )
+        .unwrap();
+        set_mtime(&s.baton_path("a"), 1_000); // seed: older
+        set_mtime(&legacy, 2_000); // misrouted terminal handoff: fresher
+
+        let read = s.status("a");
+        assert_eq!(
+            read.status.as_deref(),
+            Some("ITEM_COMPLETE"),
+            "the fresher agent-stamped legacy write is honored over the stale per-member seed",
+        );
+        // The misroute is SURFACED (not logged per-call): the drive loop routes this
+        // through the tick log's exit entry-edge so it warns once, not once per tick.
+        assert!(
+            read.misroute.is_some(),
+            "honoring the legacy baton surfaces the misroute diagnostic to the caller",
+        );
+    }
+
+    /// The fallback is PRECISE: a live member's own per-member write (the normal
+    /// path) is always the freshest of the two, so an old legacy baton lying around
+    /// on disk never shadows the real status.
+    #[test]
+    fn a_stale_legacy_baton_never_shadows_a_fresh_per_member_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a", "default", "020").expect("seeds");
+
+        // A member that DID write its own per-member baton, freshly.
+        std::fs::write(
+            s.baton_path("a"),
+            "---\nmode: fleet\nagent: a\nstatus: ITEM_COMPLETE\nitem: 020\n---\n# NEXT ACTION\ndone\n",
+        )
+        .unwrap();
+        // A stale legacy baton (older) also stamped for this agent.
+        let legacy = legacy_path(tmp.path());
+        std::fs::write(&legacy, "---\nagent: a\nstatus: QUEUE_EMPTY\n---\n").unwrap();
+        set_mtime(&legacy, 1_000); // older
+        set_mtime(&s.baton_path("a"), 2_000); // the real write: fresher
+
+        let read = s.status("a");
+        assert_eq!(
+            read.status.as_deref(),
+            Some("ITEM_COMPLETE"),
+            "the fresher per-member write wins — the stale legacy baton is ignored",
+        );
+        assert!(read.misroute.is_none(), "the normal per-member read reports no misroute");
+    }
+
+    /// One member's misroute can never be read as ANOTHER member's status: the
+    /// legacy baton is honored only when its `agent:` frontmatter matches the agent
+    /// being polled.
+    #[test]
+    fn a_legacy_baton_for_a_different_agent_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("b", "default", "021").expect("seeds"); // b's per-member seed
+
+        // A fresher legacy baton — but stamped for agent `a`, not `b`.
+        let legacy = legacy_path(tmp.path());
+        std::fs::write(&legacy, "---\nagent: a\nstatus: ITEM_COMPLETE\n---\n").unwrap();
+        set_mtime(&s.baton_path("b"), 1_000);
+        set_mtime(&legacy, 2_000);
+
+        assert_eq!(
+            s.status("b").status.as_deref(),
+            Some("IN_PROGRESS"),
+            "a legacy write stamped for agent `a` is not honored when polling agent `b`",
+        );
+    }
+
+    /// Hardening (a) — the item cross-check. A fresher, agent-stamped legacy baton
+    /// that names a DIFFERENT item than the per-member seed is a genuinely-stale
+    /// single-agent baton from OTHER work, not this member's misrouted handoff. It
+    /// must NOT shadow the per-member status even though it is fresher: correctness
+    /// no longer rests on the mtime invariant alone.
+    #[test]
+    fn a_fresher_legacy_baton_for_a_different_item_is_not_honored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a", "default", "020").expect("seeds"); // per-member seed names item 020
+
+        // A fresher, agent-stamped legacy baton — but for item 099, not 020.
+        let legacy = legacy_path(tmp.path());
+        std::fs::write(
+            &legacy,
+            "---\nmode: fleet\nagent: a\nstatus: ITEM_COMPLETE\nitem: 099\n---\n# NEXT ACTION\ndone\n",
+        )
+        .unwrap();
+        set_mtime(&s.baton_path("a"), 1_000); // seed: older
+        set_mtime(&legacy, 2_000); // stale single-agent leftover: fresher, wrong item
+
+        let read = s.status("a");
+        assert_eq!(
+            read.status.as_deref(),
+            Some("IN_PROGRESS"),
+            "a fresher legacy baton for a DIFFERENT item does not shadow the per-member seed",
+        );
+        assert!(read.misroute.is_none(), "a mismatched-item legacy baton is not a misroute");
+    }
+
+    /// TASK 044 — the protocol-shaped SHORT terminal baton. Fleet protocol step 7
+    /// says "write a SHORT terminal baton (status ITEM_COMPLETE + one line)", so a
+    /// misrouted terminal handoff plausibly OMITS `item:` — in exactly the terminal
+    /// case the fallback exists to honor. An absent legacy `item:` is
+    /// match-UNKNOWN (the agent-stamp + freshness guards carry the decision), not
+    /// a mismatch: before this, `None != Some(seed)` silently failed the guard —
+    /// no fallback AND no misroute diagnostic — so growlightd read the stale
+    /// seed's IN_PROGRESS and the 042 stall relapsed.
+    #[test]
+    fn a_terminal_legacy_baton_missing_its_item_is_still_honored_and_diagnosed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a", "default", "020").expect("seeds"); // per-member seed names item 020
+
+        // The step-7 SHORT terminal handoff, misrouted to the legacy path:
+        // agent-stamped, carries a status, fresher — but no `item:` line at all.
+        let legacy = legacy_path(tmp.path());
+        std::fs::write(
+            &legacy,
+            "---\nmode: fleet\nagent: a\nstatus: ITEM_COMPLETE\n---\n# NEXT ACTION\nfinished.\n",
+        )
+        .unwrap();
+        set_mtime(&s.baton_path("a"), 1_000); // seed: older
+        set_mtime(&legacy, 2_000); // misrouted terminal handoff: fresher
+
+        let read = s.status("a");
+        assert_eq!(
+            read.status.as_deref(),
+            Some("ITEM_COMPLETE"),
+            "an item-less terminal legacy baton is honored (match-unknown, not mismatch)",
+        );
+        assert!(
+            read.misroute.is_some(),
+            "and the misroute diagnostic is surfaced — never a silent stale-seed read",
+        );
+    }
+
+    /// Hardening (b) — the status-less fall-through. A truncated legacy baton with
+    /// frontmatter but NO `status:` (a member killed mid-write) must fall THROUGH to
+    /// the per-member file rather than force a re-roll on a `None` legacy status.
+    #[test]
+    fn a_status_less_legacy_baton_falls_through_to_the_per_member_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a", "default", "020").expect("seeds");
+
+        // A fresher, agent-stamped, same-item legacy baton — but truncated: no status.
+        let legacy = legacy_path(tmp.path());
+        std::fs::write(&legacy, "---\nmode: fleet\nagent: a\nitem: 020\n---\n# NEXT ACTION\n").unwrap();
+        set_mtime(&s.baton_path("a"), 1_000);
+        set_mtime(&legacy, 2_000);
+
+        let read = s.status("a");
+        assert_eq!(
+            read.status.as_deref(),
+            Some("IN_PROGRESS"),
+            "a status-less legacy baton falls through to the per-member file, not a re-roll",
+        );
+        assert!(read.misroute.is_none(), "a status-less legacy baton is not honored as a misroute");
     }
 }

@@ -346,6 +346,21 @@ pub enum PollOutcome {
     /// connectivity gate (slice 001) paces that re-spawn while the link is still
     /// down, so there is no spin — the false-crash-loop fix.
     Reconnecting,
+    /// A registered member re-observed DOWN (no live child) with the same exit it
+    /// already crashed on — inert. The backend's health cell LATCHES the last exit
+    /// until a re-spawn overwrites it, so a down member is re-observed with that
+    /// same stale exit every ~1s tick; before this outcome each re-observation
+    /// re-ran the crash path — streak bump + `not_before` pushed past `now` again —
+    /// so a crashed member was `HeldForBackoff` on EVERY tick and never re-rolled
+    /// (the 2026-07-11 crash-exit stall: crash → idle → 10h silence on a
+    /// still-`active` item). An exit is consumed exactly once: the first
+    /// observation (live child, or the errored exit's first sighting) runs
+    /// [`on_crash`](Supervisor::poll); re-observations are `Down` — no streak bump,
+    /// no backoff push, no alert — and [`tick`](Supervisor::tick) owns the re-roll
+    /// once the already-armed backoff elapses. The drive loop honors a pending
+    /// boundary stop on this outcome (a down member is BETWEEN sessions — at a
+    /// boundary — so stopping it beats re-spawning a session just to stop it).
+    Down,
     /// The agent was never started (unknown id) — ignored.
     Unknown,
 }
@@ -628,7 +643,25 @@ impl Supervisor {
             Verdict::CleanExit => self.on_clean_exit(agent, baton_status, now),
             Verdict::Crashed => {
                 if network_exit() {
+                    // Evaluated BEFORE the consumed-exit guard below so a
+                    // reconnecting member keeps re-classifying `Reconnecting`
+                    // every tick while the connectivity hold gates its re-roll
+                    // (the slice-002 latch + narration contract) — idempotent:
+                    // `on_network_exit` never bumps the streak and re-arms
+                    // `not_before = now`, so re-observation is harmless there.
                     self.on_network_exit(agent, health, now)
+                } else if self.agents[agent].child.is_none() {
+                    // Already-consumed exit (task 044 / the 2026-07-11 stall):
+                    // the health cell latches the exit until a re-spawn, so a
+                    // down member re-observes it every tick. Re-running
+                    // `on_crash` here re-bumped the streak and pushed
+                    // `not_before` past `now` on every tick — the re-roll was
+                    // `HeldForBackoff` forever and the crashed member never
+                    // came back. Inert instead: the first observation armed
+                    // the backoff; `tick` re-rolls when it elapses. Covers the
+                    // errored-exit re-observation AND the killed-hung child
+                    // whose stale `Alive` lingers until the reaper flips it.
+                    PollOutcome::Down
                 } else {
                     self.on_crash(agent, health, now)
                 }
@@ -1318,6 +1351,14 @@ mod tests {
         assert_eq!(s.failures("a1"), 0, "a network exit bumps no failure streak");
         assert!(s.is_registered("a1"), "the member stays registered for its re-roll");
 
+        // Re-roll it live again (a network exit is immediately re-rollable) — the
+        // consumed-exit guard (task 044) makes a DOWN member's re-observation
+        // inert, so the genuine-crash half below needs a live child to crash.
+        assert_eq!(
+            s.tick(fresh_budget(), fresh_rate(), 0, &any_work),
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }]
+        );
+
         // A genuine (non-network) exit still crashes with backoff — the unchanged path.
         let out2 = s.poll_with_network("a1", AgentHealth::Exited { code: 1 }, None, 0, || false);
         let PollOutcome::Crashed { failures, not_before, .. } = out2 else {
@@ -1325,6 +1366,55 @@ mod tests {
         };
         assert_eq!(failures, 1, "a genuine crash bumps the streak");
         assert_eq!(not_before, 2, "and schedules the backoff (base 2)");
+    }
+
+    /// TASK 044 (the 2026-07-11 crash-exit stall) — an exit is CONSUMED exactly
+    /// once. The backend health cell latches the last exit until a re-spawn
+    /// overwrites it, so the drive loop re-observes a down member with the SAME
+    /// exit every ~1s tick. Re-running the crash path on each re-observation
+    /// bumped the streak and pushed `not_before` past `now` again — the re-roll
+    /// was `HeldForBackoff` on every tick and a crashed member NEVER came back
+    /// while its item sat `active`. A re-observation is the inert [`PollOutcome::Down`];
+    /// the backoff the FIRST observation armed elapses and `tick` re-rolls.
+    #[test]
+    fn a_latched_exit_is_consumed_once_and_the_backoff_re_roll_still_fires() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend)); // base 2, cap 8
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        // First observation: the genuine crash — streak 1, backoff armed for t=2.
+        let out = s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0);
+        assert!(
+            matches!(out, PollOutcome::Crashed { failures: 1, not_before: 2, .. }),
+            "the first observation runs the crash path: {out:?}",
+        );
+
+        // Every subsequent tick re-observes the SAME latched exit: inert — no new
+        // crash event, no streak bump, no backoff push (the pre-fix behaviour
+        // bumped to failures 2/3 here and pushed not_before to 5 then 10).
+        assert_eq!(s.poll("a1", AgentHealth::Exited { code: 1 }, None, 1), PollOutcome::Down);
+        assert_eq!(s.poll("a1", AgentHealth::Exited { code: 1 }, None, 2), PollOutcome::Down);
+        assert_eq!(s.failures("a1"), 1, "a re-observed exit bumps no streak");
+
+        // The armed backoff elapses → the re-roll fires. Before the guard this was
+        // `HeldForBackoff` on every tick forever — the incident's silent stall.
+        assert_eq!(
+            s.tick(fresh_budget(), fresh_rate(), 2, &any_work),
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }]
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a1"]);
+
+        // The killed-hung twin: a hang crashes (kill + streak) once; the stale
+        // `Alive` lingering until the reaper flips it re-observes as `Down` too.
+        let out = s.poll("a1", AgentHealth::Alive { last_active: 2 }, None, 102);
+        assert!(matches!(out, PollOutcome::Crashed { failures: 2, .. }), "got {out:?}");
+        assert_eq!(backend.kill_count(), 1, "the hung child was killed");
+        assert_eq!(
+            s.poll("a1", AgentHealth::Alive { last_active: 2 }, None, 103),
+            PollOutcome::Down,
+            "the not-yet-reaped stale heartbeat is the same consumed crash",
+        );
+        assert_eq!(s.failures("a1"), 2, "still no re-observation bump");
     }
 
     /// The crash alert a `poll` returns routes through the phase-5 dispatcher to

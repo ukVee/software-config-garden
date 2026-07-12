@@ -447,9 +447,30 @@ impl AgentStderrSource for Arc<ClaudeBackend> {
 /// re-roll, so this slice ships with no behaviour change to a working member),
 /// and a test scripts the status.
 pub trait BatonStatusSource: Send + Sync + fmt::Debug {
-    /// `agent`'s terminal baton `status:` field as of its last exit, or `None`
-    /// when no baton was written/readable (the clean-exit re-roll fallback).
-    fn status(&self, agent: &str) -> Option<String>;
+    /// Read `agent`'s terminal baton for the retire-vs-re-roll decision: its
+    /// `status:` field as of its last exit (`None` when no baton was
+    /// written/readable — the clean-exit re-roll fallback), plus a diagnostic when
+    /// the read fell back to the misrouted legacy single-agent path (task 042/035).
+    fn status(&self, agent: &str) -> BatonRead;
+}
+
+/// The result of reading an exited member's terminal baton
+/// ([`BatonStatusSource::status`]): the `status:` the drive loop classifies on, plus
+/// an optional misroute diagnostic the loop routes through the tick log's exit
+/// entry-edge dedup instead of the store logging it per-call. A member latched
+/// `Exited` (rate-limited / reconnecting) is re-read every ~1s tick, so a per-call
+/// warning re-fired every second for the whole hold (task 042); routing it through
+/// the SAME edge as the exit disposition makes it warn ONCE and re-arm on re-roll.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatonRead {
+    /// The frontmatter `status:` growlightd read (`None` = missing/unreadable →
+    /// clean-exit re-roll).
+    pub status: Option<String>,
+    /// `Some((legacy_path, per_member_path))` (display strings) when the status was
+    /// read from the misrouted legacy single-agent baton instead of the per-member
+    /// file — the diagnostic routed through the exit entry-edge. `None` on the normal
+    /// per-member read.
+    pub misroute: Option<(String, String)>,
 }
 
 /// The deferred (slice 001) baton-status source: no per-member baton write-back
@@ -460,8 +481,8 @@ pub trait BatonStatusSource: Send + Sync + fmt::Debug {
 pub struct DeferredBatonStatus;
 
 impl BatonStatusSource for DeferredBatonStatus {
-    fn status(&self, _agent: &str) -> Option<String> {
-        None
+    fn status(&self, _agent: &str) -> BatonRead {
+        BatonRead::default()
     }
 }
 
@@ -546,6 +567,41 @@ pub struct HeldStart {
     pub outcome: StartOutcome,
 }
 
+/// A member whose FRESH start was skipped in step 3 BEFORE admission — no workable
+/// part to pick, or the part it picked was already spoken for. Distinct from a
+/// [`HeldStart`] (which reached admission and was refused/queued): a `HeldFresh`
+/// never even attempted a claim. Recorded so the drive loop's journal voice can
+/// name a held fleet member (task 042) — before this these two `continue`s were
+/// SILENT, so a held fleet-of-one left no trace (the 2026-07-07 4h stall).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldFresh {
+    /// The agent held out of a fresh start this tick.
+    pub agent: String,
+    /// Why (`no workable part` / `part already claimed`) — the `held (…)` reason.
+    pub reason: &'static str,
+}
+
+/// A member EXIT this tick as the drive loop classified it: the terminal baton
+/// status growlightd OBSERVED (from `agents/<id>/baton.md`, or the legacy-path
+/// misroute fallback — see [`crate::baton_store`]) and the lifecycle disposition it
+/// drove. Recorded on every classified exit so the health-pass is diagnosable from
+/// the journal (task 042): a stale or misrouted baton — growlightd reading a status
+/// the member never intended — is visible as a line, not a silent stall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitDisposition {
+    /// The exiting agent.
+    pub agent: String,
+    /// The baton status growlightd read on the exit (`None` = missing/unreadable).
+    pub baton_status: Option<String>,
+    /// The one-word disposition it drove (`rolling` / `completed` / `retired` / …).
+    pub disposition: &'static str,
+    /// `Some((legacy_path, per_member_path))` when the terminal status was read from
+    /// the misrouted legacy single-agent baton (task 042/035) instead of the
+    /// per-member file — routed onto the exit's entry edge so the misroute warns ONCE
+    /// per exit, not once per latched re-read tick. `None` on the normal read.
+    pub misrouted: Option<(String, String)>,
+}
+
 /// Everything one [`DriveLoop::tick`] did, for the caller (the live thread, or a
 /// test) to inspect and — in slice 003 — route through the single notification
 /// dispatcher.
@@ -555,6 +611,11 @@ pub struct TickReport {
     pub started: Vec<Assignment>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
+    /// Fresh starts SKIPPED in step 3 before admission — no workable part, or the
+    /// part was already spoken for (task 042's diagnosability half). Narrated as a
+    /// hold so a held fleet member names itself in the journal instead of stalling
+    /// silently; edge-deduped by the [`TickLogger`] like any other hold.
+    pub held_fresh: Vec<HeldFresh>,
     /// Re-roll outcomes from [`Supervisor::tick`] (rerolled / held / failed).
     pub rerolls: Vec<RerollOutcome>,
     /// Crash alerts surfaced by [`Supervisor::poll`] (slice 003 dispatches these).
@@ -584,6 +645,11 @@ pub struct TickReport {
     /// parked. Distinct from a crash (no kill, no backoff) and from a retire (the
     /// member is immediately re-pickable in step 3 onto a *different* part).
     pub blocked: Vec<Assignment>,
+    /// Every classified member EXIT this tick with the baton status growlightd
+    /// observed and the disposition it drove — the health-pass diagnostic (task
+    /// 042). One journal line per exit (edge-deduped by the [`TickLogger`]), so a
+    /// misread/misrouted baton is visible where a silent stall used to be.
+    pub exit_dispositions: Vec<ExitDisposition>,
     /// Boundary-async messages drained from inject lanes, per agent.
     pub injected: Vec<(String, Vec<String>)>,
     /// Parked (blocked-head) queues, surfaced for the §9 alert hook every tick —
@@ -838,10 +904,11 @@ impl DriveLoop {
             //    fix) rather than re-roll on the exit code alone; a still-alive
             //    agent has no terminal status to read.
             if let Some(health) = self.health.health(agent) {
-                let baton_status = match health {
+                let baton_read = match health {
                     AgentHealth::Exited { .. } => self.baton.status(agent),
-                    AgentHealth::Alive { .. } => None,
+                    AgentHealth::Alive { .. } => BatonRead::default(),
                 };
+                let baton_status = baton_read.status.clone();
                 // Network-exit classifier (slice 002): `poll_with_network` evaluates
                 // it ONLY on a crash verdict (so a healthy tick reads no stderr). A
                 // non-zero EXIT whose in-memory stderr tail carries a network-error
@@ -878,6 +945,28 @@ impl DriveLoop {
                         network_exit,
                     )
                 };
+                // Health-pass diagnostic (task 042): record what baton status this
+                // EXIT was classified against and the disposition it drove, so a
+                // stale/misrouted baton is visible in the journal (before this, a
+                // misclassified exit stalled the fleet silently). Only real exits are
+                // recorded — a still-registered `Healthy`/`Unknown` observation (e.g.
+                // the cross-tick latched-`Exited` re-poll of an already-gone member)
+                // is not an exit event, so it is skipped to keep the log clean; a
+                // `Down` re-observation of an already-consumed crash (task 044) is
+                // likewise not a new exit — the crash tick already recorded one.
+                if matches!(health, AgentHealth::Exited { .. })
+                    && !matches!(
+                        outcome,
+                        PollOutcome::Healthy | PollOutcome::Unknown | PollOutcome::Down
+                    )
+                {
+                    report.exit_dispositions.push(ExitDisposition {
+                        agent: agent.clone(),
+                        baton_status: baton_status.clone(),
+                        disposition: exit_disposition_label(&outcome),
+                        misrouted: baton_read.misroute.clone(),
+                    });
+                }
                 // Maintain the reconnect latch (slice 002): any non-reconnect
                 // disposition clears it (the member re-rolled, exited clean, or
                 // genuinely crashed — a fresh slate); the Reconnecting arm re-sets it
@@ -1000,6 +1089,17 @@ impl DriveLoop {
                             self.retire(agent, &mut report);
                         }
                     }
+                    PollOutcome::Down => {
+                        // A re-observation of an exit already consumed (task 044):
+                        // the crash tick armed the backoff and `Supervisor::tick`
+                        // below owns the re-roll — nothing to do here EXCEPT honor
+                        // a boundary stop posted while the member is down: down IS
+                        // a boundary (between sessions), so it retires now rather
+                        // than being re-spawned just to stop at its next exit.
+                        if self.retiring.remove(agent) {
+                            self.retire(agent, &mut report);
+                        }
+                    }
                     PollOutcome::Healthy | PollOutcome::Unknown => {}
                 }
             }
@@ -1113,12 +1213,25 @@ impl DriveLoop {
                     continue;
                 }
                 let Some((queue, part)) = pick(&snapshot, member.pin.as_deref()) else {
-                    continue; // nothing workable for this agent's pin right now
+                    // Nothing workable for this agent's pin right now. Before task 042
+                    // this `continue` was SILENT, so a held fleet-of-one (e.g. a
+                    // completed member whose next queued head has not yet surfaced)
+                    // left no journal trace — the 2026-07-07 4h stall. Narrate it as a
+                    // hold, edge-deduped like the re-roll `HeldNoWork`.
+                    report.held_fresh.push(HeldFresh {
+                        agent: agent.clone(),
+                        reason: "no workable part",
+                    });
+                    continue;
                 };
                 // A part already spoken for — held by a live member (cross-tick) or
                 // claimed earlier this tick — is taken; never double-assign it (the
                 // resume-collision guard, now cross-tick as well as same-tick).
                 if spoken_for.contains(&(queue.clone(), part.clone())) {
+                    report.held_fresh.push(HeldFresh {
+                        agent: agent.clone(),
+                        reason: "part already claimed",
+                    });
                     continue;
                 }
                 // Seed the per-member baton, then claim the part (mark it `active`
@@ -1273,6 +1386,24 @@ impl DriveLoop {
     }
 }
 
+/// The one-word disposition label for an exit poll's [`PollOutcome`] — the
+/// health-pass journal line (task 042). Exhaustive so a new outcome variant forces
+/// a label choice rather than silently reading as an unclassified exit.
+fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
+    match outcome {
+        PollOutcome::Crashed { .. } => "crashed",
+        PollOutcome::Down => "down (awaiting re-roll)",
+        PollOutcome::Reconnecting => "reconnecting (transient network)",
+        PollOutcome::Rolling => "rolling (continue status)",
+        PollOutcome::Retired => "retired (queue drained)",
+        PollOutcome::Completed => "completed (item boundary)",
+        PollOutcome::Blocked { .. } => "blocked on human",
+        PollOutcome::ParkedRateLimited => "held (rate-limited)",
+        PollOutcome::Healthy => "healthy",
+        PollOutcome::Unknown => "unknown",
+    }
+}
+
 /// The drive loop's journal voice (task 033's diagnosability half): render one
 /// terse line per fleet lifecycle event so a silent stall is debuggable from the
 /// systemd journal — before this, growlightd logged nothing after "drive loop
@@ -1290,6 +1421,20 @@ struct TickLogger {
     /// The held `(agent, kind)` states seen last tick — a hold logs only when its
     /// key enters this set.
     held: BTreeSet<(String, &'static str)>,
+    /// Agents whose EXIT was narrated last tick — an exit disposition (task 042)
+    /// logs only on its ENTRY edge, so a member re-observed `Exited` every tick
+    /// until it re-rolls/retires (e.g. a rate-limited hold) writes one line, not one
+    /// per second. Re-armed once the agent is no longer in an exit state.
+    exits: BTreeSet<String>,
+    /// Agents whose transient-network-exit disposition was narrated last tick — the
+    /// "hit a transient network exit" line logs only on its ENTRY edge (task 034),
+    /// the reconnect twin of `exits`. A latched member is re-observed with the SAME
+    /// stale exit every tick while the connectivity hold gates its re-roll, so it
+    /// re-populates `reconnecting` per tick — a HELD state, not a fresh occurrence.
+    /// Without this edge it re-narrated ~1/tick (642 lines across the 2026-07-06
+    /// wifi-drop). Re-armed once the member leaves the latch (re-rolled / exited
+    /// clean / genuinely crashed), so a genuinely NEW network exit narrates again.
+    reconnecting: BTreeSet<String>,
     /// Whether the connectivity HOLD was on last tick (its enter/exit edges log).
     offline: bool,
 }
@@ -1331,10 +1476,45 @@ impl TickLogger {
             };
             held_now.insert((held.agent.clone(), kind));
         }
+        // Step-3 fresh-start holds (task 042): a member with no workable part, or
+        // whose part was already claimed, joins the same edge-deduped hold set — so a
+        // held fleet-of-one narrates once on entry, mirroring the re-roll `HeldNoWork`.
+        for hf in &r.held_fresh {
+            held_now.insert((hf.agent.clone(), hf.reason));
+        }
         for (agent, kind) in held_now.difference(&self.held) {
             out.push(format!("fleet: holding {agent} ({kind})"));
         }
         self.held = held_now;
+        // Exit dispositions (task 042 health pass): what baton status each exit was
+        // classified against and the disposition it drove — logged once on the entry
+        // edge so a stale/misrouted baton is visible where a silent stall used to be.
+        let mut exits_now: BTreeSet<String> = BTreeSet::new();
+        for ed in &r.exit_dispositions {
+            exits_now.insert(ed.agent.clone());
+        }
+        for ed in &r.exit_dispositions {
+            if !self.exits.contains(&ed.agent) {
+                out.push(format!(
+                    "fleet: {} exited — baton {} -> {}",
+                    ed.agent,
+                    ed.baton_status.as_deref().unwrap_or("(none)"),
+                    ed.disposition,
+                ));
+                // Misroute diagnostic (task 042/035): the terminal status was read
+                // from the misrouted legacy single-agent baton, not the per-member
+                // file. Rides the exit's SAME entry edge — a member latched `Exited`
+                // and re-read every tick warns once, and re-arms when it re-rolls.
+                if let Some((legacy, per_member)) = &ed.misrouted {
+                    out.push(format!(
+                        "fleet: {} baton misrouted to the legacy single-agent path {legacy} \
+                         (task 035) — honored over the stale per-member {per_member}",
+                        ed.agent,
+                    ));
+                }
+            }
+        }
+        self.exits = exits_now;
         for agent in &r.retired {
             out.push(format!("fleet: retired {agent} to idle"));
         }
@@ -1349,11 +1529,24 @@ impl TickLogger {
                 a.agent, a.queue, a.part
             ));
         }
+        // Transient network exits (network-failsafe slice 002): a latched member
+        // whose re-roll is gated by the connectivity hold is re-classified
+        // `Reconnecting` every tick — a HELD state, not a fresh occurrence — so it
+        // narrates once on its entry edge and dedups like the exit dispositions
+        // above (task 034). A genuinely new network exit re-arms the edge and re-logs.
+        // One pass: dedup against last tick's latch (`self.reconnecting`) while
+        // rebuilding this tick's set. The check reads the OLD set, so folding the
+        // insert in is behavior-identical to the two split passes it replaces.
+        let mut reconnecting_now: BTreeSet<String> = BTreeSet::new();
         for agent in &r.reconnecting {
-            out.push(format!(
-                "fleet: {agent} hit a transient network exit (will re-roll)"
-            ));
+            if !self.reconnecting.contains(agent) {
+                out.push(format!(
+                    "fleet: {agent} hit a transient network exit (will re-roll)"
+                ));
+            }
+            reconnecting_now.insert(agent.clone());
         }
+        self.reconnecting = reconnecting_now;
         if r.waiting_for_connectivity != self.offline {
             self.offline = r.waiting_for_connectivity;
             out.push(if self.offline {
@@ -1547,8 +1740,11 @@ mod tests {
         }
     }
     impl BatonStatusSource for Arc<FakeFleet> {
-        fn status(&self, agent: &str) -> Option<String> {
-            self.baton.lock().unwrap().get(agent).cloned()
+        fn status(&self, agent: &str) -> BatonRead {
+            BatonRead {
+                status: self.baton.lock().unwrap().get(agent).cloned(),
+                misroute: None,
+            }
         }
     }
     impl BatonSeeder for Arc<FakeFleet> {
@@ -2360,15 +2556,98 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
         assert_eq!(backend.spawn_count(), 1, "no re-spawn yet");
 
-        // The re-rolled session is healthy; at the backoff boundary it re-rolls.
-        backend.set_health("a1", AgentHealth::Alive { last_active: 2 });
+        // At the backoff boundary it re-rolls. The health cell still holds the
+        // LATCHED exit — production only resets it on the re-spawn itself — so
+        // this tick's health pass re-observes the consumed crash (the inert
+        // `Down`, task 044) and must raise no new alert nor re-push the backoff.
         let r2 = loop_.tick(2);
-        assert!(r2.crashes.is_empty(), "the healthy poll raises no new crash");
+        assert!(r2.crashes.is_empty(), "a re-observed latched exit is not a new crash");
         assert_eq!(
             r2.rerolls,
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"], "a1 was re-spawned");
+    }
+
+    /// TASK 044 — the 2026-07-11 incident shape, end to end at the tick level: a
+    /// fleet-of-one member CRASHES mid-item (its scope dies; the exit stays
+    /// latched non-zero in the health cell) while its item is still `active`.
+    /// The loop must not go idle-silent: the crash pages once, the member is
+    /// held through its ORIGINAL backoff, and a later tick RE-ROLLS it onto the
+    /// SAME still-`active` item — no re-seed, no second claim (the baton
+    /// carry-forward). Before the consumed-exit guard the latched exit re-ran
+    /// the crash path every tick, pushing `not_before` past `now` forever: the
+    /// re-roll was held on every tick and the fleet sat silent ~10h on a
+    /// still-`active` item.
+    #[test]
+    fn a_crash_exit_re_rolls_the_still_active_item_on_a_later_tick() {
+        let (mut loop_, _d, backend, claimer, _queues, probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        // Fresh start: seeded + claimed p1 (now `active`) + spawned.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+
+        // ~31s in, the member's scope dies: a genuine crash (online, no network
+        // signature). The exit LATCHES in the health cell — this test never
+        // resets it by hand, matching production (only a re-spawn resets it).
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        let r = loop_.tick(31);
+        assert_eq!(r.crashes.len(), 1, "the crash pages the human");
+
+        // The next tick re-observes the SAME latched exit: no new crash, and the
+        // hold still shows the ORIGINAL backoff (base 2 → 33) — pre-fix this
+        // re-ran the crash path and pushed the hold to 36, then 40, forever.
+        let r2 = loop_.tick(32);
+        assert!(r2.crashes.is_empty(), "a re-observed exit is not a new crash");
+        assert_eq!(
+            r2.rerolls,
+            vec![RerollOutcome::HeldForBackoff { agent: "a1".into(), not_before: 33 }],
+            "held through the original backoff — the re-observation pushed nothing",
+        );
+
+        // The backoff elapses → the loop re-rolls the member onto its
+        // still-`active` item: a re-spawn, no second claim, no re-seed.
+        let r3 = loop_.tick(33);
+        assert_eq!(r3.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "re-rolled onto the same part");
+        assert_eq!(claimer.claims().len(), 1, "the standing claim is reused, not re-claimed");
+        assert_eq!(backend.seeds().len(), 1, "a re-roll never re-seeds (carry-forward)");
+        assert_eq!(probe.gui_alerts(), 1, "exactly one page across the whole episode");
+    }
+
+    /// TASK 044 — a boundary stop posted while a member is DOWN (crashed,
+    /// awaiting its re-roll) is honored at that down-boundary: down IS between
+    /// sessions, so the member retires without being re-spawned just to stop at
+    /// its next exit.
+    #[test]
+    fn a_stop_posted_while_a_member_is_down_retires_it_without_a_re_spawn() {
+        let (mut loop_, d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        loop_.tick(1); // the crash is consumed; the backoff is armed for t=3
+
+        // The human posts a boundary stop while the member is down.
+        d.inner
+            .lock()
+            .unwrap()
+            .control
+            .request_stop("a1", StopLevel::AfterSlice);
+        let r = loop_.tick(2);
+        assert_eq!(r.retired, vec!["a1".to_string()], "retired at the down-boundary");
+
+        // Never re-spawned — not even well past every backoff.
+        let r2 = loop_.tick(100);
+        assert!(r2.rerolls.is_empty() && r2.started.is_empty(), "stopped for good");
+        assert_eq!(backend.spawn_count(), 1, "no re-spawn after the stop");
     }
 
     /// THE SPIN FIX end-to-end ([[decision-growlight-fleet-loop-spin]]): a member
@@ -2852,6 +3131,206 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             ..TickReport::default()
         };
         assert!(logger.lines(&failed).is_empty());
+    }
+
+    /// TASK 042 diagnosability: a fresh-start HOLD (no workable part / part already
+    /// claimed) narrates on its entry edge and dedups like any other hold, and each
+    /// EXIT narrates its observed baton status + disposition once — so a held
+    /// fleet-of-one and a stale/misrouted baton are both visible in the journal
+    /// where a silent stall used to be.
+    #[test]
+    fn tick_logger_narrates_held_fresh_and_exit_dispositions() {
+        let mut logger = TickLogger::default();
+
+        // A completed exit that could not be re-placed this tick (the next head is
+        // not visible yet): the exit disposition AND the fresh-start hold both narrate.
+        let held_and_exited = TickReport {
+            completed: vec!["a".into()],
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "completed (item boundary)",
+                misrouted: None,
+            }],
+            held_fresh: vec![HeldFresh {
+                agent: "a".into(),
+                reason: "no workable part",
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&held_and_exited),
+            vec![
+                "fleet: holding a (no workable part)".to_string(),
+                "fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string(),
+                "fleet: a finished its part (item boundary; slot released)".to_string(),
+            ],
+        );
+
+        // The hold persists (still no head) AND the member is re-observed exited
+        // (latched) — neither repeats: one line per second is the stall bug this fixes.
+        let still_held = TickReport {
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "unknown",
+                misrouted: None,
+            }],
+            held_fresh: vec![HeldFresh {
+                agent: "a".into(),
+                reason: "no workable part",
+            }],
+            ..TickReport::default()
+        };
+        assert!(
+            logger.lines(&still_held).is_empty(),
+            "a persisting hold + a latched exit do not repeat",
+        );
+
+        // Both edges re-arm once the member starts (leaves the hold + exit states).
+        let started = TickReport {
+            started: vec![Assignment {
+                agent: "a".into(),
+                queue: "default".into(),
+                part: "y".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&started),
+            vec!["fleet: started a on default/y".to_string()],
+        );
+        // A NEW exit re-logs (the edge re-armed).
+        let re_exit = TickReport {
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: None,
+                disposition: "rolling (continue status)",
+                misrouted: None,
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&re_exit),
+            vec!["fleet: a exited — baton (none) -> rolling (continue status)".to_string()],
+        );
+    }
+
+    /// TASK 042: a member that misrouted its terminal baton to the legacy
+    /// single-agent path is re-read every tick while latched `Exited` (rate-limited /
+    /// reconnecting). The misroute diagnostic rides the exit's SAME entry edge — it
+    /// warns ONCE per exit (not once per ~1s tick, the eMMC/log churn this fixes) and
+    /// re-arms when the member re-rolls, so a genuinely new misroute warns again.
+    #[test]
+    fn tick_logger_edge_dedups_the_misroute_warning_with_the_exit() {
+        let mut logger = TickLogger::default();
+        let misrouted = || TickReport {
+            exit_dispositions: vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "completed (item boundary)",
+                misrouted: Some(("/g/baton.md".into(), "/g/agents/a/baton.md".into())),
+            }],
+            ..TickReport::default()
+        };
+
+        // Entry edge: the exit line AND the misroute line both narrate, once.
+        assert_eq!(
+            logger.lines(&misrouted()),
+            vec![
+                "fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string(),
+                "fleet: a baton misrouted to the legacy single-agent path /g/baton.md \
+                 (task 035) — honored over the stale per-member /g/agents/a/baton.md"
+                    .to_string(),
+            ],
+        );
+        // Latched re-read (same exit, same misroute) every tick → nothing repeats.
+        assert!(
+            logger.lines(&misrouted()).is_empty(),
+            "a latched misrouted exit does not re-warn per tick",
+        );
+
+        // The member re-rolls (leaves the exit state) → the edge re-arms.
+        let started = TickReport {
+            started: vec![Assignment {
+                agent: "a".into(),
+                queue: "default".into(),
+                part: "y".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(logger.lines(&started), vec!["fleet: started a on default/y".to_string()]);
+        // A NEW misrouted exit re-warns (both lines) — the edge re-armed.
+        assert_eq!(
+            logger.lines(&misrouted()),
+            vec![
+                "fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string(),
+                "fleet: a baton misrouted to the legacy single-agent path /g/baton.md \
+                 (task 035) — honored over the stale per-member /g/agents/a/baton.md"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// TASK 034: a LATCHED transient network exit — a member re-observed `Exited`
+    /// every tick while the connectivity hold gates its re-roll re-populates
+    /// `reconnecting` per tick — narrates once on its ENTRY edge, not once per tick
+    /// (the 2026-07-06 wifi-drop logged this line 642 times in ~40 min). Once the
+    /// member leaves the latch (re-rolls), the edge re-arms so a genuinely NEW
+    /// network exit narrates again.
+    #[test]
+    fn tick_logger_edge_dedups_a_latched_network_exit() {
+        let mut logger = TickLogger::default();
+
+        // Entry edge: the transient network exit narrates once.
+        let reconnect = TickReport {
+            reconnecting: vec!["a".into()],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&reconnect),
+            vec!["fleet: a hit a transient network exit (will re-roll)".to_string()],
+        );
+
+        // Latched: the offline gate holds the re-roll, so the member is re-classified
+        // `Reconnecting` every tick — across many ticks the line must NOT repeat.
+        for _ in 0..100 {
+            assert!(
+                logger.lines(&reconnect).is_empty(),
+                "a latched network exit does not re-narrate while spawns are held",
+            );
+        }
+
+        // The re-roll tick, in the shape production ACTUALLY emits: step-1's health
+        // poll re-pushes the still-`Exited` member into `reconnecting` BEFORE step-2
+        // re-rolls it, so a real re-roll tick carries BOTH `reconnecting:[a]` AND the
+        // `Rerolled` outcome. The reconnect line stays silent (still latched — no new
+        // entry edge); only the re-roll narrates. The edge does NOT re-arm on this
+        // tick — the member is still present in `reconnecting`.
+        let rerolled = TickReport {
+            reconnecting: vec!["a".into()],
+            rerolls: vec![RerollOutcome::Rerolled { agent: "a".into() }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&rerolled),
+            vec!["fleet: re-rolled a (fresh session, same part)".to_string()],
+            "the re-roll narrates but the still-latched reconnect line stays silent",
+        );
+
+        // The fresh session is first observed `Alive` the NEXT tick: no reconnecting
+        // entry, so THIS is where the edge actually re-arms. Nothing to narrate.
+        assert!(
+            logger.lines(&TickReport::default()).is_empty(),
+            "the empty post-re-roll tick re-arms the edge with no narration",
+        );
+
+        // A genuinely NEW network exit re-logs (the edge re-armed).
+        assert_eq!(
+            logger.lines(&reconnect),
+            vec!["fleet: a hit a transient network exit (will re-roll)".to_string()],
+            "a genuinely new network exit narrates after the latch cleared",
+        );
     }
 
     /// An immediate-stop (force_stop hard kill) retiring agent that is still alive
@@ -3579,5 +4058,141 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r2 = loop_.tick(2);
         assert_eq!(r2.started.len(), 1, "new work re-starts the released member");
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
+    }
+
+    /// TASK 042 repro — the incident: a fleet-of-ONE **unpinned** (fallback)
+    /// member completes item X (`ITEM_COMPLETE`, X→`done`) with item Y still
+    /// `queued` behind it in the SAME (default) queue. It must re-claim Y + spawn.
+    /// (The `an_item_complete_exit_re_claims_the_next_part_the_same_tick` sibling
+    /// covers only a PINNED member, which resolves through `pick`'s step-1 own-queue
+    /// path; an unpinned member resolves through the step-2 fallback scan — the exact
+    /// path the 2026-07-07 fleet-of-one stall rode.)
+    #[test]
+    fn fleet_of_one_unpinned_completes_and_continues_to_next_queued_head() {
+        let (mut loop_, _d, backend, claimer, queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a"))],
+            vec![q("default", &[("x", "queued"), ("y", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a starts on x (claimed `active`, seeded)
+        assert_eq!(backend.spawns(), vec!["a"], "the sole member starts on the head");
+
+        // a completed x (`set_item_status x done`) and exited ITEM_COMPLETE; the
+        // next snapshot shows x done, y still queued behind it.
+        queues.set(vec![q("default", &[("x", "done"), ("y", "queued")])]);
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+
+        let r = loop_.tick(1);
+        assert_eq!(r.completed, vec!["a".to_string()], "the member released its slot");
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a".into(), queue: "default".into(), part: "y".into() }],
+            "the fleet-of-one auto-advances to the next queued head (no manual restart)",
+        );
+        assert_eq!(backend.spawns(), vec!["a", "a"], "re-spawned on the next item");
+        assert_eq!(
+            claimer.claims(),
+            vec![("default".into(), "x".into()), ("default".into(), "y".into())],
+            "x claimed tick 0, y re-claimed the same handshake tick 1",
+        );
+    }
+
+    /// TASK 042 repro — the cross-tick latch: the exit is observed a tick BEFORE the
+    /// member's own `done` write lands in the drive loop's committed-tip snapshot
+    /// (`read_file` reads the tip; a set_item_status commit + the ~1s tick can race).
+    /// At the exit tick the head still reads `active`, so the fallback `pick` skips it
+    /// (single-active-per-queue anti-starvation) and holds; the very next tick, once
+    /// the `done` write lands, it MUST re-claim the freed head. The health cell stays
+    /// latched `Exited` across the gap (a real backend only clears it on re-spawn), so
+    /// the second-tick poll sees the member already gone (`PollOutcome::Unknown`) and
+    /// the re-start must come from step 3, not a re-poll.
+    #[test]
+    fn fleet_of_one_unpinned_recovers_when_the_done_write_lands_a_tick_late() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a"))],
+            vec![q("default", &[("x", "queued"), ("y", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a on x (x now `active` in the shared snapshot)
+        assert_eq!(backend.spawns(), vec!["a"]);
+
+        // Exit observed, but x's `done` write hasn't landed yet — the snapshot still
+        // shows x `active`, y queued behind it.
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        let r1 = loop_.tick(1);
+        assert_eq!(r1.completed, vec!["a".to_string()], "the member released its slot");
+        assert!(
+            r1.started.is_empty(),
+            "the head still reads `active` (done not landed), so the fallback holds",
+        );
+
+        // The `done` write lands: x done, y queued. The latched-Exited member is gone
+        // from the supervisor, so this re-start comes from step 3.
+        queues.set(vec![q("default", &[("x", "done"), ("y", "queued")])]);
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            r2.started,
+            vec![Assignment { agent: "a".into(), queue: "default".into(), part: "y".into() }],
+            "once the freed head is visible the fleet-of-one auto-advances — no stall",
+        );
+        assert_eq!(backend.spawns(), vec!["a", "a"], "re-spawned on the next item");
+    }
+
+    /// TASK 042 finish-criterion 5 (the diagnosability half), end to end: when a
+    /// fleet-of-one completes but its next head is not yet visible, the tick both
+    /// RECORDS the fresh-start hold + the exit disposition AND narrates them — so the
+    /// 2026-07-07 stall (a held fleet-of-one that logged nothing for 4h) is now
+    /// diagnosable from the journal. Rides the same cross-tick-latch shape as
+    /// `fleet_of_one_unpinned_recovers_when_the_done_write_lands_a_tick_late`.
+    #[test]
+    fn a_held_fleet_of_one_records_and_narrates_the_hold_and_exit_disposition() {
+        let (mut loop_, _d, backend, _claimer, _queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a"))],
+            vec![q("default", &[("x", "queued"), ("y", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a starts on x (x `active`)
+
+        // a completed x and exited ITEM_COMPLETE, but its `done` write has not landed
+        // — the head still reads `active`, so step 3's fallback pick finds no workable
+        // part and holds. Before task 042 that hold was SILENT.
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        let r = loop_.tick(1);
+
+        assert_eq!(
+            r.exit_dispositions,
+            vec![ExitDisposition {
+                agent: "a".into(),
+                baton_status: Some("ITEM_COMPLETE".into()),
+                disposition: "completed (item boundary)",
+                misrouted: None,
+            }],
+            "the exit records the observed baton status + disposition (health pass)",
+        );
+        assert_eq!(
+            r.held_fresh,
+            vec![HeldFresh { agent: "a".into(), reason: "no workable part" }],
+            "the fresh-start hold is recorded, not skipped silently",
+        );
+
+        // And it is NARRATED — a held fleet-of-one now names itself in the journal.
+        let mut logger = TickLogger::default();
+        let lines = logger.lines(&r);
+        assert!(
+            lines.contains(&"fleet: holding a (no workable part)".to_string()),
+            "the held fleet-of-one is narrated: {lines:?}",
+        );
+        assert!(
+            lines.contains(
+                &"fleet: a exited — baton ITEM_COMPLETE -> completed (item boundary)".to_string()
+            ),
+            "the exit disposition is narrated with the observed baton status: {lines:?}",
+        );
     }
 }
