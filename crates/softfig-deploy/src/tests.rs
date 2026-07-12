@@ -17,16 +17,26 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let config_dir = root.join("config");
-        std::fs::create_dir_all(config_dir.join("source")).unwrap();
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();
+        // The garden lives *under* $HOME (as on-device: ~/soft-fig_garden), so a
+        // target can resolve into it — the self-write case resolve_target refuses.
+        let garden_root = home.join("garden");
+        let config_dir = garden_root.join("config");
+        std::fs::create_dir_all(config_dir.join("source")).unwrap();
         let paths = DeployPaths {
+            garden_root,
             config_dir,
             home,
             cache_root: root.join("cache"),
         };
         Fixture { _tmp: tmp, paths }
+    }
+
+    /// A `std::fs` source reader over this fixture's `config/source/` — the
+    /// stand-in for the CLI / non-FUSE-daemon read path.
+    fn source(&self) -> FsSource {
+        FsSource::new(&self.paths)
     }
 
     fn write_source(&self, rel: &str, bytes: &[u8]) {
@@ -86,7 +96,7 @@ bashrc = { source = "bashrc", target = ".bashrc" }
     );
     let cfg = fx.load();
 
-    let p = plan(&cfg, &fx.paths).unwrap();
+    let p = plan(&cfg, &fx.paths, &fx.source()).unwrap();
     assert_eq!(p.entries.len(), 1);
     assert_eq!(p.entries[0].action, Action::CreateSymlink);
 
@@ -108,7 +118,7 @@ bashrc = { source = "bashrc", target = ".bashrc" }
     assert_eq!(Fixture::mode_of(&fx.paths.cache_root), 0o700, "cache dir 0700");
 
     // Idempotent: a second plan is a no-op.
-    let p2 = plan(&cfg, &fx.paths).unwrap();
+    let p2 = plan(&cfg, &fx.paths, &fx.source()).unwrap();
     assert_eq!(p2.entries[0].action, Action::SkipUnchanged);
 }
 
@@ -122,10 +132,10 @@ bashrc = { source = "bashrc", target = ".bashrc" }
 "#,
     );
     let cfg = fx.load();
-    apply(&plan(&cfg, &fx.paths).unwrap(), &fx.paths, &ApplyOptions::default()).unwrap();
+    apply(&plan(&cfg, &fx.paths, &fx.source()).unwrap(), &fx.paths, &ApplyOptions::default()).unwrap();
 
     fx.write_source("bashrc", b"export A=2\n");
-    let p = plan(&cfg, &fx.paths).unwrap();
+    let p = plan(&cfg, &fx.paths, &fx.source()).unwrap();
     assert_eq!(p.entries[0].action, Action::ReplaceManaged);
 
     let report = apply(&p, &fx.paths, &ApplyOptions::default()).unwrap();
@@ -146,7 +156,7 @@ bashrc = { source = "bashrc", target = ".bashrc" }
 
     std::fs::write(fx.target(".bashrc"), b"hand written\n").unwrap();
 
-    let p = plan(&cfg, &fx.paths).unwrap();
+    let p = plan(&cfg, &fx.paths, &fx.source()).unwrap();
     assert_eq!(p.entries[0].action, Action::Conflict);
 
     // No --force: refused, target untouched.
@@ -157,7 +167,7 @@ bashrc = { source = "bashrc", target = ".bashrc" }
     assert!(!std::fs::symlink_metadata(fx.target(".bashrc")).unwrap().file_type().is_symlink());
 
     // --force: back up the foreign file, then symlink.
-    let p2 = plan(&cfg, &fx.paths).unwrap();
+    let p2 = plan(&cfg, &fx.paths, &fx.source()).unwrap();
     let r2 = apply(&p2, &fx.paths, &ApplyOptions { force: true }).unwrap();
     assert_eq!(r2.forced, vec!["bashrc".to_string()]);
     assert!(std::fs::symlink_metadata(fx.target(".bashrc")).unwrap().file_type().is_symlink());
@@ -179,7 +189,7 @@ weather = { source = "weather.conf", target = ".config/weather-core/config.conf"
     );
     let cfg = fx.load();
 
-    let p = plan(&cfg, &fx.paths).unwrap();
+    let p = plan(&cfg, &fx.paths, &fx.source()).unwrap();
     assert_eq!(p.entries[0].action, Action::CopyStamped);
     let report = apply(&p, &fx.paths, &ApplyOptions::default()).unwrap();
     assert_eq!(report.copied, vec!["weather".to_string()]);
@@ -194,11 +204,11 @@ weather = { source = "weather.conf", target = ".config/weather-core/config.conf"
     assert_eq!(Fixture::mode_of(&target), 0o600);
 
     // Idempotent.
-    assert_eq!(plan(&cfg, &fx.paths).unwrap().entries[0].action, Action::SkipUnchanged);
+    assert_eq!(plan(&cfg, &fx.paths, &fx.source()).unwrap().entries[0].action, Action::SkipUnchanged);
 
     // A hand edit that drops the stamp is detected as a conflict.
     std::fs::write(&target, b"hand edited\n").unwrap();
-    assert_eq!(plan(&cfg, &fx.paths).unwrap().entries[0].action, Action::Conflict);
+    assert_eq!(plan(&cfg, &fx.paths, &fx.source()).unwrap().entries[0].action, Action::Conflict);
 }
 
 #[test]
@@ -210,7 +220,7 @@ fn absolute_target_outside_home_is_rejected() {
 x = { source = "x", target = "/etc/foo" }
 "#,
     );
-    let err = plan(&fx.load(), &fx.paths).unwrap_err();
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
     assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
 }
 
@@ -223,7 +233,7 @@ fn parent_dir_traversal_in_target_is_rejected() {
 x = { source = "x", target = "../escape" }
 "#,
     );
-    let err = plan(&fx.load(), &fx.paths).unwrap_err();
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
     assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
 }
 
@@ -236,7 +246,7 @@ fn directory_source_is_rejected_in_m4a() {
 d = { source = "adir", target = ".adir" }
 "#,
     );
-    let err = plan(&fx.load(), &fx.paths).unwrap_err();
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
     assert!(matches!(err, DeployError::DirectorySource { .. }), "got {err:?}");
 }
 
@@ -248,7 +258,7 @@ fn missing_source_is_reported() {
 gone = { source = "nope", target = ".nope" }
 "#,
     );
-    let err = plan(&fx.load(), &fx.paths).unwrap_err();
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
     assert!(matches!(err, DeployError::SourceNotFound { .. }), "got {err:?}");
 }
 
@@ -261,7 +271,7 @@ fn unsafe_dot_name_is_rejected() {
 "a/b" = { source = "x", target = ".x" }
 "#,
     );
-    let err = plan(&fx.load(), &fx.paths).unwrap_err();
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
     assert!(matches!(err, DeployError::InvalidName(_)), "got {err:?}");
 }
 
@@ -307,4 +317,240 @@ fn default_cache_root_composes_off_the_base() {
     // cache root is always `<base>/softfig/deployed`.
     assert_eq!(default_cache_root(), xdg_data_home().join("softfig").join("deployed"));
     assert!(default_cache_root().ends_with("softfig/deployed"));
+}
+
+// ---- mount-safety seam (task 036) ------------------------------------
+//
+// These stand in for FUSE mode (the workspace suite has no `/dev/fuse`): the
+// daemon snapshots each source's plaintext from its mount-safe working-tree
+// view into a `MemSource`, and the engine reads *only* through that. The tests
+// prove the two guarantees of the blocker fix.
+
+#[test]
+fn mem_source_supplies_plaintext_not_the_on_disk_redacted_bytes() {
+    // Finding (b): a `fs::read` of a Layer-B-sealed source returns the
+    // reader-redacted `[sealed:…]` placeholder, which would deploy into a live
+    // dotfile (e.g. ~/.ssh/config). The daemon instead captures the mount's
+    // *plaintext*; the engine must materialize that, never the on-disk view.
+    let fx = Fixture::new();
+    // What a reader — and thus a naive fs::read of the mount — sees for a
+    // whole-file-sealed source:
+    let redacted = b"[sealed:config/source/ssh_config]\n".to_vec();
+    fx.write_source("ssh_config", &redacted);
+    fx.write_config(
+        r#"[dots]
+ssh = { source = "ssh_config", target = ".ssh/config" }
+"#,
+    );
+    let cfg = fx.load();
+
+    // The daemon's WorkTree read yields plaintext, captured in-memory:
+    let plaintext = b"Host prod\n  IdentityFile ~/.ssh/id_prod\n".to_vec();
+    let mut mem = MemSource::new();
+    mem.insert_file("ssh_config", plaintext.clone());
+
+    let p = plan(&cfg, &fx.paths, &mem).unwrap();
+    assert_eq!(p.entries[0].action, Action::CreateSymlink);
+    apply(&p, &fx.paths, &ApplyOptions::default()).unwrap();
+
+    let got = std::fs::read(fx.target(".ssh/config")).unwrap();
+    assert_eq!(got, plaintext, "target got the working-tree plaintext");
+    assert_ne!(
+        got, redacted,
+        "the reader-redacted placeholder must never reach a live dotfile"
+    );
+
+    // Contrast: the naive fs::read path (FsSource) leaks the placeholder — the
+    // exact bug the daemon's MemSource snapshot avoids.
+    let fx2 = Fixture::new();
+    fx2.write_source("ssh_config", &redacted);
+    fx2.write_config(
+        r#"[dots]
+ssh = { source = "ssh_config", target = ".ssh/config" }
+"#,
+    );
+    let p2 = plan(&fx2.load(), &fx2.paths, &fx2.source()).unwrap();
+    apply(&p2, &fx2.paths, &ApplyOptions::default()).unwrap();
+    assert_eq!(
+        std::fs::read(fx2.target(".ssh/config")).unwrap(),
+        redacted,
+        "FsSource reads whatever is on disk — the leak the daemon avoids"
+    );
+}
+
+#[test]
+fn target_inside_garden_is_rejected() {
+    // Finding (c): a target resolving inside garden_root is a self-write of the
+    // garden mount / an uncommitted garden mutation — refused (any source).
+    let fx = Fixture::new();
+    fx.write_source("x", b"x\n");
+    // garden_root = <home>/garden, so a home-relative "garden/…" lands inside it.
+    fx.write_config(
+        r#"[dots]
+sneaky = { source = "x", target = "garden/config/source/evil" }
+"#,
+    );
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
+    assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
+}
+
+// ---- canonicalization-based garden refusal (036 review follow-up) ----
+//
+// The lexical `starts_with` refusal had two symlink escapes (record 017,
+// finding 1): a symlinked *parent* smuggling the write into the garden, and
+// unresolved symlink components in the configured roots (`/home → /var/home`)
+// silently disarming the comparison. `resolve_target` now canonicalizes the
+// target's parent chain and compares against the canonical garden root.
+
+#[test]
+fn symlink_parent_into_garden_is_refused() {
+    // `~/.config/foo` is a symlink to a dir inside the garden: the target
+    // string never mentions the garden, but apply's create_dir_all + tempfile
+    // + rename all operate *through* the parent — a garden write.
+    let fx = Fixture::new();
+    fx.write_source("x", b"x\n");
+    let inside = fx.paths.garden_root.join("smuggle");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(fx.paths.home.join(".config")).unwrap();
+    std::os::unix::fs::symlink(&inside, fx.paths.home.join(".config/foo")).unwrap();
+    fx.write_config(
+        r#"[dots]
+x = { source = "x", target = ".config/foo/bar" }
+"#,
+    );
+    let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
+    assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
+    assert!(!inside.join("bar").exists(), "nothing written into the garden");
+}
+
+#[test]
+fn benign_symlink_parent_outside_garden_still_deploys() {
+    // A symlinked parent that resolves *outside* the garden is legitimate
+    // (e.g. ~/.config on another disk) — the canonical check must not refuse it.
+    let fx = Fixture::new();
+    fx.write_source("x", b"payload\n");
+    let elsewhere = fx.paths.home.join("real-config");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fx.paths.home.join(".config")).unwrap();
+    fx.write_config(
+        r#"[dots]
+x = { source = "x", target = ".config/app.conf" }
+"#,
+    );
+    let p = plan(&fx.load(), &fx.paths, &fx.source()).unwrap();
+    assert_eq!(p.entries[0].action, Action::CreateSymlink);
+    apply(&p, &fx.paths, &ApplyOptions::default()).unwrap();
+    assert_eq!(
+        std::fs::read(elsewhere.join("app.conf")).unwrap(),
+        b"payload\n",
+        "deployed through the benign symlinked parent"
+    );
+}
+
+#[test]
+fn direct_target_symlink_stays_a_conflict_not_an_error() {
+    // The final component is deliberately left unresolved: apply *replaces* a
+    // target symlink atomically, never follows it, so a symlink target keeps
+    // its Conflict semantics — whether it points outside or inside the garden.
+    let fx = Fixture::new();
+    fx.write_source("x", b"x\n");
+    std::fs::write(fx.paths.home.join("other"), b"other\n").unwrap();
+    std::os::unix::fs::symlink(fx.paths.home.join("other"), fx.target(".out")).unwrap();
+    let garden_file = fx.paths.garden_root.join("gfile");
+    std::fs::write(&garden_file, b"garden\n").unwrap();
+    std::os::unix::fs::symlink(&garden_file, fx.target(".in")).unwrap();
+    fx.write_config(
+        r#"[dots]
+a = { source = "x", target = ".out" }
+b = { source = "x", target = ".in" }
+"#,
+    );
+    let p = plan(&fx.load(), &fx.paths, &fx.source()).unwrap();
+    assert!(p.entries.iter().all(|e| e.action == Action::Conflict), "{:?}", p.entries);
+
+    // Forcing replaces the symlinks themselves; the garden file is untouched.
+    apply(&p, &fx.paths, &ApplyOptions { force: true }).unwrap();
+    assert_eq!(std::fs::read(&garden_file).unwrap(), b"garden\n");
+    assert_eq!(std::fs::read(fx.paths.home.join("other")).unwrap(), b"other\n");
+}
+
+#[test]
+fn unresolved_root_symlink_components_still_refuse_garden_targets() {
+    // `/home → /var/home` systems: the deploy $HOME is spelled through a
+    // symlink while garden_root is configured canonically. The lexical
+    // comparison never fired here; the canonical one must.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let real_home = root.join("varhome/u");
+    let garden_root = real_home.join("garden");
+    std::fs::create_dir_all(garden_root.join("config/source")).unwrap();
+    std::os::unix::fs::symlink(root.join("varhome"), root.join("home")).unwrap();
+    let paths = DeployPaths {
+        garden_root: garden_root.clone(),
+        config_dir: garden_root.join("config"),
+        home: root.join("home/u"), // the symlinked spelling
+        cache_root: root.join("cache"),
+    };
+    std::fs::write(paths.source_dir().join("x"), b"x\n").unwrap();
+    let cfg = DeployConfig::parse(
+        r#"[dots]
+x = { source = "x", target = "garden/evil" }
+"#,
+    )
+    .unwrap();
+    let err = plan(&cfg, &paths, &FsSource::new(&paths)).unwrap_err();
+    assert!(matches!(err, DeployError::InvalidTarget { .. }), "got {err:?}");
+}
+
+#[test]
+fn cache_root_inside_garden_is_rejected() {
+    // Review follow-up finding 3: a configured deploy-cache inside the garden
+    // would make every symlink dot a garden write (and dangle on lock).
+    let fx = Fixture::new();
+    fx.write_source("x", b"x\n");
+    fx.write_config(
+        r#"[dots]
+x = { source = "x", target = ".x" }
+"#,
+    );
+    let mut paths = fx.paths.clone();
+    paths.cache_root = paths.garden_root.join("cache");
+    let err = plan(&fx.load(), &paths, &FsSource::new(&paths)).unwrap_err();
+    assert!(matches!(err, DeployError::CacheRootInsideGarden(_)), "got {err:?}");
+}
+
+#[test]
+fn source_traversal_and_absolute_sources_are_rejected() {
+    // Review follow-up finding 5: `source` is an address under config/source/
+    // (and, in daemon mode, the working-tree read key) — `..` or an absolute
+    // path could read + deploy an arbitrary garden or host file.
+    let fx = Fixture::new();
+    for src in ["../deploy.toml", "/etc/passwd", ""] {
+        fx.write_config(&format!(
+            r#"[dots]
+x = {{ source = {src:?}, target = ".x" }}
+"#
+        ));
+        let err = plan(&fx.load(), &fx.paths, &fx.source()).unwrap_err();
+        assert!(matches!(err, DeployError::InvalidSource { .. }), "{src:?}: got {err:?}");
+    }
+}
+
+#[test]
+fn mem_source_classifies_directory_and_missing() {
+    let fx = Fixture::new();
+    fx.write_config(
+        r#"[dots]
+d = { source = "adir", target = ".adir" }
+"#,
+    );
+    // A directory in the working tree → the M4a directory-source rejection.
+    let mut mem = MemSource::new();
+    mem.insert_directory("adir");
+    let err = plan(&fx.load(), &fx.paths, &mem).unwrap_err();
+    assert!(matches!(err, DeployError::DirectorySource { .. }), "got {err:?}");
+
+    // A source the daemon never captured (absent in the working tree) → not found.
+    let err2 = plan(&fx.load(), &fx.paths, &MemSource::new()).unwrap_err();
+    assert!(matches!(err2, DeployError::SourceNotFound { .. }), "got {err2:?}");
 }

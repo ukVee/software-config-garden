@@ -23,6 +23,14 @@
 //! with a `# managed by softfig` stamp so a re-deploy can tell its own file
 //! from a hand-edited one.
 //!
+//! **Sealed sources deploy as plaintext — by design.** A Layer-B-sealed
+//! source under `config/source/` is decrypted for the deploy: the real
+//! plaintext (never a `[sealed:…]` placeholder) lands in the deploy-cache
+//! and the target, both of which are ordinary owner-only (`0600`) files
+//! outside the vault. Deploying a sealed source is a deliberate
+//! declassification — point the dot at a throwaway target if that's not
+//! what you want.
+//!
 //! ## M4a scope (deliberately thin)
 //!
 //! * `$HOME` targets only — absolute targets outside `$HOME` are rejected
@@ -44,6 +52,7 @@ use std::path::PathBuf;
 mod apply;
 mod config;
 mod plan;
+mod source;
 mod stamp;
 
 #[cfg(test)]
@@ -52,6 +61,7 @@ mod tests;
 pub use apply::{apply, ApplyOptions, Report};
 pub use config::{DeployConfig, Dot, Method};
 pub use plan::{plan, Action, Plan, PlannedEntry};
+pub use source::{FsSource, MemSource, SourceEntry, SourceReader};
 
 /// Everything that can go wrong before/while computing or applying a deploy.
 #[derive(Debug, thiserror::Error)]
@@ -81,19 +91,33 @@ pub enum DeployError {
         target: String,
         reason: String,
     },
+    #[error(
+        "dot {name:?}: invalid source {source_rel:?}: sources are relative paths under \
+         config/source/ (no absolute paths, no `..`)"
+    )]
+    // `source_rel`, not `source` — thiserror reserves a `source` field for the
+    // underlying-cause chain.
+    InvalidSource { name: String, source_rel: String },
+    #[error(
+        "deploy cache root {0} resolves inside the garden — the cache must live \
+         outside the garden mount (it would dangle on lock and mutate the garden)"
+    )]
+    CacheRootInsideGarden(PathBuf),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, DeployError>;
 
-/// Resolved roots a deploy run operates against. `config_dir` is
-/// `<garden_root>/config` (holds `deploy.toml` + `source/`, read through the
-/// FUSE plaintext view); `home` is the `$HOME` boundary relative targets
-/// resolve against and absolute targets may not escape; `cache_root` is the
-/// persistent plaintext deploy-cache base.
+/// Resolved roots a deploy run operates against. `garden_root` is the garden
+/// mount root — **no target may resolve inside it** (a self-write of the garden
+/// / an uncommitted mutation); `config_dir` is `<garden_root>/config` (holds
+/// `deploy.toml` + `source/`, read through the FUSE plaintext view); `home` is
+/// the `$HOME` boundary relative targets resolve against and absolute targets
+/// may not escape; `cache_root` is the persistent plaintext deploy-cache base.
 #[derive(Debug, Clone)]
 pub struct DeployPaths {
+    pub garden_root: PathBuf,
     pub config_dir: PathBuf,
     pub home: PathBuf,
     pub cache_root: PathBuf,

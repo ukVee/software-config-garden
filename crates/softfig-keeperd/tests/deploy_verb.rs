@@ -40,13 +40,15 @@ struct Fixture {
 impl Fixture {
     fn start(unlock: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let garden = tmp.path().join("garden");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // Garden under $HOME (as on-device: ~/soft-fig_garden), so a target can
+        // resolve into it — the self-write case the deploy verbs must refuse.
+        let garden = home.join("garden");
         std::fs::create_dir_all(&garden).unwrap();
         init_garden(&garden);
 
-        let home = tmp.path().join("home");
         let cache = tmp.path().join("cache");
-        std::fs::create_dir_all(&home).unwrap();
 
         let socket = tmp.path().join("sock");
         let config = KeeperConfig::new(&garden)
@@ -221,6 +223,71 @@ fn missing_config_is_not_found() {
         err_kind(fx.call(op::DEPLOY_PLAN, serde_json::json!({}))),
         ErrorKind::NotFound
     );
+}
+
+#[test]
+fn garden_internal_target_is_refused() {
+    // A target that resolves inside the garden mount is a self-write / an
+    // uncommitted garden mutation — the deploy verbs refuse it end-to-end
+    // (task 036 finding c). `garden/…` is home-relative and the garden lives at
+    // <home>/garden, so it lands inside garden_root.
+    let fx = Fixture::start(true);
+    fx.write_config(
+        r#"[dots]
+sneaky = { source = "s", target = "garden/config/source/evil" }
+"#,
+    );
+    fx.write_source("s", b"x\n");
+    assert_eq!(
+        err_kind(fx.call(op::DEPLOY_PLAN, serde_json::json!({}))),
+        ErrorKind::BadArgs,
+        "an InvalidTarget inside the garden maps to BadArgs"
+    );
+}
+
+// ---- deploy serialization (036 review follow-up, finding 2) ----------
+
+#[test]
+fn concurrent_forced_applies_preserve_the_original_backup() {
+    // The verbs drop `inner` before their blocking work (the 036 deadlock
+    // fix), so without the daemon's deploy gate two concurrent
+    // `deploy_apply {force:true}` on the same Conflict target could
+    // interleave the backup dance: B renames A's fresh symlink over
+    // `<target>.softfig-bak`, destroying the only backup of the user's
+    // original file. With the gate the applies serialize — the loser plans
+    // against the settled state (SkipUnchanged) and the original bytes
+    // survive in the backup, every run.
+    let fx = Fixture::start(true);
+    fx.write_config(
+        r#"[dots]
+bashrc = { source = "bashrc", target = ".bashrc" }
+"#,
+    );
+    fx.write_source("bashrc", b"managed\n");
+    std::fs::write(fx.target(".bashrc"), b"user-original\n").unwrap();
+
+    let socket = fx.socket.clone();
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            let socket = socket.clone();
+            s.spawn(move || {
+                let resp = send(
+                    &socket,
+                    &Request::new(op::DEPLOY_APPLY, serde_json::json!({ "force": true })),
+                );
+                assert!(matches!(resp, Response::Ok { .. }), "apply: {resp:?}");
+            });
+        }
+    });
+
+    assert_eq!(
+        std::fs::read(fx.target(".bashrc.softfig-bak")).unwrap(),
+        b"user-original\n",
+        "the user's original bytes survive as the backup"
+    );
+    let md = std::fs::symlink_metadata(fx.target(".bashrc")).unwrap();
+    assert!(md.file_type().is_symlink(), "target is the managed symlink");
+    assert_eq!(std::fs::read(fx.target(".bashrc")).unwrap(), b"managed\n");
 }
 
 #[test]

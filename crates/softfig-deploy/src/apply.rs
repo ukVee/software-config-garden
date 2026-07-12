@@ -89,16 +89,18 @@ pub fn apply(plan: &Plan, paths: &DeployPaths, opts: &ApplyOptions) -> Result<Re
 }
 
 /// Realize one entry's desired state (used by Create / Replace / Copy and by
-/// a forced Conflict, after the existing target has been backed up).
+/// a forced Conflict, after the existing target has been backed up). Writes the
+/// source bytes captured at plan time — never re-reads the source (which for a
+/// FUSE-mode daemon would be a self-read of its own mount).
 fn materialize(e: &PlannedEntry, report: &mut Report) -> Result<()> {
-    let src = fs::read(&e.source_abs)?;
+    let src = &e.source_bytes;
     match e.method {
         Method::Symlink => {
-            write_atomic(&e.cache_abs, &src, FILE_MODE)?;
+            write_atomic(&e.cache_abs, src, FILE_MODE)?;
             place_symlink(&e.target_abs, &e.cache_abs)?;
         }
         Method::Copy => {
-            let (bytes, stamped) = stamp::compose_copy(&e.target_abs, &src, &e.source_rel);
+            let (bytes, stamped) = stamp::compose_copy(&e.target_abs, src, &e.source_rel);
             if !stamped {
                 report.warnings.push(format!(
                     "{}: no known comment syntax for {} — copied without a managed-by stamp \

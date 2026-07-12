@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{DeployConfig, Method};
+use crate::source::{SourceEntry, SourceReader};
 use crate::stamp;
 use crate::{DeployError, DeployPaths, Result};
 
@@ -45,8 +46,11 @@ impl Action {
 pub struct PlannedEntry {
     pub name: String,
     pub method: Method,
-    /// Absolute path under `config/source/`.
-    pub source_abs: PathBuf,
+    /// The source's plaintext bytes, captured at plan time from the
+    /// [`SourceReader`]. `apply` re-materializes exactly these — it never reads
+    /// the source again (which, for a FUSE-mode daemon, would be a self-read of
+    /// the very mount it serves).
+    pub source_bytes: Vec<u8>,
     /// The dot's `source` string (for the copy stamp's provenance line).
     pub source_rel: String,
     /// Resolved absolute target path.
@@ -70,35 +74,53 @@ impl Plan {
     }
 }
 
-/// Compute the plan. Reads the filesystem; does not mutate it.
-pub fn plan(config: &DeployConfig, paths: &DeployPaths) -> Result<Plan> {
+/// Compute the plan. Reads each dot's source through `source` (never `std::fs`
+/// directly — see [`crate::source`]) and stats targets/caches on the real
+/// filesystem; mutates nothing.
+pub fn plan(config: &DeployConfig, paths: &DeployPaths, source: &dyn SourceReader) -> Result<Plan> {
     let source_dir = paths.source_dir();
     let mut entries = Vec::with_capacity(config.dots.len());
 
+    // Both garden-boundary checks below compare against the *canonical* garden
+    // root, so an unresolved symlink component in the configured path (`/home`
+    // → `/var/home` systems) can't silently disarm them. Safe here: `plan` runs
+    // outside the daemon's `inner` scope (the no-canonicalize discipline is an
+    // under-`inner` rule).
+    let garden_canon = canonicalize_deepest_existing(&paths.garden_root)?;
+
+    // A deploy-cache inside the garden would make every symlink dot a write
+    // into (and a dangle-on-lock read from) the garden mount — refuse the
+    // config foot-gun outright. The default cache root is outside the garden.
+    let cache_canon = canonicalize_deepest_existing(&paths.cache_root)?;
+    if cache_canon.starts_with(&garden_canon) {
+        return Err(DeployError::CacheRootInsideGarden(paths.cache_root.clone()));
+    }
+
     for (name, dot) in &config.dots {
         validate_name(name)?;
+        validate_source(name, &dot.source)?;
 
-        let source_abs = source_dir.join(&dot.source);
-        match std::fs::symlink_metadata(&source_abs) {
-            Ok(md) if md.file_type().is_dir() => {
+        // Display-only absolute path for the not-found / directory errors; the
+        // bytes themselves come from `source`, never a mount `fs::read`.
+        let source_abs = || source_dir.join(&dot.source);
+        let src_bytes = match source.read_source(&dot.source)? {
+            SourceEntry::Directory => {
                 return Err(DeployError::DirectorySource {
                     name: name.clone(),
-                    path: source_abs,
+                    path: source_abs(),
                 });
             }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            SourceEntry::Missing => {
                 return Err(DeployError::SourceNotFound {
                     name: name.clone(),
-                    path: source_abs,
+                    path: source_abs(),
                 });
             }
-            Err(e) => return Err(e.into()),
-        }
+            SourceEntry::File(bytes) => bytes,
+        };
 
-        let target_abs = resolve_target(&paths.home, &dot.target, name)?;
+        let target_abs = resolve_target(&paths.home, &garden_canon, &dot.target, name)?;
         let cache_abs = paths.cache_root.join(name);
-        let src_bytes = std::fs::read(&source_abs)?;
 
         let (action, conflict_reason) =
             decide(dot.method, &target_abs, &cache_abs, &src_bytes, &dot.source)?;
@@ -106,7 +128,7 @@ pub fn plan(config: &DeployConfig, paths: &DeployPaths) -> Result<Plan> {
         entries.push(PlannedEntry {
             name: name.clone(),
             method: dot.method,
-            source_abs,
+            source_bytes: src_bytes,
             source_rel: dot.source.clone(),
             target_abs,
             cache_abs,
@@ -119,8 +141,19 @@ pub fn plan(config: &DeployConfig, paths: &DeployPaths) -> Result<Plan> {
 }
 
 /// Resolve + validate a dot's target into an absolute path. Rejects `..`
-/// traversal and (M4a) absolute targets outside `$HOME`.
-fn resolve_target(home: &Path, target: &str, name: &str) -> Result<PathBuf> {
+/// traversal, (M4a) absolute targets outside `$HOME`, and any target that
+/// resolves **inside the garden** (a self-write of the garden mount / an
+/// uncommitted garden mutation — deploy writes real dotfiles, never the garden).
+///
+/// The garden check is canonicalization-based, against `garden_canon` (the
+/// already-canonicalized garden root): apply's writes all go *through the
+/// target's parent* (`create_dir_all` + tempfile + rename in the parent dir),
+/// so the parent chain's symlinks are resolved — a `~/.config/foo →
+/// <garden>/x` symlink-parent can't smuggle the write into the garden. The
+/// final component is deliberately left unresolved: apply atomically
+/// *replaces* a target symlink, never follows it, so a direct target symlink
+/// keeps its existing Conflict semantics instead of becoming a hard error.
+fn resolve_target(home: &Path, garden_canon: &Path, target: &str, name: &str) -> Result<PathBuf> {
     let invalid = |reason: &str| DeployError::InvalidTarget {
         name: name.to_string(),
         target: target.to_string(),
@@ -134,15 +167,83 @@ fn resolve_target(home: &Path, target: &str, name: &str) -> Result<PathBuf> {
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(invalid("`..` is not allowed in a target"));
     }
-    if p.is_absolute() {
+    let resolved = if p.is_absolute() {
         if !p.starts_with(home) {
             return Err(invalid(
                 "absolute targets outside $HOME are deferred to the /etc slice",
             ));
         }
-        Ok(p.to_path_buf())
+        p.to_path_buf()
     } else {
-        Ok(home.join(p))
+        home.join(p)
+    };
+    let file_name = resolved
+        .file_name()
+        .ok_or_else(|| invalid("target has no file name"))?
+        .to_os_string();
+    let parent = resolved
+        .parent()
+        .expect("an absolute path with a file name has a parent");
+    let canon = canonicalize_deepest_existing(parent)?.join(file_name);
+    if canon.starts_with(garden_canon) {
+        return Err(invalid(
+            "target resolves inside the garden — deploying into the garden mount is refused",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Canonicalize `path` even when its tail doesn't exist yet: canonicalize the
+/// deepest existing ancestor (resolving its symlinks), then re-append the
+/// remaining not-yet-created components verbatim. A component that exists but
+/// can't be fully resolved (a broken symlink) is treated as not-yet-existing —
+/// apply's `create_dir_all`/rename would fail on it rather than escape.
+fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf> {
+    let mut existing = path;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(canon) => {
+                let mut out = canon;
+                for c in tail.iter().rev() {
+                    out.push(c);
+                }
+                return Ok(out);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match existing.parent() {
+                Some(parent) => {
+                    // `file_name()` is None only for `..`/root components, which
+                    // the target validation above already rejects.
+                    match existing.file_name() {
+                        Some(name) => tail.push(name.to_os_string()),
+                        None => return Ok(path.to_path_buf()),
+                    }
+                    existing = parent;
+                }
+                None => return Ok(path.to_path_buf()),
+            },
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// A dot's `source` addresses a file *under* `config/source/` — refuse absolute
+/// paths and `..` traversal so a `deploy.toml` row can't read (and deploy) an
+/// arbitrary garden or host file. In daemon mode the source string is also the
+/// working-tree read key, so this guards the plaintext snapshot path too.
+fn validate_source(name: &str, source: &str) -> Result<()> {
+    let p = Path::new(source);
+    let escapes = source.is_empty()
+        || p.is_absolute()
+        || p.components()
+            .any(|c| !matches!(c, Component::Normal(_)));
+    if escapes {
+        Err(DeployError::InvalidSource {
+            name: name.to_string(),
+            source_rel: source.to_string(),
+        })
+    } else {
+        Ok(())
     }
 }
 

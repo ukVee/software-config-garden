@@ -127,6 +127,14 @@ pub struct Daemon {
     /// mutex — the lock a thread blocked on garden I/O may be holding. See
     /// [`Daemon::request_shutdown`].
     pub garden_root: PathBuf,
+    /// Serializes the deploy verbs (task 036 follow-up): they drop `inner`
+    /// before their blocking filesystem work, so without this two concurrent
+    /// forced applies could interleave the conflict-backup dance and destroy
+    /// the only backup of a user file. Its own lock, NOT `inner` — `status`
+    /// etc. stay unblocked while a deploy runs. Lock order: the gate is
+    /// acquired *before* `inner` and nothing acquires the gate while holding
+    /// `inner`, so no cycle is possible.
+    pub deploy_gate: Arc<Mutex<()>>,
 }
 
 impl Daemon {
@@ -145,6 +153,7 @@ impl Daemon {
             suppress,
             accumulator,
             garden_root,
+            deploy_gate: Arc::new(Mutex::new(())),
         }
     }
 
