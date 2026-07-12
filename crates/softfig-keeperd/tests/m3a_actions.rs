@@ -8,14 +8,12 @@
 //! runtime; each action registers its own paths in the suppression map
 //! regardless.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use softfig_vcs::Repo;
 use softfig_ipc::verbs::{
-    op, AddNoteArgs, AddNoteReply, AddProjectArgs, AddProjectReply, AddSectionArgs,
+    op, AddCodeReviewArgs, AddCodeReviewReply, AddNoteArgs, AddNoteReply, AddProjectArgs,
+    AddProjectReply, AddSectionArgs,
     AppendToSectionArgs, ArchiveArgs, ArchiveReply, DocEditReply, EditSectionArgs,
     LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, MigrateConfigReply,
     MigrateSplitReply,
@@ -24,49 +22,18 @@ use softfig_ipc::verbs::{
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::actions::conventions;
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
+
+mod common;
+use common::{err_kind, fast_params, ok_data, send, wait_for_socket};
 
 const PASS: &[u8] = b"pw-test-12345";
 const PASS_STR: &str = "pw-test-12345";
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn init_garden(garden: &Path) {
     let (_vault, session, _recovery) =
         Vault::init_with_params(garden, PASS, fast_params()).unwrap();
     Repo::init(garden, &session).unwrap();
-}
-
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if path.exists() {
-            if let Ok(stream) = UnixStream::connect(path) {
-                drop(stream);
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} did not appear", path.display());
-}
-
-fn send(socket: &Path, req: &Request) -> Response {
-    let mut stream = UnixStream::connect(socket).unwrap();
-    let mut bytes = serde_json::to_vec(req).unwrap();
-    bytes.push(b'\n');
-    stream.write_all(&bytes).unwrap();
-    stream.flush().unwrap();
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
 }
 
 struct Fixture {
@@ -121,20 +88,6 @@ impl Drop for Fixture {
             handle.shutdown();
             let _ = handle.join();
         }
-    }
-}
-
-fn ok_data(resp: Response) -> serde_json::Value {
-    match resp {
-        Response::Ok { data, .. } => data,
-        Response::Err { kind, error, .. } => panic!("expected Ok, got {kind:?}: {error}"),
-    }
-}
-
-fn err_kind(resp: Response) -> ErrorKind {
-    match resp {
-        Response::Err { kind, .. } => kind,
-        Response::Ok { data, .. } => panic!("expected Err, got Ok: {data}"),
     }
 }
 
@@ -600,6 +553,109 @@ fn add_note_rejects_missing_parent_dir() {
         serde_json::json!({ "dir": "nope/notes", "slug": "x", "body": "b" }),
     );
     assert_eq!(err_kind(resp), ErrorKind::NotFound);
+}
+
+// ---- add_code_review (task 020) ----------------------------------------
+
+#[test]
+fn add_code_review_happy_assigns_001_and_seq() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    let resp = fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::to_value(AddCodeReviewArgs {
+            dir: "projects/demo/code-reviews".into(),
+            slug: "fleet-loop-spin".into(),
+            title: Some("Code review: fleet-loop-spin".into()),
+            body: "## Verdict\n\nPass, no defects.".into(),
+        })
+        .unwrap(),
+    );
+    let reply: AddCodeReviewReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "projects/demo/code-reviews/001-fleet-loop-spin.md");
+
+    let content = std::fs::read_to_string(fx.garden.join(&reply.path)).unwrap();
+    assert!(content.starts_with("# Code review: fleet-loop-spin\n"), "header: {content:?}");
+    assert!(content.contains(&format!("> Last reviewed: {}\n", conventions::today_hyphen())));
+    assert!(content.contains("Pass, no defects."));
+
+    // `.seq` high-water mark bumped to 1 — an independent sequence.
+    assert_eq!(
+        std::fs::read_to_string(fx.garden.join("projects/demo/code-reviews/.seq")).unwrap(),
+        "1\n"
+    );
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "code_review_added");
+    assert_eq!(payload["number"], 1);
+    assert_eq!(payload["slug"], "fleet-loop-spin");
+    assert_eq!(payload["dir"], "projects/demo/code-reviews");
+}
+
+/// `code-reviews/` numbers independently of a sibling `notes/` — each
+/// accretive folder is its own sequence.
+#[test]
+fn add_code_review_numbers_independently_of_notes() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "projects/demo/notes", "slug": "one", "body": "a" }),
+    );
+    let resp = fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "slug": "first", "body": "b" }),
+    );
+    let reply: AddCodeReviewReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.path, "projects/demo/code-reviews/001-first.md");
+}
+
+/// The genre gates are mutual: `add_code_review` refuses a `notes/` dir and
+/// `add_note` refuses a `code-reviews/` dir — a review is a distinct genre.
+#[test]
+fn add_verbs_gate_on_their_genre_folder() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    let resp = fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::json!({ "dir": "projects/demo/notes", "slug": "x", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotAccretiveDir);
+    let resp = fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "slug": "x", "body": "b" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::NotAccretiveDir);
+}
+
+/// `revise_note` treats `code-reviews/` as accretive — a review body can be
+/// revised in place (re-stamped reviewed date), same contract as notes. The
+/// revise commit carries the *code-review* revise intent (finding #10): the
+/// genre owns its revise intent, so a review revision is provenance-labeled
+/// `code_review_revised`, symmetric with its `code_review_added` creation —
+/// not the note path's hardcoded `note_revised`.
+#[test]
+fn revise_note_works_on_code_reviews() {
+    let fx = Fixture::start();
+    make_concept_dir(&fx, "projects/demo");
+    fx.call(
+        op::ADD_CODE_REVIEW,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "slug": "first", "body": "old" }),
+    );
+    let resp = fx.call(
+        op::REVISE_NOTE,
+        serde_json::json!({ "dir": "projects/demo/code-reviews", "id": 1, "body": "new verdict" }),
+    );
+    let reply: ReviseNoteReply = serde_json::from_value(ok_data(resp)).unwrap();
+    let content = std::fs::read_to_string(fx.garden.join(&reply.path)).unwrap();
+    assert!(content.starts_with("# first\n"));
+    assert!(content.contains("new verdict"));
+    assert!(!content.contains("old"));
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "code_review_revised");
+    assert_eq!(payload["id"], 1);
+    assert_eq!(payload["dir"], "projects/demo/code-reviews");
 }
 
 #[test]

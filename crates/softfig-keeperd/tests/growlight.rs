@@ -7,62 +7,28 @@
 //! Same harness as `m3a_actions` (M1c-compat garden, no FUSE, watcher off);
 //! each action registers its own paths in the suppression map.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
     op, AddBacklogItemReply, AddQueueReply, AddSliceReply, GrowlightInitReply,
     GrowlightSetResourcesReply, LogBatonReply, PostMessageReply, ReadInboxReply,
-    ReorderBacklogItemReply, SetItemStatusReply, TailBusReply,
+    ReorderBacklogItemReply, SetItemStatusReply, StatusReply, TailBusReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
 use softfig_vcs::Repo;
+
+mod common;
+use common::{err_kind, fast_params, ok_data, send, wait_for_socket};
 
 const PASS: &[u8] = b"pw-test-12345";
 const PASS_STR: &str = "pw-test-12345";
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn init_garden(garden: &Path) {
     let (_vault, session, _recovery) =
         Vault::init_with_params(garden, PASS, fast_params()).unwrap();
     Repo::init(garden, &session).unwrap();
-}
-
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if path.exists() {
-            if let Ok(stream) = UnixStream::connect(path) {
-                drop(stream);
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} did not appear", path.display());
-}
-
-fn send(socket: &Path, req: &Request) -> Response {
-    let mut stream = UnixStream::connect(socket).unwrap();
-    let mut bytes = serde_json::to_vec(req).unwrap();
-    bytes.push(b'\n');
-    stream.write_all(&bytes).unwrap();
-    stream.flush().unwrap();
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
 }
 
 struct Fixture {
@@ -195,20 +161,6 @@ impl Drop for Fixture {
             handle.shutdown();
             let _ = handle.join();
         }
-    }
-}
-
-fn ok_data(resp: Response) -> serde_json::Value {
-    match resp {
-        Response::Ok { data, .. } => data,
-        Response::Err { kind, error, .. } => panic!("expected Ok, got {kind:?}: {error}"),
-    }
-}
-
-fn err_kind(resp: Response) -> ErrorKind {
-    match resp {
-        Response::Err { kind, .. } => kind,
-        Response::Ok { data, .. } => panic!("expected Err, got Ok: {data}"),
     }
 }
 
@@ -1284,4 +1236,45 @@ fn growlight_set_resources_is_not_found_when_the_config_is_absent() {
         serde_json::json!({ "cargo_build_jobs": 4 }),
     );
     assert_eq!(err_kind(resp), ErrorKind::NotFound);
+}
+
+/// 020 slice 013: a REAL daemon's `status` reply carries the daemon-owned
+/// `growlight_enabled` bit end to end — record 015 flagged that the gate had
+/// unit coverage only, never through a live daemon's dispatch. The probed shape
+/// is the exact fresh-garden disagreement the bit exists for: `config/
+/// growlight.toml` PRESENT but the gate off, where client-side file-presence
+/// probing used to say "enabled".
+#[test]
+fn status_reply_carries_the_fail_closed_growlight_gate() {
+    let fx = Fixture::start();
+
+    // Fresh garden: no config/growlight.toml at all ⇒ fail-closed false.
+    let s: StatusReply =
+        serde_json::from_value(ok_data(fx.call(op::STATUS, serde_json::json!({})))).unwrap();
+    assert!(!s.growlight_enabled, "no toml ⇒ gate off");
+
+    // toml-present / gate-off: file presence says "yes", the gate says "no".
+    std::fs::create_dir_all(fx.garden.join("config")).unwrap();
+    std::fs::write(
+        fx.garden.join("config/growlight.toml"),
+        "fleet_enabled = false\n",
+    )
+    .unwrap();
+    let s: StatusReply =
+        serde_json::from_value(ok_data(fx.call(op::STATUS, serde_json::json!({})))).unwrap();
+    assert!(
+        !s.growlight_enabled,
+        "toml-present/gate-off garden must surface growlight_enabled = false"
+    );
+
+    // Arming the gate flips the very next status reply — the verb re-reads the
+    // gate every call (refreshes every status tick, no daemon-side caching).
+    std::fs::write(
+        fx.garden.join("config/growlight.toml"),
+        "fleet_enabled = true\n",
+    )
+    .unwrap();
+    let s: StatusReply =
+        serde_json::from_value(ok_data(fx.call(op::STATUS, serde_json::json!({})))).unwrap();
+    assert!(s.growlight_enabled, "armed gate reads true through status");
 }

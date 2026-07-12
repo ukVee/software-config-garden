@@ -12,59 +12,25 @@
 //! groupchat history — addressed `@human` for a human-attention alert, `@all` for
 //! a routine one. A suppressed (deduped) re-fire commits nothing.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use softfig_growlightd::{KeeperdBusEmit, NotifyDispatcher, NotifyEvent, NotifyPolicy};
 use softfig_ipc::verbs::{op, ChatMessage, TailBusReply};
 use softfig_ipc::{Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
 use softfig_vcs::Repo;
+
+mod common;
+use common::{fast_params, send, wait_for_socket};
 
 const PASS: &[u8] = b"pw-test-12345";
 const PASS_STR: &str = "pw-test-12345";
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn init_garden(garden: &Path) {
     let (_vault, session, _recovery) =
         Vault::init_with_params(garden, PASS, fast_params()).unwrap();
     Repo::init(garden, &session).unwrap();
-}
-
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if path.exists() {
-            if let Ok(stream) = UnixStream::connect(path) {
-                drop(stream);
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} did not appear", path.display());
-}
-
-fn send(socket: &Path, req: &Request) -> Response {
-    let mut stream = UnixStream::connect(socket).unwrap();
-    let mut bytes = serde_json::to_vec(req).unwrap();
-    bytes.push(b'\n');
-    stream.write_all(&bytes).unwrap();
-    stream.flush().unwrap();
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
 }
 
 /// A real, unlocked keeperd on a tempdir garden + socket (no FUSE, watcher off).

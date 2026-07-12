@@ -34,17 +34,12 @@ use softfig_net::endpoint_cache::endpoint_cache_path;
 use softfig_net::pairing::{pair_responder, LocalDevice};
 use softfig_net::ring::{ring_path, Ring, RingEntry};
 use softfig_net::static_attestation_message;
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
+
+mod common;
+use common::fast_params;
 
 const PASS: &str = "correct horse battery staple";
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn rpc(socket: &Path, op: &str, args: serde_json::Value) -> Response {
     let mut s = softfig_ipc::connect(socket).expect("connect");

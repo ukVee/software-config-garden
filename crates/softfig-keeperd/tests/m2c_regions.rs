@@ -11,7 +11,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::json;
@@ -27,19 +26,14 @@ use softfig_ipc::{
 };
 use softfig_keeperd::layer_b::{LayerBHook, SealedPaths};
 use softfig_keeperd::{Daemon, KeeperConfig};
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
+
+mod common;
+use common::{fast_params, wait_for_socket};
 
 const PASS: &str = "correct horse battery staple";
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn write_file(root: &Path, rel: &str, body: &str) {
     let p = root.join(rel);
@@ -74,16 +68,6 @@ fn unwrap_ok(resp: Response) -> serde_json::Value {
 
 fn unique_socket(tmp: &Path) -> PathBuf {
     tmp.join("keeperd.sock")
-}
-
-fn wait_for_socket(socket: &Path) {
-    for _ in 0..50 {
-        if socket.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} never appeared", socket.display());
 }
 
 fn bootstrap(garden: &Path) {

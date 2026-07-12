@@ -58,6 +58,12 @@ pub mod op {
     /// note in place, re-stamping the reviewed date. Title, slug, and
     /// number are immutable; commit `note_revised`.
     pub const REVISE_NOTE: &str = "revise_note";
+    /// Task 020 (code-review records): append a numbered code-review record
+    /// `NNN-slug.md` to a `code-reviews/` accretive folder (primary home
+    /// `projects/<project>/code-reviews/`). Same daemon-stamped machinery as
+    /// `add_note` (`.seq` numbering, header + reviewed line, parent index +
+    /// backlinks); commit `code_review_added`.
+    pub const ADD_CODE_REVIEW: &str = "add_code_review";
     /// M3a: move a tracked path under `journal/archive/<name>/`, commit
     /// `archive_move`.
     pub const ARCHIVE: &str = "archive";
@@ -79,6 +85,13 @@ pub mod op {
     /// (author_device, timestamp, intent) by walking the chain and diffing the
     /// path's blob across each commit. Read-only; never touches the mount.
     pub const FILE_PROVENANCE: &str = "file_provenance";
+    /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
+    /// parsed daemon-side by the authoritative queue-table parser that owns the
+    /// `\|` cell escape — so a frontend renders rows directly instead of
+    /// re-splitting the managed `<!-- softfig:queue -->` table (which mis-handles
+    /// a piped title and loses the active item). Only the default queue is
+    /// returned. Read-only; require Unlocked.
+    pub const GROWLIGHT_QUEUE: &str = "growlight_queue";
     /// M5a-4: begin pairing as the initiator — TCP-connect to the target
     /// device, run the Noise `XX` handshake + attestation, and park the
     /// pending pairing awaiting SAS confirmation. Returns the SAS to compare.
@@ -212,6 +225,18 @@ pub mod op {
     /// held lease, promoting the head waiter. Forwarded keeperd→growlightd like
     /// [`REQUEST_LEASE`]; a release by a non-holder comes back `denied`.
     pub const RELEASE_LEASE: &str = "release_lease";
+    /// M4 deploy (TUI Deploy tab): compute the deploy plan — a read-only diff of
+    /// `config/deploy.toml` against the live filesystem. The daemon runs
+    /// `softfig-deploy`'s `plan` against the unlocked garden mount so a frontend
+    /// (the TUI) never touches the filesystem itself. Require Unlocked; no
+    /// mutation, no commit. Mirrors `softfig deploy --dry-run`.
+    pub const DEPLOY_PLAN: &str = "deploy_plan";
+    /// M4 deploy (TUI Deploy tab): materialize the plan onto the filesystem
+    /// (deploy-cache + targets) via `softfig-deploy`'s `apply`, returning the
+    /// `Report`. `force` backs up a conflicting target to `<target>.softfig-bak`.
+    /// Require Unlocked. A native-FS op, not a VCS event (M4a defers that) — so
+    /// no commit. Mirrors `softfig deploy [--force]`.
+    pub const DEPLOY_APPLY: &str = "deploy_apply";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +255,13 @@ pub struct StatusReply {
     /// Unix seconds at which the armed relock token expires, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relock_expires_at: Option<i64>,
+    /// Daemon-owned growlight gate: the fail-closed `fleet_enabled()` value the
+    /// keeperd already owns, surfaced so a client never re-derives it from
+    /// file-presence and disagrees. Refreshes on every status tick.
+    /// `#[serde(default)]` keeps older daemons/clients wire-compatible
+    /// (an absent field ⇒ `false`, i.e. no tab — the fail-closed default).
+    #[serde(default)]
+    pub growlight_enabled: bool,
 }
 
 // ---- growlight relock token -------------------------------------------
@@ -581,6 +613,38 @@ pub struct ReviseNoteReply {
     pub hash: String,
 }
 
+// ---- task 020: code-review records --------------------------------------
+
+/// `add_code_review({dir, slug, title?, body}) -> {path, hash}`.
+///
+/// The code-review sibling of `add_note`: `dir` is the garden-relative path
+/// of an accretive folder whose basename must be `code-reviews` (primary
+/// home `projects/<project>/code-reviews/`). The daemon assigns the next
+/// number from the folder's `.seq` high-water mark, writes `dir/NNN-slug.md`,
+/// and stamps the `# <title>` header + `> Last reviewed:` line. The body is
+/// the caller's review markdown (see the review template in the garden's
+/// code-review-records decision file); the daemon never parses it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddCodeReviewArgs {
+    /// Garden-relative `code-reviews/` folder, e.g.
+    /// `projects/software-config_garden/code-reviews`.
+    pub dir: String,
+    /// `[a-z0-9-]+`, length 1–64. The terse filename address; immutable.
+    pub slug: String,
+    /// Human title used in the `# <title>` header. Defaults to the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Markdown review body written below the daemon-stamped header.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddCodeReviewReply {
+    /// Garden-relative path the daemon wrote (`dir/NNN-slug.md`).
+    pub path: String,
+    pub hash: String,
+}
+
 // ---- Slice 2 (small-files): universal section editing ------------------
 
 /// `add_section({path, heading, body}) -> {path, hash}`. Append a brand-new
@@ -755,8 +819,8 @@ pub struct TreeEntry {
     pub is_dir: bool,
 }
 
-/// `read_file({path}) -> {path, content, sealed}`. Returns the file's
-/// daemon-redacted content from the committed tip tree.
+/// `read_file({path}) -> {path, content, sealed, version, sections, region_ids}`.
+/// Returns the file's daemon-redacted content from the committed tip tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileArgs {
     pub path: String,
@@ -783,6 +847,16 @@ pub struct ReadFileReply {
     /// sealed / non-markdown / sectionless content.
     #[serde(default)]
     pub sections: Vec<SectionVersion>,
+    /// M2c (020 slice 003): the ids of the file's inline `<vault id="…">`
+    /// *sealed* regions — those projected as `[encrypted]` and revealable via
+    /// `vault_reveal --id`. Computed daemon-side with the authoritative region
+    /// grammar (`layer_b/regions.rs`), in document order; a frontend consumes
+    /// these directly instead of re-parsing the projected content (which can't
+    /// tell a real region from an inline-code `<vault>` mention). Empty for
+    /// sealed / non-region / malformed content. `#[serde(default)]` keeps older
+    /// clients/daemons wire-compatible.
+    #[serde(default)]
+    pub region_ids: Vec<String>,
 }
 
 /// One addressable section's CAS handle: its heading text + current content
@@ -794,6 +868,26 @@ pub struct SectionVersion {
     pub heading: String,
     /// The section's content version (heading line + body).
     pub version: String,
+}
+
+/// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default
+/// backlog queue parsed daemon-side with the authoritative table parser that
+/// owns the `\|` cell escape, so a frontend renders structured rows and never
+/// re-splits the managed `<!-- softfig:queue -->` table itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrowlightQueueReply {
+    pub rows: Vec<GrowlightQueueRow>,
+}
+
+/// One backlog item's authoritative queue state, as served over the wire: its
+/// id, title, and status. A title carrying a literal `|` round-trips intact
+/// (the daemon un-escapes the `\|` cell escape); the frontend never
+/// string-parses the table, so the active item is always found.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrowlightQueueRow {
+    pub id: String,
+    pub title: String,
+    pub status: String,
 }
 
 // ---- Phase 3 (garden CAS §4d): file provenance ------------------------
@@ -1445,4 +1539,92 @@ pub struct TailBusArgs {
 pub struct TailBusReply {
     /// Matching messages in total order (ascending number).
     pub messages: Vec<ChatMessage>,
+}
+
+// ---- M4 deploy (TUI Deploy tab) ---------------------------------------
+
+/// `deploy_plan({}) -> DeployPlanReply`. Read-only — the daemon runs
+/// `softfig-deploy`'s `plan` against the unlocked garden mount and returns a
+/// metadata-only projection (no source bytes cross the boundary).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployPlanArgs {}
+
+/// `deploy_apply({force}) -> DeployApplyReply`. Materialize the plan onto the
+/// filesystem (deploy-cache + targets).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployApplyArgs {
+    /// Back up a conflicting target to `<target>.softfig-bak` and overwrite it
+    /// instead of refusing (mirrors `softfig deploy --force`).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What `apply` would do with one dot — the wire projection of
+/// `softfig_deploy::Action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployAction {
+    /// Target absent → create the cache file + symlink.
+    CreateSymlink,
+    /// Target is ours but stale → refresh it.
+    ReplaceManaged,
+    /// `method = "copy"`, target absent → write the stamped copy.
+    CopyStamped,
+    /// Target already matches the desired state → nothing to do.
+    SkipUnchanged,
+    /// Target exists and is not ours → refused unless `force`.
+    Conflict,
+}
+
+impl DeployAction {
+    /// The compact verb rendered for this action. Must mirror
+    /// `softfig_deploy::Action::verb` (the impl-side enum in the deploy crate;
+    /// no crate dependency couples them, so the two stay in sync by hand).
+    pub const fn verb(&self) -> &'static str {
+        match self {
+            DeployAction::CreateSymlink => "symlink",
+            DeployAction::ReplaceManaged => "replace",
+            DeployAction::CopyStamped => "copy",
+            DeployAction::SkipUnchanged => "skip",
+            DeployAction::Conflict => "CONFLICT",
+        }
+    }
+}
+
+/// One planned dot as surfaced to the Deploy tab. Metadata only — the source
+/// bytes never cross IPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployPlanEntry {
+    /// The dot's name (its `config/deploy.toml` key).
+    pub name: String,
+    pub action: DeployAction,
+    /// Resolved absolute target path (for display).
+    pub target: String,
+    /// Human reason, set only when `action == Conflict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployPlanReply {
+    /// Planned dots in stable (name) order.
+    pub entries: Vec<DeployPlanEntry>,
+    /// True when any entry is a `Conflict` — `apply` would refuse it without
+    /// `force`.
+    pub has_conflicts: bool,
+}
+
+/// The wire projection of `softfig_deploy::Report` — what `apply` actually did,
+/// by category. Each vec holds dot names (conflicts carry their reason inline).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeployApplyReply {
+    pub created: Vec<String>,
+    pub replaced: Vec<String>,
+    pub copied: Vec<String>,
+    pub skipped: Vec<String>,
+    /// Conflicts that were refused (no `force`), with their reasons.
+    pub conflicts: Vec<String>,
+    /// Conflicts overridden with `force` (target backed up first).
+    pub forced: Vec<String>,
+    pub warnings: Vec<String>,
 }

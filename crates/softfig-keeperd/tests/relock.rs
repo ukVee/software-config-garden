@@ -16,18 +16,13 @@ use softfig_ipc::{
     ErrorKind, Request, Response,
 };
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
 use softfig_vcs::Repo;
 
-const PASS: &str = "correct horse battery staple";
+mod common;
+use common::fast_params;
 
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
+const PASS: &str = "correct horse battery staple";
 
 fn rpc(socket: &Path, op: &str, args: serde_json::Value) -> Response {
     let mut s = softfig_ipc::connect(socket).expect("connect");

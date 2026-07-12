@@ -35,21 +35,38 @@ pub type HandlerResult = std::result::Result<serde_json::Value, (ErrorKind, Stri
 const PROJECT: &str = "softfig-keeperd";
 
 pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
-    let inner = daemon.inner.lock().unwrap();
-    let tip_hex = match inner.repo.as_ref() {
-        Some(repo) => repo.tip().ok().flatten().map(|h| h.to_string()),
-        None => None,
+    let (state_label, tip_hex, garden_root, relock_expires_at) = {
+        let inner = daemon.inner.lock().unwrap();
+        let tip_hex = match inner.repo.as_ref() {
+            Some(repo) => repo.tip().ok().flatten().map(|h| h.to_string()),
+            None => None,
+        };
+        // Growlight: surface an armed relock token (lazily prunes an expired
+        // one). The state dir is real disk (never the mount), safe under `inner`.
+        let relock_expires_at =
+            crate::relock::pending_expires_at(inner.config.state_dir(), unix_now());
+        (
+            inner.state.label().to_string(),
+            tip_hex,
+            inner.config.garden_root.clone(),
+            relock_expires_at,
+        )
     };
-    // Growlight: surface an armed relock token (lazily prunes an expired one).
-    let relock_expires_at =
-        crate::relock::pending_expires_at(inner.config.state_dir(), unix_now());
+    // Growlight enablement — the daemon's own fail-closed `fleet_enabled()` gate,
+    // surfaced so the TUI never re-derives it from `config/growlight.toml`
+    // presence (which disagrees on a fresh garden: toml-present, pillar-absent).
+    // Read AFTER `inner` is dropped: in FUSE mode this reads the daemon's own
+    // mount, and mount I/O under `inner` is the forbidden deadlock class (same
+    // discipline as `apply_garden_config` below).
+    let growlight_enabled = crate::growlight_unit::fleet_enabled(&garden_root);
     let reply = StatusReply {
-        state: inner.state.label().to_string(),
+        state: state_label,
         tip: tip_hex,
-        garden_root: inner.config.garden_root.display().to_string(),
+        garden_root: garden_root.display().to_string(),
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
         relock_pending: relock_expires_at.is_some(),
         relock_expires_at,
+        growlight_enabled,
     };
     Ok(serde_json::to_value(reply).unwrap())
 }

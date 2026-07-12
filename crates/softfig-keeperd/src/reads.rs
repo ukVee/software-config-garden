@@ -12,8 +12,8 @@
 use softfig_vcs::Repo;
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
-    FileProvenanceArgs, FileProvenanceReply, ListTreeArgs, ListTreeReply, ProvenanceEntry,
-    ReadFileArgs, ReadFileReply, SectionVersion, TreeEntry,
+    FileProvenanceArgs, FileProvenanceReply, GrowlightQueueReply, ListTreeArgs, ListTreeReply,
+    ProvenanceEntry, ReadFileArgs, ReadFileReply, SectionVersion, TreeEntry,
 };
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
@@ -104,52 +104,7 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let rel = path_to_repo_rel_string(&garden_root, &abs)
         .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))?;
 
-    let hook = inner.layer_b.clone();
-    let session = inner.session.as_ref().expect("unlocked").clone();
-    let repo = inner.repo.as_ref().expect("unlocked");
-
-    let tip = repo
-        .tip()
-        .map_err(|e| err_to_response(e.into()))?
-        .ok_or((ErrorKind::NotFound, "no commits yet".into()))?;
-    let row = repo
-        .db()
-        .get_commit(&tip)
-        .map_err(|e| err_to_response(KeeperError::Store(e)))?;
-    let blob_hash = resolve_path_in_tree(repo, &row.root_tree, &rel)?.ok_or((
-        ErrorKind::NotFound,
-        format!("{rel}: not a file in tip tree"),
-    ))?;
-    let cipher = repo
-        .objects()
-        .get(&blob_hash)
-        .map_err(|e| err_to_response(KeeperError::Store(e)))?;
-
-    let sealed = hook.snapshot().is_sealed(&rel);
-    let bytes: Vec<u8> = if sealed {
-        // Whole-file sealed: project the FUSE placeholder. Never decrypt
-        // and return the plaintext of a sealed file.
-        format!("[sealed:{rel}]\n").into_bytes()
-    } else {
-        let layer_a = if is_layer_b(&cipher) {
-            session
-                .decrypt_layer_b(&rel, &cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?
-        } else {
-            session
-                .decrypt_blob(&cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?
-        };
-        // Same inline-region redaction the FUSE read path applies
-        // (`[encrypted]` bodies; `[malformed vault tag …]` on parse fail).
-        hook.redact_regions(&rel, layer_a)
-    };
-
-    let raw_len = bytes.len();
-    let mut content = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => format!("[binary file: {raw_len} bytes]"),
-    };
+    let (mut content, sealed, region_ids) = read_committed_file(&inner, &rel)?;
     if content.len() > READ_FILE_MAX {
         let mut end = READ_FILE_MAX;
         while !content.is_char_boundary(end) {
@@ -175,8 +130,100 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         sealed,
         version,
         sections,
+        region_ids,
     })
     .unwrap())
+}
+
+/// Read a garden file's full daemon-redacted content from the committed tip
+/// tree, no size cap. Whole-file-sealed paths surface as `[sealed:<path>]` and
+/// inline `<vault id="…">` regions as `[encrypted]` — the same projection the
+/// FUSE read path applies, so a caller never receives sealed plaintext. Returns
+/// `(content, sealed, region_ids)` — `region_ids` being the file's sealed inline
+/// `<vault id="…">` region ids, computed daemon-side with the authoritative
+/// grammar ([`LayerBHook::region_ids`](crate::layer_b::LayerBHook::region_ids))
+/// over the decrypted Layer-A bytes so a frontend never re-parses the projected
+/// content. `read_file` layers its own truncation + CAS on top; structured
+/// readers (e.g. [`growlight_queue`]) parse the full body and ignore the ids.
+/// `rel` must already be a validated repo-relative path; the caller holds
+/// `inner` locked and has checked `require_unlocked` (so `session`/`repo` are
+/// present).
+fn read_committed_file(
+    inner: &crate::daemon::DaemonInner,
+    rel: &str,
+) -> Result<(String, bool, Vec<String>), (ErrorKind, String)> {
+    let hook = inner.layer_b.clone();
+    let session = inner.session.as_ref().expect("unlocked").clone();
+    let repo = inner.repo.as_ref().expect("unlocked");
+
+    let tip = repo
+        .tip()
+        .map_err(|e| err_to_response(e.into()))?
+        .ok_or((ErrorKind::NotFound, "no commits yet".into()))?;
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| err_to_response(KeeperError::Store(e)))?;
+    let blob_hash = resolve_path_in_tree(repo, &row.root_tree, rel)?.ok_or((
+        ErrorKind::NotFound,
+        format!("{rel}: not a file in tip tree"),
+    ))?;
+    let cipher = repo
+        .objects()
+        .get(&blob_hash)
+        .map_err(|e| err_to_response(KeeperError::Store(e)))?;
+
+    let sealed = hook.snapshot().is_sealed(rel);
+    let (bytes, region_ids): (Vec<u8>, Vec<String>) = if sealed {
+        // Whole-file sealed: project the FUSE placeholder. Never decrypt
+        // and return the plaintext of a sealed file. No inline regions.
+        (format!("[sealed:{rel}]\n").into_bytes(), Vec::new())
+    } else {
+        let layer_a = if is_layer_b(&cipher) {
+            session
+                .decrypt_layer_b(rel, &cipher)
+                .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?
+        } else {
+            session
+                .decrypt_blob(&cipher)
+                .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?
+        };
+        // Collect the sealed region ids from the same authoritative grammar
+        // the redaction uses, BEFORE `redact_regions` consumes the plaintext
+        // (the projected `[encrypted]` bodies would classify as Plaintext).
+        let region_ids = hook.region_ids(rel, &layer_a);
+        // Same inline-region redaction the FUSE read path applies
+        // (`[encrypted]` bodies; `[malformed vault tag …]` on parse fail).
+        (hook.redact_regions(rel, layer_a), region_ids)
+    };
+
+    let raw_len = bytes.len();
+    let content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => format!("[binary file: {raw_len} bytes]"),
+    };
+    Ok((content, sealed, region_ids))
+}
+
+/// 020 slice 002 (finding #5): serve the default backlog queue as structured
+/// rows parsed by the daemon's authoritative queue-table parser (the one that
+/// owns the `\|` cell escape), so the TUI renders rows directly and never
+/// re-splits the managed table — a piped title round-trips and the active item
+/// is always found. Read-only; require Unlocked. A fresh garden with no backlog
+/// doc yet is an empty queue, not an error.
+pub fn growlight_queue(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let rel = crate::actions::growlight_backlog_claude();
+    let content = match read_committed_file(&inner, &rel) {
+        Ok((c, _sealed, _region_ids)) => c,
+        Err((ErrorKind::NotFound, _)) => String::new(),
+        Err(e) => return Err(e),
+    };
+
+    let rows = crate::actions::default_queue_rows(&content);
+    Ok(serde_json::to_value(GrowlightQueueReply { rows }).unwrap())
 }
 
 /// Default cap on the number of recent edits `file_provenance` returns.

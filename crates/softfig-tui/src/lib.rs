@@ -12,6 +12,7 @@ pub mod clip;
 pub mod command;
 pub mod forms;
 pub mod ipc;
+pub mod listpane;
 pub mod textarea;
 pub mod tree;
 pub mod ui;

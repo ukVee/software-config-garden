@@ -22,17 +22,12 @@ use softfig_ipc::{
 use softfig_keeperd::{
     fuse_sink::AccumulatorSink, Daemon, KeeperConfig,
 };
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
+
+mod common;
+use common::{fast_params, wait_for_socket};
 
 const PASS: &str = "correct horse battery staple";
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn unique_socket(tmp: &Path) -> PathBuf {
     tmp.join("keeperd.sock")
@@ -223,16 +218,6 @@ fn mixed_mode_daemon_handles_both_configs() {
     assert_eq!(log.commits[0].intent, "init");
     handle2.shutdown();
     handle2.join().unwrap();
-}
-
-fn wait_for_socket(socket: &Path) {
-    for _ in 0..50 {
-        if socket.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} never appeared", socket.display());
 }
 
 // ---------- Test 3: migrate prepare end-to-end via the CLI helpers. -----

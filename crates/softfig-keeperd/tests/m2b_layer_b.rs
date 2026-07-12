@@ -23,17 +23,12 @@ use softfig_ipc::{
     ErrorKind, Request, Response,
 };
 use softfig_keeperd::{layer_b, Daemon, KeeperConfig};
-use softfig_vault::{is_layer_b, params::VaultParams, Vault};
+use softfig_vault::{is_layer_b, Vault};
+
+mod common;
+use common::{fast_params, wait_for_socket};
 
 const PASS: &str = "correct horse battery staple";
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn write_file(root: &Path, rel: &str, body: &str) {
     let p = root.join(rel);
@@ -60,16 +55,6 @@ fn unwrap_ok(resp: Response) -> serde_json::Value {
 
 fn unique_socket(tmp: &Path) -> PathBuf {
     tmp.join("keeperd.sock")
-}
-
-fn wait_for_socket(socket: &Path) {
-    for _ in 0..50 {
-        if socket.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} never appeared", socket.display());
 }
 
 fn bootstrap(garden: &Path) {

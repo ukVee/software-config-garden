@@ -8,9 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
+use crate::app::{short_fp, App, BackupRow, GrowlightRow, Overlay, PairField, PeerRow, View};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
+use softfig_ipc::DeployAction;
 
 fn sel_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
@@ -35,9 +36,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Overlay::None => {}
         Overlay::Palette(buf) => render_palette(f, buf, area),
         Overlay::Unlock { buf, error } => render_unlock(f, buf, error.as_deref(), area),
-        Overlay::Reveal { path, buf, error } => {
-            render_reveal(f, path, buf, error.as_deref(), area)
-        }
+        Overlay::Reveal {
+            path,
+            buf,
+            error,
+            id,
+        } => render_reveal(f, path, id.as_deref(), buf, error.as_deref(), area),
+        Overlay::RevealRegion {
+            path,
+            ids,
+            selected,
+        } => render_reveal_region(f, path, ids, *selected, area),
         Overlay::Form(form) => render_form(f, form, area),
         Overlay::PairBegin {
             fingerprint,
@@ -65,6 +74,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             name,
             error,
         } => render_replica_revoke(f, fingerprint, name.as_deref(), error.as_deref(), area),
+        Overlay::DeployForce { error } => render_deploy_force(f, error.as_deref(), area),
         Overlay::Help => render_help(f, area),
     }
 }
@@ -88,17 +98,23 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .as_deref()
         .map(|h| h.chars().take(10).collect::<String>())
         .unwrap_or_else(|| "—".into());
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("softfig-tui ", Style::default().add_modifier(Modifier::BOLD)),
         tab("1:Browse", app.view == View::Browse),
         tab("2:History", app.view == View::History),
         tab("3:Vault", app.view == View::Vault),
         tab("4:Peers", app.view == View::Peers),
         tab("5:Backup", app.view == View::Backup),
-        Span::raw("  "),
-        Span::styled(format!("[{state}] tip:{tip}"), dim),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+        tab("6:Deploy", app.view == View::Deploy),
+    ];
+    // The Growlight tab appears ONLY when growlight is enabled on this garden —
+    // no tab, no empty pane, no error otherwise (the load-bearing gate).
+    if app.growlight_enabled == Some(true) {
+        spans.push(tab("7:Growlight", app.view == View::Growlight));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(format!("[{state}] tip:{tip}"), dim));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
@@ -127,6 +143,14 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
         View::Backup => {
             render_backup(f, app, cols[0]);
             render_backup_detail(f, app, cols[1]);
+        }
+        View::Deploy => {
+            render_deploy(f, app, cols[0]);
+            render_deploy_detail(f, app, cols[1]);
+        }
+        View::Growlight => {
+            render_growlight(f, app, cols[0]);
+            render_growlight_detail(f, app, cols[1]);
         }
     }
 }
@@ -185,17 +209,18 @@ fn render_history(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_vault(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.vault_files.is_empty() {
+    let items: Vec<ListItem> = if app.vault.items.is_empty() {
         vec![ListItem::new("(no sealed files — :seal a pattern to start)")]
     } else {
-        app.vault_files
+        app.vault
+            .items
             .iter()
             .map(|p| ListItem::new(format!("🔒 {p}")))
             .collect()
     };
     let mut st = ListState::default();
-    if !app.vault_files.is_empty() {
-        st.select(Some(app.vault_selected.min(app.vault_files.len() - 1)));
+    if !app.vault.items.is_empty() {
+        st.select(Some(app.vault.selected.min(app.vault.items.len() - 1)));
     }
     let list = List::new(items)
         .block(
@@ -249,10 +274,11 @@ fn render_vault_detail(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_peers(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.peer_rows.is_empty() {
+    let items: Vec<ListItem> = if app.peer_list.items.is_empty() {
         vec![ListItem::new("(no paired devices — p to pair)")]
     } else {
-        app.peer_rows
+        app.peer_list
+            .items
             .iter()
             .map(|row| match row {
                 PeerRow::Peer(i) => {
@@ -278,8 +304,8 @@ fn render_peers(f: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut st = ListState::default();
-    if !app.peer_rows.is_empty() {
-        st.select(Some(app.peers_selected.min(app.peer_rows.len() - 1)));
+    if !app.peer_list.items.is_empty() {
+        st.select(Some(app.peer_list.selected.min(app.peer_list.items.len() - 1)));
     }
     let title = format!(
         "peers — {} paired · {} pending · {} nearby",
@@ -384,10 +410,11 @@ fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_backup(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.backup_rows.is_empty() {
+    let items: Vec<ListItem> = if app.backup.items.is_empty() {
         vec![ListItem::new("(no backup grants — g to grant a paired host)")]
     } else {
-        app.backup_rows
+        app.backup
+            .items
             .iter()
             .map(|row| match row {
                 BackupRow::PushTo(i) => {
@@ -410,8 +437,8 @@ fn render_backup(f: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut st = ListState::default();
-    if !app.backup_rows.is_empty() {
-        st.select(Some(app.backup_selected.min(app.backup_rows.len() - 1)));
+    if !app.backup.items.is_empty() {
+        st.select(Some(app.backup.selected.min(app.backup.items.len() - 1)));
     }
     let title = format!(
         "backup — {} host me · {} I host · host:{}",
@@ -508,6 +535,229 @@ fn render_backup_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+/// A deploy action's compact verb + display colour (green create, yellow
+/// replace, dim skip, red conflict) — shared by the list + detail panes.
+fn deploy_action_style(a: DeployAction) -> (&'static str, Color) {
+    // The verb string is shared with the CLI via the wire enum's `verb()`;
+    // only the colour is a TUI concern, so it stays local here.
+    let color = match a {
+        DeployAction::CreateSymlink => Color::Green,
+        DeployAction::ReplaceManaged => Color::Yellow,
+        DeployAction::CopyStamped => Color::Green,
+        DeployAction::SkipUnchanged => Color::DarkGray,
+        DeployAction::Conflict => Color::Red,
+    };
+    (a.verb(), color)
+}
+
+fn render_deploy(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.deploy.items.is_empty() {
+        vec![ListItem::new("(no dots in config/deploy.toml)")]
+    } else {
+        app.deploy
+            .items
+            .iter()
+            .map(|e| {
+                let (verb, color) = deploy_action_style(e.action);
+                ListItem::new(Line::styled(
+                    format!("{verb:>8}  {}", e.name),
+                    Style::default().fg(color),
+                ))
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !app.deploy.items.is_empty() {
+        st.select(Some(app.deploy.selected.min(app.deploy.items.len() - 1)));
+    }
+    let title = format!(
+        "deploy — {} dot(s){}",
+        app.deploy.items.len(),
+        if app.deploy_has_conflicts() {
+            " · conflicts!"
+        } else {
+            ""
+        },
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_deploy_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    match app.selected_deploy_entry() {
+        Some(e) => {
+            let (verb, color) = deploy_action_style(e.action);
+            lines.push(Line::styled(
+                format!("{}  —  {verb}", e.name),
+                Style::default().add_modifier(Modifier::BOLD).fg(color),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(format!("  target: {}", e.target)));
+            if let Some(reason) = &e.conflict_reason {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("  conflict: {reason}"),
+                    Style::default().fg(Color::Red),
+                ));
+                lines.push(Line::styled(
+                    "  a leaves it alone · F backs it up (.softfig-bak) + overwrites",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+        None => {
+            lines.push(Line::styled(
+                "nothing to deploy",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  config/deploy.toml has no dots (or the garden is locked)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "a apply · F force · r refresh",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("deploy detail"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+/// A backlog item's status colour — active stands out, done recedes, blocked is
+/// loud. Shared by the queue list + the detail pane's active line.
+fn growlight_status_color(status: &str) -> Color {
+    match status {
+        "active" => Color::Cyan,
+        "done" => Color::DarkGray,
+        "blocked" => Color::Red,
+        "deferred" => Color::Yellow,
+        _ => Color::Gray, // queued / unknown
+    }
+}
+
+/// Left pane of the read-only Growlight section: the backlog queue in drain
+/// order, each row `<status>  <id>` coloured by status, the active item bold.
+fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.growlight.items.is_empty() {
+        vec![ListItem::new("(queue empty or not loaded)")]
+    } else {
+        app.growlight
+            .items
+            .iter()
+            .map(|r: &GrowlightRow| {
+                let color = growlight_status_color(&r.status);
+                let mut style = Style::default().fg(color);
+                if r.status == "active" {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                ListItem::new(Line::styled(format!("{:>8}  {}", r.status, r.id), style))
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !app.growlight.items.is_empty() {
+        st.select(Some(app.growlight.selected.min(app.growlight.items.len() - 1)));
+    }
+    let title = format!("growlight — {} item(s)", app.growlight.items.len());
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+/// Right pane of the Growlight section: the active item, the selected item's
+/// title, and the latest baton (the loop's most recent handoff state). All
+/// read-only — this section never controls the loop.
+fn render_growlight_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    match app.growlight_active_item() {
+        Some(a) => lines.push(Line::styled(
+            format!("active: {} — {}", a.id, a.title),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
+        )),
+        None => lines.push(Line::styled(
+            "active: (none — queue idle)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    }
+
+    if let Some(sel) = app.selected_growlight_row() {
+        lines.push(Line::styled(
+            format!("selected: [{}] {} — {}", sel.status, sel.id, sel.title),
+            Style::default().fg(growlight_status_color(&sel.status)),
+        ));
+    }
+
+    lines.push(Line::raw(""));
+    let baton_title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
+    lines.push(Line::styled(
+        format!("latest baton — {baton_title}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    match &app.growlight_baton {
+        Some(body) => {
+            for l in body.lines() {
+                lines.push(Line::raw(l));
+            }
+        }
+        None => lines.push(Line::styled(
+            "  (no baton-log entries)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("growlight detail (read-only)"),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
+    let rect = centered_rect(70, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::raw("Force-apply the deploy plan?"),
+        Line::raw(""),
+        Line::styled(
+            "Each conflicting target is moved to <target>.softfig-bak, then overwritten.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "y force · n / Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("force deploy"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
 fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
@@ -524,7 +774,7 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     let offset = app.preview_scroll.min(max);
     app.preview_scroll = offset;
 
-    let title = if total > inner_h {
+    let mut title = if total > inner_h {
         let pct = if max == 0 {
             100
         } else {
@@ -534,6 +784,13 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.preview_title.clone()
     };
+    // M2c: flag inline `<vault id=…>` regions so the user knows `x` opens the
+    // per-region reveal picker for this file.
+    if !app.regions.is_empty() {
+        let n = app.regions.len();
+        let plural = if n == 1 { "region" } else { "regions" };
+        title.push_str(&format!("  · {n} vault {plural} (x)"));
+    }
 
     let p = text
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -601,12 +858,24 @@ fn render_unlock(f: &mut Frame, buf: &str, error: Option<&str>, area: Rect) {
     f.render_widget(p, rect);
 }
 
-fn render_reveal(f: &mut Frame, path: &str, buf: &str, error: Option<&str>, area: Rect) {
+fn render_reveal(
+    f: &mut Frame,
+    path: &str,
+    id: Option<&str>,
+    buf: &str,
+    error: Option<&str>,
+    area: Rect,
+) {
     let rect = centered_rect(70, 35, area);
     f.render_widget(Clear, rect);
     let masked: String = "*".repeat(buf.chars().count());
+    // Name the exact target: a single inline region (M2c) vs. the whole file (M2b).
+    let target = match id {
+        Some(id) => format!("region <{id}> of {path}"),
+        None => path.to_string(),
+    };
     let mut body = format!(
-        "reveal {path}\n\nmaster password: {masked}\n\nEnter reveal · Esc cancel\n\n\
+        "reveal {target}\n\nmaster password: {masked}\n\nEnter reveal · Esc cancel\n\n\
          plaintext is written to a 0600 temp file — never shown here"
     );
     if let Some(e) = error {
@@ -614,6 +883,38 @@ fn render_reveal(f: &mut Frame, path: &str, buf: &str, error: Option<&str>, area
     }
     let p = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title("reveal secret"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// M2c: the inline-region picker. Lists the file's `<vault id=…>` region ids;
+/// `Enter` on the highlighted one advances to the masked-password prompt.
+fn render_reveal_region(f: &mut Frame, path: &str, ids: &[String], selected: usize, area: Rect) {
+    let rect = centered_rect(70, 45, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(format!("inline vault regions in {path}")));
+    lines.push(Line::raw(""));
+    for (i, id) in ids.iter().enumerate() {
+        let marker = if i == selected { "› " } else { "  " };
+        let style = if i == selected {
+            sel_style()
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(format!("{marker}<{id}>"), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "j/k select · Enter reveal region · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("reveal — pick a region"),
+        )
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
 }
@@ -880,7 +1181,8 @@ fn render_help(f: &mut Frame, area: Rect) {
     let body = "\
 soft-fig TUI — keys
 
-  1 2 3 4 5    switch Browse / History / Vault / Peers / Backup
+  1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
+  7            growlight (read-only; only when growlight is enabled)
   j k ↑ ↓      move selection
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
@@ -890,11 +1192,13 @@ soft-fig TUI — keys
     ^d ^u      half-page down / up
     ^f ^b      full-page down / up   PgDn/PgUp same
     g G        top / bottom
-  x            reveal selected sealed file
+  x            reveal selected sealed file; on a file with inline
+               <vault id=…> regions, pick one region to reveal
   c            copy last reveal's value to clipboard
   p            pair a device (peers view)
   D            unpair / revoke selected (peers / backup view)
   g            grant a backup host (backup view)
+  a F          apply / force-apply deploy plan (deploy view)
   r            refresh view
   u            unlock (when locked)
   :            command palette
@@ -903,7 +1207,7 @@ soft-fig TUI — keys
 
 command palette runs actions: log_decision, log_incident,
 archive, add_project, refresh_snapshot, propose, seal, unseal,
-pair / unpair / peers, and backup / grant / revoke
+pair / unpair / peers, backup / grant / revoke, deploy / apply
 
 vault: reveal writes plaintext to a 0600 temp file and never
 shows it in this TUI; c pipes that file straight to wl-copy

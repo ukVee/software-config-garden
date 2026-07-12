@@ -9,16 +9,17 @@ use std::path::Path;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
 use softfig_ipc::{
-    DiscoverListReply, DiscoveredDevice, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
-    PairListReply, PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply,
-    ReplicaRevokeReply, ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply,
-    VaultRevealReply,
+    DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
+    GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
+    PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
+    ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
 };
 
 use crate::clip;
 use crate::command::{parse_command, Command};
 use crate::forms::{ActionForm, ActionKind};
 use crate::ipc::{IpcClient, Reply, Tag};
+use crate::listpane::ListPane;
 use crate::tree::TreeModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +29,19 @@ pub enum View {
     Vault,
     Peers,
     Backup,
+    Deploy,
+    /// Read-only growlight section (the autonomous work-loop at a glance). Only
+    /// reachable when growlight is enabled on this garden (`growlight_enabled ==
+    /// Some(true)`); the tab is absent otherwise.
+    Growlight,
 }
+
+/// One row of the growlight backlog queue. Served as a structured row over the
+/// wire by the daemon's authoritative queue-table parser (020 slice 002,
+/// finding #5) — the TUI no longer re-parses the managed
+/// `<!-- softfig:queue -->` table itself, so a piped `|` in a title round-trips
+/// and the active item is always found. Read-only.
+pub type GrowlightRow = softfig_ipc::GrowlightQueueRow;
 
 /// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
 /// confirmation, or a nearby device discovered over mDNS (Slice A pick-list).
@@ -68,8 +81,24 @@ pub enum Overlay {
     None,
     Palette(String),
     Unlock { buf: String, error: Option<String> },
-    /// Masked master-password prompt for `vault_reveal` against `path`.
-    Reveal { path: String, buf: String, error: Option<String> },
+    /// Masked master-password prompt for `vault_reveal` against `path`. When
+    /// `id` is `Some`, the reveal targets a single inline `<vault id="…">`
+    /// region (M2c); `None` reveals the whole Layer-B-sealed file (M2b).
+    Reveal {
+        path: String,
+        buf: String,
+        error: Option<String>,
+        id: Option<String>,
+    },
+    /// M2c: inline-region picker. The selected file carries one or more
+    /// `<vault id="…">[encrypted]</vault>` regions (parsed from its `read_file`
+    /// projection); pick one and `Enter` advances to the masked-password
+    /// [`Overlay::Reveal`] carrying that region `id`.
+    RevealRegion {
+        path: String,
+        ids: Vec<String>,
+        selected: usize,
+    },
     Form(ActionForm),
     /// Initiate a pairing: collect the peer fingerprint + optional endpoint,
     /// then run `pair_begin`. Stays open until the SAS comes back (then it is
@@ -111,6 +140,12 @@ pub enum Overlay {
         name: Option<String>,
         error: Option<String>,
     },
+    /// M4: confirm a `--force` deploy apply — back up each conflicting target to
+    /// `<target>.softfig-bak` and overwrite it. Gates the destructive path
+    /// behind an explicit y/n (a plain `a` apply never forces).
+    DeployForce {
+        error: Option<String>,
+    },
     Help,
 }
 
@@ -150,19 +185,20 @@ pub struct App {
     pub history: Vec<HistoryLine>,
     pub history_selected: usize,
     pub vault_globs: Vec<String>,
-    pub vault_files: Vec<String>,
-    pub vault_selected: usize,
-    pub vault_loaded: bool,
+    pub vault: ListPane<String>,
     pub reveal: Option<RevealInfo>,
+    /// M2c: inline `<vault id="…">` region ids parsed from the currently-opened
+    /// file's daemon projection, plus the path they belong to. Drives the
+    /// per-region reveal picker; empty when the open file carries no regions.
+    pub regions: Vec<String>,
+    pub regions_path: Option<String>,
     pub peers: Vec<PairPeer>,
     pub pending: Vec<PendingPairing>,
     /// Nearby unpaired devices discovered over mDNS (`discover_list`).
     pub discovered: Vec<DiscoveredDevice>,
     /// Flattened selection model over `peers` ++ `pending` ++ `discovered`,
     /// rebuilt on each `pair_list` / `discover_list` reply.
-    pub peer_rows: Vec<PeerRow>,
-    pub peers_selected: usize,
-    pub peers_loaded: bool,
+    pub peer_list: ListPane<PeerRow>,
     /// M5b Backup tab (`replica_status`): whether this device hosts backups.
     pub replica_host: bool,
     /// Device-id fingerprints this device pushes its chain to (the hosts that
@@ -173,9 +209,36 @@ pub struct App {
     pub hosted: Vec<HostedChain>,
     /// Flattened selection model over `replica_push_to` ++ `hosted`, rebuilt on
     /// each `replica_status` reply.
-    pub backup_rows: Vec<BackupRow>,
-    pub backup_selected: usize,
-    pub backup_loaded: bool,
+    pub backup: ListPane<BackupRow>,
+    /// M4 Deploy tab (`deploy_plan`): the current plan's per-dot entries.
+    pub deploy: ListPane<DeployPlanEntry>,
+    /// Set when a write lands while the Deploy tab is hidden. `deploy_plan` is a
+    /// full daemon-side dot diff (re-read `deploy.toml`, `symlink_metadata`+read
+    /// per dot, stat+read every target/cache) — expensive eMMC I/O nobody is
+    /// looking at if refired for a hidden tab. Instead of eagerly re-fetching in
+    /// `refresh_view`, the tab is marked stale and lazily re-fetches on entry
+    /// (020 slice 006 — mirrors how History is view-gated).
+    pub deploy_stale: bool,
+    /// growlight enablement (load-bearing gate): `None` until the first status
+    /// reply, then the daemon-owned `growlight_enabled` bit (its fail-closed
+    /// `fleet_enabled()`), forced `Some(false)` while locked. The Growlight tab is
+    /// rendered/reachable **only** when `Some(true)` — no tab, no empty pane, no
+    /// error when growlight isn't set up/armed on this garden. Refreshed every
+    /// status tick, so it can't go stale mid-session.
+    pub growlight_enabled: Option<bool>,
+    /// The backlog queue rows (drain order + statuses), served read-only as
+    /// structured rows by the daemon's `growlight_queue` verb.
+    pub growlight: ListPane<GrowlightRow>,
+    /// The latest baton-log entry (title + body) — the loop's most recent handoff
+    /// state, read from the highest-numbered `growlight/baton-log/NNN-*.md`.
+    pub growlight_baton_title: Option<String>,
+    pub growlight_baton: Option<String>,
+    /// Set when a write lands while the Growlight tab is hidden. `load_growlight`
+    /// is three IPC round-trips (`growlight_queue` + a `list_tree` of the
+    /// unboundedly-growing baton-log + the latest-entry `read_file`) — too much
+    /// to refire for a tab nobody is viewing. Marked stale here, lazily
+    /// re-fetched on entry (020 slice 006, like `deploy_stale`).
+    pub growlight_stale: bool,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -203,22 +266,25 @@ impl App {
             history: Vec::new(),
             history_selected: 0,
             vault_globs: Vec::new(),
-            vault_files: Vec::new(),
-            vault_selected: 0,
-            vault_loaded: false,
+            vault: ListPane::new(),
             reveal: None,
+            regions: Vec::new(),
+            regions_path: None,
             peers: Vec::new(),
             pending: Vec::new(),
             discovered: Vec::new(),
-            peer_rows: Vec::new(),
-            peers_selected: 0,
-            peers_loaded: false,
+            peer_list: ListPane::new(),
             replica_host: false,
             replica_push_to: Vec::new(),
             hosted: Vec::new(),
-            backup_rows: Vec::new(),
-            backup_selected: 0,
-            backup_loaded: false,
+            backup: ListPane::new(),
+            deploy: ListPane::new(),
+            deploy_stale: false,
+            growlight_enabled: None,
+            growlight: ListPane::new(),
+            growlight_baton_title: None,
+            growlight_baton: None,
+            growlight_stale: false,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -265,9 +331,26 @@ impl App {
         ipc.send("replica_status", json!({}), Tag::ReplicaStatus);
     }
 
+    /// M4: (re)compute the deploy plan (read-only). The reply repopulates the
+    /// Deploy tab's entry list.
+    fn load_deploy(&self, ipc: &mut IpcClient) {
+        ipc.send("deploy_plan", json!({}), Tag::DeployPlan);
+    }
+
+    /// growlight: (re)load the read-only section — the backlog queue table plus a
+    /// listing of the baton-log (whose reply triggers the latest-entry read).
+    fn load_growlight(&self, ipc: &mut IpcClient) {
+        ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
+        ipc.send(
+            "list_tree",
+            json!({ "path": "growlight/baton-log" }),
+            Tag::GrowlightBatonList,
+        );
+    }
+
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
-    fn refresh_view(&self, ipc: &mut IpcClient) {
+    fn refresh_view(&mut self, ipc: &mut IpcClient) {
         for dir in self.tree.loaded_dirs() {
             self.load_dir(ipc, &dir);
         }
@@ -275,14 +358,33 @@ impl App {
         if self.view == View::History {
             self.load_history(ipc);
         }
-        if self.vault_loaded {
+        if self.vault.loaded {
             self.load_vault(ipc);
         }
-        if self.peers_loaded {
+        if self.peer_list.loaded {
             self.load_peers(ipc);
         }
-        if self.backup_loaded {
+        if self.backup.loaded {
             self.load_backup(ipc);
+        }
+        // Deploy + Growlight are the expensive loads (a full daemon-side dot
+        // diff; a 3-round-trip read over the unbounded baton-log). Gate them on
+        // the active view like History is: a write that lands while they're
+        // hidden marks them stale to lazily re-fetch on entry, instead of
+        // refiring eMMC I/O for a tab nobody is looking at (020 slice 006).
+        if self.deploy.loaded {
+            if self.view == View::Deploy {
+                self.load_deploy(ipc);
+            } else {
+                self.deploy_stale = true;
+            }
+        }
+        if self.growlight.loaded {
+            if self.view == View::Growlight {
+                self.load_growlight(ipc);
+            } else {
+                self.growlight_stale = true;
+            }
         }
     }
 
@@ -306,14 +408,12 @@ impl App {
                 rows.push(PeerRow::Discovered(i));
             }
         }
-        self.peer_rows = rows;
-        if self.peers_selected >= self.peer_rows.len() {
-            self.peers_selected = self.peer_rows.len().saturating_sub(1);
-        }
+        self.peer_list.items = rows;
+        self.peer_list.clamp();
     }
 
     pub fn selected_peer_row(&self) -> Option<PeerRow> {
-        self.peer_rows.get(self.peers_selected).copied()
+        self.peer_list.selected().copied()
     }
 
     /// Rebuild the Backup view's flattened selection list — hosts that back me
@@ -327,14 +427,27 @@ impl App {
         for i in 0..self.hosted.len() {
             rows.push(BackupRow::Hosted(i));
         }
-        self.backup_rows = rows;
-        if self.backup_selected >= self.backup_rows.len() {
-            self.backup_selected = self.backup_rows.len().saturating_sub(1);
-        }
+        self.backup.items = rows;
+        self.backup.clamp();
     }
 
     pub fn selected_backup_row(&self) -> Option<BackupRow> {
-        self.backup_rows.get(self.backup_selected).copied()
+        self.backup.selected().copied()
+    }
+
+    pub fn selected_deploy_entry(&self) -> Option<&DeployPlanEntry> {
+        self.deploy.selected()
+    }
+
+    /// True when some entry is a `Conflict` — apply refuses it without force.
+    /// Derived from the plan entries rather than stored: the daemon sets
+    /// `DeployPlanReply.has_conflicts = plan.has_conflicts()` and maps
+    /// `Action::Conflict → DeployAction::Conflict` 1:1, so this is equivalent.
+    pub fn deploy_has_conflicts(&self) -> bool {
+        self.deploy
+            .items
+            .iter()
+            .any(|e| e.action == DeployAction::Conflict)
     }
 
     /// The advertised name for a push_to host, if it's a loaded ring member.
@@ -344,6 +457,19 @@ impl App {
             .iter()
             .find(|p| p.fingerprint == fingerprint)
             .map(|p| p.name.as_str())
+    }
+
+    /// The one `active` backlog item, if any (the loop runs ≤1 active at a time).
+    pub fn growlight_active_item(&self) -> Option<&GrowlightRow> {
+        self.growlight.items.iter().find(|r| r.status == "active")
+    }
+
+    pub fn selected_growlight_row(&self) -> Option<&GrowlightRow> {
+        self.growlight.selected()
+    }
+
+    fn hint_growlight_readonly(&mut self) {
+        self.status = "growlight is a read-only view (queue · active item · latest baton)".into();
     }
 
     // ---- reply handling ----
@@ -357,6 +483,17 @@ impl App {
                         self.locked = s.state != "unlocked";
                         self.tip = s.tip;
                         self.garden_root = s.garden_root;
+                        // Daemon-owned growlight gate, refreshed every tick — the
+                        // client never re-derives it (so it can't disagree). Force
+                        // it off while locked: the section can't load, and the
+                        // daemon fail-closes anyway when the mount is down.
+                        self.growlight_enabled = Some(!self.locked && s.growlight_enabled);
+                        // The gate can flip off mid-session (config edit, lock):
+                        // the tab header disappears, so don't leave the view
+                        // stranded on a section that is no longer reachable.
+                        if self.growlight_enabled != Some(true) && self.view == View::Growlight {
+                            self.view = View::Browse;
+                        }
                         if !self.locked && (was_locked || !self.tree.is_loaded("")) {
                             self.load_dir(ipc, "");
                         }
@@ -375,6 +512,8 @@ impl App {
                     self.overlay = Overlay::None;
                     self.status = "unlocked".into();
                     self.load_dir(ipc, "");
+                    // The status reply we request next carries the daemon-owned
+                    // growlight_enabled bit — no separate probe needed.
                     ipc.send("status", json!({}), Tag::Status);
                 }
                 Err((_, m)) => {
@@ -399,6 +538,13 @@ impl App {
             Tag::ReadFile { path } => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
+                        // M2c: the daemon computes the file's sealed inline
+                        // `<vault id=…>` region ids with its authoritative grammar
+                        // (020 slice 003) — consume them directly so `x`/Enter
+                        // offers the per-region reveal picker only for real regions,
+                        // never a phantom from an inline-code `<vault>` mention.
+                        self.regions = r.region_ids;
+                        self.regions_path = Some(path.clone());
                         self.preview = r.content;
                         self.preview_title = if r.sealed {
                             format!("{path}  [sealed]")
@@ -458,11 +604,7 @@ impl App {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<VaultListSealedReply>(v) {
                         self.vault_globs = r.globs;
-                        self.vault_files = r.matching_files;
-                        self.vault_loaded = true;
-                        if self.vault_selected >= self.vault_files.len() {
-                            self.vault_selected = self.vault_files.len().saturating_sub(1);
-                        }
+                        self.vault.set_items(r.matching_files);
                     }
                 }
                 Err((_, m)) => self.status = format!("vault list: {m}"),
@@ -496,7 +638,7 @@ impl App {
                     if let Ok(r) = serde_json::from_value::<PairListReply>(v) {
                         self.peers = r.peers;
                         self.pending = r.pending;
-                        self.peers_loaded = true;
+                        self.peer_list.loaded = true;
                         self.rebuild_peer_rows();
                     }
                 }
@@ -579,7 +721,7 @@ impl App {
                         self.replica_host = r.host;
                         self.replica_push_to = r.push_to;
                         self.hosted = r.hosted;
-                        self.backup_loaded = true;
+                        self.backup.loaded = true;
                         self.rebuild_backup_rows();
                     }
                     Err(e) => self.status = format!("replica status: malformed reply: {e}"),
@@ -624,6 +766,75 @@ impl App {
                     }
                 }
             },
+            Tag::DeployPlan => match reply.result {
+                Ok(v) => match serde_json::from_value::<DeployPlanReply>(v) {
+                    Ok(r) => {
+                        self.deploy.set_items(r.entries);
+                    }
+                    Err(e) => self.status = format!("deploy plan: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("deploy plan: {m}"),
+            },
+            Tag::DeployApply => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<DeployApplyReply>(v) {
+                        Ok(r) => deploy_summary(&r),
+                        Err(e) => format!("deploy: malformed reply: {e}"),
+                    };
+                    // Close the force-confirm overlay only if it still owns the
+                    // screen, matching the specific overlay the way the Err branch
+                    // below does. A slow in-flight apply must not force-close a
+                    // `:` palette or Unlock prompt the user opened meanwhile —
+                    // that would drop the remaining keystrokes into normal mode
+                    // (a stray `q` quits, an `a` re-fires apply). Then re-plan so
+                    // the tab reflects the new on-disk state.
+                    if matches!(self.overlay, Overlay::DeployForce { .. }) {
+                        self.overlay = Overlay::None;
+                    }
+                    self.load_deploy(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("apply failed ({kind:?}): {m}");
+                    if let Overlay::DeployForce { error } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
+            Tag::GrowlightQueue => match reply.result {
+                Ok(v) => match serde_json::from_value::<GrowlightQueueReply>(v) {
+                    Ok(r) => self.growlight.set_items(r.rows),
+                    Err(e) => self.status = format!("growlight queue: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight queue: {m}"),
+            },
+            Tag::GrowlightBatonList => match reply.result {
+                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                    Ok(r) => {
+                        if let Some(path) = latest_baton_path(&r.entries) {
+                            ipc.send(
+                                "read_file",
+                                json!({ "path": path }),
+                                Tag::GrowlightBaton { path },
+                            );
+                        }
+                    }
+                    Err(e) => self.status = format!("growlight baton-log: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight baton-log: {m}"),
+            },
+            Tag::GrowlightBaton { path } => match reply.result {
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => {
+                        self.growlight_baton_title =
+                            Some(path.rsplit('/').next().unwrap_or(&path).to_string());
+                        self.growlight_baton = Some(r.content);
+                    }
+                    Err(e) => self.status = format!("growlight baton: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight baton: {m}"),
+            },
         }
     }
 
@@ -635,12 +846,14 @@ impl App {
             Overlay::Palette(_) => self.handle_key_palette(key, ipc),
             Overlay::Unlock { .. } => self.handle_key_unlock(key, ipc),
             Overlay::Reveal { .. } => self.handle_key_reveal(key, ipc),
+            Overlay::RevealRegion { .. } => self.handle_key_reveal_region(key, ipc),
             Overlay::Form(_) => self.handle_key_form(key, ipc),
             Overlay::PairBegin { .. } => self.handle_key_pair_begin(key, ipc),
             Overlay::PairConfirm { .. } => self.handle_key_pair_confirm(key, ipc),
             Overlay::Unpair { .. } => self.handle_key_unpair(key, ipc),
             Overlay::ReplicaGrant { .. } => self.handle_key_replica_grant(key, ipc),
             Overlay::ReplicaRevoke { .. } => self.handle_key_replica_revoke(key, ipc),
+            Overlay::DeployForce { .. } => self.handle_key_deploy_force(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -683,20 +896,39 @@ impl App {
             }
             KeyCode::Char('3') => {
                 self.view = View::Vault;
-                if !self.vault_loaded && !self.locked {
+                if !self.vault.loaded && !self.locked {
                     self.load_vault(ipc);
                 }
             }
             KeyCode::Char('4') => {
                 self.view = View::Peers;
-                if !self.peers_loaded && !self.locked {
+                if !self.peer_list.loaded && !self.locked {
                     self.load_peers(ipc);
                 }
             }
             KeyCode::Char('5') => {
                 self.view = View::Backup;
-                if !self.backup_loaded && !self.locked {
+                if !self.backup.loaded && !self.locked {
                     self.load_backup(ipc);
+                }
+            }
+            KeyCode::Char('6') => {
+                self.view = View::Deploy;
+                // Re-fetch on first entry, or when a write marked the tab stale
+                // while it was hidden (020 slice 006); consume the mark so we
+                // don't re-fetch again until the next hidden write.
+                if (!self.deploy.loaded || self.deploy_stale) && !self.locked {
+                    self.deploy_stale = false;
+                    self.load_deploy(ipc);
+                }
+            }
+            // Only reachable when growlight is enabled — the tab is absent
+            // otherwise, so `7` is inert on a garden without growlight.
+            KeyCode::Char('7') if self.growlight_enabled == Some(true) => {
+                self.view = View::Growlight;
+                if (!self.growlight.loaded || self.growlight_stale) && !self.locked {
+                    self.growlight_stale = false;
+                    self.load_growlight(ipc);
                 }
             }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
@@ -705,6 +937,8 @@ impl App {
             KeyCode::Char('D') if self.view == View::Peers => self.start_unpair(),
             KeyCode::Char('g') if self.view == View::Backup => self.open_grant(),
             KeyCode::Char('D') if self.view == View::Backup => self.start_revoke(),
+            KeyCode::Char('a') if self.view == View::Deploy => self.apply_deploy(ipc, false),
+            KeyCode::Char('F') if self.view == View::Deploy => self.start_force_apply(),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
@@ -756,15 +990,11 @@ impl App {
             View::History => {
                 self.history_selected = self.history_selected.saturating_sub(1);
             }
-            View::Vault => {
-                self.vault_selected = self.vault_selected.saturating_sub(1);
-            }
-            View::Peers => {
-                self.peers_selected = self.peers_selected.saturating_sub(1);
-            }
-            View::Backup => {
-                self.backup_selected = self.backup_selected.saturating_sub(1);
-            }
+            View::Vault => self.vault.up(),
+            View::Peers => self.peer_list.up(),
+            View::Backup => self.backup.up(),
+            View::Deploy => self.deploy.up(),
+            View::Growlight => self.growlight.up(),
         }
     }
 
@@ -776,21 +1006,11 @@ impl App {
                     self.history_selected += 1;
                 }
             }
-            View::Vault => {
-                if self.vault_selected + 1 < self.vault_files.len() {
-                    self.vault_selected += 1;
-                }
-            }
-            View::Peers => {
-                if self.peers_selected + 1 < self.peer_rows.len() {
-                    self.peers_selected += 1;
-                }
-            }
-            View::Backup => {
-                if self.backup_selected + 1 < self.backup_rows.len() {
-                    self.backup_selected += 1;
-                }
-            }
+            View::Vault => self.vault.down(),
+            View::Peers => self.peer_list.down(),
+            View::Backup => self.backup.down(),
+            View::Deploy => self.deploy.down(),
+            View::Growlight => self.growlight.down(),
         }
     }
 
@@ -827,6 +1047,11 @@ impl App {
             // Backup rows are read-only detail; grant/revoke are explicit
             // actions (g / D / palette), never a stray Enter.
             View::Backup => self.hint_backup_actions(),
+            // Deploy entries are read-only detail; apply is an explicit action
+            // (a / F / palette), never a stray Enter.
+            View::Deploy => self.hint_deploy_actions(),
+            // Growlight is a read-only glance — Enter is a no-op hint.
+            View::Growlight => self.hint_growlight_readonly(),
         }
     }
 
@@ -913,6 +1138,24 @@ impl App {
                 self.view = View::Backup;
                 self.start_revoke();
             }
+            Command::Deploy => {
+                self.view = View::Deploy;
+                if !self.locked {
+                    self.load_deploy(ipc);
+                }
+            }
+            Command::Apply => {
+                // `:apply` is the deliberate "apply now" verb (mirrors the `a`
+                // key), distinct from `:deploy` which only previews. Applying
+                // straight from the palette without a preview step is
+                // intentional and safe: this is a *non-force* apply, so the
+                // daemon re-plans from the freshest on-disk state and refuses
+                // every conflict (backing up nothing, overwriting no unmanaged
+                // target), and the DeployApply Ok handler re-runs `load_deploy`
+                // so the resulting plan is shown immediately after.
+                self.view = View::Deploy;
+                self.apply_deploy(ipc, false);
+            }
             Command::Reload if !self.locked => self.refresh_view(ipc),
             Command::Reload => {}
             Command::Unlock => {
@@ -964,28 +1207,77 @@ impl App {
             return;
         }
         let target = match self.view {
-            View::Vault => self.vault_files.get(self.vault_selected).cloned(),
+            View::Vault => self.vault.selected().cloned(),
             View::Browse => self
                 .tree
                 .selected_row()
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
-            View::History | View::Peers | View::Backup => None,
+            View::History | View::Peers | View::Backup | View::Deploy | View::Growlight => None,
         };
         match target {
+            // M2c: if the reveal target is the currently-open file and it
+            // carries inline `<vault id=…>` regions, pick a region first;
+            // otherwise fall through to the whole-file (M2b) reveal prompt.
+            Some(path)
+                if self.regions_path.as_deref() == Some(path.as_str())
+                    && !self.regions.is_empty() =>
+            {
+                self.overlay = Overlay::RevealRegion {
+                    path,
+                    ids: self.regions.clone(),
+                    selected: 0,
+                };
+            }
             Some(path) => {
                 self.overlay = Overlay::Reveal {
                     path,
                     buf: String::new(),
                     error: None,
+                    id: None,
                 }
             }
             None => self.status = "select a sealed file to reveal".into(),
         }
     }
 
+    /// Region picker keys (M2c): move over the `<vault id=…>` ids and `Enter`
+    /// advances to the masked-password prompt for the chosen region.
+    fn handle_key_reveal_region(&mut self, key: KeyEvent, _ipc: &mut IpcClient) {
+        let Overlay::RevealRegion {
+            path,
+            ids,
+            selected,
+        } = &mut self.overlay
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('j') | KeyCode::Down if *selected + 1 < ids.len() => {
+                *selected += 1;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let id = ids.get(*selected).cloned();
+                let path = path.clone();
+                if let Some(id) = id {
+                    self.overlay = Overlay::Reveal {
+                        path,
+                        buf: String::new(),
+                        error: None,
+                        id: Some(id),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key_reveal(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
-        let Overlay::Reveal { path, buf, .. } = &mut self.overlay else {
+        let Overlay::Reveal { path, buf, id, .. } = &mut self.overlay else {
             return;
         };
         match key.code {
@@ -997,12 +1289,13 @@ impl App {
             KeyCode::Enter => {
                 let path = path.clone();
                 let pass = buf.clone();
-                ipc.send(
-                    "vault_reveal",
-                    json!({ "path": path, "master_password": pass }),
-                    Tag::Reveal { path: path.clone() },
-                );
-                self.status = format!("revealing {path}…");
+                let id = id.clone();
+                let args = vault_reveal_args(&path, &pass, id.as_deref());
+                ipc.send("vault_reveal", args, Tag::Reveal { path: path.clone() });
+                self.status = match &id {
+                    Some(id) => format!("revealing {path} <{id}>…"),
+                    None => format!("revealing {path}…"),
+                };
             }
             _ => {}
         }
@@ -1299,6 +1592,53 @@ impl App {
         }
     }
 
+    // ---- M4 Deploy tab ----
+
+    /// `a` / `:apply` — apply the current deploy plan. `force = false` refuses
+    /// conflicting targets (they come back in the report's `conflicts`); `force
+    /// = true` (only reached via the confirm overlay) backs each up first.
+    fn apply_deploy(&mut self, ipc: &mut IpcClient, force: bool) {
+        if self.locked {
+            self.status = "locked — unlock before deploying".into();
+            return;
+        }
+        self.status = if force { "applying (force)…" } else { "applying…" }.into();
+        ipc.send("deploy_apply", json!({ "force": force }), Tag::DeployApply);
+    }
+
+    /// `F` — open the confirm for a destructive `--force` apply. Kept behind a
+    /// y/n prompt because force backs up + overwrites unmanaged targets.
+    fn start_force_apply(&mut self) {
+        if self.locked {
+            self.status = "locked — unlock before deploying".into();
+            return;
+        }
+        self.overlay = Overlay::DeployForce { error: None };
+    }
+
+    fn handle_key_deploy_force(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = Overlay::None;
+                self.status = "force apply cancelled".into();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.apply_deploy(ipc, true);
+            }
+            _ => {}
+        }
+    }
+
+    fn hint_deploy_actions(&mut self) {
+        self.status = match self.selected_deploy_entry() {
+            Some(e) if e.action == DeployAction::Conflict => {
+                "conflict — a skips it · F force (backs up + overwrites)".into()
+            }
+            Some(_) => "a apply · F force · r refresh".into(),
+            None => "no dots in config/deploy.toml".into(),
+        };
+    }
+
     fn handle_key_form(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         // Ctrl-S submits regardless of focused field.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -1337,6 +1677,50 @@ impl App {
 
 fn short_hash(h: &str) -> String {
     h.chars().take(10).collect()
+}
+
+/// Build the `vault_reveal` IPC args. `id` is threaded in only when `Some`, so
+/// a whole-file (M2b) reveal's payload stays byte-identical to the pre-M2c
+/// caller (matching the `skip_serializing_if = "Option::is_none"` on the verb).
+fn vault_reveal_args(path: &str, master_password: &str, id: Option<&str>) -> Value {
+    let mut args = json!({ "path": path, "master_password": master_password });
+    if let Some(id) = id {
+        args["id"] = json!(id);
+    }
+    args
+}
+
+/// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
+/// `list_tree growlight/baton-log` reply. Non-numeric entries (e.g. `CLAUDE.md`)
+/// and directories are ignored; returns the entry's repo-relative path.
+pub fn latest_baton_path(entries: &[softfig_ipc::TreeEntry]) -> Option<String> {
+    entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .filter_map(|e| {
+            let num: u64 = e.name.split('-').next()?.parse().ok()?;
+            Some((num, e.path.clone()))
+        })
+        .max_by_key(|(num, _)| *num)
+        .map(|(_, path)| path)
+}
+
+/// One-line summary of a deploy `Report` for the status bar. Names the counts
+/// that happened and, when some target conflicted (no `--force`), flags that
+/// `F` will force.
+fn deploy_summary(r: &DeployApplyReply) -> String {
+    let mut s = format!(
+        "deployed: {} created, {} replaced, {} copied, {} skipped, {} forced",
+        r.created.len(),
+        r.replaced.len(),
+        r.copied.len(),
+        r.skipped.len(),
+        r.forced.len(),
+    );
+    if !r.conflicts.is_empty() {
+        s.push_str(&format!(" · {} conflicted (F to force)", r.conflicts.len()));
+    }
+    s
 }
 
 /// First 16 hex chars of a device-id / transport fingerprint for compact
@@ -1449,9 +1833,9 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.vault_loaded);
+        assert!(app.vault.loaded);
         assert_eq!(app.vault_globs, vec!["secrets/**".to_string()]);
-        assert_eq!(app.vault_files.len(), 2);
+        assert_eq!(app.vault.items.len(), 2);
     }
 
     #[test]
@@ -1462,6 +1846,7 @@ mod tests {
             path: "secrets/api-keys.toml".into(),
             buf: "pw".into(),
             error: None,
+            id: None,
         };
         let mut ipc = dummy_ipc();
         app.apply_reply(
@@ -1481,6 +1866,128 @@ mod tests {
         assert_eq!(info.temp_path, "/run/user/1000/softfig-reveal-abc.toml");
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("press c to copy"));
+    }
+
+    // ---- M2c: inline-region reveal (slice 003) ----
+    // Region-id parsing now lives in the daemon (authoritative grammar); the
+    // client just consumes `ReadFileReply.region_ids`. The daemon-side
+    // computation is covered by keeperd's `m3b_reads` integration test.
+
+    #[test]
+    fn vault_reveal_args_include_id_only_when_present() {
+        // Whole-file (M2b) reveal: no `id` key at all, byte-identical to the
+        // pre-M2c payload.
+        let whole = vault_reveal_args("secrets/db.toml", "pw", None);
+        assert_eq!(whole["path"], json!("secrets/db.toml"));
+        assert_eq!(whole["master_password"], json!("pw"));
+        assert!(whole.get("id").is_none());
+        // Per-region (M2c) reveal: the chosen id rides along.
+        let region = vault_reveal_args("secrets/db.toml", "pw", Some("db-pw"));
+        assert_eq!(region["id"], json!("db-pw"));
+    }
+
+    #[test]
+    fn region_bearing_file_opens_the_picker_then_carries_the_id() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Browse;
+        app.tree.set_children(
+            "",
+            vec![softfig_ipc::TreeEntry {
+                name: "db.toml".into(),
+                path: "config/db.toml".into(),
+                is_dir: false,
+            }],
+        );
+        let mut ipc = dummy_ipc();
+
+        // Opening the file takes its inline region ids straight off the
+        // daemon-computed `region_ids` in the read_file reply.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::ReadFile {
+                    path: "config/db.toml".into(),
+                },
+                result: Ok(json!({
+                    "path": "config/db.toml",
+                    "content": "pw = <vault id=\"db-pw\">[encrypted]</vault>\n\
+                                tok = <vault id=\"api\">[encrypted]</vault>\n",
+                    "sealed": false,
+                    "region_ids": ["db-pw", "api"],
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.regions, vec!["db-pw".to_string(), "api".to_string()]);
+        assert_eq!(app.regions_path.as_deref(), Some("config/db.toml"));
+
+        // `x` on a region-bearing file opens the region picker, not the
+        // whole-file password prompt.
+        app.start_reveal(&mut ipc);
+        match &app.overlay {
+            Overlay::RevealRegion { path, ids, selected } => {
+                assert_eq!(path, "config/db.toml");
+                assert_eq!(ids, &vec!["db-pw".to_string(), "api".to_string()]);
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected region picker, got {other:?}"),
+        }
+
+        // Move to the second region and confirm — the masked-password prompt
+        // now carries that region's id.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ipc);
+        match &app.overlay {
+            Overlay::Reveal { path, id, .. } => {
+                assert_eq!(path, "config/db.toml");
+                assert_eq!(id.as_deref(), Some("api"));
+            }
+            other => panic!("expected reveal prompt with id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_file_reveal_skips_the_picker() {
+        // A file with no inline regions falls through to the whole-file prompt.
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Browse;
+        app.tree.set_children(
+            "",
+            vec![softfig_ipc::TreeEntry {
+                name: "notes.md".into(),
+                path: "notes.md".into(),
+                is_dir: false,
+            }],
+        );
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::ReadFile {
+                    path: "notes.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes.md",
+                    "content": "no secrets here\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.regions.is_empty());
+        app.start_reveal(&mut ipc);
+        match &app.overlay {
+            Overlay::Reveal { path, id, .. } => {
+                assert_eq!(path, "notes.md");
+                assert!(id.is_none());
+            }
+            other => panic!("expected whole-file reveal prompt, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1598,12 +2105,12 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.peers_loaded);
+        assert!(app.peer_list.loaded);
         assert_eq!(app.peers.len(), 1);
         assert_eq!(app.pending.len(), 1);
         // Peers first, then pending.
         assert_eq!(
-            app.peer_rows,
+            app.peer_list.items,
             vec![PeerRow::Peer(0), PeerRow::Pending(0)]
         );
     }
@@ -1654,12 +2161,12 @@ mod tests {
         let mut ipc = dummy_ipc();
 
         // Row 0 is the settled peer → activating does not open a confirm.
-        app.peers_selected = 0;
+        app.peer_list.selected = 0;
         app.activate(&mut ipc);
         assert!(matches!(app.overlay, Overlay::None));
 
         // Row 1 is the pending pairing → activating opens the SAS confirm.
-        app.peers_selected = 1;
+        app.peer_list.selected = 1;
         app.activate(&mut ipc);
         match &app.overlay {
             Overlay::PairConfirm { name, sas, .. } => {
@@ -1679,7 +2186,7 @@ mod tests {
         app.pending = vec![pending("laptop", &"22".repeat(32), "123 456")];
         app.rebuild_peer_rows();
 
-        app.peers_selected = 0; // a ring member
+        app.peer_list.selected = 0; // a ring member
         app.start_unpair();
         match &app.overlay {
             Overlay::Unpair { name, fingerprint, .. } => {
@@ -1690,7 +2197,7 @@ mod tests {
         }
 
         app.overlay = Overlay::None;
-        app.peers_selected = 1; // the pending row → cannot unpair
+        app.peer_list.selected = 1; // the pending row → cannot unpair
         app.start_unpair();
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("paired device"));
@@ -1737,7 +2244,7 @@ mod tests {
         ];
         app.rebuild_peer_rows();
         assert_eq!(
-            app.peer_rows,
+            app.peer_list.items,
             vec![
                 PeerRow::Peer(0),
                 PeerRow::Pending(0),
@@ -1753,7 +2260,7 @@ mod tests {
         app.view = View::Peers;
         app.discovered = vec![discovered(Some("desktop"), &"33".repeat(32), Some("10.0.0.3:9100"))];
         app.rebuild_peer_rows();
-        app.peers_selected = 0; // the lone discovered row
+        app.peer_list.selected = 0; // the lone discovered row
         let mut ipc = dummy_ipc();
 
         app.pair_selected(&mut ipc);
@@ -1770,7 +2277,7 @@ mod tests {
         app.view = View::Peers;
         app.peers = vec![peer("tablet", &"11".repeat(32))];
         app.rebuild_peer_rows();
-        app.peers_selected = 0; // a ring member, not discovered
+        app.peer_list.selected = 0; // a ring member, not discovered
         let mut ipc = dummy_ipc();
 
         app.pair_selected(&mut ipc);
@@ -1790,7 +2297,7 @@ mod tests {
         app.start_reveal(&mut ipc);
         assert!(matches!(app.overlay, Overlay::None));
 
-        app.vault_files = vec!["secrets/api-keys.toml".into()];
+        app.vault.items = vec!["secrets/api-keys.toml".into()];
         app.start_reveal(&mut ipc);
         match &app.overlay {
             Overlay::Reveal { path, .. } => assert_eq!(path, "secrets/api-keys.toml"),
@@ -1830,13 +2337,13 @@ mod tests {
             },
             &mut ipc,
         );
-        assert!(app.backup_loaded);
+        assert!(app.backup.loaded);
         assert!(app.replica_host);
         assert_eq!(app.replica_push_to.len(), 1);
         assert_eq!(app.hosted.len(), 1);
         // Hosts-that-back-me first, then chains-I-host.
         assert_eq!(
-            app.backup_rows,
+            app.backup.items,
             vec![BackupRow::PushTo(0), BackupRow::Hosted(0)]
         );
     }
@@ -1869,7 +2376,7 @@ mod tests {
         app.rebuild_backup_rows();
 
         // Row 0 is a granted host → revoke opens the confirm on its fingerprint.
-        app.backup_selected = 0;
+        app.backup.selected = 0;
         app.start_revoke();
         match &app.overlay {
             Overlay::ReplicaRevoke { fingerprint, .. } => {
@@ -1880,7 +2387,7 @@ mod tests {
 
         // Row 1 is a chain I host → cannot be revoked (it's a mirror, not a grant).
         app.overlay = Overlay::None;
-        app.backup_selected = 1;
+        app.backup.selected = 1;
         app.start_revoke();
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("granted host"));
@@ -1895,7 +2402,7 @@ mod tests {
         app.view = View::Backup;
         app.replica_push_to = vec!["11".repeat(32)];
         app.rebuild_backup_rows();
-        app.backup_selected = 0;
+        app.backup.selected = 0;
         app.start_revoke();
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status.contains("locked"));
@@ -1936,5 +2443,478 @@ mod tests {
             &mut ipc,
         );
         assert_eq!(app.view, View::Backup);
+    }
+
+    // ---- M4 Deploy tab ----
+
+    fn plan_entry(name: &str, action: DeployAction, reason: Option<&str>) -> DeployPlanEntry {
+        DeployPlanEntry {
+            name: name.into(),
+            action,
+            target: format!("/home/u/.{name}"),
+            conflict_reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn deploy_plan_populates_then_clamps_on_shrink() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::DeployPlan,
+                result: Ok(serde_json::to_value(DeployPlanReply {
+                    entries: vec![
+                        plan_entry("bashrc", DeployAction::CreateSymlink, None),
+                        plan_entry("vimrc", DeployAction::Conflict, Some("existing file")),
+                    ],
+                    has_conflicts: true,
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert!(app.deploy.loaded);
+        assert_eq!(app.deploy.items.len(), 2);
+        assert!(app.deploy_has_conflicts());
+
+        // Select the last row, then a smaller plan arrives → selection clamps.
+        app.deploy.selected = 1;
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::DeployPlan,
+                result: Ok(serde_json::to_value(DeployPlanReply {
+                    entries: vec![plan_entry("bashrc", DeployAction::SkipUnchanged, None)],
+                    has_conflicts: false,
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.deploy.items.len(), 1);
+        assert_eq!(app.deploy.selected, 0);
+        assert!(!app.deploy_has_conflicts());
+    }
+
+    // ---- 020 slice 006: refresh_view gates the expensive tab loads on view ----
+
+    /// A write while viewing a non-Deploy/non-Growlight tab must NOT refire the
+    /// expensive Deploy/Growlight loads (a full daemon-side dot diff; a
+    /// 3-round-trip read over the unbounded baton-log). Instead it marks them
+    /// stale so they lazily re-fetch when the user next opens them.
+    #[test]
+    fn refresh_view_marks_hidden_expensive_tabs_stale_then_entry_refetches() {
+        let mut app = App::new();
+        app.locked = false;
+        app.growlight_enabled = Some(true);
+        // Both expensive tabs were visited once (load-once flags set); the user
+        // is now looking at Browse.
+        app.deploy.loaded = true;
+        app.growlight.loaded = true;
+        app.view = View::Browse;
+        let mut ipc = dummy_ipc();
+
+        // A write lands — any tab's action reply funnels through refresh_view.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::Action {
+                    title: "log_decision".into(),
+                },
+                result: Ok(json!({ "path": "journal/x.md" })),
+            },
+            &mut ipc,
+        );
+        // Hidden → marked stale, not eagerly re-fetched.
+        assert!(app.deploy_stale, "hidden Deploy tab marked stale");
+        assert!(app.growlight_stale, "hidden Growlight tab marked stale");
+
+        // Entering Deploy consumes the mark (a re-fetch is issued).
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Deploy);
+        assert!(!app.deploy_stale, "entering Deploy re-fetches + clears stale");
+        // Growlight is still hidden → still stale.
+        assert!(app.growlight_stale);
+
+        // Entering Growlight consumes its mark too.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Growlight);
+        assert!(
+            !app.growlight_stale,
+            "entering Growlight re-fetches + clears stale"
+        );
+    }
+
+    /// A write while the expensive tab IS active re-fetches it in place and
+    /// never marks it stale — staleness is only for hidden tabs.
+    #[test]
+    fn refresh_view_refetches_active_expensive_tab_without_marking_stale() {
+        let mut app = App::new();
+        app.locked = false;
+        app.deploy.loaded = true;
+        app.view = View::Deploy;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::Action {
+                    title: "deploy".into(),
+                },
+                result: Ok(json!({ "path": "x" })),
+            },
+            &mut ipc,
+        );
+        assert!(!app.deploy_stale, "active Deploy tab re-fetches, stays fresh");
+    }
+
+    #[test]
+    fn force_apply_confirm_opens_and_cancels() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Deploy;
+        app.start_force_apply();
+        assert!(matches!(app.overlay, Overlay::DeployForce { .. }));
+
+        let mut ipc = dummy_ipc();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("cancel"));
+    }
+
+    #[test]
+    fn force_apply_blocked_when_locked() {
+        // A stale Deploy view after a re-lock must not open the force confirm.
+        let mut app = App::new();
+        app.locked = true;
+        app.view = View::Deploy;
+        app.start_force_apply();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("locked"));
+    }
+
+    #[test]
+    fn deploy_apply_reply_summarizes_and_closes_force() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::DeployForce { error: None };
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::DeployApply,
+                result: Ok(serde_json::to_value(DeployApplyReply {
+                    created: vec!["bashrc".into()],
+                    replaced: vec![],
+                    copied: vec![],
+                    skipped: vec!["gitconfig".into()],
+                    conflicts: vec![],
+                    forced: vec!["vimrc".into()],
+                    warnings: vec![],
+                })
+                .unwrap()),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("1 created"), "status was {:?}", app.status);
+        assert!(app.status.contains("1 forced"), "status was {:?}", app.status);
+    }
+
+    #[test]
+    fn deploy_apply_reply_leaves_unrelated_overlay_open() {
+        // Finding #7: a slow apply's Ok reply must not force-close a `:` palette
+        // or Unlock prompt the user opened while it was in flight — only the
+        // deploy-force overlay it owns. Otherwise the remaining keystrokes land
+        // in normal mode (a stray `q` quits, an `a` re-fires apply).
+        let ok_reply = || Reply {
+            id: 1,
+            tag: Tag::DeployApply,
+            result: Ok(serde_json::to_value(DeployApplyReply {
+                created: vec!["bashrc".into()],
+                replaced: vec![],
+                copied: vec![],
+                skipped: vec![],
+                conflicts: vec![],
+                forced: vec![],
+                warnings: vec![],
+            })
+            .unwrap()),
+        };
+
+        // Palette open meanwhile → stays open.
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::Palette("apply".into());
+        let mut ipc = dummy_ipc();
+        app.apply_reply(ok_reply(), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::Palette(_)),
+            "palette was closed by an in-flight apply reply: {:?}",
+            app.overlay
+        );
+
+        // Unlock passphrase prompt open meanwhile → stays open.
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::Unlock {
+            buf: "hunter2".into(),
+            error: None,
+        };
+        let mut ipc = dummy_ipc();
+        app.apply_reply(ok_reply(), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::Unlock { .. }),
+            "unlock prompt was closed by an in-flight apply reply: {:?}",
+            app.overlay
+        );
+    }
+
+    #[test]
+    fn deploy_summary_flags_conflicts() {
+        let r = DeployApplyReply {
+            created: vec![],
+            replaced: vec![],
+            copied: vec![],
+            skipped: vec![],
+            conflicts: vec!["vimrc (existing file)".into()],
+            forced: vec![],
+            warnings: vec![],
+        };
+        let s = deploy_summary(&r);
+        assert!(s.contains("1 conflicted"), "summary was {s:?}");
+        assert!(s.contains("F to force"), "summary was {s:?}");
+    }
+
+    #[test]
+    fn apply_blocked_when_locked() {
+        let mut app = App::new();
+        app.locked = true;
+        let mut ipc = dummy_ipc();
+        app.apply_deploy(&mut ipc, false);
+        assert!(app.status.contains("locked"));
+    }
+
+    #[test]
+    fn six_key_switches_to_deploy() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Deploy);
+    }
+
+    // ---- slice 004: read-only growlight section ----
+
+    fn tree_entry(name: &str, path: &str, is_dir: bool) -> softfig_ipc::TreeEntry {
+        softfig_ipc::TreeEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir,
+        }
+    }
+
+    // The daemon now owns the queue-table grammar (`\|` un-escape, default-queue
+    // scoping); that parse is tested in `softfig-keeperd`'s `default_queue_rows`.
+    // The TUI just consumes the structured rows over the wire — see
+    // `queue_reply_populates_and_finds_active_item`.
+
+    #[test]
+    fn latest_baton_picks_highest_numbered_entry() {
+        let entries = vec![
+            tree_entry("CLAUDE.md", "growlight/baton-log/CLAUDE.md", false),
+            tree_entry(
+                "101-tui-modernize-001.md",
+                "growlight/baton-log/101-tui-modernize-001.md",
+                false,
+            ),
+            tree_entry(
+                "103-tui-modernize-003.md",
+                "growlight/baton-log/103-tui-modernize-003.md",
+                false,
+            ),
+            tree_entry(
+                "102-tui-modernize-002.md",
+                "growlight/baton-log/102-tui-modernize-002.md",
+                false,
+            ),
+        ];
+        assert_eq!(
+            latest_baton_path(&entries).as_deref(),
+            Some("growlight/baton-log/103-tui-modernize-003.md")
+        );
+        // No numbered entries ⇒ nothing to show.
+        assert_eq!(
+            latest_baton_path(&[tree_entry("CLAUDE.md", "x/CLAUDE.md", false)]),
+            None
+        );
+    }
+
+    /// Build a `Tag::Status` reply carrying the daemon-owned growlight gate.
+    fn status_reply(state: &str, growlight_enabled: bool) -> Reply {
+        Reply {
+            id: 1,
+            tag: Tag::Status,
+            result: Ok(serde_json::to_value(StatusReply {
+                state: state.into(),
+                tip: None,
+                garden_root: "/g".into(),
+                protocol_version: softfig_ipc::PROTOCOL_VERSION,
+                relock_pending: false,
+                relock_expires_at: None,
+                growlight_enabled,
+            })
+            .unwrap()),
+        }
+    }
+
+    #[test]
+    fn status_reply_carries_growlight_gate() {
+        let mut ipc = dummy_ipc();
+
+        // Unlocked + daemon says enabled ⇒ the tab is gated on.
+        let mut app = App::new();
+        assert_eq!(app.growlight_enabled, None); // no status yet
+        app.apply_reply(status_reply("unlocked", true), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(true));
+
+        // Unlocked + daemon says disabled (fresh garden: toml present, fleet off)
+        // ⇒ gated off, silently (no tab, no load attempt, no error splat).
+        let mut app2 = App::new();
+        app2.apply_reply(status_reply("unlocked", false), &mut ipc);
+        assert_eq!(app2.growlight_enabled, Some(false));
+        assert!(!app2.growlight.loaded);
+    }
+
+    #[test]
+    fn growlight_view_snaps_to_browse_when_the_gate_flips_off() {
+        let mut ipc = dummy_ipc();
+        let mut app = App::new();
+        app.apply_reply(status_reply("unlocked", true), &mut ipc);
+        app.view = View::Growlight;
+
+        // The gate flips off mid-session: the tab header disappears, so the
+        // active view must not stay stranded on the unreachable section.
+        app.apply_reply(status_reply("unlocked", false), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(false));
+        assert_eq!(app.view, View::Browse);
+
+        // Same snap when the flip comes from locking rather than the config.
+        let mut app2 = App::new();
+        app2.apply_reply(status_reply("unlocked", true), &mut ipc);
+        app2.view = View::Growlight;
+        app2.apply_reply(status_reply("locked", true), &mut ipc);
+        assert_eq!(app2.view, View::Browse);
+
+        // A gate-on tick never disturbs the current view.
+        let mut app3 = App::new();
+        app3.apply_reply(status_reply("unlocked", true), &mut ipc);
+        app3.view = View::Growlight;
+        app3.apply_reply(status_reply("unlocked", true), &mut ipc);
+        assert_eq!(app3.view, View::Growlight);
+    }
+
+    #[test]
+    fn status_reply_forces_growlight_off_when_locked() {
+        let mut ipc = dummy_ipc();
+        let mut app = App::new();
+        // Even if the daemon reports enabled, a locked session shows no tab —
+        // the section can't load while locked.
+        app.apply_reply(status_reply("locked", true), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(false));
+        // Unlock refreshes it back on from the same daemon bit.
+        app.apply_reply(status_reply("unlocked", true), &mut ipc);
+        assert_eq!(app.growlight_enabled, Some(true));
+    }
+
+    #[test]
+    fn growlight_tab_key_inert_until_enabled() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        // Not yet enabled: `7` must NOT switch views (tab absent).
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_ne!(app.view, View::Growlight);
+
+        // Enabled: `7` switches to the growlight view.
+        app.growlight_enabled = Some(true);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Growlight);
+    }
+
+    #[test]
+    fn queue_reply_populates_and_finds_active_item() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        // Structured rows straight off the wire (`growlight_queue` reply). A
+        // title carrying a literal `|` arrives intact — the daemon un-escaped
+        // the `\|` cell escape, so the TUI never mis-splits it (finding #5).
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [
+                        { "id": "growlightd-crash-diagnostics", "title": "crash diag", "status": "done" },
+                        { "id": "tui-modernize", "title": "Modernize | the TUI", "status": "active" },
+                        { "id": "020", "title": "code-review records", "status": "queued" },
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight.loaded);
+        assert_eq!(app.growlight.items.len(), 3);
+        let active = app.growlight_active_item().expect("active item found");
+        assert_eq!(active.id, "tui-modernize");
+        // The piped title round-trips through the wire, not garbled.
+        assert_eq!(active.title, "Modernize | the TUI");
+    }
+
+    #[test]
+    fn baton_reply_records_title_and_body() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightBaton {
+                    path: "growlight/baton-log/103-tui-modernize-003.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "growlight/baton-log/103-tui-modernize-003.md",
+                    "content": "# baton tui-modernize #3\n\nshipped slice 003",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_baton_title.as_deref(),
+            Some("103-tui-modernize-003.md")
+        );
+        assert!(app.growlight_baton.unwrap().contains("shipped slice 003"));
     }
 }

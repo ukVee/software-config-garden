@@ -42,6 +42,18 @@ pub enum Tag {
     ReplicaGrant,
     /// M5b: revoke a host's backup grant (`replica_revoke`).
     ReplicaRevoke,
+    /// M4: the deploy plan (read-only diff) for the Deploy tab (`deploy_plan`).
+    DeployPlan,
+    /// M4: apply the deploy plan (`deploy_apply`); reply carries the `Report`.
+    DeployApply,
+    /// growlight: the backlog queue as daemon-parsed structured rows
+    /// (`growlight_queue`) — no client re-parse of the managed table.
+    GrowlightQueue,
+    /// growlight: list the baton-log dir (`list_tree growlight/baton-log`) to
+    /// find the highest-numbered entry (the latest handoff).
+    GrowlightBatonList,
+    /// growlight: read the latest baton-log entry (`read_file <path>`).
+    GrowlightBaton { path: String },
 }
 
 #[derive(Debug)]

@@ -46,8 +46,8 @@ fn renders_vault_frame() {
     app.locked = false;
     app.view = softfig_tui::app::View::Vault;
     app.vault_globs = vec!["secrets/**".into()];
-    app.vault_files = vec!["secrets/api-keys.toml".into()];
-    app.vault_loaded = true;
+    app.vault.items = vec!["secrets/api-keys.toml".into()];
+    app.vault.loaded = true;
     app.reveal = Some(softfig_tui::app::RevealInfo {
         path: "secrets/api-keys.toml".into(),
         temp_path: "/run/user/1000/softfig-reveal-abc.toml".into(),
@@ -85,8 +85,8 @@ fn renders_peers_frame() {
         fingerprint: "2".repeat(64),
         name: "laptop".into(),
     }];
-    app.peers_loaded = true;
-    app.peer_rows = vec![
+    app.peer_list.loaded = true;
+    app.peer_list.items = vec![
         softfig_tui::app::PeerRow::Peer(0),
         softfig_tui::app::PeerRow::Pending(0),
     ];
@@ -121,13 +121,13 @@ fn renders_backup_frame() {
         bytes: 8192,
         last_sync: Some(1_700_000_000),
     }];
-    app.backup_loaded = true;
-    app.backup_rows = vec![
+    app.backup.loaded = true;
+    app.backup.items = vec![
         softfig_tui::app::BackupRow::PushTo(0),
         softfig_tui::app::BackupRow::Hosted(0),
     ];
     // Select the hosted chain so the detail pane shows the mirror stats.
-    app.backup_selected = 1;
+    app.backup.selected = 1;
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -214,6 +214,72 @@ fn renders_scrolled_preview() {
 }
 
 #[test]
+fn renders_region_picker_overlay() {
+    // M2c: the inline `<vault id=…>` region picker lists the ids and its keys.
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Browse;
+    app.overlay = softfig_tui::app::Overlay::RevealRegion {
+        path: "config/db.toml".into(),
+        ids: vec!["db-pw".into(), "api-token".into()],
+        selected: 1,
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("pick a region"), "picker title missing:\n{rendered}");
+    assert!(rendered.contains("config/db.toml"), "file path missing");
+    assert!(rendered.contains("db-pw"), "region id missing");
+    assert!(rendered.contains("api-token"), "second region id missing");
+    assert!(rendered.contains("Enter reveal region"), "picker hint missing");
+}
+
+#[test]
+fn renders_region_reveal_prompt() {
+    // The masked-password prompt for a single region names the region target.
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = softfig_tui::app::Overlay::Reveal {
+        path: "config/db.toml".into(),
+        buf: "pw".into(),
+        error: None,
+        id: Some("db-pw".into()),
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("reveal secret"), "reveal title missing:\n{rendered}");
+    assert!(rendered.contains("region <db-pw>"), "region target missing");
+    assert!(rendered.contains("config/db.toml"), "file path missing");
+}
+
+#[test]
+fn renders_preview_region_hint() {
+    // A previewed file with inline regions flags them in the pane title.
+    let mut app = App::new();
+    app.locked = false;
+    app.tree
+        .set_children("", vec![entry("db.toml", false)]);
+    app.preview = "pw = <vault id=\"db-pw\">[encrypted]</vault>\n".into();
+    app.preview_title = "config/db.toml".into();
+    app.regions = vec!["db-pw".into()];
+    app.regions_path = Some("config/db.toml".into());
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("vault region"), "region hint missing:\n{rendered}");
+}
+
+#[test]
 fn renders_help_overlay() {
     let mut app = App::new();
     app.locked = false;
@@ -225,4 +291,121 @@ fn renders_help_overlay() {
 
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("command palette"), "help text missing");
+}
+
+#[test]
+fn renders_deploy_frame() {
+    use softfig_ipc::{DeployAction, DeployPlanEntry};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Deploy;
+    app.deploy.loaded = true;
+    app.deploy.items = vec![
+        DeployPlanEntry {
+            name: "bashrc".into(),
+            action: DeployAction::CreateSymlink,
+            target: "/home/u/.bashrc".into(),
+            conflict_reason: None,
+        },
+        DeployPlanEntry {
+            name: "vimrc".into(),
+            action: DeployAction::Conflict,
+            target: "/home/u/.vimrc".into(),
+            conflict_reason: Some("target is an existing file".into()),
+        },
+    ];
+    // `deploy_has_conflicts()` is now derived from the entries (the `vimrc`
+    // Conflict above), so the "conflicts!" title still renders.
+    // Select the conflicting entry so the detail pane shows its reason.
+    app.deploy.selected = 1;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Deploy"), "deploy tab missing:\n{rendered}");
+    assert!(rendered.contains("bashrc"), "symlink dot missing");
+    assert!(rendered.contains("CONFLICT"), "conflict row missing");
+    assert!(rendered.contains("existing file"), "conflict reason missing");
+    assert!(rendered.contains("a apply"), "apply hint missing");
+}
+
+#[test]
+fn renders_deploy_force_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Deploy;
+    app.overlay = softfig_tui::app::Overlay::DeployForce { error: None };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("force deploy"), "overlay title missing:\n{rendered}");
+    assert!(rendered.contains("softfig-bak"), "backup explanation missing");
+    assert!(rendered.contains("y force"), "confirm hint missing");
+}
+
+#[test]
+fn renders_growlight_frame_when_enabled() {
+    use softfig_tui::app::GrowlightRow;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight.items = vec![
+        GrowlightRow {
+            id: "m5b-hardening".into(),
+            title: "M5b replication hardening".into(),
+            status: "done".into(),
+        },
+        GrowlightRow {
+            id: "tui-modernize".into(),
+            title: "Modernize the TUI".into(),
+            status: "active".into(),
+        },
+    ];
+    app.growlight.selected = 1;
+    app.growlight_baton_title = Some("103-tui-modernize-003.md".into());
+    app.growlight_baton = Some("shipped slice 003 — inline-region reveal".into());
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("7:Growlight"), "growlight tab missing:\n{rendered}");
+    assert!(rendered.contains("tui-modernize"), "queue item missing");
+    assert!(rendered.contains("active"), "status missing");
+    assert!(
+        rendered.contains("active: tui-modernize"),
+        "active-item line missing"
+    );
+    assert!(rendered.contains("latest baton"), "baton panel missing");
+    assert!(rendered.contains("shipped slice 003"), "baton body missing");
+}
+
+#[test]
+fn growlight_tab_absent_when_disabled() {
+    // The load-bearing requirement: when growlight is not enabled the tab does
+    // not appear at all — no tab, no empty pane, no error.
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(false);
+    app.view = softfig_tui::app::View::Browse;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("6:Deploy"), "other tabs should still render");
+    assert!(
+        !rendered.contains("Growlight"),
+        "growlight tab must be absent when disabled:\n{rendered}"
+    );
 }

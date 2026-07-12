@@ -21,6 +21,7 @@
 
 pub mod conventions;
 
+mod add_code_review;
 mod add_note;
 mod add_project;
 mod archive;
@@ -38,6 +39,7 @@ mod split;
 mod thrash;
 mod worktree;
 
+pub use add_code_review::add_code_review;
 pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
@@ -46,6 +48,10 @@ pub use growlight::{
     post_message, read_inbox, release_lease, reorder_backlog_item, request_lease, set_item_status,
     tail_bus, HolderStore,
 };
+// Crate-internal helpers behind the `growlight_queue` read verb (020 slice 002):
+// the queue-grammar parser + the backlog-doc path. `pub(crate)`, so they can't
+// ride the `pub use` above.
+pub(crate) use growlight::{default_queue_rows, growlight_backlog_claude};
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;
 pub use migrate_config::migrate_config;

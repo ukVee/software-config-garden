@@ -225,6 +225,34 @@ impl LayerBHook {
         self.session.read().unwrap().clone()
     }
 
+    /// M2c (020 slice 003) — the ids of the file's *sealed* inline
+    /// `<vault id="…">` regions: those the read view projects as `[encrypted]`
+    /// and that `vault_reveal --id` can decrypt (i.e. [`RegionKind::Ciphertext`]
+    /// spans). Computed with the authoritative region grammar
+    /// ([`regions::parse`]) over the decrypted Layer-A `content`, so a frontend
+    /// reads the same ids the daemon sealed instead of re-deriving them from the
+    /// projected prose. Empty for whole-file-sealed, pre-unlock, malformed, or
+    /// region-free files. Read-only companion to [`Self::redact_regions`];
+    /// deliberately NOT folded into it so the FUSE read hot path skips this
+    /// allocation.
+    pub fn region_ids(&self, repo_relative: &str, content: &[u8]) -> Vec<String> {
+        if self.snapshot().is_sealed(repo_relative) {
+            return Vec::new();
+        }
+        let Some(session) = self.session() else {
+            return Vec::new();
+        };
+        let parser = regions::parser_for(repo_relative);
+        let Ok(spans) = regions::parse(parser, content, &session, repo_relative) else {
+            return Vec::new();
+        };
+        spans
+            .into_iter()
+            .filter(|s| s.kind == regions::RegionKind::Ciphertext)
+            .map(|s| s.id)
+            .collect()
+    }
+
     /// M2c — install the prior-tip plaintext snapshot built by
     /// [`build_prior_tip_snapshot`]. Daemon calls this before
     /// `commit_workdir` and clears it after.

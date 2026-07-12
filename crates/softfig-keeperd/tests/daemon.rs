@@ -18,17 +18,12 @@ use softfig_ipc::{
     ErrorKind, Request, Response,
 };
 use softfig_keeperd::{Daemon, KeeperConfig};
-use softfig_vault::{params::VaultParams, Vault};
+use softfig_vault::Vault;
+
+mod common;
+use common::fast_params;
 
 const PASS: &str = "correct horse battery staple";
-
-fn fast_params() -> VaultParams {
-    let mut p = VaultParams::default();
-    p.argon2.m_cost = 8;
-    p.argon2.t_cost = 1;
-    p.argon2.p_cost = 1;
-    p
-}
 
 fn write(root: &Path, rel: &str, body: &str) {
     let p = root.join(rel);
