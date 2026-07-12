@@ -90,9 +90,11 @@ pub fn fleet_enabled(garden_root: &Path) -> bool {
 /// directions (systemd no-ops an already-active start / already-stopped stop), so
 /// a relock resume re-firing this is harmless.
 ///
-/// No-op unless supervision is enabled in the config — so only the real keeperd
-/// binary ever shells `systemctl`. Best-effort: a `systemctl` failure is logged,
-/// never fatal to the unlock.
+/// No-op *reconciliation* unless supervision is enabled — so only the real keeperd
+/// binary ever shells `systemctl`. But when supervision is env-gated OFF while the
+/// in-garden `fleet_enabled` gate is ON, that is the binary-only-redeploy footgun
+/// (task 041): warn LOUDLY rather than stall silently (see [`fleet_gate`]).
+/// Best-effort: a `systemctl` failure is logged, never fatal to the unlock.
 pub fn apply_fleet_gate(daemon: &Daemon) {
     let (supervise, garden_root) = {
         let inner = daemon.inner.lock().unwrap();
@@ -101,22 +103,70 @@ pub fn apply_fleet_gate(daemon: &Daemon) {
             inner.config.garden_root.clone(),
         )
     };
-    if !supervise {
-        return;
-    }
-    // `unit_is_active` is only consulted on the gate-off path (lazy), so a normal
-    // gate-on unlock doesn't pay for it.
-    match gate_action(fleet_enabled(&garden_root), unit_is_active) {
-        GateAction::Start => start_unit(),
-        GateAction::Stop => {
-            eprintln!("keeperd: fleet disabled — stopping {GROWLIGHTD_UNIT}");
-            spawn_stop();
-        }
-        GateAction::Noop => {}
+    let gate_on = fleet_enabled(&garden_root);
+    match fleet_gate(supervise, gate_on) {
+        // Env unset + fleet disarmed: correct + silent (test keeperd / disabled garden).
+        FleetGate::Inert => {}
+        // Env unset + fleet ARMED: the silent no-autonomous-work footgun. Warn loudly;
+        // never touch the unit (a non-deployed keeperd must not shell `systemctl`).
+        FleetGate::WarnGatedOff => warn_supervision_gated_off(),
+        // Supervised: reconcile the unit against the gate. `unit_is_active` is only
+        // consulted on the gate-off branch (lazy) — a normal gate-on unlock skips it.
+        FleetGate::Supervise => match gate_action(gate_on, unit_is_active) {
+            GateAction::Start => start_unit(),
+            GateAction::Stop => {
+                eprintln!("keeperd: fleet disabled — stopping {GROWLIGHTD_UNIT}");
+                spawn_stop();
+            }
+            GateAction::Noop => {}
+        },
     }
 }
 
-/// What [`apply_fleet_gate`] does, factored pure for testing.
+/// What [`apply_fleet_gate`] does, given supervision (does this instance's systemd
+/// unit file export [`SUPERVISE_ENV`]?) and the in-garden `fleet_enabled` gate.
+/// Pure, so the branch logic — including the task-041 silent-stall warning — is
+/// unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum FleetGate {
+    /// Env unset AND the fleet is disarmed: correct + silent. A test-spawned
+    /// keeperd (`CARGO_BIN_EXE`, no env) or a genuinely disabled garden.
+    Inert,
+    /// Env unset BUT the in-garden gate is ARMED — the binary-only-redeploy footgun:
+    /// this keeperd will never start growlightd, so autonomous work silently won't
+    /// run. Warn loudly; do not touch the unit.
+    WarnGatedOff,
+    /// Supervised (the deployed keeperd): reconcile the unit against the gate.
+    Supervise,
+}
+
+/// Decide the gate branch. See [`FleetGate`].
+fn fleet_gate(supervise: bool, gate_on: bool) -> FleetGate {
+    match (supervise, gate_on) {
+        (true, _) => FleetGate::Supervise,
+        (false, true) => FleetGate::WarnGatedOff,
+        (false, false) => FleetGate::Inert,
+    }
+}
+
+/// Loud, actionable journal warning for the binary-only-redeploy footgun (task
+/// 041): the in-garden `fleet_enabled` gate is ARMED but this keeperd was started
+/// without [`SUPERVISE_ENV`], so it will never start growlightd and autonomous
+/// growlight work silently won't run. Almost always a `cargo build && cp` redeploy
+/// that skipped reinstalling the systemd unit — the unit file is the only thing
+/// that exports the env var.
+fn warn_supervision_gated_off() {
+    eprintln!(
+        "keeperd: WARNING — the in-garden fleet gate is ARMED (config/growlight.toml \
+         fleet_enabled = true) but {SUPERVISE_ENV} is unset, so this keeperd will NOT \
+         start {GROWLIGHTD_UNIT}: autonomous growlight work will not run. This is the \
+         signature of a binary-only redeploy that skipped the unit-file refresh (only \
+         softfig-keeperd.service exports {SUPERVISE_ENV}). Fix: reinstall the updated \
+         systemd units, `systemctl --user daemon-reload`, then `softfig daemon cycle`."
+    );
+}
+
+/// What [`apply_fleet_gate`] does on the supervised branch, factored pure for testing.
 #[derive(Debug, PartialEq, Eq)]
 enum GateAction {
     /// Gate on ⇒ start (idempotent if already active).
@@ -264,6 +314,19 @@ mod tests {
         assert_eq!(gate_action(false, || true), GateAction::Stop);
         // Gate off + unit already down ⇒ Noop (common disabled-fleet unlock).
         assert_eq!(gate_action(false, || false), GateAction::Noop);
+    }
+
+    #[test]
+    fn fleet_gate_matrix() {
+        // Supervised (the deployed keeperd, unit exports SUPERVISE_ENV) ⇒ reconcile
+        // the unit against the gate, regardless of the gate value.
+        assert_eq!(fleet_gate(true, true), FleetGate::Supervise);
+        assert_eq!(fleet_gate(true, false), FleetGate::Supervise);
+        // Env unset + fleet ARMED ⇒ the binary-only-redeploy silent-stall (task 041):
+        // warn loudly, never shell `systemctl`.
+        assert_eq!(fleet_gate(false, true), FleetGate::WarnGatedOff);
+        // Env unset + fleet disarmed ⇒ inert + silent (test keeperd / disabled garden).
+        assert_eq!(fleet_gate(false, false), FleetGate::Inert);
     }
 
     #[test]
