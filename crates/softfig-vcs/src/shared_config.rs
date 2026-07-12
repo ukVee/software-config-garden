@@ -40,6 +40,34 @@ pub const LOCAL_TOGGLES_FILE: &str = "shared-subtrees-local.toml";
 /// across devices (the `spec-sync.md` safety denylist). Rejected at add-time.
 pub const MACHINE_DIRS: &[&str] = &["hardware", "services", "os", "storage", "snapshots"];
 
+/// Top-level garden names the daemon *trusts or writes as a matter of course*,
+/// rejected at add-time alongside [`MACHINE_DIRS`] (slice 007, interim-review
+/// finding 8 — the spec's denylist ellipsis is non-exhaustive by intent):
+///
+/// * `config` — the ring/daemon config home (`peers.toml`, `keeper.toml`,
+///   `shared-subtrees.toml` itself). Grafting a shared chain here would let a
+///   peer rewrite this device's trust ring and allow-list — it blinds the
+///   loaders that every security decision reads from.
+/// * `growlight` — daemon-managed queue machinery (`.seq` counters, the
+///   managed queue table) that two devices' daemons would corrupt by turns,
+///   and `protocol.md` is injected verbatim into agent sessions (an injection
+///   surface if peer-writable).
+/// * `journal` / `inbox` — the daemon's own verbs (`log_decision`,
+///   `log_incident`, `archive`) and the documented triage flow write here
+///   unconditionally; sharing them would silently route device-private
+///   content into a peer-visible chain. Denying now is the safe v1 — relaxing
+///   later is non-breaking, the reverse is not.
+///
+/// First-component match only: `projects/app/config` is ordinary content.
+pub const RESERVED_TOP_DIRS: &[&str] = &["config", "growlight", "journal", "inbox"];
+
+/// Infrastructure names rejected at **any** path depth (slice 007): `.softfig`
+/// (the VCS/vault state namespace), `.claude` (the agent harness executes
+/// hooks/settings found here), and `.softfigignore` (controls what the VCS
+/// excludes). These names are infrastructure wherever they appear, so unlike
+/// [`RESERVED_TOP_DIRS`] the check is per-component.
+pub const INFRA_NAMES: &[&str] = &[".softfig", ".claude", ".softfigignore"];
+
 /// The committed allow-list (`config/shared-subtrees.toml`). Ring-signed +
 /// encrypted at rest in the garden; the `#[serde(rename)]` maps the array to
 /// TOML `[[subtree]]` tables.
@@ -76,9 +104,51 @@ pub struct LocalToggles {
     pub disabled: Vec<String>,
 }
 
+/// Unknown-field-tolerant mirrors of the membership schema, for
+/// [`SharedSubtreesConfig::from_toml_str_lenient`]. Rows still require the
+/// fields this version understands (a row missing `id`/`mount_path`/`ref_name`
+/// is corrupt, not newer).
+#[derive(Deserialize)]
+struct LenientSubtrees {
+    #[serde(default, rename = "subtree")]
+    subtrees: Vec<LenientEntry>,
+}
+
+#[derive(Deserialize)]
+struct LenientEntry {
+    id: String,
+    mount_path: String,
+    ref_name: String,
+    #[serde(default)]
+    key_id: Option<String>,
+}
+
 impl SharedSubtreesConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
+    }
+
+    /// Parse tolerating unknown fields — the **read/compose** path (registry
+    /// derivation, `list`, toggle membership checks), so a newer-schema file
+    /// with additive fields still composes what this version understands.
+    /// Mutations must keep the strict [`Self::from_toml_str`]: a rewrite is
+    /// only safe when every field is understood, else re-serializing would
+    /// silently drop the fields this version doesn't know (slice 007,
+    /// interim-review finding 5).
+    pub fn from_toml_str_lenient(s: &str) -> Result<Self, toml::de::Error> {
+        let lenient: LenientSubtrees = toml::from_str(s)?;
+        Ok(Self {
+            subtrees: lenient
+                .subtrees
+                .into_iter()
+                .map(|e| SharedSubtreeEntry {
+                    id: e.id,
+                    mount_path: e.mount_path,
+                    ref_name: e.ref_name,
+                    key_id: e.key_id,
+                })
+                .collect(),
+        })
     }
 
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
@@ -131,6 +201,9 @@ pub enum ShareValidationError {
     NotGardenRelative(String),
     /// The path is (or is under) a machine-specific dir (`MACHINE_DIRS`).
     MachineDir(String),
+    /// The path starts with a reserved top-level name (`RESERVED_TOP_DIRS`)
+    /// or contains an infrastructure name (`INFRA_NAMES`) at any depth.
+    ReservedPath(String),
     /// The path overlaps an existing share's mount prefix (nested or identical).
     /// v1 shares must be disjoint; carries the conflicting member id.
     Overlapping { path: String, conflict: String },
@@ -145,6 +218,10 @@ impl std::fmt::Display for ShareValidationError {
             Self::MachineDir(p) => write!(
                 f,
                 "{p:?} is (or is under) a machine-specific dir and cannot be shared"
+            ),
+            Self::ReservedPath(p) => write!(
+                f,
+                "{p:?} names (or contains) a reserved soft-fig dir and cannot be shared"
             ),
             Self::Overlapping { path, conflict } => write!(
                 f,
@@ -187,6 +264,9 @@ pub fn validate_share_add(
 
     if MACHINE_DIRS.contains(&comps[0]) {
         return Err(ShareValidationError::MachineDir(mount_path.to_string()));
+    }
+    if RESERVED_TOP_DIRS.contains(&comps[0]) || comps.iter().any(|c| INFRA_NAMES.contains(c)) {
+        return Err(ShareValidationError::ReservedPath(mount_path.to_string()));
     }
 
     for existing in &membership.subtrees {
@@ -350,6 +430,52 @@ key_id = "S-placeholder"
         assert!(validate_share_add(&cfg, "notes/wiki").is_ok());
         // A mere string-prefix sibling is disjoint (component-wise), so accepted.
         assert!(validate_share_add(&cfg, "projects-scratch").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_reserved_and_infra_names() {
+        let empty = SharedSubtreesConfig::default();
+        // Top-level reserved dirs — first component only.
+        for p in ["config", "config/deploy", "growlight", "growlight/backlog", "journal", "inbox"] {
+            assert!(
+                matches!(validate_share_add(&empty, p), Err(ShareValidationError::ReservedPath(_))),
+                "{p} should be rejected as reserved"
+            );
+        }
+        // Infrastructure names — rejected at any depth.
+        for p in [".softfig", ".claude", ".softfigignore", "projects/app/.claude", "notes/.softfig/x"] {
+            assert!(
+                matches!(validate_share_add(&empty, p), Err(ShareValidationError::ReservedPath(_))),
+                "{p} should be rejected as infrastructure"
+            );
+        }
+        // A nested dir merely *named* like a reserved top-level is content.
+        assert!(validate_share_add(&empty, "projects/app/config").is_ok());
+    }
+
+    #[test]
+    fn lenient_parse_tolerates_unknown_fields_strict_rejects_them() {
+        // A "newer schema" file: additive top-level + row fields.
+        let newer = r#"
+schema_rev = 2
+
+[[subtree]]
+id = "journals"
+mount_path = "projects/journals"
+ref_name = "chain/journals"
+write_turn = "device-b"
+"#;
+        // Strict (the mutation path) refuses — a rewrite would drop the
+        // fields this version doesn't understand.
+        assert!(SharedSubtreesConfig::from_toml_str(newer).is_err());
+        // Lenient (the compose path) still routes what it understands.
+        let cfg = SharedSubtreesConfig::from_toml_str_lenient(newer).unwrap();
+        assert_eq!(cfg.subtrees.len(), 1);
+        assert_eq!(cfg.subtrees[0].id, "journals");
+        // A row missing a required field is corrupt for both.
+        let corrupt = "[[subtree]]\nid = \"x\"\n";
+        assert!(SharedSubtreesConfig::from_toml_str_lenient(corrupt).is_err());
+        assert!(SharedSubtreesConfig::from_toml_str(corrupt).is_err());
     }
 
     #[test]

@@ -174,6 +174,33 @@ fn establish_session_locked(
                 ));
             }
         }
+    } else if inner.config.fuse_attach_unmounted {
+        // Headless test seam (slice 007): the full FUSE state machine —
+        // overlay staging, union view, registry hot-swap, commit routing —
+        // with no kernel mount, so integration tests exercise the production
+        // FUSE paths (and verbs gated on a live mount) without `/dev/fuse`.
+        let sink = crate::fuse_sink::AccumulatorSink::spawn(daemon.accumulator.clone());
+        let sealed_q: Arc<dyn SealedQuery> = hook.clone();
+        let registry = load_chain_registry(&repo, &session_arc, &state_dir);
+        match softfig_fuse::FuseMount::attach_unmounted(
+            &garden_root,
+            &state_dir,
+            session_arc.clone(),
+            sink,
+            Some(sealed_q),
+            registry,
+        ) {
+            Ok(handle) => {
+                softfig_fuse::FuseMount::install_tip_callback(&mut repo, &handle);
+                Some(handle)
+            }
+            Err(e) => {
+                return Err((
+                    ErrorKind::Io,
+                    format!("fuse attach (test seam) at {}: {e}", garden_root.display()),
+                ));
+            }
+        }
     } else {
         None
     };
@@ -1474,36 +1501,100 @@ pub(crate) fn load_chain_registry(
     softfig_vcs::ChainRegistry::from_shared_config(&membership, &local)
 }
 
-/// Read + decrypt + parse the committed `config/shared-subtrees.toml` from the
-/// device chain tip. `None` when there are no commits yet or the file is absent;
-/// a present-but-broken file logs and yields `None` (fail-safe = sharing off).
+/// Fetch + decrypt the committed `config/shared-subtrees.toml` text from the
+/// device chain tip. `Ok(None)` when there are no commits yet or the file is
+/// absent from the tip tree; `Err` when the file (or the tip it lives in)
+/// could not be read, decrypted, or decoded.
+fn read_committed_shared_subtrees_text(
+    repo: &Repo,
+    session: &softfig_vault::VaultSession,
+) -> std::result::Result<Option<String>, String> {
+    let rel = shared_subtrees_rel();
+    let Some(tip) = repo.tip().map_err(|e| format!("read device tip: {e}"))? else {
+        return Ok(None);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| format!("read tip commit: {e}"))?;
+    let Some(blob) = resolve_path_in_tree(repo, &row.root_tree, &rel).map_err(|(_, e)| e)? else {
+        return Ok(None);
+    };
+    let cipher = repo
+        .objects()
+        .get(&blob)
+        .map_err(|e| format!("read {rel} blob: {e}"))?;
+    // The config lives under `config/`, not a sealed path, but decode either
+    // layer defensively so a future seal can't silently break the router.
+    let plain = if softfig_vault::is_layer_b(&cipher) {
+        session
+            .decrypt_layer_b(&rel, &cipher)
+            .map_err(|e| format!("decrypt {rel}: {e}"))?
+    } else {
+        session
+            .decrypt_blob(&cipher)
+            .map_err(|e| format!("decrypt {rel}: {e}"))?
+    };
+    String::from_utf8(plain)
+        .map(Some)
+        .map_err(|_| format!("{rel} is not UTF-8"))
+}
+
+/// The **read/compose** view of the committed membership (registry derivation,
+/// `list`, toggle membership checks). `None` when there are no commits yet or
+/// the file is absent; a present-but-broken file logs and yields `None`
+/// (fail-safe = sharing off). Parses leniently so a newer-schema file with
+/// additive fields still composes what this version understands (slice 007).
 fn read_committed_shared_subtrees(
     repo: &Repo,
     session: &softfig_vault::VaultSession,
 ) -> Option<softfig_vcs::SharedSubtreesConfig> {
-    let rel = format!(
-        "{}/{}",
-        crate::keeper_toml::CONFIG_DIR,
-        softfig_vcs::SHARED_SUBTREES_FILE
-    );
-    let tip = repo.tip().ok()??;
-    let row = repo.db().get_commit(&tip).ok()?;
-    let blob = resolve_path_in_tree(repo, &row.root_tree, &rel).ok()??;
-    let cipher = repo.objects().get(&blob).ok()?;
-    // The config lives under `config/`, not a sealed path, but decode either
-    // layer defensively so a future seal can't silently break the router.
-    let plain = if softfig_vault::is_layer_b(&cipher) {
-        session.decrypt_layer_b(&rel, &cipher).ok()?
-    } else {
-        session.decrypt_blob(&cipher).ok()?
+    let rel = shared_subtrees_rel();
+    let text = match read_committed_shared_subtrees_text(repo, session) {
+        Ok(text) => text?,
+        Err(e) => {
+            eprintln!("keeperd: {rel} unreadable ({e}); shared subtrees off");
+            return None;
+        }
     };
-    let text = String::from_utf8(plain).ok()?;
-    match softfig_vcs::SharedSubtreesConfig::from_toml_str(&text) {
+    match softfig_vcs::SharedSubtreesConfig::from_toml_str_lenient(&text) {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             eprintln!("keeperd: {rel} parse failed ({e}); shared subtrees off");
             None
         }
+    }
+}
+
+/// The **mutation** read (slice 007, interim-review finding 5): `add`/`remove`
+/// rewrite the membership file, so a present-but-unreadable — or newer-schema,
+/// the strict parse is `deny_unknown_fields` — file must hard-error instead of
+/// defaulting to empty: an `.unwrap_or_default()` here would turn one corrupt
+/// read into a committed allow-list wipe (and a lenient rewrite would silently
+/// drop fields this daemon doesn't understand). Only a genuinely-absent file
+/// (or a repo with no commits yet) may start from an empty allow-list.
+fn read_committed_shared_subtrees_for_mutation(
+    repo: &Repo,
+    session: &softfig_vault::VaultSession,
+) -> std::result::Result<softfig_vcs::SharedSubtreesConfig, (ErrorKind, String)> {
+    let rel = shared_subtrees_rel();
+    let text = read_committed_shared_subtrees_text(repo, session).map_err(|e| {
+        (
+            ErrorKind::Io,
+            format!("could not read committed {rel} ({e}); refusing to modify shared-subtree membership"),
+        )
+    })?;
+    match text {
+        None => Ok(softfig_vcs::SharedSubtreesConfig::default()),
+        Some(text) => softfig_vcs::SharedSubtreesConfig::from_toml_str(&text).map_err(|e| {
+            (
+                ErrorKind::Internal,
+                format!(
+                    "{rel} did not parse strictly ({e}); refusing to rewrite a membership file \
+                     this daemon does not fully understand"
+                ),
+            )
+        }),
     }
 }
 
@@ -1548,7 +1639,12 @@ fn shared_subtrees_rel() -> String {
 }
 
 /// Persist the per-device local-toggle sidecar (never committed; lives in the
-/// state dir's `.softfig/`, next to the peers endpoint cache).
+/// state dir's `.softfig/`, next to the peers endpoint cache). Written
+/// tmp+rename (slice 007, interim-review finding 11): the sidecar is the only
+/// record of which shares this device disabled, and a crash-truncated file
+/// fails *open* — the broken-parse fallback is "nothing disabled", silently
+/// re-enabling every disabled share. The rename makes the swap atomic; the
+/// single-writer daemon mutex makes the fixed tmp name safe.
 fn save_local_toggles(
     state_dir: &Path,
     local: &softfig_vcs::LocalToggles,
@@ -1556,10 +1652,13 @@ fn save_local_toggles(
     let dir = state_dir.join(".softfig");
     std::fs::create_dir_all(&dir).map_err(|e| (ErrorKind::Io, format!("create .softfig: {e}")))?;
     let path = dir.join(softfig_vcs::LOCAL_TOGGLES_FILE);
+    let tmp = dir.join(format!("{}.tmp", softfig_vcs::LOCAL_TOGGLES_FILE));
     let toml = local
         .to_toml()
         .map_err(|e| (ErrorKind::Internal, format!("serialize local toggles: {e}")))?;
-    std::fs::write(&path, toml).map_err(|e| (ErrorKind::Io, format!("write {}: {e}", path.display())))
+    std::fs::write(&tmp, toml).map_err(|e| (ErrorKind::Io, format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| (ErrorKind::Io, format!("rename {} -> {}: {e}", tmp.display(), path.display())))
 }
 
 /// Validate an explicit share id: 1–64 chars of `[a-z0-9-]` (the slug charset,
@@ -1646,6 +1745,44 @@ fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_dir: &Path) 
     }
 }
 
+/// Whether the device chain's tip tree has *any* committed entry (file or
+/// directory) at `rel` — the populated-dir guard's probe (slice 007,
+/// interim-review finding 4). No commits yet ⇒ nothing is populated.
+fn device_tip_path_exists(
+    repo: &Repo,
+    rel: &str,
+) -> std::result::Result<bool, (ErrorKind, String)> {
+    let components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    if components.is_empty() {
+        return Ok(false);
+    }
+    let Some(tip) = repo.tip().map_err(|e| err_to_response(e.into()))? else {
+        return Ok(false);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| err_to_response(KeeperError::Store(e)))?;
+    let mut current = row.root_tree;
+    for (i, name) in components.iter().enumerate() {
+        let entries = repo
+            .db()
+            .get_tree(&current)
+            .map_err(|e| err_to_response(KeeperError::Store(e)))?;
+        let Some(entry) = entries.into_iter().find(|e| e.name == *name) else {
+            return Ok(false);
+        };
+        if i + 1 == components.len() {
+            return Ok(true);
+        }
+        match entry.kind {
+            TreeEntryKind::Tree => current = entry.target,
+            TreeEntryKind::Blob => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
 pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: SharedSubtreeAddArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("shared_subtree_add args: {e}")))?;
@@ -1653,16 +1790,33 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+
+    // Slice 007 (interim-review finding 14): without a union mount nothing
+    // splits — writes under the "shared" path would fold into the device chain
+    // and reach its backup replicas. Refuse instead of leaking; a direct-mode
+    // (no-FUSE / M1c-compat) daemon doesn't get a lesser version of sharing,
+    // it gets none.
+    if inner.fuse.is_none() {
+        return Err((
+            ErrorKind::BadArgs,
+            "shared_subtree_add requires the FUSE union mount; in direct (M1c-compat) mode \
+             shared-marked content would fold into the device chain and its replicas"
+                .into(),
+        ));
+    }
+
     let state_dir = inner.config.state_dir().to_path_buf();
 
-    // Current committed membership from the device tip (absent ⇒ empty).
+    // Current committed membership from the device tip. Mutation read: absent
+    // ⇒ empty, unreadable/unparseable ⇒ hard error (never wipe — finding 5).
     let mut membership = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
-        read_committed_shared_subtrees(repo, session).unwrap_or_default()
+        read_committed_shared_subtrees_for_mutation(repo, session)?
     };
 
-    // Reject a machine dir + any overlap with an existing share (v1 = disjoint).
+    // Reject a machine/reserved dir + any overlap with an existing share
+    // (v1 = disjoint).
     softfig_vcs::validate_share_add(&membership, &mount_path)
         .map_err(|e| (ErrorKind::BadArgs, e.to_string()))?;
 
@@ -1677,6 +1831,46 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         ));
     }
     let ref_name = format!("chain/{id}");
+
+    // Slice 007 (finding 4): a mount path that already has committed device
+    // content would vanish behind the graft — the new chain's empty genesis
+    // shadows it and the next device commit's carve-out drops it. Refuse; the
+    // seed-genesis-from-device-subtree migration is a later slice.
+    {
+        let repo = inner.repo.as_ref().expect("unlocked");
+        if device_tip_path_exists(repo, &mount_path)? {
+            return Err((
+                ErrorKind::PathAlreadyExists,
+                format!(
+                    "{mount_path:?} already has committed device-chain content; migrating an \
+                     existing subtree into a shared chain is not supported yet — share an \
+                     empty path or move the content aside first"
+                ),
+            ));
+        }
+    }
+
+    // Slice 007 (finding 10): the chain ref is created BEFORE the membership
+    // commit, so a mid-add failure leaves a harmless orphan ref instead of a
+    // committed membership row routing to a ref-less chain. A ref that already
+    // exists — an orphan from a retried add, or a chain kept through a prior
+    // `remove` (remove never deletes refs/objects) — is reused as-is, never
+    // reset: re-adding an id resumes its chain. No key ceremony here (m5d).
+    let ref_exists = {
+        let repo = inner.repo.as_ref().expect("unlocked");
+        repo.tip_of(&ref_name)
+            .map_err(|e| err_to_response(e.into()))?
+            .is_some()
+    };
+    if !ref_exists {
+        let genesis = Intent::init(format!("shared subtree {id} created"));
+        crate::actions::commit_snapshot_to_now(
+            &mut inner,
+            &ref_name,
+            softfig_vcs::WalkSnapshot::empty(),
+            genesis,
+        )?;
+    }
 
     // Append the membership row (`key_id` stays `None` — the collaborative key S
     // is the stubbed m5d hook) and stage the config edit through the WorkTree.
@@ -1698,16 +1892,6 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     crate::actions::commit_now(&mut inner, intent)?;
 
-    // Create the chain's genesis ref (empty tree) so the union mount can compose
-    // it. "add ⇒ chain exists + mounted"; no key ceremony here (that is m5d).
-    let genesis = Intent::init(format!("shared subtree {id} created"));
-    crate::actions::commit_snapshot_to_now(
-        &mut inner,
-        &ref_name,
-        softfig_vcs::WalkSnapshot::empty(),
-        genesis,
-    )?;
-
     refresh_mount_registry(&inner, &state_dir);
 
     Ok(serde_json::to_value(SharedSubtreeAddReply {
@@ -1727,10 +1911,13 @@ pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> Handle
     require_unlocked(&inner)?;
     let state_dir = inner.config.state_dir().to_path_buf();
 
+    // Mutation read: absent ⇒ empty, unreadable/unparseable ⇒ hard error —
+    // a lenient default here would let one corrupt read rewrite the file as
+    // an empty allow-list (slice 007, finding 5).
     let mut membership = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
-        read_committed_shared_subtrees(repo, session).unwrap_or_default()
+        read_committed_shared_subtrees_for_mutation(repo, session)?
     };
     let before = membership.subtrees.len();
     membership.subtrees.retain(|s| s.id != id);
@@ -1750,6 +1937,20 @@ pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> Handle
         let intent = Intent::new("shared_subtrees_changed", payload)
             .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
         crate::actions::commit_now(&mut inner, intent)?;
+
+        // Slice 007 (finding 9): purge the id from the local-toggle sidecar so
+        // disable → remove → re-add is never born disabled. The membership
+        // commit above already landed, so a sidecar write failure is logged
+        // loudly rather than failing an op that did remove the member.
+        let mut local = load_local_toggles(&state_dir);
+        if local.enable(&id) {
+            if let Err((_, e)) = save_local_toggles(&state_dir, &local) {
+                eprintln!(
+                    "keeperd: shared_subtree_remove {id}: could not purge the local toggle \
+                     sidecar ({e}); a future re-add of this id would start disabled here"
+                );
+            }
+        }
         refresh_mount_registry(&inner, &state_dir);
     }
 

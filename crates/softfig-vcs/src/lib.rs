@@ -27,7 +27,8 @@ pub mod walk;
 pub use chain::{Chain, ChainId, ChainKind, ChainRegistry, DEVICE_CHAIN_ID};
 pub use shared_config::{
     validate_share_add, LocalToggles, ShareValidationError, SharedSubtreeEntry,
-    SharedSubtreesConfig, LOCAL_TOGGLES_FILE, MACHINE_DIRS, SHARED_SUBTREES_FILE,
+    SharedSubtreesConfig, INFRA_NAMES, LOCAL_TOGGLES_FILE, MACHINE_DIRS, RESERVED_TOP_DIRS,
+    SHARED_SUBTREES_FILE,
 };
 pub use commit::{verify_commit, CanonicalCommit};
 pub use error::{CoreError, Result};

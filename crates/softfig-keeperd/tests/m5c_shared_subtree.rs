@@ -1,18 +1,22 @@
-//! M5c slice 003 integration: the shared-subtree lifecycle verbs end to end.
+//! M5c slice 003 + 007 integration: the shared-subtree lifecycle verbs end to
+//! end, headless. The standard fixture runs the daemon with the slice-007
+//! `fuse_attach_unmounted` seam — the full FUSE state machine (overlay
+//! staging, union view, commit routing, registry hot-swap) with no kernel
+//! mount, so the suite exercises the production paths without `/dev/fuse`
+//! (`add` refuses in true direct mode; see `add_refuses_in_direct_mode`).
 //!
-//! Two control axes, proven headless (M1c-compat garden ⇒ no FUSE, so the suite
-//! runs without `/dev/fuse`):
+//! Two control axes:
 //!
-//! * `add`/`remove` = ring membership — validate (machine dir + overlap
-//!   rejected), append to `config/shared-subtrees.toml`, create the chain's
-//!   genesis ref, commit `shared_subtrees_changed`;
+//! * `add`/`remove` = ring membership — validate (machine/reserved dir +
+//!   overlap + populated path rejected), create the chain's genesis ref, then
+//!   append to `config/shared-subtrees.toml` + commit
+//!   `shared_subtrees_changed`;
 //! * `enable`/`disable` = a per-device local toggle — flips ONLY the never-
 //!   committed sidecar, provably ceremony-free (no commit, membership byte-
 //!   unchanged across a disable→enable cycle).
 //!
-//! The live enable/disable *remount* recompose is FUSE-only and is deferred to
-//! the on-device smoke (see the slice's `## Deferred verification`); here we
-//! prove the committed-state + registry-derivation half.
+//! The live kernel-mount smoke stays deferred to the on-device step (see the
+//! slice docs' `## Deferred verification`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -80,14 +84,33 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// The standard fixture: FUSE state machine attached with no kernel mount
+    /// (the slice-007 `fuse_attach_unmounted` seam), so the suite exercises
+    /// the production union-mount paths — overlay staging, commit routing,
+    /// registry hot-swap — headlessly. `add` requires a live mount (direct
+    /// mode would fold shared content into the device chain), so this is also
+    /// what makes the lifecycle verbs reachable at all.
     fn start() -> Self {
+        Self::start_with(true)
+    }
+
+    /// A true direct-mode (M1c-compat, no FUSE) daemon — only for proving the
+    /// direct-mode `add` refusal.
+    fn start_disk() -> Self {
+        Self::start_with(false)
+    }
+
+    fn start_with(attach_fuse: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let garden = tmp.path().to_path_buf();
         init_garden(&garden);
         let socket = garden.join("sock");
-        let config = KeeperConfig::new(&garden)
+        let mut config = KeeperConfig::new(&garden)
             .without_watcher()
             .with_socket(&socket);
+        if attach_fuse {
+            config = config.with_unmounted_fuse_attach();
+        }
         let handle = Daemon::new(config).start().unwrap();
         wait_for_socket(&socket);
         let resp = send(
@@ -122,8 +145,27 @@ impl Fixture {
             .is_some()
     }
 
-    fn config_bytes(&self) -> Option<Vec<u8>> {
-        std::fs::read(self.garden.join("config/shared-subtrees.toml")).ok()
+    /// Committed text of `config/shared-subtrees.toml` through the daemon's
+    /// read path (the attach-seam fixture has no on-disk working tree to
+    /// read). `None` when absent.
+    fn config_text(&self) -> Option<String> {
+        match self.call(
+            op::READ_FILE,
+            serde_json::json!({ "path": "config/shared-subtrees.toml" }),
+        ) {
+            Response::Ok { data, .. } => Some(data["content"].as_str().unwrap().to_string()),
+            Response::Err { .. } => None,
+        }
+    }
+
+    /// Break-glass write: commit `content` at garden-relative `path` (seeds
+    /// device-chain content / corrupts the membership file for the guards).
+    fn write_committed(&self, path: &str, content: &str) {
+        let resp = self.call(
+            op::REPLACE_FILE,
+            serde_json::json!({ "path": path, "content": content }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "replace_file {path}: {resp:?}");
     }
 
     fn list(&self) -> SharedSubtreeListReply {
@@ -261,7 +303,7 @@ fn disable_enable_flips_state_and_leaves_membership_byte_unchanged() {
     // Capture the committed state right after add: the device tip and the
     // membership file bytes. A ceremony-free toggle must not perturb either.
     let tip_after_add = fx.tip();
-    let config_after_add = fx.config_bytes().expect("membership file exists after add");
+    let config_after_add = fx.config_text().expect("membership file exists after add");
 
     // Disable → transparent on this device.
     let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
@@ -271,7 +313,7 @@ fn disable_enable_flips_state_and_leaves_membership_byte_unchanged() {
 
     // No commit fired (tip unchanged) and the membership file is byte-identical.
     assert_eq!(fx.tip(), tip_after_add, "disable must not commit");
-    assert_eq!(fx.config_bytes().unwrap(), config_after_add, "membership byte-unchanged");
+    assert_eq!(fx.config_text().unwrap(), config_after_add, "membership byte-unchanged");
 
     // Idempotent: a second disable is a no-op.
     let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
@@ -283,7 +325,7 @@ fn disable_enable_flips_state_and_leaves_membership_byte_unchanged() {
     assert!(r.changed);
     assert!(fx.list().subtrees[0].enabled, "list reflects the enable");
     assert_eq!(fx.tip(), tip_after_add, "enable must not commit");
-    assert_eq!(fx.config_bytes().unwrap(), config_after_add, "membership byte-unchanged");
+    assert_eq!(fx.config_text().unwrap(), config_after_add, "membership byte-unchanged");
 }
 
 #[test]
@@ -383,4 +425,142 @@ fn lifecycle_ops_never_touch_the_replica_grant_ledger() {
     // surfaces never crossed.
     let reloaded = GrantLedger::load(&fx.garden).unwrap();
     assert_eq!(reloaded.push_to, vec!["ab".repeat(32), "cd".repeat(32)]);
+}
+
+// ---- slice 007: add-time guards + lifecycle robustness ---------------------
+
+/// Finding 14: in true direct (no-FUSE / M1c-compat) mode nothing splits —
+/// shared-marked content would fold into the device chain and reach its
+/// backup replicas — so `add` refuses outright. Un-sharing stays available.
+#[test]
+fn add_refuses_in_direct_mode() {
+    let fx = Fixture::start_disk();
+    match fx.add("projects/journals", None) {
+        Response::Err { kind, error, .. } => {
+            assert_eq!(kind, ErrorKind::BadArgs);
+            assert!(error.contains("union mount"), "unexpected message: {error}");
+        }
+        Response::Ok { data, .. } => panic!("direct-mode add must refuse, got {data}"),
+    }
+    // Nothing was created for the refused add.
+    assert!(!fx.ref_exists("chain/journals"));
+    assert!(fx.list().subtrees.is_empty());
+    // remove (un-sharing) is not mode-gated: idempotent no-op, not a refusal.
+    let reply: SharedSubtreeRemoveReply = serde_json::from_value(ok_data(fx.call(
+        op::SHARED_SUBTREE_REMOVE,
+        serde_json::to_value(SharedSubtreeRemoveArgs { id: "journals".into() }).unwrap(),
+    )))
+    .unwrap();
+    assert!(!reply.removed);
+}
+
+/// Finding 8: beyond the machine dirs, `add` rejects the reserved top-level
+/// names the daemon trusts or writes (`config`, `growlight`, `journal`,
+/// `inbox`) and the infrastructure names at any depth (`.softfig`, `.claude`,
+/// `.softfigignore`).
+#[test]
+fn add_rejects_reserved_and_infra_names() {
+    let fx = Fixture::start();
+    for p in [
+        "config",
+        "config/deploy",
+        "growlight/backlog",
+        "journal",
+        "inbox",
+        ".softfig",
+        ".softfigignore",
+        "projects/app/.claude",
+    ] {
+        assert_eq!(err_kind(fx.add(p, None)), ErrorKind::BadArgs, "{p} should reject");
+    }
+    assert!(fx.list().subtrees.is_empty());
+    // A nested dir merely named like a reserved top-level is ordinary content.
+    assert!(matches!(fx.add("projects/app/config", None), Response::Ok { .. }));
+}
+
+/// Finding 4: a mount path that already has committed device-chain content
+/// would vanish behind the graft (empty genesis shadows it; the next device
+/// commit's carve-out drops it) — `add` refuses instead.
+#[test]
+fn add_refuses_a_mount_path_with_committed_device_content() {
+    let fx = Fixture::start();
+    fx.write_committed("projects/journals/2026.md", "# journal\n");
+
+    assert_eq!(
+        err_kind(fx.add("projects/journals", None)),
+        ErrorKind::PathAlreadyExists
+    );
+    // Nothing was created for the refused add...
+    assert!(!fx.ref_exists("chain/journals"));
+    assert!(fx.list().subtrees.is_empty());
+    // ...the committed device content is untouched...
+    let resp = fx.call(
+        op::READ_FILE,
+        serde_json::json!({ "path": "projects/journals/2026.md" }),
+    );
+    assert_eq!(ok_data(resp)["content"].as_str().unwrap(), "# journal\n");
+    // ...and an empty sibling path is still shareable.
+    assert!(matches!(fx.add("projects/empty-share", None), Response::Ok { .. }));
+}
+
+/// Finding 5: a present-but-unreadable membership file must hard-error the
+/// mutations — the old `.unwrap_or_default()` turned one corrupt read into a
+/// committed allow-list wipe. The compose path (list) parses leniently, so a
+/// newer-schema file still routes what this version understands.
+#[test]
+fn mutations_hard_error_on_unreadable_membership_instead_of_wiping() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+
+    // Corrupt the committed membership file outright.
+    fx.write_committed("config/shared-subtrees.toml", "not [ valid toml");
+    assert_eq!(err_kind(fx.add("notes/wiki", None)), ErrorKind::Internal);
+    assert_eq!(
+        err_kind(fx.call(
+            op::SHARED_SUBTREE_REMOVE,
+            serde_json::to_value(SharedSubtreeRemoveArgs { id: "journals".into() }).unwrap(),
+        )),
+        ErrorKind::Internal
+    );
+    // The corrupt bytes were never rewritten by the refused mutations.
+    assert_eq!(fx.config_text().unwrap(), "not [ valid toml");
+
+    // A newer-schema file (additive unknown fields): mutations still refuse —
+    // a strict rewrite would silently drop the fields this daemon doesn't
+    // understand — but the lenient compose path still lists the member.
+    fx.write_committed(
+        "config/shared-subtrees.toml",
+        "schema_rev = 2\n\n[[subtree]]\nid = \"journals\"\nmount_path = \"projects/journals\"\n\
+         ref_name = \"chain/journals\"\nwrite_turn = \"device-b\"\n",
+    );
+    assert_eq!(err_kind(fx.add("notes/wiki", None)), ErrorKind::Internal);
+    let list = fx.list();
+    assert_eq!(list.subtrees.len(), 1, "lenient compose still sees the member");
+    assert_eq!(list.subtrees[0].id, "journals");
+}
+
+/// Finding 9 (+ the finding-10 ref-reuse semantics): disable → remove → re-add
+/// must not be born disabled — remove purges the local-toggle sidecar entry.
+/// The chain ref survives the remove (gc reclaims it later) and the re-add
+/// reuses it as-is.
+#[test]
+fn readd_after_disable_and_remove_is_born_enabled() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
+    assert!(!r.enabled);
+
+    let reply: SharedSubtreeRemoveReply = serde_json::from_value(ok_data(fx.call(
+        op::SHARED_SUBTREE_REMOVE,
+        serde_json::to_value(SharedSubtreeRemoveArgs { id: "journals".into() }).unwrap(),
+    )))
+    .unwrap();
+    assert!(reply.removed);
+    assert!(fx.ref_exists("chain/journals"), "remove keeps the chain ref");
+
+    // Re-add the same id: reuses the surviving chain, born enabled.
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let list = fx.list();
+    assert_eq!(list.subtrees.len(), 1);
+    assert!(list.subtrees[0].enabled, "re-added share must be born enabled");
 }

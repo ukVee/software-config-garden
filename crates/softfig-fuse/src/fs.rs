@@ -821,7 +821,9 @@ impl FuseMount {
     /// commit-routing invariants (slice 006) be regression-tested where
     /// `/dev/fuse` is unavailable; every in-memory code path is the production
     /// one, only the fuser session is absent ([`MountHandle::unmount`] is a
-    /// no-op). Not for daemons: a real garden must use [`Self::mount_with`].
+    /// no-op). Not for real gardens — production daemons use
+    /// [`Self::mount_with`]; the keeperd `fuse_attach_unmounted` config seam
+    /// reaches this only from integration tests.
     #[doc(hidden)]
     pub fn attach_unmounted(
         garden_root: &Path,
