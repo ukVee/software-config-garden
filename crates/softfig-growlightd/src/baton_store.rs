@@ -136,11 +136,19 @@ impl BatonStatusSource for FsBatonStore {
         //   - FRESHER than the per-member file — the member's most recent write
         //     landed on the legacy path (in normal operation the per-member write is
         //     always the fresher of the two);
-        //   - names the SAME `item:` as the per-member seed — a real misroute writes
-        //     the member's CURRENT item to the wrong path, so the two agree; a
-        //     genuinely-stale single-agent baton for OTHER work names a different
-        //     item and must not shadow, even if fresher (hardening (a) — correctness
-        //     stops resting on the mtime invariant alone).
+        //   - does not CONTRADICT the per-member seed's `item:` — a real misroute
+        //     writes the member's CURRENT item to the wrong path, so when BOTH
+        //     sides name an item they must agree; a genuinely-stale single-agent
+        //     baton for OTHER work names a different item and must not shadow,
+        //     even if fresher (hardening (a) — correctness stops resting on the
+        //     mtime invariant alone). An item ABSENT on either side is
+        //     match-UNKNOWN, not a mismatch (task 044): the fleet protocol's
+        //     step-7 "SHORT terminal baton (status ITEM_COMPLETE + one line)"
+        //     legitimately omits `item:`, and that terminal handoff is exactly
+        //     the misrouted write this fallback exists to honor — treating the
+        //     omission as a mismatch silently read the stale seed's IN_PROGRESS
+        //     and relapsed the 042 stall. The agent-stamp + freshness checks
+        //     above stay the load-bearing guards in the unknown case.
         // The misroute is RETURNED as a diagnostic (not logged here): the drive loop
         // routes it through the tick log's exit entry-edge dedup, so a member latched
         // `Exited` and re-read every ~1s tick warns ONCE, not once per tick (task
@@ -156,8 +164,13 @@ impl BatonStatusSource for FsBatonStore {
                 let seed_item = per_member_raw
                     .as_deref()
                     .and_then(|raw| parse_baton(raw).item);
-                let item_matches =
-                    seed_item.as_deref().is_none_or(|it| legacy.item.as_deref() == Some(it));
+                // Reject only a POSITIVE mismatch (both sides name an item and they
+                // differ); either side silent → match-unknown, defer to the guards
+                // above (see the block comment — task 044).
+                let item_matches = match (seed_item.as_deref(), legacy.item.as_deref()) {
+                    (Some(seed), Some(legacy_item)) => seed == legacy_item,
+                    _ => true,
+                };
                 if frontmatter_agent(&legacy_raw).as_deref() == Some(agent)
                     && legacy.status.is_some()
                     && legacy_is_fresher(&legacy_path, &per_member_path)
@@ -540,6 +553,43 @@ mod tests {
             "a fresher legacy baton for a DIFFERENT item does not shadow the per-member seed",
         );
         assert!(read.misroute.is_none(), "a mismatched-item legacy baton is not a misroute");
+    }
+
+    /// TASK 044 — the protocol-shaped SHORT terminal baton. Fleet protocol step 7
+    /// says "write a SHORT terminal baton (status ITEM_COMPLETE + one line)", so a
+    /// misrouted terminal handoff plausibly OMITS `item:` — in exactly the terminal
+    /// case the fallback exists to honor. An absent legacy `item:` is
+    /// match-UNKNOWN (the agent-stamp + freshness guards carry the decision), not
+    /// a mismatch: before this, `None != Some(seed)` silently failed the guard —
+    /// no fallback AND no misroute diagnostic — so growlightd read the stale
+    /// seed's IN_PROGRESS and the 042 stall relapsed.
+    #[test]
+    fn a_terminal_legacy_baton_missing_its_item_is_still_honored_and_diagnosed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.seed("a", "default", "020").expect("seeds"); // per-member seed names item 020
+
+        // The step-7 SHORT terminal handoff, misrouted to the legacy path:
+        // agent-stamped, carries a status, fresher — but no `item:` line at all.
+        let legacy = legacy_path(tmp.path());
+        std::fs::write(
+            &legacy,
+            "---\nmode: fleet\nagent: a\nstatus: ITEM_COMPLETE\n---\n# NEXT ACTION\nfinished.\n",
+        )
+        .unwrap();
+        set_mtime(&s.baton_path("a"), 1_000); // seed: older
+        set_mtime(&legacy, 2_000); // misrouted terminal handoff: fresher
+
+        let read = s.status("a");
+        assert_eq!(
+            read.status.as_deref(),
+            Some("ITEM_COMPLETE"),
+            "an item-less terminal legacy baton is honored (match-unknown, not mismatch)",
+        );
+        assert!(
+            read.misroute.is_some(),
+            "and the misroute diagnostic is surfaced — never a silent stale-seed read",
+        );
     }
 
     /// Hardening (b) — the status-less fall-through. A truncated legacy baton with

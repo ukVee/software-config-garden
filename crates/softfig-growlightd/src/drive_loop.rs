@@ -951,9 +951,14 @@ impl DriveLoop {
                 // misclassified exit stalled the fleet silently). Only real exits are
                 // recorded — a still-registered `Healthy`/`Unknown` observation (e.g.
                 // the cross-tick latched-`Exited` re-poll of an already-gone member)
-                // is not an exit event, so it is skipped to keep the log clean.
+                // is not an exit event, so it is skipped to keep the log clean; a
+                // `Down` re-observation of an already-consumed crash (task 044) is
+                // likewise not a new exit — the crash tick already recorded one.
                 if matches!(health, AgentHealth::Exited { .. })
-                    && !matches!(outcome, PollOutcome::Healthy | PollOutcome::Unknown)
+                    && !matches!(
+                        outcome,
+                        PollOutcome::Healthy | PollOutcome::Unknown | PollOutcome::Down
+                    )
                 {
                     report.exit_dispositions.push(ExitDisposition {
                         agent: agent.clone(),
@@ -1080,6 +1085,17 @@ impl DriveLoop {
                         // HALTED_RATE_LIMIT: the member is down-but-registered, held
                         // by admission's rate gate and re-rolled by `Supervisor::tick`
                         // once its window resets; no alert. A boundary stop retires.
+                        if self.retiring.remove(agent) {
+                            self.retire(agent, &mut report);
+                        }
+                    }
+                    PollOutcome::Down => {
+                        // A re-observation of an exit already consumed (task 044):
+                        // the crash tick armed the backoff and `Supervisor::tick`
+                        // below owns the re-roll — nothing to do here EXCEPT honor
+                        // a boundary stop posted while the member is down: down IS
+                        // a boundary (between sessions), so it retires now rather
+                        // than being re-spawned just to stop at its next exit.
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         }
@@ -1376,6 +1392,7 @@ impl DriveLoop {
 fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
     match outcome {
         PollOutcome::Crashed { .. } => "crashed",
+        PollOutcome::Down => "down (awaiting re-roll)",
         PollOutcome::Reconnecting => "reconnecting (transient network)",
         PollOutcome::Rolling => "rolling (continue status)",
         PollOutcome::Retired => "retired (queue drained)",
@@ -2539,15 +2556,98 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
         assert_eq!(backend.spawn_count(), 1, "no re-spawn yet");
 
-        // The re-rolled session is healthy; at the backoff boundary it re-rolls.
-        backend.set_health("a1", AgentHealth::Alive { last_active: 2 });
+        // At the backoff boundary it re-rolls. The health cell still holds the
+        // LATCHED exit — production only resets it on the re-spawn itself — so
+        // this tick's health pass re-observes the consumed crash (the inert
+        // `Down`, task 044) and must raise no new alert nor re-push the backoff.
         let r2 = loop_.tick(2);
-        assert!(r2.crashes.is_empty(), "the healthy poll raises no new crash");
+        assert!(r2.crashes.is_empty(), "a re-observed latched exit is not a new crash");
         assert_eq!(
             r2.rerolls,
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"], "a1 was re-spawned");
+    }
+
+    /// TASK 044 — the 2026-07-11 incident shape, end to end at the tick level: a
+    /// fleet-of-one member CRASHES mid-item (its scope dies; the exit stays
+    /// latched non-zero in the health cell) while its item is still `active`.
+    /// The loop must not go idle-silent: the crash pages once, the member is
+    /// held through its ORIGINAL backoff, and a later tick RE-ROLLS it onto the
+    /// SAME still-`active` item — no re-seed, no second claim (the baton
+    /// carry-forward). Before the consumed-exit guard the latched exit re-ran
+    /// the crash path every tick, pushing `not_before` past `now` forever: the
+    /// re-roll was held on every tick and the fleet sat silent ~10h on a
+    /// still-`active` item.
+    #[test]
+    fn a_crash_exit_re_rolls_the_still_active_item_on_a_later_tick() {
+        let (mut loop_, _d, backend, claimer, _queues, probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        // Fresh start: seeded + claimed p1 (now `active`) + spawned.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        assert_eq!(claimer.claims(), vec![("qa".to_string(), "p1".to_string())]);
+
+        // ~31s in, the member's scope dies: a genuine crash (online, no network
+        // signature). The exit LATCHES in the health cell — this test never
+        // resets it by hand, matching production (only a re-spawn resets it).
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        let r = loop_.tick(31);
+        assert_eq!(r.crashes.len(), 1, "the crash pages the human");
+
+        // The next tick re-observes the SAME latched exit: no new crash, and the
+        // hold still shows the ORIGINAL backoff (base 2 → 33) — pre-fix this
+        // re-ran the crash path and pushed the hold to 36, then 40, forever.
+        let r2 = loop_.tick(32);
+        assert!(r2.crashes.is_empty(), "a re-observed exit is not a new crash");
+        assert_eq!(
+            r2.rerolls,
+            vec![RerollOutcome::HeldForBackoff { agent: "a1".into(), not_before: 33 }],
+            "held through the original backoff — the re-observation pushed nothing",
+        );
+
+        // The backoff elapses → the loop re-rolls the member onto its
+        // still-`active` item: a re-spawn, no second claim, no re-seed.
+        let r3 = loop_.tick(33);
+        assert_eq!(r3.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "re-rolled onto the same part");
+        assert_eq!(claimer.claims().len(), 1, "the standing claim is reused, not re-claimed");
+        assert_eq!(backend.seeds().len(), 1, "a re-roll never re-seeds (carry-forward)");
+        assert_eq!(probe.gui_alerts(), 1, "exactly one page across the whole episode");
+    }
+
+    /// TASK 044 — a boundary stop posted while a member is DOWN (crashed,
+    /// awaiting its re-roll) is honored at that down-boundary: down IS between
+    /// sessions, so the member retires without being re-spawned just to stop at
+    /// its next exit.
+    #[test]
+    fn a_stop_posted_while_a_member_is_down_retires_it_without_a_re_spawn() {
+        let (mut loop_, d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        loop_.tick(1); // the crash is consumed; the backoff is armed for t=3
+
+        // The human posts a boundary stop while the member is down.
+        d.inner
+            .lock()
+            .unwrap()
+            .control
+            .request_stop("a1", StopLevel::AfterSlice);
+        let r = loop_.tick(2);
+        assert_eq!(r.retired, vec!["a1".to_string()], "retired at the down-boundary");
+
+        // Never re-spawned — not even well past every backoff.
+        let r2 = loop_.tick(100);
+        assert!(r2.rerolls.is_empty() && r2.started.is_empty(), "stopped for good");
+        assert_eq!(backend.spawn_count(), 1, "no re-spawn after the stop");
     }
 
     /// THE SPIN FIX end-to-end ([[decision-growlight-fleet-loop-spin]]): a member
