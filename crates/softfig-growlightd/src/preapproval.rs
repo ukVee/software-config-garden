@@ -308,10 +308,16 @@ fn inject_script(protocol: &Path, baton: &Path) -> String {
 set -u
 printf '=== SOFT-FIG GROWLIGHT · OPERATING PROTOCOL ===\n\n'
 cat @PROTOCOL@ 2>/dev/null || printf '(protocol.md missing — run `softfig growlight init`)\n'
-printf '\n\n=== CURRENT BATON (your only carried state) ===\n\n'
+printf '\n=== YOUR BATON FILE — rewrite THIS exact path at handoff ===\n%s\n\n' @BATONPATH@
+printf '=== CURRENT BATON (your only carried state) ===\n\n'
 cat @BATON@ 2>/dev/null || printf '(no baton yet)\n'
 "#;
+    // Name the baton's own absolute path in English in the injected prompt,
+    // independent of the seed's `baton-path:` field, so a fleet member always sees
+    // which file to rewrite at handoff and can't misroute it to the legacy root
+    // `baton.md` (task 035 — the WRITE/INJECT-side root cure).
     TPL.replace("@PROTOCOL@", &shell_quote(protocol))
+        .replace("@BATONPATH@", &shell_quote(baton))
         .replace("@BATON@", &shell_quote(baton))
 }
 
@@ -418,6 +424,12 @@ mod tests {
         let inject = fs::read_to_string(&paths.inject).unwrap();
         assert!(inject.contains(&paths.baton.display().to_string()), "hook injects the per-agent baton");
         assert!(inject.contains("/garden/growlight/protocol.md"), "hook injects the protocol");
+        // task 035: the injected prompt names the baton's own path in English so the
+        // member can't misroute its handoff to the legacy root baton.md.
+        assert!(
+            inject.contains("YOUR BATON FILE"),
+            "hook names the baton file explicitly in the prompt",
+        );
 
         // inject.sh is executable (0755).
         let mode = fs::metadata(&paths.inject).unwrap().permissions().mode();
