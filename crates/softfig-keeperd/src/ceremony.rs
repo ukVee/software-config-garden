@@ -180,6 +180,231 @@ impl<L: CeremonyLink> CeremonyTransport for SessionTransport<L> {
     }
 }
 
+// --- Persisting the outcome (slice 001 CHUNK B0) -----------------------------
+//
+// A completed ceremony leaves two durable artifacts, per
+// [[decision-shared-ceremony-transcript-persistence]] (option a — locked):
+//
+// 1. **`S` under the vault** — `VaultSession::store_shared_key` seals it at
+//    `.softfig/vault/shared-keys/<key_id>.key` (master-keyed, unlocked-only).
+//    This is what slice 002 reads to `S`-encrypt shared-chain blobs.
+// 2. **The signed transcript as a committed record** — the full transcript as
+//    `config/shared-ceremonies/<key_id>.toml` on the *device* chain
+//    (M-encrypted, M5b-replicated, durable before slice 002 exists), under the
+//    `shared_ceremony` intent with the compact payload `{chain_id, key_id}`.
+//    Each member commits its own record — no privileged copy.
+//
+// Both members call [`persist_ceremony_outcome`]: the initiator after its
+// `run_ceremony` returns, the responder inline on its serve thread. The device
+// chain's membership row (`config/shared-subtrees.toml`), when this device has
+// one for the ceremony's chain, gets its `key_id` filled in the same commit —
+// atomically pairing "the key exists" with "the subtree uses it".
+
+use serde::{Deserialize, Serialize};
+use softfig_net::ceremony::{key_id, SharedKey, Transcript, TranscriptEntry};
+use softfig_store::Hash;
+use softfig_vcs::Intent;
+use softfig_ipc::ErrorKind;
+
+use crate::actions::{commit_now, WorkTree};
+use crate::daemon::Daemon;
+use crate::handlers::{
+    read_committed_shared_subtrees_for_mutation, require_unlocked, shared_subtrees_rel,
+};
+
+/// Repo-relative path of a ceremony's committed transcript record.
+pub fn ceremony_record_rel(key_id: &str) -> String {
+    format!("{}/shared-ceremonies/{key_id}.toml", crate::keeper_toml::CONFIG_DIR)
+}
+
+/// The committed record's TOML shape: scalar identity fields, then one
+/// `[[member]]` table per contribution, all binary fields hex-encoded.
+#[derive(Debug, Serialize, Deserialize)]
+struct CeremonyRecordToml {
+    key_id: String,
+    chain_id: String,
+    nonce: String,
+    #[serde(rename = "member", default)]
+    members: Vec<CeremonyMemberToml>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CeremonyMemberToml {
+    device_id: String,
+    commitment: String,
+    r: String,
+}
+
+/// Render a transcript as the committed TOML record. Fails only on a
+/// non-UTF-8 chain id (ref names are ASCII by construction).
+pub fn render_transcript_record(t: &Transcript) -> Result<String, String> {
+    let chain_id = std::str::from_utf8(&t.chain_id)
+        .map_err(|_| "transcript chain_id is not UTF-8".to_string())?;
+    let record = CeremonyRecordToml {
+        key_id: t.key_id.clone(),
+        chain_id: chain_id.to_string(),
+        nonce: hex::encode(t.nonce),
+        members: t
+            .members
+            .iter()
+            .map(|m| CeremonyMemberToml {
+                device_id: hex::encode(m.device_id),
+                commitment: hex::encode(m.commitment),
+                r: hex::encode(m.r),
+            })
+            .collect(),
+    };
+    toml::to_string_pretty(&record).map_err(|e| format!("serialize ceremony record: {e}"))
+}
+
+/// Parse a committed TOML record back into a [`Transcript`] (the reader for
+/// slice 002/003 and audit tooling). Verification is the caller's step —
+/// `Transcript::verify` re-checks the whole record from first principles.
+pub fn parse_transcript_record(text: &str) -> Result<Transcript, String> {
+    let record: CeremonyRecordToml =
+        toml::from_str(text).map_err(|e| format!("parse ceremony record: {e}"))?;
+    Ok(Transcript {
+        nonce: hex32(&record.nonce, "nonce")?,
+        chain_id: record.chain_id.into_bytes(),
+        members: record
+            .members
+            .iter()
+            .map(|m| {
+                Ok(TranscriptEntry {
+                    device_id: hex32(&m.device_id, "device_id")?,
+                    commitment: hex32(&m.commitment, "commitment")?,
+                    r: hex32(&m.r, "r")?,
+                })
+            })
+            .collect::<Result<_, String>>()?,
+        key_id: record.key_id,
+    })
+}
+
+fn hex32(s: &str, field: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(s).map_err(|e| format!("ceremony record {field}: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("ceremony record {field} is not 32 bytes"))
+}
+
+/// Persist a completed ceremony's outcome: seal `S` under the vault, commit
+/// the transcript record (and fill this device's membership `key_id`, when a
+/// row for the chain exists) as one `shared_ceremony` commit on the device
+/// chain. Idempotent — a retried call after a partial failure finishes the
+/// missing half; a fully-persisted outcome returns the current tip without
+/// minting a duplicate commit.
+///
+/// Takes the daemon (not a locked inner) because its callers — the initiator's
+/// add-hook thread and the responder's serve thread — run the network ceremony
+/// with the daemon mutex released; only this persistence step locks it.
+pub fn persist_ceremony_outcome(
+    daemon: &Daemon,
+    s: &SharedKey,
+    transcript: &Transcript,
+) -> Result<Hash, (ErrorKind, String)> {
+    // Consistency guards before anything durable happens: the key must be the
+    // transcript's, the transcript must re-verify from first principles, and
+    // this device must be one of its members (a foreign transcript would store
+    // a key for a chain we have no part in).
+    if key_id(s) != transcript.key_id {
+        return Err((
+            ErrorKind::Internal,
+            "ceremony outcome mismatch: key_id(S) != transcript.key_id".into(),
+        ));
+    }
+    if !transcript.verify() {
+        return Err((
+            ErrorKind::Internal,
+            "ceremony transcript failed verification; refusing to persist".into(),
+        ));
+    }
+    let chain_id = std::str::from_utf8(&transcript.chain_id)
+        .map_err(|_| (ErrorKind::Internal, "ceremony chain_id is not UTF-8".to_string()))?
+        .to_string();
+    let rel = ceremony_record_rel(&transcript.key_id);
+    let record = render_transcript_record(transcript).map_err(|e| (ErrorKind::Internal, e))?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    {
+        let session = inner.session.as_ref().expect("unlocked");
+        if !transcript
+            .members
+            .iter()
+            .any(|m| m.device_id == session.identity_pubkey().to_bytes())
+        {
+            return Err((
+                ErrorKind::Internal,
+                "this device is not a member of the ceremony transcript".into(),
+            ));
+        }
+    }
+
+    // Membership fill: when this device's committed allow-list has a row for
+    // the ceremony's chain, its `key_id` becomes this ceremony's. A row is not
+    // required — the responder may not have added the subtree locally yet.
+    let membership_update = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        let mut membership = read_committed_shared_subtrees_for_mutation(repo, session)?;
+        let mut changed = false;
+        for row in membership.subtrees.iter_mut() {
+            if row.ref_name == chain_id && row.key_id.as_deref() != Some(&transcript.key_id) {
+                row.key_id = Some(transcript.key_id.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            Some(membership.to_toml().map_err(|e| {
+                (ErrorKind::Internal, format!("serialize shared-subtrees: {e}"))
+            })?)
+        } else {
+            None
+        }
+    };
+
+    // Seal `S` first: the vault write is idempotent, so a commit failure after
+    // it leaves a retryable half-state, never a committed record without a key.
+    {
+        let session = inner.session.as_ref().expect("unlocked");
+        session
+            .store_shared_key(&transcript.key_id, s)
+            .map_err(|e| (ErrorKind::Internal, format!("store shared key: {e}")))?;
+    }
+
+    let record_exists = {
+        let wt = WorkTree::new(daemon, &inner);
+        wt.exists(&rel)
+    };
+    if record_exists && membership_update.is_none() {
+        // Fully persisted already (a retried responder/initiator call): the
+        // committed record is authoritative; do not mint a duplicate commit.
+        let repo = inner.repo.as_ref().expect("unlocked");
+        let tip = repo
+            .tip()
+            .map_err(|e| (ErrorKind::Internal, format!("read tip: {e}")))?
+            .expect("unlocked repo has a genesis tip");
+        return Ok(tip);
+    }
+
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        if !record_exists {
+            wt.write(&rel, record.as_bytes())?;
+        }
+        if let Some(toml) = &membership_update {
+            wt.write(&shared_subtrees_rel(), toml.as_bytes())?;
+        }
+    }
+    let intent = Intent::new(
+        "shared_ceremony",
+        serde_json::json!({ "chain_id": chain_id, "key_id": transcript.key_id }),
+    )
+    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    commit_now(&mut inner, intent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +638,208 @@ mod tests {
         let mut transport = SessionTransport::responder(DeadLink, marker.clone());
         assert_eq!(transport.recv().unwrap(), marker); // buffered — link untouched
         assert!(transport.recv().is_err()); // now falls through to the dead link
+    }
+
+    // --- persist_ceremony_outcome (CHUNK B0) --------------------------------
+
+    use ed25519_dalek::SigningKey;
+    use softfig_net::ceremony::{derive_shared_key, MemberContribution};
+
+    use crate::handlers;
+    use crate::KeeperConfig;
+
+    const PASS: &[u8] = b"pw-test-12345";
+
+    /// An unlocked daemon over a fresh tempdir garden, on the slice-007
+    /// unmounted-FUSE attach seam (the m5c fixture's harness, without the
+    /// serve loop — the handlers are called directly).
+    fn unlocked_daemon() -> (Daemon, tempfile::TempDir) {
+        use softfig_vault::{params::VaultParams, Vault};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = VaultParams::default();
+        params.argon2.m_cost = 8;
+        params.argon2.t_cost = 1;
+        params.argon2.p_cost = 1;
+        let (_v, session, _r) = Vault::init_with_params(tmp.path(), PASS, params).unwrap();
+        softfig_vcs::Repo::init(tmp.path(), &session).unwrap();
+        drop(session);
+
+        let daemon = Daemon::new(
+            KeeperConfig::new(tmp.path())
+                .without_watcher()
+                .with_unmounted_fuse_attach(),
+        );
+        let reply = handlers::unlock(
+            &daemon,
+            serde_json::json!({ "passphrase": String::from_utf8_lossy(PASS) }),
+        );
+        assert!(reply.is_ok(), "unlock: {reply:?}");
+        (daemon, tmp)
+    }
+
+    fn daemon_device_id(daemon: &Daemon) -> [u8; 32] {
+        let inner = daemon.inner.lock().unwrap();
+        inner
+            .session
+            .as_ref()
+            .expect("unlocked")
+            .identity_pubkey()
+            .to_bytes()
+    }
+
+    /// Fabricate a completed 2-member ceremony outcome for `chain`. The
+    /// transcript carries no signatures (commit/reveal auth is the drive
+    /// loop's job), so entries for arbitrary device ids — including the
+    /// daemon's own — verify from the commitment binding alone.
+    fn fabricate_outcome(member_ids: [[u8; 32]; 2], chain: &[u8]) -> (SharedKey, Transcript) {
+        let nonce = [7u8; 32];
+        let rs = [[0x11u8; 32], [0x22u8; 32]];
+        let contributions: Vec<MemberContribution> = member_ids
+            .iter()
+            .zip(rs.iter())
+            .map(|(id, r)| MemberContribution { device_id: *id, r: *r })
+            .collect();
+        let s = derive_shared_key(&nonce, &contributions);
+        let members = contributions
+            .iter()
+            .map(|mc| TranscriptEntry {
+                device_id: mc.device_id,
+                commitment: commitment(&nonce, &mc.device_id, &mc.r),
+                r: mc.r,
+            })
+            .collect();
+        let transcript = Transcript {
+            nonce,
+            chain_id: chain.to_vec(),
+            members,
+            key_id: key_id(&s),
+        };
+        assert!(transcript.verify());
+        (s, transcript)
+    }
+
+    fn peer_id(seed: u8) -> [u8; 32] {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes()
+    }
+
+    #[test]
+    fn record_toml_roundtrips_and_reverifies() {
+        let (_s, transcript) = fabricate_outcome([peer_id(1), peer_id(2)], b"chain/demo");
+        let text = render_transcript_record(&transcript).unwrap();
+        // Hex fields + string chain id, per the locked record shape.
+        assert!(text.contains(&format!("key_id = \"{}\"", transcript.key_id)));
+        assert!(text.contains("chain_id = \"chain/demo\""));
+        assert!(text.contains(&format!("nonce = \"{}\"", hex::encode(transcript.nonce))));
+        let parsed = parse_transcript_record(&text).unwrap();
+        assert_eq!(parsed, transcript);
+        assert!(parsed.verify());
+    }
+
+    #[test]
+    fn persist_seals_s_commits_record_and_fills_membership() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let add = handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        let (s, transcript) =
+            fabricate_outcome([daemon_device_id(&daemon), peer_id(9)], ref_name.as_bytes());
+        let hash = persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
+
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+
+        // 1. `S` is sealed under the vault, addressable by key_id.
+        assert_eq!(*session.load_shared_key(&transcript.key_id).unwrap(), s);
+
+        // 2. The committed record re-parses + re-verifies, at the locked path.
+        let rel = ceremony_record_rel(&transcript.key_id);
+        let wt = WorkTree::new(&daemon, &inner);
+        let text = wt.read_to_string(&rel).expect("committed record readable");
+        let parsed = parse_transcript_record(&text).unwrap();
+        assert_eq!(parsed, transcript);
+        assert!(parsed.verify());
+
+        // 3. The membership row's key_id is filled, in the same commit.
+        let membership = read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
+        let row = membership
+            .subtrees
+            .iter()
+            .find(|r| r.ref_name == ref_name)
+            .expect("membership row");
+        assert_eq!(row.key_id.as_deref(), Some(transcript.key_id.as_str()));
+
+        // 4. The tip is a `shared_ceremony` commit with the compact payload.
+        assert_eq!(repo.tip().unwrap().unwrap(), hash);
+        let row = repo.db().get_commit(&hash).unwrap();
+        assert_eq!(row.intent, "shared_ceremony");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+        assert_eq!(payload["chain_id"].as_str(), Some(ref_name.as_str()));
+        assert_eq!(payload["key_id"].as_str(), Some(transcript.key_id.as_str()));
+    }
+
+    #[test]
+    fn persist_is_idempotent() {
+        let (daemon, _tmp) = unlocked_daemon();
+        handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let (s, transcript) =
+            fabricate_outcome([daemon_device_id(&daemon), peer_id(9)], b"chain/journals");
+
+        let first = persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
+        let second = persist_ceremony_outcome(&daemon, &s, &transcript).expect("re-persist");
+        // The retry finds everything persisted and mints no duplicate commit.
+        assert_eq!(first, second);
+        let inner = daemon.inner.lock().unwrap();
+        assert_eq!(inner.repo.as_ref().unwrap().tip().unwrap().unwrap(), first);
+    }
+
+    /// The responder case: no local membership row for the chain. `S` + the
+    /// record still persist; membership is simply untouched.
+    #[test]
+    fn persist_without_a_membership_row() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let (s, transcript) =
+            fabricate_outcome([daemon_device_id(&daemon), peer_id(9)], b"chain/elsewhere");
+        persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
+
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+        assert_eq!(*session.load_shared_key(&transcript.key_id).unwrap(), s);
+        let membership = read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
+        assert!(membership.subtrees.is_empty());
+    }
+
+    #[test]
+    fn persist_refuses_inconsistent_or_foreign_outcomes() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let our_id = daemon_device_id(&daemon);
+
+        // A transcript this device is no member of.
+        let (s, foreign) = fabricate_outcome([peer_id(1), peer_id(2)], b"chain/x");
+        assert!(persist_ceremony_outcome(&daemon, &s, &foreign).is_err());
+
+        // key_id(S) != transcript.key_id.
+        let (s, mut tampered) = fabricate_outcome([our_id, peer_id(9)], b"chain/x");
+        tampered.key_id = "S-0000000000000000".into();
+        assert!(persist_ceremony_outcome(&daemon, &s, &tampered).is_err());
+
+        // key_id matches but a commitment no longer opens: verify() fails.
+        let (s, mut broken) = fabricate_outcome([our_id, peer_id(9)], b"chain/x");
+        broken.members[0].commitment[0] ^= 1;
+        assert!(persist_ceremony_outcome(&daemon, &s, &broken).is_err());
+
+        // Nothing was persisted by the refused calls.
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        assert!(!session.has_shared_key(&key_id(&s)));
     }
 }

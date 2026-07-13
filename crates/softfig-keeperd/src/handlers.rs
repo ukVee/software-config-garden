@@ -1573,7 +1573,7 @@ fn read_committed_shared_subtrees(
 /// read into a committed allow-list wipe (and a lenient rewrite would silently
 /// drop fields this daemon doesn't understand). Only a genuinely-absent file
 /// (or a repo with no commits yet) may start from an empty allow-list.
-fn read_committed_shared_subtrees_for_mutation(
+pub(crate) fn read_committed_shared_subtrees_for_mutation(
     repo: &Repo,
     session: &softfig_vault::VaultSession,
 ) -> std::result::Result<softfig_vcs::SharedSubtreesConfig, (ErrorKind, String)> {
@@ -1630,7 +1630,7 @@ fn load_local_toggles(state_dir: &Path) -> softfig_vcs::LocalToggles {
 // recomposes live (a no-op in non-FUSE mode; re-derived at the next mount).
 
 /// Repo-relative path of the committed membership file (`config/shared-subtrees.toml`).
-fn shared_subtrees_rel() -> String {
+pub(crate) fn shared_subtrees_rel() -> String {
     format!(
         "{}/{}",
         crate::keeper_toml::CONFIG_DIR,
