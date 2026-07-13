@@ -92,9 +92,18 @@ impl Chain {
 
 /// The garden's chain composition. The device chain is always present; shared
 /// chains are added from `config/shared-subtrees.toml` (slice 003). v1 shares
-/// have **disjoint** mount prefixes (validated at add-time in slice 003), so at
-/// most one shared chain can own any path; longest-prefix routing tolerates
-/// nesting should the disjoint rule ever relax.
+/// have **disjoint** mount prefixes (validated at add-time in slice 003 via
+/// `validate_share_add`), so at most one shared chain can own any path.
+///
+/// Nesting is a **write-side** capability only. The write router
+/// ([`Self::owning_chain`] / [`Self::split_snapshot`]) routes each path to its
+/// longest-prefix owner, so a deeper mount would correctly claim its subtree
+/// even inside a shallower one. The **read side** does not compose that way:
+/// the FUSE `build_union` graft clears and overlays each enabled chain in
+/// registry order, not depth order, so a shallower mount grafted after a deeper
+/// one would wipe the deeper mount's reads. Nesting therefore stays unreachable
+/// in v1 by the disjoint add-time rule; relaxing it would first require
+/// grafting reads shallow→deep to match the router.
 #[derive(Debug, Clone)]
 pub struct ChainRegistry {
     device: Chain,
@@ -192,6 +201,12 @@ impl ChainRegistry {
     /// own nothing (an empty snapshot). A **`device_only`** registry routes every
     /// path to the device chain unchanged, so the single returned snapshot is
     /// byte-identical to `unified` — the additive, off-by-default guarantee.
+    ///
+    /// A file at **exactly** a mount path (not under it) would strip to an empty
+    /// relative path and be silently dropped here. That shape is unreachable in
+    /// v1: `add` refuses a mount path that already holds committed device content
+    /// (the populated-dir guard), and once grafted the mount is a directory, so
+    /// no file can occupy the mount path itself.
     pub fn split_snapshot(&self, unified: &WalkSnapshot) -> Vec<(String, WalkSnapshot)> {
         let mut snaps: Vec<(String, WalkSnapshot)> = self
             .enabled_chains()
@@ -200,6 +215,8 @@ impl ChainRegistry {
         for (path, mode, content) in unified.files() {
             let chain = self.owning_chain(&path);
             let rel = match &chain.mount_path {
+                // `path == mount` (a file at the mount path itself) → empty `rel`
+                // → a dropped no-op insert; unreachable in v1 (see the doc note).
                 Some(mount) => path.strip_prefix(mount).unwrap_or(&path).to_path_buf(),
                 None => path.clone(),
             };
