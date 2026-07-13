@@ -34,11 +34,19 @@ message Frame {
     GetObject get_object = 107;        // sink -> source: fetch one ciphertext blob
     ObjectData object_data = 108;      // source -> sink: ciphertext bytes (or not-found)
     ReplicaDone replica_done = 109;    // sink -> source: pull complete, close
+    // M5d (shared subtrees): the collaborative commit-reveal key ceremony that
+    // derives a shared subtree's key S, 200+. Both frames are signed by the
+    // sender's Ed25519 identity and honoured only from ring members of the
+    // ceremony's set; the pure state machine + signing-byte layout live in
+    // softfig-net's `ceremony` module.
+    SharedKeyCommit shared_key_commit = 200; // member -> members: signed H(r_i) + nonce
+    SharedKeyReveal shared_key_reveal = 201; // member -> members: signed reveal of r_i
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
   // 23-99 are held for later control-plane variants; 100-199 is the M5b data
-  // plane; 200+ stays open for later sync slices (shared subtrees, M5d+).
+  // plane; 200-201 is the M5d shared-key ceremony; 202+ stays open for later
+  // sync slices (shared-chain push, rotation, M5d+/M5e).
   reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
@@ -187,3 +195,35 @@ message ObjectData {
 
 // sink -> source: the pull completed; the source may close the session.
 message ReplicaDone {}
+
+// --- M5d shared-subtree key ceremony ---------------------------------------
+//
+// The collaborative commit-reveal ceremony that derives a shared subtree's key
+// S (meta/spec-sync.md §"Crypto — the collaboratively-generated shared key S").
+// Every member first broadcasts a signed commitment H(nonce ‖ device_id ‖ r_i)
+// plus the ceremony nonce; only once all commitments are in does anyone reveal
+// r_i, and everyone checks each reveal against the published commitment. Both
+// frames are signed by the sender's Ed25519 identity over the domain-separated
+// encodings in softfig-net's `ceremony` module (commit_signing_bytes /
+// reveal_signing_bytes) and are honoured only from ring members of the
+// ceremony's set. protobuf is not canonical: the driver re-derives the signed
+// bytes from these fields — it never signs or verifies a re-serialization.
+
+// member -> members: a signed commitment, broadcast before anyone reveals.
+message SharedKeyCommit {
+  bytes nonce = 1;       // 32-byte ceremony nonce
+  bytes chain_id = 2;    // the shared subtree's chain id this ceremony keys
+  bytes device_id = 3;   // the committer's Ed25519 identity (32 bytes)
+  bytes commitment = 4;  // 32-byte BLAKE3 commitment H(nonce ‖ device_id ‖ r_i)
+  bytes signature = 5;   // Ed25519 (64 bytes) over commit_signing_bytes(...)
+}
+
+// member -> members: the reveal of r_i; everyone checks it against the
+// commitment it published for this ceremony. A mismatch aborts the ceremony.
+message SharedKeyReveal {
+  bytes nonce = 1;        // 32-byte ceremony nonce
+  bytes chain_id = 2;     // the shared subtree's chain id
+  bytes device_id = 3;    // the revealer's Ed25519 identity (32 bytes)
+  bytes contribution = 4; // the revealed r_i (32 bytes)
+  bytes signature = 5;    // Ed25519 (64 bytes) over reveal_signing_bytes(...)
+}

@@ -12,8 +12,8 @@ mod generated {
 
 pub use generated::{
     frame, CommitData, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, ObjectData,
-    Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, StateAnnounce, TipAnnounce,
-    TreeData, TreeEntryMsg,
+    Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, SharedKeyCommit,
+    SharedKeyReveal, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg,
 };
 
 impl Frame {
@@ -125,6 +125,24 @@ impl Frame {
     pub fn replica_done() -> Self {
         Self {
             kind: Some(frame::Kind::ReplicaDone(ReplicaDone {})),
+        }
+    }
+
+    // --- M5d shared-key ceremony frame constructors ------------------------
+
+    /// A `SharedKeyCommit` frame (member -> members): a signed commitment
+    /// broadcast in the commit phase.
+    pub fn shared_key_commit(commit: SharedKeyCommit) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedKeyCommit(commit)),
+        }
+    }
+
+    /// A `SharedKeyReveal` frame (member -> members): the signed reveal of a
+    /// member's contribution in the reveal phase.
+    pub fn shared_key_reveal(reveal: SharedKeyReveal) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedKeyReveal(reveal)),
         }
     }
 }
