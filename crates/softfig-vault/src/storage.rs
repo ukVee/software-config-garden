@@ -13,6 +13,7 @@ pub const KEK_RECOVERY_FILE: &str = "k.recovery";
 pub const IDENTITY_FILE: &str = "identity.key";
 pub const TRANSPORT_FILE: &str = "transport.key";
 pub const MASTER_DIR: &str = "master";
+pub const SHARED_KEYS_DIR: &str = "shared-keys";
 
 /// Path helper centralizing the on-disk layout. Construct via `VaultPaths::for_garden`.
 #[derive(Debug, Clone)]
@@ -59,6 +60,18 @@ impl VaultPaths {
     }
     pub fn master(&self, id: u32) -> PathBuf {
         self.master_dir().join(format!("{id}.key"))
+    }
+    /// M5d — sealed shared-subtree keys, one file per `key_id`. Each holds an
+    /// externally-derived key `S` (the collaborative ceremony's output) sealed
+    /// under the master key, so it is readable only through an unlocked
+    /// session. See [`crate::session::VaultSession::store_shared_key`].
+    pub fn shared_keys_dir(&self) -> PathBuf {
+        self.root.join(SHARED_KEYS_DIR)
+    }
+    /// The sealed file for one shared key. `key_id` must already be validated
+    /// (the session methods own that) — this only joins the path.
+    pub fn shared_key(&self, key_id: &str) -> PathBuf {
+        self.shared_keys_dir().join(format!("{key_id}.key"))
     }
 
     pub fn exists(&self) -> bool {

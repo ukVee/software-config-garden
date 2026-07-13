@@ -552,3 +552,91 @@ fn relock_blob_does_not_cross_gardens() {
         other => panic!("expected AuthFailed across gardens, got {other:?}"),
     }
 }
+
+// --- M5d: sealed shared-key store (`store/load/has_shared_key`) -------------
+
+/// A ceremony-shaped id: `S-<16 hex>` (the real `key_id` form).
+const KEY_ID: &str = "S-7f3a9b2c4d5e6f01";
+const S_KEY: [u8; 32] = [0x42; 32];
+
+#[test]
+fn shared_key_roundtrips_and_is_sealed_at_rest() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    let loaded = session.load_shared_key(KEY_ID).expect("load");
+    assert_eq!(*loaded, S_KEY);
+    assert!(session.has_shared_key(KEY_ID));
+    assert!(!session.has_shared_key("S-0000000000000000"));
+
+    // At rest the file is the master-keyed blob format, not plaintext `S`.
+    let path = tmp
+        .path()
+        .join(".softfig/vault/shared-keys")
+        .join(format!("{KEY_ID}.key"));
+    let on_disk = fs::read(&path).expect("sealed file exists");
+    assert_ne!(on_disk.as_slice(), S_KEY.as_slice());
+    assert!(!on_disk
+        .windows(S_KEY.len())
+        .any(|w| w == S_KEY.as_slice()));
+}
+
+#[test]
+fn shared_key_store_is_idempotent_but_refuses_different_material() {
+    let (_tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    // Same id + same S: idempotent (convergent sealing → identical bytes).
+    session.store_shared_key(KEY_ID, &S_KEY).expect("re-store");
+    // Same id + different S: a caller bug or tampering — refused, and the
+    // original material is untouched.
+    let other = [0x43u8; 32];
+    assert!(session.store_shared_key(KEY_ID, &other).is_err());
+    assert_eq!(*session.load_shared_key(KEY_ID).expect("load"), S_KEY);
+}
+
+#[test]
+fn shared_key_rejects_traversal_shaped_ids() {
+    let (_tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    for bad in ["", "../evil", "a/b", "a.b", "S-abc def", &"x".repeat(65)] {
+        assert!(session.store_shared_key(bad, &S_KEY).is_err(), "store {bad:?}");
+        assert!(session.load_shared_key(bad).is_err(), "load {bad:?}");
+        assert!(!session.has_shared_key(bad), "has {bad:?}");
+    }
+}
+
+#[test]
+fn shared_key_survives_relock_but_tamper_fails_closed() {
+    let (tmp, vault) = fresh_vault();
+    {
+        let session = vault.unlock(PASSPHRASE).expect("unlock");
+        session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    }
+    // A fresh unlock (new session, same master) still reads it.
+    let session = Vault::at(tmp.path()).unlock(PASSPHRASE).expect("re-unlock");
+    assert_eq!(*session.load_shared_key(KEY_ID).expect("load"), S_KEY);
+
+    // Flip a ciphertext byte: AEAD auth fails closed.
+    let path = tmp
+        .path()
+        .join(".softfig/vault/shared-keys")
+        .join(format!("{KEY_ID}.key"));
+    let mut bytes = fs::read(&path).expect("read sealed");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&path, &bytes).expect("write tampered");
+    match session.load_shared_key(KEY_ID) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("expected AuthFailed on tamper, got {other:?}"),
+    }
+}
+
+#[test]
+fn random_bytes32_returns_distinct_material() {
+    // Smoke, not a statistical test: two draws differing proves the surface
+    // is wired to a live RNG rather than a constant.
+    assert_ne!(softfig_vault::random_bytes32(), softfig_vault::random_bytes32());
+}

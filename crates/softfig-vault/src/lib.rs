@@ -30,3 +30,14 @@ pub use relock::{RelockBlob, RelockToken, RELOCK_TTL_SECS};
 pub use session::VaultSession;
 pub use storage::{discover_garden, VaultPaths};
 pub use vault::Vault;
+
+/// 32 bytes of OS-sourced cryptographically secure randomness. The vault is
+/// the workspace's keygen surface (it mints every key), so callers needing
+/// fresh key-grade material — e.g. the M5d ceremony nonce and contribution —
+/// draw it here instead of growing their own RNG dependency.
+pub fn random_bytes32() -> [u8; 32] {
+    use rand::RngCore;
+    let mut out = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut out);
+    out
+}

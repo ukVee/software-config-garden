@@ -114,6 +114,56 @@ impl VaultSession {
         layer_b::decrypt(blob_file, &key)
     }
 
+    /// M5d — persist an externally-derived 32-byte shared-subtree key `S`
+    /// under the vault, addressable by its public `key_id` (`S-<hex>`). The
+    /// key is sealed with the master-keyed blob format
+    /// ([`crate::blob::encrypt_blob`]) at
+    /// `.softfig/vault/shared-keys/<key_id>.key`, so it is readable only
+    /// through an unlocked session — the same at-rest posture as every other
+    /// vault secret. `S` is full-entropy ceremony output, so the convergent
+    /// nonce derivation is safe here and makes the write idempotent (same
+    /// `S` + same master → identical sealed bytes).
+    ///
+    /// Storing a *different* `S` under an already-used `key_id` is refused:
+    /// `key_id` is a one-way hash of `S`, so a mismatch means a caller bug or
+    /// tampering, never a legitimate rotation (rotation derives a fresh
+    /// `key_id`).
+    pub fn store_shared_key(&self, key_id: &str, s: &[u8; 32]) -> Result<()> {
+        validate_shared_key_id(key_id)?;
+        let sealed = blob::encrypt_blob(&self.masters, s)?;
+        let path = self.paths.shared_key(key_id);
+        if let Ok(existing) = std::fs::read(&path) {
+            if existing == sealed {
+                return Ok(()); // idempotent re-store
+            }
+            return Err(crate::error::VaultError::Malformed(
+                "shared key id already stored with different key material",
+            ));
+        }
+        std::fs::create_dir_all(self.paths.shared_keys_dir())?;
+        std::fs::write(&path, &sealed)?;
+        Ok(())
+    }
+
+    /// M5d — fetch a stored shared-subtree key by its `key_id`. Zeroized on
+    /// drop; the caller must not copy it out of the returned guard except
+    /// into another zeroizing home.
+    pub fn load_shared_key(&self, key_id: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        validate_shared_key_id(key_id)?;
+        let sealed = std::fs::read(self.paths.shared_key(key_id))?;
+        let plain = zeroize::Zeroizing::new(blob::decrypt_blob(&self.masters, &sealed)?);
+        let s: [u8; 32] = plain.as_slice().try_into().map_err(|_| {
+            crate::error::VaultError::Malformed("shared key blob is not 32 bytes")
+        })?;
+        Ok(zeroize::Zeroizing::new(s))
+    }
+
+    /// M5d — whether a shared key is already stored under `key_id`. An
+    /// invalid id is simply "not stored".
+    pub fn has_shared_key(&self, key_id: &str) -> bool {
+        validate_shared_key_id(key_id).is_ok() && self.paths.shared_key(key_id).is_file()
+    }
+
     /// Test whether `passphrase` unlocks this session's self-path KEK.
     /// Used by the daemon to verify a fresh master-password prompt
     /// before allowing a `softfig reveal`. Argon2id cost is paid on
@@ -191,5 +241,24 @@ impl VaultSession {
             },
         )?;
         Ok(new_id)
+    }
+}
+
+/// A shared-key id is used as a filename under `.softfig/vault/shared-keys/`,
+/// so it must never traverse: non-empty, ≤ 64 bytes, and only
+/// `[A-Za-z0-9_-]` (the real ids are `S-<hex>`, well inside this). No dots,
+/// no separators.
+fn validate_shared_key_id(key_id: &str) -> Result<()> {
+    let ok = !key_id.is_empty()
+        && key_id.len() <= 64
+        && key_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::error::VaultError::Malformed(
+            "shared key id must be 1-64 chars of [A-Za-z0-9_-]",
+        ))
     }
 }
