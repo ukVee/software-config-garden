@@ -1622,10 +1622,11 @@ fn load_local_toggles(state_dir: &Path) -> softfig_vcs::LocalToggles {
 //
 // Two control axes, deliberately split ([[decision-softfig-shared-subtrees-impl]]
 // pick 3): `add`/`remove` edit the committed, ring-membership file
-// `config/shared-subtrees.toml` (the collaborative key ceremony is the stubbed
-// m5d hook — no real `S` is wired here); `enable`/`disable` flip ONLY the
-// never-committed `.softfig/shared-subtrees-local.toml` sidecar, so the on/off
-// toggle is provably ceremony-free (no membership/key_id/commit side-effect).
+// `config/shared-subtrees.toml` (the collaborative key ceremony hangs off the
+// add's commit — the m5d net reconcile sweep runs it and fills `key_id`);
+// `enable`/`disable` flip ONLY the never-committed
+// `.softfig/shared-subtrees-local.toml` sidecar, so the on/off toggle is
+// provably ceremony-free (no membership/key_id/commit side-effect).
 // After any change the mount's registry is hot-swapped so the union view
 // recomposes live (a no-op in non-FUSE mode; re-derived at the next mount).
 
@@ -1872,8 +1873,11 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         )?;
     }
 
-    // Append the membership row (`key_id` stays `None` — the collaborative key S
-    // is the stubbed m5d hook) and stage the config edit through the WorkTree.
+    // Append the membership row with `key_id` empty and stage the config edit
+    // through the WorkTree. The collaborative key ceremony (m5d) is deferred,
+    // never an inline block: this commit signals the net reconcile loop, whose
+    // ceremony sweep runs the commit-reveal with the peer and fills `key_id`
+    // when members are next online (`net::reconcile_ceremonies`).
     membership.subtrees.push(softfig_vcs::SharedSubtreeEntry {
         id: id.clone(),
         mount_path: mount_path.clone(),

@@ -39,10 +39,11 @@ use std::time::{Duration, Instant};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use softfig_ipc::verbs::DiscoveredDevice;
 use softfig_ipc::ErrorKind;
+use softfig_net::ceremony::{run_ceremony, Ceremony, SharedKey, Transcript};
 use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
-use softfig_net::proto::{frame, Frame, ReplicaGrant, TipAnnounce};
+use softfig_net::proto::{frame, Frame, ReplicaGrant, SharedKeyCommit, TipAnnounce};
 use softfig_net::connect::{plan_routes, Route};
 use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
@@ -56,6 +57,10 @@ use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo};
 
 use crate::actions::WorkTree;
+use crate::ceremony::{
+    assemble_member_set, persist_ceremony_outcome, CeremonyLink, SessionTransport,
+    VaultCeremonySigner,
+};
 use crate::config::KeeperConfig;
 use crate::daemon::{Daemon, DaemonInner};
 use crate::keeper_toml::CONFIG_DIR;
@@ -662,7 +667,7 @@ fn serve_inbound(daemon: Daemon, local: &LocalDevice, ring: &Arc<Mutex<Ring>>, c
         // dispatch on the first frame (liveness ping vs. a replication push).
         match ik_responder(conn, &local.transport_secret, &local.hello()) {
             Ok(session) => match ring_member_entry(ring, session.peer_static()) {
-                Some(owner) => serve_established(&daemon, local, &owner, session),
+                Some(owner) => serve_established(&daemon, local, &owner, ring, session),
                 None => {
                     eprintln!("keeperd: net: rejecting reconnect from unknown transport key")
                 }
@@ -674,11 +679,14 @@ fn serve_inbound(daemon: Daemon, local: &LocalDevice, ring: &Arc<Mutex<Ring>>, c
 
 /// Dispatch an established inbound session on its first frame: a `Ping` is a
 /// liveness probe (echo loop); a `ReplicaGrant` is an owner pushing its chain to
-/// us as a backup host (verify the grant, then mirror via `pull_replication`).
+/// us as a backup host (verify the grant, then mirror via `pull_replication`); a
+/// `SharedKeyCommit` is a member initiating the M5d shared-key ceremony (serve
+/// the responder role inline on this thread).
 fn serve_established(
     daemon: &Daemon,
     local: &LocalDevice,
     owner: &RingEntry,
+    ring: &Arc<Mutex<Ring>>,
     mut session: NoiseSession<TcpStream>,
 ) {
     let Ok(frame) = session.recv_frame() else {
@@ -694,8 +702,87 @@ fn serve_established(
         Some(frame::Kind::ReplicaGrant(grant)) => {
             serve_replica_ingest(daemon, local, owner, grant, session)
         }
+        Some(frame::Kind::SharedKeyCommit(commit)) => {
+            serve_ceremony_responder(daemon, local, ring, commit, session)
+        }
         // Anything else ends the session cleanly.
         _ => {}
+    }
+}
+
+/// Responder side of the M5d shared-key ceremony, dispatched on the session's
+/// first `SharedKeyCommit`. The ceremony parameters split by trust: the nonce
+/// and chain id ride the initiator's (signed) commit, but the **member set is
+/// assembled from our own ring** — never from the wire — so both sides bind the
+/// identical sorted set and a rogue frame cannot vote members in or out. The
+/// session peer is already ring-authenticated (IK + [`ring_member_entry`]), and
+/// [`run_ceremony`] signature-verifies every frame against the member set.
+/// Generic over the link so the full responder path runs headlessly in tests.
+fn serve_ceremony_responder<L: CeremonyLink>(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    ring: &Arc<Mutex<Ring>>,
+    commit: SharedKeyCommit,
+    link: L,
+) {
+    use zeroize::Zeroize;
+
+    let members = {
+        let ring = ring.lock().unwrap();
+        assemble_member_set(&ring, local.device_id)
+    };
+    if members.len() > 2 {
+        eprintln!(
+            "keeperd: net: shared-key ceremony refused: >2 ring members not yet supported \
+             (v1 is point-to-point)"
+        );
+        return;
+    }
+    let Ok(nonce) = <[u8; 32]>::try_from(commit.nonce.as_slice()) else {
+        eprintln!("keeperd: net: shared-key-commit nonce is not 32 bytes");
+        return;
+    };
+    let chain = String::from_utf8_lossy(&commit.chain_id).into_owned();
+    let contribution = softfig_vault::random_bytes32();
+    let mut ceremony = match Ceremony::new(
+        nonce,
+        commit.chain_id.clone(),
+        &members,
+        local.device_id,
+        contribution,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("keeperd: net: shared-key ceremony for {chain} refused: {e}");
+            return;
+        }
+    };
+    let signer = {
+        let inner = daemon.inner.lock().unwrap();
+        let Some(session) = inner.session.as_ref() else {
+            return; // locked mid-serve — the initiator retries a later tick
+        };
+        VaultCeremonySigner::new(Arc::clone(session))
+    };
+    // The dispatch consumed the initiator's first frame; the responder
+    // transport replays it so the driver sees every frame exactly once.
+    let first = Frame::shared_key_commit(commit);
+    let mut transport = SessionTransport::responder(link, first);
+    match run_ceremony(&mut transport, &signer, &mut ceremony) {
+        Ok((mut s, transcript)) => {
+            let key_id = transcript.key_id.clone();
+            match persist_ceremony_outcome(daemon, &s, &transcript) {
+                Ok(_) => eprintln!(
+                    "keeperd: net: shared-key ceremony complete for {chain}: {key_id}"
+                ),
+                Err((_, e)) => eprintln!(
+                    "keeperd: net: shared-key ceremony for {chain} derived {key_id} but \
+                     persisting failed: {e}"
+                ),
+            }
+            s.zeroize();
+        }
+        Err(e) => eprintln!("keeperd: net: shared-key ceremony for {chain} failed: {e}"),
     }
 }
 
@@ -985,6 +1072,14 @@ fn spawn_replica_loop(
             // early commit during the settle brings the reconcile forward.
             signal.wait_for_commit(REPLICA_INITIAL_DELAY);
             while !stop.load(Ordering::SeqCst) {
+                // M5d: pending shared-key ceremonies first, so a ceremony's
+                // `shared_ceremony` commit rides this same tick's replica push.
+                // The membership commit from `shared_subtree_add` signals this
+                // loop, which makes the add→ceremony hook event-driven; the
+                // interval is the offline-member retry (the locked liveness
+                // default: the row lands with `key_id` empty and the ceremony
+                // fills it when members next online — never an inline block).
+                reconcile_ceremonies(&daemon, &local);
                 reconcile_replicas(&daemon, &local);
                 signal.wait_for_commit(REPLICA_RECONCILE_INTERVAL);
             }
@@ -1065,6 +1160,166 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
             ),
         }
     }
+}
+
+/// One ceremony reconcile pass (M5d, initiator side): find committed shared
+/// subtrees still awaiting their key (`key_id` empty), and for each run the
+/// commit-reveal ceremony with the ring peer, then persist the outcome —
+/// filling the row's `key_id`. Snapshot under the daemon lock, ceremony with
+/// the lock released (never hold the mutex across network IO); a failed
+/// attempt (peer offline, mid-protocol error) leaves the row pending for the
+/// next tick — the deferred/retried liveness model, mirroring
+/// [`reconcile_replicas`]' per-tick catch-up.
+fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
+    use zeroize::Zeroize;
+
+    let snapshot = {
+        let inner = daemon.inner.lock().unwrap();
+        if inner.state != State::Unlocked {
+            return;
+        }
+        let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
+            return;
+        };
+        let pending: Vec<String> = {
+            let membership =
+                match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session)
+                {
+                    Ok(m) => m,
+                    Err((_, e)) => {
+                        eprintln!("keeperd: net: ceremony reconcile skipped: {e}");
+                        return;
+                    }
+                };
+            membership
+                .subtrees
+                .iter()
+                .filter(|row| row.key_id.is_none())
+                .map(|row| row.ref_name.clone())
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let state_dir = inner.config.state_dir().to_path_buf();
+        let ring = {
+            let wt = WorkTree::new(daemon, &inner);
+            load_ring(&wt, &state_dir).unwrap_or_default()
+        };
+        let relay_client = relay_client_config(&inner.config);
+        let signer = VaultCeremonySigner::new(Arc::clone(session));
+        (pending, ring, relay_client, signer)
+    };
+    let (pending, ring, relay_client, signer) = snapshot;
+
+    let members = assemble_member_set(&ring, local.device_id);
+    if members.len() < 2 {
+        // No paired peer yet — a collaborative key has no collaborator. Quiet:
+        // this is the normal share-before-pairing state, resolved by pairing.
+        return;
+    }
+    if members.len() > 2 {
+        eprintln!(
+            "keeperd: net: {} shared subtree(s) await a key, but the ring has {} members — \
+             ceremony >2 members not yet supported (v1 is point-to-point)",
+            pending.len(),
+            members.len() - 1
+        );
+        return;
+    }
+    let host = ring.peers()[0].clone();
+
+    for ref_name in pending {
+        match ceremony_with_host(local, &host, relay_client.as_ref(), &signer, &members, &ref_name)
+        {
+            Ok((mut s, transcript)) => {
+                let key_id = transcript.key_id.clone();
+                match persist_ceremony_outcome(daemon, &s, &transcript) {
+                    Ok(_) => eprintln!(
+                        "keeperd: net: shared-key ceremony complete for {ref_name}: {key_id}"
+                    ),
+                    Err((_, e)) => eprintln!(
+                        "keeperd: net: shared-key ceremony for {ref_name} derived {key_id} \
+                         but persisting failed: {e}"
+                    ),
+                }
+                s.zeroize();
+            }
+            Err(e) => eprintln!(
+                "keeperd: net: shared-key ceremony for {ref_name} skipped: {e}"
+            ),
+        }
+    }
+}
+
+/// Run the initiator side of one ceremony with the (single, v1) other member,
+/// preferring a LAN-direct dial and falling back to the relay — the
+/// [`push_to_host`] route model. Once a session is established the ceremony's
+/// result is final for this attempt (no route fallthrough mid-protocol); the
+/// reconcile tick retries with a fresh nonce.
+fn ceremony_with_host(
+    local: &LocalDevice,
+    host: &RingEntry,
+    relay_client: Option<&(String, [u8; 32])>,
+    signer: &VaultCeremonySigner,
+    members: &[[u8; 32]],
+    ref_name: &str,
+) -> Result<(SharedKey, Transcript), String> {
+    let routes = plan_routes(host, relay_client.is_some());
+    if routes.is_empty() {
+        return Err("no route to member (no LAN endpoint, no relay)".to_string());
+    }
+    let mut last_err = "no route to member".to_string();
+    for route in &routes {
+        match route {
+            Route::Direct(endpoint) => match dial_direct(local, host, endpoint) {
+                Ok(session) => return drive_initiator(session, signer, members, local, ref_name),
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            },
+            Route::Relay => {
+                let (relay_endpoint, relay_static) =
+                    relay_client.expect("relay route planned without a relay client");
+                match dial_relay(local, host, relay_endpoint, relay_static) {
+                    Ok(session) => {
+                        return drive_initiator(session, signer, members, local, ref_name)
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Drive one initiator ceremony over an established link: mint a fresh nonce +
+/// contribution from the vault's RNG, then run the commit-reveal protocol. The
+/// nonce is minted here — per established session — so no two attempts (or
+/// routes) ever share ceremony material.
+fn drive_initiator<L: CeremonyLink>(
+    link: L,
+    signer: &VaultCeremonySigner,
+    members: &[[u8; 32]],
+    local: &LocalDevice,
+    ref_name: &str,
+) -> Result<(SharedKey, Transcript), String> {
+    let nonce = softfig_vault::random_bytes32();
+    let contribution = softfig_vault::random_bytes32();
+    let mut ceremony = Ceremony::new(
+        nonce,
+        ref_name.as_bytes().to_vec(),
+        members,
+        local.device_id,
+        contribution,
+    )
+    .map_err(|e| format!("ceremony setup: {e}"))?;
+    let mut transport = SessionTransport::initiator(link);
+    run_ceremony(&mut transport, signer, &mut ceremony).map_err(|e| format!("ceremony: {e}"))
 }
 
 /// Parse the client-side relay dial target from `[relay] endpoint` +
@@ -1625,4 +1880,276 @@ mod tests {
         );
         assert_eq!(report.commits_checked, 4);
     }
+    // --- M5d slice 001 CHUNK B1: the shared-key ceremony wiring --------------
+
+    use softfig_net::static_attestation_message;
+
+    const CEREMONY_PASS: &str = "pw-test-12345";
+
+    /// An unlocked daemon on the unmounted-FUSE attach seam (the m5c/m5d
+    /// harness): handlers are called directly, no serve loop, no kernel mount.
+    fn ceremony_daemon() -> (Daemon, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = softfig_vault::params::VaultParams::default();
+        params.argon2.m_cost = 8;
+        params.argon2.t_cost = 1;
+        params.argon2.p_cost = 1;
+        let (_v, session, _r) =
+            softfig_vault::Vault::init_with_params(tmp.path(), CEREMONY_PASS.as_bytes(), params)
+                .unwrap();
+        softfig_vcs::Repo::init(tmp.path(), &session).unwrap();
+        drop(session);
+        let daemon = Daemon::new(
+            KeeperConfig::new(tmp.path())
+                .without_watcher()
+                .with_unmounted_fuse_attach(),
+        );
+        let reply = crate::handlers::unlock(
+            &daemon,
+            serde_json::json!({ "passphrase": CEREMONY_PASS }),
+        );
+        assert!(reply.is_ok(), "unlock: {reply:?}");
+        (daemon, tmp)
+    }
+
+    fn device_of(daemon: &Daemon, name: &str) -> LocalDevice {
+        let inner = daemon.inner.lock().unwrap();
+        build_local_device(inner.session.as_ref().unwrap(), name.to_string())
+    }
+
+    /// A real ring row for a live daemon: its actual identity + transport keys
+    /// and a genuine attestation, so `Ring::load` (which verifies) accepts it.
+    fn ring_entry_of(daemon: &Daemon, name: &str, endpoints: Vec<String>) -> RingEntry {
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let transport_pubkey = session.transport_pubkey();
+        RingEntry {
+            device_id: session.identity_pubkey().to_bytes(),
+            name: name.into(),
+            transport_pubkey,
+            endpoints,
+            attestation: session
+                .sign(&static_attestation_message(&transport_pubkey))
+                .to_bytes(),
+            paired_at: 1,
+        }
+    }
+
+    /// A forged (non-live) ring member with a self-consistent attestation —
+    /// enough to pass `Ring::load`'s verification without a daemon behind it.
+    fn forged_peer(seed: u8) -> RingEntry {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let transport_pubkey = [seed ^ 0xFF; 32];
+        RingEntry {
+            device_id: sk.verifying_key().to_bytes(),
+            name: format!("peer-{seed}"),
+            transport_pubkey,
+            endpoints: vec![],
+            attestation: sk
+                .sign(&static_attestation_message(&transport_pubkey))
+                .to_bytes(),
+            paired_at: 1,
+        }
+    }
+
+    /// End to end over loopback TCP with real Noise and real vaults: A adds a
+    /// shared subtree (row lands with `key_id` empty — the locked liveness
+    /// default), the reconcile sweep dials B through the production route
+    /// model, both sides drive the commit-reveal ceremony through the real
+    /// inbound dispatch, and both persist — `S` sealed in each vault, a
+    /// committed `shared_ceremony` record on each device chain, and A's
+    /// membership row `key_id` filled. The pre-live stand-in for the deferred
+    /// 2-device smoke.
+    #[test]
+    fn ceremony_end_to_end_over_loopback() {
+        let (daemon_a, tmp_a) = ceremony_daemon();
+        let (daemon_b, _tmp_b) = ceremony_daemon();
+        let local_a = device_of(&daemon_a, "dev-a");
+        let local_b = device_of(&daemon_b, "dev-b");
+
+        // B listens on an ephemeral loopback port; its ring holds A.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ring_b = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(ring_entry_of(&daemon_a, "dev-a", vec![]));
+            r
+        }));
+        let b_thread = {
+            let daemon_b = daemon_b.clone();
+            let local_b = local_b.clone();
+            let ring_b = ring_b.clone();
+            thread::spawn(move || {
+                let (conn, _) = listener.accept().unwrap();
+                serve_inbound(daemon_b, &local_b, &ring_b, conn);
+            })
+        };
+
+        // A's persisted (legacy-path) ring holds B at the loopback endpoint,
+        // where the sweep's `load_ring` finds it.
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(
+                &daemon_b,
+                "dev-b",
+                vec![format!("127.0.0.1:{port}")],
+            ));
+            ring.save(&ring_path(tmp_a.path())).unwrap();
+        }
+
+        let add = crate::handlers::shared_subtree_add(
+            &daemon_a,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+        {
+            // The add's row awaits its key — the deferred default, not a block.
+            let inner = daemon_a.inner.lock().unwrap();
+            let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+                inner.repo.as_ref().unwrap(),
+                inner.session.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert!(membership.subtrees[0].key_id.is_none());
+        }
+
+        // The production initiator path (what the replica loop tick runs).
+        reconcile_ceremonies(&daemon_a, &local_a);
+        b_thread.join().unwrap();
+
+        // A: key_id filled, S sealed, committed record re-verifies.
+        let (kid, s_a) = {
+            let inner = daemon_a.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+                inner.repo.as_ref().unwrap(),
+                session,
+            )
+            .unwrap();
+            let kid = membership.subtrees[0]
+                .key_id
+                .clone()
+                .expect("ceremony filled the membership key_id");
+            let s = *session.load_shared_key(&kid).expect("S sealed on A");
+            let wt = WorkTree::new(&daemon_a, &inner);
+            let text = wt
+                .read_to_string(&crate::ceremony::ceremony_record_rel(&kid))
+                .expect("A committed its record");
+            let t = crate::ceremony::parse_transcript_record(&text).unwrap();
+            assert!(t.verify());
+            assert_eq!(t.key_id, kid);
+            assert_eq!(t.chain_id, ref_name.as_bytes());
+            (kid, s)
+        };
+
+        // B: the identical S under the same key_id, its own committed record,
+        // and no membership row (it never ran `add`).
+        {
+            let inner = daemon_b.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            let s_b = session.load_shared_key(&kid).expect("S sealed on B");
+            assert_eq!(*s_b, s_a, "both members derived the identical S");
+            let wt = WorkTree::new(&daemon_b, &inner);
+            let text = wt
+                .read_to_string(&crate::ceremony::ceremony_record_rel(&kid))
+                .expect("B committed its record");
+            assert!(crate::ceremony::parse_transcript_record(&text).unwrap().verify());
+            let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+                inner.repo.as_ref().unwrap(),
+                session,
+            )
+            .unwrap();
+            assert!(membership.subtrees.is_empty());
+        }
+    }
+
+    /// The initiator sweep gates a >2-member ring (v1 is point-to-point): the
+    /// row stays pending, nothing dials, nothing is stored.
+    #[test]
+    fn ceremony_sweep_gates_three_member_rings() {
+        let (daemon, tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-a");
+        {
+            let mut ring = Ring::default();
+            ring.upsert(forged_peer(1));
+            ring.upsert(forged_peer(2));
+            ring.save(&ring_path(tmp.path())).unwrap();
+        }
+        crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+
+        reconcile_ceremonies(&daemon, &local);
+
+        let inner = daemon.inner.lock().unwrap();
+        let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+            inner.repo.as_ref().unwrap(),
+            inner.session.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(membership.subtrees[0].key_id.is_none());
+        assert!(!tmp.path().join(".softfig/vault/shared-keys").exists());
+    }
+
+    /// With no paired peer the sweep is a quiet no-op (the normal
+    /// share-before-pairing state) — the row simply waits.
+    #[test]
+    fn ceremony_sweep_waits_for_a_peer() {
+        let (daemon, tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-a");
+        crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+
+        reconcile_ceremonies(&daemon, &local);
+
+        let inner = daemon.inner.lock().unwrap();
+        let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+            inner.repo.as_ref().unwrap(),
+            inner.session.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(membership.subtrees[0].key_id.is_none());
+        assert!(!tmp.path().join(".softfig/vault/shared-keys").exists());
+    }
+
+    /// The responder refuses a ceremony when its own ring says >2 members —
+    /// the member set comes from the ring, never the wire.
+    #[test]
+    fn responder_gates_three_member_rings() {
+        let (daemon, tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-b");
+        let ring = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(forged_peer(1));
+            r.upsert(forged_peer(2));
+            r
+        }));
+
+        struct DeadLink;
+        impl CeremonyLink for DeadLink {
+            fn send_frame(&mut self, _f: &Frame) -> Result<(), NetError> {
+                Ok(())
+            }
+            fn recv_frame(&mut self) -> Result<Frame, NetError> {
+                Err(NetError::Protocol("gated responder must not drive the link"))
+            }
+        }
+        let commit = SharedKeyCommit {
+            nonce: vec![7u8; 32],
+            chain_id: b"chain/journals".to_vec(),
+            device_id: vec![0u8; 32],
+            commitment: vec![0u8; 32],
+            signature: vec![0u8; 64],
+        };
+        serve_ceremony_responder(&daemon, &local, &ring, commit, DeadLink);
+        assert!(!tmp.path().join(".softfig/vault/shared-keys").exists());
+    }
+
 }

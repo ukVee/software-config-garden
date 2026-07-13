@@ -47,6 +47,10 @@ mdns-sd.workspace = true
 # M2c — inline <vault> tag parsing + base64 inline ciphertext bodies
 base64.workspace = true
 
+# M5d — wipe the daemon's stack copy of a ceremony-derived shared key S after
+# it is sealed under the vault (softfig-net stays zeroize-free by design).
+zeroize.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 # M5a-4 pairing test: forge a second device (Ed25519 id + X25519 static +
