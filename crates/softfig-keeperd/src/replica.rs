@@ -39,7 +39,10 @@ use softfig_store::{
     put_commit, put_tree, set_ref, CommitRow, Db, Hash, ObjectStore, StorePaths, TreeEntryKind,
     TreeEntryRow,
 };
-use softfig_vcs::{canonical_tree_bytes, log_collect, verify_commit, CanonicalCommit, Repo, TIP_REF};
+use softfig_vcs::{
+    canonical_tree_bytes, log_collect, reachable_from, verify_commit, CanonicalCommit, Reachable,
+    Repo, TIP_REF,
+};
 use softfig_vault::VaultSession;
 
 /// Filename of the owner-side replication grant ledger within `.softfig/`.
@@ -161,7 +164,7 @@ pub fn mint_grant(
 ///
 /// **Replica isolation invariant (m5c slice 004, user requirement #2):** this
 /// announces `repo.tip()` = the **device chain** (`TIP_REF`) only — never
-/// `db.all_refs()`. Because the sink's fast-forward walk can only reach the
+/// `db.list_refs()`. Because the sink's fast-forward walk can only reach the
 /// object graph of the announced tip, a shared chain (a separate ref) is
 /// **structurally excluded** from every per-peer backup mirror. Do not change
 /// this to announce all refs: a shared chain replicates only to its own
@@ -194,9 +197,22 @@ pub fn build_announce(repo: &Repo, session: &VaultSession) -> NetResult<TipAnnou
 /// a fresh `Repo` for the serve thread (sqlite WAL allows a concurrent reader
 /// beside the daemon's writer) and a pre-signed announce snapshotted under the
 /// daemon lock.
+///
+/// **Serve-side scoping (m5c slice 008, finding 6):** the source answers
+/// `get_commit`/`get_tree`/`get_object` **only** for objects in the announced
+/// tip's reachable closure — computed once at construction from
+/// [`reachable_from`]. A chain replicates to exactly its audience *at the
+/// source*: a granted backup host that learns some other chain's hash out of
+/// band (e.g. a shared-subtree ciphertext hash) gets `found:false`, so a
+/// legitimate device-chain session can't be turned into an unscoped hash oracle
+/// over the whole `Db`/`ObjectStore`. m5d reuses this serve loop for
+/// `S`-members, so the scoping is enforced here before it becomes load-bearing
+/// for cross-audience isolation.
 pub struct RepoSource {
     repo: Repo,
     announce: TipAnnounce,
+    /// The reachable closure of the announced tip — the only objects served.
+    served: Reachable,
 }
 
 impl std::fmt::Debug for RepoSource {
@@ -208,8 +224,22 @@ impl std::fmt::Debug for RepoSource {
 }
 
 impl RepoSource {
-    pub fn new(repo: Repo, announce: TipAnnounce) -> Self {
-        Self { repo, announce }
+    /// Wrap `repo` + its pre-signed `announce`, scoping the served object set to
+    /// the announced tip's reachable closure (finding 6). An empty announce (no
+    /// commits yet) serves nothing. Fallible: computing the closure reads the
+    /// store.
+    pub fn new(repo: Repo, announce: TipAnnounce) -> NetResult<Self> {
+        let served = if announce.tip_hash.is_empty() {
+            Reachable::default()
+        } else {
+            let tip = Hash::from_bytes(h32(&announce.tip_hash)?);
+            reachable_from(repo.db(), tip).map_err(neterr)?
+        };
+        Ok(Self {
+            repo,
+            announce,
+            served,
+        })
     }
 }
 
@@ -219,6 +249,14 @@ impl ReplicaSource for RepoSource {
     }
 
     fn get_commit(&self, hash: &[u8; 32]) -> CommitData {
+        // Off-closure hashes are refused as if absent — the source serves only
+        // the announced tip's reachable set (finding 6), never the whole store.
+        if !self.served.commits.contains(&Hash::from_bytes(*hash)) {
+            return CommitData {
+                found: false,
+                ..Default::default()
+            };
+        }
         match self.repo.db().get_commit(&Hash::from_bytes(*hash)) {
             Ok(row) => commit_row_to_data(&row),
             Err(_) => CommitData {
@@ -229,6 +267,12 @@ impl ReplicaSource for RepoSource {
     }
 
     fn get_tree(&self, hash: &[u8; 32]) -> TreeData {
+        if !self.served.trees.contains(&Hash::from_bytes(*hash)) {
+            return TreeData {
+                found: false,
+                ..Default::default()
+            };
+        }
         match self.repo.db().get_tree(&Hash::from_bytes(*hash)) {
             Ok(entries) => TreeData {
                 found: true,
@@ -243,6 +287,12 @@ impl ReplicaSource for RepoSource {
     }
 
     fn get_object(&self, hash: &[u8; 32]) -> ObjectData {
+        if !self.served.blobs.contains(&Hash::from_bytes(*hash)) {
+            return ObjectData {
+                found: false,
+                ..Default::default()
+            };
+        }
         match self.repo.objects().get(&Hash::from_bytes(*hash)) {
             Ok(payload) => ObjectData {
                 found: true,

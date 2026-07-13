@@ -86,29 +86,29 @@ fn shared_blob_never_enters_the_device_tips_reachable_set() {
     let dev_blobs = reachable_from(repo.db(), dev_tip).unwrap().blobs;
     let shared_blobs = reachable_from(repo.db(), shared_tip).unwrap().blobs;
 
-    // The device tip carries its own content — so the disjointness below is not
-    // vacuously true (an empty device graph would trivially "exclude" everything).
+    // The device tip carries its own content — so the exclusive-blob assertion
+    // below is not vacuously true (an empty device graph would trivially
+    // "exclude" everything).
     assert!(!dev_blobs.is_empty(), "device tip must carry its own blob");
 
-    // The shared chain owns at least one ciphertext blob the device tip never
-    // references — the secret that must stay out of every backup mirror.
+    // The load-bearing invariant (m5c slice 008, finding 15): the shared chain
+    // owns at least one ciphertext blob NOT reachable from the device tip — the
+    // secret that must stay out of every backup mirror, since the replica push
+    // walks only `repo.tip()` (= the device ref). This is the difference-set
+    // assertion, and it is the correct invariant for m5c.
     let shared_exclusive: Vec<Hash> = shared_blobs.difference(&dev_blobs).copied().collect();
     assert!(
         !shared_exclusive.is_empty(),
-        "the shared chain must own a blob the device chain does not"
+        "the shared chain must own a blob the device chain does not reach"
     );
 
-    // The load-bearing assertion: NO shared blob is reachable from the device
-    // tip. The replica push walks only `repo.tip()` (= the device ref), so the
-    // shared object graph is structurally excluded from what it can ship.
-    assert!(
-        shared_blobs.is_disjoint(&dev_blobs),
-        "the device and shared object graphs must be disjoint (carve-out held)"
-    );
-    for h in &shared_exclusive {
-        assert!(
-            !dev_blobs.contains(h),
-            "shared blob {h} leaked into the device tip's reachable set"
-        );
-    }
+    // We deliberately do NOT assert FULL set disjointness
+    // (`shared_blobs.is_disjoint(&dev_blobs)`). Under m5c both chains encrypt
+    // with the same master key M, so convergent encryption maps identical
+    // plaintext in both chains to the same blob hash — a legitimately *shared*
+    // blob, not a leak (a backup host that already holds it via the device chain
+    // learns nothing new). Full disjointness becomes a true invariant only in
+    // m5d, when a shared chain gets its own key S ≠ M and its ciphertext can no
+    // longer collide with the device chain's. The isolation guarantee that
+    // matters here is the exclusive-blob carve-out above, not full disjointness.
 }

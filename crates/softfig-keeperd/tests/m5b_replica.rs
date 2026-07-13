@@ -34,7 +34,7 @@ use softfig_net::ring::{ring_path, Ring, RingEntry};
 use softfig_net::transport::{xx_initiator, xx_responder};
 use softfig_net::{
     pull_replication, pull_replication_pipelined, serve_replication, tipannounce_signing_bytes,
-    NetError, PullSummary, ReplicaSink,
+    NetError, PullSummary, ReplicaSink, ReplicaSource,
 };
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
 use softfig_vault::{params::VaultParams, Vault, VaultSession};
@@ -171,7 +171,7 @@ fn replicate_with(
         let hello = HelloPayload::new(owner_device_id.to_vec(), "owner");
         let mut session = xx_responder(stream, &owner_transport, &hello).unwrap();
         let repo = Repo::open(&garden).unwrap();
-        let source = RepoSource::new(repo, announce);
+        let source = RepoSource::new(repo, announce).unwrap();
         let _ = serve_replication(&mut session, &source);
     });
 
@@ -567,8 +567,21 @@ fn pipelined_rollback_announce_is_rejected_and_mirror_unchanged() {
 /// `repo.tip()` = the device `TIP_REF`, so the sink's fast-forward walk can only
 /// ever reach the device tip's object graph. A shared chain is a separate source
 /// (its own replication is m5d/m5e), never folded into the device backup.
+///
+/// Parametrized over the pull driver (m5c slice 008): the sequential
+/// request→response path AND the pipelined windowed backfill — production LAN
+/// ingest is the pipelined one, so isolation must hold on both.
 #[test]
 fn device_chain_replica_excludes_a_shared_chain() {
+    device_chain_replica_excludes_a_shared_chain_over(Driver::Sequential);
+}
+
+#[test]
+fn pipelined_device_chain_replica_excludes_a_shared_chain() {
+    device_chain_replica_excludes_a_shared_chain_over(Driver::Pipelined);
+}
+
+fn device_chain_replica_excludes_a_shared_chain_over(driver: Driver) {
     const SHARED_REF: &str = "chain/journals";
 
     let mut owner = new_owner();
@@ -608,7 +621,8 @@ fn device_chain_replica_excludes_a_shared_chain() {
     let mut mirror =
         MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
             .unwrap();
-    let summary = replicate_once(
+    let summary = replicate_with(
+        driver,
         &owner.garden,
         owner.transport_secret,
         owner.device_id,
@@ -625,12 +639,19 @@ fn device_chain_replica_excludes_a_shared_chain() {
     let db = Db::open(&paths).unwrap();
     let objects = ObjectStore::new(paths);
 
-    // (1) The mirror's only ref is the device tip; it never learned the shared ref.
-    assert_eq!(db.try_get_ref("tip").unwrap(), Some(dev_tip));
+    // (1) The mirror's ref set is EXACTLY the device tip — not merely "the shared
+    //     ref we happened to name is absent", but no extra ref of any kind
+    //     (m5c slice 008 finding-15-family strengthening).
+    let refs: Vec<(String, Hash)> = db
+        .list_refs()
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.name, r.commit_hash))
+        .collect();
     assert_eq!(
-        db.try_get_ref(SHARED_REF).unwrap(),
-        None,
-        "the mirror must not hold the shared chain's ref"
+        refs,
+        vec![("tip".to_string(), dev_tip)],
+        "the mirror must hold exactly the device tip ref and nothing else"
     );
 
     // (2) The shared chain's commit is absent from the mirror.
@@ -654,6 +675,70 @@ fn device_chain_replica_excludes_a_shared_chain() {
     }
     let report = softfig_vcs::fsck(&db, &objects).unwrap();
     assert!(report.ok(), "mirror not fsck-clean: {:?}", report.problems);
+}
+
+/// Dishonest-sink regression (m5c slice 008, finding 6): the serve side is not
+/// an unscoped hash oracle. A `RepoSource` built for a device-chain announce
+/// answers `found:false` for a shared-chain commit/tree/blob — even though those
+/// objects physically exist in the same `Db`/`ObjectStore` — while still serving
+/// every object in the announced device closure. This is what stops a granted
+/// backup host that learns a shared-chain hash out of band (the m5d threat) from
+/// fetching off-audience ciphertext in an otherwise-legitimate session.
+#[test]
+fn repo_source_refuses_off_closure_hashes() {
+    const SHARED_REF: &str = "chain/journals";
+
+    let mut owner = new_owner();
+    owner.commit_file("a.md", "alpha");
+    let dev_tip = owner.commit_file("dir/b.md", "beta");
+    // A shared chain on its own ref, carrying a ciphertext blob the device tip
+    // never references.
+    let shared_tip = owner.commit_to_chain(SHARED_REF, "secret.md", "SHARED-SUBTREE-SECRET");
+
+    // The shared chain's off-closure objects, resolved straight from the store.
+    let shared_commit = owner.repo.db().get_commit(&shared_tip).unwrap();
+    let shared_tree = shared_commit.root_tree;
+    let dev_blobs = reachable_from(owner.repo.db(), dev_tip).unwrap().blobs;
+    let shared_blobs = reachable_from(owner.repo.db(), shared_tip).unwrap().blobs;
+    let shared_blob = *shared_blobs
+        .difference(&dev_blobs)
+        .next()
+        .expect("the shared chain owns an exclusive blob");
+
+    // Build the source exactly as the serve thread does: a fresh Repo handle +
+    // the device-tip announce.
+    let announce = build_announce(&owner.repo, &owner.session).unwrap();
+    assert_eq!(announce.tip_hash, dev_tip.as_bytes().to_vec());
+    let repo = Repo::open(&owner.garden).unwrap();
+    let source = RepoSource::new(repo, announce).unwrap();
+
+    // Off-closure: the shared commit, its root tree, and its exclusive blob are
+    // all refused, so a hash learned out of band yields nothing.
+    assert!(
+        !source.get_commit(shared_tip.as_bytes()).found,
+        "shared commit served — the source is an unscoped hash oracle"
+    );
+    assert!(
+        !source.get_tree(shared_tree.as_bytes()).found,
+        "shared tree served — the source is an unscoped hash oracle"
+    );
+    assert!(
+        !source.get_object(shared_blob.as_bytes()).found,
+        "shared ciphertext blob served — the source is an unscoped hash oracle"
+    );
+
+    // In-closure: the announced device tip and every device blob still serve, so
+    // the scoping doesn't break legitimate replication.
+    assert!(
+        source.get_commit(dev_tip.as_bytes()).found,
+        "the announced device tip must still serve"
+    );
+    for h in &dev_blobs {
+        assert!(
+            source.get_object(h.as_bytes()).found,
+            "device blob {h} must still serve"
+        );
+    }
 }
 
 // --- Owner-side IPC surface (grant / revoke / status) -----------------------
