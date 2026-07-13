@@ -200,3 +200,111 @@ fn gc_never_collects_another_chains_objects() {
         );
     }
 }
+
+/// Finding 7 (MAJOR): gc retention includes **disabled** chains. Disabling is a
+/// mount/compose concern, never a retention concern — so `disable -> gc ->
+/// re-enable` must be a lossless local toggle, not a way to destroy a chain's
+/// exclusive blobs.
+#[test]
+fn gc_keeps_a_disabled_chains_exclusive_blobs() {
+    let tc = two_chains();
+
+    let dev_blobs = reachable_from(tc.repo.db(), tc.dev_tip).unwrap().blobs;
+    let b_blobs = reachable_from(tc.repo.db(), tc.b_tip).unwrap().blobs;
+    let b_exclusive: Vec<Hash> = b_blobs.difference(&dev_blobs).copied().collect();
+    assert!(!b_exclusive.is_empty(), "chain-b must own exclusive blobs");
+
+    // A genuinely-orphan object proves gc still collects the truly-dead.
+    let orphan = tc.repo.objects().put(b"orphan referenced by nobody").unwrap();
+
+    // chain-b is registered but DISABLED (the local mount/compose toggle).
+    let registry = ChainRegistry::new(
+        Chain::device(),
+        vec![Chain::shared("c-b", CHAIN_B_REF, "projects", false)],
+    );
+    let report = tc.repo.gc(&registry).unwrap();
+
+    assert!(
+        report.collected.contains(&orphan),
+        "the true orphan must still be collected"
+    );
+    assert!(!tc.repo.objects().contains(&orphan));
+    for h in &b_exclusive {
+        assert!(
+            tc.repo.objects().contains(h),
+            "disabled chain-b's exclusive blob {h} must survive gc (finding 7)"
+        );
+    }
+
+    // Re-enable + read: the closure is intact, so a per-chain fsck from chain-b's
+    // tip is clean — every reachable blob is still present on disk.
+    let re_enabled = tc.repo.fsck_chain(CHAIN_B_REF).unwrap();
+    assert!(
+        re_enabled.ok(),
+        "re-enabled chain-b must read clean: {:?}",
+        re_enabled.problems
+    );
+}
+
+/// Finding 13 (MINOR): fsck of a damaged chain returns a problem-bearing report,
+/// not an `Err`/panic. Here a referenced tree row is deleted out from under a
+/// commit.
+#[test]
+fn fsck_reports_a_deleted_tree_row_instead_of_erroring() {
+    let mut tc = two_chains();
+    let b_tip = tc.b_tip;
+
+    // Corrupt the store: delete chain-b's tip root-tree row, leaving a commit
+    // that references a now-missing tree.
+    let root_tree = tc.repo.db().get_commit(&b_tip).unwrap().root_tree;
+    let hex = root_tree.to_hex();
+    tc.repo
+        .db_mut()
+        .with_tx(|conn| {
+            // Drop the entries first (FK enforcement is on), then the tree row.
+            conn.execute(&format!("DELETE FROM tree_entries WHERE tree_hash = X'{hex}'"), ())
+                .expect("delete tree entries");
+            conn.execute(&format!("DELETE FROM trees WHERE hash = X'{hex}'"), ())
+                .expect("delete tree row");
+            Ok(())
+        })
+        .unwrap();
+
+    // fsck must REPORT the damage, never propagate an Err or panic.
+    let report = tc
+        .repo
+        .fsck_chain(CHAIN_B_REF)
+        .expect("fsck of a damaged chain must return a report, not Err");
+    assert!(!report.ok(), "a deleted tree row must surface as a problem");
+    assert!(
+        report.problems.iter().any(|p| p.contains(&root_tree.to_hex())),
+        "the report must name the missing tree {root_tree}: {:?}",
+        report.problems
+    );
+    // The device chain is untouched by chain-b's damage.
+    assert!(tc.repo.fsck_chain(TIP_REF).unwrap().ok());
+}
+
+/// Finding 13, blob face: a referenced blob missing from the object store is a
+/// reported problem, not an abort.
+#[test]
+fn fsck_reports_a_missing_blob_instead_of_erroring() {
+    let tc = two_chains();
+
+    // Remove a blob that chain-b references, simulating a torn object store.
+    let b_blobs = reachable_from(tc.repo.db(), tc.b_tip).unwrap().blobs;
+    let victim = *b_blobs.iter().next().expect("chain-b references blobs");
+    tc.repo.objects().remove(&victim).unwrap();
+    assert!(!tc.repo.objects().contains(&victim));
+
+    let report = tc
+        .repo
+        .fsck_chain(CHAIN_B_REF)
+        .expect("fsck of a damaged chain must return a report, not Err");
+    assert!(!report.ok(), "a missing blob must surface as a problem");
+    assert!(
+        report.problems.iter().any(|p| p.contains(&victim.to_hex())),
+        "the report must name the missing blob {victim}: {:?}",
+        report.problems
+    );
+}

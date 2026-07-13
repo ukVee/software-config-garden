@@ -319,14 +319,16 @@ impl Repo {
         Ok(hash)
     }
 
-    /// The tips of every enabled chain in `registry` (device + enabled shared),
-    /// skipping any chain with no commits yet. This is the live set gc must
-    /// retain and per-chain fsck iterates — deriving it from the registry keeps
-    /// gc safe by construction (no chain's objects are ever collected because
-    /// another chain was gc'd).
+    /// The tips of every **registered** chain in `registry` (device + all shared,
+    /// enabled or not), skipping any chain with no commits yet. This is gc's
+    /// retention set: a disabled chain's tip is included so its exclusive blobs
+    /// survive `disable -> gc -> re-enable` — enablement is a mount concern, not a
+    /// retention concern (m5c finding 7). Deriving it from the registry keeps gc
+    /// safe by construction: no chain's objects are collected because another
+    /// chain was gc'd.
     pub fn live_tips(&self, registry: &ChainRegistry) -> Result<Vec<Hash>> {
         let mut tips = Vec::new();
-        for chain in registry.enabled_chains() {
+        for chain in registry.all_chains() {
             if let Some(t) = self.tip_of(&chain.ref_name)? {
                 tips.push(t);
             }
@@ -340,9 +342,10 @@ impl Repo {
         crate::fsck::run_chain(&self.db, &self.objects, self.tip_of(ref_name)?)
     }
 
-    /// Collect loose objects unreachable from any enabled chain in `registry`
-    /// (see [`crate::gc::gc`]). Safe across chains: the retained set is the union
-    /// of every enabled chain's reachable blobs.
+    /// Collect loose objects unreachable from any **registered** chain in
+    /// `registry` (see [`crate::gc::gc`]). Safe across chains: the retained set is
+    /// the union of every registered chain's reachable blobs — including disabled
+    /// chains, whose blobs must not be collected (m5c finding 7).
     pub fn gc(&self, registry: &ChainRegistry) -> Result<crate::gc::GcReport> {
         let tips = self.live_tips(registry)?;
         crate::gc::gc(&self.db, &self.objects, &tips)

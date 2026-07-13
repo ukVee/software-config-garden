@@ -157,10 +157,24 @@ impl ChainRegistry {
         matches!(self.owning_chain(path).kind, ChainKind::Device)
     }
 
-    /// The device chain plus every **enabled** shared chain — the live set for
-    /// per-chain fsck and for gc (whose live blobs are the union across these).
+    /// The device chain plus every **enabled** shared chain — the *compose* set:
+    /// what the union mount projects and [`Self::split_snapshot`] routes writes
+    /// into. Enablement is a mount concern, so a disabled chain is absent here.
+    /// For gc **retention**, use [`Self::all_chains`] instead — a disabled
+    /// chain's objects must still be retained (m5c finding 7).
     pub fn enabled_chains(&self) -> impl Iterator<Item = &Chain> {
         std::iter::once(&self.device).chain(self.shared.iter().filter(|c| c.enabled))
+    }
+
+    /// Every chain in the registry — the device chain plus **all** shared chains,
+    /// enabled or not. This is gc's **retention** set: a chain that has a ref is
+    /// live for garbage collection regardless of its per-device enable/disable
+    /// toggle. Disabling is a mount/compose concern, never a retention concern —
+    /// if gc keyed on [`Self::enabled_chains`], `disable -> gc -> re-enable` would
+    /// destroy the disabled chain's exclusive blobs and break the local toggle's
+    /// "cheap, reversible" contract (m5c finding 7).
+    pub fn all_chains(&self) -> impl Iterator<Item = &Chain> {
+        std::iter::once(&self.device).chain(self.shared.iter())
     }
 
     /// Route a unified (garden-root-relative) working-tree snapshot into one

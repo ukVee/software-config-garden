@@ -23,7 +23,6 @@ use softfig_store::{Db, Hash, ObjectStore, TreeEntryKind};
 
 use crate::commit::{verify_commit, CanonicalCommit};
 use crate::error::Result;
-use crate::gc::reachable_from;
 use crate::tree::canonical_tree_bytes;
 
 #[derive(Debug, Default)]
@@ -162,20 +161,44 @@ pub fn run(db: &Db, objects: &ObjectStore) -> Result<FsckReport> {
 /// objects neither pad the counts nor mask a problem. `tip = None` (an empty
 /// chain) is trivially clean.
 ///
-/// Checks, over the reachable closure: each commit's declared hash +
-/// signature + `root_tree` existence; each tree's canonical hash + that its
-/// subtree/blob targets exist (blobs on disk, hashing back to their address).
-/// Orphan detection is a whole-store notion and stays with [`run`].
+/// Checks, over the reachable closure: each commit's declared hash + signature;
+/// each tree's canonical hash + that its subtree/blob targets exist (subtrees
+/// as tree rows, blobs present on disk). Orphan detection is a whole-store
+/// notion and stays with [`run`].
+///
+/// fsck **reports** corruption; it does not abort on it. A missing commit or
+/// tree row is recorded as a problem and stepped over, so a damaged store still
+/// yields a report. This is why the walk is fault-tolerant here rather than
+/// reusing gc's fail-closed [`crate::gc::reachable_from`] (which *must* error
+/// out so gc never under-retains — the retention path stays fail-closed).
 pub fn run_chain(db: &Db, objects: &ObjectStore, tip: Option<Hash>) -> Result<FsckReport> {
     let mut report = FsckReport::default();
     let Some(tip) = tip else {
         return Ok(report);
     };
-    let reach = reachable_from(db, tip)?;
 
-    for ch in &reach.commits {
+    let mut seen_commits: HashSet<Hash> = HashSet::new();
+    let mut seen_trees: HashSet<Hash> = HashSet::new();
+    let mut referenced_blobs: HashSet<Hash> = HashSet::new();
+    // Every commit's root tree seeds the tree walk; a missing root tree surfaces
+    // there as a `tree ...` problem, so there is no separate root-tree probe.
+    let mut tree_stack: Vec<Hash> = Vec::new();
+
+    // Commit ancestry from the tip. A missing commit row is a problem, not an
+    // abort — record it and stop descending that branch.
+    let mut commit_stack = vec![tip];
+    while let Some(ch) = commit_stack.pop() {
+        if !seen_commits.insert(ch) {
+            continue;
+        }
         report.commits_checked += 1;
-        let c = db.get_commit(ch)?;
+        let c = match db.get_commit(&ch) {
+            Ok(c) => c,
+            Err(e) => {
+                report.problems.push(format!("commit {ch}: {e}"));
+                continue;
+            }
+        };
         let payload_value: serde_json::Value = match serde_json::from_str(&c.payload) {
             Ok(v) => v,
             Err(e) => {
@@ -198,58 +221,49 @@ pub fn run_chain(db: &Db, objects: &ObjectStore, tip: Option<Hash>) -> Result<Fs
         if let Err(e) = verify_commit(&canon, c.hash, &c.signature) {
             report.problems.push(format!("commit {}: {e}", c.hash));
         }
+        tree_stack.push(c.root_tree);
         if let Some(p) = c.parent {
-            if !reach.commits.contains(&p) {
-                report
-                    .problems
-                    .push(format!("commit {}: parent {} unreachable", c.hash, p));
-            }
-        }
-        if !reach.trees.contains(&c.root_tree) {
-            report.problems.push(format!(
-                "commit {}: root_tree {} unreachable",
-                c.hash, c.root_tree
-            ));
+            commit_stack.push(p);
         }
     }
 
-    for th in &reach.trees {
+    // Trees + their entries, from every commit's root tree down. A missing tree
+    // row is a problem, not an abort.
+    while let Some(th) = tree_stack.pop() {
+        if !seen_trees.insert(th) {
+            continue;
+        }
         report.trees_checked += 1;
-        let entries = db.get_tree(th)?;
+        let entries = match db.get_tree(&th) {
+            Ok(e) => e,
+            Err(e) => {
+                report.problems.push(format!("tree {th}: {e}"));
+                continue;
+            }
+        };
         let derived = Hash::of(&canonical_tree_bytes(&entries)?);
-        if derived != *th {
+        if derived != th {
             report
                 .problems
                 .push(format!("tree {th}: derived hash {derived} mismatch"));
         }
         for e in &entries {
             match e.kind {
-                TreeEntryKind::Tree => {
-                    if !reach.trees.contains(&e.target) {
-                        report.problems.push(format!(
-                            "tree {th}: entry {} -> tree {} unreachable",
-                            e.name, e.target
-                        ));
-                    }
-                }
+                TreeEntryKind::Tree => tree_stack.push(e.target),
                 TreeEntryKind::Blob => {
-                    if !objects.contains(&e.target) {
-                        report.problems.push(format!(
-                            "tree {th}: entry {} -> blob {} missing",
-                            e.name, e.target
-                        ));
+                    // Check + count each referenced blob once, with the context of
+                    // the first tree that names it.
+                    if referenced_blobs.insert(e.target) {
+                        report.objects_checked += 1;
+                        if !objects.contains(&e.target) {
+                            report.problems.push(format!(
+                                "tree {th}: entry {} -> blob {} missing",
+                                e.name, e.target
+                            ));
+                        }
                     }
                 }
             }
-        }
-    }
-
-    // Each reachable blob must be present and hash back to its address.
-    for blob in &reach.blobs {
-        report.objects_checked += 1;
-        match objects.get(blob) {
-            Ok(_) => {}
-            Err(e) => report.problems.push(format!("blob {blob}: {e}")),
         }
     }
 
