@@ -55,6 +55,12 @@ impl LayerBKey {
     pub fn expose(&self) -> &[u8; KEY_LEN] {
         &self.0
     }
+
+    /// Wrap an already-derived 32-byte subkey — the shared-`S` derivations
+    /// in [`crate::shared`] produce the same zeroize-on-drop key type.
+    pub(crate) fn from_zeroizing(bytes: Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Self(bytes)
+    }
 }
 
 impl Drop for LayerBKey {

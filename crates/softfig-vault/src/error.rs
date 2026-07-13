@@ -23,6 +23,9 @@ pub enum VaultError {
     #[error("blob is malformed")]
     MalformedBlob,
 
+    #[error("shared key {0} is not stored in this vault")]
+    SharedKeyUnavailable(String),
+
     #[error("invalid recovery phrase")]
     InvalidRecoveryPhrase,
 

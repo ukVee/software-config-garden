@@ -19,12 +19,14 @@ pub mod params;
 pub mod recovery;
 pub mod relock;
 pub mod session;
+pub mod shared;
 pub mod storage;
 pub mod transport;
 mod vault;
 
 pub use error::{Result, VaultError};
 pub use layer_b::{is_layer_b, LayerBKey};
+pub use shared::{is_shared, is_shared_blob, is_shared_layer_b};
 pub use recovery::RecoveryPhrase;
 pub use relock::{RelockBlob, RelockToken, RELOCK_TTL_SECS};
 pub use session::VaultSession;

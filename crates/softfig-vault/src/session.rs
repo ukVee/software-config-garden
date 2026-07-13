@@ -147,10 +147,19 @@ impl VaultSession {
 
     /// M5d — fetch a stored shared-subtree key by its `key_id`. Zeroized on
     /// drop; the caller must not copy it out of the returned guard except
-    /// into another zeroizing home.
+    /// into another zeroizing home. A key this vault never stored surfaces
+    /// as [`VaultError::SharedKeyUnavailable`] — the non-member /
+    /// pre-ceremony signal, distinct from a decrypt failure.
     pub fn load_shared_key(&self, key_id: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
         validate_shared_key_id(key_id)?;
-        let sealed = std::fs::read(self.paths.shared_key(key_id))?;
+        let path = self.paths.shared_key(key_id);
+        let sealed = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                crate::error::VaultError::SharedKeyUnavailable(key_id.to_string())
+            } else {
+                e.into()
+            }
+        })?;
         let plain = zeroize::Zeroizing::new(blob::decrypt_blob(&self.masters, &sealed)?);
         let s: [u8; 32] = plain.as_slice().try_into().map_err(|_| {
             crate::error::VaultError::Malformed("shared key blob is not 32 bytes")
@@ -162,6 +171,76 @@ impl VaultSession {
     /// invalid id is simply "not stored".
     pub fn has_shared_key(&self, key_id: &str) -> bool {
         validate_shared_key_id(key_id).is_ok() && self.paths.shared_key(key_id).is_file()
+    }
+
+    /// M5d slice 002 — encrypt a shared-chain blob under the stored `S` for
+    /// `key_id` ([`crate::shared`] container, spec-convergent: every member
+    /// produces identical bytes). Fails with
+    /// [`VaultError::SharedKeyUnavailable`](crate::error::VaultError) when
+    /// this vault holds no such `S` — the caller must fail closed, never
+    /// fall back to `M` for a keyed chain.
+    pub fn encrypt_shared_blob(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let s = self.load_shared_key(key_id)?;
+        crate::shared::encrypt_blob(key_id, &s, plaintext)
+    }
+
+    /// M5d slice 002 — decrypt either shared container (`0xFE` blob or
+    /// `0xFD` Layer B whole-file seal) by resolving its embedded `key_id`
+    /// through the shared-key store. Chain-agnostic: the blob names the `S`
+    /// generation that sealed it, so reads (and post-rotation history) need
+    /// no chain context.
+    pub fn decrypt_shared_blob(&self, blob_file: &[u8]) -> Result<Vec<u8>> {
+        let key_id = crate::shared::read_key_id(blob_file)?;
+        let s = self.load_shared_key(&key_id)?;
+        crate::shared::decrypt_blob(&s, blob_file)
+    }
+
+    /// M5d slice 002 — whole-file Layer B seal *inside* a shared subtree:
+    /// the per-file subkey derives from that chain's `S`, not `M`
+    /// (`spec-vault.md`), so the seal stays members-only.
+    pub fn encrypt_shared_layer_b(
+        &self,
+        key_id: &str,
+        path: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let s = self.load_shared_key(key_id)?;
+        crate::shared::encrypt_layer_b(key_id, &s, path, plaintext)
+    }
+
+    /// M5d slice 002 — decrypt a shared Layer B whole-file seal under the
+    /// subkey derived from its embedded `key_id`'s `S` + `path`.
+    pub fn decrypt_shared_layer_b(&self, path: &str, blob_file: &[u8]) -> Result<Vec<u8>> {
+        let key_id = crate::shared::read_key_id(blob_file)?;
+        let s = self.load_shared_key(&key_id)?;
+        crate::shared::decrypt_layer_b(&s, path, blob_file)
+    }
+
+    /// M5d slice 002 — inline `<vault>` region seal inside a shared subtree
+    /// (per-region subkey from `S`; the keeperd write-path wiring is gated
+    /// on shared-chain `PriorTipGuard` coverage, but the crypto surface is
+    /// complete).
+    pub fn encrypt_shared_region(
+        &self,
+        key_id: &str,
+        path: &str,
+        id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let s = self.load_shared_key(key_id)?;
+        crate::shared::encrypt_region(key_id, &s, path, id, plaintext)
+    }
+
+    /// M5d slice 002 — decrypt an inline shared region.
+    pub fn decrypt_shared_region(
+        &self,
+        path: &str,
+        id: &str,
+        blob_file: &[u8],
+    ) -> Result<Vec<u8>> {
+        let key_id = crate::shared::read_key_id(blob_file)?;
+        let s = self.load_shared_key(&key_id)?;
+        crate::shared::decrypt_region(&s, path, id, blob_file)
     }
 
     /// Test whether `passphrase` unlocks this session's self-path KEK.

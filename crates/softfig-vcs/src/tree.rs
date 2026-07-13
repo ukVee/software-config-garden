@@ -37,6 +37,21 @@ pub trait BlobEncryptor: Send + Sync {
     /// Produce the on-disk blob_file bytes for a file. `path` is the
     /// repo-relative path (forward slashes, no leading `./`).
     fn encrypt(&self, path: &str, content: &[u8], session: &VaultSession) -> Result<Vec<u8>>;
+
+    /// Chain-aware variant (M5d slice 002): `ref_name` names the chain this
+    /// commit is being built for, so an encryptor can key a shared chain's
+    /// blobs under that chain's `S` instead of the device master `M`.
+    /// Default delegates to [`Self::encrypt`] — chain-blind encryptors
+    /// (Layer A, tests) need no change.
+    fn encrypt_for_ref(
+        &self,
+        _ref_name: &str,
+        path: &str,
+        content: &[u8],
+        session: &VaultSession,
+    ) -> Result<Vec<u8>> {
+        self.encrypt(path, content, session)
+    }
 }
 
 /// Default encryptor: Layer A only. Every blob is master-keyed
@@ -71,24 +86,25 @@ pub fn build(
     session: &VaultSession,
     root: &TreeNode,
 ) -> Result<Blueprint> {
-    build_with(objects, session, root, &LayerAEncryptor)
+    build_with(objects, session, root, &LayerAEncryptor, crate::repo::TIP_REF)
 }
 
 /// Build a blueprint from a walk snapshot. Each file is encrypted via
-/// `encryptor.encrypt(path, content, session)` so the daemon can route
-/// sealed paths through Layer B without touching this module's
-/// internals.
+/// `encryptor.encrypt_for_ref(ref_name, path, content, session)` so the
+/// daemon can route sealed paths through Layer B — and a shared chain's
+/// files through its `S` (M5d) — without touching this module's internals.
 pub fn build_with(
     objects: &ObjectStore,
     session: &VaultSession,
     root: &TreeNode,
     encryptor: &dyn BlobEncryptor,
+    ref_name: &str,
 ) -> Result<Blueprint> {
     let mut bp = Blueprint {
         trees: BTreeMap::new(),
         root: Hash::of(&[]),
     };
-    bp.root = build_node(&mut bp, objects, session, encryptor, root, "")?;
+    bp.root = build_node(&mut bp, objects, session, encryptor, ref_name, root, "")?;
     Ok(bp)
 }
 
@@ -97,6 +113,7 @@ fn build_node(
     objects: &ObjectStore,
     session: &VaultSession,
     encryptor: &dyn BlobEncryptor,
+    ref_name: &str,
     node: &TreeNode,
     prefix: &str,
 ) -> Result<Hash> {
@@ -118,7 +135,7 @@ fn build_node(
         };
         match child {
             TreeNode::File { mode, content } => {
-                let cipher = encryptor.encrypt(&child_path, content, session)?;
+                let cipher = encryptor.encrypt_for_ref(ref_name, &child_path, content, session)?;
                 let blob_hash = objects.put(&cipher)?;
                 entries.push(TreeEntryRow {
                     name: name.clone(),
@@ -128,7 +145,7 @@ fn build_node(
                 });
             }
             TreeNode::Dir(_) => {
-                let sub = build_node(bp, objects, session, encryptor, child, &child_path)?;
+                let sub = build_node(bp, objects, session, encryptor, ref_name, child, &child_path)?;
                 entries.push(TreeEntryRow {
                     name: name.clone(),
                     kind: TreeEntryKind::Tree,

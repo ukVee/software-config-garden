@@ -640,3 +640,90 @@ fn random_bytes32_returns_distinct_material() {
     // is wired to a live RNG rather than a constant.
     assert_ne!(softfig_vault::random_bytes32(), softfig_vault::random_bytes32());
 }
+
+// --- M5d slice 002: shared-chain blob crypto under S -------------------------
+
+/// The convergence property the sync/dedup design load-bears on: two members
+/// with *different* master keys but the same ceremony `S` seal the same
+/// plaintext to byte-identical blob_files — for the plain shared blob AND the
+/// shared Layer B whole-file seal.
+#[test]
+fn shared_blobs_converge_across_members_with_different_masters() {
+    let (_ta, vault_a) = fresh_vault();
+    let (_tb, vault_b) = fresh_vault();
+    let a = vault_a.unlock(PASSPHRASE).expect("unlock a");
+    let b = vault_b.unlock(PASSPHRASE).expect("unlock b");
+    a.store_shared_key(KEY_ID, &S_KEY).expect("store a");
+    b.store_shared_key(KEY_ID, &S_KEY).expect("store b");
+
+    let pt = b"# shared doc\nsame on every member\n";
+    let ct_a = a.encrypt_shared_blob(KEY_ID, pt).expect("encrypt a");
+    let ct_b = b.encrypt_shared_blob(KEY_ID, pt).expect("encrypt b");
+    assert_eq!(ct_a, ct_b, "shared blob must be convergent across members");
+    assert_eq!(a.decrypt_shared_blob(&ct_b).expect("a reads b"), pt);
+    assert_eq!(b.decrypt_shared_blob(&ct_a).expect("b reads a"), pt);
+
+    let lb_a = a
+        .encrypt_shared_layer_b(KEY_ID, "proj/secrets.toml", pt)
+        .expect("layer b a");
+    let lb_b = b
+        .encrypt_shared_layer_b(KEY_ID, "proj/secrets.toml", pt)
+        .expect("layer b b");
+    assert_eq!(lb_a, lb_b, "shared layer B must be convergent too");
+    assert_eq!(
+        b.decrypt_shared_layer_b("proj/secrets.toml", &lb_a).expect("b reads"),
+        pt
+    );
+
+    // A member's device blobs stay under its own M: same plaintext, different
+    // masters → different Layer A ciphertext (the shared path is the only
+    // cross-member-convergent one).
+    assert_ne!(a.encrypt_blob(pt).unwrap(), b.encrypt_blob(pt).unwrap());
+}
+
+/// A non-member vault (its own M, no stored `S`) holds nothing readable: the
+/// embedded key_id resolves to SharedKeyUnavailable, and its master key never
+/// even gets a chance at the AEAD.
+#[test]
+fn non_member_cannot_decrypt_shared_blobs() {
+    let (_ta, vault_a) = fresh_vault();
+    let a = vault_a.unlock(PASSPHRASE).expect("unlock a");
+    a.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    let ct = a.encrypt_shared_blob(KEY_ID, b"members only").expect("encrypt");
+
+    let (_tn, vault_n) = fresh_vault();
+    let n = vault_n.unlock(PASSPHRASE).expect("unlock non-member");
+    match n.decrypt_shared_blob(&ct) {
+        Err(VaultError::SharedKeyUnavailable(id)) => assert_eq!(id, KEY_ID),
+        other => panic!("expected SharedKeyUnavailable, got {other:?}"),
+    }
+    // Encrypting *to* a keyed chain without holding S fails the same way —
+    // the fail-closed signal the daemon's router relies on.
+    match n.encrypt_shared_blob(KEY_ID, b"x") {
+        Err(VaultError::SharedKeyUnavailable(_)) => {}
+        other => panic!("expected SharedKeyUnavailable, got {other:?}"),
+    }
+}
+
+/// An inline region inside a shared subtree round-trips under an S-derived
+/// subkey and is unreadable without S (the slice-002 region test).
+#[test]
+fn shared_region_round_trips_and_needs_s() {
+    let (_ta, vault_a) = fresh_vault();
+    let a = vault_a.unlock(PASSPHRASE).expect("unlock");
+    a.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    let ct = a
+        .encrypt_shared_region(KEY_ID, "proj/notes.md", "alpha", b"region secret")
+        .expect("encrypt region");
+    assert_eq!(
+        a.decrypt_shared_region("proj/notes.md", "alpha", &ct).expect("round-trip"),
+        b"region secret"
+    );
+
+    let (_tn, vault_n) = fresh_vault();
+    let n = vault_n.unlock(PASSPHRASE).expect("unlock non-member");
+    assert!(matches!(
+        n.decrypt_shared_region("proj/notes.md", "alpha", &ct),
+        Err(VaultError::SharedKeyUnavailable(_))
+    ));
+}

@@ -310,7 +310,7 @@ impl Repo {
             Some(enc) => enc.as_ref(),
             None => &default_enc,
         };
-        let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor)?;
+        let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor, ref_name)?;
         let now = unix_seconds();
         let hash = write_commit_tx(&mut self.db, session, ref_name, parent, &blueprint, intent, now)?;
         if let Some(cb) = &self.tip_changed {
