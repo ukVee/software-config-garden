@@ -44,6 +44,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 
 use crate::error::{NetError, Result};
+use crate::proto::{frame, Frame, SharedKeyCommit, SharedKeyReveal};
 
 /// A member's secret contribution `r_i`. Random per ceremony; revealed to all
 /// members in the reveal phase (so it is public *after* the ceremony, and the
@@ -391,6 +392,11 @@ impl Ceremony {
         &self.chain_id
     }
 
+    /// This member's own device id (bind it into outgoing frames).
+    pub fn local_id(&self) -> [u8; 32] {
+        self.local_id
+    }
+
     /// The derived `S`, once [`Phase::Derived`]. `None` until then.
     pub fn shared_key(&self) -> Option<&SharedKey> {
         self.shared_key.as_ref()
@@ -523,6 +529,217 @@ pub fn sign_reveal(
 ) -> [u8; 64] {
     sk.sign(&reveal_signing_bytes(nonce, chain_id, device_id, r))
         .to_bytes()
+}
+
+// --- The mesh drive loop ----------------------------------------------------
+//
+// The pure [`Ceremony`] above enforces the *protocol* (phases, one commitment
+// per member, the commit-reveal binding) but does no I/O and trusts its caller
+// to have authenticated each frame. This section is that caller: a
+// transport-agnostic drive loop that signs + broadcasts our own commit/reveal,
+// authenticates every inbound frame (signature against the sender's device id,
+// nonce + chain id bound to *this* ceremony), and feeds the state machine —
+// mirroring how `replica.rs` owns the wire drive loop while the vault (keeperd)
+// owns the key and the store owns persistence. keeperd wires [`CeremonySigner`]
+// to the vault session and [`CeremonyTransport`] to the live per-peer Noise
+// sessions; the headless tests wire both to in-memory channels.
+
+/// Produces the 64-byte Ed25519 signature over a ceremony message's signing
+/// bytes. keeperd backs this with the vault session (which owns the identity
+/// key: `VaultSession::sign(msg).to_bytes()`); tests back it with a raw
+/// `SigningKey`. The byte layout stays here (`commit`/`reveal_signing_bytes`);
+/// only the key crosses the trait boundary — the `attest`/`replica` split.
+pub trait CeremonySigner {
+    /// Sign `msg` with this device's Ed25519 identity key.
+    fn sign(&self, msg: &[u8]) -> [u8; 64];
+}
+
+/// The mesh a ceremony runs over: broadcast a frame to every *other* member,
+/// and block for the next inbound ceremony frame from any member. keeperd
+/// implements it over the ceremony's live per-peer Noise sessions; tests
+/// implement it over in-memory queues.
+///
+/// The driver authenticates every inbound frame by signature against the
+/// member set, so `recv` need not report which session a frame arrived on — a
+/// frame relayed by the wrong peer still fails the signature or membership
+/// check inside [`run_ceremony`]. Liveness (a member that never sends) is the
+/// caller's concern: keeperd bounds the wait with a timeout and the deferred
+/// live run exercises it; this loop is drained by honest, complete peers.
+pub trait CeremonyTransport {
+    /// Broadcast `frame` to every other member of the ceremony.
+    fn broadcast(&mut self, frame: &Frame) -> Result<()>;
+    /// Block for the next inbound ceremony frame from any member.
+    fn recv(&mut self) -> Result<Frame>;
+}
+
+/// Drive `ceremony` to completion from this member's point of view over
+/// `transport`, signing our own commit + reveal with `signer`, and return the
+/// derived `S` + its auditable [`Transcript`].
+///
+/// The protocol, in order: (1) sign + broadcast our commitment; (2) collect and
+/// authenticate peers' commitments until the commit phase closes — buffering any
+/// reveal that races ahead of a slow peer's commit (per-session FIFO holds, but
+/// cross-peer interleaving does not); (3) sign + broadcast our reveal and record
+/// it locally; (4) feed buffered + incoming reveals until `S` is derived.
+///
+/// Every inbound frame is authenticated here before it reaches the state
+/// machine: a bad signature, a frame bound to another ceremony (nonce/chain
+/// mismatch), a non-member, a duplicate, or an out-of-phase message is rejected,
+/// and a reveal that does not open its commitment aborts the ceremony (surfaced
+/// as an `Err`). On success `S` is returned by value — the caller (keeperd) must
+/// persist it only through the vault and zeroize its own copy (this crate stays
+/// `zeroize`-free by design).
+pub fn run_ceremony<T, K>(
+    transport: &mut T,
+    signer: &K,
+    ceremony: &mut Ceremony,
+) -> Result<(SharedKey, Transcript)>
+where
+    T: CeremonyTransport,
+    K: CeremonySigner,
+{
+    let nonce = *ceremony.nonce();
+    let chain_id = ceremony.chain_id().to_vec();
+    let local_id = ceremony.local_id();
+
+    // 1. Sign + broadcast our commitment. (The state machine self-seeded it in
+    //    `Ceremony::new`; the mesh has to hear it.)
+    let commitment = ceremony.local_commitment();
+    let csig = signer.sign(&commit_signing_bytes(&nonce, &chain_id, &local_id, &commitment));
+    transport.broadcast(&Frame::shared_key_commit(SharedKeyCommit {
+        nonce: nonce.to_vec(),
+        chain_id: chain_id.clone(),
+        device_id: local_id.to_vec(),
+        commitment: commitment.to_vec(),
+        signature: csig.to_vec(),
+    }))?;
+
+    // 2. Collect peers' commitments; a reveal that arrives early is buffered.
+    let mut buffered: Vec<SharedKeyReveal> = Vec::new();
+    while ceremony.phase() == Phase::Committing {
+        match transport.recv()?.kind {
+            Some(frame::Kind::SharedKeyCommit(c)) => {
+                feed_commit(ceremony, &nonce, &chain_id, &c)?;
+            }
+            Some(frame::Kind::SharedKeyReveal(r)) => buffered.push(r),
+            _ => {
+                return Err(NetError::Protocol(
+                    "unexpected frame during the ceremony commit phase",
+                ))
+            }
+        }
+    }
+
+    // 3. All commitments in — sign + broadcast our reveal, then record it
+    //    locally (the machine self-seeds our commitment but not our reveal).
+    let contribution = ceremony.local_contribution();
+    let rsig = signer.sign(&reveal_signing_bytes(&nonce, &chain_id, &local_id, &contribution));
+    transport.broadcast(&Frame::shared_key_reveal(SharedKeyReveal {
+        nonce: nonce.to_vec(),
+        chain_id: chain_id.clone(),
+        device_id: local_id.to_vec(),
+        contribution: contribution.to_vec(),
+        signature: rsig.to_vec(),
+    }))?;
+    ceremony.accept_reveal(&local_id, contribution)?;
+
+    // 4. Feed buffered reveals, then collect the rest until `S` is derived.
+    for r in buffered {
+        if ceremony.phase() != Phase::Revealing {
+            break;
+        }
+        feed_reveal(ceremony, &nonce, &chain_id, &r)?;
+    }
+    while ceremony.phase() == Phase::Revealing {
+        match transport.recv()?.kind {
+            Some(frame::Kind::SharedKeyReveal(r)) => {
+                feed_reveal(ceremony, &nonce, &chain_id, &r)?;
+            }
+            Some(frame::Kind::SharedKeyCommit(_)) => {
+                return Err(NetError::Protocol(
+                    "shared-key-commit arrived during the ceremony reveal phase",
+                ))
+            }
+            _ => {
+                return Err(NetError::Protocol(
+                    "unexpected frame during the ceremony reveal phase",
+                ))
+            }
+        }
+    }
+
+    // A reveal that failed to open its commitment aborts inside `accept_reveal`
+    // and returns `Err` above, so reaching here in any phase but `Derived` means
+    // the machine could not complete.
+    match ceremony.phase() {
+        Phase::Derived => {
+            let s = *ceremony
+                .shared_key()
+                .expect("a derived ceremony holds its shared key");
+            let transcript = ceremony
+                .transcript()
+                .expect("a derived ceremony holds its transcript")
+                .clone();
+            Ok((s, transcript))
+        }
+        _ => Err(NetError::Protocol("ceremony ended without deriving a key")),
+    }
+}
+
+/// Authenticate a `shared-key-commit` frame and feed it to the state machine.
+/// Rejects a frame bound to another ceremony (nonce/chain mismatch) or one whose
+/// signature does not verify under the claimed device id, *before* the machine's
+/// own member/phase/duplicate checks run.
+fn feed_commit(
+    ceremony: &mut Ceremony,
+    nonce: &CeremonyNonce,
+    chain_id: &[u8],
+    c: &SharedKeyCommit,
+) -> Result<()> {
+    if c.nonce.as_slice() != nonce || c.chain_id != chain_id {
+        return Err(NetError::Protocol(
+            "shared-key-commit bound to a different ceremony",
+        ));
+    }
+    let device_id = to_id32(&c.device_id)?;
+    let commitment = to_id32(&c.commitment)?;
+    if !verify_commit_sig(nonce, chain_id, &device_id, &commitment, &c.signature) {
+        return Err(NetError::Protocol(
+            "shared-key-commit signature failed to verify",
+        ));
+    }
+    ceremony.accept_commitment(&device_id, commitment)
+}
+
+/// Authenticate a `shared-key-reveal` frame and feed it to the state machine.
+/// See [`feed_commit`]; a revealed contribution that does not open the member's
+/// commitment aborts the ceremony inside `accept_reveal`.
+fn feed_reveal(
+    ceremony: &mut Ceremony,
+    nonce: &CeremonyNonce,
+    chain_id: &[u8],
+    r: &SharedKeyReveal,
+) -> Result<()> {
+    if r.nonce.as_slice() != nonce || r.chain_id != chain_id {
+        return Err(NetError::Protocol(
+            "shared-key-reveal bound to a different ceremony",
+        ));
+    }
+    let device_id = to_id32(&r.device_id)?;
+    let contribution = to_id32(&r.contribution)?;
+    if !verify_reveal_sig(nonce, chain_id, &device_id, &contribution, &r.signature) {
+        return Err(NetError::Protocol(
+            "shared-key-reveal signature failed to verify",
+        ));
+    }
+    ceremony.accept_reveal(&device_id, contribution)
+}
+
+/// A fixed-length 32-byte field from a ceremony frame, or a protocol error.
+fn to_id32(bytes: &[u8]) -> Result<[u8; 32]> {
+    bytes
+        .try_into()
+        .map_err(|_| NetError::Protocol("ceremony frame field is not 32 bytes"))
 }
 
 #[cfg(test)]
@@ -757,5 +974,216 @@ mod tests {
         // the signature layer, complementing the commitment binding).
         let other_nonce = [8u8; 32];
         assert!(!verify_reveal_sig(&other_nonce, CHAIN, &m.id, &m.r, &rsig));
+    }
+
+    // --- drive-loop tests --------------------------------------------------
+
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Signs with a raw `SigningKey` — the byte-for-byte equivalent of the vault
+    /// session keeperd wires in production.
+    struct RawSigner(SigningKey);
+    impl CeremonySigner for RawSigner {
+        fn sign(&self, msg: &[u8]) -> [u8; 64] {
+            self.0.sign(msg).to_bytes()
+        }
+    }
+
+    /// An in-memory mesh link: broadcast fans a frame to every peer's inbound
+    /// queue; recv blocks on our own. Models keeperd's per-peer Noise sessions.
+    struct ChannelTransport {
+        inbound: mpsc::Receiver<Frame>,
+        peers: Vec<mpsc::Sender<Frame>>,
+    }
+    impl CeremonyTransport for ChannelTransport {
+        fn broadcast(&mut self, frame: &Frame) -> Result<()> {
+            for p in &self.peers {
+                // A peer that already finished has dropped its receiver; a closed
+                // channel is not an error (it has what it needs).
+                let _ = p.send(frame.clone());
+            }
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Frame> {
+            self.inbound
+                .recv()
+                .map_err(|_| NetError::Protocol("ceremony transport closed"))
+        }
+    }
+
+    /// A single-member harness: hands back scripted inbound frames and records
+    /// what the driver broadcast. For the rejection paths (no live peers).
+    struct ScriptedTransport {
+        inbound: VecDeque<Frame>,
+        sent: Vec<Frame>,
+    }
+    impl CeremonyTransport for ScriptedTransport {
+        fn broadcast(&mut self, frame: &Frame) -> Result<()> {
+            self.sent.push(frame.clone());
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Frame> {
+            self.inbound
+                .pop_front()
+                .ok_or(NetError::Protocol("scripted transport exhausted"))
+        }
+    }
+
+    fn commit_frame(m: &Member, nonce: &CeremonyNonce, chain: &[u8]) -> Frame {
+        let comm = commitment(nonce, &m.id, &m.r);
+        let sig = sign_commit(&m.sk, nonce, chain, &m.id, &comm);
+        Frame::shared_key_commit(SharedKeyCommit {
+            nonce: nonce.to_vec(),
+            chain_id: chain.to_vec(),
+            device_id: m.id.to_vec(),
+            commitment: comm.to_vec(),
+            signature: sig.to_vec(),
+        })
+    }
+
+    /// Run one live driver per member over an in-memory broadcast mesh, each on
+    /// its own thread, and collect every member's derived `(S, Transcript)`.
+    fn run_mesh(members: &[Member]) -> Vec<(SharedKey, Transcript)> {
+        let n = members.len();
+        let (mut senders, mut receivers) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for _ in 0..n {
+            let (tx, rx) = mpsc::channel::<Frame>();
+            senders.push(tx);
+            receivers.push(rx);
+        }
+        let all_ids = ids(members);
+        let mut handles = Vec::with_capacity(n);
+        for (i, rx) in receivers.into_iter().enumerate() {
+            let peers: Vec<_> = senders
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, s)| s.clone())
+                .collect();
+            let member_ids = all_ids.clone();
+            let (sk, id, r) = (members[i].sk.clone(), members[i].id, members[i].r);
+            handles.push(thread::spawn(move || {
+                let mut transport = ChannelTransport { inbound: rx, peers };
+                let signer = RawSigner(sk);
+                let mut ceremony =
+                    Ceremony::new(NONCE, CHAIN.to_vec(), &member_ids, id, r).unwrap();
+                run_ceremony(&mut transport, &signer, &mut ceremony).unwrap()
+            }));
+        }
+        // Drop the template senders so each inbound closes once every peer's
+        // driver (holding the clones) has finished.
+        drop(senders);
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    }
+
+    #[test]
+    fn mesh_drivers_derive_identical_s_two_members() {
+        let members = [member(1, 11), member(2, 22)];
+        let results = run_mesh(&members);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, results[1].0);
+        assert!(results[0].1.verify());
+        assert_eq!(results[0].1.key_id, results[1].1.key_id);
+    }
+
+    #[test]
+    fn mesh_drivers_derive_identical_s_three_members() {
+        let members = [member(1, 11), member(2, 22), member(3, 33)];
+        let results = run_mesh(&members);
+        assert_eq!(results.len(), 3);
+        let s0 = results[0].0;
+        let id0 = results[0].1.key_id.clone();
+        assert!(id0.starts_with("S-"));
+        for (s, transcript) in &results {
+            // Every honest member derives the same S + key_id regardless of the
+            // (thread-nondeterministic) order it saw frames, and the transcript
+            // re-verifies from first principles.
+            assert_eq!(*s, s0);
+            assert_eq!(transcript.key_id, id0);
+            assert!(transcript.verify());
+        }
+    }
+
+    #[test]
+    fn driver_rejects_a_bad_commit_signature() {
+        let members = [member(1, 11), member(2, 22)];
+        let comm = commitment(&NONCE, &members[1].id, &members[1].r);
+        let bad = Frame::shared_key_commit(SharedKeyCommit {
+            nonce: NONCE.to_vec(),
+            chain_id: CHAIN.to_vec(),
+            device_id: members[1].id.to_vec(),
+            commitment: comm.to_vec(),
+            signature: vec![0u8; 64], // does not verify
+        });
+        let mut transport = ScriptedTransport {
+            inbound: VecDeque::from([bad]),
+            sent: Vec::new(),
+        };
+        let signer = RawSigner(members[0].sk.clone());
+        let mut ceremony =
+            Ceremony::new(NONCE, CHAIN.to_vec(), &ids(&members), members[0].id, members[0].r)
+                .unwrap();
+        let err = run_ceremony(&mut transport, &signer, &mut ceremony).unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)));
+        // Our own commitment went out before the peer's frame was rejected.
+        assert_eq!(transport.sent.len(), 1);
+    }
+
+    #[test]
+    fn driver_aborts_on_a_mismatched_reveal() {
+        let members = [member(1, 11), member(2, 22)];
+        let good_commit = commit_frame(&members[1], &NONCE, CHAIN);
+        // A validly-signed reveal, but of a contribution that does not open the
+        // commitment member 2 published.
+        let wrong = [0xAAu8; 32];
+        let rsig = sign_reveal(&members[1].sk, &NONCE, CHAIN, &members[1].id, &wrong);
+        let bad_reveal = Frame::shared_key_reveal(SharedKeyReveal {
+            nonce: NONCE.to_vec(),
+            chain_id: CHAIN.to_vec(),
+            device_id: members[1].id.to_vec(),
+            contribution: wrong.to_vec(),
+            signature: rsig.to_vec(),
+        });
+        let mut transport = ScriptedTransport {
+            inbound: VecDeque::from([good_commit, bad_reveal]),
+            sent: Vec::new(),
+        };
+        let signer = RawSigner(members[0].sk.clone());
+        let mut ceremony =
+            Ceremony::new(NONCE, CHAIN.to_vec(), &ids(&members), members[0].id, members[0].r)
+                .unwrap();
+        let err = run_ceremony(&mut transport, &signer, &mut ceremony).unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)));
+        assert_eq!(ceremony.phase(), Phase::Aborted);
+    }
+
+    #[test]
+    fn driver_rejects_a_commit_from_another_ceremony() {
+        let members = [member(1, 11), member(2, 22)];
+        // A well-formed, correctly-signed commit — but minted under a different
+        // ceremony nonce. The driver's nonce binding rejects it before the state
+        // machine sees it.
+        let other_nonce = [9u8; 32];
+        let comm = commitment(&other_nonce, &members[1].id, &members[1].r);
+        let sig = sign_commit(&members[1].sk, &other_nonce, CHAIN, &members[1].id, &comm);
+        let foreign = Frame::shared_key_commit(SharedKeyCommit {
+            nonce: other_nonce.to_vec(),
+            chain_id: CHAIN.to_vec(),
+            device_id: members[1].id.to_vec(),
+            commitment: comm.to_vec(),
+            signature: sig.to_vec(),
+        });
+        let mut transport = ScriptedTransport {
+            inbound: VecDeque::from([foreign]),
+            sent: Vec::new(),
+        };
+        let signer = RawSigner(members[0].sk.clone());
+        let mut ceremony =
+            Ceremony::new(NONCE, CHAIN.to_vec(), &ids(&members), members[0].id, members[0].r)
+                .unwrap();
+        let err = run_ceremony(&mut transport, &signer, &mut ceremony).unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)));
     }
 }
