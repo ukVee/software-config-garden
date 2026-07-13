@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attest;
+pub mod ceremony;
 pub mod connect;
 pub mod discovery;
 pub mod endpoint_cache;
@@ -49,6 +50,11 @@ pub mod sas;
 pub mod transport;
 
 pub use attest::{static_attestation_message, verify_static_attestation};
+pub use ceremony::{
+    commit_signing_bytes, commitment, derive_shared_key, key_id, reveal_signing_bytes,
+    verify_commit_sig, verify_reveal_sig, Ceremony, Contribution, MemberContribution, Phase,
+    SharedKey, Transcript, TranscriptEntry,
+};
 pub use connect::{connect_first, plan_routes, Route};
 pub use discovery::{Advertisement, DiscoveredPeer, PeerTxt};
 pub use endpoint_cache::{endpoint_cache_path, EndpointCache};

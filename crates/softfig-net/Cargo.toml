@@ -16,6 +16,8 @@ hkdf.workspace = true
 sha2.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+# M5d shared-key ceremony: BLAKE3 commitments + one-way key_id (the project hash).
+blake3.workspace = true
 serde.workspace = true
 toml.workspace = true
 # M5a-3 discovery: LAN mDNS (_softfig._tcp) announce + browse, no async runtime.
@@ -26,9 +28,6 @@ mdns-sd.workspace = true
 # production never needs this (the vault supplies both halves).
 x25519-dalek.workspace = true
 tempfile.workspace = true
-# Replica protocol tests mint self-consistent content addresses for the mock
-# chain (the production content-addressing lives in softfig-store).
-blake3.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
