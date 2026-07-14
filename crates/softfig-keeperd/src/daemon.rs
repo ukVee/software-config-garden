@@ -3,7 +3,7 @@
 //! loop hands `Arc<Mutex<DaemonInner>>` clones to each connection
 //! handler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -92,6 +92,29 @@ pub struct DaemonInner {
     /// wins, never a permanent refusal. Cleared per part when it leaves
     /// `active`. See [`crate::actions::growlight`].
     pub holders: crate::actions::HolderStore,
+    /// M5d slice 006 part 2 — shared-key ceremony convergence state (all
+    /// in-memory: a restart just re-derives them; no ceremony survives a
+    /// restart, and the tie-break clock re-counting only costs one extra tick).
+    ///
+    /// In-flight dedup: chains with a ceremony currently running on this device
+    /// (initiator or responder). A per-chain guard so one device never drives
+    /// two concurrent ceremonies for one chain — an overlapping reconcile tick,
+    /// or the reconcile-initiator racing the inbound-responder. Inserted before
+    /// an initiate/serve leg and removed when it ends (RAII
+    /// [`crate::net::CeremonyGuard`]).
+    pub ceremonies_in_flight: HashSet<String>,
+    /// Tie-break clock: chains this device saw still pending (unkeyed) in a
+    /// *prior* reconcile pass. The lexically-higher device defers initiating
+    /// until a chain is here, so in the symmetric dual-add case the lower
+    /// device's ceremony lands (and fills the higher's row as responder) before
+    /// the higher ever initiates — exactly one ceremony per chain per window.
+    pub ceremony_seen_pending: HashSet<String>,
+    /// Divergence surface (item 4): the most recent shared-key divergence
+    /// message (a completed ceremony that met a row already keyed with a
+    /// *different* key — the one-key-per-chain invariant violated). Surfaced
+    /// through the `status` verb so a divergence is visible, not stderr-only;
+    /// with S-encryption live it otherwise presents as silent chain corruption.
+    pub last_shared_key_divergence: Option<String>,
 }
 
 impl DaemonInner {
@@ -108,6 +131,9 @@ impl DaemonInner {
             pending_pairs: PendingPairs::default(),
             thrash: crate::actions::ThrashDetector::new(),
             holders: crate::actions::HolderStore::new(),
+            ceremonies_in_flight: HashSet::new(),
+            ceremony_seen_pending: HashSet::new(),
+            last_shared_key_divergence: None,
         }
     }
 }

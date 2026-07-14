@@ -352,7 +352,11 @@ pub fn persist_ceremony_outcome(
     // Rotation (slice 003's `shared_rekey`) is the ONLY authorized path that may
     // replace a live key. A row is not required — the responder may not have
     // added the subtree locally yet.
-    let membership_update = {
+    // A divergence detected inside the block below can't take `&mut inner`
+    // while the immutable session/repo borrows are live, so it breaks out with
+    // the message and we record it + return once those borrows have dropped.
+    let mut divergence: Option<String> = None;
+    let membership_update = 'mu: {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
         let mut membership = read_committed_shared_subtrees_for_mutation(repo, session)?;
@@ -372,16 +376,14 @@ pub fn persist_ceremony_outcome(
                 // before anything durable happens (this runs before the vault
                 // seal below, so nothing is sealed or committed on this path).
                 Some(existing) => {
-                    return Err((
-                        ErrorKind::Internal,
-                        format!(
-                            "shared-key divergence for chain {chain_id}: membership \
-                             row is already keyed {existing}, but this ceremony \
-                             produced {}; refusing to overwrite (rotation is the \
-                             only authorized re-key path)",
-                            transcript.key_id
-                        ),
+                    divergence = Some(format!(
+                        "shared-key divergence for chain {chain_id}: membership \
+                         row is already keyed {existing}, but this ceremony \
+                         produced {}; refusing to overwrite (rotation is the \
+                         only authorized re-key path)",
+                        transcript.key_id
                     ));
+                    break 'mu None;
                 }
             }
         }
@@ -393,6 +395,12 @@ pub fn persist_ceremony_outcome(
             None
         }
     };
+    if let Some(msg) = divergence {
+        // Surface it (item 4) so the refusal is visible through `status`, not
+        // stderr-only, then refuse — nothing durable has happened yet.
+        inner.last_shared_key_divergence = Some(msg.clone());
+        return Err((ErrorKind::Internal, msg));
+    }
 
     // Seal `S` first: the vault write is idempotent, so a commit failure after
     // it leaves a retryable half-state, never a committed record without a key.

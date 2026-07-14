@@ -269,6 +269,14 @@ pub struct StatusReply {
     /// Unix seconds at which the armed relock token expires, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relock_expires_at: Option<i64>,
+    /// M5d slice 006: the most recent shared-key ceremony divergence message, if
+    /// any — a completed ceremony that met a chain already keyed with a
+    /// *different* key (the one-key-per-chain invariant violated; with
+    /// S-encryption live this otherwise presents as silent chain corruption).
+    /// `None` in the healthy case. Surfaced here so a divergence is visible, not
+    /// stderr-only. `#[serde(default)]` keeps older daemons/clients compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_key_divergence: Option<String>,
 }
 
 // ---- growlight relock token -------------------------------------------

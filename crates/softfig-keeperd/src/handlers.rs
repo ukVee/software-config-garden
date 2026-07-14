@@ -53,6 +53,7 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
         relock_pending: relock_expires_at.is_some(),
         relock_expires_at,
+        shared_key_divergence: inner.last_shared_key_divergence.clone(),
     };
     Ok(serde_json::to_value(reply).unwrap())
 }

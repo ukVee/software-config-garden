@@ -783,6 +783,20 @@ fn serve_ceremony_responder<L: CeremonyLink>(
         }
     }
 
+    // In-flight dedup (M5d slice 006 part 2): refuse if a ceremony for this
+    // chain is already running on this device — our own reconcile sweep is
+    // initiating it, or an earlier inbound leg is still mid-protocol. Serving a
+    // second concurrent ceremony would mint a divergent key the persist backstop
+    // then has to refuse; refuse earlier, before driving the transport. The
+    // guard drops when this responder leg ends (success or failure).
+    let Some(_guard) = CeremonyGuard::try_acquire(daemon, &chain) else {
+        eprintln!(
+            "keeperd: net: shared-key ceremony for {chain} refused: a ceremony for \
+             this chain is already in flight on this device"
+        );
+        return;
+    };
+
     let contribution = softfig_vault::random_bytes32();
     let mut ceremony = match Ceremony::new(
         nonce,
@@ -1202,6 +1216,60 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
     }
 }
 
+/// Tie-break for concurrent dual-initiation (M5d slice 006 part 2). When both
+/// devices add the same mount path — the designed onboarding flow — both derive
+/// the same `chain/<id>`, both get a pending row, and both sweeps would initiate
+/// within one ~20s window, dueling to two different keys. To make convergence
+/// provable rather than racy, the lexically-lower `device_id` initiates
+/// immediately; the higher device **defers** until it has seen the chain pending
+/// across a prior reconcile pass (`seen_before`) — by then the lower device's
+/// ceremony has normally landed and filled the higher's row *as responder*, so
+/// it never initiates and there is exactly one ceremony per chain per window.
+///
+/// The defer is time-bounded, never permanent, because of the **hard
+/// constraint**: in the asymmetric flow only one device holds a row (the other
+/// is a responder that hasn't added the subtree), and that device might be the
+/// higher one. A permanent "only the lower initiates" would strand it. So the
+/// higher device still initiates once it has seen the chain pending before
+/// (`seen_before`) — one extra tick of latency, never a stall. The in-flight
+/// guard + part 1's fail-closed persist are the safety net if both still race.
+fn should_initiate_now(local_id: &[u8; 32], peer_id: &[u8; 32], seen_before: bool) -> bool {
+    local_id < peer_id || seen_before
+}
+
+/// RAII guard over [`DaemonInner::ceremonies_in_flight`] (M5d slice 006 part 2).
+/// Acquired before an initiate/serve leg for a chain and removed on drop (the
+/// leg ended, success or failure) so one device never runs two concurrent
+/// ceremonies for one chain. Holds a `Daemon` clone so it can re-lock `inner`
+/// on drop after the network IO (which runs with the mutex released).
+struct CeremonyGuard {
+    daemon: Daemon,
+    chain: String,
+}
+
+impl CeremonyGuard {
+    /// Insert `chain` into the in-flight set, returning the guard — or `None`
+    /// when a ceremony for this chain is already in flight on this device, in
+    /// which case the caller must not start a second.
+    fn try_acquire(daemon: &Daemon, chain: &str) -> Option<Self> {
+        let mut inner = daemon.inner.lock().unwrap();
+        if !inner.ceremonies_in_flight.insert(chain.to_string()) {
+            return None;
+        }
+        Some(Self {
+            daemon: daemon.clone(),
+            chain: chain.to_string(),
+        })
+    }
+}
+
+impl Drop for CeremonyGuard {
+    fn drop(&mut self) {
+        let mut inner = self.daemon.inner.lock().unwrap();
+        inner.ceremonies_in_flight.remove(&self.chain);
+    }
+}
+
 /// One ceremony reconcile pass (M5d, initiator side): find committed shared
 /// subtrees still awaiting their key (`key_id` empty), and for each run the
 /// commit-reveal ceremony with the ring peer, then persist the outcome —
@@ -1269,7 +1337,33 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
     }
     let host = ring.peers()[0].clone();
 
+    // Tie-break bookkeeping (M5d slice 006 part 2): note which pending chains
+    // were already seen pending in a *prior* pass, then refresh the seen set to
+    // the current pending list (dropping any that keyed since). Under a brief
+    // lock of its own — the snapshot above holds live session/repo borrows.
+    let seen_before: HashSet<String> = {
+        let mut inner = daemon.inner.lock().unwrap();
+        let prior = std::mem::take(&mut inner.ceremony_seen_pending);
+        let seen_before = pending.iter().filter(|c| prior.contains(*c)).cloned().collect();
+        inner.ceremony_seen_pending = pending.iter().cloned().collect();
+        seen_before
+    };
+
     for ref_name in pending {
+        // Tie-break: the lexically-higher device defers a freshly-pending chain
+        // one tick so the lower device's ceremony lands (and fills our row as
+        // responder) first — exactly one ceremony per chain per window. The
+        // asymmetric flow still converges: the sole row-holder initiates once it
+        // has seen the chain pending before, higher or not (`should_initiate_now`).
+        if !should_initiate_now(&local.device_id, &host.device_id, seen_before.contains(&ref_name)) {
+            continue;
+        }
+        // In-flight dedup: never run a second concurrent ceremony for this chain
+        // on this device (an inbound responder leg, or an overlapping tick). The
+        // guard drops at the end of the iteration, after persist.
+        let Some(_guard) = CeremonyGuard::try_acquire(daemon, &ref_name) else {
+            continue;
+        };
         match ceremony_with_host(local, &host, relay_client.as_ref(), &signer, &members, &ref_name)
         {
             Ok((mut s, transcript)) => {
@@ -2284,6 +2378,202 @@ mod tests {
             .expect("row");
         assert_eq!(row.key_id.as_deref(), Some(transcript.key_id.as_str()));
         assert_eq!(inner.repo.as_ref().unwrap().tip().unwrap().unwrap(), keyed_tip);
+    }
+
+    /// The committed membership row's `key_id` for a chain, if keyed.
+    fn row_key_id(daemon: &Daemon, ref_name: &str) -> Option<String> {
+        let inner = daemon.inner.lock().unwrap();
+        let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+            inner.repo.as_ref().unwrap(),
+            inner.session.as_ref().unwrap(),
+        )
+        .unwrap();
+        membership
+            .subtrees
+            .iter()
+            .find(|r| r.ref_name == ref_name)
+            .and_then(|r| r.key_id.clone())
+    }
+
+    /// Slice 006 part 2 tie-break decision: the lexically-lower device_id
+    /// initiates immediately; the higher device defers a *freshly*-pending chain
+    /// (unseen in a prior pass) so the lower's ceremony lands first — but STILL
+    /// initiates once it has seen the chain pending before, so the sole
+    /// row-holder in the asymmetric flow (which may be the higher device) is
+    /// never stranded (the hard constraint).
+    #[test]
+    fn tiebreak_lower_initiates_higher_defers_until_seen() {
+        let low = id_bytes(1);
+        let high = id_bytes(2);
+        assert!(low < high);
+        // Lower initiates immediately, seen before or not.
+        assert!(should_initiate_now(&low, &high, false));
+        assert!(should_initiate_now(&low, &high, true));
+        // Higher defers a freshly-pending chain...
+        assert!(!should_initiate_now(&high, &low, false));
+        // ...but still initiates once it has seen the chain pending before.
+        assert!(should_initiate_now(&high, &low, true));
+    }
+
+    /// Slice 006 part 2 in-flight dedup: while a ceremony for a chain is already
+    /// running on this device (an initiator sweep leg, held here via a live
+    /// [`CeremonyGuard`]), an inbound responder for the SAME chain is refused
+    /// before the transport is ever driven (a `DeadLink` proves it) — one device
+    /// never runs two concurrent ceremonies for one chain. Nothing is minted.
+    #[test]
+    fn responder_refuses_a_chain_with_a_ceremony_in_flight() {
+        let (daemon, tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-a");
+        let peer = forged_peer(1);
+        let ring = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(peer.clone());
+            r
+        }));
+        let add = crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // An initiator leg is already in flight for this chain on this device.
+        let guard = CeremonyGuard::try_acquire(&daemon, &ref_name).expect("acquire");
+        let keyed_tip = {
+            let inner = daemon.inner.lock().unwrap();
+            inner.repo.as_ref().unwrap().tip().unwrap().unwrap()
+        };
+
+        struct DeadLink;
+        impl CeremonyLink for DeadLink {
+            fn send_frame(&mut self, _f: &Frame) -> Result<(), NetError> {
+                Ok(())
+            }
+            fn recv_frame(&mut self) -> Result<Frame, NetError> {
+                Err(NetError::Protocol("in-flight responder must not drive the link"))
+            }
+        }
+        let commit = SharedKeyCommit {
+            nonce: vec![9u8; 32],
+            chain_id: ref_name.clone().into_bytes(),
+            device_id: vec![0u8; 32],
+            commitment: vec![0u8; 32],
+            signature: vec![0u8; 64],
+        };
+        serve_ceremony_responder(&daemon, &local, &ring, commit, DeadLink);
+
+        // The row is untouched, no key sealed, no new commit minted.
+        assert!(row_key_id(&daemon, &ref_name).is_none());
+        assert!(!tmp.path().join(".softfig/vault/shared-keys").exists());
+        assert_eq!(
+            daemon.inner.lock().unwrap().repo.as_ref().unwrap().tip().unwrap().unwrap(),
+            keyed_tip
+        );
+        drop(guard);
+    }
+
+    /// Slice 006 part 2 headline: **symmetric dual-add converges on ONE key**.
+    /// Both devices add the same mount path, so both hold a pending row for the
+    /// same `chain/<id>` and both sweeps reach the tie-break. Only the lower
+    /// device initiates; the higher defers (and is filled as responder). Driven
+    /// with the higher device's sweep run BOTH before and after the lower's, the
+    /// two members converge on one `key_id` + identical `S`, with no divergence
+    /// recorded on either side. The convergent-encryption invariant slice 002
+    /// rests on now holds provably, not racily.
+    #[test]
+    fn symmetric_dual_add_converges_on_one_key() {
+        let (daemon_a, tmp_a) = ceremony_daemon();
+        let (daemon_b, tmp_b) = ceremony_daemon();
+        let local_a = device_of(&daemon_a, "dev-a");
+        let local_b = device_of(&daemon_b, "dev-b");
+
+        // Orient by device_id: the lower initiates; the higher responds + defers.
+        let (lower_daemon, lower_tmp, lower_local, higher_daemon, higher_tmp, higher_local) =
+            if local_a.device_id < local_b.device_id {
+                (&daemon_a, &tmp_a, &local_a, &daemon_b, &tmp_b, &local_b)
+            } else {
+                (&daemon_b, &tmp_b, &local_b, &daemon_a, &tmp_a, &local_a)
+            };
+
+        // Both add the same mount → both rows land pending for one ref_name.
+        let add = crate::handlers::shared_subtree_add(
+            lower_daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("lower add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+        crate::handlers::shared_subtree_add(
+            higher_daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("higher add");
+
+        // The higher device is the responder: it listens on loopback, its
+        // inbound ring holds the lower, and it serves one inbound connection.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let higher_inbound_ring = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(ring_entry_of(lower_daemon, "lower", vec![]));
+            r
+        }));
+        let responder = {
+            let higher_daemon = higher_daemon.clone();
+            let higher_local = higher_local.clone();
+            let ring = higher_inbound_ring.clone();
+            thread::spawn(move || {
+                let (conn, _) = listener.accept().unwrap();
+                serve_inbound(higher_daemon, &higher_local, &ring, conn);
+            })
+        };
+
+        // The lower's sweep-ring holds the higher at the real listener endpoint.
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(
+                higher_daemon,
+                "higher",
+                vec![format!("127.0.0.1:{port}")],
+            ));
+            ring.save(&ring_path(lower_tmp.path())).unwrap();
+        }
+        // The higher's sweep-ring holds the lower with NO endpoint (no route),
+        // so the higher reaches the tie-break (>=2 members) and — if its defer
+        // were ever broken — could not hang the test by dialing.
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(lower_daemon, "lower", vec![]));
+            ring.save(&ring_path(higher_tmp.path())).unwrap();
+        }
+
+        // Higher sweeps FIRST: it defers the freshly-pending chain (unseen in a
+        // prior pass) → no ceremony, both rows still unkeyed.
+        reconcile_ceremonies(higher_daemon, higher_local);
+        assert!(row_key_id(higher_daemon, &ref_name).is_none());
+        assert!(!higher_tmp.path().join(".softfig/vault/shared-keys").exists());
+
+        // Lower sweeps: it initiates the one ceremony; the higher serves it.
+        reconcile_ceremonies(lower_daemon, lower_local);
+        responder.join().unwrap();
+
+        // Higher sweeps AGAIN (the "other order"): its row is now keyed → no-op.
+        reconcile_ceremonies(higher_daemon, higher_local);
+
+        // Converged: one key_id on both rows, identical S in both vaults.
+        let lower_kid = row_key_id(lower_daemon, &ref_name).expect("lower keyed");
+        let higher_kid = row_key_id(higher_daemon, &ref_name).expect("higher keyed");
+        assert_eq!(lower_kid, higher_kid, "both members converged on one key_id");
+        let s_lower = {
+            let inner = lower_daemon.inner.lock().unwrap();
+            *inner.session.as_ref().unwrap().load_shared_key(&lower_kid).expect("S lower")
+        };
+        let s_higher = {
+            let inner = higher_daemon.inner.lock().unwrap();
+            *inner.session.as_ref().unwrap().load_shared_key(&higher_kid).expect("S higher")
+        };
+        assert_eq!(s_lower, s_higher, "both members hold the identical S");
+        assert!(daemon_a.inner.lock().unwrap().last_shared_key_divergence.is_none());
+        assert!(daemon_b.inner.lock().unwrap().last_shared_key_divergence.is_none());
     }
 
 }
