@@ -347,6 +347,10 @@ pub enum BacklogKind {
     /// garden path, so it carries no `path` and the detail pane sources it from the
     /// polled `BatonReply` rather than a `read_file`.
     RuntimeBaton,
+    /// The coordination-bus history node (slice 005): a keeperd `tail_bus` read, not
+    /// a garden path, so it carries no `path` and the detail pane sources it from the
+    /// eagerly-loaded bus rows rather than a per-select `read_file`.
+    Bus,
 }
 
 /// One rendered row of the flattened, currently-visible backlog tree.
@@ -385,6 +389,9 @@ pub struct BacklogTree {
     /// Whether to emit the single live runtime-baton node (a growlightd read, not
     /// a garden path) after the loop-context section (slice 004).
     runtime_baton: bool,
+    /// Whether to emit the coordination-bus history node (a keeperd `tail_bus`
+    /// read, not a garden path) after the runtime-baton node (slice 005).
+    bus: bool,
     pub selected: usize,
 }
 
@@ -439,6 +446,14 @@ impl BacklogTree {
     /// growlightd-sourced row; the growlight page turns it on when it rebuilds.
     pub fn set_runtime_baton(&mut self, present: bool) {
         self.runtime_baton = present;
+        self.clamp_selection();
+    }
+
+    /// Toggle the coordination-bus history node (slice 005), emitted last — after
+    /// the runtime-baton node. Off by default so a bare tree (tests, pre-load) has
+    /// no keeper-sourced bus row; the growlight page turns it on when it rebuilds.
+    pub fn set_bus(&mut self, present: bool) {
+        self.bus = present;
         self.clamp_selection();
     }
 
@@ -513,8 +528,8 @@ impl BacklogTree {
                 slice_num: None,
             });
         }
-        // The live runtime-baton node closes the tree: a growlightd read (no garden
-        // `path`), sourced from the polled `BatonReply` by the detail pane.
+        // The live runtime-baton node: a growlightd read (no garden `path`), sourced
+        // from the polled `BatonReply` by the detail pane.
         if self.runtime_baton {
             out.push(BacklogVisibleRow {
                 kind: BacklogKind::RuntimeBaton,
@@ -522,6 +537,23 @@ impl BacklogTree {
                 item_id: String::new(),
                 label: "live runtime baton".to_string(),
                 status: "live".to_string(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                loaded: true,
+                path: None,
+                slice_num: None,
+            });
+        }
+        // The coordination-bus history node closes the tree: a keeperd `tail_bus`
+        // read (no garden `path`), sourced from the eagerly-loaded bus rows.
+        if self.bus {
+            out.push(BacklogVisibleRow {
+                kind: BacklogKind::Bus,
+                key: "bus".to_string(),
+                item_id: String::new(),
+                label: "coordination bus".to_string(),
+                status: "history".to_string(),
                 depth: 0,
                 expandable: false,
                 expanded: false,
@@ -829,6 +861,35 @@ mod tests {
         t.selected = 0;
         t.move_up();
         assert_eq!(t.selected, 2, "wrap-up lands on the last row (the baton node)");
+    }
+
+    #[test]
+    fn bus_node_closes_the_tree_after_the_baton_and_nav_reaches_it() {
+        let mut t = BacklogTree::new();
+        t.set_loop_context(vec![ctx("protocol.md", "growlight/protocol.md")]);
+        t.set_items(vec![task("042", "t")]);
+        t.set_runtime_baton(true);
+        // Off by default → no bus row.
+        assert!(
+            t.visible().iter().all(|r| r.kind != BacklogKind::Bus),
+            "the bus node is off until turned on",
+        );
+        // Turned on → one node, last, after the runtime-baton node.
+        t.set_bus(true);
+        let vis = t.visible();
+        assert_eq!(vis.len(), 4, "task + 1 loop-context + baton + the bus node");
+        // The baton node still precedes the bus, which now closes the tree.
+        assert_eq!(vis[2].kind, BacklogKind::RuntimeBaton);
+        let last = vis.last().unwrap();
+        assert_eq!(last.kind, BacklogKind::Bus);
+        assert_eq!(last.label, "coordination bus");
+        assert_eq!(last.status, "history");
+        assert!(!last.expandable);
+        assert_eq!(last.path, None, "a keeperd tail_bus read carries no garden path");
+        // Nav wraps onto it: from the top row, move_up lands on the bus node.
+        t.selected = 0;
+        t.move_up();
+        assert_eq!(t.selected, 3, "wrap-up lands on the last row (the bus node)");
     }
 
     #[test]

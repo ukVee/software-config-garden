@@ -11,10 +11,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use serde_json::{json, Value};
 use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
-    DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
-    GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
-    PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
-    ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
+    ChatMessage, DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply,
+    DiscoveredDevice, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
+    PairListReply, PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply,
+    ReplicaRevokeReply, ReplicaStatusReply, ShowReply, StatusReply, TailBusReply,
+    VaultListSealedReply, VaultRevealReply,
 };
 
 use crate::clip;
@@ -304,6 +305,13 @@ pub struct App {
     /// baton-headline and the live-baton tree node. Out-of-garden today, so it is
     /// the one node NOT read through keeperd — retires on the runtime FUSE mount.
     pub growlight_runtime_baton: Option<BatonReply>,
+    /// The coordination-bus history (slice 005), parsed newest-first from the
+    /// keeperd `tail_bus` reply. Eagerly loaded on Growlight-tab entry (and the
+    /// stale-refresh path) via `load_growlight`, NOT polled — the bus is garden
+    /// state on the keeperd channel, so the page shows it even with growlightd
+    /// down. Empty until the first reply (or genuinely no messages); the detail
+    /// pane renders a calm placeholder then.
+    pub growlight_bus: Vec<BusRow>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -358,6 +366,7 @@ impl App {
             growlight_stale: false,
             fleet: FleetHeader::Unknown,
             growlight_runtime_baton: None,
+            growlight_bus: Vec::new(),
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -431,6 +440,11 @@ impl App {
             json!({ "path": "growlight/baton-log" }),
             Tag::GrowlightBatonList,
         );
+        // The coordination-bus history (slice 005) — a keeperd garden read via the
+        // bespoke `tail_bus` verb (`since: 0` = the full log). Eagerly loaded here
+        // like the rest of the section (view-gated + stale-on-hidden-write), not
+        // polled: the bus is garden state, so it renders even with growlightd down.
+        ipc.send("tail_bus", json!({ "since": 0 }), Tag::GrowlightBus);
     }
 
     /// Whether the live fleet header should be polled this tick: only while the
@@ -627,11 +641,12 @@ impl App {
                 is_milestone: milestones.contains(r.id.as_str()),
             })
             .collect();
-        // The loop-context section + the live runtime-baton node are static; (re)seed
-        // them on every rebuild so the tree stays self-consistent, then set the
-        // backlog (which clamps last).
+        // The loop-context section, the live runtime-baton node, and the bus-history
+        // node are static; (re)seed them on every rebuild so the tree stays
+        // self-consistent, then set the backlog (which clamps last).
         self.growlight_tree.set_loop_context(loop_context_nodes());
         self.growlight_tree.set_runtime_baton(true);
+        self.growlight_tree.set_bus(true);
         self.growlight_tree.set_items(items);
     }
 
@@ -662,6 +677,7 @@ impl App {
                 None => return,
             },
             BacklogKind::RuntimeBaton => GrowlightArtifact::RuntimeBaton,
+            BacklogKind::Bus => GrowlightArtifact::BusHistory,
         };
         match self.growlight_source.resolve(&artifact) {
             // An in-garden node → a keeperd `read_file`, refined on reply.
@@ -696,6 +712,20 @@ impl App {
                     return;
                 }
                 self.growlight_preview_path = Some(RUNTIME_BATON_SLOT.to_string());
+                self.growlight_preview_title = row.label.clone();
+                self.growlight_preview.clear();
+                self.preview_scroll = 0;
+            }
+            // The bus is a keeperd read but a bespoke `tail_bus` verb, eagerly loaded
+            // into `growlight_bus` (not per-select) — so, like the runtime baton, NO
+            // keeperd `read_file` on select: the detail pane renders the parsed rows
+            // straight from `growlight_bus`. Mark the slot with a sentinel so a stale
+            // garden body doesn't linger and a re-select is a no-op; reset scroll.
+            Some(GrowlightRead::Bus) => {
+                if self.growlight_preview_path.as_deref() == Some(BUS_SLOT) {
+                    return;
+                }
+                self.growlight_preview_path = Some(BUS_SLOT.to_string());
                 self.growlight_preview_title = row.label.clone();
                 self.growlight_preview.clear();
                 self.preview_scroll = 0;
@@ -1183,6 +1213,17 @@ impl App {
                 // garden baton-LOG headline. Never `self.status` (no splat), never
                 // touches the garden-sourced tree/preview.
                 Err(_) => self.growlight_runtime_baton = None,
+            },
+            Tag::GrowlightBus => match reply.result {
+                // The coordination-bus history → parsed newest-first into rows. A
+                // keeperd garden read like the rest of the page, so an error goes to
+                // `self.status` (not a soft-fail to a dim line — that discipline is
+                // only for the growlightd-sourced header/baton).
+                Ok(v) => match serde_json::from_value::<TailBusReply>(v) {
+                    Ok(r) => self.growlight_bus = bus_rows(&r.messages),
+                    Err(e) => self.status = format!("growlight bus: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight bus: {m}"),
             },
         }
     }
@@ -2109,6 +2150,11 @@ fn vault_reveal_args(path: &str, master_password: &str, id: Option<&str>) -> Val
 /// real repo-relative path and keeps re-selects idempotent.
 const RUNTIME_BATON_SLOT: &str = "growlightd:runtime-baton";
 
+/// Sentinel value for `growlight_preview_path` while the bus-history node is
+/// selected — a keeperd `tail_bus` read rendered from `growlight_bus`, not a
+/// garden path, so it never collides with a real repo-relative path (slice 005).
+const BUS_SLOT: &str = "keeperd:bus-history";
+
 fn loop_context_nodes() -> Vec<LoopContextNode> {
     [
         ("protocol.md", "growlight/protocol.md"),
@@ -2219,6 +2265,36 @@ pub fn runtime_baton_head(text: &str) -> String {
         parts.push(format!("5h {h5}%"));
     }
     parts.join(" · ")
+}
+
+/// One coordination-bus message flattened for the read-only history pane (slice
+/// 005): the wire `from`/`to`/`kind`/`body`, plus a derived `is_alert` so the
+/// renderer can style `kind == "alert"` rows loud without re-parsing the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusRow {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub body: String,
+    pub is_alert: bool,
+}
+
+/// Parse a `tail_bus` reply's messages into history rows, **newest first**. The
+/// wire messages arrive in ascending total order (oldest first), so this reverses
+/// them: the most recent coordination shows at the top of the pane. Pure — no IO
+/// — so ordering + the alert flag are unit-testable over a fixture.
+pub fn bus_rows(messages: &[ChatMessage]) -> Vec<BusRow> {
+    messages
+        .iter()
+        .rev()
+        .map(|m| BusRow {
+            from: m.from.clone(),
+            to: m.to.clone(),
+            kind: m.kind.clone(),
+            body: m.body.clone(),
+            is_alert: m.kind == "alert",
+        })
+        .collect()
 }
 
 /// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
@@ -3486,16 +3562,21 @@ mod tests {
         );
 
         let vis = app.growlight_tree.visible();
-        // 2 backlog rows + the 4 static loop-context nodes + the live-baton node,
-        // all seeded on rebuild.
-        assert_eq!(vis.len(), 7);
+        // 2 backlog rows + the 4 static loop-context nodes + the live-baton node +
+        // the bus-history node, all seeded on rebuild.
+        assert_eq!(vis.len(), 8);
         assert!(vis[0].expandable, "milestone row expands");
         assert!(!vis[1].expandable, "task row is a leaf");
         assert_eq!(vis[2].kind, BacklogKind::LoopContext, "loop-context follows the backlog");
         assert_eq!(
             vis[6].kind,
             BacklogKind::RuntimeBaton,
-            "the live runtime-baton node closes the tree",
+            "the live runtime-baton node precedes the bus",
+        );
+        assert_eq!(
+            vis[7].kind,
+            BacklogKind::Bus,
+            "the bus-history node closes the tree",
         );
 
         // Expand the milestone (Enter) — fires the lazy read_file (to the dead
@@ -3531,8 +3612,8 @@ mod tests {
         );
 
         let vis = app.growlight_tree.visible();
-        // milestone + 2 slices + task + 4 loop-context + the live-baton node.
-        assert_eq!(vis.len(), 9, "milestone + 2 slices + task + loop-context + baton");
+        // milestone + 2 slices + task + 4 loop-context + baton + bus nodes.
+        assert_eq!(vis.len(), 10, "milestone + 2 slices + task + loop-context + baton + bus");
         assert_eq!(vis[1].depth, 1);
         assert_eq!(vis[1].label, "001 first");
         assert_eq!(vis[1].status, "done", "reviewed slice → done");
@@ -3960,9 +4041,13 @@ mod tests {
         seed_growlight_tree(&mut app, &mut ipc);
         app.view = View::Growlight;
 
-        // The tree = [task, 4 loop-context, live-baton]; select the last (baton).
+        // The tree = [task, 4 loop-context, live-baton, bus]; find + select the
+        // baton node (no longer the last row now the bus closes the tree).
         let vis = app.growlight_tree.visible();
-        let baton_idx = vis.len() - 1;
+        let baton_idx = vis
+            .iter()
+            .position(|r| r.kind == BacklogKind::RuntimeBaton)
+            .unwrap();
         assert_eq!(vis[baton_idx].kind, BacklogKind::RuntimeBaton);
         app.growlight_tree.selected = baton_idx;
         app.preview_scroll = 25; // a leftover offset
@@ -3978,5 +4063,122 @@ mod tests {
         app.preview_scroll = 9;
         app.refresh_growlight_selection(&mut ipc);
         assert_eq!(app.preview_scroll, 9, "re-select does not reset scroll");
+    }
+
+    fn chat_msg(number: u32, from: &str, to: &str, kind: &str, body: &str) -> ChatMessage {
+        ChatMessage {
+            number,
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            body: body.into(),
+            ts: "2026-07-14T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn bus_rows_orders_newest_first_and_flags_alerts() {
+        // The wire order is ascending (oldest first); `bus_rows` reverses it.
+        let msgs = vec![
+            chat_msg(1, "a", "@all", "info", "first"),
+            chat_msg(2, "b", "@all", "alert", "wifi down"),
+            chat_msg(3, "a", "b", "info", "third"),
+        ];
+        let rows = bus_rows(&msgs);
+        assert_eq!(
+            rows.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            vec!["third", "wifi down", "first"],
+            "newest message first",
+        );
+        // Only the `alert`-kind row is flagged loud.
+        assert_eq!(
+            rows.iter().map(|r| r.is_alert).collect::<Vec<_>>(),
+            vec![false, true, false],
+        );
+        // Fields carry through verbatim (wire forms preserved).
+        assert_eq!(rows[1].from, "b");
+        assert_eq!(rows[1].to, "@all");
+        assert_eq!(rows[1].kind, "alert");
+    }
+
+    #[test]
+    fn selecting_the_bus_node_marks_the_slot_without_a_keeperd_read() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+
+        // The bus node closes the tree (after the baton) — select the last row.
+        let vis = app.growlight_tree.visible();
+        let bus_idx = vis.len() - 1;
+        assert_eq!(vis[bus_idx].kind, BacklogKind::Bus);
+        app.growlight_tree.selected = bus_idx;
+        app.preview_scroll = 25; // a leftover offset
+        app.growlight_preview = "stale garden body".into();
+
+        app.refresh_growlight_selection(&mut ipc);
+        // No keeperd `read_file` path — the sentinel marks the bus node (its rows
+        // are eagerly loaded into `growlight_bus`, rendered directly).
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(BUS_SLOT));
+        assert_eq!(app.preview_scroll, 0, "selecting the bus node resets scroll");
+        assert!(app.growlight_preview.is_empty(), "the stale garden body is cleared");
+
+        // Re-selecting the same node is an idempotent no-op (scroll not re-reset).
+        app.preview_scroll = 9;
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(app.preview_scroll, 9, "re-select does not reset scroll");
+    }
+
+    #[test]
+    fn growlight_bus_reply_parses_rows_and_reports_malformed() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        let mut ipc = dummy_ipc();
+
+        // Ok → parsed newest-first into `growlight_bus`.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightBus,
+                result: Ok(json!({
+                    "messages": [
+                        { "number": 1, "from": "a", "to": "@all", "kind": "info", "body": "old", "ts": "t" },
+                        { "number": 2, "from": "b", "to": "@all", "kind": "alert", "body": "new", "ts": "t" },
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_bus.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            vec!["new", "old"],
+            "newest first",
+        );
+        assert!(app.growlight_bus[0].is_alert);
+        assert_eq!(app.status, "ready", "a clean parse doesn't touch the status line");
+
+        // A malformed Ok surfaces on the status line (a keeperd read, not a soft-fail).
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightBus,
+                result: Ok(json!({ "messages": "not-an-array" })),
+            },
+            &mut ipc,
+        );
+        assert!(app.status.contains("growlight bus"), "malformed reply reported");
+
+        // An Err (e.g. keeperd hiccup) is reported too.
+        app.status = "ready".into();
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightBus,
+                result: Err((softfig_ipc::ErrorKind::Io, "boom".into())),
+            },
+            &mut ipc,
+        );
+        assert!(app.status.contains("growlight bus"), "err reported");
     }
 }

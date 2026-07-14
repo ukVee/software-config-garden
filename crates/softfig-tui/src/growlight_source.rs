@@ -44,6 +44,13 @@ pub enum GrowlightArtifact {
     /// A specific fleet member's live baton (`agents/<id>/baton.md`) — likewise via
     /// the growlightd `baton` verb, carrying the member id (slice 004).
     MemberBaton { id: String },
+    /// The coordination-bus history (slice 005). Already garden state today
+    /// (`growlight/chat/`), but read via the bespoke keeperd `tail_bus` verb rather
+    /// than a plain `read_file` — so it resolves to its own [`GrowlightRead::Bus`]
+    /// on the KEEPERD arm (contrast the runtime baton's growlightd arm). When the
+    /// runtime FUSE-mount lands and the bus is served at a garden path, this
+    /// re-points to a `Garden` read with no change to the tree/viewer code.
+    BusHistory,
 }
 
 /// The concrete read an artifact resolves to: a keeperd garden read, or the
@@ -57,6 +64,12 @@ pub enum GrowlightRead {
     /// A growlightd `baton` verb call: `agent: None` = the fleet/legacy runtime
     /// baton, `Some(id)` = that member's baton. Transitional (see the enum doc).
     Growlightd { agent: Option<String> },
+    /// The coordination-bus history, read via the keeperd `tail_bus` verb (slice
+    /// 005). Garden state on the KEEPERD channel — NOT the growlightd arm — but a
+    /// bespoke verb, not a `read_file`, so it is its own read rather than a
+    /// `Garden { path }`. Retires to a `Garden` read at the mount path once the bus
+    /// is served under the runtime FUSE-mount (`## Forward-compat`).
+    Bus,
 }
 
 /// Resolves logical artifacts to reads. Holds the bare-`NNN` → full-path map for
@@ -107,6 +120,9 @@ impl GrowlightSource {
             GrowlightArtifact::MemberBaton { id } => {
                 return Some(GrowlightRead::Growlightd { agent: Some(id.clone()) })
             }
+            // The bus is garden state but read via the bespoke keeperd `tail_bus`
+            // verb — its own read, on the keeperd arm (not growlightd).
+            GrowlightArtifact::BusHistory => return Some(GrowlightRead::Bus),
         };
         Some(GrowlightRead::Garden { path })
     }
@@ -196,6 +212,19 @@ mod tests {
         assert_eq!(
             src.resolve(&GrowlightArtifact::MemberBaton { id: "a".into() }),
             Some(GrowlightRead::Growlightd { agent: Some("a".into()) })
+        );
+    }
+
+    #[test]
+    fn bus_history_routes_to_the_keeperd_tail_bus_read_not_growlightd() {
+        // The slice-005 keeperd arm: the bus is garden state read via the bespoke
+        // `tail_bus` verb, so it resolves to `Bus` — never a `Growlightd` arm (that
+        // is the runtime baton) and never a plain `Garden { path }` (that is a
+        // `read_file`).
+        let src = GrowlightSource::new();
+        assert_eq!(
+            src.resolve(&GrowlightArtifact::BusHistory),
+            Some(GrowlightRead::Bus)
         );
     }
 

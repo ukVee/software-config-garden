@@ -90,6 +90,15 @@ pub enum Tag {
     /// Transitional: retires when the runtime is a mounted garden chain, when the
     /// baton becomes a garden `read_file` like the other nodes (`## Forward-compat`).
     GrowlightRuntimeBaton,
+    /// growlight: the coordination-bus history (slice 005), read via the keeperd
+    /// `tail_bus` verb on the FIRST (keeperd `ipc`) channel — the bus is GARDEN
+    /// state, like `GrowlightNodeFile`, NOT the growlightd channel (contrast
+    /// `FleetStatus`/`GrowlightRuntimeBaton`). Eagerly loaded on tab entry (and on
+    /// the stale-refresh path), not per-select. `Ok` carries a
+    /// `softfig_ipc::TailBusReply` (messages ascending); the app parses it into
+    /// newest-first rows. An `Err` surfaces on `self.status` like the other garden
+    /// reads — the page keeps working with growlightd down (keeper-sourced).
+    GrowlightBus,
 }
 
 #[derive(Debug)]

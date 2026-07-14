@@ -4,13 +4,13 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
-    baton_headline, runtime_baton_head, short_fp, App, BackupRow, FleetHeader, Overlay, PairField,
-    PeerRow, View,
+    baton_headline, runtime_baton_head, short_fp, App, BackupRow, BusRow, FleetHeader, Overlay,
+    PairField, PeerRow, View,
 };
 use crate::command::command_hints;
 use crate::tree::BacklogKind;
@@ -703,14 +703,12 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
     render_growlight_header(f, app, rows[0]);
 
+    let selected_kind = app.growlight_tree.selected_row().map(|r| r.kind);
+
     // The live runtime-baton node is a growlightd read, not a garden `read_file`:
     // render it straight from the polled `BatonReply` (so it stays live between
     // polls) instead of the keeperd-sourced `growlight_preview`.
-    let selected_baton = matches!(
-        app.growlight_tree.selected_row().map(|r| r.kind),
-        Some(BacklogKind::RuntimeBaton)
-    );
-    if selected_baton {
+    if selected_kind == Some(BacklogKind::RuntimeBaton) {
         let (title, content) = app.runtime_baton_view();
         render_scroll_body(
             f,
@@ -724,8 +722,26 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // The bus-history node is a keeperd `tail_bus` read, eagerly loaded into
+    // `growlight_bus`: render the parsed rows (newest first, alerts loud) straight
+    // from that state through the styled scroll core — a keeper-sourced page that
+    // works even with growlightd down.
+    if selected_kind == Some(BacklogKind::Bus) {
+        let lines = bus_lines(&app.growlight_bus);
+        render_scroll_text(
+            f,
+            rows[1],
+            Text::from(lines),
+            "coordination bus — newest first  (read-only)",
+            &mut app.preview_scroll,
+            &mut app.preview_viewport,
+            &mut app.preview_total,
+        );
+        return;
+    }
+
     let placeholder =
-        "(select a node — milestone · slice · task · loop context · live baton — to view it)";
+        "(select a node — milestone · slice · task · loop context · live baton · bus — to view it)";
     let title = if app.growlight_preview.is_empty() {
         "growlight detail (read-only)".to_string()
     } else {
@@ -917,13 +933,38 @@ fn render_scroll_body(
     viewport: &mut u16,
     total_out: &mut u16,
 ) {
+    render_scroll_text(
+        f,
+        area,
+        Text::from(content),
+        title_base,
+        scroll,
+        viewport,
+        total_out,
+    );
+}
+
+/// The scroll core behind [`render_scroll_body`], taking pre-styled [`Text`] so a
+/// caller can colour individual lines (the bus history renders `alert` rows loud).
+/// Records the live viewport + wrapped-line total and clamps `scroll` to the real
+/// bottom exactly as the `&str` path does, so every scrollable pane pages
+/// identically.
+fn render_scroll_text(
+    f: &mut Frame,
+    area: Rect,
+    text: Text<'_>,
+    title_base: &str,
+    scroll: &mut u16,
+    viewport: &mut u16,
+    total_out: &mut u16,
+) {
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
 
-    let text = Paragraph::new(content).wrap(Wrap { trim: false });
-    let total = text.line_count(inner_w) as u16;
+    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    let total = para.line_count(inner_w) as u16;
 
     *viewport = inner_h;
     *total_out = total;
@@ -942,10 +983,35 @@ fn render_scroll_body(
         title_base.to_string()
     };
 
-    let p = text
+    let p = para
         .block(Block::default().borders(Borders::ALL).title(title))
         .scroll((offset, 0));
     f.render_widget(p, area);
+}
+
+/// Build the styled history lines for the bus pane (slice 005): newest-first rows,
+/// each `from → to  [kind]  body` (body newlines flattened to keep one row per
+/// message), with `alert` rows rendered LOUD (bold red). Empty → a calm dim
+/// placeholder. Pure (a `Vec<Line>`), so the alert emphasis is unit-testable.
+fn bus_lines(rows: &[BusRow]) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::styled(
+            "(no coordination-bus messages yet)",
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+    rows.iter()
+        .map(|r| {
+            let body = r.body.replace('\n', " ");
+            let text = format!("{} → {}  [{}]  {}", r.from, r.to, r.kind, body);
+            let style = if r.is_alert {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(text, style)
+        })
+        .collect()
 }
 
 fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1352,7 +1418,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 soft-fig TUI — keys
 
   1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
-  7            growlight (read-only): backlog → slices, loop-context, live baton
+  7            growlight (read-only): backlog → slices, loop-context, live baton · bus
   j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
@@ -1395,4 +1461,53 @@ any key closes this help";
         .block(Block::default().borders(Borders::ALL).title("help"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(from: &str, to: &str, kind: &str, body: &str) -> BusRow {
+        BusRow {
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            body: body.into(),
+            is_alert: kind == "alert",
+        }
+    }
+
+    #[test]
+    fn bus_lines_renders_the_row_format_and_flattens_body_newlines() {
+        let lines = bus_lines(&[row("a", "@all", "info", "line one\nline two")]);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        // `from → to  [kind]  body`, body newlines collapsed to keep one row.
+        assert_eq!(text, "a → @all  [info]  line one line two");
+    }
+
+    #[test]
+    fn bus_lines_renders_alert_rows_loud_and_plain_rows_plain() {
+        let lines = bus_lines(&[
+            row("b", "@all", "alert", "wifi down"),
+            row("a", "b", "info", "ok"),
+        ]);
+        // The alert row is bold red; the info row keeps the default style.
+        assert_eq!(
+            lines[0].style,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            "alert row must be styled loud",
+        );
+        assert_eq!(lines[1].style, Style::default(), "non-alert row stays plain");
+    }
+
+    #[test]
+    fn bus_lines_empty_shows_a_calm_placeholder_not_an_error() {
+        let lines = bus_lines(&[]);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("no coordination-bus messages"));
+        // Dim, not an alarming colour — an empty bus is normal, not a failure.
+        assert_eq!(lines[0].style, Style::default().fg(Color::DarkGray));
+    }
 }

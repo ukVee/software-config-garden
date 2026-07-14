@@ -579,6 +579,80 @@ fn selecting_the_live_baton_node_renders_it_from_the_polled_reply() {
 }
 
 #[test]
+fn selecting_the_bus_node_renders_history_newest_first_with_alerts_loud() {
+    use ratatui::style::{Color, Modifier};
+    use softfig_tui::app::BusRow;
+    use softfig_tui::tree::{BacklogItem, BacklogKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_tree.set_bus(true);
+    // Eagerly-loaded bus rows (already newest-first, as `bus_rows` produces): an
+    // alert on top, an info below.
+    app.growlight_bus = vec![
+        BusRow {
+            from: "b".into(),
+            to: "@all".into(),
+            kind: "alert".into(),
+            body: "wifi down".into(),
+            is_alert: true,
+        },
+        BusRow {
+            from: "a".into(),
+            to: "b".into(),
+            kind: "info".into(),
+            body: "rebased ok".into(),
+            is_alert: false,
+        },
+    ];
+    // Select the bus node (it closes the tree).
+    let vis = app.growlight_tree.visible();
+    app.growlight_tree.selected = vis
+        .iter()
+        .position(|r| r.kind == BacklogKind::Bus)
+        .unwrap();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("coordination bus"), "bus pane title missing:\n{rendered}");
+    assert!(rendered.contains("wifi down"), "alert message missing");
+    assert!(rendered.contains("rebased ok"), "info message missing");
+    // The alert row is rendered loud (bold red) — inspect the cell styles of the
+    // buffer row where the alert body sits, not just the text. The whole `alert`
+    // line is styled, so every visible content cell in that row is bold red.
+    let buf = terminal.backend().buffer();
+    let mut checked_alert_row = false;
+    for y in 0..buf.area.height {
+        // Reconstruct the row (column-wise, one symbol per cell) to find the alert
+        // line — column index, not byte offset, so the multi-byte `→` is harmless.
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        if !row.contains("wifi down") {
+            continue;
+        }
+        checked_alert_row = true;
+        // Every non-blank, non-border content cell on this row is bold red.
+        let loud = (0..buf.area.width)
+            .map(|x| &buf[(x, y)])
+            .filter(|c| !c.symbol().trim().is_empty() && c.symbol() != "│")
+            .all(|c| c.fg == Color::Red && c.modifier.contains(Modifier::BOLD));
+        assert!(loud, "the alert row must render bold red:\n{rendered}");
+        break;
+    }
+    assert!(checked_alert_row, "alert row not found in the buffer:\n{rendered}");
+}
+
+#[test]
 fn growlight_tab_absent_when_disabled() {
     // The load-bearing requirement: when growlight is not enabled the tab does
     // not appear at all — no tab, no empty pane, no error.
