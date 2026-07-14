@@ -402,7 +402,15 @@ pub fn persist_ceremony_outcome(
         serde_json::json!({ "chain_id": chain_id, "key_id": transcript.key_id }),
     )
     .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    commit_now(&mut inner, intent)
+    let hash = commit_now(&mut inner, intent)?;
+    // The chain just became keyed (M5d slice 002): recompose the union view
+    // and the encrypt router now, so its very next write seals under `S`
+    // instead of riding the pre-ceremony M path until a restart.
+    if membership_update.is_some() {
+        let state_dir = inner.config.state_dir().to_path_buf();
+        crate::handlers::refresh_mount_registry(&inner, &state_dir);
+    }
+    Ok(hash)
 }
 
 #[cfg(test)]

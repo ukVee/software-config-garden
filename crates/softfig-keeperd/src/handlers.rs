@@ -155,6 +155,8 @@ fn establish_session_locked(
         // allow-list (`config/shared-subtrees.toml` + local toggle sidecar).
         // Absent/empty ⇒ device_only ⇒ byte-identical to today.
         let registry = load_chain_registry(&repo, &session_arc, &state_dir);
+        // M5d slice 002 — prime the encrypt router with the keyed chains.
+        hook.set_shared_chain_keys(&registry);
         match softfig_fuse::FuseMount::mount_with(
             &garden_root,
             &state_dir,
@@ -182,6 +184,7 @@ fn establish_session_locked(
         let sink = crate::fuse_sink::AccumulatorSink::spawn(daemon.accumulator.clone());
         let sealed_q: Arc<dyn SealedQuery> = hook.clone();
         let registry = load_chain_registry(&repo, &session_arc, &state_dir);
+        hook.set_shared_chain_keys(&registry);
         match softfig_fuse::FuseMount::attach_unmounted(
             &garden_root,
             &state_dir,
@@ -701,6 +704,7 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
                 .as_ref()
                 .map(|r| load_chain_registry(r, &session, &state_dir))
                 .unwrap_or_default();
+            inner.layer_b.set_shared_chain_keys(&registry);
             match softfig_fuse::FuseMount::mount_with(
                 &garden_root,
                 &state_dir,
@@ -845,12 +849,12 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     //       only the region's plaintext
     let plaintext: Vec<u8> = match (&args.id, is_whole_file_sealed) {
         (None, true) => session
-            .decrypt_layer_b(&rel_string, &cipher)
-            .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?,
+            .decrypt_tracked_blob(&rel_string, &cipher)
+            .map_err(|e| (ErrorKind::AuthFailed, format!("sealed decrypt: {e}")))?,
         (None, false) => {
             let layer_a = session
-                .decrypt_blob(&cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?;
+                .decrypt_tracked_blob(&rel_string, &cipher)
+                .map_err(|e| (ErrorKind::AuthFailed, format!("decrypt: {e}")))?;
             let parser = layer_b::regions::parser_for(&rel_string);
             let spans = layer_b::regions::parse(parser, &layer_a, &session, &rel_string)
                 .map_err(|e| {
@@ -897,15 +901,9 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             // Region reveal — load Layer A bytes, parse for the named
             // id, decrypt the body, return only that plaintext. Works
             // whether or not the whole file is sealed.
-            let layer_a = if is_whole_file_sealed {
-                session
-                    .decrypt_layer_b(&rel_string, &cipher)
-                    .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?
-            } else {
-                session
-                    .decrypt_blob(&cipher)
-                    .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?
-            };
+            let layer_a = session
+                .decrypt_tracked_blob(&rel_string, &cipher)
+                .map_err(|e| (ErrorKind::AuthFailed, format!("decrypt: {e}")))?;
             let parser = layer_b::regions::parser_for(&rel_string);
             let spans = layer_b::regions::parse(parser, &layer_a, &session, &rel_string)
                 .map_err(|e| {
@@ -1524,17 +1522,11 @@ fn read_committed_shared_subtrees_text(
         .objects()
         .get(&blob)
         .map_err(|e| format!("read {rel} blob: {e}"))?;
-    // The config lives under `config/`, not a sealed path, but decode either
-    // layer defensively so a future seal can't silently break the router.
-    let plain = if softfig_vault::is_layer_b(&cipher) {
-        session
-            .decrypt_layer_b(&rel, &cipher)
-            .map_err(|e| format!("decrypt {rel}: {e}"))?
-    } else {
-        session
-            .decrypt_blob(&cipher)
-            .map_err(|e| format!("decrypt {rel}: {e}"))?
-    };
+    // The config lives under `config/`, not a sealed path, but decode any
+    // container defensively so a future seal can't silently break the router.
+    let plain = session
+        .decrypt_tracked_blob(&rel, &cipher)
+        .map_err(|e| format!("decrypt {rel}: {e}"))?;
     String::from_utf8(plain)
         .map(Some)
         .map_err(|_| format!("{rel} is not UTF-8"))
@@ -1733,14 +1725,17 @@ fn normalize_mount_path(raw: &str) -> std::result::Result<String, (ErrorKind, St
 
 /// Rebuild the live chain registry from the committed membership + local sidecar
 /// and hot-swap it into the FUSE mount (if any) so the union view recomposes
-/// live. A no-op in non-FUSE (Disk / M1c-compat) mode — the registry is
+/// live — and into the Layer B hook's shared-chain key router (M5d slice 002)
+/// so a freshly keyed chain's next write seals under its `S`. In non-FUSE
+/// (Disk / M1c-compat) mode only the router refresh matters — the registry is
 /// re-derived from the same two sources at the next mount there.
-fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_dir: &Path) {
+pub(crate) fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_dir: &Path) {
     let registry = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
         load_chain_registry(repo, session, state_dir)
     };
+    inner.layer_b.set_shared_chain_keys(&registry);
     if let Some(mount) = inner.fuse.as_ref() {
         mount.set_registry(registry);
     }

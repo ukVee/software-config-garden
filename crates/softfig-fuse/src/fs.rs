@@ -20,7 +20,7 @@ use fuser::{
 };
 use softfig_vcs::{ChainRegistry, Ignore, Repo, WalkSnapshot, IGNORE_FILE, TIP_REF};
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
-use softfig_vault::{is_layer_b, VaultSession};
+use softfig_vault::VaultSession;
 
 use crate::inodes::{InodeMap, ROOT_INODE};
 use crate::overlay::{Overlay, OverlayEntry};
@@ -218,12 +218,8 @@ impl SharedState {
                 ContentSource::Overlay(bytes) => bytes,
                 ContentSource::Blob(target) => {
                     let cipher = self.objects.get(&target)?;
-                    if is_layer_b(&cipher) {
-                        let rel = path.to_string_lossy().replace('\\', "/");
-                        self.session.decrypt_layer_b(&rel, &cipher)?
-                    } else {
-                        self.session.decrypt_blob(&cipher)?
-                    }
+                    let rel = path.to_string_lossy().replace('\\', "/");
+                    self.session.decrypt_tracked_blob(&rel, &cipher)?
                 }
             };
             snapshot.insert_file(&path, mode, content)?;
@@ -396,12 +392,8 @@ impl SharedState {
         };
         // Decrypt outside the lock (matches `workdir_snapshot`'s two-phase shape).
         let cipher = self.objects.get(&target)?;
-        if is_layer_b(&cipher) {
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            Ok(Some(self.session.decrypt_layer_b(&rel_str, &cipher)?))
-        } else {
-            Ok(Some(self.session.decrypt_blob(&cipher)?))
-        }
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        Ok(Some(self.session.decrypt_tracked_blob(&rel_str, &cipher)?))
     }
 
     /// Whether repo-relative `rel` resolves to a live file or directory.
@@ -1379,7 +1371,10 @@ impl FuseFs {
         };
         drop(inner);
         let cipher = self.state.objects.get(&entry.target)?;
-        let plain = self.state.session.decrypt_blob(&cipher)?;
+        // Shared-chain files flow through this union-view read too; the
+        // tracked dispatch resolves whichever container sealed the blob.
+        let rel_str = path.to_string_lossy().replace('\\', "/");
+        let plain = self.state.session.decrypt_tracked_blob(&rel_str, &cipher)?;
         let redacted = self.apply_redactions(path, plain);
         self.state
             .redacted_cache

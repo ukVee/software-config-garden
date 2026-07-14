@@ -17,7 +17,6 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
-use softfig_vault::is_layer_b;
 
 use crate::actions::sections::edit;
 use crate::daemon::{Daemon, KeeperError};
@@ -131,15 +130,9 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // and return the plaintext of a sealed file.
         format!("[sealed:{rel}]\n").into_bytes()
     } else {
-        let layer_a = if is_layer_b(&cipher) {
-            session
-                .decrypt_layer_b(&rel, &cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?
-        } else {
-            session
-                .decrypt_blob(&cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?
-        };
+        let layer_a = session
+            .decrypt_tracked_blob(&rel, &cipher)
+            .map_err(|e| (ErrorKind::AuthFailed, format!("decrypt: {e}")))?;
         // Same inline-region redaction the FUSE read path applies
         // (`[encrypted]` bodies; `[malformed vault tag …]` on parse fail).
         hook.redact_regions(&rel, layer_a)

@@ -231,6 +231,24 @@ impl VaultSession {
         crate::shared::encrypt_region(key_id, &s, path, id, plaintext)
     }
 
+    /// Decrypt a tracked file's blob under whichever container sealed it:
+    /// Layer B (`0xFF`, M-generation subkey by `path`), shared Layer B
+    /// (`0xFD`, S subkey by `path`), shared blob (`0xFE`, S), else Layer A
+    /// (M). One dispatch for every read path — a reader never needs to know
+    /// which chain (or key epoch) a blob came from, because every container
+    /// embeds its key id.
+    pub fn decrypt_tracked_blob(&self, path: &str, blob_file: &[u8]) -> Result<Vec<u8>> {
+        if crate::layer_b::is_layer_b(blob_file) {
+            self.decrypt_layer_b(path, blob_file)
+        } else if crate::shared::is_shared_layer_b(blob_file) {
+            self.decrypt_shared_layer_b(path, blob_file)
+        } else if crate::shared::is_shared_blob(blob_file) {
+            self.decrypt_shared_blob(blob_file)
+        } else {
+            self.decrypt_blob(blob_file)
+        }
+    }
+
     /// M5d slice 002 — decrypt an inline shared region.
     pub fn decrypt_shared_region(
         &self,
