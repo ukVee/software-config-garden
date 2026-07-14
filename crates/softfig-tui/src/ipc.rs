@@ -72,6 +72,15 @@ pub enum Tag {
     GrowlightBatonList,
     /// growlight: read the latest baton-log entry (`read_file <path>`).
     GrowlightBaton { path: String },
+    /// growlight: a one-shot growlightd `status` poll for the live fleet header
+    /// (slice 003). Rides the SECOND, growlightd-only [`IpcClient`] channel, not
+    /// the keeperd one — process-state is the one permanent growlightd read and
+    /// never migrates to the garden mount. `Ok` carries a
+    /// `softfig_ipc::growlightd::FleetStatusReply`; ANY `Err` (growlightd down /
+    /// fleet disarmed / a version-skew malformed reply) soft-fails to the
+    /// header's dim "unreachable" line — never a status splat, never blanking the
+    /// garden-only tree/body.
+    FleetStatus,
 }
 
 #[derive(Debug)]

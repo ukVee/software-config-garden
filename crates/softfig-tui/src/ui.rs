@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{baton_headline, short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
+use crate::app::{
+    baton_headline, short_fp, App, BackupRow, FleetHeader, Overlay, PairField, PeerRow, View,
+};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
@@ -695,7 +697,7 @@ fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
 fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
         .split(area);
     render_growlight_header(f, app, rows[0]);
 
@@ -722,27 +724,102 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-/// The always-visible fleet header strip. Slice 003 makes this the live
-/// growlightd `status` poll; today it is stubbed to the latest baton-log
-/// headline (the loop's most recent handoff), degrading to a dim line when there
-/// is none.
+/// The always-visible fleet header strip. Slice 003 renders live growlightd
+/// process-state from the `status` poll ([`App::fleet`]): the admission gate,
+/// running agents, and policy budgets, above the garden-sourced baton headline.
+/// Soft-fails: an unreachable growlightd collapses the live lines to a single
+/// dim "unreachable" line, but the baton headline (a keeperd/garden read) stays,
+/// so the header is useful even with growlightd down.
+///
+/// v1 shows no *live* budget % — that per-agent reading only arrives over the
+/// `subscribe` event stream, which is out of scope for this milestone (no
+/// streaming); the header surfaces the policy budget THRESHOLDS the `status`
+/// poll does carry.
 fn render_growlight_header(f: &mut Frame, app: &App, area: Rect) {
-    let title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
-    let mut lines = vec![Line::styled(
-        format!("loop baton · {title}"),
-        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
-    )];
-    match app.growlight_baton.as_deref().and_then(baton_headline) {
-        Some(h) => lines.push(Line::styled(h.to_string(), Style::default().fg(Color::Gray))),
-        None => lines.push(Line::styled(
-            "(no baton-log entries yet)",
+    let mut lines: Vec<Line> = Vec::new();
+    match &app.fleet {
+        FleetHeader::Live(s) => {
+            let (arm, arm_color) = if s.fleet_enabled {
+                ("armed", Color::Green)
+            } else {
+                ("disarmed", Color::DarkGray)
+            };
+            let (gate, gate_color) = if s.paused {
+                ("paused", Color::Yellow)
+            } else {
+                ("active", arm_color)
+            };
+            // Line 1: the fleet gate + running-agent count.
+            lines.push(Line::from(vec![
+                Span::styled("fleet · ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    arm,
+                    Style::default().fg(arm_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" · "),
+                Span::styled(gate, Style::default().fg(gate_color)),
+                Span::raw(format!(" · {} agent(s) running", s.agents.len())),
+            ]));
+            // Line 2: which agents are running (or the configured roster when the
+            // fleet is idle/disarmed and nothing has spawned).
+            let agents = if !s.agents.is_empty() {
+                s.agents
+                    .iter()
+                    .map(|a| format!("{}:{}", a.id, a.status))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            } else if !s.roster.is_empty() {
+                let names = s
+                    .roster
+                    .iter()
+                    .map(|m| m.agent.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("none running (roster: {names})")
+            } else {
+                "none running".to_string()
+            };
+            lines.push(Line::styled(
+                format!("agents · {agents}"),
+                Style::default().fg(Color::Gray),
+            ));
+            // Line 3: the policy budget thresholds this device runs under.
+            let p = &s.policy;
+            lines.push(Line::styled(
+                format!(
+                    "budgets · ctx roll {}% / handoff {}% · halt 5h {}% 7d {}% · ≤{} concurrent",
+                    p.ctx_roll_pct,
+                    p.ctx_handoff_pct,
+                    p.session_5h_halt_pct,
+                    p.session_7d_halt_pct,
+                    p.max_concurrent_agents,
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        FleetHeader::Unreachable => lines.push(Line::styled(
+            "growlightd unreachable — fleet status unavailable",
+            Style::default().fg(Color::DarkGray),
+        )),
+        FleetHeader::Unknown => lines.push(Line::styled(
+            "growlightd · fleet status not yet polled",
             Style::default().fg(Color::DarkGray),
         )),
     }
-    lines.push(Line::styled(
-        "live fleet header arrives in slice 003",
-        Style::default().fg(Color::DarkGray),
-    ));
+    // The loop's latest handoff headline — a garden (keeperd/baton-log) read,
+    // independent of growlightd, so it stays visible even when the fleet lines
+    // soft-fail to the dim "unreachable" line.
+    let title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
+    match app.growlight_baton.as_deref().and_then(baton_headline) {
+        Some(h) => lines.push(Line::styled(
+            format!("loop baton · {title} — {h}"),
+            Style::default().fg(Color::Cyan),
+        )),
+        None => lines.push(Line::styled(
+            "loop baton · (no baton-log entries yet)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("fleet"))
         .wrap(Wrap { trim: false });

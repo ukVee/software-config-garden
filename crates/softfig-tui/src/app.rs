@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
+use softfig_ipc::growlightd::FleetStatusReply;
 use softfig_ipc::{
     DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
     GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
@@ -39,6 +40,28 @@ pub enum View {
     /// reachable when growlight is enabled on this garden (`growlight_enabled ==
     /// Some(true)`); the tab is absent otherwise.
     Growlight,
+}
+
+/// Live growlightd fleet process-state for the Growlight header (slice 003).
+///
+/// This is the ONE permanent growlightd read: which agents are running, the
+/// admission gate, the policy budgets — none of it is a file, so it never
+/// migrates to the future runtime-FUSE mount and stays a dedicated `status`
+/// poll on its own path (milestone `## Forward-compat`). It **soft-fails**: an
+/// unreachable socket (growlightd down / fleet disarmed) or a version-skew
+/// malformed reply degrades to [`FleetHeader::Unreachable`] — one dim header
+/// line — while the garden-only tree and node bodies keep working. The page is
+/// never gated on growlightd.
+#[derive(Debug, Clone, Default)]
+pub enum FleetHeader {
+    /// Not polled yet (before the first `status` reply after entering the tab).
+    #[default]
+    Unknown,
+    /// A decoded live growlightd `status` reply.
+    Live(FleetStatusReply),
+    /// The last poll couldn't reach growlightd — render one dim line, keep the
+    /// garden-only page fully functional.
+    Unreachable,
 }
 
 /// One row of the growlight backlog queue. Served as a structured row over the
@@ -266,6 +289,13 @@ pub struct App {
     /// `read_file`) — too much to refire for a tab nobody is viewing. Marked
     /// stale here, lazily re-fetched on entry (020 slice 006, like `deploy_stale`).
     pub growlight_stale: bool,
+    /// Live growlightd process-state for the fleet header, from the second
+    /// (growlightd-only) IPC channel's `status` poll — repolled on a ~1.5s
+    /// cadence WHILE the Growlight tab is active (see `App::should_poll_fleet` /
+    /// `poll_fleet_status`), and soft-failing to `Unreachable` when growlightd is
+    /// down/disarmed. Distinct from the garden reads: process-state is not a file
+    /// and stays a dedicated growlightd read forever (`## Forward-compat`).
+    pub fleet: FleetHeader,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -318,6 +348,7 @@ impl App {
             growlight_baton_title: None,
             growlight_baton: None,
             growlight_stale: false,
+            fleet: FleetHeader::Unknown,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -391,6 +422,23 @@ impl App {
             json!({ "path": "growlight/baton-log" }),
             Tag::GrowlightBatonList,
         );
+    }
+
+    /// Whether the live fleet header should be polled this tick: only while the
+    /// Growlight tab is the active, enabled view. Mirrors the view-gated load
+    /// discipline (`refresh_view`) — the run loop must never hammer growlightd
+    /// from another tab. Kept as a predicate so the gating is unit-testable
+    /// without a live socket.
+    pub fn should_poll_fleet(&self) -> bool {
+        self.view == View::Growlight && self.growlight_enabled == Some(true)
+    }
+
+    /// Issue one one-shot growlightd `status` poll on the dedicated growlightd
+    /// channel (NOT the keeperd `ipc`), tagged [`Tag::FleetStatus`]. The reply
+    /// feeds `apply_reply`, whose `FleetStatus` arm decodes it into the live
+    /// header or soft-fails an unreachable socket to the dim line.
+    pub fn poll_fleet_status(&self, growlightd: &mut IpcClient) {
+        growlightd.send("status", json!({}), Tag::FleetStatus);
     }
 
     /// Re-fetch every directory whose children are loaded, so the view
@@ -1045,6 +1093,21 @@ impl App {
                     Err(e) => self.status = format!("growlight baton: malformed reply: {e}"),
                 },
                 Err((_, m)) => self.status = format!("growlight baton: {m}"),
+            },
+            Tag::FleetStatus => match reply.result {
+                // Live process-state → the header. A version-skewed / malformed
+                // reply degrades to the dim line rather than a splat.
+                Ok(v) => {
+                    self.fleet = match serde_json::from_value::<FleetStatusReply>(v) {
+                        Ok(reply) => FleetHeader::Live(reply),
+                        Err(_) => FleetHeader::Unreachable,
+                    };
+                }
+                // Soft-fail (load-bearing): growlightd down / disarmed → the
+                // connect errors on the worker. One dim header line — deliberately
+                // NEVER `self.status` (no status splat) and never touching the
+                // garden-sourced tree/preview, so the page keeps working.
+                Err(_) => self.fleet = FleetHeader::Unreachable,
             },
         }
     }
@@ -3484,5 +3547,122 @@ mod tests {
         );
         assert_eq!(baton_headline("just a line\nmore"), Some("just a line"));
         assert_eq!(baton_headline("\n\n   \n"), None);
+    }
+
+    // ---- slice 003: live fleet header (growlightd status poll) ----
+
+    /// A scripted growlightd `status` reply decodes into the live header.
+    #[test]
+    fn fleet_status_reply_decodes_into_live_header() {
+        let mut app = App::new();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                result: Ok(json!({
+                    "state": "running",
+                    "garden_root": "/g",
+                    "protocol_version": 1,
+                    "policy": {
+                        "max_concurrent_agents": 2,
+                        "ctx_roll_pct": 50,
+                        "ctx_handoff_pct": 60,
+                        "session_5h_halt_pct": 85,
+                        "session_7d_halt_pct": 90
+                    },
+                    "fleet_enabled": true,
+                    "paused": false,
+                    "agents": [{ "id": "a", "status": "running" }],
+                    "roster": [{ "agent": "a" }]
+                })),
+            },
+            &mut ipc,
+        );
+        match &app.fleet {
+            FleetHeader::Live(s) => {
+                assert!(s.fleet_enabled);
+                assert!(!s.paused);
+                assert_eq!(s.agents.len(), 1);
+                assert_eq!(s.agents[0].id, "a");
+                assert_eq!(s.policy.max_concurrent_agents, 2);
+            }
+            other => panic!("expected a live header, got {other:?}"),
+        }
+    }
+
+    /// The header poll is view-gated: it fires ONLY while the Growlight tab is
+    /// the active, enabled view — never from another tab, never before the
+    /// enablement gate is known.
+    #[test]
+    fn fleet_poll_gated_to_active_enabled_growlight_view() {
+        let mut app = App::new();
+        // Default view is Browse, gate unknown → no poll.
+        assert!(!app.should_poll_fleet());
+
+        // Growlight view but gate not yet known → still no poll.
+        app.view = View::Growlight;
+        assert!(!app.should_poll_fleet());
+
+        // Growlight view + enabled → poll.
+        app.growlight_enabled = Some(true);
+        assert!(app.should_poll_fleet());
+
+        // Enabled but the user is on another tab → no poll (don't hammer growlightd).
+        app.view = View::Browse;
+        assert!(!app.should_poll_fleet());
+
+        // Explicitly disabled while on the (now-stranded) view → no poll.
+        app.view = View::Growlight;
+        app.growlight_enabled = Some(false);
+        assert!(!app.should_poll_fleet());
+    }
+
+    /// Soft-fail (load-bearing): an unreachable growlightd socket degrades the
+    /// header to `Unreachable` WITHOUT a status splat or disturbing the
+    /// garden-sourced tree/preview — the page keeps working.
+    #[test]
+    fn unreachable_growlightd_soft_fails_without_status_splat() {
+        let mut app = App::new();
+        // Seed some garden-sourced state + a prior live header.
+        app.status = "ready".into();
+        app.growlight_preview = "## Mission\nbody".into();
+        app.fleet = FleetHeader::Unknown;
+
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+
+        assert!(matches!(app.fleet, FleetHeader::Unreachable));
+        // No status splat: the footer status line is untouched.
+        assert_eq!(app.status, "ready");
+        // The garden-only body is untouched — the page still works.
+        assert_eq!(app.growlight_preview, "## Mission\nbody");
+    }
+
+    /// A version-skewed / malformed `Ok` reply also degrades to the dim line
+    /// rather than splatting an error.
+    #[test]
+    fn malformed_fleet_status_reply_degrades_to_unreachable() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                // Missing the required `policy` object → decode fails.
+                result: Ok(json!({ "state": "running", "garden_root": "/g", "protocol_version": 1 })),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.fleet, FleetHeader::Unreachable));
+        assert_eq!(app.status, "ready", "malformed reply must not splat the status line");
     }
 }

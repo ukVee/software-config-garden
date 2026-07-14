@@ -437,6 +437,78 @@ fn renders_growlight_loop_context_and_clamps_node_scroll() {
 }
 
 #[test]
+fn renders_live_fleet_header_from_status_poll() {
+    use softfig_tui::app::FleetHeader;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // A decoded growlightd `status` reply drives the live header.
+    let reply: softfig_ipc::growlightd::FleetStatusReply = serde_json::from_value(serde_json::json!({
+        "state": "running",
+        "garden_root": "/g",
+        "protocol_version": 1,
+        "policy": {
+            "max_concurrent_agents": 2,
+            "ctx_roll_pct": 50,
+            "ctx_handoff_pct": 60,
+            "session_5h_halt_pct": 85,
+            "session_7d_halt_pct": 90
+        },
+        "fleet_enabled": true,
+        "paused": false,
+        "agents": [{ "id": "a", "status": "running" }]
+    }))
+    .unwrap();
+    app.fleet = FleetHeader::Live(reply);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("armed"), "fleet gate missing:\n{rendered}");
+    assert!(rendered.contains("agent(s) running"), "agent count missing");
+    assert!(rendered.contains("a:running"), "agent roster line missing");
+    assert!(rendered.contains("budgets"), "policy budget line missing");
+    assert!(rendered.contains("halt 5h 85%"), "budget thresholds missing");
+}
+
+#[test]
+fn growlight_header_soft_fails_when_growlightd_unreachable() {
+    use softfig_tui::app::FleetHeader;
+    use softfig_tui::tree::BacklogItem;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // growlightd is down: the header soft-fails, but the garden-only tree + body
+    // must keep rendering (never gate the page on growlightd).
+    app.fleet = FleetHeader::Unreachable;
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_preview_title = "tui-modernize".into();
+    app.growlight_preview = "## Mission\nstill readable with growlightd down".into();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    // One dim unreachable line, no error splat.
+    assert!(rendered.contains("growlightd unreachable"), "dim line missing:\n{rendered}");
+    // The garden-only page still works.
+    assert!(rendered.contains("tui-modernize"), "backlog tree gone");
+    assert!(rendered.contains("still readable"), "node body gone");
+}
+
+#[test]
 fn growlight_tab_absent_when_disabled() {
     // The load-bearing requirement: when growlight is not enabled the tab does
     // not appear at all — no tab, no empty pane, no error.
