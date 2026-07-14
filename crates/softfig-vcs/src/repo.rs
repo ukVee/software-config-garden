@@ -339,7 +339,8 @@ impl Repo {
     /// Per-chain fsck over the chain tracked by `ref_name` (see
     /// [`crate::fsck::run_chain`]).
     pub fn fsck_chain(&self, ref_name: &str) -> Result<crate::fsck::FsckReport> {
-        crate::fsck::run_chain(&self.db, &self.objects, self.tip_of(ref_name)?)
+        let chain_id = (ref_name != TIP_REF).then_some(ref_name);
+        crate::fsck::run_chain(&self.db, &self.objects, self.tip_of(ref_name)?, chain_id)
     }
 
     /// Collect loose objects unreachable from any **registered** chain in
@@ -376,6 +377,11 @@ fn write_commit_tx(
     let payload_canon_value: serde_json::Value =
         serde_json::from_str(&payload_canon_str)?;
 
+    // Bind the commit to its chain (M5d slice 002). The device chain
+    // (`TIP_REF`) stays `None` so its canonical bytes — and every historical
+    // hash — are unchanged; a shared chain binds its stable `ref_name`.
+    let chain_id = (ref_name != TIP_REF).then_some(ref_name);
+
     let canon = CanonicalCommit {
         parent,
         root_tree: blueprint.root,
@@ -385,6 +391,7 @@ fn write_commit_tx(
         intent: &intent_name,
         payload: &payload_canon_value,
         master_key_id,
+        chain_id,
     };
     let hash = canon.hash()?;
     let signature_bytes = session.sign(hash.as_bytes()).to_bytes();

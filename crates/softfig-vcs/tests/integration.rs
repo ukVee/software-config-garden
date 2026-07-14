@@ -123,6 +123,7 @@ fn commit_signature_verifies() {
         intent: &row.intent,
         payload: &payload,
         master_key_id: row.master_key_id,
+        chain_id: None,
     };
     verify_commit(&canon, row.hash, &row.signature).expect("signature must verify");
 }
@@ -144,6 +145,7 @@ fn jcs_canonicalization_is_deterministic() {
         intent: "init",
         payload: &payload_a,
         master_key_id: 1,
+        chain_id: None,
     };
     let h1 = canon.hash().unwrap();
     let h2 = canon.hash().unwrap();

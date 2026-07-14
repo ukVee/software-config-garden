@@ -411,6 +411,13 @@ impl ReplicaSink for MirrorStore {
             intent: &c.intent,
             payload: &payload_value,
             master_key_id: c.master_key_id,
+            // Replication announces `repo.tip()` = the device chain (`TIP_REF`)
+            // only (M5b), so a mirrored commit is always device-form
+            // (`chain_id = None`). If a shared-chain commit ever reached here it
+            // would fail hash reconstruction — fail-closed, never mis-accepted.
+            // Replicating shared chains would require `CommitData` to carry the
+            // chain_id; out of scope until that slice.
+            chain_id: None,
         };
         let declared = Hash::from_bytes(h32(&c.hash)?);
         let sig = h32_64(&c.signature)?;

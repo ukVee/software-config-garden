@@ -17,7 +17,7 @@
 //! gc and reachability pruning are deferred to v2; orphaned objects are
 //! reported, not deleted.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use softfig_store::{Db, Hash, ObjectStore, TreeEntryKind};
 
@@ -46,9 +46,35 @@ pub fn run(db: &Db, objects: &ObjectStore) -> Result<FsckReport> {
     // Commits.
     let commits = db.list_commits()?;
     let mut commit_hashes = HashSet::with_capacity(commits.len());
+    let mut parent_of: HashMap<Hash, Option<Hash>> = HashMap::with_capacity(commits.len());
     for c in &commits {
         commit_hashes.insert(c.hash);
+        parent_of.insert(c.hash, c.parent);
     }
+
+    // Derive each commit's owning chain from the refs table (M5d slice 002) so a
+    // shared-chain commit re-canonicalizes with the `chain_id` bound into its
+    // hash. Walk each non-device ref's ancestry; commits reachable only from
+    // `TIP_REF` (or from no ref) stay `None` and hash under the device form.
+    // This is the whole-store analogue of the per-ref `run_chain` — the refs
+    // table is the ground truth for chain membership, so no schema column is
+    // needed (chains never share commits: the `chain_id` in each hash makes a
+    // chain-A commit a distinct object from any chain-B commit).
+    let mut chain_of: HashMap<Hash, String> = HashMap::new();
+    for r in db.list_refs()? {
+        if r.name == crate::TIP_REF {
+            continue;
+        }
+        let mut cursor = Some(r.commit_hash);
+        while let Some(h) = cursor {
+            if chain_of.contains_key(&h) {
+                break;
+            }
+            chain_of.insert(h, r.name.clone());
+            cursor = parent_of.get(&h).copied().flatten();
+        }
+    }
+
     for c in &commits {
         report.commits_checked += 1;
 
@@ -71,6 +97,7 @@ pub fn run(db: &Db, objects: &ObjectStore) -> Result<FsckReport> {
             intent: &c.intent,
             payload: &payload_value,
             master_key_id: c.master_key_id,
+            chain_id: chain_of.get(&c.hash).map(String::as_str),
         };
         if let Err(e) = verify_commit(&canon, c.hash, &c.signature) {
             report.problems.push(format!("commit {}: {e}", c.hash));
@@ -171,7 +198,12 @@ pub fn run(db: &Db, objects: &ObjectStore) -> Result<FsckReport> {
 /// yields a report. This is why the walk is fault-tolerant here rather than
 /// reusing gc's fail-closed [`crate::gc::reachable_from`] (which *must* error
 /// out so gc never under-retains — the retention path stays fail-closed).
-pub fn run_chain(db: &Db, objects: &ObjectStore, tip: Option<Hash>) -> Result<FsckReport> {
+pub fn run_chain(
+    db: &Db,
+    objects: &ObjectStore,
+    tip: Option<Hash>,
+    chain_id: Option<&str>,
+) -> Result<FsckReport> {
     let mut report = FsckReport::default();
     let Some(tip) = tip else {
         return Ok(report);
@@ -217,6 +249,7 @@ pub fn run_chain(db: &Db, objects: &ObjectStore, tip: Option<Hash>) -> Result<Fs
             intent: &c.intent,
             payload: &payload_value,
             master_key_id: c.master_key_id,
+            chain_id,
         };
         if let Err(e) = verify_commit(&canon, c.hash, &c.signature) {
             report.problems.push(format!("commit {}: {e}", c.hash));
