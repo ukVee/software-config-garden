@@ -9,9 +9,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    baton_headline, short_fp, App, BackupRow, FleetHeader, Overlay, PairField, PeerRow, View,
+    baton_headline, runtime_baton_head, short_fp, App, BackupRow, FleetHeader, Overlay, PairField,
+    PeerRow, View,
 };
 use crate::command::command_hints;
+use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
 
@@ -701,8 +703,29 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
     render_growlight_header(f, app, rows[0]);
 
+    // The live runtime-baton node is a growlightd read, not a garden `read_file`:
+    // render it straight from the polled `BatonReply` (so it stays live between
+    // polls) instead of the keeperd-sourced `growlight_preview`.
+    let selected_baton = matches!(
+        app.growlight_tree.selected_row().map(|r| r.kind),
+        Some(BacklogKind::RuntimeBaton)
+    );
+    if selected_baton {
+        let (title, content) = app.runtime_baton_view();
+        render_scroll_body(
+            f,
+            rows[1],
+            &content,
+            &title,
+            &mut app.preview_scroll,
+            &mut app.preview_viewport,
+            &mut app.preview_total,
+        );
+        return;
+    }
+
     let placeholder =
-        "(select a node — milestone · slice · task · loop context — to view its markdown)";
+        "(select a node — milestone · slice · task · loop context · live baton — to view it)";
     let title = if app.growlight_preview.is_empty() {
         "growlight detail (read-only)".to_string()
     } else {
@@ -726,10 +749,12 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// The always-visible fleet header strip. Slice 003 renders live growlightd
 /// process-state from the `status` poll ([`App::fleet`]): the admission gate,
-/// running agents, and policy budgets, above the garden-sourced baton headline.
-/// Soft-fails: an unreachable growlightd collapses the live lines to a single
-/// dim "unreachable" line, but the baton headline (a keeperd/garden read) stays,
-/// so the header is useful even with growlightd down.
+/// running agents, and policy budgets. Below them, slice 004 shows the LIVE
+/// runtime baton headline (the growlightd `baton` verb, [`App::growlight_runtime_baton`]),
+/// falling back to the garden baton-LOG headline when growlightd is unreachable.
+/// Soft-fails: an unreachable growlightd collapses the live lines to a single dim
+/// "unreachable" line, but the garden baton-log headline still shows, so the
+/// header is useful even with growlightd down.
 ///
 /// v1 shows no *live* budget % — that per-agent reading only arrives over the
 /// `subscribe` event stream, which is out of scope for this milestone (no
@@ -806,19 +831,40 @@ fn render_growlight_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
     }
-    // The loop's latest handoff headline — a garden (keeperd/baton-log) read,
-    // independent of growlightd, so it stays visible even when the fleet lines
-    // soft-fail to the dim "unreachable" line.
-    let title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
-    match app.growlight_baton.as_deref().and_then(baton_headline) {
-        Some(h) => lines.push(Line::styled(
-            format!("loop baton · {title} — {h}"),
-            Style::default().fg(Color::Cyan),
-        )),
-        None => lines.push(Line::styled(
-            "loop baton · (no baton-log entries yet)",
-            Style::default().fg(Color::DarkGray),
-        )),
+    // The baton headline. Prefer the LIVE runtime baton (slice 004, via the
+    // growlightd `baton` verb) — the loop's actual carried state. Fall back to the
+    // garden baton-LOG headline (a keeperd read, slice 003) when growlightd is
+    // unreachable, so the header degrades but never blanks.
+    match app
+        .growlight_runtime_baton
+        .as_ref()
+        .filter(|b| !b.text.trim().is_empty())
+    {
+        Some(b) => {
+            let head = runtime_baton_head(&b.text);
+            let line = if head.is_empty() {
+                // No parseable frontmatter head — show the first body line instead.
+                baton_headline(&b.text)
+                    .map(|h| format!("runtime baton · {h}"))
+                    .unwrap_or_else(|| "runtime baton · (live)".to_string())
+            } else {
+                format!("runtime baton · {head}")
+            };
+            lines.push(Line::styled(line, Style::default().fg(Color::Cyan)));
+        }
+        None => {
+            let title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
+            match app.growlight_baton.as_deref().and_then(baton_headline) {
+                Some(h) => lines.push(Line::styled(
+                    format!("loop baton · {title} — {h}"),
+                    Style::default().fg(Color::Cyan),
+                )),
+                None => lines.push(Line::styled(
+                    "loop baton · (no baton-log entries yet)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            }
+        }
     }
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("fleet"))
@@ -1306,7 +1352,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 soft-fig TUI — keys
 
   1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
-  7            growlight (read-only): backlog → slices, loop-context, node viewer
+  7            growlight (read-only): backlog → slices, loop-context, live baton
   j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)

@@ -81,6 +81,15 @@ pub enum Tag {
     /// header's dim "unreachable" line — never a status splat, never blanking the
     /// garden-only tree/body.
     FleetStatus,
+    /// growlight: the LIVE runtime baton, polled on the SECOND (growlightd-only)
+    /// [`IpcClient`] channel via the `baton` verb (slice 004) — the loop's carried
+    /// state, which lives OUTSIDE the garden today. `Ok` carries a
+    /// `softfig_ipc::growlightd::BatonReply`; ANY `Err` (growlightd down / disarmed
+    /// / a malformed reply) soft-fails to `None` — the header then falls back to the
+    /// garden baton-LOG headline — never a status splat, never blanking the page.
+    /// Transitional: retires when the runtime is a mounted garden chain, when the
+    /// baton becomes a garden `read_file` like the other nodes (`## Forward-compat`).
+    GrowlightRuntimeBaton,
 }
 
 #[derive(Debug)]

@@ -2,18 +2,19 @@
 //! *read* resolver.
 //!
 //! Every growlight artifact the detail pane displays is fetched through this
-//! seam instead of hard-coding a path or verb at the call site. Slice 002
-//! implements only the **garden-read arm**: each artifact resolves to a keeperd
-//! `read_file` at a repo-relative garden path.
+//! seam instead of hard-coding a path or verb at the call site. Two arms:
+//! * the **garden-read arm** (slice 002): in-garden artifacts (backlog, slices,
+//!   loop-context docs) resolve to a keeperd `read_file` at a repo-relative path;
+//! * the **growlightd arm** (slice 004): the runtime baton — which lives *outside*
+//!   the garden today — resolves to the growlightd `baton` read verb.
 //!
 //! The seam exists for the planned runtime-FUSE-mount (milestone
-//! `growlight-tui-detail-pane` `## Forward-compat`): the growlight runtime state
-//! (baton, injected context) lives *outside* the garden today, so later slices
-//! add runtime artifacts that route to a growlightd verb. When that runtime is
-//! mounted as a garden chain, those artifacts re-point to garden reads at the
-//! mount path — a source swap here, with no change to the tree/viewer code.
+//! `growlight-tui-detail-pane` `## Forward-compat`): when the growlight runtime
+//! (baton, injected context) is mounted as a garden chain, the runtime artifacts
+//! re-point from the growlightd arm to garden reads at the mount path — a source
+//! swap here, with no change to the tree/viewer code, and the `baton` verb retires.
 //!
-//! Pure — no IO — so the artifact → path mapping is fully unit-testable.
+//! Pure — no IO — so the artifact → read mapping is fully unit-testable.
 
 use std::collections::HashMap;
 
@@ -36,15 +37,26 @@ pub enum GrowlightArtifact {
     /// A loop-context doc read verbatim from the garden (`protocol.md`,
     /// `protocol-fleet.md`, `session-policy.md`, the pillar `CLAUDE.md`).
     LoopContext { path: String },
+    /// The LIVE fleet/legacy single-agent runtime baton — out-of-garden today, so
+    /// it routes to the growlightd `baton` verb (slice 004). Retires when the
+    /// runtime is a mounted garden chain (`## Forward-compat`).
+    RuntimeBaton,
+    /// A specific fleet member's live baton (`agents/<id>/baton.md`) — likewise via
+    /// the growlightd `baton` verb, carrying the member id (slice 004).
+    MemberBaton { id: String },
 }
 
-/// The concrete read an artifact resolves to. Slice 002 has only the garden arm;
-/// a `Growlightd { .. }` arm (runtime verbs) arrives with slice 004's `baton`
-/// verb, and retires when the runtime is a mounted garden chain.
+/// The concrete read an artifact resolves to: a keeperd garden read, or the
+/// growlightd `baton` verb for the out-of-garden runtime baton (slice 004). The
+/// growlightd arm retires when the runtime is a mounted garden chain — the runtime
+/// artifacts then re-point to `Garden` reads at the mount path (`## Forward-compat`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrowlightRead {
     /// A keeperd garden `read_file` at this repo-relative path.
     Garden { path: String },
+    /// A growlightd `baton` verb call: `agent: None` = the fleet/legacy runtime
+    /// baton, `Some(id)` = that member's baton. Transitional (see the enum doc).
+    Growlightd { agent: Option<String> },
 }
 
 /// Resolves logical artifacts to reads. Holds the bare-`NNN` → full-path map for
@@ -87,6 +99,14 @@ impl GrowlightSource {
             GrowlightArtifact::Task { id } => self.task_paths.get(id)?.clone(),
             GrowlightArtifact::Slice { path } => path.clone(),
             GrowlightArtifact::LoopContext { path } => path.clone(),
+            // Runtime artifacts route to the growlightd `baton` verb, not a garden
+            // read — the transitional arm that retires on the runtime FUSE mount.
+            GrowlightArtifact::RuntimeBaton => {
+                return Some(GrowlightRead::Growlightd { agent: None })
+            }
+            GrowlightArtifact::MemberBaton { id } => {
+                return Some(GrowlightRead::Growlightd { agent: Some(id.clone()) })
+            }
         };
         Some(GrowlightRead::Garden { path })
     }
@@ -161,6 +181,22 @@ mod tests {
         );
         // A non-existent id still yields nothing.
         assert_eq!(src.resolve(&GrowlightArtifact::Task { id: "999".into() }), None);
+    }
+
+    #[test]
+    fn runtime_baton_artifacts_route_to_the_growlightd_verb_not_a_garden_read() {
+        // The slice-004 growlightd arm: the runtime baton is out-of-garden, so it
+        // resolves to the `baton` verb (agent None), never a `Garden` read.
+        let src = GrowlightSource::new();
+        assert_eq!(
+            src.resolve(&GrowlightArtifact::RuntimeBaton),
+            Some(GrowlightRead::Growlightd { agent: None })
+        );
+        // A per-member baton carries the agent id onto the verb.
+        assert_eq!(
+            src.resolve(&GrowlightArtifact::MemberBaton { id: "a".into() }),
+            Some(GrowlightRead::Growlightd { agent: Some("a".into()) })
+        );
     }
 
     #[test]

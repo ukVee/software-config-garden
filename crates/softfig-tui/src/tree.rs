@@ -343,6 +343,10 @@ pub enum BacklogKind {
     /// A loop-context leaf (protocol / session-policy / pillar doc), rendered as
     /// a top-level section after the backlog items.
     LoopContext,
+    /// The single LIVE runtime-baton node (slice 004): a growlightd read, not a
+    /// garden path, so it carries no `path` and the detail pane sources it from the
+    /// polled `BatonReply` rather than a `read_file`.
+    RuntimeBaton,
 }
 
 /// One rendered row of the flattened, currently-visible backlog tree.
@@ -378,6 +382,9 @@ pub struct BacklogTree {
     slices: HashMap<String, Vec<SliceChild>>,
     /// Loop-context leaves, emitted as a top-level section after the backlog.
     loop_context: Vec<LoopContextNode>,
+    /// Whether to emit the single live runtime-baton node (a growlightd read, not
+    /// a garden path) after the loop-context section (slice 004).
+    runtime_baton: bool,
     pub selected: usize,
 }
 
@@ -424,6 +431,14 @@ impl BacklogTree {
     /// Replace the loop-context section (a static set of garden-read leaves).
     pub fn set_loop_context(&mut self, nodes: Vec<LoopContextNode>) {
         self.loop_context = nodes;
+        self.clamp_selection();
+    }
+
+    /// Toggle the single live runtime-baton node (slice 004), emitted after the
+    /// loop-context section. Off by default so a bare tree (tests, pre-load) has no
+    /// growlightd-sourced row; the growlight page turns it on when it rebuilds.
+    pub fn set_runtime_baton(&mut self, present: bool) {
+        self.runtime_baton = present;
         self.clamp_selection();
     }
 
@@ -495,6 +510,23 @@ impl BacklogTree {
                 expanded: false,
                 loaded: true,
                 path: Some(ctx.path.clone()),
+                slice_num: None,
+            });
+        }
+        // The live runtime-baton node closes the tree: a growlightd read (no garden
+        // `path`), sourced from the polled `BatonReply` by the detail pane.
+        if self.runtime_baton {
+            out.push(BacklogVisibleRow {
+                kind: BacklogKind::RuntimeBaton,
+                key: "runtime-baton".to_string(),
+                item_id: String::new(),
+                label: "live runtime baton".to_string(),
+                status: "live".to_string(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                loaded: true,
+                path: None,
                 slice_num: None,
             });
         }
@@ -771,6 +803,32 @@ mod tests {
         assert_eq!(t.selected, 0);
         t.move_up();
         assert_eq!(t.selected, 2, "wrap up from the top lands on the last context row");
+    }
+
+    #[test]
+    fn runtime_baton_node_closes_the_tree_and_nav_reaches_it() {
+        let mut t = BacklogTree::new();
+        t.set_loop_context(vec![ctx("protocol.md", "growlight/protocol.md")]);
+        t.set_items(vec![task("042", "t")]);
+        // Off by default → no baton row.
+        assert!(
+            t.visible().iter().all(|r| r.kind != BacklogKind::RuntimeBaton),
+            "the baton node is off until turned on",
+        );
+        // Turned on → one node, last, after the loop-context section.
+        t.set_runtime_baton(true);
+        let vis = t.visible();
+        assert_eq!(vis.len(), 3, "task + 1 loop-context + the baton node");
+        let last = vis.last().unwrap();
+        assert_eq!(last.kind, BacklogKind::RuntimeBaton);
+        assert_eq!(last.label, "live runtime baton");
+        assert_eq!(last.status, "live");
+        assert!(!last.expandable);
+        assert_eq!(last.path, None, "a growlightd read carries no garden path");
+        // Nav wraps onto it: from the top row, move_up lands on the baton node.
+        t.selected = 0;
+        t.move_up();
+        assert_eq!(t.selected, 2, "wrap-up lands on the last row (the baton node)");
     }
 
     #[test]

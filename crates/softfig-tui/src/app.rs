@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
-use softfig_ipc::growlightd::FleetStatusReply;
+use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
     DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
     GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
@@ -296,6 +296,14 @@ pub struct App {
     /// down/disarmed. Distinct from the garden reads: process-state is not a file
     /// and stays a dedicated growlightd read forever (`## Forward-compat`).
     pub fleet: FleetHeader,
+    /// The LIVE runtime baton (slice 004), polled on the growlightd channel via the
+    /// `baton` verb on the same cadence as `fleet` while the Growlight tab is
+    /// active. `Some` when growlightd answered (even an empty baton — `text` empty);
+    /// `None` when unreachable/disarmed/malformed (the soft-fail), which is when the
+    /// header falls back to the garden baton-LOG headline. Feeds both the header
+    /// baton-headline and the live-baton tree node. Out-of-garden today, so it is
+    /// the one node NOT read through keeperd — retires on the runtime FUSE mount.
+    pub growlight_runtime_baton: Option<BatonReply>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -349,6 +357,7 @@ impl App {
             growlight_baton: None,
             growlight_stale: false,
             fleet: FleetHeader::Unknown,
+            growlight_runtime_baton: None,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -439,6 +448,41 @@ impl App {
     /// header or soft-fails an unreachable socket to the dim line.
     pub fn poll_fleet_status(&self, growlightd: &mut IpcClient) {
         growlightd.send("status", json!({}), Tag::FleetStatus);
+    }
+
+    /// Poll the LIVE runtime baton on the growlightd channel via the `baton` verb
+    /// (slice 004), same gating + cadence as [`Self::poll_fleet_status`]. No
+    /// `agent` → the fleet/legacy single-agent runtime baton. The reply feeds
+    /// `apply_reply`'s [`Tag::GrowlightRuntimeBaton`] arm; any error soft-fails to
+    /// `None` (header falls back to the garden baton-log), never a status splat.
+    pub fn poll_runtime_baton(&self, growlightd: &mut IpcClient) {
+        growlightd.send("baton", json!({}), Tag::GrowlightRuntimeBaton);
+    }
+
+    /// The right-pane view of the live runtime-baton node: a title and body sourced
+    /// from the polled [`Self::growlight_runtime_baton`] (NOT a keeperd read). A
+    /// present baton renders a compact parsed head above its post-frontmatter body;
+    /// an empty or unavailable baton renders a calm placeholder — never an error.
+    pub fn runtime_baton_view(&self) -> (String, String) {
+        match &self.growlight_runtime_baton {
+            Some(b) if !b.text.trim().is_empty() => {
+                let head = runtime_baton_head(&b.text);
+                let body = strip_frontmatter(&b.text);
+                (
+                    format!("live runtime baton — {}  (read-only)", b.path),
+                    format!("{head}\n\n{body}"),
+                )
+            }
+            Some(b) => (
+                "live runtime baton  (read-only)".to_string(),
+                format!("(the runtime baton is empty — {})", b.path),
+            ),
+            None => (
+                "live runtime baton  (read-only)".to_string(),
+                "(runtime baton unavailable — growlightd unreachable or the fleet is not initialized)"
+                    .to_string(),
+            ),
+        }
     }
 
     /// Re-fetch every directory whose children are loaded, so the view
@@ -583,9 +627,11 @@ impl App {
                 is_milestone: milestones.contains(r.id.as_str()),
             })
             .collect();
-        // The loop-context section is static; (re)seed it on every rebuild so the
-        // tree stays self-consistent, then set the backlog (which clamps last).
+        // The loop-context section + the live runtime-baton node are static; (re)seed
+        // them on every rebuild so the tree stays self-consistent, then set the
+        // backlog (which clamps last).
         self.growlight_tree.set_loop_context(loop_context_nodes());
+        self.growlight_tree.set_runtime_baton(true);
         self.growlight_tree.set_items(items);
     }
 
@@ -615,30 +661,48 @@ impl App {
                 Some(p) => GrowlightArtifact::LoopContext { path: p.clone() },
                 None => return,
             },
+            BacklogKind::RuntimeBaton => GrowlightArtifact::RuntimeBaton,
         };
-        let Some(GrowlightRead::Garden { path }) = self.growlight_source.resolve(&artifact) else {
-            return; // e.g. a task whose dir listing hasn't landed — retry later
-        };
-        if self.growlight_preview_path.as_deref() == Some(path.as_str()) {
-            return; // already showing / fetching this node
+        match self.growlight_source.resolve(&artifact) {
+            // An in-garden node → a keeperd `read_file`, refined on reply.
+            Some(GrowlightRead::Garden { path }) => {
+                if self.growlight_preview_path.as_deref() == Some(path.as_str()) {
+                    return; // already showing / fetching this node
+                }
+                // A slice node carries (milestone, num) so the reply can refine its
+                // derived status to awaiting-smoke from the loaded body.
+                let slice = match row.kind {
+                    BacklogKind::Slice => {
+                        row.slice_num.clone().map(|num| (row.item_id.clone(), num))
+                    }
+                    _ => None,
+                };
+                self.growlight_preview_path = Some(path.clone());
+                self.growlight_preview_title = row.label.clone();
+                self.preview_scroll = 0;
+                ipc.send(
+                    "read_file",
+                    json!({ "path": path }),
+                    Tag::GrowlightNodeFile { path, slice },
+                );
+            }
+            // The out-of-garden runtime baton → NO keeperd read: the detail pane
+            // renders it LIVE from the polled `growlight_runtime_baton` (fed by the
+            // growlightd `baton` verb on the fleet cadence). Mark the preview slot
+            // with a sentinel so a stale garden body doesn't linger and a re-select
+            // is a no-op, and reset the shared scroll on (re)select.
+            Some(GrowlightRead::Growlightd { .. }) => {
+                if self.growlight_preview_path.as_deref() == Some(RUNTIME_BATON_SLOT) {
+                    return;
+                }
+                self.growlight_preview_path = Some(RUNTIME_BATON_SLOT.to_string());
+                self.growlight_preview_title = row.label.clone();
+                self.growlight_preview.clear();
+                self.preview_scroll = 0;
+            }
+            // e.g. a task whose dir listing hasn't landed — retry on the listing.
+            None => {}
         }
-        // A slice node carries (milestone, num) so the reply can refine its
-        // derived status to awaiting-smoke from the loaded body.
-        let slice = match row.kind {
-            BacklogKind::Slice => row
-                .slice_num
-                .clone()
-                .map(|num| (row.item_id.clone(), num)),
-            _ => None,
-        };
-        self.growlight_preview_path = Some(path.clone());
-        self.growlight_preview_title = row.label.clone();
-        self.preview_scroll = 0;
-        ipc.send(
-            "read_file",
-            json!({ "path": path }),
-            Tag::GrowlightNodeFile { path, slice },
-        );
     }
 
     fn hint_growlight_readonly(&mut self) {
@@ -1108,6 +1172,17 @@ impl App {
                 // NEVER `self.status` (no status splat) and never touching the
                 // garden-sourced tree/preview, so the page keeps working.
                 Err(_) => self.fleet = FleetHeader::Unreachable,
+            },
+            Tag::GrowlightRuntimeBaton => match reply.result {
+                // Live runtime baton → the header baton-headline + the live-baton
+                // node. Decode into `Some` (even an empty baton is a valid answer);
+                // a malformed reply is treated like unreachable (`None`).
+                Ok(v) => self.growlight_runtime_baton = serde_json::from_value::<BatonReply>(v).ok(),
+                // Soft-fail (load-bearing), same discipline as `FleetStatus`:
+                // growlightd down/disarmed → `None`, so the header falls back to the
+                // garden baton-LOG headline. Never `self.status` (no splat), never
+                // touches the garden-sourced tree/preview.
+                Err(_) => self.growlight_runtime_baton = None,
             },
         }
     }
@@ -2029,6 +2104,11 @@ fn vault_reveal_args(path: &str, master_password: &str, id: Option<&str>) -> Val
 /// hook, so they resolve to ordinary keeperd reads. (The assembled
 /// injected-context view — protocol + the member's live baton — waits on slice
 /// 004's growlightd `baton` verb.)
+/// Sentinel value for `growlight_preview_path` while the live runtime-baton node
+/// is selected — a growlightd read, not a garden path, so it never collides with a
+/// real repo-relative path and keeps re-selects idempotent.
+const RUNTIME_BATON_SLOT: &str = "growlightd:runtime-baton";
+
 fn loop_context_nodes() -> Vec<LoopContextNode> {
     [
         ("protocol.md", "growlight/protocol.md"),
@@ -2058,6 +2138,87 @@ pub fn baton_headline(body: &str) -> Option<&str> {
         }
     }
     lines.map(str::trim).find(|l| !l.is_empty())
+}
+
+/// The body of a baton with any leading `--- … ---` YAML frontmatter block
+/// stripped — the useful part (`# NEXT ACTION`, …) shown under the compact head in
+/// the live-baton viewer. Returns the whole text when there is no (or an
+/// unterminated) frontmatter block; an empty string for a frontmatter-only baton.
+pub fn strip_frontmatter(text: &str) -> &str {
+    let Some(after_open) = text.strip_prefix("---\n") else {
+        return text; // no leading frontmatter fence
+    };
+    match after_open.split_once("\n---\n") {
+        // Drop the blank line that conventionally follows the closing fence, so
+        // the body starts at its first real line (matches `baton_headline`).
+        Some((_frontmatter, body)) => body.trim_start_matches('\n'),
+        // No `---` fence followed by a body: either frontmatter-only (fence at EOF)
+        // or an unterminated block.
+        None => match after_open.strip_suffix("\n---") {
+            Some(_) => "",   // frontmatter only, no body
+            None => text,    // unterminated fence — show the raw text
+        },
+    }
+}
+
+/// Parse the flat `key: value` pairs from a baton's leading `--- … ---` YAML
+/// frontmatter block (the baton frontmatter is flat scalars — no nested YAML).
+/// Empty when there is no frontmatter. Pure.
+fn frontmatter_fields(text: &str) -> Vec<(String, String)> {
+    let Some(after_open) = text.strip_prefix("---\n") else {
+        return Vec::new();
+    };
+    // The block is everything up to the next `---` fence line (or EOF fence).
+    let block = match after_open.split_once("\n---") {
+        Some((fm, _)) => fm,
+        None => return Vec::new(), // unterminated — treat as no frontmatter
+    };
+    block
+        .lines()
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// A compact one-line head for the live runtime baton, parsed from its YAML
+/// frontmatter (`item` / `slice` / `iteration` / `status` + the ctx & 5h budget
+/// %s) — what the loop is on right now, shown above the baton body and in the
+/// fleet header. Missing fields are omitted; a baton with no frontmatter (or none
+/// of these keys) yields an empty string, and the caller falls back to a headline.
+pub fn runtime_baton_head(text: &str) -> String {
+    let fm = frontmatter_fields(text);
+    let get = |k: &str| {
+        fm.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(item) = get("item") {
+        parts.push(format!("item {item}"));
+    }
+    if let Some(slice) = get("slice") {
+        parts.push(format!("slice {slice}"));
+    }
+    if let Some(iter) = get("iteration") {
+        parts.push(format!("iter {iter}"));
+    }
+    if let Some(status) = get("status") {
+        parts.push(status.to_string());
+    }
+    if let Some(ctx) = get("ctx_pct") {
+        parts.push(format!("ctx {ctx}%"));
+    }
+    if let Some(h5) = get("session_5h_pct") {
+        parts.push(format!("5h {h5}%"));
+    }
+    parts.join(" · ")
 }
 
 /// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
@@ -3325,11 +3486,17 @@ mod tests {
         );
 
         let vis = app.growlight_tree.visible();
-        // 2 backlog rows + the 4 static loop-context nodes seeded on rebuild.
-        assert_eq!(vis.len(), 6);
+        // 2 backlog rows + the 4 static loop-context nodes + the live-baton node,
+        // all seeded on rebuild.
+        assert_eq!(vis.len(), 7);
         assert!(vis[0].expandable, "milestone row expands");
         assert!(!vis[1].expandable, "task row is a leaf");
         assert_eq!(vis[2].kind, BacklogKind::LoopContext, "loop-context follows the backlog");
+        assert_eq!(
+            vis[6].kind,
+            BacklogKind::RuntimeBaton,
+            "the live runtime-baton node closes the tree",
+        );
 
         // Expand the milestone (Enter) — fires the lazy read_file (to the dead
         // dummy worker; no reply), marks it expanded.
@@ -3364,8 +3531,8 @@ mod tests {
         );
 
         let vis = app.growlight_tree.visible();
-        // milestone + 2 slices + task + 4 loop-context.
-        assert_eq!(vis.len(), 8, "milestone + 2 slices + task + loop-context");
+        // milestone + 2 slices + task + 4 loop-context + the live-baton node.
+        assert_eq!(vis.len(), 9, "milestone + 2 slices + task + loop-context + baton");
         assert_eq!(vis[1].depth, 1);
         assert_eq!(vis[1].label, "001 first");
         assert_eq!(vis[1].status, "done", "reviewed slice → done");
@@ -3664,5 +3831,152 @@ mod tests {
         );
         assert!(matches!(app.fleet, FleetHeader::Unreachable));
         assert_eq!(app.status, "ready", "malformed reply must not splat the status line");
+    }
+
+    // ---- slice 004: live runtime baton (growlightd `baton` verb) ----
+
+    const SAMPLE_BATON: &str = "---\n\
+        loop: soft-fig_garden\n\
+        status: IN_PROGRESS\n\
+        item: growlight-tui-detail-pane\n\
+        slice: 004\n\
+        iteration: 1\n\
+        ctx_pct: 16\n\
+        session_5h_pct: 7\n\
+        ---\n\n\
+        # NEXT ACTION\n\
+        do the thing";
+
+    #[test]
+    fn strip_frontmatter_returns_the_body_after_the_fence() {
+        assert_eq!(strip_frontmatter(SAMPLE_BATON), "# NEXT ACTION\ndo the thing");
+        // No frontmatter → the whole text passes through.
+        assert_eq!(strip_frontmatter("# just a doc\nbody"), "# just a doc\nbody");
+        // Frontmatter only, fence at EOF → empty body (no panic).
+        assert_eq!(strip_frontmatter("---\nk: v\n---"), "");
+        assert_eq!(strip_frontmatter("---\nk: v\n---\n"), "");
+        // Unterminated fence → raw text (never lose content).
+        assert_eq!(strip_frontmatter("---\nk: v\nmore"), "---\nk: v\nmore");
+    }
+
+    #[test]
+    fn runtime_baton_head_parses_the_compact_fields_in_order() {
+        assert_eq!(
+            runtime_baton_head(SAMPLE_BATON),
+            "item growlight-tui-detail-pane · slice 004 · iter 1 · IN_PROGRESS · ctx 16% · 5h 7%",
+        );
+        // A baton with no frontmatter yields an empty head (caller falls back).
+        assert_eq!(runtime_baton_head("# NEXT ACTION\ngo"), "");
+        // Only some fields present → only those, still in order.
+        assert_eq!(
+            runtime_baton_head("---\nstatus: STUCK\nitem: x\n---\nbody"),
+            "item x · STUCK",
+        );
+    }
+
+    #[test]
+    fn runtime_baton_view_renders_present_empty_and_absent() {
+        let mut app = App::new();
+        // Absent (growlightd unreachable) → a calm placeholder, never an error.
+        let (title, body) = app.runtime_baton_view();
+        assert!(title.starts_with("live runtime baton"));
+        assert!(body.contains("unavailable"), "absent baton reads as unavailable: {body}");
+
+        // Present + non-empty → compact head above the frontmatter-stripped body.
+        app.growlight_runtime_baton = Some(BatonReply {
+            agent: None,
+            path: "/x/baton.md".into(),
+            text: SAMPLE_BATON.into(),
+        });
+        let (title, body) = app.runtime_baton_view();
+        assert!(title.contains("/x/baton.md"), "the path is surfaced: {title}");
+        assert!(body.starts_with("item growlight-tui-detail-pane · slice 004"));
+        assert!(body.contains("# NEXT ACTION\ndo the thing"), "body follows the head");
+        assert!(!body.contains("loop: soft-fig_garden"), "frontmatter is stripped from the body");
+
+        // Present but empty (a real, seeded-but-blank baton) → its own placeholder.
+        app.growlight_runtime_baton = Some(BatonReply {
+            agent: None,
+            path: "/x/baton.md".into(),
+            text: "   \n".into(),
+        });
+        let (_title, body) = app.runtime_baton_view();
+        assert!(body.contains("empty"), "an empty baton reads as empty: {body}");
+    }
+
+    #[test]
+    fn runtime_baton_reply_decodes_into_some_and_soft_fails_to_none() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        app.growlight_preview = "## Mission\nbody".into();
+        let mut ipc = dummy_ipc();
+
+        // Ok → Some(reply).
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({ "path": "/x/baton.md", "text": SAMPLE_BATON })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_runtime_baton.as_ref().map(|b| b.path.as_str()),
+            Some("/x/baton.md"),
+        );
+
+        // Err → None (soft-fail), and NO status splat / no preview disturbance.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight_runtime_baton.is_none(), "unreachable → None");
+        assert_eq!(app.status, "ready", "no status splat");
+        assert_eq!(app.growlight_preview, "## Mission\nbody", "garden preview untouched");
+
+        // A malformed Ok (missing `path`) also degrades to None, not a splat.
+        app.growlight_runtime_baton = Some(BatonReply::default());
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({ "text": "no path field" })),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight_runtime_baton.is_none(), "malformed → None");
+        assert_eq!(app.status, "ready");
+    }
+
+    #[test]
+    fn selecting_the_runtime_baton_node_marks_the_slot_without_a_keeperd_read() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+
+        // The tree = [task, 4 loop-context, live-baton]; select the last (baton).
+        let vis = app.growlight_tree.visible();
+        let baton_idx = vis.len() - 1;
+        assert_eq!(vis[baton_idx].kind, BacklogKind::RuntimeBaton);
+        app.growlight_tree.selected = baton_idx;
+        app.preview_scroll = 25; // a leftover offset
+        app.growlight_preview = "stale garden body".into();
+
+        app.refresh_growlight_selection(&mut ipc);
+        // No keeperd `read_file` path — the sentinel marks the growlightd-sourced node.
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(RUNTIME_BATON_SLOT));
+        assert_eq!(app.preview_scroll, 0, "selecting the baton node resets scroll");
+        assert!(app.growlight_preview.is_empty(), "the stale garden body is cleared");
+
+        // Re-selecting the same node is an idempotent no-op (scroll not re-reset).
+        app.preview_scroll = 9;
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(app.preview_scroll, 9, "re-select does not reset scroll");
     }
 }

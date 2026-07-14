@@ -509,6 +509,76 @@ fn growlight_header_soft_fails_when_growlightd_unreachable() {
 }
 
 #[test]
+fn growlight_header_shows_the_live_runtime_baton_headline() {
+    use softfig_ipc::growlightd::BatonReply;
+    use softfig_tui::app::FleetHeader;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // Even with the growlightd STATUS poll unreachable, the LIVE runtime baton
+    // (its own verb) still drives the header baton-headline (slice 004).
+    app.fleet = FleetHeader::Unreachable;
+    app.growlight_runtime_baton = Some(BatonReply {
+        agent: None,
+        path: "/x/baton.md".into(),
+        text: "---\nstatus: IN_PROGRESS\nitem: growlight-tui-detail-pane\nslice: 004\n---\n\
+               # NEXT ACTION\ngo"
+            .into(),
+    });
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("runtime baton"), "live baton headline missing:\n{rendered}");
+    assert!(rendered.contains("IN_PROGRESS"), "parsed baton status missing:\n{rendered}");
+    assert!(rendered.contains("growlight-tui-detail-pane"), "parsed baton item missing");
+}
+
+#[test]
+fn selecting_the_live_baton_node_renders_it_from_the_polled_reply() {
+    use softfig_ipc::growlightd::BatonReply;
+    use softfig_tui::tree::{BacklogItem, BacklogKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // A tree with the live-baton node turned on; select that node.
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_tree.set_runtime_baton(true);
+    let vis = app.growlight_tree.visible();
+    let baton_idx = vis.iter().position(|r| r.kind == BacklogKind::RuntimeBaton).unwrap();
+    app.growlight_tree.selected = baton_idx;
+    // The polled runtime baton drives the right pane directly (no keeperd read).
+    app.growlight_runtime_baton = Some(BatonReply {
+        agent: None,
+        path: "/x/baton.md".into(),
+        text: "---\nstatus: IN_PROGRESS\nitem: tui-modernize\nslice: 002\n---\n\
+               # NEXT ACTION\nfinish the node viewer"
+            .into(),
+    });
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    // The node label in the tree, the parsed compact head, and the stripped body.
+    assert!(rendered.contains("live runtime baton"), "baton tree node missing:\n{rendered}");
+    assert!(rendered.contains("tui-modernize"), "parsed baton item missing:\n{rendered}");
+    assert!(rendered.contains("NEXT ACTION"), "baton body missing:\n{rendered}");
+}
+
+#[test]
 fn growlight_tab_absent_when_disabled() {
     // The load-bearing requirement: when growlight is not enabled the tab does
     // not appear at all — no tab, no empty pane, no error.

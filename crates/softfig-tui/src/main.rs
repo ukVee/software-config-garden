@@ -107,6 +107,9 @@ fn run(
             let due = last_fleet_poll.is_none_or(|t| t.elapsed() >= FLEET_POLL_INTERVAL);
             if due {
                 app.poll_fleet_status(growlightd);
+                // The live runtime baton rides the same growlightd channel + cadence
+                // (slice 004); both soft-fail independently in `apply_reply`.
+                app.poll_runtime_baton(growlightd);
                 last_fleet_poll = Some(Instant::now());
             }
         } else {
