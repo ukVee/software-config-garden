@@ -49,6 +49,13 @@ pub enum Tag {
     /// growlight: the backlog queue as daemon-parsed structured rows
     /// (`growlight_queue`) — no client re-parse of the managed table.
     GrowlightQueue,
+    /// growlight: list `growlight/backlog/milestones` to classify which queue
+    /// rows are milestones (expandable in the backlog tree) vs task leaves —
+    /// the authoritative milestone set is the dir listing, not an id heuristic.
+    GrowlightMilestones,
+    /// growlight: read a milestone `CLAUDE.md` (`read_file`) to populate its
+    /// slice children in the backlog tree (lazy, on first expand).
+    GrowlightMilestoneDoc { id: String },
     /// growlight: list the baton-log dir (`list_tree growlight/baton-log`) to
     /// find the highest-numbered entry (the latest handoff).
     GrowlightBatonList,

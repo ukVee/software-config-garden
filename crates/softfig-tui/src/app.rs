@@ -4,6 +4,7 @@
 //! their own modules and carry the unit tests; this module wires them to
 //! the worker-thread [`IpcClient`] and the key stream.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -20,7 +21,9 @@ use crate::command::{parse_command, Command};
 use crate::forms::{ActionForm, ActionKind};
 use crate::ipc::{IpcClient, Reply, Tag};
 use crate::listpane::ListPane;
-use crate::tree::TreeModel;
+use crate::tree::{
+    derive_slice_status, parse_slice_index, BacklogItem, BacklogTree, SliceChild, TreeModel,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -227,8 +230,17 @@ pub struct App {
     /// status tick, so it can't go stale mid-session.
     pub growlight_enabled: Option<bool>,
     /// The backlog queue rows (drain order + statuses), served read-only as
-    /// structured rows by the daemon's `growlight_queue` verb.
+    /// structured rows by the daemon's `growlight_queue` verb. Still the source
+    /// for the right-pane detail (active item + latest baton); the left pane is
+    /// now the navigable `growlight_tree` built from these rows.
     pub growlight: ListPane<GrowlightRow>,
+    /// Left-pane backlog tree: milestone/task items (from `growlight`) expanding
+    /// to their slices. Rebuilt whenever the queue or the milestone set arrives.
+    pub growlight_tree: BacklogTree,
+    /// Ids that are milestones (expandable) — the authoritative dir listing of
+    /// `growlight/backlog/milestones`, not an id-format heuristic. Empty until
+    /// the `GrowlightMilestones` reply lands; rows classify as tasks until then.
+    pub growlight_milestone_ids: Vec<String>,
     /// The latest baton-log entry (title + body) — the loop's most recent handoff
     /// state, read from the highest-numbered `growlight/baton-log/NNN-*.md`.
     pub growlight_baton_title: Option<String>,
@@ -282,6 +294,8 @@ impl App {
             deploy_stale: false,
             growlight_enabled: None,
             growlight: ListPane::new(),
+            growlight_tree: BacklogTree::new(),
+            growlight_milestone_ids: Vec::new(),
             growlight_baton_title: None,
             growlight_baton: None,
             growlight_stale: false,
@@ -337,10 +351,16 @@ impl App {
         ipc.send("deploy_plan", json!({}), Tag::DeployPlan);
     }
 
-    /// growlight: (re)load the read-only section — the backlog queue table plus a
-    /// listing of the baton-log (whose reply triggers the latest-entry read).
+    /// growlight: (re)load the read-only section — the backlog queue table, the
+    /// milestone set (for tree classification), plus a listing of the baton-log
+    /// (whose reply triggers the latest-entry read).
     fn load_growlight(&self, ipc: &mut IpcClient) {
         ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
+        ipc.send(
+            "list_tree",
+            json!({ "path": "growlight/backlog/milestones" }),
+            Tag::GrowlightMilestones,
+        );
         ipc.send(
             "list_tree",
             json!({ "path": "growlight/baton-log" }),
@@ -464,8 +484,33 @@ impl App {
         self.growlight.items.iter().find(|r| r.status == "active")
     }
 
+    /// The queue row for the tree's selected node — the owning milestone/task
+    /// (a slice maps to its parent milestone). Feeds the right-pane detail's
+    /// selected line while the right pane is untouched (slice 001).
     pub fn selected_growlight_row(&self) -> Option<&GrowlightRow> {
-        self.growlight.selected()
+        let sel = self.growlight_tree.selected_row()?;
+        self.growlight.items.iter().find(|r| r.id == sel.item_id)
+    }
+
+    /// Rebuild the backlog tree from the current queue rows + the milestone set.
+    /// Called whenever either the `growlight_queue` or `GrowlightMilestones`
+    /// reply lands, so the tree converges once both are in (order-independent);
+    /// `set_items` preserves expansion/slice state across rebuilds.
+    fn rebuild_growlight_tree(&mut self) {
+        let milestones: HashSet<&str> =
+            self.growlight_milestone_ids.iter().map(String::as_str).collect();
+        let items = self
+            .growlight
+            .items
+            .iter()
+            .map(|r| BacklogItem {
+                id: r.id.clone(),
+                title: r.title.clone(),
+                status: r.status.clone(),
+                is_milestone: milestones.contains(r.id.as_str()),
+            })
+            .collect();
+        self.growlight_tree.set_items(items);
     }
 
     fn hint_growlight_readonly(&mut self) {
@@ -804,10 +849,56 @@ impl App {
             },
             Tag::GrowlightQueue => match reply.result {
                 Ok(v) => match serde_json::from_value::<GrowlightQueueReply>(v) {
-                    Ok(r) => self.growlight.set_items(r.rows),
+                    Ok(r) => {
+                        self.growlight.set_items(r.rows);
+                        self.rebuild_growlight_tree();
+                    }
                     Err(e) => self.status = format!("growlight queue: malformed reply: {e}"),
                 },
                 Err((_, m)) => self.status = format!("growlight queue: {m}"),
+            },
+            Tag::GrowlightMilestones => match reply.result {
+                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                    Ok(r) => {
+                        self.growlight_milestone_ids = r
+                            .entries
+                            .iter()
+                            .filter(|e| e.is_dir)
+                            .map(|e| e.name.clone())
+                            .collect();
+                        self.rebuild_growlight_tree();
+                    }
+                    Err(e) => self.status = format!("growlight milestones: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight milestones: {m}"),
+            },
+            Tag::GrowlightMilestoneDoc { id } => match reply.result {
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => {
+                        let dir = format!("growlight/backlog/milestones/{id}");
+                        let children = parse_slice_index(&r.content)
+                            .into_iter()
+                            .map(|s| {
+                                // `is_active` (the live baton's active slice) is
+                                // wired by the growlightd `baton` verb in slice
+                                // 004; `body` (for awaiting-smoke) by the slice
+                                // 002 right-pane read. Until then a reviewed
+                                // slice reads as done, an unreviewed one queued.
+                                let status =
+                                    derive_slice_status(false, s.reviewed.as_deref(), None);
+                                SliceChild {
+                                    path: format!("{dir}/{}", s.path),
+                                    num: s.num,
+                                    title: s.title,
+                                    status,
+                                }
+                            })
+                            .collect();
+                        self.growlight_tree.set_slices(&id, children);
+                    }
+                    Err(e) => self.status = format!("growlight milestone {id}: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight milestone {id}: {m}"),
             },
             Tag::GrowlightBatonList => match reply.result {
                 Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
@@ -994,7 +1085,7 @@ impl App {
             View::Peers => self.peer_list.up(),
             View::Backup => self.backup.up(),
             View::Deploy => self.deploy.up(),
-            View::Growlight => self.growlight.up(),
+            View::Growlight => self.growlight_tree.move_up(),
         }
     }
 
@@ -1010,7 +1101,7 @@ impl App {
             View::Peers => self.peer_list.down(),
             View::Backup => self.backup.down(),
             View::Deploy => self.deploy.down(),
-            View::Growlight => self.growlight.down(),
+            View::Growlight => self.growlight_tree.move_down(),
         }
     }
 
@@ -1050,9 +1141,37 @@ impl App {
             // Deploy entries are read-only detail; apply is an explicit action
             // (a / F / palette), never a stray Enter.
             View::Deploy => self.hint_deploy_actions(),
-            // Growlight is a read-only glance — Enter is a no-op hint.
-            View::Growlight => self.hint_growlight_readonly(),
+            // Growlight is read-only: Enter/l toggles a milestone's slices
+            // (lazy-reading its CLAUDE.md on first expand); leaves just hint.
+            View::Growlight => self.activate_growlight(ipc),
         }
+    }
+
+    /// Toggle the selected milestone's slice children (lazy-load on first
+    /// expand); a task/slice leaf is a read-only glance.
+    fn activate_growlight(&mut self, ipc: &mut IpcClient) {
+        let Some(row) = self.growlight_tree.selected_row() else {
+            return self.hint_growlight_readonly();
+        };
+        if !row.expandable {
+            return self.hint_growlight_readonly();
+        }
+        if self.growlight_tree.is_expanded(&row.item_id) {
+            self.growlight_tree.collapse(&row.item_id);
+        } else {
+            self.growlight_tree.expand(&row.item_id);
+            if !self.growlight_tree.is_loaded(&row.item_id) {
+                let path = format!("growlight/backlog/milestones/{}/CLAUDE.md", row.item_id);
+                ipc.send(
+                    "read_file",
+                    json!({ "path": path }),
+                    Tag::GrowlightMilestoneDoc {
+                        id: row.item_id.clone(),
+                    },
+                );
+            }
+        }
+        self.growlight_tree.clamp_selection();
     }
 
     fn hint_backup_actions(&mut self) {
@@ -1064,14 +1183,24 @@ impl App {
     }
 
     fn collapse_selected(&mut self) {
-        if self.view != View::Browse {
-            return;
-        }
-        if let Some(row) = self.tree.selected_row() {
-            if row.is_dir && self.tree.is_expanded(&row.path) {
-                self.tree.collapse(&row.path);
-                self.tree.clamp_selection();
+        match self.view {
+            View::Browse => {
+                if let Some(row) = self.tree.selected_row() {
+                    if row.is_dir && self.tree.is_expanded(&row.path) {
+                        self.tree.collapse(&row.path);
+                        self.tree.clamp_selection();
+                    }
+                }
             }
+            View::Growlight => {
+                if let Some(row) = self.growlight_tree.selected_row() {
+                    if row.expandable && self.growlight_tree.is_expanded(&row.item_id) {
+                        self.growlight_tree.collapse(&row.item_id);
+                        self.growlight_tree.clamp_selection();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2916,5 +3045,97 @@ mod tests {
             Some("103-tui-modernize-003.md")
         );
         assert!(app.growlight_baton.unwrap().contains("shipped slice 003"));
+    }
+
+    #[test]
+    fn growlight_tree_classifies_expands_and_maps_selection() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+
+        // The authoritative milestone set is the dir listing — a milestone
+        // subdir + a stray non-dir entry the classifier must ignore.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightMilestones,
+                result: Ok(json!({
+                    "entries": [
+                        tree_entry("my-milestone", "growlight/backlog/milestones/my-milestone", true),
+                        tree_entry("CLAUDE.md", "growlight/backlog/milestones/CLAUDE.md", false),
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        // The queue: one milestone (in the set) + one task (not).
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [
+                        { "id": "my-milestone", "title": "A milestone", "status": "deferred" },
+                        { "id": "042", "title": "A task", "status": "queued" },
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+
+        let vis = app.growlight_tree.visible();
+        assert_eq!(vis.len(), 2);
+        assert!(vis[0].expandable, "milestone row expands");
+        assert!(!vis[1].expandable, "task row is a leaf");
+
+        // Expand the milestone (Enter) — fires the lazy read_file (to the dead
+        // dummy worker; no reply), marks it expanded.
+        app.view = View::Growlight;
+        app.growlight_tree.selected = 0;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert!(app.growlight_tree.is_expanded("my-milestone"));
+
+        // Feed the milestone CLAUDE.md: one reviewed slice (→ done) + one blank
+        // (→ queued).
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightMilestoneDoc {
+                    id: "my-milestone".into(),
+                },
+                result: Ok(json!({
+                    "path": "growlight/backlog/milestones/my-milestone/CLAUDE.md",
+                    "content": "<!-- softfig:index slices -->\n\
+                                | # | Note | Reviewed |\n\
+                                |---|------|----------|\n\
+                                | 001 | [first](slices/001-first.md) | 2026-07-14 |\n\
+                                | 002 | [second](slices/002-second.md) |  |\n\
+                                <!-- /softfig:index slices -->\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+
+        let vis = app.growlight_tree.visible();
+        assert_eq!(vis.len(), 4, "milestone + 2 slices + task");
+        assert_eq!(vis[1].depth, 1);
+        assert_eq!(vis[1].label, "001 first");
+        assert_eq!(vis[1].status, "done", "reviewed slice → done");
+        assert_eq!(vis[2].status, "queued", "blank-reviewed slice → queued");
+        assert_eq!(
+            vis[1].path.as_deref(),
+            Some("growlight/backlog/milestones/my-milestone/slices/001-first.md")
+        );
+
+        // Selecting a slice maps the right-pane row back to its parent milestone.
+        app.growlight_tree.selected = 1;
+        assert_eq!(
+            app.selected_growlight_row().map(|r| r.id.as_str()),
+            Some("my-milestone")
+        );
     }
 }

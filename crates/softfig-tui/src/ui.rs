@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{short_fp, App, BackupRow, GrowlightRow, Overlay, PairField, PeerRow, View};
+use crate::app::{short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
@@ -637,6 +637,7 @@ fn render_deploy_detail(f: &mut Frame, app: &App, area: Rect) {
 fn growlight_status_color(status: &str) -> Color {
     match status {
         "active" => Color::Cyan,
+        "awaiting-smoke" => Color::Magenta,
         "done" => Color::DarkGray,
         "blocked" => Color::Red,
         "deferred" => Color::Yellow,
@@ -644,30 +645,43 @@ fn growlight_status_color(status: &str) -> Color {
     }
 }
 
-/// Left pane of the read-only Growlight section: the backlog queue in drain
-/// order, each row `<status>  <id>` coloured by status, the active item bold.
+/// Left pane of the read-only Growlight section: the backlog as a navigable
+/// tree — milestone/task items in drain order, each milestone expandable to its
+/// slices (`+`/`-`), rows coloured by status (queue status, or a slice's
+/// derived status), the active item bold.
 fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.growlight.items.is_empty() {
+    let rows = app.growlight_tree.visible();
+    let items: Vec<ListItem> = if rows.is_empty() {
         vec![ListItem::new("(queue empty or not loaded)")]
     } else {
-        app.growlight
-            .items
-            .iter()
-            .map(|r: &GrowlightRow| {
-                let color = growlight_status_color(&r.status);
-                let mut style = Style::default().fg(color);
+        rows.iter()
+            .map(|r| {
+                let indent = "  ".repeat(r.depth);
+                let marker = if r.expandable {
+                    if r.expanded {
+                        "- "
+                    } else {
+                        "+ "
+                    }
+                } else {
+                    "  "
+                };
+                let mut style = Style::default().fg(growlight_status_color(&r.status));
                 if r.status == "active" {
                     style = style.add_modifier(Modifier::BOLD);
                 }
-                ListItem::new(Line::styled(format!("{:>8}  {}", r.status, r.id), style))
+                ListItem::new(Line::styled(
+                    format!("{indent}{marker}{:<14} {}", r.status, r.label),
+                    style,
+                ))
             })
             .collect()
     };
     let mut st = ListState::default();
-    if !app.growlight.items.is_empty() {
-        st.select(Some(app.growlight.selected.min(app.growlight.items.len() - 1)));
+    if !rows.is_empty() {
+        st.select(Some(app.growlight_tree.selected.min(rows.len() - 1)));
     }
-    let title = format!("growlight — {} item(s)", app.growlight.items.len());
+    let title = format!("growlight — {} row(s)", rows.len());
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
@@ -1183,10 +1197,11 @@ soft-fig TUI — keys
 
   1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
   7            growlight (read-only; only when growlight is enabled)
-  j k ↑ ↓      move selection
+  j k ↑ ↓      move selection (wraps top↔bottom in the growlight tree)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
-  h ←          collapse dir
+               / expand milestone → slices (growlight)
+  h ←          collapse dir / milestone (growlight)
   scroll preview (right pane):
     ^e ^y      line down / up        wheel  line-wise
     ^d ^u      half-page down / up
