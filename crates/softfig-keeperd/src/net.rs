@@ -743,6 +743,46 @@ fn serve_ceremony_responder<L: CeremonyLink>(
         return;
     };
     let chain = String::from_utf8_lossy(&commit.chain_id).into_owned();
+
+    // M5d slice 006 (finding 3): refuse to run a ceremony for a chain this
+    // device already holds a key for. Until slice 003's authorized rotation
+    // (`shared_rekey`) exists, a ring peer must not be able to re-key a live
+    // chain at will — otherwise a peer whose own persist keeps failing would
+    // re-initiate every reconcile tick, minting a fresh key + sealed-key +
+    // `key_id` flip forever (the `persist_ceremony_outcome` divergence refusal is
+    // the backstop; this refuses earlier, before we mint a contribution). A chain
+    // with no local row — the responder simply hasn't added the subtree yet, the
+    // normal onboarding case — is allowed through.
+    {
+        let inner = daemon.inner.lock().unwrap();
+        let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
+            return; // locked mid-serve — the initiator retries a later tick
+        };
+        match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session) {
+            Ok(membership) => {
+                if let Some(existing) = membership
+                    .subtrees
+                    .iter()
+                    .find(|r| r.ref_name == chain)
+                    .and_then(|r| r.key_id.as_deref())
+                {
+                    eprintln!(
+                        "keeperd: net: shared-key ceremony for {chain} refused: chain is \
+                         already keyed {existing} (rotation is the only authorized re-key path)"
+                    );
+                    return;
+                }
+            }
+            Err((_, e)) => {
+                eprintln!(
+                    "keeperd: net: shared-key ceremony for {chain} refused: cannot read \
+                     committed membership: {e}"
+                );
+                return;
+            }
+        }
+    }
+
     let contribution = softfig_vault::random_bytes32();
     let mut ceremony = match Ceremony::new(
         nonce,
@@ -2150,6 +2190,100 @@ mod tests {
         };
         serve_ceremony_responder(&daemon, &local, &ring, commit, DeadLink);
         assert!(!tmp.path().join(".softfig/vault/shared-keys").exists());
+    }
+
+    /// Slice 006 (finding 3): the responder refuses a ceremony for a chain it
+    /// already holds a key for — a ring peer can't re-key a live chain at will
+    /// (only slice 003's authorized rotation may). The refusal happens before
+    /// the ceremony transport is ever driven (a `DeadLink` proves it), the row's
+    /// `key_id` is untouched, and no new commit is minted.
+    #[test]
+    fn responder_refuses_an_already_keyed_chain() {
+        use softfig_net::ceremony::{
+            commitment, derive_shared_key, key_id, MemberContribution, TranscriptEntry,
+        };
+
+        let (daemon, _tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-a");
+        let peer = forged_peer(1);
+        let ring = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(peer.clone());
+            r
+        }));
+
+        let add = crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // Key the chain via a fabricated outcome over (this device, the peer).
+        let (s, transcript) = {
+            let nonce = [7u8; 32];
+            let ids = [local.device_id, peer.device_id];
+            let rs = [[0x11u8; 32], [0x22u8; 32]];
+            let contributions: Vec<MemberContribution> = ids
+                .iter()
+                .zip(rs.iter())
+                .map(|(id, r)| MemberContribution { device_id: *id, r: *r })
+                .collect();
+            let s = derive_shared_key(&nonce, &contributions);
+            let members = contributions
+                .iter()
+                .map(|mc| TranscriptEntry {
+                    device_id: mc.device_id,
+                    commitment: commitment(&nonce, &mc.device_id, &mc.r),
+                    r: mc.r,
+                })
+                .collect();
+            let transcript = Transcript {
+                nonce,
+                chain_id: ref_name.clone().into_bytes(),
+                members,
+                key_id: key_id(&s),
+            };
+            (s, transcript)
+        };
+        persist_ceremony_outcome(&daemon, &s, &transcript).expect("key the chain");
+        let keyed_tip = {
+            let inner = daemon.inner.lock().unwrap();
+            inner.repo.as_ref().unwrap().tip().unwrap().unwrap()
+        };
+
+        struct DeadLink;
+        impl CeremonyLink for DeadLink {
+            fn send_frame(&mut self, _f: &Frame) -> Result<(), NetError> {
+                Ok(())
+            }
+            fn recv_frame(&mut self) -> Result<Frame, NetError> {
+                Err(NetError::Protocol("already-keyed responder must not drive the link"))
+            }
+        }
+        let commit = SharedKeyCommit {
+            nonce: vec![9u8; 32],
+            chain_id: ref_name.clone().into_bytes(),
+            device_id: vec![0u8; 32],
+            commitment: vec![0u8; 32],
+            signature: vec![0u8; 64],
+        };
+        serve_ceremony_responder(&daemon, &local, &ring, commit, DeadLink);
+
+        // The row still carries the original key and no new commit was minted.
+        let inner = daemon.inner.lock().unwrap();
+        let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+            inner.repo.as_ref().unwrap(),
+            inner.session.as_ref().unwrap(),
+        )
+        .unwrap();
+        let row = membership
+            .subtrees
+            .iter()
+            .find(|r| r.ref_name == ref_name)
+            .expect("row");
+        assert_eq!(row.key_id.as_deref(), Some(transcript.key_id.as_str()));
+        assert_eq!(inner.repo.as_ref().unwrap().tip().unwrap().unwrap(), keyed_tip);
     }
 
 }

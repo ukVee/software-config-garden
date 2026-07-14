@@ -341,18 +341,48 @@ pub fn persist_ceremony_outcome(
         }
     }
 
-    // Membership fill: when this device's committed allow-list has a row for
-    // the ceremony's chain, its `key_id` becomes this ceremony's. A row is not
-    // required — the responder may not have added the subtree locally yet.
+    // Membership fill — M5d slice 006, "fill-if-unkeyed, never overwrite" (the
+    // finding-1 engine). When this device's committed allow-list has a row for
+    // the ceremony's chain, fill its `key_id` ONLY while the row is still
+    // unkeyed. A row already carrying *this* ceremony's key is an idempotent
+    // retry (no change). A row carrying a *different* key is a divergence — the
+    // one-key-per-chain invariant slice 002's convergent encryption rests on has
+    // been violated (with S-encryption live this otherwise presents as silent
+    // chain corruption) — so refuse loudly and name it, never a silent swap.
+    // Rotation (slice 003's `shared_rekey`) is the ONLY authorized path that may
+    // replace a live key. A row is not required — the responder may not have
+    // added the subtree locally yet.
     let membership_update = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
         let mut membership = read_committed_shared_subtrees_for_mutation(repo, session)?;
         let mut changed = false;
         for row in membership.subtrees.iter_mut() {
-            if row.ref_name == chain_id && row.key_id.as_deref() != Some(&transcript.key_id) {
-                row.key_id = Some(transcript.key_id.clone());
-                changed = true;
+            if row.ref_name != chain_id {
+                continue;
+            }
+            match row.key_id.as_deref() {
+                None => {
+                    row.key_id = Some(transcript.key_id.clone());
+                    changed = true;
+                }
+                // Idempotent re-persist of the same ceremony: leave it untouched.
+                Some(existing) if existing == transcript.key_id => {}
+                // Already keyed with a different key — a divergence. Refuse
+                // before anything durable happens (this runs before the vault
+                // seal below, so nothing is sealed or committed on this path).
+                Some(existing) => {
+                    return Err((
+                        ErrorKind::Internal,
+                        format!(
+                            "shared-key divergence for chain {chain_id}: membership \
+                             row is already keyed {existing}, but this ceremony \
+                             produced {}; refusing to overwrite (rotation is the \
+                             only authorized re-key path)",
+                            transcript.key_id
+                        ),
+                    ));
+                }
             }
         }
         if changed {
@@ -849,5 +879,51 @@ mod tests {
         let inner = daemon.inner.lock().unwrap();
         let session = inner.session.as_ref().unwrap();
         assert!(!session.has_shared_key(&key_id(&s)));
+    }
+
+    /// One key per chain (slice 006 pin): once a membership row is filled, a
+    /// *second* ceremony producing a different key for the same chain is a hard
+    /// refusal — never a silent overwrite (the pre-006 code swapped `key_id`
+    /// unconditionally, forking slice 002's convergent encryption). Nothing
+    /// durable happens on the refused path: no swap, no divergent sealed key, no
+    /// commit.
+    #[test]
+    fn persist_refuses_a_divergent_rekey_of_a_filled_row() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let add = handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+        let our_id = daemon_device_id(&daemon);
+
+        // First ceremony fills the row.
+        let (s1, t1) = fabricate_outcome([our_id, peer_id(9)], ref_name.as_bytes());
+        let tip1 = persist_ceremony_outcome(&daemon, &s1, &t1).expect("first persist");
+
+        // A second ceremony for the same chain with a *different* member set
+        // derives a different S → different key_id; persisting it must refuse.
+        let (s2, t2) = fabricate_outcome([our_id, peer_id(10)], ref_name.as_bytes());
+        assert_ne!(t1.key_id, t2.key_id, "test needs two distinct keys");
+        assert!(
+            persist_ceremony_outcome(&daemon, &s2, &t2).is_err(),
+            "divergent re-key must be refused, not silently overwritten"
+        );
+
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+        // The row still carries the first key — no swap.
+        let membership = read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
+        let row = membership
+            .subtrees
+            .iter()
+            .find(|r| r.ref_name == ref_name)
+            .expect("row");
+        assert_eq!(row.key_id.as_deref(), Some(t1.key_id.as_str()));
+        // The divergent key's S was never sealed, and no divergent commit landed.
+        assert!(!session.has_shared_key(&t2.key_id));
+        assert_eq!(repo.tip().unwrap().unwrap(), tip1);
     }
 }
