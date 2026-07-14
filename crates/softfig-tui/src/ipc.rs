@@ -53,9 +53,20 @@ pub enum Tag {
     /// rows are milestones (expandable in the backlog tree) vs task leaves —
     /// the authoritative milestone set is the dir listing, not an id heuristic.
     GrowlightMilestones,
+    /// growlight: list `growlight/backlog/tasks` so the `GrowlightSource`
+    /// resolver can map a task's bare `NNN` queue id → its `NNN-slug.md` file.
+    GrowlightTasks,
     /// growlight: read a milestone `CLAUDE.md` (`read_file`) to populate its
-    /// slice children in the backlog tree (lazy, on first expand).
-    GrowlightMilestoneDoc { id: String },
+    /// slice-index children in the backlog tree (lazy, on first expand).
+    GrowlightSliceIndex { milestone: String },
+    /// growlight: read the selected tree node's markdown body for the right pane
+    /// (`read_file`), resolved through `GrowlightSource`. `slice` carries the
+    /// node's `(milestone_id, num)` when it is a slice, so the reply can refine
+    /// that slice's derived status (awaiting-smoke) from the loaded body.
+    GrowlightNodeFile {
+        path: String,
+        slice: Option<(String, String)>,
+    },
     /// growlight: list the baton-log dir (`list_tree growlight/baton-log`) to
     /// find the highest-numbered entry (the latest handoff).
     GrowlightBatonList,

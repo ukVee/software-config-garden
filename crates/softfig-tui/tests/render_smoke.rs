@@ -351,27 +351,33 @@ fn renders_deploy_force_overlay() {
 
 #[test]
 fn renders_growlight_frame_when_enabled() {
-    use softfig_tui::app::GrowlightRow;
+    use softfig_tui::tree::BacklogItem;
 
     let mut app = App::new();
     app.locked = false;
     app.growlight_enabled = Some(true);
     app.view = softfig_tui::app::View::Growlight;
-    app.growlight.items = vec![
-        GrowlightRow {
+    // Left pane: a navigable backlog tree (populated via the pure tree API).
+    app.growlight_tree.set_items(vec![
+        BacklogItem {
             id: "m5b-hardening".into(),
             title: "M5b replication hardening".into(),
             status: "done".into(),
+            is_milestone: true,
         },
-        GrowlightRow {
+        BacklogItem {
             id: "tui-modernize".into(),
             title: "Modernize the TUI".into(),
             status: "active".into(),
+            is_milestone: true,
         },
-    ];
-    app.growlight.selected = 1;
+    ]);
+    app.growlight_tree.selected = 1;
+    // Right pane: the fleet-header baton stub + the selected node's markdown.
     app.growlight_baton_title = Some("103-tui-modernize-003.md".into());
-    app.growlight_baton = Some("shipped slice 003 — inline-region reveal".into());
+    app.growlight_baton = Some("---\nstatus: IN_PROGRESS\n---\n\n# NEXT ACTION\nship slice 002".into());
+    app.growlight_preview_title = "tui-modernize".into();
+    app.growlight_preview = "## Mission\nright-pane markdown viewer, scrollable".into();
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -381,12 +387,53 @@ fn renders_growlight_frame_when_enabled() {
     assert!(rendered.contains("7:Growlight"), "growlight tab missing:\n{rendered}");
     assert!(rendered.contains("tui-modernize"), "queue item missing");
     assert!(rendered.contains("active"), "status missing");
+    // Fleet-header strip: the latest-baton headline (frontmatter skipped).
+    assert!(rendered.contains("loop baton"), "baton header missing");
+    assert!(rendered.contains("NEXT ACTION"), "baton headline missing");
+    // Right-pane node viewer renders the selected node's markdown.
     assert!(
-        rendered.contains("active: tui-modernize"),
-        "active-item line missing"
+        rendered.contains("right-pane markdown viewer"),
+        "node body missing"
     );
-    assert!(rendered.contains("latest baton"), "baton panel missing");
-    assert!(rendered.contains("shipped slice 003"), "baton body missing");
+}
+
+#[test]
+fn renders_growlight_loop_context_and_clamps_node_scroll() {
+    use softfig_tui::tree::LoopContextNode;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight_tree
+        .set_loop_context(vec![LoopContextNode {
+            label: "protocol.md".into(),
+            path: "growlight/protocol.md".into(),
+        }]);
+    // A long node body + an over-large scroll offset must clamp to the bottom.
+    app.growlight_preview_title = "protocol.md".into();
+    app.growlight_preview = (0..100)
+        .map(|i| format!("proto-line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.preview_scroll = 400;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("protocol.md"), "loop-context row/title missing:\n{rendered}");
+    // The renderer clamped the shared offset to the real bottom (< 400) and
+    // recorded the viewport for the scroll keys.
+    assert!(app.preview_scroll < 400, "scroll not clamped to content bottom");
+    assert_eq!(
+        app.preview_scroll,
+        app.preview_total.saturating_sub(app.preview_viewport),
+        "clamped to exactly the last page"
+    );
+    assert!(app.preview_total >= 100, "wrapped total not recorded");
+    assert!(rendered.contains("proto-line99"), "bottom line should be visible");
 }
 
 #[test]

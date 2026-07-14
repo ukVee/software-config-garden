@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
+use crate::app::{baton_headline, short_fp, App, BackupRow, Overlay, PairField, PeerRow, View};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
@@ -641,7 +641,8 @@ fn growlight_status_color(status: &str) -> Color {
         "done" => Color::DarkGray,
         "blocked" => Color::Red,
         "deferred" => Color::Yellow,
-        _ => Color::Gray, // queued / unknown
+        "context" => Color::Blue, // loop-context section leaves
+        _ => Color::Gray,         // queued / unknown
     }
 }
 
@@ -688,56 +689,62 @@ fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut st);
 }
 
-/// Right pane of the Growlight section: the active item, the selected item's
-/// title, and the latest baton (the loop's most recent handoff state). All
-/// read-only — this section never controls the loop.
-fn render_growlight_detail(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+/// Right pane of the Growlight section: a fleet-header strip above a scrollable
+/// markdown viewer of the selected tree node. Read-only — this section never
+/// controls the loop.
+fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .split(area);
+    render_growlight_header(f, app, rows[0]);
 
-    match app.growlight_active_item() {
-        Some(a) => lines.push(Line::styled(
-            format!("active: {} — {}", a.id, a.title),
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::Cyan),
-        )),
+    let placeholder =
+        "(select a node — milestone · slice · task · loop context — to view its markdown)";
+    let title = if app.growlight_preview.is_empty() {
+        "growlight detail (read-only)".to_string()
+    } else {
+        format!("{}  (read-only)", app.growlight_preview_title)
+    };
+    let content: &str = if app.growlight_preview.is_empty() {
+        placeholder
+    } else {
+        app.growlight_preview.as_str()
+    };
+    render_scroll_body(
+        f,
+        rows[1],
+        content,
+        &title,
+        &mut app.preview_scroll,
+        &mut app.preview_viewport,
+        &mut app.preview_total,
+    );
+}
+
+/// The always-visible fleet header strip. Slice 003 makes this the live
+/// growlightd `status` poll; today it is stubbed to the latest baton-log
+/// headline (the loop's most recent handoff), degrading to a dim line when there
+/// is none.
+fn render_growlight_header(f: &mut Frame, app: &App, area: Rect) {
+    let title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
+    let mut lines = vec![Line::styled(
+        format!("loop baton · {title}"),
+        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+    )];
+    match app.growlight_baton.as_deref().and_then(baton_headline) {
+        Some(h) => lines.push(Line::styled(h.to_string(), Style::default().fg(Color::Gray))),
         None => lines.push(Line::styled(
-            "active: (none — queue idle)",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    }
-
-    if let Some(sel) = app.selected_growlight_row() {
-        lines.push(Line::styled(
-            format!("selected: [{}] {} — {}", sel.status, sel.id, sel.title),
-            Style::default().fg(growlight_status_color(&sel.status)),
-        ));
-    }
-
-    lines.push(Line::raw(""));
-    let baton_title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
-    lines.push(Line::styled(
-        format!("latest baton — {baton_title}"),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    match &app.growlight_baton {
-        Some(body) => {
-            for l in body.lines() {
-                lines.push(Line::raw(l));
-            }
-        }
-        None => lines.push(Line::styled(
-            "  (no baton-log entries)",
+            "(no baton-log entries yet)",
             Style::default().fg(Color::DarkGray),
         )),
     }
-
+    lines.push(Line::styled(
+        "live fleet header arrives in slice 003",
+        Style::default().fg(Color::DarkGray),
+    ));
     let p = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("growlight detail (read-only)"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("fleet"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
@@ -772,32 +779,54 @@ fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
     f.render_widget(p, rect);
 }
 
-fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
+/// Render `content` into `area` as a bordered, wrapped, vertically-scrollable
+/// `Paragraph`, recording the live viewport + total wrapped-line count so the
+/// shared scroll keys can page and clamp, and clamping `scroll` to the real
+/// bottom. `title_base` gains a ` [NN%]` suffix when the content overflows the
+/// viewport. Shared by the Browse preview and the growlight detail body so both
+/// scroll byte-identically (the scroll keys drive the same `preview_*` fields).
+fn render_scroll_body(
+    f: &mut Frame,
+    area: Rect,
+    content: &str,
+    title_base: &str,
+    scroll: &mut u16,
+    viewport: &mut u16,
+    total_out: &mut u16,
+) {
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
 
-    let text = Paragraph::new(app.preview.as_str()).wrap(Wrap { trim: false });
+    let text = Paragraph::new(content).wrap(Wrap { trim: false });
     let total = text.line_count(inner_w) as u16;
 
-    // Record the live geometry so key/mouse handlers can size pages and clamp.
-    app.preview_viewport = inner_h;
-    app.preview_total = total;
+    *viewport = inner_h;
+    *total_out = total;
     let max = total.saturating_sub(inner_h);
-    let offset = app.preview_scroll.min(max);
-    app.preview_scroll = offset;
+    let offset = (*scroll).min(max);
+    *scroll = offset;
 
-    let mut title = if total > inner_h {
+    let title = if total > inner_h {
         let pct = if max == 0 {
             100
         } else {
             (offset as u32 * 100 / max as u32) as u16
         };
-        format!("{}  [{pct}%]", app.preview_title)
+        format!("{title_base}  [{pct}%]")
     } else {
-        app.preview_title.clone()
+        title_base.to_string()
     };
+
+    let p = text
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((offset, 0));
+    f.render_widget(p, area);
+}
+
+fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
+    let mut title = app.preview_title.clone();
     // M2c: flag inline `<vault id=…>` regions so the user knows `x` opens the
     // per-region reveal picker for this file.
     if !app.regions.is_empty() {
@@ -805,11 +834,15 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
         let plural = if n == 1 { "region" } else { "regions" };
         title.push_str(&format!("  · {n} vault {plural} (x)"));
     }
-
-    let p = text
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((offset, 0));
-    f.render_widget(p, area);
+    render_scroll_body(
+        f,
+        area,
+        &app.preview,
+        &title,
+        &mut app.preview_scroll,
+        &mut app.preview_viewport,
+        &mut app.preview_total,
+    );
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -1196,13 +1229,13 @@ fn render_help(f: &mut Frame, area: Rect) {
 soft-fig TUI — keys
 
   1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
-  7            growlight (read-only; only when growlight is enabled)
-  j k ↑ ↓      move selection (wraps top↔bottom in the growlight tree)
+  7            growlight (read-only): backlog → slices, loop-context, node viewer
+  j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
                / expand milestone → slices (growlight)
   h ←          collapse dir / milestone (growlight)
-  scroll preview (right pane):
+  scroll preview / growlight node (right pane):
     ^e ^y      line down / up        wheel  line-wise
     ^d ^u      half-page down / up
     ^f ^b      full-page down / up   PgDn/PgUp same

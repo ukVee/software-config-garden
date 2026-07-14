@@ -11,6 +11,7 @@ pub mod app;
 pub mod clip;
 pub mod command;
 pub mod forms;
+pub mod growlight_source;
 pub mod ipc;
 pub mod listpane;
 pub mod textarea;

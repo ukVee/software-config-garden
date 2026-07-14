@@ -19,10 +19,12 @@ use softfig_ipc::{
 use crate::clip;
 use crate::command::{parse_command, Command};
 use crate::forms::{ActionForm, ActionKind};
+use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
 use crate::ipc::{IpcClient, Reply, Tag};
 use crate::listpane::ListPane;
 use crate::tree::{
-    derive_slice_status, parse_slice_index, BacklogItem, BacklogTree, SliceChild, TreeModel,
+    derive_slice_status, parse_slice_index, BacklogItem, BacklogKind, BacklogTree, LoopContextNode,
+    SliceChild, TreeModel,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,21 +237,34 @@ pub struct App {
     /// now the navigable `growlight_tree` built from these rows.
     pub growlight: ListPane<GrowlightRow>,
     /// Left-pane backlog tree: milestone/task items (from `growlight`) expanding
-    /// to their slices. Rebuilt whenever the queue or the milestone set arrives.
+    /// to their slices, plus the loop-context section. Rebuilt whenever the queue
+    /// or the milestone set arrives.
     pub growlight_tree: BacklogTree,
     /// Ids that are milestones (expandable) — the authoritative dir listing of
     /// `growlight/backlog/milestones`, not an id-format heuristic. Empty until
     /// the `GrowlightMilestones` reply lands; rows classify as tasks until then.
     pub growlight_milestone_ids: Vec<String>,
+    /// The logical-artifact → read resolver for the right-pane viewer (the seam
+    /// the future runtime-FUSE-mount re-points). Carries the task dir listing so
+    /// a task's bare `NNN` id resolves to its `NNN-slug.md` file.
+    pub growlight_source: GrowlightSource,
+    /// Markdown body of the selected tree node, shown scrollably in the right
+    /// pane (reuses the shared `preview_scroll`/`preview_viewport`/`preview_total`
+    /// so the same scroll keys drive it). `growlight_preview_path` is the node
+    /// currently loaded/fetching — a stale in-flight reply (the user moved on) is
+    /// dropped, and a re-select of the same node skips the re-read.
+    pub growlight_preview: String,
+    pub growlight_preview_title: String,
+    pub growlight_preview_path: Option<String>,
     /// The latest baton-log entry (title + body) — the loop's most recent handoff
     /// state, read from the highest-numbered `growlight/baton-log/NNN-*.md`.
     pub growlight_baton_title: Option<String>,
     pub growlight_baton: Option<String>,
     /// Set when a write lands while the Growlight tab is hidden. `load_growlight`
-    /// is three IPC round-trips (`growlight_queue` + a `list_tree` of the
-    /// unboundedly-growing baton-log + the latest-entry `read_file`) — too much
-    /// to refire for a tab nobody is viewing. Marked stale here, lazily
-    /// re-fetched on entry (020 slice 006, like `deploy_stale`).
+    /// is four IPC round-trips (`growlight_queue` + `list_tree` of milestones,
+    /// tasks, and the unboundedly-growing baton-log, then the latest-entry
+    /// `read_file`) — too much to refire for a tab nobody is viewing. Marked
+    /// stale here, lazily re-fetched on entry (020 slice 006, like `deploy_stale`).
     pub growlight_stale: bool,
     pub overlay: Overlay,
     pub status: String,
@@ -296,6 +311,10 @@ impl App {
             growlight: ListPane::new(),
             growlight_tree: BacklogTree::new(),
             growlight_milestone_ids: Vec::new(),
+            growlight_source: GrowlightSource::new(),
+            growlight_preview: String::new(),
+            growlight_preview_title: String::new(),
+            growlight_preview_path: None,
             growlight_baton_title: None,
             growlight_baton: None,
             growlight_stale: false,
@@ -352,14 +371,20 @@ impl App {
     }
 
     /// growlight: (re)load the read-only section — the backlog queue table, the
-    /// milestone set (for tree classification), plus a listing of the baton-log
-    /// (whose reply triggers the latest-entry read).
+    /// milestone set (for tree classification), the tasks listing (for the
+    /// resolver's `NNN` → file map), plus a listing of the baton-log (whose reply
+    /// triggers the latest-entry read).
     fn load_growlight(&self, ipc: &mut IpcClient) {
         ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
         ipc.send(
             "list_tree",
             json!({ "path": "growlight/backlog/milestones" }),
             Tag::GrowlightMilestones,
+        );
+        ipc.send(
+            "list_tree",
+            json!({ "path": "growlight/backlog/tasks" }),
+            Tag::GrowlightTasks,
         );
         ipc.send(
             "list_tree",
@@ -388,7 +413,7 @@ impl App {
             self.load_backup(ipc);
         }
         // Deploy + Growlight are the expensive loads (a full daemon-side dot
-        // diff; a 3-round-trip read over the unbounded baton-log). Gate them on
+        // diff; a 4-round-trip read over the unbounded baton-log). Gate them on
         // the active view like History is: a write that lands while they're
         // hidden marks them stale to lazily re-fetch on entry, instead of
         // refiring eMMC I/O for a tab nobody is looking at (020 slice 006).
@@ -510,11 +535,66 @@ impl App {
                 is_milestone: milestones.contains(r.id.as_str()),
             })
             .collect();
+        // The loop-context section is static; (re)seed it on every rebuild so the
+        // tree stays self-consistent, then set the backlog (which clamps last).
+        self.growlight_tree.set_loop_context(loop_context_nodes());
         self.growlight_tree.set_items(items);
     }
 
+    /// Resolve the selected tree node to its markdown artifact and fetch its body
+    /// for the right pane. Idempotent — skips the read when the node's body is
+    /// already loaded/fetching — so it is safe to call after every nav,
+    /// expand/collapse, and data reply. Resets `preview_scroll` and fires a fresh
+    /// `read_file` only when the selection lands on a *different* node. A task
+    /// whose dir listing hasn't arrived yet resolves to nothing and retries once
+    /// the `GrowlightTasks` reply seeds the resolver.
+    fn refresh_growlight_selection(&mut self, ipc: &mut IpcClient) {
+        let Some(row) = self.growlight_tree.selected_row() else {
+            return;
+        };
+        let artifact = match row.kind {
+            BacklogKind::Milestone => GrowlightArtifact::Milestone {
+                id: row.item_id.clone(),
+            },
+            BacklogKind::Task => GrowlightArtifact::Task {
+                id: row.item_id.clone(),
+            },
+            BacklogKind::Slice => match &row.path {
+                Some(p) => GrowlightArtifact::Slice { path: p.clone() },
+                None => return,
+            },
+            BacklogKind::LoopContext => match &row.path {
+                Some(p) => GrowlightArtifact::LoopContext { path: p.clone() },
+                None => return,
+            },
+        };
+        let Some(GrowlightRead::Garden { path }) = self.growlight_source.resolve(&artifact) else {
+            return; // e.g. a task whose dir listing hasn't landed — retry later
+        };
+        if self.growlight_preview_path.as_deref() == Some(path.as_str()) {
+            return; // already showing / fetching this node
+        }
+        // A slice node carries (milestone, num) so the reply can refine its
+        // derived status to awaiting-smoke from the loaded body.
+        let slice = match row.kind {
+            BacklogKind::Slice => row
+                .slice_num
+                .clone()
+                .map(|num| (row.item_id.clone(), num)),
+            _ => None,
+        };
+        self.growlight_preview_path = Some(path.clone());
+        self.growlight_preview_title = row.label.clone();
+        self.preview_scroll = 0;
+        ipc.send(
+            "read_file",
+            json!({ "path": path }),
+            Tag::GrowlightNodeFile { path, slice },
+        );
+    }
+
     fn hint_growlight_readonly(&mut self) {
-        self.status = "growlight is a read-only view (queue · active item · latest baton)".into();
+        self.status = "growlight is a read-only browser (backlog · slices · loop context)".into();
     }
 
     // ---- reply handling ----
@@ -852,6 +932,7 @@ impl App {
                     Ok(r) => {
                         self.growlight.set_items(r.rows);
                         self.rebuild_growlight_tree();
+                        self.refresh_growlight_selection(ipc);
                     }
                     Err(e) => self.status = format!("growlight queue: malformed reply: {e}"),
                 },
@@ -867,38 +948,77 @@ impl App {
                             .map(|e| e.name.clone())
                             .collect();
                         self.rebuild_growlight_tree();
+                        self.refresh_growlight_selection(ipc);
                     }
                     Err(e) => self.status = format!("growlight milestones: malformed reply: {e}"),
                 },
                 Err((_, m)) => self.status = format!("growlight milestones: {m}"),
             },
-            Tag::GrowlightMilestoneDoc { id } => match reply.result {
+            Tag::GrowlightTasks => match reply.result {
+                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                    Ok(r) => {
+                        // Seed the resolver's bare-`NNN` → file map, then retry the
+                        // selection read (a task selected before this landed had
+                        // no resolvable path).
+                        self.growlight_source.set_task_paths(&r.entries);
+                        self.refresh_growlight_selection(ipc);
+                    }
+                    Err(e) => self.status = format!("growlight tasks: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight tasks: {m}"),
+            },
+            Tag::GrowlightSliceIndex { milestone } => match reply.result {
                 Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
                     Ok(r) => {
-                        let dir = format!("growlight/backlog/milestones/{id}");
+                        let dir = format!("growlight/backlog/milestones/{milestone}");
                         let children = parse_slice_index(&r.content)
                             .into_iter()
                             .map(|s| {
                                 // `is_active` (the live baton's active slice) is
                                 // wired by the growlightd `baton` verb in slice
-                                // 004; `body` (for awaiting-smoke) by the slice
-                                // 002 right-pane read. Until then a reviewed
-                                // slice reads as done, an unreviewed one queued.
+                                // 004; `body` (for awaiting-smoke) is fed by the
+                                // right-pane read on select (`refine_slice_status`).
+                                // Until then a reviewed slice reads as done, an
+                                // unreviewed one queued; `reviewed` is kept for the
+                                // later re-derivation.
                                 let status =
                                     derive_slice_status(false, s.reviewed.as_deref(), None);
                                 SliceChild {
                                     path: format!("{dir}/{}", s.path),
                                     num: s.num,
                                     title: s.title,
+                                    reviewed: s.reviewed,
                                     status,
                                 }
                             })
                             .collect();
-                        self.growlight_tree.set_slices(&id, children);
+                        self.growlight_tree.set_slices(&milestone, children);
+                        // Slices just appeared under the selection — read the one
+                        // now selected (if selection shifted onto a slice).
+                        self.refresh_growlight_selection(ipc);
                     }
-                    Err(e) => self.status = format!("growlight milestone {id}: malformed reply: {e}"),
+                    Err(e) => {
+                        self.status = format!("growlight milestone {milestone}: malformed reply: {e}")
+                    }
                 },
-                Err((_, m)) => self.status = format!("growlight milestone {id}: {m}"),
+                Err((_, m)) => self.status = format!("growlight milestone {milestone}: {m}"),
+            },
+            Tag::GrowlightNodeFile { path, slice } => match reply.result {
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => {
+                        // Drop a stale reply: the user navigated to another node
+                        // while this read was in flight.
+                        if self.growlight_preview_path.as_deref() == Some(path.as_str()) {
+                            if let Some((milestone, num)) = &slice {
+                                self.growlight_tree
+                                    .refine_slice_status(milestone, num, false, &r.content);
+                            }
+                            self.growlight_preview = r.content;
+                        }
+                    }
+                    Err(e) => self.status = format!("growlight node {path}: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight node {path}: {m}"),
             },
             Tag::GrowlightBatonList => match reply.result {
                 Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
@@ -1017,6 +1137,10 @@ impl App {
             // otherwise, so `7` is inert on a garden without growlight.
             KeyCode::Char('7') if self.growlight_enabled == Some(true) => {
                 self.view = View::Growlight;
+                // The right-pane body reuses the shared `preview_scroll` (also
+                // driven by Browse/History), so reset it on entry — the node
+                // viewer always opens at the top, never at another view's offset.
+                self.preview_scroll = 0;
                 if (!self.growlight.loaded || self.growlight_stale) && !self.locked {
                     self.growlight_stale = false;
                     self.load_growlight(ipc);
@@ -1032,10 +1156,10 @@ impl App {
             KeyCode::Char('F') if self.view == View::Deploy => self.start_force_apply(),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
-            KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
+            KeyCode::Up | KeyCode::Char('k') => self.nav_up(ipc),
             KeyCode::Down | KeyCode::Char('j') => self.nav_down(ipc),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.activate(ipc),
-            KeyCode::Left | KeyCode::Char('h') => self.collapse_selected(),
+            KeyCode::Left | KeyCode::Char('h') => self.collapse_selected(ipc),
             KeyCode::PageDown => self.scroll_preview(self.preview_viewport.max(1) as i32),
             KeyCode::PageUp => self.scroll_preview(-(self.preview_viewport.max(1) as i32)),
             KeyCode::Char('g') => self.preview_to_top(),
@@ -1075,7 +1199,7 @@ impl App {
         self.preview_scroll = self.preview_max_scroll();
     }
 
-    fn nav_up(&mut self) {
+    fn nav_up(&mut self, ipc: &mut IpcClient) {
         match self.view {
             View::Browse => self.tree.move_up(),
             View::History => {
@@ -1085,11 +1209,14 @@ impl App {
             View::Peers => self.peer_list.up(),
             View::Backup => self.backup.up(),
             View::Deploy => self.deploy.up(),
-            View::Growlight => self.growlight_tree.move_up(),
+            View::Growlight => {
+                self.growlight_tree.move_up();
+                self.refresh_growlight_selection(ipc);
+            }
         }
     }
 
-    fn nav_down(&mut self, _ipc: &mut IpcClient) {
+    fn nav_down(&mut self, ipc: &mut IpcClient) {
         match self.view {
             View::Browse => self.tree.move_down(),
             View::History => {
@@ -1101,7 +1228,10 @@ impl App {
             View::Peers => self.peer_list.down(),
             View::Backup => self.backup.down(),
             View::Deploy => self.deploy.down(),
-            View::Growlight => self.growlight_tree.move_down(),
+            View::Growlight => {
+                self.growlight_tree.move_down();
+                self.refresh_growlight_selection(ipc);
+            }
         }
     }
 
@@ -1147,8 +1277,9 @@ impl App {
         }
     }
 
-    /// Toggle the selected milestone's slice children (lazy-load on first
-    /// expand); a task/slice leaf is a read-only glance.
+    /// Toggle the selected milestone's slice children (lazy-load its slice index
+    /// on first expand); a task/slice/loop-context leaf is a read-only glance
+    /// (its body already shows in the right pane on select).
     fn activate_growlight(&mut self, ipc: &mut IpcClient) {
         let Some(row) = self.growlight_tree.selected_row() else {
             return self.hint_growlight_readonly();
@@ -1161,17 +1292,26 @@ impl App {
         } else {
             self.growlight_tree.expand(&row.item_id);
             if !self.growlight_tree.is_loaded(&row.item_id) {
-                let path = format!("growlight/backlog/milestones/{}/CLAUDE.md", row.item_id);
-                ipc.send(
-                    "read_file",
-                    json!({ "path": path }),
-                    Tag::GrowlightMilestoneDoc {
+                // Resolve the milestone doc's path through the same seam as the
+                // body reads (its slice index lives in that CLAUDE.md).
+                if let Some(GrowlightRead::Garden { path }) = self
+                    .growlight_source
+                    .resolve(&GrowlightArtifact::Milestone {
                         id: row.item_id.clone(),
-                    },
-                );
+                    })
+                {
+                    ipc.send(
+                        "read_file",
+                        json!({ "path": path }),
+                        Tag::GrowlightSliceIndex {
+                            milestone: row.item_id.clone(),
+                        },
+                    );
+                }
             }
         }
         self.growlight_tree.clamp_selection();
+        self.refresh_growlight_selection(ipc);
     }
 
     fn hint_backup_actions(&mut self) {
@@ -1182,7 +1322,7 @@ impl App {
         };
     }
 
-    fn collapse_selected(&mut self) {
+    fn collapse_selected(&mut self, ipc: &mut IpcClient) {
         match self.view {
             View::Browse => {
                 if let Some(row) = self.tree.selected_row() {
@@ -1199,6 +1339,7 @@ impl App {
                         self.growlight_tree.clamp_selection();
                     }
                 }
+                self.refresh_growlight_selection(ipc);
             }
             _ => {}
         }
@@ -1817,6 +1958,43 @@ fn vault_reveal_args(path: &str, master_password: &str, id: Option<&str>) -> Val
         args["id"] = json!(id);
     }
     args
+}
+
+/// The loop-context docs surfaced as browsable tree nodes (plain garden reads):
+/// the injected protocol templates, the session policy, and the pillar map. The
+/// injected protocol is exactly these files read verbatim by the SessionStart
+/// hook, so they resolve to ordinary keeperd reads. (The assembled
+/// injected-context view — protocol + the member's live baton — waits on slice
+/// 004's growlightd `baton` verb.)
+fn loop_context_nodes() -> Vec<LoopContextNode> {
+    [
+        ("protocol.md", "growlight/protocol.md"),
+        ("protocol-fleet.md", "growlight/protocol-fleet.md"),
+        ("session-policy.md", "growlight/session-policy.md"),
+        ("CLAUDE.md (pillar)", "growlight/CLAUDE.md"),
+    ]
+    .into_iter()
+    .map(|(label, path)| LoopContextNode {
+        label: label.into(),
+        path: path.into(),
+    })
+    .collect()
+}
+
+/// The first meaningful line of a baton (its headline) for the fleet-header
+/// strip: the first non-empty line after an optional leading `--- … ---` YAML
+/// frontmatter block. `None` for an empty/blank baton.
+pub fn baton_headline(body: &str) -> Option<&str> {
+    let mut lines = body.lines().peekable();
+    if lines.peek().map(|l| l.trim_end()) == Some("---") {
+        lines.next();
+        for l in lines.by_ref() {
+            if l.trim_end() == "---" {
+                break;
+            }
+        }
+    }
+    lines.map(str::trim).find(|l| !l.is_empty())
 }
 
 /// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
@@ -3084,9 +3262,11 @@ mod tests {
         );
 
         let vis = app.growlight_tree.visible();
-        assert_eq!(vis.len(), 2);
+        // 2 backlog rows + the 4 static loop-context nodes seeded on rebuild.
+        assert_eq!(vis.len(), 6);
         assert!(vis[0].expandable, "milestone row expands");
         assert!(!vis[1].expandable, "task row is a leaf");
+        assert_eq!(vis[2].kind, BacklogKind::LoopContext, "loop-context follows the backlog");
 
         // Expand the milestone (Enter) — fires the lazy read_file (to the dead
         // dummy worker; no reply), marks it expanded.
@@ -3103,8 +3283,8 @@ mod tests {
         app.apply_reply(
             Reply {
                 id: 3,
-                tag: Tag::GrowlightMilestoneDoc {
-                    id: "my-milestone".into(),
+                tag: Tag::GrowlightSliceIndex {
+                    milestone: "my-milestone".into(),
                 },
                 result: Ok(json!({
                     "path": "growlight/backlog/milestones/my-milestone/CLAUDE.md",
@@ -3121,7 +3301,8 @@ mod tests {
         );
 
         let vis = app.growlight_tree.visible();
-        assert_eq!(vis.len(), 4, "milestone + 2 slices + task");
+        // milestone + 2 slices + task + 4 loop-context.
+        assert_eq!(vis.len(), 8, "milestone + 2 slices + task + loop-context");
         assert_eq!(vis[1].depth, 1);
         assert_eq!(vis[1].label, "001 first");
         assert_eq!(vis[1].status, "done", "reviewed slice → done");
@@ -3137,5 +3318,171 @@ mod tests {
             app.selected_growlight_row().map(|r| r.id.as_str()),
             Some("my-milestone")
         );
+    }
+
+    /// A small queue-only tree (one task + the loop-context section).
+    fn seed_growlight_tree(app: &mut App, ipc: &mut IpcClient) {
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [ { "id": "042", "title": "a task", "status": "queued" } ],
+                })),
+            },
+            ipc,
+        );
+    }
+
+    #[test]
+    fn selecting_a_loop_context_node_targets_its_garden_path_and_resets_scroll() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+
+        app.view = View::Growlight;
+        app.preview_scroll = 25; // a leftover offset from another view
+                                 // tree = [task, protocol.md, protocol-fleet.md, session-policy.md, pillar]
+        app.growlight_tree.selected = 1; // first loop-context node
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(
+            app.growlight_preview_path.as_deref(),
+            Some("growlight/protocol.md")
+        );
+        assert_eq!(app.preview_scroll, 0, "a new node resets the shared scroll");
+    }
+
+    #[test]
+    fn growlight_node_file_reply_populates_preview_and_drops_stale() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+        app.growlight_tree.selected = 1; // protocol.md loop-context node
+        app.refresh_growlight_selection(&mut ipc);
+
+        // The matching reply lands → the body shows in the right pane.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightNodeFile {
+                    path: "growlight/protocol.md".into(),
+                    slice: None,
+                },
+                result: Ok(json!({
+                    "path": "growlight/protocol.md",
+                    "content": "# operating protocol\nboot the baton",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight_preview.contains("operating protocol"));
+
+        // A reply for a node we already navigated away from is ignored.
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightNodeFile {
+                    path: "growlight/protocol-fleet.md".into(),
+                    slice: None,
+                },
+                result: Ok(json!({
+                    "path": "growlight/protocol-fleet.md",
+                    "content": "stale fleet body",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(
+            !app.growlight_preview.contains("stale fleet body"),
+            "a stale in-flight reply must not overwrite the current node"
+        );
+    }
+
+    #[test]
+    fn slice_node_read_lights_up_awaiting_smoke() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightMilestones,
+                result: Ok(json!({
+                    "entries": [
+                        tree_entry("m", "growlight/backlog/milestones/m", true),
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [ { "id": "m", "title": "milestone m", "status": "deferred" } ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.growlight_tree.expand("m");
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightSliceIndex { milestone: "m".into() },
+                result: Ok(json!({
+                    "path": "growlight/backlog/milestones/m/CLAUDE.md",
+                    "content": "<!-- softfig:index slices -->\n\
+                                | # | Note | Reviewed |\n\
+                                |---|------|----------|\n\
+                                | 001 | [first](slices/001-first.md) | 2026-07-14 |\n\
+                                <!-- /softfig:index slices -->\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        // A reviewed slice with no loaded body reads as done.
+        assert_eq!(app.growlight_tree.visible()[1].status, "done");
+
+        // Select the slice, then its body arrives carrying a Deferred
+        // verification section → the derived status refines to awaiting-smoke.
+        app.view = View::Growlight;
+        app.growlight_tree.selected = 1;
+        app.refresh_growlight_selection(&mut ipc);
+        let slice_path = "growlight/backlog/milestones/m/slices/001-first.md";
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(slice_path));
+        app.apply_reply(
+            Reply {
+                id: 4,
+                tag: Tag::GrowlightNodeFile {
+                    path: slice_path.into(),
+                    slice: Some(("m".into(), "001".into())),
+                },
+                result: Ok(json!({
+                    "path": slice_path,
+                    "content": "## Finish criteria\n...\n## Deferred verification\nrun on-device",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_tree.visible()[1].status, "awaiting-smoke");
+    }
+
+    #[test]
+    fn baton_headline_skips_frontmatter() {
+        assert_eq!(
+            baton_headline("---\nloop: x\nstatus: IN_PROGRESS\n---\n\n# NEXT ACTION\ngo"),
+            Some("# NEXT ACTION")
+        );
+        assert_eq!(baton_headline("just a line\nmore"), Some("just a line"));
+        assert_eq!(baton_headline("\n\n   \n"), None);
     }
 }

@@ -315,13 +315,24 @@ pub struct BacklogItem {
 }
 
 /// A loaded slice child of a milestone, its derived status baked in and its
-/// `path` resolved to a full garden path by the caller.
+/// `path` resolved to a full garden path by the caller. `reviewed` is kept so
+/// the status can be re-derived once the slice's body loads (the right-pane read
+/// lights up awaiting-smoke — see [`BacklogTree::refine_slice_status`]).
 #[derive(Debug, Clone)]
 pub struct SliceChild {
     pub num: String,
     pub title: String,
     pub path: String,
+    pub reviewed: Option<String>,
     pub status: SliceStatus,
+}
+
+/// A loop-context doc surfaced as a browsable tree node (a plain garden read):
+/// the injected protocol templates, the session policy, the pillar map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopContextNode {
+    pub label: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +340,9 @@ pub enum BacklogKind {
     Milestone,
     Task,
     Slice,
+    /// A loop-context leaf (protocol / session-policy / pillar doc), rendered as
+    /// a top-level section after the backlog items.
+    LoopContext,
 }
 
 /// One rendered row of the flattened, currently-visible backlog tree.
@@ -347,8 +361,11 @@ pub struct BacklogVisibleRow {
     pub expandable: bool,
     pub expanded: bool,
     pub loaded: bool,
-    /// A slice row's full garden path (for the slice-002 right-pane read).
+    /// A slice / loop-context row's full garden path (for the right-pane read).
     pub path: Option<String>,
+    /// A slice row's index (`num`), so the right-pane read can refine that
+    /// slice's derived status from the loaded body. `None` for non-slice rows.
+    pub slice_num: Option<String>,
 }
 
 /// The growlight backlog tree: top-level items + lazily-loaded slice children.
@@ -359,6 +376,8 @@ pub struct BacklogTree {
     expanded: HashSet<String>,
     /// Milestone id → its slice children (present ⇒ loaded).
     slices: HashMap<String, Vec<SliceChild>>,
+    /// Loop-context leaves, emitted as a top-level section after the backlog.
+    loop_context: Vec<LoopContextNode>,
     pub selected: usize,
 }
 
@@ -402,7 +421,27 @@ impl BacklogTree {
         self.slices.insert(id.to_string(), slices);
     }
 
-    /// The currently-visible flattened rows, items then any expanded slices.
+    /// Replace the loop-context section (a static set of garden-read leaves).
+    pub fn set_loop_context(&mut self, nodes: Vec<LoopContextNode>) {
+        self.loop_context = nodes;
+        self.clamp_selection();
+    }
+
+    /// Refine a loaded slice's derived status now that its body is known (the
+    /// right-pane read): re-derive so a reviewed slice carrying a `## Deferred
+    /// verification` section lights up as awaiting-smoke. No-op if the milestone
+    /// or slice isn't loaded.
+    pub fn refine_slice_status(&mut self, milestone: &str, num: &str, is_active: bool, body: &str) {
+        if let Some(children) = self.slices.get_mut(milestone) {
+            if let Some(child) = children.iter_mut().find(|c| c.num == num) {
+                child.status =
+                    derive_slice_status(is_active, child.reviewed.as_deref(), Some(body));
+            }
+        }
+    }
+
+    /// The currently-visible flattened rows: backlog items (with any expanded
+    /// slices) first, then the loop-context section.
     pub fn visible(&self) -> Vec<BacklogVisibleRow> {
         let mut out = Vec::new();
         for item in &self.items {
@@ -422,6 +461,7 @@ impl BacklogTree {
                 expanded,
                 loaded: self.slices.contains_key(&item.id),
                 path: None,
+                slice_num: None,
             });
             if expanded {
                 if let Some(children) = self.slices.get(&item.id) {
@@ -437,10 +477,26 @@ impl BacklogTree {
                             expanded: false,
                             loaded: true,
                             path: Some(s.path.clone()),
+                            slice_num: Some(s.num.clone()),
                         });
                     }
                 }
             }
+        }
+        for ctx in &self.loop_context {
+            out.push(BacklogVisibleRow {
+                kind: BacklogKind::LoopContext,
+                key: format!("ctx:{}", ctx.path),
+                item_id: String::new(),
+                label: ctx.label.clone(),
+                status: "context".to_string(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                loaded: true,
+                path: Some(ctx.path.clone()),
+                slice_num: None,
+            });
         }
         out
     }
@@ -635,7 +691,15 @@ mod tests {
             num: num.into(),
             title: format!("slice {num}"),
             path: format!("growlight/backlog/milestones/m/slices/{num}.md"),
+            reviewed: None,
             status: SliceStatus::Queued,
+        }
+    }
+
+    fn ctx(label: &str, path: &str) -> LoopContextNode {
+        LoopContextNode {
+            label: label.into(),
+            path: path.into(),
         }
     }
 
@@ -684,6 +748,56 @@ mod tests {
         assert_eq!(t.selected, 1);
         t.move_up();
         assert_eq!(t.selected, 0);
+    }
+
+    #[test]
+    fn loop_context_section_follows_the_backlog_and_carries_paths() {
+        let mut t = BacklogTree::new();
+        t.set_loop_context(vec![
+            ctx("protocol.md", "growlight/protocol.md"),
+            ctx("session-policy.md", "growlight/session-policy.md"),
+        ]);
+        t.set_items(vec![task("042", "t")]);
+        let vis = t.visible();
+        assert_eq!(vis.len(), 3, "task + 2 loop-context rows");
+        assert_eq!(vis[0].kind, BacklogKind::Task);
+        assert_eq!(vis[1].kind, BacklogKind::LoopContext);
+        assert_eq!(vis[1].label, "protocol.md");
+        assert_eq!(vis[1].status, "context");
+        assert!(!vis[1].expandable);
+        assert_eq!(vis[1].path.as_deref(), Some("growlight/protocol.md"));
+        assert_eq!(vis[2].path.as_deref(), Some("growlight/session-policy.md"));
+        // Nav wraps across the whole list, backlog + context together.
+        assert_eq!(t.selected, 0);
+        t.move_up();
+        assert_eq!(t.selected, 2, "wrap up from the top lands on the last context row");
+    }
+
+    #[test]
+    fn refine_slice_status_lights_up_awaiting_smoke_from_the_body() {
+        let mut t = BacklogTree::new();
+        t.set_items(vec![milestone("m", "m")]);
+        t.expand("m");
+        // A reviewed slice whose body isn't loaded reads as done.
+        t.set_slices(
+            "m",
+            vec![SliceChild {
+                num: "001".into(),
+                title: "s".into(),
+                path: "growlight/backlog/milestones/m/slices/001.md".into(),
+                reviewed: Some("2026-07-14".into()),
+                status: SliceStatus::Done,
+            }],
+        );
+        // Its body arrives with a Deferred verification section → awaiting-smoke.
+        t.refine_slice_status("m", "001", false, "## Finish\n## Deferred verification\nsmoke");
+        assert_eq!(t.visible()[1].status, "awaiting-smoke");
+        // A body without one keeps it done.
+        t.refine_slice_status("m", "001", false, "## Finish\nall unit-covered");
+        assert_eq!(t.visible()[1].status, "done");
+        // Unknown milestone/slice is a no-op (no panic).
+        t.refine_slice_status("nope", "001", false, "x");
+        t.refine_slice_status("m", "999", false, "x");
     }
 
     #[test]
