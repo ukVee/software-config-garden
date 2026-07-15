@@ -233,6 +233,13 @@ struct CeremonyMemberToml {
     device_id: String,
     commitment: String,
     r: String,
+    /// The member's commit + reveal signatures (hex), retained so the persisted
+    /// record proves participation — [`Transcript::verify`] re-checks them. No
+    /// serde default: a record missing them is invalid and must fail to parse
+    /// (clean break, no pre-hardening unsigned records — the branch is undeployed;
+    /// see [[decision-shared-ceremony-transcript-persistence]]).
+    commit_sig: String,
+    reveal_sig: String,
 }
 
 /// Render a transcript as the committed TOML record. Fails only on a
@@ -251,6 +258,8 @@ pub fn render_transcript_record(t: &Transcript) -> Result<String, String> {
                 device_id: hex::encode(m.device_id),
                 commitment: hex::encode(m.commitment),
                 r: hex::encode(m.r),
+                commit_sig: hex::encode(m.commit_sig),
+                reveal_sig: hex::encode(m.reveal_sig),
             })
             .collect(),
     };
@@ -274,6 +283,8 @@ pub fn parse_transcript_record(text: &str) -> Result<Transcript, String> {
                     device_id: hex32(&m.device_id, "device_id")?,
                     commitment: hex32(&m.commitment, "commitment")?,
                     r: hex32(&m.r, "r")?,
+                    commit_sig: hex64(&m.commit_sig, "commit_sig")?,
+                    reveal_sig: hex64(&m.reveal_sig, "reveal_sig")?,
                 })
             })
             .collect::<Result<_, String>>()?,
@@ -286,6 +297,13 @@ fn hex32(s: &str, field: &str) -> Result<[u8; 32], String> {
     bytes
         .try_into()
         .map_err(|_| format!("ceremony record {field} is not 32 bytes"))
+}
+
+fn hex64(s: &str, field: &str) -> Result<[u8; 64], String> {
+    let bytes = hex::decode(s).map_err(|e| format!("ceremony record {field}: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("ceremony record {field} is not 64 bytes"))
 }
 
 /// Persist a completed ceremony's outcome: seal `S` under the vault, commit
@@ -738,7 +756,8 @@ fn collect_chain_plaintext(
 mod tests {
     use super::*;
     use softfig_net::ceremony::{
-        commit_signing_bytes, commitment, run_ceremony, verify_commit_sig, Ceremony, Phase,
+        commit_signing_bytes, commitment, reveal_signing_bytes, run_ceremony, verify_commit_sig,
+        Ceremony, Phase,
     };
     use softfig_net::{NetError, RingEntry};
 
@@ -971,7 +990,7 @@ mod tests {
 
     // --- persist_ceremony_outcome (CHUNK B0) --------------------------------
 
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use softfig_net::ceremony::{derive_shared_key, MemberContribution};
 
     use crate::handlers;
@@ -1016,49 +1035,105 @@ mod tests {
             .to_bytes()
     }
 
-    /// Fabricate a completed 2-member ceremony outcome for `chain`. The
-    /// transcript carries no signatures (commit/reveal auth is the drive
-    /// loop's job), so entries for arbitrary device ids — including the
-    /// daemon's own — verify from the commitment binding alone.
-    fn fabricate_outcome(member_ids: [[u8; 32]; 2], chain: &[u8]) -> (SharedKey, Transcript) {
+    /// The signing key behind a fabricated peer id: `peer_id(seed)` is its
+    /// verifying key, so a test can mint that peer's *real* ceremony signatures.
+    fn peer_sk(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn peer_id(seed: u8) -> [u8; 32] {
+        peer_sk(seed).verifying_key().to_bytes()
+    }
+
+    /// A ceremony member for the signed-outcome builder: `(device_id, r, sign)`,
+    /// where `sign` mints that member's Ed25519 signature over given bytes.
+    type SignedMember<'a> = ([u8; 32], [u8; 32], &'a dyn Fn(&[u8]) -> [u8; 64]);
+
+    /// Build a fully-signed, verifying 2-member ceremony outcome for `chain`.
+    /// Each member's `device_id` MUST be its signer's pubkey or the transcript
+    /// will not verify. Since slice 007 the transcript carries real per-member
+    /// commit+reveal signatures, so this signs each entry with either a fabricated
+    /// peer's known key or the daemon's own vault session.
+    fn build_signed_outcome(
+        chain: &[u8],
+        m0: SignedMember<'_>,
+        m1: SignedMember<'_>,
+    ) -> (SharedKey, Transcript) {
         let nonce = [7u8; 32];
-        let rs = [[0x11u8; 32], [0x22u8; 32]];
-        let contributions: Vec<MemberContribution> = member_ids
-            .iter()
-            .zip(rs.iter())
-            .map(|(id, r)| MemberContribution { device_id: *id, r: *r })
-            .collect();
+        let contributions = vec![
+            MemberContribution { device_id: m0.0, r: m0.1 },
+            MemberContribution { device_id: m1.0, r: m1.1 },
+        ];
         let s = derive_shared_key(&nonce, &contributions);
-        let members = contributions
-            .iter()
-            .map(|mc| TranscriptEntry {
-                device_id: mc.device_id,
-                commitment: commitment(&nonce, &mc.device_id, &mc.r),
-                r: mc.r,
-            })
-            .collect();
+        let entry = |id: [u8; 32], r: [u8; 32], sign: &dyn Fn(&[u8]) -> [u8; 64]| {
+            let comm = commitment(&nonce, &id, &r);
+            TranscriptEntry {
+                device_id: id,
+                commitment: comm,
+                r,
+                commit_sig: sign(&commit_signing_bytes(&nonce, chain, &id, &comm)),
+                reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, &id, &r)),
+            }
+        };
+        let members = vec![entry(m0.0, m0.1, m0.2), entry(m1.0, m1.1, m1.2)];
         let transcript = Transcript {
             nonce,
             chain_id: chain.to_vec(),
             members,
             key_id: key_id(&s),
         };
-        assert!(transcript.verify());
         (s, transcript)
     }
 
-    fn peer_id(seed: u8) -> [u8; 32] {
-        SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes()
+    /// Fabricate a signed 2-member outcome between two fabricated peers (by seed),
+    /// each signing with its own known key — the transcript now verifies from real
+    /// signatures, not the keyless commitment binding alone.
+    fn fabricate_outcome(seeds: [u8; 2], chain: &[u8]) -> (SharedKey, Transcript) {
+        let sk0 = peer_sk(seeds[0]);
+        let sk1 = peer_sk(seeds[1]);
+        let (s, t) = build_signed_outcome(
+            chain,
+            (sk0.verifying_key().to_bytes(), [0x11; 32], &|m| sk0.sign(m).to_bytes()),
+            (sk1.verifying_key().to_bytes(), [0x22; 32], &|m| sk1.sign(m).to_bytes()),
+        );
+        assert!(t.verify());
+        (s, t)
+    }
+
+    /// Fabricate a signed 2-member outcome where member 0 is *this daemon* — its
+    /// entry signed with the vault identity key so persist's membership + the new
+    /// signature checks both pass — and member 1 is fabricated peer `peer_seed`.
+    fn fabricate_outcome_with_self(
+        daemon: &Daemon,
+        peer_seed: u8,
+        chain: &[u8],
+    ) -> (SharedKey, Transcript) {
+        let session = {
+            let inner = daemon.inner.lock().unwrap();
+            Arc::clone(inner.session.as_ref().expect("unlocked"))
+        };
+        let self_id = session.identity_pubkey().to_bytes();
+        let peer = peer_sk(peer_seed);
+        let (s, t) = build_signed_outcome(
+            chain,
+            (self_id, [0x11; 32], &|m| session.sign(m).to_bytes()),
+            (peer.verifying_key().to_bytes(), [0x22; 32], &|m| peer.sign(m).to_bytes()),
+        );
+        assert!(t.verify());
+        (s, t)
     }
 
     #[test]
     fn record_toml_roundtrips_and_reverifies() {
-        let (_s, transcript) = fabricate_outcome([peer_id(1), peer_id(2)], b"chain/demo");
+        let (_s, transcript) = fabricate_outcome([1, 2], b"chain/demo");
         let text = render_transcript_record(&transcript).unwrap();
         // Hex fields + string chain id, per the locked record shape.
         assert!(text.contains(&format!("key_id = \"{}\"", transcript.key_id)));
         assert!(text.contains("chain_id = \"chain/demo\""));
         assert!(text.contains(&format!("nonce = \"{}\"", hex::encode(transcript.nonce))));
+        // The signatures round-trip too — the whole point of slice 007's record.
+        assert!(text.contains(&format!("commit_sig = \"{}\"", hex::encode(transcript.members[0].commit_sig))));
+        assert!(text.contains(&format!("reveal_sig = \"{}\"", hex::encode(transcript.members[0].reveal_sig))));
         let parsed = parse_transcript_record(&text).unwrap();
         assert_eq!(parsed, transcript);
         assert!(parsed.verify());
@@ -1074,8 +1149,7 @@ mod tests {
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
 
-        let (s, transcript) =
-            fabricate_outcome([daemon_device_id(&daemon), peer_id(9)], ref_name.as_bytes());
+        let (s, transcript) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
         let hash = persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
 
         let inner = daemon.inner.lock().unwrap();
@@ -1119,8 +1193,7 @@ mod tests {
             serde_json::json!({ "mount_path": "projects/journals" }),
         )
         .expect("add");
-        let (s, transcript) =
-            fabricate_outcome([daemon_device_id(&daemon), peer_id(9)], b"chain/journals");
+        let (s, transcript) = fabricate_outcome_with_self(&daemon, 9, b"chain/journals");
 
         let first = persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
         let second = persist_ceremony_outcome(&daemon, &s, &transcript).expect("re-persist");
@@ -1135,8 +1208,7 @@ mod tests {
     #[test]
     fn persist_without_a_membership_row() {
         let (daemon, _tmp) = unlocked_daemon();
-        let (s, transcript) =
-            fabricate_outcome([daemon_device_id(&daemon), peer_id(9)], b"chain/elsewhere");
+        let (s, transcript) = fabricate_outcome_with_self(&daemon, 9, b"chain/elsewhere");
         persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
 
         let inner = daemon.inner.lock().unwrap();
@@ -1150,19 +1222,18 @@ mod tests {
     #[test]
     fn persist_refuses_inconsistent_or_foreign_outcomes() {
         let (daemon, _tmp) = unlocked_daemon();
-        let our_id = daemon_device_id(&daemon);
 
-        // A transcript this device is no member of.
-        let (s, foreign) = fabricate_outcome([peer_id(1), peer_id(2)], b"chain/x");
+        // A transcript this device is no member of (two fabricated peers).
+        let (s, foreign) = fabricate_outcome([1, 2], b"chain/x");
         assert!(persist_ceremony_outcome(&daemon, &s, &foreign).is_err());
 
-        // key_id(S) != transcript.key_id.
-        let (s, mut tampered) = fabricate_outcome([our_id, peer_id(9)], b"chain/x");
+        // key_id(S) != transcript.key_id (caught before the membership check).
+        let (s, mut tampered) = fabricate_outcome_with_self(&daemon, 9, b"chain/x");
         tampered.key_id = "S-0000000000000000".into();
         assert!(persist_ceremony_outcome(&daemon, &s, &tampered).is_err());
 
         // key_id matches but a commitment no longer opens: verify() fails.
-        let (s, mut broken) = fabricate_outcome([our_id, peer_id(9)], b"chain/x");
+        let (s, mut broken) = fabricate_outcome_with_self(&daemon, 9, b"chain/x");
         broken.members[0].commitment[0] ^= 1;
         assert!(persist_ceremony_outcome(&daemon, &s, &broken).is_err());
 
@@ -1170,6 +1241,55 @@ mod tests {
         let inner = daemon.inner.lock().unwrap();
         let session = inner.session.as_ref().unwrap();
         assert!(!session.has_shared_key(&key_id(&s)));
+    }
+
+    /// Slice 007 at the persist boundary: a transcript that is internally
+    /// consistent — real commitments over this device + a peer, correct `key_id`
+    /// — but whose per-member signatures are forged is refused. This isolates the
+    /// participation gate: `key_id(S)` matches (the first guard passes) and every
+    /// commitment opens, so *only* the new signature check can reject it, and it
+    /// does. Nothing is sealed. This is the `fabricate_outcome` inversion the
+    /// slice calls for: before hardening, exactly this shape verified + persisted.
+    #[test]
+    fn persist_refuses_a_forged_unsigned_transcript() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let our_id = daemon_device_id(&daemon);
+
+        let nonce = [7u8; 32];
+        let ids = [our_id, peer_id(9)];
+        let rs = [[0x11u8; 32], [0x22u8; 32]];
+        let contributions: Vec<MemberContribution> = ids
+            .iter()
+            .zip(rs.iter())
+            .map(|(id, r)| MemberContribution { device_id: *id, r: *r })
+            .collect();
+        let s = derive_shared_key(&nonce, &contributions);
+        let members = ids
+            .iter()
+            .zip(rs.iter())
+            .map(|(id, r)| TranscriptEntry {
+                device_id: *id,
+                commitment: commitment(&nonce, id, r),
+                r: *r,
+                // Forged: the forger holds neither our identity key nor the peer's.
+                commit_sig: [0u8; 64],
+                reveal_sig: [0u8; 64],
+            })
+            .collect();
+        let forged = Transcript {
+            nonce,
+            chain_id: b"chain/x".to_vec(),
+            members,
+            key_id: key_id(&s),
+        };
+        // key_id matches (persist's first guard passes) and the commitments open,
+        // so the signature check is the sole reason verify() — and persist — fail.
+        assert_eq!(key_id(&s), forged.key_id);
+        assert!(!forged.verify());
+        assert!(persist_ceremony_outcome(&daemon, &s, &forged).is_err());
+
+        let inner = daemon.inner.lock().unwrap();
+        assert!(!inner.session.as_ref().unwrap().has_shared_key(&forged.key_id));
     }
 
     /// One key per chain (slice 006 pin): once a membership row is filled, a
@@ -1187,15 +1307,14 @@ mod tests {
         )
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
-        let our_id = daemon_device_id(&daemon);
 
         // First ceremony fills the row.
-        let (s1, t1) = fabricate_outcome([our_id, peer_id(9)], ref_name.as_bytes());
+        let (s1, t1) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
         let tip1 = persist_ceremony_outcome(&daemon, &s1, &t1).expect("first persist");
 
         // A second ceremony for the same chain with a *different* member set
         // derives a different S → different key_id; persisting it must refuse.
-        let (s2, t2) = fabricate_outcome([our_id, peer_id(10)], ref_name.as_bytes());
+        let (s2, t2) = fabricate_outcome_with_self(&daemon, 10, ref_name.as_bytes());
         assert_ne!(t1.key_id, t2.key_id, "test needs two distinct keys");
         assert!(
             persist_ceremony_outcome(&daemon, &s2, &t2).is_err(),
@@ -1257,7 +1376,7 @@ mod tests {
 
         // Establish S over {self, peer 9}, then seed a real blob (sealed under S
         // via the live router that persist re-pointed).
-        let (s1, t1) = fabricate_outcome([our_id, peer_id(9)], ref_name.as_bytes());
+        let (s1, t1) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
         persist_ceremony_outcome(&daemon, &s1, &t1).expect("initial key");
         {
             let mut inner = daemon.inner.lock().unwrap();
@@ -1277,7 +1396,7 @@ mod tests {
 
         // Rotate to S' over {self, peer 10} — as if peer 9 left and the new set
         // re-ran the ceremony.
-        let (s2, t2) = fabricate_outcome([our_id, peer_id(10)], ref_name.as_bytes());
+        let (s2, t2) = fabricate_outcome_with_self(&daemon, 10, ref_name.as_bytes());
         assert_ne!(t1.key_id, t2.key_id, "test needs two distinct keys");
         let audit = rotate_shared_key(&daemon, &s2, &t2).expect("rotate");
 
@@ -1363,15 +1482,14 @@ mod tests {
         )
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
-        let our_id = daemon_device_id(&daemon);
 
         // The row exists but is unkeyed — rotation must refuse (establishment is
         // persist's job).
-        let (s, t) = fabricate_outcome([our_id, peer_id(9)], ref_name.as_bytes());
+        let (s, t) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
         assert!(rotate_shared_key(&daemon, &s, &t).is_err());
 
         // A chain with no membership row at all — also refused.
-        let (s2, t2) = fabricate_outcome([our_id, peer_id(9)], b"chain/nonexistent");
+        let (s2, t2) = fabricate_outcome_with_self(&daemon, 9, b"chain/nonexistent");
         assert!(rotate_shared_key(&daemon, &s2, &t2).is_err());
 
         // Nothing durable happened: neither key was sealed.

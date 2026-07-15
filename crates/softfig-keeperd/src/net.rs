@@ -2417,41 +2417,68 @@ mod tests {
             .to_bytes()
     }
 
-    /// Fabricate a completed 3-member ceremony outcome for `chain` (the stale
-    /// starting state a leave reduces — v1 can't *establish* a 3-member key, so
-    /// tests fabricate it per [[decision-m5d-shared-rekey-intent]] option a). No
-    /// signatures (auth is the drive loop's job), so it verifies from the
-    /// commitment binding alone — enough for persist to seal + commit it.
-    fn fabricate_3member_outcome(
-        ids: [[u8; 32]; 3],
+    /// A signing closure for a fabricated peer identified by seed: `peer_id(seed)`
+    /// / `forged_peer(seed).device_id` is its pubkey, so it mints that peer's real
+    /// ceremony signatures.
+    fn seed_sign(seed: u8) -> impl Fn(&[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        move |m: &[u8]| sk.sign(m).to_bytes()
+    }
+
+    /// A signing closure for a live daemon: signs with its vault identity key, so
+    /// a transcript entry for the daemon's own device id verifies (since slice 007
+    /// persist checks both membership *and* the per-member signature).
+    fn session_sign(daemon: &Daemon) -> impl Fn(&[u8]) -> [u8; 64] {
+        let session = {
+            let inner = daemon.inner.lock().unwrap();
+            Arc::clone(inner.session.as_ref().unwrap())
+        };
+        move |m: &[u8]| session.sign(m).to_bytes()
+    }
+
+    /// A ceremony member for [`build_signed_transcript`]: `(device_id, r, sign)`,
+    /// where `sign` mints that member's Ed25519 commit+reveal signature and
+    /// `device_id` is the signer's pubkey.
+    type SignedMember<'a> = ([u8; 32], [u8; 32], &'a dyn Fn(&[u8]) -> [u8; 64]);
+
+    /// Build a fully-signed, verifying ceremony transcript for `chain` over the
+    /// given members. Since slice 007 the transcript carries real signatures (a
+    /// leave reduces a keyed 3-member state — v1 can't *establish* a 3-member key,
+    /// so tests fabricate that starting state per
+    /// [[decision-m5d-shared-rekey-intent]] option a — with each live member
+    /// signed through its session and any forged member through its seed key).
+    fn build_signed_transcript(
         nonce: [u8; 32],
         chain: &[u8],
+        members: &[SignedMember<'_>],
     ) -> (SharedKey, Transcript) {
         use softfig_net::ceremony::{
-            commitment, derive_shared_key, key_id, MemberContribution, TranscriptEntry,
+            commit_signing_bytes, commitment, derive_shared_key, key_id, reveal_signing_bytes,
+            MemberContribution, TranscriptEntry,
         };
-        let rs = [[0x11u8; 32], [0x22u8; 32], [0x33u8; 32]];
-        let contributions: Vec<MemberContribution> = ids
+        let contributions: Vec<MemberContribution> = members
             .iter()
-            .zip(rs.iter())
-            .map(|(id, r)| MemberContribution {
-                device_id: *id,
-                r: *r,
-            })
+            .map(|(id, r, _)| MemberContribution { device_id: *id, r: *r })
             .collect();
         let s = derive_shared_key(&nonce, &contributions);
-        let members = contributions
+        let entries = members
             .iter()
-            .map(|mc| TranscriptEntry {
-                device_id: mc.device_id,
-                commitment: commitment(&nonce, &mc.device_id, &mc.r),
-                r: mc.r,
+            .map(|(id, r, sign)| {
+                let comm = commitment(&nonce, id, r);
+                TranscriptEntry {
+                    device_id: *id,
+                    commitment: comm,
+                    r: *r,
+                    commit_sig: sign(&commit_signing_bytes(&nonce, chain, id, &comm)),
+                    reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, id, r)),
+                }
             })
             .collect();
         let transcript = Transcript {
             nonce,
             chain_id: chain.to_vec(),
-            members,
+            members: entries,
             key_id: key_id(&s),
         };
         assert!(transcript.verify());
@@ -2497,9 +2524,19 @@ mod tests {
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
 
-        // Key it with a fabricated 3-member outcome {self, peer9, peer10}.
-        let (s, t) =
-            fabricate_3member_outcome([our_id, peer_id(9), peer_id(10)], [7u8; 32], ref_name.as_bytes());
+        // Key it with a fabricated (signed) 3-member outcome {self, peer9, peer10}.
+        let self_sign = session_sign(&daemon);
+        let sign9 = seed_sign(9);
+        let sign10 = seed_sign(10);
+        let (s, t) = build_signed_transcript(
+            [7u8; 32],
+            ref_name.as_bytes(),
+            &[
+                (our_id, [0x11u8; 32], &self_sign),
+                (peer_id(9), [0x22u8; 32], &sign9),
+                (peer_id(10), [0x33u8; 32], &sign10),
+            ],
+        );
         persist_ceremony_outcome(&daemon, &s, &t).expect("key the chain");
 
         let inner = daemon.inner.lock().unwrap();
@@ -2551,10 +2588,17 @@ mod tests {
         // will "leave"). Persist fills each row's key_id, seals S1, commits the
         // transcript — the pre-rotation live state.
         let c_id = forged_peer(3).device_id;
-        let (s1, t1) = fabricate_3member_outcome(
-            [local_a.device_id, local_b.device_id, c_id],
+        let sign_a = session_sign(&daemon_a);
+        let sign_b = session_sign(&daemon_b);
+        let sign_c = seed_sign(3);
+        let (s1, t1) = build_signed_transcript(
             [7u8; 32],
             ref_name.as_bytes(),
+            &[
+                (local_a.device_id, [0x11u8; 32], &sign_a),
+                (local_b.device_id, [0x22u8; 32], &sign_b),
+                (c_id, [0x33u8; 32], &sign_c),
+            ],
         );
         persist_ceremony_outcome(&daemon_a, &s1, &t1).expect("key a");
         persist_ceremony_outcome(&daemon_b, &s1, &t1).expect("key b");
@@ -2782,10 +2826,6 @@ mod tests {
     /// `key_id` is untouched, and no new commit is minted.
     #[test]
     fn responder_refuses_an_already_keyed_chain() {
-        use softfig_net::ceremony::{
-            commitment, derive_shared_key, key_id, MemberContribution, TranscriptEntry,
-        };
-
         let (daemon, _tmp) = ceremony_daemon();
         let local = device_of(&daemon, "dev-a");
         let peer = forged_peer(1);
@@ -2802,33 +2842,18 @@ mod tests {
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
 
-        // Key the chain via a fabricated outcome over (this device, the peer).
-        let (s, transcript) = {
-            let nonce = [7u8; 32];
-            let ids = [local.device_id, peer.device_id];
-            let rs = [[0x11u8; 32], [0x22u8; 32]];
-            let contributions: Vec<MemberContribution> = ids
-                .iter()
-                .zip(rs.iter())
-                .map(|(id, r)| MemberContribution { device_id: *id, r: *r })
-                .collect();
-            let s = derive_shared_key(&nonce, &contributions);
-            let members = contributions
-                .iter()
-                .map(|mc| TranscriptEntry {
-                    device_id: mc.device_id,
-                    commitment: commitment(&nonce, &mc.device_id, &mc.r),
-                    r: mc.r,
-                })
-                .collect();
-            let transcript = Transcript {
-                nonce,
-                chain_id: ref_name.clone().into_bytes(),
-                members,
-                key_id: key_id(&s),
-            };
-            (s, transcript)
-        };
+        // Key the chain via a fabricated (signed) outcome over (this device, the
+        // peer). `peer = forged_peer(1)`, so the peer entry signs with seed key 1.
+        let self_sign = session_sign(&daemon);
+        let peer_sign = seed_sign(1);
+        let (s, transcript) = build_signed_transcript(
+            [7u8; 32],
+            ref_name.as_bytes(),
+            &[
+                (local.device_id, [0x11u8; 32], &self_sign),
+                (peer.device_id, [0x22u8; 32], &peer_sign),
+            ],
+        );
         persist_ceremony_outcome(&daemon, &s, &transcript).expect("key the chain");
         let keyed_tip = {
             let inner = daemon.inner.lock().unwrap();
