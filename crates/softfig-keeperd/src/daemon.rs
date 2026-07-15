@@ -109,6 +109,14 @@ pub struct DaemonInner {
     /// device's ceremony lands (and fills the higher's row as responder) before
     /// the higher ever initiates — exactly one ceremony per chain per window.
     pub ceremony_seen_pending: HashSet<String>,
+    /// Tie-break clock for **rotation** (M5d slice 003), the keyed-chain analogue
+    /// of [`Self::ceremony_seen_pending`]: chains this device saw keyed-but-stale
+    /// (committed transcript members != current ring) in a *prior* rekey pass. A
+    /// chain is either unkeyed-pending or keyed-stale, never both, so this is a
+    /// separate set from the establishment clock — `reconcile_rekeys` takes/rebuilds
+    /// it independently of `reconcile_ceremonies`, and the same `should_initiate_now`
+    /// tie-break makes exactly one device initiate each rotation window.
+    pub rekey_seen_stale: HashSet<String>,
     /// Divergence surface (item 4): the most recent shared-key divergence
     /// message (a completed ceremony that met a row already keyed with a
     /// *different* key — the one-key-per-chain invariant violated). Surfaced
@@ -133,6 +141,7 @@ impl DaemonInner {
             holders: crate::actions::HolderStore::new(),
             ceremonies_in_flight: HashSet::new(),
             ceremony_seen_pending: HashSet::new(),
+            rekey_seen_stale: HashSet::new(),
             last_shared_key_divergence: None,
         }
     }

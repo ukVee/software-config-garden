@@ -58,8 +58,8 @@ use softfig_vcs::{Intent, Repo};
 
 use crate::actions::WorkTree;
 use crate::ceremony::{
-    assemble_member_set, persist_ceremony_outcome, CeremonyLink, SessionTransport,
-    VaultCeremonySigner,
+    assemble_member_set, persist_ceremony_outcome, rotate_shared_key, CeremonyLink,
+    SessionTransport, VaultCeremonySigner,
 };
 use crate::config::KeeperConfig;
 use crate::daemon::{Daemon, DaemonInner};
@@ -744,44 +744,76 @@ fn serve_ceremony_responder<L: CeremonyLink>(
     };
     let chain = String::from_utf8_lossy(&commit.chain_id).into_owned();
 
-    // M5d slice 006 (finding 3): refuse to run a ceremony for a chain this
-    // device already holds a key for. Until slice 003's authorized rotation
-    // (`shared_rekey`) exists, a ring peer must not be able to re-key a live
-    // chain at will — otherwise a peer whose own persist keeps failing would
-    // re-initiate every reconcile tick, minting a fresh key + sealed-key +
-    // `key_id` flip forever (the `persist_ceremony_outcome` divergence refusal is
-    // the backstop; this refuses earlier, before we mint a contribution). A chain
-    // with no local row — the responder simply hasn't added the subtree yet, the
-    // normal onboarding case — is allowed through.
-    {
+    // M5d slice 006 (finding 3) + slice 003 rotation: a chain this device already
+    // holds a key for is refused — a ring peer must not re-key a live chain at
+    // will (else a peer whose own persist keeps failing would re-initiate every
+    // tick, minting a fresh key + `key_id` flip forever) — UNLESS this device
+    // independently agrees the chain is **stale** (its committed transcript's
+    // member set != the current ring), in which case the ceremony is an
+    // authorized rotation whose outcome routes to `rotate_shared_key`, not
+    // persist. Both sides derive staleness from committed state, so a peer still
+    // cannot rotate a non-stale chain. A chain with no local row — the responder
+    // hasn't added the subtree, the normal onboarding case — is allowed through
+    // as an establishment (persist seals `S` with no row to flip).
+    let is_rotation = {
         let inner = daemon.inner.lock().unwrap();
         let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
             return; // locked mid-serve — the initiator retries a later tick
         };
-        match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session) {
-            Ok(membership) => {
-                if let Some(existing) = membership
-                    .subtrees
-                    .iter()
-                    .find(|r| r.ref_name == chain)
-                    .and_then(|r| r.key_id.as_deref())
-                {
+        let membership =
+            match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session) {
+                Ok(m) => m,
+                Err((_, e)) => {
                     eprintln!(
-                        "keeperd: net: shared-key ceremony for {chain} refused: chain is \
-                         already keyed {existing} (rotation is the only authorized re-key path)"
+                        "keeperd: net: shared-key ceremony for {chain} refused: cannot read \
+                         committed membership: {e}"
+                    );
+                    return;
+                }
+            };
+        match membership
+            .subtrees
+            .iter()
+            .find(|r| r.ref_name == chain)
+            .and_then(|r| r.key_id.as_deref())
+        {
+            None => false, // unkeyed or no row — an establishment
+            Some(existing) => {
+                let transcript =
+                    match crate::handlers::read_committed_transcript(repo, session, existing) {
+                        Ok(Some(t)) => t,
+                        // No readable transcript for the live key → can't authorize
+                        // a rotation; hold the slice-006 refusal.
+                        Ok(None) => {
+                            eprintln!(
+                                "keeperd: net: shared-key ceremony for {chain} refused: chain is \
+                                 already keyed {existing} and its transcript is unavailable to \
+                                 judge staleness (rotation is the only authorized re-key path)"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "keeperd: net: shared-key ceremony for {chain} refused: cannot \
+                                 read transcript for live key {existing}: {e}"
+                            );
+                            return;
+                        }
+                    };
+                let tmembers: Vec<[u8; 32]> =
+                    transcript.members.iter().map(|m| m.device_id).collect();
+                if shared_chain_is_stale(&tmembers, &members) {
+                    true // stale — an authorized rotation
+                } else {
+                    eprintln!(
+                        "keeperd: net: shared-key ceremony for {chain} refused: chain is already \
+                         keyed {existing} and not stale (rotation is the only authorized re-key path)"
                     );
                     return;
                 }
             }
-            Err((_, e)) => {
-                eprintln!(
-                    "keeperd: net: shared-key ceremony for {chain} refused: cannot read \
-                     committed membership: {e}"
-                );
-                return;
-            }
         }
-    }
+    };
 
     // In-flight dedup (M5d slice 006 part 2): refuse if a ceremony for this
     // chain is already running on this device — our own reconcile sweep is
@@ -825,13 +857,26 @@ fn serve_ceremony_responder<L: CeremonyLink>(
     match run_ceremony(&mut transport, &signer, &mut ceremony) {
         Ok((mut s, transcript)) => {
             let key_id = transcript.key_id.clone();
-            match persist_ceremony_outcome(daemon, &s, &transcript) {
+            // Route by the gate's verdict: a stale keyed chain is an authorized
+            // rotation (flip + re-encrypt); anything else is an establishment
+            // (persist seals `S`, filling this device's row if it has one).
+            let outcome = if is_rotation {
+                rotate_shared_key(daemon, &s, &transcript)
+            } else {
+                persist_ceremony_outcome(daemon, &s, &transcript)
+            };
+            let (verb, gerund) = if is_rotation {
+                ("rotation", "rotating")
+            } else {
+                ("ceremony", "persisting")
+            };
+            match outcome {
                 Ok(_) => eprintln!(
-                    "keeperd: net: shared-key ceremony complete for {chain}: {key_id}"
+                    "keeperd: net: shared-key {verb} complete for {chain}: {key_id}"
                 ),
                 Err((_, e)) => eprintln!(
-                    "keeperd: net: shared-key ceremony for {chain} derived {key_id} but \
-                     persisting failed: {e}"
+                    "keeperd: net: shared-key {verb} for {chain} derived {key_id} but \
+                     {gerund} failed: {e}"
                 ),
             }
             s.zeroize();
@@ -1134,6 +1179,10 @@ fn spawn_replica_loop(
                 // default: the row lands with `key_id` empty and the ceremony
                 // fills it when members next online — never an inline block).
                 reconcile_ceremonies(&daemon, &local);
+                // M5d slice 003: rotate any shared chain whose membership went
+                // stale (join/leave) — after establishment, before the replica
+                // push, so a rotation's `shared_rekey` commit rides this tick.
+                reconcile_rekeys(&daemon, &local);
                 reconcile_replicas(&daemon, &local);
                 signal.wait_for_commit(REPLICA_RECONCILE_INTERVAL);
             }
@@ -1382,6 +1431,167 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
             Err(e) => eprintln!(
                 "keeperd: net: shared-key ceremony for {ref_name} skipped: {e}"
             ),
+        }
+    }
+}
+
+/// A keyed shared chain is **stale** — it needs a rotation — when its committed
+/// ceremony transcript's member set no longer equals the current ring's member
+/// set (a join added a member, or a leave removed one). Both protocol sides
+/// derive this independently from committed state (no `SharedKeyCommit` wire
+/// field), mirroring how `reconcile_ceremonies` derives the unkeyed-detection —
+/// so a rotation is authorized only when both sides agree, and a peer cannot
+/// re-key a chain it does not itself see as stale. Order-insensitive: the ring
+/// is unsorted (`assemble_member_set` returns `[local, ...peers]`), so both
+/// sides fold into a `BTreeSet` before comparing.
+fn shared_chain_is_stale(transcript_members: &[[u8; 32]], current_members: &[[u8; 32]]) -> bool {
+    let committed: std::collections::BTreeSet<[u8; 32]> =
+        transcript_members.iter().copied().collect();
+    let current: std::collections::BTreeSet<[u8; 32]> = current_members.iter().copied().collect();
+    committed != current
+}
+
+/// Detection half of the rekey reconcile (unit-testable without a live peer):
+/// the ref_names of committed *keyed* chains whose committed transcript member
+/// set differs from `current_members`. Reads each keyed row's transcript
+/// ([`crate::handlers::read_committed_transcript`]); an unkeyed row is
+/// establishment's job (`reconcile_ceremonies`) and skipped, and a keyed row
+/// whose transcript can't be read yet is skipped rather than assumed stale (a
+/// read glitch must never trigger a rotation — a later tick retries).
+fn stale_keyed_chains(
+    repo: &Repo,
+    session: &VaultSession,
+    current_members: &[[u8; 32]],
+) -> std::result::Result<Vec<String>, (ErrorKind, String)> {
+    let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session)?;
+    let mut stale = Vec::new();
+    for row in membership.subtrees.iter() {
+        let Some(kid) = row.key_id.as_deref() else {
+            continue; // unkeyed → establishment (reconcile_ceremonies), not rotation
+        };
+        let transcript = match crate::handlers::read_committed_transcript(repo, session, kid) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue, // no readable transcript yet — don't guess stale
+            Err(e) => {
+                eprintln!(
+                    "keeperd: net: rekey reconcile: cannot read transcript for {} ({kid}): {e}",
+                    row.ref_name
+                );
+                continue;
+            }
+        };
+        let tmembers: Vec<[u8; 32]> = transcript.members.iter().map(|m| m.device_id).collect();
+        if shared_chain_is_stale(&tmembers, current_members) {
+            stale.push(row.ref_name.clone());
+        }
+    }
+    Ok(stale)
+}
+
+/// One rotation reconcile pass (M5d slice 003, initiator side): find committed
+/// keyed shared subtrees whose membership went stale (a join/leave changed the
+/// ring), and for each re-run the commit-reveal ceremony over the **current**
+/// member set, then route the outcome to [`rotate_shared_key`] — the authorized
+/// re-key path that swaps `S`→`S'` and re-encrypts the chain. Snapshot + detect
+/// under the daemon lock, ceremony with the lock released; a failed attempt
+/// leaves the chain stale for the next tick — the same deferred/retried liveness
+/// model `reconcile_ceremonies` uses. The responder mirrors the staleness check
+/// so both sides independently authorize the rotation (see
+/// [`shared_chain_is_stale`]).
+fn reconcile_rekeys(daemon: &Daemon, local: &LocalDevice) {
+    use zeroize::Zeroize;
+
+    let snapshot = {
+        let inner = daemon.inner.lock().unwrap();
+        if inner.state != State::Unlocked {
+            return;
+        }
+        let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
+            return;
+        };
+        let state_dir = inner.config.state_dir().to_path_buf();
+        let ring = {
+            let wt = WorkTree::new(daemon, &inner);
+            load_ring(&wt, &state_dir).unwrap_or_default()
+        };
+        let members = assemble_member_set(&ring, local.device_id);
+        let stale = match stale_keyed_chains(repo, session, &members) {
+            Ok(s) => s,
+            Err((_, e)) => {
+                eprintln!("keeperd: net: rekey reconcile skipped: {e}");
+                return;
+            }
+        };
+        if stale.is_empty() {
+            return;
+        }
+        let relay_client = relay_client_config(&inner.config);
+        let signer = VaultCeremonySigner::new(Arc::clone(session));
+        (stale, ring, members, relay_client, signer)
+    };
+    let (stale, ring, members, relay_client, signer) = snapshot;
+
+    // A rotation is still a collaborative ceremony over the CURRENT members — the
+    // same v1 point-to-point gates `reconcile_ceremonies` applies.
+    if members.len() < 2 {
+        // Stale but now solo (a 2→1 leave): a collaborative rekey has no
+        // collaborator. The honest custody limit (`spec-sync.md` §Crypto) — the
+        // departed member keeps only ciphertext it already held, we cannot rotate
+        // alone. Quiet: resolved if a member re-pairs.
+        return;
+    }
+    if members.len() > 2 {
+        eprintln!(
+            "keeperd: net: {} shared subtree(s) need a rekey, but the ring has {} members — \
+             >2 rotation not yet supported (v1 is point-to-point)",
+            stale.len(),
+            members.len() - 1
+        );
+        return;
+    }
+    let host = ring.peers()[0].clone();
+
+    // Tie-break bookkeeping (keyed-chain analogue of `reconcile_ceremonies`'):
+    // note which stale chains were already seen stale in a *prior* pass, then
+    // refresh the seen set to the current stale list (dropping any that rotated
+    // since). A separate set from the establishment clock (a chain is unkeyed or
+    // keyed-stale, never both).
+    let seen_before: HashSet<String> = {
+        let mut inner = daemon.inner.lock().unwrap();
+        let prior = std::mem::take(&mut inner.rekey_seen_stale);
+        let seen_before = stale.iter().filter(|c| prior.contains(*c)).cloned().collect();
+        inner.rekey_seen_stale = stale.iter().cloned().collect();
+        seen_before
+    };
+
+    for ref_name in stale {
+        // Tie-break: the lexically-higher device defers a freshly-stale chain one
+        // tick so the lower device's rotation lands (and this device responds)
+        // first — one rotation per chain per window, so both sides converge on one
+        // `S'` instead of racing to two.
+        if !should_initiate_now(&local.device_id, &host.device_id, seen_before.contains(&ref_name)) {
+            continue;
+        }
+        // In-flight dedup: never run a second concurrent ceremony for this chain
+        // on this device (an inbound responder leg, or an overlapping tick).
+        let Some(_guard) = CeremonyGuard::try_acquire(daemon, &ref_name) else {
+            continue;
+        };
+        match ceremony_with_host(local, &host, relay_client.as_ref(), &signer, &members, &ref_name) {
+            Ok((mut s, transcript)) => {
+                let key_id = transcript.key_id.clone();
+                match rotate_shared_key(daemon, &s, &transcript) {
+                    Ok(_) => eprintln!(
+                        "keeperd: net: shared-key rotation complete for {ref_name}: {key_id}"
+                    ),
+                    Err((_, e)) => eprintln!(
+                        "keeperd: net: shared-key rotation for {ref_name} derived {key_id} \
+                         but rotating failed: {e}"
+                    ),
+                }
+                s.zeroize();
+            }
+            Err(e) => eprintln!("keeperd: net: shared-key rotation for {ref_name} skipped: {e}"),
         }
     }
 }
@@ -2196,6 +2406,285 @@ mod tests {
             )
             .unwrap();
             assert!(membership.subtrees.is_empty());
+        }
+    }
+
+    /// A stable non-live device id from a seed (a forged member's identity),
+    /// matching `forged_peer(seed).device_id`.
+    fn peer_id(seed: u8) -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// Fabricate a completed 3-member ceremony outcome for `chain` (the stale
+    /// starting state a leave reduces — v1 can't *establish* a 3-member key, so
+    /// tests fabricate it per [[decision-m5d-shared-rekey-intent]] option a). No
+    /// signatures (auth is the drive loop's job), so it verifies from the
+    /// commitment binding alone — enough for persist to seal + commit it.
+    fn fabricate_3member_outcome(
+        ids: [[u8; 32]; 3],
+        nonce: [u8; 32],
+        chain: &[u8],
+    ) -> (SharedKey, Transcript) {
+        use softfig_net::ceremony::{
+            commitment, derive_shared_key, key_id, MemberContribution, TranscriptEntry,
+        };
+        let rs = [[0x11u8; 32], [0x22u8; 32], [0x33u8; 32]];
+        let contributions: Vec<MemberContribution> = ids
+            .iter()
+            .zip(rs.iter())
+            .map(|(id, r)| MemberContribution {
+                device_id: *id,
+                r: *r,
+            })
+            .collect();
+        let s = derive_shared_key(&nonce, &contributions);
+        let members = contributions
+            .iter()
+            .map(|mc| TranscriptEntry {
+                device_id: mc.device_id,
+                commitment: commitment(&nonce, &mc.device_id, &mc.r),
+                r: mc.r,
+            })
+            .collect();
+        let transcript = Transcript {
+            nonce,
+            chain_id: chain.to_vec(),
+            members,
+            key_id: key_id(&s),
+        };
+        assert!(transcript.verify());
+        (s, transcript)
+    }
+
+    /// The pure staleness predicate: order-insensitive set comparison of the
+    /// committed transcript members against the current ring — the load-bearing
+    /// both-sides rotation trigger.
+    #[test]
+    fn stale_iff_member_sets_differ() {
+        let a = peer_id(1);
+        let b = peer_id(2);
+        let c = peer_id(3);
+        // Same set, any order → not stale.
+        assert!(!shared_chain_is_stale(&[a, b], &[b, a]));
+        assert!(!shared_chain_is_stale(&[a, b, c], &[c, a, b]));
+        // A leave (3→2) and a join (2→3) → stale.
+        assert!(shared_chain_is_stale(&[a, b, c], &[a, b]));
+        assert!(shared_chain_is_stale(&[a, b], &[a, b, c]));
+        // A swap (same size, different member) → stale.
+        assert!(shared_chain_is_stale(&[a, b], &[a, c]));
+    }
+
+    /// The detection half of `reconcile_rekeys`, exercised without a live peer:
+    /// a keyed chain whose committed 3-member transcript no longer matches the
+    /// current ring is reported stale; the same chain measured against its own
+    /// 3-member set is not; and an unkeyed chain is never reported (that is
+    /// establishment's job). This drives the real reader + staleness path over
+    /// committed daemon state.
+    #[test]
+    fn stale_keyed_chains_detects_a_departed_member() {
+        let (daemon, _tmp) = ceremony_daemon();
+        let our_id = {
+            let inner = daemon.inner.lock().unwrap();
+            inner.session.as_ref().unwrap().identity_pubkey().to_bytes()
+        };
+
+        let add = crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // Key it with a fabricated 3-member outcome {self, peer9, peer10}.
+        let (s, t) =
+            fabricate_3member_outcome([our_id, peer_id(9), peer_id(10)], [7u8; 32], ref_name.as_bytes());
+        persist_ceremony_outcome(&daemon, &s, &t).expect("key the chain");
+
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+
+        // Current ring dropped peer9 → {self, peer10}: the chain is stale.
+        let after_leave = [our_id, peer_id(10)];
+        assert_eq!(
+            stale_keyed_chains(repo, session, &after_leave).unwrap(),
+            vec![ref_name.clone()]
+        );
+        // Still the full set → not stale.
+        let unchanged = [our_id, peer_id(9), peer_id(10)];
+        assert!(stale_keyed_chains(repo, session, &unchanged).unwrap().is_empty());
+    }
+
+    /// End to end over loopback: a keyed shared chain whose membership went stale
+    /// (a third member left) rotates through the production sweep + inbound
+    /// responder. Both A and B hold a keyed 3-member row; the ring drops to
+    /// {A, B}; A's `reconcile_rekeys` detects the staleness, dials B, both drive
+    /// the ceremony, and both route the outcome to `rotate_shared_key` — so both
+    /// converge on one fresh `S'`, A re-encrypts its chain blob under it, and the
+    /// departed member's old `S` can no longer read post-rotation ciphertext. The
+    /// pre-live stand-in for the deferred 2-device rotation smoke.
+    #[test]
+    fn rekey_end_to_end_over_loopback() {
+        let (daemon_a, tmp_a) = ceremony_daemon();
+        let (daemon_b, _tmp_b) = ceremony_daemon();
+        let local_a = device_of(&daemon_a, "dev-a");
+        let local_b = device_of(&daemon_b, "dev-b");
+
+        // Both devices add the shared subtree → both get a row for the same
+        // ref_name (the mount path derives it deterministically).
+        let add_a = crate::handlers::shared_subtree_add(
+            &daemon_a,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add a");
+        let ref_name = add_a["ref_name"].as_str().unwrap().to_string();
+        let add_b = crate::handlers::shared_subtree_add(
+            &daemon_b,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add b");
+        assert_eq!(add_b["ref_name"].as_str().unwrap(), ref_name);
+
+        // Fabricate a keyed 3-member state {A, B, C} on both (C is the member who
+        // will "leave"). Persist fills each row's key_id, seals S1, commits the
+        // transcript — the pre-rotation live state.
+        let c_id = forged_peer(3).device_id;
+        let (s1, t1) = fabricate_3member_outcome(
+            [local_a.device_id, local_b.device_id, c_id],
+            [7u8; 32],
+            ref_name.as_bytes(),
+        );
+        persist_ceremony_outcome(&daemon_a, &s1, &t1).expect("key a");
+        persist_ceremony_outcome(&daemon_b, &s1, &t1).expect("key b");
+        let old_kid = t1.key_id.clone();
+
+        // Seed a real blob on A's chain, sealed under S1 via the live router.
+        {
+            let mut inner = daemon_a.inner.lock().unwrap();
+            let mut snap = softfig_vcs::WalkSnapshot::empty();
+            snap.insert_file(std::path::Path::new("note.md"), 0o644, b"shared secret".to_vec())
+                .unwrap();
+            crate::actions::commit_snapshot_to_now(
+                &mut inner,
+                &ref_name,
+                snap,
+                Intent::new("shared_subtrees_changed", serde_json::json!({ "summary": "seed" }))
+                    .unwrap(),
+            )
+            .expect("seed blob");
+        }
+
+        // C leaves: the current ring is {A, B}. B listens on loopback; its ring
+        // holds A. A's persisted ring holds B at the loopback endpoint.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ring_b = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(ring_entry_of(&daemon_a, "dev-a", vec![]));
+            r
+        }));
+        let b_thread = {
+            let daemon_b = daemon_b.clone();
+            let local_b = local_b.clone();
+            let ring_b = ring_b.clone();
+            thread::spawn(move || {
+                let (conn, _) = listener.accept().unwrap();
+                serve_inbound(daemon_b, &local_b, &ring_b, conn);
+            })
+        };
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(
+                &daemon_b,
+                "dev-b",
+                vec![format!("127.0.0.1:{port}")],
+            ));
+            ring.save(&ring_path(tmp_a.path())).unwrap();
+        }
+
+        // Pre-seed A's tie-break clock as if it had seen the chain stale a prior
+        // tick, so it initiates this tick regardless of device-id ordering (the
+        // ids are random per vault). This is exactly the second-tick state.
+        {
+            let mut inner = daemon_a.inner.lock().unwrap();
+            inner.rekey_seen_stale.insert(ref_name.clone());
+        }
+
+        // The production initiator path (what the replica loop tick runs).
+        reconcile_rekeys(&daemon_a, &local_a);
+        b_thread.join().unwrap();
+
+        // A: the row now carries a fresh key (≠ old), a shared_rekey record
+        // landed, and the chain blob is re-encrypted under S' (its container names
+        // the new key, so a departed old-S-only holder can't read it), still
+        // decrypting to the original plaintext.
+        let new_kid = {
+            let inner = daemon_a.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            let repo = inner.repo.as_ref().unwrap();
+            let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+                repo, session,
+            )
+            .unwrap();
+            let kid = membership
+                .subtrees
+                .iter()
+                .find(|r| r.ref_name == ref_name)
+                .unwrap()
+                .key_id
+                .clone()
+                .expect("A's row is keyed");
+            assert_ne!(kid, old_kid, "A rotated to a fresh key");
+            assert!(session.has_shared_key(&old_kid), "old S retained (custody limit)");
+            assert!(session.has_shared_key(&kid), "new S' sealed");
+
+            let tip = repo.tip_of(&ref_name).unwrap().unwrap();
+            let root = repo.db().get_commit(&tip).unwrap().root_tree;
+            let entry = repo
+                .db()
+                .get_tree(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "note.md")
+                .unwrap();
+            let cipher = repo.objects().get(&entry.target).unwrap();
+            assert_eq!(
+                softfig_vault::shared::read_key_id(&cipher).unwrap(),
+                kid,
+                "blob re-encrypted under S'"
+            );
+            assert_eq!(
+                session
+                    .decrypt_tracked_blob("projects/journals/note.md", &cipher)
+                    .unwrap(),
+                b"shared secret"
+            );
+            kid
+        };
+
+        // B: converged on the identical S' and flipped its own row to it.
+        {
+            let inner = daemon_b.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            let repo = inner.repo.as_ref().unwrap();
+            assert!(session.has_shared_key(&new_kid), "B sealed the same S'");
+            let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
+                repo, session,
+            )
+            .unwrap();
+            assert_eq!(
+                membership
+                    .subtrees
+                    .iter()
+                    .find(|r| r.ref_name == ref_name)
+                    .unwrap()
+                    .key_id
+                    .as_deref(),
+                Some(new_kid.as_str()),
+                "B's row rotated to S' too"
+            );
         }
     }
 

@@ -1533,6 +1533,42 @@ fn read_committed_shared_subtrees_text(
         .map_err(|_| format!("{rel} is not UTF-8"))
 }
 
+/// Read + decrypt + parse a committed shared-ceremony transcript record for
+/// `key_id` from the device chain tip (M5d slice 003 rotation trigger). Mirrors
+/// [`read_committed_shared_subtrees_text`]: resolve the record's committed path
+/// ([`crate::ceremony::ceremony_record_rel`]), fetch its blob, decrypt under the
+/// tracked-blob path, parse. `Ok(None)` when there are no commits yet or the
+/// record is absent (a key whose transcript this device never committed). The
+/// caller judges staleness from the parsed transcript's member set; this only
+/// reads it back — `Transcript::verify` re-checks it from first principles when
+/// a rotation actually consumes it.
+pub(crate) fn read_committed_transcript(
+    repo: &Repo,
+    session: &softfig_vault::VaultSession,
+    key_id: &str,
+) -> std::result::Result<Option<softfig_net::ceremony::Transcript>, String> {
+    let rel = crate::ceremony::ceremony_record_rel(key_id);
+    let Some(tip) = repo.tip().map_err(|e| format!("read device tip: {e}"))? else {
+        return Ok(None);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| format!("read tip commit: {e}"))?;
+    let Some(blob) = resolve_path_in_tree(repo, &row.root_tree, &rel).map_err(|(_, e)| e)? else {
+        return Ok(None);
+    };
+    let cipher = repo
+        .objects()
+        .get(&blob)
+        .map_err(|e| format!("read {rel} blob: {e}"))?;
+    let plain = session
+        .decrypt_tracked_blob(&rel, &cipher)
+        .map_err(|e| format!("decrypt {rel}: {e}"))?;
+    let text = String::from_utf8(plain).map_err(|_| format!("{rel} is not UTF-8"))?;
+    crate::ceremony::parse_transcript_record(&text).map(Some)
+}
+
 /// The **read/compose** view of the committed membership (registry derivation,
 /// `list`, toggle membership checks). `None` when there are no commits yet or
 /// the file is absent; a present-but-broken file logs and yields `None`
