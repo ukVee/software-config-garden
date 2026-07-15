@@ -347,17 +347,27 @@ pub fn assemble_fleet(
     ))
 }
 
-/// The runtime per-agent namespace `$XDG_CONFIG_HOME/softfig/growlight/agents`
-/// (fallback `~/.config/...`) — the same churny-runtime space `softfig growlight
-/// start` owns, NOT the garden. Derived from the environment, never a literal
-/// (spec §3/§12). growlightd writes each agent's generated pre-approval under
-/// `agents/<id>/` here.
-fn runtime_agents_dir() -> PathBuf {
+/// The runtime growlight namespace root `$XDG_CONFIG_HOME/softfig/growlight`
+/// (fallback `~/.config/...`) — the churny-runtime space `softfig growlight start`
+/// owns (the runtime baton, `usage.json`, per-agent `agents/`), NOT the garden.
+/// Derived from the environment, never a literal (spec §3/§12). Public so the
+/// `baton` read verb ([`crate::server`]) can resolve the runtime baton path the
+/// same way, independent of an assembled fleet (the verb answers even when the
+/// fleet is disarmed).
+pub fn runtime_growlight_dir() -> PathBuf {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => home_dir().join(".config"),
     };
-    base.join("softfig").join(PILLAR).join("agents")
+    base.join("softfig").join(PILLAR)
+}
+
+/// The runtime per-agent namespace `$XDG_CONFIG_HOME/softfig/growlight/agents`
+/// (fallback `~/.config/...`) — the same churny-runtime space `softfig growlight
+/// start` owns, NOT the garden. growlightd writes each agent's generated
+/// pre-approval under `agents/<id>/` here.
+fn runtime_agents_dir() -> PathBuf {
+    runtime_growlight_dir().join("agents")
 }
 
 /// `~/.claude` — the harness-sensitive root the pre-approval generator refuses to

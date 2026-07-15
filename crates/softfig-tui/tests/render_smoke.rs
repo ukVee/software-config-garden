@@ -351,27 +351,33 @@ fn renders_deploy_force_overlay() {
 
 #[test]
 fn renders_growlight_frame_when_enabled() {
-    use softfig_tui::app::GrowlightRow;
+    use softfig_tui::tree::BacklogItem;
 
     let mut app = App::new();
     app.locked = false;
     app.growlight_enabled = Some(true);
     app.view = softfig_tui::app::View::Growlight;
-    app.growlight.items = vec![
-        GrowlightRow {
+    // Left pane: a navigable backlog tree (populated via the pure tree API).
+    app.growlight_tree.set_items(vec![
+        BacklogItem {
             id: "m5b-hardening".into(),
             title: "M5b replication hardening".into(),
             status: "done".into(),
+            is_milestone: true,
         },
-        GrowlightRow {
+        BacklogItem {
             id: "tui-modernize".into(),
             title: "Modernize the TUI".into(),
             status: "active".into(),
+            is_milestone: true,
         },
-    ];
-    app.growlight.selected = 1;
+    ]);
+    app.growlight_tree.selected = 1;
+    // Right pane: the fleet-header baton stub + the selected node's markdown.
     app.growlight_baton_title = Some("103-tui-modernize-003.md".into());
-    app.growlight_baton = Some("shipped slice 003 — inline-region reveal".into());
+    app.growlight_baton = Some("---\nstatus: IN_PROGRESS\n---\n\n# NEXT ACTION\nship slice 002".into());
+    app.growlight_preview_title = "tui-modernize".into();
+    app.growlight_preview = "## Mission\nright-pane markdown viewer, scrollable".into();
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -381,12 +387,315 @@ fn renders_growlight_frame_when_enabled() {
     assert!(rendered.contains("7:Growlight"), "growlight tab missing:\n{rendered}");
     assert!(rendered.contains("tui-modernize"), "queue item missing");
     assert!(rendered.contains("active"), "status missing");
+    // Fleet-header strip: the latest-baton headline (frontmatter skipped).
+    assert!(rendered.contains("loop baton"), "baton header missing");
+    assert!(rendered.contains("NEXT ACTION"), "baton headline missing");
+    // Right-pane node viewer renders the selected node's markdown.
     assert!(
-        rendered.contains("active: tui-modernize"),
-        "active-item line missing"
+        rendered.contains("right-pane markdown viewer"),
+        "node body missing"
     );
-    assert!(rendered.contains("latest baton"), "baton panel missing");
-    assert!(rendered.contains("shipped slice 003"), "baton body missing");
+}
+
+#[test]
+fn renders_growlight_loop_context_and_clamps_node_scroll() {
+    use softfig_tui::tree::LoopContextNode;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight_tree
+        .set_loop_context(vec![LoopContextNode {
+            label: "protocol.md".into(),
+            path: "growlight/protocol.md".into(),
+        }]);
+    // A long node body + an over-large scroll offset must clamp to the bottom.
+    app.growlight_preview_title = "protocol.md".into();
+    app.growlight_preview = (0..100)
+        .map(|i| format!("proto-line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.preview_scroll = 400;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("protocol.md"), "loop-context row/title missing:\n{rendered}");
+    // The renderer clamped the shared offset to the real bottom (< 400) and
+    // recorded the viewport for the scroll keys.
+    assert!(app.preview_scroll < 400, "scroll not clamped to content bottom");
+    assert_eq!(
+        app.preview_scroll,
+        app.preview_total.saturating_sub(app.preview_viewport),
+        "clamped to exactly the last page"
+    );
+    assert!(app.preview_total >= 100, "wrapped total not recorded");
+    assert!(rendered.contains("proto-line99"), "bottom line should be visible");
+}
+
+#[test]
+fn renders_live_fleet_header_from_status_poll() {
+    use softfig_tui::app::FleetHeader;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // A decoded growlightd `status` reply drives the live header.
+    let reply: softfig_ipc::growlightd::FleetStatusReply = serde_json::from_value(serde_json::json!({
+        "state": "running",
+        "garden_root": "/g",
+        "protocol_version": 1,
+        "policy": {
+            "max_concurrent_agents": 2,
+            "ctx_roll_pct": 50,
+            "ctx_handoff_pct": 60,
+            "session_5h_halt_pct": 85,
+            "session_7d_halt_pct": 90
+        },
+        "fleet_enabled": true,
+        "paused": false,
+        "agents": [{ "id": "a", "status": "running" }]
+    }))
+    .unwrap();
+    app.fleet = FleetHeader::Live(reply);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("armed"), "fleet gate missing:\n{rendered}");
+    assert!(rendered.contains("agent(s) running"), "agent count missing");
+    assert!(rendered.contains("a:running"), "agent roster line missing");
+    assert!(rendered.contains("budgets"), "policy budget line missing");
+    assert!(rendered.contains("halt 5h 85%"), "budget thresholds missing");
+}
+
+#[test]
+fn growlight_header_soft_fails_when_growlightd_unreachable() {
+    use softfig_tui::app::FleetHeader;
+    use softfig_tui::tree::BacklogItem;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // growlightd is down: the header soft-fails, but the garden-only tree + body
+    // must keep rendering (never gate the page on growlightd).
+    app.fleet = FleetHeader::Unreachable;
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_preview_title = "tui-modernize".into();
+    app.growlight_preview = "## Mission\nstill readable with growlightd down".into();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    // One dim unreachable line, no error splat.
+    assert!(rendered.contains("growlightd unreachable"), "dim line missing:\n{rendered}");
+    // The garden-only page still works.
+    assert!(rendered.contains("tui-modernize"), "backlog tree gone");
+    assert!(rendered.contains("still readable"), "node body gone");
+}
+
+#[test]
+fn growlight_header_shows_the_live_runtime_baton_headline() {
+    use softfig_ipc::growlightd::BatonReply;
+    use softfig_tui::app::FleetHeader;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // Even with the growlightd STATUS poll unreachable, the LIVE runtime baton
+    // (its own verb) still drives the header baton-headline (slice 004).
+    app.fleet = FleetHeader::Unreachable;
+    app.growlight_runtime_baton = Some(BatonReply {
+        agent: None,
+        path: "/x/baton.md".into(),
+        text: "---\nstatus: IN_PROGRESS\nitem: growlight-tui-detail-pane\nslice: 004\n---\n\
+               # NEXT ACTION\ngo"
+            .into(),
+    });
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("runtime baton"), "live baton headline missing:\n{rendered}");
+    assert!(rendered.contains("IN_PROGRESS"), "parsed baton status missing:\n{rendered}");
+    assert!(rendered.contains("growlight-tui-detail-pane"), "parsed baton item missing");
+}
+
+#[test]
+fn selecting_the_live_baton_node_renders_it_from_the_polled_reply() {
+    use softfig_ipc::growlightd::BatonReply;
+    use softfig_tui::tree::{BacklogItem, BacklogKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    // A tree with the live-baton node turned on; select that node.
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_tree.set_runtime_baton(true);
+    let vis = app.growlight_tree.visible();
+    let baton_idx = vis.iter().position(|r| r.kind == BacklogKind::RuntimeBaton).unwrap();
+    app.growlight_tree.selected = baton_idx;
+    // The polled runtime baton drives the right pane directly (no keeperd read).
+    app.growlight_runtime_baton = Some(BatonReply {
+        agent: None,
+        path: "/x/baton.md".into(),
+        text: "---\nstatus: IN_PROGRESS\nitem: tui-modernize\nslice: 002\n---\n\
+               # NEXT ACTION\nfinish the node viewer"
+            .into(),
+    });
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    // The node label in the tree, the parsed compact head, and the stripped body.
+    assert!(rendered.contains("live runtime baton"), "baton tree node missing:\n{rendered}");
+    assert!(rendered.contains("tui-modernize"), "parsed baton item missing:\n{rendered}");
+    assert!(rendered.contains("NEXT ACTION"), "baton body missing:\n{rendered}");
+}
+
+#[test]
+fn selecting_the_bus_node_renders_history_newest_first_with_alerts_loud() {
+    use ratatui::style::{Color, Modifier};
+    use softfig_tui::app::BusRow;
+    use softfig_tui::tree::{BacklogItem, BacklogKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_tree.set_bus(true);
+    // Eagerly-loaded bus rows (already newest-first, as `bus_rows` produces): an
+    // alert on top, an info below.
+    app.growlight_bus = vec![
+        BusRow {
+            from: "b".into(),
+            to: "@all".into(),
+            kind: "alert".into(),
+            body: "wifi down".into(),
+            is_alert: true,
+        },
+        BusRow {
+            from: "a".into(),
+            to: "b".into(),
+            kind: "info".into(),
+            body: "rebased ok".into(),
+            is_alert: false,
+        },
+    ];
+    // Select the bus node (it closes the tree).
+    let vis = app.growlight_tree.visible();
+    app.growlight_tree.selected = vis
+        .iter()
+        .position(|r| r.kind == BacklogKind::Bus)
+        .unwrap();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("coordination bus"), "bus pane title missing:\n{rendered}");
+    assert!(rendered.contains("wifi down"), "alert message missing");
+    assert!(rendered.contains("rebased ok"), "info message missing");
+    // The alert row is rendered loud (bold red) — inspect the cell styles of the
+    // buffer row where the alert body sits, not just the text. The whole `alert`
+    // line is styled, so every visible content cell in that row is bold red.
+    let buf = terminal.backend().buffer();
+    let mut checked_alert_row = false;
+    for y in 0..buf.area.height {
+        // Reconstruct the row (column-wise, one symbol per cell) to find the alert
+        // line — column index, not byte offset, so the multi-byte `→` is harmless.
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        if !row.contains("wifi down") {
+            continue;
+        }
+        checked_alert_row = true;
+        // Every non-blank, non-border content cell on this row is bold red.
+        let loud = (0..buf.area.width)
+            .map(|x| &buf[(x, y)])
+            .filter(|c| !c.symbol().trim().is_empty() && c.symbol() != "│")
+            .all(|c| c.fg == Color::Red && c.modifier.contains(Modifier::BOLD));
+        assert!(loud, "the alert row must render bold red:\n{rendered}");
+        break;
+    }
+    assert!(checked_alert_row, "alert row not found in the buffer:\n{rendered}");
+}
+
+#[test]
+fn selecting_the_injected_context_node_shows_both_protocol_and_baton_halves() {
+    use softfig_ipc::growlightd::BatonReply;
+    use softfig_tui::tree::{BacklogItem, BacklogKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_tree.set_injected_context(true);
+    // Both halves loaded: the protocol (a keeperd read cached on select) + the live
+    // runtime baton (the polled growlightd reply). The pane assembles them in the
+    // `inject.sh` boot framing.
+    app.growlight_injected_protocol = Some("the PROTOMARK operating body".into());
+    app.growlight_runtime_baton = Some(BatonReply {
+        agent: None,
+        path: "/x/baton.md".into(),
+        text: "---\nstatus: IN_PROGRESS\n---\n# NEXT ACTION\nBATONMARK go".into(),
+    });
+    // Select the injected-context node (it closes the tree).
+    let vis = app.growlight_tree.visible();
+    app.growlight_tree.selected = vis
+        .iter()
+        .position(|r| r.kind == BacklogKind::InjectedContext)
+        .unwrap();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("injected context"), "pane title missing:\n{rendered}");
+    // Boot framing: both section headers appear (right pane ~60 cols → no wrap).
+    assert!(rendered.contains("OPERATING PROTOCOL"), "protocol header missing:\n{rendered}");
+    assert!(rendered.contains("CURRENT BATON"), "baton header missing:\n{rendered}");
+    // Both halves' content: a protocol marker AND a baton marker.
+    assert!(rendered.contains("PROTOMARK"), "protocol half body missing:\n{rendered}");
+    assert!(rendered.contains("BATONMARK"), "baton half body missing:\n{rendered}");
 }
 
 #[test]

@@ -10,10 +10,13 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use std::path::Path;
+
 use softfig_ipc::growlightd::{
-    op, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply, PausedReply,
-    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply,
-    SetPolicyArgs, SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
+    op, BatonArgs, BatonReply, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply,
+    PausedReply, ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs,
+    ResumeItemReply, SetPolicyArgs, SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs,
+    StopLevel, StopReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
@@ -130,6 +133,8 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         // stops. Every other verb is one-shot.
         op::SUBSCRIBE => stream_subscription(&daemon, stream),
         op::STATUS => write_one_shot(&mut stream, status(&daemon)),
+        // Read-only transitional bridge to the out-of-garden runtime baton.
+        op::BATON => write_one_shot(&mut stream, baton(&req)),
         // Control family — all one-shot (spec §13 Control). The state they set is
         // intent the future drive loop reads at safe handoff boundaries (§8).
         op::PAUSE => write_one_shot(&mut stream, set_paused(&daemon, true)),
@@ -227,6 +232,66 @@ fn status(daemon: &Daemon) -> Response {
         live_scopes: daemon.live_scope_units(),
     };
     ok_reply(&reply, "status")
+}
+
+/// `baton`: read the LIVE runtime baton (read-only, transitional bridge). No
+/// `agent` → the fleet/legacy single-agent runtime baton (`<growlight>/baton.md`);
+/// `agent:"a"` → that member's `<growlight>/agents/<id>/baton.md`. A missing file
+/// soft-fails to an empty `text` (the runtime may hold no baton yet), never an
+/// error. Resolves the runtime dir from the environment (like the fleet
+/// assembler) so it answers even when the fleet is disarmed and no store is
+/// assembled. Stateless — takes no daemon lock.
+fn baton(req: &Request) -> Response {
+    let args: BatonArgs = match parse_args(req) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Guard the member id: it becomes a single path component, so reject anything
+    // that isn't a bare name (a `/`, `\`, or `.`/`..` traversal). A well-behaved
+    // client only ever sends a roster id; this keeps a malformed request from
+    // reading an arbitrary file rather than soft-failing to empty.
+    if let Some(id) = args.agent.as_deref() {
+        if !is_simple_agent_id(id) {
+            return Response::err(
+                ErrorKind::BadArgs,
+                format!("agent id {id:?} must be a bare name (no path separators)"),
+            );
+        }
+    }
+    let dir = crate::fleet::runtime_growlight_dir();
+    ok_reply(&read_runtime_baton(&dir, args.agent.as_deref()), "baton")
+}
+
+/// Whether `id` is a safe single path component for the per-member baton path: a
+/// non-empty bare name, never a `.`/`..` traversal or a name carrying a path
+/// separator. Pure (no IO), so the guard is unit-tested directly.
+pub(crate) fn is_simple_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains('\0')
+}
+
+/// Resolve + read a runtime baton under `growlight_dir`: `None` → the fleet/legacy
+/// single-agent baton `<growlight>/baton.md`; `Some(id)` → that member's
+/// `<growlight>/agents/<id>/baton.md`. A missing file is the documented soft-fail
+/// — empty `text`, never an error, never a panic. Pure but for the one read, so
+/// the default / per-member / missing-file shapes are unit-tested with a temp dir.
+pub(crate) fn read_runtime_baton(growlight_dir: &Path, agent: Option<&str>) -> BatonReply {
+    let path = match agent {
+        None => growlight_dir.join("baton.md"),
+        Some(id) => growlight_dir.join("agents").join(id).join("baton.md"),
+    };
+    // A missing runtime baton is expected (disarmed / freshly-init'd fleet, or a
+    // member that hasn't been seeded) — surface empty text, not an IO error.
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    BatonReply {
+        agent: agent.map(str::to_string),
+        path: path.display().to_string(),
+        text,
+    }
 }
 
 /// `pause` / `resume`: flip the fleet admission gate and echo the new state.
@@ -690,6 +755,60 @@ mod tests {
         assert_eq!(calls[0].cargo_build_jobs, Some(4), "the changed knob");
         assert_eq!(calls[0].memory_high.as_deref(), Some("3G"), "the merged (untouched) default");
         assert_eq!(calls[0].cpu_weight, Some(50), "the merged (untouched) default");
+    }
+
+    #[test]
+    fn baton_reads_the_default_runtime_baton() {
+        // No agent → `<growlight>/baton.md`, contents surfaced verbatim.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("baton.md"), "# NEXT ACTION\ngo").unwrap();
+        let reply = read_runtime_baton(tmp.path(), None);
+        assert_eq!(reply.agent, None, "the default read echoes no agent");
+        assert!(reply.path.ends_with("/baton.md"), "resolves the legacy root baton: {}", reply.path);
+        assert!(!reply.path.contains("/agents/"), "the default baton is NOT under agents/");
+        assert_eq!(reply.text, "# NEXT ACTION\ngo");
+    }
+
+    #[test]
+    fn baton_reads_a_per_member_baton() {
+        // `agent:"a"` → `<growlight>/agents/a/baton.md`.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents").join("a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("baton.md"), "member a baton").unwrap();
+        let reply = read_runtime_baton(tmp.path(), Some("a"));
+        assert_eq!(reply.agent.as_deref(), Some("a"), "echoes the requested member");
+        assert!(reply.path.ends_with("/agents/a/baton.md"), "per-member path: {}", reply.path);
+        assert_eq!(reply.text, "member a baton");
+    }
+
+    #[test]
+    fn baton_missing_file_soft_fails_to_empty_text_not_an_error() {
+        // The documented soft-fail: an absent runtime baton is empty text, never
+        // an error and never a panic — for both the default and per-member reads.
+        let tmp = tempfile::tempdir().unwrap();
+        let default = read_runtime_baton(tmp.path(), None);
+        assert!(default.text.is_empty(), "a missing default baton → empty text");
+        assert!(default.path.ends_with("/baton.md"), "the path is still reported: {}", default.path);
+
+        let member = read_runtime_baton(tmp.path(), Some("ghost"));
+        assert!(member.text.is_empty(), "a missing per-member baton → empty text");
+        assert_eq!(member.agent.as_deref(), Some("ghost"));
+    }
+
+    #[test]
+    fn baton_verb_rejects_a_traversal_agent_id() {
+        // A malformed agent id (path traversal) is a BadArgs refusal, so the verb
+        // can never read an arbitrary file behind an `agent` arg. A clean id
+        // (missing baton) still soft-fails to Ok/empty.
+        let bad = Request::new(op::BATON, serde_json::json!({ "agent": "../../etc/passwd" }));
+        assert!(matches!(baton(&bad), Response::Err { .. }), "traversal id refused");
+        assert!(!is_simple_agent_id("../x"));
+        assert!(!is_simple_agent_id("a/b"));
+        assert!(!is_simple_agent_id(".."));
+        assert!(!is_simple_agent_id(""));
+        assert!(is_simple_agent_id("a"));
+        assert!(is_simple_agent_id("builder"));
     }
 
     #[test]

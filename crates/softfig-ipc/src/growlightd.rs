@@ -31,6 +31,21 @@ pub mod op {
     /// occur, until the client disconnects or the daemon stops. Clients decode
     /// each line as an [`Event`], not a [`crate::Response`].
     pub const SUBSCRIBE: &str = "subscribe";
+    /// `baton(`[`BatonArgs`]`) -> `[`BatonReply`]. Read-only: the LIVE runtime
+    /// baton (the loop's carried state). The runtime baton lives OUTSIDE the
+    /// garden today (`$XDG_CONFIG_HOME/softfig/growlight/`), so keeperd's garden
+    /// read verbs can't reach it — this verb is the bridge. No `agent` → the
+    /// fleet/legacy single-agent runtime baton (`<growlight>/baton.md`);
+    /// `agent:"a"` → that member's `<growlight>/agents/<id>/baton.md`. A missing
+    /// file soft-fails to an empty `text` (the runtime may have no baton yet on a
+    /// disarmed / freshly-`init`ed fleet), never an error, never a panic.
+    ///
+    /// **Transitional bridge** (milestone `growlight-tui-detail-pane`
+    /// `## Forward-compat`): when the growlight runtime becomes a FUSE-mounted
+    /// garden chain, the baton is served as a plain garden read at the mount path
+    /// and this verb retires — the client's read-resolver re-points, no UI change.
+    /// So it is deliberately a thin read, not a control/observe surface to build on.
+    pub const BATON: &str = "baton";
 
     // --- Control family (spec §13 Control / §8 pings & control). Every control
     // verb is ONE-SHOT (a single [`crate::Response`]); only `subscribe` streams.
@@ -208,6 +223,41 @@ pub struct PolicySummary {
     pub session_5h_halt_pct: u8,
     /// 7d rolling-reserve % halt threshold.
     pub session_7d_halt_pct: u8,
+}
+
+// ---------------------------------------------------------------------------
+// Observe read family (transitional). `baton` args + reply — the one out-of-garden
+// runtime read. Retires when the runtime is a mounted garden chain (see
+// [`op::BATON`] / milestone `growlight-tui-detail-pane` `## Forward-compat`).
+// ---------------------------------------------------------------------------
+
+/// Args for `baton`: which baton to read. `None` → the fleet/legacy single-agent
+/// runtime baton; `Some(id)` → that fleet member's per-member baton. The single
+/// optional field is skipped on the wire when absent, so a bare `{}` reads the
+/// default baton.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatonArgs {
+    /// The fleet member whose per-member baton to read, or `None` for the
+    /// fleet/legacy single-agent runtime baton.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// Reply to `baton`: the baton that was read, echoing which one and where it
+/// lives. `agent` mirrors the request (`None` = the default runtime baton); `path`
+/// is the resolved file path; `text` is its contents, or **empty** when the file
+/// is absent (the documented soft-fail — a missing runtime baton is not an error).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatonReply {
+    /// The member this baton is for, or `None` for the default runtime baton —
+    /// echoes [`BatonArgs::agent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The resolved path the baton was read from (present even when absent, so the
+    /// client can report *which* file was empty).
+    pub path: String,
+    /// The baton contents, or empty when the file does not exist (soft-fail).
+    pub text: String,
 }
 
 /// One frame of the `subscribe` event stream (spec §13 Observe / §12 runtime
@@ -999,5 +1049,46 @@ mod tests {
         assert_eq!(back.roster[0].pin.as_deref(), Some("queue:build"));
         assert_eq!(back.roster[1].pin, None);
         assert_eq!(back.live_scopes, vec!["growlight-agent-builder-1.scope".to_string()]);
+    }
+
+    #[test]
+    fn baton_args_omit_the_absent_agent_and_round_trip() {
+        // The default read (no agent) is the empty object on the wire.
+        let default = BatonArgs { agent: None };
+        let s = serde_json::to_string(&default).unwrap();
+        assert_eq!(s, "{}", "an absent agent is skipped: {s}");
+        assert_eq!(serde_json::from_str::<BatonArgs>(&s).unwrap(), default);
+        // An empty object also decodes as the default (a bare `baton {}` call).
+        assert_eq!(serde_json::from_str::<BatonArgs>("{}").unwrap(), BatonArgs::default());
+
+        // A per-member read carries the agent.
+        let member = BatonArgs { agent: Some("a".into()) };
+        let s = serde_json::to_string(&member).unwrap();
+        assert!(s.contains("\"agent\":\"a\""), "carries the agent: {s}");
+        assert_eq!(serde_json::from_str::<BatonArgs>(&s).unwrap(), member);
+    }
+
+    #[test]
+    fn baton_reply_round_trips_the_default_and_per_member_shapes() {
+        // Default runtime baton: no agent echoed (skipped), path + text present.
+        let default = BatonReply {
+            agent: None,
+            path: "/home/u/.config/softfig/growlight/baton.md".into(),
+            text: "---\nstatus: IN_PROGRESS\n---\n# NEXT ACTION\ngo".into(),
+        };
+        let s = serde_json::to_string(&default).unwrap();
+        assert!(!s.contains("\"agent\""), "the absent agent is skipped: {s}");
+        assert_eq!(serde_json::from_str::<BatonReply>(&s).unwrap(), default);
+
+        // Per-member baton echoes the agent.
+        let member = BatonReply {
+            agent: Some("a".into()),
+            path: "/home/u/.config/softfig/growlight/agents/a/baton.md".into(),
+            text: String::new(), // the soft-fail (missing file) shape: empty text
+        };
+        let back: BatonReply =
+            serde_json::from_str(&serde_json::to_string(&member).unwrap()).unwrap();
+        assert_eq!(back, member);
+        assert!(back.text.is_empty(), "a missing baton is surfaced as empty text");
     }
 }

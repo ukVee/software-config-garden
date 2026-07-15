@@ -4,12 +4,16 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{short_fp, App, BackupRow, GrowlightRow, Overlay, PairField, PeerRow, View};
+use crate::app::{
+    baton_headline, runtime_baton_head, short_fp, App, BackupRow, BusRow, FleetHeader, Overlay,
+    PairField, PeerRow, View,
+};
 use crate::command::command_hints;
+use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
 
@@ -637,93 +641,268 @@ fn render_deploy_detail(f: &mut Frame, app: &App, area: Rect) {
 fn growlight_status_color(status: &str) -> Color {
     match status {
         "active" => Color::Cyan,
+        "awaiting-smoke" => Color::Magenta,
         "done" => Color::DarkGray,
         "blocked" => Color::Red,
         "deferred" => Color::Yellow,
-        _ => Color::Gray, // queued / unknown
+        "context" => Color::Blue, // loop-context section leaves
+        _ => Color::Gray,         // queued / unknown
     }
 }
 
-/// Left pane of the read-only Growlight section: the backlog queue in drain
-/// order, each row `<status>  <id>` coloured by status, the active item bold.
+/// Left pane of the read-only Growlight section: the backlog as a navigable
+/// tree — milestone/task items in drain order, each milestone expandable to its
+/// slices (`+`/`-`), rows coloured by status (queue status, or a slice's
+/// derived status), the active item bold.
 fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.growlight.items.is_empty() {
+    let rows = app.growlight_tree.visible();
+    let items: Vec<ListItem> = if rows.is_empty() {
         vec![ListItem::new("(queue empty or not loaded)")]
     } else {
-        app.growlight
-            .items
-            .iter()
-            .map(|r: &GrowlightRow| {
-                let color = growlight_status_color(&r.status);
-                let mut style = Style::default().fg(color);
+        rows.iter()
+            .map(|r| {
+                let indent = "  ".repeat(r.depth);
+                let marker = if r.expandable {
+                    if r.expanded {
+                        "- "
+                    } else {
+                        "+ "
+                    }
+                } else {
+                    "  "
+                };
+                let mut style = Style::default().fg(growlight_status_color(&r.status));
                 if r.status == "active" {
                     style = style.add_modifier(Modifier::BOLD);
                 }
-                ListItem::new(Line::styled(format!("{:>8}  {}", r.status, r.id), style))
+                ListItem::new(Line::styled(
+                    format!("{indent}{marker}{:<14} {}", r.status, r.label),
+                    style,
+                ))
             })
             .collect()
     };
     let mut st = ListState::default();
-    if !app.growlight.items.is_empty() {
-        st.select(Some(app.growlight.selected.min(app.growlight.items.len() - 1)));
+    if !rows.is_empty() {
+        st.select(Some(app.growlight_tree.selected.min(rows.len() - 1)));
     }
-    let title = format!("growlight — {} item(s)", app.growlight.items.len());
+    let title = format!("growlight — {} row(s)", rows.len());
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
 }
 
-/// Right pane of the Growlight section: the active item, the selected item's
-/// title, and the latest baton (the loop's most recent handoff state). All
-/// read-only — this section never controls the loop.
-fn render_growlight_detail(f: &mut Frame, app: &App, area: Rect) {
+/// Right pane of the Growlight section: a fleet-header strip above a scrollable
+/// markdown viewer of the selected tree node. Read-only — this section never
+/// controls the loop.
+fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(area);
+    render_growlight_header(f, app, rows[0]);
+
+    let selected_kind = app.growlight_tree.selected_row().map(|r| r.kind);
+
+    // The live runtime-baton node is a growlightd read, not a garden `read_file`:
+    // render it straight from the polled `BatonReply` (so it stays live between
+    // polls) instead of the keeperd-sourced `growlight_preview`.
+    if selected_kind == Some(BacklogKind::RuntimeBaton) {
+        let (title, content) = app.runtime_baton_view();
+        render_scroll_body(
+            f,
+            rows[1],
+            &content,
+            &title,
+            &mut app.preview_scroll,
+            &mut app.preview_viewport,
+            &mut app.preview_total,
+        );
+        return;
+    }
+
+    // The bus-history node is a keeperd `tail_bus` read, eagerly loaded into
+    // `growlight_bus`: render the parsed rows (newest first, alerts loud) straight
+    // from that state through the styled scroll core — a keeper-sourced page that
+    // works even with growlightd down.
+    if selected_kind == Some(BacklogKind::Bus) {
+        let lines = bus_lines(&app.growlight_bus);
+        render_scroll_text(
+            f,
+            rows[1],
+            Text::from(lines),
+            "coordination bus — newest first  (read-only)",
+            &mut app.preview_scroll,
+            &mut app.preview_viewport,
+            &mut app.preview_total,
+        );
+        return;
+    }
+
+    // The injected-context node is an ASSEMBLED view: the protocol half (a keeperd
+    // read cached in `growlight_injected_protocol`) + the live runtime baton (the
+    // polled growlightd reply), concatenated in `inject.sh` boot framing. Render it
+    // straight from that assembled text so it stays live between polls, and so it
+    // works garden-only (protocol half + a placeholder) with growlightd down.
+    if selected_kind == Some(BacklogKind::InjectedContext) {
+        let (title, content) = app.injected_context_view();
+        render_scroll_body(
+            f,
+            rows[1],
+            &content,
+            &title,
+            &mut app.preview_scroll,
+            &mut app.preview_viewport,
+            &mut app.preview_total,
+        );
+        return;
+    }
+
+    let placeholder =
+        "(select a node — milestone · slice · task · loop context · live baton · bus · injected-context — to view it)";
+    let title = if app.growlight_preview.is_empty() {
+        "growlight detail (read-only)".to_string()
+    } else {
+        format!("{}  (read-only)", app.growlight_preview_title)
+    };
+    let content: &str = if app.growlight_preview.is_empty() {
+        placeholder
+    } else {
+        app.growlight_preview.as_str()
+    };
+    render_scroll_body(
+        f,
+        rows[1],
+        content,
+        &title,
+        &mut app.preview_scroll,
+        &mut app.preview_viewport,
+        &mut app.preview_total,
+    );
+}
+
+/// The always-visible fleet header strip. Slice 003 renders live growlightd
+/// process-state from the `status` poll ([`App::fleet`]): the admission gate,
+/// running agents, and policy budgets. Below them, slice 004 shows the LIVE
+/// runtime baton headline (the growlightd `baton` verb, [`App::growlight_runtime_baton`]),
+/// falling back to the garden baton-LOG headline when growlightd is unreachable.
+/// Soft-fails: an unreachable growlightd collapses the live lines to a single dim
+/// "unreachable" line, but the garden baton-log headline still shows, so the
+/// header is useful even with growlightd down.
+///
+/// v1 shows no *live* budget % — that per-agent reading only arrives over the
+/// `subscribe` event stream, which is out of scope for this milestone (no
+/// streaming); the header surfaces the policy budget THRESHOLDS the `status`
+/// poll does carry.
+fn render_growlight_header(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
-
-    match app.growlight_active_item() {
-        Some(a) => lines.push(Line::styled(
-            format!("active: {} — {}", a.id, a.title),
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::Cyan),
-        )),
-        None => lines.push(Line::styled(
-            "active: (none — queue idle)",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    }
-
-    if let Some(sel) = app.selected_growlight_row() {
-        lines.push(Line::styled(
-            format!("selected: [{}] {} — {}", sel.status, sel.id, sel.title),
-            Style::default().fg(growlight_status_color(&sel.status)),
-        ));
-    }
-
-    lines.push(Line::raw(""));
-    let baton_title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
-    lines.push(Line::styled(
-        format!("latest baton — {baton_title}"),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    match &app.growlight_baton {
-        Some(body) => {
-            for l in body.lines() {
-                lines.push(Line::raw(l));
-            }
+    match &app.fleet {
+        FleetHeader::Live(s) => {
+            let (arm, arm_color) = if s.fleet_enabled {
+                ("armed", Color::Green)
+            } else {
+                ("disarmed", Color::DarkGray)
+            };
+            let (gate, gate_color) = if s.paused {
+                ("paused", Color::Yellow)
+            } else {
+                ("active", arm_color)
+            };
+            // Line 1: the fleet gate + running-agent count.
+            lines.push(Line::from(vec![
+                Span::styled("fleet · ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    arm,
+                    Style::default().fg(arm_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" · "),
+                Span::styled(gate, Style::default().fg(gate_color)),
+                Span::raw(format!(" · {} agent(s) running", s.agents.len())),
+            ]));
+            // Line 2: which agents are running (or the configured roster when the
+            // fleet is idle/disarmed and nothing has spawned).
+            let agents = if !s.agents.is_empty() {
+                s.agents
+                    .iter()
+                    .map(|a| format!("{}:{}", a.id, a.status))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            } else if !s.roster.is_empty() {
+                let names = s
+                    .roster
+                    .iter()
+                    .map(|m| m.agent.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("none running (roster: {names})")
+            } else {
+                "none running".to_string()
+            };
+            lines.push(Line::styled(
+                format!("agents · {agents}"),
+                Style::default().fg(Color::Gray),
+            ));
+            // Line 3: the policy budget thresholds this device runs under.
+            let p = &s.policy;
+            lines.push(Line::styled(
+                format!(
+                    "budgets · ctx roll {}% / handoff {}% · halt 5h {}% 7d {}% · ≤{} concurrent",
+                    p.ctx_roll_pct,
+                    p.ctx_handoff_pct,
+                    p.session_5h_halt_pct,
+                    p.session_7d_halt_pct,
+                    p.max_concurrent_agents,
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
-        None => lines.push(Line::styled(
-            "  (no baton-log entries)",
+        FleetHeader::Unreachable => lines.push(Line::styled(
+            "growlightd unreachable — fleet status unavailable",
+            Style::default().fg(Color::DarkGray),
+        )),
+        FleetHeader::Unknown => lines.push(Line::styled(
+            "growlightd · fleet status not yet polled",
             Style::default().fg(Color::DarkGray),
         )),
     }
-
+    // The baton headline. Prefer the LIVE runtime baton (slice 004, via the
+    // growlightd `baton` verb) — the loop's actual carried state. Fall back to the
+    // garden baton-LOG headline (a keeperd read, slice 003) when growlightd is
+    // unreachable, so the header degrades but never blanks.
+    match app
+        .growlight_runtime_baton
+        .as_ref()
+        .filter(|b| !b.text.trim().is_empty())
+    {
+        Some(b) => {
+            let head = runtime_baton_head(&b.text);
+            let line = if head.is_empty() {
+                // No parseable frontmatter head — show the first body line instead.
+                baton_headline(&b.text)
+                    .map(|h| format!("runtime baton · {h}"))
+                    .unwrap_or_else(|| "runtime baton · (live)".to_string())
+            } else {
+                format!("runtime baton · {head}")
+            };
+            lines.push(Line::styled(line, Style::default().fg(Color::Cyan)));
+        }
+        None => {
+            let title = app.growlight_baton_title.as_deref().unwrap_or("(none yet)");
+            match app.growlight_baton.as_deref().and_then(baton_headline) {
+                Some(h) => lines.push(Line::styled(
+                    format!("loop baton · {title} — {h}"),
+                    Style::default().fg(Color::Cyan),
+                )),
+                None => lines.push(Line::styled(
+                    "loop baton · (no baton-log entries yet)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            }
+        }
+    }
     let p = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("growlight detail (read-only)"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("fleet"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
@@ -758,32 +937,104 @@ fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
     f.render_widget(p, rect);
 }
 
-fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
+/// Render `content` into `area` as a bordered, wrapped, vertically-scrollable
+/// `Paragraph`, recording the live viewport + total wrapped-line count so the
+/// shared scroll keys can page and clamp, and clamping `scroll` to the real
+/// bottom. `title_base` gains a ` [NN%]` suffix when the content overflows the
+/// viewport. Shared by the Browse preview and the growlight detail body so both
+/// scroll byte-identically (the scroll keys drive the same `preview_*` fields).
+fn render_scroll_body(
+    f: &mut Frame,
+    area: Rect,
+    content: &str,
+    title_base: &str,
+    scroll: &mut u16,
+    viewport: &mut u16,
+    total_out: &mut u16,
+) {
+    render_scroll_text(
+        f,
+        area,
+        Text::from(content),
+        title_base,
+        scroll,
+        viewport,
+        total_out,
+    );
+}
+
+/// The scroll core behind [`render_scroll_body`], taking pre-styled [`Text`] so a
+/// caller can colour individual lines (the bus history renders `alert` rows loud).
+/// Records the live viewport + wrapped-line total and clamps `scroll` to the real
+/// bottom exactly as the `&str` path does, so every scrollable pane pages
+/// identically.
+fn render_scroll_text(
+    f: &mut Frame,
+    area: Rect,
+    text: Text<'_>,
+    title_base: &str,
+    scroll: &mut u16,
+    viewport: &mut u16,
+    total_out: &mut u16,
+) {
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
 
-    let text = Paragraph::new(app.preview.as_str()).wrap(Wrap { trim: false });
-    let total = text.line_count(inner_w) as u16;
+    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    let total = para.line_count(inner_w) as u16;
 
-    // Record the live geometry so key/mouse handlers can size pages and clamp.
-    app.preview_viewport = inner_h;
-    app.preview_total = total;
+    *viewport = inner_h;
+    *total_out = total;
     let max = total.saturating_sub(inner_h);
-    let offset = app.preview_scroll.min(max);
-    app.preview_scroll = offset;
+    let offset = (*scroll).min(max);
+    *scroll = offset;
 
-    let mut title = if total > inner_h {
+    let title = if total > inner_h {
         let pct = if max == 0 {
             100
         } else {
             (offset as u32 * 100 / max as u32) as u16
         };
-        format!("{}  [{pct}%]", app.preview_title)
+        format!("{title_base}  [{pct}%]")
     } else {
-        app.preview_title.clone()
+        title_base.to_string()
     };
+
+    let p = para
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((offset, 0));
+    f.render_widget(p, area);
+}
+
+/// Build the styled history lines for the bus pane (slice 005): newest-first rows,
+/// each `from → to  [kind]  body` (body newlines flattened to keep one row per
+/// message), with `alert` rows rendered LOUD (bold red). Empty → a calm dim
+/// placeholder. Pure (a `Vec<Line>`), so the alert emphasis is unit-testable.
+fn bus_lines(rows: &[BusRow]) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::styled(
+            "(no coordination-bus messages yet)",
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+    rows.iter()
+        .map(|r| {
+            let body = r.body.replace('\n', " ");
+            let text = format!("{} → {}  [{}]  {}", r.from, r.to, r.kind, body);
+            let style = if r.is_alert {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(text, style)
+        })
+        .collect()
+}
+
+fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
+    let mut title = app.preview_title.clone();
     // M2c: flag inline `<vault id=…>` regions so the user knows `x` opens the
     // per-region reveal picker for this file.
     if !app.regions.is_empty() {
@@ -791,11 +1042,15 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
         let plural = if n == 1 { "region" } else { "regions" };
         title.push_str(&format!("  · {n} vault {plural} (x)"));
     }
-
-    let p = text
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((offset, 0));
-    f.render_widget(p, area);
+    render_scroll_body(
+        f,
+        area,
+        &app.preview,
+        &title,
+        &mut app.preview_scroll,
+        &mut app.preview_viewport,
+        &mut app.preview_total,
+    );
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -1182,12 +1437,13 @@ fn render_help(f: &mut Frame, area: Rect) {
 soft-fig TUI — keys
 
   1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
-  7            growlight (read-only; only when growlight is enabled)
-  j k ↑ ↓      move selection
+  7            growlight (read-only): backlog → slices, loop-context, live baton · bus · injected-context
+  j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
-  h ←          collapse dir
-  scroll preview (right pane):
+               / expand milestone → slices (growlight)
+  h ←          collapse dir / milestone (growlight)
+  scroll preview / growlight node (right pane):
     ^e ^y      line down / up        wheel  line-wise
     ^d ^u      half-page down / up
     ^f ^b      full-page down / up   PgDn/PgUp same
@@ -1224,4 +1480,53 @@ any key closes this help";
         .block(Block::default().borders(Borders::ALL).title("help"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(from: &str, to: &str, kind: &str, body: &str) -> BusRow {
+        BusRow {
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            body: body.into(),
+            is_alert: kind == "alert",
+        }
+    }
+
+    #[test]
+    fn bus_lines_renders_the_row_format_and_flattens_body_newlines() {
+        let lines = bus_lines(&[row("a", "@all", "info", "line one\nline two")]);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        // `from → to  [kind]  body`, body newlines collapsed to keep one row.
+        assert_eq!(text, "a → @all  [info]  line one line two");
+    }
+
+    #[test]
+    fn bus_lines_renders_alert_rows_loud_and_plain_rows_plain() {
+        let lines = bus_lines(&[
+            row("b", "@all", "alert", "wifi down"),
+            row("a", "b", "info", "ok"),
+        ]);
+        // The alert row is bold red; the info row keeps the default style.
+        assert_eq!(
+            lines[0].style,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            "alert row must be styled loud",
+        );
+        assert_eq!(lines[1].style, Style::default(), "non-alert row stays plain");
+    }
+
+    #[test]
+    fn bus_lines_empty_shows_a_calm_placeholder_not_an_error() {
+        let lines = bus_lines(&[]);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("no coordination-bus messages"));
+        // Dim, not an alarming colour — an empty bus is normal, not a failure.
+        assert_eq!(lines[0].style, Style::default().fg(Color::DarkGray));
+    }
 }

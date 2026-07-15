@@ -4,23 +4,30 @@
 //! their own modules and carry the unit tests; this module wires them to
 //! the worker-thread [`IpcClient`] and the key stream.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
+use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
-    DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
-    GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply,
-    PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
-    ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
+    ChatMessage, DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply,
+    DiscoveredDevice, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
+    PairListReply, PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply,
+    ReplicaRevokeReply, ReplicaStatusReply, ShowReply, StatusReply, TailBusReply,
+    VaultListSealedReply, VaultRevealReply,
 };
 
 use crate::clip;
 use crate::command::{parse_command, Command};
 use crate::forms::{ActionForm, ActionKind};
+use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
 use crate::ipc::{IpcClient, Reply, Tag};
 use crate::listpane::ListPane;
-use crate::tree::TreeModel;
+use crate::tree::{
+    derive_slice_status, parse_slice_index, BacklogItem, BacklogKind, BacklogTree, LoopContextNode,
+    SliceChild, TreeModel,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -34,6 +41,28 @@ pub enum View {
     /// reachable when growlight is enabled on this garden (`growlight_enabled ==
     /// Some(true)`); the tab is absent otherwise.
     Growlight,
+}
+
+/// Live growlightd fleet process-state for the Growlight header (slice 003).
+///
+/// This is the ONE permanent growlightd read: which agents are running, the
+/// admission gate, the policy budgets — none of it is a file, so it never
+/// migrates to the future runtime-FUSE mount and stays a dedicated `status`
+/// poll on its own path (milestone `## Forward-compat`). It **soft-fails**: an
+/// unreachable socket (growlightd down / fleet disarmed) or a version-skew
+/// malformed reply degrades to [`FleetHeader::Unreachable`] — one dim header
+/// line — while the garden-only tree and node bodies keep working. The page is
+/// never gated on growlightd.
+#[derive(Debug, Clone, Default)]
+pub enum FleetHeader {
+    /// Not polled yet (before the first `status` reply after entering the tab).
+    #[default]
+    Unknown,
+    /// A decoded live growlightd `status` reply.
+    Live(FleetStatusReply),
+    /// The last poll couldn't reach growlightd — render one dim line, keep the
+    /// garden-only page fully functional.
+    Unreachable,
 }
 
 /// One row of the growlight backlog queue. Served as a structured row over the
@@ -227,18 +256,69 @@ pub struct App {
     /// status tick, so it can't go stale mid-session.
     pub growlight_enabled: Option<bool>,
     /// The backlog queue rows (drain order + statuses), served read-only as
-    /// structured rows by the daemon's `growlight_queue` verb.
+    /// structured rows by the daemon's `growlight_queue` verb. Still the source
+    /// for the right-pane detail (active item + latest baton); the left pane is
+    /// now the navigable `growlight_tree` built from these rows.
     pub growlight: ListPane<GrowlightRow>,
+    /// Left-pane backlog tree: milestone/task items (from `growlight`) expanding
+    /// to their slices, plus the loop-context section. Rebuilt whenever the queue
+    /// or the milestone set arrives.
+    pub growlight_tree: BacklogTree,
+    /// Ids that are milestones (expandable) — the authoritative dir listing of
+    /// `growlight/backlog/milestones`, not an id-format heuristic. Empty until
+    /// the `GrowlightMilestones` reply lands; rows classify as tasks until then.
+    pub growlight_milestone_ids: Vec<String>,
+    /// The logical-artifact → read resolver for the right-pane viewer (the seam
+    /// the future runtime-FUSE-mount re-points). Carries the task dir listing so
+    /// a task's bare `NNN` id resolves to its `NNN-slug.md` file.
+    pub growlight_source: GrowlightSource,
+    /// Markdown body of the selected tree node, shown scrollably in the right
+    /// pane (reuses the shared `preview_scroll`/`preview_viewport`/`preview_total`
+    /// so the same scroll keys drive it). `growlight_preview_path` is the node
+    /// currently loaded/fetching — a stale in-flight reply (the user moved on) is
+    /// dropped, and a re-select of the same node skips the re-read.
+    pub growlight_preview: String,
+    pub growlight_preview_title: String,
+    pub growlight_preview_path: Option<String>,
     /// The latest baton-log entry (title + body) — the loop's most recent handoff
     /// state, read from the highest-numbered `growlight/baton-log/NNN-*.md`.
     pub growlight_baton_title: Option<String>,
     pub growlight_baton: Option<String>,
     /// Set when a write lands while the Growlight tab is hidden. `load_growlight`
-    /// is three IPC round-trips (`growlight_queue` + a `list_tree` of the
-    /// unboundedly-growing baton-log + the latest-entry `read_file`) — too much
-    /// to refire for a tab nobody is viewing. Marked stale here, lazily
-    /// re-fetched on entry (020 slice 006, like `deploy_stale`).
+    /// is four IPC round-trips (`growlight_queue` + `list_tree` of milestones,
+    /// tasks, and the unboundedly-growing baton-log, then the latest-entry
+    /// `read_file`) — too much to refire for a tab nobody is viewing. Marked
+    /// stale here, lazily re-fetched on entry (020 slice 006, like `deploy_stale`).
     pub growlight_stale: bool,
+    /// Live growlightd process-state for the fleet header, from the second
+    /// (growlightd-only) IPC channel's `status` poll — repolled on a ~1.5s
+    /// cadence WHILE the Growlight tab is active (see `App::should_poll_fleet` /
+    /// `poll_fleet_status`), and soft-failing to `Unreachable` when growlightd is
+    /// down/disarmed. Distinct from the garden reads: process-state is not a file
+    /// and stays a dedicated growlightd read forever (`## Forward-compat`).
+    pub fleet: FleetHeader,
+    /// The LIVE runtime baton (slice 004), polled on the growlightd channel via the
+    /// `baton` verb on the same cadence as `fleet` while the Growlight tab is
+    /// active. `Some` when growlightd answered (even an empty baton — `text` empty);
+    /// `None` when unreachable/disarmed/malformed (the soft-fail), which is when the
+    /// header falls back to the garden baton-LOG headline. Feeds both the header
+    /// baton-headline and the live-baton tree node. Out-of-garden today, so it is
+    /// the one node NOT read through keeperd — retires on the runtime FUSE mount.
+    pub growlight_runtime_baton: Option<BatonReply>,
+    /// The coordination-bus history (slice 005), parsed newest-first from the
+    /// keeperd `tail_bus` reply. Eagerly loaded on Growlight-tab entry (and the
+    /// stale-refresh path) via `load_growlight`, NOT polled — the bus is garden
+    /// state on the keeperd channel, so the page shows it even with growlightd
+    /// down. Empty until the first reply (or genuinely no messages); the detail
+    /// pane renders a calm placeholder then.
+    pub growlight_bus: Vec<BusRow>,
+    /// The PROTOCOL half of the injected-context node (slice 006): `growlight/protocol.md`
+    /// read through the resolver's garden arm on select and cached here. `None`
+    /// until the first select's read lands; the detail pane assembles it with the
+    /// polled [`Self::growlight_runtime_baton`] (the growlightd arm) into the boot
+    /// context. The baton half soft-fails independently — with growlightd down the
+    /// node still shows the protocol half + a placeholder (this stays garden-sourced).
+    pub growlight_injected_protocol: Option<String>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -282,9 +362,19 @@ impl App {
             deploy_stale: false,
             growlight_enabled: None,
             growlight: ListPane::new(),
+            growlight_tree: BacklogTree::new(),
+            growlight_milestone_ids: Vec::new(),
+            growlight_source: GrowlightSource::new(),
+            growlight_preview: String::new(),
+            growlight_preview_title: String::new(),
+            growlight_preview_path: None,
             growlight_baton_title: None,
             growlight_baton: None,
             growlight_stale: false,
+            fleet: FleetHeader::Unknown,
+            growlight_runtime_baton: None,
+            growlight_bus: Vec::new(),
+            growlight_injected_protocol: None,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -337,15 +427,112 @@ impl App {
         ipc.send("deploy_plan", json!({}), Tag::DeployPlan);
     }
 
-    /// growlight: (re)load the read-only section — the backlog queue table plus a
-    /// listing of the baton-log (whose reply triggers the latest-entry read).
+    /// growlight: (re)load the read-only section — the backlog queue table, the
+    /// milestone set (for tree classification), the tasks listing (for the
+    /// resolver's `NNN` → file map), plus a listing of the baton-log (whose reply
+    /// triggers the latest-entry read).
     fn load_growlight(&self, ipc: &mut IpcClient) {
         ipc.send("growlight_queue", json!({}), Tag::GrowlightQueue);
+        ipc.send(
+            "list_tree",
+            json!({ "path": "growlight/backlog/milestones" }),
+            Tag::GrowlightMilestones,
+        );
+        ipc.send(
+            "list_tree",
+            json!({ "path": "growlight/backlog/tasks" }),
+            Tag::GrowlightTasks,
+        );
         ipc.send(
             "list_tree",
             json!({ "path": "growlight/baton-log" }),
             Tag::GrowlightBatonList,
         );
+        // The coordination-bus history (slice 005) — a keeperd garden read via the
+        // bespoke `tail_bus` verb (`since: 0` = the full log). Eagerly loaded here
+        // like the rest of the section (view-gated + stale-on-hidden-write), not
+        // polled: the bus is garden state, so it renders even with growlightd down.
+        ipc.send("tail_bus", json!({ "since": 0 }), Tag::GrowlightBus);
+    }
+
+    /// Whether the live fleet header should be polled this tick: only while the
+    /// Growlight tab is the active, enabled view. Mirrors the view-gated load
+    /// discipline (`refresh_view`) — the run loop must never hammer growlightd
+    /// from another tab. Kept as a predicate so the gating is unit-testable
+    /// without a live socket.
+    pub fn should_poll_fleet(&self) -> bool {
+        self.view == View::Growlight && self.growlight_enabled == Some(true)
+    }
+
+    /// Issue one one-shot growlightd `status` poll on the dedicated growlightd
+    /// channel (NOT the keeperd `ipc`), tagged [`Tag::FleetStatus`]. The reply
+    /// feeds `apply_reply`, whose `FleetStatus` arm decodes it into the live
+    /// header or soft-fails an unreachable socket to the dim line.
+    pub fn poll_fleet_status(&self, growlightd: &mut IpcClient) {
+        growlightd.send("status", json!({}), Tag::FleetStatus);
+    }
+
+    /// Poll the LIVE runtime baton on the growlightd channel via the `baton` verb
+    /// (slice 004), same gating + cadence as [`Self::poll_fleet_status`]. No
+    /// `agent` → the fleet/legacy single-agent runtime baton. The reply feeds
+    /// `apply_reply`'s [`Tag::GrowlightRuntimeBaton`] arm; any error soft-fails to
+    /// `None` (header falls back to the garden baton-log), never a status splat.
+    pub fn poll_runtime_baton(&self, growlightd: &mut IpcClient) {
+        growlightd.send("baton", json!({}), Tag::GrowlightRuntimeBaton);
+    }
+
+    /// Push the live runtime baton's active slice (see [`baton_active_slice`]) into
+    /// the tree's `active` overlay so the slice the loop is working right now renders
+    /// `active`. No baton, an unreadable one, or a baton that isn't `IN_PROGRESS`
+    /// clears the overlay. Called whenever the polled baton or the tree changes.
+    fn apply_active_slice(&mut self) {
+        let active = self
+            .growlight_runtime_baton
+            .as_ref()
+            .and_then(|b| baton_active_slice(&b.text));
+        self.growlight_tree.set_active(active);
+    }
+
+    /// The right-pane view of the live runtime-baton node: a title and body sourced
+    /// from the polled [`Self::growlight_runtime_baton`] (NOT a keeperd read). A
+    /// present baton renders a compact parsed head above its post-frontmatter body;
+    /// an empty or unavailable baton renders a calm placeholder — never an error.
+    pub fn runtime_baton_view(&self) -> (String, String) {
+        match &self.growlight_runtime_baton {
+            Some(b) if !b.text.trim().is_empty() => {
+                let head = runtime_baton_head(&b.text);
+                let body = strip_frontmatter(&b.text);
+                (
+                    format!("live runtime baton — {}  (read-only)", b.path),
+                    format!("{head}\n\n{body}"),
+                )
+            }
+            Some(b) => (
+                "live runtime baton  (read-only)".to_string(),
+                format!("(the runtime baton is empty — {})", b.path),
+            ),
+            None => (
+                "live runtime baton  (read-only)".to_string(),
+                "(runtime baton unavailable — growlightd unreachable or the fleet is not initialized)"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// The right-pane view of the injected-context node (slice 006): the assembled
+    /// boot context — the operating protocol (garden arm, [`Self::growlight_injected_protocol`])
+    /// followed by the live runtime baton (growlightd arm, [`Self::growlight_runtime_baton`]),
+    /// in the `inject.sh` boot framing = exactly what a fresh session receives. The
+    /// protocol not yet loaded → a calm "loading" note; the baton unavailable →
+    /// the protocol half plus a placeholder ([`assemble_injected_context`]) — never
+    /// a blank pane and never an error (the protocol half is a garden read).
+    pub fn injected_context_view(&self) -> (String, String) {
+        let title = "injected context — protocol + live baton (boot preview, read-only)".to_string();
+        let Some(protocol) = &self.growlight_injected_protocol else {
+            return (title, "(loading the operating protocol…)".to_string());
+        };
+        let baton = self.growlight_runtime_baton.as_ref().map(|b| b.text.as_str());
+        (title, assemble_injected_context(protocol, baton))
     }
 
     /// Re-fetch every directory whose children are loaded, so the view
@@ -368,7 +555,7 @@ impl App {
             self.load_backup(ipc);
         }
         // Deploy + Growlight are the expensive loads (a full daemon-side dot
-        // diff; a 3-round-trip read over the unbounded baton-log). Gate them on
+        // diff; a 4-round-trip read over the unbounded baton-log). Gate them on
         // the active view like History is: a write that lands while they're
         // hidden marks them stale to lazily re-fetch on entry, instead of
         // refiring eMMC I/O for a tab nobody is looking at (020 slice 006).
@@ -464,12 +651,162 @@ impl App {
         self.growlight.items.iter().find(|r| r.status == "active")
     }
 
+    /// The queue row for the tree's selected node — the owning milestone/task
+    /// (a slice maps to its parent milestone). Feeds the right-pane detail's
+    /// selected line while the right pane is untouched (slice 001).
     pub fn selected_growlight_row(&self) -> Option<&GrowlightRow> {
-        self.growlight.selected()
+        let sel = self.growlight_tree.selected_row()?;
+        self.growlight.items.iter().find(|r| r.id == sel.item_id)
+    }
+
+    /// Rebuild the backlog tree from the current queue rows + the milestone set.
+    /// Called whenever either the `growlight_queue` or `GrowlightMilestones`
+    /// reply lands, so the tree converges once both are in (order-independent);
+    /// `set_items` preserves expansion/slice state across rebuilds.
+    fn rebuild_growlight_tree(&mut self) {
+        let milestones: HashSet<&str> =
+            self.growlight_milestone_ids.iter().map(String::as_str).collect();
+        let items = self
+            .growlight
+            .items
+            .iter()
+            .map(|r| BacklogItem {
+                id: r.id.clone(),
+                title: r.title.clone(),
+                status: r.status.clone(),
+                is_milestone: milestones.contains(r.id.as_str()),
+            })
+            .collect();
+        // The loop-context section, the live runtime-baton node, the bus-history
+        // node, and the assembled injected-context node are static; (re)seed them on
+        // every rebuild so the tree stays self-consistent, then set the backlog
+        // (which clamps last).
+        self.growlight_tree.set_loop_context(loop_context_nodes());
+        self.growlight_tree.set_runtime_baton(true);
+        self.growlight_tree.set_bus(true);
+        self.growlight_tree.set_injected_context(true);
+        self.growlight_tree.set_items(items);
+        // Reapply the live baton's active-slice overlay onto the rebuilt tree.
+        self.apply_active_slice();
+    }
+
+    /// Resolve the selected tree node to its markdown artifact and fetch its body
+    /// for the right pane. Idempotent — skips the read when the node's body is
+    /// already loaded/fetching — so it is safe to call after every nav,
+    /// expand/collapse, and data reply. Resets `preview_scroll` and fires a fresh
+    /// `read_file` only when the selection lands on a *different* node. A task
+    /// whose dir listing hasn't arrived yet resolves to nothing and retries once
+    /// the `GrowlightTasks` reply seeds the resolver.
+    fn refresh_growlight_selection(&mut self, ipc: &mut IpcClient) {
+        let Some(row) = self.growlight_tree.selected_row() else {
+            return;
+        };
+        // The injected-context node assembles TWO artifacts (the protocol garden arm
+        // + the runtime-baton growlightd arm) rather than resolving to one read, so
+        // it is handled here before the single-artifact resolve below. The baton half
+        // is already polled into `growlight_runtime_baton`; only the protocol half
+        // needs a per-select keeperd read.
+        if row.kind == BacklogKind::InjectedContext {
+            if self.growlight_preview_path.as_deref() == Some(INJECTED_CONTEXT_SLOT) {
+                return; // already showing / fetching; the UI re-assembles live each frame
+            }
+            self.growlight_preview_path = Some(INJECTED_CONTEXT_SLOT.to_string());
+            self.growlight_preview_title = row.label.clone();
+            self.growlight_preview.clear();
+            self.preview_scroll = 0;
+            // Protocol half THROUGH the resolver (garden arm) — the SINGLE-AGENT
+            // template the SessionStart hook injects, NOT protocol-fleet.md. Fire the
+            // keeperd read; the baton half needs no round-trip (already polled).
+            if let Some(GrowlightRead::Garden { path }) =
+                self.growlight_source.resolve(&GrowlightArtifact::LoopContext {
+                    path: INJECTED_PROTOCOL_PATH.to_string(),
+                })
+            {
+                ipc.send(
+                    "read_file",
+                    json!({ "path": path }),
+                    Tag::GrowlightInjectedProtocol,
+                );
+            }
+            return;
+        }
+        let artifact = match row.kind {
+            BacklogKind::Milestone => GrowlightArtifact::Milestone {
+                id: row.item_id.clone(),
+            },
+            BacklogKind::Task => GrowlightArtifact::Task {
+                id: row.item_id.clone(),
+            },
+            BacklogKind::Slice => match &row.path {
+                Some(p) => GrowlightArtifact::Slice { path: p.clone() },
+                None => return,
+            },
+            BacklogKind::LoopContext => match &row.path {
+                Some(p) => GrowlightArtifact::LoopContext { path: p.clone() },
+                None => return,
+            },
+            BacklogKind::RuntimeBaton => GrowlightArtifact::RuntimeBaton,
+            BacklogKind::Bus => GrowlightArtifact::BusHistory,
+            BacklogKind::InjectedContext => return, // handled above
+        };
+        match self.growlight_source.resolve(&artifact) {
+            // An in-garden node → a keeperd `read_file`, refined on reply.
+            Some(GrowlightRead::Garden { path }) => {
+                if self.growlight_preview_path.as_deref() == Some(path.as_str()) {
+                    return; // already showing / fetching this node
+                }
+                // A slice node carries (milestone, num) so the reply can refine its
+                // derived status to awaiting-smoke from the loaded body.
+                let slice = match row.kind {
+                    BacklogKind::Slice => {
+                        row.slice_num.clone().map(|num| (row.item_id.clone(), num))
+                    }
+                    _ => None,
+                };
+                self.growlight_preview_path = Some(path.clone());
+                self.growlight_preview_title = row.label.clone();
+                self.preview_scroll = 0;
+                ipc.send(
+                    "read_file",
+                    json!({ "path": path }),
+                    Tag::GrowlightNodeFile { path, slice },
+                );
+            }
+            // The out-of-garden runtime baton → NO keeperd read: the detail pane
+            // renders it LIVE from the polled `growlight_runtime_baton` (fed by the
+            // growlightd `baton` verb on the fleet cadence). Mark the preview slot
+            // with a sentinel so a stale garden body doesn't linger and a re-select
+            // is a no-op, and reset the shared scroll on (re)select.
+            Some(GrowlightRead::Growlightd { .. }) => {
+                if self.growlight_preview_path.as_deref() == Some(RUNTIME_BATON_SLOT) {
+                    return;
+                }
+                self.growlight_preview_path = Some(RUNTIME_BATON_SLOT.to_string());
+                self.growlight_preview_title = row.label.clone();
+                self.growlight_preview.clear();
+                self.preview_scroll = 0;
+            }
+            // The bus is a keeperd read but a bespoke `tail_bus` verb, eagerly loaded
+            // into `growlight_bus` (not per-select) — so, like the runtime baton, NO
+            // keeperd `read_file` on select: the detail pane renders the parsed rows
+            // straight from `growlight_bus`. Mark the slot with a sentinel so a stale
+            // garden body doesn't linger and a re-select is a no-op; reset scroll.
+            Some(GrowlightRead::Bus) => {
+                if self.growlight_preview_path.as_deref() == Some(BUS_SLOT) {
+                    return;
+                }
+                self.growlight_preview_path = Some(BUS_SLOT.to_string());
+                self.growlight_preview_title = row.label.clone();
+                self.growlight_preview.clear();
+                self.preview_scroll = 0;
+            }
+            // e.g. a task whose dir listing hasn't landed — retry on the listing.
+            None => {}
+        }
     }
 
     fn hint_growlight_readonly(&mut self) {
-        self.status = "growlight is a read-only view (queue · active item · latest baton)".into();
+        self.status = "growlight is a read-only browser (backlog · slices · loop context)".into();
     }
 
     // ---- reply handling ----
@@ -804,10 +1141,94 @@ impl App {
             },
             Tag::GrowlightQueue => match reply.result {
                 Ok(v) => match serde_json::from_value::<GrowlightQueueReply>(v) {
-                    Ok(r) => self.growlight.set_items(r.rows),
+                    Ok(r) => {
+                        self.growlight.set_items(r.rows);
+                        self.rebuild_growlight_tree();
+                        self.refresh_growlight_selection(ipc);
+                    }
                     Err(e) => self.status = format!("growlight queue: malformed reply: {e}"),
                 },
                 Err((_, m)) => self.status = format!("growlight queue: {m}"),
+            },
+            Tag::GrowlightMilestones => match reply.result {
+                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                    Ok(r) => {
+                        self.growlight_milestone_ids = r
+                            .entries
+                            .iter()
+                            .filter(|e| e.is_dir)
+                            .map(|e| e.name.clone())
+                            .collect();
+                        self.rebuild_growlight_tree();
+                        self.refresh_growlight_selection(ipc);
+                    }
+                    Err(e) => self.status = format!("growlight milestones: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight milestones: {m}"),
+            },
+            Tag::GrowlightTasks => match reply.result {
+                Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                    Ok(r) => {
+                        // Seed the resolver's bare-`NNN` → file map, then retry the
+                        // selection read (a task selected before this landed had
+                        // no resolvable path).
+                        self.growlight_source.set_task_paths(&r.entries);
+                        self.refresh_growlight_selection(ipc);
+                    }
+                    Err(e) => self.status = format!("growlight tasks: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight tasks: {m}"),
+            },
+            Tag::GrowlightSliceIndex { milestone } => match reply.result {
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => {
+                        let dir = format!("growlight/backlog/milestones/{milestone}");
+                        let children = parse_slice_index(&r.content)
+                            .into_iter()
+                            .map(|s| {
+                                // The file-derived base status: a reviewed slice
+                                // reads as done, an unreviewed one queued (`body`
+                                // for awaiting-smoke arrives via the right-pane read
+                                // on select — `refine_slice_status`). `active` is a
+                                // live overlay applied by the tree from the polled
+                                // baton (`apply_active_slice`), not baked in here.
+                                let status = derive_slice_status(s.reviewed.as_deref(), None);
+                                SliceChild {
+                                    path: format!("{dir}/{}", s.path),
+                                    num: s.num,
+                                    title: s.title,
+                                    reviewed: s.reviewed,
+                                    status,
+                                }
+                            })
+                            .collect();
+                        self.growlight_tree.set_slices(&milestone, children);
+                        // Slices just appeared under the selection — read the one
+                        // now selected (if selection shifted onto a slice).
+                        self.refresh_growlight_selection(ipc);
+                    }
+                    Err(e) => {
+                        self.status = format!("growlight milestone {milestone}: malformed reply: {e}")
+                    }
+                },
+                Err((_, m)) => self.status = format!("growlight milestone {milestone}: {m}"),
+            },
+            Tag::GrowlightNodeFile { path, slice } => match reply.result {
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => {
+                        // Drop a stale reply: the user navigated to another node
+                        // while this read was in flight.
+                        if self.growlight_preview_path.as_deref() == Some(path.as_str()) {
+                            if let Some((milestone, num)) = &slice {
+                                self.growlight_tree
+                                    .refine_slice_status(milestone, num, &r.content);
+                            }
+                            self.growlight_preview = r.content;
+                        }
+                    }
+                    Err(e) => self.status = format!("growlight node {path}: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight node {path}: {m}"),
             },
             Tag::GrowlightBatonList => match reply.result {
                 Ok(v) => match serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
@@ -834,6 +1255,63 @@ impl App {
                     Err(e) => self.status = format!("growlight baton: malformed reply: {e}"),
                 },
                 Err((_, m)) => self.status = format!("growlight baton: {m}"),
+            },
+            Tag::FleetStatus => match reply.result {
+                // Live process-state → the header. A version-skewed / malformed
+                // reply degrades to the dim line rather than a splat.
+                Ok(v) => {
+                    self.fleet = match serde_json::from_value::<FleetStatusReply>(v) {
+                        Ok(reply) => FleetHeader::Live(reply),
+                        Err(_) => FleetHeader::Unreachable,
+                    };
+                }
+                // Soft-fail (load-bearing): growlightd down / disarmed → the
+                // connect errors on the worker. One dim header line — deliberately
+                // NEVER `self.status` (no status splat) and never touching the
+                // garden-sourced tree/preview, so the page keeps working.
+                Err(_) => self.fleet = FleetHeader::Unreachable,
+            },
+            Tag::GrowlightRuntimeBaton => {
+                match reply.result {
+                    // Live runtime baton → the header baton-headline + the live-baton
+                    // node. Decode into `Some` (even an empty baton is a valid answer);
+                    // a malformed reply is treated like unreachable (`None`).
+                    Ok(v) => {
+                        self.growlight_runtime_baton = serde_json::from_value::<BatonReply>(v).ok()
+                    }
+                    // Soft-fail (load-bearing), same discipline as `FleetStatus`:
+                    // growlightd down/disarmed → `None`, so the header falls back to the
+                    // garden baton-LOG headline. Never `self.status` (no splat), never
+                    // touches the garden-sourced tree/preview.
+                    Err(_) => self.growlight_runtime_baton = None,
+                }
+                // The baton just changed → refresh which slice the tree paints `active`.
+                self.apply_active_slice();
+            }
+            Tag::GrowlightBus => match reply.result {
+                // The coordination-bus history → parsed newest-first into rows. A
+                // keeperd garden read like the rest of the page, so an error goes to
+                // `self.status` (not a soft-fail to a dim line — that discipline is
+                // only for the growlightd-sourced header/baton).
+                Ok(v) => match serde_json::from_value::<TailBusReply>(v) {
+                    Ok(r) => self.growlight_bus = bus_rows(&r.messages),
+                    Err(e) => self.status = format!("growlight bus: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("growlight bus: {m}"),
+            },
+            Tag::GrowlightInjectedProtocol => match reply.result {
+                // The protocol half of the injected-context node — a keeperd garden
+                // read (`growlight/protocol.md`). Cache it; the detail pane assembles
+                // it with the polled runtime baton at render time. A keeperd read
+                // like the rest of the page, so an error goes to `self.status` (the
+                // baton half soft-fails to a placeholder on its own).
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => self.growlight_injected_protocol = Some(r.content),
+                    Err(e) => {
+                        self.status = format!("growlight injected-context: malformed reply: {e}")
+                    }
+                },
+                Err((_, m)) => self.status = format!("growlight injected-context: {m}"),
             },
         }
     }
@@ -926,6 +1404,10 @@ impl App {
             // otherwise, so `7` is inert on a garden without growlight.
             KeyCode::Char('7') if self.growlight_enabled == Some(true) => {
                 self.view = View::Growlight;
+                // The right-pane body reuses the shared `preview_scroll` (also
+                // driven by Browse/History), so reset it on entry — the node
+                // viewer always opens at the top, never at another view's offset.
+                self.preview_scroll = 0;
                 if (!self.growlight.loaded || self.growlight_stale) && !self.locked {
                     self.growlight_stale = false;
                     self.load_growlight(ipc);
@@ -941,10 +1423,10 @@ impl App {
             KeyCode::Char('F') if self.view == View::Deploy => self.start_force_apply(),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
-            KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
+            KeyCode::Up | KeyCode::Char('k') => self.nav_up(ipc),
             KeyCode::Down | KeyCode::Char('j') => self.nav_down(ipc),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.activate(ipc),
-            KeyCode::Left | KeyCode::Char('h') => self.collapse_selected(),
+            KeyCode::Left | KeyCode::Char('h') => self.collapse_selected(ipc),
             KeyCode::PageDown => self.scroll_preview(self.preview_viewport.max(1) as i32),
             KeyCode::PageUp => self.scroll_preview(-(self.preview_viewport.max(1) as i32)),
             KeyCode::Char('g') => self.preview_to_top(),
@@ -984,7 +1466,7 @@ impl App {
         self.preview_scroll = self.preview_max_scroll();
     }
 
-    fn nav_up(&mut self) {
+    fn nav_up(&mut self, ipc: &mut IpcClient) {
         match self.view {
             View::Browse => self.tree.move_up(),
             View::History => {
@@ -994,11 +1476,14 @@ impl App {
             View::Peers => self.peer_list.up(),
             View::Backup => self.backup.up(),
             View::Deploy => self.deploy.up(),
-            View::Growlight => self.growlight.up(),
+            View::Growlight => {
+                self.growlight_tree.move_up();
+                self.refresh_growlight_selection(ipc);
+            }
         }
     }
 
-    fn nav_down(&mut self, _ipc: &mut IpcClient) {
+    fn nav_down(&mut self, ipc: &mut IpcClient) {
         match self.view {
             View::Browse => self.tree.move_down(),
             View::History => {
@@ -1010,7 +1495,10 @@ impl App {
             View::Peers => self.peer_list.down(),
             View::Backup => self.backup.down(),
             View::Deploy => self.deploy.down(),
-            View::Growlight => self.growlight.down(),
+            View::Growlight => {
+                self.growlight_tree.move_down();
+                self.refresh_growlight_selection(ipc);
+            }
         }
     }
 
@@ -1050,9 +1538,47 @@ impl App {
             // Deploy entries are read-only detail; apply is an explicit action
             // (a / F / palette), never a stray Enter.
             View::Deploy => self.hint_deploy_actions(),
-            // Growlight is a read-only glance — Enter is a no-op hint.
-            View::Growlight => self.hint_growlight_readonly(),
+            // Growlight is read-only: Enter/l toggles a milestone's slices
+            // (lazy-reading its CLAUDE.md on first expand); leaves just hint.
+            View::Growlight => self.activate_growlight(ipc),
         }
+    }
+
+    /// Toggle the selected milestone's slice children (lazy-load its slice index
+    /// on first expand); a task/slice/loop-context leaf is a read-only glance
+    /// (its body already shows in the right pane on select).
+    fn activate_growlight(&mut self, ipc: &mut IpcClient) {
+        let Some(row) = self.growlight_tree.selected_row() else {
+            return self.hint_growlight_readonly();
+        };
+        if !row.expandable {
+            return self.hint_growlight_readonly();
+        }
+        if self.growlight_tree.is_expanded(&row.item_id) {
+            self.growlight_tree.collapse(&row.item_id);
+        } else {
+            self.growlight_tree.expand(&row.item_id);
+            if !self.growlight_tree.is_loaded(&row.item_id) {
+                // Resolve the milestone doc's path through the same seam as the
+                // body reads (its slice index lives in that CLAUDE.md).
+                if let Some(GrowlightRead::Garden { path }) = self
+                    .growlight_source
+                    .resolve(&GrowlightArtifact::Milestone {
+                        id: row.item_id.clone(),
+                    })
+                {
+                    ipc.send(
+                        "read_file",
+                        json!({ "path": path }),
+                        Tag::GrowlightSliceIndex {
+                            milestone: row.item_id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        self.growlight_tree.clamp_selection();
+        self.refresh_growlight_selection(ipc);
     }
 
     fn hint_backup_actions(&mut self) {
@@ -1063,15 +1589,26 @@ impl App {
         };
     }
 
-    fn collapse_selected(&mut self) {
-        if self.view != View::Browse {
-            return;
-        }
-        if let Some(row) = self.tree.selected_row() {
-            if row.is_dir && self.tree.is_expanded(&row.path) {
-                self.tree.collapse(&row.path);
-                self.tree.clamp_selection();
+    fn collapse_selected(&mut self, ipc: &mut IpcClient) {
+        match self.view {
+            View::Browse => {
+                if let Some(row) = self.tree.selected_row() {
+                    if row.is_dir && self.tree.is_expanded(&row.path) {
+                        self.tree.collapse(&row.path);
+                        self.tree.clamp_selection();
+                    }
+                }
             }
+            View::Growlight => {
+                if let Some(row) = self.growlight_tree.selected_row() {
+                    if row.expandable && self.growlight_tree.is_expanded(&row.item_id) {
+                        self.growlight_tree.collapse(&row.item_id);
+                        self.growlight_tree.clamp_selection();
+                    }
+                }
+                self.refresh_growlight_selection(ipc);
+            }
+            _ => {}
         }
     }
 
@@ -1688,6 +2225,219 @@ fn vault_reveal_args(path: &str, master_password: &str, id: Option<&str>) -> Val
         args["id"] = json!(id);
     }
     args
+}
+
+/// The loop-context docs surfaced as browsable tree nodes (plain garden reads):
+/// the injected protocol templates, the session policy, and the pillar map. The
+/// injected protocol is exactly these files read verbatim by the SessionStart
+/// hook, so they resolve to ordinary keeperd reads. (The assembled
+/// injected-context view — protocol + the member's live baton — waits on slice
+/// 004's growlightd `baton` verb.)
+/// Sentinel value for `growlight_preview_path` while the live runtime-baton node
+/// is selected — a growlightd read, not a garden path, so it never collides with a
+/// real repo-relative path and keeps re-selects idempotent.
+const RUNTIME_BATON_SLOT: &str = "growlightd:runtime-baton";
+
+/// Sentinel value for `growlight_preview_path` while the bus-history node is
+/// selected — a keeperd `tail_bus` read rendered from `growlight_bus`, not a
+/// garden path, so it never collides with a real repo-relative path (slice 005).
+const BUS_SLOT: &str = "keeperd:bus-history";
+
+/// Sentinel value for `growlight_preview_path` while the injected-context node is
+/// selected (slice 006) — an ASSEMBLED view (protocol read + polled baton), not a
+/// single garden path, so it never collides with a real repo-relative path and
+/// keeps re-selects idempotent while the UI re-assembles live each frame.
+const INJECTED_CONTEXT_SLOT: &str = "assembled:injected-context";
+
+/// The garden path of the SINGLE-AGENT operating protocol — the protocol half of
+/// the injected-context node, resolved through the `GrowlightSource` garden arm
+/// (NOT `protocol-fleet.md`; that is the fleet-member variant). Matches the file
+/// the SessionStart `inject.sh` cats.
+const INJECTED_PROTOCOL_PATH: &str = "growlight/protocol.md";
+
+/// Assemble the injected boot context exactly as the SessionStart hook does: the
+/// operating protocol, then the runtime baton, wrapped in the two section headers
+/// `inject.sh` prints. Source of truth: `~/.config/softfig/growlight/inject.sh`
+/// (GENERATED, so it can't be sourced at runtime — the header strings + ordering
+/// are replicated here; keep them in sync). `baton` is `None`/blank when growlightd
+/// is unreachable or the runtime baton is unavailable → the baton section renders a
+/// calm placeholder (never blank, never an error). A present baton is embedded raw
+/// (frontmatter and all), matching `cat baton.md`. Pure — no IO — so the
+/// protocol+baton → combined-text mapping is unit-testable.
+pub fn assemble_injected_context(protocol: &str, baton: Option<&str>) -> String {
+    // The two headers `inject.sh` emits around protocol.md and baton.md (verified
+    // 2026-07-14, inject.sh lines 6/8): `printf '=== … OPERATING PROTOCOL ===\n\n'`
+    // <protocol> `printf '\n\n=== CURRENT BATON … ===\n\n'` <baton>.
+    const PROTOCOL_HEADER: &str = "=== SOFT-FIG GROWLIGHT · OPERATING PROTOCOL ===";
+    const BATON_HEADER: &str = "=== CURRENT BATON (your only carried state) ===";
+    const NO_BATON: &str = "(live baton unavailable at boot-preview)";
+    let baton_section = match baton {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => NO_BATON,
+    };
+    format!("{PROTOCOL_HEADER}\n\n{protocol}\n\n{BATON_HEADER}\n\n{baton_section}")
+}
+
+fn loop_context_nodes() -> Vec<LoopContextNode> {
+    [
+        ("protocol.md", "growlight/protocol.md"),
+        ("protocol-fleet.md", "growlight/protocol-fleet.md"),
+        ("session-policy.md", "growlight/session-policy.md"),
+        ("CLAUDE.md (pillar)", "growlight/CLAUDE.md"),
+    ]
+    .into_iter()
+    .map(|(label, path)| LoopContextNode {
+        label: label.into(),
+        path: path.into(),
+    })
+    .collect()
+}
+
+/// The first meaningful line of a baton (its headline) for the fleet-header
+/// strip: the first non-empty line after an optional leading `--- … ---` YAML
+/// frontmatter block. `None` for an empty/blank baton.
+pub fn baton_headline(body: &str) -> Option<&str> {
+    let mut lines = body.lines().peekable();
+    if lines.peek().map(|l| l.trim_end()) == Some("---") {
+        lines.next();
+        for l in lines.by_ref() {
+            if l.trim_end() == "---" {
+                break;
+            }
+        }
+    }
+    lines.map(str::trim).find(|l| !l.is_empty())
+}
+
+/// The body of a baton with any leading `--- … ---` YAML frontmatter block
+/// stripped — the useful part (`# NEXT ACTION`, …) shown under the compact head in
+/// the live-baton viewer. Returns the whole text when there is no (or an
+/// unterminated) frontmatter block; an empty string for a frontmatter-only baton.
+pub fn strip_frontmatter(text: &str) -> &str {
+    let Some(after_open) = text.strip_prefix("---\n") else {
+        return text; // no leading frontmatter fence
+    };
+    match after_open.split_once("\n---\n") {
+        // Drop the blank line that conventionally follows the closing fence, so
+        // the body starts at its first real line (matches `baton_headline`).
+        Some((_frontmatter, body)) => body.trim_start_matches('\n'),
+        // No `---` fence followed by a body: either frontmatter-only (fence at EOF)
+        // or an unterminated block.
+        None => match after_open.strip_suffix("\n---") {
+            Some(_) => "",   // frontmatter only, no body
+            None => text,    // unterminated fence — show the raw text
+        },
+    }
+}
+
+/// Parse the flat `key: value` pairs from a baton's leading `--- … ---` YAML
+/// frontmatter block (the baton frontmatter is flat scalars — no nested YAML).
+/// Empty when there is no frontmatter. Pure.
+fn frontmatter_fields(text: &str) -> Vec<(String, String)> {
+    let Some(after_open) = text.strip_prefix("---\n") else {
+        return Vec::new();
+    };
+    // The block is everything up to the next `---` fence line (or EOF fence).
+    let block = match after_open.split_once("\n---") {
+        Some((fm, _)) => fm,
+        None => return Vec::new(), // unterminated — treat as no frontmatter
+    };
+    block
+        .lines()
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The `(item, slice)` the live runtime baton is **actively working**, from its
+/// `item` and `slice` frontmatter — but only while `status: IN_PROGRESS`, the sole
+/// within-item state (a boundary / queue-empty / halted / idle baton has no active
+/// slice, so a deferred or finished item never paints a slice `active`). Feeds the
+/// tree's live `active` overlay. `None` if not in progress or either field is
+/// missing/blank. Pure — no IO.
+fn baton_active_slice(text: &str) -> Option<(String, String)> {
+    let fm = frontmatter_fields(text);
+    let get = |k: &str| {
+        fm.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+    if get("status") != Some("IN_PROGRESS") {
+        return None;
+    }
+    Some((get("item")?.to_string(), get("slice")?.to_string()))
+}
+
+/// A compact one-line head for the live runtime baton, parsed from its YAML
+/// frontmatter (`item` / `slice` / `iteration` / `status` + the ctx & 5h budget
+/// %s) — what the loop is on right now, shown above the baton body and in the
+/// fleet header. Missing fields are omitted; a baton with no frontmatter (or none
+/// of these keys) yields an empty string, and the caller falls back to a headline.
+pub fn runtime_baton_head(text: &str) -> String {
+    let fm = frontmatter_fields(text);
+    let get = |k: &str| {
+        fm.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(item) = get("item") {
+        parts.push(format!("item {item}"));
+    }
+    if let Some(slice) = get("slice") {
+        parts.push(format!("slice {slice}"));
+    }
+    if let Some(iter) = get("iteration") {
+        parts.push(format!("iter {iter}"));
+    }
+    if let Some(status) = get("status") {
+        parts.push(status.to_string());
+    }
+    if let Some(ctx) = get("ctx_pct") {
+        parts.push(format!("ctx {ctx}%"));
+    }
+    if let Some(h5) = get("session_5h_pct") {
+        parts.push(format!("5h {h5}%"));
+    }
+    parts.join(" · ")
+}
+
+/// One coordination-bus message flattened for the read-only history pane (slice
+/// 005): the wire `from`/`to`/`kind`/`body`, plus a derived `is_alert` so the
+/// renderer can style `kind == "alert"` rows loud without re-parsing the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusRow {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub body: String,
+    pub is_alert: bool,
+}
+
+/// Parse a `tail_bus` reply's messages into history rows, **newest first**. The
+/// wire messages arrive in ascending total order (oldest first), so this reverses
+/// them: the most recent coordination shows at the top of the pane. Pure — no IO
+/// — so ordering + the alert flag are unit-testable over a fixture.
+pub fn bus_rows(messages: &[ChatMessage]) -> Vec<BusRow> {
+    messages
+        .iter()
+        .rev()
+        .map(|m| BusRow {
+            from: m.from.clone(),
+            to: m.to.clone(),
+            kind: m.kind.clone(),
+            body: m.body.clone(),
+            is_alert: m.kind == "alert",
+        })
+        .collect()
 }
 
 /// The highest-numbered `NNN-*.md` baton-log entry (the latest handoff) from a
@@ -2916,5 +3666,887 @@ mod tests {
             Some("103-tui-modernize-003.md")
         );
         assert!(app.growlight_baton.unwrap().contains("shipped slice 003"));
+    }
+
+    #[test]
+    fn growlight_tree_classifies_expands_and_maps_selection() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+
+        // The authoritative milestone set is the dir listing — a milestone
+        // subdir + a stray non-dir entry the classifier must ignore.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightMilestones,
+                result: Ok(json!({
+                    "entries": [
+                        tree_entry("my-milestone", "growlight/backlog/milestones/my-milestone", true),
+                        tree_entry("CLAUDE.md", "growlight/backlog/milestones/CLAUDE.md", false),
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        // The queue: one milestone (in the set) + one task (not).
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [
+                        { "id": "my-milestone", "title": "A milestone", "status": "deferred" },
+                        { "id": "042", "title": "A task", "status": "queued" },
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+
+        let vis = app.growlight_tree.visible();
+        // 2 backlog rows + the 4 static loop-context nodes + the live-baton node +
+        // the bus-history node + the assembled injected-context node, all seeded on
+        // rebuild.
+        assert_eq!(vis.len(), 9);
+        assert!(vis[0].expandable, "milestone row expands");
+        assert!(!vis[1].expandable, "task row is a leaf");
+        assert_eq!(vis[2].kind, BacklogKind::LoopContext, "loop-context follows the backlog");
+        assert_eq!(
+            vis[6].kind,
+            BacklogKind::RuntimeBaton,
+            "the live runtime-baton node precedes the bus",
+        );
+        assert_eq!(
+            vis[7].kind,
+            BacklogKind::Bus,
+            "the bus-history node precedes the injected-context node",
+        );
+        assert_eq!(
+            vis[8].kind,
+            BacklogKind::InjectedContext,
+            "the assembled injected-context node closes the tree",
+        );
+
+        // Expand the milestone (Enter) — fires the lazy read_file (to the dead
+        // dummy worker; no reply), marks it expanded.
+        app.view = View::Growlight;
+        app.growlight_tree.selected = 0;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert!(app.growlight_tree.is_expanded("my-milestone"));
+
+        // Feed the milestone CLAUDE.md: one reviewed slice (→ done) + one blank
+        // (→ queued).
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightSliceIndex {
+                    milestone: "my-milestone".into(),
+                },
+                result: Ok(json!({
+                    "path": "growlight/backlog/milestones/my-milestone/CLAUDE.md",
+                    "content": "<!-- softfig:index slices -->\n\
+                                | # | Note | Reviewed |\n\
+                                |---|------|----------|\n\
+                                | 001 | [first](slices/001-first.md) | 2026-07-14 |\n\
+                                | 002 | [second](slices/002-second.md) |  |\n\
+                                <!-- /softfig:index slices -->\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+
+        let vis = app.growlight_tree.visible();
+        // milestone + 2 slices + task + 4 loop-context + baton + bus + injected-context.
+        assert_eq!(
+            vis.len(),
+            11,
+            "milestone + 2 slices + task + loop-context + baton + bus + injected-context"
+        );
+        assert_eq!(vis[1].depth, 1);
+        assert_eq!(vis[1].label, "001 first");
+        assert_eq!(vis[1].status, "done", "reviewed slice → done");
+        assert_eq!(vis[2].status, "queued", "blank-reviewed slice → queued");
+        assert_eq!(
+            vis[1].path.as_deref(),
+            Some("growlight/backlog/milestones/my-milestone/slices/001-first.md")
+        );
+
+        // Selecting a slice maps the right-pane row back to its parent milestone.
+        app.growlight_tree.selected = 1;
+        assert_eq!(
+            app.selected_growlight_row().map(|r| r.id.as_str()),
+            Some("my-milestone")
+        );
+    }
+
+    /// A small queue-only tree (one task + the loop-context section).
+    fn seed_growlight_tree(app: &mut App, ipc: &mut IpcClient) {
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [ { "id": "042", "title": "a task", "status": "queued" } ],
+                })),
+            },
+            ipc,
+        );
+    }
+
+    #[test]
+    fn selecting_a_loop_context_node_targets_its_garden_path_and_resets_scroll() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+
+        app.view = View::Growlight;
+        app.preview_scroll = 25; // a leftover offset from another view
+                                 // tree = [task, protocol.md, protocol-fleet.md, session-policy.md, pillar]
+        app.growlight_tree.selected = 1; // first loop-context node
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(
+            app.growlight_preview_path.as_deref(),
+            Some("growlight/protocol.md")
+        );
+        assert_eq!(app.preview_scroll, 0, "a new node resets the shared scroll");
+    }
+
+    #[test]
+    fn growlight_node_file_reply_populates_preview_and_drops_stale() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+        app.growlight_tree.selected = 1; // protocol.md loop-context node
+        app.refresh_growlight_selection(&mut ipc);
+
+        // The matching reply lands → the body shows in the right pane.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightNodeFile {
+                    path: "growlight/protocol.md".into(),
+                    slice: None,
+                },
+                result: Ok(json!({
+                    "path": "growlight/protocol.md",
+                    "content": "# operating protocol\nboot the baton",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight_preview.contains("operating protocol"));
+
+        // A reply for a node we already navigated away from is ignored.
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightNodeFile {
+                    path: "growlight/protocol-fleet.md".into(),
+                    slice: None,
+                },
+                result: Ok(json!({
+                    "path": "growlight/protocol-fleet.md",
+                    "content": "stale fleet body",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(
+            !app.growlight_preview.contains("stale fleet body"),
+            "a stale in-flight reply must not overwrite the current node"
+        );
+    }
+
+    #[test]
+    fn slice_node_read_lights_up_awaiting_smoke() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightMilestones,
+                result: Ok(json!({
+                    "entries": [
+                        tree_entry("m", "growlight/backlog/milestones/m", true),
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [ { "id": "m", "title": "milestone m", "status": "deferred" } ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.growlight_tree.expand("m");
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightSliceIndex { milestone: "m".into() },
+                result: Ok(json!({
+                    "path": "growlight/backlog/milestones/m/CLAUDE.md",
+                    "content": "<!-- softfig:index slices -->\n\
+                                | # | Note | Reviewed |\n\
+                                |---|------|----------|\n\
+                                | 001 | [first](slices/001-first.md) | 2026-07-14 |\n\
+                                <!-- /softfig:index slices -->\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        // A reviewed slice with no loaded body reads as done.
+        assert_eq!(app.growlight_tree.visible()[1].status, "done");
+
+        // Select the slice, then its body arrives carrying a Deferred
+        // verification section → the derived status refines to awaiting-smoke.
+        app.view = View::Growlight;
+        app.growlight_tree.selected = 1;
+        app.refresh_growlight_selection(&mut ipc);
+        let slice_path = "growlight/backlog/milestones/m/slices/001-first.md";
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(slice_path));
+        app.apply_reply(
+            Reply {
+                id: 4,
+                tag: Tag::GrowlightNodeFile {
+                    path: slice_path.into(),
+                    slice: Some(("m".into(), "001".into())),
+                },
+                result: Ok(json!({
+                    "path": slice_path,
+                    "content": "## Finish criteria\n...\n## Deferred verification\nrun on-device",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_tree.visible()[1].status, "awaiting-smoke");
+    }
+
+    #[test]
+    fn baton_headline_skips_frontmatter() {
+        assert_eq!(
+            baton_headline("---\nloop: x\nstatus: IN_PROGRESS\n---\n\n# NEXT ACTION\ngo"),
+            Some("# NEXT ACTION")
+        );
+        assert_eq!(baton_headline("just a line\nmore"), Some("just a line"));
+        assert_eq!(baton_headline("\n\n   \n"), None);
+    }
+
+    // ---- slice 003: live fleet header (growlightd status poll) ----
+
+    /// A scripted growlightd `status` reply decodes into the live header.
+    #[test]
+    fn fleet_status_reply_decodes_into_live_header() {
+        let mut app = App::new();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                result: Ok(json!({
+                    "state": "running",
+                    "garden_root": "/g",
+                    "protocol_version": 1,
+                    "policy": {
+                        "max_concurrent_agents": 2,
+                        "ctx_roll_pct": 50,
+                        "ctx_handoff_pct": 60,
+                        "session_5h_halt_pct": 85,
+                        "session_7d_halt_pct": 90
+                    },
+                    "fleet_enabled": true,
+                    "paused": false,
+                    "agents": [{ "id": "a", "status": "running" }],
+                    "roster": [{ "agent": "a" }]
+                })),
+            },
+            &mut ipc,
+        );
+        match &app.fleet {
+            FleetHeader::Live(s) => {
+                assert!(s.fleet_enabled);
+                assert!(!s.paused);
+                assert_eq!(s.agents.len(), 1);
+                assert_eq!(s.agents[0].id, "a");
+                assert_eq!(s.policy.max_concurrent_agents, 2);
+            }
+            other => panic!("expected a live header, got {other:?}"),
+        }
+    }
+
+    /// The header poll is view-gated: it fires ONLY while the Growlight tab is
+    /// the active, enabled view — never from another tab, never before the
+    /// enablement gate is known.
+    #[test]
+    fn fleet_poll_gated_to_active_enabled_growlight_view() {
+        let mut app = App::new();
+        // Default view is Browse, gate unknown → no poll.
+        assert!(!app.should_poll_fleet());
+
+        // Growlight view but gate not yet known → still no poll.
+        app.view = View::Growlight;
+        assert!(!app.should_poll_fleet());
+
+        // Growlight view + enabled → poll.
+        app.growlight_enabled = Some(true);
+        assert!(app.should_poll_fleet());
+
+        // Enabled but the user is on another tab → no poll (don't hammer growlightd).
+        app.view = View::Browse;
+        assert!(!app.should_poll_fleet());
+
+        // Explicitly disabled while on the (now-stranded) view → no poll.
+        app.view = View::Growlight;
+        app.growlight_enabled = Some(false);
+        assert!(!app.should_poll_fleet());
+    }
+
+    /// Soft-fail (load-bearing): an unreachable growlightd socket degrades the
+    /// header to `Unreachable` WITHOUT a status splat or disturbing the
+    /// garden-sourced tree/preview — the page keeps working.
+    #[test]
+    fn unreachable_growlightd_soft_fails_without_status_splat() {
+        let mut app = App::new();
+        // Seed some garden-sourced state + a prior live header.
+        app.status = "ready".into();
+        app.growlight_preview = "## Mission\nbody".into();
+        app.fleet = FleetHeader::Unknown;
+
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+
+        assert!(matches!(app.fleet, FleetHeader::Unreachable));
+        // No status splat: the footer status line is untouched.
+        assert_eq!(app.status, "ready");
+        // The garden-only body is untouched — the page still works.
+        assert_eq!(app.growlight_preview, "## Mission\nbody");
+    }
+
+    /// A version-skewed / malformed `Ok` reply also degrades to the dim line
+    /// rather than splatting an error.
+    #[test]
+    fn malformed_fleet_status_reply_degrades_to_unreachable() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::FleetStatus,
+                // Missing the required `policy` object → decode fails.
+                result: Ok(json!({ "state": "running", "garden_root": "/g", "protocol_version": 1 })),
+            },
+            &mut ipc,
+        );
+        assert!(matches!(app.fleet, FleetHeader::Unreachable));
+        assert_eq!(app.status, "ready", "malformed reply must not splat the status line");
+    }
+
+    // ---- slice 004: live runtime baton (growlightd `baton` verb) ----
+
+    const SAMPLE_BATON: &str = "---\n\
+        loop: soft-fig_garden\n\
+        status: IN_PROGRESS\n\
+        item: growlight-tui-detail-pane\n\
+        slice: 004\n\
+        iteration: 1\n\
+        ctx_pct: 16\n\
+        session_5h_pct: 7\n\
+        ---\n\n\
+        # NEXT ACTION\n\
+        do the thing";
+
+    #[test]
+    fn strip_frontmatter_returns_the_body_after_the_fence() {
+        assert_eq!(strip_frontmatter(SAMPLE_BATON), "# NEXT ACTION\ndo the thing");
+        // No frontmatter → the whole text passes through.
+        assert_eq!(strip_frontmatter("# just a doc\nbody"), "# just a doc\nbody");
+        // Frontmatter only, fence at EOF → empty body (no panic).
+        assert_eq!(strip_frontmatter("---\nk: v\n---"), "");
+        assert_eq!(strip_frontmatter("---\nk: v\n---\n"), "");
+        // Unterminated fence → raw text (never lose content).
+        assert_eq!(strip_frontmatter("---\nk: v\nmore"), "---\nk: v\nmore");
+    }
+
+    #[test]
+    fn runtime_baton_head_parses_the_compact_fields_in_order() {
+        assert_eq!(
+            runtime_baton_head(SAMPLE_BATON),
+            "item growlight-tui-detail-pane · slice 004 · iter 1 · IN_PROGRESS · ctx 16% · 5h 7%",
+        );
+        // A baton with no frontmatter yields an empty head (caller falls back).
+        assert_eq!(runtime_baton_head("# NEXT ACTION\ngo"), "");
+        // Only some fields present → only those, still in order.
+        assert_eq!(
+            runtime_baton_head("---\nstatus: STUCK\nitem: x\n---\nbody"),
+            "item x · STUCK",
+        );
+    }
+
+    #[test]
+    fn runtime_baton_view_renders_present_empty_and_absent() {
+        let mut app = App::new();
+        // Absent (growlightd unreachable) → a calm placeholder, never an error.
+        let (title, body) = app.runtime_baton_view();
+        assert!(title.starts_with("live runtime baton"));
+        assert!(body.contains("unavailable"), "absent baton reads as unavailable: {body}");
+
+        // Present + non-empty → compact head above the frontmatter-stripped body.
+        app.growlight_runtime_baton = Some(BatonReply {
+            agent: None,
+            path: "/x/baton.md".into(),
+            text: SAMPLE_BATON.into(),
+        });
+        let (title, body) = app.runtime_baton_view();
+        assert!(title.contains("/x/baton.md"), "the path is surfaced: {title}");
+        assert!(body.starts_with("item growlight-tui-detail-pane · slice 004"));
+        assert!(body.contains("# NEXT ACTION\ndo the thing"), "body follows the head");
+        assert!(!body.contains("loop: soft-fig_garden"), "frontmatter is stripped from the body");
+
+        // Present but empty (a real, seeded-but-blank baton) → its own placeholder.
+        app.growlight_runtime_baton = Some(BatonReply {
+            agent: None,
+            path: "/x/baton.md".into(),
+            text: "   \n".into(),
+        });
+        let (_title, body) = app.runtime_baton_view();
+        assert!(body.contains("empty"), "an empty baton reads as empty: {body}");
+    }
+
+    #[test]
+    fn runtime_baton_reply_decodes_into_some_and_soft_fails_to_none() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        app.growlight_preview = "## Mission\nbody".into();
+        let mut ipc = dummy_ipc();
+
+        // Ok → Some(reply).
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({ "path": "/x/baton.md", "text": SAMPLE_BATON })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_runtime_baton.as_ref().map(|b| b.path.as_str()),
+            Some("/x/baton.md"),
+        );
+
+        // Err → None (soft-fail), and NO status splat / no preview disturbance.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Err((softfig_ipc::ErrorKind::Io, "connect: no such file".into())),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight_runtime_baton.is_none(), "unreachable → None");
+        assert_eq!(app.status, "ready", "no status splat");
+        assert_eq!(app.growlight_preview, "## Mission\nbody", "garden preview untouched");
+
+        // A malformed Ok (missing `path`) also degrades to None, not a splat.
+        app.growlight_runtime_baton = Some(BatonReply::default());
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({ "text": "no path field" })),
+            },
+            &mut ipc,
+        );
+        assert!(app.growlight_runtime_baton.is_none(), "malformed → None");
+        assert_eq!(app.status, "ready");
+    }
+
+    #[test]
+    fn baton_active_slice_only_when_in_progress() {
+        // A within-item (IN_PROGRESS) baton yields its (item, slice).
+        assert_eq!(
+            baton_active_slice(SAMPLE_BATON),
+            Some(("growlight-tui-detail-pane".into(), "004".into())),
+        );
+        // A boundary/idle baton has no active slice — a deferred item must NOT paint.
+        let deferred = "---\nstatus: ITEM_DEFERRED\nitem: m\nslice: 006\n---\n# NEXT ACTION\nx";
+        assert_eq!(baton_active_slice(deferred), None);
+        // IN_PROGRESS but missing the slice field → None (nothing to point at).
+        let no_slice = "---\nstatus: IN_PROGRESS\nitem: m\n---\n# NEXT ACTION\nx";
+        assert_eq!(baton_active_slice(no_slice), None);
+        // No frontmatter at all → None.
+        assert_eq!(baton_active_slice("# NEXT ACTION\nx"), None);
+    }
+
+    #[test]
+    fn in_progress_baton_paints_its_slice_active_through_apply_reply() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        // A milestone with two loaded slices: 001 reviewed (done), 002 blank (queued).
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightMilestones,
+                result: Ok(json!({
+                    "entries": [
+                        tree_entry("m", "growlight/backlog/milestones/m", true),
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [ { "id": "m", "title": "A milestone", "status": "active" } ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.growlight_tree.expand("m");
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightSliceIndex { milestone: "m".into() },
+                result: Ok(json!({
+                    "path": "growlight/backlog/milestones/m/CLAUDE.md",
+                    "content": "<!-- softfig:index slices -->\n\
+                                | # | Note | Reviewed |\n\
+                                |---|------|----------|\n\
+                                | 001 | [a](slices/001-a.md) | 2026-07-14 |\n\
+                                | 002 | [b](slices/002-b.md) |  |\n\
+                                <!-- /softfig:index slices -->\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        // Baseline: no baton → the file-derived statuses show.
+        assert_eq!(app.growlight_tree.visible()[1].status, "done");
+        assert_eq!(app.growlight_tree.visible()[2].status, "queued");
+
+        // An IN_PROGRESS baton on m/002 → slice 002 overlays `active`; 001 unchanged.
+        app.apply_reply(
+            Reply {
+                id: 4,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({
+                    "path": "/x/baton.md",
+                    "text": "---\nstatus: IN_PROGRESS\nitem: m\nslice: 002\n---\n# NEXT ACTION\ngo",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_tree.visible()[1].status, "done", "001 stays done");
+        assert_eq!(app.growlight_tree.visible()[2].status, "active", "002 is the live slice");
+
+        // Baton moves to a boundary (deferred) → the overlay clears, base returns.
+        app.apply_reply(
+            Reply {
+                id: 5,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({
+                    "path": "/x/baton.md",
+                    "text": "---\nstatus: ITEM_DEFERRED\nitem: m\nslice: 002\n---\n# NEXT ACTION\ndone",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_tree.visible()[2].status, "queued", "deferred clears active");
+    }
+
+    #[test]
+    fn selecting_the_runtime_baton_node_marks_the_slot_without_a_keeperd_read() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+
+        // The tree = [task, 4 loop-context, live-baton, bus]; find + select the
+        // baton node (no longer the last row now the bus closes the tree).
+        let vis = app.growlight_tree.visible();
+        let baton_idx = vis
+            .iter()
+            .position(|r| r.kind == BacklogKind::RuntimeBaton)
+            .unwrap();
+        assert_eq!(vis[baton_idx].kind, BacklogKind::RuntimeBaton);
+        app.growlight_tree.selected = baton_idx;
+        app.preview_scroll = 25; // a leftover offset
+        app.growlight_preview = "stale garden body".into();
+
+        app.refresh_growlight_selection(&mut ipc);
+        // No keeperd `read_file` path — the sentinel marks the growlightd-sourced node.
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(RUNTIME_BATON_SLOT));
+        assert_eq!(app.preview_scroll, 0, "selecting the baton node resets scroll");
+        assert!(app.growlight_preview.is_empty(), "the stale garden body is cleared");
+
+        // Re-selecting the same node is an idempotent no-op (scroll not re-reset).
+        app.preview_scroll = 9;
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(app.preview_scroll, 9, "re-select does not reset scroll");
+    }
+
+    fn chat_msg(number: u32, from: &str, to: &str, kind: &str, body: &str) -> ChatMessage {
+        ChatMessage {
+            number,
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            body: body.into(),
+            ts: "2026-07-14T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn bus_rows_orders_newest_first_and_flags_alerts() {
+        // The wire order is ascending (oldest first); `bus_rows` reverses it.
+        let msgs = vec![
+            chat_msg(1, "a", "@all", "info", "first"),
+            chat_msg(2, "b", "@all", "alert", "wifi down"),
+            chat_msg(3, "a", "b", "info", "third"),
+        ];
+        let rows = bus_rows(&msgs);
+        assert_eq!(
+            rows.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            vec!["third", "wifi down", "first"],
+            "newest message first",
+        );
+        // Only the `alert`-kind row is flagged loud.
+        assert_eq!(
+            rows.iter().map(|r| r.is_alert).collect::<Vec<_>>(),
+            vec![false, true, false],
+        );
+        // Fields carry through verbatim (wire forms preserved).
+        assert_eq!(rows[1].from, "b");
+        assert_eq!(rows[1].to, "@all");
+        assert_eq!(rows[1].kind, "alert");
+    }
+
+    #[test]
+    fn selecting_the_bus_node_marks_the_slot_without_a_keeperd_read() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+
+        // Find + select the bus node (the injected-context node now closes the tree,
+        // so the bus is no longer the last row).
+        let vis = app.growlight_tree.visible();
+        let bus_idx = vis
+            .iter()
+            .position(|r| r.kind == BacklogKind::Bus)
+            .unwrap();
+        app.growlight_tree.selected = bus_idx;
+        app.preview_scroll = 25; // a leftover offset
+        app.growlight_preview = "stale garden body".into();
+
+        app.refresh_growlight_selection(&mut ipc);
+        // No keeperd `read_file` path — the sentinel marks the bus node (its rows
+        // are eagerly loaded into `growlight_bus`, rendered directly).
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(BUS_SLOT));
+        assert_eq!(app.preview_scroll, 0, "selecting the bus node resets scroll");
+        assert!(app.growlight_preview.is_empty(), "the stale garden body is cleared");
+
+        // Re-selecting the same node is an idempotent no-op (scroll not re-reset).
+        app.preview_scroll = 9;
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(app.preview_scroll, 9, "re-select does not reset scroll");
+    }
+
+    #[test]
+    fn growlight_bus_reply_parses_rows_and_reports_malformed() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        let mut ipc = dummy_ipc();
+
+        // Ok → parsed newest-first into `growlight_bus`.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightBus,
+                result: Ok(json!({
+                    "messages": [
+                        { "number": 1, "from": "a", "to": "@all", "kind": "info", "body": "old", "ts": "t" },
+                        { "number": 2, "from": "b", "to": "@all", "kind": "alert", "body": "new", "ts": "t" },
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_bus.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            vec!["new", "old"],
+            "newest first",
+        );
+        assert!(app.growlight_bus[0].is_alert);
+        assert_eq!(app.status, "ready", "a clean parse doesn't touch the status line");
+
+        // A malformed Ok surfaces on the status line (a keeperd read, not a soft-fail).
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightBus,
+                result: Ok(json!({ "messages": "not-an-array" })),
+            },
+            &mut ipc,
+        );
+        assert!(app.status.contains("growlight bus"), "malformed reply reported");
+
+        // An Err (e.g. keeperd hiccup) is reported too.
+        app.status = "ready".into();
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightBus,
+                result: Err((softfig_ipc::ErrorKind::Io, "boom".into())),
+            },
+            &mut ipc,
+        );
+        assert!(app.status.contains("growlight bus"), "err reported");
+    }
+
+    #[test]
+    fn assemble_injected_context_matches_boot_framing_and_handles_absent_baton() {
+        // Both halves present → protocol then baton, wrapped in the two inject.sh
+        // headers in boot order, the baton embedded verbatim (frontmatter and all).
+        let out = assemble_injected_context(
+            "PROTOCOL BODY",
+            Some("---\nstatus: IN_PROGRESS\n---\n# NEXT ACTION\ngo"),
+        );
+        assert_eq!(
+            out,
+            "=== SOFT-FIG GROWLIGHT · OPERATING PROTOCOL ===\n\nPROTOCOL BODY\n\n\
+             === CURRENT BATON (your only carried state) ===\n\n\
+             ---\nstatus: IN_PROGRESS\n---\n# NEXT ACTION\ngo",
+        );
+        // The protocol section precedes the baton section (boot order).
+        assert!(
+            out.find("OPERATING PROTOCOL") < out.find("CURRENT BATON"),
+            "protocol half comes before the baton half",
+        );
+
+        // Baton absent (growlightd down / no runtime baton) → the protocol half + a
+        // calm placeholder, never blank, no panic.
+        let none = assemble_injected_context("PROTOCOL BODY", None);
+        assert!(none.contains("PROTOCOL BODY"), "protocol half still present");
+        assert!(
+            none.contains("(live baton unavailable at boot-preview)"),
+            "absent baton renders the placeholder note",
+        );
+        // A blank baton is treated as absent too.
+        assert!(assemble_injected_context("P", Some("  \n  "))
+            .contains("(live baton unavailable at boot-preview)"));
+    }
+
+    #[test]
+    fn selecting_the_injected_context_node_fires_the_protocol_read_and_marks_the_slot() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+
+        // The injected-context node closes the tree (after the bus) — select it.
+        let vis = app.growlight_tree.visible();
+        let idx = vis
+            .iter()
+            .position(|r| r.kind == BacklogKind::InjectedContext)
+            .unwrap();
+        assert_eq!(idx, vis.len() - 1, "the injected-context node closes the tree");
+        app.growlight_tree.selected = idx;
+        app.preview_scroll = 25; // a leftover offset
+        app.growlight_preview = "stale garden body".into();
+
+        app.refresh_growlight_selection(&mut ipc);
+        // An assembled node: the sentinel marks the slot (the protocol read is fired
+        // to the dead dummy worker; the baton half comes from the polled reply).
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(INJECTED_CONTEXT_SLOT));
+        assert_eq!(app.preview_scroll, 0, "selecting the node resets scroll");
+        assert!(app.growlight_preview.is_empty(), "the stale garden body is cleared");
+
+        // Re-selecting the same node is an idempotent no-op (scroll not re-reset).
+        app.preview_scroll = 9;
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(app.preview_scroll, 9, "re-select does not reset scroll");
+    }
+
+    #[test]
+    fn injected_context_reply_caches_the_protocol_half_and_reports_malformed() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        let mut ipc = dummy_ipc();
+
+        // Ok → the protocol content is cached for the assembler.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightInjectedProtocol,
+                result: Ok(json!({
+                    "path": "growlight/protocol.md",
+                    "content": "PROTOCOL BODY",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_injected_protocol.as_deref(),
+            Some("PROTOCOL BODY")
+        );
+        assert_eq!(app.status, "ready", "a clean read doesn't touch the status line");
+
+        // The view assembles both halves: protocol cached, no baton → placeholder.
+        let (_title, body) = app.injected_context_view();
+        assert!(body.contains("PROTOCOL BODY"), "protocol half rendered");
+        assert!(body.contains("OPERATING PROTOCOL"), "boot framing present");
+        assert!(
+            body.contains("(live baton unavailable at boot-preview)"),
+            "baton soft-fails to the placeholder",
+        );
+
+        // A malformed Ok surfaces on the status line (a keeperd read, not a soft-fail).
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightInjectedProtocol,
+                result: Ok(json!({ "nope": true })),
+            },
+            &mut ipc,
+        );
+        assert!(
+            app.status.contains("injected-context"),
+            "malformed reply reported: {}",
+            app.status
+        );
     }
 }

@@ -49,11 +49,64 @@ pub enum Tag {
     /// growlight: the backlog queue as daemon-parsed structured rows
     /// (`growlight_queue`) — no client re-parse of the managed table.
     GrowlightQueue,
+    /// growlight: list `growlight/backlog/milestones` to classify which queue
+    /// rows are milestones (expandable in the backlog tree) vs task leaves —
+    /// the authoritative milestone set is the dir listing, not an id heuristic.
+    GrowlightMilestones,
+    /// growlight: list `growlight/backlog/tasks` so the `GrowlightSource`
+    /// resolver can map a task's bare `NNN` queue id → its `NNN-slug.md` file.
+    GrowlightTasks,
+    /// growlight: read a milestone `CLAUDE.md` (`read_file`) to populate its
+    /// slice-index children in the backlog tree (lazy, on first expand).
+    GrowlightSliceIndex { milestone: String },
+    /// growlight: read the selected tree node's markdown body for the right pane
+    /// (`read_file`), resolved through `GrowlightSource`. `slice` carries the
+    /// node's `(milestone_id, num)` when it is a slice, so the reply can refine
+    /// that slice's derived status (awaiting-smoke) from the loaded body.
+    GrowlightNodeFile {
+        path: String,
+        slice: Option<(String, String)>,
+    },
     /// growlight: list the baton-log dir (`list_tree growlight/baton-log`) to
     /// find the highest-numbered entry (the latest handoff).
     GrowlightBatonList,
     /// growlight: read the latest baton-log entry (`read_file <path>`).
     GrowlightBaton { path: String },
+    /// growlight: a one-shot growlightd `status` poll for the live fleet header
+    /// (slice 003). Rides the SECOND, growlightd-only [`IpcClient`] channel, not
+    /// the keeperd one — process-state is the one permanent growlightd read and
+    /// never migrates to the garden mount. `Ok` carries a
+    /// `softfig_ipc::growlightd::FleetStatusReply`; ANY `Err` (growlightd down /
+    /// fleet disarmed / a version-skew malformed reply) soft-fails to the
+    /// header's dim "unreachable" line — never a status splat, never blanking the
+    /// garden-only tree/body.
+    FleetStatus,
+    /// growlight: the LIVE runtime baton, polled on the SECOND (growlightd-only)
+    /// [`IpcClient`] channel via the `baton` verb (slice 004) — the loop's carried
+    /// state, which lives OUTSIDE the garden today. `Ok` carries a
+    /// `softfig_ipc::growlightd::BatonReply`; ANY `Err` (growlightd down / disarmed
+    /// / a malformed reply) soft-fails to `None` — the header then falls back to the
+    /// garden baton-LOG headline — never a status splat, never blanking the page.
+    /// Transitional: retires when the runtime is a mounted garden chain, when the
+    /// baton becomes a garden `read_file` like the other nodes (`## Forward-compat`).
+    GrowlightRuntimeBaton,
+    /// growlight: the coordination-bus history (slice 005), read via the keeperd
+    /// `tail_bus` verb on the FIRST (keeperd `ipc`) channel — the bus is GARDEN
+    /// state, like `GrowlightNodeFile`, NOT the growlightd channel (contrast
+    /// `FleetStatus`/`GrowlightRuntimeBaton`). Eagerly loaded on tab entry (and on
+    /// the stale-refresh path), not per-select. `Ok` carries a
+    /// `softfig_ipc::TailBusReply` (messages ascending); the app parses it into
+    /// newest-first rows. An `Err` surfaces on `self.status` like the other garden
+    /// reads — the page keeps working with growlightd down (keeper-sourced).
+    GrowlightBus,
+    /// growlight: the PROTOCOL half of the injected-context node (slice 006) — a
+    /// keeperd `read_file` of `growlight/protocol.md` (the SINGLE-AGENT template,
+    /// through the resolver's garden arm), fired on select. `Ok` carries a
+    /// `ReadFileReply`; the app stores its content in `growlight_injected_protocol`
+    /// and the detail pane assembles it with the polled runtime baton at render
+    /// time. An `Err` surfaces on `self.status` like the other garden reads (the
+    /// baton half soft-fails on its own).
+    GrowlightInjectedProtocol,
 }
 
 #[derive(Debug)]
