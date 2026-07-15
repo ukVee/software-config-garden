@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VaultError};
@@ -130,6 +132,43 @@ pub fn ensure_dirs(paths: &VaultPaths) -> Result<()> {
     fs::create_dir_all(&paths.root)?;
     fs::create_dir_all(paths.master_dir())?;
     Ok(())
+}
+
+/// Crash-atomic write with an explicit mode. Stage the bytes to a
+/// same-directory temp file, fsync them durable, chmod, then `rename` over the
+/// target — an atomic publish within one filesystem. A crash leaves either the
+/// prior file or an orphan `*.tmp.*` sibling, **never a torn target**, so a
+/// half-written sealed key can never wedge its id (a reader either decrypts the
+/// old bytes or sees the file absent). The caller owns creating `path`'s parent.
+pub(crate) fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let tmp = tmp_sibling(path);
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// A unique same-directory temp path for [`atomic_write_mode`]. Pid + nanotime
+/// suffix (matching `softfig-store`'s object writer) — no RNG dep for a name
+/// that only needs to avoid a concurrent-writer collision.
+fn tmp_sibling(target: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let name = format!(
+        "{}.tmp.{}.{}",
+        target.file_name().and_then(|s| s.to_str()).unwrap_or("key"),
+        std::process::id(),
+        nonce
+    );
+    target.with_file_name(name)
 }
 
 pub fn list_master_ids(paths: &VaultPaths) -> Result<Vec<u32>> {

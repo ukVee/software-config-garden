@@ -1,5 +1,7 @@
 //! In-memory unlocked state. Drop = K, M-store, identity zeroed.
 
+use std::os::unix::fs::PermissionsExt;
+
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::blob;
@@ -128,20 +130,46 @@ impl VaultSession {
     /// `key_id` is a one-way hash of `S`, so a mismatch means a caller bug or
     /// tampering, never a legitimate rotation (rotation derives a fresh
     /// `key_id`).
+    ///
+    /// M5d slice 008 — the write is **crash-atomic** (stage → fsync → rename)
+    /// and the idempotence check works off the *decrypted* material, not raw
+    /// sealed bytes: a torn or otherwise undecryptable file on disk (a crash
+    /// mid-write, bit-rot) is treated as **absent** and overwritten rather than
+    /// wedging the id forever behind a bogus "different material" refusal — the
+    /// correct `S` always re-stores. A file that *does* decrypt but to different
+    /// material is the real divergence and is still refused. Comparing decrypted
+    /// plaintext also makes the idempotent re-store survive a master rotation
+    /// (the blob embeds its own master id).
     pub fn store_shared_key(&self, key_id: &str, s: &[u8; 32]) -> Result<()> {
         validate_shared_key_id(key_id)?;
-        let sealed = blob::encrypt_blob(&self.masters, s)?;
         let path = self.paths.shared_key(key_id);
         if let Ok(existing) = std::fs::read(&path) {
-            if existing == sealed {
-                return Ok(()); // idempotent re-store
+            match blob::decrypt_blob(&self.masters, &existing) {
+                // Same material already sealed — nothing to do (idempotent).
+                Ok(plain) if plain.as_slice() == s.as_slice() => return Ok(()),
+                // Decodes, but to a *different* key: a caller bug or tampering,
+                // never a legitimate rotation. Refuse; leave the file untouched.
+                Ok(_) => {
+                    return Err(crate::error::VaultError::Malformed(
+                        "shared key id already stored with different key material",
+                    ));
+                }
+                // Undecryptable corpse (torn write / corruption) — never a
+                // legitimate stored key. Warn loudly, then fall through and
+                // overwrite it atomically so the id is never wedged.
+                Err(_) => {
+                    eprintln!(
+                        "softfig-vault: shared key {key_id} on disk is undecryptable \
+                         (truncated/corrupt); treating as absent and re-storing"
+                    );
+                }
             }
-            return Err(crate::error::VaultError::Malformed(
-                "shared key id already stored with different key material",
-            ));
         }
-        std::fs::create_dir_all(self.paths.shared_keys_dir())?;
-        std::fs::write(&path, &sealed)?;
+        let sealed = blob::encrypt_blob(&self.masters, s)?;
+        let dir = self.paths.shared_keys_dir();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        crate::storage::atomic_write_mode(&path, &sealed, 0o600)?;
         Ok(())
     }
 

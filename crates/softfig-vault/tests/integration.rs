@@ -634,6 +634,53 @@ fn shared_key_survives_relock_but_tamper_fails_closed() {
     }
 }
 
+/// M5d slice 008 — a torn/undecryptable `<key_id>.key` (a crash mid-write, or
+/// bit-rot) must NOT wedge the id: the correct `S` re-stores over the corpse
+/// instead of being refused forever as "different key material". Regression for
+/// the bare-`fs::write` + raw-byte idempotence-compare that made a truncated
+/// file permanent.
+#[test]
+fn torn_shared_key_file_is_recovered_not_wedged() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let path = tmp
+        .path()
+        .join(".softfig/vault/shared-keys")
+        .join(format!("{KEY_ID}.key"));
+
+    // Simulate a crash mid-write: a truncated blob that can never decrypt.
+    // (A bare file-presence probe like `has_shared_key` still sees the corpse;
+    // the honest "do I hold usable S" check is `load_shared_key`, which fails
+    // closed — that is the signal a recovery driver must key off, not presence.)
+    fs::create_dir_all(path.parent().unwrap()).expect("mkdir shared-keys");
+    fs::write(&path, b"\x01\x02torn").expect("write torn corpse");
+    assert!(session.load_shared_key(KEY_ID).is_err(), "corpse must not load");
+
+    // The correct S re-stores over the corpse — id not wedged — and reads back.
+    session
+        .store_shared_key(KEY_ID, &S_KEY)
+        .expect("re-store over torn file must succeed");
+    assert_eq!(*session.load_shared_key(KEY_ID).expect("load"), S_KEY);
+    assert!(session.has_shared_key(KEY_ID));
+}
+
+/// M5d slice 008 — the shared-keys store is the vault's first imported-key
+/// surface, so the directory is `0700` and each sealed key is `0600`.
+#[test]
+fn shared_key_store_has_private_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+
+    let dir = tmp.path().join(".softfig/vault/shared-keys");
+    let file = dir.join(format!("{KEY_ID}.key"));
+    let dir_mode = fs::metadata(&dir).expect("dir meta").permissions().mode() & 0o777;
+    let file_mode = fs::metadata(&file).expect("file meta").permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "shared-keys dir must be 0700");
+    assert_eq!(file_mode, 0o600, "sealed key must be 0600");
+}
+
 #[test]
 fn random_bytes32_returns_distinct_material() {
     // Smoke, not a statistical test: two draws differing proves the surface
