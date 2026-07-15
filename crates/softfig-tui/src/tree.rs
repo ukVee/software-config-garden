@@ -275,25 +275,21 @@ impl SliceStatus {
     }
 }
 
-/// Derive a slice's status:
-/// * `active` — it is the live baton's active slice (`is_active`, wired by the
-///   growlightd `baton` verb in slice 004);
+/// Derive a slice's **file-derived** status:
 /// * `awaiting-smoke` — reviewed **and** its file has a `## Deferred
 ///   verification` section (a manual smoke still owed);
 /// * `done` — reviewed, no pending smoke;
 /// * `queued` — not yet reviewed.
 ///
+/// The fourth status, `active` (the slice the live baton is working right now),
+/// is **not** derived here: it is a live overlay applied by [`BacklogTree::visible`]
+/// from [`BacklogTree::set_active`], because it moves as the loop advances and must
+/// not clobber the stored file-derived base status.
+///
 /// `body` is the slice file's contents when loaded (`None` until the right-pane
 /// viewer reads it in slice 002, so the awaiting-smoke refinement lights up
 /// then).
-pub fn derive_slice_status(
-    is_active: bool,
-    reviewed: Option<&str>,
-    body: Option<&str>,
-) -> SliceStatus {
-    if is_active {
-        return SliceStatus::Active;
-    }
+pub fn derive_slice_status(reviewed: Option<&str>, body: Option<&str>) -> SliceStatus {
     match reviewed {
         None => SliceStatus::Queued,
         Some(_) if matches!(body, Some(b) if b.contains("## Deferred verification")) => {
@@ -402,6 +398,12 @@ pub struct BacklogTree {
     /// Whether to emit the assembled injected-context node (protocol + live baton)
     /// last, after the bus node (slice 006).
     injected_context: bool,
+    /// The `(milestone_id, slice_num)` the live runtime baton is actively working
+    /// (`IN_PROGRESS` on it), overlaid as `active` by [`Self::visible`]. A live
+    /// pointer, not a stored status — it moves with the baton without re-deriving
+    /// the file-derived base status. `None` when the loop is idle/at a boundary or
+    /// growlightd is unreachable.
+    active: Option<(String, String)>,
     pub selected: usize,
 }
 
@@ -479,13 +481,28 @@ impl BacklogTree {
     /// right-pane read): re-derive so a reviewed slice carrying a `## Deferred
     /// verification` section lights up as awaiting-smoke. No-op if the milestone
     /// or slice isn't loaded.
-    pub fn refine_slice_status(&mut self, milestone: &str, num: &str, is_active: bool, body: &str) {
+    pub fn refine_slice_status(&mut self, milestone: &str, num: &str, body: &str) {
         if let Some(children) = self.slices.get_mut(milestone) {
             if let Some(child) = children.iter_mut().find(|c| c.num == num) {
-                child.status =
-                    derive_slice_status(is_active, child.reviewed.as_deref(), Some(body));
+                child.status = derive_slice_status(child.reviewed.as_deref(), Some(body));
             }
         }
+    }
+
+    /// Set the slice the live runtime baton is actively working (`(milestone_id,
+    /// slice_num)`), overlaid as `active` by [`Self::visible`]. `None` clears it
+    /// (loop idle / at an item boundary / baton unreachable). A live overlay — it
+    /// does not touch any stored `SliceChild::status`, so the file-derived base
+    /// status reappears the moment the baton moves off the slice.
+    pub fn set_active(&mut self, active: Option<(String, String)>) {
+        self.active = active;
+    }
+
+    /// Whether `(milestone, num)` is the live baton's active slice.
+    fn is_active_slice(&self, milestone: &str, num: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|(m, n)| m == milestone && n == num)
     }
 
     /// The currently-visible flattened rows: backlog items (with any expanded
@@ -514,12 +531,19 @@ impl BacklogTree {
             if expanded {
                 if let Some(children) = self.slices.get(&item.id) {
                     for s in children {
+                        // `active` is a live overlay from the baton pointer; every
+                        // other status is the stored file-derived one.
+                        let status = if self.is_active_slice(&item.id, &s.num) {
+                            SliceStatus::Active.as_str()
+                        } else {
+                            s.status.as_str()
+                        };
                         out.push(BacklogVisibleRow {
                             kind: BacklogKind::Slice,
                             key: format!("{}#{}", item.id, s.num),
                             item_id: item.id.clone(),
                             label: format!("{} {}", s.num, s.title),
-                            status: s.status.as_str().to_string(),
+                            status: status.to_string(),
                             depth: 1,
                             expandable: false,
                             expanded: false,
@@ -743,29 +767,24 @@ mod tests {
 
     #[test]
     fn derive_slice_status_each_state() {
-        // active wins regardless of the rest
-        assert_eq!(
-            derive_slice_status(true, Some("2026-07-14"), None),
-            SliceStatus::Active
-        );
         // reviewed + a Deferred verification section → awaiting-smoke
         let smoke = "## Finish criteria\n...\n## Deferred verification\nrun on-device";
         assert_eq!(
-            derive_slice_status(false, Some("2026-07-14"), Some(smoke)),
+            derive_slice_status(Some("2026-07-14"), Some(smoke)),
             SliceStatus::AwaitingSmoke
         );
         // reviewed, no pending smoke → done
         assert_eq!(
-            derive_slice_status(false, Some("2026-07-14"), Some("## Finish criteria\nall unit")),
+            derive_slice_status(Some("2026-07-14"), Some("## Finish criteria\nall unit")),
             SliceStatus::Done
         );
         // reviewed but body not yet loaded → done (no smoke signal)
         assert_eq!(
-            derive_slice_status(false, Some("2026-07-14"), None),
+            derive_slice_status(Some("2026-07-14"), None),
             SliceStatus::Done
         );
         // not reviewed → queued
-        assert_eq!(derive_slice_status(false, None, None), SliceStatus::Queued);
+        assert_eq!(derive_slice_status(None, None), SliceStatus::Queued);
     }
 
     fn milestone(id: &str, title: &str) -> BacklogItem {
@@ -975,14 +994,53 @@ mod tests {
             }],
         );
         // Its body arrives with a Deferred verification section → awaiting-smoke.
-        t.refine_slice_status("m", "001", false, "## Finish\n## Deferred verification\nsmoke");
+        t.refine_slice_status("m", "001", "## Finish\n## Deferred verification\nsmoke");
         assert_eq!(t.visible()[1].status, "awaiting-smoke");
         // A body without one keeps it done.
-        t.refine_slice_status("m", "001", false, "## Finish\nall unit-covered");
+        t.refine_slice_status("m", "001", "## Finish\nall unit-covered");
         assert_eq!(t.visible()[1].status, "done");
         // Unknown milestone/slice is a no-op (no panic).
-        t.refine_slice_status("nope", "001", false, "x");
-        t.refine_slice_status("m", "999", false, "x");
+        t.refine_slice_status("nope", "001", "x");
+        t.refine_slice_status("m", "999", "x");
+    }
+
+    #[test]
+    fn set_active_overlays_active_on_the_baton_slice_without_clobbering_base() {
+        let mut t = BacklogTree::new();
+        t.set_items(vec![milestone("m", "m")]);
+        t.expand("m");
+        t.set_slices(
+            "m",
+            vec![
+                SliceChild {
+                    num: "001".into(),
+                    title: "s1".into(),
+                    path: "growlight/backlog/milestones/m/slices/001.md".into(),
+                    reviewed: Some("2026-07-14".into()),
+                    status: SliceStatus::Done,
+                },
+                SliceChild {
+                    num: "002".into(),
+                    title: "s2".into(),
+                    path: "growlight/backlog/milestones/m/slices/002.md".into(),
+                    reviewed: None,
+                    status: SliceStatus::Queued,
+                },
+            ],
+        );
+        // No baton pointer → stored base statuses show through.
+        assert_eq!(t.visible()[1].status, "done");
+        assert_eq!(t.visible()[2].status, "queued");
+        // Baton is IN_PROGRESS on m/002 → that row overlays `active`; 001 unchanged.
+        t.set_active(Some(("m".into(), "002".into())));
+        assert_eq!(t.visible()[1].status, "done");
+        assert_eq!(t.visible()[2].status, "active");
+        // A pointer at a different milestone doesn't match here.
+        t.set_active(Some(("other".into(), "002".into())));
+        assert_eq!(t.visible()[2].status, "queued");
+        // Cleared → the base status reappears (no clobber of the stored value).
+        t.set_active(None);
+        assert_eq!(t.visible()[2].status, "queued");
     }
 
     #[test]

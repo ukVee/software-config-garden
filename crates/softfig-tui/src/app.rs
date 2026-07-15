@@ -481,6 +481,18 @@ impl App {
         growlightd.send("baton", json!({}), Tag::GrowlightRuntimeBaton);
     }
 
+    /// Push the live runtime baton's active slice (see [`baton_active_slice`]) into
+    /// the tree's `active` overlay so the slice the loop is working right now renders
+    /// `active`. No baton, an unreadable one, or a baton that isn't `IN_PROGRESS`
+    /// clears the overlay. Called whenever the polled baton or the tree changes.
+    fn apply_active_slice(&mut self) {
+        let active = self
+            .growlight_runtime_baton
+            .as_ref()
+            .and_then(|b| baton_active_slice(&b.text));
+        self.growlight_tree.set_active(active);
+    }
+
     /// The right-pane view of the live runtime-baton node: a title and body sourced
     /// from the polled [`Self::growlight_runtime_baton`] (NOT a keeperd read). A
     /// present baton renders a compact parsed head above its post-frontmatter body;
@@ -674,6 +686,8 @@ impl App {
         self.growlight_tree.set_bus(true);
         self.growlight_tree.set_injected_context(true);
         self.growlight_tree.set_items(items);
+        // Reapply the live baton's active-slice overlay onto the rebuilt tree.
+        self.apply_active_slice();
     }
 
     /// Resolve the selected tree node to its markdown artifact and fetch its body
@@ -1172,15 +1186,13 @@ impl App {
                         let children = parse_slice_index(&r.content)
                             .into_iter()
                             .map(|s| {
-                                // `is_active` (the live baton's active slice) is
-                                // wired by the growlightd `baton` verb in slice
-                                // 004; `body` (for awaiting-smoke) is fed by the
-                                // right-pane read on select (`refine_slice_status`).
-                                // Until then a reviewed slice reads as done, an
-                                // unreviewed one queued; `reviewed` is kept for the
-                                // later re-derivation.
-                                let status =
-                                    derive_slice_status(false, s.reviewed.as_deref(), None);
+                                // The file-derived base status: a reviewed slice
+                                // reads as done, an unreviewed one queued (`body`
+                                // for awaiting-smoke arrives via the right-pane read
+                                // on select — `refine_slice_status`). `active` is a
+                                // live overlay applied by the tree from the polled
+                                // baton (`apply_active_slice`), not baked in here.
+                                let status = derive_slice_status(s.reviewed.as_deref(), None);
                                 SliceChild {
                                     path: format!("{dir}/{}", s.path),
                                     num: s.num,
@@ -1209,7 +1221,7 @@ impl App {
                         if self.growlight_preview_path.as_deref() == Some(path.as_str()) {
                             if let Some((milestone, num)) = &slice {
                                 self.growlight_tree
-                                    .refine_slice_status(milestone, num, false, &r.content);
+                                    .refine_slice_status(milestone, num, &r.content);
                             }
                             self.growlight_preview = r.content;
                         }
@@ -1259,17 +1271,23 @@ impl App {
                 // garden-sourced tree/preview, so the page keeps working.
                 Err(_) => self.fleet = FleetHeader::Unreachable,
             },
-            Tag::GrowlightRuntimeBaton => match reply.result {
-                // Live runtime baton → the header baton-headline + the live-baton
-                // node. Decode into `Some` (even an empty baton is a valid answer);
-                // a malformed reply is treated like unreachable (`None`).
-                Ok(v) => self.growlight_runtime_baton = serde_json::from_value::<BatonReply>(v).ok(),
-                // Soft-fail (load-bearing), same discipline as `FleetStatus`:
-                // growlightd down/disarmed → `None`, so the header falls back to the
-                // garden baton-LOG headline. Never `self.status` (no splat), never
-                // touches the garden-sourced tree/preview.
-                Err(_) => self.growlight_runtime_baton = None,
-            },
+            Tag::GrowlightRuntimeBaton => {
+                match reply.result {
+                    // Live runtime baton → the header baton-headline + the live-baton
+                    // node. Decode into `Some` (even an empty baton is a valid answer);
+                    // a malformed reply is treated like unreachable (`None`).
+                    Ok(v) => {
+                        self.growlight_runtime_baton = serde_json::from_value::<BatonReply>(v).ok()
+                    }
+                    // Soft-fail (load-bearing), same discipline as `FleetStatus`:
+                    // growlightd down/disarmed → `None`, so the header falls back to the
+                    // garden baton-LOG headline. Never `self.status` (no splat), never
+                    // touches the garden-sourced tree/preview.
+                    Err(_) => self.growlight_runtime_baton = None,
+                }
+                // The baton just changed → refresh which slice the tree paints `active`.
+                self.apply_active_slice();
+            }
             Tag::GrowlightBus => match reply.result {
                 // The coordination-bus history → parsed newest-first into rows. A
                 // keeperd garden read like the rest of the page, so an error goes to
@@ -2335,6 +2353,26 @@ fn frontmatter_fields(text: &str) -> Vec<(String, String)> {
             Some((k.to_string(), v.trim().to_string()))
         })
         .collect()
+}
+
+/// The `(item, slice)` the live runtime baton is **actively working**, from its
+/// `item` and `slice` frontmatter — but only while `status: IN_PROGRESS`, the sole
+/// within-item state (a boundary / queue-empty / halted / idle baton has no active
+/// slice, so a deferred or finished item never paints a slice `active`). Feeds the
+/// tree's live `active` overlay. `None` if not in progress or either field is
+/// missing/blank. Pure — no IO.
+fn baton_active_slice(text: &str) -> Option<(String, String)> {
+    let fm = frontmatter_fields(text);
+    let get = |k: &str| {
+        fm.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+    if get("status") != Some("IN_PROGRESS") {
+        return None;
+    }
+    Some((get("item")?.to_string(), get("slice")?.to_string()))
 }
 
 /// A compact one-line head for the live runtime baton, parsed from its YAML
@@ -4146,6 +4184,103 @@ mod tests {
         );
         assert!(app.growlight_runtime_baton.is_none(), "malformed → None");
         assert_eq!(app.status, "ready");
+    }
+
+    #[test]
+    fn baton_active_slice_only_when_in_progress() {
+        // A within-item (IN_PROGRESS) baton yields its (item, slice).
+        assert_eq!(
+            baton_active_slice(SAMPLE_BATON),
+            Some(("growlight-tui-detail-pane".into(), "004".into())),
+        );
+        // A boundary/idle baton has no active slice — a deferred item must NOT paint.
+        let deferred = "---\nstatus: ITEM_DEFERRED\nitem: m\nslice: 006\n---\n# NEXT ACTION\nx";
+        assert_eq!(baton_active_slice(deferred), None);
+        // IN_PROGRESS but missing the slice field → None (nothing to point at).
+        let no_slice = "---\nstatus: IN_PROGRESS\nitem: m\n---\n# NEXT ACTION\nx";
+        assert_eq!(baton_active_slice(no_slice), None);
+        // No frontmatter at all → None.
+        assert_eq!(baton_active_slice("# NEXT ACTION\nx"), None);
+    }
+
+    #[test]
+    fn in_progress_baton_paints_its_slice_active_through_apply_reply() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        // A milestone with two loaded slices: 001 reviewed (done), 002 blank (queued).
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightMilestones,
+                result: Ok(json!({
+                    "entries": [
+                        tree_entry("m", "growlight/backlog/milestones/m", true),
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightQueue,
+                result: Ok(json!({
+                    "rows": [ { "id": "m", "title": "A milestone", "status": "active" } ],
+                })),
+            },
+            &mut ipc,
+        );
+        app.growlight_tree.expand("m");
+        app.apply_reply(
+            Reply {
+                id: 3,
+                tag: Tag::GrowlightSliceIndex { milestone: "m".into() },
+                result: Ok(json!({
+                    "path": "growlight/backlog/milestones/m/CLAUDE.md",
+                    "content": "<!-- softfig:index slices -->\n\
+                                | # | Note | Reviewed |\n\
+                                |---|------|----------|\n\
+                                | 001 | [a](slices/001-a.md) | 2026-07-14 |\n\
+                                | 002 | [b](slices/002-b.md) |  |\n\
+                                <!-- /softfig:index slices -->\n",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        // Baseline: no baton → the file-derived statuses show.
+        assert_eq!(app.growlight_tree.visible()[1].status, "done");
+        assert_eq!(app.growlight_tree.visible()[2].status, "queued");
+
+        // An IN_PROGRESS baton on m/002 → slice 002 overlays `active`; 001 unchanged.
+        app.apply_reply(
+            Reply {
+                id: 4,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({
+                    "path": "/x/baton.md",
+                    "text": "---\nstatus: IN_PROGRESS\nitem: m\nslice: 002\n---\n# NEXT ACTION\ngo",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_tree.visible()[1].status, "done", "001 stays done");
+        assert_eq!(app.growlight_tree.visible()[2].status, "active", "002 is the live slice");
+
+        // Baton moves to a boundary (deferred) → the overlay clears, base returns.
+        app.apply_reply(
+            Reply {
+                id: 5,
+                tag: Tag::GrowlightRuntimeBaton,
+                result: Ok(json!({
+                    "path": "/x/baton.md",
+                    "text": "---\nstatus: ITEM_DEFERRED\nitem: m\nslice: 002\n---\n# NEXT ACTION\ndone",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.growlight_tree.visible()[2].status, "queued", "deferred clears active");
     }
 
     #[test]
