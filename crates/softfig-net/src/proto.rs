@@ -13,7 +13,7 @@ mod generated {
 pub use generated::{
     frame, CommitData, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, ObjectData,
     Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, SharedKeyCommit,
-    SharedKeyReveal, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg,
+    SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg,
 };
 
 impl Frame {
@@ -143,6 +143,14 @@ impl Frame {
     pub fn shared_key_reveal(reveal: SharedKeyReveal) -> Self {
         Self {
             kind: Some(frame::Kind::SharedKeyReveal(reveal)),
+        }
+    }
+
+    /// A `SharedKeyHandoff` frame (keyed member -> stranded member): the M5d
+    /// slice-008 recovery response carrying the committed transcript + `S`.
+    pub fn shared_key_handoff(handoff: SharedKeyHandoff) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedKeyHandoff(handoff)),
         }
     }
 }

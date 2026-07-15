@@ -44,7 +44,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 
 use crate::error::{NetError, Result};
-use crate::proto::{frame, Frame, SharedKeyCommit, SharedKeyReveal};
+use crate::proto::{frame, Frame, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal};
 
 /// A member's secret contribution `r_i`. Random per ceremony; revealed to all
 /// members in the reveal phase (so it is public *after* the ceremony, and the
@@ -648,15 +648,49 @@ pub trait CeremonyTransport {
     fn recv(&mut self) -> Result<Frame>;
 }
 
+/// The outcome of driving a ceremony as one member: either the commit-reveal
+/// completed and derived `S`, or — when we dialed as a member who lost `S` to a
+/// failed persist (M5d slice 008) — a peer that already holds a live, non-stale
+/// key for this chain answered our commit with a **recovery hand-off** instead
+/// of joining a fresh ceremony. The driver surfaces the raw hand-off frame; the
+/// caller (keeperd) verifies it against the vault + committed state and persists
+/// through the idempotent ceremony path.
+#[derive(Debug)]
+pub enum CeremonyOutcome {
+    /// The ceremony ran to completion: `S` and its auditable transcript.
+    Derived(SharedKey, Transcript),
+    /// The peer served a recovery hand-off (slice 008) rather than a ceremony.
+    /// Carries the peer's committed transcript record + `S` for the caller to
+    /// verify and persist. Only ever produced for the *initiator* role (it is
+    /// the response to our commit).
+    Handoff(SharedKeyHandoff),
+}
+
+impl CeremonyOutcome {
+    /// The `(S, transcript)` of a completed ceremony, or `None` for a hand-off.
+    /// A convenience for callers (and tests) that only handle the derive path.
+    pub fn derived(self) -> Option<(SharedKey, Transcript)> {
+        match self {
+            CeremonyOutcome::Derived(s, t) => Some((s, t)),
+            CeremonyOutcome::Handoff(_) => None,
+        }
+    }
+}
+
 /// Drive `ceremony` to completion from this member's point of view over
 /// `transport`, signing our own commit + reveal with `signer`, and return the
-/// derived `S` + its auditable [`Transcript`].
+/// derived `S` + its auditable [`Transcript`] (or a [`CeremonyOutcome::Handoff`]
+/// if a keyed peer served us a slice-008 recovery hand-off in response to our
+/// commit).
 ///
 /// The protocol, in order: (1) sign + broadcast our commitment; (2) collect and
 /// authenticate peers' commitments until the commit phase closes — buffering any
 /// reveal that races ahead of a slow peer's commit (per-session FIFO holds, but
 /// cross-peer interleaving does not); (3) sign + broadcast our reveal and record
-/// it locally; (4) feed buffered + incoming reveals until `S` is derived.
+/// it locally; (4) feed buffered + incoming reveals until `S` is derived. A
+/// [`SharedKeyHandoff`] arriving in the commit phase (only the initiator ever
+/// sees one — it is the peer's answer to our commit) short-circuits to
+/// [`CeremonyOutcome::Handoff`]; the caller verifies + persists it.
 ///
 /// Every inbound frame is authenticated here before it reaches the state
 /// machine: a bad signature, a frame bound to another ceremony (nonce/chain
@@ -669,7 +703,7 @@ pub fn run_ceremony<T, K>(
     transport: &mut T,
     signer: &K,
     ceremony: &mut Ceremony,
-) -> Result<(SharedKey, Transcript)>
+) -> Result<CeremonyOutcome>
 where
     T: CeremonyTransport,
     K: CeremonySigner,
@@ -701,6 +735,13 @@ where
                 feed_commit(ceremony, &nonce, &chain_id, &c)?;
             }
             Some(frame::Kind::SharedKeyReveal(r)) => buffered.push(r),
+            // M5d slice 008: a keyed peer answers our commit with a recovery
+            // hand-off instead of joining the ceremony. Surface it — we lost `S`
+            // to a failed persist and the peer is closing that gap. The caller
+            // authenticates the transcript against the vault before trusting it.
+            Some(frame::Kind::SharedKeyHandoff(h)) => {
+                return Ok(CeremonyOutcome::Handoff(h))
+            }
             _ => {
                 return Err(NetError::Protocol(
                     "unexpected frame during the ceremony commit phase",
@@ -759,7 +800,7 @@ where
                 .transcript()
                 .expect("a derived ceremony holds its transcript")
                 .clone();
-            Ok((s, transcript))
+            Ok(CeremonyOutcome::Derived(s, transcript))
         }
         _ => Err(NetError::Protocol("ceremony ended without deriving a key")),
     }
@@ -1239,7 +1280,10 @@ mod tests {
                 let signer = RawSigner(sk);
                 let mut ceremony =
                     Ceremony::new(NONCE, CHAIN.to_vec(), &member_ids, id, r).unwrap();
-                run_ceremony(&mut transport, &signer, &mut ceremony).unwrap()
+                run_ceremony(&mut transport, &signer, &mut ceremony)
+                    .unwrap()
+                    .derived()
+                    .expect("mesh members complete the ceremony, never hand off")
             }));
         }
         // Drop the template senders so each inbound closes once every peer's
@@ -1355,5 +1399,38 @@ mod tests {
                 .unwrap();
         let err = run_ceremony(&mut transport, &signer, &mut ceremony).unwrap_err();
         assert!(matches!(err, NetError::Protocol(_)));
+    }
+
+    /// M5d slice 008: an initiator that dials to re-establish a key it lost
+    /// receives a `SharedKeyHandoff` in reply to its commit. The driver
+    /// short-circuits to [`CeremonyOutcome::Handoff`], surfacing the frame
+    /// verbatim for the caller to verify + persist — it does not try to feed a
+    /// hand-off into the state machine.
+    #[test]
+    fn driver_surfaces_a_handoff_reply_as_the_outcome() {
+        let members = [member(1, 11), member(2, 22)];
+        let handoff = Frame::shared_key_handoff(SharedKeyHandoff {
+            chain_id: CHAIN.to_vec(),
+            transcript_record: "record-bytes".to_string(),
+            shared_key: vec![7u8; 32],
+        });
+        let mut transport = ScriptedTransport {
+            inbound: VecDeque::from([handoff]),
+            sent: Vec::new(),
+        };
+        let signer = RawSigner(members[0].sk.clone());
+        let mut ceremony =
+            Ceremony::new(NONCE, CHAIN.to_vec(), &ids(&members), members[0].id, members[0].r)
+                .unwrap();
+        let outcome = run_ceremony(&mut transport, &signer, &mut ceremony).unwrap();
+        let CeremonyOutcome::Handoff(h) = outcome else {
+            panic!("expected a hand-off outcome");
+        };
+        assert_eq!(h.transcript_record, "record-bytes");
+        assert_eq!(h.shared_key, vec![7u8; 32]);
+        // Our own commitment still went out before the peer's reply, and the
+        // machine never advanced past the commit phase (no key derived).
+        assert_eq!(transport.sent.len(), 1);
+        assert_eq!(ceremony.phase(), Phase::Committing);
     }
 }

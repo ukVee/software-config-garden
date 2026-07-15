@@ -39,11 +39,11 @@ use std::time::{Duration, Instant};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use softfig_ipc::verbs::DiscoveredDevice;
 use softfig_ipc::ErrorKind;
-use softfig_net::ceremony::{run_ceremony, Ceremony, SharedKey, Transcript};
+use softfig_net::ceremony::{run_ceremony, Ceremony, CeremonyOutcome};
 use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
-use softfig_net::proto::{frame, Frame, ReplicaGrant, SharedKeyCommit, TipAnnounce};
+use softfig_net::proto::{frame, Frame, ReplicaGrant, SharedKeyCommit, SharedKeyHandoff, TipAnnounce};
 use softfig_net::connect::{plan_routes, Route};
 use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
@@ -703,7 +703,7 @@ fn serve_established(
             serve_replica_ingest(daemon, local, owner, grant, session)
         }
         Some(frame::Kind::SharedKeyCommit(commit)) => {
-            serve_ceremony_responder(daemon, local, ring, commit, session)
+            serve_ceremony_responder(daemon, local, owner, ring, commit, session)
         }
         // Anything else ends the session cleanly.
         _ => {}
@@ -718,14 +718,38 @@ fn serve_established(
 /// session peer is already ring-authenticated (IK + [`ring_member_entry`]), and
 /// [`run_ceremony`] signature-verifies every frame against the member set.
 /// Generic over the link so the full responder path runs headlessly in tests.
+///
+/// `owner` is that ring-authenticated peer (resolved from the Noise static in
+/// [`serve_established`]) — the requester's *cryptographic* identity, which the
+/// slice-008 recovery hand-off gates on (we serve `S` only to a peer our own
+/// committed transcript names). It is the authenticated identity, not the
+/// unverified `commit.device_id` wire field.
 fn serve_ceremony_responder<L: CeremonyLink>(
     daemon: &Daemon,
     local: &LocalDevice,
+    owner: &RingEntry,
     ring: &Arc<Mutex<Ring>>,
     commit: SharedKeyCommit,
     link: L,
 ) {
     use zeroize::Zeroize;
+
+    /// What this device's committed state says to do with an inbound commit.
+    enum ResponderAction {
+        /// No key (or no row) for this chain yet → run the ceremony + persist.
+        Establish,
+        /// Keyed but stale (member set changed) → run the ceremony + rotate.
+        Rotate,
+        /// Keyed, not stale, and the authenticated requester is a member this
+        /// live transcript names but who lacks usable `S` (slice 008): serve the
+        /// recovery hand-off instead of running a ceremony. Carries the record
+        /// TOML + the loaded `S`; no ceremony is driven.
+        Handoff {
+            key_id: String,
+            record: String,
+            s: zeroize::Zeroizing<[u8; 32]>,
+        },
+    }
 
     let members = {
         let ring = ring.lock().unwrap();
@@ -744,18 +768,27 @@ fn serve_ceremony_responder<L: CeremonyLink>(
     };
     let chain = String::from_utf8_lossy(&commit.chain_id).into_owned();
 
-    // M5d slice 006 (finding 3) + slice 003 rotation: a chain this device already
-    // holds a key for is refused — a ring peer must not re-key a live chain at
-    // will (else a peer whose own persist keeps failing would re-initiate every
-    // tick, minting a fresh key + `key_id` flip forever) — UNLESS this device
-    // independently agrees the chain is **stale** (its committed transcript's
-    // member set != the current ring), in which case the ceremony is an
-    // authorized rotation whose outcome routes to `rotate_shared_key`, not
-    // persist. Both sides derive staleness from committed state, so a peer still
-    // cannot rotate a non-stale chain. A chain with no local row — the responder
-    // hasn't added the subtree, the normal onboarding case — is allowed through
-    // as an establishment (persist seals `S` with no row to flip).
-    let is_rotation = {
+    // M5d slice 006 (finding 3) + slice 003 rotation + slice 008 recovery: a
+    // chain this device already holds a key for is not re-keyed at a ring peer's
+    // whim (else a peer whose own persist keeps failing would re-initiate every
+    // tick, minting a fresh key + `key_id` flip forever). Its verdict follows
+    // this device's committed state:
+    //   * unkeyed / no row  → establishment (persist seals `S`).
+    //   * keyed + stale (committed transcript members != current ring) → an
+    //     authorized rotation (routes to `rotate_shared_key`). Both sides derive
+    //     staleness from committed state, so a peer cannot rotate a non-stale
+    //     chain.
+    //   * keyed + not stale + the authenticated requester is a member this live
+    //     transcript names → a slice-008 recovery HAND-OFF: the peer lost `S` to
+    //     a failed persist and re-dials, so serve it `{committed transcript, S}`
+    //     over this ring-authenticated session instead of refusing. Gated on the
+    //     *authenticated* `owner`, never the wire `commit.device_id`, and only
+    //     when we ourselves hold usable `S` (`load_shared_key`, never
+    //     `has_shared_key` — a torn corpse must not masquerade as serveable).
+    //   * keyed + not stale + requester NOT a transcript member → hold the
+    //     slice-006 refusal (defensive; unreachable in a v1 2-member ring where
+    //     a non-stale transcript equals the ring).
+    let action = {
         let inner = daemon.inner.lock().unwrap();
         let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
             return; // locked mid-serve — the initiator retries a later tick
@@ -777,13 +810,13 @@ fn serve_ceremony_responder<L: CeremonyLink>(
             .find(|r| r.ref_name == chain)
             .and_then(|r| r.key_id.as_deref())
         {
-            None => false, // unkeyed or no row — an establishment
+            None => ResponderAction::Establish, // unkeyed or no row
             Some(existing) => {
                 let transcript =
                     match crate::handlers::read_committed_transcript(repo, session, existing) {
                         Ok(Some(t)) => t,
-                        // No readable transcript for the live key → can't authorize
-                        // a rotation; hold the slice-006 refusal.
+                        // No readable transcript for the live key → can't judge
+                        // staleness or membership; hold the slice-006 refusal.
                         Ok(None) => {
                             eprintln!(
                                 "keeperd: net: shared-key ceremony for {chain} refused: chain is \
@@ -803,16 +836,80 @@ fn serve_ceremony_responder<L: CeremonyLink>(
                 let tmembers: Vec<[u8; 32]> =
                     transcript.members.iter().map(|m| m.device_id).collect();
                 if shared_chain_is_stale(&tmembers, &members) {
-                    true // stale — an authorized rotation
+                    ResponderAction::Rotate // stale — an authorized rotation
+                } else if tmembers.contains(&owner.device_id) {
+                    // The requester is a member this live transcript names but is
+                    // re-dialing → it lost `S` (failed persist). Serve the
+                    // recovery hand-off, but only if WE hold usable `S`: load it
+                    // (fails closed on a torn corpse), never trust file presence.
+                    match session.load_shared_key(existing) {
+                        Ok(s) => {
+                            let record = match crate::ceremony::render_transcript_record(
+                                &transcript,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    eprintln!(
+                                        "keeperd: net: shared-key hand-off for {chain} refused: \
+                                         cannot render transcript {existing}: {e}"
+                                    );
+                                    return;
+                                }
+                            };
+                            ResponderAction::Handoff {
+                                key_id: existing.to_string(),
+                                record,
+                                s,
+                            }
+                        }
+                        Err(e) => {
+                            // We are a transcript member too, but our own `S` is
+                            // missing/corrupt — we cannot serve. The requester
+                            // keeps dialing; another holder (or our own recovery)
+                            // may close the gap.
+                            eprintln!(
+                                "keeperd: net: shared-key hand-off for {chain} declined: this \
+                                 device lacks usable S for {existing} ({e})"
+                            );
+                            return;
+                        }
+                    }
                 } else {
                     eprintln!(
                         "keeperd: net: shared-key ceremony for {chain} refused: chain is already \
-                         keyed {existing} and not stale (rotation is the only authorized re-key path)"
+                         keyed {existing} and not stale, and the requester is not a member of its \
+                         transcript (rotation is the only authorized re-key path)"
                     );
                     return;
                 }
             }
         }
+    };
+
+    // Recovery hand-off short-circuits the ceremony: send the committed
+    // transcript + `S` over this ring-authenticated session and return — no
+    // ceremony is driven, nothing on this device changes (we already hold the
+    // authoritative key + record). Establishment/rotation fall through to run it.
+    let is_rotation = match action {
+        ResponderAction::Handoff { key_id, record, s } => {
+            let handoff = Frame::shared_key_handoff(SharedKeyHandoff {
+                chain_id: commit.chain_id.clone(),
+                transcript_record: record,
+                shared_key: s.to_vec(),
+            });
+            let mut link = link;
+            match link.send_frame(&handoff) {
+                Ok(()) => eprintln!(
+                    "keeperd: net: shared-key hand-off served for {chain}: {key_id}"
+                ),
+                Err(e) => eprintln!(
+                    "keeperd: net: shared-key hand-off for {chain} failed to send: {e}"
+                ),
+            }
+            return;
+        }
+        ResponderAction::Rotate => true,
+        ResponderAction::Establish => false,
     };
 
     // In-flight dedup (M5d slice 006 part 2): refuse if a ceremony for this
@@ -855,7 +952,7 @@ fn serve_ceremony_responder<L: CeremonyLink>(
     let first = Frame::shared_key_commit(commit);
     let mut transport = SessionTransport::responder(link, first);
     match run_ceremony(&mut transport, &signer, &mut ceremony) {
-        Ok((mut s, transcript)) => {
+        Ok(CeremonyOutcome::Derived(mut s, transcript)) => {
             let key_id = transcript.key_id.clone();
             // Route by the gate's verdict: a stale keyed chain is an authorized
             // rotation (flip + re-encrypt); anything else is an establishment
@@ -881,6 +978,13 @@ fn serve_ceremony_responder<L: CeremonyLink>(
             }
             s.zeroize();
         }
+        // The responder is the one that SERVES a hand-off; it never receives one
+        // (a hand-off is only ever the reply to an initiator's commit). A peer
+        // sending us one here is confused — drop it.
+        Ok(CeremonyOutcome::Handoff(_)) => eprintln!(
+            "keeperd: net: shared-key ceremony for {chain}: unexpected hand-off frame from the \
+             initiator; ignoring"
+        ),
         Err(e) => eprintln!("keeperd: net: shared-key ceremony for {chain} failed: {e}"),
     }
 }
@@ -1415,7 +1519,7 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
         };
         match ceremony_with_host(local, &host, relay_client.as_ref(), &signer, &members, &ref_name)
         {
-            Ok((mut s, transcript)) => {
+            Ok(CeremonyOutcome::Derived(mut s, transcript)) => {
                 let key_id = transcript.key_id.clone();
                 match persist_ceremony_outcome(daemon, &s, &transcript) {
                     Ok(_) => eprintln!(
@@ -1428,11 +1532,68 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
                 }
                 s.zeroize();
             }
+            // M5d slice 008: the peer served a recovery hand-off (it already
+            // holds a live key for this chain that names us, and we lost `S`).
+            // Verify + persist it through the idempotent ceremony path.
+            Ok(CeremonyOutcome::Handoff(handoff)) => {
+                match accept_handoff(daemon, &ref_name, handoff) {
+                    Ok(key_id) => eprintln!(
+                        "keeperd: net: shared-key recovered for {ref_name} via hand-off: {key_id}"
+                    ),
+                    Err(e) => eprintln!(
+                        "keeperd: net: shared-key hand-off for {ref_name} rejected: {e}"
+                    ),
+                }
+            }
             Err(e) => eprintln!(
                 "keeperd: net: shared-key ceremony for {ref_name} skipped: {e}"
             ),
         }
     }
+}
+
+/// M5d slice 008 — accept a recovery hand-off served by a keyed peer in reply to
+/// our re-dial. We lost `S` to a failed persist; the peer, holding a live
+/// non-stale key for this chain that names us, sent back `{committed transcript,
+/// S}` over the ring-authenticated Noise session. Verify and persist it through
+/// the idempotent [`persist_ceremony_outcome`], which re-checks the transcript
+/// from first principles (`verify`, `key_id(S) == transcript.key_id`, self ∈
+/// members) before anything durable — so a forged or foreign hand-off is refused
+/// there. Bind the transcript to the chain we actually dialed for (defense in
+/// depth: a keyed peer must not answer a probe for chain X with a key for Y).
+/// Returns the recovered `key_id`.
+fn accept_handoff(
+    daemon: &Daemon,
+    ref_name: &str,
+    handoff: SharedKeyHandoff,
+) -> std::result::Result<String, String> {
+    use zeroize::Zeroize;
+
+    let mut s: [u8; 32] = handoff
+        .shared_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "hand-off shared key is not 32 bytes".to_string())?;
+    let transcript = match crate::ceremony::parse_transcript_record(&handoff.transcript_record) {
+        Ok(t) => t,
+        Err(e) => {
+            s.zeroize();
+            return Err(format!("hand-off transcript unparseable: {e}"));
+        }
+    };
+    if transcript.chain_id != ref_name.as_bytes() {
+        s.zeroize();
+        return Err(format!(
+            "hand-off transcript is for a different chain than {ref_name}"
+        ));
+    }
+    let key_id = transcript.key_id.clone();
+    // persist re-verifies the transcript + key_id(S) binding + our membership and
+    // is idempotent: a boundary-B device that already sealed S just commits the
+    // record + fills its row.
+    let result = persist_ceremony_outcome(daemon, &s, &transcript).map_err(|(_, e)| e);
+    s.zeroize();
+    result.map(|_| key_id)
 }
 
 /// A keyed shared chain is **stale** — it needs a rotation — when its committed
@@ -1578,7 +1739,7 @@ fn reconcile_rekeys(daemon: &Daemon, local: &LocalDevice) {
             continue;
         };
         match ceremony_with_host(local, &host, relay_client.as_ref(), &signer, &members, &ref_name) {
-            Ok((mut s, transcript)) => {
+            Ok(CeremonyOutcome::Derived(mut s, transcript)) => {
                 let key_id = transcript.key_id.clone();
                 match rotate_shared_key(daemon, &s, &transcript) {
                     Ok(_) => eprintln!(
@@ -1591,6 +1752,15 @@ fn reconcile_rekeys(daemon: &Daemon, local: &LocalDevice) {
                 }
                 s.zeroize();
             }
+            // We dialed to ROTATE a chain we see as stale, but the peer answered
+            // with a recovery hand-off — i.e. it does NOT see the chain as stale
+            // (a transient membership-view disagreement). Do not feed the current
+            // key into `rotate_shared_key` (which expects a fresh, different key);
+            // skip and let a later tick re-evaluate once both views converge.
+            Ok(CeremonyOutcome::Handoff(_)) => eprintln!(
+                "keeperd: net: shared-key rotation for {ref_name} skipped: peer served a recovery \
+                 hand-off (it does not see the chain as stale); re-evaluating next tick"
+            ),
             Err(e) => eprintln!("keeperd: net: shared-key rotation for {ref_name} skipped: {e}"),
         }
     }
@@ -1608,7 +1778,7 @@ fn ceremony_with_host(
     signer: &VaultCeremonySigner,
     members: &[[u8; 32]],
     ref_name: &str,
-) -> Result<(SharedKey, Transcript), String> {
+) -> Result<CeremonyOutcome, String> {
     let routes = plan_routes(host, relay_client.is_some());
     if routes.is_empty() {
         return Err("no route to member (no LAN endpoint, no relay)".to_string());
@@ -1651,7 +1821,7 @@ fn drive_initiator<L: CeremonyLink>(
     members: &[[u8; 32]],
     local: &LocalDevice,
     ref_name: &str,
-) -> Result<(SharedKey, Transcript), String> {
+) -> Result<CeremonyOutcome, String> {
     let nonce = softfig_vault::random_bytes32();
     let contribution = softfig_vault::random_bytes32();
     let mut ceremony = Ceremony::new(
@@ -1843,6 +2013,9 @@ mod tests {
     // The relay host-leg test drives the sequential driver directly (a
     // `RelayStream` can't split); production LAN ingest uses the pipelined one.
     use softfig_net::pull_replication;
+    // Used only by the ceremony/transcript test fixtures (production paths now
+    // route these types through `CeremonyOutcome`).
+    use softfig_net::ceremony::{SharedKey, Transcript};
 
     fn id_bytes(seed: u8) -> [u8; 32] {
         [seed; 32]
@@ -2732,6 +2905,210 @@ mod tests {
         }
     }
 
+    /// End to end over loopback: the M5d slice-008 recovery hand-off closes a
+    /// stranded-responder gap with no manual step. A ceremony ran, A persisted
+    /// (keyed), but B's persist failed — B is left a transcript member with an
+    /// unkeyed row and no `S` (crash boundary A). B's `reconcile_ceremonies`
+    /// re-dials (its row is unkeyed); A, holding a live non-stale key that names
+    /// B, serves the hand-off instead of refusing (slice 006); B verifies +
+    /// persists it and ends holding the same `S`. The pre-live stand-in for the
+    /// deferred 2-device kill-9-mid-persist smoke.
+    #[test]
+    fn handoff_recovers_a_stranded_member_over_loopback() {
+        let (daemon_a, tmp_a) = ceremony_daemon();
+        let (daemon_b, tmp_b) = ceremony_daemon();
+        let local_a = device_of(&daemon_a, "dev-a");
+        let local_b = device_of(&daemon_b, "dev-b");
+        let _ = tmp_a; // A's state dir is unused here (A is the responder).
+
+        // Both devices add the shared subtree → both get an unkeyed row for the
+        // same ref_name (the mount path derives it deterministically).
+        let add_a = crate::handlers::shared_subtree_add(
+            &daemon_a,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add a");
+        let ref_name = add_a["ref_name"].as_str().unwrap().to_string();
+        let add_b = crate::handlers::shared_subtree_add(
+            &daemon_b,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add b");
+        assert_eq!(add_b["ref_name"].as_str().unwrap(), ref_name);
+
+        // Key ONLY A with a fabricated (signed) 2-member {A, B} outcome; B never
+        // persists, so it is the stranded responder — unkeyed row, no S (the
+        // crash-boundary-A state the hand-off exists to heal).
+        let sign_a = session_sign(&daemon_a);
+        let sign_b = session_sign(&daemon_b);
+        let (s, t) = build_signed_transcript(
+            [7u8; 32],
+            ref_name.as_bytes(),
+            &[
+                (local_a.device_id, [0x11u8; 32], &sign_a),
+                (local_b.device_id, [0x22u8; 32], &sign_b),
+            ],
+        );
+        persist_ceremony_outcome(&daemon_a, &s, &t).expect("key a");
+        let expected_kid = t.key_id.clone();
+
+        // Precondition: B really is stranded — its row is unkeyed and it holds no
+        // usable S (the honest `load_shared_key` probe, not `has_shared_key`).
+        {
+            let inner = daemon_b.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            let repo = inner.repo.as_ref().unwrap();
+            assert!(session.load_shared_key(&expected_kid).is_err(), "B starts without S");
+            let membership =
+                crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session)
+                    .unwrap();
+            assert!(
+                membership
+                    .subtrees
+                    .iter()
+                    .find(|r| r.ref_name == ref_name)
+                    .unwrap()
+                    .key_id
+                    .is_none(),
+                "B's row is unkeyed"
+            );
+        }
+
+        // A holds the key + listens; its ring holds B. B's persisted ring holds A
+        // at the loopback endpoint (so its reconcile sweep dials A).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ring_a = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(ring_entry_of(&daemon_b, "dev-b", vec![]));
+            r
+        }));
+        let a_thread = {
+            let daemon_a = daemon_a.clone();
+            let local_a = local_a.clone();
+            let ring_a = ring_a.clone();
+            thread::spawn(move || {
+                let (conn, _) = listener.accept().unwrap();
+                serve_inbound(daemon_a, &local_a, &ring_a, conn);
+            })
+        };
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(
+                &daemon_a,
+                "dev-a",
+                vec![format!("127.0.0.1:{port}")],
+            ));
+            ring.save(&ring_path(tmp_b.path())).unwrap();
+        }
+
+        // Pre-seed B's tie-break clock as if it had seen the chain pending a prior
+        // tick, so it initiates this tick regardless of device-id ordering.
+        {
+            let mut inner = daemon_b.inner.lock().unwrap();
+            inner.ceremony_seen_pending.insert(ref_name.clone());
+        }
+
+        // The production initiator sweep on the stranded device.
+        reconcile_ceremonies(&daemon_b, &local_b);
+        a_thread.join().unwrap();
+
+        // B recovered: its row is now keyed with A's key_id, it holds the same
+        // usable S, and it committed its own ceremony record — no manual step.
+        let inner = daemon_b.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+        let membership =
+            crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
+        assert_eq!(
+            membership
+                .subtrees
+                .iter()
+                .find(|r| r.ref_name == ref_name)
+                .unwrap()
+                .key_id
+                .as_deref(),
+            Some(expected_kid.as_str()),
+            "B's row keyed via the hand-off"
+        );
+        assert!(
+            session.load_shared_key(&expected_kid).is_ok(),
+            "B now holds usable S"
+        );
+        assert!(
+            crate::handlers::read_committed_transcript(repo, session, &expected_kid)
+                .unwrap()
+                .is_some(),
+            "B committed the ceremony record"
+        );
+    }
+
+    /// M5d slice 008 crash-boundary B: a member that sealed `S` but crashed
+    /// before committing (S present on disk, row still unkeyed) recovers
+    /// idempotently. `accept_handoff` re-seals the same `S` (a no-op) and commits
+    /// the record + fills the row — no duplicate key, no wedge, exactly one
+    /// sealed key. Exercises the accept path directly (the loopback test covers
+    /// boundary A, where `S` is absent).
+    #[test]
+    fn accept_handoff_is_idempotent_when_s_already_sealed() {
+        let (daemon, _tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-b");
+        let peer = forged_peer(2);
+
+        let add = crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // A valid signed {this device, peer} transcript for the chain.
+        let self_sign = session_sign(&daemon);
+        let peer_sign = seed_sign(2);
+        let (s, transcript) = build_signed_transcript(
+            [8u8; 32],
+            ref_name.as_bytes(),
+            &[
+                (local.device_id, [0x11u8; 32], &self_sign),
+                (peer.device_id, [0x22u8; 32], &peer_sign),
+            ],
+        );
+        let kid = transcript.key_id.clone();
+
+        // Boundary B: seal S, but leave the row unkeyed (crash before commit).
+        {
+            let inner = daemon.inner.lock().unwrap();
+            inner
+                .session
+                .as_ref()
+                .unwrap()
+                .store_shared_key(&kid, &s)
+                .expect("pre-seal S");
+        }
+        assert!(row_key_id(&daemon, &ref_name).is_none(), "row still unkeyed");
+
+        // The hand-off frame the keyed peer would send, carrying the same S.
+        let handoff = SharedKeyHandoff {
+            chain_id: ref_name.clone().into_bytes(),
+            transcript_record: crate::ceremony::render_transcript_record(&transcript).unwrap(),
+            shared_key: s.to_vec(),
+        };
+        let recovered = accept_handoff(&daemon, &ref_name, handoff).expect("accept hand-off");
+        assert_eq!(recovered, kid);
+
+        // Row filled, record committed, S still the single sealed key.
+        assert_eq!(row_key_id(&daemon, &ref_name).as_deref(), Some(kid.as_str()));
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+        assert!(session.load_shared_key(&kid).is_ok());
+        assert!(
+            crate::handlers::read_committed_transcript(repo, session, &kid)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// The initiator sweep gates a >2-member ring (v1 is point-to-point): the
     /// row stays pending, nothing dials, nothing is stored.
     #[test]
@@ -2815,17 +3192,19 @@ mod tests {
             commitment: vec![0u8; 32],
             signature: vec![0u8; 64],
         };
-        serve_ceremony_responder(&daemon, &local, &ring, commit, DeadLink);
+        serve_ceremony_responder(&daemon, &local, &forged_peer(1), &ring, commit, DeadLink);
         assert!(!tmp.path().join(".softfig/vault/shared-keys").exists());
     }
 
-    /// Slice 006 (finding 3): the responder refuses a ceremony for a chain it
-    /// already holds a key for — a ring peer can't re-key a live chain at will
-    /// (only slice 003's authorized rotation may). The refusal happens before
-    /// the ceremony transport is ever driven (a `DeadLink` proves it), the row's
-    /// `key_id` is untouched, and no new commit is minted.
+    /// M5d slice 008: when the responder already holds a live, non-stale key for
+    /// a chain and the *authenticated* requester is a member its committed
+    /// transcript names, it serves a recovery HAND-OFF (the committed transcript
+    /// plus `S`) rather than refusing (slice 006's refusal now covers only a
+    /// non-member requester). It sends exactly one hand-off frame and never
+    /// drives a ceremony (a capturing link that errors on `recv` proves it); its
+    /// own committed state — the row's `key_id`, the tip — is untouched.
     #[test]
-    fn responder_refuses_an_already_keyed_chain() {
+    fn responder_hands_off_s_to_a_stranded_member() {
         let (daemon, _tmp) = ceremony_daemon();
         let local = device_of(&daemon, "dev-a");
         let peer = forged_peer(1);
@@ -2842,8 +3221,8 @@ mod tests {
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
 
-        // Key the chain via a fabricated (signed) outcome over (this device, the
-        // peer). `peer = forged_peer(1)`, so the peer entry signs with seed key 1.
+        // Key the chain via a fabricated (signed) 2-member outcome over (this
+        // device, the peer). `peer = forged_peer(1)` signs with seed key 1.
         let self_sign = session_sign(&daemon);
         let peer_sign = seed_sign(1);
         let (s, transcript) = build_signed_transcript(
@@ -2860,25 +3239,50 @@ mod tests {
             inner.repo.as_ref().unwrap().tip().unwrap().unwrap()
         };
 
-        struct DeadLink;
-        impl CeremonyLink for DeadLink {
-            fn send_frame(&mut self, _f: &Frame) -> Result<(), NetError> {
+        // A link that captures whatever the responder sends and refuses reads —
+        // a hand-off sends one frame and never enters the ceremony recv loop.
+        #[derive(Clone)]
+        struct CaptureLink {
+            sent: Arc<Mutex<Vec<Frame>>>,
+        }
+        impl CeremonyLink for CaptureLink {
+            fn send_frame(&mut self, f: &Frame) -> Result<(), NetError> {
+                self.sent.lock().unwrap().push(f.clone());
                 Ok(())
             }
             fn recv_frame(&mut self) -> Result<Frame, NetError> {
-                Err(NetError::Protocol("already-keyed responder must not drive the link"))
+                Err(NetError::Protocol("hand-off responder must not read the link"))
             }
         }
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let link = CaptureLink { sent: sent.clone() };
+
+        // The stranded member (the peer, an authenticated ring `owner`) dials
+        // with an ordinary commit; the responder answers with a hand-off.
         let commit = SharedKeyCommit {
             nonce: vec![9u8; 32],
             chain_id: ref_name.clone().into_bytes(),
-            device_id: vec![0u8; 32],
+            device_id: peer.device_id.to_vec(),
             commitment: vec![0u8; 32],
             signature: vec![0u8; 64],
         };
-        serve_ceremony_responder(&daemon, &local, &ring, commit, DeadLink);
+        serve_ceremony_responder(&daemon, &local, &peer, &ring, commit, link);
 
-        // The row still carries the original key and no new commit was minted.
+        // Exactly one hand-off frame went out, carrying the committed record + S.
+        let frames = sent.lock().unwrap();
+        assert_eq!(frames.len(), 1, "one hand-off frame, no ceremony driven");
+        let Some(frame::Kind::SharedKeyHandoff(h)) = &frames[0].kind else {
+            panic!("expected a hand-off frame, got {:?}", frames[0].kind);
+        };
+        assert_eq!(h.chain_id, ref_name.as_bytes());
+        assert_eq!(h.shared_key, s.to_vec(), "S served verbatim");
+        let served = crate::ceremony::parse_transcript_record(&h.transcript_record)
+            .expect("served record parses");
+        assert_eq!(served.key_id, transcript.key_id);
+        assert!(served.verify(), "served transcript verifies");
+        drop(frames);
+
+        // The responder's own state is untouched: same key, no new commit.
         let inner = daemon.inner.lock().unwrap();
         let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(
             inner.repo.as_ref().unwrap(),
@@ -2974,7 +3378,7 @@ mod tests {
             commitment: vec![0u8; 32],
             signature: vec![0u8; 64],
         };
-        serve_ceremony_responder(&daemon, &local, &ring, commit, DeadLink);
+        serve_ceremony_responder(&daemon, &local, &peer, &ring, commit, DeadLink);
 
         // The row is untouched, no key sealed, no new commit minted.
         assert!(row_key_id(&daemon, &ref_name).is_none());

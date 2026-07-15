@@ -41,12 +41,17 @@ message Frame {
     // softfig-net's `ceremony` module.
     SharedKeyCommit shared_key_commit = 200; // member -> members: signed H(r_i) + nonce
     SharedKeyReveal shared_key_reveal = 201; // member -> members: signed reveal of r_i
+    // M5d slice 008 recovery: the keyed member's response to a stranded member's
+    // dial. Instead of re-running the ceremony (refused for a live non-stale
+    // chain — slice 006), it hands the caller the committed transcript + S.
+    SharedKeyHandoff shared_key_handoff = 202; // keyed member -> stranded member: recovery hand-off
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
   // 23-99 are held for later control-plane variants; 100-199 is the M5b data
-  // plane; 200-201 is the M5d shared-key ceremony; 202+ stays open for later
-  // sync slices (shared-chain push, rotation, M5d+/M5e).
+  // plane; 200-201 is the M5d shared-key ceremony; 202 is the M5d slice-008
+  // recovery hand-off; 203+ stays open for later sync slices (shared-chain
+  // push, M5d+/M5e).
   reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
@@ -226,4 +231,23 @@ message SharedKeyReveal {
   bytes device_id = 3;    // the revealer's Ed25519 identity (32 bytes)
   bytes contribution = 4; // the revealed r_i (32 bytes)
   bytes signature = 5;    // Ed25519 (64 bytes) over reveal_signing_bytes(...)
+}
+
+// M5d slice 008 (responder-persist recovery) — the recovery hand-off. A member
+// whose ceremony persist failed (crash mid-seal / vault locked) is left a
+// transcript participant with no usable S; its unkeyed membership row makes it
+// re-dial the ceremony, but the keyed peer refuses a live non-stale chain
+// (slice 006). Instead of refusing, the keyed member serves this: the committed
+// signed transcript plus S itself. S rides in the clear *inside* the frame —
+// the enclosing Noise session (ring-authenticated: IK + attestation +
+// config/peers.toml) seals it on the wire, and the signed transcript's
+// membership is the entitlement: the server sends S only to the authenticated
+// ring peer its own committed transcript already names. The requester verifies
+// the transcript, checks key_id(S) == transcript.key_id and self ∈ members,
+// then runs the idempotent persist. No new crypto — see
+// decision-m5d-shared-key-recovery.
+message SharedKeyHandoff {
+  bytes chain_id = 1;          // the shared subtree's chain id (binds the hand-off to the dial)
+  string transcript_record = 2; // the committed ceremony-record TOML (parse_transcript_record)
+  bytes shared_key = 3;         // the 32-byte S; sealed on the wire by the Noise session
 }

@@ -910,14 +910,20 @@ mod tests {
             let signer = VaultCeremonySigner::new(sess_a);
             let mut cer = Ceremony::new(nonce, ca, &ma, id_a, [0x11; 32]).unwrap();
             let mut transport = SessionTransport::initiator(link_a);
-            run_ceremony(&mut transport, &signer, &mut cer).unwrap()
+            run_ceremony(&mut transport, &signer, &mut cer)
+                .unwrap()
+                .derived()
+                .expect("these drivers complete the ceremony, never hand off")
         });
         let (mb, cb) = (members.clone(), chain.clone());
         let hb = thread::spawn(move || {
             let signer = VaultCeremonySigner::new(sess_b);
             let mut cer = Ceremony::new(nonce, cb, &mb, id_b, [0x22; 32]).unwrap();
             let mut transport = SessionTransport::initiator(link_b);
-            run_ceremony(&mut transport, &signer, &mut cer).unwrap()
+            run_ceremony(&mut transport, &signer, &mut cer)
+                .unwrap()
+                .derived()
+                .expect("these drivers complete the ceremony, never hand off")
         });
 
         let (s_a, t_a) = ha.join().unwrap();
@@ -949,7 +955,10 @@ mod tests {
             let signer = VaultCeremonySigner::new(sess_a);
             let mut cer = Ceremony::new(nonce, ca, &ma, id_a, [0x11; 32]).unwrap();
             let mut transport = SessionTransport::initiator(link_a);
-            run_ceremony(&mut transport, &signer, &mut cer).unwrap()
+            run_ceremony(&mut transport, &signer, &mut cer)
+                .unwrap()
+                .derived()
+                .expect("these drivers complete the ceremony, never hand off")
         });
 
         // Responder side, on this thread: read the dispatch frame off the wire
@@ -960,7 +969,10 @@ mod tests {
         let signer = VaultCeremonySigner::new(sess_b);
         let mut cer = Ceremony::new(nonce, chain, &members, id_b, [0x22; 32]).unwrap();
         let mut transport = SessionTransport::responder(link_b, first);
-        let (s_b, t_b) = run_ceremony(&mut transport, &signer, &mut cer).unwrap();
+        let (s_b, t_b) = run_ceremony(&mut transport, &signer, &mut cer)
+            .unwrap()
+            .derived()
+            .expect("responder completes the ceremony, never hands off");
 
         let (s_a, t_a) = ha.join().unwrap();
         assert_eq!(s_a, s_b);
