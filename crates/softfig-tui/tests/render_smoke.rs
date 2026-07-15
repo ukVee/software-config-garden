@@ -653,6 +653,52 @@ fn selecting_the_bus_node_renders_history_newest_first_with_alerts_loud() {
 }
 
 #[test]
+fn selecting_the_injected_context_node_shows_both_protocol_and_baton_halves() {
+    use softfig_ipc::growlightd::BatonReply;
+    use softfig_tui::tree::{BacklogItem, BacklogKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.growlight_enabled = Some(true);
+    app.view = softfig_tui::app::View::Growlight;
+    app.growlight_tree.set_items(vec![BacklogItem {
+        id: "tui-modernize".into(),
+        title: "Modernize the TUI".into(),
+        status: "active".into(),
+        is_milestone: true,
+    }]);
+    app.growlight_tree.set_injected_context(true);
+    // Both halves loaded: the protocol (a keeperd read cached on select) + the live
+    // runtime baton (the polled growlightd reply). The pane assembles them in the
+    // `inject.sh` boot framing.
+    app.growlight_injected_protocol = Some("the PROTOMARK operating body".into());
+    app.growlight_runtime_baton = Some(BatonReply {
+        agent: None,
+        path: "/x/baton.md".into(),
+        text: "---\nstatus: IN_PROGRESS\n---\n# NEXT ACTION\nBATONMARK go".into(),
+    });
+    // Select the injected-context node (it closes the tree).
+    let vis = app.growlight_tree.visible();
+    app.growlight_tree.selected = vis
+        .iter()
+        .position(|r| r.kind == BacklogKind::InjectedContext)
+        .unwrap();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("injected context"), "pane title missing:\n{rendered}");
+    // Boot framing: both section headers appear (right pane ~60 cols → no wrap).
+    assert!(rendered.contains("OPERATING PROTOCOL"), "protocol header missing:\n{rendered}");
+    assert!(rendered.contains("CURRENT BATON"), "baton header missing:\n{rendered}");
+    // Both halves' content: a protocol marker AND a baton marker.
+    assert!(rendered.contains("PROTOMARK"), "protocol half body missing:\n{rendered}");
+    assert!(rendered.contains("BATONMARK"), "baton half body missing:\n{rendered}");
+}
+
+#[test]
 fn growlight_tab_absent_when_disabled() {
     // The load-bearing requirement: when growlight is not enabled the tab does
     // not appear at all — no tab, no empty pane, no error.

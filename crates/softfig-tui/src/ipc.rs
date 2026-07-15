@@ -99,6 +99,14 @@ pub enum Tag {
     /// newest-first rows. An `Err` surfaces on `self.status` like the other garden
     /// reads — the page keeps working with growlightd down (keeper-sourced).
     GrowlightBus,
+    /// growlight: the PROTOCOL half of the injected-context node (slice 006) — a
+    /// keeperd `read_file` of `growlight/protocol.md` (the SINGLE-AGENT template,
+    /// through the resolver's garden arm), fired on select. `Ok` carries a
+    /// `ReadFileReply`; the app stores its content in `growlight_injected_protocol`
+    /// and the detail pane assembles it with the polled runtime baton at render
+    /// time. An `Err` surfaces on `self.status` like the other garden reads (the
+    /// baton half soft-fails on its own).
+    GrowlightInjectedProtocol,
 }
 
 #[derive(Debug)]

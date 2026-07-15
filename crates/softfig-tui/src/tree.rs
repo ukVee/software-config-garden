@@ -351,6 +351,13 @@ pub enum BacklogKind {
     /// a garden path, so it carries no `path` and the detail pane sources it from the
     /// eagerly-loaded bus rows rather than a per-select `read_file`.
     Bus,
+    /// The assembled injected-context node (slice 006): the operating protocol
+    /// (garden arm) + the live runtime baton (growlightd arm), concatenated in
+    /// `inject.sh` boot framing = exactly what a fresh session receives at boot. It
+    /// carries no single garden `path` (it assembles two artifacts through the
+    /// resolver), so the detail pane sources the protocol half from a per-select
+    /// keeperd read and the baton half from the polled runtime baton.
+    InjectedContext,
 }
 
 /// One rendered row of the flattened, currently-visible backlog tree.
@@ -392,6 +399,9 @@ pub struct BacklogTree {
     /// Whether to emit the coordination-bus history node (a keeperd `tail_bus`
     /// read, not a garden path) after the runtime-baton node (slice 005).
     bus: bool,
+    /// Whether to emit the assembled injected-context node (protocol + live baton)
+    /// last, after the bus node (slice 006).
+    injected_context: bool,
     pub selected: usize,
 }
 
@@ -454,6 +464,14 @@ impl BacklogTree {
     /// no keeper-sourced bus row; the growlight page turns it on when it rebuilds.
     pub fn set_bus(&mut self, present: bool) {
         self.bus = present;
+        self.clamp_selection();
+    }
+
+    /// Toggle the assembled injected-context node (slice 006), emitted last — after
+    /// the bus node. Off by default so a bare tree (tests, pre-load) has no assembled
+    /// row; the growlight page turns it on when it rebuilds.
+    pub fn set_injected_context(&mut self, present: bool) {
+        self.injected_context = present;
         self.clamp_selection();
     }
 
@@ -545,8 +563,8 @@ impl BacklogTree {
                 slice_num: None,
             });
         }
-        // The coordination-bus history node closes the tree: a keeperd `tail_bus`
-        // read (no garden `path`), sourced from the eagerly-loaded bus rows.
+        // The coordination-bus history node: a keeperd `tail_bus` read (no garden
+        // `path`), sourced from the eagerly-loaded bus rows.
         if self.bus {
             out.push(BacklogVisibleRow {
                 kind: BacklogKind::Bus,
@@ -554,6 +572,24 @@ impl BacklogTree {
                 item_id: String::new(),
                 label: "coordination bus".to_string(),
                 status: "history".to_string(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                loaded: true,
+                path: None,
+                slice_num: None,
+            });
+        }
+        // The assembled injected-context node closes the tree: protocol (garden arm)
+        // + live baton (growlightd arm), no single garden `path` — the detail pane
+        // assembles it from a per-select protocol read + the polled runtime baton.
+        if self.injected_context {
+            out.push(BacklogVisibleRow {
+                kind: BacklogKind::InjectedContext,
+                key: "injected-context".to_string(),
+                item_id: String::new(),
+                label: "injected context".to_string(),
+                status: "boot-preview".to_string(),
                 depth: 0,
                 expandable: false,
                 expanded: false,
@@ -890,6 +926,36 @@ mod tests {
         t.selected = 0;
         t.move_up();
         assert_eq!(t.selected, 3, "wrap-up lands on the last row (the bus node)");
+    }
+
+    #[test]
+    fn injected_context_node_closes_the_tree_after_the_bus_and_nav_reaches_it() {
+        let mut t = BacklogTree::new();
+        t.set_loop_context(vec![ctx("protocol.md", "growlight/protocol.md")]);
+        t.set_items(vec![task("042", "t")]);
+        t.set_runtime_baton(true);
+        t.set_bus(true);
+        // Off by default → no injected-context row.
+        assert!(
+            t.visible().iter().all(|r| r.kind != BacklogKind::InjectedContext),
+            "the injected-context node is off until turned on",
+        );
+        // Turned on → one node, last, after the bus node.
+        t.set_injected_context(true);
+        let vis = t.visible();
+        assert_eq!(vis.len(), 5, "task + 1 loop-context + baton + bus + injected-context");
+        // The bus node still precedes it; injected-context now closes the tree.
+        assert_eq!(vis[3].kind, BacklogKind::Bus);
+        let last = vis.last().unwrap();
+        assert_eq!(last.kind, BacklogKind::InjectedContext);
+        assert_eq!(last.label, "injected context");
+        assert_eq!(last.status, "boot-preview");
+        assert!(!last.expandable);
+        assert_eq!(last.path, None, "an assembled node carries no garden path");
+        // Nav wraps onto it: from the top row, move_up lands on the injected node.
+        t.selected = 0;
+        t.move_up();
+        assert_eq!(t.selected, 4, "wrap-up lands on the last row (the injected-context node)");
     }
 
     #[test]

@@ -740,8 +740,27 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // The injected-context node is an ASSEMBLED view: the protocol half (a keeperd
+    // read cached in `growlight_injected_protocol`) + the live runtime baton (the
+    // polled growlightd reply), concatenated in `inject.sh` boot framing. Render it
+    // straight from that assembled text so it stays live between polls, and so it
+    // works garden-only (protocol half + a placeholder) with growlightd down.
+    if selected_kind == Some(BacklogKind::InjectedContext) {
+        let (title, content) = app.injected_context_view();
+        render_scroll_body(
+            f,
+            rows[1],
+            &content,
+            &title,
+            &mut app.preview_scroll,
+            &mut app.preview_viewport,
+            &mut app.preview_total,
+        );
+        return;
+    }
+
     let placeholder =
-        "(select a node — milestone · slice · task · loop context · live baton · bus — to view it)";
+        "(select a node — milestone · slice · task · loop context · live baton · bus · injected-context — to view it)";
     let title = if app.growlight_preview.is_empty() {
         "growlight detail (read-only)".to_string()
     } else {
@@ -1418,7 +1437,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 soft-fig TUI — keys
 
   1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
-  7            growlight (read-only): backlog → slices, loop-context, live baton · bus
+  7            growlight (read-only): backlog → slices, loop-context, live baton · bus · injected-context
   j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)

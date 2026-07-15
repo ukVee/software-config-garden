@@ -312,6 +312,13 @@ pub struct App {
     /// down. Empty until the first reply (or genuinely no messages); the detail
     /// pane renders a calm placeholder then.
     pub growlight_bus: Vec<BusRow>,
+    /// The PROTOCOL half of the injected-context node (slice 006): `growlight/protocol.md`
+    /// read through the resolver's garden arm on select and cached here. `None`
+    /// until the first select's read lands; the detail pane assembles it with the
+    /// polled [`Self::growlight_runtime_baton`] (the growlightd arm) into the boot
+    /// context. The baton half soft-fails independently — with growlightd down the
+    /// node still shows the protocol half + a placeholder (this stays garden-sourced).
+    pub growlight_injected_protocol: Option<String>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -367,6 +374,7 @@ impl App {
             fleet: FleetHeader::Unknown,
             growlight_runtime_baton: None,
             growlight_bus: Vec::new(),
+            growlight_injected_protocol: None,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -497,6 +505,22 @@ impl App {
                     .to_string(),
             ),
         }
+    }
+
+    /// The right-pane view of the injected-context node (slice 006): the assembled
+    /// boot context — the operating protocol (garden arm, [`Self::growlight_injected_protocol`])
+    /// followed by the live runtime baton (growlightd arm, [`Self::growlight_runtime_baton`]),
+    /// in the `inject.sh` boot framing = exactly what a fresh session receives. The
+    /// protocol not yet loaded → a calm "loading" note; the baton unavailable →
+    /// the protocol half plus a placeholder ([`assemble_injected_context`]) — never
+    /// a blank pane and never an error (the protocol half is a garden read).
+    pub fn injected_context_view(&self) -> (String, String) {
+        let title = "injected context — protocol + live baton (boot preview, read-only)".to_string();
+        let Some(protocol) = &self.growlight_injected_protocol else {
+            return (title, "(loading the operating protocol…)".to_string());
+        };
+        let baton = self.growlight_runtime_baton.as_ref().map(|b| b.text.as_str());
+        (title, assemble_injected_context(protocol, baton))
     }
 
     /// Re-fetch every directory whose children are loaded, so the view
@@ -641,12 +665,14 @@ impl App {
                 is_milestone: milestones.contains(r.id.as_str()),
             })
             .collect();
-        // The loop-context section, the live runtime-baton node, and the bus-history
-        // node are static; (re)seed them on every rebuild so the tree stays
-        // self-consistent, then set the backlog (which clamps last).
+        // The loop-context section, the live runtime-baton node, the bus-history
+        // node, and the assembled injected-context node are static; (re)seed them on
+        // every rebuild so the tree stays self-consistent, then set the backlog
+        // (which clamps last).
         self.growlight_tree.set_loop_context(loop_context_nodes());
         self.growlight_tree.set_runtime_baton(true);
         self.growlight_tree.set_bus(true);
+        self.growlight_tree.set_injected_context(true);
         self.growlight_tree.set_items(items);
     }
 
@@ -661,6 +687,35 @@ impl App {
         let Some(row) = self.growlight_tree.selected_row() else {
             return;
         };
+        // The injected-context node assembles TWO artifacts (the protocol garden arm
+        // + the runtime-baton growlightd arm) rather than resolving to one read, so
+        // it is handled here before the single-artifact resolve below. The baton half
+        // is already polled into `growlight_runtime_baton`; only the protocol half
+        // needs a per-select keeperd read.
+        if row.kind == BacklogKind::InjectedContext {
+            if self.growlight_preview_path.as_deref() == Some(INJECTED_CONTEXT_SLOT) {
+                return; // already showing / fetching; the UI re-assembles live each frame
+            }
+            self.growlight_preview_path = Some(INJECTED_CONTEXT_SLOT.to_string());
+            self.growlight_preview_title = row.label.clone();
+            self.growlight_preview.clear();
+            self.preview_scroll = 0;
+            // Protocol half THROUGH the resolver (garden arm) — the SINGLE-AGENT
+            // template the SessionStart hook injects, NOT protocol-fleet.md. Fire the
+            // keeperd read; the baton half needs no round-trip (already polled).
+            if let Some(GrowlightRead::Garden { path }) =
+                self.growlight_source.resolve(&GrowlightArtifact::LoopContext {
+                    path: INJECTED_PROTOCOL_PATH.to_string(),
+                })
+            {
+                ipc.send(
+                    "read_file",
+                    json!({ "path": path }),
+                    Tag::GrowlightInjectedProtocol,
+                );
+            }
+            return;
+        }
         let artifact = match row.kind {
             BacklogKind::Milestone => GrowlightArtifact::Milestone {
                 id: row.item_id.clone(),
@@ -678,6 +733,7 @@ impl App {
             },
             BacklogKind::RuntimeBaton => GrowlightArtifact::RuntimeBaton,
             BacklogKind::Bus => GrowlightArtifact::BusHistory,
+            BacklogKind::InjectedContext => return, // handled above
         };
         match self.growlight_source.resolve(&artifact) {
             // An in-garden node → a keeperd `read_file`, refined on reply.
@@ -1224,6 +1280,20 @@ impl App {
                     Err(e) => self.status = format!("growlight bus: malformed reply: {e}"),
                 },
                 Err((_, m)) => self.status = format!("growlight bus: {m}"),
+            },
+            Tag::GrowlightInjectedProtocol => match reply.result {
+                // The protocol half of the injected-context node — a keeperd garden
+                // read (`growlight/protocol.md`). Cache it; the detail pane assembles
+                // it with the polled runtime baton at render time. A keeperd read
+                // like the rest of the page, so an error goes to `self.status` (the
+                // baton half soft-fails to a placeholder on its own).
+                Ok(v) => match serde_json::from_value::<ReadFileReply>(v) {
+                    Ok(r) => self.growlight_injected_protocol = Some(r.content),
+                    Err(e) => {
+                        self.status = format!("growlight injected-context: malformed reply: {e}")
+                    }
+                },
+                Err((_, m)) => self.status = format!("growlight injected-context: {m}"),
             },
         }
     }
@@ -2154,6 +2224,41 @@ const RUNTIME_BATON_SLOT: &str = "growlightd:runtime-baton";
 /// selected — a keeperd `tail_bus` read rendered from `growlight_bus`, not a
 /// garden path, so it never collides with a real repo-relative path (slice 005).
 const BUS_SLOT: &str = "keeperd:bus-history";
+
+/// Sentinel value for `growlight_preview_path` while the injected-context node is
+/// selected (slice 006) — an ASSEMBLED view (protocol read + polled baton), not a
+/// single garden path, so it never collides with a real repo-relative path and
+/// keeps re-selects idempotent while the UI re-assembles live each frame.
+const INJECTED_CONTEXT_SLOT: &str = "assembled:injected-context";
+
+/// The garden path of the SINGLE-AGENT operating protocol — the protocol half of
+/// the injected-context node, resolved through the `GrowlightSource` garden arm
+/// (NOT `protocol-fleet.md`; that is the fleet-member variant). Matches the file
+/// the SessionStart `inject.sh` cats.
+const INJECTED_PROTOCOL_PATH: &str = "growlight/protocol.md";
+
+/// Assemble the injected boot context exactly as the SessionStart hook does: the
+/// operating protocol, then the runtime baton, wrapped in the two section headers
+/// `inject.sh` prints. Source of truth: `~/.config/softfig/growlight/inject.sh`
+/// (GENERATED, so it can't be sourced at runtime — the header strings + ordering
+/// are replicated here; keep them in sync). `baton` is `None`/blank when growlightd
+/// is unreachable or the runtime baton is unavailable → the baton section renders a
+/// calm placeholder (never blank, never an error). A present baton is embedded raw
+/// (frontmatter and all), matching `cat baton.md`. Pure — no IO — so the
+/// protocol+baton → combined-text mapping is unit-testable.
+pub fn assemble_injected_context(protocol: &str, baton: Option<&str>) -> String {
+    // The two headers `inject.sh` emits around protocol.md and baton.md (verified
+    // 2026-07-14, inject.sh lines 6/8): `printf '=== … OPERATING PROTOCOL ===\n\n'`
+    // <protocol> `printf '\n\n=== CURRENT BATON … ===\n\n'` <baton>.
+    const PROTOCOL_HEADER: &str = "=== SOFT-FIG GROWLIGHT · OPERATING PROTOCOL ===";
+    const BATON_HEADER: &str = "=== CURRENT BATON (your only carried state) ===";
+    const NO_BATON: &str = "(live baton unavailable at boot-preview)";
+    let baton_section = match baton {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => NO_BATON,
+    };
+    format!("{PROTOCOL_HEADER}\n\n{protocol}\n\n{BATON_HEADER}\n\n{baton_section}")
+}
 
 fn loop_context_nodes() -> Vec<LoopContextNode> {
     [
@@ -3563,8 +3668,9 @@ mod tests {
 
         let vis = app.growlight_tree.visible();
         // 2 backlog rows + the 4 static loop-context nodes + the live-baton node +
-        // the bus-history node, all seeded on rebuild.
-        assert_eq!(vis.len(), 8);
+        // the bus-history node + the assembled injected-context node, all seeded on
+        // rebuild.
+        assert_eq!(vis.len(), 9);
         assert!(vis[0].expandable, "milestone row expands");
         assert!(!vis[1].expandable, "task row is a leaf");
         assert_eq!(vis[2].kind, BacklogKind::LoopContext, "loop-context follows the backlog");
@@ -3576,7 +3682,12 @@ mod tests {
         assert_eq!(
             vis[7].kind,
             BacklogKind::Bus,
-            "the bus-history node closes the tree",
+            "the bus-history node precedes the injected-context node",
+        );
+        assert_eq!(
+            vis[8].kind,
+            BacklogKind::InjectedContext,
+            "the assembled injected-context node closes the tree",
         );
 
         // Expand the milestone (Enter) — fires the lazy read_file (to the dead
@@ -3612,8 +3723,12 @@ mod tests {
         );
 
         let vis = app.growlight_tree.visible();
-        // milestone + 2 slices + task + 4 loop-context + baton + bus nodes.
-        assert_eq!(vis.len(), 10, "milestone + 2 slices + task + loop-context + baton + bus");
+        // milestone + 2 slices + task + 4 loop-context + baton + bus + injected-context.
+        assert_eq!(
+            vis.len(),
+            11,
+            "milestone + 2 slices + task + loop-context + baton + bus + injected-context"
+        );
         assert_eq!(vis[1].depth, 1);
         assert_eq!(vis[1].label, "001 first");
         assert_eq!(vis[1].status, "done", "reviewed slice → done");
@@ -4109,10 +4224,13 @@ mod tests {
         seed_growlight_tree(&mut app, &mut ipc);
         app.view = View::Growlight;
 
-        // The bus node closes the tree (after the baton) — select the last row.
+        // Find + select the bus node (the injected-context node now closes the tree,
+        // so the bus is no longer the last row).
         let vis = app.growlight_tree.visible();
-        let bus_idx = vis.len() - 1;
-        assert_eq!(vis[bus_idx].kind, BacklogKind::Bus);
+        let bus_idx = vis
+            .iter()
+            .position(|r| r.kind == BacklogKind::Bus)
+            .unwrap();
         app.growlight_tree.selected = bus_idx;
         app.preview_scroll = 25; // a leftover offset
         app.growlight_preview = "stale garden body".into();
@@ -4180,5 +4298,120 @@ mod tests {
             &mut ipc,
         );
         assert!(app.status.contains("growlight bus"), "err reported");
+    }
+
+    #[test]
+    fn assemble_injected_context_matches_boot_framing_and_handles_absent_baton() {
+        // Both halves present → protocol then baton, wrapped in the two inject.sh
+        // headers in boot order, the baton embedded verbatim (frontmatter and all).
+        let out = assemble_injected_context(
+            "PROTOCOL BODY",
+            Some("---\nstatus: IN_PROGRESS\n---\n# NEXT ACTION\ngo"),
+        );
+        assert_eq!(
+            out,
+            "=== SOFT-FIG GROWLIGHT · OPERATING PROTOCOL ===\n\nPROTOCOL BODY\n\n\
+             === CURRENT BATON (your only carried state) ===\n\n\
+             ---\nstatus: IN_PROGRESS\n---\n# NEXT ACTION\ngo",
+        );
+        // The protocol section precedes the baton section (boot order).
+        assert!(
+            out.find("OPERATING PROTOCOL") < out.find("CURRENT BATON"),
+            "protocol half comes before the baton half",
+        );
+
+        // Baton absent (growlightd down / no runtime baton) → the protocol half + a
+        // calm placeholder, never blank, no panic.
+        let none = assemble_injected_context("PROTOCOL BODY", None);
+        assert!(none.contains("PROTOCOL BODY"), "protocol half still present");
+        assert!(
+            none.contains("(live baton unavailable at boot-preview)"),
+            "absent baton renders the placeholder note",
+        );
+        // A blank baton is treated as absent too.
+        assert!(assemble_injected_context("P", Some("  \n  "))
+            .contains("(live baton unavailable at boot-preview)"));
+    }
+
+    #[test]
+    fn selecting_the_injected_context_node_fires_the_protocol_read_and_marks_the_slot() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        seed_growlight_tree(&mut app, &mut ipc);
+        app.view = View::Growlight;
+
+        // The injected-context node closes the tree (after the bus) — select it.
+        let vis = app.growlight_tree.visible();
+        let idx = vis
+            .iter()
+            .position(|r| r.kind == BacklogKind::InjectedContext)
+            .unwrap();
+        assert_eq!(idx, vis.len() - 1, "the injected-context node closes the tree");
+        app.growlight_tree.selected = idx;
+        app.preview_scroll = 25; // a leftover offset
+        app.growlight_preview = "stale garden body".into();
+
+        app.refresh_growlight_selection(&mut ipc);
+        // An assembled node: the sentinel marks the slot (the protocol read is fired
+        // to the dead dummy worker; the baton half comes from the polled reply).
+        assert_eq!(app.growlight_preview_path.as_deref(), Some(INJECTED_CONTEXT_SLOT));
+        assert_eq!(app.preview_scroll, 0, "selecting the node resets scroll");
+        assert!(app.growlight_preview.is_empty(), "the stale garden body is cleared");
+
+        // Re-selecting the same node is an idempotent no-op (scroll not re-reset).
+        app.preview_scroll = 9;
+        app.refresh_growlight_selection(&mut ipc);
+        assert_eq!(app.preview_scroll, 9, "re-select does not reset scroll");
+    }
+
+    #[test]
+    fn injected_context_reply_caches_the_protocol_half_and_reports_malformed() {
+        let mut app = App::new();
+        app.status = "ready".into();
+        let mut ipc = dummy_ipc();
+
+        // Ok → the protocol content is cached for the assembler.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::GrowlightInjectedProtocol,
+                result: Ok(json!({
+                    "path": "growlight/protocol.md",
+                    "content": "PROTOCOL BODY",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.growlight_injected_protocol.as_deref(),
+            Some("PROTOCOL BODY")
+        );
+        assert_eq!(app.status, "ready", "a clean read doesn't touch the status line");
+
+        // The view assembles both halves: protocol cached, no baton → placeholder.
+        let (_title, body) = app.injected_context_view();
+        assert!(body.contains("PROTOCOL BODY"), "protocol half rendered");
+        assert!(body.contains("OPERATING PROTOCOL"), "boot framing present");
+        assert!(
+            body.contains("(live baton unavailable at boot-preview)"),
+            "baton soft-fails to the placeholder",
+        );
+
+        // A malformed Ok surfaces on the status line (a keeperd read, not a soft-fail).
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::GrowlightInjectedProtocol,
+                result: Ok(json!({ "nope": true })),
+            },
+            &mut ipc,
+        );
+        assert!(
+            app.status.contains("injected-context"),
+            "malformed reply reported: {}",
+            app.status
+        );
     }
 }
