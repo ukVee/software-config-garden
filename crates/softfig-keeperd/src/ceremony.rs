@@ -202,12 +202,12 @@ impl<L: CeremonyLink> CeremonyTransport for SessionTransport<L> {
 
 use serde::{Deserialize, Serialize};
 use softfig_net::ceremony::{key_id, SharedKey, Transcript, TranscriptEntry};
-use softfig_store::Hash;
+use softfig_store::{Hash, TreeEntryKind};
 use softfig_vcs::Intent;
 use softfig_ipc::ErrorKind;
 
 use crate::actions::{commit_now, WorkTree};
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{
     read_committed_shared_subtrees_for_mutation, require_unlocked, shared_subtrees_rel,
 };
@@ -449,6 +449,289 @@ pub fn persist_ceremony_outcome(
         crate::handlers::refresh_mount_registry(&inner, &state_dir);
     }
     Ok(hash)
+}
+
+/// M5d slice 003 — the **authorized re-key path**: the one path allowed to
+/// replace a filled `key_id`, rotating a shared chain from its live `S` to a
+/// freshly-derived `S'` (a leave/join re-runs the slice-001 ceremony among the
+/// new member set, then hands its outcome here). Slice 006's
+/// [`persist_ceremony_outcome`] hard-refuses replacing a live key; this is the
+/// distinct, deliberate exception — the plain-ceremony path never reaches it, so
+/// the default stays fail-closed ([[decision-m5d-shared-rekey-intent]], the
+/// authorized-re-key seam).
+///
+/// Under the daemon lock: verify the new outcome (the persist guards), confirm
+/// the chain's row is currently keyed with a *different* key (rotation replaces a
+/// KNOWN key — it never *establishes* one; that is persist's job), seal `S'`
+/// beside the old `S`, write the new transcript record + flip the row `key_id`,
+/// commit one `shared_rekey` audit record on the device chain, re-point the
+/// router so new writes seal under `S'`, then re-encrypt the chain's existing
+/// blobs under `S'`.
+///
+/// A departed member's old `S` then only ever decrypts ciphertext it already
+/// held — the honest custody limit (`spec-sync.md` §Crypto), not a bug:
+/// collaborative generation protects the key's *birth*, rotation protects its
+/// *custody* going forward. Old `S` is intentionally **not** deleted (our own
+/// history needs it to read pre-rotation commits). GC of the superseded
+/// pre-rotation ciphertext is deferred (open `spec-sync.md` question).
+///
+/// Failure atomicity: the seal + audit commit + row flip land before the
+/// re-encrypt. A re-encrypt error is returned loud, but the key swap is already
+/// durable — the chain is then in the documented "new writes seal under `S'`,
+/// existing blobs lag under the old key" state (reads still resolve, decrypt
+/// being self-describing), recoverable by a re-encrypt pass, never corruption.
+pub fn rotate_shared_key(
+    daemon: &Daemon,
+    s_prime: &SharedKey,
+    new_transcript: &Transcript,
+) -> Result<Hash, (ErrorKind, String)> {
+    // Same consistency guards as persist: the key is the transcript's, the
+    // transcript re-verifies from first principles, and this device is a member.
+    if key_id(s_prime) != new_transcript.key_id {
+        return Err((
+            ErrorKind::Internal,
+            "rotation outcome mismatch: key_id(S') != transcript.key_id".into(),
+        ));
+    }
+    if !new_transcript.verify() {
+        return Err((
+            ErrorKind::Internal,
+            "rotation transcript failed verification; refusing to rotate".into(),
+        ));
+    }
+    let chain_id = std::str::from_utf8(&new_transcript.chain_id)
+        .map_err(|_| (ErrorKind::Internal, "rotation chain_id is not UTF-8".to_string()))?
+        .to_string();
+    let new_key_id = new_transcript.key_id.clone();
+    let rel = ceremony_record_rel(&new_key_id);
+    let record = render_transcript_record(new_transcript).map_err(|e| (ErrorKind::Internal, e))?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    {
+        let session = inner.session.as_ref().expect("unlocked");
+        if !new_transcript
+            .members
+            .iter()
+            .any(|m| m.device_id == session.identity_pubkey().to_bytes())
+        {
+            return Err((
+                ErrorKind::Internal,
+                "this device is not a member of the rotation transcript".into(),
+            ));
+        }
+    }
+
+    // The authorized-re-key guard. The committed row is the authoritative source
+    // of the old key_id (never a caller argument that could drift). The row MUST
+    // be currently keyed — no row (or an unkeyed row) is not a rotation but an
+    // establishment, which is [`persist_ceremony_outcome`]'s job — and keyed with
+    // a *different* key than the target (rotating to the live key is a no-op
+    // request, not a rotation).
+    let (old_key_id, mount_path) = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        let membership = read_committed_shared_subtrees_for_mutation(repo, session)?;
+        let row = membership
+            .subtrees
+            .iter()
+            .find(|r| r.ref_name == chain_id)
+            .ok_or((
+                ErrorKind::Internal,
+                format!(
+                    "cannot rotate {chain_id}: no committed membership row \
+                     (rotation replaces a live key — add + key the chain first)"
+                ),
+            ))?;
+        let old = row.key_id.clone().ok_or((
+            ErrorKind::Internal,
+            format!(
+                "cannot rotate {chain_id}: the chain is unkeyed \
+                 (establishment runs the plain ceremony, not rotation)"
+            ),
+        ))?;
+        if old == new_key_id {
+            return Err((
+                ErrorKind::Internal,
+                format!("cannot rotate {chain_id}: S' equals the live key {old} (rotation needs a fresh key)"),
+            ));
+        }
+        (old, row.mount_path.clone())
+    };
+
+    // Seal S' beside the old S (idempotent). Never deletes old S: the departed
+    // member's copy stays able to decrypt only ciphertext it already held (the
+    // custody limit), and our own pre-rotation history still needs old S to read.
+    {
+        let session = inner.session.as_ref().expect("unlocked");
+        session
+            .store_shared_key(&new_key_id, s_prime)
+            .map_err(|e| (ErrorKind::Internal, format!("store rotated shared key: {e}")))?;
+    }
+
+    // Flip the row key_id → new and stage the new transcript record. Both are
+    // device-chain files (under `config/`), committed together as one
+    // `shared_rekey` audit record — the same one-record-per-mutation shape persist
+    // uses for `shared_ceremony`.
+    let membership_toml = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        let mut membership = read_committed_shared_subtrees_for_mutation(repo, session)?;
+        for row in membership.subtrees.iter_mut() {
+            if row.ref_name == chain_id {
+                row.key_id = Some(new_key_id.clone());
+            }
+        }
+        membership
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, format!("serialize shared-subtrees: {e}")))?
+    };
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        wt.write(&rel, record.as_bytes())?;
+        wt.write(&shared_subtrees_rel(), membership_toml.as_bytes())?;
+    }
+    // Payload per the LOCKED shape ([[decision-m5d-shared-rekey-intent]]):
+    // `members` = the post-rotation set (hex device ids); `ceremony_ref` = the new
+    // key_id, addressing the fresh transcript record — one uniform record shape for
+    // initial ceremony + rekey.
+    let members: Vec<String> = new_transcript
+        .members
+        .iter()
+        .map(|m| hex::encode(m.device_id))
+        .collect();
+    let intent = Intent::new(
+        "shared_rekey",
+        serde_json::json!({
+            "chain_id": chain_id,
+            "old_key_id": old_key_id,
+            "new_key_id": new_key_id,
+            "members": members,
+            "ceremony_ref": new_key_id,
+        }),
+    )
+    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    let audit_hash = commit_now(&mut inner, intent)?;
+
+    // Re-point the router to S' (derives from the now-committed membership), so
+    // the chain's next write — including the re-encrypt below — seals under S'.
+    {
+        let state_dir = inner.config.state_dir().to_path_buf();
+        crate::handlers::refresh_mount_registry(&inner, &state_dir);
+    }
+
+    // Re-encrypt the chain's existing blobs under S'. Decrypt is self-describing
+    // (each container names the S generation — or pre-ceremony M — that sealed it),
+    // so this reads the old ciphertext even after the router flip and re-commits
+    // identical plaintext, now sealed under S'.
+    reencrypt_shared_chain(&mut inner, &chain_id, &mount_path, &old_key_id, &new_key_id)?;
+
+    Ok(audit_hash)
+}
+
+/// Re-seal every blob in a shared chain's current tip under the router's current
+/// key by round-tripping its plaintext through one fresh commit on the chain ref.
+/// The caller has already re-pointed the router (so `encrypt_for_ref` seals under
+/// the new key). An empty chain re-seals nothing (no commit).
+fn reencrypt_shared_chain(
+    inner: &mut DaemonInner,
+    chain_id: &str,
+    mount_path: &str,
+    old_key_id: &str,
+    new_key_id: &str,
+) -> Result<(), (ErrorKind, String)> {
+    let snapshot = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        snapshot_chain_plaintext(repo, session, chain_id, mount_path)?
+    };
+    if snapshot.files().is_empty() {
+        return Ok(());
+    }
+    let intent = Intent::new(
+        "shared_rekey",
+        serde_json::json!({
+            "chain_id": chain_id,
+            "old_key_id": old_key_id,
+            "new_key_id": new_key_id,
+            "summary": format!("re-encrypt {chain_id} under {new_key_id}"),
+        }),
+    )
+    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    crate::actions::commit_snapshot_to_now(inner, chain_id, snapshot, intent)?;
+    Ok(())
+}
+
+/// Materialize a shared chain's current tip as a plaintext [`WalkSnapshot`],
+/// decrypting each blob under whichever generation sealed it. The snapshot's
+/// paths are **chain-relative** (matching how the chain ref stores them) so a
+/// re-commit re-prefixes exactly as the write path expects; decryption uses the
+/// **garden** path (mount + chain-relative) so a sealed Layer-B (or pre-ceremony
+/// M Layer-B) subkey, which is salted by path, resolves.
+fn snapshot_chain_plaintext(
+    repo: &softfig_vcs::Repo,
+    session: &VaultSession,
+    ref_name: &str,
+    mount_path: &str,
+) -> Result<softfig_vcs::WalkSnapshot, (ErrorKind, String)> {
+    let mut snap = softfig_vcs::WalkSnapshot::empty();
+    let Some(tip) = repo
+        .tip_of(ref_name)
+        .map_err(|e| (ErrorKind::Internal, format!("read {ref_name} tip: {e}")))?
+    else {
+        return Ok(snap);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| (ErrorKind::Internal, format!("read {ref_name} tip commit: {e}")))?;
+    collect_chain_plaintext(repo, session, &row.root_tree, "", mount_path, &mut snap)?;
+    Ok(snap)
+}
+
+fn collect_chain_plaintext(
+    repo: &softfig_vcs::Repo,
+    session: &VaultSession,
+    tree: &Hash,
+    prefix: &str,
+    mount_path: &str,
+    snap: &mut softfig_vcs::WalkSnapshot,
+) -> Result<(), (ErrorKind, String)> {
+    let entries = repo
+        .db()
+        .get_tree(tree)
+        .map_err(|e| (ErrorKind::Internal, format!("read tree: {e}")))?;
+    for e in entries {
+        let chain_rel = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
+        match e.kind {
+            TreeEntryKind::Blob => {
+                let cipher = repo
+                    .objects()
+                    .get(&e.target)
+                    .map_err(|err| (ErrorKind::Internal, format!("read blob {chain_rel}: {err}")))?;
+                let garden_path = if mount_path.is_empty() {
+                    chain_rel.clone()
+                } else {
+                    format!("{mount_path}/{chain_rel}")
+                };
+                let plain = session
+                    .decrypt_tracked_blob(&garden_path, &cipher)
+                    .map_err(|err| {
+                        (ErrorKind::Internal, format!("decrypt {garden_path} for re-encrypt: {err}"))
+                    })?;
+                snap.insert_file(std::path::Path::new(&chain_rel), e.mode, plain)
+                    .map_err(|err| (ErrorKind::Internal, format!("snapshot {chain_rel}: {err}")))?;
+            }
+            TreeEntryKind::Tree => {
+                collect_chain_plaintext(repo, session, &e.target, &chain_rel, mount_path, snap)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -933,5 +1216,168 @@ mod tests {
         // The divergent key's S was never sealed, and no divergent commit landed.
         assert!(!session.has_shared_key(&t2.key_id));
         assert_eq!(repo.tip().unwrap().unwrap(), tip1);
+    }
+
+    /// The read_key_id of the blob committed at chain-relative `name` in a
+    /// shared chain's current tip — the S generation that sealed it.
+    fn chain_blob_key_id(daemon: &Daemon, ref_name: &str, name: &str) -> String {
+        let inner = daemon.inner.lock().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+        let tip = repo.tip_of(ref_name).unwrap().unwrap();
+        let root = repo.db().get_commit(&tip).unwrap().root_tree;
+        let entry = repo
+            .db()
+            .get_tree(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == name)
+            .expect("blob present");
+        let cipher = repo.objects().get(&entry.target).unwrap();
+        softfig_vault::shared::read_key_id(&cipher).unwrap()
+    }
+
+    /// Slice 003: the authorized re-key path swaps `key_id` S→S', lands a
+    /// `shared_rekey` audit record with the locked payload, commits the new
+    /// transcript, and **re-encrypts** the chain's existing blobs under S' — so a
+    /// departed member holding only the old S can no longer read post-rotation
+    /// ciphertext (its container now names S'). Old S is retained (custody limit),
+    /// not deleted. v1 is 2-member point-to-point, so this rotates one 2-member
+    /// set to another — the mechanism the fabricated-transcript >2 case reduces to
+    /// ([[decision-m5d-shared-rekey-intent]], option a).
+    #[test]
+    fn rotate_swaps_the_key_reencrypts_and_lands_a_shared_rekey_record() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let add = handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+        let our_id = daemon_device_id(&daemon);
+
+        // Establish S over {self, peer 9}, then seed a real blob (sealed under S
+        // via the live router that persist re-pointed).
+        let (s1, t1) = fabricate_outcome([our_id, peer_id(9)], ref_name.as_bytes());
+        persist_ceremony_outcome(&daemon, &s1, &t1).expect("initial key");
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            let mut snap = softfig_vcs::WalkSnapshot::empty();
+            snap.insert_file(std::path::Path::new("note.md"), 0o644, b"shared secret".to_vec())
+                .unwrap();
+            crate::actions::commit_snapshot_to_now(
+                &mut inner,
+                &ref_name,
+                snap,
+                Intent::new("shared_subtrees_changed", serde_json::json!({ "summary": "seed" }))
+                    .unwrap(),
+            )
+            .expect("seed blob");
+        }
+        assert_eq!(chain_blob_key_id(&daemon, &ref_name, "note.md"), t1.key_id);
+
+        // Rotate to S' over {self, peer 10} — as if peer 9 left and the new set
+        // re-ran the ceremony.
+        let (s2, t2) = fabricate_outcome([our_id, peer_id(10)], ref_name.as_bytes());
+        assert_ne!(t1.key_id, t2.key_id, "test needs two distinct keys");
+        let audit = rotate_shared_key(&daemon, &s2, &t2).expect("rotate");
+
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+
+        // 1. The row now carries S'.
+        let membership = read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
+        let row = membership
+            .subtrees
+            .iter()
+            .find(|r| r.ref_name == ref_name)
+            .expect("row");
+        assert_eq!(row.key_id.as_deref(), Some(t2.key_id.as_str()));
+
+        // 2. Both keys remain sealed — old S kept (custody limit), new S stored.
+        assert!(session.has_shared_key(&t1.key_id));
+        assert_eq!(*session.load_shared_key(&t2.key_id).unwrap(), s2);
+
+        // 3. The device tip is a shared_rekey audit record with the locked payload.
+        assert_eq!(repo.tip().unwrap().unwrap(), audit);
+        let crow = repo.db().get_commit(&audit).unwrap();
+        assert_eq!(crow.intent, "shared_rekey");
+        let payload: serde_json::Value = serde_json::from_str(&crow.payload).unwrap();
+        assert_eq!(payload["chain_id"].as_str(), Some(ref_name.as_str()));
+        assert_eq!(payload["old_key_id"].as_str(), Some(t1.key_id.as_str()));
+        assert_eq!(payload["new_key_id"].as_str(), Some(t2.key_id.as_str()));
+        assert_eq!(payload["ceremony_ref"].as_str(), Some(t2.key_id.as_str()));
+        // members = the post-rotation set (both device ids, hex).
+        let members: Vec<String> = payload["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(members.contains(&hex::encode(our_id)));
+        assert!(members.contains(&hex::encode(peer_id(10))));
+
+        // 4. The new transcript record is committed at its locked path + re-verifies.
+        {
+            let wt = WorkTree::new(&daemon, &inner);
+            let text = wt.read_to_string(&ceremony_record_rel(&t2.key_id)).unwrap();
+            assert_eq!(parse_transcript_record(&text).unwrap(), t2);
+        }
+        drop(inner); // release the guard — `chain_blob_key_id` re-locks it.
+
+        // 5. The chain blob is RE-ENCRYPTED under S': its container now names S'
+        //    (a departed old-S-only holder can't read it), and it still decrypts to
+        //    the original plaintext.
+        assert_eq!(chain_blob_key_id(&daemon, &ref_name, "note.md"), t2.key_id);
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+        let tip = repo.tip_of(&ref_name).unwrap().unwrap();
+        let root = repo.db().get_commit(&tip).unwrap().root_tree;
+        let entry = repo
+            .db()
+            .get_tree(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "note.md")
+            .unwrap();
+        let cipher = repo.objects().get(&entry.target).unwrap();
+        assert_eq!(
+            session
+                .decrypt_tracked_blob("projects/journals/note.md", &cipher)
+                .unwrap(),
+            b"shared secret"
+        );
+    }
+
+    /// Rotation refuses to *establish*: an unkeyed chain (no ceremony yet) has no
+    /// live key to replace, so `rotate_shared_key` is a hard refusal — the
+    /// authorized-re-key seam never doubles as a key-fill backdoor around slice
+    /// 006's fill-if-unkeyed persist path.
+    #[test]
+    fn rotate_refuses_an_unkeyed_or_missing_chain() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let add = handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+        let our_id = daemon_device_id(&daemon);
+
+        // The row exists but is unkeyed — rotation must refuse (establishment is
+        // persist's job).
+        let (s, t) = fabricate_outcome([our_id, peer_id(9)], ref_name.as_bytes());
+        assert!(rotate_shared_key(&daemon, &s, &t).is_err());
+
+        // A chain with no membership row at all — also refused.
+        let (s2, t2) = fabricate_outcome([our_id, peer_id(9)], b"chain/nonexistent");
+        assert!(rotate_shared_key(&daemon, &s2, &t2).is_err());
+
+        // Nothing durable happened: neither key was sealed.
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        assert!(!session.has_shared_key(&t.key_id));
+        assert!(!session.has_shared_key(&t2.key_id));
     }
 }
