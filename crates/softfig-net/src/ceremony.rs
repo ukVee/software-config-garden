@@ -86,6 +86,17 @@ const SHARED_KEY_INFO_PREFIX: &[u8] = b"softfig.shared-subtree.v1";
 /// ledger names a key generation without ever recording `S`.
 const KEY_ID_DOMAIN: &[u8] = b"softfig/shared-key/key-id/v1";
 
+/// BLAKE3 domain tag for the ceremony **member-set digest** — the whole
+/// participating set, bound into every commit and reveal signature (M5d slice
+/// 013 / CORR-1). Without it a member's genuine signed commit/reveal is bound
+/// only to `(nonce, chain, its own id)`, so an authenticated peer could replay
+/// that entry into a *forged* transcript over a different member set (padding it
+/// with sybils to grind `S`) and the entry's own signature would still verify.
+/// Binding the set means adding, removing, or substituting any member changes
+/// the digest and so invalidates every signature — the recombination is
+/// structurally impossible.
+const MEMBER_SET_DOMAIN: &[u8] = b"softfig/shared-key/member-set/v1";
+
 /// The commitment a member publishes for contribution `r`:
 /// `BLAKE3(COMMITMENT_DOMAIN ‖ nonce ‖ device_id ‖ r)`. Binding the nonce and
 /// the device id means a commitment is valid only for *this* ceremony and *this*
@@ -101,43 +112,73 @@ pub fn commitment(nonce: &CeremonyNonce, device_id: &[u8; 32], r: &Contribution)
     *h.finalize().as_bytes()
 }
 
+/// A canonical digest of the ceremony's participating **member set**:
+/// `BLAKE3(MEMBER_SET_DOMAIN ‖ u32-be(count) ‖ sorted(device_ids))`.
+///
+/// The ids are sorted before hashing, so this names the *set* rather than a
+/// listing order — every honest member computes the identical value regardless
+/// of the order it learned the members in, mirroring how [`derive_shared_key`]
+/// sorts. The count is bound explicitly (defence in depth; the ids are already
+/// fixed-width so the concatenation is unambiguous). Bound into every commit and
+/// reveal signature ([`commit_signing_bytes`] / [`reveal_signing_bytes`]) so no
+/// signed entry can be transplanted into a transcript over a *different* member
+/// set (M5d slice 013 / CORR-1).
+pub fn member_set_digest(members: &[[u8; 32]]) -> [u8; 32] {
+    let mut sorted: Vec<&[u8; 32]> = members.iter().collect();
+    sorted.sort_unstable();
+    let mut h = blake3::Hasher::new();
+    h.update(MEMBER_SET_DOMAIN);
+    h.update(&(members.len() as u32).to_be_bytes());
+    for id in sorted {
+        h.update(id);
+    }
+    *h.finalize().as_bytes()
+}
+
 /// The exact bytes a member's Ed25519 identity signs to broadcast its
 /// commitment. Length-prefixed + domain-separated so no two distinct tuples
-/// share an encoding (the `replica.rs` signing-byte convention).
+/// share an encoding (the `replica.rs` signing-byte convention). Binds the
+/// `member_set_digest` (M5d slice 013) so a commitment signed for one member set
+/// cannot be recombined into a transcript over another.
 pub fn commit_signing_bytes(
     nonce: &CeremonyNonce,
     chain_id: &[u8],
+    member_set_digest: &[u8; 32],
     device_id: &[u8; 32],
     commitment: &Commitment,
 ) -> Vec<u8> {
     let mut m = Vec::with_capacity(
-        COMMIT_DOMAIN.len() + 32 + 4 + chain_id.len() + 32 + 32,
+        COMMIT_DOMAIN.len() + 32 + 4 + chain_id.len() + 32 + 32 + 32,
     );
     m.extend_from_slice(COMMIT_DOMAIN);
     m.extend_from_slice(nonce);
     m.extend_from_slice(&(chain_id.len() as u32).to_be_bytes());
     m.extend_from_slice(chain_id);
+    m.extend_from_slice(member_set_digest);
     m.extend_from_slice(device_id);
     m.extend_from_slice(commitment);
     m
 }
 
 /// The exact bytes a member's Ed25519 identity signs to reveal its contribution.
-/// Carries the nonce + chain id + device id so a signed reveal is bound to this
-/// ceremony and cannot be replayed onto another.
+/// Carries the nonce + chain id + member-set digest + device id so a signed
+/// reveal is bound to this ceremony, this member set, and this member — it
+/// cannot be replayed onto another ceremony nor recombined into a forged set.
 pub fn reveal_signing_bytes(
     nonce: &CeremonyNonce,
     chain_id: &[u8],
+    member_set_digest: &[u8; 32],
     device_id: &[u8; 32],
     r: &Contribution,
 ) -> Vec<u8> {
     let mut m = Vec::with_capacity(
-        REVEAL_DOMAIN.len() + 32 + 4 + chain_id.len() + 32 + 32,
+        REVEAL_DOMAIN.len() + 32 + 4 + chain_id.len() + 32 + 32 + 32,
     );
     m.extend_from_slice(REVEAL_DOMAIN);
     m.extend_from_slice(nonce);
     m.extend_from_slice(&(chain_id.len() as u32).to_be_bytes());
     m.extend_from_slice(chain_id);
+    m.extend_from_slice(member_set_digest);
     m.extend_from_slice(device_id);
     m.extend_from_slice(r);
     m
@@ -149,13 +190,14 @@ pub fn reveal_signing_bytes(
 pub fn verify_commit_sig(
     nonce: &CeremonyNonce,
     chain_id: &[u8],
+    member_set_digest: &[u8; 32],
     device_id: &[u8; 32],
     commitment: &Commitment,
     sig: &[u8],
 ) -> bool {
     verify_sig(
         device_id,
-        &commit_signing_bytes(nonce, chain_id, device_id, commitment),
+        &commit_signing_bytes(nonce, chain_id, member_set_digest, device_id, commitment),
         sig,
     )
 }
@@ -165,13 +207,14 @@ pub fn verify_commit_sig(
 pub fn verify_reveal_sig(
     nonce: &CeremonyNonce,
     chain_id: &[u8],
+    member_set_digest: &[u8; 32],
     device_id: &[u8; 32],
     r: &Contribution,
     sig: &[u8],
 ) -> bool {
     verify_sig(
         device_id,
-        &reveal_signing_bytes(nonce, chain_id, device_id, r),
+        &reveal_signing_bytes(nonce, chain_id, member_set_digest, device_id, r),
         sig,
     )
 }
@@ -276,6 +319,29 @@ impl Transcript {
     /// (recompute each commitment, re-derive `S`), but no forger can mint a valid
     /// commit/reveal signature under an identity key it does not hold.
     pub fn verify(&self) -> bool {
+        // Member-set integrity (M5d slice 013 / CORR-2): the standalone audit
+        // primitive must be at least as strong as `Ceremony::new` — a
+        // collaborative key needs ≥ 2 *distinct* members. Reject a zero/single-
+        // member or duplicate-member transcript before any derivation, so a
+        // padded or degenerate set can never re-derive a `key_id` that happens to
+        // match. (The v1 `> 2` refusal is a drive/persist-layer policy, not an
+        // audit invariant, so it is not imposed here.)
+        if self.members.len() < 2 {
+            return false;
+        }
+        let member_ids: Vec<[u8; 32]> = self.members.iter().map(|e| e.device_id).collect();
+        {
+            let mut sorted = member_ids.clone();
+            sorted.sort_unstable();
+            if sorted.windows(2).any(|w| w[0] == w[1]) {
+                return false;
+            }
+        }
+        // Bind the whole member set into every signature check (CORR-1): a
+        // genuine commit/reveal entry replayed into a transcript over a
+        // *different* member set fails here, because the digest the signer bound
+        // no longer matches the set this transcript presents.
+        let msd = member_set_digest(&member_ids);
         let mut contributions = Vec::with_capacity(self.members.len());
         for e in &self.members {
             if commitment(&self.nonce, &e.device_id, &e.r) != e.commitment {
@@ -283,19 +349,28 @@ impl Transcript {
             }
             // Participation proof: the commit + reveal signatures must verify
             // under this member's own identity key over the same signing bytes
-            // the drive loop checked live (nonce + chain id + device id +
-            // commitment / r). A forged transcript over ids the forger cannot
-            // sign for fails here even though the commitment binding passes.
+            // the drive loop checked live (nonce + chain id + member-set digest +
+            // device id + commitment / r). A forged transcript over ids the
+            // forger cannot sign for — or a genuine entry padded into a different
+            // set — fails here even though the commitment binding passes.
             if !verify_commit_sig(
                 &self.nonce,
                 &self.chain_id,
+                &msd,
                 &e.device_id,
                 &e.commitment,
                 &e.commit_sig,
             ) {
                 return false;
             }
-            if !verify_reveal_sig(&self.nonce, &self.chain_id, &e.device_id, &e.r, &e.reveal_sig) {
+            if !verify_reveal_sig(
+                &self.nonce,
+                &self.chain_id,
+                &msd,
+                &e.device_id,
+                &e.r,
+                &e.reveal_sig,
+            ) {
                 return false;
             }
             contributions.push(MemberContribution {
@@ -338,6 +413,10 @@ pub struct Ceremony {
     chain_id: Vec<u8>,
     /// Expected members, device-id-sorted, deduplicated.
     members: Vec<[u8; 32]>,
+    /// The canonical digest of `members`, bound into every commit + reveal
+    /// signature so an entry cannot be recombined into a different set (slice
+    /// 013). Cached at construction — `members` is fixed for a ceremony's life.
+    member_set_digest: [u8; 32],
     local_id: [u8; 32],
     local_r: Contribution,
     phase: Phase,
@@ -389,10 +468,12 @@ impl Ceremony {
             return Err(NetError::Protocol("local device is not in the member set"));
         }
         let n = sorted.len();
+        let msd = member_set_digest(&sorted);
         let mut c = Ceremony {
             nonce,
             chain_id,
             members: sorted,
+            member_set_digest: msd,
             local_id,
             local_r,
             phase: Phase::Committing,
@@ -433,6 +514,13 @@ impl Ceremony {
     /// The chain this ceremony keys.
     pub fn chain_id(&self) -> &[u8] {
         &self.chain_id
+    }
+
+    /// The canonical digest of this ceremony's member set — bind it into every
+    /// commit + reveal signature (slice 013) so no entry can be recombined into a
+    /// transcript over a different set.
+    pub fn member_set_digest(&self) -> &[u8; 32] {
+        &self.member_set_digest
     }
 
     /// This member's own device id (bind it into outgoing frames).
@@ -588,11 +676,18 @@ pub fn sign_commit(
     sk: &SigningKey,
     nonce: &CeremonyNonce,
     chain_id: &[u8],
+    member_set_digest: &[u8; 32],
     device_id: &[u8; 32],
     commitment: &Commitment,
 ) -> [u8; 64] {
-    sk.sign(&commit_signing_bytes(nonce, chain_id, device_id, commitment))
-        .to_bytes()
+    sk.sign(&commit_signing_bytes(
+        nonce,
+        chain_id,
+        member_set_digest,
+        device_id,
+        commitment,
+    ))
+    .to_bytes()
 }
 
 /// Sign the reveal message for a member. See [`sign_commit`].
@@ -600,11 +695,18 @@ pub fn sign_reveal(
     sk: &SigningKey,
     nonce: &CeremonyNonce,
     chain_id: &[u8],
+    member_set_digest: &[u8; 32],
     device_id: &[u8; 32],
     r: &Contribution,
 ) -> [u8; 64] {
-    sk.sign(&reveal_signing_bytes(nonce, chain_id, device_id, r))
-        .to_bytes()
+    sk.sign(&reveal_signing_bytes(
+        nonce,
+        chain_id,
+        member_set_digest,
+        device_id,
+        r,
+    ))
+    .to_bytes()
 }
 
 // --- The mesh drive loop ----------------------------------------------------
@@ -711,11 +813,14 @@ where
     let nonce = *ceremony.nonce();
     let chain_id = ceremony.chain_id().to_vec();
     let local_id = ceremony.local_id();
+    // The member-set digest is bound into every commit + reveal signature (slice
+    // 013). It is fixed for the ceremony's life, so read it once here.
+    let msd = *ceremony.member_set_digest();
 
     // 1. Sign + broadcast our commitment. (The state machine self-seeded it in
     //    `Ceremony::new`; the mesh has to hear it.)
     let commitment = ceremony.local_commitment();
-    let csig = signer.sign(&commit_signing_bytes(&nonce, &chain_id, &local_id, &commitment));
+    let csig = signer.sign(&commit_signing_bytes(&nonce, &chain_id, &msd, &local_id, &commitment));
     // Retain our own commit signature in the machine — `new` self-seeded the
     // commitment before a signer existed, so the transcript gets ours only here.
     ceremony.record_local_commit_sig(csig);
@@ -753,7 +858,7 @@ where
     // 3. All commitments in — sign + broadcast our reveal, then record it
     //    locally (the machine self-seeds our commitment but not our reveal).
     let contribution = ceremony.local_contribution();
-    let rsig = signer.sign(&reveal_signing_bytes(&nonce, &chain_id, &local_id, &contribution));
+    let rsig = signer.sign(&reveal_signing_bytes(&nonce, &chain_id, &msd, &local_id, &contribution));
     transport.broadcast(&Frame::shared_key_reveal(SharedKeyReveal {
         nonce: nonce.to_vec(),
         chain_id: chain_id.clone(),
@@ -821,9 +926,10 @@ fn feed_commit(
             "shared-key-commit bound to a different ceremony",
         ));
     }
+    let msd = *ceremony.member_set_digest();
     let device_id = to_id32(&c.device_id)?;
     let commitment = to_id32(&c.commitment)?;
-    if !verify_commit_sig(nonce, chain_id, &device_id, &commitment, &c.signature) {
+    if !verify_commit_sig(nonce, chain_id, &msd, &device_id, &commitment, &c.signature) {
         return Err(NetError::Protocol(
             "shared-key-commit signature failed to verify",
         ));
@@ -847,9 +953,10 @@ fn feed_reveal(
             "shared-key-reveal bound to a different ceremony",
         ));
     }
+    let msd = *ceremony.member_set_digest();
     let device_id = to_id32(&r.device_id)?;
     let contribution = to_id32(&r.contribution)?;
-    if !verify_reveal_sig(nonce, chain_id, &device_id, &contribution, &r.signature) {
+    if !verify_reveal_sig(nonce, chain_id, &msd, &device_id, &contribution, &r.signature) {
         return Err(NetError::Protocol(
             "shared-key-reveal signature failed to verify",
         ));
@@ -905,15 +1012,30 @@ mod tests {
     const NONCE: CeremonyNonce = [7u8; 32];
     const CHAIN: &[u8] = b"chain/projects";
 
-    /// This member's honest commit signature under `NONCE`/`CHAIN` — what the
-    /// live drive loop would have verified before accepting the commitment.
-    fn honest_csig(m: &Member) -> [u8; 64] {
-        sign_commit(&m.sk, &NONCE, CHAIN, &m.id, &commitment(&NONCE, &m.id, &m.r))
+    /// The member-set digest for a fabricated ceremony over `members` — the value
+    /// every honest commit/reveal signature binds (slice 013).
+    fn set_digest(members: &[Member]) -> [u8; 32] {
+        member_set_digest(&ids(members))
     }
 
-    /// This member's honest reveal signature under `NONCE`/`CHAIN`.
-    fn honest_rsig(m: &Member) -> [u8; 64] {
-        sign_reveal(&m.sk, &NONCE, CHAIN, &m.id, &m.r)
+    /// This member's honest commit signature under `NONCE`/`CHAIN` over the
+    /// `members` set — what the live drive loop would have verified before
+    /// accepting the commitment.
+    fn honest_csig(members: &[Member], m: &Member) -> [u8; 64] {
+        sign_commit(
+            &m.sk,
+            &NONCE,
+            CHAIN,
+            &set_digest(members),
+            &m.id,
+            &commitment(&NONCE, &m.id, &m.r),
+        )
+    }
+
+    /// This member's honest reveal signature under `NONCE`/`CHAIN` over the
+    /// `members` set.
+    fn honest_rsig(members: &[Member], m: &Member) -> [u8; 64] {
+        sign_reveal(&m.sk, &NONCE, CHAIN, &set_digest(members), &m.id, &m.r)
     }
 
     /// Run a full honest ceremony from `local`'s perspective, feeding the other
@@ -929,13 +1051,13 @@ mod tests {
         .unwrap();
         // Our own commitment is self-seeded; the drive loop records its
         // signature, so mirror that here.
-        c.record_local_commit_sig(honest_csig(&members[local]));
+        c.record_local_commit_sig(honest_csig(members, &members[local]));
         // Commit phase: every *other* member's commitment (ours is seeded).
         for (i, m) in members.iter().enumerate() {
             if i == local {
                 continue;
             }
-            c.accept_commitment(&m.id, commitment(&NONCE, &m.id, &m.r), honest_csig(m))
+            c.accept_commitment(&m.id, commitment(&NONCE, &m.id, &m.r), honest_csig(members, m))
                 .unwrap();
         }
         assert_eq!(c.phase(), Phase::Revealing);
@@ -944,10 +1066,14 @@ mod tests {
             if i == local {
                 continue;
             }
-            c.accept_reveal(&m.id, m.r, honest_rsig(m)).unwrap();
+            c.accept_reveal(&m.id, m.r, honest_rsig(members, m)).unwrap();
         }
-        c.accept_reveal(&members[local].id, members[local].r, honest_rsig(&members[local]))
-            .unwrap();
+        c.accept_reveal(
+            &members[local].id,
+            members[local].r,
+            honest_rsig(members, &members[local]),
+        )
+        .unwrap();
         assert_eq!(c.phase(), Phase::Derived);
         c
     }
@@ -998,7 +1124,7 @@ mod tests {
         c.accept_commitment(
             &members[1].id,
             commitment(&NONCE, &members[1].id, &members[1].r),
-            honest_csig(&members[1]),
+            honest_csig(&members, &members[1]),
         )
         .unwrap();
         assert_eq!(c.phase(), Phase::Revealing);
@@ -1006,7 +1132,14 @@ mod tests {
         // signed, but it does not open the commitment — the state machine aborts
         // on the commitment mismatch, before the signature is even retained).
         let tampered = [0xAAu8; 32];
-        let tsig = sign_reveal(&members[1].sk, &NONCE, CHAIN, &members[1].id, &tampered);
+        let tsig = sign_reveal(
+            &members[1].sk,
+            &NONCE,
+            CHAIN,
+            &set_digest(&members),
+            &members[1].id,
+            &tampered,
+        );
         let err = c.accept_reveal(&members[1].id, tampered, tsig).unwrap_err();
         assert!(matches!(err, NetError::Protocol(_)));
         assert_eq!(c.phase(), Phase::Aborted);
@@ -1038,14 +1171,14 @@ mod tests {
         c.accept_commitment(
             &members[1].id,
             commitment(&other_nonce, &members[1].id, &members[1].r),
-            honest_csig(&members[1]),
+            honest_csig(&members, &members[1]),
         )
         .unwrap();
         assert_eq!(c.phase(), Phase::Revealing);
         // The honest reveal from the other ceremony does not open the commitment
         // under THIS ceremony's nonce.
         let err = c
-            .accept_reveal(&members[1].id, members[1].r, honest_rsig(&members[1]))
+            .accept_reveal(&members[1].id, members[1].r, honest_rsig(&members, &members[1]))
             .unwrap_err();
         assert!(matches!(err, NetError::Protocol(_)));
         assert_eq!(c.phase(), Phase::Aborted);
@@ -1114,6 +1247,102 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_padded_member_set() {
+        // The CORR-1 attack (slice 013): an authenticated peer replays the
+        // victims' genuine 2-member entries into a forged 3-member transcript,
+        // padding the set with a sybil it controls to bias `S` across a candidate
+        // space. Each victim's signature is bound to the {m1,m2} member-set
+        // digest, so once the set is padded to {m1,m2,attacker} the victims'
+        // signatures no longer verify — the entries cannot be recombined into a
+        // larger set, and the no-predetermination property holds.
+        let honest = [member(1, 11), member(2, 22)];
+        let genuine = run_honest(&honest, 0).transcript().unwrap().clone();
+        assert!(genuine.verify());
+
+        let attacker = member(3, 33);
+        let padded = [member(1, 11), member(2, 22), member(3, 33)];
+        let padded_msd = set_digest(&padded);
+        let att_comm = commitment(&NONCE, &attacker.id, &attacker.r);
+        let att_entry = TranscriptEntry {
+            device_id: attacker.id,
+            commitment: att_comm,
+            r: attacker.r,
+            // The attacker's OWN entry is correctly self-signed over the padded
+            // set — the recombination attack only needs the victims' entries to
+            // survive, which they must not.
+            commit_sig: sign_commit(&attacker.sk, &NONCE, CHAIN, &padded_msd, &attacker.id, &att_comm),
+            reveal_sig: sign_reveal(&attacker.sk, &NONCE, CHAIN, &padded_msd, &attacker.id, &attacker.r),
+        };
+        // Recompute key_id for the 3-member derivation so the keyless key_id
+        // check the old verify() relied on would still pass — isolating the
+        // member-set binding as the thing that catches the forgery.
+        let contributions: Vec<MemberContribution> = padded
+            .iter()
+            .map(|m| MemberContribution { device_id: m.id, r: m.r })
+            .collect();
+        let s3 = derive_shared_key(&NONCE, &contributions);
+        let mut forged = genuine.clone();
+        forged.members.push(att_entry);
+        forged.key_id = key_id(&s3);
+        assert!(!forged.verify());
+    }
+
+    #[test]
+    fn verify_rejects_degenerate_member_sets() {
+        // CORR-2: the standalone audit primitive is at least as strong as
+        // `Ceremony::new`. A single-member "collaborative" key — even a perfectly
+        // self-signed one — is refused (a key with one contributor has no
+        // collaborators).
+        let m = member(1, 11);
+        let msd1 = member_set_digest(&[m.id]);
+        let comm = commitment(&NONCE, &m.id, &m.r);
+        let one = Transcript {
+            nonce: NONCE,
+            chain_id: CHAIN.to_vec(),
+            members: vec![TranscriptEntry {
+                device_id: m.id,
+                commitment: comm,
+                r: m.r,
+                commit_sig: sign_commit(&m.sk, &NONCE, CHAIN, &msd1, &m.id, &comm),
+                reveal_sig: sign_reveal(&m.sk, &NONCE, CHAIN, &msd1, &m.id, &m.r),
+            }],
+            key_id: key_id(&derive_shared_key(
+                &NONCE,
+                &[MemberContribution { device_id: m.id, r: m.r }],
+            )),
+        };
+        assert!(!one.verify());
+
+        // A duplicate-member transcript (the same device id twice, each entry
+        // internally consistent and signed over the {d,d} set) is refused before
+        // any derivation — a padded set cannot smuggle a member in twice.
+        let d = member(5, 55);
+        let dup_ids = [d.id, d.id];
+        let dup_msd = member_set_digest(&dup_ids);
+        let dcomm = commitment(&NONCE, &d.id, &d.r);
+        let dentry = || TranscriptEntry {
+            device_id: d.id,
+            commitment: dcomm,
+            r: d.r,
+            commit_sig: sign_commit(&d.sk, &NONCE, CHAIN, &dup_msd, &d.id, &dcomm),
+            reveal_sig: sign_reveal(&d.sk, &NONCE, CHAIN, &dup_msd, &d.id, &d.r),
+        };
+        let dup = Transcript {
+            nonce: NONCE,
+            chain_id: CHAIN.to_vec(),
+            members: vec![dentry(), dentry()],
+            key_id: key_id(&derive_shared_key(
+                &NONCE,
+                &[
+                    MemberContribution { device_id: d.id, r: d.r },
+                    MemberContribution { device_id: d.id, r: d.r },
+                ],
+            )),
+        };
+        assert!(!dup.verify());
+    }
+
+    #[test]
     fn non_member_and_duplicate_commitments_rejected() {
         let members = [member(1, 11), member(2, 22)];
         let stranger = member(9, 99);
@@ -1130,13 +1359,17 @@ mod tests {
             .accept_commitment(
                 &stranger.id,
                 commitment(&NONCE, &stranger.id, &stranger.r),
-                honest_csig(&stranger),
+                honest_csig(&members, &stranger),
             )
             .unwrap_err();
         assert!(matches!(err, NetError::Protocol(_)));
         // Our own commitment was seeded; a second one for us is a duplicate.
         let err = c
-            .accept_commitment(&members[0].id, c.local_commitment(), honest_csig(&members[0]))
+            .accept_commitment(
+                &members[0].id,
+                c.local_commitment(),
+                honest_csig(&members, &members[0]),
+            )
             .unwrap_err();
         assert!(matches!(err, NetError::Protocol(_)));
     }
@@ -1156,7 +1389,7 @@ mod tests {
         // out of phase.
         assert_eq!(c.phase(), Phase::Committing);
         let err = c
-            .accept_reveal(&members[0].id, members[0].r, honest_rsig(&members[0]))
+            .accept_reveal(&members[0].id, members[0].r, honest_rsig(&members, &members[0]))
             .unwrap_err();
         assert!(matches!(err, NetError::Protocol(_)));
     }
@@ -1170,21 +1403,33 @@ mod tests {
 
     #[test]
     fn commit_and_reveal_signatures_roundtrip() {
-        let m = member(1, 11);
+        let members = [member(1, 11), member(2, 22)];
+        let msd = set_digest(&members);
+        let m = &members[0];
         let comm = commitment(&NONCE, &m.id, &m.r);
-        let csig = sign_commit(&m.sk, &NONCE, CHAIN, &m.id, &comm);
-        assert!(verify_commit_sig(&NONCE, CHAIN, &m.id, &comm, &csig));
+        let csig = sign_commit(&m.sk, &NONCE, CHAIN, &msd, &m.id, &comm);
+        assert!(verify_commit_sig(&NONCE, CHAIN, &msd, &m.id, &comm, &csig));
         // Tampered commitment fails.
         let mut bad = comm;
         bad[0] ^= 1;
-        assert!(!verify_commit_sig(&NONCE, CHAIN, &m.id, &bad, &csig));
+        assert!(!verify_commit_sig(&NONCE, CHAIN, &msd, &m.id, &bad, &csig));
 
-        let rsig = sign_reveal(&m.sk, &NONCE, CHAIN, &m.id, &m.r);
-        assert!(verify_reveal_sig(&NONCE, CHAIN, &m.id, &m.r, &rsig));
+        let rsig = sign_reveal(&m.sk, &NONCE, CHAIN, &msd, &m.id, &m.r);
+        assert!(verify_reveal_sig(&NONCE, CHAIN, &msd, &m.id, &m.r, &rsig));
         // A reveal signature is not valid under a different nonce (anti-replay at
         // the signature layer, complementing the commitment binding).
         let other_nonce = [8u8; 32];
-        assert!(!verify_reveal_sig(&other_nonce, CHAIN, &m.id, &m.r, &rsig));
+        assert!(!verify_reveal_sig(&other_nonce, CHAIN, &msd, &m.id, &m.r, &rsig));
+
+        // Slice 013 / CORR-1: mutating the member set invalidates the signatures.
+        // A signature minted over the {m1, m2} set does not verify once the set is
+        // padded to {m1, m2, m3} — so a genuine entry cannot be recombined into a
+        // transcript over a different set (the no-predetermination property).
+        let padded = [member(1, 11), member(2, 22), member(3, 33)];
+        let padded_msd = set_digest(&padded);
+        assert_ne!(msd, padded_msd);
+        assert!(!verify_commit_sig(&NONCE, CHAIN, &padded_msd, &m.id, &comm, &csig));
+        assert!(!verify_reveal_sig(&NONCE, CHAIN, &padded_msd, &m.id, &m.r, &rsig));
     }
 
     // --- drive-loop tests --------------------------------------------------
@@ -1242,9 +1487,9 @@ mod tests {
         }
     }
 
-    fn commit_frame(m: &Member, nonce: &CeremonyNonce, chain: &[u8]) -> Frame {
+    fn commit_frame(m: &Member, nonce: &CeremonyNonce, chain: &[u8], msd: &[u8; 32]) -> Frame {
         let comm = commitment(nonce, &m.id, &m.r);
-        let sig = sign_commit(&m.sk, nonce, chain, &m.id, &comm);
+        let sig = sign_commit(&m.sk, nonce, chain, msd, &m.id, &comm);
         Frame::shared_key_commit(SharedKeyCommit {
             nonce: nonce.to_vec(),
             chain_id: chain.to_vec(),
@@ -1348,11 +1593,18 @@ mod tests {
     #[test]
     fn driver_aborts_on_a_mismatched_reveal() {
         let members = [member(1, 11), member(2, 22)];
-        let good_commit = commit_frame(&members[1], &NONCE, CHAIN);
+        let good_commit = commit_frame(&members[1], &NONCE, CHAIN, &set_digest(&members));
         // A validly-signed reveal, but of a contribution that does not open the
         // commitment member 2 published.
         let wrong = [0xAAu8; 32];
-        let rsig = sign_reveal(&members[1].sk, &NONCE, CHAIN, &members[1].id, &wrong);
+        let rsig = sign_reveal(
+            &members[1].sk,
+            &NONCE,
+            CHAIN,
+            &set_digest(&members),
+            &members[1].id,
+            &wrong,
+        );
         let bad_reveal = Frame::shared_key_reveal(SharedKeyReveal {
             nonce: NONCE.to_vec(),
             chain_id: CHAIN.to_vec(),
@@ -1381,7 +1633,14 @@ mod tests {
         // machine sees it.
         let other_nonce = [9u8; 32];
         let comm = commitment(&other_nonce, &members[1].id, &members[1].r);
-        let sig = sign_commit(&members[1].sk, &other_nonce, CHAIN, &members[1].id, &comm);
+        let sig = sign_commit(
+            &members[1].sk,
+            &other_nonce,
+            CHAIN,
+            &set_digest(&members),
+            &members[1].id,
+            &comm,
+        );
         let foreign = Frame::shared_key_commit(SharedKeyCommit {
             nonce: other_nonce.to_vec(),
             chain_id: CHAIN.to_vec(),

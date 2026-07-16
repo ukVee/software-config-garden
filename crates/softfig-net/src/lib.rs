@@ -51,9 +51,9 @@ pub mod transport;
 
 pub use attest::{static_attestation_message, verify_static_attestation};
 pub use ceremony::{
-    commit_signing_bytes, commitment, derive_shared_key, key_id, reveal_signing_bytes,
-    verify_commit_sig, verify_reveal_sig, Ceremony, Contribution, MemberContribution, Phase,
-    SharedKey, Transcript, TranscriptEntry,
+    commit_signing_bytes, commitment, derive_shared_key, key_id, member_set_digest,
+    reveal_signing_bytes, verify_commit_sig, verify_reveal_sig, Ceremony, Contribution,
+    MemberContribution, Phase, SharedKey, Transcript, TranscriptEntry,
 };
 pub use connect::{connect_first, plan_routes, Route};
 pub use discovery::{Advertisement, DiscoveredPeer, PeerTxt};

@@ -2627,14 +2627,17 @@ mod tests {
         members: &[SignedMember<'_>],
     ) -> (SharedKey, Transcript) {
         use softfig_net::ceremony::{
-            commit_signing_bytes, commitment, derive_shared_key, key_id, reveal_signing_bytes,
-            MemberContribution, TranscriptEntry,
+            commit_signing_bytes, commitment, derive_shared_key, key_id, member_set_digest,
+            reveal_signing_bytes, MemberContribution, TranscriptEntry,
         };
         let contributions: Vec<MemberContribution> = members
             .iter()
             .map(|(id, r, _)| MemberContribution { device_id: *id, r: *r })
             .collect();
         let s = derive_shared_key(&nonce, &contributions);
+        // Slice 013: every commit/reveal signature binds the whole member set.
+        let member_ids: Vec<[u8; 32]> = members.iter().map(|(id, _, _)| *id).collect();
+        let msd = member_set_digest(&member_ids);
         let entries = members
             .iter()
             .map(|(id, r, sign)| {
@@ -2643,8 +2646,8 @@ mod tests {
                     device_id: *id,
                     commitment: comm,
                     r: *r,
-                    commit_sig: sign(&commit_signing_bytes(&nonce, chain, id, &comm)),
-                    reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, id, r)),
+                    commit_sig: sign(&commit_signing_bytes(&nonce, chain, &msd, id, &comm)),
+                    reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, &msd, id, r)),
                 }
             })
             .collect();

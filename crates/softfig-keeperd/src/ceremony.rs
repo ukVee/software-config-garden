@@ -756,8 +756,8 @@ fn collect_chain_plaintext(
 mod tests {
     use super::*;
     use softfig_net::ceremony::{
-        commit_signing_bytes, commitment, reveal_signing_bytes, run_ceremony, verify_commit_sig,
-        Ceremony, Phase,
+        commit_signing_bytes, commitment, member_set_digest, reveal_signing_bytes, run_ceremony,
+        verify_commit_sig, Ceremony, Phase,
     };
     use softfig_net::{NetError, RingEntry};
 
@@ -822,17 +822,23 @@ mod tests {
         let nonce = [7u8; 32];
         let chain_id = b"chain/projects";
         let r = [11u8; 32];
+        // A 2-member set (this device + a peer id) so the signature binds a real
+        // member-set digest, per slice 013. The peer id is only hashed into the
+        // set digest, so any 32 bytes stand in — only `device_id` must be a real
+        // key, since it is what the signature verifies under.
+        let peer_id = [9u8; 32];
+        let msd = member_set_digest(&[device_id, peer_id]);
         let comm = commitment(&nonce, &device_id, &r);
-        let sig = signer.sign(&commit_signing_bytes(&nonce, chain_id, &device_id, &comm));
+        let sig = signer.sign(&commit_signing_bytes(&nonce, chain_id, &msd, &device_id, &comm));
 
         // The vault-signed bytes verify byte-for-byte under the driver's verifier
         // — the whole point of the trait impl (the vault-sign ↔ net-verify
         // contract that the live mesh rides on).
-        assert!(verify_commit_sig(&nonce, chain_id, &device_id, &comm, &sig));
+        assert!(verify_commit_sig(&nonce, chain_id, &msd, &device_id, &comm, &sig));
         // A tampered commitment no longer verifies under the same signature.
         let mut bad = comm;
         bad[0] ^= 1;
-        assert!(!verify_commit_sig(&nonce, chain_id, &device_id, &bad, &sig));
+        assert!(!verify_commit_sig(&nonce, chain_id, &msd, &device_id, &bad, &sig));
     }
 
     // --- SessionTransport (the live-session CeremonyTransport) --------------
@@ -1077,14 +1083,16 @@ mod tests {
             MemberContribution { device_id: m1.0, r: m1.1 },
         ];
         let s = derive_shared_key(&nonce, &contributions);
+        // Slice 013: every commit/reveal signature binds the member-set digest.
+        let msd = member_set_digest(&[m0.0, m1.0]);
         let entry = |id: [u8; 32], r: [u8; 32], sign: &dyn Fn(&[u8]) -> [u8; 64]| {
             let comm = commitment(&nonce, &id, &r);
             TranscriptEntry {
                 device_id: id,
                 commitment: comm,
                 r,
-                commit_sig: sign(&commit_signing_bytes(&nonce, chain, &id, &comm)),
-                reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, &id, &r)),
+                commit_sig: sign(&commit_signing_bytes(&nonce, chain, &msd, &id, &comm)),
+                reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, &msd, &id, &r)),
             }
         };
         let members = vec![entry(m0.0, m0.1, m0.2), entry(m1.0, m1.1, m1.2)];
