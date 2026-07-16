@@ -78,11 +78,6 @@ pub(crate) struct Inner {
     pub(crate) tip: Option<Hash>,
     pub(crate) view: TreeView,
     pub(crate) overlay: Overlay,
-    /// The overlay generation captured by the most recent commit-input
-    /// snapshot ([`SharedState::unified_snapshot`]). A rotation absorbs
-    /// overlay entries up to this generation only — anything staged after
-    /// the snapshot was not in the commit and must survive (slice 006).
-    pub(crate) snapshot_gen: u64,
 }
 
 impl SharedState {
@@ -90,16 +85,22 @@ impl SharedState {
     /// Some(ref_name)`, fired by the repo's `tip_changed` callback) or after
     /// a registry hot-swap (`advanced = None`, no commit happened).
     ///
-    /// **Absorption invariant (M5c slice 006):** the rotation clears exactly
-    /// the overlay entries the new composition absorbed — those owned by the
-    /// chain whose ref advanced AND staged at-or-before the generation the
-    /// commit's snapshot captured. A registry swap absorbs nothing, so it
-    /// clears nothing. Other chains' staged writes and post-snapshot racers
-    /// always survive. (The old unconditional `overlay.clear()` was correct
-    /// only while every rotation followed a commit of the whole overlay —
-    /// multi-ref broke that: the confirmed data-loss family of the 2026-07-11
-    /// interim review, findings 1/2/3/12.)
-    pub(crate) fn rotate_tip(&self, advanced: Option<&str>) {
+    /// **Absorption invariant (M5c slice 006, bound per-commit in slice 012):**
+    /// the rotation clears exactly the overlay entries the new composition
+    /// absorbed — those owned by the chain whose ref advanced AND staged
+    /// at-or-before `cutoff`, the overlay generation *the firing commit's own
+    /// snapshot* captured (carried in with the commit, not read from a shared
+    /// mutable slot). `cutoff = None` absorbs nothing: a registry swap
+    /// (`advanced = None`) commits nothing, and a ref advance carrying no local
+    /// snapshot (`advanced = Some`, `cutoff = None` — the m5e `shared_pull`
+    /// shape: a network pull moves a ref forward with no local overlay capture)
+    /// must never drop a staged local write it never contained. Other chains'
+    /// staged writes and post-snapshot racers always survive. (The old
+    /// unconditional `overlay.clear()` was correct only while every rotation
+    /// followed a commit of the whole overlay — multi-ref broke that: the
+    /// confirmed data-loss family of the 2026-07-11 interim review, findings
+    /// 1/2/3/12; slice 012 closes the shared-slot residual, finding 5.)
+    pub(crate) fn rotate_tip(&self, advanced: Option<&str>, cutoff: Option<u64>) {
         // M2c — drop the redacted-content cache on every tip change;
         // the new tip may have introduced/removed/re-encrypted vault
         // regions, and the cache key (path) doesn't encode tip hash.
@@ -135,8 +136,7 @@ impl SharedState {
         for p in inner.view.paths().map(|p| p.to_path_buf()).collect::<Vec<_>>() {
             inner.inodes.intern(&p);
         }
-        if let Some(ref_name) = advanced {
-            let cutoff = inner.snapshot_gen;
+        if let (Some(ref_name), Some(cutoff)) = (advanced, cutoff) {
             inner
                 .overlay
                 .remove_absorbed(cutoff, |p| registry.owning_chain(p).ref_name == ref_name);
@@ -194,15 +194,20 @@ impl SharedState {
         // `filter_entry`. Overlay bytes are cloned here; tip blobs carry
         // only their hash so the bulk decrypt runs lock-free below.
         let mut files: Vec<(PathBuf, u32, ContentSource)> = Vec::new();
-        {
-            let mut inner = self.inner.lock().unwrap();
-            // Slice 006 — stamp the overlay generation this commit input
-            // captures, under the same lock the entries are collected, so the
-            // post-commit rotation absorbs exactly the entries snapshotted
-            // here and nothing staged after.
-            inner.snapshot_gen = inner.overlay.generation();
+        let overlay_generation = {
+            let inner = self.inner.lock().unwrap();
+            // Slice 012 — capture the overlay generation this commit input is cut
+            // at, under the same lock the entries are collected, and carry it WITH
+            // the returned snapshot (not the shared `inner.snapshot_gen` slot slice
+            // 006 used). The commit path threads it to the `tip_changed` callback,
+            // so the post-commit rotation absorbs exactly the entries snapshotted
+            // here and nothing staged after — and a ref advance with no snapshot (a
+            // network pull) carries no generation and absorbs nothing (m5e
+            // precondition; the 014 data-loss family, finding 5).
+            let captured_gen = inner.overlay.generation();
             collect_files(&inner, &ignore, Path::new(""), &mut files);
-        }
+            captured_gen
+        };
 
         // Phase 2: resolve content and assemble. Tip blobs decrypt to their
         // working-tree plaintext — raw Layer A, except a whole-file-sealed
@@ -227,6 +232,9 @@ impl SharedState {
         // Files-only collection already drops empty dirs, but prune for
         // symmetry with `walk` and robustness if that ever changes.
         snapshot.prune_empty_dirs();
+        // Carry the generation captured above with the snapshot, so the commit
+        // that lands it fires the rotation with its own cutoff (slice 012).
+        snapshot.overlay_generation = Some(overlay_generation);
         Ok(snapshot)
     }
 
@@ -288,7 +296,8 @@ impl SharedState {
         // end of this statement, before `rotate_tip` re-locks it (std `Mutex`
         // is not reentrant).
         *self.registry.lock().unwrap() = registry;
-        self.rotate_tip(None);
+        // No commit happened, so no cutoff — the rotation absorbs nothing.
+        self.rotate_tip(None, None);
     }
 
     /// The refs of every chain that owns at least one staged overlay file or
@@ -809,7 +818,6 @@ impl FuseMount {
                 tip,
                 view,
                 overlay: Overlay::new(),
-                snapshot_gen: 0,
             }),
             sink,
             sealed,
@@ -850,9 +858,9 @@ impl FuseMount {
     /// state alive past unmount.
     pub fn install_tip_callback(repo: &mut Repo, handle: &MountHandle) {
         let state = Arc::downgrade(&handle.state);
-        repo.set_tip_changed_callback(move |ref_name: &str, _hash: &Hash| {
+        repo.set_tip_changed_callback(move |ref_name: &str, _hash: &Hash, cutoff: Option<u64>| {
             if let Some(s) = state.upgrade() {
-                s.rotate_tip(Some(ref_name));
+                s.rotate_tip(Some(ref_name), cutoff);
             }
         });
     }

@@ -247,6 +247,11 @@ impl ChainRegistry {
             }
         }
         for (_, snap) in snaps.iter_mut() {
+            // Each per-chain carve-out inherits the unified snapshot's overlay
+            // generation, so a chain's commit carries the cutoff it was cut at
+            // to the rotation (slice 012 — the absorption cutoff is bound to the
+            // firing commit, not a shared mutable slot).
+            snap.overlay_generation = unified.overlay_generation;
             snap.prune_empty_dirs();
         }
         snaps

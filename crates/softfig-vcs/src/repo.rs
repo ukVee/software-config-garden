@@ -24,7 +24,13 @@ pub const TIP_REF: &str = "tip";
 /// `ref_name`. M2a wires the FUSE driver here so it can drop its stat cache and
 /// broadcast inval_inode notifications. One slot per repo for v1; if a second
 /// consumer ever shows up (sync push?), promote to a Vec.
-pub type TipChangedCallback = Box<dyn Fn(&str, &Hash) + Send + Sync>;
+/// `(ref_name, new_tip_hash, overlay_generation)`. `overlay_generation` is the
+/// FUSE-overlay generation the committed snapshot was cut at (`Some` for a
+/// commit built from a live overlay, `None` for a disk walk or a network ref
+/// advance carrying no local snapshot) — the FUSE driver's rotation absorbs
+/// overlay entries at or before that generation for the advanced ref only, so a
+/// `None` advance absorbs nothing (m5c-residual slice 012).
+pub type TipChangedCallback = Box<dyn Fn(&str, &Hash, Option<u64>) + Send + Sync>;
 
 /// A garden's VCS repository. Holds the path layout, an opened sqlite
 /// connection, and the object store. Does not hold a `VaultSession` —
@@ -241,7 +247,7 @@ impl Repo {
     /// driver here.
     pub fn set_tip_changed_callback<F>(&mut self, cb: F)
     where
-        F: Fn(&str, &Hash) + Send + Sync + 'static,
+        F: Fn(&str, &Hash, Option<u64>) + Send + Sync + 'static,
     {
         self.tip_changed = Some(Box::new(cb));
     }
@@ -295,7 +301,11 @@ impl Repo {
     ///
     /// The `tip_changed` callback (the FUSE stat-cache invalidation) fires for
     /// **whichever** ref this commit advanced, carrying `ref_name` so the FUSE
-    /// driver can recompose the union view and invalidate per chain.
+    /// driver can recompose the union view and invalidate per chain, plus the
+    /// snapshot's `overlay_generation` so the rotation absorbs exactly the
+    /// overlay entries this commit captured. A snapshot with no generation (a
+    /// network ref advance, a disk walk) fires the callback with `None` and the
+    /// rotation absorbs nothing (m5c-residual slice 012).
     pub fn commit_snapshot_to(
         &mut self,
         ref_name: &str,
@@ -309,11 +319,12 @@ impl Repo {
             Some(enc) => enc.as_ref(),
             None => &default_enc,
         };
+        let overlay_generation = snapshot.overlay_generation;
         let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor, ref_name)?;
         let now = unix_seconds();
         let hash = write_commit_tx(&mut self.db, session, ref_name, parent, &blueprint, intent, now)?;
         if let Some(cb) = &self.tip_changed {
-            cb(ref_name, &hash);
+            cb(ref_name, &hash, overlay_generation);
         }
         Ok(hash)
     }

@@ -124,14 +124,16 @@ impl MountHandle {
         &self.mount_point
     }
 
-    /// Called by `commit_workdir`'s registered tip-changed hook with the ref
-    /// the commit advanced. Rebuilds the union view from every chain's tip and
-    /// drops exactly the overlay entries that commit absorbed — the advanced
-    /// chain's entries up to the last snapshotted generation; other chains'
-    /// staged writes and post-snapshot racers survive (slice 006 absorption
-    /// invariant).
+    /// Rebuild the union view from every chain's tip after an **external** ref
+    /// advance (one not driven through `commit_snapshot_to`, e.g. a future
+    /// network pull). It carries no local overlay snapshot, so it advances with
+    /// no absorption cutoff and drops nothing — a ref moving forward with no
+    /// accompanying local capture must never absorb a staged local write it
+    /// never contained (slice 012; the m5e `shared_pull` shape). Commits made
+    /// through `commit_snapshot_to` instead fire the repo's `tip_changed` hook,
+    /// which threads that commit's own snapshot generation as the cutoff.
     pub fn on_tip_changed(&self, advanced_ref: &str) {
-        self.state.rotate_tip(Some(advanced_ref));
+        self.state.rotate_tip(Some(advanced_ref), None);
     }
 
     /// The refs of every chain owning at least one staged overlay write or

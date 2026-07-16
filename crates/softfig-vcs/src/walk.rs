@@ -41,18 +41,44 @@ impl TreeNode {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct WalkSnapshot {
     pub root: TreeNode,
+    /// The FUSE-overlay generation this snapshot was cut at (threaded up from
+    /// softfig-fuse's `Overlay::generation`), or `None` for a snapshot with no
+    /// live overlay behind it — a disk [`walk`], a caller-built tree, or a
+    /// network ref advance. `softfig-vcs` never interprets it;
+    /// [`Repo::commit_snapshot_to`] only relays it to the `tip_changed`
+    /// callback so the FUSE driver's post-commit rotation absorbs exactly the
+    /// overlay entries *this* commit captured (m5c-residual slice 012 — the
+    /// absorption cutoff is bound to the firing commit, not a shared mutable
+    /// slot). A commit carrying `None` absorbs nothing: a ref advance with no
+    /// accompanying local snapshot can never drop a staged local write (the
+    /// m5e `shared_pull` shape; the 014 data-loss family, closed here).
+    pub overlay_generation: Option<u64>,
 }
+
+/// Snapshots compare by **tree content only**: `overlay_generation` is
+/// provenance for the rotation cutoff, not part of the working tree, so two
+/// snapshots with identical trees are equal regardless of where each was cut
+/// (a disk `walk` and a FUSE overlay capture of the same tree stay equal).
+impl PartialEq for WalkSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+impl Eq for WalkSnapshot {}
 
 impl WalkSnapshot {
     /// An empty snapshot — the root is always a `Dir`, even with no
     /// entries. The shared starting point for both [`walk`] and the FUSE
     /// driver's in-memory reconstruction (`MountHandle::workdir_snapshot`).
+    /// Carries no overlay generation (a caller stamps it via
+    /// [`Self::overlay_generation`] when the tree came from a live overlay).
     pub fn empty() -> Self {
         WalkSnapshot {
             root: TreeNode::Dir(BTreeMap::new()),
+            overlay_generation: None,
         }
     }
 

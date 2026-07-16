@@ -357,7 +357,7 @@ fn commit_snapshot_commits_the_given_tree_not_the_filesystem() {
         "b.md".to_string(),
         TreeNode::File { mode: 0o644, content: b"overlay-only".to_vec() },
     );
-    let snapshot = WalkSnapshot { root: TreeNode::Dir(root) };
+    let snapshot = WalkSnapshot { root: TreeNode::Dir(root), overlay_generation: None };
 
     let intent = Intent::new(
         "memory_edit",
