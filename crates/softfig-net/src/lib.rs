@@ -48,6 +48,7 @@ pub mod replica;
 pub mod ring;
 pub mod sas;
 pub mod transport;
+pub mod turn;
 
 pub use attest::{static_attestation_message, verify_static_attestation};
 pub use ceremony::{
@@ -61,9 +62,15 @@ pub use endpoint_cache::{endpoint_cache_path, EndpointCache};
 pub use error::{NetError, Result};
 pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 pub use proto::{
-    CommitData, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, ObjectData, Ping, Pong,
-    RelayConnect, RelayData, ReplicaDone, ReplicaGrant, StateAnnounce, TipAnnounce, TreeData,
-    TreeEntryMsg,
+    CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload,
+    ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, StateAnnounce,
+    TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+};
+pub use turn::{
+    device_state_signing_bytes, turn_request_signing_bytes, turn_revoke_signing_bytes,
+    turn_yield_signing_bytes, verify_device_state_sig, verify_turn_request_sig,
+    verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseConfig, LeaseEvent, LeaseScope,
+    WriteTurn,
 };
 pub use relay::{relay_accept, relay_connect, Relay, RelayStream};
 pub use replica::{

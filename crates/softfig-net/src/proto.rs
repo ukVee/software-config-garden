@@ -11,9 +11,10 @@ mod generated {
 }
 
 pub use generated::{
-    frame, CommitData, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, ObjectData,
-    Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, SharedKeyCommit,
-    SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg,
+    frame, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree,
+    HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant,
+    SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce, TreeData,
+    TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
 };
 
 /// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
@@ -171,6 +172,38 @@ impl Frame {
     pub fn shared_key_handoff(handoff: SharedKeyHandoff) -> Self {
         Self {
             kind: Some(frame::Kind::SharedKeyHandoff(handoff)),
+        }
+    }
+
+    // --- M5e write-turn coordination frame constructors --------------------
+
+    /// A `DeviceStateAnnounce` frame (member -> members): this device's
+    /// offline / online-idle / online-active state (+ unlocked flag).
+    pub fn device_state_announce(announce: DeviceStateAnnounce) -> Self {
+        Self {
+            kind: Some(frame::Kind::DeviceStateAnnounce(announce)),
+        }
+    }
+
+    /// A `TurnRequest` frame (member -> members): request a chain's write turn.
+    pub fn turn_request(request: TurnRequest) -> Self {
+        Self {
+            kind: Some(frame::Kind::TurnRequest(request)),
+        }
+    }
+
+    /// A `TurnYield` frame (holder -> requester): yield the turn (the go-ahead).
+    pub fn turn_yield(yield_: TurnYield) -> Self {
+        Self {
+            kind: Some(frame::Kind::TurnYield(yield_)),
+        }
+    }
+
+    /// A `TurnRevoke` frame (member -> members): an expired holder's lease is
+    /// reclaimed so the turn returns.
+    pub fn turn_revoke(revoke: TurnRevoke) -> Self {
+        Self {
+            kind: Some(frame::Kind::TurnRevoke(revoke)),
         }
     }
 }
