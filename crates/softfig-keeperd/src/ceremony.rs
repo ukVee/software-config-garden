@@ -323,8 +323,9 @@ pub fn persist_ceremony_outcome(
 ) -> Result<Hash, (ErrorKind, String)> {
     // Consistency guards before anything durable happens: the key must be the
     // transcript's, the transcript must re-verify from first principles, and
-    // this device must be one of its members (a foreign transcript would store
-    // a key for a chain we have no part in).
+    // (once unlocked, below) the transcript's member set must equal this
+    // device's committed ring — a foreign or padded transcript would store a
+    // key for a member set we never authorized.
     if key_id(s) != transcript.key_id {
         return Err((
             ErrorKind::Internal,
@@ -345,16 +346,43 @@ pub fn persist_ceremony_outcome(
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
+    // M5d slice 013 pt2 — assert the authorized member set at the persist
+    // boundary (defence-in-depth on top of pt1's signed member-set binding).
+    // Require the transcript's member id-set to equal `assemble_member_set` of
+    // *this device's committed ring*, not merely `self ∈ members`: a
+    // validly-signed transcript for a member set this device never consented to
+    // (a forged/padded recovery hand-off, or a foreign 3-member set slipped past
+    // the drive-layer `>2` gate) is refused before anything durable happens.
+    // Ring-equality is strictly stronger than the old `self ∈ members` check —
+    // `assemble_member_set` always includes `local_id`, so an equal set always
+    // contains this device — and it also enforces the v1 `>2` refusal at persist
+    // (a 2-member committed ring can't equal a padded 3-member set). Rotation is
+    // deliberately NOT gated this way: `rotate_shared_key` has its own
+    // both-sides-stale authorization plus pt1's signed binding, and a strict
+    // ring-equality mid-membership-change would refuse the very rotations it
+    // exists to perform.
     {
-        let session = inner.session.as_ref().expect("unlocked");
-        if !transcript
-            .members
-            .iter()
-            .any(|m| m.device_id == session.identity_pubkey().to_bytes())
-        {
+        let local_id = inner
+            .session
+            .as_ref()
+            .expect("unlocked")
+            .identity_pubkey()
+            .to_bytes();
+        let ring = {
+            let wt = WorkTree::new(daemon, &inner);
+            crate::net::load_ring(&wt, inner.config.state_dir()).unwrap_or_default()
+        };
+        let expected: std::collections::BTreeSet<[u8; 32]> =
+            assemble_member_set(&ring, local_id).into_iter().collect();
+        let got: std::collections::BTreeSet<[u8; 32]> =
+            transcript.members.iter().map(|m| m.device_id).collect();
+        if expected != got {
             return Err((
                 ErrorKind::Internal,
-                "this device is not a member of the ceremony transcript".into(),
+                "ceremony transcript member set does not equal this device's \
+                 committed ring; refusing to persist a shared key for a member \
+                 set this device never authorized"
+                    .into(),
             ));
         }
     }
@@ -1077,32 +1105,76 @@ mod tests {
         m0: SignedMember<'_>,
         m1: SignedMember<'_>,
     ) -> (SharedKey, Transcript) {
+        build_signed_outcome_n(chain, &[m0, m1])
+    }
+
+    /// The N-member generalization: build a fully-signed, verifying ceremony
+    /// outcome for `chain` over an arbitrary member list, each member signing its
+    /// own entry over the slice-013 member-set-bound signing bytes. Used to
+    /// fabricate the padded/>2 shapes the persist ring-equality gate must refuse.
+    fn build_signed_outcome_n(chain: &[u8], members: &[SignedMember<'_>]) -> (SharedKey, Transcript) {
         let nonce = [7u8; 32];
-        let contributions = vec![
-            MemberContribution { device_id: m0.0, r: m0.1 },
-            MemberContribution { device_id: m1.0, r: m1.1 },
-        ];
+        let contributions: Vec<MemberContribution> = members
+            .iter()
+            .map(|m| MemberContribution { device_id: m.0, r: m.1 })
+            .collect();
         let s = derive_shared_key(&nonce, &contributions);
         // Slice 013: every commit/reveal signature binds the member-set digest.
-        let msd = member_set_digest(&[m0.0, m1.0]);
-        let entry = |id: [u8; 32], r: [u8; 32], sign: &dyn Fn(&[u8]) -> [u8; 64]| {
-            let comm = commitment(&nonce, &id, &r);
-            TranscriptEntry {
-                device_id: id,
-                commitment: comm,
-                r,
-                commit_sig: sign(&commit_signing_bytes(&nonce, chain, &msd, &id, &comm)),
-                reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, &msd, &id, &r)),
-            }
-        };
-        let members = vec![entry(m0.0, m0.1, m0.2), entry(m1.0, m1.1, m1.2)];
+        let ids: Vec<[u8; 32]> = members.iter().map(|m| m.0).collect();
+        let msd = member_set_digest(&ids);
+        let entries = members
+            .iter()
+            .map(|(id, r, sign)| {
+                let comm = commitment(&nonce, id, r);
+                TranscriptEntry {
+                    device_id: *id,
+                    commitment: comm,
+                    r: *r,
+                    commit_sig: sign(&commit_signing_bytes(&nonce, chain, &msd, id, &comm)),
+                    reveal_sig: sign(&reveal_signing_bytes(&nonce, chain, &msd, id, r)),
+                }
+            })
+            .collect();
         let transcript = Transcript {
             nonce,
             chain_id: chain.to_vec(),
-            members,
+            members: entries,
             key_id: key_id(&s),
         };
         (s, transcript)
+    }
+
+    /// Seed the daemon's committed ring for the persist ring-equality gate (M5d
+    /// slice 013 pt2). `persist_ceremony_outcome` now requires the transcript's
+    /// member set to equal `assemble_member_set(committed ring)`, so a fabricated
+    /// `{self, peer_seed…}` outcome only persists when the ring names those peers.
+    /// These unit fixtures never pair, so `config/peers.toml` is absent and
+    /// `load_ring` falls back to the legacy `.softfig/peers.toml` at `state_dir`
+    /// — write it directly. Each seed's `device_id` is `peer_id(seed)` (matching
+    /// the fabricated members) with a self-consistent attestation, so
+    /// `Ring::load`'s re-verification accepts it. Overwrites any prior seed, so a
+    /// test can shift membership between calls.
+    fn seed_ring(daemon: &Daemon, peer_seeds: &[u8]) {
+        use softfig_net::ring::ring_path;
+        use softfig_net::static_attestation_message;
+        let mut ring = Ring::default();
+        for &seed in peer_seeds {
+            let sk = peer_sk(seed);
+            let transport_pubkey = [seed ^ 0xFF; 32];
+            ring.upsert(RingEntry {
+                device_id: sk.verifying_key().to_bytes(),
+                name: format!("peer-{seed}"),
+                transport_pubkey,
+                endpoints: vec![],
+                attestation: sk.sign(&static_attestation_message(&transport_pubkey)).to_bytes(),
+                paired_at: 1,
+            });
+        }
+        let state_dir = {
+            let inner = daemon.inner.lock().unwrap();
+            inner.config.state_dir().to_path_buf()
+        };
+        ring.save(&ring_path(&state_dir)).expect("seed legacy ring");
     }
 
     /// Fabricate a signed 2-member outcome between two fabricated peers (by seed),
@@ -1169,6 +1241,7 @@ mod tests {
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
 
+        seed_ring(&daemon, &[9]); // committed ring == the fabricated {self, peer9} set
         let (s, transcript) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
         let hash = persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
 
@@ -1213,6 +1286,7 @@ mod tests {
             serde_json::json!({ "mount_path": "projects/journals" }),
         )
         .expect("add");
+        seed_ring(&daemon, &[9]);
         let (s, transcript) = fabricate_outcome_with_self(&daemon, 9, b"chain/journals");
 
         let first = persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
@@ -1228,6 +1302,7 @@ mod tests {
     #[test]
     fn persist_without_a_membership_row() {
         let (daemon, _tmp) = unlocked_daemon();
+        seed_ring(&daemon, &[9]);
         let (s, transcript) = fabricate_outcome_with_self(&daemon, 9, b"chain/elsewhere");
         persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist");
 
@@ -1243,7 +1318,12 @@ mod tests {
     fn persist_refuses_inconsistent_or_foreign_outcomes() {
         let (daemon, _tmp) = unlocked_daemon();
 
-        // A transcript this device is no member of (two fabricated peers).
+        // Ring == {self, peer9} so the `{self, peer9}` cases below clear the
+        // set-equality gate and fail on the guard each is probing.
+        seed_ring(&daemon, &[9]);
+
+        // A transcript this device is no member of (two fabricated peers): the set
+        // {1,2} never equals {self, peer9}, so it is refused.
         let (s, foreign) = fabricate_outcome([1, 2], b"chain/x");
         assert!(persist_ceremony_outcome(&daemon, &s, &foreign).is_err());
 
@@ -1275,6 +1355,7 @@ mod tests {
         let (daemon, _tmp) = unlocked_daemon();
         let our_id = daemon_device_id(&daemon);
 
+        seed_ring(&daemon, &[9]); // set matches → only the forged signatures reject
         let nonce = [7u8; 32];
         let ids = [our_id, peer_id(9)];
         let rs = [[0x11u8; 32], [0x22u8; 32]];
@@ -1328,12 +1409,17 @@ mod tests {
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
 
-        // First ceremony fills the row.
+        // First ceremony fills the row (ring == {self, peer9}).
+        seed_ring(&daemon, &[9]);
         let (s1, t1) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
         let tip1 = persist_ceremony_outcome(&daemon, &s1, &t1).expect("first persist");
 
         // A second ceremony for the same chain with a *different* member set
         // derives a different S → different key_id; persisting it must refuse.
+        // Shift the ring to {self, peer10} so this outcome clears the set-equality
+        // gate and the one-key-per-chain divergence refusal is what rejects it
+        // (not the ring check — that path is proven separately).
+        seed_ring(&daemon, &[10]);
         let (s2, t2) = fabricate_outcome_with_self(&daemon, 10, ref_name.as_bytes());
         assert_ne!(t1.key_id, t2.key_id, "test needs two distinct keys");
         assert!(
@@ -1355,6 +1441,71 @@ mod tests {
         // The divergent key's S was never sealed, and no divergent commit landed.
         assert!(!session.has_shared_key(&t2.key_id));
         assert_eq!(repo.tip().unwrap().unwrap(), tip1);
+    }
+
+    /// M5d slice 013 pt2 — the persist boundary refuses a transcript whose member
+    /// set is not this device's committed ring, even when the transcript is
+    /// internally flawless (real per-member signatures, `key_id` derives, every
+    /// commitment opens → `verify()` passes). This is the CORR-1 belt at persist:
+    /// a validly-signed but *padded* set {self, peer9, peer10} served against a v1
+    /// 2-member ring {self, peer9} is refused before any durable write — and the
+    /// SAME transcript persists once the ring genuinely names both peers, so the
+    /// gate keys off ring-equality, not an arbitrary member-count cap.
+    #[test]
+    fn persist_refuses_a_member_set_that_is_not_the_committed_ring() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let add = handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // A flawless, fully-signed 3-member outcome {self, peer9, peer10}.
+        let session = {
+            let inner = daemon.inner.lock().unwrap();
+            Arc::clone(inner.session.as_ref().expect("unlocked"))
+        };
+        let self_id = session.identity_pubkey().to_bytes();
+        let sk9 = peer_sk(9);
+        let sk10 = peer_sk(10);
+        let (s, t) = build_signed_outcome_n(
+            ref_name.as_bytes(),
+            &[
+                (self_id, [0x11; 32], &|m| session.sign(m).to_bytes()),
+                (peer_id(9), [0x22; 32], &|m| sk9.sign(m).to_bytes()),
+                (peer_id(10), [0x33; 32], &|m| sk10.sign(m).to_bytes()),
+            ],
+        );
+        assert!(
+            t.verify(),
+            "the transcript is internally valid — only the ring gate can reject it"
+        );
+
+        // Committed ring is the v1 2-member {self, peer9}: the padded 3-member set
+        // is refused, and nothing is sealed.
+        seed_ring(&daemon, &[9]);
+        assert!(
+            persist_ceremony_outcome(&daemon, &s, &t).is_err(),
+            "a member set beyond the committed ring must be refused at persist"
+        );
+        {
+            let inner = daemon.inner.lock().unwrap();
+            assert!(
+                !inner.session.as_ref().unwrap().has_shared_key(&t.key_id),
+                "nothing sealed on the refused path"
+            );
+        }
+
+        // Once the ring genuinely names both peers, the exact same transcript
+        // persists — proving the gate is ring-equality, not a 2-member cap.
+        seed_ring(&daemon, &[9, 10]);
+        persist_ceremony_outcome(&daemon, &s, &t).expect("persists once the ring matches the set");
+        let inner = daemon.inner.lock().unwrap();
+        assert_eq!(
+            *inner.session.as_ref().unwrap().load_shared_key(&t.key_id).unwrap(),
+            s
+        );
     }
 
     /// The read_key_id of the blob committed at chain-relative `name` in a
@@ -1396,6 +1547,7 @@ mod tests {
 
         // Establish S over {self, peer 9}, then seed a real blob (sealed under S
         // via the live router that persist re-pointed).
+        seed_ring(&daemon, &[9]); // establishment persist needs the ring to match {self, peer9}
         let (s1, t1) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
         persist_ceremony_outcome(&daemon, &s1, &t1).expect("initial key");
         {

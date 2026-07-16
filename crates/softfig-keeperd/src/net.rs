@@ -2481,7 +2481,7 @@ mod tests {
     #[test]
     fn ceremony_end_to_end_over_loopback() {
         let (daemon_a, tmp_a) = ceremony_daemon();
-        let (daemon_b, _tmp_b) = ceremony_daemon();
+        let (daemon_b, tmp_b) = ceremony_daemon();
         let local_a = device_of(&daemon_a, "dev-a");
         let local_b = device_of(&daemon_b, "dev-b");
 
@@ -2513,6 +2513,14 @@ mod tests {
                 vec![format!("127.0.0.1:{port}")],
             ));
             ring.save(&ring_path(tmp_a.path())).unwrap();
+        }
+        // B's committed ring holds A too, so B's responder-side persist clears
+        // the M5d slice-013-pt2 member-set==ring gate (its `load_ring` reads the
+        // legacy path at B's own state dir).
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(&daemon_a, "dev-a", vec![]));
+            ring.save(&ring_path(tmp_b.path())).unwrap();
         }
 
         let add = crate::handlers::shared_subtree_add(
@@ -2687,7 +2695,7 @@ mod tests {
     /// committed daemon state.
     #[test]
     fn stale_keyed_chains_detects_a_departed_member() {
-        let (daemon, _tmp) = ceremony_daemon();
+        let (daemon, tmp) = ceremony_daemon();
         let our_id = {
             let inner = daemon.inner.lock().unwrap();
             inner.session.as_ref().unwrap().identity_pubkey().to_bytes()
@@ -2699,6 +2707,17 @@ mod tests {
         )
         .expect("add");
         let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // The committed ring names peer9 + peer10, so the 3-member establishment
+        // persist below clears the M5d slice-013-pt2 member-set==ring gate. (The
+        // staleness checks that follow pass explicit member arrays, so they are
+        // unaffected by the committed ring.)
+        {
+            let mut ring = Ring::default();
+            ring.upsert(forged_peer(9));
+            ring.upsert(forged_peer(10));
+            ring.save(&ring_path(tmp.path())).unwrap();
+        }
 
         // Key it with a fabricated (signed) 3-member outcome {self, peer9, peer10}.
         let self_sign = session_sign(&daemon);
@@ -2741,7 +2760,7 @@ mod tests {
     #[test]
     fn rekey_end_to_end_over_loopback() {
         let (daemon_a, tmp_a) = ceremony_daemon();
-        let (daemon_b, _tmp_b) = ceremony_daemon();
+        let (daemon_b, tmp_b) = ceremony_daemon();
         let local_a = device_of(&daemon_a, "dev-a");
         let local_b = device_of(&daemon_b, "dev-b");
 
@@ -2776,6 +2795,22 @@ mod tests {
                 (c_id, [0x33u8; 32], &sign_c),
             ],
         );
+        // Establishment ring: both A and B commit the full pre-rotation set
+        // {A, B, C} (C = forged peer 3), so each side's persist clears the M5d
+        // slice-013-pt2 member-set==ring gate. The ring shrinks to {A, B} below
+        // when "C leaves", which is what makes the chain stale for rotation.
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(&daemon_b, "dev-b", vec![]));
+            ring.upsert(forged_peer(3));
+            ring.save(&ring_path(tmp_a.path())).unwrap();
+        }
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(&daemon_a, "dev-a", vec![]));
+            ring.upsert(forged_peer(3));
+            ring.save(&ring_path(tmp_b.path())).unwrap();
+        }
         persist_ceremony_outcome(&daemon_a, &s1, &t1).expect("key a");
         persist_ceremony_outcome(&daemon_b, &s1, &t1).expect("key b");
         let old_kid = t1.key_id.clone();
@@ -2822,6 +2857,14 @@ mod tests {
                 vec![format!("127.0.0.1:{port}")],
             ));
             ring.save(&ring_path(tmp_a.path())).unwrap();
+        }
+        // B's committed ring shrinks to {A} too, so B independently sees the
+        // 3-member chain as stale (`shared_chain_is_stale`) and authorizes the
+        // rotation the responder is asked to drive.
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(&daemon_a, "dev-a", vec![]));
+            ring.save(&ring_path(tmp_b.path())).unwrap();
         }
 
         // Pre-seed A's tie-break clock as if it had seen the chain stale a prior
@@ -2922,7 +2965,14 @@ mod tests {
         let (daemon_b, tmp_b) = ceremony_daemon();
         let local_a = device_of(&daemon_a, "dev-a");
         let local_b = device_of(&daemon_b, "dev-b");
-        let _ = tmp_a; // A's state dir is unused here (A is the responder).
+        // A's committed ring holds B, so A's establishment persist below clears
+        // the M5d slice-013-pt2 member-set==ring gate (A is the keyed peer that
+        // later serves the recovery hand-off).
+        {
+            let mut ring = Ring::default();
+            ring.upsert(ring_entry_of(&daemon_b, "dev-b", vec![]));
+            ring.save(&ring_path(tmp_a.path())).unwrap();
+        }
 
         // Both devices add the shared subtree → both get an unkeyed row for the
         // same ref_name (the mount path derives it deterministically).
@@ -3054,9 +3104,16 @@ mod tests {
     /// boundary A, where `S` is absent).
     #[test]
     fn accept_handoff_is_idempotent_when_s_already_sealed() {
-        let (daemon, _tmp) = ceremony_daemon();
+        let (daemon, tmp) = ceremony_daemon();
         let local = device_of(&daemon, "dev-b");
         let peer = forged_peer(2);
+        // The committed ring holds the peer, so `accept_handoff`'s persist clears
+        // the M5d slice-013-pt2 member-set==ring gate.
+        {
+            let mut ring = Ring::default();
+            ring.upsert(peer.clone());
+            ring.save(&ring_path(tmp.path())).unwrap();
+        }
 
         let add = crate::handlers::shared_subtree_add(
             &daemon,
@@ -3208,7 +3265,7 @@ mod tests {
     /// own committed state — the row's `key_id`, the tip — is untouched.
     #[test]
     fn responder_hands_off_s_to_a_stranded_member() {
-        let (daemon, _tmp) = ceremony_daemon();
+        let (daemon, tmp) = ceremony_daemon();
         let local = device_of(&daemon, "dev-a");
         let peer = forged_peer(1);
         let ring = Arc::new(Mutex::new({
@@ -3216,6 +3273,13 @@ mod tests {
             r.upsert(peer.clone());
             r
         }));
+        // The committed ring holds the peer too, so the establishment persist
+        // below clears the M5d slice-013-pt2 member-set==ring gate.
+        {
+            let mut disk_ring = Ring::default();
+            disk_ring.upsert(peer.clone());
+            disk_ring.save(&ring_path(tmp.path())).unwrap();
+        }
 
         let add = crate::handlers::shared_subtree_add(
             &daemon,
