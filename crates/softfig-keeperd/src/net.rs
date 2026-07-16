@@ -1287,6 +1287,14 @@ fn spawn_replica_loop(
                 // stale (join/leave) — after establishment, before the replica
                 // push, so a rotation's `shared_rekey` commit rides this tick.
                 reconcile_rekeys(&daemon, &local);
+                // M5d slice 014 (ROTATE-1): drive any keyed chain whose live tip
+                // still holds old-`S` ciphertext (a rotation whose in-line
+                // re-encrypt failed, or a crash between the row flip and the
+                // re-encrypt) back to fully-`S'` — peer-free, so it converges even
+                // if the departed member never returns. After the rekey pass so a
+                // rotation that just half-landed heals this same tick, and before
+                // the replica push so a heal's commit rides it.
+                crate::ceremony::reconcile_reencrypt_completeness(&daemon);
                 reconcile_replicas(&daemon, &local);
                 signal.wait_for_commit(REPLICA_RECONCILE_INTERVAL);
             }

@@ -780,6 +780,153 @@ fn collect_chain_plaintext(
     Ok(())
 }
 
+/// M5d slice 014 (ROTATE-1) — the re-encrypt completeness self-heal pass. A
+/// rotation swaps a chain's `key_id` + audit record (durable) and *then*
+/// re-encrypts the existing blobs under the new `S'`; if that re-encrypt fails
+/// mid-way (a transient blob read/decrypt/commit I/O error) or the daemon
+/// crashes between the two, the live tip is left with blobs still sealed under
+/// the **old** `S`. Nothing re-fired it: [`crate::net::reconcile_rekeys`] keys
+/// only off member-set drift, which the row flip already cleared, so the chain
+/// no longer reads as stale. This pass is that missing scan — peer-free and
+/// ceremony-free: it detects any keyed chain whose live tip holds a blob under a
+/// non-live shared key and re-runs [`reencrypt_shared_chain`] (the router already
+/// points at the committed live `S`) until the tip converges. Idempotent — a tip
+/// already fully under its live `S` re-encrypts nothing, so a clean chain never
+/// churns a no-op commit. Runs each reconcile tick beside the rekey pass, so a
+/// rotation whose in-line re-encrypt failed this tick heals the same or next tick
+/// with no departed-member window beyond that.
+pub(crate) fn reconcile_reencrypt_completeness(daemon: &Daemon) {
+    let mut inner = daemon.inner.lock().unwrap();
+    if require_unlocked(&inner).is_err() {
+        return;
+    }
+    let lagging = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        match chains_lagging_reencrypt(repo, session) {
+            Ok(v) => v,
+            Err((_, e)) => {
+                eprintln!("keeperd: net: re-encrypt completeness scan skipped: {e}");
+                return;
+            }
+        }
+    };
+    if lagging.is_empty() {
+        return;
+    }
+    // The re-encrypt seals under whatever key the router maps the chain to — the
+    // committed live key after a rotation's row flip + refresh. Re-derive the
+    // router from committed state defensively before healing, so a heal that runs
+    // after an out-of-band registry change still seals under the row's live `S`.
+    {
+        let state_dir = inner.config.state_dir().to_path_buf();
+        crate::handlers::refresh_mount_registry(&inner, &state_dir);
+    }
+    for LaggingChain { ref_name, mount_path, live_key_id } in lagging {
+        // old == new == the live key: this is a completeness re-seal to the row's
+        // committed `S`, not a key change (the audit shape is shared with rotation).
+        match reencrypt_shared_chain(&mut inner, &ref_name, &mount_path, &live_key_id, &live_key_id) {
+            Ok(()) => eprintln!(
+                "keeperd: net: re-encrypt completeness: {ref_name} healed — tip now sealed under {live_key_id}"
+            ),
+            Err((_, e)) => eprintln!(
+                "keeperd: net: re-encrypt completeness: {ref_name} still lagging under an old key: {e}"
+            ),
+        }
+    }
+}
+
+/// A committed keyed shared chain whose live tip still holds a blob under a
+/// non-live `S` — one [`reconcile_reencrypt_completeness`] work item.
+struct LaggingChain {
+    ref_name: String,
+    mount_path: String,
+    live_key_id: String,
+}
+
+/// Detection half of [`reconcile_reencrypt_completeness`] (unit-testable without
+/// a live peer): the committed *keyed* shared chains whose live tip still holds
+/// at least one blob sealed under a shared key other than the row's committed
+/// live `key_id` — the signature of an incomplete rotation re-encrypt. Returns
+/// `(ref_name, mount_path, live_key_id)` per lagging chain; an unkeyed row is
+/// pre-ceremony (establishment's concern) and skipped.
+fn chains_lagging_reencrypt(
+    repo: &softfig_vcs::Repo,
+    session: &VaultSession,
+) -> std::result::Result<Vec<LaggingChain>, (ErrorKind, String)> {
+    let membership = read_committed_shared_subtrees_for_mutation(repo, session)?;
+    let mut lagging = Vec::new();
+    for row in membership.subtrees.iter() {
+        let Some(live) = row.key_id.as_deref() else {
+            continue; // unkeyed → pre-ceremony, not a lagging rotation
+        };
+        if tip_has_foreign_shared_key(repo, &row.ref_name, live)? {
+            lagging.push(LaggingChain {
+                ref_name: row.ref_name.clone(),
+                mount_path: row.mount_path.clone(),
+                live_key_id: live.to_string(),
+            });
+        }
+    }
+    Ok(lagging)
+}
+
+/// True if `ref_name`'s current tip holds at least one shared blob sealed under a
+/// shared `key_id` other than `live_key_id`. Reads only each blob container's
+/// header via [`softfig_vault::shared::read_key_id`] — no decrypt, no key needed.
+/// A blob not in a shared container (a pre-ceremony `M`-keyed blob) is not
+/// "old `S`" and is skipped: rotation completeness is only about superseded
+/// shared generations, and folding `M` blobs in here would churn chains that a
+/// ceremony establishment, not a rotation, owns.
+fn tip_has_foreign_shared_key(
+    repo: &softfig_vcs::Repo,
+    ref_name: &str,
+    live_key_id: &str,
+) -> std::result::Result<bool, (ErrorKind, String)> {
+    let Some(tip) = repo
+        .tip_of(ref_name)
+        .map_err(|e| (ErrorKind::Internal, format!("read {ref_name} tip: {e}")))?
+    else {
+        return Ok(false);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| (ErrorKind::Internal, format!("read {ref_name} tip commit: {e}")))?;
+    tree_has_foreign_shared_key(repo, &row.root_tree, live_key_id)
+}
+
+fn tree_has_foreign_shared_key(
+    repo: &softfig_vcs::Repo,
+    tree: &Hash,
+    live_key_id: &str,
+) -> std::result::Result<bool, (ErrorKind, String)> {
+    let entries = repo
+        .db()
+        .get_tree(tree)
+        .map_err(|e| (ErrorKind::Internal, format!("read tree for re-encrypt scan: {e}")))?;
+    for e in entries {
+        match e.kind {
+            TreeEntryKind::Blob => {
+                let cipher = repo.objects().get(&e.target).map_err(|err| {
+                    (ErrorKind::Internal, format!("read blob for re-encrypt scan: {err}"))
+                })?;
+                if let Ok(kid) = softfig_vault::shared::read_key_id(&cipher) {
+                    if kid != live_key_id {
+                        return Ok(true);
+                    }
+                }
+            }
+            TreeEntryKind::Tree => {
+                if tree_has_foreign_shared_key(repo, &e.target, live_key_id)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1638,6 +1785,140 @@ mod tests {
                 .decrypt_tracked_blob("projects/journals/note.md", &cipher)
                 .unwrap(),
             b"shared secret"
+        );
+    }
+
+    /// Slice 014 (ROTATE-1): when a rotation's row flip + audit record commit but
+    /// its `reencrypt_shared_chain` pass does not (a transient blob I/O error, or a
+    /// daemon crash between the two), the live tip is left with blobs under the
+    /// **old** `S` and — because the chain no longer reads as membership-stale —
+    /// `reconcile_rekeys` never re-fires. `reconcile_reencrypt_completeness` is the
+    /// missing scan: it detects the lagging tip and drives it to fully-`S'`,
+    /// peer-free, so no live-tip blob stays readable under the old `S` the departed
+    /// member holds. Models the exact half-rotated on-disk state (row = S', tip
+    /// blob = old S) rather than fault-injecting, then asserts convergence.
+    #[test]
+    fn reencrypt_completeness_heals_a_tip_left_under_the_old_key() {
+        let (daemon, _tmp) = unlocked_daemon();
+        let add = handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // Establish S1 over {self, peer 9} and seed a blob under it.
+        seed_ring(&daemon, &[9]);
+        let (s1, t1) = fabricate_outcome_with_self(&daemon, 9, ref_name.as_bytes());
+        persist_ceremony_outcome(&daemon, &s1, &t1).expect("initial key");
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            let mut snap = softfig_vcs::WalkSnapshot::empty();
+            snap.insert_file(std::path::Path::new("note.md"), 0o644, b"shared secret".to_vec())
+                .unwrap();
+            crate::actions::commit_snapshot_to_now(
+                &mut inner,
+                &ref_name,
+                snap,
+                Intent::new("shared_subtrees_changed", serde_json::json!({ "summary": "seed" }))
+                    .unwrap(),
+            )
+            .expect("seed blob");
+        }
+        assert_eq!(chain_blob_key_id(&daemon, &ref_name, "note.md"), t1.key_id);
+
+        // Reproduce the failed-re-encrypt state: seal S2, flip the committed row to
+        // S2 + land its transcript record (rotation's durable first half), but
+        // leave the shared chain's tip blob under S1 — exactly what a re-encrypt
+        // that errored (or a crash) after the row flip leaves behind.
+        let (s2, t2) = fabricate_outcome_with_self(&daemon, 10, ref_name.as_bytes());
+        assert_ne!(t1.key_id, t2.key_id, "test needs two distinct keys");
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            inner
+                .session
+                .as_ref()
+                .unwrap()
+                .store_shared_key(&t2.key_id, &s2)
+                .unwrap();
+            let membership_toml = {
+                let session = inner.session.as_ref().unwrap();
+                let repo = inner.repo.as_ref().unwrap();
+                let mut membership =
+                    read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
+                for row in membership.subtrees.iter_mut() {
+                    if row.ref_name == ref_name {
+                        row.key_id = Some(t2.key_id.clone());
+                    }
+                }
+                membership.to_toml().unwrap()
+            };
+            let record = render_transcript_record(&t2).unwrap();
+            {
+                let wt = WorkTree::new(&daemon, &inner);
+                wt.write(&ceremony_record_rel(&t2.key_id), record.as_bytes()).unwrap();
+                wt.write(&shared_subtrees_rel(), membership_toml.as_bytes()).unwrap();
+            }
+            commit_now(
+                &mut inner,
+                Intent::new("shared_rekey", serde_json::json!({ "summary": "flip only" })).unwrap(),
+            )
+            .unwrap();
+            let state_dir = inner.config.state_dir().to_path_buf();
+            crate::handlers::refresh_mount_registry(&inner, &state_dir);
+        }
+        // Half-rotated: the row carries S2 but the tip blob is still under S1.
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            let repo = inner.repo.as_ref().unwrap();
+            let membership = read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
+            let row = membership.subtrees.iter().find(|r| r.ref_name == ref_name).unwrap();
+            assert_eq!(row.key_id.as_deref(), Some(t2.key_id.as_str()));
+        }
+        assert_eq!(chain_blob_key_id(&daemon, &ref_name, "note.md"), t1.key_id);
+
+        // One completeness pass heals the tip: peer-free, no ceremony.
+        reconcile_reencrypt_completeness(&daemon);
+
+        // The tip blob is now sealed under S2 (its container names S2) and still
+        // decrypts to the original plaintext — the departed old-S holder can no
+        // longer read it.
+        assert_eq!(chain_blob_key_id(&daemon, &ref_name, "note.md"), t2.key_id);
+        let inner = daemon.inner.lock().unwrap();
+        let session = inner.session.as_ref().unwrap();
+        let repo = inner.repo.as_ref().unwrap();
+        let tip = repo.tip_of(&ref_name).unwrap().unwrap();
+        let root = repo.db().get_commit(&tip).unwrap().root_tree;
+        let entry = repo
+            .db()
+            .get_tree(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "note.md")
+            .unwrap();
+        let cipher = repo.objects().get(&entry.target).unwrap();
+        assert_eq!(
+            session.decrypt_tracked_blob("projects/journals/note.md", &cipher).unwrap(),
+            b"shared secret"
+        );
+        // No live-tip blob remains decryptable under the old S: S1 fails the AEAD
+        // tag against the re-sealed container.
+        assert!(
+            softfig_vault::shared::decrypt_blob(&s1, &cipher).is_err(),
+            "old S must not decrypt a re-sealed blob"
+        );
+        let healed_tip = repo.tip_of(&ref_name).unwrap();
+        drop(inner);
+
+        // Idempotent: a now-clean tip is not re-encrypted, so the pass never churns
+        // a no-op commit on an already-converged chain.
+        reconcile_reencrypt_completeness(&daemon);
+        let inner = daemon.inner.lock().unwrap();
+        assert_eq!(
+            inner.repo.as_ref().unwrap().tip_of(&ref_name).unwrap(),
+            healed_tip,
+            "a converged tip must not advance on a second completeness pass"
         );
     }
 
