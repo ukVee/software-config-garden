@@ -8,19 +8,23 @@
 //!   commit ancestry, each commit's root tree (recursively), and the blobs
 //!   those trees name.
 //! * [`gc`] collects loose objects reachable from **no** live tip. Its
-//!   `live_tips` MUST be every **registered** chain's tip (device + all shared,
-//!   enabled or not); the caller derives them from
-//!   [`crate::ChainRegistry::all_chains`], so gc is safe by construction: an
-//!   object live in a *different* chain is in the union and is never collected.
-//!   A chain's enable/disable state is a mount/compose concern and never gates
-//!   retention — a **disabled** chain is still live for gc, so
-//!   `disable -> gc -> re-enable` can't destroy its exclusive blobs (m5c
-//!   finding 7). Running gc while a second chain exists must not touch the other
+//!   `live_tips` MUST be the tip of every **ref physically present** in the store
+//!   (`db.list_refs()`); the caller derives them via [`crate::Repo::live_tips`],
+//!   so gc is safe by construction: an object live in a *different* chain is in
+//!   the union and is never collected. Retention is keyed on **ref existence
+//!   alone** — enable/disable is a mount/compose concern (a **disabled** chain
+//!   keeps its ref, so `disable -> gc -> re-enable` can't destroy its exclusive
+//!   blobs, m5c finding 7), and an **un-shared** chain keeps its ref too, so
+//!   `remove -> gc -> re-add` resumes it intact rather than resurrecting a tip
+//!   whose blobs were collected (m5c-residual slice 011, contract (a): every ref
+//!   is live). Running gc while a second chain exists must not touch the other
 //!   chain's objects.
 //!
 //! gc collects only loose **objects** (blobs on disk); pruning unreachable
-//! commit/tree *rows* is deferred (a dropped chain's history is torn down by
-//! its remove path, slice 003, not by gc).
+//! commit/tree *rows* is deferred to a future explicit chain-drop verb. No verb
+//! drops a chain today — `remove` un-shares but keeps the ref (contract (a)) — so
+//! every commit/tree row stays reachable from some ref and nothing dangles; the
+//! row-pruning path has no trigger yet (m5c-residual slice 011).
 
 use std::collections::HashSet;
 
@@ -96,11 +100,11 @@ pub struct GcReport {
 
 /// Collect every loose object unreachable from **all** `live_tips`.
 ///
-/// `live_tips` must be the tips of every **registered** chain (device + all
-/// shared, enabled or not) — pass [`crate::ChainRegistry::all_chains`]' tips
-/// (see [`crate::Repo::live_tips`]). Because the retained set is the union over
-/// all of them, an object that belongs to a different chain — including a
-/// *disabled* one — is never collected (m5c finding 7). Deletion is idempotent
+/// `live_tips` must be the tip of every **ref present in the store**
+/// (`db.list_refs()`) — pass [`crate::Repo::live_tips`]. Because the retained set
+/// is the union over all of them, an object that belongs to a different chain —
+/// including a *disabled* or *un-shared* one whose ref still exists — is never
+/// collected (m5c finding 7; m5c-residual slice 011). Deletion is idempotent
 /// (a concurrently-removed object is not an error).
 pub fn gc(db: &Db, objects: &ObjectStore, live_tips: &[Hash]) -> Result<GcReport> {
     let live = live_blobs(db, live_tips)?;

@@ -9,7 +9,6 @@ use softfig_store::{
 };
 use softfig_vault::{Vault, VaultSession};
 
-use crate::chain::ChainRegistry;
 use crate::commit::CanonicalCommit;
 use crate::error::{CoreError, Result};
 use crate::intent::Intent;
@@ -319,21 +318,25 @@ impl Repo {
         Ok(hash)
     }
 
-    /// The tips of every **registered** chain in `registry` (device + all shared,
-    /// enabled or not), skipping any chain with no commits yet. This is gc's
-    /// retention set: a disabled chain's tip is included so its exclusive blobs
-    /// survive `disable -> gc -> re-enable` — enablement is a mount concern, not a
-    /// retention concern (m5c finding 7). Deriving it from the registry keeps gc
-    /// safe by construction: no chain's objects are collected because another
-    /// chain was gc'd.
-    pub fn live_tips(&self, registry: &ChainRegistry) -> Result<Vec<Hash>> {
-        let mut tips = Vec::new();
-        for chain in registry.all_chains() {
-            if let Some(t) = self.tip_of(&chain.ref_name)? {
-                tips.push(t);
-            }
-        }
-        Ok(tips)
+    /// The tip of **every ref physically present** in the store
+    /// (`db.list_refs()`). This is gc's retention set: a chain is live for gc iff
+    /// its ref exists — nothing else gates retention. Enable/disable is a
+    /// mount/compose concern (a disabled chain keeps its ref, so its exclusive
+    /// blobs survive `disable -> gc -> re-enable`, m5c finding 7), and an
+    /// *un-shared* chain keeps its ref + objects until an explicit chain-drop verb
+    /// deletes the ref, so `remove -> gc -> re-add` resumes the chain intact
+    /// instead of resurrecting a tip whose blobs gc collected (m5c-residual slice
+    /// 011, contract (a): every ref is live). Deriving retention from the refs
+    /// table — the ground truth — rather than the in-memory registry is exactly
+    /// what makes this resurrection-safe: a removed chain is gone from the
+    /// registry but its ref still pins its whole closure.
+    pub fn live_tips(&self) -> Result<Vec<Hash>> {
+        Ok(self
+            .db
+            .list_refs()?
+            .into_iter()
+            .map(|r| r.commit_hash)
+            .collect())
     }
 
     /// Per-chain fsck over the chain tracked by `ref_name` (see
@@ -343,12 +346,13 @@ impl Repo {
         crate::fsck::run_chain(&self.db, &self.objects, self.tip_of(ref_name)?, chain_id)
     }
 
-    /// Collect loose objects unreachable from any **registered** chain in
-    /// `registry` (see [`crate::gc::gc`]). Safe across chains: the retained set is
-    /// the union of every registered chain's reachable blobs — including disabled
-    /// chains, whose blobs must not be collected (m5c finding 7).
-    pub fn gc(&self, registry: &ChainRegistry) -> Result<crate::gc::GcReport> {
-        let tips = self.live_tips(registry)?;
+    /// Collect loose objects unreachable from **every ref's tip**
+    /// ([`Self::live_tips`], see [`crate::gc::gc`]). Safe across chains: the
+    /// retained set is the union of every ref's reachable blobs — including
+    /// disabled and un-shared (removed-but-not-dropped) chains, whose refs still
+    /// pin their objects (m5c finding 7; m5c-residual slice 011).
+    pub fn gc(&self) -> Result<crate::gc::GcReport> {
+        let tips = self.live_tips()?;
         crate::gc::gc(&self.db, &self.objects, &tips)
     }
 }

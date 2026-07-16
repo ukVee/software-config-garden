@@ -1837,6 +1837,30 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     // seed-genesis-from-device-subtree migration is a later slice.
     {
         let wt = crate::actions::WorkTree::new(daemon, &inner);
+        // m5c-residual slice 011 (018 finding 10): a committed device FILE at an
+        // *ancestor* of the mount path can't be descended through, so the
+        // emptiness probe below reads the mount path as absent (Blob mid-path ->
+        // Ok(false)) and the share is minted dead — untraversable behind the file.
+        // Refuse a blob-ancestor path explicitly before the emptiness check.
+        let mut prefix = String::new();
+        for comp in mount_path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(comp);
+            if prefix == mount_path {
+                break; // the leaf is the mount root itself — covered below
+            }
+            if wt.exists(&prefix) && !wt.is_dir(&prefix) {
+                return Err((
+                    ErrorKind::BadArgs,
+                    format!(
+                        "cannot share {mount_path:?}: ancestor {prefix:?} is a device file, so the \
+                         mount would be untraversable — remove or move that file first"
+                    ),
+                ));
+            }
+        }
         if wt.exists(&mount_path) {
             return Err((
                 ErrorKind::PathAlreadyExists,
@@ -1853,8 +1877,9 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     // commit, so a mid-add failure leaves a harmless orphan ref instead of a
     // committed membership row routing to a ref-less chain. A ref that already
     // exists — an orphan from a retried add, or a chain kept through a prior
-    // `remove` (remove never deletes refs/objects) — is reused as-is, never
-    // reset: re-adding an id resumes its chain. No key ceremony here (m5d).
+    // `remove` (remove keeps the ref, and every ref is live for gc so its objects
+    // survive — m5c-residual slice 011) — is reused as-is, never reset: re-adding
+    // an id resumes its chain intact. No key ceremony here (m5d).
     let ref_exists = {
         let repo = inner.repo.as_ref().expect("unlocked");
         repo.tip_of(&ref_name)
@@ -1926,8 +1951,13 @@ pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> Handle
     let removed = membership.subtrees.len() != before;
 
     if removed {
-        // Un-share = drop the membership row + commit. The chain ref/objects are
-        // left in place (gc reclaims them later); this only stops composing it.
+        // Un-share = drop the membership row + commit. The chain ref + objects
+        // are left in place and stay live for gc (retention is keyed on ref
+        // existence — Repo::live_tips over db.list_refs, not registry membership),
+        // so a later re-add of this id resumes the chain intact (m5c-residual
+        // slice 011, contract (a): every ref is live). Reclaiming the objects
+        // needs an explicit chain-drop verb (not built); this only stops
+        // composing the subtree.
         let toml = membership
             .to_toml()
             .map_err(|e| (ErrorKind::Internal, format!("serialize shared-subtrees: {e}")))?;

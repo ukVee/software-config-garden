@@ -191,12 +191,14 @@ impl ChainRegistry {
     }
 
     /// Every chain in the registry — the device chain plus **all** shared chains,
-    /// enabled or not. This is gc's **retention** set: a chain that has a ref is
-    /// live for garbage collection regardless of its per-device enable/disable
-    /// toggle. Disabling is a mount/compose concern, never a retention concern —
-    /// if gc keyed on [`Self::enabled_chains`], `disable -> gc -> re-enable` would
-    /// destroy the disabled chain's exclusive blobs and break the local toggle's
-    /// "cheap, reversible" contract (m5c finding 7).
+    /// enabled or not. This enumerates the *composed membership* (its use is
+    /// installing each shared chain's key in the Layer B router); it is **not**
+    /// gc's retention set. gc retains by **ref existence** ([`crate::Repo::live_tips`]
+    /// over `db.list_refs()`) — a superset that also pins an *un-shared* chain
+    /// whose ref outlives its registry membership (m5c-residual slice 011,
+    /// contract (a)). The enable/disable toggle stays a mount/compose concern
+    /// either way: a disabled chain keeps its ref, so its exclusive blobs survive
+    /// `disable -> gc -> re-enable` (m5c finding 7).
     pub fn all_chains(&self) -> impl Iterator<Item = &Chain> {
         std::iter::once(&self.device).chain(self.shared.iter())
     }

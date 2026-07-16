@@ -522,6 +522,31 @@ fn add_refuses_a_mount_path_with_committed_device_content() {
     assert!(matches!(fx.add("projects/empty-share", None), Response::Ok { .. }));
 }
 
+/// m5c-residual slice 011 (018 finding 10): a committed device FILE at an
+/// *ancestor* of the mount path can't be descended through, so the emptiness
+/// probe reads the leaf as absent (Blob mid-path -> Ok(false)) and would mint a
+/// dead, untraversable share. `add` refuses the blob-ancestor path outright.
+#[test]
+fn add_refuses_a_blob_ancestor_mount_path() {
+    let fx = Fixture::start();
+    // A device FILE at projects/notes.md; nothing can be shared *under* it.
+    fx.write_committed("projects/notes.md", "# notes\n");
+
+    let resp = fx.add("projects/notes.md/shared", None);
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs);
+    // Nothing was created for the refused add — no dead share, no orphan ref.
+    assert!(!fx.ref_exists("chain/shared"));
+    assert!(fx.list().subtrees.is_empty());
+    // The device file is untouched...
+    let read = fx.call(
+        op::READ_FILE,
+        serde_json::json!({ "path": "projects/notes.md" }),
+    );
+    assert_eq!(ok_data(read)["content"].as_str().unwrap(), "# notes\n");
+    // ...and an empty sibling path is still shareable.
+    assert!(matches!(fx.add("projects/ok-share", None), Response::Ok { .. }));
+}
+
 /// Finding 5: a present-but-unreadable membership file must hard-error the
 /// mutations — the old `.unwrap_or_default()` turned one corrupt read into a
 /// committed allow-list wipe. The compose path (list) parses leniently, so a

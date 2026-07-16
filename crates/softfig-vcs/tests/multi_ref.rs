@@ -11,7 +11,7 @@ use std::path::Path;
 
 use softfig_store::Hash;
 use softfig_vcs::{
-    fsck, live_blobs, reachable_from, walk, Chain, ChainRegistry, Intent, Repo, TIP_REF,
+    fsck, live_blobs, reachable_from, walk, Intent, Repo, TIP_REF,
 };
 use softfig_vault::{params::VaultParams, Vault, VaultSession};
 
@@ -172,13 +172,11 @@ fn gc_never_collects_another_chains_objects() {
         .unwrap();
     assert!(repo.objects().contains(&orphan));
 
-    // gc across the full chain set (device + enabled chain-b): the orphan is
-    // collected; every chain's live blob survives — including chain-b's.
-    let registry = ChainRegistry::new(
-        Chain::device(),
-        vec![Chain::shared("c-b", CHAIN_B_REF, "projects", true)],
-    );
-    let report = tc.repo.gc(&registry).unwrap();
+    // gc across the whole store (device + chain-b, both refs present): the orphan
+    // is collected; every chain's live blob survives — including chain-b's.
+    // Retention is keyed on ref existence (Repo::live_tips over db.list_refs), so
+    // no registry is consulted.
+    let report = tc.repo.gc().unwrap();
     assert!(report.collected.contains(&orphan), "orphan must be collected");
     assert!(!tc.repo.objects().contains(&orphan));
     for h in dev_blobs.iter().chain(b_blobs.iter()) {
@@ -188,10 +186,11 @@ fn gc_never_collects_another_chains_objects() {
         );
     }
 
-    // Adversarial: had the registry omitted chain-b, its exclusive blobs would
-    // be unreachable from the (device-only) live set — i.e. gc *would* delete
-    // them. Deriving live tips from the full registry is exactly what prevents
-    // that; this is the store-layer face of slice 004's isolation invariant.
+    // Adversarial: had retention been the (device-only) live set, chain-b's
+    // exclusive blobs would be unreachable — i.e. gc *would* delete them.
+    // Deriving live tips from the refs table (every ref, not the in-memory
+    // registry) is exactly what prevents that; this is the store-layer face of
+    // slice 004's isolation invariant.
     let device_only_live = live_blobs(tc.repo.db(), &[*dev_tip]).unwrap();
     for h in &b_exclusive {
         assert!(
@@ -217,12 +216,10 @@ fn gc_keeps_a_disabled_chains_exclusive_blobs() {
     // A genuinely-orphan object proves gc still collects the truly-dead.
     let orphan = tc.repo.objects().put(b"orphan referenced by nobody").unwrap();
 
-    // chain-b is registered but DISABLED (the local mount/compose toggle).
-    let registry = ChainRegistry::new(
-        Chain::device(),
-        vec![Chain::shared("c-b", CHAIN_B_REF, "projects", false)],
-    );
-    let report = tc.repo.gc(&registry).unwrap();
+    // chain-b's ref exists but the chain would be DISABLED in the registry (the
+    // local mount/compose toggle). Retention is keyed on ref existence, not the
+    // registry, so a disabled chain's exclusive blobs survive gc all the same.
+    let report = tc.repo.gc().unwrap();
 
     assert!(
         report.collected.contains(&orphan),
@@ -243,6 +240,71 @@ fn gc_keeps_a_disabled_chains_exclusive_blobs() {
         re_enabled.ok(),
         "re-enabled chain-b must read clean: {:?}",
         re_enabled.problems
+    );
+}
+
+/// m5c-residual slice 011 (018 finding 4, MAJOR) — contract (a): every ref is
+/// live. `remove` un-shares a chain but keeps its ref, and gc retains by ref
+/// existence (not registry membership), so `remove -> gc -> re-add` resumes the
+/// chain intact instead of resurrecting a tip whose exclusive blobs gc collected.
+/// Whole-store fsck stays clean across the sequence — nothing dangles.
+#[test]
+fn removed_chain_survives_gc_and_resumes_intact() {
+    let tc = two_chains();
+
+    let dev_blobs = reachable_from(tc.repo.db(), tc.dev_tip).unwrap().blobs;
+    let b_reach = reachable_from(tc.repo.db(), tc.b_tip).unwrap();
+    let b_exclusive: Vec<Hash> = b_reach.blobs.difference(&dev_blobs).copied().collect();
+    assert!(!b_exclusive.is_empty(), "chain-b must own exclusive blobs");
+
+    // chain-b is now "un-shared" — gone from the registry / committed membership,
+    // but its `chain-b` ref is left in place (the remove handler never deletes
+    // refs). Adversarial baseline: under the OLD registry-derived retention, gc's
+    // live set would be device-only, so chain-b's exclusive blobs would be
+    // unreachable from it — gc *would* collect them and a re-add would resurrect a
+    // tip that EIOs on every read.
+    let device_only_live = live_blobs(tc.repo.db(), &[tc.dev_tip]).unwrap();
+    for h in &b_exclusive {
+        assert!(
+            !device_only_live.contains(h),
+            "chain-b blob {h} is unreachable once un-shared — old registry retention would drop it"
+        );
+    }
+
+    // The fix: gc retains by ref existence. chain-b's ref still pins its whole
+    // closure, so gc collects nothing of chain-b's even though it is no longer
+    // registered.
+    let report = tc.repo.gc().unwrap();
+    for h in &b_exclusive {
+        assert!(
+            !report.collected.contains(h),
+            "un-shared chain-b's blob {h} must NOT be collected — its ref keeps it live"
+        );
+    }
+
+    // Re-add resumes the chain intact: every reachable blob is still on disk...
+    for h in &b_reach.blobs {
+        assert!(
+            tc.repo.objects().contains(h),
+            "resumed chain-b blob {h} must survive gc"
+        );
+    }
+    // ...and a per-chain fsck from chain-b's tip is clean — reads succeed.
+    let resumed = tc.repo.fsck_chain(CHAIN_B_REF).unwrap();
+    assert!(
+        resumed.ok(),
+        "resumed chain-b must read clean: {:?}",
+        resumed.problems
+    );
+
+    // The load-bearing criterion: whole-store fsck is clean after
+    // remove -> gc -> re-add — no tree row dangles at a collected blob (the
+    // forever-dangling fsck report the old contract produced is gone).
+    let whole = fsck(tc.repo.db(), tc.repo.objects()).unwrap();
+    assert!(
+        whole.ok(),
+        "whole-store fsck must be clean after remove -> gc -> re-add: {:?}",
+        whole.problems
     );
 }
 
