@@ -50,7 +50,7 @@ impl AccumulatorSink {
             if Arc::strong_count(&self) == 1 {
                 return;
             }
-            let due = {
+            let nudge_due = {
                 let mut g = self.last_nudge.lock().unwrap();
                 match *g {
                     Some(t) if t.elapsed() >= Duration::from_millis(DEBOUNCE_MS) => {
@@ -60,7 +60,13 @@ impl AccumulatorSink {
                     _ => false,
                 }
             };
-            if due {
+            // Slice 010: a failed commit re-arms a capped-backoff retry deadline
+            // on the accumulator. Poll it every tick (evaluated unconditionally
+            // so the deadline is consumed even when a nudge also fires) so the
+            // requeue retries with no new filesystem event — the idle-garden
+            // loss window this driver's one-shot `last_nudge` otherwise leaves.
+            let retry_due = self.accumulator.retry_due();
+            if nudge_due || retry_due {
                 self.accumulator.flush();
             }
         }

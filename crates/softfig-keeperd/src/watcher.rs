@@ -35,6 +35,29 @@ use crate::state::State;
 pub const DEBOUNCE_MS: u64 = 200;
 const STATE_POLL_MS: u64 = 100;
 
+/// Requeue-retry backoff (slice 010). A failed chain commit re-arms a flush
+/// this far out, **doubling each consecutive failure** up to `RETRY_MAX_MS`, so
+/// a transient blip (db busy, disk hiccup) retries in ~0.5 s but a
+/// persistently-failing chain settles to one attempt per `RETRY_MAX_MS` instead
+/// of hot-looping a commit every debounce tick. The flush drivers poll
+/// [`DirtySetAccumulator::retry_due`] on their idle tick, so the retry fires
+/// with **no new filesystem event** — closing the idle-garden loss window where
+/// a requeued write would otherwise sit RAM-only until an unrelated save.
+const RETRY_BASE_MS: u64 = 500;
+const RETRY_MAX_MS: u64 = 30_000;
+/// Cap on the backoff shift so `RETRY_BASE_MS << shift` can never overflow;
+/// `500 << 6 = 32_000` already exceeds `RETRY_MAX_MS`, so 6 is the effective
+/// ceiling regardless.
+const RETRY_MAX_SHIFT: u32 = 6;
+
+/// The capped exponential backoff for the `n`-th consecutive requeue
+/// (0-based: the first failure waits `RETRY_BASE_MS`). Pure so the schedule is
+/// unit-testable without a clock.
+fn backoff_delay(consecutive: u32) -> Duration {
+    let shift = consecutive.min(RETRY_MAX_SHIFT);
+    Duration::from_millis((RETRY_BASE_MS << shift).min(RETRY_MAX_MS))
+}
+
 // ─── DirtyEvent ───────────────────────────────────────────────────────────
 
 /// One semantic change reported by a source. Repo-relative paths.
@@ -82,6 +105,19 @@ impl Buffer {
     }
 }
 
+/// Requeue-retry schedule (slice 010). Armed by [`DirtySetAccumulator::requeue`]
+/// after a failed commit, polled by the flush drivers via
+/// [`DirtySetAccumulator::retry_due`], cleared when a flush fully succeeds.
+#[derive(Default, Debug)]
+struct RetrySchedule {
+    /// When the next requeue-driven retry flush is due. `None` = no pending
+    /// retry.
+    due_at: Option<Instant>,
+    /// Consecutive requeue count; drives the capped [`backoff_delay`]. Reset to
+    /// 0 the moment a flush lands cleanly.
+    consecutive: u32,
+}
+
 /// Source-agnostic accumulator. Sources push [`DirtyEvent`]s; on each
 /// `flush()` the buffered events are coalesced, classified, and (if the
 /// classification is non-empty) committed via `commit_workdir`.
@@ -115,6 +151,14 @@ pub struct DirtySetAccumulator {
     /// a pre-existing file is honored from the first event). The next
     /// [`Self::push`] rebuilds `cached_ignore` before filtering, then clears it.
     ignore_dirty: AtomicBool,
+    /// Requeue-retry deadline + backoff counter (slice 010). A leaf lock: taken
+    /// alone, never nested under `buffer` or `inner`.
+    retry: Mutex<RetrySchedule>,
+    /// Test-only: forces the next N chain commits in [`Self::flush`] to fail
+    /// (without touching the repo) so a regression can drive the requeue-retry
+    /// path with no real disk/db fault. Absent from release builds.
+    #[cfg(test)]
+    injected_commit_failures: std::sync::atomic::AtomicUsize,
 }
 
 impl DirtySetAccumulator {
@@ -133,6 +177,9 @@ impl DirtySetAccumulator {
             // `.softfigignore`) before any path is filtered.
             cached_ignore: RwLock::new(Ignore::builtin()),
             ignore_dirty: AtomicBool::new(true),
+            retry: Mutex::new(RetrySchedule::default()),
+            #[cfg(test)]
+            injected_commit_failures: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -226,6 +273,9 @@ impl DirtySetAccumulator {
             std::mem::take(&mut *buf).into_dirty_set()
         };
         if dirty.is_empty() {
+            // A retry tick may have fired after a normal flush already drained
+            // the buffer — nothing pending, so stand the retry schedule down.
+            self.clear_retry();
             return;
         }
         let classified = classify::classify(&dirty);
@@ -236,6 +286,9 @@ impl DirtySetAccumulator {
                 .and_then(|v| v.as_array())
                 .is_none_or(|a| a.is_empty())
         {
+            // Buffer drained to an empty manual_edit (dropped) — a clean, if
+            // no-op, resolution; clear any pending retry.
+            self.clear_retry();
             return;
         }
         let mut inner = self.inner.lock().unwrap();
@@ -289,7 +342,7 @@ impl DirtySetAccumulator {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("keeperd: watcher: chain snapshots failed: {e}");
-                        self.requeue(touched_paths);
+                        self.requeue(requeue_events(&dirty, |_| true));
                         return;
                     }
                 };
@@ -311,7 +364,7 @@ impl DirtySetAccumulator {
                 Ok(s) => (Some(s), Vec::new()),
                 Err(e) => {
                     eprintln!("keeperd: watcher: workdir walk failed: {e}");
-                    self.requeue(touched_paths);
+                    self.requeue(requeue_events(&dirty, |_| true));
                     return;
                 }
             },
@@ -331,7 +384,7 @@ impl DirtySetAccumulator {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("keeperd: watcher: prior-tip snapshot failed: {e}");
-                    self.requeue(touched_paths);
+                    self.requeue(requeue_events(&dirty, |_| true));
                     return;
                 }
             };
@@ -352,7 +405,7 @@ impl DirtySetAccumulator {
                     Ok(i) => i,
                     Err(e) => {
                         eprintln!("keeperd: watcher: invalid auto-classified intent: {e}");
-                        self.requeue(touched_paths);
+                        self.requeue(requeue_events(&dirty, |_| true));
                         return;
                     }
                 }
@@ -380,6 +433,17 @@ impl DirtySetAccumulator {
                     continue;
                 }
             };
+            #[cfg(test)]
+            let inject_fail = self.take_injected_failure();
+            #[cfg(not(test))]
+            let inject_fail = false;
+            if inject_fail {
+                eprintln!(
+                    "keeperd: watcher: [test] injected commit failure for {ref_name}"
+                );
+                failed_refs.push(ref_name);
+                continue;
+            }
             match repo.commit_snapshot_to(&ref_name, &session, snap, intent) {
                 Ok(_) => committed = true,
                 Err(e) => {
@@ -395,18 +459,17 @@ impl DirtySetAccumulator {
         // paths — the next flush rebuilds the snapshot from the overlay and
         // retries the commit. Nothing is dropped.
         if !failed_refs.is_empty() {
-            let retry: Vec<String> = match &chain_router {
-                Some(router) => touched_paths
-                    .iter()
-                    .filter(|p| {
-                        failed_refs
-                            .contains(&router.owning_chain(std::path::Path::new(p)).ref_name)
-                    })
-                    .cloned()
-                    .collect(),
-                None => touched_paths.clone(),
+            let events = match &chain_router {
+                Some(router) => requeue_events(&dirty, |p| {
+                    failed_refs.contains(&router.owning_chain(std::path::Path::new(p)).ref_name)
+                }),
+                None => requeue_events(&dirty, |_| true),
             };
-            self.requeue(retry);
+            self.requeue(events);
+        } else {
+            // Every affected chain committed — stand down any retry armed by a
+            // prior failed flush (this may itself be that retry landing).
+            self.clear_retry();
         }
 
         // Slice 1 (M5b-hardening): an auto-commit advanced a tip — wake the
@@ -419,21 +482,131 @@ impl DirtySetAccumulator {
         }
     }
 
-    /// Put `paths` back into the dirty buffer (as modifications) after a
-    /// failed commit attempt, so the next flush retries them. The write bytes
-    /// themselves are safe meanwhile — a FUSE overlay retains everything a
-    /// rotation didn't absorb (slice 006) and a direct-mode working tree is
-    /// the disk itself; this only re-arms the *trigger* that `flush` consumed
-    /// with its `mem::take`.
-    fn requeue(&self, paths: impl IntoIterator<Item = String>) {
-        let mut buf = self.buffer.lock().unwrap();
+    /// Re-file `events` into the dirty buffer after a failed commit **and** arm
+    /// a retry deadline so the next flush actually fires.
+    ///
+    /// Two responsibilities, both load-bearing (slice 010):
+    /// - **Re-file, kind-preserved.** The events go back into the buffer under
+    ///   their original kind (a removal stays a removal), so a retried flush
+    ///   doesn't re-file a delete as a `modified` and mint a `manual_edit`
+    ///   intent naming a file the commit removes (record 018 NIT). The write
+    ///   bytes themselves are safe meanwhile — a FUSE overlay retains everything
+    ///   a rotation didn't absorb (slice 006), and a direct-mode working tree is
+    ///   the disk itself; this only reconstructs the dirty *set* that `flush`
+    ///   consumed with its `mem::take`.
+    /// - **Re-arm the trigger.** `flush`'s `mem::take` also cleared the flush
+    ///   trigger, and neither driver re-arms on its own (FUSE fires off a
+    ///   one-shot `last_nudge`, inotify's timeout arm never flushes), so a
+    ///   requeued write on an idle garden would sit RAM-only until an unrelated
+    ///   save. [`Self::arm_retry`] sets a capped-backoff deadline that both
+    ///   drivers poll via [`Self::retry_due`], so the retry fires with no new
+    ///   filesystem event.
+    fn requeue(&self, events: impl IntoIterator<Item = DirtyEvent>) {
         let mut n = 0usize;
-        for p in paths {
-            buf.modified.insert(p);
-            n += 1;
+        {
+            let mut buf = self.buffer.lock().unwrap();
+            for ev in events {
+                match ev {
+                    DirtyEvent::Created(p) => {
+                        buf.created.insert(p);
+                    }
+                    DirtyEvent::Modified(p) => {
+                        buf.modified.insert(p);
+                    }
+                    DirtyEvent::Removed(p) => {
+                        buf.removed.insert(p);
+                    }
+                    DirtyEvent::Renamed { from, to } => {
+                        if to.starts_with("journal/archive/") {
+                            buf.renamed_to_archive.push((from, to));
+                        } else {
+                            buf.removed.insert(from);
+                            buf.created.insert(to);
+                        }
+                    }
+                }
+                n += 1;
+            }
         }
         if n > 0 {
-            eprintln!("keeperd: watcher: re-queued {n} path(s) for the next flush");
+            eprintln!("keeperd: watcher: re-queued {n} change(s) for retry");
+            self.arm_retry();
+        }
+    }
+
+    /// Arm (or re-arm) the requeue-retry deadline with a capped exponential
+    /// [`backoff_delay`] off the consecutive-failure count. Called only from
+    /// [`Self::requeue`] (i.e. only when something was re-filed).
+    fn arm_retry(&self) {
+        let mut sched = self.retry.lock().unwrap();
+        sched.due_at = Some(Instant::now() + backoff_delay(sched.consecutive));
+        sched.consecutive = sched.consecutive.saturating_add(1);
+    }
+
+    /// Stand the retry schedule down after a fully-successful flush (nothing
+    /// re-queued): drops the deadline and resets the backoff so the next
+    /// transient failure retries promptly.
+    fn clear_retry(&self) {
+        let mut sched = self.retry.lock().unwrap();
+        sched.due_at = None;
+        sched.consecutive = 0;
+    }
+
+    /// True **once** when an armed requeue-retry deadline has elapsed: consuming
+    /// the deadline so exactly one flush is driven per backoff interval (that
+    /// flush re-arms via [`Self::requeue`] if it fails again, or clears it on
+    /// success). The flush drivers ([`crate::fuse_sink::AccumulatorSink`]'s loop
+    /// and the inotify run loop) call this on their idle tick and `flush()` when
+    /// it returns true — the sole mechanism that re-fires a requeue with no new
+    /// filesystem event.
+    pub(crate) fn retry_due(&self) -> bool {
+        let mut sched = self.retry.lock().unwrap();
+        match sched.due_at {
+            Some(t) if Instant::now() >= t => {
+                sched.due_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Test-only: claim one injected commit failure (see
+    /// [`Self::injected_commit_failures`]).
+    #[cfg(test)]
+    fn take_injected_failure(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut cur = self.injected_commit_failures.load(Ordering::Acquire);
+        loop {
+            if cur == 0 {
+                return false;
+            }
+            match self.injected_commit_failures.compare_exchange(
+                cur,
+                cur - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Test-only: force the next `n` chain commits in [`Self::flush`] to fail.
+    #[cfg(test)]
+    pub(crate) fn inject_commit_failures(&self, n: usize) {
+        self.injected_commit_failures
+            .store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: pull an armed retry deadline into the past so [`Self::retry_due`]
+    /// fires immediately — exercises the driver-poll path without sleeping out
+    /// the real backoff.
+    #[cfg(test)]
+    pub(crate) fn expire_retry_deadline(&self) {
+        let mut sched = self.retry.lock().unwrap();
+        if sched.due_at.is_some() {
+            sched.due_at = Some(Instant::now());
         }
     }
 
@@ -678,7 +851,17 @@ impl DirtySetSource for InotifyDriver {
                         eprintln!("keeperd: watcher: notify error: {e}");
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Slice 010: no new events, but a prior failed commit may
+                    // have re-armed a retry deadline — the inotify timeout arm
+                    // never flushed on its own, so an idle-garden requeue would
+                    // sit RAM-only. Poll + drive it here, matching the FUSE
+                    // driver's per-tick retry poll.
+                    if accumulator.retry_due() {
+                        accumulator.flush();
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -711,6 +894,41 @@ pub fn spawn_with_target(daemon: Daemon, watch_target: PathBuf) -> std::thread::
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
+
+/// Reconstruct the [`DirtyEvent`]s to re-queue from a classified [`DirtySet`],
+/// keeping each path's original kind (so a removal isn't re-filed as a
+/// modification — record 018 NIT) and selecting only paths `retain` accepts (the
+/// partial-failure case re-queues just the failed chains' paths; a whole-flush
+/// failure passes `|_| true`).
+fn requeue_events(dirty: &DirtySet, mut retain: impl FnMut(&str) -> bool) -> Vec<DirtyEvent> {
+    let mut out = Vec::new();
+    for p in &dirty.created {
+        if retain(p) {
+            out.push(DirtyEvent::Created(p.clone()));
+        }
+    }
+    for p in &dirty.modified {
+        if retain(p) {
+            out.push(DirtyEvent::Modified(p.clone()));
+        }
+    }
+    for p in &dirty.removed {
+        if retain(p) {
+            out.push(DirtyEvent::Removed(p.clone()));
+        }
+    }
+    for (from, to) in &dirty.renamed_to_archive {
+        // The archive move is carried by its destination; re-queue when either
+        // side belongs to a selected chain.
+        if retain(to) || retain(from) {
+            out.push(DirtyEvent::Renamed {
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+    }
+    out
+}
 
 /// True if a dirty event touches the garden's `.softfigignore` (either side of
 /// a rename). Used to flag a rebuild of the cached ignore set.
@@ -896,5 +1114,192 @@ mod tests {
         let root = Path::new("/tmp/garden-x");
         let abs = Path::new("/etc/passwd");
         assert!(repo_relative(abs, root, root).is_none());
+    }
+
+    // ─── slice 010 — requeue re-arms the flush trigger ──────────────────────
+
+    #[test]
+    fn backoff_delay_doubles_then_caps() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(backoff_delay(1), Duration::from_millis(1_000));
+        assert_eq!(backoff_delay(2), Duration::from_millis(2_000));
+        assert_eq!(backoff_delay(3), Duration::from_millis(4_000));
+        assert_eq!(backoff_delay(4), Duration::from_millis(8_000));
+        assert_eq!(backoff_delay(5), Duration::from_millis(16_000));
+        // 500 << 6 = 32_000 → clamped to RETRY_MAX_MS, and it stays there.
+        assert_eq!(backoff_delay(6), Duration::from_millis(30_000));
+        assert_eq!(backoff_delay(7), Duration::from_millis(30_000));
+        assert_eq!(backoff_delay(1_000), Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn requeue_events_preserves_kind_and_filters_by_chain() {
+        let dirty = DirtySet {
+            created: vec!["proj/new.md".into()],
+            modified: vec!["proj/edit.md".into(), "other/keep.md".into()],
+            removed: vec!["proj/gone.md".into()],
+            renamed_to_archive: vec![(
+                "proj/old.md".into(),
+                "journal/archive/x/proj-old.md".into(),
+            )],
+        };
+        let events = requeue_events(&dirty, |p| p.starts_with("proj/"));
+        // A removal survives AS a removal — not silently re-filed `modified`
+        // (record 018 NIT: else a retried flush mints a manual_edit naming a
+        // file the commit deletes).
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DirtyEvent::Removed(p) if p == "proj/gone.md")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DirtyEvent::Created(p) if p == "proj/new.md")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DirtyEvent::Modified(p) if p == "proj/edit.md")));
+        // The unselected chain's path is filtered out.
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DirtyEvent::Modified(p) if p == "other/keep.md")));
+        // A rename is re-queued when its `from` side is selected even though the
+        // archive destination is not.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DirtyEvent::Renamed { from, .. } if from == "proj/old.md")));
+    }
+
+    #[test]
+    fn retry_schedule_arms_expires_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let acc = accumulator_rooted_at(dir.path());
+        // Nothing armed → not due, and probing an unarmed schedule is a no-op.
+        assert!(!acc.retry_due());
+        // Arming via requeue leaves a pending (not-yet-elapsed) deadline.
+        acc.requeue([DirtyEvent::Modified("a.md".into())]);
+        assert!(!acc.retry_due(), "the 500ms deadline hasn't elapsed");
+        // Simulated time passing → due exactly once (the poll consumes it).
+        acc.expire_retry_deadline();
+        assert!(acc.retry_due());
+        assert!(!acc.retry_due(), "the deadline is consumed on the first true");
+        // clear_retry stands a fresh arming down (and resets the backoff).
+        acc.requeue([DirtyEvent::Modified("a.md".into())]);
+        acc.clear_retry();
+        acc.expire_retry_deadline(); // no-op: due_at is None
+        assert!(!acc.retry_due());
+    }
+
+    struct NullSink;
+    impl softfig_fuse::DirtyEventSink for NullSink {
+        fn created(&self, _: &str) {}
+        fn modified(&self, _: &str) {}
+        fn removed(&self, _: &str) {}
+        fn renamed(&self, _: &str, _: &str) {}
+        fn nudge(&self) {}
+    }
+
+    const SHARED_REF: &str = "chain/proj";
+
+    /// A full Unlocked FUSE-mode accumulator over a tempdir garden with a shared
+    /// chain mounted at `proj/` (minus the kernel mount, via the slice-007
+    /// `attach_unmounted` seam) — lets a regression drive the real `flush`
+    /// per-chain commit routing headlessly.
+    fn fuse_accumulator(garden: &Path) -> (Arc<Mutex<DaemonInner>>, Arc<DirtySetAccumulator>) {
+        use softfig_fuse::FuseMount;
+        use softfig_vault::{params::VaultParams, Vault};
+        use softfig_vcs::{Chain, ChainRegistry, Repo, WalkSnapshot};
+
+        let mut p = VaultParams::default();
+        p.argon2.m_cost = 8;
+        p.argon2.t_cost = 1;
+        p.argon2.p_cost = 1;
+        let (_v, session, _rec) = Vault::init_with_params(garden, b"pw-test-12345", p).unwrap();
+        let session = Arc::new(session);
+        let (mut repo, _genesis) = Repo::init(garden, &session).unwrap();
+        repo.commit_snapshot_to(
+            SHARED_REF,
+            &session,
+            WalkSnapshot::empty(),
+            softfig_vcs::Intent::init("genesis"),
+        )
+        .unwrap();
+        let registry = ChainRegistry::new(
+            Chain::device(),
+            vec![Chain::shared("proj", SHARED_REF, "proj", true)],
+        );
+        let handle =
+            FuseMount::attach_unmounted(garden, garden, session.clone(), Arc::new(NullSink), None, registry)
+                .unwrap();
+        FuseMount::install_tip_callback(&mut repo, &handle);
+
+        let mut di = DaemonInner::new(KeeperConfig::new(garden));
+        di.state = crate::state::State::Unlocked;
+        di.session = Some(session);
+        di.repo = Some(repo);
+        di.fuse = Some(handle);
+        let inner = Arc::new(Mutex::new(di));
+        let acc = DirtySetAccumulator::new(
+            inner.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            garden.to_path_buf(),
+        );
+        (inner, acc)
+    }
+
+    fn shared_tip(inner: &Arc<Mutex<DaemonInner>>) -> Option<softfig_store::Hash> {
+        inner
+            .lock()
+            .unwrap()
+            .repo
+            .as_ref()
+            .unwrap()
+            .tip_of(SHARED_REF)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_failed_commit_retries_with_no_new_event_and_lands_when_it_clears() {
+        let garden = tempfile::tempdir().unwrap();
+        let (inner, acc) = fuse_accumulator(garden.path());
+
+        // A FUSE write: bytes into the overlay, the dirty event into the sink.
+        {
+            let g = inner.lock().unwrap();
+            g.fuse
+                .as_ref()
+                .unwrap()
+                .stage_write("proj/note.md", b"hello".to_vec());
+        }
+        assert!(acc.push(DirtyEvent::Created("proj/note.md".into())));
+        let before = shared_tip(&inner);
+
+        // First flush: the shared-chain commit is injected to fail once.
+        acc.inject_commit_failures(1);
+        acc.flush();
+
+        // The ref did NOT advance — but the bytes are safe in the overlay and a
+        // retry is armed (pending, not yet due: the backoff hasn't elapsed).
+        assert_eq!(shared_tip(&inner), before, "the failed commit left the ref put");
+        assert!(!acc.retry_due(), "the retry deadline is pending, not immediate");
+
+        // Idle garden: NO new filesystem event. The driver tick expires the
+        // backoff and drives the retry flush — the load-bearing pin.
+        acc.expire_retry_deadline();
+        assert!(acc.retry_due());
+        acc.flush();
+
+        // The write reached its chain, and the schedule stood down.
+        assert_ne!(
+            shared_tip(&inner),
+            before,
+            "the retry landed the commit once the failure cleared"
+        );
+        acc.expire_retry_deadline();
+        assert!(!acc.retry_due(), "a clean flush cleared the retry schedule");
+        let g = inner.lock().unwrap();
+        let mount = g.fuse.as_ref().unwrap();
+        assert!(
+            mount.pending_chain_refs().is_empty(),
+            "the overlay write was absorbed by the landed commit"
+        );
+        assert_eq!(mount.read_workfile("proj/note.md").unwrap().unwrap(), b"hello");
     }
 }
