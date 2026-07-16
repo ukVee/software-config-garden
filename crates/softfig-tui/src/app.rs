@@ -12,7 +12,9 @@ use softfig_ipc::{
     DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
     HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply, PairPeer,
     PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
-    ReplicaStatusReply, ShowReply, StatusReply, VaultListSealedReply, VaultRevealReply,
+    ReplicaStatusReply, SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply,
+    SharedSubtreeRemoveReply, SharedSubtreeToggleReply, ShowReply, StatusReply,
+    VaultListSealedReply, VaultRevealReply,
 };
 
 use crate::clip;
@@ -29,10 +31,43 @@ pub enum View {
     Peers,
     Backup,
     Deploy,
+    /// M5d slice 004: shared-subtree membership + collaborative-key ceremony
+    /// surface — which folders are shared, each share's per-device enable state,
+    /// and its ceremony/`key_id` status. Thin over the `shared_subtree_*` verbs +
+    /// `status.shared_key_divergence`; drives no crypto itself.
+    Shares,
     /// Read-only growlight section (the autonomous work-loop at a glance). Only
     /// reachable when growlight is enabled on this garden (`growlight_enabled ==
     /// Some(true)`); the tab is absent otherwise.
     Growlight,
+}
+
+/// M5d slice 004: the collaborative-key ceremony state for one shared subtree,
+/// derived purely from what the daemon exposes about it (`key_id`) — no raw key
+/// material. The ceremony itself runs deferred in the daemon's net reconcile
+/// sweep once ≥2 members are online; the TUI observes only its *outcome*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeremonyState {
+    /// `key_id` empty — the collaborative commit-reveal ceremony has not yet
+    /// produced `S` (it fires once ≥2 members are online, restart-safe).
+    Pending,
+    /// `key_id` filled — `S` was collaboratively derived and this device
+    /// verified + persisted the signed transcript. The id shown is the one-way
+    /// `S-<hex>` handle, never `S` itself.
+    Keyed,
+}
+
+/// Derive a share's [`CeremonyState`] from its daemon-surfaced `key_id`. A
+/// filled `key_id` means the ceremony completed and the transcript verified
+/// (slices 006–008 persist the key only after `verify()` passes); an empty one
+/// means the ceremony is still pending. Pure — the unit-tested "progress state
+/// machine from mock IPC events" the slice calls for.
+pub fn ceremony_state(info: &SharedSubtreeInfo) -> CeremonyState {
+    if info.key_id.is_some() {
+        CeremonyState::Keyed
+    } else {
+        CeremonyState::Pending
+    }
 }
 
 /// One row of the growlight backlog queue table, parsed from the managed
@@ -149,6 +184,20 @@ pub enum Overlay {
     DeployForce {
         error: Option<String>,
     },
+    /// M5d slice 004: register a new shared subtree — collect the garden-relative
+    /// mount path to share, then run `shared_subtree_add`. The daemon derives the
+    /// id, creates the chain, and (once ≥2 members are online) runs the ceremony.
+    AddShare {
+        mount_path: String,
+        error: Option<String>,
+    },
+    /// M5d slice 004: confirm un-sharing a subtree (`shared_subtree_remove`) —
+    /// drops its membership row; the local chain objects stay until gc.
+    RemoveShare {
+        id: String,
+        mount_path: String,
+        error: Option<String>,
+    },
     Help,
 }
 
@@ -225,6 +274,15 @@ pub struct App {
     pub deploy_has_conflicts: bool,
     pub deploy_selected: usize,
     pub deploy_loaded: bool,
+    /// M5d slice 004 Shares tab (`shared_subtree_list`): every shared subtree
+    /// this device knows about, with its per-device enable state + `key_id`.
+    pub shares: Vec<SharedSubtreeInfo>,
+    pub shares_selected: usize,
+    pub shares_loaded: bool,
+    /// M5d slice 006: the daemon's most recent shared-key ceremony divergence
+    /// message (`status.shared_key_divergence`), surfaced as a banner on the
+    /// Shares tab. `None` in the healthy case.
+    pub shared_key_divergence: Option<String>,
     /// growlight enablement (load-bearing gate): `None` until probed, `Some(true)`
     /// when `config/growlight.toml` exists, `Some(false)` otherwise. The Growlight
     /// tab is rendered/reachable **only** when `Some(true)` — no tab, no empty
@@ -291,6 +349,10 @@ impl App {
             deploy_has_conflicts: false,
             deploy_selected: 0,
             deploy_loaded: false,
+            shares: Vec::new(),
+            shares_selected: 0,
+            shares_loaded: false,
+            shared_key_divergence: None,
             growlight_enabled: None,
             growlight_probed: false,
             growlight_queue: Vec::new(),
@@ -350,6 +412,13 @@ impl App {
         ipc.send("deploy_plan", json!({}), Tag::DeployPlan);
     }
 
+    /// M5d slice 004: (re)load the Shares tab — every shared subtree with its
+    /// per-device enable state + `key_id`. Read-only; the ceremony runs in the
+    /// daemon's reconcile sweep, so a plain refresh reflects its progress.
+    fn load_shares(&self, ipc: &mut IpcClient) {
+        ipc.send("shared_subtree_list", json!({}), Tag::SharedSubtreeList);
+    }
+
     /// growlight enablement probe. Lists `config/` (a daemon read verb) so the
     /// reply can decide whether growlight is set up on this garden — detected via
     /// the presence of `config/growlight.toml`, **without** assuming the
@@ -398,6 +467,9 @@ impl App {
         }
         if self.deploy_loaded {
             self.load_deploy(ipc);
+        }
+        if self.shares_loaded {
+            self.load_shares(ipc);
         }
         if self.growlight_loaded {
             self.load_growlight(ipc);
@@ -459,6 +531,11 @@ impl App {
         self.deploy_entries.get(self.deploy_selected)
     }
 
+    /// The shared subtree under the Shares-tab cursor, if any.
+    pub fn selected_share(&self) -> Option<&SharedSubtreeInfo> {
+        self.shares.get(self.shares_selected)
+    }
+
     /// The advertised name for a push_to host, if it's a loaded ring member.
     /// A display nicety — `push_to` carries only fingerprints.
     pub fn peer_name_for(&self, fingerprint: &str) -> Option<&str> {
@@ -492,6 +569,10 @@ impl App {
                         self.locked = s.state != "unlocked";
                         self.tip = s.tip;
                         self.garden_root = s.garden_root;
+                        // M5d slice 006: a completed ceremony that met an
+                        // already-differently-keyed chain — surfaced on the
+                        // Shares tab, not stderr-only.
+                        self.shared_key_divergence = s.shared_key_divergence;
                         if !self.locked && (was_locked || !self.tree.is_loaded("")) {
                             self.load_dir(ipc, "");
                         }
@@ -801,6 +882,75 @@ impl App {
                     }
                 }
             },
+            Tag::SharedSubtreeList => match reply.result {
+                Ok(v) => match serde_json::from_value::<SharedSubtreeListReply>(v) {
+                    Ok(r) => {
+                        self.shares = r.subtrees;
+                        self.shares_loaded = true;
+                        if self.shares_selected >= self.shares.len() {
+                            self.shares_selected = self.shares.len().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => self.status = format!("shares: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("shares: {m}"),
+            },
+            Tag::SharedSubtreeAdd => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<SharedSubtreeAddReply>(v) {
+                        Ok(r) => format!("sharing {} (id {})", r.mount_path, r.id),
+                        Err(_) => "share added".into(),
+                    };
+                    self.overlay = Overlay::None;
+                    self.load_shares(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("share failed ({kind:?}): {m}");
+                    if let Overlay::AddShare { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
+            Tag::SharedSubtreeRemove => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<SharedSubtreeRemoveReply>(v) {
+                        Ok(r) if r.removed => format!("un-shared {}", r.id),
+                        Ok(r) => format!("no change ({} not shared)", r.id),
+                        Err(_) => "un-shared".into(),
+                    };
+                    self.overlay = Overlay::None;
+                    self.load_shares(ipc);
+                }
+                Err((kind, m)) => {
+                    let msg = format!("un-share failed ({kind:?}): {m}");
+                    if let Overlay::RemoveShare { error, .. } = &mut self.overlay {
+                        *error = Some(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            },
+            Tag::SharedSubtreeToggle => match reply.result {
+                Ok(v) => {
+                    self.status = match serde_json::from_value::<SharedSubtreeToggleReply>(v) {
+                        Ok(r) if !r.changed => format!(
+                            "{} already {}",
+                            r.id,
+                            if r.enabled { "enabled" } else { "disabled" }
+                        ),
+                        Ok(r) => format!(
+                            "{} {}",
+                            r.id,
+                            if r.enabled { "enabled" } else { "disabled" }
+                        ),
+                        Err(_) => "toggled".into(),
+                    };
+                    self.load_shares(ipc);
+                }
+                Err((_, m)) => self.status = format!("toggle failed: {m}"),
+            },
             // growlight enablement probe: `config/growlight.toml` present ⇒ the
             // section is enabled. A missing `config/` (Err) ⇒ disabled — degrade
             // silently, never surface an error (the tab simply won't appear).
@@ -870,6 +1020,8 @@ impl App {
             Overlay::ReplicaGrant { .. } => self.handle_key_replica_grant(key, ipc),
             Overlay::ReplicaRevoke { .. } => self.handle_key_replica_revoke(key, ipc),
             Overlay::DeployForce { .. } => self.handle_key_deploy_force(key, ipc),
+            Overlay::AddShare { .. } => self.handle_key_add_share(key, ipc),
+            Overlay::RemoveShare { .. } => self.handle_key_remove_share(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -934,9 +1086,15 @@ impl App {
                     self.load_deploy(ipc);
                 }
             }
+            KeyCode::Char('7') => {
+                self.view = View::Shares;
+                if !self.shares_loaded && !self.locked {
+                    self.load_shares(ipc);
+                }
+            }
             // Only reachable when growlight is enabled — the tab is absent
-            // otherwise, so `7` is inert on a garden without growlight.
-            KeyCode::Char('7') if self.growlight_enabled == Some(true) => {
+            // otherwise, so `8` is inert on a garden without growlight.
+            KeyCode::Char('8') if self.growlight_enabled == Some(true) => {
                 self.view = View::Growlight;
                 if !self.growlight_loaded && !self.locked {
                     self.load_growlight(ipc);
@@ -950,6 +1108,9 @@ impl App {
             KeyCode::Char('D') if self.view == View::Backup => self.start_revoke(),
             KeyCode::Char('a') if self.view == View::Deploy => self.apply_deploy(ipc, false),
             KeyCode::Char('F') if self.view == View::Deploy => self.start_force_apply(),
+            KeyCode::Char('a') if self.view == View::Shares => self.open_add_share(),
+            KeyCode::Char('D') if self.view == View::Shares => self.start_remove_share(),
+            KeyCode::Char('e') if self.view == View::Shares => self.toggle_share(ipc),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(),
@@ -1013,6 +1174,9 @@ impl App {
             View::Deploy => {
                 self.deploy_selected = self.deploy_selected.saturating_sub(1);
             }
+            View::Shares => {
+                self.shares_selected = self.shares_selected.saturating_sub(1);
+            }
             View::Growlight => {
                 self.growlight_selected = self.growlight_selected.saturating_sub(1);
             }
@@ -1045,6 +1209,11 @@ impl App {
             View::Deploy => {
                 if self.deploy_selected + 1 < self.deploy_entries.len() {
                     self.deploy_selected += 1;
+                }
+            }
+            View::Shares => {
+                if self.shares_selected + 1 < self.shares.len() {
+                    self.shares_selected += 1;
                 }
             }
             View::Growlight => {
@@ -1091,9 +1260,24 @@ impl App {
             // Deploy entries are read-only detail; apply is an explicit action
             // (a / F / palette), never a stray Enter.
             View::Deploy => self.hint_deploy_actions(),
+            // Share rows are toggled/added/removed with explicit keys; Enter is
+            // a hint, matching the Backup/Deploy read-only-detail pattern.
+            View::Shares => self.hint_shares_actions(),
             // Growlight is a read-only glance — Enter is a no-op hint.
             View::Growlight => self.hint_growlight_readonly(),
         }
+    }
+
+    fn hint_shares_actions(&mut self) {
+        self.status = match self.selected_share() {
+            Some(s) if s.enabled => {
+                format!("{} enabled · e disable · D un-share · a share a folder", s.id)
+            }
+            Some(s) => {
+                format!("{} disabled · e enable · D un-share · a share a folder", s.id)
+            }
+            None => "a share a folder across your devices".into(),
+        };
     }
 
     fn hint_backup_actions(&mut self) {
@@ -1189,6 +1373,20 @@ impl App {
                 self.view = View::Deploy;
                 self.apply_deploy(ipc, false);
             }
+            Command::Shares => {
+                self.view = View::Shares;
+                if !self.locked {
+                    self.load_shares(ipc);
+                }
+            }
+            Command::Share => {
+                self.view = View::Shares;
+                self.open_add_share();
+            }
+            Command::Unshare => {
+                self.view = View::Shares;
+                self.start_remove_share();
+            }
             Command::Reload if !self.locked => self.refresh_view(ipc),
             Command::Reload => {}
             Command::Unlock => {
@@ -1246,7 +1444,8 @@ impl App {
                 .selected_row()
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
-            View::History | View::Peers | View::Backup | View::Deploy | View::Growlight => None,
+            View::History | View::Peers | View::Backup | View::Deploy | View::Shares
+            | View::Growlight => None,
         };
         match target {
             // M2c: if the reveal target is the currently-open file and it
@@ -1670,6 +1869,117 @@ impl App {
             Some(_) => "a apply · F force · r refresh".into(),
             None => "no dots in config/deploy.toml".into(),
         };
+    }
+
+    // ---- M5d Shares tab (shared-subtree membership + ceremony) ----
+
+    /// `a` / `:share` — open the "share a folder" overlay. The daemon derives the
+    /// id from the mount path and runs the ceremony once ≥2 members are online.
+    fn open_add_share(&mut self) {
+        if self.locked {
+            self.status = "locked — unlock before sharing".into();
+            return;
+        }
+        self.overlay = Overlay::AddShare {
+            mount_path: String::new(),
+            error: None,
+        };
+    }
+
+    fn handle_key_add_share(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::AddShare { mount_path, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Backspace => {
+                mount_path.pop();
+            }
+            KeyCode::Char(c) => mount_path.push(c),
+            KeyCode::Enter => self.submit_add_share(ipc),
+            _ => {}
+        }
+    }
+
+    fn submit_add_share(&mut self, ipc: &mut IpcClient) {
+        let Overlay::AddShare { mount_path, error } = &mut self.overlay else {
+            return;
+        };
+        let path = mount_path.trim().trim_matches('/').to_string();
+        if path.is_empty() {
+            *error = Some("mount path must not be empty".into());
+            return;
+        }
+        *error = None;
+        self.status = "sharing…".into();
+        ipc.send(
+            "shared_subtree_add",
+            json!({ "mount_path": path }),
+            Tag::SharedSubtreeAdd,
+        );
+    }
+
+    /// `D` / `:unshare` — confirm un-sharing the selected subtree.
+    fn start_remove_share(&mut self) {
+        if self.locked {
+            self.status = "locked — unlock before un-sharing".into();
+            return;
+        }
+        match self.selected_share() {
+            Some(s) => {
+                self.overlay = Overlay::RemoveShare {
+                    id: s.id.clone(),
+                    mount_path: s.mount_path.clone(),
+                    error: None,
+                };
+            }
+            None => self.status = "select a shared folder to un-share".into(),
+        }
+    }
+
+    fn handle_key_remove_share(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Overlay::RemoveShare { id, .. } = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = Overlay::None;
+                self.status = "un-share cancelled".into();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let id = id.clone();
+                self.status = "un-sharing…".into();
+                ipc.send(
+                    "shared_subtree_remove",
+                    json!({ "id": id }),
+                    Tag::SharedSubtreeRemove,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// `e` — flip the selected share's per-device enable state. Enabled shares
+    /// disable (fall back to the device chain); disabled shares re-enable. No
+    /// membership or ceremony change — the headline "easy on/off".
+    fn toggle_share(&mut self, ipc: &mut IpcClient) {
+        if self.locked {
+            self.status = "locked — unlock before toggling shares".into();
+            return;
+        }
+        match self.selected_share() {
+            Some(s) => {
+                let op = if s.enabled {
+                    "shared_subtree_disable"
+                } else {
+                    "shared_subtree_enable"
+                };
+                let id = s.id.clone();
+                self.status = "toggling…".into();
+                ipc.send(op, json!({ "id": id }), Tag::SharedSubtreeToggle);
+            }
+            None => self.status = "select a shared folder to toggle".into(),
+        }
     }
 
     fn handle_key_form(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
@@ -2911,17 +3221,17 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
         let mut app = App::new();
         app.locked = false;
         let mut ipc = dummy_ipc();
-        // Not yet enabled: `7` must NOT switch views (tab absent).
+        // Not yet enabled: `8` must NOT switch views (tab absent).
         app.handle_key(
-            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE),
             &mut ipc,
         );
         assert_ne!(app.view, View::Growlight);
 
-        // Enabled: `7` switches to the growlight view.
+        // Enabled: `8` switches to the growlight view (Shares took `7`).
         app.growlight_enabled = Some(true);
         app.handle_key(
-            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE),
             &mut ipc,
         );
         assert_eq!(app.view, View::Growlight);
@@ -2976,5 +3286,153 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
             Some("103-tui-modernize-003.md")
         );
         assert!(app.growlight_baton.unwrap().contains("shipped slice 003"));
+    }
+
+    // ---- M5d slice 004: Shares tab ----
+
+    fn share_info(
+        id: &str,
+        mount: &str,
+        enabled: bool,
+        key_id: Option<&str>,
+    ) -> SharedSubtreeInfo {
+        SharedSubtreeInfo {
+            id: id.into(),
+            mount_path: mount.into(),
+            ref_name: format!("chain/{id}"),
+            enabled,
+            key_id: key_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn ceremony_state_tracks_key_id() {
+        // The pure "progress state machine": an empty key_id is Pending, a
+        // filled one (S derived + transcript verified) is Keyed.
+        let pending = share_info("journals", "projects/journals", true, None);
+        let keyed = share_info("journals", "projects/journals", true, Some("S-abc123"));
+        assert_eq!(ceremony_state(&pending), CeremonyState::Pending);
+        assert_eq!(ceremony_state(&keyed), CeremonyState::Keyed);
+    }
+
+    #[test]
+    fn shared_subtree_list_populates_then_clamps_on_shrink() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::SharedSubtreeList,
+                result: Ok(json!({ "subtrees": [
+                    {"id":"a","mount_path":"projects/a","ref_name":"chain/a","enabled":true,"key_id":"S-a"},
+                    {"id":"b","mount_path":"projects/b","ref_name":"chain/b","enabled":false}
+                ]})),
+            },
+            &mut ipc,
+        );
+        assert!(app.shares_loaded);
+        assert_eq!(app.shares.len(), 2);
+        app.shares_selected = 1;
+        // A later, shorter list clamps the selection back in-range.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::SharedSubtreeList,
+                result: Ok(json!({ "subtrees": [
+                    {"id":"a","mount_path":"projects/a","ref_name":"chain/a","enabled":true,"key_id":"S-a"}
+                ]})),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.shares.len(), 1);
+        assert_eq!(app.shares_selected, 0);
+    }
+
+    #[test]
+    fn add_share_validates_then_dispatches() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Shares;
+        let mut ipc = dummy_ipc();
+        app.open_add_share();
+        // An empty path is rejected client-side — no dispatch, error set.
+        app.submit_add_share(&mut ipc);
+        match &app.overlay {
+            Overlay::AddShare { error, .. } => assert!(error.is_some()),
+            other => panic!("expected AddShare overlay, got {other:?}"),
+        }
+        // A real path submits (leading/trailing slashes trimmed away).
+        if let Overlay::AddShare { mount_path, .. } = &mut app.overlay {
+            *mount_path = "/projects/journals/".into();
+        }
+        app.submit_add_share(&mut ipc);
+        assert!(app.status.contains("sharing"));
+    }
+
+    #[test]
+    fn toggle_share_picks_enable_or_disable() {
+        // The dispatch is proven by the status line it sets synchronously (the
+        // worker socket is a dead stub, so no reply is drained).
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Shares;
+        let mut ipc = dummy_ipc();
+        app.shares = vec![share_info("a", "projects/a", true, Some("S-a"))];
+        app.shares_selected = 0;
+        app.toggle_share(&mut ipc);
+        assert!(app.status.contains("toggling"));
+        // No selection → a hint, never a dispatch.
+        app.shares.clear();
+        app.status = "ready".into();
+        app.toggle_share(&mut ipc);
+        assert!(app.status.contains("select a shared folder"));
+    }
+
+    #[test]
+    fn remove_share_confirm_flow() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Shares;
+        let mut ipc = dummy_ipc();
+        app.shares = vec![share_info("journals", "projects/journals", true, None)];
+        app.shares_selected = 0;
+        app.start_remove_share();
+        match &app.overlay {
+            Overlay::RemoveShare { id, mount_path, .. } => {
+                assert_eq!(id, "journals");
+                assert_eq!(mount_path, "projects/journals");
+            }
+            other => panic!("expected RemoveShare overlay, got {other:?}"),
+        }
+        // `n` cancels without dispatching.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn status_reply_surfaces_shared_key_divergence() {
+        let mut app = App::new();
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::Status,
+                result: Ok(json!({
+                    "state": "unlocked", "tip": null, "garden_root": "/g",
+                    "protocol_version": 1,
+                    "shared_key_divergence": "shared-key divergence for chain chain/x: differs"
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app
+            .shared_key_divergence
+            .as_deref()
+            .unwrap()
+            .contains("divergence"));
     }
 }

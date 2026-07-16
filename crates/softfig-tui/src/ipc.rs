@@ -46,6 +46,16 @@ pub enum Tag {
     DeployPlan,
     /// M4: apply the deploy plan (`deploy_apply`); reply carries the `Report`.
     DeployApply,
+    /// M5d slice 004: list every shared subtree (`shared_subtree_list`) for the
+    /// Shares tab — membership + per-device enable state + `key_id`.
+    SharedSubtreeList,
+    /// M5d slice 004: register a new shared subtree (`shared_subtree_add`).
+    SharedSubtreeAdd,
+    /// M5d slice 004: un-share a subtree (`shared_subtree_remove`).
+    SharedSubtreeRemove,
+    /// M5d slice 004: flip a share's per-device enable state
+    /// (`shared_subtree_enable`/`disable`).
+    SharedSubtreeToggle,
     /// growlight: enablement probe (`list_tree config`) — the reply's entries
     /// decide whether the read-only Growlight section is shown at all (present
     /// iff `config/growlight.toml` exists). No tab, no pane, no error otherwise.

@@ -23,6 +23,12 @@ pub enum Command {
     Deploy,
     /// Apply the current deploy plan (`deploy_apply`, no force).
     Apply,
+    /// Switch to the Shares tab (M5d `shared_subtree_list`).
+    Shares,
+    /// Open the "share a folder" overlay (`shared_subtree_add`).
+    Share,
+    /// Un-share the selected subtree (`shared_subtree_remove`).
+    Unshare,
     Reload,
     Unlock,
     Quit,
@@ -46,6 +52,9 @@ pub fn parse_command(input: &str) -> Command {
         "revoke" => Command::Revoke,
         "deploy" => Command::Deploy,
         "apply" => Command::Apply,
+        "shares" => Command::Shares,
+        "share" => Command::Share,
+        "unshare" => Command::Unshare,
         "reload" | "r" => Command::Reload,
         "unlock" => Command::Unlock,
         "quit" | "q" => Command::Quit,
@@ -65,7 +74,8 @@ pub fn parse_command(input: &str) -> Command {
 pub fn command_hints() -> String {
     let mut names = vec![
         "browse", "history", "vault", "peers", "reveal", "pair", "unpair", "backup", "grant",
-        "revoke", "deploy", "apply", "reload", "unlock", "quit", "help",
+        "revoke", "deploy", "apply", "shares", "share", "unshare", "reload", "unlock", "quit",
+        "help",
     ];
     for k in ActionKind::ALL {
         names.push(k.command_name());
@@ -125,6 +135,15 @@ mod tests {
         assert_eq!(parse_command("apply"), Command::Apply);
         assert!(command_hints().contains("deploy"));
         assert!(command_hints().contains("apply"));
+    }
+
+    #[test]
+    fn share_commands() {
+        assert_eq!(parse_command("shares"), Command::Shares);
+        assert_eq!(parse_command("share"), Command::Share);
+        assert_eq!(parse_command("unshare"), Command::Unshare);
+        assert!(command_hints().contains("shares"));
+        assert!(command_hints().contains("unshare"));
     }
 
     #[test]

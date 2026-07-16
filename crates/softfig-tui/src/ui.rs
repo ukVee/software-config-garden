@@ -8,7 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{short_fp, App, BackupRow, GrowlightRow, Overlay, PairField, PeerRow, View};
+use crate::app::{
+    ceremony_state, short_fp, App, BackupRow, CeremonyState, GrowlightRow, Overlay, PairField,
+    PeerRow, View,
+};
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
@@ -75,6 +78,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
             error,
         } => render_replica_revoke(f, fingerprint, name.as_deref(), error.as_deref(), area),
         Overlay::DeployForce { error } => render_deploy_force(f, error.as_deref(), area),
+        Overlay::AddShare { mount_path, error } => {
+            render_add_share(f, mount_path, error.as_deref(), area)
+        }
+        Overlay::RemoveShare {
+            id,
+            mount_path,
+            error,
+        } => render_remove_share(f, id, mount_path, error.as_deref(), area),
         Overlay::Help => render_help(f, area),
     }
 }
@@ -106,11 +117,12 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         tab("4:Peers", app.view == View::Peers),
         tab("5:Backup", app.view == View::Backup),
         tab("6:Deploy", app.view == View::Deploy),
+        tab("7:Shares", app.view == View::Shares),
     ];
     // The Growlight tab appears ONLY when growlight is enabled on this garden —
     // no tab, no empty pane, no error otherwise (the load-bearing gate).
     if app.growlight_enabled == Some(true) {
-        spans.push(tab("7:Growlight", app.view == View::Growlight));
+        spans.push(tab("8:Growlight", app.view == View::Growlight));
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(format!("[{state}] tip:{tip}"), dim));
@@ -147,6 +159,10 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
         View::Deploy => {
             render_deploy(f, app, cols[0]);
             render_deploy_detail(f, app, cols[1]);
+        }
+        View::Shares => {
+            render_shares(f, app, cols[0]);
+            render_shares_detail(f, app, cols[1]);
         }
         View::Growlight => {
             render_growlight(f, app, cols[0]);
@@ -625,6 +641,132 @@ fn render_deploy_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+/// M5d slice 004: the collaborative-key ceremony status verb + colour for one
+/// share, from its [`CeremonyState`]. Shared by the Shares list + detail panes.
+fn ceremony_label(state: CeremonyState) -> (&'static str, Color) {
+    match state {
+        CeremonyState::Keyed => ("keyed", Color::Green),
+        CeremonyState::Pending => ("ceremony pending", Color::Yellow),
+    }
+}
+
+fn render_shares(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.shares.is_empty() {
+        vec![ListItem::new("(nothing shared — a to share a folder)")]
+    } else {
+        app.shares
+            .iter()
+            .map(|info| {
+                let toggle = if info.enabled { "●" } else { "○" };
+                let (verb, color) = ceremony_label(ceremony_state(info));
+                // A disabled share falls back to the device chain locally, so
+                // dim it regardless of its (still-tracked) ceremony state.
+                let color = if info.enabled { color } else { Color::DarkGray };
+                ListItem::new(Line::styled(
+                    format!("{toggle} {}  {verb}", info.mount_path),
+                    Style::default().fg(color),
+                ))
+            })
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !app.shares.is_empty() {
+        st.select(Some(app.shares_selected.min(app.shares.len() - 1)));
+    }
+    let title = format!("shares — {} folder(s)", app.shares.len());
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_shares_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // A ceremony divergence is a one-key-per-chain violation (slice 006) — the
+    // loudest thing on this surface, shown regardless of the current selection.
+    if let Some(msg) = &app.shared_key_divergence {
+        lines.push(Line::styled(
+            "⚠ shared-key divergence",
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+        ));
+        lines.push(Line::styled(
+            format!("  {msg}"),
+            Style::default().fg(Color::Red),
+        ));
+        lines.push(Line::raw(""));
+    }
+
+    match app.selected_share() {
+        Some(info) => {
+            lines.push(Line::styled(
+                info.mount_path.clone(),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ));
+            lines.push(Line::raw(format!("  id:       {}", info.id)));
+            lines.push(Line::raw(format!("  ref:      {}", info.ref_name)));
+            lines.push(Line::raw(format!(
+                "  local:    {}",
+                if info.enabled {
+                    "enabled (composed into the mount)"
+                } else {
+                    "disabled (falls back to the device chain)"
+                }
+            )));
+            lines.push(Line::raw(""));
+            let (verb, color) = ceremony_label(ceremony_state(info));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ceremony: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(verb, Style::default().fg(color)),
+            ]));
+            match ceremony_state(info) {
+                CeremonyState::Keyed => {
+                    // `key_id` is the one-way `S-<hex>` handle, never `S` itself.
+                    lines.push(Line::raw(format!(
+                        "  key:      {}",
+                        info.key_id.as_deref().unwrap_or("—")
+                    )));
+                    lines.push(Line::styled(
+                        "  S collaboratively derived · transcript verified on this device",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                CeremonyState::Pending => {
+                    lines.push(Line::styled(
+                        "  awaiting the commit-reveal ceremony — runs once ≥2 members are online",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+        }
+        None => {
+            lines.push(Line::styled(
+                "no shared folders",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  a share a folder across your paired devices",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "a share · e enable/disable · D un-share · r refresh",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("share detail"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
 /// A backlog item's status colour — active stands out, done recedes, blocked is
 /// loud. Shared by the queue list + the detail pane's active line.
 fn growlight_status_color(status: &str) -> Color {
@@ -746,6 +888,83 @@ fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
 
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("force deploy"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+fn render_add_share(f: &mut Frame, mount_path: &str, error: Option<&str>, area: Rect) {
+    let rect = centered_rect(75, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                "folder: ",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+            Span::raw(mount_path.to_string()),
+        ]),
+        Line::styled(
+            "  (garden-relative, /-separated — e.g. projects/journals)",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+        Line::raw("Share this folder across your paired devices."),
+        Line::styled(
+            "The collaborative key ceremony runs once ≥2 members are online.",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::styled(
+        "Enter share · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("share a folder"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+fn render_remove_share(
+    f: &mut Frame,
+    id: &str,
+    mount_path: &str,
+    error: Option<&str>,
+    area: Rect,
+) {
+    let rect = centered_rect(70, 40, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::raw(format!("Un-share {mount_path}?")),
+        Line::raw(format!("  id {id}")),
+        Line::raw(""),
+        Line::styled(
+            "Drops this device's membership row; the chain's objects stay until gc.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(e) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "y un-share · n / Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("un-share folder"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
 }
