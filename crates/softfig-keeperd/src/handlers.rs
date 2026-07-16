@@ -1778,44 +1778,6 @@ pub(crate) fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_d
     }
 }
 
-/// Whether the device chain's tip tree has *any* committed entry (file or
-/// directory) at `rel` — the populated-dir guard's probe (slice 007,
-/// interim-review finding 4). No commits yet ⇒ nothing is populated.
-fn device_tip_path_exists(
-    repo: &Repo,
-    rel: &str,
-) -> std::result::Result<bool, (ErrorKind, String)> {
-    let components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
-    if components.is_empty() {
-        return Ok(false);
-    }
-    let Some(tip) = repo.tip().map_err(|e| err_to_response(e.into()))? else {
-        return Ok(false);
-    };
-    let row = repo
-        .db()
-        .get_commit(&tip)
-        .map_err(|e| err_to_response(KeeperError::Store(e)))?;
-    let mut current = row.root_tree;
-    for (i, name) in components.iter().enumerate() {
-        let entries = repo
-            .db()
-            .get_tree(&current)
-            .map_err(|e| err_to_response(KeeperError::Store(e)))?;
-        let Some(entry) = entries.into_iter().find(|e| e.name == *name) else {
-            return Ok(false);
-        };
-        if i + 1 == components.len() {
-            return Ok(true);
-        }
-        match entry.kind {
-            TreeEntryKind::Tree => current = entry.target,
-            TreeEntryKind::Blob => return Ok(false),
-        }
-    }
-    Ok(false)
-}
-
 pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: SharedSubtreeAddArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("shared_subtree_add args: {e}")))?;
@@ -1865,19 +1827,23 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     }
     let ref_name = format!("chain/{id}");
 
-    // Slice 007 (finding 4): a mount path that already has committed device
-    // content would vanish behind the graft — the new chain's empty genesis
-    // shadows it and the next device commit's carve-out drops it. Refuse; the
+    // Slice 007 (finding 4) + m5c residual slice 009 (finding 1): a mount path
+    // that already holds device content would vanish behind the graft — the new
+    // chain's empty genesis shadows it and the next device commit's carve-out
+    // drops it. Probe the composed (device tip ∪ FUSE overlay) view via the
+    // WorkTree, not just the committed tip: a write staged through the live
+    // mount inside the ~200ms flush-debounce window is real content the empty
+    // graft would still swallow, and the tip-only walk missed it. Refuse; the
     // seed-genesis-from-device-subtree migration is a later slice.
     {
-        let repo = inner.repo.as_ref().expect("unlocked");
-        if device_tip_path_exists(repo, &mount_path)? {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        if wt.exists(&mount_path) {
             return Err((
                 ErrorKind::PathAlreadyExists,
                 format!(
-                    "{mount_path:?} already has committed device-chain content; migrating an \
-                     existing subtree into a shared chain is not supported yet — share an \
-                     empty path or move the content aside first"
+                    "{mount_path:?} already has device-chain content (committed or staged); \
+                     migrating an existing subtree into a shared chain is not supported yet — \
+                     share an empty path or move the content aside first"
                 ),
             ));
         }
@@ -2013,15 +1979,38 @@ fn toggle_shared_subtree(daemon: &Daemon, args: serde_json::Value, disable: bool
     let state_dir = inner.config.state_dir().to_path_buf();
 
     // Only a real member may be toggled, so a typo can't seed a phantom disable.
-    let is_member = {
+    let mount_path = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
-        read_committed_shared_subtrees(repo, session)
-            .unwrap_or_default()
-            .contains(&id)
+        let membership = read_committed_shared_subtrees(repo, session).unwrap_or_default();
+        match membership.subtrees.iter().find(|s| s.id == id) {
+            Some(entry) => entry.mount_path.clone(),
+            None => {
+                return Err((ErrorKind::NotFound, format!("no shared subtree with id {id:?}")));
+            }
+        }
     };
-    if !is_member {
-        return Err((ErrorKind::NotFound, format!("no shared subtree with id {id:?}")));
+
+    // m5c residual slice 009 (finding 2a): enabling a share whose mount path
+    // already holds content would shadow it behind the graft. While the share is
+    // disabled the chain is transparent, so a write at/under the mount path
+    // routes to the *device* chain; re-enabling grafts the shared chain over it
+    // (`retain(!starts_with(prefix))`) and the committed device content vanishes
+    // — the exact shape the add-guard prevents, reached through the sibling verb.
+    // Probe the composed (device tip ∪ FUSE overlay) view; refuse the enable if
+    // populated (disable has nothing to shadow, so it stays unguarded).
+    if !disable {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        if wt.exists(&mount_path) {
+            return Err((
+                ErrorKind::PathAlreadyExists,
+                format!(
+                    "{mount_path:?} holds device-chain content written while the share was \
+                     disabled; enabling would shadow it behind the shared graft — move it \
+                     aside first"
+                ),
+            ));
+        }
     }
 
     let mut local = load_local_toggles(&state_dir);

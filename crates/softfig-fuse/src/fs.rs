@@ -264,6 +264,17 @@ impl SharedState {
         self.registry.lock().unwrap().clone()
     }
 
+    /// Whether `path` is **exactly** the mount root of an enabled shared chain
+    /// (delegates to [`ChainRegistry::is_enabled_mount_root`] under the registry
+    /// lock, no clone). The kernel `create`/`rmdir`/`rename` handlers consult
+    /// this to refuse writes at a live graft point with `EBUSY` (m5c residual
+    /// finding 2b): a file at the mount root strips to an empty chain-relative
+    /// path and reaches no chain's history; removing or moving it detaches the
+    /// mount.
+    pub(crate) fn is_enabled_mount_root(&self, path: &Path) -> bool {
+        self.registry.lock().unwrap().is_enabled_mount_root(path)
+    }
+
     /// M5c slice 003 — hot-swap the chain registry this mount serves, then
     /// recompose the whole union view from it. The keeperd lifecycle verbs call
     /// this after flipping the local enable/disable sidecar or committing an
@@ -961,6 +972,13 @@ impl Filesystem for FuseFs {
             return reply.error(libc::EINVAL);
         };
         let path = parent_path.join(name_str);
+        // A file can't occupy a live mount root: it strips to an empty
+        // chain-relative path in the write router and reaches no chain's
+        // history (m5c residual finding 2b). Refuse with EBUSY — the path is
+        // the graft point of an active union mount.
+        if self.state.is_enabled_mount_root(&path) {
+            return reply.error(libc::EBUSY);
+        }
         let ino = {
             let mut inner = self.state.inner.lock().unwrap();
             inner.overlay.insert_file(path.clone(), Vec::new(), mode);
@@ -1091,6 +1109,13 @@ impl Filesystem for FuseFs {
             return reply.error(libc::EINVAL);
         };
         let path = parent_path.join(name_str);
+        // A live mount root can't be removed: rmdir'ing the empty-genesis graft
+        // dir and then creating a file at its path would route the write into
+        // the void (m5c residual finding 2b). Refuse with EBUSY before the
+        // dir-kind/emptiness checks — the graft point is a busy mount.
+        if self.state.is_enabled_mount_root(&path) {
+            return reply.error(libc::EBUSY);
+        }
         if self.path_kind(&path) != Some(EntryKind::Dir) {
             return reply.error(libc::ENOENT);
         }
@@ -1136,6 +1161,13 @@ impl Filesystem for FuseFs {
         let to = to_parent.join(n2);
         if self.path_kind(&from).is_none() {
             return reply.error(libc::ENOENT);
+        }
+        // Neither end may be a live mount root: moving the graft point away
+        // detaches the mount, and moving something *onto* it lands an entry at
+        // the empty-strip path that reaches no chain's history (m5c residual
+        // finding 2b). Refuse with EBUSY.
+        if self.state.is_enabled_mount_root(&from) || self.state.is_enabled_mount_root(&to) {
+            return reply.error(libc::EBUSY);
         }
         // renameat2 flags — previously ignored. RENAME_EXCHANGE (atomic swap)
         // is not implemented; reject it rather than silently doing a one-way

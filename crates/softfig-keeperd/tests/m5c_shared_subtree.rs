@@ -191,6 +191,25 @@ impl Fixture {
         )))
         .unwrap()
     }
+
+    /// Stage a create-or-overwrite directly into the daemon's FUSE overlay — no
+    /// commit, no kernel round-trip. The headless stand-in for a write through
+    /// the live mount that hasn't yet hit the ~200ms flush-debounce commit, so
+    /// the add-guard's composed-view (tip ∪ overlay) probe can be exercised in
+    /// the `fuse_attach_unmounted` fixture (m5c residual finding 1).
+    fn stage_overlay_write(&self, rel: &str, content: &[u8]) {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        let mount = inner.fuse.as_ref().expect("fuse attached");
+        mount.stage_write(rel, content.to_vec());
+    }
+
+    /// Whether the composed (tip ∪ overlay) mount view has a live entry at `rel`.
+    fn mount_path_exists(&self, rel: &str) -> bool {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        inner.fuse.as_ref().expect("fuse attached").path_exists(rel)
+    }
 }
 
 impl Drop for Fixture {
@@ -563,4 +582,82 @@ fn readd_after_disable_and_remove_is_born_enabled() {
     let list = fx.list();
     assert_eq!(list.subtrees.len(), 1);
     assert!(list.subtrees[0].enabled, "re-added share must be born enabled");
+}
+
+// ---- slice 009: composed-view add/enable guards (m5c residuals) -------------
+
+/// Slice 009 finding 1: the add-guard probes the *composed* (device tip ∪ FUSE
+/// overlay) view, not just the committed tip. A write staged through the live
+/// mount that hasn't yet hit the ~200ms flush-debounce commit is real content
+/// the empty-genesis graft would still swallow — the tip-only walk (pre-009)
+/// passed it, so `add` won the race against the flush timer and the content
+/// vanished. The composed-view probe now catches it and refuses.
+#[test]
+fn add_refuses_a_mount_path_with_overlay_staged_content() {
+    let fx = Fixture::start();
+    // Content lives only in the overlay — no commit yet (flush pending). The
+    // committed tip is empty at this path, so the old tip-only guard would have
+    // missed it; the tip ∪ overlay probe catches it.
+    fx.stage_overlay_write("projects/journals/2026.md", b"# staged, uncommitted\n");
+    assert!(
+        fx.mount_path_exists("projects/journals"),
+        "the staged child makes the mount dir live in the union view"
+    );
+
+    assert_eq!(
+        err_kind(fx.add("projects/journals", None)),
+        ErrorKind::PathAlreadyExists
+    );
+    // Nothing was created for the refused add, and the staged content is intact.
+    assert!(!fx.ref_exists("chain/journals"));
+    assert!(fx.list().subtrees.is_empty());
+    assert!(
+        fx.mount_path_exists("projects/journals"),
+        "the refusal left the staged overlay content untouched"
+    );
+    // An empty sibling is still shareable.
+    assert!(matches!(fx.add("projects/empty-share", None), Response::Ok { .. }));
+}
+
+/// Slice 009 finding 2a: `enable` gets the same composed-view populated-path
+/// guard as `add`. While a share is disabled the chain is transparent, so a
+/// write at/under the mount path routes to the device chain; re-enabling would
+/// graft the empty shared chain over it (`retain(!starts_with(prefix))`) and the
+/// committed device content would vanish — the exact shape the add-guard
+/// prevents, reached through the sibling verb. Enable refuses when the path is
+/// populated; disable (nothing to shadow) stays unguarded.
+#[test]
+fn enable_refuses_when_the_mount_path_holds_content_written_while_disabled() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let membership_after_add = fx.config_text().expect("membership exists after add");
+
+    // Disable → transparent; the mount path now routes to the device chain.
+    let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
+    assert!(!r.enabled);
+
+    // A write lands at the mount path while disabled (device-chain content
+    // stand-in — the composed-view probe sees the overlay just as it would the
+    // committed device tip).
+    fx.stage_overlay_write("projects/journals/note.md", b"# written while disabled\n");
+    assert!(fx.mount_path_exists("projects/journals"));
+
+    // Re-enabling would shadow it → refused, same kind as add.
+    assert_eq!(
+        err_kind(fx.call(
+            op::SHARED_SUBTREE_ENABLE,
+            serde_json::to_value(SharedSubtreeToggleArgs { id: "journals".into() }).unwrap(),
+        )),
+        ErrorKind::PathAlreadyExists
+    );
+    // The refused enable left the share disabled, the committed membership
+    // byte-unchanged, and the at-risk content live.
+    assert!(!fx.list().subtrees[0].enabled, "refused enable stays disabled");
+    assert_eq!(fx.config_text().unwrap(), membership_after_add, "membership byte-unchanged");
+    assert!(fx.mount_path_exists("projects/journals"), "content survived the refusal");
+
+    // Disable is never guarded — an already-disabled populated share re-disables
+    // as a plain no-op (nothing to shadow).
+    let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
+    assert!(!r.changed, "a populated path does not block a disable");
 }

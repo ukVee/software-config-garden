@@ -166,6 +166,21 @@ impl ChainRegistry {
         matches!(self.owning_chain(path).kind, ChainKind::Device)
     }
 
+    /// Whether `path` (garden-relative) is **exactly** the mount root of an
+    /// enabled shared chain — the graft point of a live union mount. Writing a
+    /// file at, removing, or renaming that path is refused by the FUSE layer
+    /// (`EBUSY`): a file there strips to an empty chain-relative path in
+    /// [`Self::split_snapshot`] and reaches no chain's history, and removing or
+    /// moving the graft point detaches the mount (m5c residual finding 2b). A
+    /// path *under* the mount root is unaffected — it routes normally through
+    /// [`Self::owning_chain`]. A disabled chain is transparent (its subtree
+    /// falls back to the device chain), so its mount root is not protected here.
+    pub fn is_enabled_mount_root(&self, path: &Path) -> bool {
+        self.shared
+            .iter()
+            .any(|c| c.enabled && c.mount_path.as_deref() == Some(path))
+    }
+
     /// The device chain plus every **enabled** shared chain — the *compose* set:
     /// what the union mount projects and [`Self::split_snapshot`] routes writes
     /// into. Enablement is a mount concern, so a disabled chain is absent here.
@@ -203,10 +218,14 @@ impl ChainRegistry {
     /// byte-identical to `unified` — the additive, off-by-default guarantee.
     ///
     /// A file at **exactly** a mount path (not under it) would strip to an empty
-    /// relative path and be silently dropped here. That shape is unreachable in
-    /// v1: `add` refuses a mount path that already holds committed device content
-    /// (the populated-dir guard), and once grafted the mount is a directory, so
-    /// no file can occupy the mount path itself.
+    /// relative path and be silently dropped here. That shape is **actively
+    /// refused**, not merely improbable (m5c residual slice 009): the FUSE
+    /// mount-root guard rejects `create`/`rmdir`/`rename` targeting an enabled
+    /// mount root with `EBUSY` (so the empty-genesis mount dir can't be
+    /// `rmdir`'d and then have a file created at its path — finding 2b), and the
+    /// composed-view populated-path guard refuses an `add`/`enable` over a path
+    /// that already holds committed **or** overlay-staged content (findings 1 +
+    /// 2a). See [`Self::is_enabled_mount_root`].
     pub fn split_snapshot(&self, unified: &WalkSnapshot) -> Vec<(String, WalkSnapshot)> {
         let mut snaps: Vec<(String, WalkSnapshot)> = self
             .enabled_chains()
@@ -268,6 +287,29 @@ mod tests {
         // Elsewhere → device chain.
         assert!(reg.is_device_owned(Path::new("notes/a.md")));
         assert_eq!(reg.enabled_chains().count(), 2);
+    }
+
+    #[test]
+    fn is_enabled_mount_root_matches_only_the_exact_enabled_root() {
+        let reg = ChainRegistry::new(
+            Chain::device(),
+            vec![
+                Chain::shared("c-proj", "ref-proj", "projects/shared", true),
+                Chain::shared("c-off", "ref-off", "notes/wiki", false),
+            ],
+        );
+        // Exact enabled mount root → protected.
+        assert!(reg.is_enabled_mount_root(Path::new("projects/shared")));
+        // A path *under* the root is not the root itself.
+        assert!(!reg.is_enabled_mount_root(Path::new("projects/shared/a.md")));
+        // A parent of the root is not the root.
+        assert!(!reg.is_enabled_mount_root(Path::new("projects")));
+        // A string-prefix sibling is not the root (path-component exact).
+        assert!(!reg.is_enabled_mount_root(Path::new("projects/shared-x")));
+        // A *disabled* chain's mount root is transparent → not protected.
+        assert!(!reg.is_enabled_mount_root(Path::new("notes/wiki")));
+        // The device chain (garden root) is never a shared mount root.
+        assert!(!reg.is_enabled_mount_root(Path::new("")));
     }
 
     #[test]
