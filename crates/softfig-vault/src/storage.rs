@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VaultError};
@@ -135,20 +135,37 @@ pub fn ensure_dirs(paths: &VaultPaths) -> Result<()> {
 }
 
 /// Crash-atomic write with an explicit mode. Stage the bytes to a
-/// same-directory temp file, fsync them durable, chmod, then `rename` over the
-/// target — an atomic publish within one filesystem. A crash leaves either the
-/// prior file or an orphan `*.tmp.*` sibling, **never a torn target**, so a
-/// half-written sealed key can never wedge its id (a reader either decrypts the
-/// old bytes or sees the file absent). The caller owns creating `path`'s parent.
+/// same-directory temp file created **at `mode` from the start**, fsync them
+/// durable, `rename` over the target, then fsync the **containing directory** —
+/// an atomic *and* crash-durable publish within one filesystem. A crash leaves
+/// either the prior file or an orphan `*.tmp.*` sibling, **never a torn
+/// target**, so a half-written sealed key can never wedge its id (a reader
+/// either decrypts the old bytes or sees the file absent). The caller owns
+/// creating `path`'s parent.
 pub(crate) fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let tmp = tmp_sibling(path);
     {
-        let mut f = fs::File::create(&tmp)?;
+        // Create the temp already at `mode` rather than `File::create` (process
+        // umask, typically 0644) + a post-hoc chmod: the latter leaves a brief
+        // window where the sealed bytes are group/world-readable (LEAK-3).
+        // `create_new` refuses a pre-existing path — the temp name is
+        // pid+nanotime-unique, so that only fires on a genuine collision, where
+        // refusing (rather than clobbering another writer's temp) is correct.
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
     fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename (the dirent) is durable, not just
+    // the file's data — otherwise a crash right after the rename can drop the
+    // just-published entry on some filesystems though the bytes were fsynced,
+    // contradicting the "crash-atomic publish" contract above (ROTATE-3).
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    fs::File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
     Ok(())
 }
 
@@ -189,4 +206,54 @@ pub fn list_master_ids(paths: &VaultPaths) -> Result<Vec<u32>> {
     }
     ids.sort_unstable();
     Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // M5d slice 018 — `atomic_write_mode` publishes the sealed-key bytes at the
+    // requested mode with no looser umask window (LEAK-3) and cleans up its temp
+    // sibling on a successful rename. The parent-dir fsync (ROTATE-3) is a
+    // durability guarantee that isn't observable without crashing the kernel, so
+    // it rides on review + the docstring; these tests pin the observable surface:
+    // round-trip, published mode, clean publish, and overwrite-existing.
+
+    #[test]
+    fn atomic_write_mode_roundtrips_and_publishes_at_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.key");
+
+        atomic_write_mode(&target, b"sealed-ciphertext", 0o600).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"sealed-ciphertext");
+        // Published at exactly 0600. Because the temp is created via
+        // create_new(mode) and never chmod'd afterward, the bytes are never on
+        // disk at a looser mode even transiently.
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // A successful publish leaves no orphan temp sibling.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp sibling must be renamed away");
+    }
+
+    #[test]
+    fn atomic_write_mode_overwrites_an_existing_target() {
+        // create_new(true) applies to the *unique* temp, not the target, so a
+        // rename over an existing target still replaces it atomically.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.key");
+
+        atomic_write_mode(&target, b"old", 0o600).unwrap();
+        atomic_write_mode(&target, b"new-longer-bytes", 0o600).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new-longer-bytes");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }
