@@ -296,6 +296,9 @@ impl DirtySetAccumulator {
             return;
         }
         let garden_root = inner.config.garden_root.clone();
+        // M5d slice 016 (NONCE-2): captured before the `repo` borrow below so the
+        // shared-chain commit path can re-derive keyed-ness from committed state.
+        let state_dir = inner.config.state_dir().to_path_buf();
         let inner = &mut *inner;
         let session = match inner.session.as_ref() {
             Some(s) => s.clone(),
@@ -422,8 +425,22 @@ impl DirtySetAccumulator {
             }
         }
 
-        // Shared chains — a plain per-ref commit (m5c has no shared-content
-        // crypto, so no Layer-B promotion). Each advances only its own ref.
+        // Shared chains — a per-ref commit that routes each blob through
+        // `encrypt_for_ref` (a keyed chain seals under `S`; the device-chain
+        // Layer-B manual_edit→seal promotion does not apply here). Each advances
+        // only its own ref.
+        //
+        // M5d slice 016 (NONCE-2): before committing, re-prime the `S` router
+        // from committed membership so keyed-ness is read from the source of
+        // truth at the moment we seal, not from a cache that a just-completed
+        // ceremony might not have refreshed yet. Only `set_shared_chain_keys`
+        // (not the full `refresh_mount_registry`) — the FUSE mount's owning-chain
+        // routing this flush already resolved must stay put. Cheap: one committed
+        // `shared-subtrees.toml` decode; skipped entirely when no shared ref moved.
+        if !shared_snapshots.is_empty() {
+            let fresh = crate::handlers::load_chain_registry(repo, &session, &state_dir);
+            hook.set_shared_chain_keys(&fresh);
+        }
         for (ref_name, snap) in shared_snapshots {
             let intent = match Intent::new(&classified.intent, classified.payload.clone()) {
                 Ok(i) => i,

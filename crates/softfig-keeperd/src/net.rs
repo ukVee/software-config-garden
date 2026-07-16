@@ -1439,6 +1439,39 @@ impl Drop for CeremonyGuard {
 /// attempt (peer offline, mid-protocol error) leaves the row pending for the
 /// next tick — the deferred/retried liveness model, mirroring
 /// [`reconcile_replicas`]' per-tick catch-up.
+/// Detection half of the establishment/recovery reconcile (unit-testable
+/// without a live peer): the ref_names of committed shared chains that need a
+/// dial this pass — either an **unkeyed** row (establishment: the ceremony
+/// derives + seals `S`) OR a **keyed** row whose sealed `S` will not load (M5d
+/// slice 016 ROTATE-2: bit-rot / torn write / deletion left the device holding
+/// a `key_id` but no usable key). A keyed row with usable `S` is skipped.
+///
+/// ROTATE-2 rationale: `reconcile_rekeys` only re-dials on member-set staleness
+/// and this pass otherwise skips every keyed row, so a keyed-but-unusable `S`
+/// had no recovery trigger — the device stayed silently locked out of a chain it
+/// legitimately belongs to, forever. Re-dialing routes it to the same slice-008
+/// hand-off requester: a keyed peer that names us serves `{transcript, S}` and
+/// [`accept_handoff`] → [`crate::ceremony::persist_ceremony_outcome`] re-seals
+/// `S` idempotently (same `key_id` ⇒ no divergence, no duplicate commit). The
+/// read/encrypt paths already fail closed on the missing `S`, so this only turns
+/// a permanent lock-out into self-healing. Mirrors [`stale_keyed_chains`] (the
+/// rotation detector) so both live-peer sweeps keep a headless-testable core.
+fn chains_awaiting_key(
+    repo: &Repo,
+    session: &VaultSession,
+) -> std::result::Result<Vec<String>, (ErrorKind, String)> {
+    let membership = crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session)?;
+    Ok(membership
+        .subtrees
+        .iter()
+        .filter(|row| match row.key_id.as_deref() {
+            None => true,
+            Some(key_id) => session.load_shared_key(key_id).is_err(),
+        })
+        .map(|row| row.ref_name.clone())
+        .collect())
+}
+
 fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
     use zeroize::Zeroize;
 
@@ -1450,22 +1483,12 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
         let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
             return;
         };
-        let pending: Vec<String> = {
-            let membership =
-                match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session)
-                {
-                    Ok(m) => m,
-                    Err((_, e)) => {
-                        eprintln!("keeperd: net: ceremony reconcile skipped: {e}");
-                        return;
-                    }
-                };
-            membership
-                .subtrees
-                .iter()
-                .filter(|row| row.key_id.is_none())
-                .map(|row| row.ref_name.clone())
-                .collect()
+        let pending: Vec<String> = match chains_awaiting_key(repo, session) {
+            Ok(p) => p,
+            Err((_, e)) => {
+                eprintln!("keeperd: net: ceremony reconcile skipped: {e}");
+                return;
+            }
         };
         if pending.is_empty() {
             return;
@@ -2679,6 +2702,89 @@ mod tests {
         };
         assert!(transcript.verify());
         (s, transcript)
+    }
+
+    /// M5d slice 016 (ROTATE-2) — the establishment/recovery detector re-drives
+    /// a keyed row whose sealed `S` went unusable. An unkeyed row is always a
+    /// candidate (establishment); a keyed row with usable `S` is left alone; a
+    /// keyed row whose `S` was deleted (stand-in for bit-rot / torn write) re-
+    /// enters the dial set so a keyed peer can hand `S` back and persist re-seals
+    /// it — closing the "keyed but locked out forever" gap.
+    #[test]
+    fn chains_awaiting_key_redrives_a_keyed_row_whose_s_is_unusable() {
+        let (daemon, tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-b");
+        let peer = forged_peer(2);
+        // Committed ring == the transcript member set, so persist's slice-013-pt2
+        // ring-equality gate passes.
+        {
+            let mut ring = Ring::default();
+            ring.upsert(peer.clone());
+            ring.save(&ring_path(tmp.path())).unwrap();
+        }
+        let add = crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+
+        // Unkeyed → always an establishment candidate.
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let (session, repo) =
+                (inner.session.as_ref().unwrap(), inner.repo.as_ref().unwrap());
+            assert!(
+                chains_awaiting_key(repo, session).unwrap().contains(&ref_name),
+                "an unkeyed row awaits establishment"
+            );
+        }
+
+        // Key the row + seal S through the real persist path.
+        let self_sign = session_sign(&daemon);
+        let peer_sign = seed_sign(2);
+        let (s, transcript) = build_signed_transcript(
+            [8u8; 32],
+            ref_name.as_bytes(),
+            &[
+                (local.device_id, [0x11u8; 32], &self_sign),
+                (peer.device_id, [0x22u8; 32], &peer_sign),
+            ],
+        );
+        let kid = transcript.key_id.clone();
+        persist_ceremony_outcome(&daemon, &s, &transcript).expect("persist keys row + seals S");
+        assert_eq!(row_key_id(&daemon, &ref_name).as_deref(), Some(kid.as_str()));
+
+        // Keyed + usable S → NOT a candidate.
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let (session, repo) =
+                (inner.session.as_ref().unwrap(), inner.repo.as_ref().unwrap());
+            assert!(session.load_shared_key(&kid).is_ok(), "S usable after persist");
+            assert!(
+                !chains_awaiting_key(repo, session).unwrap().contains(&ref_name),
+                "a keyed row with usable S is left alone"
+            );
+        }
+
+        // The sealed S becomes unusable (deletion stands in for bit-rot / torn
+        // write). ROTATE-2: the keyed row must re-enter the dial set.
+        {
+            let dir = tmp.path().join(".softfig/vault/shared-keys");
+            for entry in std::fs::read_dir(&dir).expect("shared-keys dir") {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+        }
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let (session, repo) =
+                (inner.session.as_ref().unwrap(), inner.repo.as_ref().unwrap());
+            assert!(session.load_shared_key(&kid).is_err(), "S now unusable");
+            assert!(
+                chains_awaiting_key(repo, session).unwrap().contains(&ref_name),
+                "ROTATE-2: a keyed-but-unusable-S row is re-driven through recovery"
+            );
+        }
     }
 
     /// The pure staleness predicate: order-insensitive set comparison of the

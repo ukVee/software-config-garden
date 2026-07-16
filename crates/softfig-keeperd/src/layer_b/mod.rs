@@ -25,7 +25,7 @@
 
 pub mod regions;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -192,6 +192,16 @@ pub struct LayerBHook {
     /// Layer-B path salt use the same garden-relative string the read side
     /// passes to `decrypt_tracked_blob`.
     shared_keys: RwLock<HashMap<String, (String, String)>>,
+    /// M5d slice 016 (NONCE-2) — the set of shared-chain refs whose **committed
+    /// membership row carries a `key_id`**, i.e. the chains that MUST seal under
+    /// `S`. Refreshed from the same [`softfig_vcs::ChainRegistry`] as
+    /// `shared_keys`, but consulted independently: it is the authoritative
+    /// "keyed-ness" derived from committed state, so `encrypt_for_ref` can tell a
+    /// *keyed* shared chain that is missing from `shared_keys` (a stale / not-yet-
+    /// re-primed router) from a *genuinely unkeyed* (pre-ceremony) one. The former
+    /// fails closed rather than silently writing a non-convergent, member-
+    /// unreadable `M` blob onto a keyed shared chain.
+    keyed_committed_refs: RwLock<Arc<HashSet<String>>>,
 }
 
 impl LayerBHook {
@@ -201,6 +211,7 @@ impl LayerBHook {
             session: RwLock::new(None),
             prior_tip: RwLock::new(None),
             shared_keys: RwLock::new(HashMap::new()),
+            keyed_committed_refs: RwLock::new(Arc::new(HashSet::new())),
         }
     }
 
@@ -271,13 +282,38 @@ impl LayerBHook {
                 Some((c.ref_name.clone(), (key_id, mount)))
             })
             .collect();
+        // M5d slice 016 (NONCE-2): the authoritative keyed-ness set — every
+        // shared chain the committed membership says carries a `key_id`. Derived
+        // from the same registry so `encrypt_for_ref` never has to guess "unkeyed"
+        // from a missing router entry.
+        let keyed: HashSet<String> = map.keys().cloned().collect();
         *self.shared_keys.write().unwrap() = map;
+        *self.keyed_committed_refs.write().unwrap() = Arc::new(keyed);
     }
 
     /// The `(key_id, mount_path)` a shared chain's blobs must seal under,
     /// or `None` for an unkeyed (pre-ceremony) chain.
     pub fn shared_key_for(&self, ref_name: &str) -> Option<(String, String)> {
         self.shared_keys.read().unwrap().get(ref_name).cloned()
+    }
+
+    /// M5d slice 016 (NONCE-2) — does the committed membership say this shared
+    /// ref is keyed (must seal under `S`)? Consulted by [`Self::encrypt_for_ref`]
+    /// to distinguish a keyed chain whose router entry is missing (fail closed)
+    /// from a genuinely unkeyed pre-ceremony chain (stays on `M`).
+    pub fn ref_is_keyed_committed(&self, ref_name: &str) -> bool {
+        self.keyed_committed_refs.read().unwrap().contains(ref_name)
+    }
+
+    /// Test-only: install an inconsistent state (a ref marked keyed in committed
+    /// membership but absent from the `S` router) to exercise the NONCE-2 fail-
+    /// closed guard directly — the shape a future commit path that advances a
+    /// shared ref without re-priming the router would produce.
+    #[cfg(test)]
+    pub(crate) fn force_keyed_committed_ref(&self, ref_name: &str) {
+        let mut set = HashSet::clone(&self.keyed_committed_refs.read().unwrap());
+        set.insert(ref_name.to_string());
+        *self.keyed_committed_refs.write().unwrap() = Arc::new(set);
     }
 }
 
@@ -364,6 +400,24 @@ impl BlobEncryptor for LayerBHook {
             return self.encrypt(path, content, session);
         }
         let Some((key_id, mount)) = self.shared_key_for(ref_name) else {
+            // No `S` router entry for this ref. M5d slice 016 (NONCE-2): decide M
+            // vs fail-closed from the *committed* keyed-ness, not the absence of a
+            // cache entry. A shared chain the committed membership marks keyed but
+            // that is missing from the router means the router is stale / was not
+            // re-primed for this commit — falling back to `M` here would seal a
+            // non-convergent, member-unreadable blob onto a keyed shared chain
+            // (an isolation + convergence break). Refuse: the flush treats the
+            // error as a failed ref and re-queues it, so a subsequent flush (with
+            // the router re-primed from committed state) seals it under `S`. A
+            // genuinely unkeyed (pre-ceremony) chain, or the device chain, is not
+            // in `keyed_committed_refs` and correctly stays on `M`.
+            if self.ref_is_keyed_committed(ref_name) {
+                return Err(softfig_vcs::CoreError::Io(std::io::Error::other(format!(
+                    "shared ref {ref_name} is keyed in committed membership but the key \
+                     router holds no S for it; refusing to seal under the device key M \
+                     (re-prime the chain registry / recover S)"
+                ))));
+            }
             return self.encrypt(path, content, session);
         };
         // `path` is chain-relative (split_snapshot strips the mount prefix);
@@ -1003,6 +1057,37 @@ mod tests {
         assert!(
             err.to_string().contains("not stored in this vault"),
             "want SharedKeyUnavailable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_shared_chain_keys_records_keyed_committed_refs() {
+        // The production refresh path (not the test-only forcing helper) must
+        // populate the authoritative keyed-ness set the NONCE-2 guard consults.
+        let (hook, _session) = routed_hook(true);
+        assert!(hook.ref_is_keyed_committed(SHARED_REF));
+        assert!(!hook.ref_is_keyed_committed("chain/other"));
+    }
+
+    #[test]
+    fn keyed_committed_ref_missing_from_the_router_fails_closed_not_m() {
+        use softfig_vcs::BlobEncryptor as _;
+        // M5d slice 016 (NONCE-2): the committed membership marks the chain keyed,
+        // but the S router has no entry (stale / not re-primed for this commit).
+        // Falling back to M here would seal a non-convergent, member-unreadable
+        // blob onto a keyed shared chain, so the write must fail closed — the flush
+        // re-queues it and a later flush (router re-primed from committed state)
+        // seals it under S. Distinct from the routed-but-S-absent case above (that
+        // one has a router entry and fails in the vault).
+        let session = fresh_session();
+        let hook = LayerBHook::empty(); // router holds no entry for SHARED_REF
+        hook.force_keyed_committed_ref(SHARED_REF);
+        let err = hook
+            .encrypt_for_ref(SHARED_REF, "note.md", b"x", &session)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("keyed in committed membership"),
+            "want the NONCE-2 fail-closed refusal, got: {err}"
         );
     }
 
