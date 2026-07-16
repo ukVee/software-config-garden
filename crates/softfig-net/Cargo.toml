@@ -18,6 +18,12 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 # M5d shared-key ceremony: BLAKE3 commitments + one-way key_id (the project hash).
 blake3.workspace = true
+# M5d slice 015: zeroize the derived shared key S + the HKDF ikm on drop so the
+# establishment copy doesn't linger in freed heap/stack (LEAK-2 / NONCE-5). The
+# `derive` feature gives `#[derive(Zeroize, ZeroizeOnDrop)]` for the SharedKey
+# newtype. This crate is otherwise zeroize-free by design; the newtype owns the
+# hygiene so callers no longer have to.
+zeroize.workspace = true
 serde.workspace = true
 toml.workspace = true
 # M5a-3 discovery: LAN mDNS (_softfig._tcp) announce + browse, no async runtime.

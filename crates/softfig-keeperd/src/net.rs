@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use softfig_ipc::verbs::DiscoveredDevice;
 use softfig_ipc::ErrorKind;
-use softfig_net::ceremony::{run_ceremony, Ceremony, CeremonyOutcome};
+use softfig_net::ceremony::{run_ceremony, Ceremony, CeremonyOutcome, SharedKey};
 use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
@@ -1598,8 +1598,12 @@ fn accept_handoff(
     let key_id = transcript.key_id.clone();
     // persist re-verifies the transcript + key_id(S) binding + our membership and
     // is idempotent: a boundary-B device that already sealed S just commits the
-    // record + fills its row.
-    let result = persist_ceremony_outcome(daemon, &s, &transcript).map_err(|(_, e)| e);
+    // record + fills its row. Wrap S in the zeroizing `SharedKey` newtype for the
+    // persist call (slice 015); the stack copy in `s` is `Copy`, so the newtype
+    // holds an independent copy that zeroizes on its own drop, and we still wipe
+    // the stack copy explicitly below.
+    let shared = SharedKey::from_bytes(s);
+    let result = persist_ceremony_outcome(daemon, &shared, &transcript).map_err(|(_, e)| e);
     s.zeroize();
     result.map(|_| key_id)
 }
@@ -3150,7 +3154,7 @@ mod tests {
                 .session
                 .as_ref()
                 .unwrap()
-                .store_shared_key(&kid, &s)
+                .store_shared_key(&kid, s.expose())
                 .expect("pre-seal S");
         }
         assert!(row_key_id(&daemon, &ref_name).is_none(), "row still unkeyed");
@@ -3159,7 +3163,7 @@ mod tests {
         let handoff = SharedKeyHandoff {
             chain_id: ref_name.clone().into_bytes(),
             transcript_record: crate::ceremony::render_transcript_record(&transcript).unwrap(),
-            shared_key: s.to_vec(),
+            shared_key: s.expose().to_vec(),
         };
         let recovered = accept_handoff(&daemon, &ref_name, handoff).expect("accept hand-off");
         assert_eq!(recovered, kid);
@@ -3350,7 +3354,7 @@ mod tests {
             panic!("expected a hand-off frame, got {:?}", frames[0].kind);
         };
         assert_eq!(h.chain_id, ref_name.as_bytes());
-        assert_eq!(h.shared_key, s.to_vec(), "S served verbatim");
+        assert_eq!(h.shared_key, s.expose().to_vec(), "S served verbatim");
         let served = crate::ceremony::parse_transcript_record(&h.transcript_record)
             .expect("served record parses");
         assert_eq!(served.key_id, transcript.key_id);

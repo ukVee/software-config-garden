@@ -42,6 +42,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{NetError, Result};
 use crate::proto::{frame, Frame, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal};
@@ -61,11 +62,42 @@ pub type CeremonyNonce = [u8; 32];
 /// anyone reveals.
 pub type Commitment = [u8; 32];
 
-/// A derived shared key `S`. Sensitive: the caller (keeperd) must persist it
-/// only through the vault, never in plaintext. Returned as raw bytes to match
-/// `replica.rs`'s frontend-neutral surface; this crate stays free of a `zeroize`
-/// dependency (its stated design value), so zeroization is the caller's job.
-pub type SharedKey = [u8; 32];
+/// A derived shared key `S`. Sensitive: persist it only through the vault, never
+/// in plaintext.
+///
+/// A zeroizing newtype (M5d slice 015 / LEAK-2 + NONCE-5): the 32 key bytes are
+/// wiped when the value drops, so an establishment-time copy of `S` cannot linger
+/// in freed heap/stack after the ceremony (which widens the cold-boot / zram-swap
+/// scrape window on this s2idle-only device). Its `Debug` prints `<redacted 32B>`
+/// and never the bytes (LEAK-1), so every enclosing type — [`CeremonyOutcome`],
+/// [`Ceremony`] — inherits a safe `Debug` for free. Feed it to the vault's
+/// `[u8; 32]`-taking seal path via [`SharedKey::expose`]; keep that borrow
+/// short-lived and never copy it into an un-zeroizing owner. This crate is
+/// otherwise `zeroize`-free by design — the newtype owns the hygiene so callers
+/// (keeperd) no longer carry a "zeroization is the caller's job" caveat.
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct SharedKey([u8; 32]);
+
+impl SharedKey {
+    /// Wrap raw key bytes as a zeroizing `S` — e.g. the `[u8; 32]` recovered from
+    /// a slice-008 recovery hand-off before it is re-persisted.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw 32 key bytes to hand to the vault's `store_shared_key` /
+    /// `encrypt_blob` seal path. Keep the borrow short-lived and never copy the
+    /// bytes into an owner that does not itself zeroize.
+    pub fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SharedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedKey(<redacted 32B>)")
+    }
+}
 
 /// BLAKE3 domain tag for the commitment hash. Binds the ceremony nonce + the
 /// committing member's device id under a versioned, single-purpose label.
@@ -262,7 +294,14 @@ pub fn derive_shared_key(
     let mut out = [0u8; 32];
     hk.expand(&info, &mut out)
         .expect("HKDF expand of 32 bytes fits within the Sha256 output ceiling");
-    out
+    // `ikm` is the concatenated secret contributions `r_1 ‖ … ‖ r_n`. Wipe it
+    // now (slice 015 / NONCE-5) rather than leaving it in the freed `Vec`'s
+    // heap. (`info` holds only the public device ids, no secret.)
+    ikm.zeroize();
+    let key = SharedKey::from_bytes(out);
+    // `out` is `Copy`, so wrapping it left a plaintext copy on the stack; wipe it.
+    out.zeroize();
+    key
 }
 
 /// The public identifier for a key generation: `S-<16 hex>` of a one-way hash of
@@ -271,7 +310,7 @@ pub fn derive_shared_key(
 pub fn key_id(shared_key: &SharedKey) -> String {
     let mut h = blake3::Hasher::new();
     h.update(KEY_ID_DOMAIN);
-    h.update(shared_key);
+    h.update(shared_key.expose());
     let digest = h.finalize();
     format!("S-{}", hex::encode(&digest.as_bytes()[..8]))
 }
@@ -668,6 +707,20 @@ impl Ceremony {
     }
 }
 
+impl Drop for Ceremony {
+    /// Wipe the ceremony's secret contribution material on drop (slice 015 /
+    /// LEAK-2): `local_r` is this device's secret `r_i` (secret until its own
+    /// reveal), and `reveals` holds the peers' `r_i`. The `shared_key` field is a
+    /// [`SharedKey`], which zeroizes itself. `commitments`/`transcript` are
+    /// public hashes and the eventual audit record, so they are left alone.
+    fn drop(&mut self) {
+        self.local_r.zeroize();
+        for r in self.reveals.iter_mut().flatten() {
+            r.zeroize();
+        }
+    }
+}
+
 /// Sign the commit message for a member — a convenience for the driver and tests
 /// so the exact signing-byte layout lives in one place. Production keeperd signs
 /// through the vault session (which owns the identity key), so this takes a raw
@@ -898,9 +951,10 @@ where
     // the machine could not complete.
     match ceremony.phase() {
         Phase::Derived => {
-            let s = *ceremony
+            let s = ceremony
                 .shared_key()
-                .expect("a derived ceremony holds its shared key");
+                .expect("a derived ceremony holds its shared key")
+                .clone();
             let transcript = ceremony
                 .transcript()
                 .expect("a derived ceremony holds its transcript")
@@ -1099,7 +1153,7 @@ mod tests {
         // Deriving directly from the member set (any input order) matches the
         // state machine's result.
         let members = [member(1, 11), member(2, 22), member(3, 33)];
-        let via_machine = *run_honest(&members, 0).shared_key().unwrap();
+        let via_machine = run_honest(&members, 0).shared_key().unwrap().clone();
         let forward: Vec<_> = members
             .iter()
             .map(|m| MemberContribution { device_id: m.id, r: m.r })
@@ -1552,14 +1606,14 @@ mod tests {
         let members = [member(1, 11), member(2, 22), member(3, 33)];
         let results = run_mesh(&members);
         assert_eq!(results.len(), 3);
-        let s0 = results[0].0;
+        let s0 = &results[0].0;
         let id0 = results[0].1.key_id.clone();
         assert!(id0.starts_with("S-"));
         for (s, transcript) in &results {
             // Every honest member derives the same S + key_id regardless of the
             // (thread-nondeterministic) order it saw frames, and the transcript
             // re-verifies from first principles.
-            assert_eq!(*s, s0);
+            assert_eq!(s, s0);
             assert_eq!(transcript.key_id, id0);
             assert!(transcript.verify());
         }
@@ -1691,5 +1745,103 @@ mod tests {
         // machine never advanced past the commit phase (no key derived).
         assert_eq!(transport.sent.len(), 1);
         assert_eq!(ceremony.phase(), Phase::Committing);
+    }
+
+    // --- slice 015: secret-material Debug redaction + a grep-guard ----------
+
+    /// LEAK-1/LEAK-2: `SharedKey`'s `Debug` prints a fixed redaction marker and
+    /// never the 32 key bytes, so every enclosing type (`CeremonyOutcome`,
+    /// `Ceremony`, a `Frame`) inherits a leak-proof `Debug`.
+    #[test]
+    fn shared_key_debug_is_redacted() {
+        let key = SharedKey::from_bytes([0xEE; 32]); // 0xEE == 238 decimal / "ee" hex
+        for rendered in [format!("{key:?}"), format!("{key:#?}")] {
+            assert!(rendered.contains("redacted"), "want a redaction marker: {rendered}");
+            assert!(!rendered.contains("238"), "leaked a decimal key byte: {rendered}");
+            assert!(!rendered.contains("ee"), "leaked a hex key byte: {rendered}");
+        }
+        // The `Derived(S, transcript)` variant redacts S through the same impl.
+        let outcome = CeremonyOutcome::Derived(
+            SharedKey::from_bytes([0xEE; 32]),
+            Transcript {
+                nonce: NONCE,
+                chain_id: b"chain/x".to_vec(),
+                members: Vec::new(),
+                key_id: "S-test".to_string(),
+            },
+        );
+        let rendered = format!("{outcome:?}");
+        assert!(rendered.contains("redacted"), "outcome must redact S: {rendered}");
+        assert!(!rendered.contains("238"), "outcome leaked S: {rendered}");
+    }
+
+    /// LEAK-1: `SharedKeyHandoff`'s hand-written `Debug` (prost's field-dumping
+    /// default is suppressed via `skip_debug` in build.rs) redacts the raw `S`
+    /// bytes, and a `Frame` / `CeremonyOutcome::Handoff` wrapping it inherits the
+    /// redaction — so a stray `{:?}` on the serve/initiator path can't dump `S`.
+    #[test]
+    fn handoff_debug_never_prints_s() {
+        let handoff = SharedKeyHandoff {
+            chain_id: b"chain/redact".to_vec(),
+            transcript_record: "record".to_string(),
+            shared_key: vec![0xEE; 32], // 238 decimal — must not surface
+        };
+        let direct = format!("{handoff:?}");
+        let framed = format!("{:?}", Frame::shared_key_handoff(handoff.clone()));
+        let via_outcome = format!("{:?}", CeremonyOutcome::Handoff(handoff));
+        for rendered in [direct, framed, via_outcome] {
+            assert!(rendered.contains("redacted 32B"), "want a redaction marker: {rendered}");
+            assert!(!rendered.contains("238"), "leaked a key byte: {rendered}");
+        }
+    }
+
+    /// Belt-and-suspenders over the structural redaction: this crate's *non-test*
+    /// source must never `Debug`-format a ceremony frame / outcome / shared key.
+    /// The redacting `Debug` impls already make any such format leak-proof; this
+    /// guard keeps the intent enforced and catches a regression (a future
+    /// `eprintln!("{frame:?}")` / stray `dbg!`) early. Scans `src/` and drops each
+    /// file's trailing `#[cfg(test)] mod tests { … }` so it never flags a test.
+    #[test]
+    fn no_debug_formatting_of_secret_types_in_prod() {
+        use std::fs;
+        use std::path::Path;
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in fs::read_dir(&src).expect("read src/") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("read source file");
+            // Production half only — everything before the first `mod tests`.
+            let prod = text.split("mod tests").next().unwrap_or(&text);
+            for (i, line) in prod.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // Skip comments — including this crate's own doc references to the
+                // very pattern we forbid (e.g. proto.rs's `{frame:?}` example).
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                // `:?}` catches both positional `{:?}` and named `{frame:?}`.
+                let debugish = line.contains(":?}") || line.contains(":#?}") || line.contains("dbg!(");
+                if !debugish {
+                    continue;
+                }
+                let lower = line.to_ascii_lowercase();
+                if ["frame", "handoff", "outcome", "shared_key"]
+                    .iter()
+                    .any(|kw| lower.contains(kw))
+                {
+                    offenders.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "prod code Debug-formats a secret-carrying type (route through the \
+             redacting Debug, don't `{{:?}}` the raw type):\n{}",
+            offenders.join("\n"),
+        );
     }
 }

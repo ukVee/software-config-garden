@@ -453,7 +453,7 @@ pub fn persist_ceremony_outcome(
     {
         let session = inner.session.as_ref().expect("unlocked");
         session
-            .store_shared_key(&transcript.key_id, s)
+            .store_shared_key(&transcript.key_id, s.expose())
             .map_err(|e| (ErrorKind::Internal, format!("store shared key: {e}")))?;
     }
 
@@ -611,7 +611,7 @@ pub fn rotate_shared_key(
     {
         let session = inner.session.as_ref().expect("unlocked");
         session
-            .store_shared_key(&new_key_id, s_prime)
+            .store_shared_key(&new_key_id, s_prime.expose())
             .map_err(|e| (ErrorKind::Internal, format!("store rotated shared key: {e}")))?;
     }
 
@@ -1397,7 +1397,7 @@ mod tests {
         let repo = inner.repo.as_ref().unwrap();
 
         // 1. `S` is sealed under the vault, addressable by key_id.
-        assert_eq!(*session.load_shared_key(&transcript.key_id).unwrap(), s);
+        assert_eq!(&*session.load_shared_key(&transcript.key_id).unwrap(), s.expose());
 
         // 2. The committed record re-parses + re-verifies, at the locked path.
         let rel = ceremony_record_rel(&transcript.key_id);
@@ -1456,7 +1456,7 @@ mod tests {
         let inner = daemon.inner.lock().unwrap();
         let session = inner.session.as_ref().unwrap();
         let repo = inner.repo.as_ref().unwrap();
-        assert_eq!(*session.load_shared_key(&transcript.key_id).unwrap(), s);
+        assert_eq!(&*session.load_shared_key(&transcript.key_id).unwrap(), s.expose());
         let membership = read_committed_shared_subtrees_for_mutation(repo, session).unwrap();
         assert!(membership.subtrees.is_empty());
     }
@@ -1650,8 +1650,8 @@ mod tests {
         persist_ceremony_outcome(&daemon, &s, &t).expect("persists once the ring matches the set");
         let inner = daemon.inner.lock().unwrap();
         assert_eq!(
-            *inner.session.as_ref().unwrap().load_shared_key(&t.key_id).unwrap(),
-            s
+            &*inner.session.as_ref().unwrap().load_shared_key(&t.key_id).unwrap(),
+            s.expose()
         );
     }
 
@@ -1734,7 +1734,7 @@ mod tests {
 
         // 2. Both keys remain sealed — old S kept (custody limit), new S stored.
         assert!(session.has_shared_key(&t1.key_id));
-        assert_eq!(*session.load_shared_key(&t2.key_id).unwrap(), s2);
+        assert_eq!(&*session.load_shared_key(&t2.key_id).unwrap(), s2.expose());
 
         // 3. The device tip is a shared_rekey audit record with the locked payload.
         assert_eq!(repo.tip().unwrap().unwrap(), audit);
@@ -1839,7 +1839,7 @@ mod tests {
                 .session
                 .as_ref()
                 .unwrap()
-                .store_shared_key(&t2.key_id, &s2)
+                .store_shared_key(&t2.key_id, s2.expose())
                 .unwrap();
             let membership_toml = {
                 let session = inner.session.as_ref().unwrap();
@@ -1905,7 +1905,7 @@ mod tests {
         // No live-tip blob remains decryptable under the old S: S1 fails the AEAD
         // tag against the re-sealed container.
         assert!(
-            softfig_vault::shared::decrypt_blob(&s1, &cipher).is_err(),
+            softfig_vault::shared::decrypt_blob(s1.expose(), &cipher).is_err(),
             "old S must not decrypt a re-sealed blob"
         );
         let healed_tip = repo.tip_of(&ref_name).unwrap();

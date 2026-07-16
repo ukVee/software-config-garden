@@ -16,6 +16,26 @@ pub use generated::{
     SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg,
 };
 
+/// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
+/// message carries raw `S` in `shared_key`; prost's default field-dumping
+/// `Debug` is suppressed for this type in `build.rs` (`skip_debug`), so this
+/// hand-written impl is the only one — it prints the framing fields but never
+/// the key bytes. That makes a future `eprintln!("{frame:?}")` / panic-with-frame
+/// unable to dump `S` to journald. Every enclosing type (`frame::Kind`, `Frame`,
+/// `CeremonyOutcome::Handoff`) recurses through this impl for free.
+impl std::fmt::Debug for SharedKeyHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedKeyHandoff")
+            .field("chain_id", &self.chain_id)
+            .field("transcript_record", &self.transcript_record)
+            .field(
+                "shared_key",
+                &format_args!("<redacted {}B>", self.shared_key.len()),
+            )
+            .finish()
+    }
+}
+
 impl Frame {
     /// A `Ping` control frame.
     pub fn ping(nonce: u64) -> Self {
