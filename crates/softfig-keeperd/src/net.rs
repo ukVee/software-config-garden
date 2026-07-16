@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use softfig_ipc::verbs::DiscoveredDevice;
 use softfig_ipc::ErrorKind;
-use softfig_net::ceremony::{run_ceremony, Ceremony, CeremonyOutcome, SharedKey};
+use softfig_net::ceremony::{
+    nonce_is_fresh, run_ceremony, Ceremony, CeremonyOutcome, SharedKey,
+};
 use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
@@ -836,6 +838,20 @@ fn serve_ceremony_responder<L: CeremonyLink>(
                 let tmembers: Vec<[u8; 32]> =
                     transcript.members.iter().map(|m| m.device_id).collect();
                 if shared_chain_is_stale(&tmembers, &members) {
+                    // M5d slice 017 / CORR-3: a rotation must derive `S'` under a
+                    // salt distinct from the generation it replaces. The
+                    // initiator mints a fresh random nonce per session, so an
+                    // honest rotation never reuses one — refuse a replay against
+                    // committed state (the live transcript's nonce) rather than
+                    // trust freshness. Cheap: `transcript` is already in hand.
+                    if !nonce_is_fresh(&nonce, &[transcript.nonce]) {
+                        eprintln!(
+                            "keeperd: net: shared-key rotation for {chain} refused: the ceremony \
+                             nonce reuses the live generation's salt (a rotation must derive S' \
+                             under a fresh nonce)"
+                        );
+                        return;
+                    }
                     ResponderAction::Rotate // stale — an authorized rotation
                 } else if tmembers.contains(&owner.device_id) {
                     // The requester is a member this live transcript names but is
@@ -3573,6 +3589,113 @@ mod tests {
             keyed_tip
         );
         drop(guard);
+    }
+
+    /// M5d slice 017 / CORR-3: the responder refuses a rotation whose ceremony
+    /// nonce **reuses** the live generation's salt. A keyed 3-member chain goes
+    /// stale (a member left → current ring is 2), so an inbound commit for it is
+    /// a rotation — but this one replays the establishment nonce (`[7u8; 32]`).
+    /// The guard fires against committed state (the live transcript's nonce)
+    /// *before* the ceremony is driven, so `run_ceremony` never broadcasts the
+    /// responder's commitment: zero frames leave the link, and the row keeps its
+    /// original key. A rotation under a *fresh* nonce would fall through to the
+    /// transport and send that first frame — which is exactly what a live
+    /// initiator (a fresh random nonce per session) always presents.
+    #[test]
+    fn responder_refuses_a_rotation_that_reuses_the_live_nonce() {
+        let (daemon, tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "dev-a");
+        let peer1 = forged_peer(1); // the requester (an authenticated ring owner)
+        let peer2 = forged_peer(2); // the member who later "leaves"
+
+        // Key a 3-member chain {local, peer1, peer2} under nonce [7u8; 32]. The
+        // committed ring must equal that set at persist time (slice-013-pt2
+        // member-set==ring gate), so seed {peer1, peer2} on disk before persist.
+        {
+            let mut disk_ring = Ring::default();
+            disk_ring.upsert(peer1.clone());
+            disk_ring.upsert(peer2.clone());
+            disk_ring.save(&ring_path(tmp.path())).unwrap();
+        }
+        let add = crate::handlers::shared_subtree_add(
+            &daemon,
+            serde_json::json!({ "mount_path": "projects/journals" }),
+        )
+        .expect("add");
+        let ref_name = add["ref_name"].as_str().unwrap().to_string();
+        let self_sign = session_sign(&daemon);
+        let sign1 = seed_sign(1);
+        let sign2 = seed_sign(2);
+        let (s, transcript) = build_signed_transcript(
+            [7u8; 32],
+            ref_name.as_bytes(),
+            &[
+                (local.device_id, [0x11u8; 32], &self_sign),
+                (peer1.device_id, [0x22u8; 32], &sign1),
+                (peer2.device_id, [0x33u8; 32], &sign2),
+            ],
+        );
+        persist_ceremony_outcome(&daemon, &s, &transcript).expect("key the chain");
+        let keyed_kid = row_key_id(&daemon, &ref_name).expect("row is keyed");
+        let keyed_tip = {
+            let inner = daemon.inner.lock().unwrap();
+            inner.repo.as_ref().unwrap().tip().unwrap().unwrap()
+        };
+
+        // Current ring drops peer2 → {local, peer1}: the chain is now stale, so
+        // the inbound commit is treated as a rotation.
+        let ring = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(peer1.clone());
+            r
+        }));
+
+        // A link that records sends and refuses reads. A driven ceremony
+        // broadcasts the responder's commitment *first* (`run_ceremony` step 1),
+        // so any send here would mean the guard failed to fire.
+        #[derive(Clone)]
+        struct CaptureLink {
+            sent: Arc<Mutex<Vec<Frame>>>,
+        }
+        impl CeremonyLink for CaptureLink {
+            fn send_frame(&mut self, f: &Frame) -> Result<(), NetError> {
+                self.sent.lock().unwrap().push(f.clone());
+                Ok(())
+            }
+            fn recv_frame(&mut self) -> Result<Frame, NetError> {
+                Err(NetError::Protocol("refused rotation must not drive the link"))
+            }
+        }
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let link = CaptureLink { sent: sent.clone() };
+
+        // peer1 (an authenticated owner) dials with a commit that REUSES the
+        // live nonce.
+        let commit = SharedKeyCommit {
+            nonce: vec![7u8; 32],
+            chain_id: ref_name.clone().into_bytes(),
+            device_id: peer1.device_id.to_vec(),
+            commitment: vec![0u8; 32],
+            signature: vec![0u8; 64],
+        };
+        serve_ceremony_responder(&daemon, &local, &peer1, &ring, commit, link);
+
+        // The guard fired before the transport: nothing was sent, the row keeps
+        // its original key, and no new commit landed.
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a nonce-reusing rotation is refused before the ceremony broadcasts"
+        );
+        assert_eq!(
+            row_key_id(&daemon, &ref_name).as_deref(),
+            Some(keyed_kid.as_str()),
+            "the chain keeps its original key"
+        );
+        assert_eq!(
+            daemon.inner.lock().unwrap().repo.as_ref().unwrap().tip().unwrap().unwrap(),
+            keyed_tip,
+            "no rotation was persisted"
+        );
     }
 
     /// Slice 006 part 2 headline: **symmetric dual-add converges on ONE key**.

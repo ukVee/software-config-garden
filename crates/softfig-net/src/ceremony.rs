@@ -52,10 +52,26 @@ use crate::proto::{frame, Frame, SharedKeyCommit, SharedKeyHandoff, SharedKeyRev
 /// transcript can carry it for audit).
 pub type Contribution = [u8; 32];
 
-/// The per-ceremony nonce. Chosen fresh by the initiator and bound into every
-/// commitment, every signed message, the KDF salt, and the transcript, so no
-/// two ceremonies share derived material or can have messages transplanted
-/// between them.
+/// The per-ceremony nonce. Minted fresh by the initiator and bound into every
+/// commitment, every signed message, the KDF salt, and the transcript.
+///
+/// Its job is **domain separation, not unpredictability** (M5d slice 017 /
+/// CORR-3 — a correction of an earlier overclaim). Because the initiator picks
+/// the nonce, it is *not* an unpredictable value the initiator can be forced to
+/// randomise; a repeated nonce is a spec-fidelity flaw, not a break. What makes
+/// `S` unbiasable is not this salt but the **commit-then-reveal of every
+/// member's hidden `r_i`**: the initiator commits `H(nonce ‖ id ‖ r_init)`
+/// before it can see the responder's `r_resp`, so even under a replayed nonce
+/// the responder's fresh contribution changes `S` and no party can steer it.
+///
+/// Freshness of the salt is nonetheless *enforced* where it can be, against
+/// committed state rather than trust: the initiator mints a fresh random nonce
+/// per session ([`crate::ceremony`]'s drive loop), the responder refuses a
+/// rotation whose nonce reuses the generation it replaces (see
+/// [`nonce_is_fresh`]), and one-key-per-chain fill-if-unkeyed plus the in-flight
+/// ceremony guard preclude re-running an establishment for an already-keyed
+/// chain. So no two *completed* ceremonies for a chain share salt material —
+/// stated here as the enforced guarantee, not an unconditional one.
 pub type CeremonyNonce = [u8; 32];
 
 /// A commitment `H(nonce ‖ device_id ‖ r_i)` — what a member broadcasts before
@@ -110,8 +126,10 @@ const COMMIT_DOMAIN: &[u8] = b"softfig/shared-key/commit/v1";
 /// Domain-separation prefix for a `shared-key-reveal` message signature.
 const REVEAL_DOMAIN: &[u8] = b"softfig/shared-key/reveal/v1";
 
-/// The `info` prefix for the `S` HKDF, taken verbatim from the spec. The sorted
-/// member pubkeys are appended after it (see [`derive_shared_key`]).
+/// The `info` prefix for the `S` HKDF, taken verbatim from the spec. A u32-be
+/// member count then the sorted member pubkeys are appended after it (see
+/// [`derive_shared_key`] — the count is a slice-017/CORR-5 self-delimiting
+/// reinforcement of the spec's `PREFIX ‖ sorted(pubkeys)`, not a new KDF input).
 const SHARED_KEY_INFO_PREFIX: &[u8] = b"softfig.shared-subtree.v1";
 
 /// BLAKE3 domain tag for the public `key_id` derived from `S`. One-way, so the
@@ -273,8 +291,20 @@ pub struct MemberContribution {
 ///
 /// The members are sorted by device id so every honest participant, regardless
 /// of the order it received reveals, feeds an identical `ikm` (the `r_i` in
-/// sorted order) and an identical `info` (`SHARED_KEY_INFO_PREFIX` ‖ the sorted
-/// pubkeys) into the KDF, and therefore derives the identical `S`.
+/// sorted order) and an identical `info` (`SHARED_KEY_INFO_PREFIX` ‖ u32-be
+/// member count ‖ the sorted pubkeys) into the KDF, and therefore derives the
+/// identical `S`.
+///
+/// The member **count** is bound explicitly into `info` (M5d slice 017 /
+/// CORR-5): the pubkeys and `r_i` are all fixed 32-byte fields, so the raw
+/// concatenation is *already* unambiguous — but that safety is an accident of
+/// today's fixed widths, one schema change from an ambiguity. Prefixing the
+/// count makes the KDF inputs self-delimiting by construction (defence in depth)
+/// and mirrors `member_set_digest`, which binds the same count into every
+/// commit/reveal signature (slice 013). The `r_i` in `ikm` need no separate
+/// count prefix: `ikm` and `info` are distinct HKDF inputs, and every honest
+/// member feeds the same set, so the one count in `info` pins the cardinality of
+/// both.
 pub fn derive_shared_key(
     nonce: &CeremonyNonce,
     contributions: &[MemberContribution],
@@ -283,8 +313,9 @@ pub fn derive_shared_key(
     sorted.sort_by_key(|a| a.device_id);
 
     let mut ikm = Vec::with_capacity(sorted.len() * 32);
-    let mut info = Vec::with_capacity(SHARED_KEY_INFO_PREFIX.len() + sorted.len() * 32);
+    let mut info = Vec::with_capacity(SHARED_KEY_INFO_PREFIX.len() + 4 + sorted.len() * 32);
     info.extend_from_slice(SHARED_KEY_INFO_PREFIX);
+    info.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
     for mc in &sorted {
         ikm.extend_from_slice(&mc.r);
         info.extend_from_slice(&mc.device_id);
@@ -302,6 +333,24 @@ pub fn derive_shared_key(
     // `out` is `Copy`, so wrapping it left a plaintext copy on the stack; wipe it.
     out.zeroize();
     key
+}
+
+/// Whether a ceremony `candidate` nonce is fresh with respect to the nonces a
+/// chain has already used (`used`) — the enforced half of the salt's
+/// domain-separation guarantee (M5d slice 017 / CORR-3).
+///
+/// The nonce is minted by the initiator, so freshness cannot be *trusted*; it is
+/// *checked* against committed state. Today the only durable prior nonce a
+/// responder holds for a keyed chain is its live transcript's, so the drive
+/// layer passes that as the single `used` entry when authorizing a rotation — a
+/// rotation that replays the establishment nonce is refused, so `S'` never
+/// shares salt material with the generation it replaces. The `&[..]` shape
+/// generalises to the multi-generation / >2-member case without a signature
+/// change. (Establishment reuse for a chain is precluded upstream by
+/// one-key-per-chain fill-if-unkeyed plus the in-flight ceremony guard, so it
+/// needs no entry here.)
+pub fn nonce_is_fresh(candidate: &CeremonyNonce, used: &[CeremonyNonce]) -> bool {
+    !used.contains(candidate)
 }
 
 /// The public identifier for a key generation: `S-<16 hex>` of a one-way hash of
@@ -1162,6 +1211,48 @@ mod tests {
         reversed.reverse();
         assert_eq!(derive_shared_key(&NONCE, &forward), via_machine);
         assert_eq!(derive_shared_key(&NONCE, &reversed), via_machine);
+    }
+
+    #[test]
+    fn member_count_is_bound_into_the_derivation() {
+        // M5d slice 017 / CORR-5: the member count is length-prefixed into the
+        // KDF `info`. The device ids + `r_i` are all fixed 32-byte fields, so the
+        // raw concatenation is already unambiguous — a differing cardinality
+        // trivially differs in total length. The count prefix is therefore
+        // defence in depth (self-delimiting by construction, one schema change
+        // ahead of an ambiguity), so the meaningful guard is a *golden*
+        // characterisation that pins the exact `info` layout: any future change
+        // to it (dropping the count, reordering, widening a field) breaks this,
+        // even though it would leave convergence — which all honest members
+        // recompute — intact and so slip past every functional test.
+        let two: Vec<_> = [member(1, 11), member(2, 22)]
+            .iter()
+            .map(|m| MemberContribution { device_id: m.id, r: m.r })
+            .collect();
+        let three: Vec<_> = [member(1, 11), member(2, 22), member(3, 33)]
+            .iter()
+            .map(|m| MemberContribution { device_id: m.id, r: m.r })
+            .collect();
+        let s2 = derive_shared_key(&NONCE, &two);
+        let s3 = derive_shared_key(&NONCE, &three);
+        assert_ne!(s2, s3, "a different member count derives a different S");
+        assert_ne!(key_id(&s2), key_id(&s3));
+        // Golden: the exact `key_id` for this fixed 2-member set + NONCE. Pins
+        // `info = PREFIX ‖ u32-be(count) ‖ sorted(ids)` and `ikm = sorted(r_i)`.
+        assert_eq!(key_id(&s2), "S-643b325cee0e0d4a");
+    }
+
+    #[test]
+    fn nonce_freshness_predicate() {
+        // M5d slice 017 / CORR-3: the enforced half of the salt's
+        // domain-separation guarantee. A nonce is fresh iff it is not among the
+        // chain's already-used nonces.
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert!(nonce_is_fresh(&a, &[]), "any nonce is fresh against no history");
+        assert!(nonce_is_fresh(&a, &[b]), "a distinct nonce is fresh");
+        assert!(!nonce_is_fresh(&a, &[a]), "a replayed nonce is not fresh");
+        assert!(!nonce_is_fresh(&a, &[b, a]), "reuse anywhere in history is caught");
     }
 
     #[test]
