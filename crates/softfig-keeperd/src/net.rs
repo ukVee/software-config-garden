@@ -3331,7 +3331,11 @@ pub fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
 /// receiver pulls + applies it as a local `shared_pull` commit. A
 /// dial/handshake/send failure falls through to the next route; once serving
 /// begins the result is returned (a mid-serve error is not retried elsewhere).
-fn push_shared_chain_to_host(
+#[doc(hidden)] // test seam — see `serve_established`. Drives the outbound push
+               // primitive directly so the 3-daemon mesh test can seed A→B over
+               // a real dial (the same path the `Applied`-arm re-push uses).
+#[allow(clippy::too_many_arguments)]
+pub fn push_shared_chain_to_host(
     local: &LocalDevice,
     host: &RingEntry,
     frame: &Frame,
