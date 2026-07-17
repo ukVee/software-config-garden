@@ -13,8 +13,8 @@ mod generated {
 pub use generated::{
     frame, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree,
     HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant,
-    SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce, TreeData,
-    TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+    SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce,
+    TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
 };
 
 /// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
@@ -204,6 +204,14 @@ impl Frame {
     pub fn turn_revoke(revoke: TurnRevoke) -> Self {
         Self {
             kind: Some(frame::Kind::TurnRevoke(revoke)),
+        }
+    }
+
+    /// A `SharedChainPush` frame (writer -> S-members): a committed shared-subtree
+    /// edit to adopt (M5e slice 002 shared-pull).
+    pub fn shared_chain_push(push: SharedChainPush) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedChainPush(push)),
         }
     }
 }

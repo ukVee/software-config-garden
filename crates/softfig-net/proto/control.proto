@@ -58,13 +58,21 @@ message Frame {
     TurnRequest turn_request = 204;                  // member -> members: request a chain's write turn
     TurnYield turn_yield = 205;                      // holder -> requester: yield the turn (the go-ahead)
     TurnRevoke turn_revoke = 206;                    // member -> members: an expired holder's lease is reclaimed
+    // M5e slice 002 (shared-pull): the data-plane push a writer sends its chain's
+    // other S-members after committing a shared-subtree edit — the new tree + the
+    // base tree it was authored over (both content hashes) so the receiver fetches
+    // just that tree closure (GetTree/GetObject; the commit graph is NOT sent) and
+    // re-authors the edit as its own local `shared_pull` commit. Signed like the
+    // other M5e frames and honoured only from S-members. See softfig-net's `turn`
+    // module + keeperd's shared_pull apply.
+    SharedChainPush shared_chain_push = 207;         // writer -> S-members: a committed shared-subtree edit to adopt
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
   // 23-99 are held for later control-plane variants; 100-199 is the M5b data
   // plane; 200-201 is the M5d shared-key ceremony; 202 is the M5d slice-008
-  // recovery hand-off; 203-206 is the M5e write-turn coordination; 207+ stays
-  // open for later sync slices (shared-chain push, ...).
+  // recovery hand-off; 203-206 is the M5e write-turn coordination; 207 is the
+  // M5e shared-chain push (slice 002); 208+ stays open for later sync slices.
   reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
@@ -331,4 +339,31 @@ message TurnRevoke {
   bytes revoked = 3;    // the holder whose lease is being revoked (32 bytes)
   uint64 epoch = 4;     // the lease epoch (grant generation) being revoked
   bytes signature = 5;  // Ed25519 over turn_revoke_signing_bytes(...)
+}
+
+// writer -> members (M5e slice 002 shared-pull): a committed shared-subtree edit
+// to adopt. After an S-member commits an edit to a shared subtree it pushes this
+// to the chain's other reachable S-members. It carries only *content hashes* +
+// provenance — never the peer's commit row — so the receiver fetches the
+// `new_tree` closure (GetTree/GetObject over the same session, the M5b transfer
+// primitive `pull_subtree`) into its LOCAL store and then re-authors the edit as
+// its own `shared_pull` commit (parent = local chain tip, tree = new_tree). The
+// receiver's three-way apply decides by TREE: `new_tree == local tip tree` is the
+// ping-pong terminator; `base_tree == local tip tree` (or an unborn chain) is a
+// clean fast-forward; otherwise it diverged (the slice-003 LWW+sidecar path).
+// `base_tree` is on the wire *because* the receiver never holds the peer's commit
+// graph and so can't derive the base from a parent pointer (decision-m5e-shared-
+// pull-intent, "apply mechanics"). Signed by the sender's Ed25519 identity over
+// shared_chain_push_signing_bytes(...) and honoured only from S-members of the
+// chain — a paired non-member has no role in a chain's sync. protobuf is not
+// canonical: the driver re-derives the signed bytes from these fields.
+message SharedChainPush {
+  bytes chain_id = 1;        // the chain ref name (utf-8 "chain/<subtree>"), same convention as the turn frames
+  string subtree = 2;        // the subtree path the chain projects (e.g. "proj")
+  bytes new_tree = 3;        // root_tree of the sender's edit commit — the content to adopt (32-byte BLAKE3)
+  bytes base_tree = 4;       // root_tree the sender authored its edit over — the apply base (32-byte BLAKE3)
+  bytes device_id = 5;       // the sending device's Ed25519 identity (32 bytes); must match the session peer
+  string writer_device = 6;  // the originating edit author's device name (provenance; propagated verbatim on re-push)
+  repeated string files = 7; // the edited file paths (payload provenance)
+  bytes signature = 8;       // Ed25519 (64 bytes) over shared_chain_push_signing_bytes(...)
 }

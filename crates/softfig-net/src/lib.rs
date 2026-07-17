@@ -63,20 +63,20 @@ pub use error::{NetError, Result};
 pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 pub use proto::{
     CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload,
-    ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, StateAnnounce,
-    TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+    ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, SharedChainPush,
+    StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
 };
 pub use turn::{
-    device_state_signing_bytes, turn_request_signing_bytes, turn_revoke_signing_bytes,
-    turn_yield_signing_bytes, verify_device_state_sig, verify_turn_request_sig,
-    verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseConfig, LeaseEvent, LeaseScope,
-    WriteTurn,
+    device_state_signing_bytes, shared_chain_push_signing_bytes, turn_request_signing_bytes,
+    turn_revoke_signing_bytes, turn_yield_signing_bytes, verify_device_state_sig,
+    verify_shared_chain_push_sig, verify_turn_request_sig, verify_turn_revoke_sig,
+    verify_turn_yield_sig, DeviceState, LeaseConfig, LeaseEvent, LeaseScope, WriteTurn,
 };
 pub use relay::{relay_accept, relay_connect, Relay, RelayStream};
 pub use replica::{
-    grant_signing_bytes, pull_replication, pull_replication_pipelined, serve_replication,
-    tipannounce_signing_bytes, verify_grant, verify_tipannounce, PullSummary, ReplicaSink,
-    ReplicaSource, ServeSummary,
+    grant_signing_bytes, pull_replication, pull_replication_pipelined, pull_subtree,
+    serve_replication, tipannounce_signing_bytes, verify_grant, verify_tipannounce, PullSummary,
+    ReplicaSink, ReplicaSource, ServeSummary, SubtreeSummary,
 };
 pub use ring::{ring_path, Ring, RingEntry};
 pub use sas::Sas;

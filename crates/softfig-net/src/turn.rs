@@ -444,6 +444,9 @@ const TURN_YIELD_DOMAIN: &[u8] = b"softfig/turn/yield/v1";
 /// Domain-separation prefix for a `turn-revoke` signature.
 const TURN_REVOKE_DOMAIN: &[u8] = b"softfig/turn/revoke/v1";
 
+/// Domain-separation prefix for a `shared-chain-push` signature (M5e slice 002).
+const SHARED_CHAIN_PUSH_DOMAIN: &[u8] = b"softfig/turn/shared-chain-push/v1";
+
 /// The exact bytes a device's Ed25519 identity signs to announce its state.
 /// Binds the device id, the state code, the unlocked flag, and the per-device
 /// logical clock `seq` so a stale announce can be ordered against a fresh one and
@@ -523,6 +526,61 @@ pub fn turn_revoke_signing_bytes(
     m
 }
 
+/// The exact bytes the sending device's Ed25519 identity signs to push a
+/// committed shared-subtree edit to the chain's other S-members (M5e slice 002).
+/// Every variable-length field — the chain ref, the subtree path, the writer's
+/// device name, and each edited file path (count-prefixed, then each
+/// length-prefixed) — is length-prefixed so no two distinct pushes share an
+/// encoding, and the fixed-size content hashes + sender id bind the exact tree
+/// transition being adopted. Signing the `new_tree` + `base_tree` pair means a
+/// captured push can't be replayed to graft a different tree or a different base
+/// onto the chain. The vault produces the signature; keeperd's inbound handler
+/// re-derives these bytes from the wire fields (protobuf is not canonical) and
+/// checks it against the sender's identity — a valid signature proves *who*
+/// pushed; S-membership (a separate committed-state check) proves they may.
+#[allow(clippy::too_many_arguments)]
+pub fn shared_chain_push_signing_bytes(
+    chain_id: &[u8],
+    subtree: &str,
+    new_tree: &[u8; 32],
+    base_tree: &[u8; 32],
+    device_id: &[u8; 32],
+    writer_device: &str,
+    files: &[String],
+) -> Vec<u8> {
+    let files_len: usize = files.iter().map(|f| 4 + f.len()).sum();
+    let mut m = Vec::with_capacity(
+        SHARED_CHAIN_PUSH_DOMAIN.len()
+            + 4
+            + chain_id.len()
+            + 4
+            + subtree.len()
+            + 32
+            + 32
+            + 32
+            + 4
+            + writer_device.len()
+            + 4
+            + files_len,
+    );
+    m.extend_from_slice(SHARED_CHAIN_PUSH_DOMAIN);
+    m.extend_from_slice(&(chain_id.len() as u32).to_be_bytes());
+    m.extend_from_slice(chain_id);
+    m.extend_from_slice(&(subtree.len() as u32).to_be_bytes());
+    m.extend_from_slice(subtree.as_bytes());
+    m.extend_from_slice(new_tree);
+    m.extend_from_slice(base_tree);
+    m.extend_from_slice(device_id);
+    m.extend_from_slice(&(writer_device.len() as u32).to_be_bytes());
+    m.extend_from_slice(writer_device.as_bytes());
+    m.extend_from_slice(&(files.len() as u32).to_be_bytes());
+    for f in files {
+        m.extend_from_slice(&(f.len() as u32).to_be_bytes());
+        m.extend_from_slice(f.as_bytes());
+    }
+    m
+}
+
 /// Verify a `device-state-announce` signature against the announcing device's
 /// Ed25519 identity key. Never panics — a bad key, wrong-length signature, or a
 /// non-verifying signature all return `false` (the `ceremony`/`replica` shape).
@@ -587,6 +645,37 @@ pub fn verify_turn_revoke_sig(
     verify_sig(
         device_id,
         &turn_revoke_signing_bytes(chain_id, device_id, revoked, epoch),
+        sig,
+    )
+}
+
+/// Verify a `shared-chain-push` signature against the sending device's Ed25519
+/// identity key (M5e slice 002). Never panics. As with the turn frames, a valid
+/// signature proves *who* pushed the edit; S-membership authorization (is the
+/// sender a member of the chain?) is a separate check keeperd runs against the
+/// committed shared-subtree membership before applying.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_shared_chain_push_sig(
+    chain_id: &[u8],
+    subtree: &str,
+    new_tree: &[u8; 32],
+    base_tree: &[u8; 32],
+    device_id: &[u8; 32],
+    writer_device: &str,
+    files: &[String],
+    sig: &[u8],
+) -> bool {
+    verify_sig(
+        device_id,
+        &shared_chain_push_signing_bytes(
+            chain_id,
+            subtree,
+            new_tree,
+            base_tree,
+            device_id,
+            writer_device,
+            files,
+        ),
         sig,
     )
 }
@@ -981,6 +1070,69 @@ mod tests {
         assert!(!verify_device_state_sig(&id, DeviceState::OnlineIdle, true, 3, &sig));
         assert!(!verify_device_state_sig(&id, DeviceState::OnlineActive, false, 3, &sig));
         assert!(!verify_device_state_sig(&id, DeviceState::OnlineActive, true, 4, &sig));
+    }
+
+    #[test]
+    fn shared_chain_push_signature_verifies_and_binds_the_tree_transition() {
+        let writer = SigningKey::from_bytes(&[8u8; 32]);
+        let id = writer.verifying_key().to_bytes();
+        let chain = b"chain/proj";
+        let new_tree = [9u8; 32];
+        let base_tree = [10u8; 32];
+        let files = vec!["proj/a.md".to_string(), "proj/b.md".to_string()];
+        let bytes = shared_chain_push_signing_bytes(
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files,
+        );
+        let sig = writer.sign(&bytes).to_bytes();
+
+        assert!(verify_shared_chain_push_sig(
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, &sig
+        ));
+
+        // A captured push can't be replayed to graft a different tree, a
+        // different base, or onto a different chain/subtree — each field is
+        // bound.
+        let other = [11u8; 32];
+        assert!(!verify_shared_chain_push_sig(
+            chain, "proj", &other, &base_tree, &id, "peerbox", &files, &sig
+        ));
+        assert!(!verify_shared_chain_push_sig(
+            chain, "proj", &new_tree, &other, &id, "peerbox", &files, &sig
+        ));
+        assert!(!verify_shared_chain_push_sig(
+            b"chain/other", "proj", &new_tree, &base_tree, &id, "peerbox", &files, &sig
+        ));
+        assert!(!verify_shared_chain_push_sig(
+            chain, "other", &new_tree, &base_tree, &id, "peerbox", &files, &sig
+        ));
+        // Provenance + the edited-file list are signed too.
+        assert!(!verify_shared_chain_push_sig(
+            chain, "proj", &new_tree, &base_tree, &id, "otherbox", &files, &sig
+        ));
+        let fewer = vec!["proj/a.md".to_string()];
+        assert!(!verify_shared_chain_push_sig(
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &fewer, &sig
+        ));
+
+        // A forger who re-signs with their own key over the member's claimed id
+        // fails: the signature is checked against the *claimed* device_id.
+        let attacker = SigningKey::from_bytes(&[12u8; 32]);
+        let forged = attacker.sign(&bytes).to_bytes();
+        assert!(!verify_shared_chain_push_sig(
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, &forged
+        ));
+    }
+
+    #[test]
+    fn shared_chain_push_length_prefixing_defeats_field_run_together() {
+        // Two distinct (subtree, writer_device) splits that would collide under
+        // naive concatenation must produce distinct signing bytes — the length
+        // prefixes keep the boundary unambiguous.
+        let id = [1u8; 32];
+        let (nt, bt) = ([2u8; 32], [3u8; 32]);
+        let a = shared_chain_push_signing_bytes(b"c", "ab", &nt, &bt, &id, "cd", &[]);
+        let b = shared_chain_push_signing_bytes(b"c", "abc", &nt, &bt, &id, "d", &[]);
+        assert_ne!(a, b);
     }
 
     #[test]

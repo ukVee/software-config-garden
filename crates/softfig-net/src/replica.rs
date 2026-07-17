@@ -202,6 +202,15 @@ pub struct ServeSummary {
     pub objects_served: u64,
 }
 
+/// What a [`pull_subtree`] run fetched, for the caller's status/log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubtreeSummary {
+    /// The store already held the whole closure; nothing fetched.
+    pub up_to_date: bool,
+    pub trees: u64,
+    pub objects: u64,
+}
+
 /// What a pull negotiation ([`negotiate_pull`]) resolved to: what, if anything,
 /// the mirror must backfill. Computed identically for the sequential and
 /// full-duplex drivers so they agree on the fast-forward / fork decision
@@ -371,6 +380,44 @@ fn ensure_tree<S: Read + Write>(
     sink.store_tree(&tree)?;
     summary.trees += 1;
     Ok(())
+}
+
+/// Fetch the full subtree rooted at `root_tree` — every tree row + ciphertext
+/// object in its closure the sink lacks — from a peer running
+/// [`serve_replication`], **without** touching the commit graph. This is the M5e
+/// shared-pull transfer primitive: a `SharedChainPush` names a peer's committed
+/// edit by its `new_tree` content hash, and the receiver pulls exactly that tree
+/// closure into its LOCAL store so it can re-author the edit as its own
+/// `shared_pull` commit — the peer's commit row is never transferred or adopted
+/// (re-authoring gives each device its own author + signature; convergence is by
+/// content, see keeperd's `apply_shared_pull`). Because the source's
+/// [`serve_replication`] answers `GetTree`/`GetObject` for any hash, the same
+/// unchanged serve loop backs both this and [`pull_replication`].
+///
+/// Unlike [`pull_replication`] there is no tip announce, no fast-forward walk,
+/// and no tip advance — so only the sink's tree/object methods
+/// ([`has_tree`](ReplicaSink::has_tree) / [`store_tree`](ReplicaSink::store_tree)
+/// / [`has_object`](ReplicaSink::has_object) /
+/// [`store_object`](ReplicaSink::store_object)) are exercised, each verifying its
+/// content address before storing. Post-order like [`ensure_tree`], so a stored
+/// tree still implies its whole subtree is present (the `has_tree` short-circuit
+/// stays sound across an interrupted earlier run). The CALLER decides what to do
+/// with `root_tree` once its closure is present (keeperd hands it to
+/// `apply_shared_pull`). Sends `ReplicaDone` when finished so the source closes.
+pub fn pull_subtree<S: Read + Write>(
+    session: &mut NoiseSession<S>,
+    sink: &mut dyn ReplicaSink,
+    root_tree: &[u8; 32],
+) -> Result<SubtreeSummary> {
+    let already_present = sink.has_tree(root_tree);
+    let mut summary = PullSummary::default();
+    ensure_tree(session, sink, root_tree, &mut summary)?;
+    session.send_frame(&Frame::replica_done())?;
+    Ok(SubtreeSummary {
+        up_to_date: already_present,
+        trees: summary.trees,
+        objects: summary.objects,
+    })
 }
 
 // --- Full-duplex pipelined backfill ----------------------------------------
@@ -1306,5 +1353,59 @@ mod tests {
             "a forked chain must be rejected"
         );
         assert_eq!(sink.stored_tip(), Some(tip_a), "mirror tip unchanged");
+    }
+
+    /// Run a [`pull_subtree`] against a [`serve_replication`] source over an
+    /// in-process socket, returning the result and the resulting sink.
+    fn run_subtree(
+        chain: Chain,
+        mut sink: MockSink,
+        root: [u8; 32],
+    ) -> (Result<SubtreeSummary>, MockSink) {
+        let (a, b) = UnixStream::pair().unwrap();
+        let src = MockSource { chain };
+        let server = thread::spawn(move || {
+            let mut s = xx_responder(b, &[2u8; 32], &hello("writer")).unwrap();
+            let _ = serve_replication(&mut s, &src);
+        });
+        let mut client = xx_initiator(a, &[1u8; 32], &hello("receiver")).unwrap();
+        let result = pull_subtree(&mut client, &mut sink, &root);
+        drop(client);
+        server.join().unwrap();
+        (result, sink)
+    }
+
+    #[test]
+    fn pull_subtree_fetches_a_tree_closure_without_the_commit_graph() {
+        // A peer commits a shared-subtree edit whose root tree fans out to blobs
+        // plus a nested subtree. The receiver pulls exactly that tree closure
+        // into an empty store — every tree + object — and NOT the commit row:
+        // shared-pull re-authors locally, it never adopts the peer's commit.
+        let mut chain = Chain::default();
+        let commit = chain.commit_wide("edit", 3);
+        let root = to_hash32(&chain.commits.get(&commit).unwrap().root_tree).unwrap();
+        let want_objects = chain.objects.len(); // 3 root blobs + 3 sub blobs
+
+        let (res, sink) = run_subtree(chain.clone(), MockSink::default(), root);
+        let summary = res.unwrap();
+        assert!(!summary.up_to_date);
+        assert_eq!(summary.trees, 2, "root tree + nested subtree");
+        assert_eq!(summary.objects, want_objects as u64);
+        assert!(sink.has_tree(&root), "the named tree landed");
+        assert_eq!(sink.objects.len(), want_objects);
+        assert!(
+            sink.commits.is_empty(),
+            "no commit row transferred — shared-pull re-authors locally"
+        );
+        assert_eq!(sink.stored_tip(), None, "pull_subtree never advances a tip");
+
+        // Idempotent: re-pulling into the now-complete store fetches nothing and
+        // reports up_to_date (the `has_tree` short-circuit stays sound).
+        let (res2, sink2) = run_subtree(chain, sink, root);
+        let s2 = res2.unwrap();
+        assert!(s2.up_to_date);
+        assert_eq!(s2.trees, 0);
+        assert_eq!(s2.objects, 0);
+        assert_eq!(sink2.objects.len(), want_objects, "store unchanged");
     }
 }
