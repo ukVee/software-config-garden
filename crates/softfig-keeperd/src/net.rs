@@ -701,7 +701,13 @@ fn serve_inbound(daemon: Daemon, local: &LocalDevice, ring: &Arc<Mutex<Ring>>, c
 /// us as a backup host (verify the grant, then mirror via `pull_replication`); a
 /// `SharedKeyCommit` is a member initiating the M5d shared-key ceremony (serve
 /// the responder role inline on this thread).
-fn serve_established(
+// `pub` + `#[doc(hidden)]` is a deliberate **test seam** (not general API): the
+// m5e slice-002 loopback integration tests (`tests/m5e_shared_pull.rs`) drive
+// the inbound shared-chain-push dispatch directly over a hand-built Noise session
+// — the 2b-3 push/apply/re-push path is otherwise only reachable through the live
+// net runtime. Same rationale for `serve_shared_subtree` / `build_shared_chain_push_frame`.
+#[doc(hidden)]
+pub fn serve_established(
     daemon: &Daemon,
     local: &LocalDevice,
     owner: &RingEntry,
@@ -3258,8 +3264,9 @@ fn serve_chain<S: std::io::Read + std::io::Write>(
 /// `writer_device` carries the ORIGINATING author's name verbatim — on a re-push
 /// it is the upstream member's name, not ours (advisory provenance; a re-pusher
 /// can forge it in v1 — locked, don't fix).
+#[doc(hidden)] // test seam — see `serve_established`.
 #[allow(clippy::too_many_arguments)]
-fn build_shared_chain_push_frame(
+pub fn build_shared_chain_push_frame(
     session: &VaultSession,
     local: &LocalDevice,
     chain: &str,
@@ -3302,7 +3309,8 @@ fn build_shared_chain_push_frame(
 /// the frame). Generic over the stream so the same drive runs LAN-direct or
 /// relayed. The just-committed tree closure is durable in the store before this
 /// runs, so a fresh reader beside the daemon's writer (sqlite WAL) serves it.
-fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
+#[doc(hidden)] // test seam — see `serve_established`.
+pub fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
     session: &mut NoiseSession<S>,
     root_tree: &[u8; 32],
     garden_root: &std::path::Path,
