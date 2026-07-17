@@ -54,8 +54,9 @@ use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
-    pull_replication_pipelined, serve_replication, static_attestation_message, verify_device_state_sig,
-    verify_grant, verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState,
+    device_state_signing_bytes, pull_replication_pipelined, serve_replication,
+    static_attestation_message, turn_revoke_signing_bytes, verify_device_state_sig, verify_grant,
+    verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseEvent,
     LeaseScope, NetError, ServeSummary, WriteTurn,
 };
 use softfig_store::Hash;
@@ -811,7 +812,26 @@ fn resolve_chain_members(
                 return None;
             }
         };
-    let members = match membership
+    let members = chain_members(&membership, &ring_members, repo, session, chain);
+    Some((membership, members))
+}
+
+/// The S-member device-id set for `chain`: a keyed chain's are its committed
+/// ceremony transcript's members; an unkeyed chain (pre-ceremony) falls back to
+/// `ring_members` — the current ring, which in v1 point-to-point coincides. A
+/// keyed row whose transcript can't be read yet also falls back to the ring
+/// rather than dropping to empty (a read glitch must not silently disenfranchise
+/// the chain). Shared by the inbound authorization ([`resolve_chain_members`])
+/// and the outbound fan-out ([`reconcile_write_turns`]) so both derive the same
+/// set from the same committed state.
+fn chain_members(
+    membership: &softfig_vcs::SharedSubtreesConfig,
+    ring_members: &[[u8; 32]],
+    repo: &Repo,
+    session: &VaultSession,
+    chain: &str,
+) -> Vec<[u8; 32]> {
+    match membership
         .subtrees
         .iter()
         .find(|r| r.ref_name == chain)
@@ -821,10 +841,9 @@ fn resolve_chain_members(
             .ok()
             .flatten()
             .map(|t| t.members.iter().map(|m| m.device_id).collect())
-            .unwrap_or(ring_members),
-        None => ring_members,
-    };
-    Some((membership, members))
+            .unwrap_or_else(|| ring_members.to_vec()),
+        None => ring_members.to_vec(),
+    }
 }
 
 /// Apply an inbound `DeviceStateAnnounce`: verify the signature, confirm the
@@ -1028,6 +1047,233 @@ fn handle_turn_revoke(
                 rv.epoch
             );
         }
+    }
+}
+
+// --- M5e write-turn coordination (outbound driver + expiry poll) ------------
+//
+// The SEND half of the gossip protocol, mirroring the ceremony/replica push:
+// this device signs its own coordination frames with the vault identity and fans
+// them to the chain's reachable S-members (self excluded), LAN-direct-first with
+// the relay as fallback — exactly [`push_to_host`]'s route policy. Turn gossip is
+// one-shot and fire-and-forget: dial, send, drop the session; the receiver's
+// inbound handler applies it after re-verifying the signature + S-membership. The
+// two triggers whose events exist at this layer are wired here — a device-state
+// change (Offline→OnlineIdle on unlock) and an expiry-revoke (the poll loop). The
+// `TurnRequest`/`TurnYield` broadcasts ride the commit boundary (their call sites
+// are part 3), so they land with that path rather than as dead code here.
+
+/// Send one signed, one-shot coordination frame to a single ring peer,
+/// best-effort. Mirrors [`push_to_host`]'s route policy — each known LAN endpoint
+/// as a [`Route::Direct`], then a [`Route::Relay`] iff a client relay is
+/// configured — but sends a single fire-and-forget frame instead of driving a
+/// serve loop. A dial/send failure falls through to the next route; the last
+/// error is returned for the caller to log.
+fn send_turn_frame_to(
+    local: &LocalDevice,
+    host: &RingEntry,
+    relay_client: Option<&(String, [u8; 32])>,
+    frame: &Frame,
+) -> Result<(), String> {
+    let routes = plan_routes(host, relay_client.is_some());
+    if routes.is_empty() {
+        return Err("no route (no LAN endpoint, no relay)".to_string());
+    }
+    let mut last_err = "no route".to_string();
+    for route in &routes {
+        match route {
+            Route::Direct(endpoint) => match dial_direct(local, host, endpoint) {
+                Ok(mut session) => {
+                    return session
+                        .send_frame(frame)
+                        .map_err(|e| format!("send (direct {endpoint}): {e}"));
+                }
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            },
+            Route::Relay => {
+                let (relay_endpoint, relay_static) =
+                    relay_client.expect("relay route planned without a relay client");
+                match dial_relay(local, host, relay_endpoint, relay_static) {
+                    Ok(mut session) => {
+                        return session
+                            .send_frame(frame)
+                            .map_err(|e| format!("send (relay {relay_endpoint}): {e}"));
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Fan one signed frame to every reachable target, best-effort; log each miss.
+/// A dropped frame is only a delay — the lease re-derives under its TTL and the
+/// periodic driver re-broadcasts — never a stuck turn, so a failed dial is logged
+/// and the fan continues to the next peer.
+fn fan_turn_frame(
+    local: &LocalDevice,
+    targets: &[RingEntry],
+    relay_client: Option<&(String, [u8; 32])>,
+    frame: &Frame,
+    what: &str,
+) {
+    for host in targets {
+        if let Err(e) = send_turn_frame_to(local, host, relay_client, frame) {
+            eprintln!("keeperd: net: {what} to {} skipped: {e}", host.fingerprint());
+        }
+    }
+}
+
+/// Poll every chain's lease forward to `now`, returning the `(chain,
+/// revoked_device, epoch)` of each lease that just expired — the daemon then
+/// signs + fans a `TurnRevoke` for each. Pure over the map (the `now` is passed,
+/// never read, and there is no IO) so the "silent holder → expiry → revoke"
+/// slice test runs headlessly. [`LeaseEvent::Granted`] is intentionally dropped:
+/// after a revoke every member re-derives the same deterministic FIFO winner
+/// locally ([`WriteTurn::poll`]), so a grant needs no broadcast — only the
+/// revoke, the crash/partition signal, is gossiped.
+fn poll_expiries(
+    write_turns: &mut HashMap<String, WriteTurn>,
+    now: i64,
+) -> Vec<(String, [u8; 32], u64)> {
+    let mut revokes = Vec::new();
+    let chains: Vec<String> = write_turns.keys().cloned().collect();
+    for chain in chains {
+        if let Some(turn) = write_turns.get_mut(&chain) {
+            for ev in turn.poll(now) {
+                if let LeaseEvent::Revoked { device_id, epoch } = ev {
+                    revokes.push((chain.clone(), device_id, epoch));
+                }
+            }
+        }
+    }
+    revokes
+}
+
+/// One write-turn reconcile pass, run on the replica loop's tick (M5e slice 001
+/// part 2b). Two outbound duties, both snapshotted under the daemon lock so the
+/// network IO runs off the mutex (the ceremony/replica discipline):
+///
+/// 1. **Device-state announce.** Lift `Offline`→`OnlineIdle` the first tick after
+///    unlock and fan the signed [`DeviceStateAnnounce`] to every ring peer. It is
+///    a state-change trigger, not a periodic beacon — later ticks find the state
+///    already lifted and send nothing. (The `OnlineIdle`↔`OnlineActive` flip rides
+///    a write-session attach; part 3.)
+/// 2. **Expiry-revoke.** [`poll_expiries`] revokes any lease whose holder went
+///    silent past its renew window (or hit the max-lease ceiling); each revoke is
+///    signed and fanned to the chain's reachable S-members. This is the
+///    crash/partition recovery path — without it one dead holder would brick the
+///    subtree's turn forever.
+fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
+    let now = now_secs();
+    let mut announce_frame: Option<(Frame, Vec<RingEntry>)> = None;
+    let mut revoke_frames: Vec<(Frame, Vec<RingEntry>)> = Vec::new();
+    let relay_client;
+    {
+        let mut inner = daemon.inner.lock().unwrap();
+        if inner.state != State::Unlocked {
+            return;
+        }
+        let Some(session) = inner.session.clone() else {
+            return;
+        };
+        relay_client = relay_client_config(&inner.config);
+        let relay_available = relay_client.is_some();
+        let state_dir = inner.config.state_dir().to_path_buf();
+        // Load the live ring once (mount-safe under the lock via the WorkTree),
+        // reused for the device-state fan-out and each revoke's S-member fan-out.
+        let ring = {
+            let wt = WorkTree::new(daemon, &inner);
+            load_ring(&wt, &state_dir).unwrap_or_default()
+        };
+
+        // (1) Lift Offline→OnlineIdle on unlock and announce the change once.
+        if inner.device_state == DeviceState::Offline {
+            inner.device_state = DeviceState::OnlineIdle;
+            inner.announce_seq += 1;
+            let seq = inner.announce_seq;
+            let state = inner.device_state;
+            let signature = session
+                .sign(&device_state_signing_bytes(&local.device_id, state, true, seq))
+                .to_bytes()
+                .to_vec();
+            let frame = Frame::device_state_announce(DeviceStateAnnounce {
+                device_id: local.device_id.to_vec(),
+                state: state.as_u32(),
+                unlocked: true,
+                seq,
+                signature,
+            });
+            // Device state is global (not per-chain), so it fans to every ring
+            // peer; in v1 point-to-point a ring peer is exactly an S-member.
+            let targets: Vec<RingEntry> = ring
+                .peers()
+                .iter()
+                .filter(|h| !plan_routes(h, relay_available).is_empty())
+                .cloned()
+                .collect();
+            announce_frame = Some((frame, targets));
+        }
+
+        // (2) Expiry poll → sign + resolve targets for each revoke.
+        let revokes = poll_expiries(&mut inner.write_turns, now);
+        if !revokes.is_empty() {
+            let membership = inner.repo.as_ref().and_then(|repo| {
+                crate::handlers::read_committed_shared_subtrees_for_mutation(repo, &session).ok()
+            });
+            if let (Some(membership), Some(repo)) = (membership, inner.repo.as_ref()) {
+                let ring_members = assemble_member_set(&ring, local.device_id);
+                for (chain, revoked, epoch) in revokes {
+                    let members = chain_members(&membership, &ring_members, repo, &session, &chain);
+                    let targets: Vec<RingEntry> = members
+                        .iter()
+                        .filter(|id| **id != local.device_id)
+                        .filter_map(|id| ring.peers().iter().find(|p| &p.device_id == id).cloned())
+                        .filter(|host| !plan_routes(host, relay_available).is_empty())
+                        .collect();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let signature = session
+                        .sign(&turn_revoke_signing_bytes(
+                            chain.as_bytes(),
+                            &local.device_id,
+                            &revoked,
+                            epoch,
+                        ))
+                        .to_bytes()
+                        .to_vec();
+                    let frame = Frame::turn_revoke(TurnRevoke {
+                        chain_id: chain.into_bytes(),
+                        device_id: local.device_id.to_vec(),
+                        revoked: revoked.to_vec(),
+                        epoch,
+                        signature,
+                    });
+                    revoke_frames.push((frame, targets));
+                }
+            }
+        }
+    }
+    // Lock released — the dials run off the daemon mutex.
+    if let Some((frame, targets)) = announce_frame {
+        fan_turn_frame(
+            local,
+            &targets,
+            relay_client.as_ref(),
+            &frame,
+            "device-state-announce",
+        );
+    }
+    for (frame, targets) in revoke_frames {
+        fan_turn_frame(local, &targets, relay_client.as_ref(), &frame, "turn-revoke");
     }
 }
 
@@ -1631,6 +1877,13 @@ fn spawn_replica_loop(
                 // the replica push so a heal's commit rides it.
                 crate::ceremony::reconcile_reencrypt_completeness(&daemon);
                 reconcile_replicas(&daemon, &local);
+                // M5e slice 001 part 2b: announce our device state (once, on the
+                // unlock lift) and expire any silent write-turn holder, fanning a
+                // signed `TurnRevoke` so the mesh reclaims the turn — the
+                // crash/partition recovery path. Rides this same loop (like the
+                // ceremony/rekey passes) so the whole coordination plane shares
+                // one outbound tick + its commit-driven wake.
+                reconcile_write_turns(&daemon, &local);
                 signal.wait_for_commit(REPLICA_RECONCILE_INTERVAL);
             }
         })
@@ -2522,6 +2775,39 @@ mod tests {
             &members,
             &id_bytes(1)
         ));
+    }
+
+    /// The daemon half of "silent holder → expiry → revoke" (part 2b poll loop).
+    /// `poll_expiries` must revoke exactly the lease whose holder went silent past
+    /// its renew window, name that holder + its lease epoch (so the fanned
+    /// `TurnRevoke` binds to one generation), clear it locally, and leave a still-
+    /// live holder untouched — the crash/partition recovery path, minus the dial.
+    #[test]
+    fn poll_expiries_revokes_only_the_silent_holder() {
+        let mut turns: HashMap<String, WriteTurn> = HashMap::new();
+
+        // chain/a: dev(1) granted at t=0 → deadline 30 (default ttl). At t=100 it
+        // has long gone silent.
+        let mut a = WriteTurn::whole_subtree();
+        assert_eq!(a.apply_yield(id_bytes(1), 0), Some(1)); // first grant → epoch 1
+        turns.insert("chain/a".to_string(), a);
+
+        // chain/b: dev(2) granted at t=90 → deadline 120, still live at t=100.
+        let mut b = WriteTurn::whole_subtree();
+        b.apply_yield(id_bytes(2), 90);
+        turns.insert("chain/b".to_string(), b);
+
+        let revokes = poll_expiries(&mut turns, 100);
+
+        assert_eq!(revokes.len(), 1, "only the silent holder is revoked");
+        assert_eq!(revokes[0], ("chain/a".to_string(), id_bytes(1), 1));
+        // The expired lease is cleared locally; the live one is untouched.
+        assert!(turns["chain/a"].holder().is_none());
+        assert_eq!(turns["chain/b"].holder(), Some(id_bytes(2)));
+
+        // Idempotent: a second poll at the same instant has nothing left to revoke
+        // (the turn is free with no waiters — no phantom re-revoke of a gone lease).
+        assert!(poll_expiries(&mut turns, 100).is_empty());
     }
 
     // --- slice 1: event-driven replica push signal ---------------------------
