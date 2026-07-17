@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use softfig_store::{
-    put_commit, put_tree, set_ref, CommitRow, Db, Hash, ObjectStore, StorePaths,
+    put_commit, put_tree, set_ref_cas, CommitRow, Db, Hash, ObjectStore, StorePaths,
 };
 use softfig_vault::{Vault, VaultSession};
 
@@ -429,7 +429,11 @@ fn write_commit_tx(
             put_tree(conn, tree_hash, entries)?;
         }
         put_commit(conn, &row)?;
-        set_ref(conn, ref_name, &hash)?;
+        // CAS the ref against the tip we read as `parent`: the write lands only
+        // if no concurrent writer advanced this chain since, else the whole
+        // commit tx rolls back. Uncontended (the single-writer device chain)
+        // this is identical to a plain advance; it guards a shared chain race.
+        set_ref_cas(conn, ref_name, parent.as_ref(), &hash)?;
         Ok(())
     })?;
 

@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use softfig_store::Hash;
+use softfig_store::{set_ref_cas, Hash, StoreError};
 use softfig_vcs::{
     fsck, live_blobs, reachable_from, walk, Intent, Repo, TIP_REF,
 };
@@ -369,4 +369,58 @@ fn fsck_reports_a_missing_blob_instead_of_erroring() {
         "the report must name the missing blob {victim}: {:?}",
         report.problems
     );
+}
+
+#[test]
+fn shared_chain_ref_advance_is_compare_and_swap() {
+    // The commit tx CASes the ref against the tip it read as `parent`, so a
+    // writer that lost the race (still expecting a superseded tip) can't clobber
+    // the winner — its whole commit tx rolls back. The public commit path
+    // re-reads the tip and self-heals, so the guard only bites under a genuine
+    // concurrent advance; here we drive the exact store CAS the tx is built on
+    // against the repo's real, commit-populated refs table.
+    let mut tc = two_chains();
+
+    // Advance chain-b once more the normal way; `stale` is now a superseded tip.
+    let stale = tc.b_tip;
+    let b_next = commit_to_chain(
+        &mut tc.repo,
+        &tc.session,
+        CHAIN_B_REF,
+        "only-in-b.md",
+        "chain B content v3",
+    );
+    assert_eq!(tc.repo.tip_of(CHAIN_B_REF).unwrap(), Some(b_next));
+
+    // A losing writer that still expects `stale` is rejected, ref untouched.
+    let intruder = Hash::of(b"would-be lost update");
+    let err = tc
+        .repo
+        .db_mut()
+        .with_tx(|conn| set_ref_cas(conn, CHAIN_B_REF, Some(&stale), &intruder))
+        .expect_err("stale expected-tip must lose the CAS");
+    match err {
+        StoreError::RefCasMismatch { name, expected, actual } => {
+            assert_eq!(name, CHAIN_B_REF);
+            assert_eq!(expected, Some(stale));
+            assert_eq!(actual, Some(b_next));
+        }
+        other => panic!("expected RefCasMismatch, got {other:?}"),
+    }
+    assert_eq!(
+        tc.repo.tip_of(CHAIN_B_REF).unwrap(),
+        Some(b_next),
+        "the winning tip must survive the losing writer"
+    );
+
+    // The device chain's ref was never touched by any of this.
+    assert_eq!(tc.repo.tip_of(TIP_REF).unwrap(), Some(tc.dev_tip));
+
+    // A writer holding the fresh tip advances cleanly through the same CAS.
+    let winner = Hash::of(b"fast-forward winner");
+    tc.repo
+        .db_mut()
+        .with_tx(|conn| set_ref_cas(conn, CHAIN_B_REF, Some(&b_next), &winner))
+        .expect("matching expected-tip must win the CAS");
+    assert_eq!(tc.repo.tip_of(CHAIN_B_REF).unwrap(), Some(winner));
 }

@@ -386,6 +386,61 @@ pub fn set_ref(conn: &Connection, name: &str, hash: &Hash) -> Result<()> {
     Ok(())
 }
 
+/// Compare-and-swap advance of `name` to `hash`: the write lands only if the
+/// currently-stored tip equals `expected`. `expected == None` requires the ref
+/// to not yet exist (the first commit on a chain). On a mismatch — a concurrent
+/// writer created or advanced the ref since the caller read `expected` — nothing
+/// is written and [`StoreError::RefCasMismatch`] is returned, so the enclosing
+/// transaction rolls back the whole commit instead of clobbering the winner.
+///
+/// This is the write-path guard against a lost update when two writers race the
+/// same ref (m5e slice 001). The single-writer device chain (`TIP_REF`) passes
+/// its just-read tip as `expected`, so the CAS always succeeds and the advance
+/// is identical to [`set_ref`]; it only ever fires under genuine contention on a
+/// shared chain.
+pub fn set_ref_cas(
+    conn: &Connection,
+    name: &str,
+    expected: Option<&Hash>,
+    hash: &Hash,
+) -> Result<()> {
+    let changed = match expected {
+        // Advance an existing ref only while it still points at `prior`.
+        Some(prior) => conn.execute(
+            "UPDATE refs SET commit_hash = ?3 WHERE name = ?1 AND commit_hash = ?2",
+            params![
+                name,
+                prior.as_bytes().as_slice(),
+                hash.as_bytes().as_slice()
+            ],
+        )?,
+        // First commit on this chain: insert only while the ref is absent.
+        None => conn.execute(
+            "INSERT INTO refs(name, commit_hash) SELECT ?1, ?2
+             WHERE NOT EXISTS(SELECT 1 FROM refs WHERE name = ?1)",
+            params![name, hash.as_bytes().as_slice()],
+        )?,
+    };
+    if changed == 0 {
+        // Report the tip we lost the race to (absent -> None) for diagnostics.
+        let actual = conn
+            .query_row(
+                "SELECT commit_hash FROM refs WHERE name = ?1",
+                params![name],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|b| hash_from_blob(&b))
+            .transpose()?;
+        return Err(StoreError::RefCasMismatch {
+            name: name.to_string(),
+            expected: expected.copied(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
 // ---- internal ----
 
 fn configure(conn: &Connection) -> Result<()> {
@@ -478,4 +533,113 @@ fn row_to_commit(r: &rusqlite::Row<'_>) -> rusqlite::Result<CommitRow> {
         master_key_id: master_key_id as u32,
         signature,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REF: &str = "chain-x";
+
+    fn scratch_db(dir: &Path) -> Db {
+        let paths = StorePaths::for_garden(dir);
+        Db::create(&paths, "test-repo", 0).expect("create scratch db")
+    }
+
+    fn h(seed: &[u8]) -> Hash {
+        Hash::of(seed)
+    }
+
+    #[test]
+    fn cas_creates_ref_only_while_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = scratch_db(dir.path());
+        let c1 = h(b"c1");
+
+        // expected == None inserts the first tip.
+        db.with_tx(|conn| set_ref_cas(conn, REF, None, &c1)).unwrap();
+        assert_eq!(db.try_get_ref(REF).unwrap(), Some(c1));
+
+        // A second create against a now-present ref is a lost race, not a clobber.
+        let c2 = h(b"c2");
+        let err = db
+            .with_tx(|conn| set_ref_cas(conn, REF, None, &c2))
+            .unwrap_err();
+        match err {
+            StoreError::RefCasMismatch { name, expected, actual } => {
+                assert_eq!(name, REF);
+                assert_eq!(expected, None);
+                assert_eq!(actual, Some(c1));
+            }
+            other => panic!("expected RefCasMismatch, got {other:?}"),
+        }
+        // The winner's tip is untouched.
+        assert_eq!(db.try_get_ref(REF).unwrap(), Some(c1));
+    }
+
+    #[test]
+    fn cas_advances_only_when_tip_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = scratch_db(dir.path());
+        let (c1, c2, c3) = (h(b"c1"), h(b"c2"), h(b"c3"));
+
+        db.with_tx(|conn| set_ref_cas(conn, REF, None, &c1)).unwrap();
+        // Expected tip matches -> advance lands.
+        db.with_tx(|conn| set_ref_cas(conn, REF, Some(&c1), &c2))
+            .unwrap();
+        assert_eq!(db.try_get_ref(REF).unwrap(), Some(c2));
+
+        // A writer that still expects the old tip loses the race.
+        let err = db
+            .with_tx(|conn| set_ref_cas(conn, REF, Some(&c1), &c3))
+            .unwrap_err();
+        match err {
+            StoreError::RefCasMismatch { expected, actual, .. } => {
+                assert_eq!(expected, Some(c1));
+                assert_eq!(actual, Some(c2));
+            }
+            other => panic!("expected RefCasMismatch, got {other:?}"),
+        }
+        assert_eq!(db.try_get_ref(REF).unwrap(), Some(c2));
+    }
+
+    #[test]
+    fn cas_advance_against_absent_ref_is_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = scratch_db(dir.path());
+        let c1 = h(b"c1");
+
+        // Expecting a prior tip on a ref that never existed reports actual: None.
+        let err = db
+            .with_tx(|conn| set_ref_cas(conn, REF, Some(&c1), &h(b"c2")))
+            .unwrap_err();
+        match err {
+            StoreError::RefCasMismatch { expected, actual, .. } => {
+                assert_eq!(expected, Some(c1));
+                assert_eq!(actual, None);
+            }
+            other => panic!("expected RefCasMismatch, got {other:?}"),
+        }
+        assert_eq!(db.try_get_ref(REF).unwrap(), None);
+    }
+
+    #[test]
+    fn cas_matches_plain_set_ref_when_uncontended() {
+        // The device-chain path: parent == stored tip every advance, so CAS is
+        // byte-for-byte the same end state as a plain `set_ref` chain.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut cas = scratch_db(dir_a.path());
+        let mut plain = scratch_db(dir_b.path());
+        let (c1, c2) = (h(b"tip1"), h(b"tip2"));
+
+        cas.with_tx(|conn| set_ref_cas(conn, REF, None, &c1)).unwrap();
+        cas.with_tx(|conn| set_ref_cas(conn, REF, Some(&c1), &c2))
+            .unwrap();
+        plain.with_tx(|conn| set_ref(conn, REF, &c1)).unwrap();
+        plain.with_tx(|conn| set_ref(conn, REF, &c2)).unwrap();
+
+        assert_eq!(cas.try_get_ref(REF).unwrap(), plain.try_get_ref(REF).unwrap());
+        assert_eq!(cas.try_get_ref(REF).unwrap(), Some(c2));
+    }
 }
