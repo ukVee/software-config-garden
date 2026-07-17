@@ -33,7 +33,6 @@ use crate::server::err_to_response;
 /// The inbound edit to apply: the peer commit's tree (already content-addressed
 /// into this store by the transfer), the base tree it was authored over, and
 /// the metadata that becomes the `shared_pull` commit payload.
-#[allow(dead_code)] // Part 2 (net receive/push wire) constructs + consumes this.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedPullInput {
     /// The shared chain's ref (`chain/<id>`).
@@ -54,7 +53,6 @@ pub(crate) struct SharedPullInput {
 }
 
 /// The result of applying one inbound peer edit.
-#[allow(dead_code)] // Variants are matched by Part 2's dispatch + these tests.
 #[derive(Debug)]
 pub(crate) enum SharedPullOutcome {
     /// Re-authored a local `shared_pull` commit; the chain ref fast-forwarded
@@ -82,7 +80,6 @@ pub(crate) enum SharedPullOutcome {
 /// is enforced on the writer side (an online-active receiver yields the turn
 /// before calling this; Part 3 wires that). The caller holds the inner lock and
 /// has verified the vault is unlocked.
-#[allow(dead_code)] // Part 2 (net receive/push wire) is the production caller.
 pub(crate) fn apply_shared_pull(
     inner: &mut DaemonInner,
     input: SharedPullInput,

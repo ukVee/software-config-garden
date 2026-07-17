@@ -54,6 +54,7 @@ pub use log_incident::log_incident;
 pub use migrate_config::migrate_config;
 pub use refresh_snapshot::refresh_snapshot;
 pub use sections::{add_section, append_to_section, edit_section, set_reviewed};
+pub(crate) use shared_pull::{apply_shared_pull, SharedPullInput, SharedPullOutcome};
 pub use split::migrate_split;
 pub use thrash::ThrashDetector;
 pub(crate) use worktree::{Tree, WorkTree};

@@ -46,25 +46,25 @@ use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 use softfig_net::proto::{
-    frame, DeviceStateAnnounce, Frame, ReplicaGrant, SharedKeyCommit, SharedKeyHandoff,
-    TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
+    frame, DeviceStateAnnounce, Frame, ReplicaGrant, SharedChainPush, SharedKeyCommit,
+    SharedKeyHandoff, TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
 };
 use softfig_net::connect::{plan_routes, Route};
 use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
-    device_state_signing_bytes, pull_replication_pipelined, serve_replication,
+    device_state_signing_bytes, pull_replication_pipelined, pull_subtree, serve_replication,
     static_attestation_message, turn_request_signing_bytes, turn_revoke_signing_bytes,
-    turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_turn_request_sig,
-    verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseEvent, LeaseScope, NetError,
-    ServeSummary, WriteTurn,
+    turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_shared_chain_push_sig,
+    verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseEvent,
+    LeaseScope, NetError, ServeSummary, WriteTurn,
 };
 use softfig_store::Hash;
 use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo};
 
-use crate::actions::WorkTree;
+use crate::actions::{apply_shared_pull, SharedPullInput, SharedPullOutcome, WorkTree};
 use crate::ceremony::{
     assemble_member_set, persist_ceremony_outcome, rotate_shared_key, CeremonyLink,
     SessionTransport, VaultCeremonySigner,
@@ -736,6 +736,13 @@ fn serve_established(
         }
         Some(frame::Kind::TurnYield(y)) => handle_turn_yield(daemon, local, owner, ring, y),
         Some(frame::Kind::TurnRevoke(rv)) => handle_turn_revoke(daemon, local, owner, ring, rv),
+        // M5e slice 002 part 2b — a chain S-member pushed a committed edit for us
+        // to adopt. Unlike the one-shot gossip arms above, this SERVES the
+        // sender's `serve_replication` on the same session: authorize, pull the
+        // edit's tree closure into the live store, re-author it locally.
+        Some(frame::Kind::SharedChainPush(p)) => {
+            serve_shared_chain_push(daemon, local, owner, ring, p, session)
+        }
         // Anything else ends the session cleanly.
         _ => {}
     }
@@ -1932,6 +1939,141 @@ fn serve_replica_ingest(
         Err(e) => eprintln!(
             "keeperd: net: replica INGEST REJECTED from {owner_fp} (tamper/fork alarm): {e}"
         ),
+    }
+}
+
+/// Serve an inbound `SharedChainPush` (M5e slice 002, part 2b): a chain
+/// S-member pushed a committed edit for us to adopt. The choreography mirrors
+/// [`serve_replica_ingest`] — the sender dialed, sent this frame, and is now
+/// serving [`serve_replication`] on the same session — so we receive-then-pull:
+/// authorize the push, PULL its tree closure into the LIVE store, then re-author
+/// it as a local `shared_pull` commit.
+///
+/// Auth is the same spine as the turn handlers: the Ed25519 signature proves
+/// *who* signed (and must be the authenticated session peer), and committed
+/// S-membership proves they *may* push to this chain. A forged push — bad
+/// signature, spoofed sender, or non-member — is rejected before any store write.
+///
+/// The pull runs **off the daemon lock** (only the store paths are read under a
+/// brief lock; the network round trips hold nothing). Only the post-pull
+/// re-author ([`apply_shared_pull`]) takes the lock. See the store-handle LOCKED
+/// DECISION: the sink is a second WAL connection on the live store, serialized
+/// against the daemon's `Repo` by the store's busy-timeout.
+fn serve_shared_chain_push(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    owner: &RingEntry,
+    ring: &Arc<Mutex<Ring>>,
+    p: SharedChainPush,
+    mut session: NoiseSession<TcpStream>,
+) {
+    let chain = String::from_utf8_lossy(&p.chain_id).into_owned();
+    let Ok(sender) = <[u8; 32]>::try_from(p.device_id.as_slice()) else {
+        eprintln!("keeperd: net: shared-chain-push device_id is not 32 bytes");
+        return;
+    };
+    let Ok(new_tree) = <[u8; 32]>::try_from(p.new_tree.as_slice()) else {
+        eprintln!("keeperd: net: shared-chain-push for {chain} new_tree is not 32 bytes");
+        return;
+    };
+    let Ok(base_tree) = <[u8; 32]>::try_from(p.base_tree.as_slice()) else {
+        eprintln!("keeperd: net: shared-chain-push for {chain} base_tree is not 32 bytes");
+        return;
+    };
+    // v1 point-to-point: the signed sender must be the authenticated peer.
+    if sender != owner.device_id {
+        eprintln!("keeperd: net: shared-chain-push device_id != authenticated peer; rejecting");
+        return;
+    }
+    if !verify_shared_chain_push_sig(
+        &p.chain_id,
+        &p.subtree,
+        &new_tree,
+        &base_tree,
+        &sender,
+        &p.writer_device,
+        &p.files,
+        &p.signature,
+    ) {
+        eprintln!("keeperd: net: shared-chain-push for {chain} signature invalid; rejecting");
+        return;
+    }
+    let Some((membership, members)) = resolve_chain_members(daemon, ring, local, &chain) else {
+        return; // locked mid-serve — the sender retries on its next tick
+    };
+    if !turn_sender_is_member(&membership, &chain, &members, &sender) {
+        eprintln!(
+            "keeperd: net: shared-chain-push for {chain} from non-member {}; rejecting",
+            hex::encode(sender)
+        );
+        return;
+    }
+
+    // Pull the edit's tree closure into the LIVE store OFF the daemon lock: read
+    // the store paths under a brief lock, release it, then run the network pull
+    // (GetTree/GetObject round trips against the still-connected sender) holding
+    // no lock. Only the post-pull re-author takes the lock.
+    let paths = {
+        let inner = daemon.inner.lock().unwrap();
+        let Some(repo) = inner.repo.as_ref() else {
+            return; // locked mid-serve
+        };
+        repo.paths().clone()
+    };
+    let mut sink = match replica::SharedChainSink::open(&paths) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("keeperd: net: shared-chain-push for {chain}: sink open failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = pull_subtree(&mut session, &mut sink, &new_tree) {
+        eprintln!(
+            "keeperd: net: shared-chain-push for {chain} PULL REJECTED (tamper/transfer): {e}"
+        );
+        return;
+    }
+
+    // The closure is fully stored; re-author it as this device's own shared_pull
+    // commit under the daemon lock.
+    let input = SharedPullInput {
+        chain_ref: chain.clone(),
+        peer_tree: Hash::from_bytes(new_tree),
+        base_hash: Hash::from_bytes(base_tree),
+        writer_device: p.writer_device,
+        subtree: p.subtree,
+        files: p.files,
+    };
+    let mut inner = daemon.inner.lock().unwrap();
+    match apply_shared_pull(&mut inner, input) {
+        Ok(SharedPullOutcome::Applied(hash)) => {
+            eprintln!(
+                "keeperd: net: shared-chain-push for {chain} applied as {} (writer {})",
+                hash.to_hex(),
+                hex::encode(sender)
+            );
+            // Part 2b-3 wires the bidirectional re-push to the OTHER S-members
+            // here (the mesh; `AlreadyPresent` on those hops terminates it).
+        }
+        Ok(SharedPullOutcome::AlreadyPresent) => {
+            eprintln!(
+                "keeperd: net: shared-chain-push for {chain} already present (ping-pong terminated)"
+            );
+        }
+        Ok(SharedPullOutcome::Conflict {
+            base_hash,
+            local_tree,
+        }) => {
+            eprintln!(
+                "keeperd: net: shared-chain-push for {chain} CONFLICT (peer base {}, local tip {}); \
+                 skipped (slice 003 resolves)",
+                base_hash.to_hex(),
+                local_tree.map(|h| h.to_hex()).unwrap_or_else(|| "unborn".to_string())
+            );
+        }
+        Err((_, e)) => {
+            eprintln!("keeperd: net: shared-chain-push for {chain} apply failed: {e}");
+        }
     }
 }
 
