@@ -5,6 +5,7 @@
 //! genesis schema and bumps `PRAGMA user_version` to `1`.
 
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -447,6 +448,13 @@ fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // WAL already lets many readers run beside one writer, but two *writers* on
+    // separate handles to the same file (e.g. the daemon's `Repo` and a
+    // shared-chain `SharedChainSink` landing a pulled subtree) would otherwise
+    // race straight to `SQLITE_BUSY`. A busy-timeout makes the loser wait for
+    // the in-flight write transaction to commit instead of erroring — writes
+    // still serialize (WAL guarantees that), they just queue rather than fail.
+    conn.busy_timeout(Duration::from_secs(5))?;
     Ok(())
 }
 
