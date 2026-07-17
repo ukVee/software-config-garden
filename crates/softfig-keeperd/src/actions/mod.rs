@@ -35,6 +35,7 @@ mod migrate_config;
 mod numbering;
 mod refresh_snapshot;
 pub(crate) mod sections;
+mod shared_pull;
 mod split;
 mod thrash;
 mod worktree;

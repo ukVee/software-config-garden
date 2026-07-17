@@ -329,6 +329,45 @@ impl Repo {
         Ok(hash)
     }
 
+    /// Re-author a commit over an **existing** `root_tree` hash on `ref_name`,
+    /// advancing that ref to a new commit whose tree is `root_tree` — no
+    /// workdir walk, no tree rebuild. The m5e `shared_pull` apply primitive: a
+    /// peer's shared-chain tree, already fetched content-addressed into this
+    /// store, is re-committed as **this device's own** commit (its own author /
+    /// signature / hash) parented on the local chain tip. Convergence is by
+    /// content (identical `root_tree`), history is per-device — the peer's exact
+    /// commit hash is never adopted and no merge object is ever minted (the
+    /// chain stays linear / single-parent, per [[decision-m5e-shared-pull-intent]]).
+    ///
+    /// Preconditions the caller upholds:
+    /// - `root_tree` and its full subtree + blob closure are already in the
+    ///   object store (the m5e transfer — M5b content-addressed object pull —
+    ///   guarantees this before apply);
+    /// - the fast-forward decision (base tree == local tip tree; content dedup)
+    ///   is already made upstream. This method only authors + CAS-advances; the
+    ///   per-ref CAS still rolls back on a concurrent local advance.
+    ///
+    /// Fires `tip_changed` with a `None` overlay generation — a network-driven
+    /// ref advance carries no local overlay snapshot, so the FUSE rotation
+    /// absorbs nothing (it only recomposes the union view; m5c-residual slice
+    /// 012, the 014 data-loss family).
+    pub fn commit_over_tree(
+        &mut self,
+        ref_name: &str,
+        session: &VaultSession,
+        root_tree: Hash,
+        intent: Intent,
+    ) -> Result<Hash> {
+        let parent = self.tip_of(ref_name)?;
+        let now = unix_seconds();
+        let hash =
+            write_reauthor_tx(&mut self.db, session, ref_name, parent, root_tree, intent, now)?;
+        if let Some(cb) = &self.tip_changed {
+            cb(ref_name, &hash, None);
+        }
+        Ok(hash)
+    }
+
     /// The tip of **every ref physically present** in the store
     /// (`db.list_refs()`). This is gc's retention set: a chain is live for gc iff
     /// its ref exists — nothing else gates retention. Enable/disable is a
@@ -368,17 +407,19 @@ impl Repo {
     }
 }
 
-/// Transactional commit writer: insert all new tree rows + the commit
-/// row + bump tip, all in one sqlite tx.
-fn write_commit_tx(
-    db: &mut Db,
+/// Author the signed commit row over a known `root_tree` hash — shared by the
+/// snapshot-commit path (trees freshly built into a [`Blueprint`]) and the
+/// re-author-over-existing-tree path ([`Repo::commit_over_tree`], the m5e
+/// `shared_pull` apply). Pure: no I/O, no ref touched — the caller drives the
+/// transaction and decides whether new tree rows accompany the commit.
+fn author_commit_row(
     session: &VaultSession,
     ref_name: &str,
     parent: Option<Hash>,
-    blueprint: &Blueprint,
+    root_tree: Hash,
     intent: Intent,
     timestamp: i64,
-) -> Result<Hash> {
+) -> Result<(CommitRow, Hash)> {
     let author_device = local_device_label();
     let author_pubkey = session.identity_pubkey().to_bytes();
     let master_key_id = session.active_master_key_id();
@@ -399,7 +440,7 @@ fn write_commit_tx(
 
     let canon = CanonicalCommit {
         parent,
-        root_tree: blueprint.root,
+        root_tree,
         author_device: &author_device,
         author_pubkey,
         timestamp,
@@ -414,7 +455,7 @@ fn write_commit_tx(
     let row = CommitRow {
         hash,
         parent,
-        root_tree: blueprint.root,
+        root_tree,
         author_device,
         author_pubkey,
         timestamp,
@@ -423,6 +464,22 @@ fn write_commit_tx(
         master_key_id,
         signature: signature_bytes,
     };
+    Ok((row, hash))
+}
+
+/// Transactional commit writer: insert all new tree rows + the commit
+/// row + CAS the ref, all in one sqlite tx.
+fn write_commit_tx(
+    db: &mut Db,
+    session: &VaultSession,
+    ref_name: &str,
+    parent: Option<Hash>,
+    blueprint: &Blueprint,
+    intent: Intent,
+    timestamp: i64,
+) -> Result<Hash> {
+    let (row, hash) =
+        author_commit_row(session, ref_name, parent, blueprint.root, intent, timestamp)?;
 
     db.with_tx(|conn| {
         for (tree_hash, entries) in &blueprint.trees {
@@ -433,6 +490,34 @@ fn write_commit_tx(
         // if no concurrent writer advanced this chain since, else the whole
         // commit tx rolls back. Uncontended (the single-writer device chain)
         // this is identical to a plain advance; it guards a shared chain race.
+        set_ref_cas(conn, ref_name, parent.as_ref(), &hash)?;
+        Ok(())
+    })?;
+
+    Ok(hash)
+}
+
+/// Transactional re-author writer: insert the commit row + CAS the ref, with
+/// **no** tree insertion — `root_tree` (and its whole object closure) is
+/// already present in the store. The m5e `shared_pull` apply: a peer's
+/// shared-chain tree, fetched content-addressed into this store, is
+/// re-committed as this device's own commit over the local chain tip.
+fn write_reauthor_tx(
+    db: &mut Db,
+    session: &VaultSession,
+    ref_name: &str,
+    parent: Option<Hash>,
+    root_tree: Hash,
+    intent: Intent,
+    timestamp: i64,
+) -> Result<Hash> {
+    let (row, hash) = author_commit_row(session, ref_name, parent, root_tree, intent, timestamp)?;
+
+    db.with_tx(|conn| {
+        put_commit(conn, &row)?;
+        // Same per-ref CAS guard as `write_commit_tx`: the apply lands only if
+        // the local chain tip is still `parent`, else it rolls back — a
+        // concurrent local advance re-opens the fast-forward decision upstream.
         set_ref_cas(conn, ref_name, parent.as_ref(), &hash)?;
         Ok(())
     })?;
