@@ -1371,6 +1371,32 @@ fn active_or_idle(since_last_write: Option<Duration>) -> DeviceState {
     }
 }
 
+/// Whether an **inbound** shared-chain apply must yield the write turn *before*
+/// applying (M5e slice 002 part 3 — turn-ordering compose). The apply itself is
+/// not a local write (part 1), so it never runs [`gate_shared_chain_commit`]; but
+/// an **online-active** receiver that currently holds this chain's turn is mid-
+/// authoring with the lease in hand, and applying a peer's edit under our own
+/// held turn would race our next local commit against it. So at the receive
+/// boundary such a holder yields the turn to the incoming writer first (released
+/// locally + a `TurnYield` fanned so the mesh converges on that writer as the
+/// current holder), then applies — the receive-side mirror of the commit-boundary
+/// gate's [`TurnGateAction::ProceedYield`].
+///
+/// Returns `false` (apply immediately, no handshake) for every other case:
+/// - an **online-idle** receiver — nothing is editing, so there is no local write
+///   to race (`meta/spec-sync.md` §"Sync semantics": "online-idle members just
+///   apply");
+/// - an active receiver that does **not** hold the turn — its staged write is
+///   already quiesced, gated behind the turn it lacks ([`TurnGateAction::Defer`]),
+///   so no held lease can race the apply.
+///
+/// Pure over its lease view (mirrors [`decide_turn_gate`]) so the active-vs-idle
+/// receive branch is unit-tested headlessly; the caller performs the release +
+/// broadcast + `signal_commit` under the daemon lock.
+fn active_receiver_must_yield(state: DeviceState, turn: &WriteTurn, local: &[u8; 32]) -> bool {
+    state == DeviceState::OnlineActive && turn.is_held_by(local)
+}
+
 /// Sign and frame a `DeviceStateAnnounce` for `state` at `seq`. The `seq` bump
 /// and the `device_state` write are the caller's (done under the lock); this only
 /// signs + frames, so the unlock lift and the `OnlineIdle`↔`OnlineActive`
@@ -2062,6 +2088,44 @@ fn serve_shared_chain_push(
     };
     let repush = {
         let mut inner = daemon.inner.lock().unwrap();
+        // Part 3 (turn-ordering compose): before applying, an online-active
+        // receiver that holds this chain's turn yields it to the incoming writer
+        // (`sender`) so the peer's edit can't race our own held-turn local commit;
+        // an online-idle receiver — or an active one that does not hold the turn —
+        // applies straight through (`meta/spec-sync.md` §"Sync semantics"). The
+        // apply is not a local write, so this is the receive-side counterpart to
+        // `gate_shared_chain_commit`, never a second pass through it.
+        let our_state =
+            active_or_idle(inner.last_write_at.map(|t| Instant::now().duration_since(t)));
+        let yield_turn = {
+            let turn = inner
+                .write_turns
+                .entry(chain.clone())
+                .or_insert_with(WriteTurn::whole_subtree);
+            let must = active_receiver_must_yield(our_state, turn, &local.device_id);
+            if must {
+                turn.release(&local.device_id);
+            }
+            must
+        };
+        if yield_turn {
+            let seq = now_secs().max(0) as u64;
+            inner
+                .pending_turn_broadcasts
+                .push(PendingTurnBroadcast::Yield {
+                    chain: chain.clone(),
+                    grantee: sender,
+                    seq,
+                });
+            if let Some(net) = inner.net.as_ref() {
+                net.signal_commit();
+            }
+            eprintln!(
+                "keeperd: net: shared-chain-push for {chain}: online-active receiver \
+                 yielded the turn to {} before applying",
+                hex::encode(sender)
+            );
+        }
         match apply_shared_pull(&mut inner, input) {
             Ok(SharedPullOutcome::Applied(hash)) => {
                 eprintln!(
@@ -3718,6 +3782,47 @@ mod tests {
             active_or_idle(Some(WRITE_ACTIVITY_WINDOW + Duration::from_secs(60))),
             DeviceState::OnlineIdle
         );
+    }
+
+    /// Part 3 receive-boundary decision (`active_receiver_must_yield`): an
+    /// ONLINE-ACTIVE receiver holding the chain's turn must yield it *before*
+    /// applying an inbound edit (else the apply races our own held-turn commit); an
+    /// ONLINE-IDLE holder — and an active receiver that does *not* hold the turn
+    /// (its staged write already deferred behind the turn it lacks) — apply
+    /// immediately, no handshake.
+    #[test]
+    fn active_holder_yields_before_apply_idle_and_non_holder_do_not() {
+        let local = id_bytes(1);
+        // We hold the turn (mid-authoring): active → yield first, idle → apply now.
+        let mut held = WriteTurn::whole_subtree();
+        held.apply_yield(local, 0);
+        assert!(held.is_held_by(&local));
+        assert!(active_receiver_must_yield(
+            DeviceState::OnlineActive,
+            &held,
+            &local
+        ));
+        assert!(!active_receiver_must_yield(
+            DeviceState::OnlineIdle,
+            &held,
+            &local
+        ));
+        // A PEER holds the turn (our write is deferred behind it) → nothing of ours
+        // to race, so an active receiver applies immediately.
+        let mut peer_held = WriteTurn::whole_subtree();
+        peer_held.apply_yield(id_bytes(2), 0);
+        assert!(!active_receiver_must_yield(
+            DeviceState::OnlineActive,
+            &peer_held,
+            &local
+        ));
+        // Free turn, no holder → nothing to yield even while active.
+        let free = WriteTurn::whole_subtree();
+        assert!(!active_receiver_must_yield(
+            DeviceState::OnlineActive,
+            &free,
+            &local
+        ));
     }
 
     // --- slice 1: event-driven replica push signal ---------------------------
