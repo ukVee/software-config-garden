@@ -40,8 +40,8 @@ use softfig_store::{
     TreeEntryRow,
 };
 use softfig_vcs::{
-    canonical_tree_bytes, log_collect, reachable_from, verify_commit, CanonicalCommit, Reachable,
-    Repo, TIP_REF,
+    canonical_tree_bytes, log_collect, reachable_from, reachable_from_tree, verify_commit,
+    CanonicalCommit, Reachable, Repo, TIP_REF,
 };
 use softfig_vault::VaultSession;
 
@@ -238,6 +238,24 @@ impl RepoSource {
         Ok(Self {
             repo,
             announce,
+            served,
+        })
+    }
+
+    /// Wrap `repo` scoped to a single **subtree** closure — the serve source for
+    /// an M5e shared-chain push (slice 002 part 2b-3). `serve_replication` here
+    /// answers only `get_tree`/`get_object` for objects reachable from
+    /// `root_tree` (the just-committed shared-chain tip's tree the receiver's
+    /// [`pull_subtree`](softfig_net::pull_subtree) walks), so a member serving one
+    /// chain's edit can't be turned into an unscoped hash oracle over the whole
+    /// store — the same finding-6 scoping the device-chain serve gets, rooted at
+    /// a tree. The announce is empty: `pull_subtree` never requests a tip or a
+    /// commit, so `tip_announce`/`get_commit` are unreachable on this path.
+    pub fn for_subtree(repo: Repo, root_tree: [u8; 32]) -> NetResult<Self> {
+        let served = reachable_from_tree(repo.db(), Hash::from_bytes(root_tree)).map_err(neterr)?;
+        Ok(Self {
+            repo,
+            announce: TipAnnounce::default(),
             served,
         })
     }

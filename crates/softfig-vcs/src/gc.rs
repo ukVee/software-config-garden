@@ -59,6 +59,20 @@ pub fn reachable_from(db: &Db, tip: Hash) -> Result<Reachable> {
     Ok(r)
 }
 
+/// The object closure of a single **tree** root — the tree, its subtrees, and
+/// the blobs they name (no commit ancestry). The tree-rooted counterpart of
+/// [`reachable_from`], used by the m5e shared-chain push serve to scope its
+/// `serve_replication` source to exactly the pushed subtree's closure: the same
+/// "a serve answers only for its announced closure, never the whole store"
+/// property finding 6 gives the device-chain serve, rooted at a tree instead of
+/// a commit tip. `commits` stays empty (the shared-chain transfer ships trees +
+/// objects only, never the peer's commit graph).
+pub fn reachable_from_tree(db: &Db, root_tree: Hash) -> Result<Reachable> {
+    let mut r = Reachable::default();
+    walk_tree(db, root_tree, &mut r)?;
+    Ok(r)
+}
+
 /// Add `root` and every subtree/blob under it to `r`.
 fn walk_tree(db: &Db, root: Hash, r: &mut Reachable) -> Result<()> {
     let mut stack = vec![root];

@@ -55,7 +55,8 @@ use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
     device_state_signing_bytes, pull_replication_pipelined, pull_subtree, serve_replication,
-    static_attestation_message, turn_request_signing_bytes, turn_revoke_signing_bytes,
+    shared_chain_push_signing_bytes, static_attestation_message, turn_request_signing_bytes,
+    turn_revoke_signing_bytes,
     turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_shared_chain_push_sig,
     verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseEvent,
     LeaseScope, NetError, ServeSummary, WriteTurn,
@@ -2034,8 +2035,17 @@ fn serve_shared_chain_push(
         return;
     }
 
+    // Provenance for the mesh re-push (part 2b-3 (B)), cloned before `input`
+    // consumes the frame: the forwarded edit carries the ORIGINATING author +
+    // files verbatim, never re-attributed to this relaying device.
+    let repush_subtree = p.subtree.clone();
+    let repush_writer = p.writer_device.clone();
+    let repush_files = p.files.clone();
+
     // The closure is fully stored; re-author it as this device's own shared_pull
-    // commit under the daemon lock.
+    // commit under the daemon lock, then DROP the lock before any network
+    // re-push. On a fresh `Applied`, capture the vault session + config the
+    // off-lock fan-out needs (`Some` ⇒ re-push).
     let input = SharedPullInput {
         chain_ref: chain.clone(),
         peer_tree: Hash::from_bytes(new_tree),
@@ -2044,35 +2054,96 @@ fn serve_shared_chain_push(
         subtree: p.subtree,
         files: p.files,
     };
-    let mut inner = daemon.inner.lock().unwrap();
-    match apply_shared_pull(&mut inner, input) {
-        Ok(SharedPullOutcome::Applied(hash)) => {
-            eprintln!(
-                "keeperd: net: shared-chain-push for {chain} applied as {} (writer {})",
-                hash.to_hex(),
-                hex::encode(sender)
-            );
-            // Part 2b-3 wires the bidirectional re-push to the OTHER S-members
-            // here (the mesh; `AlreadyPresent` on those hops terminates it).
+    let repush = {
+        let mut inner = daemon.inner.lock().unwrap();
+        match apply_shared_pull(&mut inner, input) {
+            Ok(SharedPullOutcome::Applied(hash)) => {
+                eprintln!(
+                    "keeperd: net: shared-chain-push for {chain} applied as {} (writer {})",
+                    hash.to_hex(),
+                    hex::encode(sender)
+                );
+                // Mesh forward (part 2b-3 (B)): re-push the just-applied edit to
+                // the OTHER S-members. `AlreadyPresent` on those hops terminates
+                // the ping-pong (a member that already holds the tree never
+                // re-pushes). Deliberately NOT wired to `signal_commit` — the
+                // apply core omits it precisely so the re-push rides THIS path.
+                inner.session.clone().map(|session| {
+                    (
+                        session,
+                        relay_client_config(&inner.config),
+                        inner.config.garden_root.clone(),
+                        inner.config.state_root.clone(),
+                    )
+                })
+            }
+            Ok(SharedPullOutcome::AlreadyPresent) => {
+                eprintln!(
+                    "keeperd: net: shared-chain-push for {chain} already present (ping-pong terminated)"
+                );
+                None
+            }
+            Ok(SharedPullOutcome::Conflict {
+                base_hash,
+                local_tree,
+            }) => {
+                eprintln!(
+                    "keeperd: net: shared-chain-push for {chain} CONFLICT (peer base {}, local tip {}); \
+                     skipped (slice 003 resolves)",
+                    base_hash.to_hex(),
+                    local_tree.map(|h| h.to_hex()).unwrap_or_else(|| "unborn".to_string())
+                );
+                None
+            }
+            Err((_, e)) => {
+                eprintln!("keeperd: net: shared-chain-push for {chain} apply failed: {e}");
+                None
+            }
         }
-        Ok(SharedPullOutcome::AlreadyPresent) => {
-            eprintln!(
-                "keeperd: net: shared-chain-push for {chain} already present (ping-pong terminated)"
+    };
+
+    // Lock released — the mesh re-push dials run off the daemon mutex. Targets:
+    // the chain's S-members minus THIS device and minus the sender it arrived
+    // from. The re-push base is the incoming `base_tree`: an `Applied` outcome
+    // means our pre-apply tip tree equalled `base_tree` (a clean fast-forward)
+    // or our chain was unborn — in both cases `base_tree` is the shared-history
+    // base a downstream member fast-forwards from, so re-derives to it exactly.
+    if let Some((session, relay_client, garden_root, state_root)) = repush {
+        let relay_available = relay_client.is_some();
+        let ring_snapshot = ring.lock().unwrap().clone();
+        let targets: Vec<RingEntry> = members
+            .iter()
+            .filter(|id| **id != local.device_id && **id != sender)
+            .filter_map(|id| ring_snapshot.peers().iter().find(|p| &p.device_id == id).cloned())
+            .filter(|host| !plan_routes(host, relay_available).is_empty())
+            .collect();
+        if !targets.is_empty() {
+            let frame = build_shared_chain_push_frame(
+                &session,
+                local,
+                &chain,
+                &repush_subtree,
+                &new_tree,
+                &base_tree,
+                &repush_writer,
+                &repush_files,
             );
-        }
-        Ok(SharedPullOutcome::Conflict {
-            base_hash,
-            local_tree,
-        }) => {
-            eprintln!(
-                "keeperd: net: shared-chain-push for {chain} CONFLICT (peer base {}, local tip {}); \
-                 skipped (slice 003 resolves)",
-                base_hash.to_hex(),
-                local_tree.map(|h| h.to_hex()).unwrap_or_else(|| "unborn".to_string())
-            );
-        }
-        Err((_, e)) => {
-            eprintln!("keeperd: net: shared-chain-push for {chain} apply failed: {e}");
+            for host in &targets {
+                if let Err(e) = push_shared_chain_to_host(
+                    local,
+                    host,
+                    &frame,
+                    &new_tree,
+                    &garden_root,
+                    state_root.as_deref(),
+                    relay_client.as_ref(),
+                ) {
+                    eprintln!(
+                        "keeperd: net: shared-chain re-push of {chain} to {} skipped: {e}",
+                        host.fingerprint()
+                    );
+                }
+            }
         }
     }
 }
@@ -2326,6 +2397,12 @@ fn spawn_replica_loop(
                 // the replica push so a heal's commit rides it.
                 crate::ceremony::reconcile_reencrypt_completeness(&daemon);
                 reconcile_replicas(&daemon, &local);
+                // M5e slice 002 part 2b-3 (A): push each shared chain's current
+                // tip to its S-members. Rides the SAME commit-driven wake as the
+                // device-chain replica push (a shared-subtree commit fires
+                // `signal_commit`), so one signal covers both — the loop stays
+                // single. Idempotent; quiet when no chain is member-reachable.
+                reconcile_shared_pushes(&daemon, &local);
                 // M5e slice 001 part 2b: announce our device state (once, on the
                 // unlock lift) and expire any silent write-turn holder, fanning a
                 // signed `TurnRevoke` so the mesh reclaims the turn — the
@@ -2410,6 +2487,134 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
                 "keeperd: net: replica push to {} skipped: {e}",
                 host.fingerprint()
             ),
+        }
+    }
+}
+
+/// One shared-chain content push pass (M5e slice 002 part 2b-3 (A)): for every
+/// shared chain this device is an `S`-member of that holds an edit beyond
+/// genesis, push its current tip to the chain's reachable `S`-members. Woken by
+/// the same [`ReplicaSignal`] `signal_commit` as the device-chain replica push
+/// (a local shared-subtree commit fires it via `commit_now`/the watcher flush),
+/// with the reconcile interval as the offline catch-up fallback — the M5b
+/// push-loop model, but the targets are the chain's `S`-members
+/// ([`resolve_turn_targets`]) not `ledger.push_to`, and the transfer is the
+/// subtree closure (`SharedChainPush` + [`serve_shared_subtree`]) not the whole
+/// device chain. Idempotent: a member already at the tip dedups to
+/// `AlreadyPresent` (one round-trip), so re-pushing the current tip every tick is
+/// safe (the same posture as `reconcile_replicas`). All snapshotting is under the
+/// daemon lock; every dial runs off it.
+fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
+    struct SharedPush {
+        chain: String,
+        new_tree: [u8; 32],
+        frame: Frame,
+        targets: Vec<RingEntry>,
+    }
+    let (pushes, garden_root, state_root, relay_client) = {
+        let inner = daemon.inner.lock().unwrap();
+        if inner.state != State::Unlocked {
+            return;
+        }
+        let (Some(session), Some(repo)) = (inner.session.clone(), inner.repo.as_ref()) else {
+            return; // locked mid-tick
+        };
+        let membership =
+            match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, &session) {
+                Ok(m) => m,
+                Err((_, e)) => {
+                    eprintln!("keeperd: net: shared-chain push skipped: cannot read membership: {e}");
+                    return;
+                }
+            };
+        if membership.subtrees.is_empty() {
+            return; // no shared chains — quiet
+        }
+        let state_dir = inner.config.state_dir().to_path_buf();
+        let ring = {
+            let wt = WorkTree::new(daemon, &inner);
+            load_ring(&wt, &state_dir).unwrap_or_default()
+        };
+        let ring_members = assemble_member_set(&ring, local.device_id);
+        let relay_client = relay_client_config(&inner.config);
+        let relay_available = relay_client.is_some();
+
+        let mut pushes: Vec<SharedPush> = Vec::new();
+        for entry in &membership.subtrees {
+            let chain = entry.ref_name.clone();
+            // The edit to propagate + the base a member fast-forwards from. An
+            // unborn chain (no tip) or a genesis-only chain (tip has no parent)
+            // has no edit to push — skip it.
+            let Some(tip) = repo.tip_of(&chain).ok().flatten() else {
+                continue;
+            };
+            let Ok(tip_row) = repo.db().get_commit(&tip) else {
+                continue;
+            };
+            let Some(parent) = tip_row.parent else {
+                continue;
+            };
+            let Ok(parent_row) = repo.db().get_commit(&parent) else {
+                continue;
+            };
+            let new_tree = *tip_row.root_tree.as_bytes();
+            let base_tree = *parent_row.root_tree.as_bytes();
+            let targets = resolve_turn_targets(
+                &membership,
+                &ring,
+                &ring_members,
+                repo,
+                &session,
+                &local.device_id,
+                relay_available,
+                &chain,
+            );
+            if targets.is_empty() {
+                continue; // no reachable S-member this tick
+            }
+            let (writer_device, files) = shared_push_provenance(&tip_row.payload, &local.device_name);
+            let frame = build_shared_chain_push_frame(
+                &session,
+                local,
+                &chain,
+                &entry.mount_path,
+                &new_tree,
+                &base_tree,
+                &writer_device,
+                &files,
+            );
+            pushes.push(SharedPush {
+                chain,
+                new_tree,
+                frame,
+                targets,
+            });
+        }
+        if pushes.is_empty() {
+            return; // nothing member-reachable to push
+        }
+        let garden_root = inner.config.garden_root.clone();
+        let state_root = inner.config.state_root.clone();
+        (pushes, garden_root, state_root, relay_client)
+    };
+    // Lock released — every dial + serve runs off the daemon mutex.
+    for push in pushes {
+        for host in &push.targets {
+            if let Err(e) = push_shared_chain_to_host(
+                local,
+                host,
+                &push.frame,
+                &push.new_tree,
+                &garden_root,
+                state_root.as_deref(),
+                relay_client.as_ref(),
+            ) {
+                eprintln!(
+                    "keeperd: net: shared-chain push of {} to {} skipped: {e}",
+                    push.chain,
+                    host.fingerprint()
+                );
+            }
         }
     }
 }
@@ -3042,6 +3247,153 @@ fn serve_chain<S: std::io::Read + std::io::Write>(
     let repo = Repo::open_with(garden_root, state_root).map_err(|e| format!("open repo: {e}"))?;
     let source = RepoSource::new(repo, announce.clone()).map_err(|e| format!("scope source: {e}"))?;
     serve_replication(session, &source).map_err(|e| e.to_string())
+}
+
+/// Sign + frame a [`SharedChainPush`] for one shared-chain edit (M5e slice 002
+/// part 2b-3). Shared by the push-on-local-commit sweep
+/// ([`reconcile_shared_pushes`]) and the inbound mesh re-push
+/// ([`serve_shared_chain_push`]'s `Applied` arm) so both sign the exact bytes
+/// [`verify_shared_chain_push_sig`] checks. `device_id` is always THIS device
+/// (the immediate sender, which must equal the authenticated session peer);
+/// `writer_device` carries the ORIGINATING author's name verbatim — on a re-push
+/// it is the upstream member's name, not ours (advisory provenance; a re-pusher
+/// can forge it in v1 — locked, don't fix).
+#[allow(clippy::too_many_arguments)]
+fn build_shared_chain_push_frame(
+    session: &VaultSession,
+    local: &LocalDevice,
+    chain: &str,
+    subtree: &str,
+    new_tree: &[u8; 32],
+    base_tree: &[u8; 32],
+    writer_device: &str,
+    files: &[String],
+) -> Frame {
+    let signature = session
+        .sign(&shared_chain_push_signing_bytes(
+            chain.as_bytes(),
+            subtree,
+            new_tree,
+            base_tree,
+            &local.device_id,
+            writer_device,
+            files,
+        ))
+        .to_bytes()
+        .to_vec();
+    Frame::shared_chain_push(SharedChainPush {
+        chain_id: chain.as_bytes().to_vec(),
+        subtree: subtree.to_string(),
+        new_tree: new_tree.to_vec(),
+        base_tree: base_tree.to_vec(),
+        device_id: local.device_id.to_vec(),
+        writer_device: writer_device.to_string(),
+        files: files.to_vec(),
+        signature,
+    })
+}
+
+/// Serve one shared-chain subtree closure over an established (direct or
+/// relayed) session: open a fresh read-only `Repo` handle, scope a
+/// [`RepoSource`] to `root_tree`'s tree closure ([`RepoSource::for_subtree`]),
+/// and drive [`serve_replication`] while the receiver's
+/// [`pull_subtree`](softfig_net::pull_subtree) fetches the trees + objects it
+/// lacks. The send-frame-then-serve choreography's second half (the caller sent
+/// the frame). Generic over the stream so the same drive runs LAN-direct or
+/// relayed. The just-committed tree closure is durable in the store before this
+/// runs, so a fresh reader beside the daemon's writer (sqlite WAL) serves it.
+fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
+    session: &mut NoiseSession<S>,
+    root_tree: &[u8; 32],
+    garden_root: &std::path::Path,
+    state_root: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let repo = Repo::open_with(garden_root, state_root).map_err(|e| format!("open repo: {e}"))?;
+    let source =
+        RepoSource::for_subtree(repo, *root_tree).map_err(|e| format!("scope source: {e}"))?;
+    serve_replication(session, &source)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Push one shared-chain edit to one `S`-member, preferring a LAN-direct dial and
+/// falling back to the zero-trust relay ([`plan_routes`] / [`push_to_host`] route
+/// model). On each route: run the Noise `IK` handshake, send the signed
+/// `SharedChainPush` `frame`, then serve `new_tree`'s subtree closure while the
+/// receiver pulls + applies it as a local `shared_pull` commit. A
+/// dial/handshake/send failure falls through to the next route; once serving
+/// begins the result is returned (a mid-serve error is not retried elsewhere).
+fn push_shared_chain_to_host(
+    local: &LocalDevice,
+    host: &RingEntry,
+    frame: &Frame,
+    new_tree: &[u8; 32],
+    garden_root: &std::path::Path,
+    state_root: Option<&std::path::Path>,
+    relay_client: Option<&(String, [u8; 32])>,
+) -> Result<(), String> {
+    let routes = plan_routes(host, relay_client.is_some());
+    if routes.is_empty() {
+        return Err("no route to member (no LAN endpoint, no relay)".to_string());
+    }
+    let mut last_err = "no route to member".to_string();
+    for route in &routes {
+        match route {
+            Route::Direct(endpoint) => match dial_direct(local, host, endpoint) {
+                Ok(mut session) => {
+                    if let Err(e) = session.send_frame(frame) {
+                        last_err = format!("send push (direct {endpoint}): {e}");
+                        continue;
+                    }
+                    return serve_shared_subtree(&mut session, new_tree, garden_root, state_root);
+                }
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            },
+            Route::Relay => {
+                let (relay_endpoint, relay_static) =
+                    relay_client.expect("relay route planned without a relay client");
+                match dial_relay(local, host, relay_endpoint, relay_static) {
+                    Ok(mut session) => {
+                        if let Err(e) = session.send_frame(frame) {
+                            last_err = format!("send push (relay {relay_endpoint}): {e}");
+                            continue;
+                        }
+                        return serve_shared_subtree(&mut session, new_tree, garden_root, state_root);
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Derive a shared-chain push's advisory provenance (`writer_device`, `files`)
+/// from the tip commit's payload. A re-authored `shared_pull` tip carries the
+/// upstream `writer_device` + `files` verbatim (propagate the origin, exactly as
+/// the mesh re-push does); a locally-authored edit (e.g. `manual_edit`, with no
+/// such fields) is attributed to THIS device with an empty file list. Advisory
+/// only — the receiver stores it as provenance; the tree is the source of truth.
+fn shared_push_provenance(payload: &str, local_name: &str) -> (String, Vec<String>) {
+    let json: serde_json::Value =
+        serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
+    let writer = json
+        .get("writer_device")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| local_name.to_string());
+    let files = json
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    (writer, files)
 }
 
 /// Announce on the LAN, returning the registered fullname (empty on failure).
