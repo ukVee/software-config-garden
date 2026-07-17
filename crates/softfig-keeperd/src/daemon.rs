@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use softfig_vcs::Repo;
 use softfig_fuse::MountHandle;
+use softfig_net::{DeviceState, WriteTurn};
 use softfig_vault::VaultSession;
 use thiserror::Error;
 
@@ -123,6 +124,31 @@ pub struct DaemonInner {
     /// through the `status` verb so a divergence is visible, not stderr-only;
     /// with S-encryption live it otherwise presents as silent chain corruption.
     pub last_shared_key_divergence: Option<String>,
+    /// M5e slice 001 part 2 — this device's shared-coordination state, announced
+    /// to S-members via a signed `DeviceStateAnnounce`. `OnlineActive` (an
+    /// interactive write session is attached) is derived from a write-capable IPC
+    /// session registering with the daemon — that wiring is part 2b, so until it
+    /// lands this stays whatever the lifecycle set it to (`Offline` while Locked;
+    /// part 2b lifts it to `OnlineIdle` on unlock). Reset on lock.
+    pub device_state: DeviceState,
+    /// M5e — this device's monotonic announce clock. Bumped on every state change
+    /// so a peer can order a stale `DeviceStateAnnounce` against a fresh one and
+    /// none can be replayed as a newer state. In-memory: a restart re-announces
+    /// from a low seq, which a peer accepts as the fresh generation of a restarted
+    /// device (its prior view is only kept while that device was reachable).
+    pub announce_seq: u64,
+    /// M5e — peers' most-recently-announced coordination state, keyed by device
+    /// id, kept current by the inbound `DeviceStateAnnounce` handler (an announce
+    /// with a `seq` at or below the stored one is ignored as stale). Read by the
+    /// turn driver to know which S-members are online-active.
+    pub peer_states: HashMap<[u8; 32], crate::net::PeerAnnounce>,
+    /// M5e — this device's local view of each shared chain's write-turn lease,
+    /// keyed by `ref_name`. Driven by the inbound turn handlers (this slice) and,
+    /// in part 2b, the outbound broadcast driver + the commit boundary. In-memory
+    /// by design (like [`Self::ceremonies_in_flight`]): a restart drops it and the
+    /// lease re-derives from live announces under the lease TTL, so no turn
+    /// survives a bounce — a crashed holder's lease simply expires.
+    pub write_turns: HashMap<String, WriteTurn>,
 }
 
 impl DaemonInner {
@@ -143,6 +169,10 @@ impl DaemonInner {
             ceremony_seen_pending: HashSet::new(),
             rekey_seen_stale: HashSet::new(),
             last_shared_key_divergence: None,
+            device_state: DeviceState::Offline,
+            announce_seq: 0,
+            peer_states: HashMap::new(),
+            write_turns: HashMap::new(),
         }
     }
 }

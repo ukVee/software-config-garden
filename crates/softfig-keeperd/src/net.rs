@@ -45,14 +45,18 @@ use softfig_net::ceremony::{
 use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
-use softfig_net::proto::{frame, Frame, ReplicaGrant, SharedKeyCommit, SharedKeyHandoff, TipAnnounce};
+use softfig_net::proto::{
+    frame, DeviceStateAnnounce, Frame, ReplicaGrant, SharedKeyCommit, SharedKeyHandoff,
+    TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
+};
 use softfig_net::connect::{plan_routes, Route};
 use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
-    pull_replication_pipelined, serve_replication, static_attestation_message, verify_grant,
-    NetError, ServeSummary,
+    pull_replication_pipelined, serve_replication, static_attestation_message, verify_device_state_sig,
+    verify_grant, verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState,
+    LeaseScope, NetError, ServeSummary, WriteTurn,
 };
 use softfig_store::Hash;
 use softfig_vault::VaultSession;
@@ -707,8 +711,323 @@ fn serve_established(
         Some(frame::Kind::SharedKeyCommit(commit)) => {
             serve_ceremony_responder(daemon, local, owner, ring, commit, session)
         }
+        // M5e slice 001 part 2 — write-turn coordination gossip. Each is a
+        // one-shot frame (the sender broadcast it; we apply it to our local view
+        // and the session closes). Every one is signature-verified against its
+        // claimed sender AND S-member-authorized against committed membership
+        // before it touches the lease — the security spine the slice requires.
+        Some(frame::Kind::DeviceStateAnnounce(a)) => {
+            handle_device_state_announce(daemon, owner, a)
+        }
+        Some(frame::Kind::TurnRequest(req)) => {
+            handle_turn_request(daemon, local, owner, ring, req)
+        }
+        Some(frame::Kind::TurnYield(y)) => handle_turn_yield(daemon, local, owner, ring, y),
+        Some(frame::Kind::TurnRevoke(rv)) => handle_turn_revoke(daemon, local, owner, ring, rv),
         // Anything else ends the session cleanly.
         _ => {}
+    }
+}
+
+// --- M5e write-turn coordination (inbound handlers) -------------------------
+//
+// The turn protocol is gossip, not request-reply: an active member broadcasts a
+// signed `TurnRequest` to the chain's S-members; the holder broadcasts a signed
+// `TurnYield` (the go-ahead) at its commit boundary; any member broadcasts a
+// signed `TurnRevoke` when a holder's lease expires; every online member
+// broadcasts a signed `DeviceStateAnnounce` on a state change. These handlers are
+// the RECEIVE half — apply one gossiped frame to this device's local view of the
+// lease (the pure `softfig_net::WriteTurn` state machine, part 1) after verifying
+// its signature and authorizing its sender against committed S-membership. The
+// SEND half (broadcasting our own request/yield/revoke/announce by dialing the
+// chain's members) is the outbound driver in part 2b, mirroring
+// [`ceremony_with_host`]. Splitting receive from send keeps the security spine —
+// "membership-authorize every message" — landable and testable on its own.
+
+/// A peer's most-recently-announced coordination state, stored in
+/// [`DaemonInner::peer_states`]. Ordered by `seq` (per-device monotonic) so a
+/// stale announce never overwrites a fresh one.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAnnounce {
+    pub state: DeviceState,
+    pub unlocked: bool,
+    pub seq: u64,
+}
+
+/// Wall-clock seconds — the lease state machine's time base. `WriteTurn` never
+/// reads the clock itself (every transition takes `now`), so the daemon stamps it
+/// here at handler time. Seconds are the same unit as the signed edit timestamps
+/// the conflict fallback (slice 003) compares.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The daemon S-membership authorization for an inbound turn message, pulled out
+/// pure so it is unit-testable without a live session (the same "detection half"
+/// shape as [`chains_awaiting_key`] / [`should_initiate_now`]): the chain must be
+/// a committed shared subtree AND `sender` must be among its resolved members.
+/// This is the daemon half of "a forged turn-request from a non-member is
+/// rejected" — the signature (verified separately) proves *who* signed; this
+/// proves they are entitled to the chain's turn.
+fn turn_sender_is_member(
+    membership: &softfig_vcs::SharedSubtreesConfig,
+    chain: &str,
+    members: &[[u8; 32]],
+    sender: &[u8; 32],
+) -> bool {
+    membership.subtrees.iter().any(|r| r.ref_name == chain) && members.contains(sender)
+}
+
+/// Read committed state and resolve `(membership, S-member set)` for `chain`. The
+/// member set is derived from committed/ring state, **never the wire**: a keyed
+/// chain's members are its committed transcript's; an unkeyed chain (pre-ceremony)
+/// falls back to the current ring (`assemble_member_set`) — in v1 point-to-point
+/// the two coincide. `None` (and a log) when the daemon is locked mid-serve or
+/// committed state can't be read; the sender simply retries on its next tick.
+fn resolve_chain_members(
+    daemon: &Daemon,
+    ring: &Arc<Mutex<Ring>>,
+    local: &LocalDevice,
+    chain: &str,
+) -> Option<(softfig_vcs::SharedSubtreesConfig, Vec<[u8; 32]>)> {
+    // Ring member set first, off the daemon mutex — never nest `ring` inside
+    // `inner` (the ceremony responder keeps this same lock ordering).
+    let ring_members = {
+        let ring = ring.lock().unwrap();
+        assemble_member_set(&ring, local.device_id)
+    };
+    let inner = daemon.inner.lock().unwrap();
+    let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
+        return None; // locked mid-serve
+    };
+    let membership =
+        match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session) {
+            Ok(m) => m,
+            Err((_, e)) => {
+                eprintln!("keeperd: net: turn for {chain}: cannot read committed membership: {e}");
+                return None;
+            }
+        };
+    let members = match membership
+        .subtrees
+        .iter()
+        .find(|r| r.ref_name == chain)
+        .and_then(|r| r.key_id.as_deref())
+    {
+        Some(key_id) => crate::handlers::read_committed_transcript(repo, session, key_id)
+            .ok()
+            .flatten()
+            .map(|t| t.members.iter().map(|m| m.device_id).collect())
+            .unwrap_or(ring_members),
+        None => ring_members,
+    };
+    Some((membership, members))
+}
+
+/// Apply an inbound `DeviceStateAnnounce`: verify the signature, confirm the
+/// authenticated peer is announcing its own id, and record the state if it is
+/// fresher (`seq` strictly greater) than what we last saw for that device.
+fn handle_device_state_announce(daemon: &Daemon, owner: &RingEntry, a: DeviceStateAnnounce) {
+    let Ok(dev) = <[u8; 32]>::try_from(a.device_id.as_slice()) else {
+        eprintln!("keeperd: net: device-state-announce device_id is not 32 bytes");
+        return;
+    };
+    // v1 point-to-point: the authenticated session peer speaks only for itself.
+    if dev != owner.device_id {
+        eprintln!("keeperd: net: device-state-announce device_id != authenticated peer; ignoring");
+        return;
+    }
+    let Some(state) = DeviceState::from_u32(a.state) else {
+        eprintln!(
+            "keeperd: net: device-state-announce from {} has unknown state {}; ignoring",
+            hex::encode(dev),
+            a.state
+        );
+        return;
+    };
+    if !verify_device_state_sig(&dev, state, a.unlocked, a.seq, &a.signature) {
+        eprintln!("keeperd: net: device-state-announce signature invalid; ignoring");
+        return;
+    }
+    let mut inner = daemon.inner.lock().unwrap();
+    // Monotonic per device: a `seq` at or below the stored one is a replay or a
+    // reordered stale frame — drop it, never let it clobber a fresher state.
+    if inner.peer_states.get(&dev).is_some_and(|prev| prev.seq >= a.seq) {
+        return;
+    }
+    inner.peer_states.insert(
+        dev,
+        PeerAnnounce {
+            state,
+            unlocked: a.unlocked,
+            seq: a.seq,
+        },
+    );
+    eprintln!(
+        "keeperd: net: device-state from {}: {state:?} unlocked={} seq={}",
+        hex::encode(dev),
+        a.unlocked,
+        a.seq
+    );
+}
+
+/// Apply an inbound `TurnRequest`: verify the signature, authorize the requester
+/// as an S-member of the chain, then record the request in our local lease view
+/// (FIFO by `(seq, device_id)`). Granting the turn to a waiter — broadcasting the
+/// go-ahead `TurnYield` when we are the holder quiescing at a commit boundary —
+/// is the outbound driver (part 2b); this handler only records the request.
+fn handle_turn_request(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    owner: &RingEntry,
+    ring: &Arc<Mutex<Ring>>,
+    req: TurnRequest,
+) {
+    let chain = String::from_utf8_lossy(&req.chain_id).into_owned();
+    let Ok(sender) = <[u8; 32]>::try_from(req.device_id.as_slice()) else {
+        eprintln!("keeperd: net: turn-request device_id is not 32 bytes");
+        return;
+    };
+    let Some(scope) = LeaseScope::from_u32(req.scope) else {
+        eprintln!(
+            "keeperd: net: turn-request for {chain} has unknown scope {}; rejecting",
+            req.scope
+        );
+        return;
+    };
+    if sender != owner.device_id {
+        eprintln!("keeperd: net: turn-request device_id != authenticated peer; rejecting");
+        return;
+    }
+    if !verify_turn_request_sig(&req.chain_id, &sender, req.seq, scope, &req.signature) {
+        eprintln!("keeperd: net: turn-request for {chain} signature invalid; rejecting");
+        return;
+    }
+    let Some((membership, members)) = resolve_chain_members(daemon, ring, local, &chain) else {
+        return;
+    };
+    if !turn_sender_is_member(&membership, &chain, &members, &sender) {
+        eprintln!(
+            "keeperd: net: turn-request for {chain} from non-member {}; rejecting",
+            hex::encode(sender)
+        );
+        return;
+    }
+    let mut inner = daemon.inner.lock().unwrap();
+    inner
+        .write_turns
+        .entry(chain.clone())
+        .or_insert_with(WriteTurn::whole_subtree)
+        .request(sender, req.seq);
+    eprintln!(
+        "keeperd: net: turn-request for {chain} from {} queued (seq {})",
+        hex::encode(sender),
+        req.seq
+    );
+}
+
+/// Apply an inbound `TurnYield`: verify the signature, authorize the yielder as
+/// an S-member, then converge our local view onto the named `grantee` under a
+/// fresh epoch (idempotent when it already holds).
+fn handle_turn_yield(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    owner: &RingEntry,
+    ring: &Arc<Mutex<Ring>>,
+    y: TurnYield,
+) {
+    let chain = String::from_utf8_lossy(&y.chain_id).into_owned();
+    let Ok(yielder) = <[u8; 32]>::try_from(y.device_id.as_slice()) else {
+        eprintln!("keeperd: net: turn-yield device_id is not 32 bytes");
+        return;
+    };
+    let Ok(grantee) = <[u8; 32]>::try_from(y.grantee.as_slice()) else {
+        eprintln!("keeperd: net: turn-yield grantee is not 32 bytes");
+        return;
+    };
+    if yielder != owner.device_id {
+        eprintln!("keeperd: net: turn-yield device_id != authenticated peer; rejecting");
+        return;
+    }
+    if !verify_turn_yield_sig(&y.chain_id, &yielder, &grantee, y.seq, &y.signature) {
+        eprintln!("keeperd: net: turn-yield for {chain} signature invalid; rejecting");
+        return;
+    }
+    let Some((membership, members)) = resolve_chain_members(daemon, ring, local, &chain) else {
+        return;
+    };
+    if !turn_sender_is_member(&membership, &chain, &members, &yielder) {
+        eprintln!(
+            "keeperd: net: turn-yield for {chain} from non-member {}; rejecting",
+            hex::encode(yielder)
+        );
+        return;
+    }
+    let now = now_secs();
+    let mut inner = daemon.inner.lock().unwrap();
+    if let Some(epoch) = inner
+        .write_turns
+        .entry(chain.clone())
+        .or_insert_with(WriteTurn::whole_subtree)
+        .apply_yield(grantee, now)
+    {
+        eprintln!(
+            "keeperd: net: turn for {chain} granted to {} (epoch {epoch})",
+            hex::encode(grantee)
+        );
+    }
+}
+
+/// Apply an inbound `TurnRevoke`: verify the signature, authorize the revoker as
+/// an S-member, then clear the holder — but only when it matches both the named
+/// device and the exact lease `epoch` (a stale revoke can never kill a fresh
+/// grant). A revoke for a chain we hold no view of is a safe no-op.
+fn handle_turn_revoke(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    owner: &RingEntry,
+    ring: &Arc<Mutex<Ring>>,
+    rv: TurnRevoke,
+) {
+    let chain = String::from_utf8_lossy(&rv.chain_id).into_owned();
+    let Ok(revoker) = <[u8; 32]>::try_from(rv.device_id.as_slice()) else {
+        eprintln!("keeperd: net: turn-revoke device_id is not 32 bytes");
+        return;
+    };
+    let Ok(revoked) = <[u8; 32]>::try_from(rv.revoked.as_slice()) else {
+        eprintln!("keeperd: net: turn-revoke revoked is not 32 bytes");
+        return;
+    };
+    if revoker != owner.device_id {
+        eprintln!("keeperd: net: turn-revoke device_id != authenticated peer; rejecting");
+        return;
+    }
+    if !verify_turn_revoke_sig(&rv.chain_id, &revoker, &revoked, rv.epoch, &rv.signature) {
+        eprintln!("keeperd: net: turn-revoke for {chain} signature invalid; rejecting");
+        return;
+    }
+    let Some((membership, members)) = resolve_chain_members(daemon, ring, local, &chain) else {
+        return;
+    };
+    if !turn_sender_is_member(&membership, &chain, &members, &revoker) {
+        eprintln!(
+            "keeperd: net: turn-revoke for {chain} from non-member {}; rejecting",
+            hex::encode(revoker)
+        );
+        return;
+    }
+    let mut inner = daemon.inner.lock().unwrap();
+    if let Some(turn) = inner.write_turns.get_mut(&chain) {
+        if turn.apply_revoke(&revoked, rv.epoch) {
+            eprintln!(
+                "keeperd: net: turn for {chain} revoked (holder {} epoch {})",
+                hex::encode(revoked),
+                rv.epoch
+            );
+        }
     }
 }
 
@@ -2149,6 +2468,60 @@ mod tests {
             names,
             vec![None, Some("apple".into()), Some("banana".into())]
         );
+    }
+
+    // --- m5e slice 001 part 2: write-turn S-membership authorization ----------
+
+    /// A shared-subtrees membership holding a single chain, for the turn
+    /// authorization tests. `key_id` stays `None` (an unkeyed chain resolves its
+    /// members from the ring in production; here we pass the member set directly).
+    fn membership_with_chain(chain: &str) -> softfig_vcs::SharedSubtreesConfig {
+        softfig_vcs::SharedSubtreesConfig {
+            subtrees: vec![softfig_vcs::SharedSubtreeEntry {
+                id: "sub-1".into(),
+                mount_path: "projects/journal".into(),
+                ref_name: chain.into(),
+                key_id: None,
+            }],
+        }
+    }
+
+    /// The daemon half of "a forged turn-request from a non-member is rejected":
+    /// a valid signature proves *who* signed (the crypto half, in `turn.rs`), but
+    /// the turn only moves for a device that is an S-member of *this* chain. A
+    /// non-member id, or any id on a chain we don't share, is refused before it
+    /// touches the lease.
+    #[test]
+    fn turn_sender_authorized_only_for_members_of_the_named_chain() {
+        let chain = "chain/journal";
+        let membership = membership_with_chain(chain);
+        let members = vec![id_bytes(1), id_bytes(2)];
+
+        // An S-member of the named chain is authorized.
+        assert!(turn_sender_is_member(
+            &membership,
+            chain,
+            &members,
+            &id_bytes(1)
+        ));
+
+        // A well-signed request from a device outside the member set is rejected —
+        // the forged-non-member daemon guard.
+        assert!(!turn_sender_is_member(
+            &membership,
+            chain,
+            &members,
+            &id_bytes(9)
+        ));
+
+        // A genuine member, but for a chain this device shares no subtree for, is
+        // also rejected (can't borrow membership of one chain to act on another).
+        assert!(!turn_sender_is_member(
+            &membership,
+            "chain/unknown",
+            &members,
+            &id_bytes(1)
+        ));
     }
 
     // --- slice 1: event-driven replica push signal ---------------------------
