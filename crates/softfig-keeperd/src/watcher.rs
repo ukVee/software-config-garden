@@ -372,6 +372,18 @@ impl DirtySetAccumulator {
                 }
             },
         };
+        // M5e part 3b-ii: gate each shared chain's ref advance on holding its
+        // write turn. A quiesced chain (a peer holds the turn) is skipped in the
+        // commit loop and re-queued (via `failed_refs`) so the capped-backoff
+        // retry lands it on a later flush once we're granted the turn — the FUSE
+        // overlay retains the staged bytes, so nothing is dropped. No-op /
+        // self-acquire when net is down, so a solo device never blocks.
+        let mut deferred_refs: Vec<String> = Vec::new();
+        for (ref_name, _) in &shared_snapshots {
+            if !crate::net::gate_shared_chain_commit(inner, ref_name) {
+                deferred_refs.push(ref_name.clone());
+            }
+        }
         let repo = match inner.repo.as_mut() {
             Some(r) => r,
             None => return,
@@ -442,6 +454,16 @@ impl DirtySetAccumulator {
             hook.set_shared_chain_keys(&fresh);
         }
         for (ref_name, snap) in shared_snapshots {
+            // M5e part 3b-ii: quiesced on its write turn (a peer holds it). The
+            // overlay retains `snap`'s bytes; route it through the partial-failure
+            // requeue so the capped-backoff retry lands it once we're granted.
+            if deferred_refs.contains(&ref_name) {
+                eprintln!(
+                    "keeperd: watcher: shared-chain commit to {ref_name} deferred on write turn"
+                );
+                failed_refs.push(ref_name);
+                continue;
+            }
             let intent = match Intent::new(&classified.intent, classified.payload.clone()) {
                 Ok(i) => i,
                 Err(e) => {

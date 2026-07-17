@@ -137,6 +137,19 @@ pub(crate) fn commit_now(
         }
         None => None,
     };
+    // M5e part 3b-ii: gate each shared chain's ref advance on holding its write
+    // turn. A quiesced (peer holds the turn) chain is skipped below — its staged
+    // write stays in the FUSE overlay and lands on a later boundary once we are
+    // granted the turn. No-op / self-acquire when net is down (a solo device
+    // never blocks), so every non-mesh commit path is byte-unchanged.
+    let mut deferred_shared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some((_, shared)) = &fuse_snapshots {
+        for (ref_name, _) in shared {
+            if !crate::net::gate_shared_chain_commit(inner, ref_name) {
+                deferred_shared.insert(ref_name.clone());
+            }
+        }
+    }
     let hook = inner.layer_b.clone();
     let hash = {
         let session = inner.session.as_ref().expect("unlocked");
@@ -154,14 +167,26 @@ pub(crate) fn commit_now(
                 }
                 let device_hash = last;
                 for (ref_name, snap) in shared_snapshots {
+                    // Quiesced on its write turn (a peer holds it) — leave the
+                    // snapshot staged in the overlay for a later boundary.
+                    if deferred_shared.contains(&ref_name) {
+                        continue;
+                    }
                     last = Some(
                         repo.commit_snapshot_to(&ref_name, session, snap, intent.clone())
                             .map_err(|e| err_to_response(e.into()))?,
                     );
                 }
-                device_hash
-                    .or(last)
-                    .expect("commit_now commits at least the device chain")
+                match device_hash.or(last) {
+                    Some(h) => h,
+                    // Every advancing chain was deferred on its write turn: nothing
+                    // committed this call — return the device tip unchanged (the
+                    // staged writes land on a later boundary once granted).
+                    None => repo
+                        .tip()
+                        .map_err(|e| err_to_response(e.into()))?
+                        .expect("device chain always has a genesis tip"),
+                }
             }
             None => {
                 let _guard =

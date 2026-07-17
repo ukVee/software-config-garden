@@ -55,9 +55,10 @@ use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
     device_state_signing_bytes, pull_replication_pipelined, serve_replication,
-    static_attestation_message, turn_revoke_signing_bytes, verify_device_state_sig, verify_grant,
-    verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseEvent,
-    LeaseScope, NetError, ServeSummary, WriteTurn,
+    static_attestation_message, turn_request_signing_bytes, turn_revoke_signing_bytes,
+    turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_turn_request_sig,
+    verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseEvent, LeaseScope, NetError,
+    ServeSummary, WriteTurn,
 };
 use softfig_store::Hash;
 use softfig_vault::VaultSession;
@@ -1067,11 +1068,160 @@ fn handle_turn_revoke(
 // them to the chain's reachable S-members (self excluded), LAN-direct-first with
 // the relay as fallback — exactly [`push_to_host`]'s route policy. Turn gossip is
 // one-shot and fire-and-forget: dial, send, drop the session; the receiver's
-// inbound handler applies it after re-verifying the signature + S-membership. The
-// two triggers whose events exist at this layer are wired here — a device-state
-// change (Offline→OnlineIdle on unlock) and an expiry-revoke (the poll loop). The
-// `TurnRequest`/`TurnYield` broadcasts ride the commit boundary (their call sites
-// are part 3), so they land with that path rather than as dead code here.
+// inbound handler applies it after re-verifying the signature + S-membership. All
+// four triggers land here — a device-state change (Offline→OnlineIdle on unlock)
+// and an expiry-revoke (the poll loop), plus (part 3b-ii) the `TurnRequest` /
+// `TurnYield` broadcasts at the shared-chain commit boundary: those two decide
+// under the daemon lock at the boundary ([`decide_turn_gate`] /
+// [`gate_shared_chain_commit`]), queue a [`PendingTurnBroadcast`], and are
+// signed + fanned off-lock by [`reconcile_write_turns`] on its commit-driven
+// wake — never as dead code, always with their call site.
+
+/// A coordination frame the shared-chain commit boundary decided to send,
+/// queued on [`DaemonInner::pending_turn_broadcasts`] under the daemon lock for
+/// [`reconcile_write_turns`] to resolve S-members + sign + fan off-lock (the
+/// expiry-revoke discipline). Carries only the plaintext fields; the signature
+/// is minted at fan time from the live vault session.
+#[derive(Debug)]
+pub enum PendingTurnBroadcast {
+    /// A local shared-chain write wants the turn — fan a signed `TurnRequest` so
+    /// the current holder yields at its next commit boundary (and peers queue
+    /// behind us rather than double-granting a free turn).
+    Request { chain: String, seq: u64 },
+    /// We held the turn, committed, and a peer is queued behind us — fan a signed
+    /// `TurnYield` naming the FIFO winner `grantee` (stamping the `seq` it
+    /// requested with) so it may write next.
+    Yield {
+        chain: String,
+        grantee: [u8; 32],
+        seq: u64,
+    },
+}
+
+/// What the shared-chain commit boundary must do for one chain, decided from +
+/// applied to our local lease view by [`decide_turn_gate`].
+#[derive(Debug, PartialEq, Eq)]
+enum TurnGateAction {
+    /// We already hold the turn and no peer is queued — advance the ref, keep the
+    /// turn (a bursty local writer holds its lease across commits). No broadcast.
+    Proceed,
+    /// A free/expired turn we just self-acquired (uncontested) — advance the ref
+    /// and announce the claim with a `TurnRequest` so peers converge on us as the
+    /// active writer instead of double-granting.
+    ProceedRequest { seq: u64 },
+    /// We hold the turn, are flushing this commit, and a peer is queued — advance
+    /// the ref, then yield at this boundary: released locally + a `TurnYield`
+    /// names the FIFO winner.
+    ProceedYield { grantee: [u8; 32], seq: u64 },
+    /// A peer holds the turn — quiesce: do NOT advance the ref; request the turn
+    /// so the holder yields at its next boundary. The staged write stays in the
+    /// FUSE overlay and lands on a later boundary once we are granted the turn
+    /// (the watcher's requeue-retry drives that; reads never reach here).
+    Defer { seq: u64 },
+}
+
+/// Decide + apply the write-turn gate at a shared-chain commit boundary, over
+/// our local lease `turn` for that chain. Pure over the state machine (`local` /
+/// `seq` / `now` are passed, no IO) so the "holder yields only at a commit
+/// boundary" policy is unit-tested headlessly, mirroring [`poll_expiries`].
+///
+/// Three shapes (self-acquire keeps a solo device from deadlocking on its own
+/// free turn):
+/// - **We hold it.** Advance. If a peer is queued, yield here (finish our commit,
+///   then hand the turn on) — the [`TurnGateAction::ProceedYield`] path the slice
+///   test exercises. Else keep the lease ([`TurnGateAction::Proceed`]).
+/// - **Free / expired turn.** [`WriteTurn::request`] + [`WriteTurn::poll`] grants
+///   the deterministic FIFO winner; if that is us we advance + announce
+///   ([`TurnGateAction::ProceedRequest`]). (A revoke `poll` may consume is not
+///   re-broadcast here — peers self-expire on the same lease TTL; the reconcile
+///   tick is the revoke path.)
+/// - **A peer won / holds it.** Quiesce: request the turn and defer the ref
+///   advance ([`TurnGateAction::Defer`]).
+fn decide_turn_gate(turn: &mut WriteTurn, local: &[u8; 32], seq: u64, now: i64) -> TurnGateAction {
+    if turn.is_held_by(local) {
+        if let Some((grantee, grantee_seq)) = turn.next_grant() {
+            turn.release(local);
+            return TurnGateAction::ProceedYield {
+                grantee,
+                seq: grantee_seq,
+            };
+        }
+        return TurnGateAction::Proceed;
+    }
+    // We don't hold it: record our request and let the queue advance (a free or
+    // just-expired turn is granted to the deterministic FIFO winner).
+    turn.request(*local, seq);
+    turn.poll(now);
+    if turn.is_held_by(local) {
+        TurnGateAction::ProceedRequest { seq }
+    } else {
+        TurnGateAction::Defer { seq }
+    }
+}
+
+/// Consult + advance the write-turn at a shared-chain commit boundary, under the
+/// daemon lock. Returns whether the shared-chain ref advance may proceed now;
+/// queues any `TurnRequest`/`TurnYield` into [`DaemonInner::pending_turn_broadcasts`]
+/// for [`reconcile_write_turns`] to sign + fan off-lock, and wakes that loop
+/// (via `signal_commit`) so the frame goes out promptly rather than on the next
+/// ~20 s tick.
+///
+/// **Fast-path proceed** when there is no mesh (`net` is down / no session): a
+/// solo daemon has nothing to coordinate, so gating is a no-op and every
+/// existing single-device commit path is byte-unchanged. Only a live net engages
+/// the lease — and even then a chain with no reachable S-members resolves to an
+/// empty fan (skipped), so the only real quiesce is a genuine peer contending.
+pub(crate) fn gate_shared_chain_commit(inner: &mut DaemonInner, chain: &str) -> bool {
+    if inner.net.is_none() {
+        return true;
+    }
+    let Some(session) = inner.session.as_ref() else {
+        return true;
+    };
+    let local_id = session.identity_pubkey().to_bytes();
+    let now = now_secs();
+    // Logical request-time for FIFO fairness = wall-clock seconds, the shared
+    // time base across devices (and the unit the LWW conflict fallback compares).
+    // Cross-device clock skew is the documented v1 open question, not this gate's.
+    let seq = now.max(0) as u64;
+    let turn = inner
+        .write_turns
+        .entry(chain.to_string())
+        .or_insert_with(WriteTurn::whole_subtree);
+    let action = decide_turn_gate(turn, &local_id, seq, now);
+    let (proceed, broadcast) = match action {
+        TurnGateAction::Proceed => (true, None),
+        TurnGateAction::ProceedRequest { seq } => (
+            true,
+            Some(PendingTurnBroadcast::Request {
+                chain: chain.to_string(),
+                seq,
+            }),
+        ),
+        TurnGateAction::ProceedYield { grantee, seq } => (
+            true,
+            Some(PendingTurnBroadcast::Yield {
+                chain: chain.to_string(),
+                grantee,
+                seq,
+            }),
+        ),
+        TurnGateAction::Defer { seq } => (
+            false,
+            Some(PendingTurnBroadcast::Request {
+                chain: chain.to_string(),
+                seq,
+            }),
+        ),
+    };
+    if let Some(b) = broadcast {
+        inner.pending_turn_broadcasts.push(b);
+        if let Some(net) = inner.net.as_ref() {
+            net.signal_commit();
+        }
+    }
+    proceed
+}
 
 /// Send one signed, one-shot coordination frame to a single ring peer,
 /// best-effort. Mirrors [`push_to_host`]'s route policy — each known LAN endpoint
@@ -1139,6 +1289,32 @@ fn fan_turn_frame(
             eprintln!("keeperd: net: {what} to {} skipped: {e}", host.fingerprint());
         }
     }
+}
+
+/// The reachable ring peers to fan a chain's turn frame to: its `S`-members
+/// minus this device, each with a viable route ([`plan_routes`]). Shared by the
+/// expiry-revoke and the commit-boundary request/yield fan-outs so every turn
+/// message targets the same set derived from the same committed membership. An
+/// empty result ⇒ nothing to send (the caller skips the frame — e.g. a solo
+/// device whose chain has no online peer).
+#[allow(clippy::too_many_arguments)]
+fn resolve_turn_targets(
+    membership: &softfig_vcs::SharedSubtreesConfig,
+    ring: &Ring,
+    ring_members: &[[u8; 32]],
+    repo: &Repo,
+    session: &VaultSession,
+    local_id: &[u8; 32],
+    relay_available: bool,
+    chain: &str,
+) -> Vec<RingEntry> {
+    let members = chain_members(membership, ring_members, repo, session, chain);
+    members
+        .iter()
+        .filter(|id| *id != local_id)
+        .filter_map(|id| ring.peers().iter().find(|p| &p.device_id == id).cloned())
+        .filter(|host| !plan_routes(host, relay_available).is_empty())
+        .collect()
 }
 
 /// Poll every chain's lease forward to `now`, returning the `(chain,
@@ -1226,6 +1402,9 @@ fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
     let now_instant = Instant::now();
     let mut announce_frame: Option<(Frame, Vec<RingEntry>)> = None;
     let mut revoke_frames: Vec<(Frame, Vec<RingEntry>)> = Vec::new();
+    // Part 3b-ii: commit-boundary `TurnRequest`/`TurnYield` frames, each labelled
+    // for its fan-out log line.
+    let mut turn_frames: Vec<(Frame, Vec<RingEntry>, &'static str)> = Vec::new();
     let relay_client;
     {
         let mut inner = daemon.inner.lock().unwrap();
@@ -1268,42 +1447,121 @@ fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
             announce_frame = Some((frame, targets));
         }
 
-        // (2) Expiry poll → sign + resolve targets for each revoke.
+        // (2) Expiry-revoke (poll) + commit-boundary broadcasts (part 3b-ii) →
+        // resolve S-member targets + sign each, off the lock's IO. Both need the
+        // committed membership + the ring member set, so load once and serve both;
+        // `pending` is drained by value so a membership-read glitch re-queues it
+        // (a request/yield must not be silently dropped).
         let revokes = poll_expiries(&mut inner.write_turns, now);
-        if !revokes.is_empty() {
+        let pending = std::mem::take(&mut inner.pending_turn_broadcasts);
+        if !revokes.is_empty() || !pending.is_empty() {
             let membership = inner.repo.as_ref().and_then(|repo| {
                 crate::handlers::read_committed_shared_subtrees_for_mutation(repo, &session).ok()
             });
-            if let (Some(membership), Some(repo)) = (membership, inner.repo.as_ref()) {
-                let ring_members = assemble_member_set(&ring, local.device_id);
-                for (chain, revoked, epoch) in revokes {
-                    let members = chain_members(&membership, &ring_members, repo, &session, &chain);
-                    let targets: Vec<RingEntry> = members
-                        .iter()
-                        .filter(|id| **id != local.device_id)
-                        .filter_map(|id| ring.peers().iter().find(|p| &p.device_id == id).cloned())
-                        .filter(|host| !plan_routes(host, relay_available).is_empty())
-                        .collect();
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let signature = session
-                        .sign(&turn_revoke_signing_bytes(
-                            chain.as_bytes(),
+            match (membership, inner.repo.as_ref()) {
+                (Some(membership), Some(repo)) => {
+                    let ring_members = assemble_member_set(&ring, local.device_id);
+                    // Expiry-revokes: the crash/partition recovery path.
+                    for (chain, revoked, epoch) in revokes {
+                        let targets = resolve_turn_targets(
+                            &membership,
+                            &ring,
+                            &ring_members,
+                            repo,
+                            &session,
                             &local.device_id,
-                            &revoked,
+                            relay_available,
+                            &chain,
+                        );
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        let signature = session
+                            .sign(&turn_revoke_signing_bytes(
+                                chain.as_bytes(),
+                                &local.device_id,
+                                &revoked,
+                                epoch,
+                            ))
+                            .to_bytes()
+                            .to_vec();
+                        let frame = Frame::turn_revoke(TurnRevoke {
+                            chain_id: chain.into_bytes(),
+                            device_id: local.device_id.to_vec(),
+                            revoked: revoked.to_vec(),
                             epoch,
-                        ))
-                        .to_bytes()
-                        .to_vec();
-                    let frame = Frame::turn_revoke(TurnRevoke {
-                        chain_id: chain.into_bytes(),
-                        device_id: local.device_id.to_vec(),
-                        revoked: revoked.to_vec(),
-                        epoch,
-                        signature,
-                    });
-                    revoke_frames.push((frame, targets));
+                            signature,
+                        });
+                        revoke_frames.push((frame, targets));
+                    }
+                    // Commit-boundary `TurnRequest`/`TurnYield` the gate queued.
+                    for b in pending {
+                        let (chain, frame, what) = match b {
+                            PendingTurnBroadcast::Request { chain, seq } => {
+                                let signature = session
+                                    .sign(&turn_request_signing_bytes(
+                                        chain.as_bytes(),
+                                        &local.device_id,
+                                        seq,
+                                        LeaseScope::WholeSubtree,
+                                    ))
+                                    .to_bytes()
+                                    .to_vec();
+                                let frame = Frame::turn_request(TurnRequest {
+                                    chain_id: chain.clone().into_bytes(),
+                                    device_id: local.device_id.to_vec(),
+                                    seq,
+                                    scope: LeaseScope::WholeSubtree.as_u32(),
+                                    signature,
+                                });
+                                (chain, frame, "turn-request")
+                            }
+                            PendingTurnBroadcast::Yield {
+                                chain,
+                                grantee,
+                                seq,
+                            } => {
+                                let signature = session
+                                    .sign(&turn_yield_signing_bytes(
+                                        chain.as_bytes(),
+                                        &local.device_id,
+                                        &grantee,
+                                        seq,
+                                    ))
+                                    .to_bytes()
+                                    .to_vec();
+                                let frame = Frame::turn_yield(TurnYield {
+                                    chain_id: chain.clone().into_bytes(),
+                                    device_id: local.device_id.to_vec(),
+                                    grantee: grantee.to_vec(),
+                                    seq,
+                                    signature,
+                                });
+                                (chain, frame, "turn-yield")
+                            }
+                        };
+                        let targets = resolve_turn_targets(
+                            &membership,
+                            &ring,
+                            &ring_members,
+                            repo,
+                            &session,
+                            &local.device_id,
+                            relay_available,
+                            &chain,
+                        );
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        turn_frames.push((frame, targets, what));
+                    }
+                }
+                _ => {
+                    // Committed membership unreadable this tick (a transient
+                    // glitch): re-queue the commit-boundary broadcasts so the next
+                    // tick retries them. Revokes are dropped as before — the lease
+                    // already expired locally and peers self-expire on the same TTL.
+                    inner.pending_turn_broadcasts = pending;
                 }
             }
         }
@@ -1320,6 +1578,9 @@ fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
     }
     for (frame, targets) in revoke_frames {
         fan_turn_frame(local, &targets, relay_client.as_ref(), &frame, "turn-revoke");
+    }
+    for (frame, targets, what) in turn_frames {
+        fan_turn_frame(local, &targets, relay_client.as_ref(), &frame, what);
     }
 }
 
@@ -2854,6 +3115,76 @@ mod tests {
         // Idempotent: a second poll at the same instant has nothing left to revoke
         // (the turn is free with no waiters — no phantom re-revoke of a gone lease).
         assert!(poll_expiries(&mut turns, 100).is_empty());
+    }
+
+    /// Part 3b-ii — the pure commit-boundary gate over one chain's local lease
+    /// (the decision `reconcile_write_turns` acts on). Mirrors the `poll_expiries`
+    /// headless shape: no IO, `now`/`seq` passed in.
+    #[test]
+    fn commit_gate_self_acquires_a_free_turn() {
+        // A solo/uncontended write: the turn is free, so we take it and proceed,
+        // announcing the claim with a request — no deadlock without a grantor.
+        let mut t = WriteTurn::whole_subtree();
+        let action = decide_turn_gate(&mut t, &id_bytes(1), 100, 100);
+        assert_eq!(action, TurnGateAction::ProceedRequest { seq: 100 });
+        assert!(t.is_held_by(&id_bytes(1)));
+    }
+
+    #[test]
+    fn commit_gate_proceeds_while_we_hold_with_no_waiters() {
+        // We already hold the lease: a follow-up commit proceeds and keeps the
+        // turn — a bursty writer isn't forced to re-handshake every commit.
+        let mut t = WriteTurn::whole_subtree();
+        t.apply_yield(id_bytes(1), 100);
+        let action = decide_turn_gate(&mut t, &id_bytes(1), 200, 200);
+        assert_eq!(action, TurnGateAction::Proceed);
+        assert!(t.is_held_by(&id_bytes(1)));
+    }
+
+    #[test]
+    fn commit_gate_yields_at_the_boundary_when_a_peer_is_queued() {
+        // THE slice test at the daemon layer — "a holder yields only at a commit
+        // boundary": we hold, a peer requested behind us, so this commit flushes
+        // and then yields, naming the FIFO winner + the seq it requested with (for
+        // the signed `turn-yield`). A mid-edit never triggers this; only a boundary.
+        let mut t = WriteTurn::whole_subtree();
+        t.apply_yield(id_bytes(1), 100); // we hold
+        t.request(id_bytes(2), 150); // a peer queues mid-hold
+        let action = decide_turn_gate(&mut t, &id_bytes(1), 200, 200);
+        assert_eq!(
+            action,
+            TurnGateAction::ProceedYield {
+                grantee: id_bytes(2),
+                seq: 150,
+            }
+        );
+        // Released at the boundary (the yield hands the turn on); the ref advance
+        // still proceeded — we flushed this commit first.
+        assert!(!t.is_held_by(&id_bytes(1)));
+    }
+
+    #[test]
+    fn commit_gate_defers_when_a_peer_holds_a_live_turn() {
+        // A peer holds a live lease: we must NOT advance the shared ref (quiesce).
+        // We request the turn (so the holder yields at its next boundary) + defer;
+        // the watcher's requeue-retry lands the staged write once we're granted.
+        let mut t = WriteTurn::whole_subtree();
+        t.apply_yield(id_bytes(2), 100); // peer holds, deadline 100+30=130
+        let action = decide_turn_gate(&mut t, &id_bytes(1), 120, 120); // 120 < 130 → live
+        assert_eq!(action, TurnGateAction::Defer { seq: 120 });
+        assert!(t.is_held_by(&id_bytes(2))); // peer still holds
+        assert_eq!(t.next_in_line(), Some(id_bytes(1))); // we're queued behind it
+    }
+
+    #[test]
+    fn commit_gate_takes_over_an_expired_peer_lease() {
+        // The peer's lease has expired (crash/partition): the boundary poll revokes
+        // it and grants us, so we proceed — no write is stuck behind a dead holder.
+        let mut t = WriteTurn::whole_subtree();
+        t.apply_yield(id_bytes(2), 0); // peer granted at 0, deadline 30
+        let action = decide_turn_gate(&mut t, &id_bytes(1), 100, 100); // long past 30
+        assert_eq!(action, TurnGateAction::ProceedRequest { seq: 100 });
+        assert!(t.is_held_by(&id_bytes(1)));
     }
 
     /// The part-3a activity-window derivation: a recent local write reads as

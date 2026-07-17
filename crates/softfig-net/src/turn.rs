@@ -268,10 +268,20 @@ impl WriteTurn {
     /// next: the minimum by (`seq`, `device_id`). `None` when no one is waiting.
     /// Deterministic, so every member computes the same next holder.
     pub fn next_in_line(&self) -> Option<[u8; 32]> {
+        self.next_grant().map(|(device_id, _)| device_id)
+    }
+
+    /// The FIFO winner as `(device_id, seq)` — the queued request a free turn
+    /// would grant next, minimum by (`seq`, `device_id`). `None` when no one
+    /// waits. Companion to [`WriteTurn::next_in_line`], which drops the `seq`: the
+    /// daemon stamps the returned `seq` into an outgoing `turn-yield` so the go-
+    /// ahead names the exact granted request (the seq the grantee signed its
+    /// `turn-request` with).
+    pub fn next_grant(&self) -> Option<([u8; 32], u64)> {
         self.waiters
             .iter()
             .min_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.device_id.cmp(&b.device_id)))
-            .map(|w| w.device_id)
+            .map(|w| (w.device_id, w.seq))
     }
 
     /// Record a turn request from `device_id` at logical request-time `seq`.
@@ -652,6 +662,19 @@ mod tests {
         // The loser is still queued FIFO, not dropped.
         assert!(t.has_waiters());
         assert_eq!(t.next_in_line(), Some(dev(9)));
+    }
+
+    #[test]
+    fn next_grant_returns_the_fifo_winner_with_its_seq() {
+        // Mirrors `next_in_line`'s ordering but also surfaces the winner's `seq`,
+        // which the daemon stamps into the `turn-yield` it signs.
+        let mut t = turn();
+        assert_eq!(t.next_grant(), None);
+        t.request(dev(9), 7);
+        t.request(dev(2), 7); // equal seq -> device-id tiebreak: dev(2) < dev(9)
+        t.request(dev(5), 3); // lowest seq wins outright
+        assert_eq!(t.next_grant(), Some((dev(5), 3)));
+        assert_eq!(t.next_in_line(), Some(dev(5)));
     }
 
     #[test]

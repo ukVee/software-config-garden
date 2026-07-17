@@ -159,6 +159,14 @@ pub struct DaemonInner {
     /// lease re-derives from live announces under the lease TTL, so no turn
     /// survives a bounce — a crashed holder's lease simply expires.
     pub write_turns: HashMap<String, WriteTurn>,
+    /// M5e part 3b-ii — coordination frames the shared-chain commit boundary
+    /// decided to send (a `TurnRequest` when a local write wants the turn, a
+    /// `TurnYield` when we hold + quiesce with a peer queued), queued under the
+    /// daemon lock and drained + signed + fanned off-lock by
+    /// [`crate::net::reconcile_write_turns`] on its commit-driven wake — the same
+    /// snapshot-under-lock / IO-off-lock discipline as the expiry-revoke path.
+    /// In-memory; cleared on soft lock alongside [`Self::write_turns`].
+    pub pending_turn_broadcasts: Vec<crate::net::PendingTurnBroadcast>,
 }
 
 impl DaemonInner {
@@ -184,6 +192,7 @@ impl DaemonInner {
             announce_seq: 0,
             peer_states: HashMap::new(),
             write_turns: HashMap::new(),
+            pending_turn_broadcasts: Vec::new(),
         }
     }
 }
@@ -315,6 +324,7 @@ impl Daemon {
             inner.device_state = DeviceState::Offline;
             inner.last_write_at = None;
             inner.write_turns.clear();
+            inner.pending_turn_broadcasts.clear();
             inner.peer_states.clear();
             inner.session = None;
             inner.repo = None;
