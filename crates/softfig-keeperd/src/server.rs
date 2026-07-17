@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use softfig_ipc::{ErrorKind, Request, Response};
 
@@ -169,6 +169,48 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
+/// Does this op represent a **local, user-initiated garden-content write**? Used
+/// only to stamp [`DaemonInner::last_write_at`] for the M5e device-state
+/// activity window (part 3a) — a local authoring commit lifts this device to
+/// `OnlineActive` for its S-members. This is a coarse "is the user actively
+/// editing" hint, so over/under-inclusion at the margins is benign; the safe
+/// default is an allow-list (a new verb reads as *not* active until listed,
+/// never wrongly active). Intentionally excluded: reads (`status`/`log`/
+/// `read_file`/…), one-time/structural ops (`migrate_*`, `growlight_init`,
+/// `vault_reveal` — a read-to-tmpfile), pairing/replica/relock/shared-subtree
+/// control, lease bookkeeping, and `deploy_*` (writes the filesystem, not the
+/// garden VCS).
+fn op_is_local_write(op: &str) -> bool {
+    use softfig_ipc::op;
+    matches!(
+        op,
+        op::COMMIT
+            | op::REPLACE_FILE
+            | op::LOG_DECISION
+            | op::LOG_INCIDENT
+            | op::ADD_NOTE
+            | op::REVISE_NOTE
+            | op::ADD_CODE_REVIEW
+            | op::ADD_SECTION
+            | op::EDIT_SECTION
+            | op::APPEND_TO_SECTION
+            | op::SET_REVIEWED
+            | op::LOG_BATON
+            | op::ADD_BACKLOG_ITEM
+            | op::ADD_QUEUE
+            | op::ADD_SLICE
+            | op::SET_ITEM_STATUS
+            | op::REORDER_BACKLOG_ITEM
+            | op::GROWLIGHT_SET_RESOURCES
+            | op::POST_MESSAGE
+            | op::ARCHIVE
+            | op::ADD_PROJECT
+            | op::REFRESH_SNAPSHOT
+            | op::VAULT_SEAL
+            | op::VAULT_UNSEAL
+    )
+}
+
 fn dispatch(daemon: &Daemon, req: Request) -> Response {
     use softfig_ipc::op;
 
@@ -245,6 +287,15 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
             format!("unknown op {other:?}"),
         )),
     };
+
+    // M5e part 3a: a successful local authoring write stamps the activity window,
+    // lifting this device to `OnlineActive` on the next reconcile tick. Only local
+    // IPC writes reach `dispatch` — peer-applied and ceremony/replica-internal
+    // commits go through the net path, not here — so this stamp never fires for a
+    // write we didn't originate.
+    if result.is_ok() && op_is_local_write(&req.op) {
+        daemon.inner.lock().unwrap().last_write_at = Some(Instant::now());
+    }
 
     match result {
         Ok(data) => Response::ok(data),

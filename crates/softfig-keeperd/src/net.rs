@@ -108,6 +108,16 @@ const PUSH_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// device↔relay leg the inner `RelayStream` rides on.
 const PUSH_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// M5e part 3a: how long after a local authoring write this device advertises
+/// `OnlineActive` before decaying back to `OnlineIdle`. Because the flip is
+/// re-evaluated on the reconcile tick ([`REPLICA_RECONCILE_INTERVAL`], ~20s),
+/// the window is kept comfortably wider than the tick so a write is reliably
+/// observed as active on the following tick and the active state spans a few
+/// ticks — the same coarse-latency tolerance the lease poll already accepts. It
+/// is the one tuning knob the activity-window design (vs a session attach/detach
+/// verb) introduces.
+pub(crate) const WRITE_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
+
 // --- Discovery cache (Slice A pick-list) ------------------------------------
 
 /// One nearby device the mDNS browse loop has resolved, cached for the
@@ -1157,15 +1167,55 @@ fn poll_expiries(
     revokes
 }
 
+/// Derive this device's coordination state from recent local write activity:
+/// `OnlineActive` while a local authoring write landed within
+/// [`WRITE_ACTIVITY_WINDOW`], else `OnlineIdle`. Pure over its input (the elapsed
+/// duration is passed, [`Instant::duration_since`] is saturating so there is no
+/// clock IO or panic) so the part-3a activity-window flip is unit-tested
+/// headlessly. Called only while unlocked; `Offline` is the locked floor, set by
+/// the lifecycle, and is never derived here.
+fn active_or_idle(since_last_write: Option<Duration>) -> DeviceState {
+    match since_last_write {
+        Some(elapsed) if elapsed < WRITE_ACTIVITY_WINDOW => DeviceState::OnlineActive,
+        _ => DeviceState::OnlineIdle,
+    }
+}
+
+/// Sign and frame a `DeviceStateAnnounce` for `state` at `seq`. The `seq` bump
+/// and the `device_state` write are the caller's (done under the lock); this only
+/// signs + frames, so the unlock lift and the `OnlineIdle`↔`OnlineActive`
+/// activity flip share one signing path. `unlocked` is always `true` here — the
+/// reconcile pass runs only while unlocked (`Offline` is announced by nothing;
+/// the net runtime is already gone by the time we lock).
+fn build_device_state_announce(
+    session: &VaultSession,
+    local: &LocalDevice,
+    state: DeviceState,
+    seq: u64,
+) -> Frame {
+    let signature = session
+        .sign(&device_state_signing_bytes(&local.device_id, state, true, seq))
+        .to_bytes()
+        .to_vec();
+    Frame::device_state_announce(DeviceStateAnnounce {
+        device_id: local.device_id.to_vec(),
+        state: state.as_u32(),
+        unlocked: true,
+        seq,
+        signature,
+    })
+}
+
 /// One write-turn reconcile pass, run on the replica loop's tick (M5e slice 001
-/// part 2b). Two outbound duties, both snapshotted under the daemon lock so the
-/// network IO runs off the mutex (the ceremony/replica discipline):
+/// part 2b + 3a). Two outbound duties, both snapshotted under the daemon lock so
+/// the network IO runs off the mutex (the ceremony/replica discipline):
 ///
-/// 1. **Device-state announce.** Lift `Offline`→`OnlineIdle` the first tick after
-///    unlock and fan the signed [`DeviceStateAnnounce`] to every ring peer. It is
-///    a state-change trigger, not a periodic beacon — later ticks find the state
-///    already lifted and send nothing. (The `OnlineIdle`↔`OnlineActive` flip rides
-///    a write-session attach; part 3.)
+/// 1. **Device-state announce.** Recompute this device's coordination state and
+///    fan a signed [`DeviceStateAnnounce`] to every ring peer *only when it
+///    changes* — a state-change trigger, not a periodic beacon. The first
+///    post-unlock tick lifts `Offline`→`OnlineIdle` (the "I'm online" beacon);
+///    later ticks flip `OnlineIdle`↔`OnlineActive` from the local-write activity
+///    window ([`active_or_idle`], part 3a). A tick with no change sends nothing.
 /// 2. **Expiry-revoke.** [`poll_expiries`] revokes any lease whose holder went
 ///    silent past its renew window (or hit the max-lease ceiling); each revoke is
 ///    signed and fanned to the chain's reachable S-members. This is the
@@ -1173,6 +1223,7 @@ fn poll_expiries(
 ///    subtree's turn forever.
 fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
     let now = now_secs();
+    let now_instant = Instant::now();
     let mut announce_frame: Option<(Frame, Vec<RingEntry>)> = None;
     let mut revoke_frames: Vec<(Frame, Vec<RingEntry>)> = Vec::new();
     let relay_client;
@@ -1194,23 +1245,18 @@ fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
             load_ring(&wt, &state_dir).unwrap_or_default()
         };
 
-        // (1) Lift Offline→OnlineIdle on unlock and announce the change once.
-        if inner.device_state == DeviceState::Offline {
-            inner.device_state = DeviceState::OnlineIdle;
+        // (1) Recompute the coordination state from local write activity and
+        // announce any change. On the first post-unlock tick `device_state` is
+        // `Offline`, so this fires the `OnlineIdle` (or `OnlineActive`, if a write
+        // already landed) lift; later ticks flip `OnlineIdle`↔`OnlineActive` as the
+        // write window opens and decays.
+        let desired_state =
+            active_or_idle(inner.last_write_at.map(|t| now_instant.duration_since(t)));
+        if inner.device_state != desired_state {
+            inner.device_state = desired_state;
             inner.announce_seq += 1;
             let seq = inner.announce_seq;
-            let state = inner.device_state;
-            let signature = session
-                .sign(&device_state_signing_bytes(&local.device_id, state, true, seq))
-                .to_bytes()
-                .to_vec();
-            let frame = Frame::device_state_announce(DeviceStateAnnounce {
-                device_id: local.device_id.to_vec(),
-                state: state.as_u32(),
-                unlocked: true,
-                seq,
-                signature,
-            });
+            let frame = build_device_state_announce(&session, local, desired_state, seq);
             // Device state is global (not per-chain), so it fans to every ring
             // peer; in v1 point-to-point a ring peer is exactly an S-member.
             let targets: Vec<RingEntry> = ring
@@ -2808,6 +2854,33 @@ mod tests {
         // Idempotent: a second poll at the same instant has nothing left to revoke
         // (the turn is free with no waiters — no phantom re-revoke of a gone lease).
         assert!(poll_expiries(&mut turns, 100).is_empty());
+    }
+
+    /// The part-3a activity-window derivation: a recent local write reads as
+    /// `OnlineActive`, a stale one (or none) as `OnlineIdle`. `Offline` is never
+    /// produced here — it is the locked floor, set by the lifecycle.
+    #[test]
+    fn active_or_idle_reflects_the_write_window() {
+        // No write since unlock → idle.
+        assert_eq!(active_or_idle(None), DeviceState::OnlineIdle);
+        // A write just now (and one right at the far edge) → active.
+        assert_eq!(
+            active_or_idle(Some(Duration::from_secs(0))),
+            DeviceState::OnlineActive
+        );
+        assert_eq!(
+            active_or_idle(Some(WRITE_ACTIVITY_WINDOW - Duration::from_secs(1))),
+            DeviceState::OnlineActive
+        );
+        // At/after the window boundary the active hint has decayed → idle.
+        assert_eq!(
+            active_or_idle(Some(WRITE_ACTIVITY_WINDOW)),
+            DeviceState::OnlineIdle
+        );
+        assert_eq!(
+            active_or_idle(Some(WRITE_ACTIVITY_WINDOW + Duration::from_secs(60))),
+            DeviceState::OnlineIdle
+        );
     }
 
     // --- slice 1: event-driven replica push signal ---------------------------

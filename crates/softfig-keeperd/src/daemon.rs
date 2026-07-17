@@ -125,12 +125,22 @@ pub struct DaemonInner {
     /// with S-encryption live it otherwise presents as silent chain corruption.
     pub last_shared_key_divergence: Option<String>,
     /// M5e slice 001 part 2 — this device's shared-coordination state, announced
-    /// to S-members via a signed `DeviceStateAnnounce`. `OnlineActive` (an
-    /// interactive write session is attached) is derived from a write-capable IPC
-    /// session registering with the daemon — that wiring is part 2b, so until it
-    /// lands this stays whatever the lifecycle set it to (`Offline` while Locked;
-    /// part 2b lifts it to `OnlineIdle` on unlock). Reset on lock.
+    /// to S-members via a signed `DeviceStateAnnounce`. The lifecycle sets the
+    /// floor: `Offline` while `Locked` (this field is reset to `Offline` on lock,
+    /// below). On unlock the reconcile tick lifts it to `OnlineIdle`, then flips
+    /// `OnlineIdle`↔`OnlineActive` from recent local write activity — the IPC is
+    /// per-call (no persistent write session to refcount), so "actively writing"
+    /// is derived from an [`Self::last_write_at`] activity window (part 3a) rather
+    /// than a session attach/detach. Each change bumps [`Self::announce_seq`] and
+    /// re-announces exactly once.
     pub device_state: DeviceState,
+    /// M5e part 3a — monotonic (`Instant`) stamp of the most recent local,
+    /// user-initiated garden write (set by the IPC dispatch, never by a
+    /// peer-applied or ceremony/replica-internal commit). The reconcile tick reads
+    /// it: a write within [`crate::net::WRITE_ACTIVITY_WINDOW`] ⇒ `OnlineActive`,
+    /// else `OnlineIdle`. `None` = no write since unlock. Reset on lock so a stale
+    /// pre-lock write can't read as active after the next unlock.
+    pub last_write_at: Option<Instant>,
     /// M5e — this device's monotonic announce clock. Bumped on every state change
     /// so a peer can order a stale `DeviceStateAnnounce` against a fresh one and
     /// none can be replayed as a newer state. In-memory: a restart re-announces
@@ -170,6 +180,7 @@ impl DaemonInner {
             rekey_seen_stale: HashSet::new(),
             last_shared_key_divergence: None,
             device_state: DeviceState::Offline,
+            last_write_at: None,
             announce_seq: 0,
             peer_states: HashMap::new(),
             write_turns: HashMap::new(),
@@ -295,6 +306,16 @@ impl Daemon {
             let fuse = inner.fuse.take();
             let net = inner.net.take();
             inner.pending_pairs.clear();
+            // M5e: drop all shared-coordination state — the net runtime is going
+            // away, so leases/peer views are meaningless, and returning
+            // `device_state` to `Offline` makes the next unlock re-announce the
+            // `Offline`→`OnlineIdle` lift (the "I'm back online" beacon). Keep
+            // `announce_seq` monotonic across a soft lock so a peer never accepts a
+            // regressed post-unlock announce as stale.
+            inner.device_state = DeviceState::Offline;
+            inner.last_write_at = None;
+            inner.write_turns.clear();
+            inner.peer_states.clear();
             inner.session = None;
             inner.repo = None;
             (fuse, net, supervise, resume_pending)
