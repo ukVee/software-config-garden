@@ -37,6 +37,7 @@ use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo, WalkSnapshot};
 
+use crate::actions::conventions::sanitize_name_component;
 use crate::daemon::{DaemonInner, KeeperError};
 use crate::handlers::resolve_path_in_tree;
 use crate::server::err_to_response;
@@ -144,10 +145,23 @@ pub(crate) fn resolve_sync_conflict(
             return Ok(ConflictResolution::LoserUnresolvable { path: sides.path });
         };
 
+        // `loser_device` is the LOSING side's device *name*; when the local edit
+        // wins it is the peer's self-reported `writer_device`, propagated verbatim
+        // off the push payload (see `net.rs` provenance). Sanitize it to a single
+        // safe path component before it reaches this in-tree write path, so a `/`
+        // or `..` in a hostile peer name cannot relocate the sidecar or silently
+        // overwrite a tracked file (`insert_file` splits on `/`, honors `..`, and
+        // has no exists-check). The sanitizer is pure + deterministic, so both
+        // nodes still derive the identical sidecar path (LWW convergence survives).
+        // `tree_path` needs no guard: it is the path of a real blob that
+        // `read_file_from_tree` resolved out of the loser's committed tree (only
+        // real entry names — never `..`/absolute), and `loser_ts` is an `i64`.
+        //
         // Spec-faithful literal suffix — appended even when `<path>` already ends
         // in `.md`. A sibling of the resolved tree path, so it lands in the same
         // directory as the file it preserves.
-        let sidecar_path = format!("{tree_path}.conflict-{loser_device}-{loser_ts}.md");
+        let safe_device = sanitize_name_component(&loser_device);
+        let sidecar_path = format!("{tree_path}.conflict-{safe_device}-{loser_ts}.md");
 
         let mut snapshot = materialize_tree(repo, &session, winner_tree)?;
         snapshot
@@ -290,6 +304,7 @@ mod tests {
     use softfig_vcs::{Intent, Repo, WalkSnapshot};
 
     use super::{resolve_sync_conflict, ConflictResolution, ConflictSides};
+    use crate::actions::conventions::sanitize_name_component;
     use crate::config::KeeperConfig;
     use crate::daemon::DaemonInner;
     use crate::handlers::resolve_path_in_tree;
@@ -328,6 +343,23 @@ mod tests {
         let mut snap = WalkSnapshot::empty();
         snap.insert_file(Path::new(PATH), 0o100644, content.to_vec())
             .unwrap();
+        let commit = repo
+            .commit_snapshot_to(ref_name, &session, snap, Intent::init("genesis"))
+            .unwrap();
+        repo.db().get_commit(&commit).unwrap().root_tree
+    }
+
+    /// Commit a set of `(path, content)` files onto `ref_name`, returning the
+    /// new tip tree — the multi-file analogue of [`commit_file`], used to plant
+    /// a second tracked file a hostile sidecar path might try to overwrite.
+    fn commit_files(inner: &mut DaemonInner, ref_name: &str, files: &[(&str, &[u8])]) -> Hash {
+        let session = inner.session.clone().unwrap();
+        let repo = inner.repo.as_mut().unwrap();
+        let mut snap = WalkSnapshot::empty();
+        for (path, content) in files {
+            snap.insert_file(Path::new(path), 0o100644, content.to_vec())
+                .unwrap();
+        }
         let commit = repo
             .commit_snapshot_to(ref_name, &session, snap, Intent::init("genesis"))
             .unwrap();
@@ -504,6 +536,102 @@ mod tests {
             inner.repo.as_ref().unwrap().tip_of(SHARED_REF).unwrap(),
             tip_before,
             "a refused resolution must NOT advance the chain",
+        );
+    }
+
+    #[test]
+    fn hostile_loser_device_name_is_sanitized_and_convergent() {
+        // Slice 006: the LOSING side's device name reaches the in-tree sidecar
+        // path. When the local edit wins, `loser_device` is the peer's verbatim
+        // self-reported `writer_device` — a `/` or `..` in it must not relocate
+        // the sidecar, and the sanitized path must be identical on both nodes
+        // (LWW convergence must survive the guard).
+        for hostile in ["a/b", "../escape", "x/../../y"] {
+            let mut sidecars = Vec::new();
+            for _ in 0..2 {
+                // Two independent nodes, identical inputs → identical sidecar.
+                let garden = tempfile::tempdir().unwrap();
+                let (mut inner, _s) = unlocked_inner(garden.path());
+                let local_tree = commit_file(&mut inner, SHARED_REF, b"winner");
+                let incoming_tree = commit_file(&mut inner, "chain/peer-src", b"loser bytes");
+                // local ts newer → local wins → loser = incoming (hostile name).
+                let s = sides(&inner, incoming_tree, hostile, 100, local_tree, "thisbox", 200);
+                let sidecar = match resolve_sync_conflict(&mut inner, s).unwrap() {
+                    ConflictResolution::Resolved { loser_sidecar, .. } => loser_sidecar,
+                    other => panic!("expected Resolved, got {other:?}"),
+                };
+                // One safe component appended under `proj/a.md`: uses the
+                // sanitized device name, injects no separator, climbs nowhere.
+                assert_eq!(
+                    sidecar,
+                    format!("proj/a.md.conflict-{}-100.md", sanitize_name_component(hostile)),
+                    "sidecar uses the sanitized device component ({hostile})",
+                );
+                assert_eq!(
+                    sidecar.matches('/').count(),
+                    "proj/a.md".matches('/').count(),
+                    "no separator injected by the device name ({hostile})",
+                );
+                assert!(
+                    !sidecar.split('/').any(|c| c == ".."),
+                    "no parent-traversal component ({hostile})",
+                );
+                // Loser bytes land at the sanitized sidecar; winner stays live.
+                assert_eq!(
+                    read_tip_file(&inner, SHARED_REF, &sidecar).as_deref(),
+                    Some(&b"loser bytes"[..]),
+                    "loser recoverable at the sanitized sidecar ({hostile})",
+                );
+                assert_eq!(
+                    read_tip_file(&inner, SHARED_REF, PATH).as_deref(),
+                    Some(&b"winner"[..]),
+                    "winner content live ({hostile})",
+                );
+                sidecars.push(sidecar);
+            }
+            assert_eq!(sidecars[0], sidecars[1], "convergent sidecar path for {hostile}");
+        }
+    }
+
+    #[test]
+    fn hostile_loser_device_cannot_overwrite_a_tracked_file() {
+        // Pre-fix, a `loser_device` of `x/../secret` would have made the sidecar
+        // path `proj/a.md.conflict-x/../secret-100.md` → `insert_file` splits on
+        // `/`, honors `..`, and (no exists-check) would clobber the tracked
+        // `proj/secret-100.md` in the winner tree. Post-sanitization the device
+        // name is one component, so the tracked file is untouched.
+        let garden = tempfile::tempdir().unwrap();
+        let (mut inner, _session) = unlocked_inner(garden.path());
+
+        // Winner (local) tree carries the conflicting file AND a bystander file.
+        let local_tree = commit_files(
+            &mut inner,
+            SHARED_REF,
+            &[("proj/a.md", b"winner"), ("proj/secret-100.md", b"do not overwrite")],
+        );
+        let incoming_tree = commit_file(&mut inner, "chain/peer-src", b"loser bytes");
+
+        // local ts newer → local wins → loser = incoming with the hostile name.
+        let s = sides(&inner, incoming_tree, "x/../secret", 100, local_tree, "thisbox", 200);
+        let sidecar = match resolve_sync_conflict(&mut inner, s).unwrap() {
+            ConflictResolution::Resolved { kept_device, loser_sidecar, .. } => {
+                assert_eq!(kept_device, "thisbox");
+                loser_sidecar
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        };
+
+        // The bystander file keeps its content — NOT the loser's bytes.
+        assert_eq!(
+            read_tip_file(&inner, SHARED_REF, "proj/secret-100.md").as_deref(),
+            Some(&b"do not overwrite"[..]),
+            "a hostile device name must not overwrite a tracked file",
+        );
+        // The sidecar lands at the sanitized sibling path with the loser bytes.
+        assert_eq!(sidecar, "proj/a.md.conflict-x_._secret-100.md");
+        assert_eq!(
+            read_tip_file(&inner, SHARED_REF, &sidecar).as_deref(),
+            Some(&b"loser bytes"[..]),
         );
     }
 }
