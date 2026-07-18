@@ -10,8 +10,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use softfig_vcs::{fsck as run_fsck, log_collect, Intent, Repo};
 use softfig_fuse::SealedQuery;
+use softfig_net::{DeviceState, WriteTurn};
 use softfig_ipc::verbs::{
-    CommitArgs, CommitReply, DiscoverListReply, FsckReply, HostedChain, LogArgs, LogEntry, LogReply,
+    CommitArgs, CommitReply, CoordinationStatusReply, DiscoverListReply, FsckReply, HostedChain,
+    LogArgs, LogEntry, LogReply, PeerCoordRow, TurnCoordRow,
     MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
     PairRemoveReply, PendingPairing, RelockMintArgs, RelockMintReply, RelockRedeemArgs,
@@ -1433,6 +1435,83 @@ pub fn replica_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResul
     .unwrap())
 }
 
+/// `coordination_status({}) -> {local_device_id, local_state, peers, turns}`.
+/// A read-only snapshot of the daemon's live write-turn + device-state
+/// coordination surface — the turn holder per shared chain plus the local and
+/// each peer's device state. This state lives only in the running daemon (it is
+/// cleared on lock) so `list_tree`/`read_file` can't reach it; hence a dedicated
+/// read verb. Require Unlocked; no mutation, no commit. v1 exposes the turn
+/// holder only (waiter-queue depth deferred). See
+/// `decision-m5e-coordination-status-verb`.
+pub fn coordination_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    // The session is present under Unlocked (require_unlocked guarantees it); its
+    // identity pubkey IS this device's coordination id — the same bytes peers key
+    // their `DeviceStateAnnounce`s on — so it needs no separate stored field.
+    let local_device_id = inner
+        .session
+        .as_ref()
+        .expect("unlocked")
+        .identity_pubkey()
+        .to_bytes();
+    let reply = marshal_coordination_status(
+        local_device_id,
+        inner.device_state,
+        &inner.peer_states,
+        &inner.write_turns,
+    );
+    Ok(serde_json::to_value(reply).unwrap())
+}
+
+/// The wire/display label for a coordination [`DeviceState`] — the same three
+/// tokens the announce's `as_u32` encoding names (0 offline / 1 online-idle /
+/// 2 online-active).
+fn device_state_label(state: DeviceState) -> &'static str {
+    match state {
+        DeviceState::Offline => "offline",
+        DeviceState::OnlineIdle => "online-idle",
+        DeviceState::OnlineActive => "online-active",
+    }
+}
+
+/// Pure marshaller for [`coordination_status`]: fold the three live sources into
+/// the read-only reply. Split out from the handler (this crate's pure-vs-daemon
+/// idiom, e.g. `decide_turn_gate`) so the reply shape is unit-testable without a
+/// live session. Both vecs are sorted — the source maps are unordered, so this
+/// gives a stable render and deterministic assertions.
+fn marshal_coordination_status(
+    local_device_id: [u8; 32],
+    local_state: DeviceState,
+    peer_states: &std::collections::HashMap<[u8; 32], crate::net::PeerAnnounce>,
+    write_turns: &std::collections::HashMap<String, WriteTurn>,
+) -> CoordinationStatusReply {
+    let mut peers: Vec<PeerCoordRow> = peer_states
+        .iter()
+        .map(|(id, announce)| PeerCoordRow {
+            device_id: hex::encode(id),
+            state: device_state_label(announce.state).to_string(),
+        })
+        .collect();
+    peers.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+
+    let mut turns: Vec<TurnCoordRow> = write_turns
+        .iter()
+        .map(|(chain, turn)| TurnCoordRow {
+            chain: chain.clone(),
+            holder_device_id: turn.holder().map(hex::encode),
+        })
+        .collect();
+    turns.sort_by(|a, b| a.chain.cmp(&b.chain));
+
+    CoordinationStatusReply {
+        local_device_id: hex::encode(local_device_id),
+        local_state: device_state_label(local_state).to_string(),
+        peers,
+        turns,
+    }
+}
+
 /// Resolve a fingerprint query (full or unique prefix) to a single ring
 /// member's full device-id fingerprint, or an error if none / ambiguous.
 fn resolve_ring_fingerprint(
@@ -2327,5 +2406,65 @@ mod tests {
             let e = validate_repo_path(&root(), p).unwrap_err();
             assert!(e.contains(".."), "{p}: {e}");
         }
+    }
+
+    // A device id filled with a single byte, so its hex is easy to eyeball.
+    fn dev(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    #[test]
+    fn coordination_status_marshals_local_peers_and_turns() {
+        use std::collections::HashMap;
+
+        let local = dev(0xaa);
+
+        // Two peers with distinct announced states, inserted out of id order so
+        // the sort is actually exercised.
+        let mut peer_states: HashMap<[u8; 32], crate::net::PeerAnnounce> = HashMap::new();
+        peer_states.insert(
+            dev(0x02),
+            crate::net::PeerAnnounce { state: DeviceState::OnlineActive, unlocked: true, seq: 7 },
+        );
+        peer_states.insert(
+            dev(0x01),
+            crate::net::PeerAnnounce { state: DeviceState::OnlineIdle, unlocked: false, seq: 3 },
+        );
+
+        // One held chain (holder = dev(0x09)) + one free chain, again out of order.
+        let mut held = WriteTurn::whole_subtree();
+        held.request(dev(0x09), 5);
+        held.poll(1_000);
+        assert_eq!(held.holder(), Some(dev(0x09)), "turn should be granted after poll");
+        let free = WriteTurn::whole_subtree();
+        let mut write_turns: HashMap<String, WriteTurn> = HashMap::new();
+        write_turns.insert("shared/projects".to_string(), held);
+        write_turns.insert("shared/journals".to_string(), free);
+
+        let reply = marshal_coordination_status(
+            local,
+            DeviceState::OnlineActive,
+            &peer_states,
+            &write_turns,
+        );
+
+        // Local identity + state.
+        assert_eq!(reply.local_device_id, hex::encode(local));
+        assert_eq!(reply.local_state, "online-active");
+
+        // Peers sorted by device-id hex: dev(0x01) before dev(0x02).
+        assert_eq!(reply.peers.len(), 2);
+        assert_eq!(reply.peers[0].device_id, hex::encode(dev(0x01)));
+        assert_eq!(reply.peers[0].state, "online-idle");
+        assert_eq!(reply.peers[1].device_id, hex::encode(dev(0x02)));
+        assert_eq!(reply.peers[1].state, "online-active");
+
+        // Turns sorted by chain name: "shared/journals" (free) before
+        // "shared/projects" (held); free turn marshals a null holder.
+        assert_eq!(reply.turns.len(), 2);
+        assert_eq!(reply.turns[0].chain, "shared/journals");
+        assert_eq!(reply.turns[0].holder_device_id, None);
+        assert_eq!(reply.turns[1].chain, "shared/projects");
+        assert_eq!(reply.turns[1].holder_device_id, Some(hex::encode(dev(0x09))));
     }
 }

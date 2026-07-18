@@ -274,6 +274,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::REPLICA_GRANT => handlers::replica_grant(daemon, req.args),
         op::REPLICA_REVOKE => handlers::replica_revoke(daemon, req.args),
         op::REPLICA_STATUS => handlers::replica_status(daemon, req.args),
+        op::COORDINATION_STATUS => handlers::coordination_status(daemon, req.args),
         op::SHARED_SUBTREE_ADD => handlers::shared_subtree_add(daemon, req.args),
         op::SHARED_SUBTREE_REMOVE => handlers::shared_subtree_remove(daemon, req.args),
         op::SHARED_SUBTREE_ENABLE => handlers::shared_subtree_enable(daemon, req.args),
