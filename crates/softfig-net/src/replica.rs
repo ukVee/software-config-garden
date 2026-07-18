@@ -471,12 +471,34 @@ where
     })
 }
 
+/// A fetched tree that can't be stored yet. `pending` counts its distinct
+/// children (subtrees + blobs) not yet present in the mirror; when it reaches
+/// zero the whole subtree is stored, so the tree can be too. Only these *open*
+/// trees are buffered — never every tree in the backfill at once.
+struct OpenTree {
+    data: TreeData,
+    pending: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Peak size of the open-tree buffer on the last `drive_backfill` run on this
+    /// thread — lets `pipelined_tree_buffer_stays_bounded` assert the buffer stays
+    /// bounded independent of history size. Test-only; `drive_backfill` runs on the
+    /// caller's own thread (only the request-writer is spawned), so the value lands
+    /// on the thread that called `pull_replication_pipelined`.
+    static PEAK_OPEN_TREES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The full-duplex backfill loop. Seeds the request frontier with the missing
 /// commits' root trees, then keeps [`PIPELINE_WINDOW`] requests in flight —
-/// storing each object as it arrives and expanding each tree's missing children
-/// into the frontier — until the frontier and the in-flight queue both drain.
-/// Trees are buffered and stored **post-order** afterward (their objects and
-/// subtrees are all present by then); commits apply oldest→newest; the tip
+/// storing each object as it arrives and storing each **tree the moment its last
+/// outstanding child is stored** (an outstanding-child refcount per open tree +
+/// a ready-cascade). It descends **depth-first** — a discovered child is
+/// scheduled ahead of not-yet-explored roots — so only the open-tree frontier is
+/// buffered, never every fetched tree (peak ≈ O(window + open-tree depth), not
+/// O(all unique trees)). Trees still land subtree-before-parent (a stored tree
+/// implies its whole subtree is present); commits apply oldest→newest; the tip
 /// advances last — the exact order [`pull_replication`] applies.
 fn drive_backfill<R: Read>(
     reader: &mut NoiseReader<R>,
@@ -492,7 +514,13 @@ fn drive_backfill<R: Read>(
     let mut frontier: VecDeque<Want> = VecDeque::new();
     let mut outstanding: VecDeque<Want> = VecDeque::new();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
-    let mut trees: HashMap<[u8; 32], TreeData> = HashMap::new();
+    // Fetched-but-unstored trees (the open frontier) + reverse edges from a
+    // not-yet-present child to the open trees waiting on it. Bounded by the DFS
+    // descent, not the total tree count.
+    let mut open: HashMap<[u8; 32], OpenTree> = HashMap::new();
+    let mut waiters: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    #[cfg(test)]
+    let mut peak_open = 0usize;
 
     // Seed: every missing commit's root tree the mirror lacks. Dedup so a tree
     // shared across commits is requested only once.
@@ -536,30 +564,44 @@ fn drive_backfill<R: Read>(
                 if to_hash32(&t.hash)? != hash {
                     return Err(NetError::Protocol("tree_data hash does not match request"));
                 }
-                // Discover the tree's missing children; dedup against what we've
-                // already scheduled this run and what the mirror already holds.
+                // Discover the tree's not-yet-present children. Each distinct
+                // missing child is one dependency: schedule it (dedup against what
+                // we've already requested + what the mirror holds), record a
+                // reverse edge, and count it. Children go to the *front* so we
+                // finish this subtree before opening unrelated roots (depth-first
+                // keeps the open buffer bounded).
+                let mut pending = 0usize;
+                let mut dep_seen: HashSet<[u8; 32]> = HashSet::new();
                 for entry in &t.entries {
                     let target = to_hash32(&entry.target)?;
-                    let child = match entry.kind.as_str() {
-                        "tree" => {
-                            if sink.has_tree(&target) {
-                                continue;
-                            }
-                            Want::Tree(target)
-                        }
-                        "blob" => {
-                            if sink.has_object(&target) {
-                                continue;
-                            }
-                            Want::Object(target)
-                        }
+                    let (present, child) = match entry.kind.as_str() {
+                        "tree" => (sink.has_tree(&target), Want::Tree(target)),
+                        "blob" => (sink.has_object(&target), Want::Object(target)),
                         _ => return Err(NetError::Protocol("tree entry has unknown kind")),
                     };
+                    // A child already in the mirror, or one this tree lists twice
+                    // (same content address), is not an extra dependency.
+                    if present || !dep_seen.insert(target) {
+                        continue;
+                    }
+                    pending += 1;
+                    waiters.entry(target).or_default().push(hash);
                     if seen.insert(target) {
-                        frontier.push_back(child);
+                        frontier.push_front(child);
                     }
                 }
-                trees.insert(hash, t);
+                if pending == 0 {
+                    // Subtree already complete: store now and satisfy any parents.
+                    sink.store_tree(&t)?;
+                    summary.trees += 1;
+                    cascade(sink, &mut open, &mut waiters, hash, &mut summary)?;
+                } else {
+                    open.insert(hash, OpenTree { data: t, pending });
+                    #[cfg(test)]
+                    {
+                        peak_open = peak_open.max(open.len());
+                    }
+                }
             }
             (Want::Object(hash), Some(frame::Kind::ObjectData(o))) => {
                 if !o.found {
@@ -570,6 +612,9 @@ fn drive_backfill<R: Read>(
                 }
                 sink.store_object(&hash, &o.payload)?;
                 summary.objects += 1;
+                // The blob is present now: any tree that was waiting on it may be
+                // ready to store.
+                cascade(sink, &mut open, &mut waiters, hash, &mut summary)?;
             }
             _ => {
                 return Err(NetError::Protocol(
@@ -579,50 +624,64 @@ fn drive_backfill<R: Read>(
         }
     }
 
-    // Every object and subtree is now stored/buffered. Store trees post-order
-    // (subtree before the tree that references it), then commits oldest→newest,
-    // then advance the tip.
-    let mut stored: HashSet<[u8; 32]> = HashSet::new();
-    for c in missing {
-        let root = to_hash32(&c.root_tree)?;
-        store_tree_postorder(sink, &trees, &root, &mut stored, &mut summary)?;
+    // Incremental storage means every fetched tree is stored the moment its
+    // subtree completes, so nothing may remain open once the pipe drains. A
+    // leftover means the source served a tree whose child it never delivered.
+    if !open.is_empty() {
+        return Err(NetError::Protocol(
+            "backfill drained with trees still unstored (inconsistent subtree from source)",
+        ));
     }
+
+    // Commits apply oldest -> newest; the tip advances last — the exact order
+    // `pull_replication` applies.
     for c in missing.iter().rev() {
         sink.store_commit(c)?;
         summary.commits += 1;
     }
     sink.advance_tip(&announced_tip, height)?;
     summary.new_tip = Some(announced_tip);
+    #[cfg(test)]
+    PEAK_OPEN_TREES.with(|c| c.set(peak_open));
     Ok(summary)
 }
 
-/// Store the subtree rooted at `hash` post-order (descendants first) from the
-/// trees buffered during the pipelined fetch — the same invariant
-/// [`ensure_tree`] preserves, so a stored tree still implies its whole subtree
-/// is present. A tree already in the mirror (or already stored this pass)
-/// short-circuits.
-fn store_tree_postorder(
+/// A child (tree or object) just became present in the mirror: decrement every
+/// open tree waiting on it, store any tree whose last child is now present, and
+/// repeat for that newly-stored tree's own parents — a cascade run to a fixpoint
+/// over an explicit worklist (the content-addressed tree DAG is acyclic, so it
+/// terminates). Stores subtree-before-parent, preserving the invariant that a
+/// stored tree implies its whole subtree is present.
+fn cascade(
     sink: &mut dyn ReplicaSink,
-    trees: &std::collections::HashMap<[u8; 32], TreeData>,
-    hash: &[u8; 32],
-    stored: &mut std::collections::HashSet<[u8; 32]>,
+    open: &mut std::collections::HashMap<[u8; 32], OpenTree>,
+    waiters: &mut std::collections::HashMap<[u8; 32], Vec<[u8; 32]>>,
+    first: [u8; 32],
     summary: &mut PullSummary,
 ) -> Result<()> {
-    if stored.contains(hash) || sink.has_tree(hash) {
-        return Ok(());
-    }
-    let tree = trees
-        .get(hash)
-        .ok_or(NetError::Protocol("post-order store: a needed tree was not fetched"))?;
-    for entry in &tree.entries {
-        if entry.kind.as_str() == "tree" {
-            let child = to_hash32(&entry.target)?;
-            store_tree_postorder(sink, trees, &child, stored, summary)?;
+    let mut present: Vec<[u8; 32]> = vec![first];
+    while let Some(done) = present.pop() {
+        let Some(parents) = waiters.remove(&done) else {
+            continue;
+        };
+        for p in parents {
+            let ready = {
+                let ot = open.get_mut(&p).ok_or(NetError::Protocol(
+                    "replication refcount references an unknown open tree",
+                ))?;
+                ot.pending -= 1;
+                ot.pending == 0
+            };
+            if ready {
+                let entry = open
+                    .remove(&p)
+                    .expect("a ready tree is still in the open set");
+                sink.store_tree(&entry.data)?;
+                summary.trees += 1;
+                present.push(p); // now present for its own parents
+            }
         }
     }
-    sink.store_tree(tree)?;
-    stored.insert(*hash);
-    summary.trees += 1;
     Ok(())
 }
 
@@ -1249,6 +1308,58 @@ mod tests {
         assert_eq!(sink.trees, chain.trees);
         assert_eq!(summary.objects as usize, chain.objects.len());
         assert_eq!(summary.trees as usize, chain.trees.len());
+    }
+
+    #[test]
+    fn pipelined_tree_buffer_stays_bounded() {
+        // A long, shallow history: many commits, each a distinct single-file tree.
+        // The old driver buffered *every* fetched tree until the end (peak = one
+        // per commit); the incremental driver stores each tree as soon as its blob
+        // lands, so the open-tree buffer stays ~window-bounded no matter how long
+        // the history is.
+        let n = PIPELINE_WINDOW * 4;
+        let mut chain = Chain::default();
+        for i in 0..n {
+            chain.commit(format!("commit-{i}").as_bytes());
+        }
+        let tip = chain.tip.unwrap();
+        let total_trees = chain.trees.len();
+        assert!(
+            total_trees >= 4 * PIPELINE_WINDOW,
+            "the test needs many more trees ({total_trees}) than the window to be meaningful"
+        );
+
+        PEAK_OPEN_TREES.with(|c| c.set(0));
+        let (res, sink) = run_pipelined(
+            chain.clone(),
+            MockSink {
+                announce_ok: true,
+                ..Default::default()
+            },
+        );
+        let summary = res.unwrap();
+        let peak = PEAK_OPEN_TREES.with(|c| c.get());
+
+        // Correct + byte-identical mirror, and the summary counts every unique
+        // (the sequential-equivalence invariant, on a many-tree chain).
+        assert_eq!(summary.new_tip, Some(tip));
+        assert_eq!(sink.stored_tip(), Some(tip));
+        assert_eq!(summary.commits as usize, n);
+        assert_eq!(sink.trees, chain.trees);
+        assert_eq!(sink.objects, chain.objects);
+        assert_eq!(summary.trees as usize, total_trees);
+        assert_eq!(summary.objects as usize, chain.objects.len());
+
+        // The headline: peak tree buffer is bounded by the in-flight window, NOT
+        // by the O(history) total-tree count.
+        assert!(
+            peak <= PIPELINE_WINDOW,
+            "open-tree buffer peaked at {peak}, must stay within the {PIPELINE_WINDOW}-request window"
+        );
+        assert!(
+            peak < total_trees,
+            "buffer ({peak}) must stay bounded well below the total tree count ({total_trees})"
+        );
     }
 
     #[test]
