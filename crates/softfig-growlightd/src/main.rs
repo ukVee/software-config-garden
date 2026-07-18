@@ -129,19 +129,61 @@ fn main() -> Result<()> {
     // outright (the sender may have exited by read time — correlate by uid/time).
     let shutdown_daemon = handle.daemon.clone();
     let mut signals = SignalsInfo::<WithOrigin>::new([SIGTERM, SIGINT])?;
+    // Whether this signal is parking a *live* fleet. Captured (Copy) before the
+    // handler closure so a clean stop is never *silent* about its blast radius —
+    // the resilience half of task 032. A graceful signal handler exits 0, so
+    // systemd's `Restart=on-failure` will NOT revive growlightd; the fleet then
+    // stays parked until the next garden unlock (keeperd relaunches growlightd
+    // on unlock) or an explicit restart. We log that consequence + the recovery
+    // lever loudly. We deliberately do NOT auto-re-arm (exit non-zero to force a
+    // Restart) — fighting an operator's deliberate stop is a behaviour change
+    // that is the human's call; see the task's criterion-4 decision.
+    let fleet_running = drive_loop.is_some();
+    let member_count = fleet_config.members.len();
     thread::Builder::new()
         .name("growlightd-signal".into())
         .spawn(move || {
             if let Some(origin) = signals.forever().next() {
                 match origin.process {
-                    Some(p) => eprintln!(
-                        "softfig-growlightd: caught signal {} from pid {} (uid {}); shutting down",
-                        origin.signal, p.pid, p.uid,
-                    ),
+                    Some(p) => {
+                        // /proc/<pid>/comm names the sender while it is still
+                        // alive — a StopUnit job's sender is the user manager
+                        // (`systemd`); a direct kill names the tool. The sender
+                        // may have exited by read time, leaving only pid/uid.
+                        match std::fs::read_to_string(format!("/proc/{}/comm", p.pid))
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                        {
+                            Some(comm) => eprintln!(
+                                "softfig-growlightd: caught signal {} from pid {} ({}, uid {}); shutting down",
+                                origin.signal, p.pid, comm, p.uid,
+                            ),
+                            None => eprintln!(
+                                "softfig-growlightd: caught signal {} from pid {} (uid {}); shutting down",
+                                origin.signal, p.pid, p.uid,
+                            ),
+                        }
+                    }
                     None => eprintln!(
                         "softfig-growlightd: caught signal {} (sender unknown); shutting down",
                         origin.signal,
                     ),
+                }
+                if fleet_running {
+                    // Greppable marker `fleet-park`: the difference between a
+                    // silent park and an explained one (task 032). Names the
+                    // blast radius, the no-auto-restart consequence, and the
+                    // recovery lever so the journal alone tells the operator why
+                    // the fleet went dark and how to bring it back.
+                    eprintln!(
+                        "softfig-growlightd: [fleet-park] this clean stop is parking the ARMED fleet \
+                         ({} member(s)) — a graceful exit is exit 0, so Restart=on-failure will NOT \
+                         revive it; the fleet stays parked until the next garden unlock or an explicit \
+                         `systemctl --user restart softfig-growlightd.service` / `softfig daemon cycle`. \
+                         If this stop was not an intended lock/cycle, investigate the sender logged above.",
+                        member_count,
+                    );
                 }
                 shutdown_daemon.request_shutdown();
             }
