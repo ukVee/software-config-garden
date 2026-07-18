@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(d.notifier_count(Channel::Log), 0);
 
         // A fresh identity fires: GUI delivers, the deregistered log does not.
-        let chans = d.notify(&NotifyEvent::Usage, 0);
+        let chans = d.notify(&NotifyEvent::Usage { pct: 97 }, 0);
         assert!(chans.contains(&Channel::Gui) && chans.contains(&Channel::Log));
         assert!(sub.try_recv().is_ok(), "GUI still receives");
         assert!(spy.lines().is_empty(), "the deregistered log channel receives nothing");

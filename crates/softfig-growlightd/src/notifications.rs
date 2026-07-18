@@ -68,7 +68,15 @@ pub enum NotifyEvent {
     /// ([`USAGE_ALERT_PCT`](crate::usage::USAGE_ALERT_PCT), §7 refined
     /// 2026-06-23). One dedup identity — the rising budget announces it once, to
     /// the phone (it is near the halt rail).
-    Usage,
+    Usage {
+        /// The LIVE fleet-aggregate 5h reserve % at fire time — the drive loop
+        /// reads it off [`UsageAggregator::aggregate_or_fresh`](crate::usage::UsageAggregator::aggregate_or_fresh),
+        /// NOT the constant rung, so the log/alert shows the real number a
+        /// stale-or-pinned value would betray (task 031). NOT part of the dedup
+        /// identity — [`dedup_key`](Self::dedup_key) keys on the class alone, so a
+        /// rising budget still announces exactly once per cooldown window.
+        pct: u8,
+    },
     /// An item parked `BLOCKED_ON_HUMAN` (§6 pivot-on-block) — needs a human
     /// answer before it can proceed.
     BlockedOnHuman {
@@ -156,7 +164,7 @@ impl NotifyEvent {
     /// human decision; everything else is GUI/log only.
     pub fn is_human_attention(&self) -> bool {
         match self {
-            Self::Usage
+            Self::Usage { .. }
             | Self::BlockedOnHuman { .. }
             | Self::QueueEmpty { .. }
             | Self::AgentCrashed { .. }
@@ -185,7 +193,7 @@ impl NotifyEvent {
     /// keys never suppress each other.
     pub fn dedup_key(&self) -> String {
         match self {
-            Self::Usage => "usage".to_string(),
+            Self::Usage { .. } => "usage".to_string(),
             Self::BlockedOnHuman { item } => format!("blocked:{item}"),
             Self::QueueEmpty { queue } => format!("queue-empty:{queue}"),
             Self::SliceComplete { part } => format!("slice-complete:{part}"),
@@ -203,7 +211,7 @@ impl NotifyEvent {
     /// formatting; lives on the event because the event owns its own meaning.
     pub fn summary(&self) -> String {
         match self {
-            Self::Usage => format!("5h budget at {}%", crate::usage::USAGE_ALERT_PCT),
+            Self::Usage { pct } => format!("5h budget at {pct}%"),
             Self::BlockedOnHuman { item } => {
                 format!("`{item}` is blocked on a human decision")
             }
@@ -292,7 +300,7 @@ mod tests {
     #[test]
     fn gui_and_log_always_fire_for_every_event() {
         let events = [
-            NotifyEvent::Usage,
+            NotifyEvent::Usage { pct: 97 },
             blocked("004"),
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),
@@ -362,7 +370,7 @@ mod tests {
     fn human_attention_set_routes_to_phone_others_do_not() {
         // Human-attention: budget near the rail, blocked, drained, crashed.
         for e in [
-            NotifyEvent::Usage,
+            NotifyEvent::Usage { pct: 97 },
             blocked("004"),
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),
@@ -443,18 +451,18 @@ mod tests {
         let mut p = NotifyPolicy::with_cooldown(1000);
         // First fire routes everywhere, phone included (near-exhaustion).
         assert_eq!(
-            p.decide(&NotifyEvent::Usage, 0),
+            p.decide(&NotifyEvent::Usage { pct: 97 }, 0),
             vec![Channel::Gui, Channel::Log, Channel::Phone]
         );
         // A repeat inside the cooldown is suppressed — no re-spam of a sustained 97%.
-        assert!(p.decide(&NotifyEvent::Usage, 1).is_empty());
-        assert!(p.decide(&NotifyEvent::Usage, 999).is_empty());
+        assert!(p.decide(&NotifyEvent::Usage { pct: 97 }, 1).is_empty());
+        assert!(p.decide(&NotifyEvent::Usage { pct: 97 }, 999).is_empty());
     }
 
     /// Dedup keys encode class + subject so the identity is stable and unique.
     #[test]
     fn dedup_keys_distinguish_class_and_subject() {
-        assert_eq!(NotifyEvent::Usage.dedup_key(), "usage");
+        assert_eq!(NotifyEvent::Usage { pct: 97 }.dedup_key(), "usage");
         assert_eq!(blocked("004").dedup_key(), "blocked:004");
         assert_ne!(blocked("004").dedup_key(), blocked("005").dedup_key());
         assert_eq!(
@@ -472,7 +480,7 @@ mod tests {
     #[test]
     fn every_event_summary_is_non_empty() {
         for e in [
-            NotifyEvent::Usage,
+            NotifyEvent::Usage { pct: 97 },
             blocked("004"),
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),
@@ -514,8 +522,8 @@ mod tests {
 
         // `with_stderr_tail` is a no-op on a non-crash event.
         assert_eq!(
-            NotifyEvent::Usage.with_stderr_tail(vec!["x".to_string()]),
-            NotifyEvent::Usage
+            NotifyEvent::Usage { pct: 97 }.with_stderr_tail(vec!["x".to_string()]),
+            NotifyEvent::Usage { pct: 97 }
         );
     }
 }

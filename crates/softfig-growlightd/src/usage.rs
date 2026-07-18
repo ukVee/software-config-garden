@@ -282,7 +282,7 @@ mod tests {
         // the shared meter).
         for five_h in [80u8, 90, 96, 98, 99] {
             agg.observe(sample("a1", five_h, 5));
-            if agg.fleet_alert() && !d.notify(&NotifyEvent::Usage, now).is_empty() {
+            if agg.fleet_alert() && !d.notify(&NotifyEvent::Usage { pct: five_h }, now).is_empty() {
                 fires += 1;
             }
         }
@@ -298,14 +298,14 @@ mod tests {
 
         assert!(agg.fleet_alert());
         assert!(
-            !d.notify(&NotifyEvent::Usage, 0).is_empty(),
+            !d.notify(&NotifyEvent::Usage { pct: 98 }, 0).is_empty(),
             "the reached rung fires once"
         );
         // A later sample still over 97 re-reaches the rung but does not re-fire.
         agg.observe(sample("a1", 99, 5));
         assert!(agg.fleet_alert());
         assert!(
-            d.notify(&NotifyEvent::Usage, 1).is_empty(),
+            d.notify(&NotifyEvent::Usage { pct: 99 }, 1).is_empty(),
             "the already-announced rung stays quiet"
         );
     }

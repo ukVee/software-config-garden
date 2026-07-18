@@ -859,16 +859,26 @@ impl DriveLoop {
         let fleet = self.fleet.clone();
 
         // 0. Refresh the cross-agent usage aggregate BEFORE the admission gate
-        //    (spec §7): fold in each live agent's latest reading of the shared
-        //    pool, and forget a stopped agent's stale reading so it can never pin
-        //    the aggregate after it leaves the fleet (see [`crate::usage`]).
+        //    (spec §7): fold in each LIVE agent's latest reading of the shared pool,
+        //    and forget every non-running agent's reading so a stale sample can never
+        //    pin the aggregate after that agent stops contributing (see [`crate::usage`]).
+        //    The liveness gate is the structural cure for the phantom-halt deadlock
+        //    (task 031): a crashed/down/exited/never-spawned/boundary-stopped agent is
+        //    not `is_running`, so its last (possibly near-full) reading is dropped
+        //    rather than re-observed every tick. Without it, a crash-time high sample
+        //    self-pins the fleet 5h reserve — only a running agent can report a fresh,
+        //    decayed reading, but admission is halted by that very reading, so no agent
+        //    can start to lower it. Dropping non-running samples means a re-rolled
+        //    session re-observes fresh, and an all-down fleet reads a clean (0,0).
         for member in &fleet {
             let agent = &member.spec.agent;
-            if self.stopped.contains(agent) {
+            if self.supervisor.is_running(agent) {
+                if let Some(budget) = self.samples.budget(agent) {
+                    self.aggregator
+                        .observe(UsageSample::new(agent.clone(), budget));
+                }
+            } else {
                 self.aggregator.forget(agent);
-            } else if let Some(budget) = self.samples.budget(agent) {
-                self.aggregator
-                    .observe(UsageSample::new(agent.clone(), budget));
             }
         }
         let budget = self.aggregator.aggregate_or_fresh();
@@ -984,10 +994,19 @@ impl DriveLoop {
                         // only on a crash — a healthy tick never touches stderr.
                         let event = event.with_stderr_tail(self.stderr.stderr_tail(agent));
                         report.crashes.push(event);
-                        // A retiring agent that crashes at its boundary stops here
-                        // rather than re-rolling.
+                        // Drop the crashed agent's last budget reading (symmetric with
+                        // the Retired/Completed/Blocked arms): a crash leaves a dead
+                        // session whose stale sample must never pin the fleet 5h
+                        // aggregate (task 031). Step-0's `is_running` gate already stops
+                        // re-observing it next tick; forgetting HERE drops it this tick
+                        // so the same-tick §9 usage alert (below) reflects the live
+                        // post-crash aggregate rather than the dead reading. A retiring
+                        // agent that crashes at its boundary is retired for good
+                        // (`retire()` also forgets).
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
+                        } else {
+                            self.aggregator.forget(agent);
                         }
                     }
                     PollOutcome::Reconnecting => {
@@ -1338,8 +1357,19 @@ impl DriveLoop {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: part.clone() }, now);
         }
-        if self.aggregator.fleet_alert() {
-            self.dispatcher.notify(&NotifyEvent::Usage, now);
+        // The §9 near-exhaustion alert carries the LIVE fleet-aggregate 5h reserve %
+        // (task 031), not the constant rung — so a genuinely-pinned or stale value is
+        // diagnosable straight from the log/bus (the old alert always rendered "97%",
+        // indistinguishable from a real 97%). The dispatcher's `usage` dedup still
+        // fires it exactly once per cooldown regardless of the number carried.
+        let agg = self.aggregator.aggregate_or_fresh();
+        if crate::usage::usage_alert_reached(agg) {
+            self.dispatcher.notify(
+                &NotifyEvent::Usage {
+                    pct: agg.session_5h_pct,
+                },
+                now,
+            );
         }
         // Sustained-offline alert policy (network-failsafe slice 003). A blip stays
         // QUIET — the pre-spawn gate holds spawns but NOTHING pages while offline is
@@ -2413,26 +2443,52 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(loop_.supervisor.policy().max_concurrent_agents, 3);
     }
 
-    /// An exhausted shared budget refuses a start (not a slot wait): the fleet
-    /// aggregate, fed from a1's hot reading of the shared pool, is over the rail.
+    /// An exhausted shared budget refuses a fresh start (not a slot wait): a LIVE
+    /// member's hot reading of the shared pool pushes the fleet aggregate over the
+    /// rail, so admission refuses another member's start on `Budget5h`. Post-task-031
+    /// the gating reading must come from a *running* contributor — a not-yet-started
+    /// agent's injected sample no longer gates (only a live agent reads the shared
+    /// meter), so the hot reading is staged from a1 while it runs.
     #[test]
     fn an_exhausted_budget_refuses_the_start() {
-        let (mut loop_, _d, backend, _probe) =
-            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
-        backend.set_budget("a1", hot_budget());
+        // cap 1: a1 runs first and reads the pool hot; a2 waits behind the cap.
+        let policy = Policy {
+            max_concurrent_agents: 1,
+            ..Policy::default()
+        };
+        let (mut loop_, d, backend, _probe) = make(
+            vec![member("a1", "qa"), member("a2", "qb")],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            policy,
+        );
 
-        let r = loop_.tick(0);
-        assert!(r.started.is_empty());
+        // Tick 0: a1 starts (cap 1); a2 is held behind the cap.
+        assert_eq!(loop_.tick(0).started.len(), 1);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // a1 — now running — reads the shared pool over the 5h rail, and the cap is
+        // raised so a2 is cap-eligible: only the exhausted aggregate can hold it now.
+        backend.set_budget("a1", hot_budget());
+        d.set_policy(Policy {
+            max_concurrent_agents: 2,
+            ..Policy::default()
+        });
+
+        let r = loop_.tick(1);
+        assert!(
+            r.started.is_empty(),
+            "a2's start is refused on the shared budget, not slot-waited",
+        );
         assert_eq!(
             r.held_starts,
             vec![HeldStart {
-                agent: "a1".into(),
+                agent: "a2".into(),
                 outcome: StartOutcome::Refused {
                     reason: RefuseReason::Budget5h
                 },
             }],
         );
-        assert_eq!(backend.spawn_count(), 0, "a refused start never spawns");
+        assert_eq!(backend.spawn_count(), 1, "a refused start never spawns");
     }
 
     /// A blocked pinned head does not halt the agent — it pivots to another queue,
@@ -3389,18 +3445,29 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(backend.spawns(), vec!["a1"]);
     }
 
-    /// Belt-and-suspenders: a budget that goes hot AFTER the fleet is running holds
-    /// a re-roll on admission (the cap never gates a roll, the budget rail does).
+    /// Belt-and-suspenders: a budget that goes hot AFTER the fleet is running holds a
+    /// re-roll on admission (the cap never gates a roll, the budget rail does). The
+    /// hot reading comes from a LIVE peer (a2) — post-task-031 the crashed member's
+    /// OWN pre-crash reading is dropped the moment it stops running, so it can never
+    /// self-pin its re-roll (that self-pin was the phantom-halt deadlock; the fleet's
+    /// legitimate cross-agent gate — a *live* peer over the rail — still holds).
     #[test]
     fn a_re_roll_is_held_when_the_budget_goes_hot() {
-        let (mut loop_, _d, backend, _probe) =
-            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
-        loop_.tick(0); // start a1
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa"), member("a2", "qb")],
+            vec![q("qa", &[("p1", "queued")]), q("qb", &[("p2", "queued")])],
+            Policy::default(), // cap 2 → both a1 and a2 run
+        );
+        loop_.tick(0); // start a1 + a2
+        assert_eq!(backend.spawns(), vec!["a1", "a2"]);
+
+        // a1 crashes (genuine — online, no network signature) → held for backoff.
         backend.set_health("a1", AgentHealth::Exited { code: 1 });
         loop_.tick(0); // crash → backoff not_before 2
 
-        backend.set_budget("a1", hot_budget());
-        backend.set_health("a1", AgentHealth::Alive { last_active: 2 });
+        // a2 stays alive and now reads the shared pool HOT: the live peer pins the
+        // aggregate over the rail, so a1's re-roll at its backoff boundary is refused.
+        backend.set_budget("a2", hot_budget());
         let r = loop_.tick(2);
         assert_eq!(
             r.rerolls,
@@ -3411,41 +3478,140 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 },
             }],
         );
-        assert_eq!(backend.spawn_count(), 1, "the held re-roll did not spawn");
+        assert_eq!(backend.spawn_count(), 2, "the held re-roll did not spawn a third session");
     }
 
-    /// Admission gates on the cross-agent aggregate (spec §7): one agent that saw
-    /// the shared pool deeper than the others pushes the per-field MAX over the 5h
-    /// rail, so EVERY start is refused on budget — not just that agent's.
+    /// TASK 031 finish-criterion (a) — the phantom-halt cure at the tick level: a
+    /// fleet-of-one member reads the shared pool HOT, then CRASHES. Its last (hot)
+    /// sample must NOT gate its own re-roll — else the fleet self-pins forever (only a
+    /// running agent can report a fresh, decayed reading, but admission is halted by
+    /// that very reading, so nothing can start to lower it). The crash drops the
+    /// sample (the symmetric crash-arm forget + the `is_running` step-0 gate), so the
+    /// aggregate reads fresh and the re-roll is ADMITTED at its backoff boundary.
+    /// Before the fix this re-roll was `HeldForAdmission { Budget5h }` every tick,
+    /// indefinitely — the 2026-07-06 live phantom halt.
+    #[test]
+    fn a_crashed_agents_stale_reading_never_holds_its_reroll() {
+        let (mut loop_, _d, backend, _probe) =
+            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+
+        // Tick 0: a1 starts. It then reads the shared pool HOT while running, and the
+        // per-tick refresh folds that reading into the fleet aggregate.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+        backend.set_budget("a1", hot_budget());
+        loop_.tick(1);
+        assert_eq!(
+            loop_.aggregator.aggregate_or_fresh(),
+            hot_budget(),
+            "while a1 runs, its hot reading (over the 85 rail) is in the aggregate",
+        );
+
+        // a1 crashes: its hot sample is dropped (symmetric with the boundary arms), so
+        // the fleet aggregate falls straight back to a fresh (0,0) — a crashed agent
+        // never pins it.
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        loop_.tick(2); // crash → forget + backoff not_before 4
+        assert_eq!(
+            loop_.aggregator.aggregate_or_fresh(),
+            BudgetUsage::new(0, 0),
+            "the crashed agent's stale hot reading is gone — no phantom pin (task 031)",
+        );
+
+        // At the backoff boundary the re-roll is ADMITTED (not budget-held): the dead
+        // sample cannot block the fresh session that would report a decayed reading.
+        let r = loop_.tick(4);
+        assert_eq!(
+            r.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "the crashed agent's stale reading does not block its own re-roll",
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a1"], "a fresh session spawned");
+    }
+
+    /// TASK 031 finish-criterion (b): an aggregate with NO live contributors reads a
+    /// fresh (0,0), never a frozen-high — even though the underlying sample SOURCE
+    /// still hands back the departed agent's stale reading (that cache is keeperd's,
+    /// cleared only when a new session reports). The aggregator's `is_running` gate,
+    /// not the sample source, is what stops a dead reading from pinning admission.
+    #[test]
+    fn an_all_down_fleet_aggregate_reads_fresh_not_frozen_high() {
+        let (mut loop_, _d, backend, _probe) =
+            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+
+        loop_.tick(0); // start a1
+        backend.set_budget("a1", hot_budget());
+        loop_.tick(1); // a1 (running) contributes its hot reading
+        assert_eq!(loop_.aggregator.agent_count(), 1);
+
+        // a1 crashes and stays down. The sample source STILL returns its stale hot
+        // reading, but no agent is live this tick, so the aggregate is a clean (0,0).
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        loop_.tick(2); // crash → a1 forgotten, down
+        assert_eq!(
+            backend.budget("a1"),
+            Some(hot_budget()),
+            "the sample source still holds the departed agent's stale reading",
+        );
+        assert_eq!(loop_.aggregator.agent_count(), 0, "no live contributors remain");
+        assert_eq!(
+            loop_.aggregator.aggregate_or_fresh(),
+            BudgetUsage::new(0, 0),
+            "an all-down fleet reads fresh, never frozen-high (task 031)",
+        );
+    }
+
+    /// Admission gates on the cross-agent aggregate (spec §7): the per-field MAX
+    /// across the LIVE fleet's readings of the shared pool is what admission sees, so
+    /// one running member that saw the pool deeper than the others pushes the
+    /// aggregate over the 5h rail and refuses a fresh start. Post-task-031 only
+    /// *running* members contribute (a not-yet-started member's injected sample no
+    /// longer gates), so the two contributors run first and the gated member is
+    /// released behind a cap-raise.
     #[test]
     fn admission_gates_on_the_cross_agent_aggregate() {
-        let (mut loop_, _d, backend, _probe) = make(
+        // cap 2: a1 + a2 run and read the pool; a3 waits behind the cap.
+        let policy = Policy {
+            max_concurrent_agents: 2,
+            ..Policy::default()
+        };
+        let (mut loop_, d, backend, _probe) = make(
             vec![member("a1", "qa"), member("a2", "qb"), member("a3", "qc")],
             vec![
                 q("qa", &[("p1", "queued")]),
                 q("qb", &[("p2", "queued")]),
                 q("qc", &[("p3", "queued")]),
             ],
-            Policy::default(),
+            policy,
         );
-        // a1/a2 each read the pool under the 85 rail; a3 saw it at 88 (over).
-        backend.set_budget("a1", BudgetUsage::new(50, 10));
-        backend.set_budget("a2", BudgetUsage::new(70, 10));
-        backend.set_budget("a3", BudgetUsage::new(88, 10));
 
-        let r = loop_.tick(0);
-        assert!(r.started.is_empty(), "the fleet aggregate (88) is over the rail");
-        assert_eq!(r.held_starts.len(), 3, "every member's start is held");
-        assert!(
-            r.held_starts.iter().all(|h| matches!(
-                h.outcome,
-                StartOutcome::Refused {
+        // Tick 0: a1 + a2 start (cap 2); a3 is held behind the cap.
+        assert_eq!(loop_.tick(0).started.len(), 2);
+        assert_eq!(backend.spawns(), vec!["a1", "a2"]);
+
+        // Both live: a1 saw the pool under the rail, a2 saw it deeper (88, over). The
+        // per-field MAX (88) is the aggregate. Raise the cap so only the budget — not
+        // the slot — can hold a3's fresh start.
+        backend.set_budget("a1", BudgetUsage::new(50, 10));
+        backend.set_budget("a2", BudgetUsage::new(88, 10));
+        d.set_policy(Policy {
+            max_concurrent_agents: 3,
+            ..Policy::default()
+        });
+
+        let r = loop_.tick(1);
+        assert!(r.started.is_empty(), "the live fleet aggregate (88) is over the rail");
+        assert_eq!(
+            r.held_starts,
+            vec![HeldStart {
+                agent: "a3".into(),
+                outcome: StartOutcome::Refused {
                     reason: RefuseReason::Budget5h
-                }
-            )),
-            "all refused on the shared 5h budget, not the cap",
+                },
+            }],
+            "a3's fresh start is refused on the shared 5h budget (the max across live a1/a2), not the cap",
         );
-        assert_eq!(backend.spawn_count(), 0, "nothing spawns over the budget rail");
+        assert_eq!(backend.spawn_count(), 2, "nothing new spawns over the budget rail");
     }
 
     /// A retired agent's stale-hot reading is forgotten, so it stops pinning the
@@ -3501,7 +3667,9 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// The cross-agent aggregate crossing the single 97% rung fires exactly ONE
     /// usage alert through the loop's owned dispatcher (one GUI hub message + one
     /// audit line); sub-97 readings fire nothing and a later still-hot reading
-    /// does not re-announce it (the §9 dedup holds across ticks).
+    /// does not re-announce it (the §9 dedup holds across ticks). The alert body
+    /// renders the LIVE aggregate % at fire time (task 031) — here 98, the reading
+    /// that crossed the rung — NOT the constant 97 rung the old code always printed.
     #[test]
     fn the_aggregate_crossing_97_alerts_exactly_once_via_the_owned_dispatcher() {
         let (mut loop_, _d, backend, probe) = make(
@@ -3527,8 +3695,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(probe.gui_alerts(), 1, "exactly one GUI alert across the crossing");
         assert_eq!(
             probe.log_lines(),
-            vec!["growlightd alert: 5h budget at 97%".to_string()],
-            "exactly one audit line",
+            vec!["growlightd alert: 5h budget at 98%".to_string()],
+            "exactly one audit line, rendering the LIVE 98% that crossed the rung (task 031)",
         );
     }
 
