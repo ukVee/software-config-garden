@@ -37,6 +37,7 @@ mod refresh_snapshot;
 pub(crate) mod sections;
 mod shared_pull;
 mod split;
+mod sync_conflict;
 mod thrash;
 mod worktree;
 
@@ -56,6 +57,7 @@ pub use refresh_snapshot::refresh_snapshot;
 pub use sections::{add_section, append_to_section, edit_section, set_reviewed};
 pub(crate) use shared_pull::{apply_shared_pull, SharedPullInput, SharedPullOutcome};
 pub use split::migrate_split;
+pub(crate) use sync_conflict::{resolve_sync_conflict, ConflictResolution, ConflictSides};
 pub use thrash::ThrashDetector;
 pub(crate) use worktree::{Tree, WorkTree};
 

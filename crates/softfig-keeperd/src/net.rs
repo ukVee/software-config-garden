@@ -65,7 +65,10 @@ use softfig_store::Hash;
 use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo};
 
-use crate::actions::{apply_shared_pull, SharedPullInput, SharedPullOutcome, WorkTree};
+use crate::actions::{
+    apply_shared_pull, resolve_sync_conflict, ConflictResolution, ConflictSides, SharedPullInput,
+    SharedPullOutcome, WorkTree,
+};
 use crate::ceremony::{
     assemble_member_set, persist_ceremony_outcome, rotate_shared_key, CeremonyLink,
     SessionTransport, VaultCeremonySigner,
@@ -2162,13 +2165,78 @@ fn serve_shared_chain_push(
                 base_hash,
                 local_tree,
             }) => {
-                eprintln!(
-                    "keeperd: net: shared-chain-push for {chain} CONFLICT (peer base {}, local tip {}); \
-                     skipped (slice 003 resolves)",
-                    base_hash.to_hex(),
-                    local_tree.map(|h| h.to_hex()).unwrap_or_else(|| "unborn".to_string())
-                );
-                None
+                // Slice 003: resolve the conflict LWW+sidecar rather than skip.
+                // A conflict implies a born local tip (slice 002: apply returns
+                // Conflict only when the tip tree diverged), so `local_tree` is
+                // always `Some`; read that tip commit for its LWW key (signed
+                // timestamp + author device — `p.timestamp` is the incoming key).
+                let local_meta = inner.repo.as_ref().and_then(|repo| {
+                    let tip = repo.tip_of(&chain).ok().flatten()?;
+                    let row = repo.db().get_commit(&tip).ok()?;
+                    Some((row.timestamp, row.author_device))
+                });
+                match (local_tree, local_meta) {
+                    (Some(local_tree), Some((local_ts, local_device))) => {
+                        let sides = ConflictSides {
+                            chain_ref: chain.clone(),
+                            subtree: repush_subtree.clone(),
+                            path: repush_files.first().cloned().unwrap_or_default(),
+                            base_hash,
+                            incoming_tree: Hash::from_bytes(new_tree),
+                            incoming_device: repush_writer.clone(),
+                            incoming_ts: repush_timestamp,
+                            local_tree,
+                            local_device,
+                            local_ts,
+                        };
+                        match resolve_sync_conflict(&mut inner, sides) {
+                            Ok(ConflictResolution::Resolved {
+                                hash,
+                                kept_device,
+                                loser_sidecar,
+                            }) => {
+                                eprintln!(
+                                    "keeperd: net: shared-chain-push for {chain} CONFLICT resolved \
+                                     (kept {kept_device}, loser -> {loser_sidecar}, commit {})",
+                                    hash.to_hex()
+                                );
+                                // Propagate the resolution tip like a local write:
+                                // the M5b push-on-commit sweep fans it to other
+                                // S-members (a 3rd device catches up as a normal
+                                // fast-forward). No in-arm re-push — convergence
+                                // by construction means every conflicting member
+                                // reconstructs the identical winner-tree+sidecar,
+                                // so only the tip propagates, never the sidecar.
+                                if let Some(net) = inner.net.as_ref() {
+                                    net.signal_commit();
+                                }
+                                None
+                            }
+                            Ok(ConflictResolution::LoserUnresolvable { path }) => {
+                                eprintln!(
+                                    "keeperd: net: shared-chain-push for {chain} CONFLICT: could not \
+                                     locate loser bytes for {path}; left unresolved (no work dropped)"
+                                );
+                                None
+                            }
+                            Err((_, e)) => {
+                                eprintln!(
+                                    "keeperd: net: shared-chain-push for {chain} CONFLICT resolve \
+                                     failed: {e}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => {
+                        eprintln!(
+                            "keeperd: net: shared-chain-push for {chain} CONFLICT on an unborn/ \
+                             unreadable local tip (base {}); skipped",
+                            base_hash.to_hex()
+                        );
+                        None
+                    }
+                }
             }
             Err((_, e)) => {
                 eprintln!("keeperd: net: shared-chain-push for {chain} apply failed: {e}");
