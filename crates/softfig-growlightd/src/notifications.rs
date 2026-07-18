@@ -126,6 +126,22 @@ pub enum NotifyEvent {
     /// alert (network-failsafe slice 003): the fleet's spawns resume. Info only (NOT
     /// human-attention) — it clears the outage on `growlight watch` / the log.
     NetworkRecovered,
+    /// growlightd caught a stop signal (SIGTERM/SIGINT) while the fleet was armed
+    /// (task 032). A graceful teardown exits 0, so systemd's `Restart=on-failure`
+    /// will NOT revive it — the whole fleet stays parked until the next garden
+    /// unlock (keeperd relaunches growlightd) or an explicit restart.
+    /// Human-attention: the operator is *paged* on the committed bus, not merely
+    /// left a `[fleet-park]` journal line to go grep, because a silent park left
+    /// the fleet dead for hours on 2026-07-05/06
+    /// (incident-20260706-growlightd-fleet-liveness-2bugs). Raised ONLY from the
+    /// signal handler (the sole signal path), so an asked-for IPC `shutdown` stays
+    /// quiet; it still fires on an *expected* keeperd terminal-lock stop, which
+    /// growlightd cannot distinguish from a phantom one by pid — the loud-but-passive
+    /// call in decision-growlightd-clean-stop-no-silent-fleet-park.
+    FleetParked {
+        /// How many fleet members were armed when the stop landed — the blast radius.
+        members: usize,
+    },
 }
 
 impl NotifyEvent {
@@ -160,7 +176,8 @@ impl NotifyEvent {
             | Self::BlockedOnHuman { .. }
             | Self::QueueEmpty { .. }
             | Self::AgentCrashed { .. }
-            | Self::NetworkOffline { .. } => true,
+            | Self::NetworkOffline { .. }
+            | Self::FleetParked { .. } => true,
             Self::SliceComplete { .. }
             | Self::ThrashDetected { .. }
             | Self::LeaseDenied { .. }
@@ -192,9 +209,11 @@ impl NotifyEvent {
             Self::AgentCrashed { agent, .. } => format!("agent-crashed:{agent}"),
             Self::ThrashDetected { target } => format!("thrash:{target}"),
             Self::LeaseDenied { key, agent } => format!("lease-denied:{key}:{agent}"),
-            // Class-only identities (no subject): one outage / one recovery at a time.
+            // Class-only identities (no subject): one outage / one recovery / one
+            // fleet-park at a time (the park's process is exiting anyway).
             Self::NetworkOffline { .. } => "network-offline".to_string(),
             Self::NetworkRecovered => "network-recovered".to_string(),
+            Self::FleetParked { .. } => "fleet-parked".to_string(),
         }
     }
 
@@ -227,6 +246,11 @@ impl NotifyEvent {
                 format!("network offline for {secs}s — fleet spawns held")
             }
             Self::NetworkRecovered => "network recovered — fleet spawns resumed".to_string(),
+            Self::FleetParked { members } => format!(
+                "growlightd stopped while the fleet was armed — {members} member(s) parked; \
+                 Restart=on-failure will NOT revive it, so restart softfig-growlightd or unlock \
+                 the garden to re-arm"
+            ),
         }
     }
 }
@@ -516,6 +540,33 @@ mod tests {
         assert_eq!(
             NotifyEvent::Usage.with_stderr_tail(vec!["x".to_string()]),
             NotifyEvent::Usage
+        );
+    }
+
+    /// TASK 032 — a stop-while-armed park is human-attention (pages Phone+GUI+Log),
+    /// keyed class-only (`"fleet-parked"` — one park at a time, the process is
+    /// exiting), and renders a recovery-bearing summary. The loud half of the
+    /// clean-stop-resilience decision (the `[fleet-park]` journal line is the other).
+    #[test]
+    fn fleet_parked_pages_the_human_and_keys_class_only() {
+        let e = NotifyEvent::FleetParked { members: 3 };
+        assert!(
+            e.is_human_attention(),
+            "a stop-while-armed park pages the human"
+        );
+        assert_eq!(e.channels(), vec![Channel::Gui, Channel::Log, Channel::Phone]);
+        // Class-only identity: the member count is not part of the key.
+        assert_eq!(e.dedup_key(), "fleet-parked");
+        assert_eq!(
+            NotifyEvent::FleetParked { members: 1 }.dedup_key(),
+            NotifyEvent::FleetParked { members: 9 }.dedup_key(),
+        );
+        // The summary names the blast radius + the recovery lever.
+        let s = e.summary();
+        assert!(s.contains("3 member"), "names the blast radius: {s}");
+        assert!(
+            s.contains("re-arm") || s.contains("unlock"),
+            "names the recovery lever: {s}",
         );
     }
 }

@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use softfig_growlightd::{
     garden_root_via_keeperd, load_fleet_config, reconcile_on_boot, spawn_bus_tailer, spawn_fleet,
-    Daemon, GrowlightdConfig, KeeperdBusSource, KeeperdItemResumer, KeeperdResourcePersister,
-    Policy, BUS_POLL_MS,
+    BusEmit, Daemon, GrowlightdConfig, KeeperdBusEmit, KeeperdBusSource, KeeperdItemResumer,
+    KeeperdResourcePersister, NotifyEvent, Policy, BUS_POLL_MS,
 };
 use softfig_ipc::{growlightd_runtime_socket_path, runtime_socket_path};
 
@@ -140,6 +140,9 @@ fn main() -> Result<()> {
     // that is the human's call; see the task's criterion-4 decision.
     let fleet_running = drive_loop.is_some();
     let member_count = fleet_config.members.len();
+    // A keeperd-socket handle for the one final "page" the signal handler posts on
+    // a stop-while-armed park (the FleetParked emit below). Moved into the closure.
+    let keeperd_socket_for_signal = keeperd_socket.clone();
     thread::Builder::new()
         .name("growlightd-signal".into())
         .spawn(move || {
@@ -183,6 +186,27 @@ fn main() -> Result<()> {
                          `systemctl --user restart softfig-growlightd.service` / `softfig daemon cycle`. \
                          If this stop was not an intended lock/cycle, investigate the sender logged above.",
                         member_count,
+                    );
+                    // The loud *other* half of criterion 4: page the operator on
+                    // keeperd's committed coordination bus (a durable `kind: alert`
+                    // @human message) so a parked armed fleet is *announced*, not just
+                    // left a journal line to go grep. The drive loop OWNS the live
+                    // NotifyDispatcher and it is unreachable from this signal thread —
+                    // and the fleet dispatcher has no bus/phone channel bound anyway —
+                    // so we post the one final alert directly through a best-effort
+                    // KeeperdBusEmit (the sanctioned growlightd→keeperd write). Sent
+                    // BEFORE `request_shutdown` so it completes while the process is
+                    // fully alive; bounded (RetryPolicy budget 3s) and best-effort, so
+                    // a keeperd that is itself going down on a full-system shutdown is
+                    // simply unreachable — the post is logged+dropped, never stalling
+                    // our own graceful exit. Only the signal path reaches here, so an
+                    // asked-for IPC `shutdown` never pages; an *expected* keeperd
+                    // terminal-lock stop still does (indistinguishable from a phantom
+                    // by pid — decision-growlightd-clean-stop-no-silent-fleet-park).
+                    KeeperdBusEmit::new(keeperd_socket_for_signal).emit_alert(
+                        &NotifyEvent::FleetParked {
+                            members: member_count,
+                        },
                     );
                 }
                 shutdown_daemon.request_shutdown();
