@@ -67,6 +67,17 @@ pub enum Tag {
     GrowlightBatonList,
     /// growlight: read the latest baton-log entry (`read_file <path>`).
     GrowlightBaton { path: String },
+    /// m5e slice 004: the live coordination snapshot (`coordination_status`) —
+    /// write-turn holders + S-member device states for the Coordination tab.
+    CoordinationStatus,
+    /// m5e slice 004: list every shared subtree (`shared_subtree_list`) so each
+    /// mount root can be scanned for `.conflict-` sidecars.
+    CoordinationShares,
+    /// m5e slice 004: one shared subtree's mount-root listing (`list_tree`) —
+    /// its `.conflict-` entries (slice 003 output) are the conflict sidecars.
+    CoordinationSidecarList,
+    /// m5e slice 004: read a selected conflict sidecar (`read_file`) for preview.
+    CoordinationSidecar,
 }
 
 #[derive(Debug)]

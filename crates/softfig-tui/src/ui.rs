@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    ceremony_state, short_fp, App, BackupRow, CeremonyState, GrowlightRow, Overlay, PairField,
-    PeerRow, View,
+    ceremony_state, short_fp, App, BackupRow, CeremonyState, CoordRow, GrowlightRow, Overlay,
+    PairField, PeerRow, View,
 };
 use crate::command::command_hints;
 use crate::forms::{ActionForm, FieldValue};
@@ -124,6 +124,8 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     if app.growlight_enabled == Some(true) {
         spans.push(tab("8:Growlight", app.view == View::Growlight));
     }
+    // Coordination (M5e) is ungated — always shown, unlike the growlight tab.
+    spans.push(tab("9:Coord", app.view == View::Coordination));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(format!("[{state}] tip:{tip}"), dim));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -167,6 +169,10 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
         View::Growlight => {
             render_growlight(f, app, cols[0]);
             render_growlight_detail(f, app, cols[1]);
+        }
+        View::Coordination => {
+            render_coordination(f, app, cols[0]);
+            render_coordination_detail(f, app, cols[1]);
         }
     }
 }
@@ -862,6 +868,181 @@ fn render_growlight_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+/// A coordination device-state's colour — the active writer stands out, idle is
+/// calm, offline recedes. Shared by the peer list + the detail pane.
+fn coord_state_color(state: &str) -> Color {
+    match state {
+        "online-active" => Color::Cyan,
+        "online-idle" => Color::Green,
+        "offline" => Color::DarkGray,
+        _ => Color::Gray, // unknown / future label
+    }
+}
+
+/// Left pane of the read-only Coordination section (M5e slice 004): this
+/// device's live state in the title, then the flattened selection list — each
+/// peer's device state, each shared chain's write-turn holder, then the conflict
+/// sidecars. Read-only throughout.
+fn render_coordination(f: &mut Frame, app: &App, area: Rect) {
+    let (title, items): (String, Vec<ListItem>) = match &app.coordination {
+        None => (
+            "coordination — (loading…)".to_string(),
+            vec![ListItem::new("(loading coordination status…)")],
+        ),
+        Some(c) => {
+            let title = format!(
+                "coordination — this: {} [{}]",
+                c.local_state,
+                short_fp(&c.local_device_id),
+            );
+            let items: Vec<ListItem> = if app.coordination_rows.is_empty() {
+                vec![ListItem::new("(no peers, turns, or conflicts)")]
+            } else {
+                app.coordination_rows
+                    .iter()
+                    .map(|row| match *row {
+                        CoordRow::Peer(i) => match c.peers.get(i) {
+                            Some(p) => ListItem::new(Line::styled(
+                                format!(
+                                    "peer      {:>13}  {}",
+                                    p.state,
+                                    short_fp(&p.device_id)
+                                ),
+                                Style::default().fg(coord_state_color(&p.state)),
+                            )),
+                            None => ListItem::new(""),
+                        },
+                        CoordRow::Turn(i) => match c.turns.get(i) {
+                            Some(t) => {
+                                let holder = t
+                                    .holder_device_id
+                                    .as_deref()
+                                    .map(short_fp)
+                                    .unwrap_or("(free)");
+                                ListItem::new(Line::raw(format!(
+                                    "turn      {} → {}",
+                                    t.chain, holder
+                                )))
+                            }
+                            None => ListItem::new(""),
+                        },
+                        CoordRow::Sidecar(i) => match app.coordination_sidecars.get(i) {
+                            Some(e) => ListItem::new(Line::styled(
+                                format!("conflict  {}", e.name),
+                                Style::default().fg(Color::Red),
+                            )),
+                            None => ListItem::new(""),
+                        },
+                    })
+                    .collect()
+            };
+            (title, items)
+        }
+    };
+    let mut st = ListState::default();
+    if !app.coordination_rows.is_empty() {
+        st.select(Some(
+            app.coordination_selected
+                .min(app.coordination_rows.len() - 1),
+        ));
+    }
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(sel_style());
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+/// Right pane of the read-only Coordination section: a summary line, then the
+/// selected row's detail — a peer/turn line, or the selected conflict sidecar's
+/// contents (loaded via `read_file` on Enter). Read-only; never mutates.
+fn render_coordination_detail(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    match &app.coordination {
+        None => lines.push(Line::raw("(loading coordination status…)")),
+        Some(c) => {
+            lines.push(Line::styled(
+                format!(
+                    "this device: {} [{}]",
+                    c.local_state,
+                    short_fp(&c.local_device_id)
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(format!(
+                "{} peer(s) · {} turn(s) · {} conflict(s)",
+                c.peers.len(),
+                c.turns.len(),
+                app.coordination_sidecars.len(),
+            )));
+            lines.push(Line::raw(""));
+            match app.selected_coordination_row() {
+                Some(CoordRow::Peer(i)) => {
+                    if let Some(p) = c.peers.get(i) {
+                        lines.push(Line::styled(
+                            "peer",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ));
+                        lines.push(Line::raw(format!("device: {}", p.device_id)));
+                        lines.push(Line::styled(
+                            format!("state:  {}", p.state),
+                            Style::default().fg(coord_state_color(&p.state)),
+                        ));
+                    }
+                }
+                Some(CoordRow::Turn(i)) => {
+                    if let Some(t) = c.turns.get(i) {
+                        lines.push(Line::styled(
+                            "write-turn",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ));
+                        lines.push(Line::raw(format!("chain:  {}", t.chain)));
+                        match &t.holder_device_id {
+                            Some(h) => lines.push(Line::raw(format!("holder: {h}"))),
+                            None => lines.push(Line::styled(
+                                "holder: (free — no device holds the turn)",
+                                Style::default().fg(Color::DarkGray),
+                            )),
+                        }
+                    }
+                }
+                Some(CoordRow::Sidecar(i)) => {
+                    if let Some(e) = app.coordination_sidecars.get(i) {
+                        lines.push(Line::styled(
+                            format!("conflict sidecar — {}", e.name),
+                            Style::default()
+                                .add_modifier(Modifier::BOLD)
+                                .fg(Color::Red),
+                        ));
+                        match &app.coordination_preview {
+                            Some(body) => {
+                                for l in body.lines() {
+                                    lines.push(Line::raw(l.to_string()));
+                                }
+                            }
+                            None => lines.push(Line::styled(
+                                "  (press Enter to load this conflict's contents)",
+                                Style::default().fg(Color::DarkGray),
+                            )),
+                        }
+                    }
+                }
+                None => lines.push(Line::styled(
+                    "(read-only — nothing to coordinate yet)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            }
+        }
+    }
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("coordination detail (read-only)"),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
 fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
     let rect = centered_rect(70, 40, area);
     f.render_widget(Clear, rect);
@@ -1392,8 +1573,9 @@ fn render_help(f: &mut Frame, area: Rect) {
     let body = "\
 soft-fig TUI — keys
 
-  1 2 3 4 5 6  switch Browse / History / Vault / Peers / Backup / Deploy
-  7            growlight (read-only; only when growlight is enabled)
+  1-7          Browse / History / Vault / Peers / Backup / Deploy / Shares
+  8            growlight (read-only; only when growlight is enabled)
+  9            coordination (read-only; write-turns · device states · conflicts)
   j k ↑ ↓      move selection
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)

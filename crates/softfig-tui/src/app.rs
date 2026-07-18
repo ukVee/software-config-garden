@@ -9,7 +9,8 @@ use std::path::Path;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use serde_json::{json, Value};
 use softfig_ipc::{
-    DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply, DiscoverListReply, DiscoveredDevice,
+    CoordinationStatusReply, DeployAction, DeployApplyReply, DeployPlanEntry, DeployPlanReply,
+    DiscoverListReply, DiscoveredDevice,
     HostedChain, LogReply, PairBeginReply, PairConfirmReply, PairListReply, PairPeer,
     PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply, ReplicaRevokeReply,
     ReplicaStatusReply, SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply,
@@ -40,6 +41,12 @@ pub enum View {
     /// reachable when growlight is enabled on this garden (`growlight_enabled ==
     /// Some(true)`); the tab is absent otherwise.
     Growlight,
+    /// M5e slice 004: read-only coordination surface — the write-turn holder per
+    /// shared chain, S-member device states, and conflict sidecars. Unlike the
+    /// growlight-gated section this tab is **always** available when unlocked (no
+    /// probe gate); its content is live daemon state (`coordination_status`) plus
+    /// `.conflict-` sidecars discovered via `list_tree`. Read-only — never mutates.
+    Coordination,
 }
 
 /// M5d slice 004: the collaborative-key ceremony state for one shared subtree,
@@ -79,6 +86,21 @@ pub struct GrowlightRow {
     pub kind: String,
     pub title: String,
     pub status: String,
+}
+
+/// One navigable row in the read-only Coordination view (M5e slice 004): a
+/// peer's announced device state, a shared chain's write-turn holder, or a
+/// conflict sidecar. The three collections flatten into a single selection list
+/// (peers, then turns, then sidecars) so `j`/`k` move over all of them; Enter on
+/// a sidecar row previews it (a read, never a mutation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordRow {
+    /// Index into [`App::coordination`]'s `peers`.
+    Peer(usize),
+    /// Index into [`App::coordination`]'s `turns`.
+    Turn(usize),
+    /// Index into [`App::coordination_sidecars`].
+    Sidecar(usize),
 }
 
 /// One navigable row in the Peers view: a ring member, a pairing awaiting SAS
@@ -300,6 +322,23 @@ pub struct App {
     pub growlight_baton_title: Option<String>,
     pub growlight_baton: Option<String>,
     pub growlight_loaded: bool,
+    /// M5e slice 004: the daemon's live coordination snapshot
+    /// (`coordination_status`) — local device state + id, each peer's announced
+    /// state, and the write-turn holder per shared chain. `None` until first
+    /// loaded. Read-only.
+    pub coordination: Option<CoordinationStatusReply>,
+    /// Conflict sidecars (`.conflict-<device>-<ts>.md`, slice 003 output)
+    /// discovered by `list_tree`-ing each shared subtree's mount root and keeping
+    /// the `.conflict-` entries. Read-only.
+    pub coordination_sidecars: Vec<softfig_ipc::TreeEntry>,
+    /// Flattened Coordination selection list (peers, then turns, then sidecars),
+    /// rebuilt whenever any of those three change.
+    pub coordination_rows: Vec<CoordRow>,
+    pub coordination_selected: usize,
+    /// The selected conflict sidecar's contents (`read_file`), shown in the
+    /// detail pane. Cleared on nav so it only shows for the row Enter loaded.
+    pub coordination_preview: Option<String>,
+    pub coordination_loaded: bool,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -360,6 +399,12 @@ impl App {
             growlight_baton_title: None,
             growlight_baton: None,
             growlight_loaded: false,
+            coordination: None,
+            coordination_sidecars: Vec::new(),
+            coordination_rows: Vec::new(),
+            coordination_selected: 0,
+            coordination_preview: None,
+            coordination_loaded: false,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -446,6 +491,17 @@ impl App {
         );
     }
 
+    /// M5e slice 004: (re)load the read-only Coordination surface — the live
+    /// write-turn/device snapshot (`coordination_status`) plus a listing of every
+    /// shared subtree (`shared_subtree_list`), whose reply fans out one
+    /// `list_tree` per mount root to discover `.conflict-` sidecars. **No probe
+    /// gate** — the tab is always live when unlocked (unlike the growlight
+    /// section, which is presence-gated). Purely read-only.
+    fn load_coordination(&self, ipc: &mut IpcClient) {
+        ipc.send("coordination_status", json!({}), Tag::CoordinationStatus);
+        ipc.send("shared_subtree_list", json!({}), Tag::CoordinationShares);
+    }
+
     /// Re-fetch every directory whose children are loaded, so the view
     /// reflects a write that just landed.
     fn refresh_view(&self, ipc: &mut IpcClient) {
@@ -473,6 +529,9 @@ impl App {
         }
         if self.growlight_loaded {
             self.load_growlight(ipc);
+        }
+        if self.coordination_loaded {
+            self.load_coordination(ipc);
         }
     }
 
@@ -556,6 +615,52 @@ impl App {
 
     fn hint_growlight_readonly(&mut self) {
         self.status = "growlight is a read-only view (queue · active item · latest baton)".into();
+    }
+
+    /// Rebuild the flattened Coordination selection list — peers, then write-turn
+    /// holders, then conflict sidecars — and clamp the selection into range.
+    fn rebuild_coordination_rows(&mut self) {
+        let mut rows = Vec::new();
+        if let Some(c) = &self.coordination {
+            for i in 0..c.peers.len() {
+                rows.push(CoordRow::Peer(i));
+            }
+            for i in 0..c.turns.len() {
+                rows.push(CoordRow::Turn(i));
+            }
+        }
+        for i in 0..self.coordination_sidecars.len() {
+            rows.push(CoordRow::Sidecar(i));
+        }
+        self.coordination_rows = rows;
+        if self.coordination_selected >= self.coordination_rows.len() {
+            self.coordination_selected = self.coordination_rows.len().saturating_sub(1);
+        }
+    }
+
+    pub fn selected_coordination_row(&self) -> Option<CoordRow> {
+        self.coordination_rows.get(self.coordination_selected).copied()
+    }
+
+    /// Enter on a Coordination row: a conflict sidecar is previewed (a
+    /// `read_file`, read-only); a peer/turn row is a no-op hint. The tab never
+    /// mutates coordination state.
+    fn activate_coordination(&mut self, ipc: &mut IpcClient) {
+        match self.selected_coordination_row() {
+            Some(CoordRow::Sidecar(i)) => {
+                if let Some(e) = self.coordination_sidecars.get(i) {
+                    ipc.send(
+                        "read_file",
+                        json!({ "path": e.path }),
+                        Tag::CoordinationSidecar,
+                    );
+                }
+            }
+            _ => {
+                self.status =
+                    "coordination is read-only · Enter on a conflict previews it".into();
+            }
+        }
     }
 
     // ---- reply handling ----
@@ -1001,6 +1106,58 @@ impl App {
                 }
                 Err((_, m)) => self.status = format!("growlight baton: {m}"),
             },
+            // M5e slice 004: the live coordination snapshot (write-turn holders +
+            // device states). Read-only; malformed/errored replies degrade to a
+            // status line, never a panic.
+            Tag::CoordinationStatus => match reply.result {
+                Ok(v) => match serde_json::from_value::<CoordinationStatusReply>(v) {
+                    Ok(r) => {
+                        self.coordination = Some(r);
+                        self.coordination_loaded = true;
+                        self.rebuild_coordination_rows();
+                    }
+                    Err(e) => self.status = format!("coordination: malformed reply: {e}"),
+                },
+                Err((_, m)) => self.status = format!("coordination: {m}"),
+            },
+            // Conflict-sidecar discovery: for each shared subtree, list its mount
+            // root; the per-mount replies keep the `.conflict-` entries. Clear
+            // first so a reload doesn't double-count.
+            Tag::CoordinationShares => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<SharedSubtreeListReply>(v) {
+                        self.coordination_sidecars.clear();
+                        self.rebuild_coordination_rows();
+                        for s in &r.subtrees {
+                            ipc.send(
+                                "list_tree",
+                                json!({ "path": s.mount_path }),
+                                Tag::CoordinationSidecarList,
+                            );
+                        }
+                    }
+                }
+                Err((_, m)) => self.status = format!("coordination shares: {m}"),
+            },
+            // A mount root never written to yet has no listing — an error there
+            // just contributes no sidecars, so only the Ok path does work.
+            Tag::CoordinationSidecarList => {
+                if let Ok(v) = reply.result {
+                    if let Ok(r) = serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                        self.coordination_sidecars
+                            .extend(r.entries.into_iter().filter(is_conflict_sidecar));
+                        self.rebuild_coordination_rows();
+                    }
+                }
+            }
+            Tag::CoordinationSidecar => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
+                        self.coordination_preview = Some(r.content);
+                    }
+                }
+                Err((_, m)) => self.status = format!("conflict sidecar: {m}"),
+            },
         }
     }
 
@@ -1100,6 +1257,15 @@ impl App {
                     self.load_growlight(ipc);
                 }
             }
+            // M5e slice 004: the Coordination tab is ALWAYS available when
+            // unlocked — no growlight-style presence gate; its content is live
+            // daemon state loaded lazily on first open.
+            KeyCode::Char('9') => {
+                self.view = View::Coordination;
+                if !self.coordination_loaded && !self.locked {
+                    self.load_coordination(ipc);
+                }
+            }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
             KeyCode::Char('p') if self.view == View::Peers => self.pair_selected(ipc),
@@ -1180,6 +1346,12 @@ impl App {
             View::Growlight => {
                 self.growlight_selected = self.growlight_selected.saturating_sub(1);
             }
+            View::Coordination => {
+                self.coordination_selected = self.coordination_selected.saturating_sub(1);
+                // The sidecar preview belongs to the row Enter loaded; moving
+                // off it clears the stale body.
+                self.coordination_preview = None;
+            }
         }
     }
 
@@ -1220,6 +1392,12 @@ impl App {
                 if self.growlight_selected + 1 < self.growlight_queue.len() {
                     self.growlight_selected += 1;
                 }
+            }
+            View::Coordination => {
+                if self.coordination_selected + 1 < self.coordination_rows.len() {
+                    self.coordination_selected += 1;
+                }
+                self.coordination_preview = None;
             }
         }
     }
@@ -1265,6 +1443,9 @@ impl App {
             View::Shares => self.hint_shares_actions(),
             // Growlight is a read-only glance — Enter is a no-op hint.
             View::Growlight => self.hint_growlight_readonly(),
+            // Coordination is read-only: Enter previews a conflict sidecar (a
+            // read), else a no-op hint.
+            View::Coordination => self.activate_coordination(ipc),
         }
     }
 
@@ -1445,7 +1626,7 @@ impl App {
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
             View::History | View::Peers | View::Backup | View::Deploy | View::Shares
-            | View::Growlight => None,
+            | View::Growlight | View::Coordination => None,
         };
         match target {
             // M2c: if the reveal target is the currently-open file and it
@@ -2149,6 +2330,14 @@ pub fn latest_baton_path(entries: &[softfig_ipc::TreeEntry]) -> Option<String> {
         })
         .max_by_key(|(num, _)| *num)
         .map(|(_, path)| path)
+}
+
+/// Is this tree entry a conflict sidecar — a `<path>.conflict-<device>-<ts>.md`
+/// file (slice 003 LWW output)? Matched by name so the Coordination tab can
+/// surface unresolved-tip conflicts discovered under a shared subtree's mount
+/// root. Directories never qualify.
+pub fn is_conflict_sidecar(e: &softfig_ipc::TreeEntry) -> bool {
+    !e.is_dir && e.name.contains(".conflict-")
 }
 
 /// One-line summary of a deploy `Report` for the status bar. Names the counts
@@ -3286,6 +3475,154 @@ backup = <vault id=\"db-pw\">[encrypted]</vault>
             Some("103-tui-modernize-003.md")
         );
         assert!(app.growlight_baton.unwrap().contains("shipped slice 003"));
+    }
+
+    // ---- M5e slice 004 part B: read-only coordination surface ----
+
+    #[test]
+    fn conflict_sidecar_matches_by_name_not_dirs() {
+        assert!(is_conflict_sidecar(&tree_entry(
+            "notes.md.conflict-tablet-1784000000.md",
+            "projects/a/notes.md.conflict-tablet-1784000000.md",
+            false,
+        )));
+        // A plain doc is not a sidecar.
+        assert!(!is_conflict_sidecar(&tree_entry(
+            "notes.md",
+            "projects/a/notes.md",
+            false
+        )));
+        // A directory that happens to contain the marker never qualifies.
+        assert!(!is_conflict_sidecar(&tree_entry(
+            "x.conflict-y",
+            "projects/a/x.conflict-y",
+            true
+        )));
+    }
+
+    #[test]
+    fn coordination_tab_key_switches_view_ungated() {
+        // Unlike growlight, the coordination tab has NO enablement gate — `9`
+        // switches to it straight away (no probe, no `*_enabled` flag).
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Coordination);
+    }
+
+    #[test]
+    fn coordination_status_reply_populates_and_builds_rows() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::CoordinationStatus,
+                result: Ok(json!({
+                    "local_device_id": "aa11",
+                    "local_state": "online-active",
+                    "peers": [
+                        {"device_id": "bb22", "state": "online-idle"},
+                        {"device_id": "cc33", "state": "offline"},
+                    ],
+                    "turns": [
+                        {"chain": "chain/a", "holder_device_id": "aa11"},
+                        {"chain": "chain/b"},
+                    ],
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.coordination_loaded);
+        let c = app.coordination.as_ref().unwrap();
+        assert_eq!(c.local_state, "online-active");
+        assert_eq!(c.peers.len(), 2);
+        assert_eq!(c.turns.len(), 2);
+        // A free turn deserializes to a None holder.
+        assert!(c.turns[1].holder_device_id.is_none());
+        // Rows = 2 peers + 2 turns (no sidecars yet).
+        assert_eq!(app.coordination_rows.len(), 4);
+        assert_eq!(app.selected_coordination_row(), Some(CoordRow::Peer(0)));
+    }
+
+    #[test]
+    fn sidecar_list_reply_keeps_only_conflicts_and_appends_rows() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        // Seed a coordination snapshot so rows already hold one peer.
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::CoordinationStatus,
+                result: Ok(json!({
+                    "local_device_id": "aa11",
+                    "local_state": "online-idle",
+                    "peers": [{"device_id": "bb22", "state": "online-idle"}],
+                    "turns": [],
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.coordination_rows.len(), 1);
+        // A mount-root listing with one real conflict + noise.
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::CoordinationSidecarList,
+                result: Ok(json!({
+                    "entries": [
+                        {"name": "notes.md", "path": "projects/a/notes.md", "is_dir": false},
+                        {"name": "notes.md.conflict-tablet-1784000000.md",
+                         "path": "projects/a/notes.md.conflict-tablet-1784000000.md",
+                         "is_dir": false},
+                        {"name": "sub", "path": "projects/a/sub", "is_dir": true},
+                    ]
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.coordination_sidecars.len(), 1);
+        assert_eq!(
+            app.coordination_sidecars[0].name,
+            "notes.md.conflict-tablet-1784000000.md"
+        );
+        // Rows now = 1 peer + 1 sidecar.
+        assert_eq!(app.coordination_rows.len(), 2);
+        assert_eq!(app.coordination_rows[1], CoordRow::Sidecar(0));
+    }
+
+    #[test]
+    fn sidecar_preview_reply_fills_then_nav_clears_it() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::CoordinationSidecar,
+                result: Ok(json!({
+                    "path": "projects/a/notes.md.conflict-tablet-1.md",
+                    "content": "loser edit body",
+                    "sealed": false,
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.coordination_preview.as_deref(), Some("loser edit body"));
+        // Moving the cursor clears the stale preview (it belonged to the row
+        // Enter loaded, not wherever we navigate next).
+        app.view = View::Coordination;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut ipc,
+        );
+        assert!(app.coordination_preview.is_none());
     }
 
     // ---- M5d slice 004: Shares tab ----
