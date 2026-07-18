@@ -547,6 +547,7 @@ pub fn shared_chain_push_signing_bytes(
     device_id: &[u8; 32],
     writer_device: &str,
     files: &[String],
+    timestamp: i64,
 ) -> Vec<u8> {
     let files_len: usize = files.iter().map(|f| 4 + f.len()).sum();
     let mut m = Vec::with_capacity(
@@ -561,7 +562,8 @@ pub fn shared_chain_push_signing_bytes(
             + 4
             + writer_device.len()
             + 4
-            + files_len,
+            + files_len
+            + 8,
     );
     m.extend_from_slice(SHARED_CHAIN_PUSH_DOMAIN);
     m.extend_from_slice(&(chain_id.len() as u32).to_be_bytes());
@@ -578,6 +580,7 @@ pub fn shared_chain_push_signing_bytes(
         m.extend_from_slice(&(f.len() as u32).to_be_bytes());
         m.extend_from_slice(f.as_bytes());
     }
+    m.extend_from_slice(&timestamp.to_be_bytes());
     m
 }
 
@@ -663,6 +666,7 @@ pub fn verify_shared_chain_push_sig(
     device_id: &[u8; 32],
     writer_device: &str,
     files: &[String],
+    timestamp: i64,
     sig: &[u8],
 ) -> bool {
     verify_sig(
@@ -675,6 +679,7 @@ pub fn verify_shared_chain_push_sig(
             device_id,
             writer_device,
             files,
+            timestamp,
         ),
         sig,
     )
@@ -1080,13 +1085,15 @@ mod tests {
         let new_tree = [9u8; 32];
         let base_tree = [10u8; 32];
         let files = vec!["proj/a.md".to_string(), "proj/b.md".to_string()];
+        // The signed edit timestamp (the slice-003 LWW key) is part of the bytes.
+        let ts: i64 = 1_700_000_500;
         let bytes = shared_chain_push_signing_bytes(
-            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files,
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, ts,
         );
         let sig = writer.sign(&bytes).to_bytes();
 
         assert!(verify_shared_chain_push_sig(
-            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, &sig
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, ts, &sig
         ));
 
         // A captured push can't be replayed to graft a different tree, a
@@ -1094,24 +1101,29 @@ mod tests {
         // bound.
         let other = [11u8; 32];
         assert!(!verify_shared_chain_push_sig(
-            chain, "proj", &other, &base_tree, &id, "peerbox", &files, &sig
+            chain, "proj", &other, &base_tree, &id, "peerbox", &files, ts, &sig
         ));
         assert!(!verify_shared_chain_push_sig(
-            chain, "proj", &new_tree, &other, &id, "peerbox", &files, &sig
+            chain, "proj", &new_tree, &other, &id, "peerbox", &files, ts, &sig
         ));
         assert!(!verify_shared_chain_push_sig(
-            b"chain/other", "proj", &new_tree, &base_tree, &id, "peerbox", &files, &sig
+            b"chain/other", "proj", &new_tree, &base_tree, &id, "peerbox", &files, ts, &sig
         ));
         assert!(!verify_shared_chain_push_sig(
-            chain, "other", &new_tree, &base_tree, &id, "peerbox", &files, &sig
+            chain, "other", &new_tree, &base_tree, &id, "peerbox", &files, ts, &sig
         ));
         // Provenance + the edited-file list are signed too.
         assert!(!verify_shared_chain_push_sig(
-            chain, "proj", &new_tree, &base_tree, &id, "otherbox", &files, &sig
+            chain, "proj", &new_tree, &base_tree, &id, "otherbox", &files, ts, &sig
         ));
         let fewer = vec!["proj/a.md".to_string()];
         assert!(!verify_shared_chain_push_sig(
-            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &fewer, &sig
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &fewer, ts, &sig
+        ));
+        // The signed edit timestamp is bound too — a captured push can't be
+        // re-stamped to make a stale edit win the LWW compare.
+        assert!(!verify_shared_chain_push_sig(
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, ts + 1, &sig
         ));
 
         // A forger who re-signs with their own key over the member's claimed id
@@ -1119,7 +1131,7 @@ mod tests {
         let attacker = SigningKey::from_bytes(&[12u8; 32]);
         let forged = attacker.sign(&bytes).to_bytes();
         assert!(!verify_shared_chain_push_sig(
-            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, &forged
+            chain, "proj", &new_tree, &base_tree, &id, "peerbox", &files, ts, &forged
         ));
     }
 
@@ -1130,8 +1142,8 @@ mod tests {
         // prefixes keep the boundary unambiguous.
         let id = [1u8; 32];
         let (nt, bt) = ([2u8; 32], [3u8; 32]);
-        let a = shared_chain_push_signing_bytes(b"c", "ab", &nt, &bt, &id, "cd", &[]);
-        let b = shared_chain_push_signing_bytes(b"c", "abc", &nt, &bt, &id, "d", &[]);
+        let a = shared_chain_push_signing_bytes(b"c", "ab", &nt, &bt, &id, "cd", &[], 0);
+        let b = shared_chain_push_signing_bytes(b"c", "abc", &nt, &bt, &id, "d", &[], 0);
         assert_ne!(a, b);
     }
 

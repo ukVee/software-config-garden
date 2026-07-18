@@ -45,6 +45,7 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "shared_ceremony",
     "shared_rekey",
     "shared_pull",
+    "sync_conflict",
     "schema_change",
     "rollback",
     "vault_seal",
@@ -110,7 +111,7 @@ const KNOWN_INTENTS_LIST: &str =
      growlight_resources_set, \
      chat_message_posted, inbox_read, \
      config_migrated, \
-     peers_changed, shared_subtrees_changed, shared_ceremony, shared_rekey, shared_pull, schema_change, rollback, vault_seal, vault_reveal";
+     peers_changed, shared_subtrees_changed, shared_ceremony, shared_rekey, shared_pull, sync_conflict, schema_change, rollback, vault_seal, vault_reveal";
 
 fn type_name(v: &Value) -> &'static str {
     match v {

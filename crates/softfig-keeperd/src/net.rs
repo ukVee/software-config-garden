@@ -2026,6 +2026,7 @@ fn serve_shared_chain_push(
         &sender,
         &p.writer_device,
         &p.files,
+        p.timestamp,
         &p.signature,
     ) {
         eprintln!("keeperd: net: shared-chain-push for {chain} signature invalid; rejecting");
@@ -2073,6 +2074,10 @@ fn serve_shared_chain_push(
     let repush_subtree = p.subtree.clone();
     let repush_writer = p.writer_device.clone();
     let repush_files = p.files.clone();
+    // The originating edit's signed timestamp is propagated verbatim on the mesh
+    // re-push (the LWW key must survive relays intact — a re-stamp would make a
+    // relayed edit look newer than it is).
+    let repush_timestamp = p.timestamp;
 
     // The closure is fully stored; re-author it as this device's own shared_pull
     // commit under the daemon lock, then DROP the lock before any network
@@ -2197,6 +2202,7 @@ fn serve_shared_chain_push(
                 &base_tree,
                 &repush_writer,
                 &repush_files,
+                repush_timestamp,
             );
             for host in &targets {
                 if let Err(e) = push_shared_chain_to_host(
@@ -2652,6 +2658,7 @@ fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
                 &base_tree,
                 &writer_device,
                 &files,
+                tip_row.timestamp,
             );
             pushes.push(SharedPush {
                 chain,
@@ -3339,6 +3346,7 @@ pub fn build_shared_chain_push_frame(
     base_tree: &[u8; 32],
     writer_device: &str,
     files: &[String],
+    timestamp: i64,
 ) -> Frame {
     let signature = session
         .sign(&shared_chain_push_signing_bytes(
@@ -3349,6 +3357,7 @@ pub fn build_shared_chain_push_frame(
             &local.device_id,
             writer_device,
             files,
+            timestamp,
         ))
         .to_bytes()
         .to_vec();
@@ -3361,6 +3370,7 @@ pub fn build_shared_chain_push_frame(
         writer_device: writer_device.to_string(),
         files: files.to_vec(),
         signature,
+        timestamp,
     })
 }
 

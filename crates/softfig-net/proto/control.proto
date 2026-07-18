@@ -366,4 +366,5 @@ message SharedChainPush {
   string writer_device = 6;  // the originating edit author's device name (provenance; propagated verbatim on re-push)
   repeated string files = 7; // the edited file paths (payload provenance)
   bytes signature = 8;       // Ed25519 (64 bytes) over shared_chain_push_signing_bytes(...)
+  int64 timestamp = 9;       // the originating edit commit's signed unix-secs timestamp; folded into the signed bytes — the LWW key for slice 003's sync_conflict. Propagated verbatim on mesh re-push (never re-stamped), so a relayed edit can't look newer than it is.
 }

@@ -229,6 +229,7 @@ fn push_edit(
         base_tree.as_bytes(),
         &sender.name,
         files,
+        1_700_000_000,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -509,6 +510,7 @@ fn mesh_converges_and_terminates_across_three_daemons() {
         base_tree.as_bytes(),
         &a.name,
         &files,
+        1_700_000_000,
     );
     let seed = {
         let a_local = a.local.clone();
