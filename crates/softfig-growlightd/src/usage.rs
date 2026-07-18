@@ -348,4 +348,36 @@ mod tests {
             }
         );
     }
+
+    /// TASK 037 (finish-criterion 4, co-member half): once a parked rate-limited
+    /// member's reading is FORGOTTEN it must stop pinning the aggregate — else its
+    /// stale near-full sample would keep refusing a co-member the shared window has
+    /// room for. While the parked member still contributes, the per-field MAX gates
+    /// admission; the forget (the drive loop's `ParkedRateLimited` arm, symmetric
+    /// with task 031's boundary forgets) drops it so admission reads the co-member's
+    /// fresh reading and re-admits. The ONE structural rule, not two patches.
+    #[test]
+    fn a_forgotten_parked_reading_stops_pinning_a_co_member() {
+        let g = AdmissionGovernor::new(Policy::default()); // 5h halt 85
+        let mut agg = UsageAggregator::new();
+        // a1 tripped the 5h window (98%, over the rail); a2 is fresh. While a1's
+        // parked sample lingers, the per-field MAX refuses a2's start.
+        agg.observe(sample("a1", 98, 5));
+        agg.observe(sample("a2", 20, 5));
+        assert_eq!(
+            g.decide(Intent::Start, 0, agg.aggregate_or_fresh(), fresh_rate()),
+            AdmissionDecision::Refuse {
+                reason: RefuseReason::Budget5h
+            },
+            "a1's hot parked reading pins the aggregate over the 5h rail",
+        );
+        // a1 parks rate-limited → its reading is forgotten. The aggregate falls to
+        // a2's fresh reading → the co-member is admitted (no pin, no restart).
+        agg.forget("a1");
+        assert!(
+            g.decide(Intent::Start, 0, agg.aggregate_or_fresh(), fresh_rate())
+                .is_admit(),
+            "the forgotten parked reading no longer blocks the co-member",
+        );
+    }
 }

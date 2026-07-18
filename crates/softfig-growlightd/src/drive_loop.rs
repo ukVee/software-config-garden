@@ -149,6 +149,15 @@ pub trait BudgetSampleSource: Send + Sync + fmt::Debug {
     /// `agent`'s latest reading of the shared pool, or `None` if it has not
     /// reported a parseable reserve yet (so the aggregator skips it this tick).
     fn budget(&self, agent: &str) -> Option<BudgetUsage>;
+
+    /// The reopen time (unix secs) of any rate-limit window `agent` reports as
+    /// tripped, or `None`. The loop holds admission until this boundary then
+    /// auto-resumes — the deleted `--auto` governor's timed-resume (task 037).
+    /// Defaulted to `None` so a seam that carries no rate-limit signal opts out;
+    /// the live backend overrides it off the stream-json `resetsAt`.
+    fn budget_reset(&self, _agent: &str) -> Option<i64> {
+        None
+    }
 }
 
 impl BudgetSampleSource for Arc<ClaudeBackend> {
@@ -156,6 +165,10 @@ impl BudgetSampleSource for Arc<ClaudeBackend> {
         // Disambiguate from this trait method: call the inherent one on the
         // backed `ClaudeBackend`.
         self.as_ref().budget(agent)
+    }
+
+    fn budget_reset(&self, agent: &str) -> Option<i64> {
+        self.as_ref().budget_reset(agent)
     }
 }
 
@@ -666,6 +679,16 @@ pub struct TickReport {
     /// the spawn is held. Health/control (step 1) still ran — exits and boundary
     /// stops are observed regardless.
     pub waiting_for_connectivity: bool,
+    /// The rate-limit window boundary (unix secs) admission is HELD until this tick,
+    /// or `None` when not rate-limited (task 037). While `Some(t)`, the re-roll and
+    /// fresh-start passes (steps 2 and 3) HOLD every spawn — no backoff, no crash —
+    /// exactly like the connectivity gate, so the fleet does not spin-spawn into a
+    /// still-exhausted window. The hold self-clears at `now >= t`, so admission
+    /// resumes at the window reset without a human bounce (the restored `--auto`
+    /// timed-resume). The boundary is learned off a running/just-exited member's
+    /// `resetsAt`, so it survives that member's exit and the task-031 forget.
+    /// Health/control (step 1) still run — exits and boundary stops are observed.
+    pub waiting_for_rate_limit_reset: Option<i64>,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -763,6 +786,16 @@ pub struct DriveLoop {
     /// it pages EXACTLY ONCE (not every tick past the threshold) and re-arms only after
     /// a reconnect (network-failsafe slice 003).
     offline_alerted: bool,
+    /// The rate-limit window reopen boundary (unix secs) admission is HELD until, or
+    /// `None` when not rate-limited (task 037). Learned from a running/just-exited
+    /// member's tripped-window `resetsAt` in step 0 and PERSISTED here so the hold
+    /// outlives that member's exit and the task-031 forget (which would otherwise
+    /// free admission and spin-spawn into the still-exhausted window). Self-clearing
+    /// at `now >= it`: the fleet auto-resumes at the reset with no human bounce — the
+    /// capability the deleted `--auto` governor had. Extended (never shortened) to
+    /// the LATER boundary when multiple windows are tripped, so admission reopens
+    /// only once every tripped window has.
+    rate_limit_hold_until: Option<i64>,
 }
 
 impl DriveLoop {
@@ -814,6 +847,7 @@ impl DriveLoop {
             assignments: std::collections::BTreeMap::new(),
             offline_since: None,
             offline_alerted: false,
+            rate_limit_hold_until: None,
         }
     }
 
@@ -872,6 +906,22 @@ impl DriveLoop {
         //    session re-observes fresh, and an all-down fleet reads a clean (0,0).
         for member in &fleet {
             let agent = &member.spec.agent;
+            // Rate-limit timed-resume (task 037): capture the reopen boundary of any
+            // window this member reports as TRIPPED, even if it has since gone down.
+            // The budget cell retains the reading until the next spawn, so a member
+            // that tripped the window and exited within one ~1s tick is not missed;
+            // and because the boundary is a FUTURE instant that self-clears at
+            // `now >= it`, retaining it past the member's exit (unlike the pct sample
+            // the task-031 forget drops below) can never wedge admission — it only
+            // stops the post-forget aggregate (a fresh 0,0) from spin-spawning into a
+            // window that has not actually reset. Extend to the LATER boundary so
+            // admission reopens only once every tripped window has.
+            if let Some(reset_at) = self.samples.budget_reset(agent) {
+                self.rate_limit_hold_until = Some(
+                    self.rate_limit_hold_until
+                        .map_or(reset_at, |held| held.max(reset_at)),
+                );
+            }
             if self.supervisor.is_running(agent) {
                 if let Some(budget) = self.samples.budget(agent) {
                     self.aggregator
@@ -881,6 +931,19 @@ impl DriveLoop {
                 self.aggregator.forget(agent);
             }
         }
+        // Clear an ELAPSED hold — the window has reset, so admission resumes with no
+        // human bounce (the restored `--auto` timed-resume). Checked against the
+        // tick's injected `now`, so the pure `tick` stays time-driven and unit-proven.
+        if let Some(until) = self.rate_limit_hold_until {
+            if now >= until {
+                self.rate_limit_hold_until = None;
+            }
+        }
+        // A live hold gates every spawn this tick (steps 2 + 3), the pre-spawn HOLD
+        // twin of `offline`: no re-roll, no fresh start, no backoff, no crash count —
+        // the fleet simply waits out the window instead of crash-looping into it.
+        let rate_limited = self.rate_limit_hold_until.is_some();
+        report.waiting_for_rate_limit_reset = self.rate_limit_hold_until;
         let budget = self.aggregator.aggregate_or_fresh();
         let rate = self.rate.rate(now);
 
@@ -1101,11 +1164,23 @@ impl DriveLoop {
                         }
                     }
                     PollOutcome::ParkedRateLimited => {
-                        // HALTED_RATE_LIMIT: the member is down-but-registered, held
-                        // by admission's rate gate and re-rolled by `Supervisor::tick`
-                        // once its window resets; no alert. A boundary stop retires.
+                        // HALTED_RATE_LIMIT: the member is down-but-registered and
+                        // re-rolled by `Supervisor::tick` once its window resets; no
+                        // alert. FORGET its budget sample now — symmetric with the
+                        // crash/retire/complete/block arms (task 031's rule: a boundary
+                        // arm never lets a departed reading linger in the aggregate).
+                        // This is the "forget a parked member's reading" half of task
+                        // 037 — the ONE boundary arm task 031 did not cover, so the two
+                        // fixes are now ONE rule, not two overlapping patches. What
+                        // actually holds its re-roll until the window's `resetsAt` is
+                        // the step-0 `rate_limit_hold_until` gate (task 037), NOT a
+                        // pinned sample — otherwise it would re-roll the instant its
+                        // forgotten sample let admission read fresh and spin into the
+                        // still-exhausted window. A boundary stop retires it instead.
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
+                        } else {
+                            self.aggregator.forget(agent);
                         }
                     }
                     PollOutcome::Down => {
@@ -1152,7 +1227,12 @@ impl DriveLoop {
         //    the 2026-07-01 crash-loop path. Held here means no re-spawn, no backoff,
         //    no crash; the member stays down (its `not_before` is absolute, so
         //    skipping `Supervisor::tick` strands nothing) and re-rolls once online.
-        if !paused && !offline {
+        //    ALSO rate-limit-gated (`!rate_limited`, task 037): re-rolling a
+        //    HALTED_RATE_LIMIT/exited member into a still-exhausted window would
+        //    instant-trip it again — the spin the task-031 forget otherwise enables
+        //    once its pinning sample is dropped. Held here until the window's
+        //    `resetsAt`, then it re-rolls on the first tick past the boundary.
+        if !paused && !offline && !rate_limited {
             // Map each configured member to its pin so the queue-gate can ask "is
             // there workable work for this agent?" via the same `pick` a fresh
             // start uses. A member not in the configured fleet (shouldn't happen)
@@ -1204,7 +1284,10 @@ impl DriveLoop {
         //    an offline fresh start is exactly the "spawn a headless `claude -p` with
         //    no route" instant-crash this milestone exists to prevent, so it is held
         //    (no claim, no spawn, no backoff) and retried next tick once online.
-        if !paused && !offline {
+        //    Rate-limit-gated (`!rate_limited`, task 037) for the same reason as the
+        //    re-roll above: a fresh start into an exhausted window instant-trips it,
+        //    so admission is held until the window's `resetsAt`, then resumes.
+        if !paused && !offline && !rate_limited {
             // Parts already SPOKEN FOR — excluded before a fresh start so the SAME
             // `(queue, part)` is never assigned twice. SEEDED from the LIVE
             // `assignments` (every part a registered member already holds, recorded on
@@ -1467,6 +1550,12 @@ struct TickLogger {
     reconnecting: BTreeSet<String>,
     /// Whether the connectivity HOLD was on last tick (its enter/exit edges log).
     offline: bool,
+    /// Whether the rate-limit timed HOLD was on last tick (task 037). Its enter/exit
+    /// edges log ONCE — a held fleet is re-observed every ~1s tick until the window
+    /// resets, so without this edge it would narrate ~1/tick for hours. No page: a
+    /// rate-limit hold is a transient, expected wait (the deleted `--auto` governor
+    /// slept silently), unlike the sustained-offline alert.
+    rate_limited: bool,
 }
 
 impl TickLogger {
@@ -1585,6 +1674,19 @@ impl TickLogger {
                 "fleet: connectivity hold cleared — spawns resume".to_string()
             });
         }
+        // Rate-limit timed HOLD (task 037): narrate its enter/exit edges once so the
+        // journal shows the window-reset wait AND the auto-resume — where a pinned
+        // deadlock used to strand the fleet with no trace until a human bounce.
+        let rate_limited = r.waiting_for_rate_limit_reset.is_some();
+        if rate_limited != self.rate_limited {
+            self.rate_limited = rate_limited;
+            out.push(match r.waiting_for_rate_limit_reset {
+                Some(until) => format!(
+                    "fleet: rate-limited — holding spawns until the window resets (resetsAt {until})"
+                ),
+                None => "fleet: rate-limit hold cleared — window reset, spawns resume".to_string(),
+            });
+        }
         out
     }
 }
@@ -1669,6 +1771,11 @@ mod tests {
         /// ring to enrich a crash alert — crash-diagnostics slice 001).
         stderr: Mutex<BTreeMap<String, Vec<String>>>,
         budgets: Mutex<BTreeMap<String, BudgetUsage>>,
+        /// Scripted rate-limit window reopen boundary (`resetsAt`, unix secs) per
+        /// agent — what the live backend surfaces off a TRIPPED window (task 037).
+        /// Unset = no tripped window (no timed hold); the cell is retained past the
+        /// agent's exit (mirroring the live budget cell) until a test clears it.
+        budget_resets: Mutex<BTreeMap<String, i64>>,
         /// Scripted terminal baton status per agent (the per-member write-back the
         /// live loop reads on exit — slice 002's real reader is `FsBatonStore`).
         baton: Mutex<BTreeMap<String, String>>,
@@ -1730,6 +1837,21 @@ mod tests {
         fn set_budget(&self, agent: &str, b: BudgetUsage) {
             self.budgets.lock().unwrap().insert(agent.to_string(), b);
         }
+        /// Script `agent`'s tripped-window reopen boundary (`resetsAt`, unix secs) —
+        /// the timed-resume hold source (task 037). Retained past its exit like the
+        /// live budget cell, so a member that trips the window then goes down still
+        /// surfaces its reset until [`clear_budget_reset`] (a fresh session's spawn).
+        fn set_budget_reset(&self, agent: &str, reset_at: i64) {
+            self.budget_resets
+                .lock()
+                .unwrap()
+                .insert(agent.to_string(), reset_at);
+        }
+        /// Clear `agent`'s scripted reset — models the budget cell being replaced on
+        /// the next spawn (a fresh session reads a not-yet-tripped window).
+        fn clear_budget_reset(&self, agent: &str) {
+            self.budget_resets.lock().unwrap().remove(agent);
+        }
         fn spawns(&self) -> Vec<String> {
             self.spawns.lock().unwrap().clone()
         }
@@ -1767,6 +1889,9 @@ mod tests {
     impl BudgetSampleSource for Arc<FakeFleet> {
         fn budget(&self, agent: &str) -> Option<BudgetUsage> {
             self.budgets.lock().unwrap().get(agent).copied()
+        }
+        fn budget_reset(&self, agent: &str) -> Option<i64> {
+            self.budget_resets.lock().unwrap().get(agent).copied()
         }
     }
     impl BatonStatusSource for Arc<FakeFleet> {
@@ -3558,6 +3683,83 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             loop_.aggregator.aggregate_or_fresh(),
             BudgetUsage::new(0, 0),
             "an all-down fleet reads fresh, never frozen-high (task 031)",
+        );
+    }
+
+    /// TASK 037 — the rate-limit timed-resume (the deleted `--auto` governor's
+    /// capability). A fleet-of-one trips the 5h window; growlightd captures the
+    /// event's `resetsAt` and HOLDS every spawn until that boundary, then resumes on
+    /// its own — no human bounce. This is the piece task 031 does NOT cover: 031's
+    /// forget stops a dead sample from FREEZING admission forever, but that very
+    /// forget makes the post-exit aggregate read a fresh (0,0), which absent this
+    /// hold would spin-spawn straight back into the still-exhausted window. Together
+    /// they are ONE rule: a parked sample never gates admission (031), but the window
+    /// is respected until it actually reopens (037).
+    #[test]
+    fn a_rate_limited_window_holds_the_reroll_until_reset_then_auto_resumes() {
+        let (mut loop_, _d, backend, _probe) =
+            make(vec![member("a1", "qa")], vec![q("qa", &[("p1", "queued")])], Policy::default());
+
+        // Tick 0: a1 starts.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // a1 (running) trips the 5h window: it reads the pool HOT and its
+        // `rate_limit_event` carries a `resetsAt` far in the future (tick 100). Step 0
+        // folds the hot reading AND captures the reopen boundary into the hold.
+        backend.set_budget("a1", hot_budget());
+        backend.set_budget_reset("a1", 100);
+        let r1 = loop_.tick(1);
+        assert_eq!(
+            r1.waiting_for_rate_limit_reset,
+            Some(100),
+            "a running member's tripped-window resetsAt arms the timed hold",
+        );
+
+        // a1 exits on a HALTED_RATE_LIMIT baton — parked (down, kept, no backoff/alert).
+        // Its budget cell (incl. the resetsAt) is retained until the next spawn.
+        backend.set_baton("a1", "HALTED_RATE_LIMIT");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+
+        // Tick 10 (long before the reset): a1 is down, so task 031 forgets its sample
+        // and the aggregate reads a fresh (0,0) — absent the hold, admission would
+        // ADMIT and spin a1 straight back into the exhausted window. The task-037 hold
+        // is the ONLY thing keeping it down: no re-roll, no second spawn.
+        let r10 = loop_.tick(10);
+        assert_eq!(
+            loop_.aggregator.aggregate_or_fresh(),
+            BudgetUsage::new(0, 0),
+            "the parked member's sample is forgotten (task 031) — the aggregate is not the blocker",
+        );
+        assert_eq!(
+            r10.waiting_for_rate_limit_reset,
+            Some(100),
+            "the hold persists past the member's exit — it survives the task-031 forget",
+        );
+        assert!(r10.rerolls.is_empty(), "no re-roll while the window is held");
+        assert_eq!(
+            backend.spawns(),
+            vec!["a1"],
+            "no spin-spawn into the still-exhausted window",
+        );
+
+        // The window resets at tick 100. The fresh session will replace the budget
+        // cell, so its reset clears. Admission resumes WITHOUT a restart and a1 re-rolls.
+        backend.clear_budget_reset("a1");
+        let r100 = loop_.tick(100);
+        assert_eq!(
+            r100.waiting_for_rate_limit_reset, None,
+            "at the window boundary the hold self-clears — the restored --auto timed-resume",
+        );
+        assert_eq!(
+            r100.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "the fleet auto-resumes at the reset — no growlightd bounce",
+        );
+        assert_eq!(
+            backend.spawns(),
+            vec!["a1", "a1"],
+            "a fresh session spawned once the window reopened",
         );
     }
 
