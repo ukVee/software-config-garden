@@ -156,15 +156,32 @@ pub struct AgentBudgetState {
 struct ReserveCell {
     five_h_pct: Option<u8>,
     seven_d_pct: Option<u8>,
+    /// The reopen time (unix secs) reported alongside each window's latest
+    /// `rate_limit_event` (`resetsAt`), retained so the drive loop can hold
+    /// admission until a TRIPPED window actually reopens then auto-resume (task
+    /// 037). `None` until an event carries one. Unlike the pct (task 031), a future
+    /// boundary is self-clearing (`now >= reset`), so it is safe to keep past the
+    /// reporting agent's exit — it can never wedge admission.
+    five_h_reset: Option<i64>,
+    seven_d_reset: Option<i64>,
 }
 
 impl AgentBudgetState {
-    /// Record one window's latest reserve % (from a `rate_limit_event`).
-    fn record_window(&self, window: BudgetWindow, pct: u8) {
+    /// Record one window's latest reserve % + its `resetsAt` (from a
+    /// `rate_limit_event`). The reset is stored per window so a later read can tell
+    /// WHEN a tripped window reopens (task 037); a window that reports no reset
+    /// stores `None` for it (its pct still gates via the aggregate while live).
+    fn record_window(&self, window: BudgetWindow, pct: u8, resets_at: Option<i64>) {
         let mut cell = self.inner.lock().unwrap();
         match window {
-            BudgetWindow::FiveHour => cell.five_h_pct = Some(pct),
-            BudgetWindow::SevenDay => cell.seven_d_pct = Some(pct),
+            BudgetWindow::FiveHour => {
+                cell.five_h_pct = Some(pct);
+                cell.five_h_reset = resets_at;
+            }
+            BudgetWindow::SevenDay => {
+                cell.seven_d_pct = Some(pct);
+                cell.seven_d_reset = resets_at;
+            }
         }
     }
 
@@ -184,6 +201,27 @@ impl AgentBudgetState {
             (None, None) => None,
             (five, seven) => Some(BudgetUsage::new(five.unwrap_or(0), seven.unwrap_or(0))),
         }
+    }
+
+    /// The reopen time (unix secs) of any currently-TRIPPED window — one whose
+    /// latest `status` was non-`allowed`, saturated to 100% by [`window_pct`] — or
+    /// `None` when no window is tripped or none carried a `resetsAt`. When both are
+    /// tripped, the LATER boundary: admission clears only once both windows reopen.
+    /// The drive loop holds spawns until this instant then resumes (task 037
+    /// timed-resume). A non-saturated `used_percentage` reading (which never carries
+    /// a headless `resetsAt`) is deliberately NOT treated as a timed hold — its pct
+    /// still gates the aggregate while the reporting agent is live.
+    fn budget_reset(&self) -> Option<i64> {
+        let cell = *self.inner.lock().unwrap();
+        let tripped =
+            |pct: Option<u8>, reset: Option<i64>| (pct == Some(100)).then_some(reset).flatten();
+        [
+            tripped(cell.five_h_pct, cell.five_h_reset),
+            tripped(cell.seven_d_pct, cell.seven_d_reset),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
     }
 }
 
@@ -483,7 +521,7 @@ fn window_pct(status: Option<&str>, used_percentage: Option<u8>) -> Option<u8> {
 /// keys off the status. `None` for any other line, malformed JSON, an event with
 /// no `rate_limit_info`, or an unrecognized `rateLimitType`. Pure — a fixture
 /// drives it, no real spawn.
-fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8)> {
+fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8, Option<i64>)> {
     let ev = serde_json::from_str::<Value>(line).ok()?;
     if ev.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
         return None;
@@ -499,7 +537,11 @@ fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8)> {
         .get("used_percentage")
         .and_then(Value::as_u64)
         .map(|p| p.min(100) as u8);
-    window_pct(status, used).map(|pct| (window, pct))
+    // The window's reopen time — the reliable headless signal for the timed-resume
+    // (task 037). Present on both `rejected` and `allowed` events, so it is only
+    // acted on when the window is actually tripped (see [`AgentBudgetState::budget_reset`]).
+    let resets_at = info.get("resetsAt").and_then(Value::as_i64);
+    window_pct(status, used).map(|pct| (window, pct, resets_at))
 }
 
 /// Opportunistic account-wide 5h/7d reserve from a `rate_limits` object on a
@@ -559,8 +601,8 @@ fn pump<R: BufRead>(
         // headless source (spec §6/§7). Fold it into the budget cell the drive
         // loop's UsageAggregator reads; a non-"allowed" window saturates it so the
         // admission gate refuses (`window_pct`).
-        if let Some((window, pct)) = rate_limit_window_for_line(line) {
-            budget.record_window(window, pct);
+        if let Some((window, pct, resets_at)) = rate_limit_window_for_line(line) {
+            budget.record_window(window, pct, resets_at);
         }
         for (kind, text) in deltas_for_line(line) {
             hub.publish(Event::agent_delta(agent, kind, text));
@@ -716,6 +758,21 @@ impl ClaudeBackend {
             .unwrap()
             .get(agent)
             .and_then(|s| s.observe())
+    }
+
+    /// The reopen time (unix secs) of any rate-limit window `agent` currently
+    /// reports as tripped (a non-`allowed` `rate_limit_event`), or `None`. Sibling
+    /// to [`budget`](Self::budget): the drive loop holds admission until this
+    /// boundary then resumes without a human bounce — the capability the deleted
+    /// `--auto` governor had (task 037). Read for a down-but-not-yet-re-rolled agent
+    /// too — the budget cell retains the reading until the next spawn replaces it,
+    /// so a window tripped in the same ~1s tick the agent exits is not missed.
+    pub fn budget_reset(&self, agent: &str) -> Option<i64> {
+        self.budgets
+            .lock()
+            .unwrap()
+            .get(agent)
+            .and_then(|s| s.budget_reset())
     }
 
     /// The **fleet-wide** rolling-minute `(tpm_used, rpm_used)` at `now`: the sum
@@ -1476,12 +1533,19 @@ mod tests {
         let five_rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected","resetsAt":1782367800}}"#;
         assert_eq!(
             rate_limit_window_for_line(five_rejected),
-            Some((BudgetWindow::FiveHour, 100))
+            Some((BudgetWindow::FiveHour, 100, Some(1782367800)))
         );
         let seven_allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#;
         assert_eq!(
             rate_limit_window_for_line(seven_allowed),
-            Some((BudgetWindow::SevenDay, 0))
+            Some((BudgetWindow::SevenDay, 0, Some(1782900000)))
+        );
+        // A tripped window with no `resetsAt` still parses (pct saturated, reset
+        // absent) — the pct gates the aggregate; there is just no timed hold.
+        let five_no_reset = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected"}}"#;
+        assert_eq!(
+            rate_limit_window_for_line(five_no_reset),
+            Some((BudgetWindow::FiveHour, 100, None))
         );
         // Non-events, malformed JSON, and an unrecognized window carry no reading.
         assert!(rate_limit_window_for_line(r#"{"type":"result","result":"done"}"#).is_none());
@@ -1523,6 +1587,15 @@ mod tests {
         // The non-"allowed" 5h status folded to a saturated 100; the allowed 7d to 0.
         let reserve = budget.observe().expect("a reserve was folded from the events");
         assert_eq!(reserve, BudgetUsage::new(100, 0));
+
+        // The tripped 5h window surfaces its `resetsAt` for the timed-resume hold
+        // (task 037); the allowed 7d window's reset is ignored (not tripped), so the
+        // reopen boundary is the 5h one alone.
+        assert_eq!(
+            budget.budget_reset(),
+            Some(1782367800),
+            "the tripped 5h window's reset boundary is exposed for the hold",
+        );
 
         // End-to-end: this reading trips the §9 fleet near-exhaustion rung AND
         // makes the admission governor REFUSE a start on the 5h rail.
