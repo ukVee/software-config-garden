@@ -124,6 +124,13 @@ pub struct FleetConfig {
     /// [`BuildCaps::default`] (conservative for the 7.7 GB tablet). Threaded into
     /// the backend so [`crate::claude_backend::ClaudeBackend`] caps every spawn.
     pub build_caps: BuildCaps,
+    /// `max_iterations` — the bounded-run debugging knob (task 040 — the growlightd
+    /// counterpart of the retired `--auto --max-iterations`): after this many completed
+    /// member work-chunks the fleet stops CLEANLY. `None` (the key omitted) = unbounded,
+    /// the normal armed-fleet behaviour; `Some(1)` = single-shot. Threaded into the
+    /// [`DriveLoop`] at [`assemble_fleet`]; a `0` is rejected at parse (fail-closed to a
+    /// disabled fleet) since it would stop before any work runs.
+    pub max_iterations: Option<u64>,
 }
 
 impl FleetConfig {
@@ -136,6 +143,7 @@ impl FleetConfig {
             prompt: DEFAULT_PROMPT.to_string(),
             members: Vec::new(),
             build_caps: BuildCaps::default(),
+            max_iterations: None,
         }
     }
 
@@ -154,6 +162,8 @@ impl FleetConfig {
             fleet: Vec<FleetMemberConfig>,
             #[serde(default)]
             build_caps: BuildCaps,
+            /// The bounded-run knob (task 040). Absent ⇒ `None` ⇒ unbounded.
+            max_iterations: Option<u64>,
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
@@ -166,12 +176,25 @@ impl FleetConfig {
         // second member fail-closed-never-spawns). Validate here so a valid config
         // never exercises that lossy path; fail-closed (load treats Err as disabled).
         validate_fleet_member_ids(&doc.fleet)?;
+        // Reject-not-clamp at the config boundary (mirrors `validate_fleet_member_ids`):
+        // `max_iterations = 0` would stop the fleet before any work runs — almost
+        // certainly a typo for "unbounded" (omit the key) or single-shot (`1`). Fail
+        // it loudly rather than silently arming a fleet that does nothing; the loader
+        // treats the Err as a disabled fleet, so a config problem never *enables* one.
+        if doc.max_iterations == Some(0) {
+            return Err(
+                "max_iterations must be >= 1 (single-shot is 1) — omit the key for an \
+                 unbounded run; 0 would stop the fleet before any work runs"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             enabled: doc.fleet_enabled,
             bin: doc.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
             prompt: doc.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
             members: doc.fleet,
             build_caps: doc.build_caps,
+            max_iterations: doc.max_iterations,
         })
     }
 }
@@ -346,7 +369,11 @@ pub fn assemble_fleet(
         Box::new(SystemExeProbe::capture()), // exe_probe — re-stat growlightd's own launch binary (stale-binary guard, task 039)
         dispatcher,
         members,
-    ))
+    )
+    // Bounded-run knob (task 040): honor `config/growlight.toml`'s `max_iterations`
+    // (`None` = unbounded, the default). Read once here at arm time — a bounded run's
+    // bound must not move mid-run.
+    .with_max_iterations(fleet.max_iterations))
 }
 
 /// The runtime growlight namespace root `$XDG_CONFIG_HOME/softfig/growlight`
@@ -601,6 +628,36 @@ agent = "reviewer"
         assert_eq!(cfg.bin, DEFAULT_CLAUDE_BIN);
         assert_eq!(cfg.prompt, DEFAULT_PROMPT);
         assert!(cfg.members.is_empty());
+    }
+
+    #[test]
+    fn max_iterations_parses_and_defaults_to_unbounded() {
+        // Absent ⇒ None ⇒ unbounded (the normal armed fleet), on both a parsed config
+        // and the disabled default.
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\n").unwrap();
+        assert_eq!(cfg.max_iterations, None, "the key omitted ⇒ unbounded");
+        assert_eq!(FleetConfig::disabled().max_iterations, None);
+
+        // Present ⇒ the bounded-run knob: single-shot and an N-iteration bound.
+        let one =
+            FleetConfig::from_growlight_toml("fleet_enabled = true\nmax_iterations = 1\n").unwrap();
+        assert_eq!(one.max_iterations, Some(1), "1 = single-shot");
+        let n =
+            FleetConfig::from_growlight_toml("fleet_enabled = true\nmax_iterations = 7\n").unwrap();
+        assert_eq!(n.max_iterations, Some(7));
+    }
+
+    #[test]
+    fn max_iterations_zero_is_rejected_fail_closed() {
+        // 0 would stop the fleet before any work runs — a typo, not a valid bound. It is
+        // rejected at parse; the loader turns that Err into a disabled fleet (a config
+        // problem can never silently arm a fleet that does nothing).
+        let err = FleetConfig::from_growlight_toml("fleet_enabled = true\nmax_iterations = 0\n")
+            .unwrap_err();
+        assert!(
+            err.contains("max_iterations"),
+            "the error names the offending key: {err}"
+        );
     }
 
     #[test]

@@ -785,6 +785,16 @@ pub struct TickReport {
     /// control (step 1) still run, so in-flight members are still observed to their
     /// boundary; only NEW spawns/re-rolls are held.
     pub binary_superseded: bool,
+    /// Whether the bounded-run limit has been reached this tick (task 040 — the
+    /// growlightd counterpart of the retired `--auto --max-iterations`): the configured
+    /// `config/growlight.toml` `max_iterations` completed member work-chunks have run,
+    /// so the loop has stopped the fleet CLEANLY (the member(s) at the bounding boundary
+    /// retired; steps 2 + 3 now HOLD every spawn). Once true it LATCHES true for the
+    /// life of the loop — a bounded run does not resume without a daemon restart, which
+    /// re-arms a fresh bounded batch. The loud "bounded run complete" narration is
+    /// edge-logged by the [`TickLogger`] on the tripping tick. `false` on every tick of
+    /// an unbounded (`max_iterations` absent) run — the default.
+    pub bounded_run_stopped: bool,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -909,6 +919,27 @@ pub struct DriveLoop {
     /// While set, steps 2 + 3 hold every spawn so no iteration runs on the superseded
     /// binary.
     binary_superseded: bool,
+    /// Bounded-run limit (task 040 — the growlightd counterpart of the retired
+    /// `--auto --max-iterations` debugging affordance): the max number of completed
+    /// member work-chunks (clean continue/complete handoff boundaries) this loop runs
+    /// before stopping the fleet CLEANLY. Fleet-wide (summed across members), so a
+    /// fleet-of-one — the debugging case — reads it as "run N iterations then stop".
+    /// `None` = unbounded (the default; a normal armed fleet runs open-ended);
+    /// `Some(1)` = single-shot. Set once from `config/growlight.toml`'s
+    /// `max_iterations` at [`assemble_fleet`](crate::fleet::assemble_fleet), never
+    /// live-mutated (a bounded run's bound must not move mid-run).
+    max_iterations: Option<u64>,
+    /// Completed iterations so far (task 040): incremented once at each member's clean
+    /// `Rolling`/`Completed` handoff boundary (a crash/reconnect/block is NOT a
+    /// productive iteration and never counts). Compared against `max_iterations` to
+    /// trip the bounded-run stop.
+    iterations_completed: u64,
+    /// Bounded-run TERMINAL latch (task 040): set once `iterations_completed` reaches
+    /// `max_iterations`. Like `binary_superseded`, it holds every spawn (steps 2 + 3)
+    /// for the life of the loop — no re-roll, no fresh start — so a bounded run stops
+    /// after EXACTLY the configured count and never resumes without a daemon restart
+    /// (which re-arms a fresh bounded batch). Never set when `max_iterations` is `None`.
+    iteration_bound_reached: bool,
 }
 
 impl DriveLoop {
@@ -965,6 +996,47 @@ impl DriveLoop {
             exe_probe,
             exe_baseline: None,
             binary_superseded: false,
+            max_iterations: None,
+            iterations_completed: 0,
+            iteration_bound_reached: false,
+        }
+    }
+
+    /// Set the bounded-run limit (task 040): after `max` completed member work-chunks
+    /// (clean continue/complete handoff boundaries) the loop stops the fleet cleanly —
+    /// the debugging affordance the retired `--auto --max-iterations` provided
+    /// (`Some(1)` = single-shot). `None` (the default) is unbounded. A builder so the
+    /// 15-arg [`new`](Self::new) — and every test that builds a loop through it — is
+    /// unchanged; only the live [`assemble_fleet`](crate::fleet::assemble_fleet) and
+    /// the bounded-run tests opt in.
+    #[must_use]
+    pub fn with_max_iterations(mut self, max: Option<u64>) -> Self {
+        self.max_iterations = max;
+        self
+    }
+
+    /// Count one completed member work-chunk against the bounded-run limit (task 040)
+    /// and report whether the fleet is now spent. Called once per member at each clean
+    /// `Rolling`/`Completed` handoff boundary. Returns `true` — the caller retires that
+    /// member at THIS boundary instead of continuing it — exactly when the configured
+    /// `max_iterations` has been reached; it also sets the fleet-wide terminal latch
+    /// [`iteration_bound_reached`](Self::iteration_bound_reached) that holds every later
+    /// spawn (steps 2 + 3). `None` (unbounded) always returns `false`; once latched it
+    /// returns `true` for any straggler so a member still mid-session retires at its
+    /// next boundary too.
+    fn record_iteration(&mut self) -> bool {
+        let Some(max) = self.max_iterations else {
+            return false; // unbounded — the default; never stops on a count
+        };
+        if self.iteration_bound_reached {
+            return true; // already spent — retire any straggler at its boundary
+        }
+        self.iterations_completed = self.iterations_completed.saturating_add(1);
+        if self.iterations_completed >= max {
+            self.iteration_bound_reached = true;
+            true
+        } else {
+            false
         }
     }
 
@@ -1249,9 +1321,14 @@ impl DriveLoop {
                     }
                     PollOutcome::Rolling => {
                         // Clean boundary exit on a continue status (or no baton yet):
-                        // a retiring agent stops here instead of re-rolling;
-                        // otherwise `Supervisor::tick` rolls it below.
-                        if self.retiring.remove(agent) {
+                        // a retiring agent stops here instead of re-rolling; a bounded
+                        // run (task 040) that has reached its `max_iterations` retires
+                        // the member at THIS clean boundary too, instead of re-rolling
+                        // it in step 2 — so the fleet stops after EXACTLY the configured
+                        // count; otherwise `Supervisor::tick` rolls it below. The `||`
+                        // short-circuits, so a human retire never also consumes an
+                        // iteration count.
+                        if self.retiring.remove(agent) || self.record_iteration() {
                             self.retire(agent, &mut report);
                         }
                     }
@@ -1280,7 +1357,13 @@ impl DriveLoop {
                         // not re-pick). Drop the finished assignment; step 3 records
                         // the next one if it re-picks.
                         self.assignments.remove(agent);
-                        if self.retiring.remove(agent) {
+                        // A human boundary stop OR a reached bounded-run limit (task 040)
+                        // retires the member — an item boundary is a completed iteration
+                        // too, so at the bound it retires instead of letting step 3
+                        // re-claim it onto its next part. A plain completion (the `else`)
+                        // releases its slot for that step-3 re-claim. The `||`
+                        // short-circuits, so a human retire never also consumes a count.
+                        if self.retiring.remove(agent) || self.record_iteration() {
                             self.retire(agent, &mut report);
                         } else {
                             self.aggregator.forget(agent);
@@ -1371,6 +1454,18 @@ impl DriveLoop {
         }
         report.parked = parked(&snapshot);
 
+        // Bounded-run stop (task 040): once the iteration limit was reached (latched in
+        // the health pass above, when a member's clean boundary hit `max_iterations`),
+        // HOLD every spawn — no re-roll (step 2), no fresh start (step 3) — the
+        // pre-spawn twin of `superseded`, and equally TERMINAL (only a daemon restart
+        // clears it, re-arming a fresh bounded batch). The member(s) that hit the bound
+        // already retired above; this stops the fleet from starting anything new, so the
+        // fleet stops after EXACTLY the configured count. Read AFTER the health pass
+        // (the latch may have just been set) — unlike `superseded`, which is known up
+        // front.
+        let bound_reached = self.iteration_bound_reached;
+        report.bounded_run_stopped = bound_reached;
+
         // 2. Re-roll due agents ([`Intent::Roll`]). `pause` is the admission gate
         //    (spec §8): a paused fleet attempts no rolls (and no starts, below).
         //    The re-roll is ALSO queue-gated — a member is re-rolled only if its
@@ -1394,7 +1489,7 @@ impl DriveLoop {
         //    session on the SUPERSEDED daemon build — the very thing the guard exists to
         //    stop. Held here (TERMINAL, unlike the transient holds above) until a human
         //    restarts the daemon onto the new binary.
-        if !paused && !offline && !rate_limited && !superseded {
+        if !paused && !offline && !rate_limited && !superseded && !bound_reached {
             // Map each configured member to its pin so the queue-gate can ask "is
             // there workable work for this agent?" via the same `pick` a fresh
             // start uses. A member not in the configured fleet (shouldn't happen)
@@ -1453,7 +1548,7 @@ impl DriveLoop {
         //    seed + spawn a new part on a SUPERSEDED daemon build, so once the launch
         //    binary is replaced mid-run no fresh start is admitted — terminally, until a
         //    daemon restart. No claim, no seed, no spawn.
-        if !paused && !offline && !rate_limited && !superseded {
+        if !paused && !offline && !rate_limited && !superseded && !bound_reached {
             // Parts already SPOKEN FOR — excluded before a fresh start so the SAME
             // `(queue, part)` is never assigned twice. SEEDED from the LIVE
             // `assignments` (every part a registered member already holds, recorded on
@@ -1732,6 +1827,12 @@ struct TickLogger {
     /// this edge the loud "restart required" line would repeat every ~1s tick. Unlike
     /// the transient rate-limit/offline holds there is no clearing edge to narrate.
     binary_superseded: bool,
+    /// Whether the bounded-run stop was reported last tick (task 040). Its entry edge
+    /// logs ONCE — the latch is TERMINAL like `binary_superseded` (a bounded run does
+    /// not resume without a daemon restart, at which point a fresh loop starts with a
+    /// fresh logger), so without this edge the "bounded run complete" line would repeat
+    /// every ~1s tick.
+    bounded_run_stopped: bool,
 }
 
 impl TickLogger {
@@ -1876,6 +1977,19 @@ impl TickLogger {
                 "fleet: BINARY SUPERSEDED — growlightd's launch binary was replaced on disk \
                  mid-run; holding all spawns on the stale build, RESTART REQUIRED \
                  (`systemctl --user restart softfig-growlightd.service`) to pick up the new build"
+                    .to_string(),
+            );
+        }
+        // Bounded-run stop (task 040): the configured `max_iterations` was reached, so
+        // the loop has stopped the fleet cleanly. LATCHED terminal like the stale-binary
+        // guard — narrate once on the tripping edge, naming that a restart re-arms a
+        // fresh bounded batch. The growlightd counterpart of the retired `--auto
+        // --max-iterations` completing its bounded run.
+        if r.bounded_run_stopped && !self.bounded_run_stopped {
+            self.bounded_run_stopped = true;
+            out.push(
+                "fleet: BOUNDED RUN COMPLETE — reached the configured max_iterations; \
+                 holding all spawns (restart growlightd to run another bounded batch)"
                     .to_string(),
             );
         }
@@ -3023,6 +3137,134 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         let r2 = loop_.tick(2);
         assert!(r2.started.is_empty() && r2.rerolls.is_empty());
         assert_eq!(backend.spawn_count(), 1, "a stopped agent is never re-started");
+    }
+
+    /// TASK 040 — a bounded run stops after EXACTLY `max_iterations` completed member
+    /// work-chunks. A fleet-of-one that keeps handing off on a continue baton runs
+    /// exactly `max` sessions (the initial start + `max - 1` re-rolls); the `max`-th
+    /// clean boundary retires it instead of re-rolling, the tick reports
+    /// `bounded_run_stopped`, and no later tick ever re-spawns it — the growlightd
+    /// counterpart of the retired `--auto --max-iterations`.
+    #[test]
+    fn a_bounded_run_stops_after_exactly_the_configured_iteration_count() {
+        let (loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        let mut loop_ = loop_.with_max_iterations(Some(3));
+
+        // Tick 0 starts a1 (session 1). No iteration has COMPLETED yet.
+        assert_eq!(loop_.tick(0).started.len(), 1);
+        assert_eq!(backend.spawn_count(), 1);
+
+        // Each subsequent tick a1 exits clean on a continue status (no baton write-back
+        // → the historical continue re-roll), which is one completed iteration. With no
+        // baton set the exit re-classifies Rolling every tick, so ticking drives the
+        // count. Iterations 1 and 2 are BELOW the bound → the member re-rolls.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r1 = loop_.tick(1);
+        assert!(!r1.bounded_run_stopped, "iteration 1 is below the bound");
+        assert!(r1.retired.is_empty(), "a below-bound boundary re-rolls, not retires");
+        assert_eq!(backend.spawn_count(), 2, "iteration 1 re-rolled (session 2)");
+
+        let r2 = loop_.tick(2);
+        assert!(!r2.bounded_run_stopped, "iteration 2 is still below the bound");
+        assert_eq!(backend.spawn_count(), 3, "iteration 2 re-rolled (session 3)");
+
+        // Iteration 3 REACHES the bound: a1 retires at this clean boundary instead of
+        // re-rolling, and the tick reports the bounded-run stop.
+        let r3 = loop_.tick(3);
+        assert_eq!(r3.retired, vec!["a1".to_string()], "the bound retired a1 cleanly");
+        assert!(r3.bounded_run_stopped, "the tick reports the bounded-run stop");
+        assert!(
+            r3.rerolls.iter().all(|o| !matches!(o, RerollOutcome::Rerolled { .. })),
+            "the bounding iteration does not re-roll",
+        );
+        assert_eq!(backend.spawn_count(), 3, "EXACTLY max=3 sessions ran, no 4th");
+
+        // The stop is TERMINAL: later ticks never re-spawn, even with p1 still workable,
+        // and keep reporting the latch.
+        let r4 = loop_.tick(4);
+        assert!(r4.started.is_empty() && r4.rerolls.is_empty());
+        assert!(r4.bounded_run_stopped, "the bounded-run latch is terminal");
+        assert_eq!(backend.spawn_count(), 3, "a spent bounded run is never re-started");
+    }
+
+    /// TASK 040 — single-shot (`max_iterations = 1`): the fleet runs ONE work-chunk
+    /// then stops. The first clean boundary retires the member; exactly one session
+    /// ever spawns.
+    #[test]
+    fn single_shot_runs_one_iteration_then_stops() {
+        let (loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        let mut loop_ = loop_.with_max_iterations(Some(1));
+
+        loop_.tick(0); // start a1 (session 1)
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 completes its one chunk (continue baton) — single-shot stops here.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(r.retired, vec!["a1".to_string()], "single-shot retires after one chunk");
+        assert!(r.bounded_run_stopped);
+        assert!(r.rerolls.iter().all(|o| !matches!(o, RerollOutcome::Rerolled { .. })));
+        assert_eq!(backend.spawn_count(), 1, "exactly one session ran");
+
+        let r2 = loop_.tick(2);
+        assert!(r2.started.is_empty() && r2.rerolls.is_empty());
+        assert_eq!(backend.spawn_count(), 1, "single-shot never re-starts");
+    }
+
+    /// TASK 040 — an ITEM boundary (`ITEM_COMPLETE`) is a completed iteration too, so it
+    /// counts against the bound: a single-shot member that finishes its part retires
+    /// (reported `retired`, NOT `completed`) instead of being re-claimed onto its next
+    /// part in step 3.
+    #[test]
+    fn an_item_boundary_counts_as_a_bounded_iteration() {
+        let (loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            // Two queued parts: without the bound, completing p1 would re-claim p2.
+            vec![q("qa", &[("p1", "queued"), ("p2", "queued")])],
+            Policy::default(),
+        );
+        let mut loop_ = loop_.with_max_iterations(Some(1));
+
+        loop_.tick(0); // start a1 on p1 (session 1)
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 finishes its part: ITEM_COMPLETE at a clean exit → the item boundary.
+        backend.set_baton("a1", "ITEM_COMPLETE");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(r.retired, vec!["a1".to_string()], "the bound retired a1 at the item boundary");
+        assert!(r.completed.is_empty(), "a bounded item boundary is a retire, not a re-pickable completion");
+        assert!(r.bounded_run_stopped);
+        assert_eq!(backend.spawn_count(), 1, "p2 is NOT re-claimed — the fleet stopped at the bound");
+    }
+
+    /// TASK 040 — the default (`max_iterations` absent ⇒ `None`) is unbounded: the loop
+    /// re-rolls open-endedly and never reports a bounded-run stop, so an armed fleet's
+    /// behaviour is byte-identical to before the knob existed.
+    #[test]
+    fn an_unbounded_run_never_trips_the_iteration_stop() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // start a1
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        for t in 1..=5 {
+            let r = loop_.tick(t);
+            assert!(!r.bounded_run_stopped, "an unbounded run never stops on a count");
+            assert!(r.retired.is_empty(), "an unbounded run never retires on a count");
+        }
+        assert_eq!(backend.spawn_count(), 6, "unbounded: 1 start + 5 re-rolls, still going");
     }
 
     /// The inject lane is boundary-async: a queued message is invisible until the

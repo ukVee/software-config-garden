@@ -17,6 +17,14 @@
 # journal/decisions/decision-growlight-config-in-garden.md.)
 fleet_enabled = false
 
+# Bounded-run knob for controlled debugging — the growlightd equivalent of the
+# retired `--auto --max-iterations`. Stops the fleet CLEANLY after this many
+# completed member work-chunks (clean continue / item-boundary handoffs), then
+# holds every spawn until growlightd is restarted (which re-arms a fresh bounded
+# batch). `1` = single-shot (run one iteration and stop). Omit the key for an
+# unbounded run (the normal armed fleet); `0` is rejected. Read once at arm time.
+# max_iterations = 1
+
 # The `claude` binary growlightd's backend shells. Defaults to `claude` on PATH.
 # claude_bin = "claude"
 
