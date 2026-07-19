@@ -480,6 +480,14 @@ pub struct BatonRead {
     /// The frontmatter `status:` growlightd read (`None` = missing/unreadable →
     /// clean-exit re-roll).
     pub status: Option<String>,
+    /// The `# NEXT ACTION` section body from the SAME baton the `status` was read
+    /// from (the per-member file, or the legacy misroute fallback) — the spin-guard
+    /// progress signal (task 038). The supervisor compares it across consecutive
+    /// continue re-rolls: unchanged across `STALL_LIMIT` iterations means the member
+    /// is wedged (no progress), mirroring the deleted `--auto` STUCK threshold
+    /// (protocol step 6). `None` when absent/unreadable — a `None` never proves a
+    /// repeat, so it can't trip the guard.
+    pub next_action: Option<String>,
     /// `Some((legacy_path, per_member_path))` (display strings) when the status was
     /// read from the misrouted legacy single-agent baton instead of the per-member
     /// file — the diagnostic routed through the exit entry-edge. `None` on the normal
@@ -986,6 +994,10 @@ impl DriveLoop {
                     AgentHealth::Alive { .. } => BatonRead::default(),
                 };
                 let baton_status = baton_read.status.clone();
+                // The member's `# NEXT ACTION` from the SAME baton — the spin guard's
+                // progress signal (task 038): the supervisor trips it when this repeats
+                // unchanged across `STALL_LIMIT` continue re-rolls.
+                let baton_next_action = baton_read.next_action.clone();
                 // Network-exit classifier (slice 002): `poll_with_network` evaluates
                 // it ONLY on a crash verdict (so a healthy tick reads no stderr). A
                 // non-zero EXIT whose in-memory stderr tail carries a network-error
@@ -1018,6 +1030,7 @@ impl DriveLoop {
                         agent,
                         health,
                         baton_status.as_deref(),
+                        baton_next_action.as_deref(),
                         now,
                         network_exit,
                     )
@@ -1514,6 +1527,10 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
         PollOutcome::Rolling => "rolling (continue status)",
         PollOutcome::Retired => "retired (queue drained)",
         PollOutcome::Completed => "completed (item boundary)",
+        // The supervisor's spin guard synthesized this block (NEXT ACTION unchanged
+        // across `STALL_LIMIT` re-rolls, task 038) — name it distinctly so a spin
+        // never reads as a member-declared human block in the journal.
+        PollOutcome::Blocked { spin_guard: true, .. } => "stuck (spin guard — NEXT ACTION unchanged)",
         PollOutcome::Blocked { .. } => "blocked on human",
         PollOutcome::ParkedRateLimited => "held (rate-limited)",
         PollOutcome::Healthy => "healthy",
@@ -1784,6 +1801,10 @@ mod tests {
         /// Scripted terminal baton status per agent (the per-member write-back the
         /// live loop reads on exit — slice 002's real reader is `FsBatonStore`).
         baton: Mutex<BTreeMap<String, String>>,
+        /// Scripted `# NEXT ACTION` per agent (the spin-guard progress signal, task
+        /// 038). Unset = no NEXT ACTION (the guard stays inert, as with the historical
+        /// no-baton read); the real reader parses it off the same baton as the status.
+        baton_next_action: Mutex<BTreeMap<String, String>>,
         /// Recorded per-member baton seeds `(agent, queue, part)` — the slice-002
         /// seed the loop writes on a FRESH start. A test asserts a fresh start
         /// seeds and a re-roll does not (carry-across-iterations).
@@ -1820,6 +1841,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(agent.to_string(), status.to_string());
+        }
+        /// Script `agent`'s `# NEXT ACTION` (the spin-guard progress signal, task 038).
+        fn set_baton_next_action(&self, agent: &str, next_action: &str) {
+            self.baton_next_action
+                .lock()
+                .unwrap()
+                .insert(agent.to_string(), next_action.to_string());
         }
         /// Force every subsequent `spawn` to fail (the fail-closed path).
         fn set_fail_spawn(&self, fail: bool) {
@@ -1905,6 +1933,7 @@ mod tests {
         fn status(&self, agent: &str) -> BatonRead {
             BatonRead {
                 status: self.baton.lock().unwrap().get(agent).cloned(),
+                next_action: self.baton_next_action.lock().unwrap().get(agent).cloned(),
                 misroute: None,
             }
         }
@@ -2936,6 +2965,70 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
         // keeperd now holds p1 `blocked` (committed by the parker) — so a later
         // snapshot keeps pivoting past it until a human clears it (slice 004).
+        assert_eq!(
+            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            QueueState::Blocked("p1".into()),
+        );
+    }
+
+    /// SPIN GUARD (task 038) end-to-end: a member that keeps clean-exiting
+    /// `IN_PROGRESS` with an UNCHANGED `# NEXT ACTION` is caught by the supervisor's
+    /// spin guard on the `STALL_LIMIT`-th re-roll and flows through the SAME release
+    /// path as an agent-written STUCK — its part is item-parked (`blocked`), the human
+    /// is alerted on the item, and the freed member pivots past it — instead of being
+    /// re-rolled forever against the shared budget. The FIRST repeat still re-rolls
+    /// (it might be progress); only the REPEAT is a stall.
+    #[test]
+    fn a_spinning_member_is_caught_item_parked_and_pivots() {
+        let (mut loop_, _d, backend, _claimer, parker, queues, probe) = make_full(
+            vec![member("a1", "qa")],
+            vec![
+                q("qa", &[("p1", "queued")]), // a1's pinned work — the one it spins on
+                q("qb", &[("o1", "queued")]), // the pivot target
+            ],
+            Policy::default(),
+        );
+
+        loop_.tick(0); // a1 starts on qa/p1
+        assert_eq!(backend.spawn_count(), 1);
+
+        // a1 clean-exits on a continue status with a FIXED NEXT ACTION (a compile it
+        // can't fix) — the wedged-member signature.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "compile it (can't fix)");
+
+        // First such exit: the streak only ARMS (1) — a1 re-rolls, not parked.
+        let r1 = loop_.tick(1);
+        assert!(r1.blocked.is_empty(), "the first repeat is not yet a stall");
+        assert_eq!(probe.gui_alerts(), 0, "no alert on the first continue re-roll");
+        assert_eq!(backend.spawn_count(), 2, "a1 re-rolled on the continue status");
+
+        // Second IDENTICAL exit (health + baton unchanged): no progress → the guard
+        // trips (STALL_LIMIT = 2) and releases a1 exactly like an agent-written STUCK.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            parker.parks(),
+            vec![("qa".into(), "p1".into())],
+            "the spun-out member's part is marked blocked in keeperd",
+        );
+        assert_eq!(
+            r2.blocked,
+            vec![Assignment { agent: "a1".into(), queue: "qa".into(), part: "p1".into() }],
+            "the spin-guard release is reported with its item",
+        );
+        assert_eq!(probe.gui_alerts(), 1, "the human is alerted on the spun item, once");
+        assert!(r2.crashes.is_empty(), "a spin-guard park is not a crash");
+        // The freed member pivots onto qb the same tick — NOT re-rolled onto the stall.
+        assert_eq!(
+            r2.started,
+            vec![Assignment { agent: "a1".into(), queue: "qb".into(), part: "o1".into() }],
+            "the released member pivots past its stalled part (pivot-on-block)",
+        );
+        assert!(r2.rerolls.is_empty(), "a released member re-starts, it is not re-rolled");
+        assert_eq!(backend.spawn_count(), 3, "the pivot is a fresh spawn, not a re-roll of the stall");
+
+        // keeperd now holds p1 `blocked` — later snapshots keep pivoting past it.
         assert_eq!(
             classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
             QueueState::Blocked("p1".into()),

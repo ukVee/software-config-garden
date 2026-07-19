@@ -178,6 +178,10 @@ impl BatonStatusSource for FsBatonStore {
                 {
                     return BatonRead {
                         status: legacy.status,
+                        // The NEXT ACTION comes from the SAME (legacy) baton the status
+                        // was read from, so the spin guard compares like with like even
+                        // through the misroute fallback (task 038).
+                        next_action: legacy.next_action,
                         misroute: Some((
                             legacy_path.display().to_string(),
                             per_member_path.display().to_string(),
@@ -188,9 +192,13 @@ impl BatonStatusSource for FsBatonStore {
         }
 
         // A missing/unreadable baton is the clean-exit fallback (None → re-roll),
-        // identical to the deferred source slice 001 shipped against.
+        // identical to the deferred source slice 001 shipped against. Parse ONCE and
+        // carry both the status and the NEXT ACTION (the spin-guard progress signal,
+        // task 038) off the same read.
+        let view = per_member_raw.as_deref().map(parse_baton).unwrap_or_default();
         BatonRead {
-            status: per_member_raw.as_deref().and_then(|raw| parse_baton(raw).status),
+            status: view.status,
+            next_action: view.next_action,
             misroute: None,
         }
     }

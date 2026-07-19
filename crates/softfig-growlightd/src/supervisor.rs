@@ -99,6 +99,16 @@ const DEFAULT_BACKOFF_CAP_SECS: i64 = 300;
 /// this long is treated as hung (and re-rolled). Generous because a working
 /// session can think/tool-call silently for a while.
 const DEFAULT_HANG_SECS: i64 = 600;
+/// Spin guard (task 038): a member that clean-exits on a **continue** status
+/// (`IN_PROGRESS` / no baton) with a `# NEXT ACTION` byte-identical to its
+/// previous continue-exit this many times in a row is wedged — making no progress
+/// yet re-rollable — so instead of re-rolling it (and burning the shared budget in
+/// a tight loop) the supervisor releases it as `STUCK`. Mirrors the deleted
+/// `--auto` orchestrator's `STALL_LIMIT` (protocol step 6: "NEXT ACTION materially
+/// unchanged across 2+ iterations → STUCK"): the first repeat arms the streak, the
+/// second trips it, so a stuck member burns at most one extra session before it is
+/// parked with a reason rather than spinning until a budget rail trips.
+const STALL_LIMIT: u32 = 2;
 
 /// The per-agent spec a backend spawns from: the agent's bus id (work-stream
 /// name) plus the paths to its pre-approval `loop.json` and `mcp.json` (§15 —
@@ -321,8 +331,18 @@ pub enum PollOutcome {
     /// for the log (the item-park / pivot is the drive loop's job; the supervisor
     /// only releases + names the block).
     Blocked {
-        /// The raw terminal baton status that blocked the member (for the log).
+        /// The raw terminal baton status that blocked the member (for the log). For a
+        /// member-written block this is its `STUCK` / `BLOCKED_ON_HUMAN` / unrecognized
+        /// status; for a spin-guard block it is a synthesized reason naming the
+        /// unchanged-NEXT-ACTION streak.
         status: String,
+        /// The supervisor **synthesized** this block from its spin guard (the
+        /// member's `# NEXT ACTION` was unchanged across [`STALL_LIMIT`] consecutive
+        /// continue re-rolls — task 038), rather than the member itself writing a
+        /// `STUCK` / `BLOCKED_ON_HUMAN` baton. The lifecycle is identical (release to
+        /// idle + item-park + human alert); the flag only distinguishes the
+        /// journal/alert reason so a spin never reads as a member-declared human block.
+        spin_guard: bool,
     },
     /// Crashed (errored exit or hung) — killed any live child, bumped the failure
     /// streak, scheduled a backoff re-roll, and surfaced this alert for the caller
@@ -413,6 +433,17 @@ struct Supervised {
     consecutive_failures: u32,
     /// Earliest Unix-seconds the next re-roll may spawn.
     not_before: i64,
+    /// The `# NEXT ACTION` body this member handed off on its PREVIOUS **continue**
+    /// (`IN_PROGRESS` / no-baton) clean exit — the spin-guard progress baseline
+    /// (task 038). `None` until the first continue-exit. Reset when the member is
+    /// re-picked onto a fresh part (an item-boundary release drops the whole
+    /// `Supervised`, so a re-seeded member starts its streak clean) and when it
+    /// parks on a rate limit (a budget pause is not a stall).
+    last_next_action: Option<String>,
+    /// Consecutive continue clean-exits whose `# NEXT ACTION` was byte-identical to
+    /// the previous one — the no-progress streak. At [`STALL_LIMIT`] the spin guard
+    /// releases the member as `STUCK` instead of re-rolling it (task 038).
+    unchanged_streak: u32,
 }
 
 /// The fleet supervisor: owns the spawn seam, the admission governor, and the
@@ -580,6 +611,8 @@ impl Supervisor {
                                 child: Some(child),
                                 consecutive_failures: 0,
                                 not_before: now,
+                                last_next_action: None,
+                                unchanged_streak: 0,
                             },
                         );
                         StartOutcome::Started
@@ -612,10 +645,13 @@ impl Supervisor {
         now: i64,
     ) -> PollOutcome {
         // Default the network classifier to "never a network exit" — the pre-slice-
-        // 002 behaviour, where every non-zero exit is a genuine crash. The drive loop
-        // uses `poll_with_network` to feed the real classifier off the stderr ring +
-        // a connectivity probe; the supervisor's own tests exercise this default.
-        self.poll_with_network(agent, health, baton_status, now, || false)
+        // 002 behaviour, where every non-zero exit is a genuine crash — AND default
+        // the spin-guard's NEXT ACTION signal to `None` (a `None` never proves a
+        // repeat, so the guard stays inert). The drive loop uses `poll_with_network`
+        // to feed the real classifier off the stderr ring + a connectivity probe and
+        // the real NEXT ACTION off the baton; the supervisor's own tests exercise
+        // this default (a spin-guard test passes the NEXT ACTION via that richer form).
+        self.poll_with_network(agent, health, baton_status, None, now, || false)
     }
 
     /// Like [`poll`](Self::poll), but with a `network_exit` predicate — evaluated
@@ -631,6 +667,7 @@ impl Supervisor {
         agent: &str,
         health: AgentHealth,
         baton_status: Option<&str>,
+        next_action: Option<&str>,
         now: i64,
         network_exit: F,
     ) -> PollOutcome {
@@ -640,7 +677,7 @@ impl Supervisor {
         }
         match classify(&health, hang_secs, now) {
             Verdict::Healthy => PollOutcome::Healthy,
-            Verdict::CleanExit => self.on_clean_exit(agent, baton_status, now),
+            Verdict::CleanExit => self.on_clean_exit(agent, baton_status, next_action, now),
             Verdict::Crashed => {
                 if network_exit() {
                     // Evaluated BEFORE the consumed-exit guard below so a
@@ -746,15 +783,24 @@ impl Supervisor {
     /// A released/retired member is gone (its slot freed); a rate-limited one is
     /// down-but-registered (re-rolled when its window recovers). All stop the
     /// blind re-roll, which is what kept `claude -p` spinning.
-    fn on_clean_exit(&mut self, agent: &str, baton_status: Option<&str>, now: i64) -> PollOutcome {
-        // No baton signal → the historical clean-exit re-roll. Slice 002 wires the
-        // per-member write-back so a working member always supplies a status; until
-        // then (and for a brand-new member's first boundary) this is the fallback.
+    fn on_clean_exit(
+        &mut self,
+        agent: &str,
+        baton_status: Option<&str>,
+        next_action: Option<&str>,
+        now: i64,
+    ) -> PollOutcome {
+        // No baton signal → the historical clean-exit re-roll, but still through the
+        // spin guard: a member that never rewrites its baton keeps the seed's constant
+        // NEXT ACTION, so `roll_or_spin` catches it as a stall (its NEXT ACTION repeats
+        // unchanged) rather than re-rolling it forever. A truly missing/unreadable
+        // baton leaves `next_action` `None`, which never proves a repeat, so the guard
+        // stays inert there — the exact historical re-roll.
         let Some(status) = baton_status else {
-            return self.roll(agent, now);
+            return self.roll_or_spin(agent, next_action, now);
         };
         match classify_status(Some(status)) {
-            BatonDisposition::Continue => self.roll(agent, now),
+            BatonDisposition::Continue => self.roll_or_spin(agent, next_action, now),
             BatonDisposition::ItemBoundary => {
                 // Item boundary: the member already wrote `set_item_status <part>
                 // done|deferred`, so its part is finished. Release its slot — drop
@@ -777,8 +823,13 @@ impl Supervisor {
                 // it registered, so it stays a re-roll candidate. Admission's rate
                 // gate — not a sticky flag — holds it every `tick` until its window
                 // recovers, at which point `tick` re-rolls it (the timed re-arm).
+                // Reset the spin streak: a rate-limit park is a budget pause, not a
+                // no-progress stall, so a member that resumes on the SAME NEXT ACTION
+                // after its window reopens must not be mistaken for spinning (task 038).
                 if let Some(sup) = self.agents.get_mut(agent) {
                     sup.child = None;
+                    sup.last_next_action = None;
+                    sup.unchanged_streak = 0;
                 }
                 PollOutcome::ParkedRateLimited
             }
@@ -793,9 +844,65 @@ impl Supervisor {
                 self.agents.remove(agent);
                 PollOutcome::Blocked {
                     status: status.to_string(),
+                    // The MEMBER wrote this block — not the supervisor's spin guard.
+                    spin_guard: false,
                 }
             }
         }
+    }
+
+    /// A **continue** clean exit (`IN_PROGRESS` / no baton): re-roll the SAME part —
+    /// UNLESS the member's `# NEXT ACTION` has repeated byte-identical across
+    /// [`STALL_LIMIT`] consecutive continue-exits, the **spin guard** (task 038).
+    ///
+    /// growlightd's re-roll path had no fleet equivalent of the deleted `--auto`
+    /// STUCK threshold (protocol step 6): a member wedged on the same next-action
+    /// (a compile it can't fix, a question it keeps re-asking) was re-spawned
+    /// immediately with no backoff, burning the shared 5h/7d pool until a budget rail
+    /// tripped. This mirrors that threshold structurally: the NEXT ACTION is the
+    /// progress signal, and an unchanged one across the streak means no progress.
+    ///
+    /// The streak update matches the `--auto` guard exactly — a repeat requires BOTH
+    /// the previous and current NEXT ACTION to be present and equal; anything else (a
+    /// changed action, or a missing one) resets the streak to 1, and a `None` can
+    /// never prove a repeat. On a trip the member is **released to idle** (dropped
+    /// from the fleet, exactly like an agent-written `STUCK`), so the drive loop
+    /// item-parks its part `blocked` and alerts the human on the item — the block is
+    /// tagged `spin_guard` so the journal names WHY it parked instead of reading as a
+    /// member-declared human block. Not a re-roll, so no more budget is burned.
+    fn roll_or_spin(&mut self, agent: &str, next_action: Option<&str>, now: i64) -> PollOutcome {
+        let streak = {
+            let sup = self
+                .agents
+                .get_mut(agent)
+                .expect("agent exists (checked in poll)");
+            let same = matches!(
+                (sup.last_next_action.as_deref(), next_action),
+                (Some(prev), Some(cur)) if prev == cur
+            );
+            sup.unchanged_streak = if same {
+                sup.unchanged_streak.saturating_add(1)
+            } else {
+                1
+            };
+            sup.last_next_action = next_action.map(str::to_string);
+            sup.unchanged_streak
+        };
+        if streak >= STALL_LIMIT {
+            // Spin guard tripped: the member handed off the same NEXT ACTION `streak`
+            // continue-exits running — wedged, not progressing. Do NOT re-roll it into
+            // another budget-burning session. Release it to idle (drop from the fleet,
+            // the agent-written-`STUCK` lifecycle) and name the block for the log/alert;
+            // the drive loop item-parks its part + pages the human on the item.
+            self.agents.remove(agent);
+            return PollOutcome::Blocked {
+                status: format!(
+                    "STUCK (spin guard): NEXT ACTION unchanged across {streak} consecutive re-rolls"
+                ),
+                spin_guard: true,
+            };
+        }
+        self.roll(agent, now)
     }
 
     /// Schedule an immediate re-roll for a cleanly-exited member: drop the dead
@@ -1346,7 +1453,7 @@ mod tests {
         s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
 
         // A network-classified non-zero exit → Reconnecting, no streak bump, no alert.
-        let out = s.poll_with_network("a1", AgentHealth::Exited { code: 1 }, None, 0, || true);
+        let out = s.poll_with_network("a1", AgentHealth::Exited { code: 1 }, None, None, 0, || true);
         assert_eq!(out, PollOutcome::Reconnecting);
         assert_eq!(s.failures("a1"), 0, "a network exit bumps no failure streak");
         assert!(s.is_registered("a1"), "the member stays registered for its re-roll");
@@ -1360,7 +1467,7 @@ mod tests {
         );
 
         // A genuine (non-network) exit still crashes with backoff — the unchanged path.
-        let out2 = s.poll_with_network("a1", AgentHealth::Exited { code: 1 }, None, 0, || false);
+        let out2 = s.poll_with_network("a1", AgentHealth::Exited { code: 1 }, None, None, 0, || false);
         let PollOutcome::Crashed { failures, not_before, .. } = out2 else {
             panic!("expected a crash, got {out2:?}");
         };
@@ -1558,6 +1665,7 @@ mod tests {
             s.poll("a1", AgentHealth::Exited { code: 0 }, Some("STUCK"), 10),
             PollOutcome::Blocked {
                 status: "STUCK".into(),
+                spin_guard: false,
             }
         );
         // Released = gone from the fleet (slot freed), exactly like an item boundary
@@ -1584,6 +1692,7 @@ mod tests {
             s.poll("a1", AgentHealth::Exited { code: 0 }, Some("BLOCKED_ON_HUMAN"), 10),
             PollOutcome::Blocked {
                 status: "BLOCKED_ON_HUMAN".into(),
+                spin_guard: false,
             }
         );
         assert!(!s.is_registered("a1"), "a blocked member releases its slot");
@@ -1603,6 +1712,7 @@ mod tests {
             s.poll("a1", AgentHealth::Exited { code: 0 }, Some("WAT_IS_THIS"), 10),
             PollOutcome::Blocked {
                 status: "WAT_IS_THIS".into(),
+                spin_guard: false,
             }
         );
         assert!(!s.is_registered("a1"));
@@ -1734,6 +1844,185 @@ mod tests {
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "a continue baton re-rolls");
+    }
+
+    /// SPIN GUARD (task 038): a member that clean-exits on a continue status
+    /// (`IN_PROGRESS`) with the SAME `# NEXT ACTION` across `STALL_LIMIT` consecutive
+    /// re-rolls is wedged — the fleet analog of the deleted `--auto` STUCK threshold
+    /// (protocol step 6). The first repeat arms the streak (still re-rolls), the
+    /// second TRIPS it: the member is released to idle as a spin-guard block instead
+    /// of re-rolled, so it stops burning the shared budget, and the block is tagged
+    /// `spin_guard: true` so the drive loop can name WHY it parked. (This is also the
+    /// never-rewrites-its-baton case — an untouched seed keeps a constant NEXT ACTION.)
+    #[test]
+    fn spin_guard_trips_when_next_action_is_unchanged_across_re_rolls() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert_eq!(backend.spawn_count(), 1);
+
+        // First continue-exit on "compile it" → arms the streak (1), re-rolls as normal.
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                Some("compile it"),
+                10,
+                || false,
+            ),
+            PollOutcome::Rolling
+        );
+        assert!(s.is_registered("a1"), "still in the fleet after the first repeat");
+        assert_eq!(
+            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }]
+        );
+        assert_eq!(backend.spawn_count(), 2, "the first re-roll fired");
+
+        // Second continue-exit on the SAME NEXT ACTION: no progress → the guard trips.
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                Some("compile it"),
+                20,
+                || false,
+            ),
+            PollOutcome::Blocked {
+                status: "STUCK (spin guard): NEXT ACTION unchanged across 2 consecutive re-rolls"
+                    .into(),
+                spin_guard: true,
+            }
+        );
+        // Released like an agent-written STUCK — slot freed, never re-rolled, so no
+        // further sessions (no shared-budget burn) are spent on the wedged member.
+        assert!(!s.is_registered("a1"), "the spun-out member left the fleet");
+        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert_eq!(backend.spawn_count(), 2, "no re-roll of the released member");
+        assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
+    }
+
+    /// The guard does NOT trip while the member makes progress: a DIFFERENT
+    /// `# NEXT ACTION` each continue-exit resets the streak, so it keeps re-rolling
+    /// indefinitely (the normal within-item handoff — the opposite failure mode from
+    /// task 033's stall, which the guard must not reintroduce).
+    #[test]
+    fn spin_guard_does_not_trip_when_next_action_changes() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        for (i, na) in ["step one", "step two", "step three", "step four"]
+            .iter()
+            .enumerate()
+        {
+            let now = (i as i64) * 10;
+            assert_eq!(
+                s.poll_with_network(
+                    "a1",
+                    AgentHealth::Exited { code: 0 },
+                    Some("IN_PROGRESS"),
+                    Some(na),
+                    now,
+                    || false,
+                ),
+                PollOutcome::Rolling,
+                "a changing NEXT ACTION keeps re-rolling (iteration {i})"
+            );
+            assert!(s.is_registered("a1"));
+            // Re-roll it live so the next iteration observes a fresh exit.
+            s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+        }
+        assert!(s.is_registered("a1"), "progress never trips the guard");
+        assert_eq!(backend.spawn_count(), 5, "start + one re-roll per progressing exit");
+    }
+
+    /// A `HALTED_RATE_LIMIT` park between two identical continue-exits RESETS the spin
+    /// streak — a budget pause is not a no-progress stall, so a member that resumes on
+    /// the same NEXT ACTION after its window reopens is not mistaken for spinning.
+    #[test]
+    fn spin_guard_streak_resets_on_a_rate_limit_park() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        // Continue-exit on "resume the build" → arms the streak (1).
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                Some("resume the build"),
+                10,
+                || false,
+            ),
+            PollOutcome::Rolling
+        );
+        s.tick(fresh_budget(), fresh_rate(), 10, &any_work);
+        // A rate-limit park before the next session clears the streak.
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("HALTED_RATE_LIMIT"),
+                None,
+                20,
+                || false,
+            ),
+            PollOutcome::ParkedRateLimited
+        );
+        s.tick(fresh_budget(), fresh_rate(), 20, &any_work);
+        // Window reopened; the member exits on the SAME NEXT ACTION. With the streak
+        // reset this is only the FIRST repeat again → re-roll, not a trip.
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                Some("resume the build"),
+                30,
+                || false,
+            ),
+            PollOutcome::Rolling
+        );
+        assert!(
+            s.is_registered("a1"),
+            "the rate-limit park cleared the streak, so no spin trip"
+        );
+    }
+
+    /// With NO `# NEXT ACTION` signal (a missing/unreadable baton) the guard stays
+    /// inert — a `None` can't prove a repeat — preserving the historical no-baton
+    /// clean-exit re-roll exactly (mirrors the `--auto` guard, which also required
+    /// both sides present to count a repeat).
+    #[test]
+    fn spin_guard_stays_inert_without_a_next_action_signal() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        for i in 0..4 {
+            let now = i * 10;
+            assert_eq!(
+                s.poll_with_network(
+                    "a1",
+                    AgentHealth::Exited { code: 0 },
+                    Some("IN_PROGRESS"),
+                    None,
+                    now,
+                    || false,
+                ),
+                PollOutcome::Rolling,
+                "no NEXT ACTION signal → historical re-roll (iteration {i})"
+            );
+            s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+        }
+        assert!(
+            s.is_registered("a1"),
+            "a no-signal member keeps re-rolling, never spin-tripped"
+        );
     }
 
     /// THE FLEET-MEMBER-MODEL FIX (slice 001): a member that exits cleanly on an
