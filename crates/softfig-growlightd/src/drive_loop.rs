@@ -51,6 +51,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -401,6 +402,79 @@ fn is_transient_network_exit(stderr_tail: &[String], online_at_exit: bool) -> bo
     !online_at_exit || stderr_matches_network_signature(stderr_tail)
 }
 
+/// Identity of an on-disk binary, for the stale-binary guard (task 039 — the
+/// growlightd counterpart of the retired task-007 `--auto` guard). A rebuild-and-
+/// redeploy replaces the file at the launch path with a fresh inode (and typically
+/// a new mtime/size), so any change here means the long-lived growlightd daemon is
+/// now executing SUPERSEDED code. Compared by value; a missing reading (see
+/// [`ExeProbe`]) never trips the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExeIdentity {
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    size: u64,
+}
+
+/// The seam "what binary is on disk at growlightd's launch path right now", so the
+/// stale-binary guard is unit-testable without a real reinstall — mirrors the other
+/// live/deferred seams ([`Connectivity`], [`RateSource`]). The production
+/// [`SystemExeProbe`] re-stats the path captured from `current_exe()` at daemon
+/// start; a test scripts an identity that flips on cue.
+pub trait ExeProbe: Send + Sync + fmt::Debug {
+    /// The identity of the binary on disk at the daemon's launch path, or `None` if
+    /// it can't be determined — a missing reading must NEVER trip the guard, so an
+    /// un-stattable path simply disables it (never a false hold of a healthy fleet).
+    fn current_identity(&self) -> Option<ExeIdentity>;
+}
+
+/// The production [`ExeProbe`]: re-stat the launch path captured once at daemon
+/// start.
+///
+/// The path is taken from `current_exe()` *before* any reinstall and then
+/// re-statted each tick — we must not call `current_exe()` again, because once the
+/// running file is replaced `/proc/self/exe` reads back `…/softfig-growlightd
+/// (deleted)`, which would never match the new on-disk file. Only growlightd's OWN
+/// binary is watched (not the `claude` agent): the redeploy hazard this restores a
+/// guard for is a `softfig` rebuild-and-install while the fleet is live, and
+/// re-statting `claude` would false-trip on an unrelated Claude Code update — a
+/// stop the fleet must not take (exactly the task-007 posture: guard your own
+/// binary).
+#[derive(Debug, Default)]
+pub struct SystemExeProbe {
+    path: Option<PathBuf>,
+}
+
+impl SystemExeProbe {
+    /// Capture the running daemon's launch path now (resolved via `current_exe()`)
+    /// for later re-stat. Infallible: an unresolvable path is stored as `None`,
+    /// which disables the guard rather than wedging the loop.
+    pub fn capture() -> Self {
+        Self {
+            path: std::env::current_exe().ok(),
+        }
+    }
+}
+
+impl ExeProbe for SystemExeProbe {
+    fn current_identity(&self) -> Option<ExeIdentity> {
+        self.path.as_deref().and_then(stat_identity)
+    }
+}
+
+/// Stat a path into an [`ExeIdentity`] (Unix dev/ino/mtime/size); `None` if it
+/// can't be statted. The filesystem read the production probe re-runs each tick.
+fn stat_identity(path: &Path) -> Option<ExeIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some(ExeIdentity {
+        dev: m.dev(),
+        ino: m.ino(),
+        mtime: m.mtime(),
+        size: m.size(),
+    })
+}
+
 /// The default [`QueueSource`] until the live keeperd queue feed lands
 /// (`growlight-live-fleet` slice 002): an **empty** [`Snapshot`], so the
 /// scheduler picks nothing and a gated-on fleet stays idle. Fail-closed — a
@@ -698,6 +772,19 @@ pub struct TickReport {
     /// `resetsAt`, so it survives that member's exit and the task-031 forget.
     /// Health/control (step 1) still run — exits and boundary stops are observed.
     pub waiting_for_rate_limit_reset: Option<i64>,
+    /// Whether the stale-binary guard has TRIPPED this tick (task 039 — the
+    /// growlightd counterpart of the retired task-007 `--auto` guard): growlightd's
+    /// OWN launch binary was replaced on disk since this loop started, so the running
+    /// daemon is now executing SUPERSEDED code (an operator installed a fix but this
+    /// process never picked it up). Once true it LATCHES true for the life of the loop
+    /// and HOLDS every spawn (steps 2 + 3, the pre-spawn twin of `paused`/`offline`/
+    /// `rate_limited`) — no further iteration runs on the stale binary — until the
+    /// human RESTARTS the daemon, which re-execs the new build and constructs a fresh
+    /// loop with a fresh baseline. The loud "binary superseded — restart required"
+    /// narration is edge-logged by the [`TickLogger`] on the tripping tick. Health/
+    /// control (step 1) still run, so in-flight members are still observed to their
+    /// boundary; only NEW spawns/re-rolls are held.
+    pub binary_superseded: bool,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -805,6 +892,23 @@ pub struct DriveLoop {
     /// the LATER boundary when multiple windows are tripped, so admission reopens
     /// only once every tripped window has.
     rate_limit_hold_until: Option<i64>,
+    /// The stale-binary guard's on-disk identity probe (task 039). Re-statted each
+    /// tick and compared to `exe_baseline`; the live [`SystemExeProbe`] in production
+    /// (re-stats growlightd's captured launch path), a scripted fake in tests.
+    exe_probe: Box<dyn ExeProbe>,
+    /// The launch binary's identity as first observed — captured LAZILY on the first
+    /// tick that can stat it (not at construction), so a transient un-stattable read
+    /// at boot simply defers the baseline rather than disabling the guard forever.
+    /// `None` until that first successful read; a `None` probe reading never advances
+    /// it and never trips the guard. The baseline every later tick compares against
+    /// to detect a mid-run replacement.
+    exe_baseline: Option<ExeIdentity>,
+    /// The stale-binary guard's TERMINAL latch (task 039): set once the re-statted
+    /// launch binary differs from `exe_baseline`, and never cleared for the life of
+    /// this loop — the only cure is a daemon restart, which re-execs the new build.
+    /// While set, steps 2 + 3 hold every spawn so no iteration runs on the superseded
+    /// binary.
+    binary_superseded: bool,
 }
 
 impl DriveLoop {
@@ -831,6 +935,7 @@ impl DriveLoop {
         samples: Box<dyn BudgetSampleSource>,
         rate: Box<dyn RateSource>,
         connectivity: Box<dyn Connectivity>,
+        exe_probe: Box<dyn ExeProbe>,
         dispatcher: NotifyDispatcher,
         fleet: Vec<FleetMember>,
     ) -> Self {
@@ -857,6 +962,9 @@ impl DriveLoop {
             offline_since: None,
             offline_alerted: false,
             rate_limit_hold_until: None,
+            exe_probe,
+            exe_baseline: None,
+            binary_superseded: false,
         }
     }
 
@@ -884,6 +992,38 @@ impl DriveLoop {
         // peer runs, unpreventable here) is slice 002's non-punitive re-classify.
         let offline = !paused && !self.connectivity.online();
         report.waiting_for_connectivity = offline;
+
+        // Stale-binary guard (task 039 — restores the retired task-007 guard for
+        // growlightd). Re-stat growlightd's OWN launch binary and compare to the
+        // baseline (its first stattable reading). A rebuild-and-redeploy while the
+        // fleet is live REPLACES the file at the launch path with a fresh inode/mtime/
+        // size, so a changed identity means this long-lived daemon is now executing
+        // SUPERSEDED code — the operator installed a fix but the running fleet never
+        // picked it up. Rather than silently drive another iteration on the old build,
+        // TRIP a terminal latch that holds every spawn below (steps 2 + 3, the pre-
+        // spawn twin of `paused`/`offline`/`rate_limited`); it clears only on a daemon
+        // restart, which re-execs the new build. A missing/unstattable reading never
+        // trips it (fail-open — an unresolvable launch path disables the guard rather
+        // than wedging a healthy fleet), and the baseline is captured on the first
+        // successful read so a transient boot-time stat miss just defers it. Run
+        // regardless of `paused`: a superseded binary is superseded either way, and
+        // latching while paused still fires the loud one-shot narration. Health/
+        // control (step 1) run regardless — in-flight members are still driven to
+        // their boundary; only NEW spawns are held.
+        let exe_now = self.exe_probe.current_identity();
+        match (&self.exe_baseline, &exe_now) {
+            // Capture the baseline the first tick a stat succeeds (a `None` reading
+            // leaves it unset to retry next tick) — never a trip on the first read.
+            (None, _) => self.exe_baseline = exe_now.clone(),
+            // Both known and different → the launch binary was replaced mid-run.
+            (Some(baseline), Some(current)) if baseline != current => {
+                self.binary_superseded = true;
+            }
+            // Same identity, or a transient unreadable current → no trip.
+            _ => {}
+        }
+        let superseded = self.binary_superseded;
+        report.binary_superseded = superseded;
 
         // Refresh the admission policy from the runtime source of truth BEFORE any
         // admission decision this tick: the daemon's `config.policy` is what the
@@ -1249,7 +1389,12 @@ impl DriveLoop {
         //    instant-trip it again — the spin the task-031 forget otherwise enables
         //    once its pinning sample is dropped. Held here until the window's
         //    `resetsAt`, then it re-rolls on the first tick past the boundary.
-        if !paused && !offline && !rate_limited {
+        //    ALSO stale-binary-gated (`!superseded`, task 039): once growlightd's own
+        //    launch binary is replaced mid-run, re-rolling a member would spawn a fresh
+        //    session on the SUPERSEDED daemon build — the very thing the guard exists to
+        //    stop. Held here (TERMINAL, unlike the transient holds above) until a human
+        //    restarts the daemon onto the new binary.
+        if !paused && !offline && !rate_limited && !superseded {
             // Map each configured member to its pin so the queue-gate can ask "is
             // there workable work for this agent?" via the same `pick` a fresh
             // start uses. A member not in the configured fleet (shouldn't happen)
@@ -1304,7 +1449,11 @@ impl DriveLoop {
         //    Rate-limit-gated (`!rate_limited`, task 037) for the same reason as the
         //    re-roll above: a fresh start into an exhausted window instant-trips it,
         //    so admission is held until the window's `resetsAt`, then resumes.
-        if !paused && !offline && !rate_limited {
+        //    Stale-binary-gated (`!superseded`, task 039): a fresh start would claim +
+        //    seed + spawn a new part on a SUPERSEDED daemon build, so once the launch
+        //    binary is replaced mid-run no fresh start is admitted — terminally, until a
+        //    daemon restart. No claim, no seed, no spawn.
+        if !paused && !offline && !rate_limited && !superseded {
             // Parts already SPOKEN FOR — excluded before a fresh start so the SAME
             // `(queue, part)` is never assigned twice. SEEDED from the LIVE
             // `assignments` (every part a registered member already holds, recorded on
@@ -1577,6 +1726,12 @@ struct TickLogger {
     /// rate-limit hold is a transient, expected wait (the deleted `--auto` governor
     /// slept silently), unlike the sustained-offline alert.
     rate_limited: bool,
+    /// Whether the stale-binary guard's latch was on last tick (task 039). Its
+    /// entry edge logs ONCE — the latch is TERMINAL (it never clears until a daemon
+    /// restart, at which point a fresh loop starts with a fresh logger), so without
+    /// this edge the loud "restart required" line would repeat every ~1s tick. Unlike
+    /// the transient rate-limit/offline holds there is no clearing edge to narrate.
+    binary_superseded: bool,
 }
 
 impl TickLogger {
@@ -1708,6 +1863,22 @@ impl TickLogger {
                 None => "fleet: rate-limit hold cleared — window reset, spawns resume".to_string(),
             });
         }
+        // Stale-binary guard (task 039): growlightd's own launch binary was replaced
+        // on disk mid-run, so the running daemon is now executing SUPERSEDED code.
+        // LATCHED terminal — narrate LOUDLY exactly once on the tripping edge (it
+        // never clears until a restart re-execs the daemon into a fresh loop), naming
+        // the required action so the operator sees the fleet is now idle on stale code
+        // until they restart. This is the growlightd counterpart of the retired task-007
+        // "stop the --auto loop loudly" banner.
+        if r.binary_superseded && !self.binary_superseded {
+            self.binary_superseded = true;
+            out.push(
+                "fleet: BINARY SUPERSEDED — growlightd's launch binary was replaced on disk \
+                 mid-run; holding all spawns on the stale build, RESTART REQUIRED \
+                 (`systemctl --user restart softfig-growlightd.service`) to pick up the new build"
+                    .to_string(),
+            );
+        }
         out
     }
 }
@@ -1820,6 +1991,13 @@ mod tests {
         /// HOLD path, network-failsafe slice 001). Defaults to `false` = online, so a
         /// loop built by `make_*` spawns exactly as before unless a test toggles it.
         offline: AtomicBool,
+        /// Scripted on-disk launch-binary identity the [`ExeProbe`] returns (the
+        /// stale-binary guard's probe, task 039). Defaults to `None` = un-stattable, so
+        /// a loop built by `make_*` never captures a baseline and the guard stays inert
+        /// (existing tests spawn exactly as before); a test flips it to a concrete
+        /// identity to arm the baseline, then to a DIFFERENT one to simulate a mid-run
+        /// reinstall and trip the guard.
+        exe_identity: Mutex<Option<ExeIdentity>>,
     }
     impl FakeFleet {
         fn new() -> Arc<Self> {
@@ -1861,6 +2039,13 @@ mod tests {
         /// pre-spawn HOLD gate (network-failsafe slice 001).
         fn set_offline(&self, offline: bool) {
             self.offline.store(offline, Ordering::SeqCst);
+        }
+        /// Script the on-disk launch-binary identity the [`ExeProbe`] reads (the
+        /// stale-binary guard's probe, task 039): `Some(id)` = a stattable binary with
+        /// that identity, `None` = un-stattable. A test arms the baseline with one
+        /// identity then flips to a DIFFERENT one to simulate a mid-run reinstall.
+        fn set_exe_identity(&self, id: Option<ExeIdentity>) {
+            *self.exe_identity.lock().unwrap() = id;
         }
         /// The recorded `(agent, queue, part)` seeds, in call order.
         fn seeds(&self) -> Vec<(String, String, String)> {
@@ -1953,6 +2138,11 @@ mod tests {
     impl Connectivity for Arc<FakeFleet> {
         fn online(&self) -> bool {
             !self.offline.load(Ordering::SeqCst)
+        }
+    }
+    impl ExeProbe for Arc<FakeFleet> {
+        fn current_identity(&self) -> Option<ExeIdentity> {
+            self.exe_identity.lock().unwrap().clone()
         }
     }
 
@@ -2221,6 +2411,7 @@ mod tests {
             Box::new(Arc::clone(&backend)),
             Box::new(PermissiveRate),
             Box::new(Arc::clone(&backend)), // connectivity — scripted via set_offline (default online)
+            Box::new(Arc::clone(&backend)), // exe_probe — scripted via set_exe_identity (default None → guard inert)
             dispatcher,
             fleet,
         );
@@ -2308,6 +2499,125 @@ mod tests {
             "re-rolls the moment the link returns",
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"], "re-rolled on reconnect");
+    }
+
+    /// TASK 039 — the stale-binary guard restores the retired task-007 protection for
+    /// growlightd. growlightd's OWN launch binary being REPLACED on disk between ticks
+    /// (a rebuild-and-redeploy while the fleet is live) trips a TERMINAL latch that
+    /// HOLDS every spawn — no re-roll, no fresh start — and reports `binary_superseded`,
+    /// so the daemon never silently drives another iteration on the superseded build.
+    /// Structured exactly like the offline-holds-a-reroll test above (the clean
+    /// IN_PROGRESS exit re-rolls absent a hold), with the on-disk identity flipped in
+    /// place of the connectivity toggle — except this hold, unlike the offline one, is
+    /// TERMINAL: a later matching read does NOT un-stick it (only a daemon restart does).
+    #[test]
+    fn a_replaced_launch_binary_trips_the_guard_and_holds_the_reroll() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        // tick 0: arm the baseline with a concrete on-disk identity; a1 starts on p1.
+        // The guard NEVER trips on its first (baseline) reading.
+        backend.set_exe_identity(Some(ExeIdentity {
+            dev: 1,
+            ino: 100,
+            mtime: 10,
+            size: 4096,
+        }));
+        let r0 = loop_.tick(0);
+        assert!(!r0.binary_superseded, "the baseline reading does not trip the guard");
+        assert_eq!(backend.spawns(), vec!["a1"], "a1 starts on the baseline tick");
+
+        // a1 exits clean on a continue baton → a down re-roll candidate (the offline
+        // test proves this re-rolls absent a hold). A rebuild-and-redeploy replaces the
+        // file at the launch path → a NEW inode/mtime/size. The next tick re-stats it,
+        // sees the change, and trips the guard, which HOLDS the re-roll.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_exe_identity(Some(ExeIdentity {
+            dev: 2,
+            ino: 200,
+            mtime: 12,
+            size: 5120,
+        }));
+        let r1 = loop_.tick(1);
+        assert!(r1.binary_superseded, "a replaced launch binary trips the guard");
+        assert!(r1.rerolls.is_empty(), "no re-roll is attempted on the superseded build");
+        assert!(r1.started.is_empty(), "no fresh start is admitted on the superseded build");
+        assert!(r1.crashes.is_empty(), "a held spawn is NOT a crash");
+        assert_eq!(backend.spawn_count(), 1, "NO new spawn once the binary is superseded");
+
+        // The latch is TERMINAL: even a later reading that MATCHES the replaced binary
+        // keeps the guard tripped and every spawn held — only a daemon restart (a fresh
+        // loop with a fresh baseline) clears it. This is the key difference from the
+        // transient offline/rate-limit holds, which self-clear.
+        backend.set_exe_identity(Some(ExeIdentity {
+            dev: 2,
+            ino: 200,
+            mtime: 12,
+            size: 5120,
+        }));
+        let r2 = loop_.tick(2);
+        assert!(r2.binary_superseded, "the guard latch is terminal — it does not un-stick");
+        assert!(r2.rerolls.is_empty(), "still holding the re-roll on tick 2");
+        assert_eq!(backend.spawn_count(), 1, "still no new spawn on tick 2");
+    }
+
+    /// TASK 039 — a missing/unstattable probe reading NEVER trips the guard (fail-open):
+    /// a loop whose probe always returns `None` (an unresolvable launch path) captures
+    /// no baseline and drives normally, spawning exactly as it would with no guard at
+    /// all — so an un-stattable exe can never wedge a healthy fleet.
+    #[test]
+    fn an_unstattable_launch_binary_leaves_the_guard_inert() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        // Probe defaults to `None` (un-stattable) — never set an identity.
+        let r0 = loop_.tick(0);
+        assert!(!r0.binary_superseded, "no reading → no baseline → the guard stays inert");
+        assert_eq!(backend.spawns(), vec!["a1"], "a1 starts normally");
+
+        // A clean exit still re-rolls (the guard is inert), proving spawns are not held.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        let r1 = loop_.tick(1);
+        assert!(!r1.binary_superseded, "still inert on a subsequent tick");
+        assert_eq!(
+            r1.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "the re-roll proceeds — an un-stattable exe never holds a spawn",
+        );
+    }
+
+    /// TASK 039 — the production probe's core [`stat_identity`]: a file re-statted in
+    /// place reads the SAME identity (the guard must NOT trip), while REPLACING the file
+    /// at the same path (a reinstall → new inode/size) reads a DIFFERENT identity (the
+    /// guard MUST trip) — no real `softfig-growlightd` reinstall needed. An un-stattable
+    /// path reads `None`.
+    #[test]
+    fn stat_identity_distinguishes_a_replaced_binary_from_a_stable_one() {
+        let dir = std::env::temp_dir().join(format!("softfig-growlightd-exeid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bin");
+
+        std::fs::write(&path, b"v1").unwrap();
+        let a = stat_identity(&path).expect("stat v1");
+        // Same file, re-statted → identical identity (the guard must NOT trip).
+        assert_eq!(stat_identity(&path).as_ref(), Some(&a));
+
+        // Replace the file at the same path (drop + recreate → new inode/size, exactly
+        // like a rebuild-and-install over the launch path).
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"v2-longer").unwrap();
+        let b = stat_identity(&path).expect("stat v2");
+        assert_ne!(a, b, "a replaced binary reads a different identity");
+
+        assert!(stat_identity(&dir.join("does-not-exist")).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// SLICE 001 — the pure IPv4 routing-table parser [`v4_has_default`] over

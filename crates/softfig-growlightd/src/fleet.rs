@@ -58,7 +58,8 @@ use crate::claim::{KeeperdItemParker, KeeperdPartClaimer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
-    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RouteConnectivity, DRIVE_POLL_MS,
+    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RouteConnectivity, SystemExeProbe,
+    DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::preapproval::{agent_paths, PreApproval};
@@ -342,6 +343,7 @@ pub fn assemble_fleet(
         Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
         Box::new(LiveRate::new(Arc::clone(&backend), daemon.rate_limits())), // rate — live TPM/RPM meter (slice 006)
         Box::new(RouteConnectivity), // connectivity — live kernel routing-table probe (network-failsafe slice 001)
+        Box::new(SystemExeProbe::capture()), // exe_probe — re-stat growlightd's own launch binary (stale-binary guard, task 039)
         dispatcher,
         members,
     ))
