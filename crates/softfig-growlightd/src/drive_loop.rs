@@ -150,12 +150,13 @@ pub trait BudgetSampleSource: Send + Sync + fmt::Debug {
     /// reported a parseable reserve yet (so the aggregator skips it this tick).
     fn budget(&self, agent: &str) -> Option<BudgetUsage>;
 
-    /// The reopen time (unix secs) of any rate-limit window `agent` reports as
-    /// tripped, or `None`. The loop holds admission until this boundary then
-    /// auto-resumes — the deleted `--auto` governor's timed-resume (task 037).
-    /// Defaulted to `None` so a seam that carries no rate-limit signal opts out;
-    /// the live backend overrides it off the stream-json `resetsAt`.
-    fn budget_reset(&self, _agent: &str) -> Option<i64> {
+    /// The instant admission may re-probe any rate-limit window `agent` reports as
+    /// `rejected`, or `None`. The loop holds admission until this boundary then
+    /// auto-resumes — the deleted `--auto` governor's timed-resume (task 037); the
+    /// reopen is the wire's `resetsAt` or a pinned bounded fail-safe (fix ①), and a
+    /// `warning` never sets one (fix ②). Defaulted to `None` so a seam that carries
+    /// no rate-limit signal opts out; the live backend overrides it.
+    fn rate_limit_reopen(&self, _agent: &str) -> Option<i64> {
         None
     }
 }
@@ -167,8 +168,8 @@ impl BudgetSampleSource for Arc<ClaudeBackend> {
         self.as_ref().budget(agent)
     }
 
-    fn budget_reset(&self, agent: &str) -> Option<i64> {
-        self.as_ref().budget_reset(agent)
+    fn rate_limit_reopen(&self, agent: &str) -> Option<i64> {
+        self.as_ref().rate_limit_reopen(agent)
     }
 }
 
@@ -906,20 +907,23 @@ impl DriveLoop {
         //    session re-observes fresh, and an all-down fleet reads a clean (0,0).
         for member in &fleet {
             let agent = &member.spec.agent;
-            // Rate-limit timed-resume (task 037): capture the reopen boundary of any
-            // window this member reports as TRIPPED, even if it has since gone down.
-            // The budget cell retains the reading until the next spawn, so a member
-            // that tripped the window and exited within one ~1s tick is not missed;
-            // and because the boundary is a FUTURE instant that self-clears at
-            // `now >= it`, retaining it past the member's exit (unlike the pct sample
-            // the task-031 forget drops below) can never wedge admission — it only
-            // stops the post-forget aggregate (a fresh 0,0) from spin-spawning into a
-            // window that has not actually reset. Extend to the LATER boundary so
-            // admission reopens only once every tripped window has.
-            if let Some(reset_at) = self.samples.budget_reset(agent) {
+            // Rate-limit timed-resume (task 037): if this member reports a window as
+            // `rejected`, hold admission until it reopens. The reopen is a concrete
+            // instant — the wire's `resetsAt`, or a bounded fail-safe the backend pins
+            // when a rejected window carried none (fix ①) so admission can't re-roll
+            // straight back into the closed window and spin the shared pool; a
+            // `warning` sets no trip, so it never freezes a still-running fleet (fix
+            // ②). Captured even if the member has since gone down (the budget cell
+            // retains the reading until the next spawn, so a window tripped in the same
+            // ~1s tick the member exits is not missed); and because the boundary is a
+            // FUTURE instant that self-clears at `now >= it`, retaining it past the
+            // exit (unlike the pct sample the task-031 forget drops below) can never
+            // wedge admission. Extend to the LATER boundary so admission reopens only
+            // once every rejected window has.
+            if let Some(reopen) = self.samples.rate_limit_reopen(agent) {
                 self.rate_limit_hold_until = Some(
                     self.rate_limit_hold_until
-                        .map_or(reset_at, |held| held.max(reset_at)),
+                        .map_or(reopen, |held| held.max(reopen)),
                 );
             }
             if self.supervisor.is_running(agent) {
@@ -1771,11 +1775,12 @@ mod tests {
         /// ring to enrich a crash alert — crash-diagnostics slice 001).
         stderr: Mutex<BTreeMap<String, Vec<String>>>,
         budgets: Mutex<BTreeMap<String, BudgetUsage>>,
-        /// Scripted rate-limit window reopen boundary (`resetsAt`, unix secs) per
-        /// agent — what the live backend surfaces off a TRIPPED window (task 037).
-        /// Unset = no tripped window (no timed hold); the cell is retained past the
-        /// agent's exit (mirroring the live budget cell) until a test clears it.
-        budget_resets: Mutex<BTreeMap<String, i64>>,
+        /// Scripted rate-limit reopen instant (unix secs) per agent — what the live
+        /// backend surfaces off a `rejected` window (task 037): the wire's `resetsAt`
+        /// or a pinned fail-safe (fix ①). Unset = no rejected window; the cell is
+        /// retained past the agent's exit (mirroring the live budget cell) until a
+        /// test clears it.
+        rate_limit_reopens: Mutex<BTreeMap<String, i64>>,
         /// Scripted terminal baton status per agent (the per-member write-back the
         /// live loop reads on exit — slice 002's real reader is `FsBatonStore`).
         baton: Mutex<BTreeMap<String, String>>,
@@ -1837,20 +1842,22 @@ mod tests {
         fn set_budget(&self, agent: &str, b: BudgetUsage) {
             self.budgets.lock().unwrap().insert(agent.to_string(), b);
         }
-        /// Script `agent`'s tripped-window reopen boundary (`resetsAt`, unix secs) —
-        /// the timed-resume hold source (task 037). Retained past its exit like the
-        /// live budget cell, so a member that trips the window then goes down still
-        /// surfaces its reset until [`clear_budget_reset`] (a fresh session's spawn).
+        /// Script `agent`'s rejected-window reopen instant (unix secs) — the
+        /// timed-resume hold source (task 037), whether the wire's `resetsAt` or a
+        /// backend-pinned fail-safe (fix ①); at the drive-loop layer they are the same
+        /// concrete boundary. Retained past its exit like the live budget cell, so a
+        /// member that trips the window then goes down still surfaces its reopen until
+        /// [`clear_budget_reset`] (a fresh session's spawn).
         fn set_budget_reset(&self, agent: &str, reset_at: i64) {
-            self.budget_resets
+            self.rate_limit_reopens
                 .lock()
                 .unwrap()
                 .insert(agent.to_string(), reset_at);
         }
-        /// Clear `agent`'s scripted reset — models the budget cell being replaced on
-        /// the next spawn (a fresh session reads a not-yet-tripped window).
+        /// Clear `agent`'s scripted reopen — models the budget cell being replaced on
+        /// the next spawn (a fresh session reads a not-yet-rejected window).
         fn clear_budget_reset(&self, agent: &str) {
-            self.budget_resets.lock().unwrap().remove(agent);
+            self.rate_limit_reopens.lock().unwrap().remove(agent);
         }
         fn spawns(&self) -> Vec<String> {
             self.spawns.lock().unwrap().clone()
@@ -1890,8 +1897,8 @@ mod tests {
         fn budget(&self, agent: &str) -> Option<BudgetUsage> {
             self.budgets.lock().unwrap().get(agent).copied()
         }
-        fn budget_reset(&self, agent: &str) -> Option<i64> {
-            self.budget_resets.lock().unwrap().get(agent).copied()
+        fn rate_limit_reopen(&self, agent: &str) -> Option<i64> {
+            self.rate_limit_reopens.lock().unwrap().get(agent).copied()
         }
     }
     impl BatonStatusSource for Arc<FakeFleet> {
