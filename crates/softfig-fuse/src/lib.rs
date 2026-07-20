@@ -242,6 +242,16 @@ impl MountHandle {
         self.state.live_repo_paths()
     }
 
+    /// M5f slice 001 (key-before-content) — the mount path of the enabled
+    /// shared chain that owns `rel` while still unkeyed (pre-ceremony), or
+    /// `None`. The keeperd action-verb staging (`actions::worktree`) consults
+    /// this to refuse up front — mirroring the kernel ops' `EROFS` guard — so
+    /// a verb write into an unkeyed share errors cleanly instead of staging
+    /// content the commit path must then refuse to seal.
+    pub fn unkeyed_shared_owner(&self, rel: &str) -> Option<String> {
+        self.state.unkeyed_shared_owner(std::path::Path::new(rel))
+    }
+
     /// Stage a create-or-overwrite into the overlay (mode preserved on
     /// overwrite, else `0o100644`).
     pub fn stage_write(&self, rel: &str, content: Vec<u8>) {

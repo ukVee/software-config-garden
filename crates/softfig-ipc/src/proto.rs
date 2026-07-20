@@ -147,6 +147,13 @@ pub enum ErrorKind {
     /// should re-read the current content (+ version) and re-apply. No lock is
     /// ever held, so a crashed agent strands nothing.
     Conflict,
+    /// M5f slice 001 (key-before-content): a write verb targeted a path under
+    /// an enabled shared subtree whose key ceremony has not run yet (`key_id`
+    /// empty). Pre-ceremony content would seal under the per-device `M` —
+    /// unreadable to every other member and never converted by establishment —
+    /// so the daemon refuses until the share is keyed (run/accept the
+    /// ceremony, or `migrate-into-share` for existing content).
+    SharedChainUnkeyed,
     /// Unknown / unhandled internal error.
     Internal,
 }

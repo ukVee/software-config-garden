@@ -849,7 +849,9 @@ struct LaggingChain {
 /// at least one blob sealed under a shared key other than the row's committed
 /// live `key_id` — the signature of an incomplete rotation re-encrypt. Returns
 /// `(ref_name, mount_path, live_key_id)` per lagging chain; an unkeyed row is
-/// pre-ceremony (establishment's concern) and skipped.
+/// pre-ceremony — no `S` generation exists to lag behind — and skipped (its
+/// content, if any predates the m5f key-before-content refusal, waits for
+/// `migrate-into-share`, not a heal).
 fn chains_lagging_reencrypt(
     repo: &softfig_vcs::Repo,
     session: &VaultSession,
@@ -874,10 +876,13 @@ fn chains_lagging_reencrypt(
 /// True if `ref_name`'s current tip holds at least one shared blob sealed under a
 /// shared `key_id` other than `live_key_id`. Reads only each blob container's
 /// header via [`softfig_vault::shared::read_key_id`] — no decrypt, no key needed.
-/// A blob not in a shared container (a pre-ceremony `M`-keyed blob) is not
-/// "old `S`" and is skipped: rotation completeness is only about superseded
-/// shared generations, and folding `M` blobs in here would churn chains that a
-/// ceremony establishment, not a rotation, owns.
+/// A blob not in a shared container (a pre-m5f `M`-keyed blob) is not "old `S`"
+/// and is skipped: rotation completeness is only about superseded shared
+/// generations. Establishment does NOT convert M→S — `persist_ceremony_outcome`
+/// never re-encrypts existing blobs — so an M blob here is not any heal's to
+/// churn; the explicit `migrate-into-share` verb (m5f slice 004) is the only
+/// M→S path, and the write-path key-before-content refusal (m5f slice 001)
+/// keeps new M blobs off shared chains in the first place.
 fn tip_has_foreign_shared_key(
     repo: &softfig_vcs::Repo,
     ref_name: &str,

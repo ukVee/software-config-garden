@@ -210,6 +210,46 @@ impl Fixture {
         let inner = daemon.inner.lock().unwrap();
         inner.fuse.as_ref().expect("fuse attached").path_exists(rel)
     }
+
+    /// The m5f key-before-content predicate the kernel content ops and the
+    /// action-verb staging consult, read from the live mount registry.
+    fn unkeyed_shared_owner(&self, rel: &str) -> Option<String> {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        inner.fuse.as_ref().expect("fuse attached").unkeyed_shared_owner(rel)
+    }
+
+    /// Stage a rename directly into the FUSE overlay (the raw seam, like
+    /// [`Self::stage_overlay_write`]) — the m5f rescue path for content that
+    /// reached an unkeyed share past the kernel guard.
+    fn stage_overlay_rename(&self, from: &str, to: &str) {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        let mount = inner.fuse.as_ref().expect("fuse attached");
+        mount.stage_rename(from, to).unwrap();
+    }
+
+    /// Headless stand-in for the m5d key ceremony: store `S` in the vault
+    /// (a parallel session over the same vault dir — the daemon's session
+    /// loads shared keys from disk on demand), fill `key_id` in the committed
+    /// membership row via the break-glass write, then a disable/enable cycle
+    /// so the daemon re-derives the mount registry + `S` router from the
+    /// committed row (production keying — `persist_ceremony_outcome` — does
+    /// that refresh itself; a break-glass edit doesn't). The chain must be
+    /// empty at this point or the enable populated-path probe refuses.
+    fn key_chain(&self, id: &str, ref_name: &str, s_id: &str) {
+        let session = Vault::at(&self.garden).unlock(PASS).unwrap();
+        session.store_shared_key(s_id, &[0x51u8; 32]).unwrap();
+        let text = self.config_text().expect("membership exists after add");
+        let needle = format!("ref_name = \"{ref_name}\"");
+        assert!(text.contains(&needle), "no membership row for {ref_name} in: {text}");
+        let keyed = text.replace(&needle, &format!("{needle}\nkey_id = \"{s_id}\""));
+        self.write_committed("config/shared-subtrees.toml", &keyed);
+        let r = self.toggle(op::SHARED_SUBTREE_DISABLE, id);
+        assert!(!r.enabled);
+        let r = self.toggle(op::SHARED_SUBTREE_ENABLE, id);
+        assert!(r.enabled);
+    }
 }
 
 impl Drop for Fixture {
@@ -699,6 +739,8 @@ fn enable_refuses_when_the_mount_path_holds_content_written_while_disabled() {
 fn stray_overlay_file_at_mount_root_does_not_wipe_the_shared_chain() {
     let fx = Fixture::start();
     assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    // m5f slice 001: the chain must be keyed before it accepts content.
+    fx.key_chain("journals", "chain/journals", "S-stray-test-0001");
     fx.write_committed("projects/journals/2026.md", "# year notes\n");
 
     // Fabricate finding 1's artifact: a File overlay at the graft point itself.
@@ -725,5 +767,118 @@ fn stray_overlay_file_at_mount_root_does_not_wipe_the_shared_chain() {
     assert!(
         fx.mount_path_exists("projects/journals/2026.md"),
         "grafted subtree content survives the stray artifact"
+    );
+}
+
+// ---- m5f slice 001: key-before-content ------------------------------------
+
+/// A write verb into an enabled-but-unkeyed share is refused up front with the
+/// dedicated error kind, and nothing is staged — the share is read-only until
+/// its ceremony runs. Keying the chain lifts the refusal and the same write
+/// then seals under `S` from birth (never `M`).
+#[test]
+fn pre_ceremony_write_is_refused_then_lands_s_keyed_once_the_chain_is_keyed() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap();
+
+    // The predicate the kernel content ops (EROFS) + verb staging consult.
+    assert_eq!(
+        fx.unkeyed_shared_owner("projects/journals/x.md").as_deref(),
+        Some("projects/journals")
+    );
+
+    // Pre-ceremony verb write → refused, clear kind, nothing staged, chain
+    // tip untouched.
+    let resp = fx.call(
+        op::REPLACE_FILE,
+        serde_json::json!({ "path": "projects/journals/x.md", "content": "pre-key\n" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::SharedChainUnkeyed);
+    assert!(!fx.mount_path_exists("projects/journals/x.md"), "refusal staged nothing");
+    assert_eq!(
+        Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap(),
+        genesis,
+        "the unkeyed chain tip must not advance"
+    );
+
+    // Key the chain (headless ceremony stand-in) → the guard lifts…
+    fx.key_chain("journals", "chain/journals", "S-kbc-test-0001");
+    assert_eq!(fx.unkeyed_shared_owner("projects/journals/x.md"), None);
+
+    // …and the same write commits, sealed under `S` from birth.
+    fx.write_committed("projects/journals/x.md", "post-key\n");
+    let repo = Repo::open(&fx.garden).unwrap();
+    let tip = repo.tip_of("chain/journals").unwrap().unwrap();
+    assert_ne!(tip, genesis, "the keyed chain accepted the write");
+    let root = repo.db().get_commit(&tip).unwrap().root_tree;
+    let entry = repo
+        .db()
+        .get_tree(&root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "x.md")
+        .expect("chain-relative blob committed");
+    let cipher = repo.objects().get(&entry.target).unwrap();
+    assert!(
+        softfig_vault::is_shared_blob(&cipher),
+        "post-ceremony content must be in the shared (S) container, not Layer A/M"
+    );
+    assert_eq!(
+        softfig_vault::shared::read_key_id(&cipher).unwrap(),
+        "S-kbc-test-0001"
+    );
+}
+
+/// The commit-path backstop: content that reaches the overlay past the up-front
+/// guards (here via the raw staging seam — the shape of a write racing the
+/// registry refresh) is REFUSED at seal time, never silently M-committed onto
+/// the shared chain. Renaming it out (the rescue path) un-wedges the verbs and
+/// lands the bytes on the device chain.
+#[test]
+fn raced_staged_content_never_m_commits_and_can_be_rescued_out() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap();
+
+    // Race artifact: staged straight into the overlay, past the kernel guard.
+    fx.stage_overlay_write("projects/journals/raced.md", b"raced past the guard\n");
+
+    // Any verb commit now tries to advance the pending unkeyed shared ref and
+    // the encrypt_for_ref backstop refuses — surfacing the reason to the CLI.
+    let resp = fx.call(
+        op::REPLACE_FILE,
+        serde_json::json!({ "path": "device-note.md", "content": "device write\n" }),
+    );
+    let Response::Err { error, .. } = resp else {
+        panic!("expected the backstop to fail the verb, got {resp:?}");
+    };
+    assert!(
+        error.contains("no established key yet"),
+        "want the key-before-content refusal surfaced, got: {error}"
+    );
+    assert_eq!(
+        Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap(),
+        genesis,
+        "no path may M-commit content onto the shared chain"
+    );
+
+    // Rescue: move the stranded bytes out to device-owned ground (allowed —
+    // a rename out adds no blob to the chain), then verbs flow again.
+    fx.stage_overlay_rename("projects/journals/raced.md", "rescued.md");
+    let resp = fx.call(
+        op::REPLACE_FILE,
+        serde_json::json!({ "path": "device-note.md", "content": "device write\n" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "verbs un-wedged: {resp:?}");
+    assert!(fx.mount_path_exists("rescued.md"));
+    // The rescue may advance the chain ref with a removal-only commit (no-op
+    // same-tree skip is task 028, deferred), but no blob ever enters it.
+    let repo = Repo::open(&fx.garden).unwrap();
+    let tip = repo.tip_of("chain/journals").unwrap().unwrap();
+    let root = repo.db().get_commit(&tip).unwrap().root_tree;
+    assert!(
+        repo.db().get_tree(&root).unwrap().is_empty(),
+        "the rescue itself adds nothing to the unkeyed chain"
     );
 }

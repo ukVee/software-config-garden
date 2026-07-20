@@ -166,6 +166,23 @@ impl ChainRegistry {
         matches!(self.owning_chain(path).kind, ChainKind::Device)
     }
 
+    /// The enabled shared chain that owns `path` while its membership row is
+    /// still **unkeyed** (`key_id` empty — pre-ceremony), or `None` when the
+    /// path is device-owned or its owning share is keyed.
+    ///
+    /// M5f slice 001 (key-before-content): a shared chain accepts content only
+    /// once its collaborative `S` is established — content taken earlier would
+    /// seal under the per-device `M`, unreadable to every other member, and
+    /// neither establishment nor the rotation heal ever converts it (the
+    /// explicit `migrate-into-share` verb is the only M→S path). The FUSE
+    /// content ops and the keeperd action-verb staging consult this to refuse
+    /// up front. A *disabled* unkeyed share stays transparent (its subtree is
+    /// device-owned via [`Self::owning_chain`]), so it is not flagged here.
+    pub fn unkeyed_shared_owner(&self, path: &Path) -> Option<&Chain> {
+        let owner = self.owning_chain(path);
+        (owner.kind == ChainKind::Shared && owner.key_id.is_none()).then_some(owner)
+    }
+
     /// Whether `path` (garden-relative) is **exactly** the mount root of an
     /// enabled shared chain — the graft point of a live union mount. Writing a
     /// file at, removing, or renaming that path is refused by the FUSE layer
@@ -297,6 +314,32 @@ mod tests {
         // Elsewhere → device chain.
         assert!(reg.is_device_owned(Path::new("notes/a.md")));
         assert_eq!(reg.enabled_chains().count(), 2);
+    }
+
+    #[test]
+    fn unkeyed_shared_owner_flags_only_an_enabled_unkeyed_share() {
+        let mut keyed = Chain::shared("c-keyed", "ref-keyed", "projects/keyed", true);
+        keyed.key_id = Some("S-abc".into());
+        let reg = ChainRegistry::new(
+            Chain::device(),
+            vec![
+                keyed,
+                Chain::shared("c-raw", "ref-raw", "projects/raw", true),
+                Chain::shared("c-off", "ref-off", "projects/off", false),
+            ],
+        );
+        // Enabled + unkeyed → flagged, at the mount root and below it.
+        assert_eq!(reg.unkeyed_shared_owner(Path::new("projects/raw")).unwrap().id, "c-raw");
+        assert_eq!(
+            reg.unkeyed_shared_owner(Path::new("projects/raw/deep/a.md")).unwrap().id,
+            "c-raw"
+        );
+        // Keyed share → content is welcome.
+        assert!(reg.unkeyed_shared_owner(Path::new("projects/keyed/a.md")).is_none());
+        // Disabled unkeyed share → transparent (device-owned), not flagged.
+        assert!(reg.unkeyed_shared_owner(Path::new("projects/off/a.md")).is_none());
+        // Device-owned paths → never flagged.
+        assert!(reg.unkeyed_shared_owner(Path::new("notes/a.md")).is_none());
     }
 
     #[test]

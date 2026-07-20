@@ -122,10 +122,35 @@ impl<'a> WorkTree<'a> {
         }
     }
 
+    /// M5f slice 001 (key-before-content): refuse an action-verb write landing
+    /// under an enabled shared mount whose key ceremony has not run yet. The
+    /// commit path's `encrypt_for_ref` backstop would refuse to seal it anyway,
+    /// but only after staging — leaving the overlay holding content whose
+    /// chain can't advance, and failing the verb *after* its device-chain
+    /// commit. Refusing here surfaces the clear error to the caller with
+    /// nothing staged. Disk mode has no shared chains (`add` refuses in direct
+    /// mode), so only the FUSE arm can trip.
+    fn refuse_unkeyed_shared(&self, rel: &str) -> ActionResult {
+        if let WorkTree::Fuse { mount } = self {
+            if let Some(share) = mount.unkeyed_shared_owner(rel) {
+                return Err((
+                    ErrorKind::SharedChainUnkeyed,
+                    format!(
+                        "{rel} is inside shared subtree {share:?}, which has no established \
+                         key yet (key-before-content): content is accepted only after the \
+                         share's key ceremony — run/accept the ceremony first"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Create-or-overwrite repo-relative `rel`. Disk: create parent dirs +
     /// register the path for self-write suppression so the watcher drops the
     /// event, then write. FUSE: stage into the overlay (no kernel event).
     pub fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        self.refuse_unkeyed_shared(rel)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
                 let abs = Self::abs(garden_root, rel);
@@ -141,8 +166,11 @@ impl<'a> WorkTree<'a> {
 
     /// Rename `from` → `to` (file or directory). Disk: `std::fs::rename` with
     /// both sides suppressed and the destination parent created. FUSE: re-key
-    /// the overlay (descendants included).
+    /// the overlay (descendants included). The destination gets the
+    /// key-before-content refusal (m5f slice 001); the source side stays
+    /// unguarded — moving *out* of an unkeyed share adds no blob to it.
     pub fn rename(&self, from: &str, to: &str) -> ActionResult {
+        self.refuse_unkeyed_shared(to)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
                 let from_abs = Self::abs(garden_root, from);

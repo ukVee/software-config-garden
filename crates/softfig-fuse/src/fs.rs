@@ -287,6 +287,30 @@ impl SharedState {
         self.registry.lock().unwrap().is_enabled_mount_root(path)
     }
 
+    /// M5f slice 001 (key-before-content) — the mount path of the enabled
+    /// shared chain that owns `path` while still unkeyed (pre-ceremony), or
+    /// `None`. The kernel content ops (`create`/`write`/`mkdir`/`rename`-dest/
+    /// staging `setattr`) and the keeperd action-verb staging consult this to
+    /// refuse with `EROFS`: content accepted before the key ceremony would seal
+    /// under the per-device `M` — unreadable to every other member and never
+    /// converted by establishment or the rotation heal — so an unkeyed share is
+    /// read-only until keyed. Removals (`unlink`/`rmdir`) and rename-*out*
+    /// stay allowed: they add no blob to the chain. Delegates under the
+    /// registry lock, like [`Self::is_enabled_mount_root`].
+    pub(crate) fn unkeyed_shared_owner(&self, path: &Path) -> Option<String> {
+        self.registry
+            .lock()
+            .unwrap()
+            .unkeyed_shared_owner(path)
+            .map(|c| {
+                c.mount_path
+                    .as_deref()
+                    .unwrap_or(Path::new(""))
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+    }
+
     /// Every enabled shared chain's mount root — the union graft points, for
     /// [`collect_files`]'s File-at-graft-point immunity (m5e slice 007). The
     /// device chain has no mount path and drops out of the filter_map.
@@ -1030,6 +1054,10 @@ impl Filesystem for FuseFs {
         if self.state.is_enabled_mount_root(&path) {
             return reply.error(libc::EBUSY);
         }
+        // Key-before-content (m5f slice 001): no new file in an unkeyed share.
+        if self.refuses_unkeyed_shared_write(&path, "create") {
+            return reply.error(libc::EROFS);
+        }
         let ino = {
             let mut inner = self.state.inner.lock().unwrap();
             inner.overlay.insert_file(path.clone(), Vec::new(), mode);
@@ -1060,6 +1088,10 @@ impl Filesystem for FuseFs {
             Some(p) => p,
             None => return reply.error(libc::ENOENT),
         };
+        // Key-before-content (m5f slice 001): no content into an unkeyed share.
+        if self.refuses_unkeyed_shared_write(&path, "write") {
+            return reply.error(libc::EROFS);
+        }
         let bytes = match self.read_bytes(&path) {
             Ok(b) => b,
             Err(_) => return reply.error(libc::EIO),
@@ -1099,6 +1131,12 @@ impl Filesystem for FuseFs {
             return reply.error(libc::EINVAL);
         };
         let path = parent_path.join(name_str);
+        // Key-before-content (m5f slice 001): an unkeyed share is read-only as
+        // a whole — refusing dirs too keeps the posture coherent (a dir that
+        // could never receive a file would just dangle un-versioned).
+        if self.refuses_unkeyed_shared_write(&path, "mkdir") {
+            return reply.error(libc::EROFS);
+        }
         let ino = {
             let mut inner = self.state.inner.lock().unwrap();
             inner.overlay.insert_dir(path.clone(), mode);
@@ -1220,6 +1258,13 @@ impl Filesystem for FuseFs {
         if self.state.is_enabled_mount_root(&from) || self.state.is_enabled_mount_root(&to) {
             return reply.error(libc::EBUSY);
         }
+        // Key-before-content (m5f slice 001): a rename may not land content in
+        // an unkeyed share. The source side stays unguarded — moving *out* is a
+        // removal (no blob enters the chain) and doubles as the rescue path for
+        // content stranded pre-enforcement.
+        if self.refuses_unkeyed_shared_write(&to, "rename") {
+            return reply.error(libc::EROFS);
+        }
         // renameat2 flags — previously ignored. RENAME_EXCHANGE (atomic swap)
         // is not implemented; reject it rather than silently doing a one-way
         // move. RENAME_NOREPLACE must fail if the destination exists.
@@ -1279,6 +1324,15 @@ impl Filesystem for FuseFs {
         if (mode.is_some() || size.is_some()) && self.state.is_enabled_mount_root(&path) {
             return reply.error(libc::EBUSY);
         }
+        // Key-before-content (m5f slice 001): both staging branches below
+        // insert a File overlay entry — content the unkeyed chain's commit
+        // would have to seal — so they get the same refusal as `write`. A
+        // timestamp-only setattr stages nothing and passes through.
+        if (mode.is_some() || size.is_some())
+            && self.refuses_unkeyed_shared_write(&path, "setattr")
+        {
+            return reply.error(libc::EROFS);
+        }
         // Truncate semantics: a setattr with size=0 + an O_TRUNC open
         // flag from the editor.
         if let Some(new_size) = size {
@@ -1313,6 +1367,27 @@ impl Filesystem for FuseFs {
 // ---- internal helpers ----
 
 impl FuseFs {
+    /// M5f slice 001 (key-before-content) — refuse a kernel content op into an
+    /// unkeyed shared mount. `true` = refused (the caller replies `EROFS`);
+    /// the reason is journal-surfaced here so the user sees more than a bare
+    /// errno. Composes with the mount-root `EBUSY` guards: those protect the
+    /// graft point structurally, this makes the whole pre-ceremony subtree
+    /// read-only until its `S` is established.
+    fn refuses_unkeyed_shared_write(&self, path: &Path, op: &str) -> bool {
+        match self.state.unkeyed_shared_owner(path) {
+            Some(mount) => {
+                eprintln!(
+                    "keeperd: fuse: {op} {} refused: shared subtree {mount:?} has no \
+                     established key yet (key-before-content) — content is accepted only \
+                     after the share's key ceremony; run/accept the share ceremony first",
+                    path.display()
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
     fn path_of(&self, ino: u64) -> Option<PathBuf> {
         let inner = self.state.inner.lock().unwrap();
         inner.inodes.path_of(ino).map(|p| p.to_path_buf())
