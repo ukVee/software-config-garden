@@ -12,6 +12,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod actions;
+pub mod ceremony;
 pub mod classify;
 pub mod config;
 pub mod daemon;

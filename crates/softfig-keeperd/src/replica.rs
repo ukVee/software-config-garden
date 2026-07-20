@@ -40,8 +40,8 @@ use softfig_store::{
     TreeEntryRow,
 };
 use softfig_vcs::{
-    canonical_tree_bytes, log_collect, reachable_from, verify_commit, CanonicalCommit, Reachable,
-    Repo, TIP_REF,
+    canonical_tree_bytes, log_collect, reachable_from, reachable_from_tree, verify_commit,
+    CanonicalCommit, Reachable, Repo, TIP_REF,
 };
 use softfig_vault::VaultSession;
 
@@ -241,6 +241,24 @@ impl RepoSource {
             served,
         })
     }
+
+    /// Wrap `repo` scoped to a single **subtree** closure — the serve source for
+    /// an M5e shared-chain push (slice 002 part 2b-3). `serve_replication` here
+    /// answers only `get_tree`/`get_object` for objects reachable from
+    /// `root_tree` (the just-committed shared-chain tip's tree the receiver's
+    /// [`pull_subtree`](softfig_net::pull_subtree) walks), so a member serving one
+    /// chain's edit can't be turned into an unscoped hash oracle over the whole
+    /// store — the same finding-6 scoping the device-chain serve gets, rooted at
+    /// a tree. The announce is empty: `pull_subtree` never requests a tip or a
+    /// commit, so `tip_announce`/`get_commit` are unreachable on this path.
+    pub fn for_subtree(repo: Repo, root_tree: [u8; 32]) -> NetResult<Self> {
+        let served = reachable_from_tree(repo.db(), Hash::from_bytes(root_tree)).map_err(neterr)?;
+        Ok(Self {
+            repo,
+            announce: TipAnnounce::default(),
+            served,
+        })
+    }
 }
 
 impl ReplicaSource for RepoSource {
@@ -411,6 +429,13 @@ impl ReplicaSink for MirrorStore {
             intent: &c.intent,
             payload: &payload_value,
             master_key_id: c.master_key_id,
+            // Replication announces `repo.tip()` = the device chain (`TIP_REF`)
+            // only (M5b), so a mirrored commit is always device-form
+            // (`chain_id = None`). If a shared-chain commit ever reached here it
+            // would fail hash reconstruction — fail-closed, never mis-accepted.
+            // Replicating shared chains would require `CommitData` to carry the
+            // chain_id; out of scope until that slice.
+            chain_id: None,
         };
         let declared = Hash::from_bytes(h32(&c.hash)?);
         let sig = h32_64(&c.signature)?;
@@ -432,19 +457,7 @@ impl ReplicaSink for MirrorStore {
     }
 
     fn store_tree(&mut self, t: &TreeData) -> NetResult<()> {
-        let entries: Vec<TreeEntryRow> = t
-            .entries
-            .iter()
-            .map(msg_to_entry)
-            .collect::<NetResult<_>>()?;
-        let want = Hash::of(&canonical_tree_bytes(&entries).map_err(neterr)?);
-        if want != Hash::from_bytes(h32(&t.hash)?) {
-            return Err(NetError::Protocol("tree hash does not match its canonical form"));
-        }
-        self.db
-            .with_tx(|conn| put_tree(conn, &want, &entries))
-            .map_err(neterr)?;
-        Ok(())
+        verify_and_put_tree(&mut self.db, t)
     }
 
     fn has_object(&self, hash: &[u8; 32]) -> bool {
@@ -452,14 +465,7 @@ impl ReplicaSink for MirrorStore {
     }
 
     fn store_object(&mut self, hash: &[u8; 32], bytes: &[u8]) -> NetResult<()> {
-        // ObjectStore::put content-addresses by BLAKE3(bytes); cross-check it
-        // equals the claimed hash so a mislabeled object is rejected, not stored
-        // under the wrong name.
-        let stored = self.objects.put(bytes).map_err(neterr)?;
-        if stored != Hash::from_bytes(*hash) {
-            return Err(NetError::Protocol("object content-address mismatch"));
-        }
-        Ok(())
+        verify_and_put_object(&self.objects, hash, bytes)
     }
 
     fn advance_tip(&mut self, hash: &[u8; 32], height: u64) -> NetResult<()> {
@@ -474,6 +480,130 @@ impl ReplicaSink for MirrorStore {
             .meta_put("mirror_tip_height", &height.to_string())
             .map_err(neterr)?;
         Ok(())
+    }
+}
+
+// --- Shared verify-then-store helpers (one address check, two sinks) --------
+
+/// Verify a wire `TreeData` against its claimed canonical hash, then persist the
+/// tree row. Shared by every `ReplicaSink` that lands trees ([`MirrorStore`],
+/// [`SharedChainSink`]) so the `BLAKE3(canonical_tree_bytes)` address check lives
+/// in exactly one place.
+fn verify_and_put_tree(db: &mut Db, t: &TreeData) -> NetResult<()> {
+    let entries: Vec<TreeEntryRow> = t
+        .entries
+        .iter()
+        .map(msg_to_entry)
+        .collect::<NetResult<_>>()?;
+    let want = Hash::of(&canonical_tree_bytes(&entries).map_err(neterr)?);
+    if want != Hash::from_bytes(h32(&t.hash)?) {
+        return Err(NetError::Protocol("tree hash does not match its canonical form"));
+    }
+    db.with_tx(|conn| put_tree(conn, &want, &entries))
+        .map_err(neterr)?;
+    Ok(())
+}
+
+/// Content-address a wire object (`ObjectStore::put` hashes `bytes` with BLAKE3),
+/// reject a mislabeled one, then persist it. Idempotent: re-putting the same
+/// bytes returns the same address and stores nothing new.
+fn verify_and_put_object(objects: &ObjectStore, hash: &[u8; 32], bytes: &[u8]) -> NetResult<()> {
+    let stored = objects.put(bytes).map_err(neterr)?;
+    if stored != Hash::from_bytes(*hash) {
+        return Err(NetError::Protocol("object content-address mismatch"));
+    }
+    Ok(())
+}
+
+// --- Shared-chain sink (live store) -----------------------------------------
+
+/// A [`ReplicaSink`] that lands a shared-chain subtree's trees + objects into the
+/// **live garden store** — the very `Db` + `ObjectStore` the daemon's `Repo`
+/// reads from — so `Repo::commit_over_tree` can re-author over the pulled tree.
+///
+/// Unlike [`MirrorStore`] (a keyless per-peer *mirror* of a whole device chain),
+/// this sink is driven only by [`pull_subtree`](softfig_net::pull_subtree): it
+/// fetches a single tree closure (trees + objects) with **no** tip announce, no
+/// fast-forward walk, and no commit rows. Only the tree/object half of the trait
+/// is ever exercised; the commit-graph methods (`verify_announce` / `stored_tip`
+/// / `has_commit` / `verify_commit` / `store_commit` / `advance_tip`) are
+/// unreachable on this path and are implemented **fail-closed** (falsy / `Err`)
+/// rather than `unreachable!`, so a malformed peer degrades to a rejected pull
+/// instead of panicking the daemon.
+///
+/// It opens its own `Db` + `ObjectStore` handles on the live store paths — a
+/// *second* connection beside the daemon's `Repo`. WAL plus the store's
+/// busy-timeout serialize the two writers safely, and the pull itself runs off
+/// the daemon lock (only the local `commit_over_tree`, run after the pull
+/// completes, takes the lock). Objects are content-addressed files, so concurrent
+/// puts are inherently collision-free and idempotent.
+#[derive(Debug)]
+pub struct SharedChainSink {
+    db: Db,
+    objects: ObjectStore,
+}
+
+impl SharedChainSink {
+    /// Open the live garden store for shared-chain writes. `paths` is the running
+    /// daemon repo's `StorePaths` (`repo.paths().clone()`); the store must already
+    /// exist (the daemon is unlocked with a live `Repo`).
+    pub fn open(paths: &StorePaths) -> NetResult<Self> {
+        let db = Db::open(paths).map_err(neterr)?;
+        let objects = ObjectStore::new(paths.clone());
+        Ok(Self { db, objects })
+    }
+}
+
+impl ReplicaSink for SharedChainSink {
+    // --- commit-graph half: unreachable on the pull_subtree path -------------
+    // `pull_subtree` never announces a tip, walks the chain, or ships commit
+    // rows, so none of these run. Fail-closed (never trust / never store) rather
+    // than `unreachable!`.
+    fn verify_announce(&self, _ann: &TipAnnounce) -> bool {
+        false
+    }
+
+    fn stored_tip(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    fn has_commit(&self, _hash: &[u8; 32]) -> bool {
+        false
+    }
+
+    fn verify_commit(&self, _c: &CommitData) -> NetResult<()> {
+        Err(NetError::Protocol(
+            "SharedChainSink: commit-graph path is unreachable for a shared-chain pull",
+        ))
+    }
+
+    fn store_commit(&mut self, _c: &CommitData) -> NetResult<()> {
+        Err(NetError::Protocol(
+            "SharedChainSink: commit-graph path is unreachable for a shared-chain pull",
+        ))
+    }
+
+    fn advance_tip(&mut self, _hash: &[u8; 32], _height: u64) -> NetResult<()> {
+        Err(NetError::Protocol(
+            "SharedChainSink: commit-graph path is unreachable for a shared-chain pull",
+        ))
+    }
+
+    // --- tree/object half: the transfer target -------------------------------
+    fn has_tree(&self, hash: &[u8; 32]) -> bool {
+        self.db.tree_exists(&Hash::from_bytes(*hash)).unwrap_or(false)
+    }
+
+    fn store_tree(&mut self, t: &TreeData) -> NetResult<()> {
+        verify_and_put_tree(&mut self.db, t)
+    }
+
+    fn has_object(&self, hash: &[u8; 32]) -> bool {
+        self.objects.contains(&Hash::from_bytes(*hash))
+    }
+
+    fn store_object(&mut self, hash: &[u8; 32], bytes: &[u8]) -> NetResult<()> {
+        verify_and_put_object(&self.objects, hash, bytes)
     }
 }
 
@@ -706,5 +836,102 @@ mod tests {
         fs::create_dir_all(root.path().join("not-a-device")).unwrap();
         fs::create_dir_all(root.path().join("ab".repeat(32))).unwrap();
         assert!(list_hosted(root.path()).is_empty());
+    }
+
+    // --- SharedChainSink (shared-chain pull into the live store) -------------
+
+    /// Create a fresh live store at `dir` and return its paths. Mirrors the
+    /// daemon's on-disk layout closely enough to open a real `Db` + `ObjectStore`
+    /// over it. Returns the live `Db` handle too so the test can hold a second
+    /// connection open beside the sink (the concurrency scenario).
+    fn live_store(dir: &Path) -> (StorePaths, Db) {
+        let paths = StorePaths::with_state_root(dir, dir);
+        fs::create_dir_all(paths.softfig_dir()).unwrap();
+        ObjectStore::new(paths.clone()).ensure_root().unwrap();
+        let db = Db::create(&paths, "shared-chain-test", now_unix()).unwrap();
+        (paths, db)
+    }
+
+    /// Build a one-entry blob tree over `bytes`, returning its wire `TreeData`,
+    /// the tree hash, and the object hash (= `BLAKE3(bytes)`).
+    fn blob_tree(name: &str, bytes: &[u8]) -> (TreeData, Hash, Hash) {
+        let obj_hash = Hash::of(bytes);
+        let entries = vec![TreeEntryRow {
+            name: name.to_string(),
+            kind: TreeEntryKind::Blob,
+            mode: 0o100644,
+            target: obj_hash,
+        }];
+        let tree_hash = Hash::of(&canonical_tree_bytes(&entries).unwrap());
+        let tree = TreeData {
+            found: true,
+            hash: tree_hash.as_bytes().to_vec(),
+            entries: entries.iter().map(entry_to_msg).collect(),
+        };
+        (tree, tree_hash, obj_hash)
+    }
+
+    #[test]
+    fn shared_chain_sink_lands_closure_into_the_live_store() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hold the creating handle open — the sink is a *second* connection on
+        // the same store, exactly as it will be beside the daemon's live `Repo`.
+        let (paths, _live_db) = live_store(dir.path());
+        let bytes = b"shared-chain payload".as_slice();
+        let (tree, tree_hash, obj_hash) = blob_tree("note.md", bytes);
+        let obj_arr = *obj_hash.as_bytes();
+        let tree_arr = *tree_hash.as_bytes();
+
+        let mut sink = SharedChainSink::open(&paths).unwrap();
+        assert!(!sink.has_object(&obj_arr));
+        assert!(!sink.has_tree(&tree_arr));
+        sink.store_object(&obj_arr, bytes).unwrap();
+        sink.store_tree(&tree).unwrap();
+        assert!(sink.has_object(&obj_arr));
+        assert!(sink.has_tree(&tree_arr));
+
+        // The whole point: a *fresh* handle (what the daemon's `Repo` /
+        // `commit_over_tree` uses) reads the pulled closure back — same store,
+        // not a per-peer mirror.
+        let fresh_db = Db::open(&paths).unwrap();
+        let fresh_objects = ObjectStore::new(paths.clone());
+        assert!(fresh_db.tree_exists(&tree_hash).unwrap());
+        assert!(fresh_objects.contains(&obj_hash));
+        assert_eq!(fresh_objects.get(&obj_hash).unwrap(), bytes);
+
+        // Re-pull is idempotent (ping-pong / mesh re-push must not error).
+        sink.store_object(&obj_arr, bytes).unwrap();
+        sink.store_tree(&tree).unwrap();
+    }
+
+    #[test]
+    fn shared_chain_sink_rejects_mislabeled_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _live_db) = live_store(dir.path());
+        let mut sink = SharedChainSink::open(&paths).unwrap();
+
+        // Object claimed under a hash that is not BLAKE3(bytes).
+        let wrong = [0x11u8; 32];
+        assert!(sink.store_object(&wrong, b"real bytes").is_err());
+
+        // Tree whose declared hash does not match its canonical form.
+        let (mut tree, _h, _o) = blob_tree("f.md", b"x");
+        tree.hash = vec![0x22u8; 32];
+        assert!(sink.store_tree(&tree).is_err());
+    }
+
+    #[test]
+    fn shared_chain_sink_commit_graph_is_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _live_db) = live_store(dir.path());
+        let mut sink = SharedChainSink::open(&paths).unwrap();
+        // The commit-graph half is unreachable on the pull_subtree path and must
+        // never trust / never store, and must not panic.
+        assert!(!sink.verify_announce(&TipAnnounce::default()));
+        assert!(sink.stored_tip().is_none());
+        assert!(!sink.has_commit(&[0u8; 32]));
+        assert!(sink.verify_commit(&CommitData::default()).is_err());
+        assert!(sink.store_commit(&CommitData::default()).is_err());
+        assert!(sink.advance_tip(&[0u8; 32], 1).is_err());
     }
 }

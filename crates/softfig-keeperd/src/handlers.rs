@@ -10,8 +10,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use softfig_vcs::{fsck as run_fsck, log_collect, Intent, Repo};
 use softfig_fuse::SealedQuery;
+use softfig_net::{DeviceState, WriteTurn};
 use softfig_ipc::verbs::{
-    CommitArgs, CommitReply, DiscoverListReply, FsckReply, HostedChain, LogArgs, LogEntry, LogReply,
+    CommitArgs, CommitReply, CoordinationStatusReply, DiscoverListReply, FsckReply, HostedChain,
+    LogArgs, LogEntry, LogReply, PeerCoordRow, TurnCoordRow,
     MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
     PairRemoveReply, PendingPairing, RelockMintArgs, RelockMintReply, RelockRedeemArgs,
@@ -38,7 +40,7 @@ pub type HandlerResult = std::result::Result<serde_json::Value, (ErrorKind, Stri
 const PROJECT: &str = "softfig-keeperd";
 
 pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
-    let (state_label, tip_hex, garden_root, relock_expires_at) = {
+    let (state_label, tip_hex, garden_root, relock_expires_at, shared_key_divergence) = {
         let inner = daemon.inner.lock().unwrap();
         let tip_hex = match inner.repo.as_ref() {
             Some(repo) => repo.tip().ok().flatten().map(|h| h.to_string()),
@@ -53,6 +55,8 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
             tip_hex,
             inner.config.garden_root.clone(),
             relock_expires_at,
+            // M5d slice 006: in-memory daemon field, safe under `inner`.
+            inner.last_shared_key_divergence.clone(),
         )
     };
     // Growlight enablement — the daemon's own fail-closed `fleet_enabled()` gate,
@@ -70,6 +74,7 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
         relock_pending: relock_expires_at.is_some(),
         relock_expires_at,
         growlight_enabled,
+        shared_key_divergence,
     };
     Ok(serde_json::to_value(reply).unwrap())
 }
@@ -172,6 +177,8 @@ fn establish_session_locked(
         // allow-list (`config/shared-subtrees.toml` + local toggle sidecar).
         // Absent/empty ⇒ device_only ⇒ byte-identical to today.
         let registry = load_chain_registry(&repo, &session_arc, &state_dir);
+        // M5d slice 002 — prime the encrypt router with the keyed chains.
+        hook.set_shared_chain_keys(&registry);
         match softfig_fuse::FuseMount::mount_with(
             &garden_root,
             &state_dir,
@@ -199,6 +206,7 @@ fn establish_session_locked(
         let sink = crate::fuse_sink::AccumulatorSink::spawn(daemon.accumulator.clone());
         let sealed_q: Arc<dyn SealedQuery> = hook.clone();
         let registry = load_chain_registry(&repo, &session_arc, &state_dir);
+        hook.set_shared_chain_keys(&registry);
         match softfig_fuse::FuseMount::attach_unmounted(
             &garden_root,
             &state_dir,
@@ -718,6 +726,7 @@ pub fn migrate_finalize(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
                 .as_ref()
                 .map(|r| load_chain_registry(r, &session, &state_dir))
                 .unwrap_or_default();
+            inner.layer_b.set_shared_chain_keys(&registry);
             match softfig_fuse::FuseMount::mount_with(
                 &garden_root,
                 &state_dir,
@@ -862,12 +871,12 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     //       only the region's plaintext
     let plaintext: Vec<u8> = match (&args.id, is_whole_file_sealed) {
         (None, true) => session
-            .decrypt_layer_b(&rel_string, &cipher)
-            .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?,
+            .decrypt_tracked_blob(&rel_string, &cipher)
+            .map_err(|e| (ErrorKind::AuthFailed, format!("sealed decrypt: {e}")))?,
         (None, false) => {
             let layer_a = session
-                .decrypt_blob(&cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?;
+                .decrypt_tracked_blob(&rel_string, &cipher)
+                .map_err(|e| (ErrorKind::AuthFailed, format!("decrypt: {e}")))?;
             let parser = layer_b::regions::parser_for(&rel_string);
             let spans = layer_b::regions::parse(parser, &layer_a, &session, &rel_string)
                 .map_err(|e| {
@@ -914,15 +923,9 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             // Region reveal — load Layer A bytes, parse for the named
             // id, decrypt the body, return only that plaintext. Works
             // whether or not the whole file is sealed.
-            let layer_a = if is_whole_file_sealed {
-                session
-                    .decrypt_layer_b(&rel_string, &cipher)
-                    .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?
-            } else {
-                session
-                    .decrypt_blob(&cipher)
-                    .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?
-            };
+            let layer_a = session
+                .decrypt_tracked_blob(&rel_string, &cipher)
+                .map_err(|e| (ErrorKind::AuthFailed, format!("decrypt: {e}")))?;
             let parser = layer_b::regions::parser_for(&rel_string);
             let spans = layer_b::regions::parse(parser, &layer_a, &session, &rel_string)
                 .map_err(|e| {
@@ -1451,6 +1454,83 @@ pub fn replica_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResul
     .unwrap())
 }
 
+/// `coordination_status({}) -> {local_device_id, local_state, peers, turns}`.
+/// A read-only snapshot of the daemon's live write-turn + device-state
+/// coordination surface — the turn holder per shared chain plus the local and
+/// each peer's device state. This state lives only in the running daemon (it is
+/// cleared on lock) so `list_tree`/`read_file` can't reach it; hence a dedicated
+/// read verb. Require Unlocked; no mutation, no commit. v1 exposes the turn
+/// holder only (waiter-queue depth deferred). See
+/// `decision-m5e-coordination-status-verb`.
+pub fn coordination_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    // The session is present under Unlocked (require_unlocked guarantees it); its
+    // identity pubkey IS this device's coordination id — the same bytes peers key
+    // their `DeviceStateAnnounce`s on — so it needs no separate stored field.
+    let local_device_id = inner
+        .session
+        .as_ref()
+        .expect("unlocked")
+        .identity_pubkey()
+        .to_bytes();
+    let reply = marshal_coordination_status(
+        local_device_id,
+        inner.device_state,
+        &inner.peer_states,
+        &inner.write_turns,
+    );
+    Ok(serde_json::to_value(reply).unwrap())
+}
+
+/// The wire/display label for a coordination [`DeviceState`] — the same three
+/// tokens the announce's `as_u32` encoding names (0 offline / 1 online-idle /
+/// 2 online-active).
+fn device_state_label(state: DeviceState) -> &'static str {
+    match state {
+        DeviceState::Offline => "offline",
+        DeviceState::OnlineIdle => "online-idle",
+        DeviceState::OnlineActive => "online-active",
+    }
+}
+
+/// Pure marshaller for [`coordination_status`]: fold the three live sources into
+/// the read-only reply. Split out from the handler (this crate's pure-vs-daemon
+/// idiom, e.g. `decide_turn_gate`) so the reply shape is unit-testable without a
+/// live session. Both vecs are sorted — the source maps are unordered, so this
+/// gives a stable render and deterministic assertions.
+fn marshal_coordination_status(
+    local_device_id: [u8; 32],
+    local_state: DeviceState,
+    peer_states: &std::collections::HashMap<[u8; 32], crate::net::PeerAnnounce>,
+    write_turns: &std::collections::HashMap<String, WriteTurn>,
+) -> CoordinationStatusReply {
+    let mut peers: Vec<PeerCoordRow> = peer_states
+        .iter()
+        .map(|(id, announce)| PeerCoordRow {
+            device_id: hex::encode(id),
+            state: device_state_label(announce.state).to_string(),
+        })
+        .collect();
+    peers.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+
+    let mut turns: Vec<TurnCoordRow> = write_turns
+        .iter()
+        .map(|(chain, turn)| TurnCoordRow {
+            chain: chain.clone(),
+            holder_device_id: turn.holder().map(hex::encode),
+        })
+        .collect();
+    turns.sort_by(|a, b| a.chain.cmp(&b.chain));
+
+    CoordinationStatusReply {
+        local_device_id: hex::encode(local_device_id),
+        local_state: device_state_label(local_state).to_string(),
+        peers,
+        turns,
+    }
+}
+
 /// Resolve a fingerprint query (full or unique prefix) to a single ring
 /// member's full device-id fingerprint, or an error if none / ambiguous.
 fn resolve_ring_fingerprint(
@@ -1541,20 +1621,50 @@ fn read_committed_shared_subtrees_text(
         .objects()
         .get(&blob)
         .map_err(|e| format!("read {rel} blob: {e}"))?;
-    // The config lives under `config/`, not a sealed path, but decode either
-    // layer defensively so a future seal can't silently break the router.
-    let plain = if softfig_vault::is_layer_b(&cipher) {
-        session
-            .decrypt_layer_b(&rel, &cipher)
-            .map_err(|e| format!("decrypt {rel}: {e}"))?
-    } else {
-        session
-            .decrypt_blob(&cipher)
-            .map_err(|e| format!("decrypt {rel}: {e}"))?
-    };
+    // The config lives under `config/`, not a sealed path, but decode any
+    // container defensively so a future seal can't silently break the router.
+    let plain = session
+        .decrypt_tracked_blob(&rel, &cipher)
+        .map_err(|e| format!("decrypt {rel}: {e}"))?;
     String::from_utf8(plain)
         .map(Some)
         .map_err(|_| format!("{rel} is not UTF-8"))
+}
+
+/// Read + decrypt + parse a committed shared-ceremony transcript record for
+/// `key_id` from the device chain tip (M5d slice 003 rotation trigger). Mirrors
+/// [`read_committed_shared_subtrees_text`]: resolve the record's committed path
+/// ([`crate::ceremony::ceremony_record_rel`]), fetch its blob, decrypt under the
+/// tracked-blob path, parse. `Ok(None)` when there are no commits yet or the
+/// record is absent (a key whose transcript this device never committed). The
+/// caller judges staleness from the parsed transcript's member set; this only
+/// reads it back — `Transcript::verify` re-checks it from first principles when
+/// a rotation actually consumes it.
+pub(crate) fn read_committed_transcript(
+    repo: &Repo,
+    session: &softfig_vault::VaultSession,
+    key_id: &str,
+) -> std::result::Result<Option<softfig_net::ceremony::Transcript>, String> {
+    let rel = crate::ceremony::ceremony_record_rel(key_id);
+    let Some(tip) = repo.tip().map_err(|e| format!("read device tip: {e}"))? else {
+        return Ok(None);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| format!("read tip commit: {e}"))?;
+    let Some(blob) = resolve_path_in_tree(repo, &row.root_tree, &rel).map_err(|(_, e)| e)? else {
+        return Ok(None);
+    };
+    let cipher = repo
+        .objects()
+        .get(&blob)
+        .map_err(|e| format!("read {rel} blob: {e}"))?;
+    let plain = session
+        .decrypt_tracked_blob(&rel, &cipher)
+        .map_err(|e| format!("decrypt {rel}: {e}"))?;
+    let text = String::from_utf8(plain).map_err(|_| format!("{rel} is not UTF-8"))?;
+    crate::ceremony::parse_transcript_record(&text).map(Some)
 }
 
 /// The **read/compose** view of the committed membership (registry derivation,
@@ -1590,7 +1700,7 @@ fn read_committed_shared_subtrees(
 /// read into a committed allow-list wipe (and a lenient rewrite would silently
 /// drop fields this daemon doesn't understand). Only a genuinely-absent file
 /// (or a repo with no commits yet) may start from an empty allow-list.
-fn read_committed_shared_subtrees_for_mutation(
+pub(crate) fn read_committed_shared_subtrees_for_mutation(
     repo: &Repo,
     session: &softfig_vault::VaultSession,
 ) -> std::result::Result<softfig_vcs::SharedSubtreesConfig, (ErrorKind, String)> {
@@ -1639,15 +1749,16 @@ fn load_local_toggles(state_dir: &Path) -> softfig_vcs::LocalToggles {
 //
 // Two control axes, deliberately split ([[decision-softfig-shared-subtrees-impl]]
 // pick 3): `add`/`remove` edit the committed, ring-membership file
-// `config/shared-subtrees.toml` (the collaborative key ceremony is the stubbed
-// m5d hook — no real `S` is wired here); `enable`/`disable` flip ONLY the
-// never-committed `.softfig/shared-subtrees-local.toml` sidecar, so the on/off
-// toggle is provably ceremony-free (no membership/key_id/commit side-effect).
+// `config/shared-subtrees.toml` (the collaborative key ceremony hangs off the
+// add's commit — the m5d net reconcile sweep runs it and fills `key_id`);
+// `enable`/`disable` flip ONLY the never-committed
+// `.softfig/shared-subtrees-local.toml` sidecar, so the on/off toggle is
+// provably ceremony-free (no membership/key_id/commit side-effect).
 // After any change the mount's registry is hot-swapped so the union view
 // recomposes live (a no-op in non-FUSE mode; re-derived at the next mount).
 
 /// Repo-relative path of the committed membership file (`config/shared-subtrees.toml`).
-fn shared_subtrees_rel() -> String {
+pub(crate) fn shared_subtrees_rel() -> String {
     format!(
         "{}/{}",
         crate::keeper_toml::CONFIG_DIR,
@@ -1749,55 +1860,20 @@ fn normalize_mount_path(raw: &str) -> std::result::Result<String, (ErrorKind, St
 
 /// Rebuild the live chain registry from the committed membership + local sidecar
 /// and hot-swap it into the FUSE mount (if any) so the union view recomposes
-/// live. A no-op in non-FUSE (Disk / M1c-compat) mode — the registry is
+/// live — and into the Layer B hook's shared-chain key router (M5d slice 002)
+/// so a freshly keyed chain's next write seals under its `S`. In non-FUSE
+/// (Disk / M1c-compat) mode only the router refresh matters — the registry is
 /// re-derived from the same two sources at the next mount there.
-fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_dir: &Path) {
+pub(crate) fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_dir: &Path) {
     let registry = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
         load_chain_registry(repo, session, state_dir)
     };
+    inner.layer_b.set_shared_chain_keys(&registry);
     if let Some(mount) = inner.fuse.as_ref() {
         mount.set_registry(registry);
     }
-}
-
-/// Whether the device chain's tip tree has *any* committed entry (file or
-/// directory) at `rel` — the populated-dir guard's probe (slice 007,
-/// interim-review finding 4). No commits yet ⇒ nothing is populated.
-fn device_tip_path_exists(
-    repo: &Repo,
-    rel: &str,
-) -> std::result::Result<bool, (ErrorKind, String)> {
-    let components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
-    if components.is_empty() {
-        return Ok(false);
-    }
-    let Some(tip) = repo.tip().map_err(|e| err_to_response(e.into()))? else {
-        return Ok(false);
-    };
-    let row = repo
-        .db()
-        .get_commit(&tip)
-        .map_err(|e| err_to_response(KeeperError::Store(e)))?;
-    let mut current = row.root_tree;
-    for (i, name) in components.iter().enumerate() {
-        let entries = repo
-            .db()
-            .get_tree(&current)
-            .map_err(|e| err_to_response(KeeperError::Store(e)))?;
-        let Some(entry) = entries.into_iter().find(|e| e.name == *name) else {
-            return Ok(false);
-        };
-        if i + 1 == components.len() {
-            return Ok(true);
-        }
-        match entry.kind {
-            TreeEntryKind::Tree => current = entry.target,
-            TreeEntryKind::Blob => return Ok(false),
-        }
-    }
-    Ok(false)
 }
 
 pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -1849,19 +1925,47 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     }
     let ref_name = format!("chain/{id}");
 
-    // Slice 007 (finding 4): a mount path that already has committed device
-    // content would vanish behind the graft — the new chain's empty genesis
-    // shadows it and the next device commit's carve-out drops it. Refuse; the
+    // Slice 007 (finding 4) + m5c residual slice 009 (finding 1): a mount path
+    // that already holds device content would vanish behind the graft — the new
+    // chain's empty genesis shadows it and the next device commit's carve-out
+    // drops it. Probe the composed (device tip ∪ FUSE overlay) view via the
+    // WorkTree, not just the committed tip: a write staged through the live
+    // mount inside the ~200ms flush-debounce window is real content the empty
+    // graft would still swallow, and the tip-only walk missed it. Refuse; the
     // seed-genesis-from-device-subtree migration is a later slice.
     {
-        let repo = inner.repo.as_ref().expect("unlocked");
-        if device_tip_path_exists(repo, &mount_path)? {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        // m5c-residual slice 011 (018 finding 10): a committed device FILE at an
+        // *ancestor* of the mount path can't be descended through, so the
+        // emptiness probe below reads the mount path as absent (Blob mid-path ->
+        // Ok(false)) and the share is minted dead — untraversable behind the file.
+        // Refuse a blob-ancestor path explicitly before the emptiness check.
+        let mut prefix = String::new();
+        for comp in mount_path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(comp);
+            if prefix == mount_path {
+                break; // the leaf is the mount root itself — covered below
+            }
+            if wt.exists(&prefix) && !wt.is_dir(&prefix) {
+                return Err((
+                    ErrorKind::BadArgs,
+                    format!(
+                        "cannot share {mount_path:?}: ancestor {prefix:?} is a device file, so the \
+                         mount would be untraversable — remove or move that file first"
+                    ),
+                ));
+            }
+        }
+        if wt.exists(&mount_path) {
             return Err((
                 ErrorKind::PathAlreadyExists,
                 format!(
-                    "{mount_path:?} already has committed device-chain content; migrating an \
-                     existing subtree into a shared chain is not supported yet — share an \
-                     empty path or move the content aside first"
+                    "{mount_path:?} already has device-chain content (committed or staged); \
+                     migrating an existing subtree into a shared chain is not supported yet — \
+                     share an empty path or move the content aside first"
                 ),
             ));
         }
@@ -1871,8 +1975,9 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     // commit, so a mid-add failure leaves a harmless orphan ref instead of a
     // committed membership row routing to a ref-less chain. A ref that already
     // exists — an orphan from a retried add, or a chain kept through a prior
-    // `remove` (remove never deletes refs/objects) — is reused as-is, never
-    // reset: re-adding an id resumes its chain. No key ceremony here (m5d).
+    // `remove` (remove keeps the ref, and every ref is live for gc so its objects
+    // survive — m5c-residual slice 011) — is reused as-is, never reset: re-adding
+    // an id resumes its chain intact. No key ceremony here (m5d).
     let ref_exists = {
         let repo = inner.repo.as_ref().expect("unlocked");
         repo.tip_of(&ref_name)
@@ -1889,8 +1994,11 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         )?;
     }
 
-    // Append the membership row (`key_id` stays `None` — the collaborative key S
-    // is the stubbed m5d hook) and stage the config edit through the WorkTree.
+    // Append the membership row with `key_id` empty and stage the config edit
+    // through the WorkTree. The collaborative key ceremony (m5d) is deferred,
+    // never an inline block: this commit signals the net reconcile loop, whose
+    // ceremony sweep runs the commit-reveal with the peer and fills `key_id`
+    // when members are next online (`net::reconcile_ceremonies`).
     membership.subtrees.push(softfig_vcs::SharedSubtreeEntry {
         id: id.clone(),
         mount_path: mount_path.clone(),
@@ -1941,8 +2049,13 @@ pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> Handle
     let removed = membership.subtrees.len() != before;
 
     if removed {
-        // Un-share = drop the membership row + commit. The chain ref/objects are
-        // left in place (gc reclaims them later); this only stops composing it.
+        // Un-share = drop the membership row + commit. The chain ref + objects
+        // are left in place and stay live for gc (retention is keyed on ref
+        // existence — Repo::live_tips over db.list_refs, not registry membership),
+        // so a later re-add of this id resumes the chain intact (m5c-residual
+        // slice 011, contract (a): every ref is live). Reclaiming the objects
+        // needs an explicit chain-drop verb (not built); this only stops
+        // composing the subtree.
         let toml = membership
             .to_toml()
             .map_err(|e| (ErrorKind::Internal, format!("serialize shared-subtrees: {e}")))?;
@@ -1994,15 +2107,38 @@ fn toggle_shared_subtree(daemon: &Daemon, args: serde_json::Value, disable: bool
     let state_dir = inner.config.state_dir().to_path_buf();
 
     // Only a real member may be toggled, so a typo can't seed a phantom disable.
-    let is_member = {
+    let mount_path = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
-        read_committed_shared_subtrees(repo, session)
-            .unwrap_or_default()
-            .contains(&id)
+        let membership = read_committed_shared_subtrees(repo, session).unwrap_or_default();
+        match membership.subtrees.iter().find(|s| s.id == id) {
+            Some(entry) => entry.mount_path.clone(),
+            None => {
+                return Err((ErrorKind::NotFound, format!("no shared subtree with id {id:?}")));
+            }
+        }
     };
-    if !is_member {
-        return Err((ErrorKind::NotFound, format!("no shared subtree with id {id:?}")));
+
+    // m5c residual slice 009 (finding 2a): enabling a share whose mount path
+    // already holds content would shadow it behind the graft. While the share is
+    // disabled the chain is transparent, so a write at/under the mount path
+    // routes to the *device* chain; re-enabling grafts the shared chain over it
+    // (`retain(!starts_with(prefix))`) and the committed device content vanishes
+    // — the exact shape the add-guard prevents, reached through the sibling verb.
+    // Probe the composed (device tip ∪ FUSE overlay) view; refuse the enable if
+    // populated (disable has nothing to shadow, so it stays unguarded).
+    if !disable {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        if wt.exists(&mount_path) {
+            return Err((
+                ErrorKind::PathAlreadyExists,
+                format!(
+                    "{mount_path:?} holds device-chain content written while the share was \
+                     disabled; enabling would shadow it behind the shared graft — move it \
+                     aside first"
+                ),
+            ));
+        }
     }
 
     let mut local = load_local_toggles(&state_dir);
@@ -2289,5 +2425,65 @@ mod tests {
             let e = validate_repo_path(&root(), p).unwrap_err();
             assert!(e.contains(".."), "{p}: {e}");
         }
+    }
+
+    // A device id filled with a single byte, so its hex is easy to eyeball.
+    fn dev(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    #[test]
+    fn coordination_status_marshals_local_peers_and_turns() {
+        use std::collections::HashMap;
+
+        let local = dev(0xaa);
+
+        // Two peers with distinct announced states, inserted out of id order so
+        // the sort is actually exercised.
+        let mut peer_states: HashMap<[u8; 32], crate::net::PeerAnnounce> = HashMap::new();
+        peer_states.insert(
+            dev(0x02),
+            crate::net::PeerAnnounce { state: DeviceState::OnlineActive, unlocked: true, seq: 7 },
+        );
+        peer_states.insert(
+            dev(0x01),
+            crate::net::PeerAnnounce { state: DeviceState::OnlineIdle, unlocked: false, seq: 3 },
+        );
+
+        // One held chain (holder = dev(0x09)) + one free chain, again out of order.
+        let mut held = WriteTurn::whole_subtree();
+        held.request(dev(0x09), 5);
+        held.poll(1_000);
+        assert_eq!(held.holder(), Some(dev(0x09)), "turn should be granted after poll");
+        let free = WriteTurn::whole_subtree();
+        let mut write_turns: HashMap<String, WriteTurn> = HashMap::new();
+        write_turns.insert("shared/projects".to_string(), held);
+        write_turns.insert("shared/journals".to_string(), free);
+
+        let reply = marshal_coordination_status(
+            local,
+            DeviceState::OnlineActive,
+            &peer_states,
+            &write_turns,
+        );
+
+        // Local identity + state.
+        assert_eq!(reply.local_device_id, hex::encode(local));
+        assert_eq!(reply.local_state, "online-active");
+
+        // Peers sorted by device-id hex: dev(0x01) before dev(0x02).
+        assert_eq!(reply.peers.len(), 2);
+        assert_eq!(reply.peers[0].device_id, hex::encode(dev(0x01)));
+        assert_eq!(reply.peers[0].state, "online-idle");
+        assert_eq!(reply.peers[1].device_id, hex::encode(dev(0x02)));
+        assert_eq!(reply.peers[1].state, "online-active");
+
+        // Turns sorted by chain name: "shared/journals" (free) before
+        // "shared/projects" (held); free turn marshals a null holder.
+        assert_eq!(reply.turns.len(), 2);
+        assert_eq!(reply.turns[0].chain, "shared/journals");
+        assert_eq!(reply.turns[0].holder_device_id, None);
+        assert_eq!(reply.turns[1].chain, "shared/projects");
+        assert_eq!(reply.turns[1].holder_device_id, Some(hex::encode(dev(0x09))));
     }
 }

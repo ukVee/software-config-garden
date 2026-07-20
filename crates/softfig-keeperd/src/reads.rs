@@ -17,7 +17,6 @@ use softfig_ipc::verbs::{
 };
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
-use softfig_vault::is_layer_b;
 
 use crate::actions::sections::edit;
 use crate::daemon::{Daemon, KeeperError};
@@ -179,15 +178,12 @@ fn read_committed_file(
         // and return the plaintext of a sealed file. No inline regions.
         (format!("[sealed:{rel}]\n").into_bytes(), Vec::new())
     } else {
-        let layer_a = if is_layer_b(&cipher) {
-            session
-                .decrypt_layer_b(rel, &cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer b decrypt: {e}")))?
-        } else {
-            session
-                .decrypt_blob(&cipher)
-                .map_err(|e| (ErrorKind::AuthFailed, format!("layer a decrypt: {e}")))?
-        };
+        // M5d: the tracked dispatch resolves whichever container sealed the
+        // blob (device M / a shared chain's S / Layer B), so shared-chain
+        // files read the same way device files do.
+        let layer_a = session
+            .decrypt_tracked_blob(rel, &cipher)
+            .map_err(|e| (ErrorKind::AuthFailed, format!("decrypt: {e}")))?;
         // Collect the sealed region ids from the same authoritative grammar
         // the redaction uses, BEFORE `redact_regions` consumes the plaintext
         // (the projected `[encrypted]` bodies would classify as Plaintext).

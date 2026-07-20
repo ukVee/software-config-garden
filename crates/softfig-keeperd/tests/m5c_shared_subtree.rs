@@ -191,6 +191,25 @@ impl Fixture {
         )))
         .unwrap()
     }
+
+    /// Stage a create-or-overwrite directly into the daemon's FUSE overlay — no
+    /// commit, no kernel round-trip. The headless stand-in for a write through
+    /// the live mount that hasn't yet hit the ~200ms flush-debounce commit, so
+    /// the add-guard's composed-view (tip ∪ overlay) probe can be exercised in
+    /// the `fuse_attach_unmounted` fixture (m5c residual finding 1).
+    fn stage_overlay_write(&self, rel: &str, content: &[u8]) {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        let mount = inner.fuse.as_ref().expect("fuse attached");
+        mount.stage_write(rel, content.to_vec());
+    }
+
+    /// Whether the composed (tip ∪ overlay) mount view has a live entry at `rel`.
+    fn mount_path_exists(&self, rel: &str) -> bool {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        inner.fuse.as_ref().expect("fuse attached").path_exists(rel)
+    }
 }
 
 impl Drop for Fixture {
@@ -503,6 +522,31 @@ fn add_refuses_a_mount_path_with_committed_device_content() {
     assert!(matches!(fx.add("projects/empty-share", None), Response::Ok { .. }));
 }
 
+/// m5c-residual slice 011 (018 finding 10): a committed device FILE at an
+/// *ancestor* of the mount path can't be descended through, so the emptiness
+/// probe reads the leaf as absent (Blob mid-path -> Ok(false)) and would mint a
+/// dead, untraversable share. `add` refuses the blob-ancestor path outright.
+#[test]
+fn add_refuses_a_blob_ancestor_mount_path() {
+    let fx = Fixture::start();
+    // A device FILE at projects/notes.md; nothing can be shared *under* it.
+    fx.write_committed("projects/notes.md", "# notes\n");
+
+    let resp = fx.add("projects/notes.md/shared", None);
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs);
+    // Nothing was created for the refused add — no dead share, no orphan ref.
+    assert!(!fx.ref_exists("chain/shared"));
+    assert!(fx.list().subtrees.is_empty());
+    // The device file is untouched...
+    let read = fx.call(
+        op::READ_FILE,
+        serde_json::json!({ "path": "projects/notes.md" }),
+    );
+    assert_eq!(ok_data(read)["content"].as_str().unwrap(), "# notes\n");
+    // ...and an empty sibling path is still shareable.
+    assert!(matches!(fx.add("projects/ok-share", None), Response::Ok { .. }));
+}
+
 /// Finding 5: a present-but-unreadable membership file must hard-error the
 /// mutations — the old `.unwrap_or_default()` turned one corrupt read into a
 /// committed allow-list wipe. The compose path (list) parses leniently, so a
@@ -563,4 +607,123 @@ fn readd_after_disable_and_remove_is_born_enabled() {
     let list = fx.list();
     assert_eq!(list.subtrees.len(), 1);
     assert!(list.subtrees[0].enabled, "re-added share must be born enabled");
+}
+
+// ---- slice 009: composed-view add/enable guards (m5c residuals) -------------
+
+/// Slice 009 finding 1: the add-guard probes the *composed* (device tip ∪ FUSE
+/// overlay) view, not just the committed tip. A write staged through the live
+/// mount that hasn't yet hit the ~200ms flush-debounce commit is real content
+/// the empty-genesis graft would still swallow — the tip-only walk (pre-009)
+/// passed it, so `add` won the race against the flush timer and the content
+/// vanished. The composed-view probe now catches it and refuses.
+#[test]
+fn add_refuses_a_mount_path_with_overlay_staged_content() {
+    let fx = Fixture::start();
+    // Content lives only in the overlay — no commit yet (flush pending). The
+    // committed tip is empty at this path, so the old tip-only guard would have
+    // missed it; the tip ∪ overlay probe catches it.
+    fx.stage_overlay_write("projects/journals/2026.md", b"# staged, uncommitted\n");
+    assert!(
+        fx.mount_path_exists("projects/journals"),
+        "the staged child makes the mount dir live in the union view"
+    );
+
+    assert_eq!(
+        err_kind(fx.add("projects/journals", None)),
+        ErrorKind::PathAlreadyExists
+    );
+    // Nothing was created for the refused add, and the staged content is intact.
+    assert!(!fx.ref_exists("chain/journals"));
+    assert!(fx.list().subtrees.is_empty());
+    assert!(
+        fx.mount_path_exists("projects/journals"),
+        "the refusal left the staged overlay content untouched"
+    );
+    // An empty sibling is still shareable.
+    assert!(matches!(fx.add("projects/empty-share", None), Response::Ok { .. }));
+}
+
+/// Slice 009 finding 2a: `enable` gets the same composed-view populated-path
+/// guard as `add`. While a share is disabled the chain is transparent, so a
+/// write at/under the mount path routes to the device chain; re-enabling would
+/// graft the empty shared chain over it (`retain(!starts_with(prefix))`) and the
+/// committed device content would vanish — the exact shape the add-guard
+/// prevents, reached through the sibling verb. Enable refuses when the path is
+/// populated; disable (nothing to shadow) stays unguarded.
+#[test]
+fn enable_refuses_when_the_mount_path_holds_content_written_while_disabled() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let membership_after_add = fx.config_text().expect("membership exists after add");
+
+    // Disable → transparent; the mount path now routes to the device chain.
+    let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
+    assert!(!r.enabled);
+
+    // A write lands at the mount path while disabled (device-chain content
+    // stand-in — the composed-view probe sees the overlay just as it would the
+    // committed device tip).
+    fx.stage_overlay_write("projects/journals/note.md", b"# written while disabled\n");
+    assert!(fx.mount_path_exists("projects/journals"));
+
+    // Re-enabling would shadow it → refused, same kind as add.
+    assert_eq!(
+        err_kind(fx.call(
+            op::SHARED_SUBTREE_ENABLE,
+            serde_json::to_value(SharedSubtreeToggleArgs { id: "journals".into() }).unwrap(),
+        )),
+        ErrorKind::PathAlreadyExists
+    );
+    // The refused enable left the share disabled, the committed membership
+    // byte-unchanged, and the at-risk content live.
+    assert!(!fx.list().subtrees[0].enabled, "refused enable stays disabled");
+    assert_eq!(fx.config_text().unwrap(), membership_after_add, "membership byte-unchanged");
+    assert!(fx.mount_path_exists("projects/journals"), "content survived the refusal");
+
+    // Disable is never guarded — an already-disabled populated share re-disables
+    // as a plain no-op (nothing to shadow).
+    let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
+    assert!(!r.changed, "a populated path does not block a disable");
+}
+
+/// m5e slice 007 (pre-merge review finding 1): a File overlay staged at
+/// **exactly** an enabled mount root — the shape a kernel `setattr`/chmod of
+/// the mount dir used to stage before the EBUSY guard — must not shadow the
+/// grafted subtree in the snapshot composer and drive an empty-carve-out
+/// commit of the shared chain. The kernel op itself now refuses (live-mount
+/// §7b smoke); here the artifact is fabricated through the raw staging seam,
+/// so this exercises the compose-level immunity that closes the whole op
+/// class regardless of the staging source.
+#[test]
+fn stray_overlay_file_at_mount_root_does_not_wipe_the_shared_chain() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    fx.write_committed("projects/journals/2026.md", "# year notes\n");
+
+    // Fabricate finding 1's artifact: a File overlay at the graft point itself.
+    fx.stage_overlay_write("projects/journals", b"");
+
+    // Any subsequent commit builds the unified snapshot with the artifact
+    // present; without the immunity the shared carve-out is empty and the
+    // chain tip advances to an empty tree.
+    fx.write_committed("device-note.md", "device write\n");
+
+    let repo = Repo::open(&fx.garden).unwrap();
+    let tip = repo
+        .tip_of("chain/journals")
+        .unwrap()
+        .expect("shared chain has a tip");
+    let root_tree = repo.db().get_commit(&tip).unwrap().root_tree;
+    let entries = repo.db().get_tree(&root_tree).unwrap();
+    assert!(
+        !entries.is_empty(),
+        "the shared chain tip must not advance to an empty tree \
+         (the stray mount-root File shadowed the graft)"
+    );
+    // The union view still serves the subtree content.
+    assert!(
+        fx.mount_path_exists("projects/journals/2026.md"),
+        "grafted subtree content survives the stray artifact"
+    );
 }

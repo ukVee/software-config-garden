@@ -34,11 +34,45 @@ message Frame {
     GetObject get_object = 107;        // sink -> source: fetch one ciphertext blob
     ObjectData object_data = 108;      // source -> sink: ciphertext bytes (or not-found)
     ReplicaDone replica_done = 109;    // sink -> source: pull complete, close
+    // M5d (shared subtrees): the collaborative commit-reveal key ceremony that
+    // derives a shared subtree's key S, 200+. Both frames are signed by the
+    // sender's Ed25519 identity and honoured only from ring members of the
+    // ceremony's set; the pure state machine + signing-byte layout live in
+    // softfig-net's `ceremony` module.
+    SharedKeyCommit shared_key_commit = 200; // member -> members: signed H(r_i) + nonce
+    SharedKeyReveal shared_key_reveal = 201; // member -> members: signed reveal of r_i
+    // M5d slice 008 recovery: the keyed member's response to a stranded member's
+    // dial. Instead of re-running the ceremony (refused for a live non-stale
+    // chain — slice 006), it hands the caller the committed transcript + S.
+    SharedKeyHandoff shared_key_handoff = 202; // keyed member -> stranded member: recovery hand-off
+    // M5e (write-turn coordination): the active-member write-turn lease + device
+    // states, 203+ (meta/spec-sync.md §"Active / idle coordination — a write-turn
+    // lease"). Every frame is signed by the sender's Ed25519 identity over the
+    // domain-separated encodings in softfig-net's `turn` module and honoured only
+    // from S-members of the chain — a paired-but-non-member device has no role in
+    // a chain's coordination, so a forged turn-request (freeze/DoS) or turn-yield
+    // (induce the race) from a non-member is rejected. protobuf is not canonical:
+    // the driver re-derives the signed bytes from these fields, never a
+    // re-serialization. The pure lease state machine lives in the same module.
+    DeviceStateAnnounce device_state_announce = 203; // member -> members: offline / online-idle / online-active (+ unlocked)
+    TurnRequest turn_request = 204;                  // member -> members: request a chain's write turn
+    TurnYield turn_yield = 205;                      // holder -> requester: yield the turn (the go-ahead)
+    TurnRevoke turn_revoke = 206;                    // member -> members: an expired holder's lease is reclaimed
+    // M5e slice 002 (shared-pull): the data-plane push a writer sends its chain's
+    // other S-members after committing a shared-subtree edit — the new tree + the
+    // base tree it was authored over (both content hashes) so the receiver fetches
+    // just that tree closure (GetTree/GetObject; the commit graph is NOT sent) and
+    // re-authors the edit as its own local `shared_pull` commit. Signed like the
+    // other M5e frames and honoured only from S-members. See softfig-net's `turn`
+    // module + keeperd's shared_pull apply.
+    SharedChainPush shared_chain_push = 207;         // writer -> S-members: a committed shared-subtree edit to adopt
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
   // 23-99 are held for later control-plane variants; 100-199 is the M5b data
-  // plane; 200+ stays open for later sync slices (shared subtrees, M5d+).
+  // plane; 200-201 is the M5d shared-key ceremony; 202 is the M5d slice-008
+  // recovery hand-off; 203-206 is the M5e write-turn coordination; 207 is the
+  // M5e shared-chain push (slice 002); 208+ stays open for later sync slices.
   reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
@@ -187,3 +221,150 @@ message ObjectData {
 
 // sink -> source: the pull completed; the source may close the session.
 message ReplicaDone {}
+
+// --- M5d shared-subtree key ceremony ---------------------------------------
+//
+// The collaborative commit-reveal ceremony that derives a shared subtree's key
+// S (meta/spec-sync.md §"Crypto — the collaboratively-generated shared key S").
+// Every member first broadcasts a signed commitment H(nonce ‖ device_id ‖ r_i)
+// plus the ceremony nonce; only once all commitments are in does anyone reveal
+// r_i, and everyone checks each reveal against the published commitment. Both
+// frames are signed by the sender's Ed25519 identity over the domain-separated
+// encodings in softfig-net's `ceremony` module (commit_signing_bytes /
+// reveal_signing_bytes) and are honoured only from ring members of the
+// ceremony's set. protobuf is not canonical: the driver re-derives the signed
+// bytes from these fields — it never signs or verifies a re-serialization.
+
+// member -> members: a signed commitment, broadcast before anyone reveals.
+message SharedKeyCommit {
+  bytes nonce = 1;       // 32-byte ceremony nonce
+  bytes chain_id = 2;    // the shared subtree's chain id this ceremony keys
+  bytes device_id = 3;   // the committer's Ed25519 identity (32 bytes)
+  bytes commitment = 4;  // 32-byte BLAKE3 commitment H(nonce ‖ device_id ‖ r_i)
+  bytes signature = 5;   // Ed25519 (64 bytes) over commit_signing_bytes(...)
+}
+
+// member -> members: the reveal of r_i; everyone checks it against the
+// commitment it published for this ceremony. A mismatch aborts the ceremony.
+message SharedKeyReveal {
+  bytes nonce = 1;        // 32-byte ceremony nonce
+  bytes chain_id = 2;     // the shared subtree's chain id
+  bytes device_id = 3;    // the revealer's Ed25519 identity (32 bytes)
+  bytes contribution = 4; // the revealed r_i (32 bytes)
+  bytes signature = 5;    // Ed25519 (64 bytes) over reveal_signing_bytes(...)
+}
+
+// M5d slice 008 (responder-persist recovery) — the recovery hand-off. A member
+// whose ceremony persist failed (crash mid-seal / vault locked) is left a
+// transcript participant with no usable S; its unkeyed membership row makes it
+// re-dial the ceremony, but the keyed peer refuses a live non-stale chain
+// (slice 006). Instead of refusing, the keyed member serves this: the committed
+// signed transcript plus S itself. S rides in the clear *inside* the frame —
+// the enclosing Noise session (ring-authenticated: IK + attestation +
+// config/peers.toml) seals it on the wire, and the signed transcript's
+// membership is the entitlement: the server sends S only to the authenticated
+// ring peer its own committed transcript already names. The requester verifies
+// the transcript, checks key_id(S) == transcript.key_id and self ∈ members,
+// then runs the idempotent persist. No new crypto — see
+// decision-m5d-shared-key-recovery.
+message SharedKeyHandoff {
+  bytes chain_id = 1;          // the shared subtree's chain id (binds the hand-off to the dial)
+  string transcript_record = 2; // the committed ceremony-record TOML (parse_transcript_record)
+  bytes shared_key = 3;         // the 32-byte S; sealed on the wire by the Noise session
+}
+
+// --- M5e write-turn coordination -------------------------------------------
+//
+// The active/idle write-turn lease (meta/spec-sync.md §"Active / idle
+// coordination — a write-turn lease"). When members are online and active,
+// coordinate writers so concurrent edits to the same shared content don't
+// happen in the first place: to commit to a shared subtree an active member
+// must hold that chain's turn, token-passed FIFO with a deterministic tiebreak.
+// The turn is a *lease*, not a lock — time-bounded, so a crashed or partitioned
+// holder can't brick the subtree (its lease expires and the turn returns; that
+// expiry is exactly where the LWW + sidecar fallback in slice 003 takes over).
+// All frames are signed by the sender's Ed25519 identity over the
+// domain-separated encodings in softfig-net's `turn` module and honoured only
+// from S-members of the chain. protobuf is not canonical: the driver re-derives
+// the signed bytes from these fields, never a re-serialization.
+
+// member -> members: this device's shared-coordination state. `online-active`
+// members participate in the turn handshake; `online-idle` members apply
+// incoming commits immediately (nothing is editing, no handshake needed);
+// `offline` implies unreachable. `unlocked` = false means online but no S in
+// memory (a locked device queues S-encrypted commits until unlock). Signed so a
+// peer can't forge a state that e.g. omits another device from the handshake.
+message DeviceStateAnnounce {
+  bytes device_id = 1;  // the announcing device's Ed25519 identity (32 bytes)
+  uint32 state = 2;     // DeviceState: 0 = offline, 1 = online-idle, 2 = online-active
+  bool unlocked = 3;    // S available in memory (a locked device queues commits)
+  uint64 seq = 4;       // per-device monotonic logical clock (orders a stale announce vs a fresh one)
+  bytes signature = 5;  // Ed25519 over device_state_signing_bytes(...)
+}
+
+// member -> members: request the chain's write turn. `seq` is the requester's
+// logical request-time; the turn queues FIFO by (seq, device_id), so two
+// devices requesting at once have one deterministic winner and neither
+// deadlocks. `scope` is the lease's path-scope (v1 always 0 = whole subtree),
+// carried from day one so a future narrowed lease is an extension, not a wire
+// change.
+message TurnRequest {
+  bytes chain_id = 1;   // the shared subtree's chain id
+  bytes device_id = 2;  // the requester's Ed25519 identity (32 bytes)
+  uint64 seq = 3;       // logical request-time (the FIFO ordering key)
+  uint32 scope = 4;     // LeaseScope: 0 = whole subtree (v1)
+  bytes signature = 5;  // Ed25519 over turn_request_signing_bytes(...)
+}
+
+// holder -> requester: the go-ahead. Sent once the holder reaches a commit
+// boundary, quiesces new commits to the subtree, and flushes the in-flight one.
+// `grantee` + `seq` bind the yield to the exact request it answers, so a
+// forged/stale yield can't hand the turn to the wrong device.
+message TurnYield {
+  bytes chain_id = 1;   // the shared subtree's chain id
+  bytes device_id = 2;  // the yielding holder's Ed25519 identity (32 bytes)
+  bytes grantee = 3;    // the device the turn passes to (32 bytes)
+  uint64 seq = 4;       // the granted request's seq (binds the yield to the request)
+  bytes signature = 5;  // Ed25519 over turn_yield_signing_bytes(...)
+}
+
+// member -> members: a holder's lease expired (it went silent past the lease
+// TTL) so the turn is reclaimed — one dead device must never brick the subtree.
+// `revoked` names the holder losing the turn and `epoch` the exact lease
+// generation, so a resurrected holder's stale state can't be revoked twice nor a
+// fresh grant killed by a late revoke.
+message TurnRevoke {
+  bytes chain_id = 1;   // the shared subtree's chain id
+  bytes device_id = 2;  // the revoker's Ed25519 identity (32 bytes)
+  bytes revoked = 3;    // the holder whose lease is being revoked (32 bytes)
+  uint64 epoch = 4;     // the lease epoch (grant generation) being revoked
+  bytes signature = 5;  // Ed25519 over turn_revoke_signing_bytes(...)
+}
+
+// writer -> members (M5e slice 002 shared-pull): a committed shared-subtree edit
+// to adopt. After an S-member commits an edit to a shared subtree it pushes this
+// to the chain's other reachable S-members. It carries only *content hashes* +
+// provenance — never the peer's commit row — so the receiver fetches the
+// `new_tree` closure (GetTree/GetObject over the same session, the M5b transfer
+// primitive `pull_subtree`) into its LOCAL store and then re-authors the edit as
+// its own `shared_pull` commit (parent = local chain tip, tree = new_tree). The
+// receiver's three-way apply decides by TREE: `new_tree == local tip tree` is the
+// ping-pong terminator; `base_tree == local tip tree` (or an unborn chain) is a
+// clean fast-forward; otherwise it diverged (the slice-003 LWW+sidecar path).
+// `base_tree` is on the wire *because* the receiver never holds the peer's commit
+// graph and so can't derive the base from a parent pointer (decision-m5e-shared-
+// pull-intent, "apply mechanics"). Signed by the sender's Ed25519 identity over
+// shared_chain_push_signing_bytes(...) and honoured only from S-members of the
+// chain — a paired non-member has no role in a chain's sync. protobuf is not
+// canonical: the driver re-derives the signed bytes from these fields.
+message SharedChainPush {
+  bytes chain_id = 1;        // the chain ref name (utf-8 "chain/<subtree>"), same convention as the turn frames
+  string subtree = 2;        // the subtree path the chain projects (e.g. "proj")
+  bytes new_tree = 3;        // root_tree of the sender's edit commit — the content to adopt (32-byte BLAKE3)
+  bytes base_tree = 4;       // root_tree the sender authored its edit over — the apply base (32-byte BLAKE3)
+  bytes device_id = 5;       // the sending device's Ed25519 identity (32 bytes); must match the session peer
+  string writer_device = 6;  // the originating edit author's device name (provenance; propagated verbatim on re-push)
+  repeated string files = 7; // the edited file paths (payload provenance)
+  bytes signature = 8;       // Ed25519 (64 bytes) over shared_chain_push_signing_bytes(...)
+  int64 timestamp = 9;       // the originating edit commit's signed unix-secs timestamp; folded into the signed bytes — the LWW key for slice 003's sync_conflict. Propagated verbatim on mesh re-push (never re-stamped), so a relayed edit can't look newer than it is.
+}

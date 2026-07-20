@@ -123,6 +123,7 @@ fn commit_signature_verifies() {
         intent: &row.intent,
         payload: &payload,
         master_key_id: row.master_key_id,
+        chain_id: None,
     };
     verify_commit(&canon, row.hash, &row.signature).expect("signature must verify");
 }
@@ -144,6 +145,7 @@ fn jcs_canonicalization_is_deterministic() {
         intent: "init",
         payload: &payload_a,
         master_key_id: 1,
+        chain_id: None,
     };
     let h1 = canon.hash().unwrap();
     let h2 = canon.hash().unwrap();
@@ -355,7 +357,7 @@ fn commit_snapshot_commits_the_given_tree_not_the_filesystem() {
         "b.md".to_string(),
         TreeNode::File { mode: 0o644, content: b"overlay-only".to_vec() },
     );
-    let snapshot = WalkSnapshot { root: TreeNode::Dir(root) };
+    let snapshot = WalkSnapshot { root: TreeNode::Dir(root), overlay_generation: None };
 
     let intent = Intent::new(
         "memory_edit",

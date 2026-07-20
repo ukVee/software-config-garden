@@ -253,6 +253,45 @@ pub fn slugify(text: &str) -> String {
     out
 }
 
+/// Reduce a free-form name to a single, safe filename component for
+/// interpolation into an **in-tree** path. Any character outside
+/// `[A-Za-z0-9._-]` (notably `/`) becomes `_`, so the result is exactly one
+/// path component with no separators; any run of `.` collapses to a single
+/// `.`, so the name can never form a `..` parent-traversal component even glued
+/// into surrounding text. Empty (or fully-stripped) input yields `_`.
+///
+/// Pure + deterministic — the same input bytes always map to the same output —
+/// so two nodes independently sanitizing the same peer device name derive the
+/// identical path (the conflict-sidecar resolver depends on this: LWW
+/// convergence must survive the guard). Unlike [`slugify`] it preserves case
+/// and the `[._]` set, keeping the human-visible sidecar name close to the real
+/// device name.
+pub(crate) fn sanitize_name_component(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dot = false;
+    for ch in name.chars() {
+        let c = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            ch
+        } else {
+            '_'
+        };
+        if c == '.' {
+            // Collapse a run of dots to one, killing any `..` traversal.
+            if prev_dot {
+                continue;
+            }
+            prev_dot = true;
+        } else {
+            prev_dot = false;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
 /// `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, length 1–64 (no leading/trailing dash).
 pub fn validate_project_name(name: &str) -> Result<(), (ErrorKind, String)> {
     if name.is_empty() || name.len() > PROJECT_NAME_MAX {
@@ -495,6 +534,26 @@ mod tests {
         assert_eq!(slug_from_note_name("004-adb-port.md"), "adb-port");
         assert_eq!(slug_from_note_name("001-x.md"), "x");
         assert_eq!(slug_from_note_name("garbled"), "note");
+    }
+
+    #[test]
+    fn sanitize_name_component_yields_one_safe_component() {
+        // Common device names round-trip unchanged (case + `[._-]` preserved).
+        assert_eq!(sanitize_name_component("peerbox"), "peerbox");
+        assert_eq!(sanitize_name_component("laptop-01_v2.3"), "laptop-01_v2.3");
+        // Separators and traversal are neutralized to one safe component.
+        assert_eq!(sanitize_name_component("a/b"), "a_b");
+        assert_eq!(sanitize_name_component(".."), ".");
+        assert_eq!(sanitize_name_component("../escape"), "._escape");
+        assert_eq!(sanitize_name_component("x/../../y"), "x_._._y");
+        assert_eq!(sanitize_name_component(""), "_");
+        // Invariant: never a separator, never a bare `..` run, never empty.
+        for s in ["a/b", "../escape", "x/../../y", "..", "///", "a..b..c", "dev name!"] {
+            let out = sanitize_name_component(s);
+            assert!(!out.contains('/'), "{s:?} -> {out:?} kept a separator");
+            assert!(!out.contains(".."), "{s:?} -> {out:?} kept a '..' run");
+            assert!(!out.is_empty(), "{s:?} -> empty");
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! loop hands `Arc<Mutex<DaemonInner>>` clones to each connection
 //! handler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use softfig_vcs::Repo;
 use softfig_fuse::MountHandle;
+use softfig_net::{DeviceState, WriteTurn};
 use softfig_vault::VaultSession;
 use thiserror::Error;
 
@@ -92,6 +93,80 @@ pub struct DaemonInner {
     /// wins, never a permanent refusal. Cleared per part when it leaves
     /// `active`. See [`crate::actions::growlight`].
     pub holders: crate::actions::HolderStore,
+    /// M5d slice 006 part 2 — shared-key ceremony convergence state (all
+    /// in-memory: a restart just re-derives them; no ceremony survives a
+    /// restart, and the tie-break clock re-counting only costs one extra tick).
+    ///
+    /// In-flight dedup: chains with a ceremony currently running on this device
+    /// (initiator or responder). A per-chain guard so one device never drives
+    /// two concurrent ceremonies for one chain — an overlapping reconcile tick,
+    /// or the reconcile-initiator racing the inbound-responder. Inserted before
+    /// an initiate/serve leg and removed when it ends (RAII
+    /// [`crate::net::CeremonyGuard`]).
+    pub ceremonies_in_flight: HashSet<String>,
+    /// Tie-break clock: chains this device saw still pending (unkeyed) in a
+    /// *prior* reconcile pass. The lexically-higher device defers initiating
+    /// until a chain is here, so in the symmetric dual-add case the lower
+    /// device's ceremony lands (and fills the higher's row as responder) before
+    /// the higher ever initiates — exactly one ceremony per chain per window.
+    pub ceremony_seen_pending: HashSet<String>,
+    /// Tie-break clock for **rotation** (M5d slice 003), the keyed-chain analogue
+    /// of [`Self::ceremony_seen_pending`]: chains this device saw keyed-but-stale
+    /// (committed transcript members != current ring) in a *prior* rekey pass. A
+    /// chain is either unkeyed-pending or keyed-stale, never both, so this is a
+    /// separate set from the establishment clock — `reconcile_rekeys` takes/rebuilds
+    /// it independently of `reconcile_ceremonies`, and the same `should_initiate_now`
+    /// tie-break makes exactly one device initiate each rotation window.
+    pub rekey_seen_stale: HashSet<String>,
+    /// Divergence surface (item 4): the most recent shared-key divergence
+    /// message (a completed ceremony that met a row already keyed with a
+    /// *different* key — the one-key-per-chain invariant violated). Surfaced
+    /// through the `status` verb so a divergence is visible, not stderr-only;
+    /// with S-encryption live it otherwise presents as silent chain corruption.
+    pub last_shared_key_divergence: Option<String>,
+    /// M5e slice 001 part 2 — this device's shared-coordination state, announced
+    /// to S-members via a signed `DeviceStateAnnounce`. The lifecycle sets the
+    /// floor: `Offline` while `Locked` (this field is reset to `Offline` on lock,
+    /// below). On unlock the reconcile tick lifts it to `OnlineIdle`, then flips
+    /// `OnlineIdle`↔`OnlineActive` from recent local write activity — the IPC is
+    /// per-call (no persistent write session to refcount), so "actively writing"
+    /// is derived from an [`Self::last_write_at`] activity window (part 3a) rather
+    /// than a session attach/detach. Each change bumps [`Self::announce_seq`] and
+    /// re-announces exactly once.
+    pub device_state: DeviceState,
+    /// M5e part 3a — monotonic (`Instant`) stamp of the most recent local,
+    /// user-initiated garden write (set by the IPC dispatch, never by a
+    /// peer-applied or ceremony/replica-internal commit). The reconcile tick reads
+    /// it: a write within [`crate::net::WRITE_ACTIVITY_WINDOW`] ⇒ `OnlineActive`,
+    /// else `OnlineIdle`. `None` = no write since unlock. Reset on lock so a stale
+    /// pre-lock write can't read as active after the next unlock.
+    pub last_write_at: Option<Instant>,
+    /// M5e — this device's monotonic announce clock. Bumped on every state change
+    /// so a peer can order a stale `DeviceStateAnnounce` against a fresh one and
+    /// none can be replayed as a newer state. In-memory: a restart re-announces
+    /// from a low seq, which a peer accepts as the fresh generation of a restarted
+    /// device (its prior view is only kept while that device was reachable).
+    pub announce_seq: u64,
+    /// M5e — peers' most-recently-announced coordination state, keyed by device
+    /// id, kept current by the inbound `DeviceStateAnnounce` handler (an announce
+    /// with a `seq` at or below the stored one is ignored as stale). Read by the
+    /// turn driver to know which S-members are online-active.
+    pub peer_states: HashMap<[u8; 32], crate::net::PeerAnnounce>,
+    /// M5e — this device's local view of each shared chain's write-turn lease,
+    /// keyed by `ref_name`. Driven by the inbound turn handlers (this slice) and,
+    /// in part 2b, the outbound broadcast driver + the commit boundary. In-memory
+    /// by design (like [`Self::ceremonies_in_flight`]): a restart drops it and the
+    /// lease re-derives from live announces under the lease TTL, so no turn
+    /// survives a bounce — a crashed holder's lease simply expires.
+    pub write_turns: HashMap<String, WriteTurn>,
+    /// M5e part 3b-ii — coordination frames the shared-chain commit boundary
+    /// decided to send (a `TurnRequest` when a local write wants the turn, a
+    /// `TurnYield` when we hold + quiesce with a peer queued), queued under the
+    /// daemon lock and drained + signed + fanned off-lock by
+    /// [`crate::net::reconcile_write_turns`] on its commit-driven wake — the same
+    /// snapshot-under-lock / IO-off-lock discipline as the expiry-revoke path.
+    /// In-memory; cleared on soft lock alongside [`Self::write_turns`].
+    pub pending_turn_broadcasts: Vec<crate::net::PendingTurnBroadcast>,
 }
 
 impl DaemonInner {
@@ -108,6 +183,16 @@ impl DaemonInner {
             pending_pairs: PendingPairs::default(),
             thrash: crate::actions::ThrashDetector::new(),
             holders: crate::actions::HolderStore::new(),
+            ceremonies_in_flight: HashSet::new(),
+            ceremony_seen_pending: HashSet::new(),
+            rekey_seen_stale: HashSet::new(),
+            last_shared_key_divergence: None,
+            device_state: DeviceState::Offline,
+            last_write_at: None,
+            announce_seq: 0,
+            peer_states: HashMap::new(),
+            write_turns: HashMap::new(),
+            pending_turn_broadcasts: Vec::new(),
         }
     }
 }
@@ -239,6 +324,17 @@ impl Daemon {
             let fuse = inner.fuse.take();
             let net = inner.net.take();
             inner.pending_pairs.clear();
+            // M5e: drop all shared-coordination state — the net runtime is going
+            // away, so leases/peer views are meaningless, and returning
+            // `device_state` to `Offline` makes the next unlock re-announce the
+            // `Offline`→`OnlineIdle` lift (the "I'm back online" beacon). Keep
+            // `announce_seq` monotonic across a soft lock so a peer never accepts a
+            // regressed post-unlock announce as stale.
+            inner.device_state = DeviceState::Offline;
+            inner.last_write_at = None;
+            inner.write_turns.clear();
+            inner.pending_turn_broadcasts.clear();
+            inner.peer_states.clear();
             inner.session = None;
             inner.repo = None;
             (fuse, net, supervise, resume_pending)

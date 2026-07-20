@@ -350,6 +350,91 @@ fn renders_deploy_force_overlay() {
 }
 
 #[test]
+fn renders_shares_frame() {
+    use softfig_ipc::SharedSubtreeInfo;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Shares;
+    app.shares = vec![
+        SharedSubtreeInfo {
+            id: "journals".into(),
+            mount_path: "projects/journals".into(),
+            ref_name: "chain/journals".into(),
+            enabled: true,
+            key_id: Some("S-deadbeef".into()),
+        },
+        SharedSubtreeInfo {
+            id: "notes".into(),
+            mount_path: "projects/notes".into(),
+            ref_name: "chain/notes".into(),
+            enabled: false,
+            key_id: None,
+        },
+    ];
+    app.shares_loaded = true;
+    // Select the keyed share so the detail pane shows its ceremony outcome.
+    app.shares_selected = 0;
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("7:Shares"), "shares tab missing:\n{rendered}");
+    assert!(rendered.contains("projects/journals"), "shared folder missing");
+    assert!(rendered.contains("keyed"), "keyed ceremony state missing");
+    assert!(
+        rendered.contains("ceremony pending"),
+        "pending ceremony state missing"
+    );
+    assert!(rendered.contains("S-deadbeef"), "key_id missing from detail");
+    assert!(
+        rendered.contains("transcript verified"),
+        "ceremony verification line missing"
+    );
+}
+
+#[test]
+fn renders_shares_divergence_banner() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Shares;
+    app.shared_key_divergence =
+        Some("shared-key divergence for chain chain/journals: differs".into());
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("shared-key divergence"),
+        "divergence banner missing:\n{rendered}"
+    );
+}
+
+#[test]
+fn renders_add_share_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Shares;
+    app.overlay = softfig_tui::app::Overlay::AddShare {
+        mount_path: "projects/journals".into(),
+        error: None,
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("share a folder"), "overlay title missing:\n{rendered}");
+    assert!(rendered.contains("projects/journals"), "typed path missing");
+    assert!(rendered.contains("Enter share"), "share hint missing");
+}
+
+#[test]
 fn renders_growlight_frame_when_enabled() {
     use softfig_tui::tree::BacklogItem;
 
@@ -384,7 +469,7 @@ fn renders_growlight_frame_when_enabled() {
     terminal.draw(|f| ui::render(f, &mut app)).unwrap();
 
     let rendered = format!("{}", terminal.backend());
-    assert!(rendered.contains("7:Growlight"), "growlight tab missing:\n{rendered}");
+    assert!(rendered.contains("8:Growlight"), "growlight tab missing:\n{rendered}");
     assert!(rendered.contains("tui-modernize"), "queue item missing");
     assert!(rendered.contains("active"), "status missing");
     // Fleet-header strip: the latest-baton headline (frontmatter skipped).

@@ -29,6 +29,13 @@ pub enum StoreError {
     #[error("ref {0} not set")]
     RefNotSet(String),
 
+    #[error("ref {name} CAS mismatch: expected {expected:?}, found {actual:?}")]
+    RefCasMismatch {
+        name: String,
+        expected: Option<crate::Hash>,
+        actual: Option<crate::Hash>,
+    },
+
     #[error("malformed hex hash: {0}")]
     BadHashHex(String),
 

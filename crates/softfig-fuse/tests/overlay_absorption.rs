@@ -14,7 +14,11 @@
 //! * (c) an unabsorbed write is *recoverable* — the next snapshot of its
 //!   chain still carries it, and committing that chain absorbs it;
 //! * a write racing in after the snapshot capture survives the rotation
-//!   (the generation cutoff, not just chain ownership).
+//!   (the generation cutoff, not just chain ownership);
+//! * (slice 012) a ref advance carrying **no** overlay generation — the m5e
+//!   `shared_pull` shape — absorbs nothing, even with an earlier device
+//!   snapshot's high-water mark left stale (the cutoff is now bound to the
+//!   firing commit, not a shared mutable slot; interim-review finding 5).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -203,5 +207,57 @@ fn write_racing_in_after_the_snapshot_survives_the_rotation() {
         fx.handle.pending_chain_refs(),
         vec![TIP_REF.to_string()],
         "the racer stays pending for the next flush"
+    );
+}
+
+/// m5e precondition (slice 012): a ref advance carrying **no** overlay
+/// generation — the network-pull shape (`shared_pull`: a ref moves forward with
+/// no local snapshot) — must absorb NOTHING. Before the cutoff was bound to the
+/// firing commit, the rotation read a shared high-water `snapshot_gen` left
+/// stale-high by an *earlier* device snapshot and dropped a staged local write
+/// the pull never contained (the 014 data-loss family, reopened one milestone
+/// later; interim-review finding 5). Absorption is now gated on the commit's
+/// own carried cutoff, not statement-order luck.
+#[test]
+fn ref_advance_carrying_no_generation_absorbs_nothing() {
+    let mut fx = fixture();
+    // A local write staged into the shared chain, not yet committed (overlay
+    // generation 1).
+    fx.handle.stage_write("proj/x.md", b"staged local".to_vec());
+
+    // An earlier *device* snapshot + commit leaves the old shared high-water
+    // mark stale-high (>= the staged write's generation) — the exact
+    // coincidence that made the shared slot load-bearing. The device rotation
+    // absorbs only device-owned entries, so proj/x.md is untouched here.
+    fx.handle.stage_write("note.md", b"device".to_vec());
+    let dev_snap = fx.handle.workdir_snapshot().unwrap();
+    fx.repo
+        .commit_snapshot(&fx.session, dev_snap, Intent::init("device commit"))
+        .unwrap();
+    assert_eq!(read(&fx.handle, "proj/x.md").unwrap(), b"staged local");
+
+    // Now the m5e pull shape: SHARED_REF advances via a commit whose snapshot
+    // carries no overlay generation (a network-built tree) and did NOT contain
+    // the staged local write.
+    let pull = WalkSnapshot::empty();
+    assert_eq!(
+        pull.overlay_generation, None,
+        "a network snapshot carries no local overlay generation"
+    );
+    fx.repo
+        .commit_snapshot_to(SHARED_REF, &fx.session, pull, Intent::init("shared pull"))
+        .unwrap();
+
+    // The staged local write MUST survive: the pull carried no cutoff, so its
+    // rotation absorbed nothing — regardless of the stale device high-water.
+    assert_eq!(
+        read(&fx.handle, "proj/x.md").unwrap(),
+        b"staged local",
+        "a ref advance with no accompanying local snapshot must not absorb a staged write"
+    );
+    assert_eq!(
+        fx.handle.pending_chain_refs(),
+        vec![SHARED_REF.to_string()],
+        "the staged write stays pending for its own chain's next flush"
     );
 }

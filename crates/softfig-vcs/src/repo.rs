@@ -5,11 +5,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use softfig_store::{
-    put_commit, put_tree, set_ref, CommitRow, Db, Hash, ObjectStore, StorePaths,
+    put_commit, put_tree, set_ref_cas, CommitRow, Db, Hash, ObjectStore, StorePaths,
 };
 use softfig_vault::{Vault, VaultSession};
 
-use crate::chain::ChainRegistry;
 use crate::commit::CanonicalCommit;
 use crate::error::{CoreError, Result};
 use crate::intent::Intent;
@@ -25,7 +24,13 @@ pub const TIP_REF: &str = "tip";
 /// `ref_name`. M2a wires the FUSE driver here so it can drop its stat cache and
 /// broadcast inval_inode notifications. One slot per repo for v1; if a second
 /// consumer ever shows up (sync push?), promote to a Vec.
-pub type TipChangedCallback = Box<dyn Fn(&str, &Hash) + Send + Sync>;
+/// `(ref_name, new_tip_hash, overlay_generation)`. `overlay_generation` is the
+/// FUSE-overlay generation the committed snapshot was cut at (`Some` for a
+/// commit built from a live overlay, `None` for a disk walk or a network ref
+/// advance carrying no local snapshot) — the FUSE driver's rotation absorbs
+/// overlay entries at or before that generation for the advanced ref only, so a
+/// `None` advance absorbs nothing (m5c-residual slice 012).
+pub type TipChangedCallback = Box<dyn Fn(&str, &Hash, Option<u64>) + Send + Sync>;
 
 /// A garden's VCS repository. Holds the path layout, an opened sqlite
 /// connection, and the object store. Does not hold a `VaultSession` —
@@ -242,7 +247,7 @@ impl Repo {
     /// driver here.
     pub fn set_tip_changed_callback<F>(&mut self, cb: F)
     where
-        F: Fn(&str, &Hash) + Send + Sync + 'static,
+        F: Fn(&str, &Hash, Option<u64>) + Send + Sync + 'static,
     {
         self.tip_changed = Some(Box::new(cb));
     }
@@ -296,7 +301,11 @@ impl Repo {
     ///
     /// The `tip_changed` callback (the FUSE stat-cache invalidation) fires for
     /// **whichever** ref this commit advanced, carrying `ref_name` so the FUSE
-    /// driver can recompose the union view and invalidate per chain.
+    /// driver can recompose the union view and invalidate per chain, plus the
+    /// snapshot's `overlay_generation` so the rotation absorbs exactly the
+    /// overlay entries this commit captured. A snapshot with no generation (a
+    /// network ref advance, a disk walk) fires the callback with `None` and the
+    /// rotation absorbs nothing (m5c-residual slice 012).
     pub fn commit_snapshot_to(
         &mut self,
         ref_name: &str,
@@ -310,59 +319,107 @@ impl Repo {
             Some(enc) => enc.as_ref(),
             None => &default_enc,
         };
-        let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor)?;
+        let overlay_generation = snapshot.overlay_generation;
+        let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor, ref_name)?;
         let now = unix_seconds();
         let hash = write_commit_tx(&mut self.db, session, ref_name, parent, &blueprint, intent, now)?;
         if let Some(cb) = &self.tip_changed {
-            cb(ref_name, &hash);
+            cb(ref_name, &hash, overlay_generation);
         }
         Ok(hash)
     }
 
-    /// The tips of every **registered** chain in `registry` (device + all shared,
-    /// enabled or not), skipping any chain with no commits yet. This is gc's
-    /// retention set: a disabled chain's tip is included so its exclusive blobs
-    /// survive `disable -> gc -> re-enable` — enablement is a mount concern, not a
-    /// retention concern (m5c finding 7). Deriving it from the registry keeps gc
-    /// safe by construction: no chain's objects are collected because another
-    /// chain was gc'd.
-    pub fn live_tips(&self, registry: &ChainRegistry) -> Result<Vec<Hash>> {
-        let mut tips = Vec::new();
-        for chain in registry.all_chains() {
-            if let Some(t) = self.tip_of(&chain.ref_name)? {
-                tips.push(t);
-            }
+    /// Re-author a commit over an **existing** `root_tree` hash on `ref_name`,
+    /// advancing that ref to a new commit whose tree is `root_tree` — no
+    /// workdir walk, no tree rebuild. The m5e `shared_pull` apply primitive: a
+    /// peer's shared-chain tree, already fetched content-addressed into this
+    /// store, is re-committed as **this device's own** commit (its own author /
+    /// signature / hash) parented on the local chain tip. Convergence is by
+    /// content (identical `root_tree`), history is per-device — the peer's exact
+    /// commit hash is never adopted and no merge object is ever minted (the
+    /// chain stays linear / single-parent, per [[decision-m5e-shared-pull-intent]]).
+    ///
+    /// Preconditions the caller upholds:
+    /// - `root_tree` and its full subtree + blob closure are already in the
+    ///   object store (the m5e transfer — M5b content-addressed object pull —
+    ///   guarantees this before apply);
+    /// - the fast-forward decision (base tree == local tip tree; content dedup)
+    ///   is already made upstream. This method only authors + CAS-advances; the
+    ///   per-ref CAS still rolls back on a concurrent local advance.
+    ///
+    /// Fires `tip_changed` with a `None` overlay generation — a network-driven
+    /// ref advance carries no local overlay snapshot, so the FUSE rotation
+    /// absorbs nothing (it only recomposes the union view; m5c-residual slice
+    /// 012, the 014 data-loss family).
+    pub fn commit_over_tree(
+        &mut self,
+        ref_name: &str,
+        session: &VaultSession,
+        root_tree: Hash,
+        intent: Intent,
+    ) -> Result<Hash> {
+        let parent = self.tip_of(ref_name)?;
+        let now = unix_seconds();
+        let hash =
+            write_reauthor_tx(&mut self.db, session, ref_name, parent, root_tree, intent, now)?;
+        if let Some(cb) = &self.tip_changed {
+            cb(ref_name, &hash, None);
         }
-        Ok(tips)
+        Ok(hash)
+    }
+
+    /// The tip of **every ref physically present** in the store
+    /// (`db.list_refs()`). This is gc's retention set: a chain is live for gc iff
+    /// its ref exists — nothing else gates retention. Enable/disable is a
+    /// mount/compose concern (a disabled chain keeps its ref, so its exclusive
+    /// blobs survive `disable -> gc -> re-enable`, m5c finding 7), and an
+    /// *un-shared* chain keeps its ref + objects until an explicit chain-drop verb
+    /// deletes the ref, so `remove -> gc -> re-add` resumes the chain intact
+    /// instead of resurrecting a tip whose blobs gc collected (m5c-residual slice
+    /// 011, contract (a): every ref is live). Deriving retention from the refs
+    /// table — the ground truth — rather than the in-memory registry is exactly
+    /// what makes this resurrection-safe: a removed chain is gone from the
+    /// registry but its ref still pins its whole closure.
+    pub fn live_tips(&self) -> Result<Vec<Hash>> {
+        Ok(self
+            .db
+            .list_refs()?
+            .into_iter()
+            .map(|r| r.commit_hash)
+            .collect())
     }
 
     /// Per-chain fsck over the chain tracked by `ref_name` (see
     /// [`crate::fsck::run_chain`]).
     pub fn fsck_chain(&self, ref_name: &str) -> Result<crate::fsck::FsckReport> {
-        crate::fsck::run_chain(&self.db, &self.objects, self.tip_of(ref_name)?)
+        let chain_id = (ref_name != TIP_REF).then_some(ref_name);
+        crate::fsck::run_chain(&self.db, &self.objects, self.tip_of(ref_name)?, chain_id)
     }
 
-    /// Collect loose objects unreachable from any **registered** chain in
-    /// `registry` (see [`crate::gc::gc`]). Safe across chains: the retained set is
-    /// the union of every registered chain's reachable blobs — including disabled
-    /// chains, whose blobs must not be collected (m5c finding 7).
-    pub fn gc(&self, registry: &ChainRegistry) -> Result<crate::gc::GcReport> {
-        let tips = self.live_tips(registry)?;
+    /// Collect loose objects unreachable from **every ref's tip**
+    /// ([`Self::live_tips`], see [`crate::gc::gc`]). Safe across chains: the
+    /// retained set is the union of every ref's reachable blobs — including
+    /// disabled and un-shared (removed-but-not-dropped) chains, whose refs still
+    /// pin their objects (m5c finding 7; m5c-residual slice 011).
+    pub fn gc(&self) -> Result<crate::gc::GcReport> {
+        let tips = self.live_tips()?;
         crate::gc::gc(&self.db, &self.objects, &tips)
     }
 }
 
-/// Transactional commit writer: insert all new tree rows + the commit
-/// row + bump tip, all in one sqlite tx.
-fn write_commit_tx(
-    db: &mut Db,
+/// Author the signed commit row over a known `root_tree` hash — shared by the
+/// snapshot-commit path (trees freshly built into a [`Blueprint`]) and the
+/// re-author-over-existing-tree path ([`Repo::commit_over_tree`], the m5e
+/// `shared_pull` apply). Pure: no I/O, no ref touched — the caller drives the
+/// transaction and decides whether new tree rows accompany the commit.
+fn author_commit_row(
     session: &VaultSession,
     ref_name: &str,
     parent: Option<Hash>,
-    blueprint: &Blueprint,
+    root_tree: Hash,
     intent: Intent,
     timestamp: i64,
-) -> Result<Hash> {
+) -> Result<(CommitRow, Hash)> {
     let author_device = local_device_label();
     let author_pubkey = session.identity_pubkey().to_bytes();
     let master_key_id = session.active_master_key_id();
@@ -376,15 +433,21 @@ fn write_commit_tx(
     let payload_canon_value: serde_json::Value =
         serde_json::from_str(&payload_canon_str)?;
 
+    // Bind the commit to its chain (M5d slice 002). The device chain
+    // (`TIP_REF`) stays `None` so its canonical bytes — and every historical
+    // hash — are unchanged; a shared chain binds its stable `ref_name`.
+    let chain_id = (ref_name != TIP_REF).then_some(ref_name);
+
     let canon = CanonicalCommit {
         parent,
-        root_tree: blueprint.root,
+        root_tree,
         author_device: &author_device,
         author_pubkey,
         timestamp,
         intent: &intent_name,
         payload: &payload_canon_value,
         master_key_id,
+        chain_id,
     };
     let hash = canon.hash()?;
     let signature_bytes = session.sign(hash.as_bytes()).to_bytes();
@@ -392,7 +455,7 @@ fn write_commit_tx(
     let row = CommitRow {
         hash,
         parent,
-        root_tree: blueprint.root,
+        root_tree,
         author_device,
         author_pubkey,
         timestamp,
@@ -401,13 +464,61 @@ fn write_commit_tx(
         master_key_id,
         signature: signature_bytes,
     };
+    Ok((row, hash))
+}
+
+/// Transactional commit writer: insert all new tree rows + the commit
+/// row + CAS the ref, all in one sqlite tx.
+fn write_commit_tx(
+    db: &mut Db,
+    session: &VaultSession,
+    ref_name: &str,
+    parent: Option<Hash>,
+    blueprint: &Blueprint,
+    intent: Intent,
+    timestamp: i64,
+) -> Result<Hash> {
+    let (row, hash) =
+        author_commit_row(session, ref_name, parent, blueprint.root, intent, timestamp)?;
 
     db.with_tx(|conn| {
         for (tree_hash, entries) in &blueprint.trees {
             put_tree(conn, tree_hash, entries)?;
         }
         put_commit(conn, &row)?;
-        set_ref(conn, ref_name, &hash)?;
+        // CAS the ref against the tip we read as `parent`: the write lands only
+        // if no concurrent writer advanced this chain since, else the whole
+        // commit tx rolls back. Uncontended (the single-writer device chain)
+        // this is identical to a plain advance; it guards a shared chain race.
+        set_ref_cas(conn, ref_name, parent.as_ref(), &hash)?;
+        Ok(())
+    })?;
+
+    Ok(hash)
+}
+
+/// Transactional re-author writer: insert the commit row + CAS the ref, with
+/// **no** tree insertion — `root_tree` (and its whole object closure) is
+/// already present in the store. The m5e `shared_pull` apply: a peer's
+/// shared-chain tree, fetched content-addressed into this store, is
+/// re-committed as this device's own commit over the local chain tip.
+fn write_reauthor_tx(
+    db: &mut Db,
+    session: &VaultSession,
+    ref_name: &str,
+    parent: Option<Hash>,
+    root_tree: Hash,
+    intent: Intent,
+    timestamp: i64,
+) -> Result<Hash> {
+    let (row, hash) = author_commit_row(session, ref_name, parent, root_tree, intent, timestamp)?;
+
+    db.with_tx(|conn| {
+        put_commit(conn, &row)?;
+        // Same per-ref CAS guard as `write_commit_tx`: the apply lands only if
+        // the local chain tip is still `parent`, else it rolls back — a
+        // concurrent local advance re-opens the fast-forward decision upstream.
+        set_ref_cas(conn, ref_name, parent.as_ref(), &hash)?;
         Ok(())
     })?;
 

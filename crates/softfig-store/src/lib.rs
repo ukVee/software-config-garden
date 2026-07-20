@@ -22,8 +22,8 @@ pub mod objects;
 pub mod paths;
 
 pub use db::{
-    put_commit, put_tree, set_ref, CommitRow, Db, RefRow, TreeEntryKind, TreeEntryRow,
-    SCHEMA_VERSION,
+    put_commit, put_tree, set_ref, set_ref_cas, CommitRow, Db, RefRow, TreeEntryKind,
+    TreeEntryRow, SCHEMA_VERSION,
 };
 pub use error::{Result, StoreError};
 pub use hash::{Hash, HASH_LEN};

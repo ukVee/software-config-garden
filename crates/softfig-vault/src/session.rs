@@ -1,5 +1,7 @@
 //! In-memory unlocked state. Drop = K, M-store, identity zeroed.
 
+use std::os::unix::fs::PermissionsExt;
+
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::blob;
@@ -114,6 +116,179 @@ impl VaultSession {
         layer_b::decrypt(blob_file, &key)
     }
 
+    /// M5d — persist an externally-derived 32-byte shared-subtree key `S`
+    /// under the vault, addressable by its public `key_id` (`S-<hex>`). The
+    /// key is sealed with the master-keyed blob format
+    /// ([`crate::blob::encrypt_blob`]) at
+    /// `.softfig/vault/shared-keys/<key_id>.key`, so it is readable only
+    /// through an unlocked session — the same at-rest posture as every other
+    /// vault secret. `S` is full-entropy ceremony output, so the convergent
+    /// nonce derivation is safe here and makes the write idempotent (same
+    /// `S` + same master → identical sealed bytes).
+    ///
+    /// Storing a *different* `S` under an already-used `key_id` is refused:
+    /// `key_id` is a one-way hash of `S`, so a mismatch means a caller bug or
+    /// tampering, never a legitimate rotation (rotation derives a fresh
+    /// `key_id`).
+    ///
+    /// M5d slice 008 — the write is **crash-atomic** (stage → fsync → rename)
+    /// and the idempotence check works off the *decrypted* material, not raw
+    /// sealed bytes: a torn or otherwise undecryptable file on disk (a crash
+    /// mid-write, bit-rot) is treated as **absent** and overwritten rather than
+    /// wedging the id forever behind a bogus "different material" refusal — the
+    /// correct `S` always re-stores. A file that *does* decrypt but to different
+    /// material is the real divergence and is still refused. Comparing decrypted
+    /// plaintext also makes the idempotent re-store survive a master rotation
+    /// (the blob embeds its own master id).
+    pub fn store_shared_key(&self, key_id: &str, s: &[u8; 32]) -> Result<()> {
+        validate_shared_key_id(key_id)?;
+        let path = self.paths.shared_key(key_id);
+        if let Ok(existing) = std::fs::read(&path) {
+            match blob::decrypt_blob(&self.masters, &existing) {
+                // Same material already sealed — nothing to do (idempotent).
+                Ok(plain) if plain.as_slice() == s.as_slice() => return Ok(()),
+                // Decodes, but to a *different* key: a caller bug or tampering,
+                // never a legitimate rotation. Refuse; leave the file untouched.
+                Ok(_) => {
+                    return Err(crate::error::VaultError::Malformed(
+                        "shared key id already stored with different key material",
+                    ));
+                }
+                // Undecryptable corpse (torn write / corruption) — never a
+                // legitimate stored key. Warn loudly, then fall through and
+                // overwrite it atomically so the id is never wedged.
+                Err(_) => {
+                    eprintln!(
+                        "softfig-vault: shared key {key_id} on disk is undecryptable \
+                         (truncated/corrupt); treating as absent and re-storing"
+                    );
+                }
+            }
+        }
+        let sealed = blob::encrypt_blob(&self.masters, s)?;
+        let dir = self.paths.shared_keys_dir();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        crate::storage::atomic_write_mode(&path, &sealed, 0o600)?;
+        Ok(())
+    }
+
+    /// M5d — fetch a stored shared-subtree key by its `key_id`. Zeroized on
+    /// drop; the caller must not copy it out of the returned guard except
+    /// into another zeroizing home. A key this vault never stored surfaces
+    /// as [`VaultError::SharedKeyUnavailable`] — the non-member /
+    /// pre-ceremony signal, distinct from a decrypt failure.
+    pub fn load_shared_key(&self, key_id: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        validate_shared_key_id(key_id)?;
+        let path = self.paths.shared_key(key_id);
+        let sealed = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                crate::error::VaultError::SharedKeyUnavailable(key_id.to_string())
+            } else {
+                e.into()
+            }
+        })?;
+        let plain = zeroize::Zeroizing::new(blob::decrypt_blob(&self.masters, &sealed)?);
+        let s: [u8; 32] = plain.as_slice().try_into().map_err(|_| {
+            crate::error::VaultError::Malformed("shared key blob is not 32 bytes")
+        })?;
+        Ok(zeroize::Zeroizing::new(s))
+    }
+
+    /// M5d — whether a shared key is already stored under `key_id`. An
+    /// invalid id is simply "not stored".
+    pub fn has_shared_key(&self, key_id: &str) -> bool {
+        validate_shared_key_id(key_id).is_ok() && self.paths.shared_key(key_id).is_file()
+    }
+
+    /// M5d slice 002 — encrypt a shared-chain blob under the stored `S` for
+    /// `key_id` ([`crate::shared`] container, spec-convergent: every member
+    /// produces identical bytes). Fails with
+    /// [`VaultError::SharedKeyUnavailable`](crate::error::VaultError) when
+    /// this vault holds no such `S` — the caller must fail closed, never
+    /// fall back to `M` for a keyed chain.
+    pub fn encrypt_shared_blob(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let s = self.load_shared_key(key_id)?;
+        crate::shared::encrypt_blob(key_id, &s, plaintext)
+    }
+
+    /// M5d slice 002 — decrypt either shared container (`0xFE` blob or
+    /// `0xFD` Layer B whole-file seal) by resolving its embedded `key_id`
+    /// through the shared-key store. Chain-agnostic: the blob names the `S`
+    /// generation that sealed it, so reads (and post-rotation history) need
+    /// no chain context.
+    pub fn decrypt_shared_blob(&self, blob_file: &[u8]) -> Result<Vec<u8>> {
+        let key_id = crate::shared::read_key_id(blob_file)?;
+        let s = self.load_shared_key(&key_id)?;
+        crate::shared::decrypt_blob(&s, blob_file)
+    }
+
+    /// M5d slice 002 — whole-file Layer B seal *inside* a shared subtree:
+    /// the per-file subkey derives from that chain's `S`, not `M`
+    /// (`spec-vault.md`), so the seal stays members-only.
+    pub fn encrypt_shared_layer_b(
+        &self,
+        key_id: &str,
+        path: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let s = self.load_shared_key(key_id)?;
+        crate::shared::encrypt_layer_b(key_id, &s, path, plaintext)
+    }
+
+    /// M5d slice 002 — decrypt a shared Layer B whole-file seal under the
+    /// subkey derived from its embedded `key_id`'s `S` + `path`.
+    pub fn decrypt_shared_layer_b(&self, path: &str, blob_file: &[u8]) -> Result<Vec<u8>> {
+        let key_id = crate::shared::read_key_id(blob_file)?;
+        let s = self.load_shared_key(&key_id)?;
+        crate::shared::decrypt_layer_b(&s, path, blob_file)
+    }
+
+    /// M5d slice 002 — inline `<vault>` region seal inside a shared subtree
+    /// (per-region subkey from `S`; the keeperd write-path wiring is gated
+    /// on shared-chain `PriorTipGuard` coverage, but the crypto surface is
+    /// complete).
+    pub fn encrypt_shared_region(
+        &self,
+        key_id: &str,
+        path: &str,
+        id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let s = self.load_shared_key(key_id)?;
+        crate::shared::encrypt_region(key_id, &s, path, id, plaintext)
+    }
+
+    /// Decrypt a tracked file's blob under whichever container sealed it:
+    /// Layer B (`0xFF`, M-generation subkey by `path`), shared Layer B
+    /// (`0xFD`, S subkey by `path`), shared blob (`0xFE`, S), else Layer A
+    /// (M). One dispatch for every read path — a reader never needs to know
+    /// which chain (or key epoch) a blob came from, because every container
+    /// embeds its key id.
+    pub fn decrypt_tracked_blob(&self, path: &str, blob_file: &[u8]) -> Result<Vec<u8>> {
+        if crate::layer_b::is_layer_b(blob_file) {
+            self.decrypt_layer_b(path, blob_file)
+        } else if crate::shared::is_shared_layer_b(blob_file) {
+            self.decrypt_shared_layer_b(path, blob_file)
+        } else if crate::shared::is_shared_blob(blob_file) {
+            self.decrypt_shared_blob(blob_file)
+        } else {
+            self.decrypt_blob(blob_file)
+        }
+    }
+
+    /// M5d slice 002 — decrypt an inline shared region.
+    pub fn decrypt_shared_region(
+        &self,
+        path: &str,
+        id: &str,
+        blob_file: &[u8],
+    ) -> Result<Vec<u8>> {
+        let key_id = crate::shared::read_key_id(blob_file)?;
+        let s = self.load_shared_key(&key_id)?;
+        crate::shared::decrypt_region(&s, path, id, blob_file)
+    }
+
     /// Test whether `passphrase` unlocks this session's self-path KEK.
     /// Used by the daemon to verify a fresh master-password prompt
     /// before allowing a `softfig reveal`. Argon2id cost is paid on
@@ -191,5 +366,24 @@ impl VaultSession {
             },
         )?;
         Ok(new_id)
+    }
+}
+
+/// A shared-key id is used as a filename under `.softfig/vault/shared-keys/`,
+/// so it must never traverse: non-empty, ≤ 64 bytes, and only
+/// `[A-Za-z0-9_-]` (the real ids are `S-<hex>`, well inside this). No dots,
+/// no separators.
+fn validate_shared_key_id(key_id: &str) -> Result<()> {
+    let ok = !key_id.is_empty()
+        && key_id.len() <= 64
+        && key_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::error::VaultError::Malformed(
+            "shared key id must be 1-64 chars of [A-Za-z0-9_-]",
+        ))
     }
 }

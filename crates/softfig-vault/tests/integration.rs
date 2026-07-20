@@ -552,3 +552,225 @@ fn relock_blob_does_not_cross_gardens() {
         other => panic!("expected AuthFailed across gardens, got {other:?}"),
     }
 }
+
+// --- M5d: sealed shared-key store (`store/load/has_shared_key`) -------------
+
+/// A ceremony-shaped id: `S-<16 hex>` (the real `key_id` form).
+const KEY_ID: &str = "S-7f3a9b2c4d5e6f01";
+const S_KEY: [u8; 32] = [0x42; 32];
+
+#[test]
+fn shared_key_roundtrips_and_is_sealed_at_rest() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    let loaded = session.load_shared_key(KEY_ID).expect("load");
+    assert_eq!(*loaded, S_KEY);
+    assert!(session.has_shared_key(KEY_ID));
+    assert!(!session.has_shared_key("S-0000000000000000"));
+
+    // At rest the file is the master-keyed blob format, not plaintext `S`.
+    let path = tmp
+        .path()
+        .join(".softfig/vault/shared-keys")
+        .join(format!("{KEY_ID}.key"));
+    let on_disk = fs::read(&path).expect("sealed file exists");
+    assert_ne!(on_disk.as_slice(), S_KEY.as_slice());
+    assert!(!on_disk
+        .windows(S_KEY.len())
+        .any(|w| w == S_KEY.as_slice()));
+}
+
+#[test]
+fn shared_key_store_is_idempotent_but_refuses_different_material() {
+    let (_tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    // Same id + same S: idempotent (convergent sealing → identical bytes).
+    session.store_shared_key(KEY_ID, &S_KEY).expect("re-store");
+    // Same id + different S: a caller bug or tampering — refused, and the
+    // original material is untouched.
+    let other = [0x43u8; 32];
+    assert!(session.store_shared_key(KEY_ID, &other).is_err());
+    assert_eq!(*session.load_shared_key(KEY_ID).expect("load"), S_KEY);
+}
+
+#[test]
+fn shared_key_rejects_traversal_shaped_ids() {
+    let (_tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    for bad in ["", "../evil", "a/b", "a.b", "S-abc def", &"x".repeat(65)] {
+        assert!(session.store_shared_key(bad, &S_KEY).is_err(), "store {bad:?}");
+        assert!(session.load_shared_key(bad).is_err(), "load {bad:?}");
+        assert!(!session.has_shared_key(bad), "has {bad:?}");
+    }
+}
+
+#[test]
+fn shared_key_survives_relock_but_tamper_fails_closed() {
+    let (tmp, vault) = fresh_vault();
+    {
+        let session = vault.unlock(PASSPHRASE).expect("unlock");
+        session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    }
+    // A fresh unlock (new session, same master) still reads it.
+    let session = Vault::at(tmp.path()).unlock(PASSPHRASE).expect("re-unlock");
+    assert_eq!(*session.load_shared_key(KEY_ID).expect("load"), S_KEY);
+
+    // Flip a ciphertext byte: AEAD auth fails closed.
+    let path = tmp
+        .path()
+        .join(".softfig/vault/shared-keys")
+        .join(format!("{KEY_ID}.key"));
+    let mut bytes = fs::read(&path).expect("read sealed");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&path, &bytes).expect("write tampered");
+    match session.load_shared_key(KEY_ID) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("expected AuthFailed on tamper, got {other:?}"),
+    }
+}
+
+/// M5d slice 008 — a torn/undecryptable `<key_id>.key` (a crash mid-write, or
+/// bit-rot) must NOT wedge the id: the correct `S` re-stores over the corpse
+/// instead of being refused forever as "different key material". Regression for
+/// the bare-`fs::write` + raw-byte idempotence-compare that made a truncated
+/// file permanent.
+#[test]
+fn torn_shared_key_file_is_recovered_not_wedged() {
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let path = tmp
+        .path()
+        .join(".softfig/vault/shared-keys")
+        .join(format!("{KEY_ID}.key"));
+
+    // Simulate a crash mid-write: a truncated blob that can never decrypt.
+    // (A bare file-presence probe like `has_shared_key` still sees the corpse;
+    // the honest "do I hold usable S" check is `load_shared_key`, which fails
+    // closed — that is the signal a recovery driver must key off, not presence.)
+    fs::create_dir_all(path.parent().unwrap()).expect("mkdir shared-keys");
+    fs::write(&path, b"\x01\x02torn").expect("write torn corpse");
+    assert!(session.load_shared_key(KEY_ID).is_err(), "corpse must not load");
+
+    // The correct S re-stores over the corpse — id not wedged — and reads back.
+    session
+        .store_shared_key(KEY_ID, &S_KEY)
+        .expect("re-store over torn file must succeed");
+    assert_eq!(*session.load_shared_key(KEY_ID).expect("load"), S_KEY);
+    assert!(session.has_shared_key(KEY_ID));
+}
+
+/// M5d slice 008 — the shared-keys store is the vault's first imported-key
+/// surface, so the directory is `0700` and each sealed key is `0600`.
+#[test]
+fn shared_key_store_has_private_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    session.store_shared_key(KEY_ID, &S_KEY).expect("store");
+
+    let dir = tmp.path().join(".softfig/vault/shared-keys");
+    let file = dir.join(format!("{KEY_ID}.key"));
+    let dir_mode = fs::metadata(&dir).expect("dir meta").permissions().mode() & 0o777;
+    let file_mode = fs::metadata(&file).expect("file meta").permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "shared-keys dir must be 0700");
+    assert_eq!(file_mode, 0o600, "sealed key must be 0600");
+}
+
+#[test]
+fn random_bytes32_returns_distinct_material() {
+    // Smoke, not a statistical test: two draws differing proves the surface
+    // is wired to a live RNG rather than a constant.
+    assert_ne!(softfig_vault::random_bytes32(), softfig_vault::random_bytes32());
+}
+
+// --- M5d slice 002: shared-chain blob crypto under S -------------------------
+
+/// The convergence property the sync/dedup design load-bears on: two members
+/// with *different* master keys but the same ceremony `S` seal the same
+/// plaintext to byte-identical blob_files — for the plain shared blob AND the
+/// shared Layer B whole-file seal.
+#[test]
+fn shared_blobs_converge_across_members_with_different_masters() {
+    let (_ta, vault_a) = fresh_vault();
+    let (_tb, vault_b) = fresh_vault();
+    let a = vault_a.unlock(PASSPHRASE).expect("unlock a");
+    let b = vault_b.unlock(PASSPHRASE).expect("unlock b");
+    a.store_shared_key(KEY_ID, &S_KEY).expect("store a");
+    b.store_shared_key(KEY_ID, &S_KEY).expect("store b");
+
+    let pt = b"# shared doc\nsame on every member\n";
+    let ct_a = a.encrypt_shared_blob(KEY_ID, pt).expect("encrypt a");
+    let ct_b = b.encrypt_shared_blob(KEY_ID, pt).expect("encrypt b");
+    assert_eq!(ct_a, ct_b, "shared blob must be convergent across members");
+    assert_eq!(a.decrypt_shared_blob(&ct_b).expect("a reads b"), pt);
+    assert_eq!(b.decrypt_shared_blob(&ct_a).expect("b reads a"), pt);
+
+    let lb_a = a
+        .encrypt_shared_layer_b(KEY_ID, "proj/secrets.toml", pt)
+        .expect("layer b a");
+    let lb_b = b
+        .encrypt_shared_layer_b(KEY_ID, "proj/secrets.toml", pt)
+        .expect("layer b b");
+    assert_eq!(lb_a, lb_b, "shared layer B must be convergent too");
+    assert_eq!(
+        b.decrypt_shared_layer_b("proj/secrets.toml", &lb_a).expect("b reads"),
+        pt
+    );
+
+    // A member's device blobs stay under its own M: same plaintext, different
+    // masters → different Layer A ciphertext (the shared path is the only
+    // cross-member-convergent one).
+    assert_ne!(a.encrypt_blob(pt).unwrap(), b.encrypt_blob(pt).unwrap());
+}
+
+/// A non-member vault (its own M, no stored `S`) holds nothing readable: the
+/// embedded key_id resolves to SharedKeyUnavailable, and its master key never
+/// even gets a chance at the AEAD.
+#[test]
+fn non_member_cannot_decrypt_shared_blobs() {
+    let (_ta, vault_a) = fresh_vault();
+    let a = vault_a.unlock(PASSPHRASE).expect("unlock a");
+    a.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    let ct = a.encrypt_shared_blob(KEY_ID, b"members only").expect("encrypt");
+
+    let (_tn, vault_n) = fresh_vault();
+    let n = vault_n.unlock(PASSPHRASE).expect("unlock non-member");
+    match n.decrypt_shared_blob(&ct) {
+        Err(VaultError::SharedKeyUnavailable(id)) => assert_eq!(id, KEY_ID),
+        other => panic!("expected SharedKeyUnavailable, got {other:?}"),
+    }
+    // Encrypting *to* a keyed chain without holding S fails the same way —
+    // the fail-closed signal the daemon's router relies on.
+    match n.encrypt_shared_blob(KEY_ID, b"x") {
+        Err(VaultError::SharedKeyUnavailable(_)) => {}
+        other => panic!("expected SharedKeyUnavailable, got {other:?}"),
+    }
+}
+
+/// An inline region inside a shared subtree round-trips under an S-derived
+/// subkey and is unreadable without S (the slice-002 region test).
+#[test]
+fn shared_region_round_trips_and_needs_s() {
+    let (_ta, vault_a) = fresh_vault();
+    let a = vault_a.unlock(PASSPHRASE).expect("unlock");
+    a.store_shared_key(KEY_ID, &S_KEY).expect("store");
+    let ct = a
+        .encrypt_shared_region(KEY_ID, "proj/notes.md", "alpha", b"region secret")
+        .expect("encrypt region");
+    assert_eq!(
+        a.decrypt_shared_region("proj/notes.md", "alpha", &ct).expect("round-trip"),
+        b"region secret"
+    );
+
+    let (_tn, vault_n) = fresh_vault();
+    let n = vault_n.unlock(PASSPHRASE).expect("unlock non-member");
+    assert!(matches!(
+        n.decrypt_shared_region("proj/notes.md", "alpha", &ct),
+        Err(VaultError::SharedKeyUnavailable(_))
+    ));
+}

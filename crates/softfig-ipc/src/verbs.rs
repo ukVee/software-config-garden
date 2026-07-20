@@ -258,6 +258,14 @@ pub mod op {
     /// Require Unlocked. A native-FS op, not a VCS event (M4a defers that) — so
     /// no commit. Mirrors `softfig deploy [--force]`.
     pub const DEPLOY_APPLY: &str = "deploy_apply";
+    /// M5e slice 004 (TUI Coordination tab): read the daemon's live write-turn +
+    /// device-state coordination snapshot — the turn holder per shared chain, the
+    /// local device state, and each peer's announced state. Read-only, no args, no
+    /// mutation, no commit; this state lives only in the running daemon (not in any
+    /// committed file, so `list_tree`/`read_file` can't reach it) and is cleared on
+    /// lock, so Require Unlocked. v1 exposes the turn HOLDER only (queue depth
+    /// deferred). Device ids are hex; names are resolved frontend-side via the ring.
+    pub const COORDINATION_STATUS: &str = "coordination_status";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +291,14 @@ pub struct StatusReply {
     /// (an absent field ⇒ `false`, i.e. no tab — the fail-closed default).
     #[serde(default)]
     pub growlight_enabled: bool,
+    /// M5d slice 006: the most recent shared-key ceremony divergence message, if
+    /// any — a completed ceremony that met a chain already keyed with a
+    /// *different* key (the one-key-per-chain invariant violated; with
+    /// S-encryption live this otherwise presents as silent chain corruption).
+    /// `None` in the healthy case. Surfaced here so a divergence is visible, not
+    /// stderr-only. `#[serde(default)]` keeps older daemons/clients compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_key_divergence: Option<String>,
 }
 
 // ---- growlight relock token -------------------------------------------
@@ -1148,6 +1164,47 @@ pub struct HostedChain {
     /// Unix seconds of the last successful sync, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<i64>,
+}
+
+// ---- M5e slice 004: coordination-status read ------------------------------
+
+/// `coordination_status({}) -> {local_device_id, local_state, peers, turns}`.
+/// A read-only snapshot of the daemon's live write-turn + device-state
+/// coordination surface (the TUI Coordination tab renders it). Device ids are
+/// lowercase hex; frontends resolve them to names via the peer ring.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoordinationStatusArgs {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoordinationStatusReply {
+    /// This device's own id (hex of its Ed25519 identity pubkey).
+    pub local_device_id: String,
+    /// This device's coordination state: `offline` / `online-idle` / `online-active`.
+    pub local_state: String,
+    /// Each peer's most-recently-announced coordination state, sorted by device id.
+    pub peers: Vec<PeerCoordRow>,
+    /// The current write-turn holder per shared chain, sorted by chain ref name.
+    pub turns: Vec<TurnCoordRow>,
+}
+
+/// One peer's announced coordination state (from `DaemonInner::peer_states`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerCoordRow {
+    /// The peer's device id (lowercase hex).
+    pub device_id: String,
+    /// The peer's announced state: `offline` / `online-idle` / `online-active`.
+    pub state: String,
+}
+
+/// The write-turn holder for one shared chain (from `DaemonInner::write_turns`).
+/// v1 exposes the holder only; the waiter queue depth is deferred.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnCoordRow {
+    /// The shared chain's ref name (its `write_turns` map key).
+    pub chain: String,
+    /// The current turn holder's device id (hex), or null when the turn is free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_device_id: Option<String>,
 }
 
 // ---- M5c slice 003: shared-subtree lifecycle -------------------------------

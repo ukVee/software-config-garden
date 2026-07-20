@@ -11,10 +11,31 @@ mod generated {
 }
 
 pub use generated::{
-    frame, CommitData, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, ObjectData,
-    Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, StateAnnounce, TipAnnounce,
-    TreeData, TreeEntryMsg,
+    frame, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree,
+    HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant,
+    SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce,
+    TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
 };
+
+/// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
+/// message carries raw `S` in `shared_key`; prost's default field-dumping
+/// `Debug` is suppressed for this type in `build.rs` (`skip_debug`), so this
+/// hand-written impl is the only one — it prints the framing fields but never
+/// the key bytes. That makes a future `eprintln!("{frame:?}")` / panic-with-frame
+/// unable to dump `S` to journald. Every enclosing type (`frame::Kind`, `Frame`,
+/// `CeremonyOutcome::Handoff`) recurses through this impl for free.
+impl std::fmt::Debug for SharedKeyHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedKeyHandoff")
+            .field("chain_id", &self.chain_id)
+            .field("transcript_record", &self.transcript_record)
+            .field(
+                "shared_key",
+                &format_args!("<redacted {}B>", self.shared_key.len()),
+            )
+            .finish()
+    }
+}
 
 impl Frame {
     /// A `Ping` control frame.
@@ -125,6 +146,72 @@ impl Frame {
     pub fn replica_done() -> Self {
         Self {
             kind: Some(frame::Kind::ReplicaDone(ReplicaDone {})),
+        }
+    }
+
+    // --- M5d shared-key ceremony frame constructors ------------------------
+
+    /// A `SharedKeyCommit` frame (member -> members): a signed commitment
+    /// broadcast in the commit phase.
+    pub fn shared_key_commit(commit: SharedKeyCommit) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedKeyCommit(commit)),
+        }
+    }
+
+    /// A `SharedKeyReveal` frame (member -> members): the signed reveal of a
+    /// member's contribution in the reveal phase.
+    pub fn shared_key_reveal(reveal: SharedKeyReveal) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedKeyReveal(reveal)),
+        }
+    }
+
+    /// A `SharedKeyHandoff` frame (keyed member -> stranded member): the M5d
+    /// slice-008 recovery response carrying the committed transcript + `S`.
+    pub fn shared_key_handoff(handoff: SharedKeyHandoff) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedKeyHandoff(handoff)),
+        }
+    }
+
+    // --- M5e write-turn coordination frame constructors --------------------
+
+    /// A `DeviceStateAnnounce` frame (member -> members): this device's
+    /// offline / online-idle / online-active state (+ unlocked flag).
+    pub fn device_state_announce(announce: DeviceStateAnnounce) -> Self {
+        Self {
+            kind: Some(frame::Kind::DeviceStateAnnounce(announce)),
+        }
+    }
+
+    /// A `TurnRequest` frame (member -> members): request a chain's write turn.
+    pub fn turn_request(request: TurnRequest) -> Self {
+        Self {
+            kind: Some(frame::Kind::TurnRequest(request)),
+        }
+    }
+
+    /// A `TurnYield` frame (holder -> requester): yield the turn (the go-ahead).
+    pub fn turn_yield(yield_: TurnYield) -> Self {
+        Self {
+            kind: Some(frame::Kind::TurnYield(yield_)),
+        }
+    }
+
+    /// A `TurnRevoke` frame (member -> members): an expired holder's lease is
+    /// reclaimed so the turn returns.
+    pub fn turn_revoke(revoke: TurnRevoke) -> Self {
+        Self {
+            kind: Some(frame::Kind::TurnRevoke(revoke)),
+        }
+    }
+
+    /// A `SharedChainPush` frame (writer -> S-members): a committed shared-subtree
+    /// edit to adopt (M5e slice 002 shared-pull).
+    pub fn shared_chain_push(push: SharedChainPush) -> Self {
+        Self {
+            kind: Some(frame::Kind::SharedChainPush(push)),
         }
     }
 }

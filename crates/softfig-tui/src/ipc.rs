@@ -46,6 +46,16 @@ pub enum Tag {
     DeployPlan,
     /// M4: apply the deploy plan (`deploy_apply`); reply carries the `Report`.
     DeployApply,
+    /// M5d slice 004: list every shared subtree (`shared_subtree_list`) for the
+    /// Shares tab — membership + per-device enable state + `key_id`.
+    SharedSubtreeList,
+    /// M5d slice 004: register a new shared subtree (`shared_subtree_add`).
+    SharedSubtreeAdd,
+    /// M5d slice 004: un-share a subtree (`shared_subtree_remove`).
+    SharedSubtreeRemove,
+    /// M5d slice 004: flip a share's per-device enable state
+    /// (`shared_subtree_enable`/`disable`).
+    SharedSubtreeToggle,
     /// growlight: the backlog queue as daemon-parsed structured rows
     /// (`growlight_queue`) — no client re-parse of the managed table.
     GrowlightQueue,
@@ -107,6 +117,17 @@ pub enum Tag {
     /// time. An `Err` surfaces on `self.status` like the other garden reads (the
     /// baton half soft-fails on its own).
     GrowlightInjectedProtocol,
+    /// m5e slice 004: the live coordination snapshot (`coordination_status`) —
+    /// write-turn holders + S-member device states for the Coordination tab.
+    CoordinationStatus,
+    /// m5e slice 004: list every shared subtree (`shared_subtree_list`) so each
+    /// mount root can be scanned for `.conflict-` sidecars.
+    CoordinationShares,
+    /// m5e slice 004: one shared subtree's mount-root listing (`list_tree`) —
+    /// its `.conflict-` entries (slice 003 output) are the conflict sidecars.
+    CoordinationSidecarList,
+    /// m5e slice 004: read a selected conflict sidecar (`read_file`) for preview.
+    CoordinationSidecar,
 }
 
 #[derive(Debug)]

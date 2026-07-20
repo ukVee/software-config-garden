@@ -25,7 +25,7 @@
 
 pub mod regions;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use softfig_vcs::{BlobEncryptor, Intent, Repo, WalkSnapshot};
 use softfig_fuse::SealedQuery;
 use softfig_store::{Hash, TreeEntryKind};
-use softfig_vault::{is_layer_b, VaultSession};
+use softfig_vault::VaultSession;
 use walkdir::WalkDir;
 
 use self::regions::RegionParseError;
@@ -181,6 +181,27 @@ pub struct LayerBHook {
     /// write-path region encoder when a Plaintext body equals the
     /// reserved `[encrypted]` placeholder.
     prior_tip: RwLock<Option<Arc<PriorTipSnapshot>>>,
+    /// M5d slice 002 — `ref_name` → `(key_id, mount_path)` for every
+    /// *keyed* shared chain, refreshed wherever the chain registry is
+    /// rebuilt (unlock, subtree add/remove/toggle, ceremony persist). A
+    /// shared ref absent here is unkeyed (pre-ceremony) and stays on the
+    /// device master `M` — the m5c status quo until the ceremony fills the
+    /// membership row. The mount path rides along because a shared chain's
+    /// snapshot paths are chain-relative (`split_snapshot` strips the mount
+    /// prefix): the router re-prefixes them so sealed-glob matching and the
+    /// Layer-B path salt use the same garden-relative string the read side
+    /// passes to `decrypt_tracked_blob`.
+    shared_keys: RwLock<HashMap<String, (String, String)>>,
+    /// M5d slice 016 (NONCE-2) — the set of shared-chain refs whose **committed
+    /// membership row carries a `key_id`**, i.e. the chains that MUST seal under
+    /// `S`. Refreshed from the same [`softfig_vcs::ChainRegistry`] as
+    /// `shared_keys`, but consulted independently: it is the authoritative
+    /// "keyed-ness" derived from committed state, so `encrypt_for_ref` can tell a
+    /// *keyed* shared chain that is missing from `shared_keys` (a stale / not-yet-
+    /// re-primed router) from a *genuinely unkeyed* (pre-ceremony) one. The former
+    /// fails closed rather than silently writing a non-convergent, member-
+    /// unreadable `M` blob onto a keyed shared chain.
+    keyed_committed_refs: RwLock<Arc<HashSet<String>>>,
 }
 
 impl LayerBHook {
@@ -189,6 +210,8 @@ impl LayerBHook {
             sealed: RwLock::new(Arc::new(initial)),
             session: RwLock::new(None),
             prior_tip: RwLock::new(None),
+            shared_keys: RwLock::new(HashMap::new()),
+            keyed_committed_refs: RwLock::new(Arc::new(HashSet::new())),
         }
     }
 
@@ -267,6 +290,59 @@ impl LayerBHook {
     fn prior_tip_snapshot(&self) -> Option<Arc<PriorTipSnapshot>> {
         self.prior_tip.read().unwrap().clone()
     }
+
+    /// M5d slice 002 — sync the shared-chain key routing with a freshly
+    /// derived [`softfig_vcs::ChainRegistry`]. Every *keyed* shared chain
+    /// (enabled or not — key routing must never depend on the local mount
+    /// toggle) maps its ref to its `key_id` + mount path; unkeyed chains
+    /// are absent.
+    pub fn set_shared_chain_keys(&self, registry: &softfig_vcs::ChainRegistry) {
+        let map: HashMap<String, (String, String)> = registry
+            .all_chains()
+            .filter(|c| c.kind == softfig_vcs::ChainKind::Shared)
+            .filter_map(|c| {
+                let key_id = c.key_id.clone()?;
+                let mount = c
+                    .mount_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                Some((c.ref_name.clone(), (key_id, mount)))
+            })
+            .collect();
+        // M5d slice 016 (NONCE-2): the authoritative keyed-ness set — every
+        // shared chain the committed membership says carries a `key_id`. Derived
+        // from the same registry so `encrypt_for_ref` never has to guess "unkeyed"
+        // from a missing router entry.
+        let keyed: HashSet<String> = map.keys().cloned().collect();
+        *self.shared_keys.write().unwrap() = map;
+        *self.keyed_committed_refs.write().unwrap() = Arc::new(keyed);
+    }
+
+    /// The `(key_id, mount_path)` a shared chain's blobs must seal under,
+    /// or `None` for an unkeyed (pre-ceremony) chain.
+    pub fn shared_key_for(&self, ref_name: &str) -> Option<(String, String)> {
+        self.shared_keys.read().unwrap().get(ref_name).cloned()
+    }
+
+    /// M5d slice 016 (NONCE-2) — does the committed membership say this shared
+    /// ref is keyed (must seal under `S`)? Consulted by [`Self::encrypt_for_ref`]
+    /// to distinguish a keyed chain whose router entry is missing (fail closed)
+    /// from a genuinely unkeyed pre-ceremony chain (stays on `M`).
+    pub fn ref_is_keyed_committed(&self, ref_name: &str) -> bool {
+        self.keyed_committed_refs.read().unwrap().contains(ref_name)
+    }
+
+    /// Test-only: install an inconsistent state (a ref marked keyed in committed
+    /// membership but absent from the `S` router) to exercise the NONCE-2 fail-
+    /// closed guard directly — the shape a future commit path that advances a
+    /// shared ref without re-priming the router would produce.
+    #[cfg(test)]
+    pub(crate) fn force_keyed_committed_ref(&self, ref_name: &str) {
+        let mut set = HashSet::clone(&self.keyed_committed_refs.read().unwrap());
+        set.insert(ref_name.to_string());
+        *self.keyed_committed_refs.write().unwrap() = Arc::new(set);
+    }
 }
 
 impl BlobEncryptor for LayerBHook {
@@ -331,6 +407,89 @@ impl BlobEncryptor for LayerBHook {
             ))
         })?;
         Ok(session.encrypt_blob(&post)?)
+    }
+
+    /// M5d slice 002 — per-chain key routing. The device chain keeps the
+    /// full M path above; a *keyed* shared chain seals everything under its
+    /// `S` (spec-sync: convergent across members) and **fails closed** when
+    /// the vault doesn't hold that `S` — an M fallback there would commit
+    /// member-unreadable, non-convergent blobs onto a keyed chain. An
+    /// *unkeyed* shared chain (membership row's `key_id` still empty,
+    /// pre-ceremony) stays on M — the m5c status quo — until the ceremony
+    /// fills the row and the registry refresh flips this router.
+    fn encrypt_for_ref(
+        &self,
+        ref_name: &str,
+        path: &str,
+        content: &[u8],
+        session: &VaultSession,
+    ) -> softfig_vcs::Result<Vec<u8>> {
+        if ref_name == softfig_vcs::TIP_REF {
+            return self.encrypt(path, content, session);
+        }
+        let Some((key_id, mount)) = self.shared_key_for(ref_name) else {
+            // No `S` router entry for this ref. M5d slice 016 (NONCE-2): decide M
+            // vs fail-closed from the *committed* keyed-ness, not the absence of a
+            // cache entry. A shared chain the committed membership marks keyed but
+            // that is missing from the router means the router is stale / was not
+            // re-primed for this commit — falling back to `M` here would seal a
+            // non-convergent, member-unreadable blob onto a keyed shared chain
+            // (an isolation + convergence break). Refuse: the flush treats the
+            // error as a failed ref and re-queues it, so a subsequent flush (with
+            // the router re-primed from committed state) seals it under `S`. A
+            // genuinely unkeyed (pre-ceremony) chain, or the device chain, is not
+            // in `keyed_committed_refs` and correctly stays on `M`.
+            if self.ref_is_keyed_committed(ref_name) {
+                return Err(softfig_vcs::CoreError::Io(std::io::Error::other(format!(
+                    "shared ref {ref_name} is keyed in committed membership but the key \
+                     router holds no S for it; refusing to seal under the device key M \
+                     (re-prime the chain registry / recover S)"
+                ))));
+            }
+            return self.encrypt(path, content, session);
+        };
+        // `path` is chain-relative (split_snapshot strips the mount prefix);
+        // re-prefix it so glob matching + the Layer-B path salt line up with
+        // the garden-relative strings the read side uses.
+        let garden_path = if mount.is_empty() {
+            path.to_string()
+        } else {
+            format!("{mount}/{path}")
+        };
+        if self.snapshot().is_sealed(&garden_path) {
+            // A sealed-glob match inside a shared subtree derives its
+            // whole-file subkey from S, not M (spec-vault), so the seal
+            // stays readable to exactly the chain's members.
+            return session
+                .encrypt_shared_layer_b(&key_id, &garden_path, content)
+                .map_err(softfig_vcs::CoreError::Vault);
+        }
+        // Inline `<vault>` regions inside shared mounts are gated until the
+        // shared-chain commit path gains PriorTipGuard coverage (m5c-review
+        // precondition 3): refuse rather than seal them wrong or commit the
+        // secret-intent text as ordinary content.
+        let parser = regions::parser_for(&garden_path);
+        match regions::parse(parser, content, session, &garden_path) {
+            Ok(spans) if spans.is_empty() => {}
+            Ok(_) => {
+                return Err(softfig_vcs::CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "inline <vault> regions are not supported inside a shared subtree yet \
+                         (remove the tag from {garden_path} or keep the secret on the device chain)"
+                    ),
+                )));
+            }
+            Err(e) => {
+                return Err(softfig_vcs::CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed vault tag in {garden_path}: {e}"),
+                )));
+            }
+        }
+        session
+            .encrypt_shared_blob(&key_id, content)
+            .map_err(softfig_vcs::CoreError::Vault)
     }
 }
 
@@ -405,13 +564,9 @@ fn walk_tree_into(
         match e.kind {
             TreeEntryKind::Blob => {
                 let cipher = repo.objects().get(&e.target).map_err(KeeperError::Store)?;
-                let plain = if is_layer_b(&cipher) {
-                    session
-                        .decrypt_layer_b(&child_path, &cipher)
-                        .map_err(KeeperError::Vault)?
-                } else {
-                    session.decrypt_blob(&cipher).map_err(KeeperError::Vault)?
-                };
+                let plain = session
+                    .decrypt_tracked_blob(&child_path, &cipher)
+                    .map_err(KeeperError::Vault)?;
                 snap.plaintext_by_path.insert(child_path, plain);
             }
             TreeEntryKind::Tree => {
@@ -853,6 +1008,153 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(paths, vec!["notes.md".to_string()]);
+    }
+
+    // --- M5d slice 002: per-chain key routing (`encrypt_for_ref`) -----------
+
+    const S_ID: &str = "S-7f3a9b2c4d5e6f01";
+    const S_MATERIAL: [u8; 32] = [0x51; 32];
+    const SHARED_REF: &str = "chain/proj";
+
+    /// A hook whose router maps `chain/proj` → `S_ID`, over a session that
+    /// holds (or deliberately lacks) the S material.
+    fn routed_hook(keyed: bool) -> (LayerBHook, VaultSession) {
+        let session = fresh_session();
+        if keyed {
+            session.store_shared_key(S_ID, &S_MATERIAL).unwrap();
+        }
+        let mut chain = softfig_vcs::Chain::shared("proj", SHARED_REF, "proj", true);
+        chain.key_id = Some(S_ID.to_string());
+        let registry =
+            softfig_vcs::ChainRegistry::new(softfig_vcs::Chain::device(), vec![chain]);
+        let hook = LayerBHook::empty();
+        hook.set_shared_chain_keys(&registry);
+        (hook, session)
+    }
+
+    #[test]
+    fn device_chain_stays_on_m_and_keyed_shared_chain_seals_under_s() {
+        use softfig_vcs::BlobEncryptor as _;
+        let (hook, session) = routed_hook(true);
+        let pt = b"content";
+
+        // Device ref: unchanged Layer A under M.
+        let dev = hook
+            .encrypt_for_ref(softfig_vcs::TIP_REF, "note.md", pt, &session)
+            .unwrap();
+        assert!(!softfig_vault::is_shared(&dev));
+        assert_eq!(session.decrypt_blob(&dev).unwrap(), pt);
+
+        // Keyed shared ref: the 0xFE convergent container under S. Paths reach
+        // `encrypt_for_ref` chain-relative — `split_snapshot` strips the mount
+        // prefix before the commit walk — and the router re-prefixes with the
+        // chain's mount, so tests pass the same chain-relative strings.
+        let shared = hook
+            .encrypt_for_ref(SHARED_REF, "note.md", pt, &session)
+            .unwrap();
+        assert!(softfig_vault::is_shared_blob(&shared));
+        assert_eq!(session.decrypt_shared_blob(&shared).unwrap(), pt);
+        // Convergence through the router: a second member (different M,
+        // same S) produces byte-identical ciphertext.
+        let (hook_b, session_b) = routed_hook(true);
+        let shared_b = hook_b
+            .encrypt_for_ref(SHARED_REF, "note.md", pt, &session_b)
+            .unwrap();
+        assert_eq!(shared, shared_b);
+    }
+
+    #[test]
+    fn unkeyed_shared_chain_keeps_the_m_path_until_the_ceremony_fills_key_id() {
+        use softfig_vcs::BlobEncryptor as _;
+        let session = fresh_session();
+        let hook = LayerBHook::empty(); // router knows no keyed chains
+        let ct = hook
+            .encrypt_for_ref(SHARED_REF, "note.md", b"pre-key", &session)
+            .unwrap();
+        assert!(!softfig_vault::is_shared(&ct));
+        assert_eq!(session.decrypt_blob(&ct).unwrap(), b"pre-key");
+    }
+
+    #[test]
+    fn keyed_chain_with_missing_s_fails_closed_never_falls_back_to_m() {
+        use softfig_vcs::BlobEncryptor as _;
+        let (hook, session) = routed_hook(false); // key_id routed, S absent
+        let err = hook
+            .encrypt_for_ref(SHARED_REF, "note.md", b"x", &session)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not stored in this vault"),
+            "want SharedKeyUnavailable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_shared_chain_keys_records_keyed_committed_refs() {
+        // The production refresh path (not the test-only forcing helper) must
+        // populate the authoritative keyed-ness set the NONCE-2 guard consults.
+        let (hook, _session) = routed_hook(true);
+        assert!(hook.ref_is_keyed_committed(SHARED_REF));
+        assert!(!hook.ref_is_keyed_committed("chain/other"));
+    }
+
+    #[test]
+    fn keyed_committed_ref_missing_from_the_router_fails_closed_not_m() {
+        use softfig_vcs::BlobEncryptor as _;
+        // M5d slice 016 (NONCE-2): the committed membership marks the chain keyed,
+        // but the S router has no entry (stale / not re-primed for this commit).
+        // Falling back to M here would seal a non-convergent, member-unreadable
+        // blob onto a keyed shared chain, so the write must fail closed — the flush
+        // re-queues it and a later flush (router re-primed from committed state)
+        // seals it under S. Distinct from the routed-but-S-absent case above (that
+        // one has a router entry and fails in the vault).
+        let session = fresh_session();
+        let hook = LayerBHook::empty(); // router holds no entry for SHARED_REF
+        hook.force_keyed_committed_ref(SHARED_REF);
+        let err = hook
+            .encrypt_for_ref(SHARED_REF, "note.md", b"x", &session)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("keyed in committed membership"),
+            "want the NONCE-2 fail-closed refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sealed_glob_inside_a_keyed_shared_chain_derives_from_s() {
+        use softfig_vcs::BlobEncryptor as _;
+        let (hook, session) = routed_hook(true);
+        hook.replace(SealedPaths::compile(&["proj/secrets/**".to_string()]).unwrap());
+        // Chain-relative in, garden-relative glob out: the router reconstructs
+        // `proj/secrets/api.toml`, which the sealed glob matches → shared Layer B.
+        let ct = hook
+            .encrypt_for_ref(SHARED_REF, "secrets/api.toml", b"shh", &session)
+            .unwrap();
+        assert!(softfig_vault::is_shared_layer_b(&ct));
+        assert_eq!(
+            session
+                .decrypt_shared_layer_b("proj/secrets/api.toml", &ct)
+                .unwrap(),
+            b"shh"
+        );
+        // A non-member session can't read it (needs S, not just any M).
+        let outsider = fresh_session();
+        assert!(outsider
+            .decrypt_shared_layer_b("proj/secrets/api.toml", &ct)
+            .is_err());
+    }
+
+    #[test]
+    fn inline_vault_tags_inside_a_keyed_shared_chain_are_refused() {
+        use softfig_vcs::BlobEncryptor as _;
+        let (hook, session) = routed_hook(true);
+        let content = b"intro\n<vault id=\"a\">secret</vault>\n";
+        let err = hook
+            .encrypt_for_ref(SHARED_REF, "note.md", content, &session)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not supported inside a shared subtree"),
+            "want the gated-regions refusal, got: {err}"
+        );
     }
 
     #[test]
