@@ -1834,8 +1834,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 soft-fig TUI — keys
 
   1-7          Browse / History / Vault / Peers / Backup / Deploy / Shares
-  8            growlight (read-only): backlog → slices, loop-context, live baton · bus · injected-context
-  9            coordination (read-only): write-turns · device states · conflicts
+  8 9          growlight (read-only, when enabled) · coordination (turns · states · conflicts)
   j k ↑ ↓      move selection (wraps top↔bottom; a growlight node shows its md)
   Enter l →    open file / expand dir / show commit / reveal (vault)
                / confirm pending pairing (peers)
