@@ -221,13 +221,16 @@ impl ChainRegistry {
     ///
     /// A file at **exactly** a mount path (not under it) would strip to an empty
     /// relative path and be silently dropped here. That shape is **actively
-    /// refused**, not merely improbable (m5c residual slice 009): the FUSE
-    /// mount-root guard rejects `create`/`rmdir`/`rename` targeting an enabled
-    /// mount root with `EBUSY` (so the empty-genesis mount dir can't be
-    /// `rmdir`'d and then have a file created at its path — finding 2b), and the
-    /// composed-view populated-path guard refuses an `add`/`enable` over a path
-    /// that already holds committed **or** overlay-staged content (findings 1 +
-    /// 2a). See [`Self::is_enabled_mount_root`].
+    /// refused**, not merely improbable (m5c residual slice 009 + m5e slice
+    /// 007): the FUSE mount-root guard rejects `create`/`rmdir`/`rename` *and*
+    /// `setattr` (mode/size — chmod/truncate stage a File overlay too) targeting
+    /// an enabled mount root with `EBUSY`, the composed-view populated-path
+    /// guard refuses an `add`/`enable` over a path that already holds committed
+    /// **or** overlay-staged content (findings 1 + 2a), and — belt and braces —
+    /// the snapshot composer (`collect_files`) *ignores* a stray staged File at
+    /// a graft point rather than letting it shadow the grafted subtree, so even
+    /// an unforeseen staging source cannot drive an empty-carve-out commit.
+    /// See [`Self::is_enabled_mount_root`].
     pub fn split_snapshot(&self, unified: &WalkSnapshot) -> Vec<(String, WalkSnapshot)> {
         let mut snaps: Vec<(String, WalkSnapshot)> = self
             .enabled_chains()

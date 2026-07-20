@@ -194,6 +194,10 @@ impl SharedState {
         // `filter_entry`. Overlay bytes are cloned here; tip blobs carry
         // only their hash so the bulk decrypt runs lock-free below.
         let mut files: Vec<(PathBuf, u32, ContentSource)> = Vec::new();
+        // Graft points snapshotted before `inner` is locked (the registry and
+        // `inner` locks never nest) — `collect_files` needs them for the
+        // File-at-mount-root immunity (m5e slice 007).
+        let mount_roots = self.enabled_mount_roots();
         let overlay_generation = {
             let inner = self.inner.lock().unwrap();
             // Slice 012 — capture the overlay generation this commit input is cut
@@ -205,7 +209,7 @@ impl SharedState {
             // network pull) carries no generation and absorbs nothing (m5e
             // precondition; the 014 data-loss family, finding 5).
             let captured_gen = inner.overlay.generation();
-            collect_files(&inner, &ignore, Path::new(""), &mut files);
+            collect_files(&inner, &ignore, &mount_roots, Path::new(""), &mut files);
             captured_gen
         };
 
@@ -281,6 +285,19 @@ impl SharedState {
     /// mount.
     pub(crate) fn is_enabled_mount_root(&self, path: &Path) -> bool {
         self.registry.lock().unwrap().is_enabled_mount_root(path)
+    }
+
+    /// Every enabled shared chain's mount root — the union graft points, for
+    /// [`collect_files`]'s File-at-graft-point immunity (m5e slice 007). The
+    /// device chain has no mount path and drops out of the filter_map.
+    /// Snapshotted before `inner` is locked so the two locks never nest.
+    pub(crate) fn enabled_mount_roots(&self) -> Vec<PathBuf> {
+        self.registry
+            .lock()
+            .unwrap()
+            .enabled_chains()
+            .filter_map(|c| c.mount_path.clone())
+            .collect()
     }
 
     /// M5c slice 003 — hot-swap the chain registry this mount serves, then
@@ -367,9 +384,10 @@ impl SharedState {
     pub(crate) fn live_repo_paths(&self) -> Result<Vec<String>> {
         let ignore = self.inmem_ignore()?;
         let mut files: Vec<(PathBuf, u32, ContentSource)> = Vec::new();
+        let mount_roots = self.enabled_mount_roots();
         {
             let inner = self.inner.lock().unwrap();
-            collect_files(&inner, &ignore, Path::new(""), &mut files);
+            collect_files(&inner, &ignore, &mount_roots, Path::new(""), &mut files);
         }
         Ok(files
             .into_iter()
@@ -684,6 +702,7 @@ enum ContentSource {
 fn collect_files(
     inner: &Inner,
     ignore: &Ignore,
+    mount_roots: &[PathBuf],
     dir: &Path,
     out: &mut Vec<(PathBuf, u32, ContentSource)>,
 ) {
@@ -695,21 +714,45 @@ fn collect_files(
         match entry {
             OverlayEntry::Removed => {}
             OverlayEntry::File { content, mode } => {
+                // A File overlay at exactly an enabled mount root can only be
+                // a stray staging artifact — every kernel op that could stage
+                // one (`create`/`rename`/`setattr`) refuses EBUSY there.
+                // Emitting it would shadow the grafted subtree in the tip loop
+                // below and drive an empty-carve-out commit of the shared
+                // chain — the silent wipe of m5e slice 007 / pre-merge review
+                // finding 1. Skip it; the tip loop below treats the graft
+                // point as unshadowed, so the subtree survives any source of
+                // the artifact, present or future.
+                if mount_roots.iter().any(|r| r.as_path() == path) {
+                    eprintln!(
+                        "keeperd: fuse: ignoring stray staged file at enabled mount root {} \
+                         (would shadow the grafted subtree)",
+                        path.display()
+                    );
+                    continue;
+                }
                 out.push((path.to_path_buf(), *mode, ContentSource::Overlay(content.clone())));
             }
-            OverlayEntry::Dir { .. } => collect_files(inner, ignore, path, out),
+            OverlayEntry::Dir { .. } => collect_files(inner, ignore, mount_roots, path, out),
         }
     }
     // Tip-view children not shadowed by any overlay entry for the same path.
     for (path, entry) in inner.view.children(dir) {
-        if inner.overlay.get(path).is_some() || ignore.is_ignored(path) {
+        let shadowed = match inner.overlay.get(path) {
+            None => false,
+            // The stray File-at-graft-point artifact skipped above must not
+            // shadow the graft either, or the subtree still vanishes.
+            Some(OverlayEntry::File { .. }) => !mount_roots.iter().any(|r| r.as_path() == path),
+            Some(_) => true,
+        };
+        if shadowed || ignore.is_ignored(path) {
             continue;
         }
         match entry.kind {
             EntryKind::Blob => {
                 out.push((path.to_path_buf(), entry.mode, ContentSource::Blob(entry.target)));
             }
-            EntryKind::Dir => collect_files(inner, ignore, path, out),
+            EntryKind::Dir => collect_files(inner, ignore, mount_roots, path, out),
         }
     }
 }
@@ -1226,6 +1269,16 @@ impl Filesystem for FuseFs {
             Some(p) => p,
             None => return reply.error(libc::ENOENT),
         };
+        // A live mount root can't be staged as a file: both branches below
+        // stage `read_bytes` (empty for a dir) as a File overlay entry at
+        // `path`, which at a graft point would shadow the whole grafted
+        // subtree in `collect_files` and commit the shared chain as an empty
+        // tree — silent data loss (m5e slice 007, pre-merge review finding 1;
+        // the guard `create`/`rmdir`/`rename` already carry). A
+        // timestamp-only setattr stages nothing and passes through.
+        if (mode.is_some() || size.is_some()) && self.state.is_enabled_mount_root(&path) {
+            return reply.error(libc::EBUSY);
+        }
         // Truncate semantics: a setattr with size=0 + an O_TRUNC open
         // flag from the editor.
         if let Some(new_size) = size {

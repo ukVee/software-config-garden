@@ -686,3 +686,44 @@ fn enable_refuses_when_the_mount_path_holds_content_written_while_disabled() {
     let r = fx.toggle(op::SHARED_SUBTREE_DISABLE, "journals");
     assert!(!r.changed, "a populated path does not block a disable");
 }
+
+/// m5e slice 007 (pre-merge review finding 1): a File overlay staged at
+/// **exactly** an enabled mount root — the shape a kernel `setattr`/chmod of
+/// the mount dir used to stage before the EBUSY guard — must not shadow the
+/// grafted subtree in the snapshot composer and drive an empty-carve-out
+/// commit of the shared chain. The kernel op itself now refuses (live-mount
+/// §7b smoke); here the artifact is fabricated through the raw staging seam,
+/// so this exercises the compose-level immunity that closes the whole op
+/// class regardless of the staging source.
+#[test]
+fn stray_overlay_file_at_mount_root_does_not_wipe_the_shared_chain() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    fx.write_committed("projects/journals/2026.md", "# year notes\n");
+
+    // Fabricate finding 1's artifact: a File overlay at the graft point itself.
+    fx.stage_overlay_write("projects/journals", b"");
+
+    // Any subsequent commit builds the unified snapshot with the artifact
+    // present; without the immunity the shared carve-out is empty and the
+    // chain tip advances to an empty tree.
+    fx.write_committed("device-note.md", "device write\n");
+
+    let repo = Repo::open(&fx.garden).unwrap();
+    let tip = repo
+        .tip_of("chain/journals")
+        .unwrap()
+        .expect("shared chain has a tip");
+    let root_tree = repo.db().get_commit(&tip).unwrap().root_tree;
+    let entries = repo.db().get_tree(&root_tree).unwrap();
+    assert!(
+        !entries.is_empty(),
+        "the shared chain tip must not advance to an empty tree \
+         (the stray mount-root File shadowed the graft)"
+    );
+    // The union view still serves the subtree content.
+    assert!(
+        fx.mount_path_exists("projects/journals/2026.md"),
+        "grafted subtree content survives the stray artifact"
+    );
+}
