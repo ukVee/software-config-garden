@@ -1199,7 +1199,7 @@ fn serve_chain<S: std::io::Read + std::io::Write>(
     state_root: Option<&std::path::Path>,
 ) -> Result<ServeSummary, String> {
     let repo = Repo::open_with(garden_root, state_root).map_err(|e| format!("open repo: {e}"))?;
-    let source = RepoSource::new(repo, announce.clone());
+    let source = RepoSource::new(repo, announce.clone()).map_err(|e| format!("scope source: {e}"))?;
     serve_replication(session, &source).map_err(|e| e.to_string())
 }
 

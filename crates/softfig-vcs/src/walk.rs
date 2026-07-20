@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
@@ -106,10 +106,37 @@ impl WalkSnapshot {
         }
     }
 
+    /// Every tracked file as `(repo-relative path, mode, content)`, depth-first
+    /// in BTreeMap order. The read-side counterpart to [`Self::insert_file`]:
+    /// the union-mount router ([`crate::ChainRegistry::split_snapshot`]) walks
+    /// these to route each path to its owning chain. Directories are implicit in
+    /// the returned paths' ancestry, exactly as `insert_file` reconstructs them.
+    pub fn files(&self) -> Vec<(PathBuf, u32, &[u8])> {
+        let mut out = Vec::new();
+        if let TreeNode::Dir(children) = &self.root {
+            collect_files(children, Path::new(""), &mut out);
+        }
+        out
+    }
+
     fn root_children_mut(&mut self) -> &mut BTreeMap<String, TreeNode> {
         match &mut self.root {
             TreeNode::Dir(children) => children,
             TreeNode::File { .. } => unreachable!("WalkSnapshot root is always a Dir"),
+        }
+    }
+}
+
+fn collect_files<'a>(
+    children: &'a BTreeMap<String, TreeNode>,
+    prefix: &Path,
+    out: &mut Vec<(PathBuf, u32, &'a [u8])>,
+) {
+    for (name, node) in children {
+        let path = prefix.join(name);
+        match node {
+            TreeNode::File { mode, content } => out.push((path, *mode, content.as_slice())),
+            TreeNode::Dir(sub) => collect_files(sub, &path, out),
         }
     }
 }
@@ -121,6 +148,22 @@ const MODE_MASK: u32 = 0o7777;
 /// `WalkSnapshot`. The root node is always a `Dir`, even for an empty
 /// garden.
 pub fn walk(root: &Path) -> Result<WalkSnapshot> {
+    walk_filtered(root, |_| true)
+}
+
+/// Walk `root`, keeping only paths for which `keep(rel)` is true, applied on
+/// top of the built-in + `.softfigignore` exclusions. The per-path hook is the
+/// union-mount router carve-out: a device-chain snapshot is
+/// `walk_filtered(garden_root, |p| registry.is_device_owned(p))`, which prunes
+/// a shared chain's subtree out of the device walk (M5c slice 002 "Design lock
+/// 2026-07-05"). This predicate is distinct from `.softfigignore`: an ignored
+/// path means *no chain tracks it*, whereas a filtered-out path means *a
+/// different chain tracks it*. Returning `false` for a directory prunes its
+/// whole subtree, so an owned mount prefix is never descended into.
+pub fn walk_filtered<F>(root: &Path, keep: F) -> Result<WalkSnapshot>
+where
+    F: Fn(&Path) -> bool,
+{
     let mut snapshot = WalkSnapshot::empty();
 
     // Load the exclusion set (built-ins + the garden's `.softfigignore`) once
@@ -139,7 +182,7 @@ pub fn walk(root: &Path) -> Result<WalkSnapshot> {
             // an empty path (never ignored) and is excluded by min_depth(1).
             e.path()
                 .strip_prefix(root)
-                .map(|rel| !ignore.is_ignored(rel))
+                .map(|rel| !ignore.is_ignored(rel) && keep(rel))
                 .unwrap_or(true)
         })
     {

@@ -9,6 +9,7 @@ mod cmd_pair;
 mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
+mod cmd_shared_subtree;
 mod cmd_vault;
 mod growlight_backend;
 
@@ -71,6 +72,11 @@ enum Cmd {
     #[command(subcommand)]
     Replica(cmd_replica::ReplicaCmd),
 
+    /// Shared-subtree lifecycle (M5c): register/un-share subtrees (ring
+    /// membership) and enable/disable them per-device (a local toggle).
+    #[command(subcommand)]
+    SharedSubtree(cmd_shared_subtree::SharedSubtreeCmd),
+
     /// growlight — the autonomous work-loop pillar. `init` scaffolds it into
     /// an already-onboarded garden; `start` sets up the loop runtime and
     /// launches the agent in loop mode.
@@ -104,6 +110,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Peers(args) => cmd_pair::peers(args),
         Cmd::Unpair(args) => cmd_pair::unpair(args),
         Cmd::Replica(cmd) => cmd_replica::run(cmd),
+        Cmd::SharedSubtree(cmd) => cmd_shared_subtree::run(cmd),
         Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
     }
 }

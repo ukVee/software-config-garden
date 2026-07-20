@@ -124,12 +124,23 @@ impl MountHandle {
         &self.mount_point
     }
 
-    /// Called by `commit_workdir`'s registered tip-changed hook. Drops
-    /// the in-memory write overlay (now subsumed by the new tip),
-    /// rebuilds the tree-at-tip cache from the new tip, and broadcasts
-    /// `inval_inode` so kernel page cache stops returning stale data.
-    pub fn on_tip_changed(&self) {
-        self.state.rotate_tip();
+    /// Called by `commit_workdir`'s registered tip-changed hook with the ref
+    /// the commit advanced. Rebuilds the union view from every chain's tip and
+    /// drops exactly the overlay entries that commit absorbed — the advanced
+    /// chain's entries up to the last snapshotted generation; other chains'
+    /// staged writes and post-snapshot racers survive (slice 006 absorption
+    /// invariant).
+    pub fn on_tip_changed(&self, advanced_ref: &str) {
+        self.state.rotate_tip(Some(advanced_ref));
+    }
+
+    /// The refs of every chain owning at least one staged overlay write or
+    /// removal — the chains a commit must advance for the pending overlay to
+    /// be fully absorbed. The keeperd action-verb commit path routes through
+    /// this so a staged write under a shared mount commits to the owning
+    /// chain instead of vanishing via the device carve-out (slice 006).
+    pub fn pending_chain_refs(&self) -> Vec<String> {
+        self.state.pending_chain_refs()
     }
 
     /// Reconstruct the current working tree (committed tip-view ∪ pending
@@ -145,6 +156,33 @@ impl MountHandle {
     /// `SharedState::workdir_snapshot` for the full rule-parity contract.
     pub fn workdir_snapshot(&self) -> Result<softfig_vcs::WalkSnapshot> {
         self.state.workdir_snapshot()
+    }
+
+    /// M5c slice 002 — one commit snapshot per enabled chain (`(ref_name,
+    /// snapshot)`), routed by the mount's [`softfig_vcs::ChainRegistry`]: the
+    /// device chain carved to device-owned paths, each shared chain's subtree
+    /// with the mount prefix stripped. The keeperd commit path commits each
+    /// affected chain's snapshot to its own ref, so a write under a shared mount
+    /// never advances the device ref. `device_only` ⇒ a single `(TIP_REF, …)`
+    /// snapshot equal to [`Self::workdir_snapshot`].
+    pub fn chain_snapshots(&self) -> Result<Vec<(String, softfig_vcs::WalkSnapshot)>> {
+        self.state.chain_snapshots()
+    }
+
+    /// A clone of the chain registry this mount serves, for the commit path to
+    /// route dirty paths ([`softfig_vcs::ChainRegistry::owning_chain`]) to the
+    /// set of chains a flush must commit.
+    pub fn registry(&self) -> softfig_vcs::ChainRegistry {
+        self.state.registry()
+    }
+
+    /// M5c slice 003 — hot-swap the chain registry this mount serves and
+    /// recompose the union view live. The keeperd shared-subtree lifecycle verbs
+    /// call this after an add/remove membership commit or an enable/disable local
+    /// toggle, so the mounted garden reflects the new composition immediately with
+    /// no remount (a remount would tear down + drop the pending write overlay).
+    pub fn set_registry(&self, registry: softfig_vcs::ChainRegistry) {
+        self.state.set_registry(registry);
     }
 
     /// The exclusion set (built-in defaults ∪ the user `.softfigignore`) in

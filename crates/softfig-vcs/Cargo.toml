@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 

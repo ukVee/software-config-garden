@@ -21,6 +21,13 @@ pub struct KeeperConfig {
     /// over `garden_root` after the unlock transition. Tests disable
     /// this to exercise the daemon's M2a wiring without the real mount.
     pub enable_fuse: bool,
+    /// Headless test seam (slice 007): when true, `unlock` attaches the full
+    /// FUSE state machine via [`softfig_fuse::FuseMount::attach_unmounted`] —
+    /// overlay staging, union view, registry hot-swap, the real commit
+    /// routing — with no kernel mount behind it, so the integration suite
+    /// exercises the production FUSE paths where `/dev/fuse` is unavailable.
+    /// Never set by a real daemon; production is `mount_with` or nothing.
+    pub fuse_attach_unmounted: bool,
     /// M5a-4: when true (and `[net] enabled`), the daemon hosts the
     /// `softfig-net` instance (inbound listener + mDNS + optional relay)
     /// after `unlock`. Tests disable this so the pairing *verbs* can be
@@ -162,6 +169,7 @@ impl KeeperConfig {
             socket_path: softfig_ipc::runtime_socket_path(),
             enable_watcher: true,
             enable_fuse: true,
+            fuse_attach_unmounted: false,
             enable_net: true,
             reveal: RevealConfig::default(),
             net: NetConfig::default(),
@@ -195,6 +203,7 @@ impl KeeperConfig {
             socket_path: softfig_ipc::runtime_socket_path(),
             enable_watcher: true,
             enable_fuse: true,
+            fuse_attach_unmounted: false,
             enable_net: true,
             reveal: RevealConfig {
                 idle_seconds: cfg.reveal.idle_seconds,
@@ -262,6 +271,14 @@ impl KeeperConfig {
 
     pub fn without_fuse(mut self) -> Self {
         self.enable_fuse = false;
+        self
+    }
+
+    /// Headless test seam: attach the full FUSE state machine with no kernel
+    /// mount on unlock. See [`fuse_attach_unmounted`](Self::fuse_attach_unmounted).
+    #[doc(hidden)]
+    pub fn with_unmounted_fuse_attach(mut self) -> Self {
+        self.fuse_attach_unmounted = true;
         self
     }
 

@@ -34,11 +34,11 @@ use softfig_net::ring::{ring_path, Ring, RingEntry};
 use softfig_net::transport::{xx_initiator, xx_responder};
 use softfig_net::{
     pull_replication, pull_replication_pipelined, serve_replication, tipannounce_signing_bytes,
-    NetError, PullSummary, ReplicaSink,
+    NetError, PullSummary, ReplicaSink, ReplicaSource,
 };
 use softfig_store::{Db, Hash, ObjectStore, StorePaths};
 use softfig_vault::{Vault, VaultSession};
-use softfig_vcs::{Intent, Repo};
+use softfig_vcs::{reachable_from, walk, Intent, Repo};
 
 mod common;
 use common::fast_params;
@@ -99,6 +99,19 @@ impl Owner {
         let intent = Intent::new("manual_edit", json!({ "dir": dir })).unwrap();
         self.repo.commit_workdir(&self.session, intent).unwrap()
     }
+
+    /// Commit `body` as a single file to a **shared chain**'s own ref (m5c),
+    /// from an out-of-garden staging dir so the shared content never touches the
+    /// device working tree. Advances `ref_name` only — the device tip stays put.
+    /// Returns the new tip of that chain.
+    fn commit_to_chain(&mut self, ref_name: &str, filename: &str, body: &str) -> Hash {
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::write(stage.path().join(filename), body).unwrap();
+        let snapshot = walk::walk(stage.path()).unwrap();
+        self.repo
+            .commit_snapshot_to(ref_name, &self.session, snapshot, Intent::init("shared chain advance"))
+            .unwrap()
+    }
 }
 
 /// Which pull driver [`replicate_with`] exercises.
@@ -153,7 +166,7 @@ fn replicate_with(
         let hello = HelloPayload::new(owner_device_id.to_vec(), "owner");
         let mut session = xx_responder(stream, &owner_transport, &hello).unwrap();
         let repo = Repo::open(&garden).unwrap();
-        let source = RepoSource::new(repo, announce);
+        let source = RepoSource::new(repo, announce).unwrap();
         let _ = serve_replication(&mut session, &source);
     });
 
@@ -537,6 +550,190 @@ fn pipelined_rollback_announce_is_rejected_and_mirror_unchanged() {
         Some(*tip_b.as_bytes()),
         "mirror tip must be left at B, never force-updated"
     );
+}
+
+// --- M5c slice 004: replica isolation — the mirror gets the DEVICE ref only ---
+
+/// The adversarial end-to-end isolation proof (user requirement #2): an owner
+/// with a device chain **and** a shared chain runs a real M5b replica push to a
+/// backup host; the resulting mirror holds **exactly** the device chain's
+/// closure — the shared chain's commit, ref, and ciphertext blob are all
+/// **absent**. Enforced by construction: `build_announce` announces
+/// `repo.tip()` = the device `TIP_REF`, so the sink's fast-forward walk can only
+/// ever reach the device tip's object graph. A shared chain is a separate source
+/// (its own replication is m5d/m5e), never folded into the device backup.
+///
+/// Parametrized over the pull driver (m5c slice 008): the sequential
+/// request→response path AND the pipelined windowed backfill — production LAN
+/// ingest is the pipelined one, so isolation must hold on both.
+#[test]
+fn device_chain_replica_excludes_a_shared_chain() {
+    device_chain_replica_excludes_a_shared_chain_over(Driver::Sequential);
+}
+
+#[test]
+fn pipelined_device_chain_replica_excludes_a_shared_chain() {
+    device_chain_replica_excludes_a_shared_chain_over(Driver::Pipelined);
+}
+
+fn device_chain_replica_excludes_a_shared_chain_over(driver: Driver) {
+    const SHARED_REF: &str = "chain/journals";
+
+    let mut owner = new_owner();
+    // Device chain: genesis + two device commits.
+    owner.commit_file("a.md", "alpha");
+    let dev_tip = owner.commit_file("dir/b.md", "beta");
+
+    // A shared chain on its OWN ref, carrying content unique to it — the blob
+    // that must never reach a backup mirror.
+    let shared_tip = owner.commit_to_chain(SHARED_REF, "secret.md", "SHARED-SUBTREE-SECRET");
+    assert_eq!(
+        owner.repo.tip().unwrap(),
+        Some(dev_tip),
+        "a shared-chain write must not move the device ref"
+    );
+
+    // The shared chain owns a ciphertext blob the device tip never references.
+    let dev_blobs = reachable_from(owner.repo.db(), dev_tip).unwrap().blobs;
+    let shared_blobs = reachable_from(owner.repo.db(), shared_tip).unwrap().blobs;
+    let shared_exclusive: Vec<Hash> = shared_blobs.difference(&dev_blobs).copied().collect();
+    assert!(
+        !shared_exclusive.is_empty(),
+        "the shared chain must own an exclusive blob"
+    );
+
+    // Push to a backup host over a real Noise serve/pull session.
+    let chain_id = owner.repo.repo_id().unwrap().into_bytes();
+    let announce = build_announce(&owner.repo, &owner.session).unwrap();
+    // The announce ships the DEVICE tip, never the shared tip.
+    assert_eq!(
+        announce.tip_hash,
+        dev_tip.as_bytes().to_vec(),
+        "build_announce must announce the device tip only"
+    );
+
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut mirror =
+        MirrorStore::open_or_create(replica_root.path(), &owner.device_id, "owner", &chain_id)
+            .unwrap();
+    let summary = replicate_with(
+        driver,
+        &owner.garden,
+        owner.transport_secret,
+        owner.device_id,
+        announce,
+        &mut mirror,
+    )
+    .unwrap();
+    assert_eq!(summary.new_tip, Some(*dev_tip.as_bytes()));
+    drop(mirror);
+
+    // Inspect the mirror on disk: it holds EXACTLY the device chain's closure.
+    let dir = mirror_dir(replica_root.path(), &owner.device_id);
+    let paths = StorePaths::with_state_root(&dir, &dir);
+    let db = Db::open(&paths).unwrap();
+    let objects = ObjectStore::new(paths);
+
+    // (1) The mirror's ref set is EXACTLY the device tip — not merely "the shared
+    //     ref we happened to name is absent", but no extra ref of any kind
+    //     (m5c slice 008 finding-15-family strengthening).
+    let refs: Vec<(String, Hash)> = db
+        .list_refs()
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.name, r.commit_hash))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("tip".to_string(), dev_tip)],
+        "the mirror must hold exactly the device tip ref and nothing else"
+    );
+
+    // (2) The shared chain's commit is absent from the mirror.
+    assert!(
+        !db.commit_exists(&shared_tip).unwrap(),
+        "the shared commit must not reach the mirror"
+    );
+
+    // (3) The shared chain's exclusive ciphertext blob(s) never entered the mirror.
+    for h in &shared_exclusive {
+        assert!(
+            !objects.contains(h),
+            "shared blob {h} leaked into the backup mirror"
+        );
+    }
+
+    // (4) Positive control: every device-tip blob DID reach the mirror, and the
+    //     mirror is fsck-clean and scoped to the device closure only.
+    for h in &dev_blobs {
+        assert!(objects.contains(h), "device blob {h} must be in the mirror");
+    }
+    let report = softfig_vcs::fsck(&db, &objects).unwrap();
+    assert!(report.ok(), "mirror not fsck-clean: {:?}", report.problems);
+}
+
+/// Dishonest-sink regression (m5c slice 008, finding 6): the serve side is not
+/// an unscoped hash oracle. A `RepoSource` built for a device-chain announce
+/// answers `found:false` for a shared-chain commit/tree/blob — even though those
+/// objects physically exist in the same `Db`/`ObjectStore` — while still serving
+/// every object in the announced device closure. This is what stops a granted
+/// backup host that learns a shared-chain hash out of band (the m5d threat) from
+/// fetching off-audience ciphertext in an otherwise-legitimate session.
+#[test]
+fn repo_source_refuses_off_closure_hashes() {
+    const SHARED_REF: &str = "chain/journals";
+
+    let mut owner = new_owner();
+    owner.commit_file("a.md", "alpha");
+    let dev_tip = owner.commit_file("dir/b.md", "beta");
+    // A shared chain on its own ref, carrying a ciphertext blob the device tip
+    // never references.
+    let shared_tip = owner.commit_to_chain(SHARED_REF, "secret.md", "SHARED-SUBTREE-SECRET");
+
+    // The shared chain's off-closure objects, resolved straight from the store.
+    let shared_commit = owner.repo.db().get_commit(&shared_tip).unwrap();
+    let shared_tree = shared_commit.root_tree;
+    let dev_blobs = reachable_from(owner.repo.db(), dev_tip).unwrap().blobs;
+    let shared_blobs = reachable_from(owner.repo.db(), shared_tip).unwrap().blobs;
+    let shared_blob = *shared_blobs
+        .difference(&dev_blobs)
+        .next()
+        .expect("the shared chain owns an exclusive blob");
+
+    // Build the source exactly as the serve thread does: a fresh Repo handle +
+    // the device-tip announce.
+    let announce = build_announce(&owner.repo, &owner.session).unwrap();
+    assert_eq!(announce.tip_hash, dev_tip.as_bytes().to_vec());
+    let repo = Repo::open(&owner.garden).unwrap();
+    let source = RepoSource::new(repo, announce).unwrap();
+
+    // Off-closure: the shared commit, its root tree, and its exclusive blob are
+    // all refused, so a hash learned out of band yields nothing.
+    assert!(
+        !source.get_commit(shared_tip.as_bytes()).found,
+        "shared commit served — the source is an unscoped hash oracle"
+    );
+    assert!(
+        !source.get_tree(shared_tree.as_bytes()).found,
+        "shared tree served — the source is an unscoped hash oracle"
+    );
+    assert!(
+        !source.get_object(shared_blob.as_bytes()).found,
+        "shared ciphertext blob served — the source is an unscoped hash oracle"
+    );
+
+    // In-closure: the announced device tip and every device blob still serve, so
+    // the scoping doesn't break legitimate replication.
+    assert!(
+        source.get_commit(dev_tip.as_bytes()).found,
+        "the announced device tip must still serve"
+    );
+    for h in &dev_blobs {
+        assert!(
+            source.get_object(h.as_bytes()).found,
+            "device blob {h} must still serve"
+        );
+    }
 }
 
 // --- Owner-side IPC surface (grant / revoke / status) -----------------------
