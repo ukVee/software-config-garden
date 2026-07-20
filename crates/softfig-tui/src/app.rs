@@ -4198,7 +4198,9 @@ mod tests {
                 tag: Tag::GrowlightQueue,
                 result: Ok(json!({
                     "rows": [
-                        { "id": "my-milestone", "title": "A milestone", "status": "deferred" },
+                        // `active` so the file-derived per-slice status shows through
+                        // the task-045 clamp (a non-active milestone forces `queued`).
+                        { "id": "my-milestone", "title": "A milestone", "status": "active" },
                         { "id": "042", "title": "A task", "status": "queued" },
                     ],
                 })),
@@ -4392,7 +4394,9 @@ mod tests {
                 id: 2,
                 tag: Tag::GrowlightQueue,
                 result: Ok(json!({
-                    "rows": [ { "id": "m", "title": "milestone m", "status": "deferred" } ],
+                    // `active` so the awaiting-smoke refinement isn't clamped to
+                    // `queued` by the task-045 parent-milestone clamp.
+                    "rows": [ { "id": "m", "title": "milestone m", "status": "active" } ],
                 })),
             },
             &mut ipc,

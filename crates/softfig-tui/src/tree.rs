@@ -299,6 +299,32 @@ pub fn derive_slice_status(reviewed: Option<&str>, body: Option<&str>) -> SliceS
     }
 }
 
+/// Clamp a slice's file-derived status to its parent milestone's **authoritative**
+/// queue-table status (task 045).
+///
+/// [`derive_slice_status`] reads the slice's "Reviewed" cell, but that is a
+/// documentation-freshness stamp set when the slice *spec* was authored — it says
+/// nothing about whether the code was built. So a milestone that was spec-reviewed
+/// during planning but never started has every slice carrying a Reviewed date, and
+/// the raw file-derived status would render them all `done`. There is no
+/// machine-readable per-slice completion flag in the backlog; completion is tracked
+/// only at the milestone level (the queue table). So the honest display status is
+/// the file-derived one clamped to the milestone:
+///
+/// * milestone `done` ⇒ every slice `done`;
+/// * milestone `active` ⇒ keep the file-derived status (the only case where
+///   per-slice differentiation is real; the live-baton `active` overlay is applied
+///   on top by [`BacklogTree::visible`]);
+/// * milestone not-started (`queued`/`deferred`/`blocked`/anything else) ⇒ nothing
+///   is built yet, so every slice reads `queued` regardless of its Reviewed cell.
+pub fn clamp_slice_status(milestone_status: &str, derived: SliceStatus) -> SliceStatus {
+    match milestone_status {
+        "done" => SliceStatus::Done,
+        "active" => derived,
+        _ => SliceStatus::Queued,
+    }
+}
+
 /// A top-level backlog row (milestone or task) in the growlight tree.
 #[derive(Debug, Clone)]
 pub struct BacklogItem {
@@ -531,12 +557,17 @@ impl BacklogTree {
             if expanded {
                 if let Some(children) = self.slices.get(&item.id) {
                     for s in children {
-                        // `active` is a live overlay from the baton pointer; every
-                        // other status is the stored file-derived one.
+                        // Clamp the stored file-derived status to the parent
+                        // milestone's authoritative queue status (task 045): a
+                        // spec-reviewed slice of a not-yet-started milestone reads
+                        // `queued`, not `done`. `active` is then a live overlay from
+                        // the baton pointer, applied on top (only ever set for the
+                        // active milestone's slice).
+                        let clamped = clamp_slice_status(&item.status, s.status);
                         let status = if self.is_active_slice(&item.id, &s.num) {
                             SliceStatus::Active.as_str()
                         } else {
-                            s.status.as_str()
+                            clamped.as_str()
                         };
                         out.push(BacklogVisibleRow {
                             kind: BacklogKind::Slice,
@@ -787,13 +818,17 @@ mod tests {
         assert_eq!(derive_slice_status(None, None), SliceStatus::Queued);
     }
 
-    fn milestone(id: &str, title: &str) -> BacklogItem {
+    fn milestone_st(id: &str, title: &str, status: &str) -> BacklogItem {
         BacklogItem {
             id: id.into(),
             title: title.into(),
-            status: "deferred".into(),
+            status: status.into(),
             is_milestone: true,
         }
+    }
+
+    fn milestone(id: &str, title: &str) -> BacklogItem {
+        milestone_st(id, title, "deferred")
     }
 
     fn task(id: &str, title: &str) -> BacklogItem {
@@ -980,7 +1015,9 @@ mod tests {
     #[test]
     fn refine_slice_status_lights_up_awaiting_smoke_from_the_body() {
         let mut t = BacklogTree::new();
-        t.set_items(vec![milestone("m", "m")]);
+        // Milestone `active` so the file-derived base status shows through the
+        // task-045 clamp (a non-active milestone would force every slice `queued`).
+        t.set_items(vec![milestone_st("m", "m", "active")]);
         t.expand("m");
         // A reviewed slice whose body isn't loaded reads as done.
         t.set_slices(
@@ -1007,7 +1044,9 @@ mod tests {
     #[test]
     fn set_active_overlays_active_on_the_baton_slice_without_clobbering_base() {
         let mut t = BacklogTree::new();
-        t.set_items(vec![milestone("m", "m")]);
+        // Milestone `active` so per-slice differentiation + the baton overlay are
+        // live (the only regime where the file-derived base is real; task 045).
+        t.set_items(vec![milestone_st("m", "m", "active")]);
         t.expand("m");
         t.set_slices(
             "m",
@@ -1041,6 +1080,78 @@ mod tests {
         // Cleared → the base status reappears (no clobber of the stored value).
         t.set_active(None);
         assert_eq!(t.visible()[2].status, "queued");
+    }
+
+    #[test]
+    fn clamp_slice_status_by_milestone() {
+        use SliceStatus::*;
+        // Milestone in flight → the file-derived status passes through unchanged.
+        assert_eq!(clamp_slice_status("active", Done), Done);
+        assert_eq!(clamp_slice_status("active", AwaitingSmoke), AwaitingSmoke);
+        assert_eq!(clamp_slice_status("active", Queued), Queued);
+        // Milestone finished → every slice is done.
+        assert_eq!(clamp_slice_status("done", Queued), Done);
+        assert_eq!(clamp_slice_status("done", AwaitingSmoke), Done);
+        // Not started (any non-active/done status) → queued, Reviewed cell or not.
+        for st in ["queued", "deferred", "blocked", "unknown"] {
+            assert_eq!(clamp_slice_status(st, Done), Queued, "{st}");
+            assert_eq!(clamp_slice_status(st, AwaitingSmoke), Queued, "{st}");
+        }
+    }
+
+    #[test]
+    fn slice_status_clamps_to_the_parent_milestone_queue_status() {
+        // A milestone spec-reviewed during planning but never started: every slice
+        // row carries a Reviewed date, so its raw file-derived status is `done` /
+        // `awaiting-smoke`. This is the m5e-write-turn case (queued milestone, all
+        // slices reviewed 2026-07-01) that task 045 fixes.
+        let reviewed_slices = || {
+            vec![
+                SliceChild {
+                    num: "001".into(),
+                    title: "s1".into(),
+                    path: "growlight/backlog/milestones/m/slices/001.md".into(),
+                    reviewed: Some("2026-07-01".into()),
+                    status: SliceStatus::Done,
+                },
+                SliceChild {
+                    num: "002".into(),
+                    title: "s2".into(),
+                    path: "growlight/backlog/milestones/m/slices/002.md".into(),
+                    reviewed: Some("2026-07-01".into()),
+                    status: SliceStatus::AwaitingSmoke,
+                },
+            ]
+        };
+
+        // queued / deferred / blocked = not started → all slices read `queued`.
+        for st in ["queued", "deferred", "blocked"] {
+            let mut t = BacklogTree::new();
+            t.set_items(vec![milestone_st("m", "m", st)]);
+            t.expand("m");
+            t.set_slices("m", reviewed_slices());
+            let vis = t.visible();
+            assert_eq!(vis[1].status, "queued", "milestone {st} → slice 001 queued");
+            assert_eq!(vis[2].status, "queued", "milestone {st} → slice 002 queued");
+        }
+
+        // done milestone → every slice is done (even one whose body owes a smoke).
+        let mut t = BacklogTree::new();
+        t.set_items(vec![milestone_st("m", "m", "done")]);
+        t.expand("m");
+        t.set_slices("m", reviewed_slices());
+        let vis = t.visible();
+        assert_eq!(vis[1].status, "done");
+        assert_eq!(vis[2].status, "done");
+
+        // active milestone → the file-derived base shows through (real per-slice case).
+        let mut t = BacklogTree::new();
+        t.set_items(vec![milestone_st("m", "m", "active")]);
+        t.expand("m");
+        t.set_slices("m", reviewed_slices());
+        let vis = t.visible();
+        assert_eq!(vis[1].status, "done");
+        assert_eq!(vis[2].status, "awaiting-smoke");
     }
 
     #[test]
