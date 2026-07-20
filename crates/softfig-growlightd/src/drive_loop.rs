@@ -851,7 +851,7 @@ pub struct DriveLoop {
     connectivity: Box<dyn Connectivity>,
     /// The cross-agent usage aggregate (owned): refreshed from `samples` each tick,
     /// it feeds admission (gate on real fleet burn) and the single §9 usage alert
-    /// ([`UsageAggregator::fleet_alert`]).
+    /// ([`UsageAggregator::fleet_alert_at`]).
     aggregator: UsageAggregator,
     /// The single notification dispatcher (owned): every tick's events — crashes,
     /// parked (blocked-head) items, the usage alert — route through it, so its
@@ -1148,8 +1148,11 @@ impl DriveLoop {
             }
             if self.supervisor.is_running(agent) {
                 if let Some(budget) = self.samples.budget(agent) {
+                    // Stamp the reading with the tick's `now`; an unchanged re-report
+                    // keeps its prior age so a wedged agent's frozen sample ages out
+                    // of its window (task 046 window-staleness bound).
                     self.aggregator
-                        .observe(UsageSample::new(agent.clone(), budget));
+                        .observe(UsageSample::new(agent.clone(), budget, now));
                 }
             } else {
                 self.aggregator.forget(agent);
@@ -1168,7 +1171,7 @@ impl DriveLoop {
         // the fleet simply waits out the window instead of crash-looping into it.
         let rate_limited = self.rate_limit_hold_until.is_some();
         report.waiting_for_rate_limit_reset = self.rate_limit_hold_until;
-        let budget = self.aggregator.aggregate_or_fresh();
+        let budget = self.aggregator.aggregate_or_fresh_at(now);
         let rate = self.rate.rate(now);
 
         // Parts item-parked this tick (a member exited on a human-block): collected
@@ -1669,7 +1672,7 @@ impl DriveLoop {
     /// Route a completed tick's events through the single owned
     /// [`NotifyDispatcher`] (spec §9): every surfaced crash and every parked
     /// (blocked-head) item alerts, and the cross-agent usage aggregate reaching
-    /// the single near-exhaustion rung ([`UsageAggregator::fleet_alert`]) fires
+    /// the single near-exhaustion rung ([`UsageAggregator::fleet_alert_at`]) fires
     /// the one usage alert. The dispatcher's per-event dedup/cooldown makes a
     /// sustained condition — a still-blocked head, a still-hot pool — announce at
     /// most once per window, even though `tick` surfaces it every cycle.
@@ -1706,7 +1709,7 @@ impl DriveLoop {
         // diagnosable straight from the log/bus (the old alert always rendered "97%",
         // indistinguishable from a real 97%). The dispatcher's `usage` dedup still
         // fires it exactly once per cooldown regardless of the number carried.
-        let agg = self.aggregator.aggregate_or_fresh();
+        let agg = self.aggregator.aggregate_or_fresh_at(now);
         if crate::usage::usage_alert_reached(agg) {
             self.dispatcher.notify(
                 &NotifyEvent::Usage {
@@ -4279,7 +4282,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         backend.set_budget("a1", hot_budget());
         loop_.tick(1);
         assert_eq!(
-            loop_.aggregator.aggregate_or_fresh(),
+            loop_.aggregator.aggregate_or_fresh_at(1),
             hot_budget(),
             "while a1 runs, its hot reading (over the 85 rail) is in the aggregate",
         );
@@ -4290,7 +4293,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         backend.set_health("a1", AgentHealth::Exited { code: 1 });
         loop_.tick(2); // crash → forget + backoff not_before 4
         assert_eq!(
-            loop_.aggregator.aggregate_or_fresh(),
+            loop_.aggregator.aggregate_or_fresh_at(2),
             BudgetUsage::new(0, 0),
             "the crashed agent's stale hot reading is gone — no phantom pin (task 031)",
         );
@@ -4332,7 +4335,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
         assert_eq!(loop_.aggregator.agent_count(), 0, "no live contributors remain");
         assert_eq!(
-            loop_.aggregator.aggregate_or_fresh(),
+            loop_.aggregator.aggregate_or_fresh_at(2),
             BudgetUsage::new(0, 0),
             "an all-down fleet reads fresh, never frozen-high (task 031)",
         );
@@ -4379,7 +4382,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // is the ONLY thing keeping it down: no re-roll, no second spawn.
         let r10 = loop_.tick(10);
         assert_eq!(
-            loop_.aggregator.aggregate_or_fresh(),
+            loop_.aggregator.aggregate_or_fresh_at(10),
             BudgetUsage::new(0, 0),
             "the parked member's sample is forgotten (task 031) — the aggregate is not the blocker",
         );
