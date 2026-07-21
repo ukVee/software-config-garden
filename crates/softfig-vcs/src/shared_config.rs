@@ -6,9 +6,11 @@
 //!
 //! * **`config/shared-subtrees.toml`** — the committed, ring-signed (m5d),
 //!   encrypted, versioned **membership** allow-list. Each `[[subtree]]` carries
-//!   the stable `id`, the garden-relative `mount_path`, the `refs`-table
-//!   `ref_name` that holds the chain's tip, and an optional `key_id` (a
-//!   placeholder until m5d's collaborative `S` key). Add/remove edit this file
+//!   the stable `id`, **this device's** `mount_path` (placement is per-device
+//!   state — [[decision-shared-subtree-recipient-placement]]), the `refs`-table
+//!   `ref_name` that holds the chain's tip, an optional `key_id` (a
+//!   placeholder until m5d's collaborative `S` key), and the sharer's advisory
+//!   `recommended_path` (m5f slice 002). Add/remove edit this file
 //!   under a ring proposal (the key ceremony is a stubbed hook in m5c).
 //!
 //! * **`.softfig/shared-subtrees-local.toml`** — a per-device, **never
@@ -80,18 +82,34 @@ pub struct SharedSubtreesConfig {
 
 /// One shared-subtree membership row. `enabled` is deliberately **absent** — the
 /// on/off state is per-device and lives in [`LocalToggles`], not here.
+///
+/// The cross-member contract for a share is its *identity* — `{id, ref_name,
+/// key_id, members}` — plus the advisory `recommended_path`; **placement is
+/// per-device state** ([[decision-shared-subtree-recipient-placement]]). Each
+/// device authors its own row, so `mount_path` here is *this device's* choice
+/// and two members' rows for one chain may legitimately differ in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedSubtreeEntry {
     /// Stable id, assigned at add-time (the ring proposal). Keys the local toggle.
     pub id: String,
-    /// Garden-relative mount prefix (`/`-separated), e.g. `projects/journals`.
+    /// **This device's** placement: the garden-relative mount prefix
+    /// (`/`-separated, e.g. `projects/journals`) where *this* device projects
+    /// the chain. Per-device state — never ring-agreed, never on the wire; other
+    /// members may mount the same chain elsewhere.
     pub mount_path: String,
     /// The `refs`-table ref holding this chain's tip.
     pub ref_name: String,
     /// The collaborative key id — a placeholder (`None`) until m5d.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// The sharer's advisory placement recommendation, set at share time and
+    /// kept in the committed row so a late-joining device still sees it.
+    /// Advisory ONLY — the accept default, never validated against and never
+    /// authoritative; `mount_path` is what this device actually chose. Absent
+    /// on pre-placement rows (m5f slice 002 added it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_path: Option<String>,
 }
 
 /// The per-device local-toggle sidecar (`.softfig/shared-subtrees-local.toml`).
@@ -121,6 +139,8 @@ struct LenientEntry {
     ref_name: String,
     #[serde(default)]
     key_id: Option<String>,
+    #[serde(default)]
+    recommended_path: Option<String>,
 }
 
 impl SharedSubtreesConfig {
@@ -146,6 +166,7 @@ impl SharedSubtreesConfig {
                     mount_path: e.mount_path,
                     ref_name: e.ref_name,
                     key_id: e.key_id,
+                    recommended_path: e.recommended_path,
                 })
                 .collect(),
         })
@@ -324,6 +345,7 @@ id = "wiki"
 mount_path = "notes/wiki"
 ref_name = "chain/wiki"
 key_id = "S-placeholder"
+recommended_path = "shared/wiki"
 "#;
 
     #[test]
@@ -331,12 +353,19 @@ key_id = "S-placeholder"
         let cfg = SharedSubtreesConfig::from_toml_str(SAMPLE).unwrap();
         assert_eq!(cfg.subtrees.len(), 2);
         assert_eq!(cfg.subtrees[1].key_id.as_deref(), Some("S-placeholder"));
+        // The pre-placement row parses with no recommendation; the wiki row's
+        // recommendation is advisory — the registry mounts at THIS device's
+        // `mount_path` (`notes/wiki`), never at the sharer's recommendation.
+        assert_eq!(cfg.subtrees[0].recommended_path, None);
+        assert_eq!(cfg.subtrees[1].recommended_path.as_deref(), Some("shared/wiki"));
 
         let reg = ChainRegistry::from_shared_config(&cfg, &LocalToggles::default());
         // device + 2 enabled shared chains all live.
         assert_eq!(reg.enabled_chains().count(), 3);
         assert_eq!(reg.owning_chain(Path::new("projects/journals/2026.md")).id, "journals");
         assert_eq!(reg.owning_chain(Path::new("notes/wiki/index.md")).id, "wiki");
+        // The recommendation is NOT a mount: content there stays device-owned.
+        assert!(reg.is_device_owned(Path::new("shared/wiki/index.md")));
         // Elsewhere → device.
         assert!(reg.is_device_owned(Path::new("shell/aliases.md")));
         // A sibling that only shares a string prefix stays device-owned.
@@ -401,6 +430,7 @@ key_id = "S-placeholder"
                 mount_path: "projects".into(),
                 ref_name: "chain/proj".into(),
                 key_id: None,
+                recommended_path: None,
             }],
         };
         // Nested under an existing share → overlap.
@@ -415,6 +445,7 @@ key_id = "S-placeholder"
                 mount_path: "projects/app".into(),
                 ref_name: "chain/app".into(),
                 key_id: None,
+                recommended_path: None,
             }],
         };
         assert!(matches!(
@@ -463,15 +494,18 @@ schema_rev = 2
 id = "journals"
 mount_path = "projects/journals"
 ref_name = "chain/journals"
+recommended_path = "projects/journals"
 write_turn = "device-b"
 "#;
         // Strict (the mutation path) refuses — a rewrite would drop the
         // fields this version doesn't understand.
         assert!(SharedSubtreesConfig::from_toml_str(newer).is_err());
-        // Lenient (the compose path) still routes what it understands.
+        // Lenient (the compose path) still routes what it understands,
+        // including the fields it does know (the recommendation survives).
         let cfg = SharedSubtreesConfig::from_toml_str_lenient(newer).unwrap();
         assert_eq!(cfg.subtrees.len(), 1);
         assert_eq!(cfg.subtrees[0].id, "journals");
+        assert_eq!(cfg.subtrees[0].recommended_path.as_deref(), Some("projects/journals"));
         // A row missing a required field is corrupt for both.
         let corrupt = "[[subtree]]\nid = \"x\"\n";
         assert!(SharedSubtreesConfig::from_toml_str_lenient(corrupt).is_err());

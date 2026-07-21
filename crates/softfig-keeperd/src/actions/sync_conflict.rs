@@ -50,8 +50,11 @@ use crate::server::err_to_response;
 pub(crate) struct ConflictSides {
     /// The shared chain's ref (`chain/<id>`).
     pub chain_ref: String,
-    /// The subtree the chain projects (payload `subtree`) — the mount prefix
-    /// stripped when the tree stores paths chain-relative.
+    /// The payload `subtree` label. An m5f-slice-002 sender puts the share's
+    /// stable id here and sends `files` chain-relative (they resolve verbatim);
+    /// a legacy sender puts its own mount path, which
+    /// [`read_file_from_tree`]'s fallback strips from the mount-prefixed paths
+    /// such a sender ships.
     pub subtree: String,
     /// The conflicting file (payload `files[0]`; v1 is single-file). Addresses
     /// the loser's bytes and names the sidecar.

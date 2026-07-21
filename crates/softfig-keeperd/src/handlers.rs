@@ -1999,11 +1999,17 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     // never an inline block: this commit signals the net reconcile loop, whose
     // ceremony sweep runs the commit-reveal with the peer and fills `key_id`
     // when members are next online (`net::reconcile_ceremonies`).
+    //
+    // The adder is the sharer, so its chosen placement doubles as the advisory
+    // `recommended_path` — committed in the row so a late-joining device still
+    // sees the recommendation; recipients place independently (m5f slice 002,
+    // [[decision-shared-subtree-recipient-placement]]).
     membership.subtrees.push(softfig_vcs::SharedSubtreeEntry {
         id: id.clone(),
         mount_path: mount_path.clone(),
         ref_name: ref_name.clone(),
         key_id: None,
+        recommended_path: Some(mount_path.clone()),
     });
     let toml = membership
         .to_toml()

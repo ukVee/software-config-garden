@@ -2717,11 +2717,16 @@ fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
                 continue; // no reachable S-member this tick
             }
             let (writer_device, files) = shared_push_provenance(&tip_row.payload, &local.device_name);
+            // Placement never crosses the wire (m5f slice 002): the frame names
+            // the share by its stable id, and provenance files travel
+            // chain-relative — this device's `mount_path` is per-device state
+            // a receiver placed elsewhere could do nothing with.
+            let files = placement_free_files(files, &entry.mount_path);
             let frame = build_shared_chain_push_frame(
                 &session,
                 local,
                 &chain,
-                &entry.mount_path,
+                &entry.id,
                 &new_tree,
                 &base_tree,
                 &writer_device,
@@ -3403,6 +3408,10 @@ fn serve_chain<S: std::io::Read + std::io::Write>(
 /// `writer_device` carries the ORIGINATING author's name verbatim — on a re-push
 /// it is the upstream member's name, not ours (advisory provenance; a re-pusher
 /// can forge it in v1 — locked, don't fix).
+///
+/// `subtree` is the share's **stable id** and `files` are **chain-relative**
+/// (m5f slice 002): a member's `mount_path` is per-device state and never
+/// crosses the wire ([[decision-shared-subtree-recipient-placement]]).
 #[doc(hidden)] // test seam — see `serve_established`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_shared_chain_push_frame(
@@ -3550,6 +3559,23 @@ fn shared_push_provenance(payload: &str, local_name: &str) -> (String, Vec<Strin
     (writer, files)
 }
 
+/// Strip this device's mount prefix from a push's provenance files so they
+/// travel **chain-relative** — placement never crosses the wire (m5f slice 002,
+/// [[decision-shared-subtree-recipient-placement]]). A file not under the
+/// prefix (e.g. a legacy garden-relative path propagated verbatim off an older
+/// sender's payload) passes through unchanged; the receive side resolves both
+/// conventions (`read_file_from_tree` tries verbatim first, then stripped).
+fn placement_free_files(files: Vec<String>, mount_path: &str) -> Vec<String> {
+    let prefix = format!("{mount_path}/");
+    files
+        .into_iter()
+        .map(|f| match f.strip_prefix(&prefix) {
+            Some(rel) => rel.to_string(),
+            None => f,
+        })
+        .collect()
+}
+
 /// Announce on the LAN, returning the registered fullname (empty on failure).
 /// Best-effort — announce needs real multicast (the manual smoke step).
 fn announce_best_effort(svc: &ServiceDaemon, ad: &Advertisement) -> String {
@@ -3690,6 +3716,7 @@ mod tests {
                 mount_path: "projects/journal".into(),
                 ref_name: chain.into(),
                 key_id: None,
+                recommended_path: None,
             }],
         }
     }
@@ -4219,9 +4246,13 @@ mod tests {
                 .unwrap();
         softfig_vcs::Repo::init(tmp.path(), &session).unwrap();
         drop(session);
+        // `without_net`: these tests spawn their own loopback listeners; a live
+        // runtime would race every parallel test daemon for the default
+        // 0.0.0.0:9100 bind (+ real mDNS) — the port-collision flake class.
         let daemon = Daemon::new(
             KeeperConfig::new(tmp.path())
                 .without_watcher()
+                .without_net()
                 .with_unmounted_fuse_attach(),
         );
         let reply = crate::handlers::unlock(
@@ -5554,4 +5585,77 @@ mod tests {
         assert!(daemon_b.inner.lock().unwrap().last_shared_key_divergence.is_none());
     }
 
+    // --- m5f slice 002: placement never crosses the wire ---------------------
+
+    #[test]
+    fn placement_free_files_strips_only_this_devices_mount_prefix() {
+        let files = vec![
+            "notes/wiki/index.md".to_string(),   // under this device's mount → stripped
+            "recipes/pie.md".to_string(),        // already chain-relative → verbatim
+            "notes/wikiing/decoy.md".to_string(), // string-prefix sibling, not under the mount
+        ];
+        let out = placement_free_files(files, "notes/wiki");
+        assert_eq!(
+            out,
+            vec!["index.md", "recipes/pie.md", "notes/wikiing/decoy.md"],
+            "only a true `<mount>/` prefix strips; everything else passes through"
+        );
+    }
+
+    /// The production push frame carries the share's stable id + chain-relative
+    /// files — this device's `mount_path` appears in NO field (m5f slice 002,
+    /// [[decision-shared-subtree-recipient-placement]]). Built exactly as
+    /// `reconcile_shared_pushes` builds it: `subtree` = the row's `id`, `files`
+    /// through `placement_free_files`.
+    #[test]
+    fn shared_chain_push_frame_carries_no_mount_path() {
+        use softfig_vault::{params::VaultParams, Vault};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = VaultParams::default();
+        params.argon2.m_cost = 8;
+        params.argon2.t_cost = 1;
+        params.argon2.p_cost = 1;
+        let (_v, session, _r) =
+            Vault::init_with_params(tmp.path(), b"correct horse battery staple", params).unwrap();
+        let local = build_local_device(&session, "sharer".into());
+
+        let entry = softfig_vcs::SharedSubtreeEntry {
+            id: "wiki".into(),
+            mount_path: "my/private/place".into(),
+            ref_name: "chain/wiki".into(),
+            key_id: Some("S-1".into()),
+            recommended_path: Some("shared/wiki".into()),
+        };
+        let files =
+            placement_free_files(vec!["my/private/place/index.md".into()], &entry.mount_path);
+        let frame = build_shared_chain_push_frame(
+            &session,
+            &local,
+            &entry.ref_name,
+            &entry.id,
+            &[1u8; 32],
+            &[2u8; 32],
+            "sharer",
+            &files,
+            1_700_000_000,
+        );
+
+        let Some(frame::Kind::SharedChainPush(push)) = frame.kind else {
+            panic!("expected a SharedChainPush frame");
+        };
+        assert_eq!(push.subtree, "wiki", "the share travels by stable id");
+        assert_eq!(push.files, vec!["index.md"], "files travel chain-relative");
+        // No field carries the placement — check every string-shaped one.
+        for field in [&push.subtree, &push.writer_device]
+            .into_iter()
+            .chain(push.files.iter())
+        {
+            assert!(
+                !field.contains("my/private/place"),
+                "placement leaked onto the wire in {field:?}"
+            );
+        }
+        assert!(!String::from_utf8_lossy(&push.chain_id).contains("my/private/place"));
+    }
 }

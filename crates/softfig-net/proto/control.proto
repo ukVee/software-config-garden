@@ -359,12 +359,12 @@ message TurnRevoke {
 // canonical: the driver re-derives the signed bytes from these fields.
 message SharedChainPush {
   bytes chain_id = 1;        // the chain ref name (utf-8 "chain/<subtree>"), same convention as the turn frames
-  string subtree = 2;        // the subtree path the chain projects (e.g. "proj")
+  string subtree = 2;        // the share's stable id (m5f slice 002; a legacy sender ships its mount path — opaque either way, placement never drives a lookup)
   bytes new_tree = 3;        // root_tree of the sender's edit commit — the content to adopt (32-byte BLAKE3)
   bytes base_tree = 4;       // root_tree the sender authored its edit over — the apply base (32-byte BLAKE3)
   bytes device_id = 5;       // the sending device's Ed25519 identity (32 bytes); must match the session peer
   string writer_device = 6;  // the originating edit author's device name (provenance; propagated verbatim on re-push)
-  repeated string files = 7; // the edited file paths (payload provenance)
+  repeated string files = 7; // the edited file paths, chain-relative (payload provenance; a legacy sender ships them mount-prefixed — the receiver resolves both)
   bytes signature = 8;       // Ed25519 (64 bytes) over shared_chain_push_signing_bytes(...)
   int64 timestamp = 9;       // the originating edit commit's signed unix-secs timestamp; folded into the signed bytes — the LWW key for slice 003's sync_conflict. Propagated verbatim on mesh re-push (never re-stamped), so a relayed edit can't look newer than it is.
 }

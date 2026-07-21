@@ -46,6 +46,11 @@ pub enum ChainKind {
 /// garden root, i.e. the device chain), an optional key id (a placeholder until
 /// m5d), and a per-device enabled toggle (slice 003 — the device chain is always
 /// enabled).
+///
+/// `mount_path` is **this device's** placement — per-device state, never part
+/// of the cross-member share contract; other members may mount the same chain
+/// at different paths ([[decision-shared-subtree-recipient-placement]]). Chain
+/// trees store paths chain-relative, so placement never reaches content.
 #[derive(Debug, Clone)]
 pub struct Chain {
     pub id: ChainId,
@@ -70,9 +75,9 @@ impl Chain {
         }
     }
 
-    /// A shared chain mounted at `mount_path` (garden-relative), tracked by
-    /// `ref_name`. `enabled` is the per-device local toggle; `key_id` is a
-    /// placeholder in m5c.
+    /// A shared chain mounted at `mount_path` (garden-relative, **this
+    /// device's** chosen placement), tracked by `ref_name`. `enabled` is the
+    /// per-device local toggle; `key_id` is a placeholder in m5c.
     pub fn shared(
         id: impl Into<ChainId>,
         ref_name: impl Into<String>,

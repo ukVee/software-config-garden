@@ -231,3 +231,25 @@ impl HelloPayload {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// m5f slice 002 — placement never crosses the wire. A member's mount path
+    /// is per-device state ([[decision-shared-subtree-recipient-placement]]);
+    /// what the ring agrees on is the share's identity (plus the advisory
+    /// recommendation, slice 003) — never where any device mounted it. This
+    /// tripwire fails the moment a `mount_path` field lands in the wire schema,
+    /// so the addition has to confront the decision.
+    #[test]
+    fn no_wire_message_declares_a_mount_path_field() {
+        let proto = include_str!("../proto/control.proto");
+        for line in proto.lines() {
+            // Declarations only — a comment may *discuss* mount paths.
+            let code = line.split("//").next().unwrap_or(line);
+            assert!(
+                !code.contains("mount_path"),
+                "placement leaked into the wire schema: {line}"
+            );
+        }
+    }
+}

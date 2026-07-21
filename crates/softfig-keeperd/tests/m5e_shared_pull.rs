@@ -57,6 +57,11 @@ use softfig_vcs::{Intent, Repo, WalkSnapshot};
 const PASS: &str = "correct horse battery staple";
 const CHAIN_ID: &str = "journals";
 const CHAIN_REF: &str = "chain/journals";
+// These tests hand-build frames in the LEGACY pre-m5f convention — `subtree` =
+// the sender's mount path, `files` mount-prefixed — deliberately kept as compat
+// coverage for `read_file_from_tree`'s strip fallback. The production sender
+// ships the stable id + chain-relative files since m5f slice 002
+// (`reconcile_shared_pushes` → `placement_free_files`); receivers resolve both.
 const MOUNT_PATH: &str = "proj/journals";
 
 fn fast_params() -> VaultParams {

@@ -1210,9 +1210,13 @@ mod tests {
         softfig_vcs::Repo::init(tmp.path(), &session).unwrap();
         drop(session);
 
+        // `without_net`: these tests drive the sweeps directly; a live runtime
+        // would race every parallel test daemon for the default 0.0.0.0:9100
+        // bind (+ real mDNS) — the port-collision flake class.
         let daemon = Daemon::new(
             KeeperConfig::new(tmp.path())
                 .without_watcher()
+                .without_net()
                 .with_unmounted_fuse_attach(),
         );
         let reply = handlers::unlock(
