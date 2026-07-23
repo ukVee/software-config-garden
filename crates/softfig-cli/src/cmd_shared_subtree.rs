@@ -19,9 +19,9 @@ use clap::{Args, Subcommand};
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{
-        op, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply,
-        SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply, SharedSubtreeToggleArgs,
-        SharedSubtreeToggleReply,
+        op, SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
+        SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply, SharedSubtreeRemoveArgs,
+        SharedSubtreeRemoveReply, SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
     },
     Request,
 };
@@ -41,6 +41,10 @@ pub enum SharedSubtreeCmd {
     Disable(IdArgs),
     /// List every shared-subtree member with its per-device enabled state.
     List(ListArgs),
+    /// Accept a pending share-offer from a peer at a mount path of YOUR choosing
+    /// (default = the sharer's recommended path). Validates the placement locally
+    /// against your own garden; the key ceremony runs when the sharer is online.
+    Accept(AcceptArgs),
 }
 
 #[derive(Args, Debug)]
@@ -72,6 +76,19 @@ pub struct ListArgs {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct AcceptArgs {
+    /// The offered share's id (as fanned by the sharer).
+    pub id: String,
+    /// Where to mount the share in YOUR garden. Defaults to the sharer's
+    /// advisory recommended path when omitted.
+    #[arg(long)]
+    pub mount_path: Option<String>,
+    /// Override the daemon socket path.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+}
+
 pub fn run(cmd: SharedSubtreeCmd) -> Result<()> {
     match cmd {
         SharedSubtreeCmd::Add(args) => add(args),
@@ -79,6 +96,7 @@ pub fn run(cmd: SharedSubtreeCmd) -> Result<()> {
         SharedSubtreeCmd::Enable(args) => toggle(args, true),
         SharedSubtreeCmd::Disable(args) => toggle(args, false),
         SharedSubtreeCmd::List(args) => list(args),
+        SharedSubtreeCmd::Accept(args) => accept(args),
     }
 }
 
@@ -124,6 +142,29 @@ fn toggle(args: IdArgs, enable: bool) -> Result<()> {
         println!("{state} shared subtree {} on this device", reply.id);
     } else {
         println!("no change ({} was already {state})", reply.id);
+    }
+    Ok(())
+}
+
+fn accept(args: AcceptArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let call = serde_json::to_value(SharedSubtreeAcceptArgs {
+        id: args.id,
+        mount_path: args.mount_path,
+    })?;
+    let reply: SharedSubtreeAcceptReply =
+        serde_json::from_value(daemon_call(&socket, op::SHARED_SUBTREE_ACCEPT, call)?)?;
+    if reply.already_accepted {
+        println!(
+            "shared subtree {} already accepted at {} (chain {})",
+            reply.id, reply.mount_path, reply.ref_name
+        );
+    } else {
+        println!(
+            "accepted shared subtree {} at {} (chain {}); the key ceremony runs when the sharer \
+             is next online — until then the mount holds no content",
+            reply.id, reply.mount_path, reply.ref_name
+        );
     }
     Ok(())
 }

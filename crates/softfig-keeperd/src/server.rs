@@ -281,6 +281,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::SHARED_SUBTREE_ENABLE => handlers::shared_subtree_enable(daemon, req.args),
         op::SHARED_SUBTREE_DISABLE => handlers::shared_subtree_disable(daemon, req.args),
         op::SHARED_SUBTREE_LIST => handlers::shared_subtree_list(daemon, req.args),
+        op::SHARED_SUBTREE_ACCEPT => handlers::shared_subtree_accept(daemon, req.args),
         op::DEPLOY_PLAN => crate::deploy::deploy_plan(daemon, req.args),
         op::DEPLOY_APPLY => crate::deploy::deploy_apply(daemon, req.args),
         op::SHUTDOWN => handlers::shutdown(daemon, req.args),

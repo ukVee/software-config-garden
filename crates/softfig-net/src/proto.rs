@@ -13,8 +13,8 @@ mod generated {
 pub use generated::{
     frame, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree,
     HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant,
-    SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce,
-    TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+    ShareOffer, SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce,
+    TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
 };
 
 /// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
@@ -212,6 +212,16 @@ impl Frame {
     pub fn shared_chain_push(push: SharedChainPush) -> Self {
         Self {
             kind: Some(frame::Kind::SharedChainPush(push)),
+        }
+    }
+
+    // --- M5f share-offer frame constructor ---------------------------------
+
+    /// A `ShareOffer` frame (sharer -> ring): a share a recipient may accept +
+    /// place at its own path (M5f slice 003).
+    pub fn share_offer(offer: ShareOffer) -> Self {
+        Self {
+            kind: Some(frame::Kind::ShareOffer(offer)),
         }
     }
 }

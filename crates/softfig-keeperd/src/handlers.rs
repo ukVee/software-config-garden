@@ -19,7 +19,8 @@ use softfig_ipc::verbs::{
     PairRemoveReply, PendingPairing, RelockMintArgs, RelockMintReply, RelockRedeemArgs,
     RelockRedeemReply, ReplaceFileArgs, ReplaceFileReply,
     ReplicaGrantArgs, ReplicaGrantReply, ReplicaRevokeArgs, ReplicaRevokeReply,
-    ReplicaStatusReply, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeInfo,
+    ReplicaStatusReply, SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
+    SharedSubtreeAddReply, SharedSubtreeInfo,
     SharedSubtreeListReply, SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply,
     SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
     ShowArgs, ShowCommit, ShowReply, ShowTreeEntry, StatusReply, UnlockArgs,
@@ -1792,7 +1793,7 @@ fn save_local_toggles(
 /// Validate an explicit share id: 1–64 chars of `[a-z0-9-]` (the slug charset,
 /// safe as both a `chain/<id>` ref component and a config key), and not the
 /// reserved device-chain id.
-fn validate_share_id(raw: &str) -> std::result::Result<String, (ErrorKind, String)> {
+pub(crate) fn validate_share_id(raw: &str) -> std::result::Result<String, (ErrorKind, String)> {
     let id = raw.trim();
     let ok = !id.is_empty()
         && id.len() <= 64
@@ -1876,6 +1877,57 @@ pub(crate) fn refresh_mount_registry(inner: &crate::daemon::DaemonInner, state_d
     }
 }
 
+/// The composed (device tip ∪ FUSE overlay) placement probe shared by
+/// [`shared_subtree_add`] and [`shared_subtree_accept`]. A mount path that
+/// already holds device content would vanish behind the graft — the new chain's
+/// empty genesis shadows it and the next device commit's carve-out drops it
+/// (slice 007 finding 4 + m5c residual slice 009 finding 1). Probe the composed
+/// view via the [`WorkTree`](crate::actions::WorkTree), not just the committed
+/// tip: a write staged through the live mount inside the ~200ms flush-debounce
+/// window is real content the empty graft would still swallow. And a committed
+/// device FILE at an *ancestor* of the mount path is untraversable behind the
+/// file (m5c-residual slice 011 / 018 finding 10) — refuse it explicitly before
+/// the emptiness check, which would otherwise read the mount as absent and mint
+/// a dead share. Pure guard — no mutation. At recipient accept-time this runs
+/// against THIS device's own garden at THIS device's chosen path.
+fn probe_placement_free(
+    daemon: &Daemon,
+    inner: &crate::daemon::DaemonInner,
+    mount_path: &str,
+) -> std::result::Result<(), (ErrorKind, String)> {
+    let wt = crate::actions::WorkTree::new(daemon, inner);
+    let mut prefix = String::new();
+    for comp in mount_path.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(comp);
+        if prefix == mount_path {
+            break; // the leaf is the mount root itself — covered below
+        }
+        if wt.exists(&prefix) && !wt.is_dir(&prefix) {
+            return Err((
+                ErrorKind::BadArgs,
+                format!(
+                    "cannot share {mount_path:?}: ancestor {prefix:?} is a device file, so the \
+                     mount would be untraversable — remove or move that file first"
+                ),
+            ));
+        }
+    }
+    if wt.exists(mount_path) {
+        return Err((
+            ErrorKind::PathAlreadyExists,
+            format!(
+                "{mount_path:?} already has device-chain content (committed or staged); \
+                 migrating an existing subtree into a shared chain is not supported yet — \
+                 share an empty path or move the content aside first"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: SharedSubtreeAddArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("shared_subtree_add args: {e}")))?;
@@ -1925,51 +1977,10 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     }
     let ref_name = format!("chain/{id}");
 
-    // Slice 007 (finding 4) + m5c residual slice 009 (finding 1): a mount path
-    // that already holds device content would vanish behind the graft — the new
-    // chain's empty genesis shadows it and the next device commit's carve-out
-    // drops it. Probe the composed (device tip ∪ FUSE overlay) view via the
-    // WorkTree, not just the committed tip: a write staged through the live
-    // mount inside the ~200ms flush-debounce window is real content the empty
-    // graft would still swallow, and the tip-only walk missed it. Refuse; the
-    // seed-genesis-from-device-subtree migration is a later slice.
-    {
-        let wt = crate::actions::WorkTree::new(daemon, &inner);
-        // m5c-residual slice 011 (018 finding 10): a committed device FILE at an
-        // *ancestor* of the mount path can't be descended through, so the
-        // emptiness probe below reads the mount path as absent (Blob mid-path ->
-        // Ok(false)) and the share is minted dead — untraversable behind the file.
-        // Refuse a blob-ancestor path explicitly before the emptiness check.
-        let mut prefix = String::new();
-        for comp in mount_path.split('/') {
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(comp);
-            if prefix == mount_path {
-                break; // the leaf is the mount root itself — covered below
-            }
-            if wt.exists(&prefix) && !wt.is_dir(&prefix) {
-                return Err((
-                    ErrorKind::BadArgs,
-                    format!(
-                        "cannot share {mount_path:?}: ancestor {prefix:?} is a device file, so the \
-                         mount would be untraversable — remove or move that file first"
-                    ),
-                ));
-            }
-        }
-        if wt.exists(&mount_path) {
-            return Err((
-                ErrorKind::PathAlreadyExists,
-                format!(
-                    "{mount_path:?} already has device-chain content (committed or staged); \
-                     migrating an existing subtree into a shared chain is not supported yet — \
-                     share an empty path or move the content aside first"
-                ),
-            ));
-        }
-    }
+    // A mount path already holding device content would vanish behind the empty
+    // graft — refuse it (the composed tip ∪ overlay probe; the migration into a
+    // populated path is a later slice).
+    probe_placement_free(daemon, &inner, &mount_path)?;
 
     // Slice 007 (finding 10): the chain ref is created BEFORE the membership
     // commit, so a mid-add failure leaves a harmless orphan ref instead of a
@@ -2029,6 +2040,157 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         id,
         mount_path,
         ref_name,
+    })
+    .unwrap())
+}
+
+/// M5f slice 003: accept a device-local pending share-offer at THIS device's
+/// chosen placement. The offer (fanned by the sharer, held in the never-committed
+/// `.softfig/pending-share-offers.toml` sidecar) names the chain + an advisory
+/// `recommended_path`; the recipient picks its own `mount_path` (default = the
+/// recommendation) and the add-time guards run LOCALLY against this garden. The
+/// row lands with `key_id` empty — the collaborative key ceremony runs on the
+/// next reconcile sweep and composes with slice 001 (until keyed the mount
+/// accepts no content). Placement never crosses the wire
+/// ([[decision-shared-subtree-recipient-placement]]).
+pub fn shared_subtree_accept(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: SharedSubtreeAcceptArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("shared_subtree_accept args: {e}")))?;
+    let id = validate_share_id(&args.id)?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    // Same union-mount requirement as `add`: without a FUSE mount the accepted
+    // subtree would fold into the device chain (and its replicas) instead of
+    // splitting off. Refuse rather than leak.
+    if inner.fuse.is_none() {
+        return Err((
+            ErrorKind::BadArgs,
+            "shared_subtree_accept requires the FUSE union mount; in direct (M1c-compat) mode \
+             shared-marked content would fold into the device chain and its replicas"
+                .into(),
+        ));
+    }
+
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    // The offer must exist — accepting an id we were never offered is a user
+    // error, not a silent add of an unknown chain.
+    let mut offers = crate::pending_offers::PendingOffers::load(&state_dir);
+    let Some(offer) = offers.get(&id).cloned() else {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("no pending share offer {id:?}; nothing to accept"),
+        ));
+    };
+
+    // Current committed membership (mutation read: hard error rather than wipe).
+    let mut membership = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        read_committed_shared_subtrees_for_mutation(repo, session)?
+    };
+
+    // Idempotent: an id we already accepted (a re-offer race, or a stale pending
+    // row) is a no-op — consume the offer and report the existing placement.
+    if let Some(existing) = membership.subtrees.iter().find(|e| e.id == id) {
+        let reply = SharedSubtreeAcceptReply {
+            id: id.clone(),
+            mount_path: existing.mount_path.clone(),
+            ref_name: existing.ref_name.clone(),
+            already_accepted: true,
+        };
+        if offers.remove(&id) {
+            let _ = offers.save(&state_dir);
+        }
+        return Ok(serde_json::to_value(reply).unwrap());
+    }
+
+    // Placement is THIS device's choice: the arg, else the sharer's advisory
+    // recommendation. Neither ⇒ the recipient must name one (advisory-only means
+    // an offer with no recommendation is legal, it just can't self-place).
+    let raw_placement = args
+        .mount_path
+        .clone()
+        .or_else(|| offer.recommended_path.clone())
+        .ok_or_else(|| {
+            (
+                ErrorKind::BadArgs,
+                format!(
+                    "offer {id:?} carries no recommended_path; pass a mount_path to choose where \
+                     to mount it"
+                ),
+            )
+        })?;
+    let mount_path = normalize_mount_path(&raw_placement)?;
+
+    // Placement-time validation is LOCAL — the exact add-time guards against THIS
+    // device's own garden at THIS device's chosen path (the sharer's path is
+    // never authoritative). On refusal the offer stays PENDING (not consumed) so
+    // the recipient can retry at a different path.
+    softfig_vcs::validate_share_add(&membership, &mount_path)
+        .map_err(|e| (ErrorKind::BadArgs, e.to_string()))?;
+    probe_placement_free(daemon, &inner, &mount_path)?;
+
+    // Adopt the offered chain ref. It is normally unborn locally (the sharer's
+    // content arrives via shared_pull once keyed); create an EMPTY genesis so the
+    // union mount can compose it and the first inbound push fast-forwards from
+    // the matching empty tree — exactly as `shared_subtree_add` seeds a chain. A
+    // ref that already exists (an offer re-accepted after a partial run) is
+    // reused as-is.
+    let ref_name = offer.ref_name.clone();
+    let ref_exists = {
+        let repo = inner.repo.as_ref().expect("unlocked");
+        repo.tip_of(&ref_name)
+            .map_err(|e| err_to_response(e.into()))?
+            .is_some()
+    };
+    if !ref_exists {
+        let genesis = Intent::init(format!("shared subtree {id} accepted"));
+        crate::actions::commit_snapshot_to_now(
+            &mut inner,
+            &ref_name,
+            softfig_vcs::WalkSnapshot::empty(),
+            genesis,
+        )?;
+    }
+
+    // Append THIS device's membership row: our chosen `mount_path`, `key_id`
+    // empty (the ceremony fills it on the next reconcile tick), and the sharer's
+    // recommendation carried forward in the row for a late surface.
+    membership.subtrees.push(softfig_vcs::SharedSubtreeEntry {
+        id: id.clone(),
+        mount_path: mount_path.clone(),
+        ref_name: ref_name.clone(),
+        key_id: None,
+        recommended_path: offer.recommended_path.clone(),
+    });
+    let toml = membership
+        .to_toml()
+        .map_err(|e| (ErrorKind::Internal, format!("serialize shared-subtrees: {e}")))?;
+    {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        wt.write(&shared_subtrees_rel(), toml.as_bytes())?;
+    }
+    let payload = serde_json::json!({ "summary": format!("accept shared subtree {id}") });
+    let intent = Intent::new("shared_subtrees_changed", payload)
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    crate::actions::commit_now(&mut inner, intent)?;
+
+    refresh_mount_registry(&inner, &state_dir);
+
+    // Consume the offer only after the membership row is durably committed — a
+    // crash before this leaves the offer pending, so accept is safely retryable.
+    if offers.remove(&id) {
+        let _ = offers.save(&state_dir);
+    }
+
+    Ok(serde_json::to_value(SharedSubtreeAcceptReply {
+        id,
+        mount_path,
+        ref_name,
+        already_accepted: false,
     })
     .unwrap())
 }

@@ -46,7 +46,7 @@ use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 use softfig_net::proto::{
-    frame, DeviceStateAnnounce, Frame, ReplicaGrant, SharedChainPush, SharedKeyCommit,
+    frame, DeviceStateAnnounce, Frame, ReplicaGrant, ShareOffer, SharedChainPush, SharedKeyCommit,
     SharedKeyHandoff, TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
 };
 use softfig_net::connect::{plan_routes, Route};
@@ -55,11 +55,11 @@ use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
     device_state_signing_bytes, pull_replication_pipelined, pull_subtree, serve_replication,
-    shared_chain_push_signing_bytes, static_attestation_message, turn_request_signing_bytes,
-    turn_revoke_signing_bytes,
-    turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_shared_chain_push_sig,
-    verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, DeviceState, LeaseEvent,
-    LeaseScope, NetError, ServeSummary, WriteTurn,
+    share_offer_signing_bytes, shared_chain_push_signing_bytes, static_attestation_message,
+    turn_request_signing_bytes, turn_revoke_signing_bytes,
+    turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_share_offer_sig,
+    verify_shared_chain_push_sig, verify_turn_request_sig, verify_turn_revoke_sig,
+    verify_turn_yield_sig, DeviceState, LeaseEvent, LeaseScope, NetError, ServeSummary, WriteTurn,
 };
 use softfig_store::Hash;
 use softfig_vault::VaultSession;
@@ -753,6 +753,12 @@ pub fn serve_established(
         Some(frame::Kind::SharedChainPush(p)) => {
             serve_shared_chain_push(daemon, local, owner, ring, p, session)
         }
+        // M5f slice 003 — a ring peer offered us a share. One-shot like the turn
+        // gossip: verify the signature, then persist it device-locally as a
+        // PENDING offer (the authenticated session already proves the peer is a
+        // ring member — that IS the offer's authorization). The recipient accepts
+        // it later at a path of its own choosing. The session closes after.
+        Some(frame::Kind::ShareOffer(offer)) => handle_share_offer(daemon, owner, offer),
         // Anything else ends the session cleanly.
         _ => {}
     }
@@ -2547,6 +2553,12 @@ fn spawn_replica_loop(
                 // `signal_commit`), so one signal covers both — the loop stays
                 // single. Idempotent; quiet when no chain is member-reachable.
                 reconcile_shared_pushes(&daemon, &local);
+                // M5f slice 003: fan a share-offer for each shared subtree this
+                // device holds to its ring peers, so a recipient can accept +
+                // place it at a path of its own choosing. Idempotent on the
+                // receiver, so re-fanning each tick is the offline/locked-
+                // recipient retry (same discipline as the passes above).
+                reconcile_share_offers(&daemon, &local);
                 // M5e slice 001 part 2b: announce our device state (once, on the
                 // unlock lift) and expire any silent write-turn holder, fanning a
                 // signed `TurnRevoke` so the mesh reclaims the turn — the
@@ -2767,6 +2779,182 @@ fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
             }
         }
     }
+}
+
+/// M5f slice 003 — fan a signed [`ShareOffer`] for every shared subtree this
+/// device holds to every reachable ring peer. Each offer carries the share's
+/// identity + the sharer's advisory `recommended_path` ONLY (placement never
+/// crosses the wire). A recipient that is already a member (or already has the
+/// offer pending) treats it as an idempotent no-op, so re-fanning each reconcile
+/// tick is the offline / locked-recipient retry — the same commit-driven-wake,
+/// converge-on-retry discipline as the ceremony / turn / shared-push passes. v1
+/// rings are point-to-point (≤2 members), so this is a single peer in practice.
+///
+/// A device re-offers even shares it itself accepted from a peer; the original
+/// sharer just drops the echo as an already-member no-op. A one-shot fan on
+/// add + on-pair (instead of every tick) is a v2 refinement — noted, not built.
+fn reconcile_share_offers(daemon: &Daemon, local: &LocalDevice) {
+    let (frames, targets, relay_client) = {
+        let inner = daemon.inner.lock().unwrap();
+        if inner.state != State::Unlocked {
+            return;
+        }
+        let (Some(session), Some(repo)) = (inner.session.clone(), inner.repo.as_ref()) else {
+            return; // locked mid-tick
+        };
+        let membership =
+            match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, &session) {
+                Ok(m) => m,
+                Err((_, e)) => {
+                    eprintln!("keeperd: net: share-offer fan skipped: cannot read membership: {e}");
+                    return;
+                }
+            };
+        if membership.subtrees.is_empty() {
+            return; // no shared chains — quiet
+        }
+        let state_dir = inner.config.state_dir().to_path_buf();
+        let ring = {
+            let wt = WorkTree::new(daemon, &inner);
+            load_ring(&wt, &state_dir).unwrap_or_default()
+        };
+        let relay_client = relay_client_config(&inner.config);
+        let relay_available = relay_client.is_some();
+        let targets: Vec<RingEntry> = ring
+            .peers()
+            .iter()
+            .filter(|p| p.device_id != local.device_id)
+            .filter(|p| !plan_routes(p, relay_available).is_empty())
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return; // no reachable ring peer this tick
+        }
+        let frames: Vec<Frame> = membership
+            .subtrees
+            .iter()
+            .map(|entry| {
+                let recommended = entry.recommended_path.as_deref().unwrap_or("");
+                build_share_offer_frame(&session, local, &entry.ref_name, &entry.id, recommended)
+            })
+            .collect();
+        (frames, targets, relay_client)
+    };
+    // Lock released — every dial + send runs off the daemon mutex. Reuse the
+    // one-shot fire-and-forget fan the turn frames use (an offer is the same
+    // shape: a single signed frame, no serve loop).
+    for frame in &frames {
+        fan_turn_frame(local, &targets, relay_client.as_ref(), frame, "share-offer");
+    }
+}
+
+/// M5f slice 003 — receive one inbound [`ShareOffer`]: verify its signature and
+/// persist it device-locally as a PENDING offer (never in the committed garden).
+/// The authenticated Noise session already proves `owner` is a ring member —
+/// that IS the offer's authorization (only a paired peer may offer us a share);
+/// there is no S-membership check because we are not yet a member (accepting is
+/// what makes us one). A re-offer of an id we already accepted is dropped (and
+/// any stale pending row cleaned up); otherwise it is an idempotent upsert the
+/// `shared_subtree_accept` verb later consumes.
+fn handle_share_offer(daemon: &Daemon, owner: &RingEntry, offer: ShareOffer) {
+    let chain = String::from_utf8_lossy(&offer.chain_id).into_owned();
+    let Ok(sender) = <[u8; 32]>::try_from(offer.device_id.as_slice()) else {
+        eprintln!("keeperd: net: share-offer device_id is not 32 bytes");
+        return;
+    };
+    // v1 point-to-point: the signed sender must be the authenticated peer.
+    if sender != owner.device_id {
+        eprintln!("keeperd: net: share-offer device_id != authenticated peer; rejecting");
+        return;
+    }
+    if !verify_share_offer_sig(
+        &offer.chain_id,
+        &offer.subtree,
+        &offer.recommended_path,
+        &sender,
+        &offer.signature,
+    ) {
+        eprintln!("keeperd: net: share-offer for {chain} signature invalid; rejecting");
+        return;
+    }
+    let id = offer.subtree.clone();
+    // The id must be a clean slug and the chain its canonical ref — a malformed
+    // offer can't be turned into a valid membership row / ref, so reject it
+    // rather than persist a poisoned pending row.
+    if crate::handlers::validate_share_id(&id).is_err() || chain != format!("chain/{id}") {
+        eprintln!("keeperd: net: share-offer {id:?} has a malformed id/chain; rejecting");
+        return;
+    }
+    let recommended = if offer.recommended_path.is_empty() {
+        None
+    } else {
+        Some(offer.recommended_path.clone())
+    };
+
+    let (state_dir, already_member) = {
+        let inner = daemon.inner.lock().unwrap();
+        if inner.state != State::Unlocked {
+            return; // locked — the sharer re-fans on our next online tick
+        }
+        let state_dir = inner.config.state_dir().to_path_buf();
+        let already = match (inner.session.as_ref(), inner.repo.as_ref()) {
+            (Some(session), Some(repo)) => {
+                match crate::handlers::read_committed_shared_subtrees_for_mutation(repo, session) {
+                    Ok(m) => m.contains(&id),
+                    Err(_) => return, // unreadable mid-serve — the sharer retries
+                }
+            }
+            _ => return,
+        };
+        (state_dir, already)
+    };
+
+    let mut store = crate::pending_offers::PendingOffers::load(&state_dir);
+    if already_member {
+        // Re-offer of an already-accepted id → idempotent no-op; drop any stale
+        // pending row left from before we accepted.
+        if store.remove(&id) {
+            let _ = store.save(&state_dir);
+        }
+        return;
+    }
+    store.upsert(crate::pending_offers::PendingOffer {
+        id: id.clone(),
+        ref_name: chain,
+        recommended_path: recommended,
+        offered_by: owner.fingerprint(),
+    });
+    if let Err(e) = store.save(&state_dir) {
+        eprintln!("keeperd: net: share-offer for {id}: persist failed: {e}");
+    }
+}
+
+/// Sign + frame a [`ShareOffer`] (M5f slice 003). `device_id` is always THIS
+/// device's identity; `recommended_path` is the sharer's advisory placement
+/// (empty = none) — never a recipient's actual mount path.
+pub fn build_share_offer_frame(
+    session: &VaultSession,
+    local: &LocalDevice,
+    chain: &str,
+    subtree: &str,
+    recommended_path: &str,
+) -> Frame {
+    let signature = session
+        .sign(&share_offer_signing_bytes(
+            chain.as_bytes(),
+            subtree,
+            recommended_path,
+            &local.device_id,
+        ))
+        .to_bytes()
+        .to_vec();
+    Frame::share_offer(ShareOffer {
+        chain_id: chain.as_bytes().to_vec(),
+        subtree: subtree.to_string(),
+        recommended_path: recommended_path.to_string(),
+        device_id: local.device_id.to_vec(),
+        signature,
+    })
 }
 
 /// Tie-break for concurrent dual-initiation (M5d slice 006 part 2). When both
@@ -5657,5 +5845,47 @@ mod tests {
             );
         }
         assert!(!String::from_utf8_lossy(&push.chain_id).contains("my/private/place"));
+    }
+
+    // --- m5f slice 003: the share-offer carries only the recommendation -------
+
+    /// The production share-offer frame carries the share's stable id + the
+    /// sharer's advisory `recommended_path` — a recipient's actual placement
+    /// appears in NO field (m5f slice 003, [[decision-shared-subtree-recipient-
+    /// placement]]). The schema-level tripwire (softfig-net's proto.rs
+    /// `no_wire_message_declares_a_mount_path_field`) guards the wire from a
+    /// `mount_path` field ever landing; this proves the built frame's shape.
+    #[test]
+    fn share_offer_frame_carries_recommendation_not_placement() {
+        use softfig_vault::{params::VaultParams, Vault};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = VaultParams::default();
+        params.argon2.m_cost = 8;
+        params.argon2.t_cost = 1;
+        params.argon2.p_cost = 1;
+        let (_v, session, _r) =
+            Vault::init_with_params(tmp.path(), b"correct horse battery staple", params).unwrap();
+        let local = build_local_device(&session, "sharer".into());
+
+        let frame = build_share_offer_frame(&session, &local, "chain/wiki", "wiki", "shared/wiki");
+        let Some(frame::Kind::ShareOffer(offer)) = frame.kind else {
+            panic!("expected a ShareOffer frame");
+        };
+        assert_eq!(offer.subtree, "wiki", "the share travels by stable id");
+        assert_eq!(
+            offer.recommended_path, "shared/wiki",
+            "the advisory recommendation is the only placement on the wire"
+        );
+        assert_eq!(offer.chain_id, b"chain/wiki");
+        // The signature verifies under this device's identity (the offer is
+        // authenticated end to end, not just ring-session-authorized).
+        assert!(verify_share_offer_sig(
+            &offer.chain_id,
+            &offer.subtree,
+            &offer.recommended_path,
+            &local.device_id,
+            &offer.signature,
+        ));
     }
 }

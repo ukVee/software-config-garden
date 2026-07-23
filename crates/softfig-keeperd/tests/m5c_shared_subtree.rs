@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeListReply,
-    SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply, SharedSubtreeToggleArgs,
-    SharedSubtreeToggleReply,
+    op, SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
+    SharedSubtreeAddReply, SharedSubtreeListReply, SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply,
+    SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
@@ -179,6 +179,48 @@ impl Fixture {
             serde_json::to_value(SharedSubtreeAddArgs {
                 mount_path: mount_path.into(),
                 id: id.map(str::to_string),
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Seed a device-local pending share-offer as if a peer had fanned it over
+    /// the wire (m5f slice 003) — bypasses the net receive path so the accept
+    /// flow is testable headlessly, writing the same `.softfig/` sidecar
+    /// `handle_share_offer` would.
+    fn seed_offer(&self, id: &str, recommended_path: Option<&str>) {
+        use softfig_keeperd::pending_offers::{PendingOffer, PendingOffers};
+        let state_dir = {
+            let inner = self.handle.as_ref().unwrap().daemon.inner.lock().unwrap();
+            inner.config.state_dir().to_path_buf()
+        };
+        let mut store = PendingOffers::load(&state_dir);
+        store.upsert(PendingOffer {
+            id: id.into(),
+            ref_name: format!("chain/{id}"),
+            recommended_path: recommended_path.map(str::to_string),
+            offered_by: "aa".repeat(32),
+        });
+        store.save(&state_dir).unwrap();
+    }
+
+    /// Whether a device-local pending offer for `id` still exists.
+    fn offer_pending(&self, id: &str) -> bool {
+        let state_dir = {
+            let inner = self.handle.as_ref().unwrap().daemon.inner.lock().unwrap();
+            inner.config.state_dir().to_path_buf()
+        };
+        softfig_keeperd::pending_offers::PendingOffers::load(&state_dir)
+            .get(id)
+            .is_some()
+    }
+
+    fn accept(&self, id: &str, mount_path: Option<&str>) -> Response {
+        self.call(
+            op::SHARED_SUBTREE_ACCEPT,
+            serde_json::to_value(SharedSubtreeAcceptArgs {
+                id: id.into(),
+                mount_path: mount_path.map(str::to_string),
             })
             .unwrap(),
         )
@@ -880,5 +922,120 @@ fn raced_staged_content_never_m_commits_and_can_be_rescued_out() {
     assert!(
         repo.db().get_tree(&root).unwrap().is_empty(),
         "the rescue itself adds nothing to the unkeyed chain"
+    );
+}
+
+// ---- m5f slice 003: offer -> accept at the recipient's own path -----------
+
+/// The headline recipient-placement flow: a pending offer accepted with no
+/// mount_path lands at the sharer's advisory `recommended_path`, creates the
+/// chain's genesis ref (so the union mount composes it) with `key_id` empty (the
+/// ceremony fills it later — composes with slice 001), and consumes the offer.
+#[test]
+fn accept_places_at_the_recommended_path() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", Some("projects/journals"));
+
+    let reply: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", None))).unwrap();
+    assert_eq!(reply.mount_path, "projects/journals");
+    assert_eq!(reply.ref_name, "chain/journals");
+    assert!(!reply.already_accepted);
+
+    let list = fx.list();
+    let row = list
+        .subtrees
+        .iter()
+        .find(|s| s.id == "journals")
+        .expect("membership row after accept");
+    assert_eq!(row.mount_path, "projects/journals");
+    assert!(
+        row.key_id.is_none(),
+        "unkeyed until the ceremony runs (key-before-content, slice 001)"
+    );
+    assert!(fx.ref_exists("chain/journals"), "genesis ref composes the mount");
+    assert!(!fx.offer_pending("journals"), "the offer is consumed on accept");
+}
+
+/// Two members legitimately mount one chain at DIFFERENT paths: the recipient's
+/// explicit mount_path overrides the sharer's recommendation. Placement is
+/// per-device state ([[decision-shared-subtree-recipient-placement]]).
+#[test]
+fn accept_honors_a_divergent_recipient_path() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", Some("projects/journals"));
+
+    let reply: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", Some("elsewhere/my-journals")))).unwrap();
+    assert_eq!(
+        reply.mount_path, "elsewhere/my-journals",
+        "the recipient's chosen placement wins over the recommendation"
+    );
+
+    let list = fx.list();
+    let row = list.subtrees.iter().find(|s| s.id == "journals").expect("row");
+    assert_eq!(row.mount_path, "elsewhere/my-journals");
+    assert!(!fx.offer_pending("journals"));
+}
+
+/// A local guard refusal (here: the offer recommends a machine dir) must leave
+/// the offer PENDING, not consume it — the recipient can retry at a legal path.
+#[test]
+fn accept_guard_refusal_leaves_the_offer_pending() {
+    let fx = Fixture::start();
+    fx.seed_offer("hw", Some("hardware/gpu")); // machine dir → the guard refuses
+
+    assert_eq!(err_kind(fx.accept("hw", None)), ErrorKind::BadArgs);
+    assert!(fx.list().subtrees.iter().all(|s| s.id != "hw"), "not a member");
+    assert!(
+        fx.offer_pending("hw"),
+        "a guard refusal must not consume the offer"
+    );
+
+    // Retrying at a legal path now succeeds and consumes it.
+    let reply: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("hw", Some("projects/hw")))).unwrap();
+    assert_eq!(reply.mount_path, "projects/hw");
+    assert!(!fx.offer_pending("hw"));
+}
+
+/// Accepting an id we were never offered is a user error, not a silent add.
+#[test]
+fn accept_unknown_offer_is_refused() {
+    let fx = Fixture::start();
+    assert_eq!(err_kind(fx.accept("ghost", None)), ErrorKind::BadArgs);
+    assert!(fx.list().subtrees.is_empty());
+}
+
+/// An offer with no recommendation and no explicit mount_path can't self-place.
+#[test]
+fn accept_without_a_placement_is_refused() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", None);
+    assert_eq!(err_kind(fx.accept("journals", None)), ErrorKind::BadArgs);
+    assert!(fx.offer_pending("journals"), "still pending — nothing placed");
+}
+
+/// Re-accepting an already-accepted id is an idempotent no-op that reports the
+/// existing placement and cleans up any stale pending row.
+#[test]
+fn accept_is_idempotent_for_an_existing_member() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", Some("projects/journals"));
+    let first: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", None))).unwrap();
+    assert!(!first.already_accepted);
+
+    // A re-offer arrives (peer re-fanned); accepting again is a no-op.
+    fx.seed_offer("journals", Some("projects/journals"));
+    let again: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", Some("some/other/path")))).unwrap();
+    assert!(again.already_accepted, "already a member");
+    assert_eq!(again.mount_path, "projects/journals", "the original placement stands");
+    assert!(!fx.offer_pending("journals"), "the stale re-offer is cleared");
+    assert_eq!(
+        fx.list().subtrees.iter().filter(|s| s.id == "journals").count(),
+        1,
+        "no duplicate row"
     );
 }

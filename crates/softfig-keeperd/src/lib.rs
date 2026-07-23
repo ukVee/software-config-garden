@@ -25,6 +25,7 @@ pub mod layer_b;
 pub mod migrate;
 pub mod net;
 pub mod peer;
+pub mod pending_offers;
 pub mod reads;
 pub mod relock;
 pub mod replica;

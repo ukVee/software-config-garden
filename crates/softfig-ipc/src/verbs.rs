@@ -141,6 +141,13 @@ pub mod op {
     /// M5c slice 003: list every shared-subtree member with its per-device
     /// enabled state. Read-only.
     pub const SHARED_SUBTREE_LIST: &str = "shared_subtree_list";
+    /// M5f slice 003: accept a device-local pending share-offer at THIS device's
+    /// chosen mount path (default = the sharer's advisory `recommended_path`).
+    /// Runs the add-time placement guards locally against this garden, appends
+    /// the membership row (key ceremony deferred to the reconcile sweep — until
+    /// keyed the mount accepts no content, composing with slice 001), and
+    /// consumes the offer. Commit `shared_subtrees_changed`.
+    pub const SHARED_SUBTREE_ACCEPT: &str = "shared_subtree_accept";
     /// Slice 2 (small-files): append a brand-new heading-addressed section
     /// to the end of any markdown doc. The heading must not already exist;
     /// commit `section_added`.
@@ -1281,6 +1288,33 @@ pub struct SharedSubtreeInfo {
     /// The collaborative key id — a placeholder (`None`) until m5d.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+}
+
+/// `shared_subtree_accept({id, mount_path?}) -> {id, mount_path, ref_name,
+/// already_accepted}`. Accept a device-local pending share-offer at a placement
+/// of this device's own choosing (default = the offer's advisory
+/// `recommended_path`). Placement is per-device state and never crosses the wire
+/// ([[decision-shared-subtree-recipient-placement]]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeAcceptArgs {
+    /// The offered share's id (as fanned by the sharer).
+    pub id: String,
+    /// Where THIS device mounts the share; defaults to the offer's
+    /// `recommended_path` when omitted. Validated locally, never sent to peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedSubtreeAcceptReply {
+    pub id: String,
+    /// The garden-relative mount prefix this device chose.
+    pub mount_path: String,
+    /// The `refs`-table ref holding the adopted chain's tip (`chain/<id>`).
+    pub ref_name: String,
+    /// True when the id was already a member (idempotent no-op; the offer was
+    /// consumed and the existing placement returned).
+    pub already_accepted: bool,
 }
 
 /// `migrate split [--apply]` — one-time monolith → numbered-notes splitter.
