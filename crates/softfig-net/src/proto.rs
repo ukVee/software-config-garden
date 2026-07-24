@@ -13,8 +13,8 @@ mod generated {
 pub use generated::{
     frame, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree,
     HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant,
-    SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce, TipAnnounce,
-    TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+    ShareOffer, SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce,
+    TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
 };
 
 /// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
@@ -214,6 +214,16 @@ impl Frame {
             kind: Some(frame::Kind::SharedChainPush(push)),
         }
     }
+
+    // --- M5f share-offer frame constructor ---------------------------------
+
+    /// A `ShareOffer` frame (sharer -> ring): a share a recipient may accept +
+    /// place at its own path (M5f slice 003).
+    pub fn share_offer(offer: ShareOffer) -> Self {
+        Self {
+            kind: Some(frame::Kind::ShareOffer(offer)),
+        }
+    }
 }
 
 impl HelloPayload {
@@ -228,6 +238,28 @@ impl HelloPayload {
             device_id,
             device_name: device_name.into(),
             static_attestation: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// m5f slice 002 — placement never crosses the wire. A member's mount path
+    /// is per-device state ([[decision-shared-subtree-recipient-placement]]);
+    /// what the ring agrees on is the share's identity (plus the advisory
+    /// recommendation, slice 003) — never where any device mounted it. This
+    /// tripwire fails the moment a `mount_path` field lands in the wire schema,
+    /// so the addition has to confront the decision.
+    #[test]
+    fn no_wire_message_declares_a_mount_path_field() {
+        let proto = include_str!("../proto/control.proto");
+        for line in proto.lines() {
+            // Declarations only — a comment may *discuss* mount paths.
+            let code = line.split("//").next().unwrap_or(line);
+            assert!(
+                !code.contains("mount_path"),
+                "placement leaked into the wire schema: {line}"
+            );
         }
     }
 }

@@ -66,13 +66,21 @@ message Frame {
     // other M5e frames and honoured only from S-members. See softfig-net's `turn`
     // module + keeperd's shared_pull apply.
     SharedChainPush shared_chain_push = 207;         // writer -> S-members: a committed shared-subtree edit to adopt
+    // M5f slice 003 (recipient-chosen placement): the share-offer a sharer fans
+    // to the ring so each recipient can adopt the share at ITS OWN path. Signed
+    // like the other coordination frames and honoured only from authenticated
+    // ring peers. Carries the sharer's advisory recommended_path ONLY — the
+    // recipient's real placement is per-device state that never crosses the wire
+    // (the mount_path tripwire). See softfig-net's `offer` helpers.
+    ShareOffer share_offer = 208;                    // sharer -> ring: "here is a share you may accept + place"
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
   // 23-99 are held for later control-plane variants; 100-199 is the M5b data
   // plane; 200-201 is the M5d shared-key ceremony; 202 is the M5d slice-008
   // recovery hand-off; 203-206 is the M5e write-turn coordination; 207 is the
-  // M5e shared-chain push (slice 002); 208+ stays open for later sync slices.
+  // M5e shared-chain push (slice 002); 208 is the M5f share-offer (slice 003);
+  // 209+ stays open for later sync slices.
   reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
@@ -359,12 +367,33 @@ message TurnRevoke {
 // canonical: the driver re-derives the signed bytes from these fields.
 message SharedChainPush {
   bytes chain_id = 1;        // the chain ref name (utf-8 "chain/<subtree>"), same convention as the turn frames
-  string subtree = 2;        // the subtree path the chain projects (e.g. "proj")
+  string subtree = 2;        // the share's stable id (m5f slice 002; a legacy sender ships its mount path — opaque either way, placement never drives a lookup)
   bytes new_tree = 3;        // root_tree of the sender's edit commit — the content to adopt (32-byte BLAKE3)
   bytes base_tree = 4;       // root_tree the sender authored its edit over — the apply base (32-byte BLAKE3)
   bytes device_id = 5;       // the sending device's Ed25519 identity (32 bytes); must match the session peer
   string writer_device = 6;  // the originating edit author's device name (provenance; propagated verbatim on re-push)
-  repeated string files = 7; // the edited file paths (payload provenance)
+  repeated string files = 7; // the edited file paths, chain-relative (payload provenance; a legacy sender ships them mount-prefixed — the receiver resolves both)
   bytes signature = 8;       // Ed25519 (64 bytes) over shared_chain_push_signing_bytes(...)
   int64 timestamp = 9;       // the originating edit commit's signed unix-secs timestamp; folded into the signed bytes — the LWW key for slice 003's sync_conflict. Propagated verbatim on mesh re-push (never re-stamped), so a relayed edit can't look newer than it is.
+}
+
+// --- M5f share-offer (recipient-chosen placement) --------------------------
+//
+// sharer -> ring members (M5f slice 003, [[decision-shared-subtree-recipient-
+// placement]]): "I am sharing this subtree; here is its identity and where I'd
+// suggest you mount it." The recipient persists this as a device-local PENDING
+// offer and later ACCEPTS it at a mount path of its own choosing (default =
+// recommended_path). Only the advisory recommendation travels — the recipient's
+// real placement is per-device state that never crosses the wire (the mount_path
+// tripwire in proto.rs). Signed by the sender's Ed25519 identity over
+// share_offer_signing_bytes(...) and honoured only from authenticated ring
+// peers (the authenticated Noise session IS the authorization — only a paired
+// device may offer). protobuf is not canonical: the driver re-derives the signed
+// bytes from these fields, never a re-serialization.
+message ShareOffer {
+  bytes chain_id = 1;          // the chain ref name (utf-8 "chain/<subtree>"), same convention as the turn/push frames
+  string subtree = 2;          // the share's stable id
+  string recommended_path = 3; // the sharer's advisory placement (empty = none); advisory ONLY, not the recipient's placement
+  bytes device_id = 4;         // the offering device's Ed25519 identity (32 bytes); must match the session peer
+  bytes signature = 5;         // Ed25519 (64 bytes) over share_offer_signing_bytes(...)
 }

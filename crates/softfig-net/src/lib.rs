@@ -41,6 +41,7 @@ pub mod connect;
 pub mod discovery;
 pub mod endpoint_cache;
 pub mod error;
+pub mod offer;
 pub mod pairing;
 pub mod proto;
 pub mod relay;
@@ -60,11 +61,13 @@ pub use connect::{connect_first, plan_routes, Route};
 pub use discovery::{Advertisement, DiscoveredPeer, PeerTxt};
 pub use endpoint_cache::{endpoint_cache_path, EndpointCache};
 pub use error::{NetError, Result};
+pub use offer::{share_offer_signing_bytes, verify_share_offer_sig};
 pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 pub use proto::{
     CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload,
-    ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, SharedChainPush,
-    StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+    ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, ShareOffer,
+    SharedChainPush, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke,
+    TurnYield,
 };
 pub use turn::{
     device_state_signing_bytes, shared_chain_push_signing_bytes, turn_request_signing_bytes,

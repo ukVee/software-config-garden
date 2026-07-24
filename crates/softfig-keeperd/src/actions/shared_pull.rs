@@ -46,7 +46,9 @@ pub(crate) struct SharedPullInput {
     pub base_hash: Hash,
     /// The authoring member (payload `writer_device`).
     pub writer_device: String,
-    /// The shared chain's mount subtree (payload `subtree`).
+    /// The share's stable id (payload `subtree`; m5f slice 002 — a legacy
+    /// sender puts its mount path here instead). Opaque provenance either way:
+    /// placement is per-device state and never drives a lookup.
     pub subtree: String,
     /// The changed paths (payload `files`).
     pub files: Vec<String>,

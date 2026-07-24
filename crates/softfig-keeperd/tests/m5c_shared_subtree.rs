@@ -24,15 +24,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeListReply,
+    op, MigrateIntoShareArgs, MigrateIntoShareReply, SharedSubtreeAcceptArgs,
+    SharedSubtreeAcceptReply, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeListReply,
     SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply, SharedSubtreeToggleArgs,
     SharedSubtreeToggleReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
-use softfig_store::Hash;
+use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::{params::VaultParams, Vault};
-use softfig_vcs::Repo;
+use softfig_vcs::{Repo, TIP_REF};
 
 const PASS: &[u8] = b"pw-test-12345";
 const PASS_STR: &str = "pw-test-12345";
@@ -184,6 +185,59 @@ impl Fixture {
         )
     }
 
+    /// Seed a device-local pending share-offer as if a peer had fanned it over
+    /// the wire (m5f slice 003) — bypasses the net receive path so the accept
+    /// flow is testable headlessly, writing the same `.softfig/` sidecar
+    /// `handle_share_offer` would.
+    fn seed_offer(&self, id: &str, recommended_path: Option<&str>) {
+        use softfig_keeperd::pending_offers::{PendingOffer, PendingOffers};
+        let state_dir = {
+            let inner = self.handle.as_ref().unwrap().daemon.inner.lock().unwrap();
+            inner.config.state_dir().to_path_buf()
+        };
+        let mut store = PendingOffers::load(&state_dir);
+        store.upsert(PendingOffer {
+            id: id.into(),
+            ref_name: format!("chain/{id}"),
+            recommended_path: recommended_path.map(str::to_string),
+            offered_by: "aa".repeat(32),
+        });
+        store.save(&state_dir).unwrap();
+    }
+
+    /// Whether a device-local pending offer for `id` still exists.
+    fn offer_pending(&self, id: &str) -> bool {
+        let state_dir = {
+            let inner = self.handle.as_ref().unwrap().daemon.inner.lock().unwrap();
+            inner.config.state_dir().to_path_buf()
+        };
+        softfig_keeperd::pending_offers::PendingOffers::load(&state_dir)
+            .get(id)
+            .is_some()
+    }
+
+    fn accept(&self, id: &str, mount_path: Option<&str>) -> Response {
+        self.call(
+            op::SHARED_SUBTREE_ACCEPT,
+            serde_json::to_value(SharedSubtreeAcceptArgs {
+                id: id.into(),
+                mount_path: mount_path.map(str::to_string),
+            })
+            .unwrap(),
+        )
+    }
+
+    fn migrate(&self, id: &str, from: &str) -> Response {
+        self.call(
+            op::MIGRATE_INTO_SHARE,
+            serde_json::to_value(MigrateIntoShareArgs {
+                id: id.into(),
+                from: from.into(),
+            })
+            .unwrap(),
+        )
+    }
+
     fn toggle(&self, op_name: &str, id: &str) -> SharedSubtreeToggleReply {
         serde_json::from_value(ok_data(self.call(
             op_name,
@@ -209,6 +263,46 @@ impl Fixture {
         let daemon = &self.handle.as_ref().unwrap().daemon;
         let inner = daemon.inner.lock().unwrap();
         inner.fuse.as_ref().expect("fuse attached").path_exists(rel)
+    }
+
+    /// The m5f key-before-content predicate the kernel content ops and the
+    /// action-verb staging consult, read from the live mount registry.
+    fn unkeyed_shared_owner(&self, rel: &str) -> Option<String> {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        inner.fuse.as_ref().expect("fuse attached").unkeyed_shared_owner(rel)
+    }
+
+    /// Stage a rename directly into the FUSE overlay (the raw seam, like
+    /// [`Self::stage_overlay_write`]) — the m5f rescue path for content that
+    /// reached an unkeyed share past the kernel guard.
+    fn stage_overlay_rename(&self, from: &str, to: &str) {
+        let daemon = &self.handle.as_ref().unwrap().daemon;
+        let inner = daemon.inner.lock().unwrap();
+        let mount = inner.fuse.as_ref().expect("fuse attached");
+        mount.stage_rename(from, to).unwrap();
+    }
+
+    /// Headless stand-in for the m5d key ceremony: store `S` in the vault
+    /// (a parallel session over the same vault dir — the daemon's session
+    /// loads shared keys from disk on demand), fill `key_id` in the committed
+    /// membership row via the break-glass write, then a disable/enable cycle
+    /// so the daemon re-derives the mount registry + `S` router from the
+    /// committed row (production keying — `persist_ceremony_outcome` — does
+    /// that refresh itself; a break-glass edit doesn't). The chain must be
+    /// empty at this point or the enable populated-path probe refuses.
+    fn key_chain(&self, id: &str, ref_name: &str, s_id: &str) {
+        let session = Vault::at(&self.garden).unlock(PASS).unwrap();
+        session.store_shared_key(s_id, &[0x51u8; 32]).unwrap();
+        let text = self.config_text().expect("membership exists after add");
+        let needle = format!("ref_name = \"{ref_name}\"");
+        assert!(text.contains(&needle), "no membership row for {ref_name} in: {text}");
+        let keyed = text.replace(&needle, &format!("{needle}\nkey_id = \"{s_id}\""));
+        self.write_committed("config/shared-subtrees.toml", &keyed);
+        let r = self.toggle(op::SHARED_SUBTREE_DISABLE, id);
+        assert!(!r.enabled);
+        let r = self.toggle(op::SHARED_SUBTREE_ENABLE, id);
+        assert!(r.enabled);
     }
 }
 
@@ -699,6 +793,8 @@ fn enable_refuses_when_the_mount_path_holds_content_written_while_disabled() {
 fn stray_overlay_file_at_mount_root_does_not_wipe_the_shared_chain() {
     let fx = Fixture::start();
     assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    // m5f slice 001: the chain must be keyed before it accepts content.
+    fx.key_chain("journals", "chain/journals", "S-stray-test-0001");
     fx.write_committed("projects/journals/2026.md", "# year notes\n");
 
     // Fabricate finding 1's artifact: a File overlay at the graft point itself.
@@ -726,4 +822,378 @@ fn stray_overlay_file_at_mount_root_does_not_wipe_the_shared_chain() {
         fx.mount_path_exists("projects/journals/2026.md"),
         "grafted subtree content survives the stray artifact"
     );
+}
+
+// ---- m5f slice 001: key-before-content ------------------------------------
+
+/// A write verb into an enabled-but-unkeyed share is refused up front with the
+/// dedicated error kind, and nothing is staged — the share is read-only until
+/// its ceremony runs. Keying the chain lifts the refusal and the same write
+/// then seals under `S` from birth (never `M`).
+#[test]
+fn pre_ceremony_write_is_refused_then_lands_s_keyed_once_the_chain_is_keyed() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap();
+
+    // The predicate the kernel content ops (EROFS) + verb staging consult.
+    assert_eq!(
+        fx.unkeyed_shared_owner("projects/journals/x.md").as_deref(),
+        Some("projects/journals")
+    );
+
+    // Pre-ceremony verb write → refused, clear kind, nothing staged, chain
+    // tip untouched.
+    let resp = fx.call(
+        op::REPLACE_FILE,
+        serde_json::json!({ "path": "projects/journals/x.md", "content": "pre-key\n" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::SharedChainUnkeyed);
+    assert!(!fx.mount_path_exists("projects/journals/x.md"), "refusal staged nothing");
+    assert_eq!(
+        Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap(),
+        genesis,
+        "the unkeyed chain tip must not advance"
+    );
+
+    // Key the chain (headless ceremony stand-in) → the guard lifts…
+    fx.key_chain("journals", "chain/journals", "S-kbc-test-0001");
+    assert_eq!(fx.unkeyed_shared_owner("projects/journals/x.md"), None);
+
+    // …and the same write commits, sealed under `S` from birth.
+    fx.write_committed("projects/journals/x.md", "post-key\n");
+    let repo = Repo::open(&fx.garden).unwrap();
+    let tip = repo.tip_of("chain/journals").unwrap().unwrap();
+    assert_ne!(tip, genesis, "the keyed chain accepted the write");
+    let root = repo.db().get_commit(&tip).unwrap().root_tree;
+    let entry = repo
+        .db()
+        .get_tree(&root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "x.md")
+        .expect("chain-relative blob committed");
+    let cipher = repo.objects().get(&entry.target).unwrap();
+    assert!(
+        softfig_vault::is_shared_blob(&cipher),
+        "post-ceremony content must be in the shared (S) container, not Layer A/M"
+    );
+    assert_eq!(
+        softfig_vault::shared::read_key_id(&cipher).unwrap(),
+        "S-kbc-test-0001"
+    );
+}
+
+/// The commit-path backstop: content that reaches the overlay past the up-front
+/// guards (here via the raw staging seam — the shape of a write racing the
+/// registry refresh) is REFUSED at seal time, never silently M-committed onto
+/// the shared chain. Renaming it out (the rescue path) un-wedges the verbs and
+/// lands the bytes on the device chain.
+#[test]
+fn raced_staged_content_never_m_commits_and_can_be_rescued_out() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("projects/journals", None), Response::Ok { .. }));
+    let genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap();
+
+    // Race artifact: staged straight into the overlay, past the kernel guard.
+    fx.stage_overlay_write("projects/journals/raced.md", b"raced past the guard\n");
+
+    // Any verb commit now tries to advance the pending unkeyed shared ref and
+    // the encrypt_for_ref backstop refuses — surfacing the reason to the CLI.
+    let resp = fx.call(
+        op::REPLACE_FILE,
+        serde_json::json!({ "path": "device-note.md", "content": "device write\n" }),
+    );
+    let Response::Err { error, .. } = resp else {
+        panic!("expected the backstop to fail the verb, got {resp:?}");
+    };
+    assert!(
+        error.contains("no established key yet"),
+        "want the key-before-content refusal surfaced, got: {error}"
+    );
+    assert_eq!(
+        Repo::open(&fx.garden).unwrap().tip_of("chain/journals").unwrap().unwrap(),
+        genesis,
+        "no path may M-commit content onto the shared chain"
+    );
+
+    // Rescue: move the stranded bytes out to device-owned ground (allowed —
+    // a rename out adds no blob to the chain), then verbs flow again.
+    fx.stage_overlay_rename("projects/journals/raced.md", "rescued.md");
+    let resp = fx.call(
+        op::REPLACE_FILE,
+        serde_json::json!({ "path": "device-note.md", "content": "device write\n" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "verbs un-wedged: {resp:?}");
+    assert!(fx.mount_path_exists("rescued.md"));
+    // The rescue may advance the chain ref with a removal-only commit (no-op
+    // same-tree skip is task 028, deferred), but no blob ever enters it.
+    let repo = Repo::open(&fx.garden).unwrap();
+    let tip = repo.tip_of("chain/journals").unwrap().unwrap();
+    let root = repo.db().get_commit(&tip).unwrap().root_tree;
+    assert!(
+        repo.db().get_tree(&root).unwrap().is_empty(),
+        "the rescue itself adds nothing to the unkeyed chain"
+    );
+}
+
+// ---- m5f slice 003: offer -> accept at the recipient's own path -----------
+
+/// The headline recipient-placement flow: a pending offer accepted with no
+/// mount_path lands at the sharer's advisory `recommended_path`, creates the
+/// chain's genesis ref (so the union mount composes it) with `key_id` empty (the
+/// ceremony fills it later — composes with slice 001), and consumes the offer.
+#[test]
+fn accept_places_at_the_recommended_path() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", Some("projects/journals"));
+
+    let reply: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", None))).unwrap();
+    assert_eq!(reply.mount_path, "projects/journals");
+    assert_eq!(reply.ref_name, "chain/journals");
+    assert!(!reply.already_accepted);
+
+    let list = fx.list();
+    let row = list
+        .subtrees
+        .iter()
+        .find(|s| s.id == "journals")
+        .expect("membership row after accept");
+    assert_eq!(row.mount_path, "projects/journals");
+    assert!(
+        row.key_id.is_none(),
+        "unkeyed until the ceremony runs (key-before-content, slice 001)"
+    );
+    assert!(fx.ref_exists("chain/journals"), "genesis ref composes the mount");
+    assert!(!fx.offer_pending("journals"), "the offer is consumed on accept");
+}
+
+/// Two members legitimately mount one chain at DIFFERENT paths: the recipient's
+/// explicit mount_path overrides the sharer's recommendation. Placement is
+/// per-device state ([[decision-shared-subtree-recipient-placement]]).
+#[test]
+fn accept_honors_a_divergent_recipient_path() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", Some("projects/journals"));
+
+    let reply: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", Some("elsewhere/my-journals")))).unwrap();
+    assert_eq!(
+        reply.mount_path, "elsewhere/my-journals",
+        "the recipient's chosen placement wins over the recommendation"
+    );
+
+    let list = fx.list();
+    let row = list.subtrees.iter().find(|s| s.id == "journals").expect("row");
+    assert_eq!(row.mount_path, "elsewhere/my-journals");
+    assert!(!fx.offer_pending("journals"));
+}
+
+/// A local guard refusal (here: the offer recommends a machine dir) must leave
+/// the offer PENDING, not consume it — the recipient can retry at a legal path.
+#[test]
+fn accept_guard_refusal_leaves_the_offer_pending() {
+    let fx = Fixture::start();
+    fx.seed_offer("hw", Some("hardware/gpu")); // machine dir → the guard refuses
+
+    assert_eq!(err_kind(fx.accept("hw", None)), ErrorKind::BadArgs);
+    assert!(fx.list().subtrees.iter().all(|s| s.id != "hw"), "not a member");
+    assert!(
+        fx.offer_pending("hw"),
+        "a guard refusal must not consume the offer"
+    );
+
+    // Retrying at a legal path now succeeds and consumes it.
+    let reply: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("hw", Some("projects/hw")))).unwrap();
+    assert_eq!(reply.mount_path, "projects/hw");
+    assert!(!fx.offer_pending("hw"));
+}
+
+/// Accepting an id we were never offered is a user error, not a silent add.
+#[test]
+fn accept_unknown_offer_is_refused() {
+    let fx = Fixture::start();
+    assert_eq!(err_kind(fx.accept("ghost", None)), ErrorKind::BadArgs);
+    assert!(fx.list().subtrees.is_empty());
+}
+
+/// An offer with no recommendation and no explicit mount_path can't self-place.
+#[test]
+fn accept_without_a_placement_is_refused() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", None);
+    assert_eq!(err_kind(fx.accept("journals", None)), ErrorKind::BadArgs);
+    assert!(fx.offer_pending("journals"), "still pending — nothing placed");
+}
+
+/// Re-accepting an already-accepted id is an idempotent no-op that reports the
+/// existing placement and cleans up any stale pending row.
+#[test]
+fn accept_is_idempotent_for_an_existing_member() {
+    let fx = Fixture::start();
+    fx.seed_offer("journals", Some("projects/journals"));
+    let first: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", None))).unwrap();
+    assert!(!first.already_accepted);
+
+    // A re-offer arrives (peer re-fanned); accepting again is a no-op.
+    fx.seed_offer("journals", Some("projects/journals"));
+    let again: SharedSubtreeAcceptReply =
+        serde_json::from_value(ok_data(fx.accept("journals", Some("some/other/path")))).unwrap();
+    assert!(again.already_accepted, "already a member");
+    assert_eq!(again.mount_path, "projects/journals", "the original placement stands");
+    assert!(!fx.offer_pending("journals"), "the stale re-offer is cleared");
+    assert_eq!(
+        fx.list().subtrees.iter().filter(|s| s.id == "journals").count(),
+        1,
+        "no duplicate row"
+    );
+}
+
+// ---- m5f slice 004: migrate-into-share (explicit M→S migration) -----------
+
+/// The committed cipher blob at chain-relative `rel` under `ref_name`'s tip
+/// (navigating the tree component by component), or `None` if the ref is unborn
+/// or the path is absent / not a blob. Lets a test assert both presence + the
+/// container kind (M vs S) of migrated content.
+fn committed_blob(garden: &Path, ref_name: &str, rel: &str) -> Option<Vec<u8>> {
+    let repo = Repo::open(garden).unwrap();
+    let tip = repo.tip_of(ref_name).unwrap()?;
+    let mut tree = repo.db().get_commit(&tip).unwrap().root_tree;
+    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    for (i, comp) in comps.iter().enumerate() {
+        let entry = repo
+            .db()
+            .get_tree(&tree)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == *comp)?;
+        if i + 1 == comps.len() {
+            return match entry.kind {
+                TreeEntryKind::Blob => Some(repo.objects().get(&entry.target).unwrap()),
+                TreeEntryKind::Tree => None,
+            };
+        }
+        match entry.kind {
+            TreeEntryKind::Tree => tree = entry.target,
+            TreeEntryKind::Blob => return None, // path descends through a file
+        }
+    }
+    None
+}
+
+/// The headline "share a folder that already has content": an empty share is
+/// keyed, device content is authored elsewhere, then `migrate-into-share` re-homes
+/// it under the share — S-sealed from birth and carved out of the device chain in
+/// the same operation (no double-ownership). Also proves the source is consumed
+/// (a second migrate finds nothing), the "already done" recovery signal.
+#[test]
+fn migrate_into_share_moves_device_content_into_the_keyed_share() {
+    let fx = Fixture::start();
+    // An empty share, keyed while empty (the key_chain precondition).
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    fx.key_chain("journal", "chain/journal", "S-migrate-0001");
+    let share_genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap();
+
+    // Author device content at a disjoint device path (a nested subtree).
+    fx.write_committed("notes/journal/a.md", "alpha\n");
+    fx.write_committed("notes/journal/sub/b.md", "beta\n");
+    let dev_before = fx.tip();
+    assert!(
+        committed_blob(&fx.garden, TIP_REF, "notes/journal/a.md").is_some(),
+        "the content starts device-owned"
+    );
+
+    // Migrate the whole subtree into the keyed share.
+    let reply: MigrateIntoShareReply =
+        serde_json::from_value(ok_data(fx.migrate("journal", "notes/journal"))).unwrap();
+    assert_eq!(reply.files, 2);
+    assert_eq!(reply.mount_path, "shared/journal");
+    assert_eq!(reply.from, "notes/journal");
+
+    // The share chain now holds both files (structure preserved), S-sealed from
+    // birth under the share's key — never the per-device M.
+    let share_tip = Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap();
+    assert_ne!(share_tip, share_genesis, "the share accepted the migrated content");
+    for rel in ["a.md", "sub/b.md"] {
+        let cipher = committed_blob(&fx.garden, "chain/journal", rel)
+            .unwrap_or_else(|| panic!("share missing migrated {rel}"));
+        assert!(
+            softfig_vault::is_shared_blob(&cipher),
+            "{rel} must be in the shared (S) container, not M"
+        );
+        assert_eq!(softfig_vault::shared::read_key_id(&cipher).unwrap(), "S-migrate-0001");
+    }
+
+    // The device chain no longer owns the migrated content (no double-ownership).
+    assert_ne!(fx.tip(), dev_before, "the device carve-out committed");
+    assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/a.md").is_none());
+    assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/sub/b.md").is_none());
+
+    // The source is consumed: a re-run finds nothing to migrate (fail-closed
+    // "already done" — no double migrate, no error onto a half state).
+    assert_eq!(err_kind(fx.migrate("journal", "notes/journal")), ErrorKind::BadArgs);
+}
+
+/// Key-before-content, the migrate direction: an UNKEYED target is refused with
+/// `SharedChainUnkeyed` and nothing moves — no M content is ever sealed into a
+/// shared chain (mirror of slice 001).
+#[test]
+fn migrate_into_an_unkeyed_share_is_refused() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    // Deliberately NOT keyed.
+    fx.write_committed("notes/journal/a.md", "alpha\n");
+    let share_genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap();
+    let dev_before = fx.tip();
+
+    assert_eq!(
+        err_kind(fx.migrate("journal", "notes/journal")),
+        ErrorKind::SharedChainUnkeyed
+    );
+
+    // Nothing moved: device content intact, both chain tips untouched.
+    assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/a.md").is_some());
+    assert_eq!(fx.tip(), dev_before, "the refusal committed nothing to the device chain");
+    assert_eq!(
+        Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap(),
+        share_genesis,
+        "the unkeyed share tip must not advance"
+    );
+}
+
+/// The source must be device-owned content disjoint from every share: migrating
+/// a share's own mount path (or a path under it) into itself is refused before
+/// any commit.
+#[test]
+fn migrate_refuses_a_source_overlapping_a_share() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    fx.key_chain("journal", "chain/journal", "S-migrate-0002");
+    let dev_before = fx.tip();
+
+    // Source == the share's own mount → overlap.
+    assert_eq!(err_kind(fx.migrate("journal", "shared/journal")), ErrorKind::BadArgs);
+    // Source under the share → overlap.
+    assert_eq!(err_kind(fx.migrate("journal", "shared/journal/inner")), ErrorKind::BadArgs);
+
+    assert_eq!(fx.tip(), dev_before, "a refused migrate commits nothing");
+}
+
+/// An unknown share id and an empty source are both user errors surfaced before
+/// any mutation.
+#[test]
+fn migrate_refuses_unknown_share_and_empty_source() {
+    let fx = Fixture::start();
+    // Unknown share id (no membership yet).
+    assert_eq!(err_kind(fx.migrate("nope", "notes/x")), ErrorKind::BadArgs);
+
+    // A known keyed share, but the source path holds no committed content.
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    fx.key_chain("journal", "chain/journal", "S-migrate-0003");
+    let dev_before = fx.tip();
+    assert_eq!(err_kind(fx.migrate("journal", "notes/empty")), ErrorKind::BadArgs);
+    assert_eq!(fx.tip(), dev_before, "the empty-source refusal commits nothing");
 }

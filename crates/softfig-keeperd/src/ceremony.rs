@@ -714,7 +714,7 @@ fn reencrypt_shared_chain(
 /// re-commit re-prefixes exactly as the write path expects; decryption uses the
 /// **garden** path (mount + chain-relative) so a sealed Layer-B (or pre-ceremony
 /// M Layer-B) subkey, which is salted by path, resolves.
-fn snapshot_chain_plaintext(
+pub(crate) fn snapshot_chain_plaintext(
     repo: &softfig_vcs::Repo,
     session: &VaultSession,
     ref_name: &str,
@@ -732,6 +732,73 @@ fn snapshot_chain_plaintext(
         .get_commit(&tip)
         .map_err(|e| (ErrorKind::Internal, format!("read {ref_name} tip commit: {e}")))?;
     collect_chain_plaintext(repo, session, &row.root_tree, "", mount_path, &mut snap)?;
+    Ok(snap)
+}
+
+/// Materialize the **device-chain** subtree at garden `subtree_path` as a
+/// plaintext [`WalkSnapshot`] whose paths are RELATIVE TO `subtree_path` (a lone
+/// file yields just its basename), so the result can be re-prefixed under a
+/// shared chain's mount by [`crate::actions::commit_snapshot_to_now`]. Each blob
+/// is decrypted under its real garden path (`subtree_path` + chain-relative), so
+/// the per-device `M` subkey — path-salted like every Layer-B key — resolves. An
+/// absent path (or one that descends through a file) yields an empty snapshot.
+/// Repo-only: it walks the committed device tip via `db()`/`objects()` and never
+/// self-reads the mount. The m5f slice 004 `migrate-into-share` source read,
+/// mirroring [`snapshot_chain_plaintext`] but scoped to one device subtree.
+pub(crate) fn snapshot_device_subtree_plaintext(
+    repo: &softfig_vcs::Repo,
+    session: &VaultSession,
+    subtree_path: &str,
+) -> Result<softfig_vcs::WalkSnapshot, (ErrorKind, String)> {
+    let mut snap = softfig_vcs::WalkSnapshot::empty();
+    let Some(tip) = repo
+        .tip_of(softfig_vcs::TIP_REF)
+        .map_err(|e| (ErrorKind::Internal, format!("read device tip: {e}")))?
+    else {
+        return Ok(snap);
+    };
+    let row = repo
+        .db()
+        .get_commit(&tip)
+        .map_err(|e| (ErrorKind::Internal, format!("read device tip commit: {e}")))?;
+    // Navigate the device root tree down to `subtree_path`, component by
+    // component (the chain stores garden-root-relative paths).
+    let comps: Vec<&str> = subtree_path.split('/').filter(|c| !c.is_empty()).collect();
+    let mut cur = row.root_tree;
+    for (i, comp) in comps.iter().enumerate() {
+        let entries = repo
+            .db()
+            .get_tree(&cur)
+            .map_err(|e| (ErrorKind::Internal, format!("read tree: {e}")))?;
+        let Some(entry) = entries.into_iter().find(|e| e.name == *comp) else {
+            return Ok(snap); // path absent → nothing to migrate
+        };
+        match entry.kind {
+            TreeEntryKind::Tree => cur = entry.target,
+            TreeEntryKind::Blob => {
+                if i + 1 != comps.len() {
+                    return Ok(snap); // path descends through a file → absent
+                }
+                // A lone-file source: decrypt at its garden path, key by basename.
+                let cipher = repo
+                    .objects()
+                    .get(&entry.target)
+                    .map_err(|e| (ErrorKind::Internal, format!("read blob {subtree_path}: {e}")))?;
+                let plain = session
+                    .decrypt_tracked_blob(subtree_path, &cipher)
+                    .map_err(|e| {
+                        (ErrorKind::Internal, format!("decrypt {subtree_path} for migrate: {e}"))
+                    })?;
+                snap.insert_file(std::path::Path::new(comp), entry.mode, plain)
+                    .map_err(|e| (ErrorKind::Internal, format!("snapshot {comp}: {e}")))?;
+                return Ok(snap);
+            }
+        }
+    }
+    // `cur` is the subtree root: collect it with the mount prefix = subtree_path
+    // (so decrypt garden paths are correct) and an empty chain prefix (so the
+    // snapshot paths come out relative to subtree_path).
+    collect_chain_plaintext(repo, session, &cur, "", subtree_path, &mut snap)?;
     Ok(snap)
 }
 
@@ -849,7 +916,9 @@ struct LaggingChain {
 /// at least one blob sealed under a shared key other than the row's committed
 /// live `key_id` — the signature of an incomplete rotation re-encrypt. Returns
 /// `(ref_name, mount_path, live_key_id)` per lagging chain; an unkeyed row is
-/// pre-ceremony (establishment's concern) and skipped.
+/// pre-ceremony — no `S` generation exists to lag behind — and skipped (its
+/// content, if any predates the m5f key-before-content refusal, waits for
+/// `migrate-into-share`, not a heal).
 fn chains_lagging_reencrypt(
     repo: &softfig_vcs::Repo,
     session: &VaultSession,
@@ -874,10 +943,13 @@ fn chains_lagging_reencrypt(
 /// True if `ref_name`'s current tip holds at least one shared blob sealed under a
 /// shared `key_id` other than `live_key_id`. Reads only each blob container's
 /// header via [`softfig_vault::shared::read_key_id`] — no decrypt, no key needed.
-/// A blob not in a shared container (a pre-ceremony `M`-keyed blob) is not
-/// "old `S`" and is skipped: rotation completeness is only about superseded
-/// shared generations, and folding `M` blobs in here would churn chains that a
-/// ceremony establishment, not a rotation, owns.
+/// A blob not in a shared container (a pre-m5f `M`-keyed blob) is not "old `S`"
+/// and is skipped: rotation completeness is only about superseded shared
+/// generations. Establishment does NOT convert M→S — `persist_ceremony_outcome`
+/// never re-encrypts existing blobs — so an M blob here is not any heal's to
+/// churn; the explicit `migrate-into-share` verb (m5f slice 004) is the only
+/// M→S path, and the write-path key-before-content refusal (m5f slice 001)
+/// keeps new M blobs off shared chains in the first place.
 fn tip_has_foreign_shared_key(
     repo: &softfig_vcs::Repo,
     ref_name: &str,
@@ -1205,9 +1277,13 @@ mod tests {
         softfig_vcs::Repo::init(tmp.path(), &session).unwrap();
         drop(session);
 
+        // `without_net`: these tests drive the sweeps directly; a live runtime
+        // would race every parallel test daemon for the default 0.0.0.0:9100
+        // bind (+ real mDNS) — the port-collision flake class.
         let daemon = Daemon::new(
             KeeperConfig::new(tmp.path())
                 .without_watcher()
+                .without_net()
                 .with_unmounted_fuse_attach(),
         );
         let reply = handlers::unlock(

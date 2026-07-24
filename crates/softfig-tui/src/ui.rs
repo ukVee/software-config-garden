@@ -665,29 +665,50 @@ fn ceremony_label(state: CeremonyState) -> (&'static str, Color) {
 }
 
 fn render_shares(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = if app.shares.is_empty() {
-        vec![ListItem::new("(nothing shared — a to share a folder)")]
-    } else {
-        app.shares
-            .iter()
-            .map(|info| {
-                let toggle = if info.enabled { "●" } else { "○" };
-                let (verb, color) = ceremony_label(ceremony_state(info));
-                // A disabled share falls back to the device chain locally, so
-                // dim it regardless of its (still-tracked) ceremony state.
-                let color = if info.enabled { color } else { Color::DarkGray };
-                ListItem::new(Line::styled(
-                    format!("{toggle} {}  {verb}", info.mount_path),
-                    Style::default().fg(color),
-                ))
-            })
-            .collect()
-    };
+    let mut items: Vec<ListItem> = app
+        .shares
+        .iter()
+        .map(|info| {
+            let toggle = if info.enabled { "●" } else { "○" };
+            let (verb, color) = ceremony_label(ceremony_state(info));
+            // A disabled share falls back to the device chain locally, so
+            // dim it regardless of its (still-tracked) ceremony state.
+            let color = if info.enabled { color } else { Color::DarkGray };
+            ListItem::new(Line::styled(
+                format!("{toggle} {}  {verb}", info.mount_path),
+                Style::default().fg(color),
+            ))
+        })
+        .collect();
+
+    // M5f slice 006: pending offers as visually distinct trailing rows (⇣ +
+    // magenta). They are NOT selectable — the detail pane tracks the mounted
+    // selection, which clamps to `shares.len()` — and accept stays a CLI verb.
+    for o in &app.share_offers {
+        let rec = o.recommended_path.as_deref().unwrap_or("no path hint");
+        items.push(ListItem::new(Line::styled(
+            format!("⇣ {}  offer · recommends {rec}", o.id),
+            Style::default().fg(Color::Magenta),
+        )));
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new("(nothing shared — a to share a folder)"));
+    }
+
     let mut st = ListState::default();
     if !app.shares.is_empty() {
         st.select(Some(app.shares_selected.min(app.shares.len() - 1)));
     }
-    let title = format!("shares — {} folder(s)", app.shares.len());
+    let title = if app.share_offers.is_empty() {
+        format!("shares — {} folder(s)", app.shares.len())
+    } else {
+        format!(
+            "shares — {} folder(s), {} offer(s)",
+            app.shares.len(),
+            app.share_offers.len()
+        )
+    };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
@@ -719,6 +740,16 @@ fn render_shares_detail(f: &mut Frame, app: &App, area: Rect) {
             ));
             lines.push(Line::raw(format!("  id:       {}", info.id)));
             lines.push(Line::raw(format!("  ref:      {}", info.ref_name)));
+            // Placement is per-device (M5f). Surface the sharer's advisory
+            // recommendation only when this device chose a different path.
+            if let Some(rec) = info.recommended_path.as_deref() {
+                if rec != info.mount_path {
+                    lines.push(Line::styled(
+                        format!("  placed here; sharer recommended {rec}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
             lines.push(Line::raw(format!(
                 "  local:    {}",
                 if info.enabled {
@@ -765,6 +796,28 @@ fn render_shares_detail(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::styled(
                 "  a share a folder across your paired devices",
                 Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    // M5f slice 006: pending offers detail — the accept command lives on the
+    // CLI, so name it here rather than implying a TUI mutation.
+    if !app.share_offers.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(
+                "⇣ {} pending offer(s) — accept from the CLI",
+                app.share_offers.len()
+            ),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Magenta),
+        ));
+        for o in &app.share_offers {
+            let rec = o.recommended_path.as_deref().unwrap_or("no hint — name a path");
+            lines.push(Line::styled(
+                format!("  {} · recommends {rec}", o.id),
+                Style::default().fg(Color::Magenta),
             ));
         }
     }

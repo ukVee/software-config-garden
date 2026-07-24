@@ -351,7 +351,7 @@ fn renders_deploy_force_overlay() {
 
 #[test]
 fn renders_shares_frame() {
-    use softfig_ipc::SharedSubtreeInfo;
+    use softfig_ipc::{PendingShareOfferInfo, SharedSubtreeInfo};
 
     let mut app = App::new();
     app.locked = false;
@@ -363,6 +363,9 @@ fn renders_shares_frame() {
             ref_name: "chain/journals".into(),
             enabled: true,
             key_id: Some("S-deadbeef".into()),
+            // Divergent placement: this device chose projects/journals; the
+            // sharer recommended rec/j. The detail pane surfaces the hint.
+            recommended_path: Some("rec/j".into()),
         },
         SharedSubtreeInfo {
             id: "notes".into(),
@@ -370,8 +373,16 @@ fn renders_shares_frame() {
             ref_name: "chain/notes".into(),
             enabled: false,
             key_id: None,
+            recommended_path: None,
         },
     ];
+    // M5f slice 006: a pending offer surfaces as a trailing row + a detail block.
+    app.share_offers = vec![PendingShareOfferInfo {
+        id: "wiki".into(),
+        ref_name: "chain/wiki".into(),
+        recommended_path: Some("rec/w".into()),
+        offered_by: "a1b2c3d4e5f6".into(),
+    }];
     app.shares_loaded = true;
     // Select the keyed share so the detail pane shows its ceremony outcome.
     app.shares_selected = 0;
@@ -392,6 +403,17 @@ fn renders_shares_frame() {
     assert!(
         rendered.contains("transcript verified"),
         "ceremony verification line missing"
+    );
+    // M5f slice 006 surface: the divergent recommendation on the selected share,
+    // plus the pending offer (id + its recommended path).
+    assert!(
+        rendered.contains("rec/j"),
+        "sharer-recommended path missing from share detail:\n{rendered}"
+    );
+    assert!(rendered.contains("wiki"), "pending offer row missing:\n{rendered}");
+    assert!(
+        rendered.contains("rec/w"),
+        "pending offer recommended path missing:\n{rendered}"
     );
 }
 

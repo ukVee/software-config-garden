@@ -184,9 +184,10 @@ pub struct LayerBHook {
     /// M5d slice 002 — `ref_name` → `(key_id, mount_path)` for every
     /// *keyed* shared chain, refreshed wherever the chain registry is
     /// rebuilt (unlock, subtree add/remove/toggle, ceremony persist). A
-    /// shared ref absent here is unkeyed (pre-ceremony) and stays on the
-    /// device master `M` — the m5c status quo until the ceremony fills the
-    /// membership row. The mount path rides along because a shared chain's
+    /// shared ref absent here is unkeyed (pre-ceremony) and refuses content
+    /// until the ceremony fills the membership row (m5f slice 001,
+    /// key-before-content; it replaced the m5c "stays on `M`" status
+    /// quo). The mount path rides along because a shared chain's
     /// snapshot paths are chain-relative (`split_snapshot` strips the mount
     /// prefix): the router re-prefixes them so sealed-glob matching and the
     /// Layer-B path salt use the same garden-relative string the read side
@@ -327,8 +328,9 @@ impl LayerBHook {
 
     /// M5d slice 016 (NONCE-2) — does the committed membership say this shared
     /// ref is keyed (must seal under `S`)? Consulted by [`Self::encrypt_for_ref`]
-    /// to distinguish a keyed chain whose router entry is missing (fail closed)
-    /// from a genuinely unkeyed pre-ceremony chain (stays on `M`).
+    /// to distinguish a keyed chain whose router entry is missing (fail closed,
+    /// re-queued for a re-primed flush) from a genuinely unkeyed pre-ceremony
+    /// chain (refused outright — m5f slice 001 key-before-content).
     pub fn ref_is_keyed_committed(&self, ref_name: &str) -> bool {
         self.keyed_committed_refs.read().unwrap().contains(ref_name)
     }
@@ -415,8 +417,16 @@ impl BlobEncryptor for LayerBHook {
     /// the vault doesn't hold that `S` — an M fallback there would commit
     /// member-unreadable, non-convergent blobs onto a keyed chain. An
     /// *unkeyed* shared chain (membership row's `key_id` still empty,
-    /// pre-ceremony) stays on M — the m5c status quo — until the ceremony
-    /// fills the row and the registry refresh flips this router.
+    /// pre-ceremony) **refuses content outright** (m5f slice 001,
+    /// key-before-content — this replaced the m5c "unkeyed → M" status quo):
+    /// an M-sealed blob on a shared chain is per-device, so no other member
+    /// could ever read it, and neither establishment nor the rotation heal
+    /// converts M→S (`migrate-into-share` is the only M→S path). The FUSE
+    /// write path and the action-verb staging already refuse these up front;
+    /// this is the commit-path backstop so NO route silently M-commits onto a
+    /// shared chain. The flush treats the error as a failed ref and re-queues
+    /// with capped backoff; once the ceremony fills the row, retained overlay
+    /// content lands S-keyed from birth.
     fn encrypt_for_ref(
         &self,
         ref_name: &str,
@@ -436,9 +446,7 @@ impl BlobEncryptor for LayerBHook {
             // non-convergent, member-unreadable blob onto a keyed shared chain
             // (an isolation + convergence break). Refuse: the flush treats the
             // error as a failed ref and re-queues it, so a subsequent flush (with
-            // the router re-primed from committed state) seals it under `S`. A
-            // genuinely unkeyed (pre-ceremony) chain, or the device chain, is not
-            // in `keyed_committed_refs` and correctly stays on `M`.
+            // the router re-primed from committed state) seals it under `S`.
             if self.ref_is_keyed_committed(ref_name) {
                 return Err(softfig_vcs::CoreError::Io(std::io::Error::other(format!(
                     "shared ref {ref_name} is keyed in committed membership but the key \
@@ -446,7 +454,19 @@ impl BlobEncryptor for LayerBHook {
                      (re-prime the chain registry / recover S)"
                 ))));
             }
-            return self.encrypt(path, content, session);
+            // M5f slice 001 (key-before-content): a genuinely unkeyed
+            // (pre-ceremony) shared chain refuses content too — the m5c
+            // "unkeyed → M" fallback sealed pre-ceremony writes under the
+            // per-device M, unreadable to every other member and never
+            // converted by establishment or the rotation heal, so the chain
+            // could not converge. Only the device chain (`TIP_REF`, handled
+            // above) may seal under M.
+            return Err(softfig_vcs::CoreError::Io(std::io::Error::other(format!(
+                "shared ref {ref_name} has no established key yet (key-before-content); \
+                 refusing to seal content under the device key M — run/accept the \
+                 share's key ceremony first (existing device content moves in via \
+                 migrate-into-share once keyed)"
+            ))));
         };
         // `path` is chain-relative (split_snapshot strips the mount prefix);
         // re-prefix it so glob matching + the Layer-B path salt line up with
@@ -1064,15 +1084,26 @@ mod tests {
     }
 
     #[test]
-    fn unkeyed_shared_chain_keeps_the_m_path_until_the_ceremony_fills_key_id() {
+    fn unkeyed_shared_chain_refuses_content_pre_ceremony() {
+        // M5f slice 001 (key-before-content): the m5c "unkeyed → M" fallback is
+        // gone — a pre-ceremony shared ref refuses content outright, because an
+        // M-sealed blob is per-device and nothing (establishment included) ever
+        // converts it to S. The device ref is unaffected.
         use softfig_vcs::BlobEncryptor as _;
         let session = fresh_session();
         let hook = LayerBHook::empty(); // router knows no keyed chains
-        let ct = hook
+        let err = hook
             .encrypt_for_ref(SHARED_REF, "note.md", b"pre-key", &session)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no established key yet"),
+            "want the key-before-content refusal, got: {err}"
+        );
+        // The device chain still seals under M as ever.
+        let dev = hook
+            .encrypt_for_ref(softfig_vcs::TIP_REF, "note.md", b"pre-key", &session)
             .unwrap();
-        assert!(!softfig_vault::is_shared(&ct));
-        assert_eq!(session.decrypt_blob(&ct).unwrap(), b"pre-key");
+        assert_eq!(session.decrypt_blob(&dev).unwrap(), b"pre-key");
     }
 
     #[test]
