@@ -1283,12 +1283,18 @@ pub struct SharedSubtreeListArgs {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedSubtreeListReply {
     pub subtrees: Vec<SharedSubtreeInfo>,
+    /// Device-local pending share-offers awaiting `accept` (M5f slice 006).
+    /// `#[serde(default)]` so a pre-m5f reply (subtrees only) still decodes.
+    #[serde(default)]
+    pub offers: Vec<PendingShareOfferInfo>,
 }
 
 /// One shared-subtree member as surfaced to `softfig shared-subtree list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedSubtreeInfo {
     pub id: String,
+    /// Where THIS device mounts the share — per-device placement, never sent to
+    /// peers ([[decision-shared-subtree-recipient-placement]]).
     pub mount_path: String,
     pub ref_name: String,
     /// Per-device enabled state (`!local.is_disabled(id)`).
@@ -1296,6 +1302,30 @@ pub struct SharedSubtreeInfo {
     /// The collaborative key id — a placeholder (`None`) until m5d.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// The sharer's advisory placement hint (M5f slice 002). Shown alongside
+    /// `mount_path` when they differ; `None` = no hint. Advisory only — this
+    /// device's actual placement is always `mount_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_path: Option<String>,
+}
+
+/// One device-local pending share-offer surfaced to `softfig shared-subtree
+/// list` + the TUI Shares tab (M5f slice 006). Held only until this device
+/// accepts it at a placement of its own choosing; read-only on both surfaces
+/// (accept stays a CLI verb in v1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingShareOfferInfo {
+    /// The offered share's stable id (what `accept` names).
+    pub id: String,
+    /// The chain ref (`chain/<id>`) an accepted mount would track.
+    pub ref_name: String,
+    /// The sharer's advisory placement hint (the accept default); `None` = the
+    /// recipient must name a mount path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_path: Option<String>,
+    /// The offering peer's device fingerprint (lowercase hex) — provenance only,
+    /// not an authorization input.
+    pub offered_by: String,
 }
 
 /// `shared_subtree_accept({id, mount_path?}) -> {id, mount_path, ref_name,

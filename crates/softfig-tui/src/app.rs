@@ -14,8 +14,9 @@ use softfig_ipc::{
     ChatMessage, CoordinationStatusReply, DeployAction, DeployApplyReply, DeployPlanEntry,
     DeployPlanReply, DiscoverListReply,
     DiscoveredDevice, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
-    PairListReply, PairPeer, PairRemoveReply, PendingPairing, ReadFileReply, ReplicaGrantReply,
-    ReplicaRevokeReply, ReplicaStatusReply, SharedSubtreeAddReply, SharedSubtreeInfo,
+    PairListReply, PairPeer, PairRemoveReply, PendingPairing, PendingShareOfferInfo, ReadFileReply,
+    ReplicaGrantReply, ReplicaRevokeReply, ReplicaStatusReply, SharedSubtreeAddReply,
+    SharedSubtreeInfo,
     SharedSubtreeListReply, SharedSubtreeRemoveReply, SharedSubtreeToggleReply, ShowReply,
     StatusReply, TailBusReply, VaultListSealedReply, VaultRevealReply,
 };
@@ -323,6 +324,10 @@ pub struct App {
     pub shares: Vec<SharedSubtreeInfo>,
     pub shares_selected: usize,
     pub shares_loaded: bool,
+    /// M5f slice 006: device-local pending share-offers from peers, surfaced on
+    /// the Shares tab as read-only rows below the mounted shares (accept stays a
+    /// CLI verb in v1). Rides the same `shared_subtree_list` reply as `shares`.
+    pub share_offers: Vec<PendingShareOfferInfo>,
     /// M5d slice 006: the daemon's most recent shared-key ceremony divergence
     /// message (`status.shared_key_divergence`), surfaced as a banner on the
     /// Shares tab. `None` in the healthy case.
@@ -459,6 +464,7 @@ impl App {
             shares: Vec::new(),
             shares_selected: 0,
             shares_loaded: false,
+            share_offers: Vec::new(),
             shared_key_divergence: None,
             coordination: None,
             coordination_sidecars: Vec::new(),
@@ -1516,6 +1522,7 @@ impl App {
                 Ok(v) => match serde_json::from_value::<SharedSubtreeListReply>(v) {
                     Ok(r) => {
                         self.shares = r.subtrees;
+                        self.share_offers = r.offers;
                         self.shares_loaded = true;
                         if self.shares_selected >= self.shares.len() {
                             self.shares_selected = self.shares.len().saturating_sub(1);
@@ -5214,6 +5221,7 @@ mod tests {
             ref_name: format!("chain/{id}"),
             enabled,
             key_id: key_id.map(str::to_string),
+            recommended_path: None,
         }
     }
 
@@ -5259,6 +5267,62 @@ mod tests {
         );
         assert_eq!(app.shares.len(), 1);
         assert_eq!(app.shares_selected, 0);
+    }
+
+    #[test]
+    fn shared_subtree_list_surfaces_offers_and_recommended_path() {
+        // M5f slice 006: the same reply now carries pending offers + the
+        // sharer's advisory recommended_path; both land on the app for the
+        // Shares surface.
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::SharedSubtreeList,
+                result: Ok(json!({
+                    "subtrees": [
+                        {"id":"a","mount_path":"collab/a","ref_name":"chain/a","enabled":true,"key_id":"S-a","recommended_path":"projects/a"}
+                    ],
+                    "offers": [
+                        {"id":"wiki","ref_name":"chain/wiki","recommended_path":"shared/wiki","offered_by":"a1b2c3d4"}
+                    ]
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.shares.len(), 1);
+        assert_eq!(app.shares[0].recommended_path.as_deref(), Some("projects/a"));
+        assert_eq!(app.share_offers.len(), 1);
+        assert_eq!(app.share_offers[0].id, "wiki");
+        assert_eq!(
+            app.share_offers[0].recommended_path.as_deref(),
+            Some("shared/wiki")
+        );
+        assert_eq!(app.share_offers[0].offered_by, "a1b2c3d4");
+    }
+
+    #[test]
+    fn shared_subtree_list_defaults_offers_when_absent() {
+        // A pre-m5f reply (subtrees only, no `offers`) must still decode —
+        // offers default to empty, never a deserialize error.
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::SharedSubtreeList,
+                result: Ok(json!({ "subtrees": [
+                    {"id":"a","mount_path":"projects/a","ref_name":"chain/a","enabled":true,"key_id":"S-a"}
+                ]})),
+            },
+            &mut ipc,
+        );
+        assert!(app.shares_loaded);
+        assert_eq!(app.shares.len(), 1);
+        assert!(app.share_offers.is_empty());
     }
 
     #[test]

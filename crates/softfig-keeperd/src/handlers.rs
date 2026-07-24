@@ -17,7 +17,8 @@ use softfig_ipc::verbs::{
     MigrateFinalizeArgs, MigrateFinalizeReply, MigrateIntoShareArgs, MigrateIntoShareReply,
     PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
-    PairRemoveReply, PendingPairing, RelockMintArgs, RelockMintReply, RelockRedeemArgs,
+    PairRemoveReply, PendingPairing, PendingShareOfferInfo, RelockMintArgs, RelockMintReply,
+    RelockRedeemArgs,
     RelockRedeemReply, ReplaceFileArgs, ReplaceFileReply,
     ReplicaGrantArgs, ReplicaGrantReply, ReplicaRevokeArgs, ReplicaRevokeReply,
     ReplicaStatusReply, SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
@@ -2526,6 +2527,9 @@ pub fn shared_subtree_list(daemon: &Daemon, _args: serde_json::Value) -> Handler
         read_committed_shared_subtrees(repo, session).unwrap_or_default()
     };
     let local = load_local_toggles(&state_dir);
+    // Member ids first (offer dedup, below) — the map consumes `subtrees`.
+    let member_ids: std::collections::HashSet<String> =
+        membership.subtrees.iter().map(|e| e.id.clone()).collect();
     let subtrees = membership
         .subtrees
         .into_iter()
@@ -2537,11 +2541,42 @@ pub fn shared_subtree_list(daemon: &Daemon, _args: serde_json::Value) -> Handler
                 ref_name: e.ref_name,
                 enabled,
                 key_id: e.key_id,
+                // The advisory sharer hint (slice 002) — was dropped at this
+                // boundary before slice 006; the surface shows it when it
+                // differs from this device's `mount_path`.
+                recommended_path: e.recommended_path,
             }
         })
         .collect();
 
-    Ok(serde_json::to_value(SharedSubtreeListReply { subtrees }).unwrap())
+    let offers = surface_pending_offers(
+        &crate::pending_offers::PendingOffers::load(&state_dir),
+        &member_ids,
+    );
+
+    Ok(serde_json::to_value(SharedSubtreeListReply { subtrees, offers }).unwrap())
+}
+
+/// Map device-local pending offers onto the wire surface (M5f slice 006),
+/// dropping any whose id is already an accepted member. `handle_share_offer`
+/// already refuses to persist a re-offer of a member, so this only bites in the
+/// crash window between an accept committing membership and its offer-row
+/// removal — but it keeps the surface from ever double-listing an accepted
+/// share. Pure over its inputs.
+fn surface_pending_offers(
+    offers: &crate::pending_offers::PendingOffers,
+    member_ids: &std::collections::HashSet<String>,
+) -> Vec<PendingShareOfferInfo> {
+    offers
+        .iter()
+        .filter(|o| !member_ids.contains(&o.id))
+        .map(|o| PendingShareOfferInfo {
+            id: o.id.clone(),
+            ref_name: o.ref_name.clone(),
+            recommended_path: o.recommended_path.clone(),
+            offered_by: o.offered_by.clone(),
+        })
+        .collect()
 }
 
 pub(crate) fn resolve_path_in_tree(
@@ -2737,6 +2772,39 @@ mod tests {
     // invariant in decision-softfig-commit-from-memory.
     fn root() -> PathBuf {
         PathBuf::from("/nonexistent/garden-root")
+    }
+
+    #[test]
+    fn surface_pending_offers_maps_and_dedups_members() {
+        use crate::pending_offers::{PendingOffer, PendingOffers};
+        use std::collections::HashSet;
+
+        let mut store = PendingOffers::default();
+        store.upsert(PendingOffer {
+            id: "wiki".into(),
+            ref_name: "chain/wiki".into(),
+            recommended_path: Some("shared/wiki".into()),
+            offered_by: "aa".repeat(32),
+        });
+        // An offer whose id is already an accepted member must not surface (the
+        // accept-crash window; steady state never gets here).
+        store.upsert(PendingOffer {
+            id: "journals".into(),
+            ref_name: "chain/journals".into(),
+            recommended_path: None,
+            offered_by: "bb".repeat(32),
+        });
+
+        let members: HashSet<String> = ["journals".to_string()].into_iter().collect();
+        let surfaced = surface_pending_offers(&store, &members);
+        assert_eq!(surfaced.len(), 1, "the accepted-member offer must be deduped");
+        assert_eq!(surfaced[0].id, "wiki");
+        assert_eq!(surfaced[0].ref_name, "chain/wiki");
+        assert_eq!(surfaced[0].recommended_path.as_deref(), Some("shared/wiki"));
+        assert_eq!(surfaced[0].offered_by, "aa".repeat(32));
+
+        // No accepted members ⇒ every pending offer surfaces.
+        assert_eq!(surface_pending_offers(&store, &HashSet::new()).len(), 2);
     }
 
     #[test]

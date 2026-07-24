@@ -19,10 +19,10 @@ use clap::{Args, Subcommand};
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{
-        op, MigrateIntoShareArgs, MigrateIntoShareReply, SharedSubtreeAcceptArgs,
-        SharedSubtreeAcceptReply, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeInfo,
-        SharedSubtreeListReply, SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply,
-        SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
+        op, MigrateIntoShareArgs, MigrateIntoShareReply, PendingShareOfferInfo,
+        SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
+        SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply, SharedSubtreeRemoveArgs,
+        SharedSubtreeRemoveReply, SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
     },
     Request,
 };
@@ -210,13 +210,27 @@ fn list(args: ListArgs) -> Result<()> {
         serde_json::Value::Null,
     )?)?;
 
-    if reply.subtrees.is_empty() {
-        println!("no shared subtrees (sharing off)");
+    if reply.subtrees.is_empty() && reply.offers.is_empty() {
+        println!("no shared subtrees and no pending offers (sharing off)");
         return Ok(());
     }
-    println!("shared subtrees ({}):", reply.subtrees.len());
-    for s in &reply.subtrees {
-        print_subtree(s);
+
+    if reply.subtrees.is_empty() {
+        println!("no shared subtrees mounted");
+    } else {
+        println!("shared subtrees ({}):", reply.subtrees.len());
+        for s in &reply.subtrees {
+            print_subtree(s);
+        }
+    }
+
+    // M5f slice 006: pending offers from peers, held until this device accepts
+    // them at a placement of its own choosing (accept is a separate verb).
+    if !reply.offers.is_empty() {
+        println!("pending share offers ({}):", reply.offers.len());
+        for o in &reply.offers {
+            print_offer(o);
+        }
     }
     Ok(())
 }
@@ -228,6 +242,33 @@ fn print_subtree(s: &SharedSubtreeInfo) {
         "  {}  {}  {state}  chain {}  key {key}",
         s.id, s.mount_path, s.ref_name
     );
+    // Placement is per-device; the sharer's recommendation is only a hint. Show
+    // it solely when this device chose a different path (the divergent-placement
+    // case the milestone makes first-class).
+    if let Some(rec) = s.recommended_path.as_deref() {
+        if rec != s.mount_path {
+            println!("      (sharer recommended {rec})");
+        }
+    }
+}
+
+/// Render a pending share-offer row (M5f slice 006). Read-only surface — accept
+/// is a separate verb, so each row spells out the accept command.
+fn print_offer(o: &PendingShareOfferInfo) {
+    // `offered_by` is a 64-hex-char fingerprint; a short prefix is enough to
+    // tell peers apart on the surface without wrapping the line.
+    let from = o.offered_by.get(..12).unwrap_or(&o.offered_by);
+    match o.recommended_path.as_deref() {
+        Some(rec) => println!(
+            "  {}  from {from}…  recommends {rec}  chain {}",
+            o.id, o.ref_name
+        ),
+        None => println!(
+            "  {}  from {from}…  (no path hint — name one on accept)  chain {}",
+            o.id, o.ref_name
+        ),
+    }
+    println!("      accept: softfig shared-subtree accept {}", o.id);
 }
 
 /// Call the daemon, surfacing an absent daemon as an error (shared-subtree state
