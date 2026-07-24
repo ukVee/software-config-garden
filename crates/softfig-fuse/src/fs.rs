@@ -583,6 +583,27 @@ impl SharedState {
         Ok(())
     }
 
+    /// Stage a recursive removal of `path` (a file or a whole directory subtree)
+    /// into the overlay — the removal half of [`Self::stage_rename`] with no
+    /// destination. Every live entry under `path` (inclusive; files and
+    /// sub-directories, honoring overlay precedence + `Removed`) is marked
+    /// `Removed` and its inode forgotten, so the subtree leaves the live
+    /// (tip ∪ overlay) view and the next commit's snapshot carves it out of the
+    /// owning chain. Unlike the kernel `rmdir` (POSIX empty-only), this removes a
+    /// populated directory in one call — the m5f slice 004 `migrate-into-share`
+    /// device-side carve-out, run only AFTER the content is durably re-committed
+    /// into the shared chain (so an interrupted migrate leaves the content in
+    /// both chains, never neither). Reuses [`Self::rename_movers`] to enumerate
+    /// the subtree, so it matches the dir-aware rename's descendant handling.
+    pub(crate) fn stage_remove(&self, path: &Path) {
+        let (files, dirs) = self.rename_movers(path);
+        let mut inner = self.inner.lock().unwrap();
+        for src in files.into_iter().chain(dirs) {
+            inner.overlay.mark_removed(src.clone());
+            inner.inodes.forget(&src);
+        }
+    }
+
     /// Partition every live entry under `from` (inclusive) into regular-file
     /// paths (to re-key with their bytes) and directory paths (to move as overlay
     /// markers), honoring overlay precedence and `Removed`. A lone file yields

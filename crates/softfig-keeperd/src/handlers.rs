@@ -14,7 +14,8 @@ use softfig_net::{DeviceState, WriteTurn};
 use softfig_ipc::verbs::{
     CommitArgs, CommitReply, CoordinationStatusReply, DiscoverListReply, FsckReply, HostedChain,
     LogArgs, LogEntry, LogReply, PeerCoordRow, TurnCoordRow,
-    MigrateFinalizeArgs, MigrateFinalizeReply, PairBeginArgs, PairBeginReply,
+    MigrateFinalizeArgs, MigrateFinalizeReply, MigrateIntoShareArgs, MigrateIntoShareReply,
+    PairBeginArgs, PairBeginReply,
     PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
     PairRemoveReply, PendingPairing, RelockMintArgs, RelockMintReply, RelockRedeemArgs,
     RelockRedeemReply, ReplaceFileArgs, ReplaceFileReply,
@@ -2193,6 +2194,192 @@ pub fn shared_subtree_accept(daemon: &Daemon, args: serde_json::Value) -> Handle
         already_accepted: false,
     })
     .unwrap())
+}
+
+/// M5f slice 004: migrate existing DEVICE-chain content at garden path `from`
+/// into an already-**keyed** shared chain — the explicit, only M→S path
+/// ([[decision-shared-subtree-recipient-placement]] point 4). Key-before-content
+/// is the precondition (the mirror of slice 001, refusing the opposite
+/// direction): an unkeyed target is refused, because migrating into it would
+/// seal the content under this device's `M`, unreadable to peers and converted
+/// by neither establishment nor the rotation heal.
+///
+/// The move is a paired cross-chain commit ordered for a **no-loss** interrupt
+/// window: (1) re-encrypt the source under the share's `S` and commit it onto
+/// the share ref FIRST (durable), then (2) carve the source out of the device
+/// chain. `commit_now` advances the device carve-out before any shared one and
+/// can defer a shared advance on its write turn, so a device-first single commit
+/// would strand the removal ahead of the add — instead each step is its own
+/// commit and the durable share add precedes the device removal. A crash between
+/// them leaves the content in BOTH chains (re-run the migrate to finish), never
+/// gone from both. The source read and the share re-seal are repo-only
+/// (`snapshot_*_plaintext` + `commit_snapshot_to_now`), so nothing self-reads the
+/// mount under `inner`.
+pub fn migrate_into_share(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: MigrateIntoShareArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("migrate_into_share args: {e}")))?;
+    let id = validate_share_id(&args.id)?;
+    let from = normalize_mount_path(&args.from)?;
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    // Same union-mount requirement as add/accept: without the FUSE mount there
+    // are no shared chains at all (add refuses in direct mode), so nothing to
+    // migrate into.
+    if inner.fuse.is_none() {
+        return Err((
+            ErrorKind::BadArgs,
+            "migrate_into_share requires the FUSE union mount; direct (M1c-compat) mode has no \
+             shared chains"
+                .into(),
+        ));
+    }
+
+    let state_dir = inner.config.state_dir().to_path_buf();
+
+    // Committed membership (mutation read: hard error rather than a silent wipe).
+    let membership = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        read_committed_shared_subtrees_for_mutation(repo, session)?
+    };
+
+    // The target share must exist and be KEYED (key-before-content).
+    let Some(target) = membership.subtrees.iter().find(|s| s.id == id) else {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("no shared subtree {id:?} to migrate into"),
+        ));
+    };
+    if target.key_id.is_none() {
+        return Err((
+            ErrorKind::SharedChainUnkeyed,
+            format!(
+                "shared subtree {id:?} has no established key yet (key-before-content): migrate \
+                 only after its key ceremony has run — an unkeyed chain would seal the content \
+                 under this device's key, unreadable to every other member"
+            ),
+        ));
+    }
+    let ref_name = target.ref_name.clone();
+    let mount_path = target.mount_path.clone();
+
+    // `from` must be device-owned content disjoint from every share: not inside a
+    // share (already sealed under another chain's S), and not equal to / an
+    // ancestor of one (removing it would detach a live mount).
+    for row in &membership.subtrees {
+        if paths_overlap(&from, &row.mount_path) {
+            return Err((
+                ErrorKind::BadArgs,
+                format!(
+                    "cannot migrate {from:?}: it overlaps shared subtree {:?} mounted at {:?} — \
+                     migrate device-owned content that is disjoint from every share",
+                    row.id, row.mount_path
+                ),
+            ));
+        }
+    }
+
+    // Read the device-chain source subtree as plaintext (repo-only; each `M` blob
+    // decrypted at its garden path) and the share's current content, then compose
+    // the source onto the share at its root (source-relative == share-relative).
+    let source_snapshot = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        crate::ceremony::snapshot_device_subtree_plaintext(repo, session, &from)?
+    };
+    if source_snapshot.files().is_empty() {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("nothing to migrate: {from:?} holds no committed device content"),
+        ));
+    }
+    let mut share_snapshot = {
+        let session = inner.session.as_ref().expect("unlocked");
+        let repo = inner.repo.as_ref().expect("unlocked");
+        crate::ceremony::snapshot_chain_plaintext(repo, session, &ref_name, &mount_path)?
+    };
+    // Refuse a collision rather than silently overwrite existing share content.
+    let existing: std::collections::HashSet<PathBuf> =
+        share_snapshot.files().into_iter().map(|(p, _, _)| p).collect();
+    let mut files = 0usize;
+    for (rel, mode, content) in source_snapshot.files() {
+        if existing.contains(&rel) {
+            return Err((
+                ErrorKind::PathAlreadyExists,
+                format!(
+                    "shared subtree {id:?} already has content at {rel:?}; migrate into a share \
+                     that is empty at that path"
+                ),
+            ));
+        }
+        share_snapshot
+            .insert_file(&rel, mode, content.to_vec())
+            .map_err(|e| (ErrorKind::Internal, format!("compose {rel:?} into share: {e}")))?;
+        files += 1;
+    }
+
+    // Point the router at the share's committed `S` before the seal (defensive —
+    // mirrors the rotation heal's pre-refresh; a keyed row installs S here).
+    refresh_mount_registry(&inner, &state_dir);
+
+    // Commit 1 — the shared add, DURABLE first. `commit_snapshot_to_now` re-seals
+    // every composed blob under the share's `S` via the router (bypassing the
+    // FUSE overlay + the write-turn gate, exactly as genesis-seed and the rekey
+    // re-encrypt do), so migrated content is S-keyed from birth.
+    let add_intent = Intent::new(
+        "migrate_into_share",
+        serde_json::json!({
+            "id": id,
+            "from": from,
+            "mount_path": mount_path,
+            "files": files,
+            "summary": format!("migrate {from} into shared subtree {id}"),
+        }),
+    )
+    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    crate::actions::commit_snapshot_to_now(&mut inner, &ref_name, share_snapshot, add_intent)?;
+
+    // Commit 2 — carve the migrated content out of the device chain, only now
+    // that it is durably in the share. Staged as a recursive overlay removal and
+    // committed device-only (the share ref is not pending, so `commit_now` writes
+    // only the device carve-out); untouched device blobs are content-addressed
+    // and reused — no whole-chain re-encrypt.
+    {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        wt.remove(&from)?;
+    }
+    let carve_intent = Intent::new(
+        "migrate_into_share_carve",
+        serde_json::json!({
+            "id": id,
+            "from": from,
+            "summary": format!("carve {from} out of the device chain (migrated into {id})"),
+        }),
+    )
+    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    crate::actions::commit_now(&mut inner, carve_intent)?;
+
+    refresh_mount_registry(&inner, &state_dir);
+
+    Ok(serde_json::to_value(MigrateIntoShareReply {
+        id,
+        mount_path,
+        from,
+        files,
+    })
+    .unwrap())
+}
+
+/// Two garden-relative paths overlap when they are equal or one is a proper
+/// path-prefix of the other (component-wise: `a/b` overlaps `a/b/c` and itself,
+/// but not the sibling `a/bx`). Used to keep a `migrate-into-share` source
+/// disjoint from every share mount.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'))
+        || b.strip_prefix(a).is_some_and(|r| r.starts_with('/'))
 }
 
 pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {

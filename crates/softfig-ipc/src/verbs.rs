@@ -148,6 +148,14 @@ pub mod op {
     /// keyed the mount accepts no content, composing with slice 001), and
     /// consumes the offer. Commit `shared_subtrees_changed`.
     pub const SHARED_SUBTREE_ACCEPT: &str = "shared_subtree_accept";
+    /// M5f slice 004: migrate existing DEVICE-chain content at a garden path into
+    /// an already-**keyed** shared chain (the explicit, only M→S path — refused
+    /// on an unkeyed chain). Re-encrypts each blob under the share's `S` and
+    /// re-homes it under the share's mount as two ordered commits — the shared
+    /// add first (durable), then the device-side carve-out — so an interrupted
+    /// migrate leaves the content in both chains, never neither. Commits
+    /// `migrate_into_share` (share) + `migrate_into_share_carve` (device).
+    pub const MIGRATE_INTO_SHARE: &str = "migrate_into_share";
     /// Slice 2 (small-files): append a brand-new heading-addressed section
     /// to the end of any markdown doc. The heading must not already exist;
     /// commit `section_added`.
@@ -1315,6 +1323,30 @@ pub struct SharedSubtreeAcceptReply {
     /// True when the id was already a member (idempotent no-op; the offer was
     /// consumed and the existing placement returned).
     pub already_accepted: bool,
+}
+
+/// `migrate_into_share({id, from}) -> {id, mount_path, from, files}`. Move the
+/// device-chain content at garden path `from` into the already-keyed shared
+/// chain `id`, re-encrypting each blob under the share's `S`. Refused on an
+/// unkeyed chain (key-before-content) and when `from` overlaps any share.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrateIntoShareArgs {
+    /// The target share's id (must already exist and be keyed).
+    pub id: String,
+    /// Garden-relative device path whose content moves into the share.
+    pub from: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrateIntoShareReply {
+    /// The share the content was migrated into.
+    pub id: String,
+    /// This device's mount path for the share (where the content now lives).
+    pub mount_path: String,
+    /// The device path the content was migrated out of.
+    pub from: String,
+    /// How many files were re-homed into the share.
+    pub files: usize,
 }
 
 /// `migrate split [--apply]` — one-time monolith → numbered-notes splitter.

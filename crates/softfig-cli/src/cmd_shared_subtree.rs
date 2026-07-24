@@ -19,9 +19,10 @@ use clap::{Args, Subcommand};
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{
-        op, SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
-        SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply, SharedSubtreeRemoveArgs,
-        SharedSubtreeRemoveReply, SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
+        op, MigrateIntoShareArgs, MigrateIntoShareReply, SharedSubtreeAcceptArgs,
+        SharedSubtreeAcceptReply, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeInfo,
+        SharedSubtreeListReply, SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply,
+        SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
     },
     Request,
 };
@@ -45,6 +46,11 @@ pub enum SharedSubtreeCmd {
     /// (default = the sharer's recommended path). Validates the placement locally
     /// against your own garden; the key ceremony runs when the sharer is online.
     Accept(AcceptArgs),
+    /// Migrate existing device content into a keyed share — the explicit M→S
+    /// path. Moves the content at a garden path into an already-keyed shared
+    /// subtree, re-encrypted under its key; refused on an unkeyed chain (run the
+    /// key ceremony first). The way to "share a folder that already has content".
+    MigrateIntoShare(MigrateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -89,6 +95,17 @@ pub struct AcceptArgs {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// The target share's id (must already exist and be keyed).
+    pub id: String,
+    /// Garden-relative device path whose content moves into the share.
+    pub from: String,
+    /// Override the daemon socket path.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+}
+
 pub fn run(cmd: SharedSubtreeCmd) -> Result<()> {
     match cmd {
         SharedSubtreeCmd::Add(args) => add(args),
@@ -97,6 +114,7 @@ pub fn run(cmd: SharedSubtreeCmd) -> Result<()> {
         SharedSubtreeCmd::Disable(args) => toggle(args, false),
         SharedSubtreeCmd::List(args) => list(args),
         SharedSubtreeCmd::Accept(args) => accept(args),
+        SharedSubtreeCmd::MigrateIntoShare(args) => migrate_into_share(args),
     }
 }
 
@@ -166,6 +184,21 @@ fn accept(args: AcceptArgs) -> Result<()> {
             reply.id, reply.mount_path, reply.ref_name
         );
     }
+    Ok(())
+}
+
+fn migrate_into_share(args: MigrateArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let call = serde_json::to_value(MigrateIntoShareArgs {
+        id: args.id,
+        from: args.from,
+    })?;
+    let reply: MigrateIntoShareReply =
+        serde_json::from_value(daemon_call(&socket, op::MIGRATE_INTO_SHARE, call)?)?;
+    println!(
+        "migrated {} file(s) from {} into shared subtree {} at {}",
+        reply.files, reply.from, reply.id, reply.mount_path
+    );
     Ok(())
 }
 

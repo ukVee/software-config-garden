@@ -24,15 +24,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use softfig_ipc::verbs::{
-    op, SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
-    SharedSubtreeAddReply, SharedSubtreeListReply, SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply,
-    SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
+    op, MigrateIntoShareArgs, MigrateIntoShareReply, SharedSubtreeAcceptArgs,
+    SharedSubtreeAcceptReply, SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeListReply,
+    SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply, SharedSubtreeToggleArgs,
+    SharedSubtreeToggleReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
-use softfig_store::Hash;
+use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::{params::VaultParams, Vault};
-use softfig_vcs::Repo;
+use softfig_vcs::{Repo, TIP_REF};
 
 const PASS: &[u8] = b"pw-test-12345";
 const PASS_STR: &str = "pw-test-12345";
@@ -221,6 +222,17 @@ impl Fixture {
             serde_json::to_value(SharedSubtreeAcceptArgs {
                 id: id.into(),
                 mount_path: mount_path.map(str::to_string),
+            })
+            .unwrap(),
+        )
+    }
+
+    fn migrate(&self, id: &str, from: &str) -> Response {
+        self.call(
+            op::MIGRATE_INTO_SHARE,
+            serde_json::to_value(MigrateIntoShareArgs {
+                id: id.into(),
+                from: from.into(),
             })
             .unwrap(),
         )
@@ -1038,4 +1050,150 @@ fn accept_is_idempotent_for_an_existing_member() {
         1,
         "no duplicate row"
     );
+}
+
+// ---- m5f slice 004: migrate-into-share (explicit M→S migration) -----------
+
+/// The committed cipher blob at chain-relative `rel` under `ref_name`'s tip
+/// (navigating the tree component by component), or `None` if the ref is unborn
+/// or the path is absent / not a blob. Lets a test assert both presence + the
+/// container kind (M vs S) of migrated content.
+fn committed_blob(garden: &Path, ref_name: &str, rel: &str) -> Option<Vec<u8>> {
+    let repo = Repo::open(garden).unwrap();
+    let tip = repo.tip_of(ref_name).unwrap()?;
+    let mut tree = repo.db().get_commit(&tip).unwrap().root_tree;
+    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    for (i, comp) in comps.iter().enumerate() {
+        let entry = repo
+            .db()
+            .get_tree(&tree)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == *comp)?;
+        if i + 1 == comps.len() {
+            return match entry.kind {
+                TreeEntryKind::Blob => Some(repo.objects().get(&entry.target).unwrap()),
+                TreeEntryKind::Tree => None,
+            };
+        }
+        match entry.kind {
+            TreeEntryKind::Tree => tree = entry.target,
+            TreeEntryKind::Blob => return None, // path descends through a file
+        }
+    }
+    None
+}
+
+/// The headline "share a folder that already has content": an empty share is
+/// keyed, device content is authored elsewhere, then `migrate-into-share` re-homes
+/// it under the share — S-sealed from birth and carved out of the device chain in
+/// the same operation (no double-ownership). Also proves the source is consumed
+/// (a second migrate finds nothing), the "already done" recovery signal.
+#[test]
+fn migrate_into_share_moves_device_content_into_the_keyed_share() {
+    let fx = Fixture::start();
+    // An empty share, keyed while empty (the key_chain precondition).
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    fx.key_chain("journal", "chain/journal", "S-migrate-0001");
+    let share_genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap();
+
+    // Author device content at a disjoint device path (a nested subtree).
+    fx.write_committed("notes/journal/a.md", "alpha\n");
+    fx.write_committed("notes/journal/sub/b.md", "beta\n");
+    let dev_before = fx.tip();
+    assert!(
+        committed_blob(&fx.garden, TIP_REF, "notes/journal/a.md").is_some(),
+        "the content starts device-owned"
+    );
+
+    // Migrate the whole subtree into the keyed share.
+    let reply: MigrateIntoShareReply =
+        serde_json::from_value(ok_data(fx.migrate("journal", "notes/journal"))).unwrap();
+    assert_eq!(reply.files, 2);
+    assert_eq!(reply.mount_path, "shared/journal");
+    assert_eq!(reply.from, "notes/journal");
+
+    // The share chain now holds both files (structure preserved), S-sealed from
+    // birth under the share's key — never the per-device M.
+    let share_tip = Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap();
+    assert_ne!(share_tip, share_genesis, "the share accepted the migrated content");
+    for rel in ["a.md", "sub/b.md"] {
+        let cipher = committed_blob(&fx.garden, "chain/journal", rel)
+            .unwrap_or_else(|| panic!("share missing migrated {rel}"));
+        assert!(
+            softfig_vault::is_shared_blob(&cipher),
+            "{rel} must be in the shared (S) container, not M"
+        );
+        assert_eq!(softfig_vault::shared::read_key_id(&cipher).unwrap(), "S-migrate-0001");
+    }
+
+    // The device chain no longer owns the migrated content (no double-ownership).
+    assert_ne!(fx.tip(), dev_before, "the device carve-out committed");
+    assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/a.md").is_none());
+    assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/sub/b.md").is_none());
+
+    // The source is consumed: a re-run finds nothing to migrate (fail-closed
+    // "already done" — no double migrate, no error onto a half state).
+    assert_eq!(err_kind(fx.migrate("journal", "notes/journal")), ErrorKind::BadArgs);
+}
+
+/// Key-before-content, the migrate direction: an UNKEYED target is refused with
+/// `SharedChainUnkeyed` and nothing moves — no M content is ever sealed into a
+/// shared chain (mirror of slice 001).
+#[test]
+fn migrate_into_an_unkeyed_share_is_refused() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    // Deliberately NOT keyed.
+    fx.write_committed("notes/journal/a.md", "alpha\n");
+    let share_genesis = Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap();
+    let dev_before = fx.tip();
+
+    assert_eq!(
+        err_kind(fx.migrate("journal", "notes/journal")),
+        ErrorKind::SharedChainUnkeyed
+    );
+
+    // Nothing moved: device content intact, both chain tips untouched.
+    assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/a.md").is_some());
+    assert_eq!(fx.tip(), dev_before, "the refusal committed nothing to the device chain");
+    assert_eq!(
+        Repo::open(&fx.garden).unwrap().tip_of("chain/journal").unwrap().unwrap(),
+        share_genesis,
+        "the unkeyed share tip must not advance"
+    );
+}
+
+/// The source must be device-owned content disjoint from every share: migrating
+/// a share's own mount path (or a path under it) into itself is refused before
+/// any commit.
+#[test]
+fn migrate_refuses_a_source_overlapping_a_share() {
+    let fx = Fixture::start();
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    fx.key_chain("journal", "chain/journal", "S-migrate-0002");
+    let dev_before = fx.tip();
+
+    // Source == the share's own mount → overlap.
+    assert_eq!(err_kind(fx.migrate("journal", "shared/journal")), ErrorKind::BadArgs);
+    // Source under the share → overlap.
+    assert_eq!(err_kind(fx.migrate("journal", "shared/journal/inner")), ErrorKind::BadArgs);
+
+    assert_eq!(fx.tip(), dev_before, "a refused migrate commits nothing");
+}
+
+/// An unknown share id and an empty source are both user errors surfaced before
+/// any mutation.
+#[test]
+fn migrate_refuses_unknown_share_and_empty_source() {
+    let fx = Fixture::start();
+    // Unknown share id (no membership yet).
+    assert_eq!(err_kind(fx.migrate("nope", "notes/x")), ErrorKind::BadArgs);
+
+    // A known keyed share, but the source path holds no committed content.
+    assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
+    fx.key_chain("journal", "chain/journal", "S-migrate-0003");
+    let dev_before = fx.tip();
+    assert_eq!(err_kind(fx.migrate("journal", "notes/empty")), ErrorKind::BadArgs);
+    assert_eq!(fx.tip(), dev_before, "the empty-source refusal commits nothing");
 }

@@ -188,6 +188,37 @@ impl<'a> WorkTree<'a> {
                 .map_err(|e| (ErrorKind::Io, format!("stage rename: {e}"))),
         }
     }
+
+    /// Recursively remove repo-relative `rel` (a file or a whole directory).
+    /// Disk: `std::fs` remove with self-write suppression; an already-absent
+    /// path is a no-op. FUSE: stage a recursive removal marker into the overlay
+    /// (captured by the next [`commit_now`](super::commit_now)). The m5f slice
+    /// 004 `migrate-into-share` device-side carve-out — run only AFTER the
+    /// content is durably re-committed into the shared chain — is the only
+    /// caller today; a removal carries no key-before-content concern (it strips
+    /// a blob, never adds one), so no `refuse_unkeyed_shared` guard is needed.
+    pub fn remove(&self, rel: &str) -> ActionResult {
+        match self {
+            WorkTree::Disk { daemon, garden_root } => {
+                let abs = Self::abs(garden_root, rel);
+                daemon.mark_self_write(abs.clone());
+                if abs.is_dir() {
+                    std::fs::remove_dir_all(&abs)
+                        .map_err(|e| (ErrorKind::Io, format!("remove_dir_all {rel}: {e}")))
+                } else {
+                    match std::fs::remove_file(&abs) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err((ErrorKind::Io, format!("remove_file {rel}: {e}"))),
+                    }
+                }
+            }
+            WorkTree::Fuse { mount } => {
+                mount.stage_remove(rel);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// The minimal working-tree surface a `.seq`-numbered doc store needs: read a

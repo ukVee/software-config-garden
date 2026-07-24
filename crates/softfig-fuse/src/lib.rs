@@ -264,6 +264,13 @@ impl MountHandle {
             .stage_rename(std::path::Path::new(from), std::path::Path::new(to))
     }
 
+    /// Stage a recursive removal of `rel` (a file or a whole directory subtree)
+    /// into the overlay — the m5f slice 004 `migrate-into-share` device-side
+    /// carve-out (the removal half of a rename, no destination).
+    pub fn stage_remove(&self, rel: &str) {
+        self.state.stage_remove(std::path::Path::new(rel))
+    }
+
     /// Tear down the FUSE session. Idempotent — a second call is a no-op.
     ///
     /// Before dropping the `BackgroundSession`, forcibly release the kernel
