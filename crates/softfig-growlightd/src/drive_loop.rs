@@ -3590,6 +3590,73 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// TASK 047 (integration): a continue-status member whose re-roll is admission-
+    /// HELD is re-observed with the SAME latched clean exit every tick — that stays a
+    /// HOLD (part workable, no §9 alert), never a spin-guard mislabel-park. Pre-fix,
+    /// two held ticks bumped the unchanged-NEXT-ACTION streak to `STALL_LIMIT` (= 2)
+    /// and the loop parked the item `blocked` on a human + started the 30-min alert
+    /// nag (the 2026-07-20 m5f double-park: `holding a (admission budget/rate)` → one
+    /// second later `blocked on a human decision`). A live co-member keeps the shared
+    /// budget exhausted so the hold spans several ticks; when it cools, the held
+    /// member resumes on the next admission window — no park ever happened. The
+    /// counterpart to `a_spinning_member_is_caught_item_parked_and_pivots`: a REAL
+    /// spin still parks; a mere budget hold must not.
+    #[test]
+    fn an_admission_held_continue_member_holds_without_a_mislabel_park() {
+        let policy = Policy {
+            max_concurrent_agents: 2,
+            ..Policy::default()
+        };
+        let (mut loop_, _d, backend, _claimer, parker, queues, probe) = make_full(
+            vec![member("a1", "qa"), member("a2", "qb")],
+            vec![
+                q("qa", &[("p1", "queued")]), // a1's part — the one it "holds" on
+                q("qb", &[("p2", "queued")]), // a2's part — a2 stays live, budget hot
+            ],
+            policy,
+        );
+
+        // Tick 0: both start (cap 2). a2's live reading will keep the pool exhausted.
+        loop_.tick(0);
+        assert_eq!(backend.spawn_count(), 2);
+        backend.set_budget("a2", hot_budget());
+
+        // a1 clean-exits on a continue status with a FIXED NEXT ACTION — the same
+        // signature the spin guard trips on, but here it is merely budget-held.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "compile it");
+
+        // Several HELD ticks: a1's re-roll is refused on a2's hot budget, and each
+        // re-observed latched exit is inert — never a park, never an alert, and its
+        // part stays workable (`active`), so admission can resume it later.
+        for t in 1..=4 {
+            let r = loop_.tick(t);
+            assert!(r.blocked.is_empty(), "a budget-held member is never item-parked (tick {t})");
+            assert!(parker.parks().is_empty(), "nothing is written `blocked` in keeperd (tick {t})");
+            assert_eq!(probe.gui_alerts(), 0, "no blocked-on-human alert while merely held (tick {t})");
+            assert_eq!(
+                classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+                QueueState::Active("p1".into()),
+                "a1's part stays active/workable while held (tick {t})",
+            );
+        }
+        assert_eq!(backend.spawn_count(), 2, "no re-roll while the shared budget is exhausted");
+
+        // The co-member's window cools → admission recovers → a1 resumes on the next
+        // window, with no park having ever happened.
+        backend.set_budget("a2", BudgetUsage::new(20, 5)); // cool → admission re-admits
+        let r = loop_.tick(5);
+        assert_eq!(
+            r.rerolls,
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }],
+            "a1 resumes via the next admission window",
+        );
+        assert!(r.blocked.is_empty() && parker.parks().is_empty(), "resume parks nothing");
+        assert_eq!(probe.gui_alerts(), 0, "resume is silent — the mislabel-park nag never fired");
+        assert_eq!(backend.spawn_count(), 3, "a1 re-rolled: start a1 + start a2 + resume a1");
+    }
+
     /// Fail-soft: if the keeperd item-park WRITE can't be confirmed, the member is
     /// STILL released and STILL pivots this tick (the local snapshot mark drives the
     /// pivot + alert); only the cross-tick `blocked` commit is missing, so keeperd's

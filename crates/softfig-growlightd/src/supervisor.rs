@@ -677,7 +677,25 @@ impl Supervisor {
         }
         match classify(&health, hang_secs, now) {
             Verdict::Healthy => PollOutcome::Healthy,
-            Verdict::CleanExit => self.on_clean_exit(agent, baton_status, next_action, now),
+            Verdict::CleanExit => {
+                if self.agents[agent].child.is_none() {
+                    // Already-consumed CLEAN exit (task 047, the twin of task 044's
+                    // crash-side guard below): the health cell latches the exit until
+                    // a re-spawn, so a member whose re-roll is HELD (admission
+                    // budget/rate, the queue-gate) re-observes the same clean exit on
+                    // every ~1s tick. Re-running `on_clean_exit` fed the spin guard
+                    // the SAME baton NEXT ACTION each observation — two held ticks
+                    // read as a no-progress "stall" and the guard mislabel-parked the
+                    // item `blocked` on a human (the 2026-07-20 m5f parks). Inert
+                    // instead: the first observation consumed the exit (`roll` / the
+                    // rate-park cleared `child`; every other disposition removes the
+                    // agent), and `tick` owns the re-roll once the hold clears — the
+                    // spin streak counts real consecutive sessions only.
+                    PollOutcome::Down
+                } else {
+                    self.on_clean_exit(agent, baton_status, next_action, now)
+                }
+            }
             Verdict::Crashed => {
                 if network_exit() {
                     // Evaluated BEFORE the consumed-exit guard below so a
@@ -1902,6 +1920,88 @@ mod tests {
         assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
         assert_eq!(backend.spawn_count(), 2, "no re-roll of the released member");
         assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
+    }
+
+    /// Task 047: a continue-exit whose re-roll is HELD (admission budget/rate)
+    /// re-observes the same latched clean exit every tick — those re-observations
+    /// are inert (`Down`), never fed to the spin guard. Pre-fix, two held ticks
+    /// bumped the unchanged-NEXT-ACTION streak to `STALL_LIMIT` and the guard
+    /// mislabel-parked the item `blocked` on a human (the 2026-07-20 m5f parks:
+    /// `holding a (admission budget/rate)` → one second later `blocked on a
+    /// human decision`). The member must stay registered on its part, resume via
+    /// the next admission window, and the guard must still trip on REAL
+    /// consecutive sessions.
+    #[test]
+    fn a_held_continue_exit_is_consumed_once_and_never_trips_the_spin_guard() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert_eq!(backend.spawn_count(), 1);
+
+        // The continue-exit: streak 1, immediate re-roll armed.
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                Some("compile it"),
+                10,
+                || false,
+            ),
+            PollOutcome::Rolling
+        );
+
+        // The re-roll is admission-held (hot budget) — the member stays down.
+        assert_eq!(
+            s.tick(hot_budget(), fresh_rate(), 11, &any_work),
+            vec![RerollOutcome::HeldForAdmission {
+                agent: "a1".into(),
+                decision: AdmissionDecision::Refuse { reason: RefuseReason::Budget5h }
+            }]
+        );
+
+        // Every held tick re-observes the SAME latched clean exit: inert. Pre-fix
+        // the second observation returned `Blocked { spin_guard: true }` here.
+        for t in 12..16 {
+            assert_eq!(
+                s.poll_with_network(
+                    "a1",
+                    AgentHealth::Exited { code: 0 },
+                    Some("IN_PROGRESS"),
+                    Some("compile it"),
+                    t,
+                    || false,
+                ),
+                PollOutcome::Down,
+                "a held member's re-observed clean exit must stay inert (t={t})",
+            );
+        }
+        assert!(s.is_registered("a1"), "the held member never left the fleet");
+
+        // Admission recovers → the timed resume re-rolls the SAME member.
+        assert_eq!(
+            s.tick(fresh_budget(), fresh_rate(), 20, &any_work),
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }]
+        );
+        assert_eq!(backend.spawn_count(), 2, "resumed via the admission window");
+
+        // The guard still does its real job: a SECOND full session ending on the
+        // byte-identical NEXT ACTION is a genuine no-progress streak → trip.
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                Some("compile it"),
+                30,
+                || false,
+            ),
+            PollOutcome::Blocked {
+                status: "STUCK (spin guard): NEXT ACTION unchanged across 2 consecutive re-rolls"
+                    .into(),
+                spin_guard: true,
+            }
+        );
     }
 
     /// The guard does NOT trip while the member makes progress: a DIFFERENT
