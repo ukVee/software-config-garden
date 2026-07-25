@@ -168,7 +168,8 @@ fn mixed_mode_daemon_handles_both_configs() {
     let socket = unique_socket(tmp1.path());
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start m1c-compat");
     wait_for_socket(&socket);
@@ -194,6 +195,7 @@ fn mixed_mode_daemon_handles_both_configs() {
         .with_state_root(&state2)
         .with_socket(&socket2)
         .without_watcher()
+        .without_net()
         .without_fuse();
     let daemon2 = Daemon::new(cfg2);
     let handle2 = daemon2.start().expect("start m2a");
@@ -271,7 +273,8 @@ fn migrate_finalize_unmounts_deletes_remounts() {
     let cfg = KeeperConfig::new(&garden)
         .with_state_root(&state)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = match daemon.start() {
         Ok(h) => h,
@@ -340,7 +343,8 @@ fn fuse_sink_pushes_into_accumulator() {
     let socket = unique_socket(tmp.path());
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);

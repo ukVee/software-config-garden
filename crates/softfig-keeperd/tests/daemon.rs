@@ -68,7 +68,8 @@ fn full_lifecycle() {
     let socket = unique_socket(tmp.path());
     let config = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(config);
     let handle = daemon.start().expect("start");
 
@@ -199,7 +200,8 @@ fn rejects_traversal_in_replace_paths() {
     let daemon = Daemon::new(
         KeeperConfig::new(garden)
             .with_socket(&socket)
-            .without_watcher(),
+            .without_watcher()
+            .without_net(),
     );
     let handle = daemon.start().unwrap();
     for _ in 0..50 {
@@ -262,7 +264,8 @@ fn accumulator_classifies_synthetic_events() {
     // Watcher disabled — we drive the accumulator manually.
     let config = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(config);
     let handle = daemon.start().expect("start");
 

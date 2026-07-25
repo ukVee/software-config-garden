@@ -88,7 +88,8 @@ fn layer_b_seal_writes_layer_b_blob() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -184,7 +185,8 @@ fn auto_migrate_on_glob_add() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -254,7 +256,8 @@ fn reveal_writes_temp_file_and_audits() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -341,6 +344,7 @@ fn reveal_idle_window_semantics() {
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
         .without_watcher()
+        .without_net()
         .with_reveal_idle_seconds(60);
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
@@ -403,7 +407,8 @@ fn unseal_removes_glob_but_keeps_blobs_sealed() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);

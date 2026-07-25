@@ -123,7 +123,8 @@ fn region_write_round_trip_blob_and_redact_view() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -213,7 +214,8 @@ fn placeholder_preservation_two_regions() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -316,7 +318,8 @@ fn classifier_promotes_to_vault_seal_on_new_id() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -391,7 +394,8 @@ fn region_reveal_writes_temp_file() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -460,7 +464,8 @@ fn malformed_tag_fails_closed_on_write() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -511,7 +516,8 @@ fn m2b_compat_serialization_for_whole_file_reveal() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);
@@ -575,7 +581,8 @@ fn region_round_trip_toml_literal_multiline() {
     let socket = unique_socket(garden);
     let cfg = KeeperConfig::new(garden)
         .with_socket(&socket)
-        .without_watcher();
+        .without_watcher()
+        .without_net();
     let daemon = Daemon::new(cfg);
     let handle = daemon.start().expect("start");
     wait_for_socket(&socket);

@@ -48,6 +48,7 @@ impl Keeper {
         let sock = garden.join("sock");
         let config = KeeperConfig::new(&garden)
             .without_watcher()
+            .without_net()
             .with_socket(&sock);
         let handle = Daemon::new(config).start().unwrap();
         wait_for_socket(&sock);

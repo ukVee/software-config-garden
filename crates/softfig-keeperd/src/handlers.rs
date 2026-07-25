@@ -2291,29 +2291,28 @@ pub fn migrate_into_share(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         crate::ceremony::snapshot_device_subtree_plaintext(repo, session, &from)?
     };
     if source_snapshot.files().is_empty() {
-        return Err((
-            ErrorKind::BadArgs,
-            format!("nothing to migrate: {from:?} holds no committed device content"),
-        ));
+        return Ok(serde_json::to_value(MigrateIntoShareReply {
+            id,
+            mount_path,
+            from,
+            files: 0,
+        })
+        .unwrap());
     }
     let mut share_snapshot = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_ref().expect("unlocked");
         crate::ceremony::snapshot_chain_plaintext(repo, session, &ref_name, &mount_path)?
     };
-    // Refuse a collision rather than silently overwrite existing share content.
+    // Skip files already in the share (idempotent: after a crash between the
+    // two commits below, re-running the migrate finds the content already
+    // durably in the share from commit 1 and should proceed to commit 2).
     let existing: std::collections::HashSet<PathBuf> =
         share_snapshot.files().into_iter().map(|(p, _, _)| p).collect();
     let mut files = 0usize;
     for (rel, mode, content) in source_snapshot.files() {
         if existing.contains(&rel) {
-            return Err((
-                ErrorKind::PathAlreadyExists,
-                format!(
-                    "shared subtree {id:?} already has content at {rel:?}; migrate into a share \
-                     that is empty at that path"
-                ),
-            ));
+            continue;
         }
         share_snapshot
             .insert_file(&rel, mode, content.to_vec())
@@ -2329,18 +2328,22 @@ pub fn migrate_into_share(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     // every composed blob under the share's `S` via the router (bypassing the
     // FUSE overlay + the write-turn gate, exactly as genesis-seed and the rekey
     // re-encrypt do), so migrated content is S-keyed from birth.
-    let add_intent = Intent::new(
-        "migrate_into_share",
-        serde_json::json!({
-            "id": id,
-            "from": from,
-            "mount_path": mount_path,
-            "files": files,
-            "summary": format!("migrate {from} into shared subtree {id}"),
-        }),
-    )
-    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    crate::actions::commit_snapshot_to_now(&mut inner, &ref_name, share_snapshot, add_intent)?;
+    // On re-run after a crash between the two commits, all files are already
+    // in the share (skipped above); skip commit 1 and proceed to the carve-out.
+    if files > 0 {
+        let add_intent = Intent::new(
+            "migrate_into_share",
+            serde_json::json!({
+                "id": id,
+                "from": from,
+                "mount_path": mount_path,
+                "files": files,
+                "summary": format!("migrate {from} into shared subtree {id}"),
+            }),
+        )
+        .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+        crate::actions::commit_snapshot_to_now(&mut inner, &ref_name, share_snapshot, add_intent)?;
+    }
 
     // Commit 2 — carve the migrated content out of the device chain, only now
     // that it is durably in the share. Staged as a recursive overlay removal and

@@ -49,6 +49,7 @@ impl Fixture {
         let socket = garden.join("sock");
         let config = KeeperConfig::new(&garden)
             .without_watcher()
+            .without_net()
             .with_socket(&socket);
         let handle = Daemon::new(config).start().unwrap();
         wait_for_socket(&socket);
@@ -264,7 +265,10 @@ fn provenance_refuses_when_locked() {
     let garden = tmp.path().to_path_buf();
     init_garden(&garden);
     let socket = garden.join("sock");
-    let config = KeeperConfig::new(&garden).without_watcher().with_socket(&socket);
+    let config = KeeperConfig::new(&garden)
+        .without_watcher()
+        .without_net()
+        .with_socket(&socket);
     let handle = Daemon::new(config).start().unwrap();
     wait_for_socket(&socket);
     // No unlock.

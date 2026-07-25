@@ -53,6 +53,7 @@ impl Fixture {
         let socket = tmp.path().join("sock");
         let config = KeeperConfig::new(&garden)
             .without_watcher()
+            .without_net()
             .with_socket(&socket)
             .with_deploy_home(&home)
             .with_deploy_cache_root(&cache);

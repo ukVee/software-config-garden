@@ -75,6 +75,7 @@ impl Fixture {
         let keeper_sock = garden.join("keeper.sock");
         let config = KeeperConfig::new(&garden)
             .without_watcher()
+            .without_net()
             .with_socket(&keeper_sock)
             .with_growlightd_socket(&target);
         let keeper = Daemon::new(config).start().unwrap();

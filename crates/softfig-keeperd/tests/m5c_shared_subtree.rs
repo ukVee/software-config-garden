@@ -108,6 +108,7 @@ impl Fixture {
         let socket = garden.join("sock");
         let mut config = KeeperConfig::new(&garden)
             .without_watcher()
+            .without_net()
             .with_socket(&socket);
         if attach_fuse {
             config = config.with_unmounted_fuse_attach();
@@ -1132,9 +1133,12 @@ fn migrate_into_share_moves_device_content_into_the_keyed_share() {
     assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/a.md").is_none());
     assert!(committed_blob(&fx.garden, TIP_REF, "notes/journal/sub/b.md").is_none());
 
-    // The source is consumed: a re-run finds nothing to migrate (fail-closed
-    // "already done" — no double migrate, no error onto a half state).
-    assert_eq!(err_kind(fx.migrate("journal", "notes/journal")), ErrorKind::BadArgs);
+    // The source is consumed: a re-run is idempotent — finds nothing to migrate
+    // and returns success with files=0 instead of a spurious error.
+    let rerun: MigrateIntoShareReply =
+        serde_json::from_value(ok_data(fx.migrate("journal", "notes/journal"))).unwrap();
+    assert_eq!(rerun.files, 0);
+    assert_eq!(rerun.id, "journal");
 }
 
 /// Key-before-content, the migrate direction: an UNKEYED target is refused with
@@ -1194,6 +1198,10 @@ fn migrate_refuses_unknown_share_and_empty_source() {
     assert!(matches!(fx.add("shared/journal", Some("journal")), Response::Ok { .. }));
     fx.key_chain("journal", "chain/journal", "S-migrate-0003");
     let dev_before = fx.tip();
-    assert_eq!(err_kind(fx.migrate("journal", "notes/empty")), ErrorKind::BadArgs);
-    assert_eq!(fx.tip(), dev_before, "the empty-source refusal commits nothing");
+    // Empty source is idempotent: nothing to migrate, returns success.
+    let reply: MigrateIntoShareReply =
+        serde_json::from_value(ok_data(fx.migrate("journal", "notes/empty"))).unwrap();
+    assert_eq!(reply.files, 0, "empty source succeeds with zero files migrated");
+    assert_eq!(reply.id, "journal");
+    assert_eq!(fx.tip(), dev_before, "an empty-source migrate commits nothing");
 }

@@ -46,6 +46,7 @@ impl Fixture {
         let socket = garden.join("sock");
         let config = KeeperConfig::new(&garden)
             .without_watcher()
+            .without_net()
             .with_socket(&socket);
         let handle = Daemon::new(config).start().unwrap();
         wait_for_socket(&socket);
@@ -74,6 +75,7 @@ impl Fixture {
         }
         let config = KeeperConfig::new(&self.garden)
             .without_watcher()
+            .without_net()
             .with_socket(&self.socket);
         let handle = Daemon::new(config).start().unwrap();
         wait_for_socket(&self.socket);
