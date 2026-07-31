@@ -24,8 +24,70 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
+
+/// Which agent the human-driven semi-auto loop (`softfig growlight start`) runs
+/// on — the CLI-side interactive-first landing of the AgentBackend seam
+/// (spec-agents §4.1 / decision-semi-auto-backend-seam). `Claude` is
+/// byte-for-byte identical to the original hardwired path; `Opencode` is being
+/// wired up across the `semi-auto-backend-seam` milestone (generated config =
+/// slice 002, interactive launch = slice 003, headless `--auto` = slice 004).
+///
+/// Distinct from the [`AgentBackend`] trait below: that is the headless `-p`
+/// per-iteration seam the `--auto` driver shells; this enum is the CLI selector
+/// that *chooses* which agent (and which interactive argv) to run. The fleet
+/// (growlightd) has its own backend config and is intentionally untouched.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// Claude Code (`claude`) — the default; behaviour unchanged.
+    #[default]
+    Claude,
+    /// opencode — interactive-first; headless `--auto` deferred to slice 004.
+    Opencode,
+}
+
+impl Backend {
+    /// The launcher binary name, for the spawn and user-facing messages.
+    pub fn agent_bin(&self) -> &'static str {
+        match self {
+            Backend::Claude => "claude",
+            Backend::Opencode => "opencode",
+        }
+    }
+
+    /// Build the interactive loop command for this backend, carrying the
+    /// generated loop settings + MCP config. Pure (constructs, never spawns) so
+    /// the argv is unit-testable. `claude` reproduces the original hardwired
+    /// invocation exactly (`claude --name <name> --settings <loop> --mcp-config
+    /// <mcp>`); `opencode` is deferred to slice 003 and errors clearly until
+    /// then (its argv + generated config are a different shape — see
+    /// decision-semi-auto-backend-seam).
+    pub fn interactive_command(
+        &self,
+        agent_name: &str,
+        loop_settings: &Path,
+        mcp_config: &Path,
+    ) -> Result<Command> {
+        match self {
+            Backend::Claude => {
+                let mut cmd = Command::new(self.agent_bin());
+                cmd.arg("--name")
+                    .arg(agent_name)
+                    .arg("--settings")
+                    .arg(loop_settings)
+                    .arg("--mcp-config")
+                    .arg(mcp_config);
+                Ok(cmd)
+            }
+            Backend::Opencode => bail!(
+                "the opencode backend's interactive launch is not wired up yet \
+                 (semi-auto-backend-seam slice 003); use `--backend claude` for now"
+            ),
+        }
+    }
+}
 
 /// What the driver hands a backend for one iteration: the generated loop
 /// settings (whose SessionStart hook injects protocol + baton — confirmed to
@@ -490,5 +552,44 @@ mod tests {
         assert_eq!(v["rate_limits"]["five_hour"]["status"], "allowed");
         assert!(v["rate_limits"]["five_hour"]["used_percentage"].is_null());
         assert!(v["ts"].is_number());
+    }
+
+    #[test]
+    fn claude_backend_is_the_default() {
+        assert_eq!(Backend::default(), Backend::Claude);
+    }
+
+    #[test]
+    fn claude_interactive_command_is_the_hardwired_argv() {
+        use std::ffi::{OsStr, OsString};
+        let loop_path = Path::new("/run/softfig/growlight/loop.json");
+        let mcp_path = Path::new("/run/softfig/growlight/mcp.json");
+        let cmd = Backend::Claude
+            .interactive_command("softfig-loop", loop_path, mcp_path)
+            .expect("claude backend builds a command");
+        assert_eq!(cmd.get_program(), OsStr::new("claude"));
+        let args: Vec<OsString> = cmd.get_args().map(OsStr::to_owned).collect();
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--name"),
+                OsString::from("softfig-loop"),
+                OsString::from("--settings"),
+                OsString::from(loop_path),
+                OsString::from("--mcp-config"),
+                OsString::from(mcp_path),
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_interactive_launch_errors_clearly_until_slice_003() {
+        let err = Backend::Opencode
+            .interactive_command("softfig-loop", Path::new("/l"), Path::new("/m"))
+            .expect_err("opencode interactive launch is not wired yet");
+        assert!(
+            err.to_string().contains("opencode"),
+            "error should name the unimplemented backend: {err}"
+        );
     }
 }

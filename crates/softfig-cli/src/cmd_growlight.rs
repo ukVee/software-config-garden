@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     ClientError, Request, growlightd_runtime_socket_path, runtime_socket_path,
@@ -36,8 +36,8 @@ use softfig_growlightd_client::{decode_frame, Frame};
 
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
-    AgentBackend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, IterationOutcome, IterationRequest,
-    RateWindow, SystemClock, SystemExeProbe, UsageSnapshot,
+    AgentBackend, Backend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, IterationOutcome,
+    IterationRequest, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot,
 };
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
@@ -178,6 +178,15 @@ pub struct StartArgs {
     /// Ignored without `--auto`.
     #[arg(long)]
     pub max_iterations: Option<u64>,
+    /// Which agent backend the interactive loop runs on (spec-agents §4.1).
+    /// `claude` (default) is byte-identical to before; `opencode` runs the same
+    /// human-driven loop on opencode — interactive-first, so headless `--auto`
+    /// opencode is not yet implemented (deferred to slice 004).
+    #[arg(long, value_enum, default_value = "claude")]
+    pub backend: Backend,
+    /// Shorthand for `--backend opencode`.
+    #[arg(long, conflicts_with = "backend")]
+    pub opencode: bool,
 }
 
 /// Args for `say` — the human-post seam. Unlike the growlightd client verbs,
@@ -341,6 +350,13 @@ fn short_hash(hash: &str) -> &str {
 // ---- start (Phase 2b): runtime + launcher ------------------------------
 
 fn start(args: StartArgs) -> Result<()> {
+    // `--opencode` is shorthand for `--backend opencode` (they can't both be set
+    // — `conflicts_with`), so a bare `--opencode` overrides the default.
+    let backend = if args.opencode {
+        Backend::Opencode
+    } else {
+        args.backend
+    };
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
     let garden_root = resolve_garden_root(&socket, args.garden_root)?;
 
@@ -411,16 +427,34 @@ fn start(args: StartArgs) -> Result<()> {
     }
 
     if args.no_launch {
-        println!(
-            "\n(--no-launch) runtime ready. launch with:\n  {AGENT_BIN} --name {AGENT_NAME} \
-             --settings {} --mcp-config {}",
-            loop_path.display(),
-            mcp_path.display()
-        );
+        match backend {
+            Backend::Claude => println!(
+                "\n(--no-launch) runtime ready. launch with:\n  {AGENT_BIN} --name {AGENT_NAME} \
+                 --settings {} --mcp-config {}",
+                loop_path.display(),
+                mcp_path.display()
+            ),
+            // The opencode invocation shape + its generated config land in
+            // semi-auto-backend-seam slices 002/003; don't print a claude
+            // command the opencode backend can't run.
+            Backend::Opencode => println!(
+                "\n(--no-launch) runtime ready. the opencode backend's launch hint + generated \
+                 config land in the semi-auto-backend-seam milestone (slices 002/003)."
+            ),
+        }
         return Ok(());
     }
     if args.auto {
-        let backend = ClaudeBackend::new(AGENT_BIN);
+        // Headless `--auto` is claude-only so far; the opencode `-p` event
+        // parser + non-subscription budget model are deferred to slice 004.
+        // Keep the claude construction byte-identical.
+        let backend = match backend {
+            Backend::Claude => ClaudeBackend::new(AGENT_BIN),
+            Backend::Opencode => bail!(
+                "`--auto` headless mode is only implemented for the claude backend so far; \
+                 opencode `--auto` is deferred to the semi-auto-backend-seam milestone (slice 004)"
+            ),
+        };
         let clock = SystemClock;
         // Captured before the loop, while our own binary is still the live inode;
         // re-statted between iterations to catch a mid-run reinstall (task 007).
@@ -446,7 +480,7 @@ fn start(args: StartArgs) -> Result<()> {
         print_loop_summary(&summary, &usage_path, &log_path);
         return Ok(());
     }
-    launch_agent(&loop_path, &mcp_path)
+    launch_agent(backend, &loop_path, &mcp_path)
 }
 
 // ---- headless orchestrator (full-auto, slices 001-002) -----------------
@@ -989,17 +1023,16 @@ fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<Path
     }
 }
 
-fn launch_agent(loop_path: &Path, mcp_path: &Path) -> Result<()> {
-    println!("\nlaunching {AGENT_BIN} --name {AGENT_NAME} …\n");
-    let status = std::process::Command::new(AGENT_BIN)
-        .arg("--name")
-        .arg(AGENT_NAME)
-        .arg("--settings")
-        .arg(loop_path)
-        .arg("--mcp-config")
-        .arg(mcp_path)
+fn launch_agent(backend: Backend, loop_path: &Path, mcp_path: &Path) -> Result<()> {
+    // The interactive argv is owned by the backend seam; for `claude` this is
+    // byte-identical to the original hardwired invocation. `opencode` errors
+    // here until slice 003 wires it.
+    let mut cmd = backend.interactive_command(AGENT_NAME, loop_path, mcp_path)?;
+    let bin = backend.agent_bin();
+    println!("\nlaunching {bin} --name {AGENT_NAME} …\n");
+    let status = cmd
         .status()
-        .with_context(|| format!("failed to launch `{AGENT_BIN}` — is it on PATH?"))?;
+        .with_context(|| format!("failed to launch `{bin}` — is it on PATH?"))?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
