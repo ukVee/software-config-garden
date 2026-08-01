@@ -48,6 +48,43 @@ pub enum Backend {
     Opencode,
 }
 
+/// The inputs an interactive launch needs, across backends. Each backend
+/// consumes only the subset relevant to it (claude: the name, `loop_settings`,
+/// and `mcp_config`; opencode: the name, `opencode_config`, `cwd`, and
+/// `boot_prompt`), so the seam stays a single call while neither backend has to
+/// fabricate the paths the other needs. Borrows throughout (the caller owns the
+/// generated runtime paths); pure data, no I/O.
+pub struct InteractiveLaunch<'a> {
+    /// The loop session's tag: claude's `--name`, opencode's `--agent`.
+    pub agent_name: &'a str,
+    /// claude `--settings`: the generated `loop.json` (SessionStart hooks +
+    /// statusline). Ignored by opencode.
+    pub loop_settings: &'a Path,
+    /// claude `--mcp-config`: the generated `mcp.json` attaching softfig-mcp.
+    /// Ignored by opencode (its mcp block lives inside `opencode_config`).
+    pub mcp_config: &'a Path,
+    /// opencode `OPENCODE_CONFIG`: the generated `opencode.json` (the
+    /// `softfig-loop` agent = protocol-by-reference + step-0 baton boot +
+    /// garden edit-deny + explicit softfig-mcp block, slice 002). Ignored by
+    /// claude.
+    pub opencode_config: &'a Path,
+    /// opencode launch cwd = the **runtime dir** (where the baton lives), NOT the
+    /// garden. opencode makes the cwd its "project root" and matches in-project
+    /// files by their project-relative path while gating everything outside it
+    /// behind `external_directory`; rooting at the runtime dir keeps the baton
+    /// in-project (freely read + rewritten each handoff) and the garden external
+    /// (denied to raw edits, reachable only via softfig-mcp — see
+    /// `opencode_config`). Ignored by claude (which inherits the caller's cwd,
+    /// unchanged). softfig-mcp is attached explicitly, so it resolves regardless
+    /// of cwd.
+    pub cwd: &'a Path,
+    /// opencode first-turn kick (`--prompt`): tells the fresh session to begin
+    /// its iteration (step 0 = read the baton, then follow the protocol).
+    /// claude's interactive TUI takes no kick — the human sends the first turn —
+    /// so this is opencode-only.
+    pub boot_prompt: &'a str,
+}
+
 impl Backend {
     /// The launcher binary name, for the spawn and user-facing messages.
     pub fn agent_bin(&self) -> &'static str {
@@ -57,35 +94,44 @@ impl Backend {
         }
     }
 
-    /// Build the interactive loop command for this backend, carrying the
-    /// generated loop settings + MCP config. Pure (constructs, never spawns) so
-    /// the argv is unit-testable. `claude` reproduces the original hardwired
-    /// invocation exactly (`claude --name <name> --settings <loop> --mcp-config
-    /// <mcp>`); `opencode` is deferred to slice 003 and errors clearly until
-    /// then (its argv + generated config are a different shape — see
-    /// decision-semi-auto-backend-seam).
-    pub fn interactive_command(
-        &self,
-        agent_name: &str,
-        loop_settings: &Path,
-        mcp_config: &Path,
-    ) -> Result<Command> {
+    /// Build the interactive loop command for this backend. Pure (constructs,
+    /// never spawns) so the argv/env/cwd are unit-testable.
+    ///
+    /// - **claude** reproduces the original hardwired invocation exactly —
+    ///   `claude --name <name> --settings <loop.json> --mcp-config <mcp.json>` —
+    ///   inheriting the caller's environment and cwd (byte-identical to before
+    ///   the seam existed: it sets neither env nor `current_dir`).
+    /// - **opencode** launches the TUI on the generated agent —
+    ///   `opencode --agent <name> --prompt <boot>` — with `OPENCODE_CONFIG`
+    ///   pointing at the generated `opencode.json` (opencode's analog of claude's
+    ///   `--settings`; the agent, its permission map, and the softfig-mcp block
+    ///   all live in that one file, so there is no separate `--mcp-config`) and
+    ///   cwd set to the runtime dir (`launch.cwd`) so the baton is in-project and
+    ///   the garden is external — see [`InteractiveLaunch::cwd`]. The `--prompt`
+    ///   is the reseed kick: opencode has no SessionStart hook, so the roll is the
+    ///   agent prompt's step-0 baton read, and this first turn nudges the fresh
+    ///   session into it.
+    pub fn interactive_command(&self, launch: &InteractiveLaunch) -> Result<Command> {
+        let mut cmd = Command::new(self.agent_bin());
         match self {
             Backend::Claude => {
-                let mut cmd = Command::new(self.agent_bin());
                 cmd.arg("--name")
-                    .arg(agent_name)
+                    .arg(launch.agent_name)
                     .arg("--settings")
-                    .arg(loop_settings)
+                    .arg(launch.loop_settings)
                     .arg("--mcp-config")
-                    .arg(mcp_config);
-                Ok(cmd)
+                    .arg(launch.mcp_config);
             }
-            Backend::Opencode => bail!(
-                "the opencode backend's interactive launch is not wired up yet \
-                 (semi-auto-backend-seam slice 003); use `--backend claude` for now"
-            ),
+            Backend::Opencode => {
+                cmd.arg("--agent")
+                    .arg(launch.agent_name)
+                    .arg("--prompt")
+                    .arg(launch.boot_prompt)
+                    .env("OPENCODE_CONFIG", launch.opencode_config)
+                    .current_dir(launch.cwd);
+            }
         }
+        Ok(cmd)
     }
 }
 
@@ -105,14 +151,32 @@ impl Backend {
 ///   a step-0 line naming the baton path. A fresh session (`/new` / relaunch)
 ///   rebuilds the system prompt → reloads the protocol → step 0 re-reads the
 ///   current baton. The protocol *is* the bootstrap.
-/// - **preapprove.** Translates claude's `loop.json` allow/deny. opencode has no
-///   separate `write` permission — `edit` gates file modification — so claude's
-///   dual `Edit`/`Write` garden deny collapses onto one path-scoped `edit` map:
-///   allow edits generally (the code repos), deny the garden subtree. That
-///   enforces the MCP-only garden convention structurally (last-matching rule
-///   wins, so the garden `**` deny beats the `*` allow). `softfig-mcp*` is
-///   allowed so the garden verbs don't prompt; `read`/`bash` mirror the claude
-///   allow-list.
+/// - **preapprove.** Translates claude's `loop.json` allow/deny, shaped by three
+///   on-device findings about opencode's permission model: (1) the `edit`
+///   permission gates ALL file modification (the `write` + `apply_patch` tools
+///   too); (2) it matches IN-project files (under cwd) by their project-RELATIVE
+///   path and does NOT match an EXTERNAL file's absolute path, so an `edit` deny is
+///   a no-op for anything outside cwd; and (3) a broad `*` deny is deny-overrides —
+///   it beats every specific allow, so a `*` default-deny would also block the
+///   loop's OWN baton rewrite. The launch roots opencode at the RUNTIME dir (see
+///   `InteractiveLaunch::cwd`): the baton is in-project (freely read + rewritten at
+///   opencode's default-allow), and the garden is external — guarded not by `edit`
+///   but by `external_directory` (next bullet). `softfig-mcp*` is allowed so the
+///   garden verbs don't prompt; `read`/`bash` mirror the claude allow-list (a
+///   `bash` write into the garden stays possible — accepted, like claude's
+///   Bash-allow posture).
+/// - **external_directory (the garden guard).** cwd is the runtime dir, so the
+///   garden, the code repos, and the claude-memory tree are all "external", and on
+///   this opencode version external access is ALL-OR-NOTHING here (an `allow`
+///   permits read AND write; there is no external read-only). So DENY the garden
+///   outright: raw read/edit/write of the garden is refused and the agent reaches
+///   garden content the only intended way — through softfig-mcp verbs (the
+///   protocol's "everything else lives in the garden, read via softfig-mcp
+///   pointers"). Grant the claude-memory tree so its pointers stay reachable +
+///   editable. Surgical, never a bare `allow`: the `~/.claude` OAuth token +
+///   harness settings stay out of reach, and code repos fall through to opencode's
+///   default (the interactive human approves them per-prompt; unattended external
+///   edits are the headless slice-004 concern).
 /// - **attach_mcp.** Emits an explicit project-scoped `mcp.softfig-mcp` block
 ///   (mirroring why claude gets an explicit `--mcp-config`) so the garden verbs
 ///   exist regardless of launch cwd, without depending on the user's global
@@ -127,6 +191,7 @@ pub fn opencode_config(
     garden_root: &Path,
     mcp_bin: &Path,
     model: &str,
+    claude_projects: &Path,
 ) -> String {
     // The system prompt: the protocol by reference (opencode expands `{file:…}`
     // at prompt-build time — verified to resolve an absolute path) + the step-0
@@ -141,15 +206,33 @@ pub fn opencode_config(
         baton = baton.display(),
     );
 
-    // `edit` folds claude's Edit+Write: allow generally, deny the garden subtree
-    // (last-match wins). softfig-mcp verbs pre-approved; read/bash mirror claude.
-    let mut edit = serde_json::Map::new();
-    edit.insert("*".to_string(), Value::from("allow"));
-    edit.insert(format!("{}/**", garden_root.display()), Value::from("deny"));
+    let garden_glob = format!("{}/**", garden_root.display());
+    let memory_glob = format!("{}/**", claude_projects.display());
+
+    // `external_directory` is the garden guard. Launched from the runtime dir
+    // (cwd), the garden is EXTERNAL, and opencode gates external access here — and,
+    // on this version, it is ALL-OR-NOTHING for external paths: an `external_
+    // directory` allow permits read AND write, while the `edit` permission's
+    // pattern (matched relative to cwd) does NOT match an external absolute path,
+    // so an `edit` deny is a no-op for the garden (both proven on-device). So DENY
+    // the garden outright: raw read/edit/write of the garden is refused, and the
+    // agent reaches garden content the ONLY intended way — through softfig-mcp
+    // verbs (the protocol's "everything else lives in the garden, read via
+    // softfig-mcp pointers"). The claude-memory tree is granted so its pointers
+    // stay reachable + editable. The baton + the rest of the runtime dir are
+    // in-project (the cwd), so they need no grant — the loop reads and rewrites its
+    // baton there freely. Surgical, never a bare `allow`: the ~/.claude OAuth token
+    // + harness settings stay out of reach, and code repos fall through to
+    // opencode's default (the interactive human approves them per-prompt). A `bash`
+    // write into the garden stays possible — accepted, same as claude's Bash-allow.
+    let mut external = serde_json::Map::new();
+    external.insert(garden_glob, Value::from("deny"));
+    external.insert(memory_glob, Value::from("allow"));
+
     let mut permission = serde_json::Map::new();
     permission.insert("read".to_string(), Value::from("allow"));
     permission.insert("bash".to_string(), Value::from("allow"));
-    permission.insert("edit".to_string(), Value::Object(edit));
+    permission.insert("external_directory".to_string(), Value::Object(external));
     permission.insert("softfig-mcp*".to_string(), Value::from("allow"));
 
     let agent = serde_json::json!({
@@ -650,8 +733,17 @@ mod tests {
         use std::ffi::{OsStr, OsString};
         let loop_path = Path::new("/run/softfig/growlight/loop.json");
         let mcp_path = Path::new("/run/softfig/growlight/mcp.json");
+        let launch = InteractiveLaunch {
+            agent_name: "softfig-loop",
+            loop_settings: loop_path,
+            mcp_config: mcp_path,
+            // opencode-only fields — the claude arm must ignore them entirely.
+            opencode_config: Path::new("/run/softfig/growlight/opencode.json"),
+            cwd: Path::new("/run/softfig/growlight"),
+            boot_prompt: "begin",
+        };
         let cmd = Backend::Claude
-            .interactive_command("softfig-loop", loop_path, mcp_path)
+            .interactive_command(&launch)
             .expect("claude backend builds a command");
         assert_eq!(cmd.get_program(), OsStr::new("claude"));
         let args: Vec<OsString> = cmd.get_args().map(OsStr::to_owned).collect();
@@ -666,6 +758,14 @@ mod tests {
                 OsString::from(mcp_path),
             ]
         );
+        // Byte-identical means the claude arm touches neither cwd nor env — it
+        // inherits the caller's exactly as the original hardwired invocation did.
+        assert!(cmd.get_current_dir().is_none(), "claude must not set cwd");
+        assert!(
+            !cmd.get_envs()
+                .any(|(k, _)| k == OsStr::new("OPENCODE_CONFIG")),
+            "claude must not set OPENCODE_CONFIG"
+        );
     }
 
     #[test]
@@ -677,6 +777,7 @@ mod tests {
             Path::new("/g"),
             Path::new("/usr/bin/softfig-mcp"),
             "deepseek/deepseek-reasoner",
+            Path::new("/home/u/.claude/projects"),
         );
         // Must be valid JSON that opencode can load (real-config validation is the
         // slice-002 on-device check; here we assert structure).
@@ -700,11 +801,23 @@ mod tests {
             "step-0 boot must name the baton path: {prompt}"
         );
 
-        // preapprove: the garden edit/write deny (opencode folds Write into edit),
-        // general edits allowed, softfig-mcp verbs allowed.
-        assert_eq!(agent["permission"]["edit"]["/g/**"], "deny");
-        assert_eq!(agent["permission"]["edit"]["*"], "allow");
+        // preapprove: the garden is guarded by external_directory (below), NOT by
+        // an `edit` entry — an `edit` deny is a no-op for external paths, and a `*`
+        // default-deny would block the in-project baton rewrite. So there is no
+        // `edit` key at all; in-project baton edits keep opencode's default (allow).
+        assert!(agent["permission"]["edit"].is_null(), "no edit key (garden guarded via external_directory)");
+        assert!(agent["permission"]["write"].is_null(), "no separate write key");
         assert_eq!(agent["permission"]["softfig-mcp*"], "allow");
+        assert_eq!(agent["permission"]["read"], "allow");
+
+        // external_directory (the garden guard): the garden is DENIED outright (raw
+        // read/edit/write refused → garden reached only via softfig-mcp), and the
+        // claude-memory tree is allowed. Nothing else granted, so code repos +
+        // ~/.claude credentials stay gated. The baton is in-project (not listed).
+        let ext = &agent["permission"]["external_directory"];
+        assert_eq!(ext["/g/**"], "deny", "garden denied (MCP-only; no raw read/write)");
+        assert_eq!(ext["/home/u/.claude/projects/**"], "allow", "memory reachable + editable");
+        assert_eq!(ext.as_object().unwrap().len(), 2, "only the garden (deny) + memory (allow)");
 
         // attach_mcp: explicit project-scoped softfig-mcp block, binary resolved
         // like the claude mcp.json (cwd-independent).
@@ -714,13 +827,53 @@ mod tests {
     }
 
     #[test]
-    fn opencode_interactive_launch_errors_clearly_until_slice_003() {
-        let err = Backend::Opencode
-            .interactive_command("softfig-loop", Path::new("/l"), Path::new("/m"))
-            .expect_err("opencode interactive launch is not wired yet");
-        assert!(
-            err.to_string().contains("opencode"),
-            "error should name the unimplemented backend: {err}"
+    fn opencode_interactive_command_wires_agent_config_env_and_runtime_cwd() {
+        use std::ffi::OsStr;
+        let opencode_cfg = Path::new("/rt/opencode.json");
+        let runtime = Path::new("/rt");
+        let launch = InteractiveLaunch {
+            agent_name: "softfig-loop",
+            // claude-only fields — the opencode arm must ignore them entirely.
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            opencode_config: opencode_cfg,
+            cwd: runtime,
+            boot_prompt: "Begin your growlight iteration.",
+        };
+        let cmd = Backend::Opencode
+            .interactive_command(&launch)
+            .expect("opencode backend builds a command");
+
+        assert_eq!(cmd.get_program(), OsStr::new("opencode"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Selects the generated primary agent + kicks the first turn (the reseed
+        // roll, since opencode has no SessionStart hook).
+        assert_eq!(
+            args,
+            vec![
+                "--agent",
+                "softfig-loop",
+                "--prompt",
+                "Begin your growlight iteration."
+            ]
         );
+
+        // The generated config is handed over via OPENCODE_CONFIG (opencode's
+        // analog of claude's --settings), not a flag — and no --settings/
+        // --mcp-config leaks through from the ignored claude fields.
+        let opencode_env = cmd
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new("OPENCODE_CONFIG"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(opencode_env.as_deref(), Some("/rt/opencode.json"));
+        assert!(!args.iter().any(|a| a == "--settings" || a == "--mcp-config"));
+
+        // cwd = the runtime dir (baton in-project, garden external — see
+        // InteractiveLaunch::cwd), NOT the garden.
+        assert_eq!(cmd.get_current_dir(), Some(runtime));
     }
 }

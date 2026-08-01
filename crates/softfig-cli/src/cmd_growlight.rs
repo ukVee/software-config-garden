@@ -36,8 +36,9 @@ use softfig_growlightd_client::{decode_frame, Frame};
 
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
-    AgentBackend, Backend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, IterationOutcome,
-    IterationRequest, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, opencode_config,
+    AgentBackend, Backend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, InteractiveLaunch,
+    IterationOutcome, IterationRequest, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot,
+    opencode_config,
 };
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
@@ -53,6 +54,16 @@ const AGENT_NAME: &str = "softfig-loop";
 /// `deepseek/deepseek-reasoner` vs `deepseek/deepseek-v4-pro`) is a one-line
 /// change. Confirmed present on-box via `opencode models`.
 const DEFAULT_OPENCODE_MODEL: &str = "deepseek/deepseek-reasoner";
+
+/// The first-turn kick for an interactive **opencode** launch (`--prompt`).
+/// opencode has no SessionStart hook, so — unlike claude's TUI, where the
+/// injected protocol+baton sit as context and the human types the first turn —
+/// the opencode session needs a nudge to begin. Its agent prompt already carries
+/// the protocol + the step-0 "read your baton" bootstrap (slice 002), so this
+/// just says "start". Kept short + generic; the real reseed work is the agent
+/// prompt's step 0, not this line.
+const OPENCODE_KICK: &str = "Begin your growlight iteration: complete step 0 (read your baton) \
+    and follow the operating protocol in your instructions.";
 
 #[derive(Subcommand, Debug)]
 pub enum GrowlightCmd {
@@ -423,6 +434,7 @@ fn start(args: StartArgs) -> Result<()> {
             &garden_root,
             &softfig_mcp_path(),
             DEFAULT_OPENCODE_MODEL,
+            &claude_projects,
         ),
     )?;
     write_script(&inject_path, &inject_script(&protocol, &baton_path))?;
@@ -460,13 +472,18 @@ fn start(args: StartArgs) -> Result<()> {
                 loop_path.display(),
                 mcp_path.display()
             ),
-            // slice 002 generates the `softfig-loop` opencode config; the launch
-            // shape (`OPENCODE_CONFIG=… opencode --agent softfig-loop`) is wired
-            // in slice 003, so don't yet print a runnable command.
+            // The opencode config is handed over via `OPENCODE_CONFIG` (its
+            // analog of claude's `--settings`) and the launch runs from the
+            // runtime dir (baton in-project, garden external — see
+            // InteractiveLaunch::cwd). `growlight start --opencode` does the cd +
+            // kick for you; this hint is the copy-pasteable manual equivalent
+            // (minus the first-turn `--prompt`, which the human can type instead).
             Backend::Opencode => println!(
-                "\n(--no-launch) runtime ready. generated opencode config:\n  {}\n(the \
-                 opencode launch wiring lands in semi-auto-backend-seam slice 003.)",
-                opencode_path.display()
+                "\n(--no-launch) runtime ready. launch with:\n  cd {} && OPENCODE_CONFIG={} {} \
+                 --agent {AGENT_NAME}",
+                runtime.display(),
+                opencode_path.display(),
+                backend.agent_bin(),
             ),
         }
         return Ok(());
@@ -507,7 +524,17 @@ fn start(args: StartArgs) -> Result<()> {
         print_loop_summary(&summary, &usage_path, &log_path);
         return Ok(());
     }
-    launch_agent(backend, &loop_path, &mcp_path)
+    let launch = InteractiveLaunch {
+        agent_name: AGENT_NAME,
+        loop_settings: &loop_path,
+        mcp_config: &mcp_path,
+        opencode_config: &opencode_path,
+        // opencode roots at the runtime dir (baton in-project, garden external);
+        // see InteractiveLaunch::cwd. claude ignores it.
+        cwd: &runtime,
+        boot_prompt: OPENCODE_KICK,
+    };
+    launch_agent(backend, &launch)
 }
 
 // ---- headless orchestrator (full-auto, slices 001-002) -----------------
@@ -1050,13 +1077,17 @@ fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<Path
     }
 }
 
-fn launch_agent(backend: Backend, loop_path: &Path, mcp_path: &Path) -> Result<()> {
-    // The interactive argv is owned by the backend seam; for `claude` this is
-    // byte-identical to the original hardwired invocation. `opencode` errors
-    // here until slice 003 wires it.
-    let mut cmd = backend.interactive_command(AGENT_NAME, loop_path, mcp_path)?;
+fn launch_agent(backend: Backend, launch: &InteractiveLaunch) -> Result<()> {
+    // The interactive argv/env/cwd is owned by the backend seam; for `claude`
+    // this is byte-identical to the original hardwired invocation, and for
+    // `opencode` it wires `OPENCODE_CONFIG` + the garden cwd + the first-turn
+    // kick (slice 003).
+    let mut cmd = backend.interactive_command(launch)?;
     let bin = backend.agent_bin();
-    println!("\nlaunching {bin} --name {AGENT_NAME} …\n");
+    match backend {
+        Backend::Claude => println!("\nlaunching {bin} --name {AGENT_NAME} …\n"),
+        Backend::Opencode => println!("\nlaunching {bin} --agent {AGENT_NAME} …\n"),
+    }
     let status = cmd
         .status()
         .with_context(|| format!("failed to launch `{bin}` — is it on PATH?"))?;
