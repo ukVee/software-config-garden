@@ -89,6 +89,92 @@ impl Backend {
     }
 }
 
+/// Generate the opencode-native equivalent of claude's `loop.json` + `mcp.json`:
+/// an `opencode.json` (loaded via `OPENCODE_CONFIG=<path>` — opencode's analog of
+/// claude's `--settings`) defining a `softfig-loop` **agent**. This carries the
+/// three interactive legs of the seam for opencode (spec-agents §4.1 /
+/// decision-semi-auto-backend-seam's mapping table): `inject_baton`,
+/// `preapprove`, and `attach_mcp`. Pure (builds the string, never writes/spawns)
+/// so it's unit-testable like the claude generators. Slice 003 wires the launch
+/// that consumes it.
+///
+/// - **inject_baton (the reseed bootstrap).** opencode has no SessionStart hook,
+///   so the roll can't re-cat a baton the way claude's `/clear` does. Instead the
+///   agent's `prompt` = the garden `protocol.md` (pulled in by opencode's
+///   `{file:…}` reference, so the protocol text is *reused*, never duplicated) +
+///   a step-0 line naming the baton path. A fresh session (`/new` / relaunch)
+///   rebuilds the system prompt → reloads the protocol → step 0 re-reads the
+///   current baton. The protocol *is* the bootstrap.
+/// - **preapprove.** Translates claude's `loop.json` allow/deny. opencode has no
+///   separate `write` permission — `edit` gates file modification — so claude's
+///   dual `Edit`/`Write` garden deny collapses onto one path-scoped `edit` map:
+///   allow edits generally (the code repos), deny the garden subtree. That
+///   enforces the MCP-only garden convention structurally (last-matching rule
+///   wins, so the garden `**` deny beats the `*` allow). `softfig-mcp*` is
+///   allowed so the garden verbs don't prompt; `read`/`bash` mirror the claude
+///   allow-list.
+/// - **attach_mcp.** Emits an explicit project-scoped `mcp.softfig-mcp` block
+///   (mirroring why claude gets an explicit `--mcp-config`) so the garden verbs
+///   exist regardless of launch cwd, without depending on the user's global
+///   `~/.config/opencode` registration. The binary is resolved the same way as
+///   the claude `mcp.json` (`softfig_mcp_path` — the sibling of the running exe).
+/// - **model.** A DeepSeek id, held as a passed-in param (never inlined): until
+///   the slice-005 picker/`--model` supplies it, the caller passes a default.
+pub fn opencode_config(
+    agent_name: &str,
+    protocol: &Path,
+    baton: &Path,
+    garden_root: &Path,
+    mcp_bin: &Path,
+    model: &str,
+) -> String {
+    // The system prompt: the protocol by reference (opencode expands `{file:…}`
+    // at prompt-build time — verified to resolve an absolute path) + the step-0
+    // baton-boot line that makes every fresh session re-read the live baton.
+    let prompt = format!(
+        "{{file:{protocol}}}\n\n\
+         STEP 0 (every session, first): Read your baton at `{baton}` and follow the \
+         operating protocol above — the baton is your only carried state. opencode has \
+         no SessionStart hook, so a fresh session (`/new` or a relaunch) re-reads the \
+         baton here; that reread IS the roll.",
+        protocol = protocol.display(),
+        baton = baton.display(),
+    );
+
+    // `edit` folds claude's Edit+Write: allow generally, deny the garden subtree
+    // (last-match wins). softfig-mcp verbs pre-approved; read/bash mirror claude.
+    let mut edit = serde_json::Map::new();
+    edit.insert("*".to_string(), Value::from("allow"));
+    edit.insert(format!("{}/**", garden_root.display()), Value::from("deny"));
+    let mut permission = serde_json::Map::new();
+    permission.insert("read".to_string(), Value::from("allow"));
+    permission.insert("bash".to_string(), Value::from("allow"));
+    permission.insert("edit".to_string(), Value::Object(edit));
+    permission.insert("softfig-mcp*".to_string(), Value::from("allow"));
+
+    let agent = serde_json::json!({
+        "mode": "primary",
+        "model": model,
+        "prompt": prompt,
+        "permission": Value::Object(permission),
+    });
+    let mut agents = serde_json::Map::new();
+    agents.insert(agent_name.to_string(), agent);
+
+    let v = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            "softfig-mcp": {
+                "type": "local",
+                "command": [ mcp_bin.display().to_string() ],
+                "enabled": true,
+            }
+        },
+        "agent": Value::Object(agents),
+    });
+    format!("{}\n", serde_json::to_string_pretty(&v).unwrap())
+}
+
 /// What the driver hands a backend for one iteration: the generated loop
 /// settings (whose SessionStart hook injects protocol + baton — confirmed to
 /// fire under `-p`), the generated MCP config that *attaches* `softfig-mcp`
@@ -580,6 +666,51 @@ mod tests {
                 OsString::from(mcp_path),
             ]
         );
+    }
+
+    #[test]
+    fn opencode_config_wires_agent_garden_deny_mcp_and_model() {
+        let cfg = opencode_config(
+            "softfig-loop",
+            Path::new("/g/growlight/protocol.md"),
+            Path::new("/rt/baton.md"),
+            Path::new("/g"),
+            Path::new("/usr/bin/softfig-mcp"),
+            "deepseek/deepseek-reasoner",
+        );
+        // Must be valid JSON that opencode can load (real-config validation is the
+        // slice-002 on-device check; here we assert structure).
+        let v: Value = serde_json::from_str(&cfg).expect("generated opencode config is valid JSON");
+
+        // The agent: primary, DeepSeek model held as config (the passed-in param,
+        // never inlined), selectable as `softfig-loop`.
+        let agent = &v["agent"]["softfig-loop"];
+        assert_eq!(agent["mode"], "primary");
+        assert_eq!(agent["model"], "deepseek/deepseek-reasoner");
+
+        // inject_baton: protocol reused BY REFERENCE (no duplicated text) + a
+        // step-0 line naming the runtime baton path (the reseed bootstrap).
+        let prompt = agent["prompt"].as_str().expect("prompt is a string");
+        assert!(
+            prompt.contains("{file:/g/growlight/protocol.md}"),
+            "protocol must be pulled in by reference, not duplicated: {prompt}"
+        );
+        assert!(
+            prompt.contains("STEP 0") && prompt.contains("/rt/baton.md"),
+            "step-0 boot must name the baton path: {prompt}"
+        );
+
+        // preapprove: the garden edit/write deny (opencode folds Write into edit),
+        // general edits allowed, softfig-mcp verbs allowed.
+        assert_eq!(agent["permission"]["edit"]["/g/**"], "deny");
+        assert_eq!(agent["permission"]["edit"]["*"], "allow");
+        assert_eq!(agent["permission"]["softfig-mcp*"], "allow");
+
+        // attach_mcp: explicit project-scoped softfig-mcp block, binary resolved
+        // like the claude mcp.json (cwd-independent).
+        assert_eq!(v["mcp"]["softfig-mcp"]["type"], "local");
+        assert_eq!(v["mcp"]["softfig-mcp"]["command"][0], "/usr/bin/softfig-mcp");
+        assert_eq!(v["mcp"]["softfig-mcp"]["enabled"], true);
     }
 
     #[test]

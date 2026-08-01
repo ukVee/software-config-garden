@@ -37,7 +37,7 @@ use softfig_growlightd_client::{decode_frame, Frame};
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
     AgentBackend, Backend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, IterationOutcome,
-    IterationRequest, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot,
+    IterationRequest, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, opencode_config,
 };
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
@@ -45,6 +45,14 @@ use crate::growlight_backend::{
 /// generated isolated hooks so normal `claude` stays untouched.
 const AGENT_BIN: &str = "claude";
 const AGENT_NAME: &str = "softfig-loop";
+
+/// The opencode agent's default `model` until the slice-005 picker / `--model`
+/// supplies one. DeepSeek's reasoning model (decision-semi-auto-backend-seam
+/// "## Refinement 2026-07-31"). Held as config here — never inlined in the
+/// generator — so swapping the id (the human's open sub-question:
+/// `deepseek/deepseek-reasoner` vs `deepseek/deepseek-v4-pro`) is a one-line
+/// change. Confirmed present on-box via `opencode models`.
+const DEFAULT_OPENCODE_MODEL: &str = "deepseek/deepseek-reasoner";
 
 #[derive(Subcommand, Debug)]
 pub enum GrowlightCmd {
@@ -376,6 +384,7 @@ fn start(args: StartArgs) -> Result<()> {
 
     let loop_path = runtime.join("loop.json");
     let mcp_path = runtime.join("mcp.json");
+    let opencode_path = runtime.join("opencode.json");
     let inject_path = runtime.join("inject.sh");
     let statusline_path = runtime.join("statusline.sh");
     let baton_path = runtime.join("baton.md");
@@ -399,6 +408,23 @@ fn start(args: StartArgs) -> Result<()> {
     // project-scoped registration in ~/.claude.json only loads with cwd in the
     // garden). Without it every state-advancing iteration STUCKs (auto-run log).
     write_file(&mcp_path, &mcp_json(&softfig_mcp_path()))?;
+    // The opencode-native equivalent (`softfig-loop` agent = protocol-by-
+    // reference + step-0 baton boot; garden edit/write deny; explicit softfig-mcp
+    // block). Refreshed every launch like the claude files; consumed by the
+    // slice-003 launch via `OPENCODE_CONFIG`. Written on both backends (self-heal;
+    // it's inert for a claude run). The model is the slice-005 picker's job — for
+    // now it's `DEFAULT_OPENCODE_MODEL`.
+    write_file(
+        &opencode_path,
+        &opencode_config(
+            AGENT_NAME,
+            &protocol,
+            &baton_path,
+            &garden_root,
+            &softfig_mcp_path(),
+            DEFAULT_OPENCODE_MODEL,
+        ),
+    )?;
     write_script(&inject_path, &inject_script(&protocol, &baton_path))?;
     write_script(
         &statusline_path,
@@ -434,12 +460,13 @@ fn start(args: StartArgs) -> Result<()> {
                 loop_path.display(),
                 mcp_path.display()
             ),
-            // The opencode invocation shape + its generated config land in
-            // semi-auto-backend-seam slices 002/003; don't print a claude
-            // command the opencode backend can't run.
+            // slice 002 generates the `softfig-loop` opencode config; the launch
+            // shape (`OPENCODE_CONFIG=… opencode --agent softfig-loop`) is wired
+            // in slice 003, so don't yet print a runnable command.
             Backend::Opencode => println!(
-                "\n(--no-launch) runtime ready. the opencode backend's launch hint + generated \
-                 config land in the semi-auto-backend-seam milestone (slices 002/003)."
+                "\n(--no-launch) runtime ready. generated opencode config:\n  {}\n(the \
+                 opencode launch wiring lands in semi-auto-backend-seam slice 003.)",
+                opencode_path.display()
             ),
         }
         return Ok(());
@@ -1048,7 +1075,7 @@ fn jq_present() -> bool {
 
 fn print_setup(runtime: &Path, loop_path: &Path, baton_seeded: bool, questions_seeded: bool) {
     println!("runtime: {}", runtime.display());
-    println!("  refreshed  loop.json, inject.sh, statusline.sh");
+    println!("  refreshed  loop.json, mcp.json, opencode.json, inject.sh, statusline.sh");
     println!(
         "  baton.md   {}",
         if baton_seeded {
