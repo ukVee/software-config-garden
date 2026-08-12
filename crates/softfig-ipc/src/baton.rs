@@ -115,6 +115,13 @@ pub struct BatonView {
     pub status: Option<String>,
     /// The frontmatter `item:` field (the active backlog item), if present.
     pub item: Option<String>,
+    /// The frontmatter `slice:` field — which ordered slice of `item` is being
+    /// worked, for a milestone. `None` for a standalone task (and for a milestone
+    /// baton that names none). A reader resolving the ACTIVE slice's doc — the
+    /// launcher, reading the model that slice declares for itself — needs this
+    /// alongside `item`; it is parsed here rather than re-derived, like every
+    /// other frontmatter field.
+    pub slice: Option<String>,
     /// The frontmatter `iteration:` counter, if a valid integer.
     pub iteration: Option<u64>,
     /// The `# NEXT ACTION` section body, if present.
@@ -128,12 +135,13 @@ impl BatonView {
     }
 }
 
-/// Parse the runtime baton: `status` / `item` / `iteration` from the YAML
-/// frontmatter and the `# NEXT ACTION` section body. Pure; a reader re-reads this
-/// after every iteration to decide whether to keep driving.
+/// Parse the runtime baton: `status` / `item` / `slice` / `iteration` from the
+/// YAML frontmatter and the `# NEXT ACTION` section body. Pure; a reader re-reads
+/// this after every iteration to decide whether to keep driving.
 pub fn parse_baton(baton: &str) -> BatonView {
     let mut status = None;
     let mut item = None;
+    let mut slice = None;
     let mut iteration = None;
 
     let mut lines = baton.lines();
@@ -154,6 +162,11 @@ pub fn parse_baton(baton: &str) -> BatonView {
                 if !v.is_empty() && v != "null" {
                     item = Some(v.to_string());
                 }
+            } else if let Some(v) = line.strip_prefix("slice:") {
+                let v = v.trim();
+                if !v.is_empty() && v != "null" {
+                    slice = Some(v.to_string());
+                }
             } else if let Some(v) = line.strip_prefix("iteration:") {
                 iteration = v.trim().parse::<u64>().ok();
             }
@@ -163,6 +176,7 @@ pub fn parse_baton(baton: &str) -> BatonView {
     BatonView {
         status,
         item,
+        slice,
         iteration,
         next_action: extract_section(baton, "# NEXT ACTION"),
     }
@@ -220,6 +234,21 @@ mod tests {
         assert!(nullish.item.is_none());
         assert_eq!(nullish.status.as_deref(), Some("IN_PROGRESS"));
         assert_eq!(nullish.next_action.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_baton_reads_the_active_slice() {
+        // The launcher resolves the active slice's doc from `item` + `slice`, so
+        // the slice must survive the parse verbatim (padded or not).
+        let v = parse_baton("---\nstatus: IN_PROGRESS\nitem: astro-view\nslice: 006\n---\n");
+        assert_eq!(v.item.as_deref(), Some("astro-view"));
+        assert_eq!(v.slice.as_deref(), Some("006"));
+        assert_eq!(parse_baton("---\nslice: 6\n---\n").slice.as_deref(), Some("6"));
+
+        // A task baton (or a milestone that hasn't named one) carries no slice —
+        // `null` and absent both read as None, never the literal string.
+        assert!(parse_baton("---\nitem: 047\nslice: null\n---\n").slice.is_none());
+        assert!(parse_baton("---\nitem: 047\n---\n").slice.is_none());
     }
 
     #[test]
