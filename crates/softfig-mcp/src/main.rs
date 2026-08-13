@@ -20,8 +20,9 @@ use softfig_ipc::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
-        LogDecisionArgs, LogIncidentArgs, PostMessageArgs, ReadInboxArgs, RefreshSnapshotArgs,
-        ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
+        LogDecisionArgs, LogIncidentArgs, PostMessageArgs, ReadInboxArgs, ReadVersionsArgs,
+        RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
+        SetItemStatusArgs, SetReviewedArgs,
     },
     Request, Response,
 };
@@ -556,6 +557,24 @@ fn tool_defs() -> Vec<Value> {
                 },
             },
         }),
+        json!({
+            "name": "read_versions",
+            "description": "A garden file's current CAS version tokens, WITHOUT its content — a \
+                            coordination primitive, not a content read (content reads stay native). \
+                            Returns the whole-file version plus per-section versions computed over \
+                            the daemon-redacted content, so you can seed an `expected_version` guard \
+                            on the very first edit in a session (edit replies only hand back the \
+                            NEW version, so without this verb the first version can only be learned \
+                            by making an edit). Also flags whole-file-sealed paths, which the write \
+                            verbs refuse. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative file to project versions for" },
+                },
+            },
+        }),
     ]
 }
 
@@ -652,6 +671,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: FileProvenanceArgs = serde_json::from_value(args)?;
             (op::FILE_PROVENANCE, serde_json::to_value(a)?)
         }
+        "read_versions" => {
+            let a: ReadVersionsArgs = serde_json::from_value(args)?;
+            (op::READ_VERSIONS, serde_json::to_value(a)?)
+        }
         "request_lease" => {
             let a: RequestLeaseArgs = serde_json::from_value(args)?;
             (op::REQUEST_LEASE, serde_json::to_value(a)?)
@@ -712,6 +735,29 @@ fn summarize(name: &str, data: &Value) -> String {
             }
             _ => format!("file_provenance {path}: no recorded edits"),
         };
+    }
+    if name == "read_versions" {
+        // A coordination primitive: render the version tokens (the whole point),
+        // not content. Callers feed these straight into `expected_version` guards.
+        let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let version = data.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        let sealed = data.get("sealed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let flag = if sealed { " (sealed)" } else { "" };
+        let sections = data.get("sections").and_then(|v| v.as_array());
+        let sec_lines: Vec<String> = sections
+            .map(|ss| {
+                ss.iter()
+                    .map(|s| {
+                        let g = |k: &str| s.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+                        format!("  {}: {}", g("heading"), g("version"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if sec_lines.is_empty() {
+            return format!("read_versions {path}: {version}{flag}");
+        }
+        return format!("read_versions {path}: {version}{flag}\n{}", sec_lines.join("\n"));
     }
     if name == "request_lease" || name == "release_lease" {
         let g = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or("?");
@@ -782,9 +828,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_four() {
+    fn tools_list_has_twenty_five() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 24);
+        assert_eq!(defs.len(), 25);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -809,6 +855,7 @@ mod tests {
             "post_message",
             "read_inbox",
             "file_provenance",
+            "read_versions",
             "request_lease",
             "release_lease",
         ] {
@@ -820,7 +867,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 25);
     }
 
     #[test]
@@ -920,6 +967,11 @@ mod tests {
                 op::FILE_PROVENANCE,
             ),
             (
+                "read_versions",
+                json!({ "path": "meta/conventions.md" }),
+                op::READ_VERSIONS,
+            ),
+            (
                 "request_lease",
                 json!({ "agent": "roudy", "key": "dock.rs §Layout" }),
                 op::REQUEST_LEASE,
@@ -982,6 +1034,23 @@ mod tests {
         assert!(prov.contains("1 edit(s)"));
         assert!(prov.contains("abcdef12 [section_edited] tablet"));
         assert!(summarize("file_provenance", &json!({ "path": "p", "edits": [] })).contains("no recorded edits"));
+        // read_versions renders the version tokens (the whole point) — and must
+        // NOT fall through to the generic "wrote …; commit ?" shape.
+        let rv = summarize(
+            "read_versions",
+            &json!({ "path": "meta/x.md", "version": "abc123", "sections": [
+                { "heading": "Child", "version": "def456" },
+                { "heading": "Cross-refs", "version": "789aaa" },
+            ], "sealed": false }),
+        );
+        assert!(rv.contains("read_versions meta/x.md: abc123"));
+        assert!(rv.contains("  Child: def456"));
+        assert!(rv.contains("  Cross-refs: 789aaa"));
+        assert!(!rv.contains("wrote"), "read_versions must not use the write summary: {rv}");
+        assert_eq!(
+            summarize("read_versions", &json!({ "path": "s", "version": "v", "sections": [], "sealed": true })),
+            "read_versions s: v (sealed)"
+        );
         // lease replies render key + state + holder/position/reason (no commit hash).
         assert_eq!(
             summarize("request_lease", &json!({ "key": "dock.rs §Layout", "state": "granted", "holder": "a" })),

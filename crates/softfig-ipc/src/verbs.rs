@@ -85,6 +85,12 @@ pub mod op {
     /// (author_device, timestamp, intent) by walking the chain and diffing the
     /// path's blob across each commit. Read-only; never touches the mount.
     pub const FILE_PROVENANCE: &str = "file_provenance";
+    /// mcp-surgical-writes slice 001: the CAS-seeding read — the whole-file
+    /// content version + per-section versions for a garden file, computed over
+    /// the daemon-redacted content (the same projection `read_file` returns and
+    /// the write verbs' `expected_version` checks against). Pure projection;
+    /// read-only, requires Unlocked, never commits.
+    pub const READ_VERSIONS: &str = "read_versions";
     /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
     /// parsed daemon-side by the authoritative queue-table parser that owns the
     /// `\|` cell escape — so a frontend renders rows directly instead of
@@ -920,6 +926,34 @@ pub struct SectionVersion {
     pub heading: String,
     /// The section's content version (heading line + body).
     pub version: String,
+}
+
+/// `read_versions({path}) -> {path, version, sections, sealed}` (mcp-surgical-
+/// writes slice 001). The CAS-seeding read: a file's current version tokens,
+/// without its content — how a caller learns the FIRST version in a session
+/// (before any edit has handed one back), so the write verbs' `expected_version`
+/// guards are usable from step one rather than only once a chain is started.
+/// Versions are computed over the daemon-redacted content the write verbs would
+/// check against. Read-only; no commit, no intent, no thrash registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadVersionsArgs {
+    /// Garden-relative path to the file whose versions to project.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadVersionsReply {
+    /// The projected garden-relative path.
+    pub path: String,
+    /// Whole-file content version of the (redacted) content — pass to
+    /// `replace_file`'s `expected_version`.
+    pub version: String,
+    /// Per-section content versions for every addressable ATX heading, in
+    /// document order. Empty for sealed / non-markdown / sectionless content.
+    pub sections: Vec<SectionVersion>,
+    /// True when the whole file is sealed (Layer B) — write verbs will refuse
+    /// it, and `version` is the version of the `[sealed:<path>]` placeholder.
+    pub sealed: bool,
 }
 
 /// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default
