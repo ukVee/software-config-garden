@@ -91,6 +91,13 @@ pub mod op {
     /// the write verbs' `expected_version` checks against). Pure projection;
     /// read-only, requires Unlocked, never commits.
     pub const READ_VERSIONS: &str = "read_versions";
+    /// mcp-surgical-writes slice 002: replace one exact occurrence of `old`
+    /// with `new` in a garden file — the keystone surgical-mutation verb. The
+    /// match must be unique within the whole file or within the optional
+    /// `anchor`'s line range; zero matches → `TextNotFound`, several →
+    /// `TextAmbiguous`. Whole-file CAS via `expected_version`; commit
+    /// `text_patched`. Refused on vault-protected targets.
+    pub const PATCH_FILE: &str = "patch_file";
     /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
     /// parsed daemon-side by the authoritative queue-table parser that owns the
     /// `\|` cell escape — so a frontend renders rows directly instead of
@@ -954,6 +961,53 @@ pub struct ReadVersionsReply {
     /// True when the whole file is sealed (Layer B) — write verbs will refuse
     /// it, and `version` is the version of the `[sealed:<path>]` placeholder.
     pub sealed: bool,
+}
+
+/// `patch_file({path, old, new, expected_version?, anchor?, editor?}) ->
+/// {path, hash, version}` (mcp-surgical-writes slice 002). Surgical old→new
+/// exact string replacement — the keystone of the middle write band between
+/// whole-file `replace_file` and the section verbs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchFileArgs {
+    /// Garden-relative path of the file to patch.
+    pub path: String,
+    /// The exact text to replace (may be multi-line). Must occur exactly once
+    /// within the search window (the whole file, or the `anchor`'s line
+    /// range); zero → `TextNotFound`, several → `TextAmbiguous`.
+    pub old: String,
+    /// The replacement text. May be empty — that's the sanctioned
+    /// "delete this text" path (`remove_section`/`unlink` own whole-section /
+    /// whole-file deletion).
+    pub new: String,
+    /// Phase 3 CAS (optional): the whole-file content version the caller
+    /// based this patch on (from `read_versions` / a prior reply). When set,
+    /// the daemon applies only if the file still carries it, else `Conflict`.
+    /// Whole-file (not section-level) because a patch may span any byte range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// Optional disambiguator: a string that must occur exactly once in the
+    /// file; its line range becomes the search window for `old`. Zero matches
+    /// → `TextNotFound`, several → `TextAmbiguous` — an agent's retry
+    /// strategy differs (pick a better needle vs. add/narrow the anchor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// fed to the daemon's ping-pong detector (spec §4d). Absent → `"anon"`,
+    /// so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchFileReply {
+    /// Garden-relative path the daemon patched.
+    pub path: String,
+    pub hash: String,
+    /// Phase 3 CAS: the whole-file content version after the patch — feed it
+    /// back as the next `expected_version` to chain patches without
+    /// re-reading.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default

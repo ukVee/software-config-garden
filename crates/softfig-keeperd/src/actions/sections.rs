@@ -90,7 +90,7 @@ pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     };
     let reply =
         write_and_commit(daemon, &mut inner, &rel, new, "section_edited", &args.heading, version)?;
-    note_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
+    note_section_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
     Ok(reply)
 }
 
@@ -123,7 +123,7 @@ pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
         &args.heading,
         version,
     )?;
-    note_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
+    note_section_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
     Ok(reply)
 }
 
@@ -182,12 +182,13 @@ fn cas_check_section(
 
 // ---- handler helpers ---------------------------------------------------
 
-fn resolve(garden_root: &Path, path: &str) -> Result<String, (ErrorKind, String)> {
+/// Validate `path` against the garden root and return its repo-relative form —
+/// the shared resolve for every doc-edit verb (`patch_file` included).
+pub(crate) fn resolve(garden_root: &Path, path: &str) -> Result<String, (ErrorKind, String)> {
     let abs = validate_repo_path(garden_root, path).map_err(|m| (ErrorKind::BadArgs, m))?;
     path_to_repo_rel_string(garden_root, &abs)
         .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))
 }
-
 /// Read `rel`'s working-tree bytes as plaintext **iff** a plaintext rewrite
 /// is safe — the file isn't whole-file-sealed and carries no inline
 /// `<vault>` region (malformed tags count as unsafe). Returns `None` for a
@@ -209,10 +210,11 @@ pub(crate) fn read_if_unprotected(wt: &WorkTree, inner: &DaemonInner, rel: &str)
 }
 
 /// Read the working-tree bytes of `rel` as plaintext, refusing any vault
-/// target so a section rewrite can never clobber ciphertext (see module
+/// target so a plaintext rewrite can never clobber ciphertext (see module
 /// docs). Returns the UTF-8 content on success. Reads through the
 /// [`WorkTree`], so a FUSE-mode daemon never `std::fs`-reads the mount.
-fn load_unprotected(
+/// Shared with the surgical write verbs (`patch_file`, `remove_section`).
+pub(crate) fn load_unprotected(
     wt: &WorkTree,
     inner: &DaemonInner,
     rel: &str,
@@ -278,7 +280,7 @@ fn write_and_commit(
     .unwrap())
 }
 
-/// After a section edit commits, feed `(target, editor)` into the daemon's
+/// After a doc edit commits, feed `(target, editor)` into the daemon's
 /// ping-pong detector (spec §4d). On a trip — an A↔B alternation on the same
 /// `(path, heading)` within the window — post one `coord-request` nudge to the
 /// coordination bus ("settle `<target>`") from the system sender `growlightd`
@@ -292,17 +294,19 @@ fn write_and_commit(
 /// caller still holds `inner`, so the nudge commit is serialized after the edit
 /// on the same lock. `editor` defaults to `"anon"` when absent — a lone editor
 /// can't alternate with itself, so the single-agent loop never trips.
-fn note_edit_for_thrash(
+/// `heading` is `None` for whole-file targets (`patch_file`); section edits
+/// pass their heading text so `(path, heading)` and `(path, None)` are
+/// distinct contention targets.
+pub(crate) fn note_edit_for_thrash(
     daemon: &Daemon,
     inner: &mut DaemonInner,
     rel: &str,
-    heading_arg: &str,
+    heading: Option<&str>,
     editor: Option<&str>,
 ) {
-    let (_level, heading_text) = edit::parse_heading_arg(heading_arg);
     let editor = editor.unwrap_or("anon");
     let now = conventions::now_unix_secs();
-    let Some(trip) = inner.thrash.record(rel, Some(&heading_text), editor, now) else {
+    let Some(trip) = inner.thrash.record(rel, heading, editor, now) else {
         return;
     };
 
@@ -333,6 +337,19 @@ fn note_edit_for_thrash(
     if let Ok(intent) = Intent::new("chat_message_posted", payload) {
         let _ = commit_now(inner, intent);
     }
+}
+
+/// Section-verb wrapper over [`note_edit_for_thrash`]: parse the caller's
+/// heading argument into its address text and register `(rel, heading)`.
+fn note_section_edit_for_thrash(
+    daemon: &Daemon,
+    inner: &mut DaemonInner,
+    rel: &str,
+    heading_arg: &str,
+    editor: Option<&str>,
+) {
+    let (_level, heading_text) = edit::parse_heading_arg(heading_arg);
+    note_edit_for_thrash(daemon, inner, rel, Some(&heading_text), editor);
 }
 
 fn section_err(rel: &str, heading: &str, e: edit::SectionError) -> (ErrorKind, String) {

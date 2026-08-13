@@ -266,6 +266,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::LIST_TREE => crate::reads::list_tree(daemon, req.args),
         op::READ_FILE => crate::reads::read_file(daemon, req.args),
         op::READ_VERSIONS => crate::reads::read_versions(daemon, req.args),
+        op::PATCH_FILE => crate::actions::patch_file(daemon, req.args),
         op::FILE_PROVENANCE => crate::reads::file_provenance(daemon, req.args),
         op::GROWLIGHT_QUEUE => crate::reads::growlight_queue(daemon, req.args),
         op::PAIR_BEGIN => handlers::pair_begin(daemon, req.args),

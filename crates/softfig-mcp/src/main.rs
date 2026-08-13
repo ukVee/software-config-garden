@@ -20,7 +20,8 @@ use softfig_ipc::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
-        LogDecisionArgs, LogIncidentArgs, PostMessageArgs, ReadInboxArgs, ReadVersionsArgs,
+        LogDecisionArgs, LogIncidentArgs, PatchFileArgs, PostMessageArgs, ReadInboxArgs,
+        ReadVersionsArgs,
         RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
         SetItemStatusArgs, SetReviewedArgs,
     },
@@ -575,6 +576,30 @@ fn tool_defs() -> Vec<Value> {
                 },
             },
         }),
+        json!({
+            "name": "patch_file",
+            "description": "Surgical old→new exact string replacement in a garden file — the \
+                            opencode-Edit-tool model, keeperd-mediated. `old` must occur exactly \
+                            once within the search window (the whole file, or the `anchor`'s line \
+                            range when given): zero matches → TextNotFound, several → TextAmbiguous \
+                            (narrow it with `anchor`). Exact match only, no whitespace \
+                            normalization. `new` may be empty to delete the matched text. \
+                            Whole-file CAS via `expected_version` (seed it from read_versions / a \
+                            prior reply). Refused on vault-sealed targets. Whole-section deletion \
+                            is remove_section's job; whole-file deletion is unlink's.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "old", "new"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative file to patch" },
+                    "old": { "type": "string", "description": "exact text to replace (may be multi-line); must occur exactly once within the search window" },
+                    "new": { "type": "string", "description": "replacement text; may be empty to delete the matched text" },
+                    "expected_version": { "type": "string", "description": "optional whole-file CAS guard: the version you read (from read_versions / a prior reply). Applies only if the file is unchanged, else Conflict. Omit for last-writer-wins." },
+                    "anchor": { "type": "string", "description": "optional disambiguator: a string occurring exactly once in the file; its line range becomes the search window for `old`" },
+                    "editor": { "type": "string", "description": "optional per-agent identity for the contention detector (multi-agent fleets); see edit_section. Omit in single-agent mode." },
+                },
+            },
+        }),
     ]
 }
 
@@ -674,6 +699,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
         "read_versions" => {
             let a: ReadVersionsArgs = serde_json::from_value(args)?;
             (op::READ_VERSIONS, serde_json::to_value(a)?)
+        }
+        "patch_file" => {
+            let a: PatchFileArgs = serde_json::from_value(args)?;
+            (op::PATCH_FILE, serde_json::to_value(a)?)
         }
         "request_lease" => {
             let a: RequestLeaseArgs = serde_json::from_value(args)?;
@@ -828,9 +857,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_five() {
+    fn tools_list_has_twenty_six() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 25);
+        assert_eq!(defs.len(), 26);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -856,6 +885,7 @@ mod tests {
             "read_inbox",
             "file_provenance",
             "read_versions",
+            "patch_file",
             "request_lease",
             "release_lease",
         ] {
@@ -867,7 +897,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 26);
     }
 
     #[test]
@@ -972,6 +1002,11 @@ mod tests {
                 op::READ_VERSIONS,
             ),
             (
+                "patch_file",
+                json!({ "path": "doc.md", "old": "was", "new": "now", "anchor": "## S", "expected_version": "abc", "editor": "a" }),
+                op::PATCH_FILE,
+            ),
+            (
                 "request_lease",
                 json!({ "agent": "roudy", "key": "dock.rs §Layout" }),
                 op::REQUEST_LEASE,
@@ -1024,6 +1059,9 @@ mod tests {
         // CAS verbs surface the post-edit version alongside the commit.
         assert!(summarize("edit_section", &json!({ "path": "p", "hash": "h", "version": "deadbeef" }))
             .contains("version deadbeef"));
+        assert!(summarize("patch_file", &json!({ "path": "p", "hash": "h", "version": "cafe" }))
+            .contains("wrote p") && summarize("patch_file", &json!({ "path": "p", "hash": "h", "version": "cafe" }))
+            .contains("version cafe"));
         // file_provenance renders its edit list (the MCP forwards only text).
         let prov = summarize(
             "file_provenance",

@@ -1,6 +1,7 @@
 //! mcp-surgical-writes integration: the surgical write-surface verbs
 //! (`read_versions`, `patch_file`, `remove_section`, `unlink`, `batch`) —
-//! slice 001 first: the CAS-seeding read verb.
+//! slice 001 (`read_versions`, the CAS-seeding read) and slice 002
+//! (`patch_file`, the keystone surgical string replacement).
 //!
 //! Same harness posture as `m3b_reads.rs`: M1c-compat gardens (no FUSE), files
 //! reach the committed tip via `replace_file` (the same `BlobEncryptor` hook
@@ -12,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use softfig_ipc::verbs::{op, ReadFileReply, ReadVersionsReply};
+use softfig_ipc::verbs::{op, ChatMessage, PatchFileReply, ReadFileReply, ReadVersionsReply, TailBusReply};
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
 use softfig_vault::Vault;
@@ -188,5 +189,280 @@ fn read_versions_refuses_when_locked() {
     assert_eq!(
         err_kind(fx.call(op::READ_VERSIONS, serde_json::json!({ "path": "anything.md" }))),
         ErrorKind::VaultLocked
+    );
+}
+
+// ---- patch_file (slice 002) --------------------------------------------
+
+fn patch(
+    fx: &Fixture,
+    path: &str,
+    old: &str,
+    new: &str,
+    extra: serde_json::Value,
+) -> Response {
+    let mut args = serde_json::json!({ "path": path, "old": old, "new": new });
+    if let serde_json::Value::Object(map) = &extra {
+        for (k, v) in map {
+            args[k] = v.clone();
+        }
+    }
+    fx.call(op::PATCH_FILE, args)
+}
+
+#[test]
+fn patch_replaces_a_unique_occurrence_and_replies_the_new_version() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "# T\n\nold line\n\nkeep\n");
+
+    let reply: PatchFileReply = serde_json::from_value(ok_data(patch(
+        &fx,
+        "doc.md",
+        "old line",
+        "new line",
+        serde_json::json!({}),
+    )))
+    .unwrap();
+    assert_eq!(reply.path, "doc.md");
+    assert!(!reply.hash.is_empty());
+
+    let r = read(&fx, "doc.md");
+    assert_eq!(r.content, "# T\n\nnew line\n\nkeep\n");
+    // The reply's version is the post-patch whole-file version — feed it back
+    // as the next `expected_version`.
+    assert_eq!(reply.version, versions(&fx, "doc.md").version);
+    assert_eq!(reply.version, r.version);
+}
+
+#[test]
+fn patch_replaces_a_multi_line_occurrence() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "start\nfoo\nbar\nend\n");
+
+    assert!(matches!(
+        patch(&fx, "doc.md", "foo\nbar", "replaced", serde_json::json!({})),
+        Response::Ok { .. }
+    ));
+    assert_eq!(read(&fx, "doc.md").content, "start\nreplaced\nend\n");
+}
+
+#[test]
+fn patch_ambiguous_and_not_found_are_machine_distinct() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "dup dup\n");
+
+    let resp = patch(&fx, "doc.md", "dup", "x", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::TextAmbiguous);
+
+    let resp = patch(&fx, "doc.md", "absent", "x", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::TextNotFound);
+}
+
+#[test]
+fn patch_anchor_narrows_the_search_window() {
+    let fx = Fixture::start(true);
+    fx.write_file(
+        "doc.md",
+        "## A\n\nvalue: one\n\n## B\n\nvalue: one\n\n## C\n\nvalue: one\n",
+    );
+
+    // Without the anchor: three occurrences → ambiguous.
+    let resp = patch(&fx, "doc.md", "value: one", "value: two", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::TextAmbiguous);
+
+    // The anchor's LINE RANGE is the window (spec-literal): a same-line unique
+    // marker disambiguates the needle, and a multi-line anchor can span the
+    // target line to cover it.
+    fx.write_file("doc2.md", "port = 8080 # staging\nport = 8080 # prod\n");
+    let resp = patch(
+        &fx,
+        "doc2.md",
+        "port = 8080",
+        "port = 9090",
+        serde_json::json!({ "anchor": "# prod" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "anchored patch: {resp:?}");
+    assert_eq!(
+        read(&fx, "doc2.md").content,
+        "port = 8080 # staging\nport = 9090 # prod\n"
+    );
+
+    // A multi-line anchor spanning the target line narrows to its own range.
+    let resp = patch(
+        &fx,
+        "doc.md",
+        "value: one",
+        "value: two",
+        serde_json::json!({ "anchor": "## B\n\nvalue: one" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "spanning anchor: {resp:?}");
+    assert_eq!(
+        read(&fx, "doc.md").content,
+        "## A\n\nvalue: one\n\n## B\n\nvalue: two\n\n## C\n\nvalue: one\n"
+    );
+
+    // A missing / ambiguous anchor surfaces the same machine kinds.
+    let resp = patch(
+        &fx,
+        "doc.md",
+        "value: one",
+        "x",
+        serde_json::json!({ "anchor": "absent" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::TextNotFound);
+    let resp = patch(
+        &fx,
+        "doc.md",
+        "value: one",
+        "x",
+        serde_json::json!({ "anchor": "value" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::TextAmbiguous);
+}
+
+#[test]
+fn patch_empty_new_deletes_the_matched_text() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "keep\nDELETE ME\nkeep\n");
+
+    assert!(matches!(
+        patch(&fx, "doc.md", "DELETE ME\n", "", serde_json::json!({})),
+        Response::Ok { .. }
+    ));
+    assert_eq!(read(&fx, "doc.md").content, "keep\nkeep\n");
+}
+
+#[test]
+fn patch_cas_guard_conflicts_on_stale_version() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "v0\n");
+
+    let v0 = versions(&fx, "doc.md").version;
+    // Stale guard: the pinned version no longer matches the current file.
+    fx.write_file("doc.md", "v1\n");
+    let resp = patch(
+        &fx,
+        "doc.md",
+        "v1",
+        "v2",
+        serde_json::json!({ "expected_version": v0 }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::Conflict);
+
+    // Current guard: applies cleanly and hands back the new version.
+    let v1 = versions(&fx, "doc.md").version;
+    let reply: PatchFileReply = serde_json::from_value(ok_data(patch(
+        &fx,
+        "doc.md",
+        "v1",
+        "v2",
+        serde_json::json!({ "expected_version": v1 }),
+    )))
+    .unwrap();
+    assert_eq!(read(&fx, "doc.md").content, "v2\n");
+    assert_eq!(reply.version, versions(&fx, "doc.md").version);
+}
+
+#[test]
+fn patch_refuses_vault_sealed_targets() {
+    let fx = Fixture::start(true);
+    let resp = fx.call(op::VAULT_SEAL, serde_json::json!({ "pattern": "secrets/**" }));
+    assert!(matches!(resp, Response::Ok { .. }), "seal: {resp:?}");
+    fx.write_file("secrets/key.txt", "TOPSECRET");
+
+    let resp = patch(&fx, "secrets/key.txt", "TOPSECRET", "x", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::VaultProtected);
+}
+
+#[test]
+fn patch_rejects_bad_args() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "x\n");
+    // `old` must be non-empty; a provided `anchor` must be non-empty too.
+    assert_eq!(
+        err_kind(patch(&fx, "doc.md", "", "y", serde_json::json!({}))),
+        ErrorKind::BadArgs
+    );
+    assert_eq!(
+        err_kind(patch(&fx, "doc.md", "x", "y", serde_json::json!({ "anchor": "" }))),
+        ErrorKind::BadArgs
+    );
+    assert_eq!(
+        err_kind(patch(&fx, "../outside.md", "x", "y", serde_json::json!({}))),
+        ErrorKind::BadArgs
+    );
+}
+
+#[test]
+fn patch_refuses_when_locked() {
+    let fx = Fixture::start(false); // do NOT unlock
+    assert_eq!(
+        err_kind(patch(&fx, "doc.md", "x", "y", serde_json::json!({}))),
+        ErrorKind::VaultLocked
+    );
+}
+
+/// The patch path feeds the §4d ping-pong detector like the section verbs: an
+/// A↔B alternation on the same whole-file target lands one `coord-request`
+/// nudge naming the path (no heading), committed to the bus.
+#[test]
+fn patch_ping_pong_nudges_the_bus_once() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "v0\n");
+
+    for (i, editor) in ["agent-a", "agent-b", "agent-a", "agent-b"].iter().enumerate() {
+        let old = format!("v{i}");
+        let new = format!("v{}", i + 1);
+        let resp = patch(
+            &fx,
+            "doc.md",
+            &old,
+            &new,
+            serde_json::json!({ "editor": editor }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "patch {i} by {editor}: {resp:?}");
+    }
+
+    let reply: TailBusReply = serde_json::from_value(ok_data(fx.call(
+        op::TAIL_BUS,
+        serde_json::json!({ "since": 0 }),
+    )))
+    .unwrap();
+    let nudges: Vec<ChatMessage> = reply
+        .messages
+        .into_iter()
+        .filter(|m| m.from == "growlightd")
+        .collect();
+    assert_eq!(nudges.len(), 1, "exactly one nudge: {nudges:?}");
+    assert_eq!(nudges[0].kind, "coord-request");
+    assert!(nudges[0].body.contains("doc.md"), "names the target: {}", nudges[0].body);
+    assert!(
+        !nudges[0].body.contains('§'),
+        "a whole-file patch has no heading address: {}",
+        nudges[0].body
+    );
+
+    // A single editor (the single-agent loop) never trips.
+    let fx2 = Fixture::start(true);
+    fx2.write_file("doc.md", "s0\n");
+    for i in 0..6 {
+        let resp = patch(
+            &fx2,
+            "doc.md",
+            &format!("s{i}"),
+            &format!("s{}", i + 1),
+            serde_json::json!({ "editor": "agent-a" }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "solo patch {i}: {resp:?}");
+    }
+    let reply: TailBusReply = serde_json::from_value(ok_data(fx2.call(
+        op::TAIL_BUS,
+        serde_json::json!({ "since": 0 }),
+    )))
+    .unwrap();
+    assert!(
+        !reply.messages.iter().any(|m| m.from == "growlightd"),
+        "single editor never thrashes: {:?}",
+        reply.messages
     );
 }

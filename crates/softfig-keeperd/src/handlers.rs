@@ -565,6 +565,29 @@ pub fn fsck(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
     Ok(serde_json::to_value(reply).unwrap())
 }
 
+/// Phase 3 whole-file CAS guard shared by the whole-file write verbs
+/// (`replace_file`, `patch_file`): when the caller pinned an
+/// `expected_version`, the file must still exist with that whole-file content
+/// version (hashed over the working-tree bytes — the same bytes the edit path
+/// rewrites), else `Conflict` (stale — the caller re-reads + reapplies). No
+/// lock is held at any point; a crashed caller strands nothing.
+pub(crate) fn cas_check_whole_file(
+    wt: &crate::actions::WorkTree,
+    rel: &str,
+    expected: &Option<String>,
+) -> Result<(), (ErrorKind, String)> {
+    if let Some(want) = expected {
+        let current = wt.read(rel).map(|b| softfig_store::Hash::of(&b).to_hex());
+        if current.as_deref() != Some(want.as_str()) {
+            return Err((
+                ErrorKind::Conflict,
+                format!("stale: {rel} changed since version {want} — re-read and retry"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Break-glass verbatim file write — the narrowed/renamed
 /// `propose_doc_update`. Writes one file with no convention stamping and
 /// commits `memory_edit`. Callers should prefer the structural verbs.
@@ -585,18 +608,8 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // the watcher event + writes. Scoped so its borrow ends before the commit.
     {
         let wt = crate::actions::WorkTree::new(daemon, &inner);
-        // Phase 3 CAS: when the caller pinned an `expected_version`, the file
-        // must still exist with that whole-file version, else stale-reject.
-        // The read rides the worktree (no mount I/O under `inner`).
-        if let Some(want) = &args.expected_version {
-            let current = wt.read(&rel).map(|b| softfig_store::Hash::of(&b).to_hex());
-            if current.as_deref() != Some(want.as_str()) {
-                return Err((
-                    ErrorKind::Conflict,
-                    format!("stale: {rel} changed since version {want} — re-read and retry"),
-                ));
-            }
-        }
+        // Phase 3 CAS: the read rides the worktree (no mount I/O under `inner`).
+        cas_check_whole_file(&wt, &rel, &args.expected_version)?;
         wt.write(&rel, args.content.as_bytes())?;
     }
 
