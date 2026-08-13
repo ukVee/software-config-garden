@@ -98,6 +98,14 @@ pub mod op {
     /// `TextAmbiguous`. Whole-file CAS via `expected_version`; commit
     /// `text_patched`. Refused on vault-protected targets.
     pub const PATCH_FILE: &str = "patch_file";
+    /// mcp-surgical-writes slice 003: delete one uniquely-addressed section
+    /// (heading line + body) from a garden file — the delete counterpart to
+    /// `add_section` / `edit_section`. Same heading addressing (unique match
+    /// required); section-level CAS via `expected_version`; refused on
+    /// vault-protected targets, on the last remaining heading (use `unlink`),
+    /// and on ranges overlapping a managed `<!-- softfig:index -->` region.
+    /// Commit `section_removed`.
+    pub const REMOVE_SECTION: &str = "remove_section";
     /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
     /// parsed daemon-side by the authoritative queue-table parser that owns the
     /// `\|` cell escape — so a frontend renders rows directly instead of
@@ -1008,6 +1016,36 @@ pub struct PatchFileReply {
     /// re-reading.
     #[serde(default)]
     pub version: String,
+}
+
+/// `remove_section({path, heading, expected_version?, editor?}) ->
+/// {path, hash, version}` (mcp-surgical-writes slice 003). Heading-addressed
+/// section deletion — the delete counterpart to `add_section`/`edit_section`.
+/// The caller emits no content: the daemon owns the deletion window (the
+/// heading line + its body, through the line before the next same-or-higher
+/// heading — subsections included). Reply reuses [`DocEditReply`]; its
+/// `version` is the new **whole-file** version (the section no longer exists,
+/// so there is no post-delete section version to chain).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveSectionArgs {
+    /// Garden-relative path of the file to delete a section from.
+    pub path: String,
+    /// The heading to delete, addressed like `edit_section` (`'#'` prefix
+    /// optional, case-sensitive, level-agnostic). Must match exactly one
+    /// heading; ambiguous → `BadArgs`, absent → `NotFound`.
+    pub heading: String,
+    /// Phase 3 CAS (optional): the **section-level** content version the
+    /// caller read for this heading (from `read_versions` / a prior
+    /// `edit_section` reply). When set, the daemon deletes only if the
+    /// section still carries it, else `Conflict` — the guard proves you're
+    /// deleting what you read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// fed to the daemon's ping-pong detector (spec §4d). Absent → `"anon"`,
+    /// so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 /// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default

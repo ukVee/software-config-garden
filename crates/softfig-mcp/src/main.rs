@@ -21,7 +21,7 @@ use softfig_ipc::{
         AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
         LogDecisionArgs, LogIncidentArgs, PatchFileArgs, PostMessageArgs, ReadInboxArgs,
-        ReadVersionsArgs,
+        ReadVersionsArgs, RemoveSectionArgs,
         RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
         SetItemStatusArgs, SetReviewedArgs,
     },
@@ -600,6 +600,29 @@ fn tool_defs() -> Vec<Value> {
                 },
             },
         }),
+        json!({
+            "name": "remove_section",
+            "description": "Delete one section of a garden file by heading address — the delete \
+                            counterpart to add_section/edit_section. The heading text must match \
+                            exactly one heading (case-sensitive, level-agnostic; a '#' prefix is \
+                            optional); the whole section goes (heading line + body, subsections \
+                            included) — you emit no content, the daemon owns the deletion window. \
+                            Section-level CAS via `expected_version` (seed it from read_versions \
+                            / a prior edit reply): the guard proves you're deleting what you read. \
+                            Refused when the section is the file's last remaining heading (unlink \
+                            the file instead), when the deletion would touch a daemon-managed \
+                            `<!-- softfig:index -->` region, and on vault-sealed targets.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "heading"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative file to delete a section from" },
+                    "heading": { "type": "string", "description": "the section to delete, addressed like edit_section ('#' prefix optional, case-sensitive, level-agnostic); must be unique" },
+                    "expected_version": { "type": "string", "description": "optional section-level CAS guard: the version you read for this heading (from read_versions / a prior reply). Deletes only if the section is unchanged, else Conflict. Omit for last-writer-wins." },
+                    "editor": { "type": "string", "description": "optional per-agent identity for the contention detector (multi-agent fleets); see edit_section. Omit in single-agent mode." },
+                },
+            },
+        }),
     ]
 }
 
@@ -704,6 +727,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: PatchFileArgs = serde_json::from_value(args)?;
             (op::PATCH_FILE, serde_json::to_value(a)?)
         }
+        "remove_section" => {
+            let a: RemoveSectionArgs = serde_json::from_value(args)?;
+            (op::REMOVE_SECTION, serde_json::to_value(a)?)
+        }
         "request_lease" => {
             let a: RequestLeaseArgs = serde_json::from_value(args)?;
             (op::REQUEST_LEASE, serde_json::to_value(a)?)
@@ -806,6 +833,17 @@ fn summarize(name: &str, data: &Value) -> String {
         }
         return format!("{name} {key}: {state}{detail}");
     }
+    if name == "remove_section" {
+        // A deletion, not a "wrote": the generic write summary would mislead.
+        let p = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
+        return match data.get("version").and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => {
+                format!("remove_section: removed the section from {p}; commit {hash}; version {v}")
+            }
+            _ => format!("remove_section: removed the section from {p}; commit {hash}"),
+        };
+    }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
         data.get("from").and_then(|v| v.as_str()),
@@ -857,9 +895,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_six() {
+    fn tools_list_has_twenty_seven() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 26);
+        assert_eq!(defs.len(), 27);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -886,6 +924,7 @@ mod tests {
             "file_provenance",
             "read_versions",
             "patch_file",
+            "remove_section",
             "request_lease",
             "release_lease",
         ] {
@@ -897,7 +936,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 27);
     }
 
     #[test]
@@ -1007,6 +1046,11 @@ mod tests {
                 op::PATCH_FILE,
             ),
             (
+                "remove_section",
+                json!({ "path": "doc.md", "heading": "Old", "expected_version": "abc", "editor": "a" }),
+                op::REMOVE_SECTION,
+            ),
+            (
                 "request_lease",
                 json!({ "agent": "roudy", "key": "dock.rs §Layout" }),
                 op::REQUEST_LEASE,
@@ -1062,6 +1106,9 @@ mod tests {
         assert!(summarize("patch_file", &json!({ "path": "p", "hash": "h", "version": "cafe" }))
             .contains("wrote p") && summarize("patch_file", &json!({ "path": "p", "hash": "h", "version": "cafe" }))
             .contains("version cafe"));
+        // remove_section renders a deletion, not a "wrote".
+        let rm = summarize("remove_section", &json!({ "path": "p", "hash": "h", "version": "cafe" }));
+        assert!(rm.contains("removed the section from p") && rm.contains("version cafe"));
         // file_provenance renders its edit list (the MCP forwards only text).
         let prov = summarize(
             "file_provenance",

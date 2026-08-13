@@ -66,6 +66,40 @@ pub fn region_body(content: &str, tag: &str) -> Option<String> {
     Some(body.join("\n"))
 }
 
+/// If `line` is a managed-region OPEN marker (`<!-- softfig:<tag> -->` — not
+/// the `/` close form, not prose that merely mentions the syntax), its tag
+/// text. `None` for a blank tag.
+fn open_tag(line: &str) -> Option<String> {
+    let t = line.trim();
+    let tag = t.strip_prefix("<!-- softfig:")?.strip_suffix("-->")?;
+    let tag = tag.trim();
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+/// The tag of the first well-formed managed region whose marker span
+/// `[open, close + 1)` overlaps the caller's half-open `[start, end)` line
+/// range — the cheap guard behind `remove_section`'s managed-region refusal
+/// (deleting through an index table would silently drop daemon-owned
+/// content). `None` when no region overlaps; an unterminated open marker
+/// isn't a region and is skipped, like [`locate`].
+pub fn overlapping_region(content: &str, start: usize, end: usize) -> Option<String> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(tag) = open_tag(line) else {
+            continue;
+        };
+        let close = close_marker(&tag);
+        let Some(j) = lines[i + 1..].iter().position(|l| l.trim() == close) else {
+            continue;
+        };
+        let close_idx = i + 1 + j;
+        if start < close_idx + 1 && end > i {
+            return Some(tag);
+        }
+    }
+    None
+}
+
 /// Insert or replace the region `tag` so its inner body is exactly `body`
 /// (which must not contain the marker lines and carries no surrounding
 /// newlines). Present → swap the inner lines, keeping the markers in place.
@@ -207,5 +241,37 @@ mod tests {
         let c = upsert(&b, "index notes", "A2");
         assert!(c.contains("A2"));
         assert!(c.contains("\nB\n"));
+    }
+
+    #[test]
+    fn open_tag_matches_open_markers_only() {
+        assert_eq!(open_tag("<!-- softfig:index notes -->").as_deref(), Some("index notes"));
+        assert_eq!(open_tag("  <!-- softfig:queue -->  ").as_deref(), Some("queue"));
+        assert_eq!(open_tag("<!-- /softfig:index notes -->"), None);
+        assert_eq!(open_tag("<!-- softfig: -->"), None);
+        assert_eq!(open_tag("prose <!-- softfig:index notes --> inline"), None);
+    }
+
+    #[test]
+    fn overlapping_region_detects_full_and_partial_overlaps() {
+        // lines: 0 "# T", 1 "", 2 "body", 3 "", 4 open, 5 "", 6 "| # |",
+        //        7 "", 8 close, 9 ""
+        let doc = "# T\n\nbody\n\n<!-- softfig:index notes -->\n\n| # |\n\n<!-- /softfig:index notes -->\n";
+        // Full containment of the region.
+        assert_eq!(overlapping_region(doc, 3, 9).as_deref(), Some("index notes"));
+        // Top-edge partial overlap.
+        assert_eq!(overlapping_region(doc, 2, 5).as_deref(), Some("index notes"));
+        // Bottom-edge partial overlap (deletes the close marker line).
+        assert_eq!(overlapping_region(doc, 8, 10).as_deref(), Some("index notes"));
+        // Clear of the region.
+        assert_eq!(overlapping_region(doc, 0, 3), None);
+        // Adjacent-but-disjoint ranges don't count.
+        assert_eq!(overlapping_region(doc, 0, 4), None);
+    }
+
+    #[test]
+    fn overlapping_region_ignores_unterminated_markers() {
+        let doc = "# T\n\n<!-- softfig:index notes -->\n\nno close\n";
+        assert_eq!(overlapping_region(doc, 0, 6), None);
     }
 }

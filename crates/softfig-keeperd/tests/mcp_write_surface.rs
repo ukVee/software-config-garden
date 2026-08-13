@@ -1,7 +1,8 @@
 //! mcp-surgical-writes integration: the surgical write-surface verbs
 //! (`read_versions`, `patch_file`, `remove_section`, `unlink`, `batch`) —
-//! slice 001 (`read_versions`, the CAS-seeding read) and slice 002
-//! (`patch_file`, the keystone surgical string replacement).
+//! slice 001 (`read_versions`, the CAS-seeding read), slice 002
+//! (`patch_file`, the keystone surgical string replacement), and slice 003
+//! (`remove_section`, the heading-addressed section deletion).
 //!
 //! Same harness posture as `m3b_reads.rs`: M1c-compat gardens (no FUSE), files
 //! reach the committed tip via `replace_file` (the same `BlobEncryptor` hook
@@ -13,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use softfig_ipc::verbs::{op, ChatMessage, PatchFileReply, ReadFileReply, ReadVersionsReply, TailBusReply};
+use softfig_ipc::verbs::{op, ChatMessage, DocEditReply, PatchFileReply, ReadFileReply, ReadVersionsReply, TailBusReply};
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
 use softfig_vault::Vault;
@@ -464,5 +465,224 @@ fn patch_ping_pong_nudges_the_bus_once() {
         !reply.messages.iter().any(|m| m.from == "growlightd"),
         "single editor never thrashes: {:?}",
         reply.messages
+    );
+}
+
+// ---- remove_section (slice 003) -----------------------------------------
+
+fn remove(fx: &Fixture, path: &str, heading: &str, extra: serde_json::Value) -> Response {
+    let mut args = serde_json::json!({ "path": path, "heading": heading });
+    if let serde_json::Value::Object(map) = &extra {
+        for (k, v) in map {
+            args[k] = v.clone();
+        }
+    }
+    fx.call(op::REMOVE_SECTION, args)
+}
+
+#[test]
+fn remove_section_deletes_heading_body_and_subsections() {
+    let fx = Fixture::start(true);
+    fx.write_file(
+        "doc.md",
+        "# T\n\n## A\n\nintro\n\n### sub\n\ndetail\n\n## B\n\nb\n",
+    );
+
+    let reply: DocEditReply = serde_json::from_value(ok_data(remove(
+        &fx,
+        "doc.md",
+        "A",
+        serde_json::json!({}),
+    )))
+    .unwrap();
+    assert_eq!(reply.path, "doc.md");
+    assert!(!reply.hash.is_empty());
+    assert_eq!(read(&fx, "doc.md").content, "# T\n\n## B\n\nb\n");
+    // The reply's version is the new WHOLE-FILE version — the section no
+    // longer exists, so there is no post-delete section version to chain.
+    assert_eq!(reply.version, versions(&fx, "doc.md").version);
+}
+
+#[test]
+fn remove_section_addressing_errors() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "## A\n\nx\n\n## A\n\ny\n");
+
+    // Ambiguous → BadArgs (same mapping as edit_section).
+    assert_eq!(
+        err_kind(remove(&fx, "doc.md", "A", serde_json::json!({}))),
+        ErrorKind::BadArgs
+    );
+    // Absent → NotFound.
+    assert_eq!(
+        err_kind(remove(&fx, "doc.md", "Nope", serde_json::json!({}))),
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        err_kind(remove(&fx, "doc.md", "##", serde_json::json!({}))),
+        ErrorKind::BadArgs
+    );
+    assert_eq!(read(&fx, "doc.md").content, "## A\n\nx\n\n## A\n\ny\n");
+}
+
+#[test]
+fn remove_section_cas_guard_is_section_level() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "# T\n\n## A\n\nalpha\n\n## B\n\nbeta\n");
+    let va = versions(&fx, "doc.md")
+        .sections
+        .iter()
+        .find(|s| s.heading == "A")
+        .unwrap()
+        .version
+        .clone();
+
+    // Editing the OTHER section leaves A's section version untouched — a
+    // section-level guard must not conflict where a whole-file one would.
+    let edit_b = fx.call(
+        op::EDIT_SECTION,
+        serde_json::json!({ "path": "doc.md", "heading": "B", "body": "BETA!" }),
+    );
+    assert!(matches!(edit_b, Response::Ok { .. }), "edit B: {edit_b:?}");
+
+    // Current guard: deletes cleanly.
+    let resp = remove(
+        &fx,
+        "doc.md",
+        "A",
+        serde_json::json!({ "expected_version": va }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "remove A: {resp:?}");
+    assert_eq!(read(&fx, "doc.md").content, "# T\n\n## B\n\nBETA!\n");
+
+    // Stale guard: the section changed since the caller read it → Conflict.
+    fx.write_file("doc2.md", "# T\n\n## C\n\nc0\n\n## D\n\nd\n");
+    let vc0 = versions(&fx, "doc2.md")
+        .sections
+        .iter()
+        .find(|s| s.heading == "C")
+        .unwrap()
+        .version
+        .clone();
+    let edit_c = fx.call(
+        op::EDIT_SECTION,
+        serde_json::json!({ "path": "doc2.md", "heading": "C", "body": "c1" }),
+    );
+    assert!(matches!(edit_c, Response::Ok { .. }), "edit C: {edit_c:?}");
+    let resp = remove(
+        &fx,
+        "doc2.md",
+        "C",
+        serde_json::json!({ "expected_version": vc0 }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::Conflict);
+}
+
+#[test]
+fn remove_section_refuses_the_last_remaining_heading() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "# T\n\nonly section\n");
+    let resp = remove(&fx, "doc.md", "T", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs);
+    assert_eq!(read(&fx, "doc.md").content, "# T\n\nonly section\n");
+
+    // A parent whose span swallows every subsection is the same refusal.
+    fx.write_file("doc2.md", "# T\n\n### sub\n\ndetail\n");
+    let resp = remove(&fx, "doc2.md", "T", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs);
+    assert_eq!(read(&fx, "doc2.md").content, "# T\n\n### sub\n\ndetail\n");
+}
+
+#[test]
+fn remove_section_refuses_over_managed_regions() {
+    let fx = Fixture::start(true);
+    // Deleting the only heading (whose span holds the region) is refused and
+    // the managed region survives byte-intact.
+    fx.write_file(
+        "folder/CLAUDE.md",
+        "# folder\n\nrouting prose\n\n<!-- softfig:index notes -->\n\n| # | Note |\n|---|------|\n\n<!-- /softfig:index notes -->\n",
+    );
+    let resp = remove(&fx, "folder/CLAUDE.md", "folder", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs);
+    assert!(
+        read(&fx, "folder/CLAUDE.md").content.contains("<!-- softfig:index notes -->"),
+        "region must survive a refused removal"
+    );
+
+    // A section clear of the region (the region sits inside a SIBLING's
+    // span) deletes cleanly and leaves the region alone.
+    fx.write_file(
+        "two.md",
+        "# T\n\n## A\n\n<!-- softfig:index notes -->\n\n| # |\n\n<!-- /softfig:index notes -->\n\n## B\n\nx\n",
+    );
+    let resp = remove(&fx, "two.md", "B", serde_json::json!({}));
+    assert!(matches!(resp, Response::Ok { .. }), "clear section: {resp:?}");
+    let content = read(&fx, "two.md").content;
+    assert!(content.contains("<!-- softfig:index notes -->"), "region intact: {content}");
+    assert!(content.contains("## A"), "sibling intact: {content}");
+    assert!(!content.contains("## B"), "B gone: {content}");
+}
+
+#[test]
+fn remove_section_refuses_vault_targets() {
+    let fx = Fixture::start(true);
+    let resp = fx.call(op::VAULT_SEAL, serde_json::json!({ "pattern": "secrets/**" }));
+    assert!(matches!(resp, Response::Ok { .. }), "seal: {resp:?}");
+    fx.write_file("secrets/doc.md", "# S\n\nsecret body\n");
+
+    let resp = remove(&fx, "secrets/doc.md", "S", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::VaultProtected);
+}
+
+#[test]
+fn remove_section_rejects_bad_args_and_locked() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "# T\n\n## A\n\nx\n");
+    assert_eq!(
+        err_kind(remove(&fx, "../outside.md", "A", serde_json::json!({}))),
+        ErrorKind::BadArgs
+    );
+
+    let fx = Fixture::start(false); // do NOT unlock
+    assert_eq!(
+        err_kind(remove(&fx, "doc.md", "A", serde_json::json!({}))),
+        ErrorKind::VaultLocked
+    );
+}
+
+/// The remove path feeds the §4d ping-pong detector like the section verbs:
+/// an A↔B alternation on the same `(path, heading)` target lands one
+/// `coord-request` nudge naming the section, committed to the bus.
+#[test]
+fn remove_section_ping_pong_nudges_the_bus_once() {
+    let fx = Fixture::start(true);
+
+    for (i, editor) in ["agent-a", "agent-b", "agent-a", "agent-b"].iter().enumerate() {
+        fx.write_file("doc.md", &format!("# T\n\n## G\n\nbody v{i}\n"));
+        let resp = remove(
+            &fx,
+            "doc.md",
+            "G",
+            serde_json::json!({ "editor": editor }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "remove {i} by {editor}: {resp:?}");
+    }
+
+    let reply: TailBusReply = serde_json::from_value(ok_data(fx.call(
+        op::TAIL_BUS,
+        serde_json::json!({ "since": 0 }),
+    )))
+    .unwrap();
+    let nudges: Vec<ChatMessage> = reply
+        .messages
+        .into_iter()
+        .filter(|m| m.from == "growlightd")
+        .collect();
+    assert_eq!(nudges.len(), 1, "exactly one nudge: {nudges:?}");
+    assert_eq!(nudges[0].kind, "coord-request");
+    assert!(
+        nudges[0].body.contains("doc.md") && nudges[0].body.contains("G"),
+        "names the section target: {}",
+        nudges[0].body
     );
 }

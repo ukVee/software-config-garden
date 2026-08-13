@@ -6,8 +6,10 @@
 //! tokens it emits are the irreducible new content — never the rest of the
 //! file. The daemon keeps the heading line; the caller re-emits only the
 //! body (`edit_section`), a single new row (`append_to_section`), a fresh
-//! section (`add_section`), or nothing at all (`set_reviewed`). See
-//! `meta/spec-small-files.md`.
+//! section (`add_section`), or nothing at all (`set_reviewed`) — or names a
+//! section to delete outright (`remove_section`, mcp-surgical-writes slice
+//! 003). See `meta/spec-small-files.md` and
+//! `meta/spec-mcp-writes/spec-remove-section.md`.
 //!
 //! ## Heading addressing
 //!
@@ -23,7 +25,7 @@
 //! ## Vault refusal
 //!
 //! `reads.rs` projects sealed content (`[sealed:…]`, `[encrypted]`), so a
-//! plaintext rewrite of a vault file would clobber ciphertext. All four
+//! plaintext rewrite of a vault file would clobber ciphertext. All five
 //! verbs therefore refuse a target that is whole-file-sealed or that
 //! contains an inline `<vault id=…>` region (`VaultProtected`), or whose
 //! tags are malformed (`MalformedVaultTag`). Headings themselves are never
@@ -33,7 +35,8 @@ use std::path::Path;
 
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{
-    AddSectionArgs, AppendToSectionArgs, DocEditReply, EditSectionArgs, SetReviewedArgs,
+    AddSectionArgs, AppendToSectionArgs, DocEditReply, EditSectionArgs, RemoveSectionArgs,
+    SetReviewedArgs,
 };
 use softfig_ipc::ErrorKind;
 
@@ -120,6 +123,51 @@ pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
         &rel,
         new,
         "section_appended",
+        &args.heading,
+        version,
+    )?;
+    note_section_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
+    Ok(reply)
+}
+
+pub fn remove_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: RemoveSectionArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("remove_section args: {e}")))?;
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
+    let rel = resolve(&garden_root, &args.path)?;
+
+    let new = {
+        let wt = WorkTree::new(daemon, &inner);
+        let content = load_unprotected(&wt, &inner, &rel)?;
+        cas_check_section(&content, &args.heading, &args.expected_version)?;
+        // Guard: never delete through a daemon-managed region — an index
+        // table's content belongs to its machinery, not to the agent.
+        let (rstart, rend) = edit::section_range(&content, &args.heading)
+            .map_err(|e| section_err(&rel, &args.heading, e))?;
+        if let Some(tag) = super::managed::overlapping_region(&content, rstart, rend) {
+            return Err((
+                ErrorKind::BadArgs,
+                format!(
+                    "{rel}: section {:?} overlaps the daemon-managed <!-- softfig:{tag} --> \
+                     region — regenerate that region through its owning machinery, not by hand",
+                    args.heading
+                ),
+            ));
+        }
+        edit::remove_section(&content, &args.heading)
+            .map_err(|e| section_err(&rel, &args.heading, e))?
+    };
+    // The section no longer exists, so the reply carries the new whole-file
+    // version — there is no post-delete section version to chain.
+    let version = edit::content_version(&new);
+    let reply = write_and_commit(
+        daemon,
+        &mut inner,
+        &rel,
+        new,
+        "section_removed",
         &args.heading,
         version,
     )?;
@@ -245,7 +293,8 @@ pub(crate) fn load_unprotected(
     String::from_utf8(bytes).map_err(|_| (ErrorKind::BadArgs, format!("{rel}: not UTF-8 text")))
 }
 
-/// Common tail for the three section verbs: write the rebuilt content + refresh
+/// Common tail for the section verbs (edit/append/remove): write the rebuilt
+/// content + refresh
 /// backlinks through a scoped [`WorkTree`] (mount-safe in FUSE mode), then
 /// commit `intent` with a `{path, heading}` payload and reply `{path, hash}`.
 /// The worktree is dropped before the `&mut inner` commit so its shared borrow
@@ -368,6 +417,13 @@ fn section_err(rel: &str, heading: &str, e: edit::SectionError) -> (ErrorKind, S
             format!("{rel}: section {heading:?} already exists"),
         ),
         EmptyHeading => (ErrorKind::BadArgs, "heading must be non-empty".into()),
+        LastSection => (
+            ErrorKind::BadArgs,
+            format!(
+                "{rel}: deleting section {heading:?} would leave the file without \
+                 any heading — unlink the file instead if it should be empty"
+            ),
+        ),
     }
 }
 
@@ -391,6 +447,10 @@ pub mod edit {
         AlreadyExists,
         /// The heading argument had no text after the `#`s.
         EmptyHeading,
+        /// Deleting the addressed section would leave the file with no
+        /// headings at all (a parent whose span swallows every subsection
+        /// counts) — an agent that truly wants an empty file unlinks it.
+        LastSection,
     }
 
     struct Heading {
@@ -563,6 +623,58 @@ pub mod edit {
         Ok(s)
     }
 
+    /// The `[start, end)` line range the uniquely-addressed section occupies —
+    /// its heading line through the line before the next same-or-higher
+    /// heading (subsections included), i.e. exactly the span
+    /// [`remove_section`] deletes. Exposed so the handler can run the
+    /// managed-region overlap guard against the precise deletion window
+    /// before transforming.
+    pub fn section_range(content: &str, heading_arg: &str) -> Result<(usize, usize), SectionError> {
+        let (_level, want) = parse_heading_arg(heading_arg);
+        if want.is_empty() {
+            return Err(SectionError::EmptyHeading);
+        }
+        let lines: Vec<&str> = content.split('\n').collect();
+        let hs = headings(&lines);
+        let target = find_unique(&hs, &want)?;
+        let (_, end) = body_range(lines.len(), &hs, target);
+        Ok((target.line, end))
+    }
+
+    /// Delete the uniquely-addressed section — its heading line and body,
+    /// through the line before the next same-or-higher heading (subsections
+    /// included). Refused (`LastSection`) when the deletion range holds
+    /// every heading: deleting a parent swallows its subsections, so the
+    /// guard counts them, and a heading-less file is almost always a
+    /// mistake. When the deleted section runs to end-of-doc, the blank
+    /// separator that preceded it collapses and the final newline is kept.
+    pub fn remove_section(content: &str, heading_arg: &str) -> Result<String, SectionError> {
+        let (start, end) = section_range(content, heading_arg)?;
+        let lines: Vec<&str> = content.split('\n').collect();
+        let hs = headings(&lines);
+        let doomed = hs.iter().filter(|h| h.line >= start && h.line < end).count();
+        if doomed == hs.len() {
+            return Err(SectionError::LastSection);
+        }
+        let mut start = start;
+        let mut end = end;
+        if end >= lines.len() {
+            // End-of-doc deletion: swallow the blank separator that preceded
+            // the section (no stray trailing blanks), but keep the trailing
+            // newline's split artifact (the final empty line) out of the
+            // range so the file stays newline-terminated.
+            if start > 0 && lines[start - 1].trim().is_empty() {
+                start -= 1;
+            }
+            if lines.last() == Some(&"") {
+                end -= 1;
+            }
+        }
+        let mut out: Vec<String> = lines[..start].iter().map(|s| s.to_string()).collect();
+        out.extend(lines[end..].iter().map(|s| s.to_string()));
+        Ok(out.join("\n"))
+    }
+
     /// Rewrite the first `Last reviewed:` line (optionally `> `-quoted /
     /// indented) to `today`, preserving its prefix. `None` if absent.
     pub fn set_reviewed(content: &str, today: &str) -> Option<String> {
@@ -732,6 +844,69 @@ pub mod edit {
         #[test]
         fn add_into_empty_doc() {
             assert_eq!(add_section("", "Start", "go").unwrap(), "## Start\n\ngo\n");
+        }
+
+        #[test]
+        fn remove_deletes_heading_body_and_subsections() {
+            let doc = "# T\n\n## A\n\nintro\n\n### sub\n\ndetail\n\n## B\n\nb\n";
+            let out = remove_section(doc, "A").unwrap();
+            assert_eq!(out, "# T\n\n## B\n\nb\n");
+        }
+
+        #[test]
+        fn remove_last_section_collapses_blank_and_keeps_newline() {
+            let doc = "# T\n\n## A\n\nbody\n";
+            let out = remove_section(doc, "A").unwrap();
+            assert_eq!(out, "# T\n");
+            // With a preceding section that itself ends in content.
+            let doc = "## A\n\nbody\n\n## B\n\nx\n";
+            let out = remove_section(doc, "B").unwrap();
+            assert_eq!(out, "## A\n\nbody\n");
+        }
+
+        #[test]
+        fn remove_first_heading_leaves_following_untouched() {
+            let doc = "## A\n\nbody\n\n## B\n\nx\n";
+            let out = remove_section(doc, "A").unwrap();
+            assert_eq!(out, "## B\n\nx\n");
+        }
+
+        #[test]
+        fn remove_refuses_the_last_remaining_heading() {
+            assert_eq!(
+                remove_section("# T\n\nonly section\n", "T"),
+                Err(SectionError::LastSection)
+            );
+            // A parent whose span swallows every subsection is the same
+            // refusal — the file would be heading-less either way.
+            assert_eq!(
+                remove_section("# T\n\n### sub\n\ndetail\n", "T"),
+                Err(SectionError::LastSection)
+            );
+        }
+
+        #[test]
+        fn remove_errors_match_the_addressing_rules() {
+            let doc = "## A\n\nx\n\n## A\n\ny\n";
+            assert_eq!(remove_section(doc, "Nope"), Err(SectionError::NotFound));
+            assert_eq!(remove_section(doc, "A"), Err(SectionError::Ambiguous));
+            assert_eq!(remove_section(doc, "##"), Err(SectionError::EmptyHeading));
+        }
+
+        #[test]
+        fn remove_preserves_untouched_regions_byte_identical() {
+            let doc = "# T\n\nlead para\n\n## Keep\n\nkeep me\n\n## Gone\n\nold\n";
+            let out = remove_section(doc, "Gone").unwrap();
+            assert!(out.contains("# T\n\nlead para\n\n## Keep\n\nkeep me\n"));
+            assert!(out.ends_with("## Keep\n\nkeep me\n"));
+        }
+
+        #[test]
+        fn section_range_is_the_deletion_window() {
+            let doc = "# T\n\n## A\n\nintro\n\n### sub\n\ndetail\n\n## B\n\nb\n";
+            assert_eq!(section_range(doc, "A"), Ok((2, 10)));
+            assert_eq!(section_range(doc, "Nope"), Err(SectionError::NotFound));
+            assert_eq!(section_range(doc, "##"), Err(SectionError::EmptyHeading));
         }
 
         #[test]
