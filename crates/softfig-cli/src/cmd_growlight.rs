@@ -15,11 +15,11 @@
 //! clobbered.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write, stdin};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     ClientError, Request, growlightd_runtime_socket_path, runtime_socket_path,
@@ -36,8 +36,10 @@ use softfig_growlightd_client::{decode_frame, Frame};
 
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
-    AgentBackend, ClaudeBackend, Clock, ExeIdentity, ExeProbe, IterationOutcome, IterationRequest,
-    RateWindow, SystemClock, SystemExeProbe, UsageSnapshot,
+    AgentBackend, Backend, ClaudeBackend, Clock, DEEPSEEK_FLASH, DEEPSEEK_REASONING, ExeIdentity,
+    ExeProbe, InteractiveLaunch, IterationOutcome, IterationRequest, ModelChoice, ModelSpec,
+    OpencodeConfigInputs, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, item_model_field,
+    opencode_config, parse_model_spec,
 };
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
@@ -45,6 +47,22 @@ use crate::growlight_backend::{
 /// generated isolated hooks so normal `claude` stays untouched.
 const AGENT_BIN: &str = "claude";
 const AGENT_NAME: &str = "softfig-loop";
+
+/// The opencode model used when a launch selects opencode without naming a model
+/// (a bare `--backend opencode` / `--opencode`, or a "let growlight decide" that
+/// finds no declaration on the active backlog item). Cheap by default — reasoning
+/// is opt-in, per the human's 2026-08-08 call closing the slice-005 sub-question.
+const DEFAULT_OPENCODE_MODEL: &str = DEEPSEEK_FLASH;
+
+/// The first-turn kick for an interactive **opencode** launch (`--prompt`).
+/// opencode has no SessionStart hook, so — unlike claude's TUI, where the
+/// injected protocol+baton sit as context and the human types the first turn —
+/// the opencode session needs a nudge to begin. Its agent prompt already carries
+/// the protocol + the step-0 "read your baton" bootstrap (slice 002), so this
+/// just says "start". Kept short + generic; the real reseed work is the agent
+/// prompt's step 0, not this line.
+const OPENCODE_KICK: &str = "Begin your growlight iteration: complete step 0 (read your baton) \
+    and follow the operating protocol in your instructions.";
 
 #[derive(Subcommand, Debug)]
 pub enum GrowlightCmd {
@@ -178,6 +196,23 @@ pub struct StartArgs {
     /// Ignored without `--auto`.
     #[arg(long)]
     pub max_iterations: Option<u64>,
+    /// Which agent backend the interactive loop runs on (spec-agents §4.1).
+    /// `claude` (the default when nothing is chosen) is byte-identical to before;
+    /// `opencode` runs the same human-driven loop on opencode — interactive-first,
+    /// so headless `--auto` opencode is not yet implemented (deferred to slice
+    /// 004). Omitting it on a TTY brings up the picker instead.
+    #[arg(long, value_enum)]
+    pub backend: Option<Backend>,
+    /// Shorthand for `--backend opencode`.
+    #[arg(long, conflicts_with = "backend")]
+    pub opencode: bool,
+    /// Backend + model in one word, bypassing the picker:
+    /// `claude` | `reasoning` | `flash` | `auto` | `provider/model`, with an
+    /// optional ` variant=<v>` (alias ` effort=<v>`) tail for opencode.
+    /// `auto` = "let growlight decide": use the model the active backlog item
+    /// declares in its `> Model:` line, defaulting to deepseek flash.
+    #[arg(long, conflicts_with_all = ["backend", "opencode"])]
+    pub model: Option<String>,
 }
 
 /// Args for `say` — the human-post seam. Unlike the growlightd client verbs,
@@ -341,8 +376,8 @@ fn short_hash(hash: &str) -> &str {
 // ---- start (Phase 2b): runtime + launcher ------------------------------
 
 fn start(args: StartArgs) -> Result<()> {
-    let socket = args.socket.unwrap_or_else(runtime_socket_path);
-    let garden_root = resolve_garden_root(&socket, args.garden_root)?;
+    let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+    let garden_root = resolve_garden_root(&socket, args.garden_root.clone())?;
 
     // The hook injects this on every (re)start; its absence means the durable
     // pillar was never scaffolded.
@@ -354,12 +389,13 @@ fn start(args: StartArgs) -> Result<()> {
         ));
     }
 
-    let runtime = runtime_dir(args.config_dir)?;
+    let runtime = runtime_dir(args.config_dir.clone())?;
     fs::create_dir_all(&runtime)
         .with_context(|| format!("creating runtime dir {}", runtime.display()))?;
 
     let loop_path = runtime.join("loop.json");
     let mcp_path = runtime.join("mcp.json");
+    let opencode_path = runtime.join("opencode.json");
     let inject_path = runtime.join("inject.sh");
     let statusline_path = runtime.join("statusline.sh");
     let baton_path = runtime.join("baton.md");
@@ -410,17 +446,65 @@ fn start(args: StartArgs) -> Result<()> {
         );
     }
 
+    // Resolve WHAT to launch — backend + (for opencode) model + variant — from an
+    // explicit flag, else the interactive picker, else claude. Deliberately after
+    // the setup print and before anything is launched: the picker is the last thing
+    // between the human and the running agent. The baton is seeded by now, so a
+    // "let growlight decide" can read the active item's declaration.
+    let choice = resolve_model_choice(&args, &garden_root, &baton_path)?;
+    let backend = choice.backend;
+
+    // The opencode-native equivalent of loop.json + mcp.json (`softfig-loop` agent
+    // = protocol-by-reference + step-0 baton boot; garden guarded via
+    // external_directory; explicit softfig-mcp block). Refreshed every launch like
+    // the claude files, on both backends (self-heal; inert for a claude run) — and
+    // written HERE, after resolution, because the resolved model + variant go into
+    // it.
+    write_file(
+        &opencode_path,
+        &opencode_config(&OpencodeConfigInputs {
+            agent_name: AGENT_NAME,
+            protocol: &protocol,
+            baton: &baton_path,
+            runtime_root: runtime_grant_root(&runtime),
+            mcp_bin: &softfig_mcp_path(),
+            claude_projects: &claude_projects,
+            model: choice.opencode_model(),
+            variant: choice.variant.as_deref(),
+        }),
+    )?;
+
+    // Built BEFORE the `--no-launch` branch, not just before the spawn, so the
+    // printed hint and the real launch are derived from the same value and cannot
+    // drift apart (they did: the hint kept naming the pre-slice-006 runtime cwd
+    // long after the launch had moved to the garden).
+    let launch = InteractiveLaunch {
+        agent_name: AGENT_NAME,
+        loop_settings: &loop_path,
+        mcp_config: &mcp_path,
+        // BOTH backends now root at the garden: claude for slice 005's auto-cd,
+        // opencode since slice 006 so garden docs are ordinary in-project reads.
+        // See the field's doc on `InteractiveLaunch`.
+        garden_root: &garden_root,
+        opencode_config: &opencode_path,
+        boot_prompt: OPENCODE_KICK,
+    };
+
     if args.no_launch {
-        println!(
-            "\n(--no-launch) runtime ready. launch with:\n  {AGENT_BIN} --name {AGENT_NAME} \
-             --settings {} --mcp-config {}",
-            loop_path.display(),
-            mcp_path.display()
-        );
+        println!("\n{}", no_launch_hint(&choice, &launch));
         return Ok(());
     }
     if args.auto {
-        let backend = ClaudeBackend::new(AGENT_BIN);
+        // Headless `--auto` is claude-only so far; the opencode `-p` event
+        // parser + non-subscription budget model are deferred to slice 004.
+        // Keep the claude construction byte-identical.
+        let backend = match backend {
+            Backend::Claude => ClaudeBackend::new(AGENT_BIN),
+            Backend::Opencode => bail!(
+                "`--auto` headless mode is only implemented for the claude backend so far; \
+                 opencode `--auto` is deferred to the semi-auto-backend-seam milestone (slice 004)"
+            ),
+        };
         let clock = SystemClock;
         // Captured before the loop, while our own binary is still the live inode;
         // re-statted between iterations to catch a mid-run reinstall (task 007).
@@ -446,7 +530,225 @@ fn start(args: StartArgs) -> Result<()> {
         print_loop_summary(&summary, &usage_path, &log_path);
         return Ok(());
     }
-    launch_agent(&loop_path, &mcp_path)
+    launch_agent(&choice, &launch)
+}
+
+/// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
+/// and built from the very [`InteractiveLaunch`] the spawn would consume, so a
+/// test can assert the hint names the same cwd the launcher really uses.
+///
+/// That equivalence is load-bearing for opencode: the generated config grants
+/// only the runtime root + the claude-memory tree via `external_directory`, so a
+/// session started from anywhere other than the garden cannot read the garden at
+/// all — the exact failure slice 006 removed. A hint that names the wrong cwd
+/// hands the human a session that looks fine and is blind.
+///
+/// The `cd` is shown for both backends because the launcher pins the cwd for both
+/// (slice 005's auto-cd for claude, slice 006 for opencode); a hint that silently
+/// inherited the human's cwd would reproduce neither.
+fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
+    let garden = launch.garden_root.display();
+    match choice.backend {
+        Backend::Claude => format!(
+            "(--no-launch) runtime ready. launch with:\n  cd {garden} && {AGENT_BIN} \
+             --name {AGENT_NAME} --settings {} --mcp-config {}",
+            launch.loop_settings.display(),
+            launch.mcp_config.display(),
+        ),
+        // The opencode config is handed over via `OPENCODE_CONFIG` (its analog of
+        // claude's `--settings`), so there is no `--settings`/`--mcp-config` here.
+        // `growlight start --opencode` does the cd + first-turn kick for you; this
+        // is the manual equivalent minus the `--prompt`, which the human types
+        // instead. The model is already baked into the config just written.
+        Backend::Opencode => format!(
+            "(--no-launch) runtime ready ({}). launch with:\n  cd {garden} && OPENCODE_CONFIG={} \
+             {} --agent {AGENT_NAME}",
+            choice.opencode_model(),
+            launch.opencode_config.display(),
+            choice.backend.agent_bin(),
+        ),
+    }
+}
+
+// ---- backend + model resolution (slice 005) ----------------------------
+
+/// Resolve the interactive launch target: an explicit flag wins, else the picker
+/// (TTY only), else claude.
+///
+/// `--backend`/`--opencode` choose a backend at its default model;
+/// `--model <spec>` chooses backend AND model in one word (and can itself be
+/// `auto`). With nothing given, a TTY gets the picker and everything else gets
+/// claude — the launcher must never block on stdin in a script, a pipe, or a
+/// headless run.
+fn resolve_model_choice(
+    args: &StartArgs,
+    garden_root: &Path,
+    baton_path: &Path,
+) -> Result<ModelChoice> {
+    let flagged = args.opencode || args.backend.is_some() || args.model.is_some();
+
+    let spec = if should_prompt(flagged, args.auto, args.no_launch, stdin().is_terminal()) {
+        prompt_for_model()?
+    } else if let Some(spec) = flag_spec(args)? {
+        spec
+    } else {
+        // Nothing chosen and nobody to ask (non-TTY, `--auto`, or `--no-launch`):
+        // the documented default, never a prompt into a stdin that can't answer.
+        ModelSpec::Fixed(ModelChoice::claude())
+    };
+
+    Ok(match spec {
+        ModelSpec::Fixed(choice) => choice,
+        ModelSpec::Auto => declared_model(garden_root, baton_path),
+    })
+}
+
+/// The spec the command line asked for, if any. `--opencode` is shorthand for
+/// `--backend opencode`, and `--model` carries backend + model together; clap
+/// keeps all three mutually exclusive, so at most one arm can fire.
+fn flag_spec(args: &StartArgs) -> Result<Option<ModelSpec>> {
+    if args.opencode {
+        return Ok(Some(ModelSpec::Fixed(ModelChoice::opencode(
+            DEFAULT_OPENCODE_MODEL,
+        ))));
+    }
+    if let Some(backend) = args.backend {
+        return Ok(Some(ModelSpec::Fixed(match backend {
+            Backend::Claude => ModelChoice::claude(),
+            Backend::Opencode => ModelChoice::opencode(DEFAULT_OPENCODE_MODEL),
+        })));
+    }
+    args.model
+        .as_deref()
+        .map(parse_model_spec)
+        .transpose()
+        .context("--model")
+}
+
+/// Whether `growlight start` should bring up the backend/model picker. Pure, so
+/// the "never hang waiting on stdin" rule is unit-tested rather than trusted: a
+/// prompt happens only when the human made no choice on the command line, a human
+/// is actually there (stdin is a TTY), and the run is interactive at all
+/// (`--auto` drives itself; `--no-launch` launches nothing to pick for).
+fn should_prompt(flagged: bool, auto: bool, no_launch: bool, stdin_is_tty: bool) -> bool {
+    !flagged && !auto && !no_launch && stdin_is_tty
+}
+
+/// The interactive picker (spec: the confirmed `1/2/3/4` UX). Reads one line from
+/// stdin; a bare Enter takes option 1, and EOF (stdin closed mid-run) falls back
+/// to the same default rather than erroring out of a launch the human asked for.
+fn prompt_for_model() -> Result<ModelSpec> {
+    println!("\nbackend + model:");
+    println!("  1) claude                (default)");
+    println!("  2) deepseek reasoning    ({DEEPSEEK_REASONING})");
+    println!("  3) deepseek flash        ({DEEPSEEK_FLASH})");
+    println!("  4) let growlight decide  (the active backlog item's `> Model:`, else flash)");
+    print!("choice [1]: ");
+    // The prompt has no newline, so it sits in the line buffer until flushed.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let mut line = String::new();
+    if stdin().read_line(&mut line).unwrap_or(0) == 0 {
+        println!();
+    }
+    Ok(match line.trim() {
+        "" | "1" => ModelSpec::Fixed(ModelChoice::claude()),
+        "2" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_REASONING)),
+        "3" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_FLASH)),
+        "4" => ModelSpec::Auto,
+        // A typo shouldn't silently run the wrong (possibly pricier) model.
+        other => bail!("unknown choice `{other}` — pick 1, 2, 3, or 4"),
+    })
+}
+
+/// "Let growlight decide": use the model the ACTIVE backlog item declares for
+/// itself. The judgement of which model suits a piece of work belongs to whoever
+/// queued it, so the launcher reads rather than guesses — the active slice doc's
+/// optional `> Model:` line, falling back to the milestone doc (declare once for a
+/// whole milestone), then to [`DEFAULT_OPENCODE_MODEL`].
+///
+/// Never fails the launch: an unreadable baton, an item whose doc has moved, or a
+/// malformed declaration all fall through to the default with a printed reason —
+/// a bad metadata line must not stand between the human and their loop.
+fn declared_model(garden_root: &Path, baton_path: &Path) -> ModelChoice {
+    let default = || ModelChoice::opencode(DEFAULT_OPENCODE_MODEL);
+
+    let Ok(baton) = fs::read_to_string(baton_path) else {
+        println!("growlight decides: {DEFAULT_OPENCODE_MODEL} (no readable baton)");
+        return default();
+    };
+    let view = parse_baton(&baton);
+    let Some(item) = view.item.as_deref() else {
+        println!("growlight decides: {DEFAULT_OPENCODE_MODEL} (baton names no active item)");
+        return default();
+    };
+
+    for doc_path in item_doc_candidates(garden_root, item, view.slice.as_deref()) {
+        let Ok(doc) = fs::read_to_string(&doc_path) else {
+            continue;
+        };
+        let Some(field) = item_model_field(&doc) else {
+            continue;
+        };
+        let label = doc_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| item.to_string());
+        match parse_model_spec(field) {
+            // A doc declaring `auto` would be circular — treat it as no
+            // declaration and keep looking up the chain.
+            Ok(ModelSpec::Auto) => continue,
+            Ok(ModelSpec::Fixed(choice)) => {
+                println!("growlight decides: {field} (declared by {label})");
+                return choice;
+            }
+            Err(e) => {
+                println!("growlight decides: {DEFAULT_OPENCODE_MODEL} — ignoring {label}: {e}");
+                return default();
+            }
+        }
+    }
+
+    println!("growlight decides: {DEFAULT_OPENCODE_MODEL} (no `> Model:` declared by {item})");
+    default()
+}
+
+/// Where an active item's `> Model:` declaration may live, nearest-first: the
+/// active slice's own doc, then the milestone doc that owns it. A standalone task
+/// has just the one doc.
+///
+/// Filenames carry a slug we don't know (`005-backend-model-picker.md`), so each
+/// is found by its numeric prefix rather than reconstructed.
+fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) -> Vec<PathBuf> {
+    let backlog = garden_root.join(PILLAR).join("backlog");
+    let milestone = backlog.join("milestones").join(item);
+    if milestone.is_dir() {
+        let mut candidates = Vec::new();
+        // Baton slices are written `6` or `006`; the files are always zero-padded.
+        if let Some(slice) = slice {
+            let padded = format!("{:0>3}", slice.trim());
+            if let Some(doc) = find_by_number(&milestone.join("slices"), &padded) {
+                candidates.push(doc);
+            }
+        }
+        candidates.push(milestone.join("CLAUDE.md"));
+        return candidates;
+    }
+    find_by_number(&backlog.join("tasks"), item)
+        .into_iter()
+        .collect()
+}
+
+/// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`.
+fn find_by_number(dir: &Path, number: &str) -> Option<PathBuf> {
+    let prefix = format!("{number}-");
+    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".md"))
+            .then_some(path)
+    })
 }
 
 // ---- headless orchestrator (full-auto, slices 001-002) -----------------
@@ -989,17 +1291,33 @@ fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<Path
     }
 }
 
-fn launch_agent(loop_path: &Path, mcp_path: &Path) -> Result<()> {
-    println!("\nlaunching {AGENT_BIN} --name {AGENT_NAME} …\n");
-    let status = std::process::Command::new(AGENT_BIN)
-        .arg("--name")
-        .arg(AGENT_NAME)
-        .arg("--settings")
-        .arg(loop_path)
-        .arg("--mcp-config")
-        .arg(mcp_path)
+fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> {
+    // The interactive argv/env/cwd is owned by the backend seam; for `claude`
+    // this is the original hardwired argv rooted at the garden, and for
+    // `opencode` it wires `OPENCODE_CONFIG` + the runtime cwd + the first-turn
+    // kick (slice 003).
+    let backend = choice.backend;
+    let mut cmd = backend.interactive_command(launch)?;
+    let bin = backend.agent_bin();
+    match backend {
+        Backend::Claude => println!("\nlaunching {bin} --name {AGENT_NAME} …\n"),
+        // Name the model: with four ways to pick one, the human should never have
+        // to guess which one is about to burn tokens.
+        Backend::Opencode => {
+            let variant = choice
+                .variant
+                .as_deref()
+                .map(|v| format!(" ({v})"))
+                .unwrap_or_default();
+            println!(
+                "\nlaunching {bin} --agent {AGENT_NAME} on {}{variant} …\n",
+                choice.opencode_model()
+            );
+        }
+    }
+    let status = cmd
         .status()
-        .with_context(|| format!("failed to launch `{AGENT_BIN}` — is it on PATH?"))?;
+        .with_context(|| format!("failed to launch `{bin}` — is it on PATH?"))?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -1015,7 +1333,7 @@ fn jq_present() -> bool {
 
 fn print_setup(runtime: &Path, loop_path: &Path, baton_seeded: bool, questions_seeded: bool) {
     println!("runtime: {}", runtime.display());
-    println!("  refreshed  loop.json, inject.sh, statusline.sh");
+    println!("  refreshed  loop.json, mcp.json, opencode.json, inject.sh, statusline.sh");
     println!(
         "  baton.md   {}",
         if baton_seeded {
@@ -1038,6 +1356,22 @@ const PILLAR: &str = "growlight";
 
 /// `$XDG_CONFIG_HOME/softfig/growlight` (fallback `~/.config/...`). Never a
 /// literal — derived from the environment per spec §3/§12.
+/// Which directory the opencode agent is granted via `external_directory` so it
+/// can read and rewrite its baton (slice 006).
+///
+/// In the standard layout the runtime dir is `<config>/softfig/growlight`, and the
+/// grant is its **parent** — `<config>/softfig` — so sibling runtime state (usage,
+/// per-member `agents/`, anything the daemon adds later) is covered by the same
+/// rule rather than needing a new one each time. Under a `--config-dir` override
+/// the runtime dir is wherever the caller said, and its parent is none of our
+/// business — grant exactly that directory.
+fn runtime_grant_root(runtime: &Path) -> &Path {
+    match runtime.parent() {
+        Some(parent) if runtime.file_name() == Some(std::ffi::OsStr::new(PILLAR)) => parent,
+        _ => runtime,
+    }
+}
+
 fn runtime_dir(override_: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_ {
         return Ok(p);
@@ -2593,6 +2927,7 @@ mod tests {
         BatonView {
             status: Some(status.to_string()),
             item: Some("item-a".to_string()),
+            slice: None,
             iteration: Some(1),
             next_action: Some(next.to_string()),
         }
@@ -3105,5 +3440,205 @@ mod tests {
             other => panic!("expected Stop, got {other:?}"),
         }
         assert!(TestCli::try_parse_from(["g", "stop"]).is_err());
+    }
+
+    // ---- slice 005: picker suppression + item-declared model ------------
+
+    #[test]
+    fn the_picker_prompts_only_for_an_unflagged_interactive_launch() {
+        // The one case a human is asked: no flag, a TTY, and a real launch.
+        assert!(should_prompt(false, false, false, true));
+
+        // Never prompt when the human already chose on the command line …
+        assert!(!should_prompt(true, false, false, true));
+        // … when nothing interactive is being launched …
+        assert!(!should_prompt(false, true, false, true), "--auto drives itself");
+        assert!(!should_prompt(false, false, true, true), "--no-launch launches nothing");
+        // … and above all NEVER without a TTY: a pipe/cron/script must not block
+        // forever on a read that can't be answered.
+        assert!(!should_prompt(false, false, false, false));
+        assert!(!should_prompt(true, true, true, false));
+    }
+
+    #[test]
+    fn the_no_launch_hint_names_the_same_cwd_the_launcher_really_uses() {
+        // The hint is what a human copy-pastes INSTEAD of the spawn, so it must
+        // reproduce it. Both are derived from one `InteractiveLaunch` here, and
+        // the test compares the printed `cd` against the command's real cwd —
+        // the drift that shipped in slice 006 (hint said the runtime dir, the
+        // launch had moved to the garden) fails this.
+        let garden = Path::new("/home/u/garden");
+        let launch = InteractiveLaunch {
+            agent_name: AGENT_NAME,
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: garden,
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: OPENCODE_KICK,
+        };
+
+        for choice in [
+            ModelChoice::claude(),
+            ModelChoice::opencode(DEEPSEEK_FLASH),
+        ] {
+            let hint = no_launch_hint(&choice, &launch);
+            let cwd = choice
+                .backend
+                .interactive_command(&launch)
+                .unwrap()
+                .get_current_dir()
+                .map(Path::to_path_buf)
+                .expect("the launcher pins a cwd on both backends");
+            assert_eq!(cwd, garden);
+            assert!(
+                hint.contains(&format!("cd {}", cwd.display())),
+                "hint must name the launch cwd, got: {hint}"
+            );
+        }
+
+        // An opencode hint carries the config over OPENCODE_CONFIG and names the
+        // resolved model, never claude's --settings/--mcp-config.
+        let opencode = no_launch_hint(&ModelChoice::opencode(DEEPSEEK_REASONING), &launch);
+        assert!(opencode.contains("OPENCODE_CONFIG=/rt/opencode.json"));
+        assert!(opencode.contains(DEEPSEEK_REASONING), "name the model: {opencode}");
+        assert!(!opencode.contains("--settings") && !opencode.contains("--mcp-config"));
+
+        // The claude hint keeps the settings pair it always had.
+        let claude = no_launch_hint(&ModelChoice::claude(), &launch);
+        assert!(claude.contains("--settings /rt/loop.json"));
+        assert!(claude.contains("--mcp-config /rt/mcp.json"));
+        assert!(!claude.contains("OPENCODE_CONFIG"));
+    }
+
+    #[test]
+    fn start_args_parse_the_model_flag_and_keep_the_selectors_exclusive() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+        let start = |args: &[&str]| match TestCli::try_parse_from(args).map(|c| c.cmd) {
+            Ok(GrowlightCmd::Start(a)) => Ok(a),
+            Ok(other) => panic!("expected Start, got {other:?}"),
+            Err(e) => Err(e),
+        };
+
+        // Nothing chosen → no backend, no model (the picker's cue).
+        let bare = start(&["g", "start"]).unwrap();
+        assert_eq!(bare.backend, None);
+        assert!(!bare.opencode);
+        assert_eq!(bare.model, None);
+
+        assert_eq!(
+            start(&["g", "start", "--model", "flash effort=high"])
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("flash effort=high")
+        );
+        assert_eq!(
+            start(&["g", "start", "--backend", "opencode"]).unwrap().backend,
+            Some(Backend::Opencode)
+        );
+        assert!(start(&["g", "start", "--opencode"]).unwrap().opencode);
+
+        // The three selectors are mutually exclusive — two disagreeing choices
+        // must be a parse error, never a silent precedence rule.
+        assert!(start(&["g", "start", "--model", "flash", "--opencode"]).is_err());
+        assert!(start(&["g", "start", "--model", "claude", "--backend", "claude"]).is_err());
+        assert!(start(&["g", "start", "--opencode", "--backend", "claude"]).is_err());
+    }
+
+    /// A garden with one milestone (slices + CLAUDE.md) and one task, plus a
+    /// baton pointing at a chosen item/slice.
+    fn declaring_garden(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("sf-declmodel-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let backlog = root.join(PILLAR).join("backlog");
+        let slices = backlog.join("milestones").join("m-x").join("slices");
+        fs::create_dir_all(&slices).unwrap();
+        fs::create_dir_all(backlog.join("tasks")).unwrap();
+
+        // Slice 005 declares reasoning; slice 006 declares nothing (so it inherits
+        // the milestone's flash); the milestone declares flash for everything else.
+        fs::write(slices.join("005-picker.md"), "# Picker\n\n> Model: reasoning\n").unwrap();
+        fs::write(slices.join("006-focus.md"), "# Focus\n\n> Last reviewed: 2026-08-08\n").unwrap();
+        fs::write(
+            backlog.join("milestones").join("m-x").join("CLAUDE.md"),
+            "# backlog: m-x\n\n> Model: flash effort=low\n",
+        )
+        .unwrap();
+        fs::write(
+            backlog.join("tasks").join("047-a-task.md"),
+            "# A task\n\n> Model: claude\n",
+        )
+        .unwrap();
+        root
+    }
+
+    fn baton_at(root: &Path, item: &str, slice: &str) -> PathBuf {
+        let path = root.join(format!("baton-{item}-{slice}.md"));
+        fs::write(
+            &path,
+            format!("---\nstatus: IN_PROGRESS\nitem: {item}\nslice: {slice}\n---\n# NEXT ACTION\ngo\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn growlight_decides_reads_the_slice_then_the_milestone_then_falls_back() {
+        let root = declaring_garden("chain");
+
+        // The active slice's own declaration wins.
+        let on_005 = declared_model(&root, &baton_at(&root, "m-x", "005"));
+        assert_eq!(on_005, ModelChoice::opencode(DEEPSEEK_REASONING));
+
+        // A slice that declares nothing inherits the milestone's — including its
+        // variant, so a milestone can set effort once for all its slices.
+        let on_006 = declared_model(&root, &baton_at(&root, "m-x", "006"));
+        assert_eq!(on_006.model.as_deref(), Some(DEEPSEEK_FLASH));
+        assert_eq!(on_006.variant.as_deref(), Some("low"));
+
+        // The baton writes the slice unpadded as often as padded; both resolve.
+        assert_eq!(declared_model(&root, &baton_at(&root, "m-x", "5")), on_005);
+
+        // A standalone task has one doc, and may name claude just as a slice can.
+        assert_eq!(
+            declared_model(&root, &baton_at(&root, "047", "")),
+            ModelChoice::claude()
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn growlight_decides_falls_back_to_flash_and_never_fails_the_launch() {
+        let root = declaring_garden("fallback");
+        let flash = ModelChoice::opencode(DEFAULT_OPENCODE_MODEL);
+
+        // No baton at all / a baton naming no item / an item with no doc anywhere:
+        // all resolve to the cheap default rather than erroring out of a launch.
+        assert_eq!(declared_model(&root, &root.join("nope.md")), flash);
+        let itemless = root.join("itemless.md");
+        fs::write(&itemless, "---\nstatus: IN_PROGRESS\nitem: null\n---\n").unwrap();
+        assert_eq!(declared_model(&root, &itemless), flash);
+        assert_eq!(declared_model(&root, &baton_at(&root, "ghost", "001")), flash);
+
+        // A milestone slice that exists but declares nothing, under a milestone
+        // that also declares nothing.
+        let bare = root.join(PILLAR).join("backlog").join("milestones").join("m-bare");
+        fs::create_dir_all(bare.join("slices")).unwrap();
+        fs::write(bare.join("slices").join("001-x.md"), "# X\n").unwrap();
+        assert_eq!(declared_model(&root, &baton_at(&root, "m-bare", "001")), flash);
+
+        // A MALFORMED declaration is reported and defaulted, never propagated as a
+        // launch failure — a bad metadata line must not stand between the human and
+        // their loop.
+        fs::write(bare.join("slices").join("002-bad.md"), "# X\n\n> Model: gpt-9\n").unwrap();
+        assert_eq!(declared_model(&root, &baton_at(&root, "m-bare", "002")), flash);
+
+        fs::remove_dir_all(&root).ok();
     }
 }
