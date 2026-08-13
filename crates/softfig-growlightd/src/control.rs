@@ -38,9 +38,9 @@ use softfig_ipc::growlightd::StopLevel;
 
 /// A live agent's forcibly-killable process handle.
 ///
-/// Implemented over a real `claude -p` child by
-/// [`crate::claude_backend::ClaudeChild`] (a scope-cgroup SIGKILL + controller
-/// reap). The live backend stores one in the daemon's
+/// Implemented over a real agent child by
+/// [`crate::agent_harness::ScopedChild`] (a scope-cgroup SIGKILL + controller
+/// reap), whichever backend spawned it. The live backend stores one in the daemon's
 /// [`crate::daemon::Daemon::kill_handles`] registry on every spawn, so the
 /// hard-kill path reaches the agent the supervisor is actually running.
 ///

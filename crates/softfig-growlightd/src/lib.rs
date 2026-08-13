@@ -19,6 +19,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod admission;
+pub mod agent_harness;
 pub mod baton_store;
 pub mod bus;
 pub mod claim;
@@ -52,7 +53,8 @@ pub use admission::{
 pub use baton_store::FsBatonStore;
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
-pub use claude_backend::{AgentHealthState, ClaudeBackend};
+pub use agent_harness::{AgentHealthState, BackendFlavor, Harness, LineObserver};
+pub use claude_backend::ClaudeBackend;
 pub use config::{BuildCaps, GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};

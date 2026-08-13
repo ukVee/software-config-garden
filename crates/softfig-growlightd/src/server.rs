@@ -20,7 +20,7 @@ use softfig_ipc::growlightd::{
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
-use crate::claude_backend::apply_set_property;
+use crate::agent_harness::apply_set_property;
 use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::resume::ResumeOutcome;
