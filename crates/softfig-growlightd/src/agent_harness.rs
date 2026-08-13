@@ -77,6 +77,25 @@ const STDERR_ALERT_TAIL_LINES: usize = 10;
 /// the trailing minute (spec §7 "tokens/requests per minute"). One minute.
 const RATE_WINDOW_SECS: i64 = 60;
 
+/// Cap on a rendered tool-call argument string, so one giant tool `input` can't
+/// flood the event stream / GUI. Provider-neutral: every backend's observer
+/// renders a tool call into one delta line, so the cap belongs beside the pipeline
+/// they all publish on rather than in any one flavor.
+pub(crate) const TOOL_RENDER_MAX_CHARS: usize = 200;
+
+/// Truncate `s` to at most `max` **chars**, appending `…` when anything was cut.
+/// Char-wise, because `String::truncate` panics mid-codepoint — a tool argument or
+/// a stderr line is arbitrary UTF-8 from a child process.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let mut t: String = s.chars().take(max).collect();
+        t.push('…');
+        t
+    } else {
+        s.to_string()
+    }
+}
+
 /// Shared, lock-free observation of one live agent: the Unix-seconds heartbeat
 /// (bumped on every stream line) and the exit code once the child ends. The
 /// reader thread writes it; the drive loop reads it via [`Harness::health`] to
@@ -202,13 +221,7 @@ impl AgentStderrState {
     /// dropping the oldest once the ring exceeds [`STDERR_RING_MAX_LINES`]. Called
     /// once per non-empty line by the reader thread.
     fn push_line(&self, line: &str) {
-        let line = if line.chars().count() > STDERR_LINE_MAX_CHARS {
-            let mut t: String = line.chars().take(STDERR_LINE_MAX_CHARS).collect();
-            t.push('…');
-            t
-        } else {
-            line.to_string()
-        };
+        let line = truncate_chars(line, STDERR_LINE_MAX_CHARS);
         let mut buf = self.inner.lock().unwrap();
         buf.push_back(line);
         while buf.len() > STDERR_RING_MAX_LINES {

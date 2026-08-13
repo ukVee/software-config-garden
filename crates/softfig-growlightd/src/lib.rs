@@ -34,6 +34,7 @@ pub mod hub;
 pub mod leases;
 pub mod notifications;
 pub mod notify_dispatch;
+pub mod opencode_backend;
 pub mod peer;
 pub mod persist;
 pub mod preapproval;

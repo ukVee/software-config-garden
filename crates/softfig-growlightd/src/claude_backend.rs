@@ -51,7 +51,9 @@ use serde_json::Value;
 use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 
 use crate::admission::BudgetUsage;
-use crate::agent_harness::{AgentRateState, BackendFlavor, Harness, LineObserver};
+use crate::agent_harness::{
+    AgentRateState, BackendFlavor, Harness, LineObserver, TOOL_RENDER_MAX_CHARS, truncate_chars,
+};
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
 use crate::hub::EventHub;
@@ -65,9 +67,9 @@ use crate::agent_harness::AgentHealthState;
 #[cfg(test)]
 use std::io::BufRead;
 
-/// Cap on a rendered tool-call argument string, so one giant `input` can't flood
-/// the event stream / GUI.
-const TOOL_RENDER_MAX_CHARS: usize = 200;
+// The rendered-tool-call cap + its char-safe truncation are provider-neutral and
+// live in the harness ([`crate::agent_harness::TOOL_RENDER_MAX_CHARS`] /
+// [`truncate_chars`]), shared with every other flavor's renderer.
 
 /// Which rolling reserve window a `rate_limit_event` reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,17 +292,12 @@ fn render_tool_use(block: &Value) -> String {
         .get("input")
         .map(|i| serde_json::to_string(i).unwrap_or_default())
         .unwrap_or_default();
-    let mut rendered = if input.is_empty() || input == "null" {
+    let rendered = if input.is_empty() || input == "null" {
         name.to_string()
     } else {
         format!("{name}({input})")
     };
-    // Truncate on a char boundary (`String::truncate` panics mid-codepoint).
-    if rendered.chars().count() > TOOL_RENDER_MAX_CHARS {
-        rendered = rendered.chars().take(TOOL_RENDER_MAX_CHARS).collect();
-        rendered.push('…');
-    }
-    rendered
+    truncate_chars(&rendered, TOOL_RENDER_MAX_CHARS)
 }
 
 /// One agent's parsed `result`-line budget reading: the reliable per-agent
