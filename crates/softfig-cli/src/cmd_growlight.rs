@@ -466,7 +466,7 @@ fn start(args: StartArgs) -> Result<()> {
             agent_name: AGENT_NAME,
             protocol: &protocol,
             baton: &baton_path,
-            garden_root: &garden_root,
+            runtime_root: runtime_grant_root(&runtime),
             mcp_bin: &softfig_mcp_path(),
             claude_projects: &claude_projects,
             model: choice.opencode_model(),
@@ -540,13 +540,11 @@ fn start(args: StartArgs) -> Result<()> {
         agent_name: AGENT_NAME,
         loop_settings: &loop_path,
         mcp_config: &mcp_path,
-        // Each backend roots where its own design needs: claude at the garden
-        // (auto-cd, so `growlight start` works from anywhere), opencode at the
-        // runtime dir (baton in-project, garden external). See the two fields'
-        // docs on `InteractiveLaunch`.
+        // BOTH backends now root at the garden: claude for slice 005's auto-cd,
+        // opencode since slice 006 so garden docs are ordinary in-project reads.
+        // See the field's doc on `InteractiveLaunch`.
         garden_root: &garden_root,
         opencode_config: &opencode_path,
-        runtime_dir: &runtime,
         boot_prompt: OPENCODE_KICK,
     };
     launch_agent(&choice, &launch)
@@ -1338,6 +1336,22 @@ const PILLAR: &str = "growlight";
 
 /// `$XDG_CONFIG_HOME/softfig/growlight` (fallback `~/.config/...`). Never a
 /// literal — derived from the environment per spec §3/§12.
+/// Which directory the opencode agent is granted via `external_directory` so it
+/// can read and rewrite its baton (slice 006).
+///
+/// In the standard layout the runtime dir is `<config>/softfig/growlight`, and the
+/// grant is its **parent** — `<config>/softfig` — so sibling runtime state (usage,
+/// per-member `agents/`, anything the daemon adds later) is covered by the same
+/// rule rather than needing a new one each time. Under a `--config-dir` override
+/// the runtime dir is wherever the caller said, and its parent is none of our
+/// business — grant exactly that directory.
+fn runtime_grant_root(runtime: &Path) -> &Path {
+    match runtime.parent() {
+        Some(parent) if runtime.file_name() == Some(std::ffi::OsStr::new(PILLAR)) => parent,
+        _ => runtime,
+    }
+}
+
 fn runtime_dir(override_: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_ {
         return Ok(p);
