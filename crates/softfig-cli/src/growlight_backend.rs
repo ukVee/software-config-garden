@@ -202,7 +202,7 @@ pub fn item_model_field(doc: &str) -> Option<&str> {
 /// The inputs an interactive launch needs, across backends. Each backend
 /// consumes only the subset relevant to it (claude: the name, `loop_settings`,
 /// `mcp_config`, and `garden_root`; opencode: the name, `opencode_config`,
-/// `runtime_dir`, and `boot_prompt`), so the seam stays a single call while
+/// `garden_root`, and `boot_prompt`), so the seam stays a single call while
 /// neither backend has to fabricate the paths the other needs. Borrows throughout
 /// (the caller owns the generated runtime paths); pure data, no I/O.
 pub struct InteractiveLaunch<'a> {

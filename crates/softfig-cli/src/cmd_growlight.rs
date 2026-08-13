@@ -474,30 +474,24 @@ fn start(args: StartArgs) -> Result<()> {
         }),
     )?;
 
+    // Built BEFORE the `--no-launch` branch, not just before the spawn, so the
+    // printed hint and the real launch are derived from the same value and cannot
+    // drift apart (they did: the hint kept naming the pre-slice-006 runtime cwd
+    // long after the launch had moved to the garden).
+    let launch = InteractiveLaunch {
+        agent_name: AGENT_NAME,
+        loop_settings: &loop_path,
+        mcp_config: &mcp_path,
+        // BOTH backends now root at the garden: claude for slice 005's auto-cd,
+        // opencode since slice 006 so garden docs are ordinary in-project reads.
+        // See the field's doc on `InteractiveLaunch`.
+        garden_root: &garden_root,
+        opencode_config: &opencode_path,
+        boot_prompt: OPENCODE_KICK,
+    };
+
     if args.no_launch {
-        match backend {
-            Backend::Claude => println!(
-                "\n(--no-launch) runtime ready. launch with:\n  {AGENT_BIN} --name {AGENT_NAME} \
-                 --settings {} --mcp-config {}",
-                loop_path.display(),
-                mcp_path.display()
-            ),
-            // The opencode config is handed over via `OPENCODE_CONFIG` (its
-            // analog of claude's `--settings`) and the launch runs from the
-            // runtime dir (baton in-project, garden external — see
-            // InteractiveLaunch::runtime_dir). `growlight start --opencode` does
-            // the cd + kick for you; this hint is the copy-pasteable manual
-            // equivalent (minus the first-turn `--prompt`, which the human can type
-            // instead). The model is already baked into the config just written.
-            Backend::Opencode => println!(
-                "\n(--no-launch) runtime ready ({}). launch with:\n  cd {} && OPENCODE_CONFIG={} \
-                 {} --agent {AGENT_NAME}",
-                choice.opencode_model(),
-                runtime.display(),
-                opencode_path.display(),
-                backend.agent_bin(),
-            ),
-        }
+        println!("\n{}", no_launch_hint(&choice, &launch));
         return Ok(());
     }
     if args.auto {
@@ -536,18 +530,44 @@ fn start(args: StartArgs) -> Result<()> {
         print_loop_summary(&summary, &usage_path, &log_path);
         return Ok(());
     }
-    let launch = InteractiveLaunch {
-        agent_name: AGENT_NAME,
-        loop_settings: &loop_path,
-        mcp_config: &mcp_path,
-        // BOTH backends now root at the garden: claude for slice 005's auto-cd,
-        // opencode since slice 006 so garden docs are ordinary in-project reads.
-        // See the field's doc on `InteractiveLaunch`.
-        garden_root: &garden_root,
-        opencode_config: &opencode_path,
-        boot_prompt: OPENCODE_KICK,
-    };
     launch_agent(&choice, &launch)
+}
+
+/// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
+/// and built from the very [`InteractiveLaunch`] the spawn would consume, so a
+/// test can assert the hint names the same cwd the launcher really uses.
+///
+/// That equivalence is load-bearing for opencode: the generated config grants
+/// only the runtime root + the claude-memory tree via `external_directory`, so a
+/// session started from anywhere other than the garden cannot read the garden at
+/// all — the exact failure slice 006 removed. A hint that names the wrong cwd
+/// hands the human a session that looks fine and is blind.
+///
+/// The `cd` is shown for both backends because the launcher pins the cwd for both
+/// (slice 005's auto-cd for claude, slice 006 for opencode); a hint that silently
+/// inherited the human's cwd would reproduce neither.
+fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
+    let garden = launch.garden_root.display();
+    match choice.backend {
+        Backend::Claude => format!(
+            "(--no-launch) runtime ready. launch with:\n  cd {garden} && {AGENT_BIN} \
+             --name {AGENT_NAME} --settings {} --mcp-config {}",
+            launch.loop_settings.display(),
+            launch.mcp_config.display(),
+        ),
+        // The opencode config is handed over via `OPENCODE_CONFIG` (its analog of
+        // claude's `--settings`), so there is no `--settings`/`--mcp-config` here.
+        // `growlight start --opencode` does the cd + first-turn kick for you; this
+        // is the manual equivalent minus the `--prompt`, which the human types
+        // instead. The model is already baked into the config just written.
+        Backend::Opencode => format!(
+            "(--no-launch) runtime ready ({}). launch with:\n  cd {garden} && OPENCODE_CONFIG={} \
+             {} --agent {AGENT_NAME}",
+            choice.opencode_model(),
+            launch.opencode_config.display(),
+            choice.backend.agent_bin(),
+        ),
+    }
 }
 
 // ---- backend + model resolution (slice 005) ----------------------------
@@ -3438,6 +3458,56 @@ mod tests {
         // forever on a read that can't be answered.
         assert!(!should_prompt(false, false, false, false));
         assert!(!should_prompt(true, true, true, false));
+    }
+
+    #[test]
+    fn the_no_launch_hint_names_the_same_cwd_the_launcher_really_uses() {
+        // The hint is what a human copy-pastes INSTEAD of the spawn, so it must
+        // reproduce it. Both are derived from one `InteractiveLaunch` here, and
+        // the test compares the printed `cd` against the command's real cwd —
+        // the drift that shipped in slice 006 (hint said the runtime dir, the
+        // launch had moved to the garden) fails this.
+        let garden = Path::new("/home/u/garden");
+        let launch = InteractiveLaunch {
+            agent_name: AGENT_NAME,
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: garden,
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: OPENCODE_KICK,
+        };
+
+        for choice in [
+            ModelChoice::claude(),
+            ModelChoice::opencode(DEEPSEEK_FLASH),
+        ] {
+            let hint = no_launch_hint(&choice, &launch);
+            let cwd = choice
+                .backend
+                .interactive_command(&launch)
+                .unwrap()
+                .get_current_dir()
+                .map(Path::to_path_buf)
+                .expect("the launcher pins a cwd on both backends");
+            assert_eq!(cwd, garden);
+            assert!(
+                hint.contains(&format!("cd {}", cwd.display())),
+                "hint must name the launch cwd, got: {hint}"
+            );
+        }
+
+        // An opencode hint carries the config over OPENCODE_CONFIG and names the
+        // resolved model, never claude's --settings/--mcp-config.
+        let opencode = no_launch_hint(&ModelChoice::opencode(DEEPSEEK_REASONING), &launch);
+        assert!(opencode.contains("OPENCODE_CONFIG=/rt/opencode.json"));
+        assert!(opencode.contains(DEEPSEEK_REASONING), "name the model: {opencode}");
+        assert!(!opencode.contains("--settings") && !opencode.contains("--mcp-config"));
+
+        // The claude hint keeps the settings pair it always had.
+        let claude = no_launch_hint(&ModelChoice::claude(), &launch);
+        assert!(claude.contains("--settings /rt/loop.json"));
+        assert!(claude.contains("--mcp-config /rt/mcp.json"));
+        assert!(!claude.contains("OPENCODE_CONFIG"));
     }
 
     #[test]
