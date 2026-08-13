@@ -100,6 +100,39 @@ pub fn overlapping_region(content: &str, start: usize, end: usize) -> Option<Str
     None
 }
 
+/// Enumerate every well-formed managed region as `(tag, body)` in document
+/// order — the body with its one blank pad line on each side stripped (the
+/// same trim as [`region_body`]). The `unlink` reference refusal scans
+/// `index *` region bodies for a listing of the target path. An unterminated
+/// open marker isn't a region and is skipped, like [`locate`].
+pub fn regions(content: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(tag) = open_tag(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let close = close_marker(&tag);
+        let Some(j) = lines[i + 1..].iter().position(|l| l.trim() == close) else {
+            i += 1;
+            continue;
+        };
+        let close_idx = i + 1 + j;
+        let mut body = &lines[i + 1..close_idx];
+        while body.first().is_some_and(|l| l.trim().is_empty()) {
+            body = &body[1..];
+        }
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body = &body[..body.len() - 1];
+        }
+        out.push((tag, body.join("\n")));
+        i = close_idx + 1;
+    }
+    out
+}
+
 /// Insert or replace the region `tag` so its inner body is exactly `body`
 /// (which must not contain the marker lines and carries no surrounding
 /// newlines). Present → swap the inner lines, keeping the markers in place.
@@ -273,5 +306,20 @@ mod tests {
     fn overlapping_region_ignores_unterminated_markers() {
         let doc = "# T\n\n<!-- softfig:index notes -->\n\nno close\n";
         assert_eq!(overlapping_region(doc, 0, 6), None);
+    }
+
+    #[test]
+    fn regions_enumerates_bodies_in_order() {
+        let doc = "# D\n\n<!-- softfig:index notes -->\n\nA\n\n<!-- /softfig:index notes -->\n\n\
+                   prose\n\n<!-- softfig:queue -->\n\n| r |\n\n<!-- /softfig:queue -->\n\
+                   <!-- softfig:index notes -->\n\nunterminated\n";
+        assert_eq!(
+            regions(doc),
+            vec![
+                ("index notes".to_string(), "A".to_string()),
+                ("queue".to_string(), "| r |".to_string()),
+            ]
+        );
+        assert!(regions("# D\n\nno regions\n").is_empty());
     }
 }

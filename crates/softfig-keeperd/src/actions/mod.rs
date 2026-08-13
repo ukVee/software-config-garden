@@ -40,6 +40,7 @@ mod shared_pull;
 mod split;
 mod sync_conflict;
 mod thrash;
+mod unlink;
 mod worktree;
 
 pub use add_code_review::add_code_review;
@@ -65,6 +66,7 @@ pub(crate) use shared_pull::{apply_shared_pull, SharedPullInput, SharedPullOutco
 pub use split::migrate_split;
 pub(crate) use sync_conflict::{resolve_sync_conflict, ConflictResolution, ConflictSides};
 pub use thrash::ThrashDetector;
+pub use unlink::unlink;
 pub(crate) use worktree::{Tree, WorkTree};
 
 use std::path::Path;

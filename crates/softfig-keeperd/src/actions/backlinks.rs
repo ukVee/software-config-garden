@@ -111,10 +111,37 @@ pub fn rewrite_refs_to_archived(
     }
 }
 
+/// The sources that reference `rel` right now via a resolvable `[[…]]`
+/// token — the `unlink` reference refusal's backlink arm. The target itself
+/// is skipped as a source (a self-reference dies with the file). Sorted.
+/// Whole-garden walk, best-effort like the maintenance itself: a
+/// vault-protected or unreadable source is skipped, never blocking the
+/// primary op.
+pub fn inbound_refs(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Vec<String> {
+    let exists = |r: &str| wt.exists(r) && !wt.is_dir(r);
+    let mut out = Vec::new();
+    for source in collect_md(wt) {
+        if source == rel {
+            continue;
+        }
+        let Some(content) = super::sections::read_if_unprotected(wt, inner, &source) else {
+            continue;
+        };
+        if refs::parse_refs(&content)
+            .iter()
+            .any(|t| refs::resolve_ref(&source, t, &exists).as_deref() == Some(rel))
+        {
+            out.push(source);
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Collect garden-relative paths of every `.md` file, skipping the
 /// `journal/archive` graveyard and any dot-prefixed entry (`.softfig`,
 /// `.git`, `.seq`, …). Symlinked dirs are not followed.
-fn collect_md(wt: &WorkTree) -> Vec<String> {
+pub(crate) fn collect_md(wt: &WorkTree) -> Vec<String> {
     let mut out = Vec::new();
     walk(wt, "", &mut out);
     out

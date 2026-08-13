@@ -234,8 +234,19 @@ fn cas_check_section(
 /// the shared resolve for every doc-edit verb (`patch_file` included).
 pub(crate) fn resolve(garden_root: &Path, path: &str) -> Result<String, (ErrorKind, String)> {
     let abs = validate_repo_path(garden_root, path).map_err(|m| (ErrorKind::BadArgs, m))?;
-    path_to_repo_rel_string(garden_root, &abs)
-        .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))
+    let rel = path_to_repo_rel_string(garden_root, &abs)
+        .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))?;
+    // The daemon state dir is not garden content and is VCS-ignored — a
+    // doc-edit verb must never land on it (mcp-surgical-writes slice 004
+    // tightened this here, one guard for the whole family; `unlink`'s
+    // history-recoverability argument wouldn't hold for ignored state).
+    if rel == ".softfig" || rel.starts_with(".softfig/") {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("{rel}: the daemon state dir (.softfig/) is not garden content"),
+        ));
+    }
+    Ok(rel)
 }
 /// Read `rel`'s working-tree bytes as plaintext **iff** a plaintext rewrite
 /// is safe — the file isn't whole-file-sealed and carries no inline

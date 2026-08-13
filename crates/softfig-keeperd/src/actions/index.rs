@@ -149,6 +149,65 @@ fn escape_link_text(s: &str) -> String {
     s.replace('|', "\\|").replace('[', "(").replace(']', ")")
 }
 
+// ---- unlink reference refusal ------------------------------------------
+
+/// Host docs whose managed `<!-- softfig:index … -->` regions list `rel` —
+/// the `unlink` reference refusal's index arm (a `.seq` slot / TOC row /
+/// slice row is history; deleting through it would corrupt the table's
+/// invariants — `archive` is the tool that does it right). Each entry names
+/// the host + region tag, e.g. `services/waydroid/CLAUDE.md (softfig:index
+/// notes)`. Index rows link targets **relative to the host doc**, so both
+/// the repo-relative and the host-relative form of `rel` are checked.
+/// Whole-garden walk, best-effort like the maintenance itself:
+/// vault-protected or unreadable hosts are skipped.
+pub fn index_listings(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for host in super::backlinks::collect_md(wt) {
+        let Some(content) = super::sections::read_if_unprotected(wt, inner, &host) else {
+            continue;
+        };
+        let host_dir = Path::new(&host)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        let host_rel = rel.strip_prefix(host_dir).and_then(|s| s.strip_prefix('/'));
+        for (tag, body) in managed::regions(&content) {
+            if !tag.starts_with("index ") {
+                continue;
+            }
+            let listed = mentions(&body, rel)
+                || host_rel.is_some_and(|r| !r.is_empty() && mentions(&body, r));
+            if listed {
+                out.push(format!("{host} (softfig:{tag})"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether a managed-region body lists `rel` — a path-shaped mention bounded
+/// by non-path characters on both sides, so `notes/002-gpu.md` doesn't match
+/// inside `notes/002-gpu.md.backup`. Region bodies are daemon-rendered:
+/// index rows link `[title](<rel>)`, so both `(`/`)` delimit — the boundary
+/// check is exact.
+fn mentions(body: &str, rel: &str) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    let path_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
+    let mut rest = body;
+    while let Some(i) = rest.find(rel) {
+        let before = rest[..i].chars().next_back();
+        let after = rest[i + rel.len()..].chars().next();
+        if before.is_none_or(|c| !path_char(c)) && after.is_none_or(|c| !path_char(c)) {
+            return true;
+        }
+        rest = &rest[i + rel.len()..];
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +269,19 @@ mod tests {
         assert!(table.contains("[a\\|b (v2)](notes/001-a.md)"), "{table}");
         // Empty reviewed renders as an empty cell, not a panic.
         assert!(table.ends_with("|  |"));
+    }
+
+    #[test]
+    fn mentions_requires_path_shaped_boundaries() {
+        // Link-target form (index rows) and backtick form (backlink rows).
+        assert!(mentions("| 001 | [A](notes/002-gpu.md) | 2026 |", "notes/002-gpu.md"));
+        assert!(mentions("- `notes/002-gpu.md`", "notes/002-gpu.md"));
+        // A bare token at the start / end of the body counts too.
+        assert!(mentions("notes/002-gpu.md\n", "notes/002-gpu.md"));
+        // Substring-of-a-path mentions don't: the neighbor is a path char.
+        assert!(!mentions("(notes/002-gpu.md.backup)", "notes/002-gpu.md"));
+        assert!(!mentions("(xnotes/002-gpu.md)", "notes/002-gpu.md"));
+        // Only `index *` tags are scanned, so the empty needle never loops.
+        assert!(!mentions("anything", ""));
     }
 }

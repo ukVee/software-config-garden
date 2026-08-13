@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use softfig_ipc::verbs::{op, ChatMessage, DocEditReply, PatchFileReply, ReadFileReply, ReadVersionsReply, TailBusReply};
+use softfig_ipc::verbs::{op, ChatMessage, DocEditReply, LogReply, PatchFileReply, ReadFileReply, ReadVersionsReply, ShowReply, TailBusReply, UnlinkReply};
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
 use softfig_vault::Vault;
@@ -684,5 +684,194 @@ fn remove_section_ping_pong_nudges_the_bus_once() {
         nudges[0].body.contains("doc.md") && nudges[0].body.contains("G"),
         "names the section target: {}",
         nudges[0].body
+    );
+}
+
+// ---- unlink (slice 004) ------------------------------------------------
+
+fn unlink(fx: &Fixture, path: &str, extra: serde_json::Value) -> Response {
+    let mut args = serde_json::json!({ "path": path });
+    if let serde_json::Value::Object(map) = &extra {
+        for (k, v) in map {
+            args[k] = v.clone();
+        }
+    }
+    fx.call(op::UNLINK, args)
+}
+
+#[test]
+fn unlink_deletes_a_leaf_and_commits_file_unlinked() {
+    let fx = Fixture::start(true);
+    fx.write_file("junk.md", "triage leftover\n");
+
+    let reply: UnlinkReply = serde_json::from_value(ok_data(unlink(
+        &fx,
+        "junk.md",
+        serde_json::json!({}),
+    )))
+    .unwrap();
+    assert_eq!(reply.path, "junk.md");
+    assert!(!reply.hash.is_empty());
+    assert_eq!(
+        err_kind(fx.call(op::READ_FILE, serde_json::json!({ "path": "junk.md" }))),
+        ErrorKind::NotFound
+    );
+
+    // The tip commit carries the `file_unlinked` intent.
+    let log: LogReply = serde_json::from_value(ok_data(fx.call(
+        op::LOG,
+        serde_json::json!({ "limit": 1 }),
+    )))
+    .unwrap();
+    assert_eq!(log.commits[0].intent, "file_unlinked");
+}
+
+#[test]
+fn unlink_refuses_when_listed_in_a_managed_index() {
+    let fx = Fixture::start(true);
+    fx.write_file(
+        "folder/CLAUDE.md",
+        "# folder\n\n<!-- softfig:index notes -->\n\n| # | Note | Reviewed |\n\
+         |---|------|----------|\n| 001 | [A note](notes/001-a.md) | 2026-08-13 |\n\n\
+         <!-- /softfig:index notes -->\n",
+    );
+    fx.write_file("folder/notes/001-a.md", "# A note\n\nbody\n");
+
+    let resp = unlink(&fx, "folder/notes/001-a.md", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::ReferencedElsewhere);
+    assert_eq!(read(&fx, "folder/notes/001-a.md").content, "# A note\n\nbody\n");
+
+    // A file NOT listed in the index is a plain leaf → deletable.
+    fx.write_file("folder/notes/002-b.md", "# B\n");
+    let resp = unlink(&fx, "folder/notes/002-b.md", serde_json::json!({}));
+    assert!(matches!(resp, Response::Ok { .. }), "unlisted leaf: {resp:?}");
+}
+
+#[test]
+fn unlink_refuses_when_inbound_backlinks_exist() {
+    let fx = Fixture::start(true);
+    fx.write_file("notes/002-target.md", "# Target\n");
+    fx.write_file("notes/001-source.md", "# Source\n\nsee [[002-target]]\n");
+
+    let resp = unlink(&fx, "notes/002-target.md", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::ReferencedElsewhere);
+    assert_eq!(read(&fx, "notes/002-target.md").content, "# Target\n");
+
+    // The backlink source itself is a leaf (nothing links TO it) → deletable.
+    let resp = unlink(&fx, "notes/001-source.md", serde_json::json!({}));
+    assert!(matches!(resp, Response::Ok { .. }), "source leaf: {resp:?}");
+}
+
+/// Deleting a file drops it from every backlinks region that named it as a
+/// source — no dangling rows after an unlink.
+#[test]
+fn unlink_drops_the_deleted_file_from_backlinks_regions() {
+    let fx = Fixture::start(true);
+    fx.write_file("notes/002-target.md", "# T\n\ntarget body\n");
+    // Make 001 reference 002, then force the graph to materialize 002's
+    // backlinks region via a patch (which refreshes the graph).
+    fx.write_file("notes/001-source.md", "# S\n\nref [[002-target]]\n");
+    let resp = patch(
+        &fx,
+        "notes/001-source.md",
+        "ref [[002-target]]",
+        "ref [[002-target]] kept",
+        serde_json::json!({}),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "patch: {resp:?}");
+    assert!(
+        read(&fx, "notes/002-target.md").content.contains("001-source"),
+        "region materialized"
+    );
+
+    // 002 does NOT reference 001, so 001 is an unreferenced leaf → deletable;
+    // the graph refresh must drop 001 from 002's region.
+    let resp = unlink(&fx, "notes/001-source.md", serde_json::json!({}));
+    assert!(matches!(resp, Response::Ok { .. }), "unlink: {resp:?}");
+    let t = read(&fx, "notes/002-target.md").content;
+    assert!(!t.contains("001-source"), "dangling backlink row: {t}");
+}
+
+#[test]
+fn unlink_cas_guard_conflicts_on_stale_version() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "v0\n");
+    let v0 = versions(&fx, "doc.md").version;
+
+    // Stale guard: the pinned version no longer matches the current file.
+    fx.write_file("doc.md", "v1\n");
+    let resp = unlink(&fx, "doc.md", serde_json::json!({ "expected_version": v0 }));
+    assert_eq!(err_kind(resp), ErrorKind::Conflict);
+    assert_eq!(read(&fx, "doc.md").content, "v1\n");
+
+    // Current guard: deletes cleanly.
+    let v1 = versions(&fx, "doc.md").version;
+    let resp = unlink(&fx, "doc.md", serde_json::json!({ "expected_version": v1 }));
+    assert!(matches!(resp, Response::Ok { .. }), "unlink: {resp:?}");
+    assert_eq!(
+        err_kind(fx.call(op::READ_FILE, serde_json::json!({ "path": "doc.md" }))),
+        ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn unlink_refuses_directories() {
+    let fx = Fixture::start(true);
+    fx.write_file("sub/keep.md", "x\n");
+    let resp = unlink(&fx, "sub", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs);
+    assert_eq!(read(&fx, "sub/keep.md").content, "x\n");
+}
+
+#[test]
+fn unlink_deletes_a_sealed_file_with_a_sealed_payload_flag() {
+    let fx = Fixture::start(true);
+    // Seal first, then write the secret so it commits Layer B directly.
+    let resp = fx.call(op::VAULT_SEAL, serde_json::json!({ "pattern": "secrets/**" }));
+    assert!(matches!(resp, Response::Ok { .. }), "seal: {resp:?}");
+    fx.write_file("secrets/key.txt", "TOPSECRET-do-not-leak");
+
+    // No vault refusal: a sealed blob is deletable (history keeps the bytes),
+    // and the commit payload marks that the deleted content was vault-tagged.
+    let reply: UnlinkReply = serde_json::from_value(ok_data(unlink(
+        &fx,
+        "secrets/key.txt",
+        serde_json::json!({}),
+    )))
+    .unwrap();
+    let show: ShowReply = serde_json::from_value(ok_data(fx.call(
+        op::SHOW,
+        serde_json::json!({ "hash": reply.hash }),
+    )))
+    .unwrap();
+    assert_eq!(show.commit.intent, "file_unlinked");
+    let payload: serde_json::Value = serde_json::from_str(&show.commit.payload).unwrap();
+    assert_eq!(payload["path"], "secrets/key.txt");
+    assert_eq!(payload["sealed"], serde_json::json!(true));
+}
+
+#[test]
+fn unlink_rejects_bad_args_and_locked() {
+    let fx = Fixture::start(true);
+    fx.write_file("doc.md", "x\n");
+    assert_eq!(
+        err_kind(unlink(&fx, "../outside.md", serde_json::json!({}))),
+        ErrorKind::BadArgs
+    );
+    // Daemon state is not garden content (and not VCS-recoverable).
+    assert_eq!(
+        err_kind(unlink(&fx, ".softfig/keeper.toml", serde_json::json!({}))),
+        ErrorKind::BadArgs
+    );
+    assert_eq!(
+        err_kind(unlink(&fx, "absent.md", serde_json::json!({}))),
+        ErrorKind::NotFound
+    );
+    assert_eq!(read(&fx, "doc.md").content, "x\n");
+
+    let fx = Fixture::start(false); // do NOT unlock
+    assert_eq!(
+        err_kind(unlink(&fx, "doc.md", serde_json::json!({}))),
+        ErrorKind::VaultLocked
     );
 }

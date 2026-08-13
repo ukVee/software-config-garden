@@ -106,6 +106,17 @@ pub mod op {
     /// and on ranges overlapping a managed `<!-- softfig:index -->` region.
     /// Commit `section_removed`.
     pub const REMOVE_SECTION: &str = "remove_section";
+    /// mcp-surgical-writes slice 004: delete one garden file — the
+    /// deliberate, guarded exception to the "don't delete, archive" rule.
+    /// Files only (no directories, no recursion). Refused with
+    /// `ReferencedElsewhere` when the file is listed in a daemon-managed
+    /// `<!-- softfig:index … -->` region or has inbound `[[…]]` backlinks —
+    /// unlink can only cut an unreferenced leaf; `archive` is the tool for
+    /// anything referenced. Vault-sealed targets ARE deletable (history keeps
+    /// every committed byte); the commit payload marks `sealed: true` when
+    /// the deleted content was vault-tagged. Optional whole-file CAS. Commit
+    /// `file_unlinked`.
+    pub const UNLINK: &str = "unlink";
     /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
     /// parsed daemon-side by the authoritative queue-table parser that owns the
     /// `\|` cell escape — so a frontend renders rows directly instead of
@@ -1046,6 +1057,34 @@ pub struct RemoveSectionArgs {
     /// so a single-editor loop never self-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+}
+
+/// `unlink({path, expected_version?, editor?}) -> {path, hash}`
+/// (mcp-surgical-writes slice 004). Deliberate whole-file deletion — the
+/// narrow, guarded exception to the garden's "don't delete, archive" rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlinkArgs {
+    /// Garden-relative path of the file to delete. Files only — a directory
+    /// target is refused (no recursion; `archive` moves trees).
+    pub path: String,
+    /// Phase 3 CAS (optional): the whole-file content version the caller
+    /// based the deletion on (from `read_versions`). When set, the daemon
+    /// deletes only if the file still carries it, else `Conflict` — the
+    /// guard proves you're deleting what you read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// fed to the daemon's ping-pong detector (spec §4d). Absent → `"anon"`,
+    /// so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlinkReply {
+    /// Garden-relative path the daemon deleted.
+    pub path: String,
+    pub hash: String,
 }
 
 /// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default
