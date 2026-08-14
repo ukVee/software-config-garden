@@ -26,6 +26,7 @@ mod add_note;
 mod add_project;
 mod archive;
 mod backlinks;
+mod batch;
 mod growlight;
 mod index;
 mod log_decision;
@@ -47,6 +48,7 @@ pub use add_code_review::add_code_review;
 pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
+pub use batch::batch;
 pub use growlight::{
     add_backlog_item, add_queue, add_slice, growlight_init, growlight_set_resources, log_baton,
     post_message, read_inbox, release_lease, reorder_backlog_item, request_lease, set_item_status,

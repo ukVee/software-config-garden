@@ -91,7 +91,10 @@ pub fn patch_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     Ok(reply)
 }
 
-fn patch_err(
+/// Map a pure patch-core error onto the wire `(ErrorKind, message)` pair —
+/// `pub(crate)` so the batch verb (slice 005) reuses the identical mapping for
+/// its `patch_file` sub-ops instead of duplicating it.
+pub(crate) fn patch_err(
     rel: &str,
     old: &str,
     anchor: Option<&str>,

@@ -117,6 +117,14 @@ pub mod op {
     /// the deleted content was vault-tagged. Optional whole-file CAS. Commit
     /// `file_unlinked`.
     pub const UNLINK: &str = "unlink";
+    /// mcp-surgical-writes slice 005: atomic multi-op commit — N whitelisted
+    /// sub-ops (the file-mutation family: `patch_file`, `edit_section`,
+    /// `append_to_section`, `add_section`, `remove_section`, `set_reviewed`,
+    /// `add_note`, `revise_note`) applied sequentially against one working
+    /// state (op N sees op N−1), all validated before any mutation is staged,
+    /// landing in ONE `batch_applied` commit. No nesting, no growlight ops, no
+    /// archive/add_project/log_decision/log_incident/unlink in v1.
+    pub const BATCH: &str = "batch";
     /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
     /// parsed daemon-side by the authoritative queue-table parser that owns the
     /// `\|` cell escape — so a frontend renders rows directly instead of
@@ -1086,6 +1094,51 @@ pub struct UnlinkReply {
     pub path: String,
     pub hash: String,
 }
+
+/// One sub-op of a [`BatchArgs`] — the whitelisted verb name plus that verb's
+/// own typed args shape. The daemon parses `args` against the named verb's
+/// `*Args` struct during the validation pass, so a malformed sub-op aborts the
+/// whole batch before anything is staged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchOp {
+    /// One of the batch whitelist: `patch_file`, `edit_section`,
+    /// `append_to_section`, `add_section`, `remove_section`, `set_reviewed`,
+    /// `add_note`, `revise_note`. Anything else (incl. `batch` itself, `unlink`,
+    /// and every growlight/archive/log verb) is refused for the whole batch.
+    pub op: String,
+    /// That verb's arguments (its typed `*Args` JSON shape).
+    pub args: Value,
+}
+
+/// `batch({ops, editor?}) -> {hash, ops, paths}` (mcp-surgical-writes slice
+/// 005). The atomic multi-op commit: several file-mutation sub-ops compose one
+/// logical change into ONE commit — no intermediate history entries, and a
+/// failure anywhere leaves the garden untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchArgs {
+    /// The ordered sub-ops, applied sequentially against one working state (op
+    /// N sees op N−1's result — two ops on the same file compose). Non-empty.
+    /// Each sub-op may carry its own `expected_version` (whole-file or
+    /// section, per that verb's contract); a `batch`-level guard is redundant.
+    pub ops: Vec<BatchOp>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// propagated to every sub-op's contention-detector touch. Absent →
+    /// `"anon"`, so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReply {
+    /// The single commit hash the whole batch landed in.
+    pub hash: String,
+    /// How many sub-ops were applied.
+    pub ops: usize,
+    /// The mutated garden-relative paths, deduped in first-touch order (a
+    /// multi-op change to one file lists it once).
+    pub paths: Vec<String>,
+}
+
 
 /// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default
 /// backlog queue parsed daemon-side with the authoritative table parser that

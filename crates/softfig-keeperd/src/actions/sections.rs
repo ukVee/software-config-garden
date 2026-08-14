@@ -209,8 +209,9 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 /// `Conflict` (stale — the caller re-reads + reapplies). A `None` current
 /// version (heading absent / ambiguous) is passed through so the edit transform
 /// surfaces the precise `NotFound` / `Ambiguous` error instead. No lock is held
-/// at any point — a crashed caller strands nothing.
-fn cas_check_section(
+/// at any point — a crashed caller strands nothing. `pub(crate)` so the batch
+/// verb (slice 005) can run the same guard against its simulated working state.
+pub(crate) fn cas_check_section(
     content: &str,
     heading: &str,
     expected: &Option<String>,
@@ -412,7 +413,10 @@ fn note_section_edit_for_thrash(
     note_edit_for_thrash(daemon, inner, rel, Some(&heading_text), editor);
 }
 
-fn section_err(rel: &str, heading: &str, e: edit::SectionError) -> (ErrorKind, String) {
+/// Map a pure section-core error onto the wire `(ErrorKind, message)` pair —
+/// `pub(crate)` so the batch verb (slice 005) reuses the identical mapping for
+/// its sub-ops instead of duplicating it.
+pub(crate) fn section_err(rel: &str, heading: &str, e: edit::SectionError) -> (ErrorKind, String) {
     use edit::SectionError::*;
     match e {
         NotFound => (

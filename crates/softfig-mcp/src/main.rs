@@ -19,9 +19,9 @@ use softfig_ipc::{
     verbs::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
-        AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
-        LogDecisionArgs, LogIncidentArgs, PatchFileArgs, PostMessageArgs, ReadInboxArgs,
-        ReadVersionsArgs, RemoveSectionArgs,
+        AppendToSectionArgs, ArchiveArgs, BatchArgs, EditSectionArgs, FileProvenanceArgs,
+        LogBatonArgs, LogDecisionArgs, LogIncidentArgs, PatchFileArgs, PostMessageArgs,
+        ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
         RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
         SetItemStatusArgs, SetReviewedArgs, UnlinkArgs,
     },
@@ -646,6 +646,40 @@ fn tool_defs() -> Vec<Value> {
                 },
             },
         }),
+        json!({
+            "name": "batch",
+            "description": "Atomic multi-op commit: apply several file-mutation sub-ops as ONE commit — \
+                            all-or-nothing. `ops` runs in order against one working state (op N sees \
+                            op N−1's result, so two ops on the same file compose). EVERY op is validated \
+                            (args shape, path, vault refusal, CAS, uniqueness) BEFORE anything is \
+                            written; any failure aborts the whole batch with nothing changed and the \
+                            error names the failing op index + kind. WHITELIST (v1): patch_file, \
+                            edit_section, append_to_section, add_section, remove_section, set_reviewed, \
+                            add_note, revise_note. Refused sub-ops: batch itself (no nesting), unlink, \
+                            archive, add_project, log_decision, log_incident, and every growlight verb. \
+                            Each sub-op may carry its own expected_version (whole-file or section, per \
+                            that verb's contract). One batch_applied commit; the reply is the commit \
+                            hash + the deduped mutated paths.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ops"],
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "description": "ordered sub-ops; each is {op: <whitelisted name>, args: <that verb's typed args>}",
+                        "items": {
+                            "type": "object",
+                            "required": ["op", "args"],
+                            "properties": {
+                                "op": { "type": "string", "description": "patch_file | edit_section | append_to_section | add_section | remove_section | set_reviewed | add_note | revise_note" },
+                                "args": { "type": "object", "description": "that verb's own args shape (see its tool description)" },
+                            },
+                        },
+                    },
+                    "editor": { "type": "string", "description": "optional per-agent identity for the contention detector (multi-agent fleets); propagated to every sub-op. Omit in single-agent mode." },
+                },
+            },
+        }),
     ]
 }
 
@@ -757,6 +791,10 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
         "unlink" => {
             let a: UnlinkArgs = serde_json::from_value(args)?;
             (op::UNLINK, serde_json::to_value(a)?)
+        }
+        "batch" => {
+            let a: BatchArgs = serde_json::from_value(args)?;
+            (op::BATCH, serde_json::to_value(a)?)
         }
         "request_lease" => {
             let a: RequestLeaseArgs = serde_json::from_value(args)?;
@@ -877,6 +915,23 @@ fn summarize(name: &str, data: &Value) -> String {
         let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
         return format!("unlink: deleted {p}; commit {hash}");
     }
+    if name == "batch" {
+        // An atomic multi-op commit: the op count + the deduped paths it
+        // touched (one commit hash — that's the whole point).
+        let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
+        let ops = data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
+        let paths = data
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| p.as_str().unwrap_or("?").to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!("batch: {ops} op(s) applied to {paths}; commit {hash}");
+    }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
         data.get("from").and_then(|v| v.as_str()),
@@ -928,9 +983,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_eight() {
+    fn tools_list_has_twenty_nine() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 28);
+        assert_eq!(defs.len(), 29);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -959,6 +1014,7 @@ mod tests {
             "patch_file",
             "remove_section",
             "unlink",
+            "batch",
             "request_lease",
             "release_lease",
         ] {
@@ -970,7 +1026,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 29);
     }
 
     #[test]
@@ -1090,6 +1146,14 @@ mod tests {
                 op::UNLINK,
             ),
             (
+                "batch",
+                json!({ "ops": [
+                    { "op": "patch_file", "args": { "path": "a.md", "old": "x", "new": "y" } },
+                    { "op": "set_reviewed", "args": { "path": "b.md" } },
+                ], "editor": "a" }),
+                op::BATCH,
+            ),
+            (
                 "request_lease",
                 json!({ "agent": "roudy", "key": "dock.rs §Layout" }),
                 op::REQUEST_LEASE,
@@ -1152,6 +1216,14 @@ mod tests {
         assert_eq!(
             summarize("unlink", &json!({ "path": "p", "hash": "h" })),
             "unlink: deleted p; commit h"
+        );
+        // batch renders the atomic multi-op shape: op count + paths + hash.
+        assert_eq!(
+            summarize(
+                "batch",
+                &json!({ "hash": "h", "ops": 2, "paths": ["a.md", "b.md"] })
+            ),
+            "batch: 2 op(s) applied to a.md, b.md; commit h"
         );
         // file_provenance renders its edit list (the MCP forwards only text).
         let prov = summarize(

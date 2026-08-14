@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use softfig_ipc::verbs::{op, ChatMessage, DocEditReply, LogReply, PatchFileReply, ReadFileReply, ReadVersionsReply, ShowReply, TailBusReply, UnlinkReply};
+use softfig_ipc::verbs::{op, BatchReply, ChatMessage, DocEditReply, LogReply, PatchFileReply, ReadFileReply, ReadVersionsReply, ShowReply, TailBusReply, UnlinkReply};
 use softfig_ipc::{ErrorKind, Request, Response};
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
 use softfig_vault::Vault;
@@ -874,4 +874,272 @@ fn unlink_rejects_bad_args_and_locked() {
         err_kind(unlink(&fx, "doc.md", serde_json::json!({}))),
         ErrorKind::VaultLocked
     );
+}
+
+// ---- batch (slice 005) ---------------------------------------------------
+
+fn batch(fx: &Fixture, ops: serde_json::Value, extra: serde_json::Value) -> Response {
+    let mut args = serde_json::json!({ "ops": ops });
+    if let serde_json::Value::Object(map) = &extra {
+        for (k, v) in map {
+            args[k] = v.clone();
+        }
+    }
+    fx.call(op::BATCH, args)
+}
+
+fn subop(op: &str, args: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "op": op, "args": args })
+}
+
+/// The happy path: several sub-ops land in ONE `batch_applied` commit, two of
+/// them composing on the same file (edit_section, then a patch INSIDE the
+/// section it just wrote — the spec's supported idiom).
+#[test]
+fn batch_multi_op_happy_path_one_commit_ops_compose() {
+    let fx = Fixture::start(true);
+    fx.write_file("a.md", "# T\n\n## A\n\nold\n\n## B\n\nkeep\n");
+    fx.write_file("b.md", "# B doc\n\n> Last reviewed: 2026-01-01\n\nbody\n");
+
+    let resp = batch(
+        &fx,
+        serde_json::json!([
+            subop("edit_section", serde_json::json!({ "path": "a.md", "heading": "A", "body": "new body text" })),
+            // Op 2 searches the file op 1 just rewrote: "new body" occurs once.
+            subop("patch_file", serde_json::json!({ "path": "a.md", "old": "new body", "new": "NEW BODY" })),
+            subop("set_reviewed", serde_json::json!({ "path": "b.md" })),
+        ]),
+        serde_json::json!({}),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "batch: {resp:?}");
+    let reply: BatchReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.ops, 3);
+    // a.md is deduped (touched by two ops) — first-touch order.
+    assert_eq!(reply.paths, vec!["a.md", "b.md"]);
+    assert!(!reply.hash.is_empty());
+
+    assert_eq!(read(&fx, "a.md").content, "# T\n\n## A\n\nNEW BODY text\n\n## B\n\nkeep\n");
+    let b = read(&fx, "b.md").content;
+    assert!(b.contains("Last reviewed:"), "stamped: {b}");
+    assert!(!b.contains("2026-01-01"), "date bumped: {b}");
+
+    // ONE commit, and it carries the compact `{ops: [{op, path}]}` payload.
+    let show: ShowReply = serde_json::from_value(ok_data(fx.call(
+        op::SHOW,
+        serde_json::json!({ "hash": reply.hash }),
+    )))
+    .unwrap();
+    assert_eq!(show.commit.intent, "batch_applied");
+    let payload: serde_json::Value = serde_json::from_str(&show.commit.payload).unwrap();
+    assert_eq!(
+        payload["ops"],
+        serde_json::json!([
+            { "op": "edit_section", "path": "a.md" },
+            { "op": "patch_file", "path": "a.md" },
+            { "op": "set_reviewed", "path": "b.md" },
+        ])
+    );
+}
+
+/// Atomicity: a failure in op 2 aborts the WHOLE batch — nothing written, the
+/// error names the failing op index + kind.
+#[test]
+fn batch_mid_failure_aborts_with_nothing_written_and_names_the_op() {
+    let fx = Fixture::start(true);
+    fx.write_file("a.md", "# T\n\n## A\n\nbody\n");
+    let before = read(&fx, "a.md").content;
+
+    let resp = batch(
+        &fx,
+        serde_json::json!([
+            subop("patch_file", serde_json::json!({ "path": "a.md", "old": "body", "new": "body2" })),
+            // Invalid heading: op 1 would fail — the batch must abort first.
+            subop("edit_section", serde_json::json!({ "path": "a.md", "heading": "Nope", "body": "x" })),
+        ]),
+        serde_json::json!({}),
+    );
+    assert_eq!(err_kind(resp.clone()), ErrorKind::NotFound);
+    let msg = match resp {
+        Response::Err { error, .. } => error,
+        _ => panic!("expected error"),
+    };
+    assert!(msg.contains("op[1]"), "names the failing op index: {msg}");
+    assert!(msg.contains("edit_section"), "names the failing op kind: {msg}");
+
+    // Nothing written: op 0's valid patch is rolled back with the rest.
+    assert_eq!(read(&fx, "a.md").content, before);
+    let log: LogReply = serde_json::from_value(ok_data(fx.call(
+        op::LOG,
+        serde_json::json!({ "limit": 1 }),
+    )))
+    .unwrap();
+    assert_ne!(log.commits[0].intent, "batch_applied", "no batch commit minted");
+}
+
+/// The whitelist is closed: unlink, growlight ops, and batch itself (no
+/// nesting) refuse the whole batch with the whitelist named.
+#[test]
+fn batch_rejects_non_whitelisted_ops() {
+    let fx = Fixture::start(true);
+    fx.write_file("junk.md", "x\n");
+    fx.write_file("a.md", "y\n");
+
+    for (bad, args) in [
+        ("unlink", serde_json::json!({ "path": "junk.md" })),
+        ("set_item_status", serde_json::json!({ "id": "x", "status": "queued" })),
+        ("archive", serde_json::json!({ "src": "junk.md" })),
+        (
+            "batch",
+            serde_json::json!({ "ops": [subop("patch_file", serde_json::json!({ "path": "a.md", "old": "y", "new": "z" }))] }),
+        ),
+    ] {
+        let resp = batch(
+            &fx,
+            serde_json::json!([subop(bad, args)]),
+            serde_json::json!({}),
+        );
+        assert_eq!(err_kind(resp.clone()), ErrorKind::BadArgs, "op {bad}");
+        let msg = match resp {
+            Response::Err { error, .. } => error,
+            _ => panic!("expected error for {bad}"),
+        };
+        assert!(msg.contains("not a batch sub-op"), "names the refusal: {msg}");
+        assert!(msg.contains("op[0]"), "names the op index: {msg}");
+        assert!(msg.contains("patch_file") && msg.contains("edit_section"), "enumerates the whitelist: {msg}");
+    }
+    // The rejected batches wrote nothing.
+    assert_eq!(read(&fx, "a.md").content, "y\n");
+    assert_eq!(read(&fx, "junk.md").content, "x\n");
+}
+
+/// Per-op CAS passes through: a stale whole-file pin on the patch sub-op
+/// conflicts (naming the op) and nothing lands; a current pin applies.
+#[test]
+fn batch_per_op_cas_guard() {
+    let fx = Fixture::start(true);
+    fx.write_file("a.md", "v0\n");
+    let v0 = versions(&fx, "a.md").version;
+    fx.write_file("a.md", "v1\n");
+
+    let resp = batch(
+        &fx,
+        serde_json::json!([
+            subop(
+                "patch_file",
+                serde_json::json!({ "path": "a.md", "old": "v1", "new": "v2", "expected_version": v0 }),
+            ),
+        ]),
+        serde_json::json!({}),
+    );
+    assert_eq!(err_kind(resp.clone()), ErrorKind::Conflict);
+    let msg = match resp {
+        Response::Err { error, .. } => error,
+        _ => panic!("expected error"),
+    };
+    assert!(msg.contains("op[0]") && msg.contains("stale"), "CAS names its op: {msg}");
+    assert_eq!(read(&fx, "a.md").content, "v1\n", "nothing written");
+
+    // Current pin: the same op applies cleanly.
+    let v1 = versions(&fx, "a.md").version;
+    let resp = batch(
+        &fx,
+        serde_json::json!([
+            subop(
+                "patch_file",
+                serde_json::json!({ "path": "a.md", "old": "v1", "new": "v2", "expected_version": v1 }),
+            ),
+        ]),
+        serde_json::json!({}),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "current CAS: {resp:?}");
+    assert_eq!(read(&fx, "a.md").content, "v2\n");
+}
+
+/// A vault target anywhere in the batch refuses the whole batch — atomicity
+/// extends to refusals, and ops before the sealed one do not land.
+#[test]
+fn batch_vault_target_refuses_whole() {
+    let fx = Fixture::start(true);
+    let resp = fx.call(op::VAULT_SEAL, serde_json::json!({ "pattern": "secrets/**" }));
+    assert!(matches!(resp, Response::Ok { .. }), "seal: {resp:?}");
+    fx.write_file("secrets/key.txt", "TOPSECRET");
+    fx.write_file("services/waydroid/keep.md", "concept dir anchor\n");
+
+    let resp = batch(
+        &fx,
+        serde_json::json!([
+            subop(
+                "add_note",
+                serde_json::json!({ "dir": "services/waydroid/notes", "slug": "early", "body": "first" }),
+            ),
+            subop(
+                "patch_file",
+                serde_json::json!({ "path": "secrets/key.txt", "old": "TOPSECRET", "new": "leak" }),
+            ),
+        ]),
+        serde_json::json!({}),
+    );
+    assert_eq!(err_kind(resp.clone()), ErrorKind::VaultProtected);
+    let msg = match resp {
+        Response::Err { error, .. } => error,
+        _ => panic!("expected error"),
+    };
+    assert!(msg.contains("op[1]"), "names the failing op: {msg}");
+    // The valid add_note (op 0) did NOT land either.
+    assert_eq!(
+        err_kind(fx.call(op::READ_FILE, serde_json::json!({ "path": "services/waydroid/notes/001-early.md" }))),
+        ErrorKind::NotFound,
+        "nothing staged"
+    );
+}
+
+/// add_note + revise_note compose inside one batch: sequential numbering, and
+/// revising a note the same batch just added resolves from the working state.
+#[test]
+fn batch_add_and_revise_notes_compose() {
+    let fx = Fixture::start(true);
+    fx.write_file("services/waydroid/keep.md", "anchor\n");
+
+    let resp = batch(
+        &fx,
+        serde_json::json!([
+            subop("add_note", serde_json::json!({ "dir": "services/waydroid/notes", "slug": "first", "body": "one" })),
+            subop("add_note", serde_json::json!({ "dir": "services/waydroid/notes", "slug": "second", "body": "two" })),
+            subop("revise_note", serde_json::json!({ "dir": "services/waydroid/notes", "id": 1, "body": "one revised" })),
+        ]),
+        serde_json::json!({}),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "batch: {resp:?}");
+    let reply: BatchReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert_eq!(reply.ops, 3);
+    // revise_note rewrites 001 in place — paths are deduped.
+    assert_eq!(
+        reply.paths,
+        vec!["services/waydroid/notes/001-first.md", "services/waydroid/notes/002-second.md"]
+    );
+
+    let first = read(&fx, "services/waydroid/notes/001-first.md").content;
+    assert!(first.contains("# first"), "title immutable: {first}");
+    assert!(first.contains("one revised"), "body swapped: {first}");
+    assert!(!first.contains("\none\n"), "old body gone: {first}");
+    let second = read(&fx, "services/waydroid/notes/002-second.md").content;
+    assert!(second.contains("# second") && second.contains("two"), "second note: {second}");
+}
+
+#[test]
+fn batch_rejects_empty_ops_and_locked() {
+    let fx = Fixture::start(true);
+    let resp = batch(&fx, serde_json::json!([]), serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs);
+
+    let fx = Fixture::start(false); // do NOT unlock
+    let resp = batch(
+        &fx,
+        serde_json::json!([subop(
+            "patch_file",
+            serde_json::json!({ "path": "a.md", "old": "x", "new": "y" }),
+        )]),
+        serde_json::json!({}),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::VaultLocked);
 }
