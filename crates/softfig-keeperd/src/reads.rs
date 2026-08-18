@@ -13,7 +13,8 @@ use softfig_vcs::Repo;
 use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{
     FileProvenanceArgs, FileProvenanceReply, GrowlightQueueReply, ListTreeArgs, ListTreeReply,
-    ProvenanceEntry, ReadFileArgs, ReadFileReply, SectionVersion, TreeEntry,
+    ProvenanceEntry, ReadFileArgs, ReadFileReply, ReadVersionsArgs, ReadVersionsReply,
+    SectionVersion, TreeEntry,
 };
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
@@ -130,6 +131,51 @@ pub fn read_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         version,
         sections,
         region_ids,
+    })
+    .unwrap())
+}
+
+/// `read_versions` (mcp-surgical-writes slice 001): the CAS-seeding read — a
+/// file's version tokens without its content. How a caller learns the FIRST
+/// version in a session (before any edit reply has handed one back) so the
+/// write verbs' `expected_version` guards are usable from step one.
+///
+/// Same posture as [`read_file`] (Unlocked, committed tip, `LayerBHook`
+/// projection) and the same Phase 3 computation — but over the FULL redacted
+/// content, with no size cap and no truncation: the truncation `read_file`
+/// applies is a UI guard, and a version must match what the edit path itself
+/// hashes (the complete committed bytes), so the token handed back here is the
+/// token an edit is actually checked against. Read-only: no commit, no intent,
+/// no thrash registration — the "reads are native" rule is untouched because
+/// this returns coordination state (version tokens), not content.
+pub fn read_versions(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: ReadVersionsArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("read_versions args: {e}")))?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let garden_root = inner.config.garden_root.clone();
+
+    let abs = validate_repo_path(&garden_root, &args.path)
+        .map_err(|m| (ErrorKind::BadArgs, m))?;
+    let rel = path_to_repo_rel_string(&garden_root, &abs)
+        .ok_or((ErrorKind::BadArgs, "path outside garden root".into()))?;
+
+    let (content, sealed, _region_ids) = read_committed_file(&inner, &rel)?;
+
+    // Phase 3 CAS over the daemon-redacted content the write verbs would check
+    // against — the same projection `read_file` returns, minus its UI truncation.
+    let version = edit::content_version(&content);
+    let sections = edit::section_versions(&content)
+        .into_iter()
+        .map(|(heading, version)| SectionVersion { heading, version })
+        .collect();
+
+    Ok(serde_json::to_value(ReadVersionsReply {
+        path: rel,
+        version,
+        sections,
+        sealed,
     })
     .unwrap())
 }

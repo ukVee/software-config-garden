@@ -26,6 +26,7 @@ mod add_note;
 mod add_project;
 mod archive;
 mod backlinks;
+mod batch;
 mod growlight;
 mod index;
 mod log_decision;
@@ -33,18 +34,21 @@ mod log_incident;
 mod managed;
 mod migrate_config;
 mod numbering;
+mod patch_file;
 mod refresh_snapshot;
 pub(crate) mod sections;
 mod shared_pull;
 mod split;
 mod sync_conflict;
 mod thrash;
+mod unlink;
 mod worktree;
 
 pub use add_code_review::add_code_review;
 pub use add_note::{add_note, revise_note};
 pub use add_project::add_project;
 pub use archive::archive;
+pub use batch::batch;
 pub use growlight::{
     add_backlog_item, add_queue, add_slice, growlight_init, growlight_set_resources, log_baton,
     post_message, read_inbox, release_lease, reorder_backlog_item, request_lease, set_item_status,
@@ -57,12 +61,14 @@ pub(crate) use growlight::{default_queue_rows, growlight_backlog_claude};
 pub use log_decision::log_decision;
 pub use log_incident::log_incident;
 pub use migrate_config::migrate_config;
+pub use patch_file::patch_file;
 pub use refresh_snapshot::refresh_snapshot;
 pub use sections::{add_section, append_to_section, edit_section, set_reviewed};
 pub(crate) use shared_pull::{apply_shared_pull, SharedPullInput, SharedPullOutcome};
 pub use split::migrate_split;
 pub(crate) use sync_conflict::{resolve_sync_conflict, ConflictResolution, ConflictSides};
 pub use thrash::ThrashDetector;
+pub use unlink::unlink;
 pub(crate) use worktree::{Tree, WorkTree};
 
 use std::path::Path;

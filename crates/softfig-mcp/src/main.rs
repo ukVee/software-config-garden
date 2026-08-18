@@ -19,9 +19,11 @@ use softfig_ipc::{
     verbs::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
-        AppendToSectionArgs, ArchiveArgs, EditSectionArgs, FileProvenanceArgs, LogBatonArgs,
-        LogDecisionArgs, LogIncidentArgs, PostMessageArgs, ReadInboxArgs, RefreshSnapshotArgs,
-        ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs, SetItemStatusArgs, SetReviewedArgs,
+        AppendToSectionArgs, ArchiveArgs, BatchArgs, EditSectionArgs, FileProvenanceArgs,
+        LogBatonArgs, LogDecisionArgs, LogIncidentArgs, PatchFileArgs, PostMessageArgs,
+        ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
+        RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
+        SetItemStatusArgs, SetReviewedArgs, UnlinkArgs,
     },
     Request, Response,
 };
@@ -287,7 +289,9 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "archive",
             "description": "Move a garden path under journal/archive/<name>/ and commit \
-                            archive_move. archive_name defaults to the basename of src.",
+                            archive_move. archive_name defaults to the basename of src. \
+                            Archive preserves + rewrites references; deliberate DELETION of an \
+                            unreferenced leaf is unlink's job.",
             "inputSchema": {
                 "type": "object",
                 "required": ["src"],
@@ -556,6 +560,126 @@ fn tool_defs() -> Vec<Value> {
                 },
             },
         }),
+        json!({
+            "name": "read_versions",
+            "description": "A garden file's current CAS version tokens, WITHOUT its content — a \
+                            coordination primitive, not a content read (content reads stay native). \
+                            Returns the whole-file version plus per-section versions computed over \
+                            the daemon-redacted content, so you can seed an `expected_version` guard \
+                            on the very first edit in a session (edit replies only hand back the \
+                            NEW version, so without this verb the first version can only be learned \
+                            by making an edit). Also flags whole-file-sealed paths, which the write \
+                            verbs refuse. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative file to project versions for" },
+                },
+            },
+        }),
+        json!({
+            "name": "patch_file",
+            "description": "Surgical old→new exact string replacement in a garden file — the \
+                            opencode-Edit-tool model, keeperd-mediated. `old` must occur exactly \
+                            once within the search window (the whole file, or the `anchor`'s line \
+                            range when given): zero matches → TextNotFound, several → TextAmbiguous \
+                            (narrow it with `anchor`). Exact match only, no whitespace \
+                            normalization. `new` may be empty to delete the matched text. \
+                            Whole-file CAS via `expected_version` (seed it from read_versions / a \
+                            prior reply). Refused on vault-sealed targets. Whole-section deletion \
+                            is remove_section's job; whole-file deletion is unlink's.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "old", "new"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative file to patch" },
+                    "old": { "type": "string", "description": "exact text to replace (may be multi-line); must occur exactly once within the search window" },
+                    "new": { "type": "string", "description": "replacement text; may be empty to delete the matched text" },
+                    "expected_version": { "type": "string", "description": "optional whole-file CAS guard: the version you read (from read_versions / a prior reply). Applies only if the file is unchanged, else Conflict. Omit for last-writer-wins." },
+                    "anchor": { "type": "string", "description": "optional disambiguator: a string occurring exactly once in the file; its line range becomes the search window for `old`" },
+                    "editor": { "type": "string", "description": "optional per-agent identity for the contention detector (multi-agent fleets); see edit_section. Omit in single-agent mode." },
+                },
+            },
+        }),
+        json!({
+            "name": "remove_section",
+            "description": "Delete one section of a garden file by heading address — the delete \
+                            counterpart to add_section/edit_section. The heading text must match \
+                            exactly one heading (case-sensitive, level-agnostic; a '#' prefix is \
+                            optional); the whole section goes (heading line + body, subsections \
+                            included) — you emit no content, the daemon owns the deletion window. \
+                            Section-level CAS via `expected_version` (seed it from read_versions \
+                            / a prior edit reply): the guard proves you're deleting what you read. \
+                            Refused when the section is the file's last remaining heading (unlink \
+                            the file instead), when the deletion would touch a daemon-managed \
+                            `<!-- softfig:index -->` region, and on vault-sealed targets.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "heading"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative file to delete a section from" },
+                    "heading": { "type": "string", "description": "the section to delete, addressed like edit_section ('#' prefix optional, case-sensitive, level-agnostic); must be unique" },
+                    "expected_version": { "type": "string", "description": "optional section-level CAS guard: the version you read for this heading (from read_versions / a prior reply). Deletes only if the section is unchanged, else Conflict. Omit for last-writer-wins." },
+                    "editor": { "type": "string", "description": "optional per-agent identity for the contention detector (multi-agent fleets); see edit_section. Omit in single-agent mode." },
+                },
+            },
+        }),
+        json!({
+            "name": "unlink",
+            "description": "Delete one garden FILE — the deliberate, guarded exception to the \
+                            garden's don't-delete-archive rule. Files only (no directories, no \
+                            recursion). Refused (ReferencedElsewhere) when the file is listed in a \
+                            daemon-managed <!-- softfig:index --> region or has inbound [[…]] \
+                            backlinks — unlink can only cut an unreferenced leaf; for anything \
+                            referenced use `archive`, which preserves it and rewrites the \
+                            references. Vault-sealed targets ARE deletable; the deleted bytes stay \
+                            recoverable from history (softfig show <hash> / rollback). Optional \
+                            whole-file CAS via `expected_version` (seed it from read_versions).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string", "description": "garden-relative FILE to delete (a leaf nothing points at)" },
+                    "expected_version": { "type": "string", "description": "optional whole-file CAS guard: the version you read (from read_versions / a prior reply). Deletes only if the file is unchanged, else Conflict. Omit for last-writer-wins." },
+                    "editor": { "type": "string", "description": "optional per-agent identity for the contention detector (multi-agent fleets); see edit_section. Omit in single-agent mode." },
+                },
+            },
+        }),
+        json!({
+            "name": "batch",
+            "description": "Atomic multi-op commit: apply several file-mutation sub-ops as ONE commit — \
+                            all-or-nothing. `ops` runs in order against one working state (op N sees \
+                            op N−1's result, so two ops on the same file compose). EVERY op is validated \
+                            (args shape, path, vault refusal, CAS, uniqueness) BEFORE anything is \
+                            written; any failure aborts the whole batch with nothing changed and the \
+                            error names the failing op index + kind. WHITELIST (v1): patch_file, \
+                            edit_section, append_to_section, add_section, remove_section, set_reviewed, \
+                            add_note, revise_note. Refused sub-ops: batch itself (no nesting), unlink, \
+                            archive, add_project, log_decision, log_incident, and every growlight verb. \
+                            Each sub-op may carry its own expected_version (whole-file or section, per \
+                            that verb's contract). One batch_applied commit; the reply is the commit \
+                            hash + the deduped mutated paths.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ops"],
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "description": "ordered sub-ops; each is {op: <whitelisted name>, args: <that verb's typed args>}",
+                        "items": {
+                            "type": "object",
+                            "required": ["op", "args"],
+                            "properties": {
+                                "op": { "type": "string", "description": "patch_file | edit_section | append_to_section | add_section | remove_section | set_reviewed | add_note | revise_note" },
+                                "args": { "type": "object", "description": "that verb's own args shape (see its tool description)" },
+                            },
+                        },
+                    },
+                    "editor": { "type": "string", "description": "optional per-agent identity for the contention detector (multi-agent fleets); propagated to every sub-op. Omit in single-agent mode." },
+                },
+            },
+        }),
     ]
 }
 
@@ -652,6 +776,26 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: FileProvenanceArgs = serde_json::from_value(args)?;
             (op::FILE_PROVENANCE, serde_json::to_value(a)?)
         }
+        "read_versions" => {
+            let a: ReadVersionsArgs = serde_json::from_value(args)?;
+            (op::READ_VERSIONS, serde_json::to_value(a)?)
+        }
+        "patch_file" => {
+            let a: PatchFileArgs = serde_json::from_value(args)?;
+            (op::PATCH_FILE, serde_json::to_value(a)?)
+        }
+        "remove_section" => {
+            let a: RemoveSectionArgs = serde_json::from_value(args)?;
+            (op::REMOVE_SECTION, serde_json::to_value(a)?)
+        }
+        "unlink" => {
+            let a: UnlinkArgs = serde_json::from_value(args)?;
+            (op::UNLINK, serde_json::to_value(a)?)
+        }
+        "batch" => {
+            let a: BatchArgs = serde_json::from_value(args)?;
+            (op::BATCH, serde_json::to_value(a)?)
+        }
         "request_lease" => {
             let a: RequestLeaseArgs = serde_json::from_value(args)?;
             (op::REQUEST_LEASE, serde_json::to_value(a)?)
@@ -713,6 +857,29 @@ fn summarize(name: &str, data: &Value) -> String {
             _ => format!("file_provenance {path}: no recorded edits"),
         };
     }
+    if name == "read_versions" {
+        // A coordination primitive: render the version tokens (the whole point),
+        // not content. Callers feed these straight into `expected_version` guards.
+        let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let version = data.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        let sealed = data.get("sealed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let flag = if sealed { " (sealed)" } else { "" };
+        let sections = data.get("sections").and_then(|v| v.as_array());
+        let sec_lines: Vec<String> = sections
+            .map(|ss| {
+                ss.iter()
+                    .map(|s| {
+                        let g = |k: &str| s.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+                        format!("  {}: {}", g("heading"), g("version"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if sec_lines.is_empty() {
+            return format!("read_versions {path}: {version}{flag}");
+        }
+        return format!("read_versions {path}: {version}{flag}\n{}", sec_lines.join("\n"));
+    }
     if name == "request_lease" || name == "release_lease" {
         let g = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or("?");
         let key = g("key");
@@ -730,6 +897,40 @@ fn summarize(name: &str, data: &Value) -> String {
             detail.push_str(&format!(" — {r}"));
         }
         return format!("{name} {key}: {state}{detail}");
+    }
+    if name == "remove_section" {
+        // A deletion, not a "wrote": the generic write summary would mislead.
+        let p = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
+        return match data.get("version").and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => {
+                format!("remove_section: removed the section from {p}; commit {hash}; version {v}")
+            }
+            _ => format!("remove_section: removed the section from {p}; commit {hash}"),
+        };
+    }
+    if name == "unlink" {
+        // A deletion, not a "wrote"; there is no post-delete version to chain.
+        let p = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
+        return format!("unlink: deleted {p}; commit {hash}");
+    }
+    if name == "batch" {
+        // An atomic multi-op commit: the op count + the deduped paths it
+        // touched (one commit hash — that's the whole point).
+        let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
+        let ops = data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
+        let paths = data
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| p.as_str().unwrap_or("?").to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!("batch: {ops} op(s) applied to {paths}; commit {hash}");
     }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
@@ -782,9 +983,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_four() {
+    fn tools_list_has_twenty_nine() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 24);
+        assert_eq!(defs.len(), 29);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -809,6 +1010,11 @@ mod tests {
             "post_message",
             "read_inbox",
             "file_provenance",
+            "read_versions",
+            "patch_file",
+            "remove_section",
+            "unlink",
+            "batch",
             "request_lease",
             "release_lease",
         ] {
@@ -820,7 +1026,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 29);
     }
 
     #[test]
@@ -920,6 +1126,34 @@ mod tests {
                 op::FILE_PROVENANCE,
             ),
             (
+                "read_versions",
+                json!({ "path": "meta/conventions.md" }),
+                op::READ_VERSIONS,
+            ),
+            (
+                "patch_file",
+                json!({ "path": "doc.md", "old": "was", "new": "now", "anchor": "## S", "expected_version": "abc", "editor": "a" }),
+                op::PATCH_FILE,
+            ),
+            (
+                "remove_section",
+                json!({ "path": "doc.md", "heading": "Old", "expected_version": "abc", "editor": "a" }),
+                op::REMOVE_SECTION,
+            ),
+            (
+                "unlink",
+                json!({ "path": "junk.md", "expected_version": "abc", "editor": "a" }),
+                op::UNLINK,
+            ),
+            (
+                "batch",
+                json!({ "ops": [
+                    { "op": "patch_file", "args": { "path": "a.md", "old": "x", "new": "y" } },
+                    { "op": "set_reviewed", "args": { "path": "b.md" } },
+                ], "editor": "a" }),
+                op::BATCH,
+            ),
+            (
                 "request_lease",
                 json!({ "agent": "roudy", "key": "dock.rs §Layout" }),
                 op::REQUEST_LEASE,
@@ -972,6 +1206,25 @@ mod tests {
         // CAS verbs surface the post-edit version alongside the commit.
         assert!(summarize("edit_section", &json!({ "path": "p", "hash": "h", "version": "deadbeef" }))
             .contains("version deadbeef"));
+        assert!(summarize("patch_file", &json!({ "path": "p", "hash": "h", "version": "cafe" }))
+            .contains("wrote p") && summarize("patch_file", &json!({ "path": "p", "hash": "h", "version": "cafe" }))
+            .contains("version cafe"));
+        // remove_section renders a deletion, not a "wrote".
+        let rm = summarize("remove_section", &json!({ "path": "p", "hash": "h", "version": "cafe" }));
+        assert!(rm.contains("removed the section from p") && rm.contains("version cafe"));
+        // unlink renders a deletion, not a "wrote"; no version to chain.
+        assert_eq!(
+            summarize("unlink", &json!({ "path": "p", "hash": "h" })),
+            "unlink: deleted p; commit h"
+        );
+        // batch renders the atomic multi-op shape: op count + paths + hash.
+        assert_eq!(
+            summarize(
+                "batch",
+                &json!({ "hash": "h", "ops": 2, "paths": ["a.md", "b.md"] })
+            ),
+            "batch: 2 op(s) applied to a.md, b.md; commit h"
+        );
         // file_provenance renders its edit list (the MCP forwards only text).
         let prov = summarize(
             "file_provenance",
@@ -982,6 +1235,23 @@ mod tests {
         assert!(prov.contains("1 edit(s)"));
         assert!(prov.contains("abcdef12 [section_edited] tablet"));
         assert!(summarize("file_provenance", &json!({ "path": "p", "edits": [] })).contains("no recorded edits"));
+        // read_versions renders the version tokens (the whole point) — and must
+        // NOT fall through to the generic "wrote …; commit ?" shape.
+        let rv = summarize(
+            "read_versions",
+            &json!({ "path": "meta/x.md", "version": "abc123", "sections": [
+                { "heading": "Child", "version": "def456" },
+                { "heading": "Cross-refs", "version": "789aaa" },
+            ], "sealed": false }),
+        );
+        assert!(rv.contains("read_versions meta/x.md: abc123"));
+        assert!(rv.contains("  Child: def456"));
+        assert!(rv.contains("  Cross-refs: 789aaa"));
+        assert!(!rv.contains("wrote"), "read_versions must not use the write summary: {rv}");
+        assert_eq!(
+            summarize("read_versions", &json!({ "path": "s", "version": "v", "sections": [], "sealed": true })),
+            "read_versions s: v (sealed)"
+        );
         // lease replies render key + state + holder/position/reason (no commit hash).
         assert_eq!(
             summarize("request_lease", &json!({ "key": "dock.rs §Layout", "state": "granted", "holder": "a" })),

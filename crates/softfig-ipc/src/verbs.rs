@@ -85,6 +85,46 @@ pub mod op {
     /// (author_device, timestamp, intent) by walking the chain and diffing the
     /// path's blob across each commit. Read-only; never touches the mount.
     pub const FILE_PROVENANCE: &str = "file_provenance";
+    /// mcp-surgical-writes slice 001: the CAS-seeding read — the whole-file
+    /// content version + per-section versions for a garden file, computed over
+    /// the daemon-redacted content (the same projection `read_file` returns and
+    /// the write verbs' `expected_version` checks against). Pure projection;
+    /// read-only, requires Unlocked, never commits.
+    pub const READ_VERSIONS: &str = "read_versions";
+    /// mcp-surgical-writes slice 002: replace one exact occurrence of `old`
+    /// with `new` in a garden file — the keystone surgical-mutation verb. The
+    /// match must be unique within the whole file or within the optional
+    /// `anchor`'s line range; zero matches → `TextNotFound`, several →
+    /// `TextAmbiguous`. Whole-file CAS via `expected_version`; commit
+    /// `text_patched`. Refused on vault-protected targets.
+    pub const PATCH_FILE: &str = "patch_file";
+    /// mcp-surgical-writes slice 003: delete one uniquely-addressed section
+    /// (heading line + body) from a garden file — the delete counterpart to
+    /// `add_section` / `edit_section`. Same heading addressing (unique match
+    /// required); section-level CAS via `expected_version`; refused on
+    /// vault-protected targets, on the last remaining heading (use `unlink`),
+    /// and on ranges overlapping a managed `<!-- softfig:index -->` region.
+    /// Commit `section_removed`.
+    pub const REMOVE_SECTION: &str = "remove_section";
+    /// mcp-surgical-writes slice 004: delete one garden file — the
+    /// deliberate, guarded exception to the "don't delete, archive" rule.
+    /// Files only (no directories, no recursion). Refused with
+    /// `ReferencedElsewhere` when the file is listed in a daemon-managed
+    /// `<!-- softfig:index … -->` region or has inbound `[[…]]` backlinks —
+    /// unlink can only cut an unreferenced leaf; `archive` is the tool for
+    /// anything referenced. Vault-sealed targets ARE deletable (history keeps
+    /// every committed byte); the commit payload marks `sealed: true` when
+    /// the deleted content was vault-tagged. Optional whole-file CAS. Commit
+    /// `file_unlinked`.
+    pub const UNLINK: &str = "unlink";
+    /// mcp-surgical-writes slice 005: atomic multi-op commit — N whitelisted
+    /// sub-ops (the file-mutation family: `patch_file`, `edit_section`,
+    /// `append_to_section`, `add_section`, `remove_section`, `set_reviewed`,
+    /// `add_note`, `revise_note`) applied sequentially against one working
+    /// state (op N sees op N−1), all validated before any mutation is staged,
+    /// landing in ONE `batch_applied` commit. No nesting, no growlight ops, no
+    /// archive/add_project/log_decision/log_incident/unlink in v1.
+    pub const BATCH: &str = "batch";
     /// 020 slice 002 (finding #5): serve the backlog queue as structured rows,
     /// parsed daemon-side by the authoritative queue-table parser that owns the
     /// `\|` cell escape — so a frontend renders rows directly instead of
@@ -921,6 +961,184 @@ pub struct SectionVersion {
     /// The section's content version (heading line + body).
     pub version: String,
 }
+
+/// `read_versions({path}) -> {path, version, sections, sealed}` (mcp-surgical-
+/// writes slice 001). The CAS-seeding read: a file's current version tokens,
+/// without its content — how a caller learns the FIRST version in a session
+/// (before any edit has handed one back), so the write verbs' `expected_version`
+/// guards are usable from step one rather than only once a chain is started.
+/// Versions are computed over the daemon-redacted content the write verbs would
+/// check against. Read-only; no commit, no intent, no thrash registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadVersionsArgs {
+    /// Garden-relative path to the file whose versions to project.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadVersionsReply {
+    /// The projected garden-relative path.
+    pub path: String,
+    /// Whole-file content version of the (redacted) content — pass to
+    /// `replace_file`'s `expected_version`.
+    pub version: String,
+    /// Per-section content versions for every addressable ATX heading, in
+    /// document order. Empty for sealed / non-markdown / sectionless content.
+    pub sections: Vec<SectionVersion>,
+    /// True when the whole file is sealed (Layer B) — write verbs will refuse
+    /// it, and `version` is the version of the `[sealed:<path>]` placeholder.
+    pub sealed: bool,
+}
+
+/// `patch_file({path, old, new, expected_version?, anchor?, editor?}) ->
+/// {path, hash, version}` (mcp-surgical-writes slice 002). Surgical old→new
+/// exact string replacement — the keystone of the middle write band between
+/// whole-file `replace_file` and the section verbs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchFileArgs {
+    /// Garden-relative path of the file to patch.
+    pub path: String,
+    /// The exact text to replace (may be multi-line). Must occur exactly once
+    /// within the search window (the whole file, or the `anchor`'s line
+    /// range); zero → `TextNotFound`, several → `TextAmbiguous`.
+    pub old: String,
+    /// The replacement text. May be empty — that's the sanctioned
+    /// "delete this text" path (`remove_section`/`unlink` own whole-section /
+    /// whole-file deletion).
+    pub new: String,
+    /// Phase 3 CAS (optional): the whole-file content version the caller
+    /// based this patch on (from `read_versions` / a prior reply). When set,
+    /// the daemon applies only if the file still carries it, else `Conflict`.
+    /// Whole-file (not section-level) because a patch may span any byte range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// Optional disambiguator: a string that must occur exactly once in the
+    /// file; its line range becomes the search window for `old`. Zero matches
+    /// → `TextNotFound`, several → `TextAmbiguous` — an agent's retry
+    /// strategy differs (pick a better needle vs. add/narrow the anchor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// fed to the daemon's ping-pong detector (spec §4d). Absent → `"anon"`,
+    /// so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchFileReply {
+    /// Garden-relative path the daemon patched.
+    pub path: String,
+    pub hash: String,
+    /// Phase 3 CAS: the whole-file content version after the patch — feed it
+    /// back as the next `expected_version` to chain patches without
+    /// re-reading.
+    #[serde(default)]
+    pub version: String,
+}
+
+/// `remove_section({path, heading, expected_version?, editor?}) ->
+/// {path, hash, version}` (mcp-surgical-writes slice 003). Heading-addressed
+/// section deletion — the delete counterpart to `add_section`/`edit_section`.
+/// The caller emits no content: the daemon owns the deletion window (the
+/// heading line + its body, through the line before the next same-or-higher
+/// heading — subsections included). Reply reuses [`DocEditReply`]; its
+/// `version` is the new **whole-file** version (the section no longer exists,
+/// so there is no post-delete section version to chain).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveSectionArgs {
+    /// Garden-relative path of the file to delete a section from.
+    pub path: String,
+    /// The heading to delete, addressed like `edit_section` (`'#'` prefix
+    /// optional, case-sensitive, level-agnostic). Must match exactly one
+    /// heading; ambiguous → `BadArgs`, absent → `NotFound`.
+    pub heading: String,
+    /// Phase 3 CAS (optional): the **section-level** content version the
+    /// caller read for this heading (from `read_versions` / a prior
+    /// `edit_section` reply). When set, the daemon deletes only if the
+    /// section still carries it, else `Conflict` — the guard proves you're
+    /// deleting what you read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// fed to the daemon's ping-pong detector (spec §4d). Absent → `"anon"`,
+    /// so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+}
+
+/// `unlink({path, expected_version?, editor?}) -> {path, hash}`
+/// (mcp-surgical-writes slice 004). Deliberate whole-file deletion — the
+/// narrow, guarded exception to the garden's "don't delete, archive" rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlinkArgs {
+    /// Garden-relative path of the file to delete. Files only — a directory
+    /// target is refused (no recursion; `archive` moves trees).
+    pub path: String,
+    /// Phase 3 CAS (optional): the whole-file content version the caller
+    /// based the deletion on (from `read_versions`). When set, the daemon
+    /// deletes only if the file still carries it, else `Conflict` — the
+    /// guard proves you're deleting what you read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// fed to the daemon's ping-pong detector (spec §4d). Absent → `"anon"`,
+    /// so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlinkReply {
+    /// Garden-relative path the daemon deleted.
+    pub path: String,
+    pub hash: String,
+}
+
+/// One sub-op of a [`BatchArgs`] — the whitelisted verb name plus that verb's
+/// own typed args shape. The daemon parses `args` against the named verb's
+/// `*Args` struct during the validation pass, so a malformed sub-op aborts the
+/// whole batch before anything is staged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchOp {
+    /// One of the batch whitelist: `patch_file`, `edit_section`,
+    /// `append_to_section`, `add_section`, `remove_section`, `set_reviewed`,
+    /// `add_note`, `revise_note`. Anything else (incl. `batch` itself, `unlink`,
+    /// and every growlight/archive/log verb) is refused for the whole batch.
+    pub op: String,
+    /// That verb's arguments (its typed `*Args` JSON shape).
+    pub args: Value,
+}
+
+/// `batch({ops, editor?}) -> {hash, ops, paths}` (mcp-surgical-writes slice
+/// 005). The atomic multi-op commit: several file-mutation sub-ops compose one
+/// logical change into ONE commit — no intermediate history entries, and a
+/// failure anywhere leaves the garden untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchArgs {
+    /// The ordered sub-ops, applied sequentially against one working state (op
+    /// N sees op N−1's result — two ops on the same file compose). Non-empty.
+    /// Each sub-op may carry its own `expected_version` (whole-file or
+    /// section, per that verb's contract); a `batch`-level guard is redundant.
+    pub ops: Vec<BatchOp>,
+    /// Phase 3 thrash detection (optional): the per-agent editor identity,
+    /// propagated to every sub-op's contention-detector touch. Absent →
+    /// `"anon"`, so a single-editor loop never self-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReply {
+    /// The single commit hash the whole batch landed in.
+    pub hash: String,
+    /// How many sub-ops were applied.
+    pub ops: usize,
+    /// The mutated garden-relative paths, deduped in first-touch order (a
+    /// multi-op change to one file lists it once).
+    pub paths: Vec<String>,
+}
+
 
 /// `growlight_queue() -> {rows}` (020 slice 002, finding #5). The default
 /// backlog queue parsed daemon-side with the authoritative table parser that
