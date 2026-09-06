@@ -610,8 +610,11 @@ pub struct VaultUnsealArgs {
 pub struct VaultUnsealReply {
     /// The device chain's tip after the call. Unsealing deliberately re-seals
     /// every still-matching file to its identical blob (no bulk-decrypt), and
-    /// `sealed-paths.toml` is not in the tree — so the tree never changes and,
-    /// since task 028, no commit is minted: this is the untouched tip.
+    /// `sealed-paths.toml` is not in the tree — so this commit is empty by
+    /// construction. It is minted anyway (`SameTreePolicy::Record`) when a
+    /// pattern was actually `removed`, because it is the only trace the history
+    /// keeps of a security downgrade; unsealing a pattern that was not there
+    /// records nothing and this is the untouched tip.
     pub schema_commit: String,
     /// Whether the pattern was actually present (false = no-op).
     pub removed: bool,
