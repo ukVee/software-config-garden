@@ -45,6 +45,7 @@ pub mod state;
 pub mod supervisor;
 pub mod thrash_bridge;
 pub mod usage;
+pub mod usage_file;
 
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,

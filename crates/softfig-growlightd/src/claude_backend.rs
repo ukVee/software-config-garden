@@ -49,6 +49,7 @@ use std::thread;
 
 use serde_json::Value;
 use softfig_ipc::growlightd::{AgentDeltaKind, Event};
+use softfig_ipc::usage::RateWindow;
 
 use crate::admission::BudgetUsage;
 use crate::config::BuildCaps;
@@ -57,6 +58,7 @@ use crate::hub::EventHub;
 use crate::preapproval::PreApproval;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
 use crate::usage::WindowResets;
+use crate::usage_file::UsageCapture;
 
 /// Sentinel in [`AgentHealthState::exit_code`] meaning "still running".
 const NOT_EXITED: i64 = i64::MIN;
@@ -127,7 +129,7 @@ impl AgentHealthState {
 
 /// Which rolling reserve window a `rate_limit_event` reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BudgetWindow {
+pub enum BudgetWindow {
     /// The 5h rolling account-wide reserve.
     FiveHour,
     /// The 7d rolling account-wide reserve.
@@ -598,11 +600,15 @@ fn window_pct(status: Option<&str>, used_percentage: Option<u8>) -> Option<u8> {
 /// keys off the status. `None` for any other line, malformed JSON, an event with
 /// no `rate_limit_info`, or an unrecognized `rateLimitType`. Pure — a fixture
 /// drives it, no real spawn.
-/// Returns `(window, pct, rejected, resets_at)`: `rejected` is the hard-`rejected`
-/// status (only that latches a hold — fix ②; `pump` builds the [`WindowTrip`] since
-/// it owns the clock the no-`resetsAt` fail-safe needs, fix ①), `resets_at` the
-/// wire's reopen when present.
-fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8, bool, Option<i64>)> {
+/// Returns `(window, pct, reading)`: `pct` is the folded reserve the admission
+/// aggregate gates on, and `reading` is the window **exactly as the wire reported
+/// it** — status, `resetsAt`, and a used-percentage only if one was actually given.
+/// The raw reading is what the hold (`pump` builds the [`WindowTrip`] from the
+/// `rejected` status, since it owns the clock the no-`resetsAt` fail-safe needs —
+/// task 037 fix ①/②), the [`WindowResets`] bound, and the headless `usage.json`
+/// capture ([`crate::usage_file`]) all key off; collapsing it to a percentage here
+/// would leave every one of them unable to tell a coarse status from a measurement.
+fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8, RateWindow)> {
     let ev = serde_json::from_str::<Value>(line).ok()?;
     if ev.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
         return None;
@@ -622,7 +628,14 @@ fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8, bool, Opt
     // (task 037). Present on both `rejected` and `allowed` events; acted on only for
     // a rejected window (an allowed window is open, so its reset is irrelevant).
     let resets_at = info.get("resetsAt").and_then(Value::as_i64);
-    window_pct(status, used).map(|pct| (window, pct, status == Some("rejected"), resets_at))
+    window_pct(status, used).map(|pct| {
+        let reading = RateWindow {
+            used_percentage: used,
+            resets_at,
+            status: status.map(str::to_string),
+        };
+        (window, pct, reading)
+    })
 }
 
 /// Opportunistic account-wide 5h/7d reserve from a `rate_limits` object on a
@@ -661,6 +674,7 @@ fn reserve_from_result(ev: &Value) -> Option<(BudgetUsage, [bool; 2])> {
 /// source), and recording the terminal `result` line's context gauge (+ its
 /// opportunistic `rate_limits` reserve). Pure over its `reader` / `now` seams: a
 /// test drives it with a scripted fixture + fake clock, no real spawn.
+#[allow(clippy::too_many_arguments)]
 fn pump<R: BufRead>(
     reader: R,
     agent: &str,
@@ -668,6 +682,7 @@ fn pump<R: BufRead>(
     health: &AgentHealthState,
     budget: &AgentBudgetState,
     rate: &AgentRateState,
+    usage: &UsageCapture,
     now: &dyn Fn() -> i64,
 ) {
     for line in reader.lines() {
@@ -688,15 +703,20 @@ fn pump<R: BufRead>(
         // headless source (spec §6/§7). Fold it into the budget cell the drive
         // loop's UsageAggregator reads; a non-"allowed" window saturates it so the
         // admission gate refuses (`window_pct`).
-        if let Some((window, pct, rejected, resets_at)) = rate_limit_window_for_line(line) {
+        if let Some((window, pct, reading)) = rate_limit_window_for_line(line) {
             // Only a hard `rejected` window latches a hold (task 037 fix ②). Pin a
             // concrete reopen: the wire's `resetsAt`, else a bounded fail-safe deadline
             // off THIS line's clock so a rejected-without-reset window can't spin the
             // fleet (fix ①). A `warning`/`allowed` passes `None`, clearing any prior trip.
+            let rejected = reading.status.as_deref() == Some("rejected");
             let trip = rejected.then(|| WindowTrip {
-                reopen: resets_at.unwrap_or(at + RATE_LIMIT_FALLBACK_HOLD_SECS),
+                reopen: reading.resets_at.unwrap_or(at + RATE_LIMIT_FALLBACK_HOLD_SECS),
             });
-            budget.record_window(window, pct, trip, resets_at);
+            budget.record_window(window, pct, trip, reading.resets_at);
+            // Tee the SAME reading to the runtime `usage.json` (task 048): a headless
+            // member has no statusline, so without this the file everyone else reads
+            // fossilizes at the human's last interactive session.
+            usage.record(window, reading, at);
         }
         for (kind, text) in deltas_for_line(line) {
             hub.publish(Event::agent_delta(agent, kind, text));
@@ -797,6 +817,13 @@ pub struct ClaudeBackend {
     /// a re-roll's newer handle is never clobbered — the exact lifecycle of
     /// `live_scopes`, carrying the kill handle alongside the scope name.
     kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
+    /// The headless tee from every member's `rate_limit_event`s to the runtime
+    /// `usage.json` (task 048). Shared by all reader threads because the file
+    /// describes the one account-wide pool they all read. Defaults to
+    /// [`UsageCapture::disabled`]; the fleet assembly installs the real one with
+    /// [`with_usage_capture`](Self::with_usage_capture), so a backend built outside
+    /// a growlight runtime (a test) writes nothing.
+    usage_capture: Arc<UsageCapture>,
 }
 
 impl ClaudeBackend {
@@ -826,7 +853,17 @@ impl ClaudeBackend {
             scope_gen: AtomicU64::new(0),
             live_scopes,
             kill_handles,
+            usage_capture: Arc::new(UsageCapture::disabled()),
         }
+    }
+
+    /// Install the headless budget capture this backend tees every member's
+    /// `rate_limit_event` reading to (task 048) — the fleet assembly's, pointed at
+    /// the runtime `usage.json`. Without it the backend keeps the disabled capture
+    /// and writes nothing.
+    pub fn with_usage_capture(mut self, capture: Arc<UsageCapture>) -> Self {
+        self.usage_capture = capture;
+        self
     }
 
     /// `agent`'s current health (heartbeat-or-exit), or `None` if this backend
@@ -1294,6 +1331,7 @@ impl AgentBackend for Arc<ClaudeBackend> {
         let reader_child = Arc::clone(&child);
         let reader_live_scopes = Arc::clone(&self.live_scopes);
         let reader_kill_handles = Arc::clone(&self.kill_handles);
+        let reader_usage = Arc::clone(&self.usage_capture);
         let reader_scope_unit = scope_unit.clone();
         thread::spawn(move || {
             pump(
@@ -1303,6 +1341,7 @@ impl AgentBackend for Arc<ClaudeBackend> {
                 &reader_state,
                 &reader_budget,
                 &reader_rate,
+                &reader_usage,
                 &|| unix_now(),
             );
             // stdout closed → the child is ending; reap it for the exit code.
@@ -1385,6 +1424,7 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use softfig_ipc::usage::UsageSnapshot;
     use std::io::Cursor;
 
     /// A realistic stream-json run: system init, an assistant turn carrying a
@@ -1490,12 +1530,13 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
 
         // A fake clock that ticks 10, 20, 30, … once per line read.
         let clock = AtomicI64::new(0);
         let now = || clock.fetch_add(10, Ordering::SeqCst) + 10;
 
-        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
 
         // The four content deltas reach the hub in block order, tagged by kind.
         let expect = [
@@ -1536,9 +1577,10 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
         let now = || 100; // init line stamped at t=100, then nothing more
 
-        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
 
         // No exit recorded → still Alive, but pinned at the stale init stamp.
         assert_eq!(state.observe(), AgentHealth::Alive { last_active: 100 });
@@ -1651,33 +1693,54 @@ mod tests {
     #[test]
     fn rate_limit_window_for_line_parses_the_headless_event_shape() {
         // The real headless wire shape: a per-window `rate_limit_event` carrying a
-        // coarse status + reset (no percentage).
-        // A hard-`rejected` window: rejected=true, carrying its reopen boundary.
+        // coarse status + reset (no percentage). The reading rides through verbatim —
+        // status and boundary — alongside the folded pct.
+        let raw = |status: &str, resets_at: Option<i64>| RateWindow {
+            used_percentage: None,
+            resets_at,
+            status: Some(status.to_string()),
+        };
+        // A hard-`rejected` window: pct saturates, and the raw status is what the
+        // hold keys off, carrying its reopen boundary.
         let five_rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected","resetsAt":1782367800}}"#;
         assert_eq!(
             rate_limit_window_for_line(five_rejected),
-            Some((BudgetWindow::FiveHour, 100, true, Some(1782367800)))
+            Some((
+                BudgetWindow::FiveHour,
+                100,
+                raw("rejected", Some(1782367800))
+            ))
         );
-        // An `allowed` window is not rejected → pct 0, rejected=false (its resetsAt,
-        // present on allowed events too, is ignored downstream — the window is open).
+        // An `allowed` window → pct 0, and its `resetsAt` (present on allowed events
+        // too) rides along: no hold latches, but it IS the 048 staleness boundary and
+        // the reading the headless usage.json capture writes.
         let seven_allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#;
         assert_eq!(
             rate_limit_window_for_line(seven_allowed),
-            Some((BudgetWindow::SevenDay, 0, false, Some(1782900000)))
+            Some((
+                BudgetWindow::SevenDay,
+                0,
+                raw("allowed", Some(1782900000))
+            ))
         );
         // A `warning` saturates the pct (throttling the live aggregate) but is NOT a
-        // rejection → rejected=false, so it never latches a timed hold (task 037 ②).
+        // rejection, so it never latches a timed hold (task 037 ②) — the raw status
+        // is the only thing that can tell the two apart downstream.
         let five_warning = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"warning","resetsAt":1782367800}}"#;
         assert_eq!(
             rate_limit_window_for_line(five_warning),
-            Some((BudgetWindow::FiveHour, 100, false, Some(1782367800)))
+            Some((
+                BudgetWindow::FiveHour,
+                100,
+                raw("warning", Some(1782367800))
+            ))
         );
-        // A rejected window with no `resetsAt`: rejected=true, resets_at absent — pump
-        // pins the bounded fail-safe reopen rather than letting it spin (task 037 ①).
+        // A rejected window with no `resetsAt`: the boundary is absent — pump pins
+        // the bounded fail-safe reopen rather than letting it spin (task 037 ①).
         let five_no_reset = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected"}}"#;
         assert_eq!(
             rate_limit_window_for_line(five_no_reset),
-            Some((BudgetWindow::FiveHour, 100, true, None))
+            Some((BudgetWindow::FiveHour, 100, raw("rejected", None)))
         );
         // Non-events, malformed JSON, and an unrecognized window carry no reading.
         assert!(rate_limit_window_for_line(r#"{"type":"result","result":"done"}"#).is_none());
@@ -1700,6 +1763,7 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
         let now = || 100;
 
         // A headless run: the 5h window goes to `rejected` (pool exhausted) while
@@ -1714,7 +1778,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
 
         // The non-"allowed" 5h status folded to a saturated 100; the allowed 7d to 0.
         let reserve = budget.observe().expect("a reserve was folded from the events");
@@ -1760,6 +1824,7 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
         let now = || 100;
 
         let stream = concat!(
@@ -1768,7 +1833,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"warning","resetsAt":1782900000}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
 
         assert_eq!(
             budget.window_resets(),
@@ -1789,11 +1854,59 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"allowed"}}"#,
             "\n",
         );
-        pump(Cursor::new(no_boundary), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(no_boundary), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
         assert_eq!(
             budget.window_resets(),
             WindowResets::new(None, Some(1782900000)),
             "the re-read 5h window carries no boundary; the untouched 7d one keeps its",
+        );
+    }
+
+    #[test]
+    fn a_headless_run_refreshes_usage_json_without_a_statusline() {
+        // Task 048, the capture half: drive the pump with a real headless stream and
+        // a REAL capture, and the runtime `usage.json` every other reader consults —
+        // the loop protocol's §2b boot check, the human — is fresh afterwards, with
+        // no statusline anywhere in the picture.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let hub = EventHub::new();
+        let state = AgentHealthState::new(0);
+        let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::new(path.clone());
+        let now = || 1_782_360_000;
+
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init","model":"claude-opus-4-8"}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"warning","resetsAt":1782367800}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
+            "\n",
+        );
+        pump(Cursor::new(stream), "a", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+
+        let written = UsageSnapshot::load(&path)
+            .unwrap()
+            .expect("the headless run wrote the budget file");
+        assert_eq!(written.ts, 1_782_360_000.0, "stamped with the run's own clock");
+        assert_eq!(written.rate_limits.five_hour.status.as_deref(), Some("warning"));
+        assert_eq!(written.rate_limits.five_hour.resets_at, Some(1_782_367_800));
+        assert_eq!(written.rate_limits.seven_day.status.as_deref(), Some("allowed"));
+        assert_eq!(written.rate_limits.seven_day.resets_at, Some(1_782_900_000));
+        // The wire reported no percentage, so the file claims none — a `0` here would
+        // read as an empty pool and silently disable every governor downstream.
+        assert_eq!(written.rate_limits.five_hour.used_percentage, None);
+        assert_eq!(written.rate_limits.seven_day.used_percentage, None);
+        // And the same reading is live in the cell the drive loop folds, boundaries
+        // included: one parse, two consumers, no second source of truth.
+        assert_eq!(budget.observe(), Some(BudgetUsage::new(100, 0)));
+        assert_eq!(
+            budget.window_resets(),
+            WindowResets::new(Some(1_782_367_800), Some(1_782_900_000)),
         );
     }
 
@@ -1808,12 +1921,13 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
         let now = || 100;
         let stream = concat!(
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected"}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
         // The pct still saturates (throttles the aggregate)...
         assert_eq!(budget.observe(), Some(BudgetUsage::new(100, 0)));
         // ...and the reopen is the bounded fail-safe off the line's clock (100), not
@@ -1835,12 +1949,13 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
         let now = || 100;
         let stream = concat!(
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"warning","resetsAt":1782367800}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
         assert_eq!(
             budget.observe(),
             Some(BudgetUsage::new(100, 0)),
@@ -1863,6 +1978,7 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
         let now = || 0;
 
         let stream = concat!(
@@ -1871,7 +1987,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
 
         // Both windows allowed → a fresh (0,0) reserve: no alert, admission admits.
         let reserve = budget.observe().expect("an allowed reading still records (0,0)");
@@ -1951,6 +2067,7 @@ mod tests {
         let state = AgentHealthState::new(0);
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
         let now = || 1000; // every line stamped inside one minute
 
         // A headless turn whose terminal result reports 90k tokens of usage.
@@ -1960,7 +2077,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":80000,"output_tokens":10000},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
 
         // The meter observed 90k tokens / 1 request in the trailing minute.
         let (tpm_used, rpm_used) = rate_meter.window(1000);
