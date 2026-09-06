@@ -16,6 +16,18 @@ pub const IDENTITY_FILE: &str = "identity.key";
 pub const TRANSPORT_FILE: &str = "transport.key";
 pub const MASTER_DIR: &str = "master";
 pub const SHARED_KEYS_DIR: &str = "shared-keys";
+/// Declared recovery policy — non-secret metadata, deliberately a file of its
+/// own rather than a table in `params.toml`. A malformed declaration must
+/// never be able to fail the params load that gates every unlock; see
+/// [`crate::recovery_policy`].
+pub const RECOVERY_POLICY_FILE: &str = "recovery.toml";
+/// Reserved home for peer-path wrappings of `K` (`<peer-id>.key`), the
+/// trust-matrix door described in `meta/spec-vault.md`. **Nothing writes
+/// here yet** — the peer path is spec, not code. It exists so enumeration
+/// has one structural place to look instead of special-casing "unimplemented",
+/// which is what lets a declared `passphrase+peers` report an honest
+/// divergence today.
+pub const PEER_KEKS_DIR: &str = "peer-keks";
 
 /// Path helper centralizing the on-disk layout. Construct via `VaultPaths::for_garden`.
 #[derive(Debug, Clone)]
@@ -62,6 +74,20 @@ impl VaultPaths {
     }
     pub fn master(&self, id: u32) -> PathBuf {
         self.master_dir().join(format!("{id}.key"))
+    }
+    /// The declared recovery policy. Absent = undeclared, which is a reportable
+    /// state rather than an error (see [`crate::recovery_policy`]).
+    pub fn recovery_policy(&self) -> PathBuf {
+        self.root.join(RECOVERY_POLICY_FILE)
+    }
+    /// Reserved directory for peer-path wrappings — see [`PEER_KEKS_DIR`].
+    pub fn peer_keks_dir(&self) -> PathBuf {
+        self.root.join(PEER_KEKS_DIR)
+    }
+    /// The wrapping file for one peer. `peer_id` must already be validated by
+    /// the caller — this only joins the path.
+    pub fn peer_kek(&self, peer_id: &str) -> PathBuf {
+        self.peer_keks_dir().join(format!("{peer_id}.key"))
     }
     /// M5d — sealed shared-subtree keys, one file per `key_id`. Each holds an
     /// externally-derived key `S` (the collaborative ceremony's output) sealed
@@ -206,6 +232,28 @@ pub fn list_master_ids(paths: &VaultPaths) -> Result<Vec<u32>> {
     }
     ids.sort_unstable();
     Ok(ids)
+}
+
+/// Peer ids with a wrapping of `K` on disk, sorted. Presence only — this never
+/// opens a wrapping, which is what keeps the caller (`vault status`) usable on
+/// a locked vault. An unreadable directory yields no ids rather than an error:
+/// status must never fail on the way to reporting what it found.
+pub fn list_peer_kek_ids(paths: &VaultPaths) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Ok(entries) = fs::read_dir(paths.peer_keks_dir()) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(stem) = name.strip_suffix(".key") {
+            if !stem.is_empty() {
+                ids.push(stem.to_string());
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids
 }
 
 #[cfg(test)]

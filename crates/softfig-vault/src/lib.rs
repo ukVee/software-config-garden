@@ -17,6 +17,7 @@ pub mod layer_b;
 pub mod master;
 pub mod params;
 pub mod recovery;
+pub mod recovery_policy;
 pub mod relock;
 pub mod session;
 pub mod shared;
@@ -28,6 +29,9 @@ pub use error::{Result, VaultError};
 pub use layer_b::{is_layer_b, LayerBKey};
 pub use shared::{is_shared, is_shared_blob, is_shared_layer_b};
 pub use recovery::RecoveryPhrase;
+pub use recovery_policy::{
+    DeclaredPolicy, Divergence, RecoveryPath, RecoveryPolicy, RecoveryStatus, Wrappings,
+};
 pub use relock::{RelockBlob, RelockToken, RELOCK_TTL_SECS};
 pub use session::VaultSession;
 pub use storage::{discover_garden, VaultPaths};

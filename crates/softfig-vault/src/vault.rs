@@ -10,6 +10,7 @@ use crate::kek::{self, Kek};
 use crate::master::{self, MasterKey, MasterKeyStore};
 use crate::params::{aad, ActiveKey, VaultParams};
 use crate::recovery::RecoveryPhrase;
+use crate::recovery_policy::{self, RecoveryPath, RecoveryPolicy};
 use crate::session::VaultSession;
 use crate::storage::{self, VaultPaths};
 use crate::transport::{self, TransportKey};
@@ -95,6 +96,18 @@ impl Vault {
 
         let identity = Identity::generate();
         identity::write_identity(&paths, &kek, &identity)?;
+
+        // Declare the shape `init` just built. This is not the tool inventing
+        // an intent on the user's behalf — the two doors were created by this
+        // very call, so the declaration is a true statement about them, and
+        // there is no divergence for it to paper over. Leaving a fresh vault
+        // undeclared would instead make "undeclared" the permanent normal
+        // state, which is the silence this milestone exists to break. Re-declare
+        // at any time with `vault recovery declare`.
+        recovery_policy::store_declared_policy(
+            &paths,
+            &RecoveryPolicy::new([RecoveryPath::Passphrase, RecoveryPath::Phrase]),
+        )?;
 
         // M5a: the X25519 transport key joins M and the identity under K.
         let transport = TransportKey::generate();
@@ -197,6 +210,8 @@ impl Vault {
         let new_self =
             kek::wrap_kek_under_passphrase(new_passphrase, &kek, &params.argon2, aad::KEK_SELF);
         fs::write(self.paths.kek_self(), new_self)?;
+        // The declared policy is deliberately untouched: recovery replaces the
+        // secret behind the self-path door, it does not add or remove a door.
         Ok(())
     }
 }

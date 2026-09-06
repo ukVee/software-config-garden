@@ -774,3 +774,95 @@ fn shared_region_round_trips_and_needs_s() {
         Err(VaultError::SharedKeyUnavailable(_))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Recovery policy (milestone `vault-recovery-policy`, slice 001)
+//
+// The unit tests in `src/recovery_policy.rs` cover the model against synthetic
+// fixtures. These cover it against a *real* vault, and pin the one property
+// that cannot be checked with fixtures: reading the recovery status never opens
+// a wrapping.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_declares_the_shape_it_just_built() {
+    use softfig_vault::RecoveryStatus;
+
+    let (tmp, vault) = fresh_vault();
+    assert!(
+        vault.paths().recovery_policy().exists(),
+        "init should leave the vault declared, not undeclared"
+    );
+
+    let status = RecoveryStatus::read(vault.paths());
+    assert!(
+        !status.is_inferred(),
+        "a freshly-initialized vault must not report an inferred policy"
+    );
+    assert_eq!(status.effective().to_string(), "passphrase+phrase");
+    assert!(
+        status.divergences.is_empty(),
+        "init builds exactly what it declares: {:?}",
+        status.divergences
+    );
+    drop(tmp);
+}
+
+#[test]
+fn recovery_status_never_opens_a_wrapping() {
+    use softfig_vault::{DeclaredPolicy, RecoveryPolicy, RecoveryStatus};
+
+    let (_tmp, vault) = fresh_vault();
+    let paths = vault.paths();
+
+    // Destroy both wrappings. Every byte of `k.self` and `k.recovery` is now
+    // garbage, so ANY attempt to unwrap `K` — with the right passphrase or
+    // otherwise — fails. This is also, precisely, a *locked* vault from the
+    // status path's point of view: it holds no secret with which to open
+    // anything.
+    fs::write(paths.kek_self(), b"shredded").expect("clobber k.self");
+    fs::write(paths.kek_recovery(), b"shredded").expect("clobber k.recovery");
+    assert!(
+        vault.unlock(PASSPHRASE).is_err(),
+        "precondition: the wrappings must genuinely be unopenable"
+    );
+
+    // Status still reports the whole picture. If it unwrapped anything on the
+    // way, this call would have failed instead.
+    let status = RecoveryStatus::read(paths);
+    assert!(status.wrappings.passphrase);
+    assert!(status.wrappings.phrase);
+    assert_eq!(status.effective().to_string(), "passphrase+phrase");
+    assert!(status.divergences.is_empty());
+
+    // And divergence is still computed against the declaration, not against
+    // anything the wrappings would have to be opened to learn.
+    softfig_vault::recovery_policy::store_declared_policy(
+        paths,
+        &RecoveryPolicy::passphrase_only(),
+    )
+    .expect("declare");
+    let status = RecoveryStatus::read(paths);
+    assert!(matches!(status.declared, DeclaredPolicy::Declared(_)));
+    assert_eq!(status.divergences.len(), 1, "{:?}", status.divergences);
+}
+
+#[test]
+fn an_existing_undeclared_vault_reports_inferred_and_is_not_written_to() {
+    use softfig_vault::{DeclaredPolicy, RecoveryStatus};
+
+    // A garden created before the declaration existed: remove the file `init`
+    // wrote and you have exactly the pre-milestone on-disk shape.
+    let (_tmp, vault) = fresh_vault();
+    let paths = vault.paths();
+    fs::remove_file(paths.recovery_policy()).expect("de-declare");
+
+    let status = RecoveryStatus::read(paths);
+    assert_eq!(status.declared, DeclaredPolicy::Undeclared);
+    assert!(status.is_inferred());
+    assert_eq!(status.effective().to_string(), "passphrase+phrase");
+    assert!(
+        !paths.recovery_policy().exists(),
+        "reading status must never write a declaration on the user's behalf"
+    );
+}

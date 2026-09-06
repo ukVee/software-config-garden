@@ -8,7 +8,9 @@ use softfig_ipc::{
         op, VaultListSealedReply, VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
     },
 };
-use softfig_vault::{discover_garden, RecoveryPhrase, Vault};
+use softfig_vault::recovery_policy::{self, RecoveryStatus, Wrappings};
+use softfig_vault::storage;
+use softfig_vault::{discover_garden, DeclaredPolicy, RecoveryPhrase, RecoveryPolicy, Vault};
 
 use crate::cmd_daemon::try_daemon_call;
 
@@ -20,10 +22,24 @@ pub enum VaultCmd {
         #[arg(long)]
         garden: Option<PathBuf>,
     },
-    /// Print vault status (active key id, generations on disk, identity fingerprint).
+    /// Print vault status: the declared recovery policy, the wrappings of K
+    /// actually on disk, and any divergence between them, plus the master-key
+    /// generations.
+    ///
+    /// Readable on a **locked** vault — it opens nothing and asks for no
+    /// passphrase. Pass `--identity` to additionally unlock and print the
+    /// identity fingerprint, the one fact here that cannot be read otherwise.
     Status {
         #[arg(long)]
         garden: Option<PathBuf>,
+        /// Also prompt for the passphrase and print the identity public key.
+        #[arg(long)]
+        identity: bool,
+    },
+    /// Manage the garden's declared recovery policy.
+    Recovery {
+        #[command(subcommand)]
+        cmd: RecoveryCmd,
     },
     /// Generate a new master-key generation and make it active.
     RotateKey {
@@ -59,10 +75,31 @@ pub enum VaultCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum RecoveryCmd {
+    /// Declare the recovery shape this garden is meant to have.
+    ///
+    /// POLICY is `passphrase-only`, `passphrase+phrase`, `passphrase+peers`,
+    /// or any `+`-joined combination of `passphrase`, `phrase`, and `peers`.
+    ///
+    /// This records **intent only**. It adds and removes no wrapping and
+    /// touches no key material — declaring a door you do not have is legal,
+    /// and `vault status` will report it as a divergence rather than refuse.
+    Declare {
+        /// The policy to declare.
+        policy: String,
+        #[arg(long)]
+        garden: Option<PathBuf>,
+    },
+}
+
 pub fn run(cmd: VaultCmd) -> Result<()> {
     match cmd {
         VaultCmd::Init { garden } => init(resolve_for_init(garden)?),
-        VaultCmd::Status { garden } => status(resolve(garden)?),
+        VaultCmd::Status { garden, identity } => status(resolve(garden)?, identity),
+        VaultCmd::Recovery { cmd } => match cmd {
+            RecoveryCmd::Declare { policy, garden } => declare(resolve(garden)?, &policy),
+        },
         VaultCmd::RotateKey { garden } => rotate_key(resolve(garden)?),
         VaultCmd::Recover { garden } => recover(resolve(garden)?),
         VaultCmd::Seal { pattern, socket } => seal(pattern, socket),
@@ -171,28 +208,144 @@ fn init(garden: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn status(garden: PathBuf) -> Result<()> {
+/// `vault status` observes; `vault escrow verify` proves. Nothing here opens a
+/// wrapping, which is what keeps status usable on a locked vault — and is why
+/// the passphrase prompt moved behind `--identity` rather than gating the whole
+/// command. The active key id and the generation list were never secret: they
+/// are `active.toml` and the filenames under `master/`.
+fn status(garden: PathBuf, identity: bool) -> Result<()> {
     let vault = Vault::at(&garden);
     if !vault.is_initialized() {
         println!("no vault at {}", vault.paths().root.display());
         return Ok(());
     }
-    let pass = prompt_passphrase("Passphrase: ")?;
-    let session = vault.unlock(pass.as_bytes())?;
     println!("Vault: {}", vault.paths().root.display());
-    println!(
-        "  active master_key_id : {}",
-        session.active_master_key_id()
-    );
-    println!(
-        "  generations on disk  : {:?}",
-        session.known_master_key_ids()
-    );
-    println!(
-        "  identity pubkey      : {}",
-        hex::encode(session.identity_pubkey().to_bytes())
-    );
+    print_recovery_status(&RecoveryStatus::read(vault.paths()));
+
+    println!();
+    match storage::load_active(vault.paths()) {
+        Ok(active) => println!("  active master_key_id : {}", active.master_key_id),
+        Err(e) => println!("  active master_key_id : (unreadable: {e})"),
+    }
+    match storage::list_master_ids(vault.paths()) {
+        Ok(ids) => println!("  generations on disk  : {ids:?}"),
+        Err(e) => println!("  generations on disk  : (unreadable: {e})"),
+    }
+
+    if identity {
+        let pass = prompt_passphrase("Passphrase: ")?;
+        let session = vault.unlock(pass.as_bytes())?;
+        println!(
+            "  identity pubkey      : {}",
+            hex::encode(session.identity_pubkey().to_bytes())
+        );
+    } else {
+        println!("  identity pubkey      : (locked — re-run with --identity to show)");
+    }
     Ok(())
+}
+
+/// Record the operator's intent, then immediately show what that intent looks
+/// like against the disk. A declaration that introduces a divergence is
+/// accepted and reported, not refused: "I mean to have a phrase, and I am about
+/// to add one" is a legitimate thing to say.
+fn declare(garden: PathBuf, policy: &str) -> Result<()> {
+    let vault = Vault::at(&garden);
+    if !vault.is_initialized() {
+        return Err(anyhow!("no vault at {}", vault.paths().root.display()));
+    }
+    let policy = RecoveryPolicy::parse(policy).map_err(|e| anyhow!("{e}"))?;
+    recovery_policy::store_declared_policy(vault.paths(), &policy)?;
+    println!("Declared recovery policy: {policy}");
+    println!();
+    println!("Vault: {}", vault.paths().root.display());
+    print_recovery_status(&RecoveryStatus::read(vault.paths()));
+    Ok(())
+}
+
+fn print_recovery_status(st: &RecoveryStatus) {
+    let effective = st.effective();
+    let provenance = match &st.declared {
+        DeclaredPolicy::Declared(_) => "declared",
+        DeclaredPolicy::Undeclared => "inferred from disk — not declared",
+        DeclaredPolicy::Unreadable(_) => "inferred from disk — the declaration is unreadable",
+    };
+    println!("  recovery policy      : {effective}  ({provenance})");
+    // The reason gets its own line: a TOML parse error is long, and burying it
+    // in a parenthetical is how an operator ends up not reading it.
+    if let DeclaredPolicy::Unreadable(reason) = &st.declared {
+        println!(
+            "    ! {}: {reason}",
+            storage::RECOVERY_POLICY_FILE
+        );
+    }
+    println!(
+        "  wrappings on disk    : {}",
+        describe_wrappings(&st.wrappings)
+    );
+
+    if st.divergences.is_empty() {
+        match &st.declared {
+            DeclaredPolicy::Declared(_) => println!("  divergence           : none"),
+            DeclaredPolicy::Undeclared => {
+                println!("  divergence           : (nothing declared, so nothing to diverge from)")
+            }
+            DeclaredPolicy::Unreadable(_) => {
+                println!("  divergence           : (unchecked — the declaration could not be read)")
+            }
+        }
+    } else {
+        println!("  divergence           :");
+        for d in &st.divergences {
+            println!("    ! {d}");
+        }
+    }
+
+    if st.is_inferred() {
+        println!();
+        match &st.declared {
+            DeclaredPolicy::Unreadable(_) => println!(
+                "  The declaration above could not be read, so the shape was taken from the"
+            ),
+            _ => println!(
+                "  No recovery policy is declared, so the shape above was taken from the"
+            ),
+        }
+        println!("  disk rather than from you — which means nothing here can tell you a door");
+        println!("  is missing. State what you intend:");
+        println!("      softfig vault recovery declare {effective}");
+    }
+
+    if st.wrappings.count() == 1 {
+        println!();
+        println!("  Note: exactly one wrapping of K exists. Recovery is your passphrase AND");
+        println!("  that file — the passphrase alone opens nothing, because no server holds a");
+        println!("  copy. Keep the vault directory backed up somewhere off this device.");
+    }
+}
+
+/// Name the file behind each door. A divergence the operator cannot locate is
+/// most of the way to no divergence report at all.
+fn describe_wrappings(w: &Wrappings) -> String {
+    let mut parts = Vec::new();
+    if w.passphrase {
+        parts.push(format!("passphrase ({})", storage::KEK_SELF_FILE));
+    }
+    if w.phrase {
+        parts.push(format!("phrase ({})", storage::KEK_RECOVERY_FILE));
+    }
+    if !w.peers.is_empty() {
+        parts.push(format!(
+            "peers ({}/: {})",
+            storage::PEER_KEKS_DIR,
+            w.peers.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        "(none — this vault cannot be opened)".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 fn rotate_key(garden: PathBuf) -> Result<()> {
