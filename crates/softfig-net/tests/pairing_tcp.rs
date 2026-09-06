@@ -4,7 +4,7 @@
 //! in M5a-4. Focused MITM / tamper / SAS cases live in the `pairing` and `ring`
 //! module unit tests.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::thread;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -15,11 +15,7 @@ use softfig_net::{
 };
 
 fn tcp_pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let addr = listener.local_addr().expect("local addr");
-    let client = TcpStream::connect(addr).expect("connect");
-    let (server, _) = listener.accept().expect("accept");
-    (client, server)
+    softfig_net::testing::loopback_pair("pairing peer")
 }
 
 /// A device with a self-attestation, exactly as keeperd would assemble it from

@@ -48,6 +48,10 @@ pub mod relay;
 pub mod replica;
 pub mod ring;
 pub mod sas;
+// Test support (task 055): bounded accepts/reads for tests that own both ends of
+// a loopback socket. `pub` because keeperd's unit AND integration tests need it
+// too, and three copies of a poll loop is three different deadlines.
+pub mod testing;
 pub mod transport;
 pub mod turn;
 
