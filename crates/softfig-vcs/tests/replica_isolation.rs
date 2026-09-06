@@ -59,9 +59,18 @@ fn shared_blob_never_enters_the_device_tips_reachable_set() {
     // the shared mount, each carrying content unique to it. This is the tree the
     // FUSE write path presents; route it exactly as slice 002 does.
     let shared_body = b"SHARED-SUBTREE-SECRET that must never reach a backup mirror".to_vec();
+    //
+    // The device file carries *edited* bytes: the same-tree guard (task 028)
+    // skips a commit whose tree matches its parent's, so re-committing genesis'
+    // content byte-for-byte would advance no device tip and the assertion below
+    // would be testing the guard rather than the carve-out.
     let mut unified = WalkSnapshot::empty();
     unified
-        .insert_file(Path::new("device.md"), 0o100644, b"device-only content".to_vec())
+        .insert_file(
+            Path::new("device.md"),
+            0o100644,
+            b"device-only content, edited".to_vec(),
+        )
         .unwrap();
     unified
         .insert_file(

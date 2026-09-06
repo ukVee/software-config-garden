@@ -108,7 +108,12 @@ pub fn commit(args: CommitArgs) -> Result<()> {
             .get("hash")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("daemon reply missing 'hash'"))?;
-        println!("Committed: {hash}");
+        // A pre-028 daemon omits `committed`; treat a missing flag as a commit.
+        let committed = reply
+            .get("committed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        print_commit_result(hash, committed);
         return Ok(());
     }
 
@@ -122,9 +127,20 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         .with_context(|| format!("invalid intent {intent_name:?}"))?;
 
     let mut repo = Repo::open(&garden)?;
-    let hash = repo.commit_workdir(&session, intent)?;
-    println!("Committed: {hash}");
+    let outcome = repo.commit_workdir_outcome(&session, intent)?;
+    print_commit_result(&outcome.hash.to_string(), outcome.committed);
     Ok(())
+}
+
+/// Report a commit the same way in daemon and direct mode. An unchanged tree
+/// mints nothing (the same-tree guard, task 028), so say so instead of printing
+/// the old tip as if it were a fresh commit.
+fn print_commit_result(hash: &str, committed: bool) {
+    if committed {
+        println!("Committed: {hash}");
+    } else {
+        println!("Nothing to commit (tree unchanged at {hash})");
+    }
 }
 
 pub fn log(args: LogArgs) -> Result<()> {

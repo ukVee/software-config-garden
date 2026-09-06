@@ -72,6 +72,17 @@ impl Fixture {
         send(&self.socket, &Request::new(op_name, args))
     }
 
+    /// The device chain's current tip.
+    fn tip(&self) -> softfig_store::Hash {
+        Repo::open(&self.garden).unwrap().tip().unwrap().unwrap()
+    }
+
+    /// How many commits the store holds — the direct way to assert that a verb
+    /// minted one, or (task 028) that it deliberately minted none.
+    fn commit_count(&self) -> usize {
+        Repo::open(&self.garden).unwrap().db().list_commits().unwrap().len()
+    }
+
     /// Intent + payload of the current tip commit (read via a fresh repo
     /// handle; WAL lets it coexist with the daemon's connection).
     fn tip_intent(&self) -> (String, serde_json::Value) {
@@ -853,6 +864,32 @@ fn set_reviewed_bumps_date() {
         format!("# Note\n\n> Last reviewed: {}\n\nbody\n", conventions::today_hyphen())
     );
     assert_eq!(fx.tip_intent().0, "reviewed_stamped");
+}
+
+/// Task 028 — a same-day re-stamp rewrites the file with the bytes it already
+/// had. The verb still succeeds (it is idempotent by design), but the commit
+/// path must recognise the unchanged tree and mint nothing: an empty commit
+/// here is peer-synced churn for a date that did not move.
+#[test]
+fn set_reviewed_restamp_same_day_mints_no_commit() {
+    let fx = Fixture::start();
+    let today = conventions::today_hyphen();
+    write_doc(&fx, "n.md", &format!("# Note\n\n> Last reviewed: {today}\n\nbody\n"));
+    // First stamp: the file is new to the tip, so this one really does commit.
+    let resp = fx.call(op::SET_REVIEWED, serde_json::json!({ "path": "n.md" }));
+    assert!(matches!(resp, Response::Ok { .. }), "first stamp: {resp:?}");
+    let tip = fx.tip();
+    let count = fx.commit_count();
+
+    // Second stamp, same day, same bytes.
+    let resp = fx.call(op::SET_REVIEWED, serde_json::json!({ "path": "n.md" }));
+    assert!(matches!(resp, Response::Ok { .. }), "re-stamp: {resp:?}");
+
+    assert_eq!(fx.commit_count(), count, "the re-stamp minted an empty commit");
+    assert_eq!(fx.tip(), tip, "the tip must not move on a no-op");
+    // The reply still carries a usable hash: the untouched tip.
+    let reply = ok_data(fx.call(op::SET_REVIEWED, serde_json::json!({ "path": "n.md" })));
+    assert_eq!(reply["hash"].as_str().unwrap(), tip.to_string());
 }
 
 #[test]

@@ -424,7 +424,19 @@ pub struct CommitArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitReply {
+    /// The device chain's tip after the call. On a no-op (`committed == false`)
+    /// this is the untouched tip, not a new commit.
     pub hash: String,
+    /// Whether a commit was actually written. `false` when the working tree
+    /// already matched the tip — the same-tree guard in the vcs commit path
+    /// (task 028). Defaults to `true` so a reply from a pre-028 daemon still
+    /// reads as a real commit.
+    #[serde(default = "yes")]
+    pub committed: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,12 +586,15 @@ pub struct VaultSealArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultSealReply {
-    /// Hash of the `schema_change` commit recording the sealed-paths
-    /// edit.
+    /// The device chain's tip after the call. Task 028 folded the seal flow
+    /// into a single commit, so this is the `vault_seal` migration commit when
+    /// one was minted — and the untouched tip when there was nothing to seal
+    /// (`sealed-paths.toml` lives under `.softfig/` and is never in the tree,
+    /// so a glob edit alone changes no content and mints no commit).
     pub schema_commit: String,
-    /// Hash of the follow-up `vault_seal` commit that performed the
-    /// auto-migration, or `None` if no tracked files newly matched the
-    /// added glob.
+    /// Hash of the `vault_seal` commit that performed the auto-migration, or
+    /// `None` when no tracked file newly matched the added glob (or they were
+    /// already sealed, leaving the tree unchanged).
     pub seal_commit: Option<String>,
     /// Tracked files that were just sealed (Layer-B-encrypted) by the
     /// auto-migration pass.
@@ -593,7 +608,10 @@ pub struct VaultUnsealArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultUnsealReply {
-    /// Hash of the `schema_change` commit recording the removal.
+    /// The device chain's tip after the call. Unsealing deliberately re-seals
+    /// every still-matching file to its identical blob (no bulk-decrypt), and
+    /// `sealed-paths.toml` is not in the tree — so the tree never changes and,
+    /// since task 028, no commit is minted: this is the untouched tip.
     pub schema_commit: String,
     /// Whether the pattern was actually present (false = no-op).
     pub removed: bool,
