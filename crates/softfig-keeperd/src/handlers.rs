@@ -451,9 +451,10 @@ pub fn commit(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 
     // FUSE-mode-safe commit: in FUSE mode this snapshots the in-memory
     // (tip ∪ overlay) tree rather than walking the mount under `inner`.
-    let hash = crate::actions::commit_now(&mut inner, intent)?;
+    let outcome = crate::actions::commit_now_outcome(&mut inner, intent)?;
     Ok(serde_json::to_value(CommitReply {
-        hash: hash.to_string(),
+        hash: outcome.hash.to_string(),
+        committed: outcome.committed,
     })
     .unwrap())
 }
@@ -1000,9 +1001,13 @@ pub fn vault_reveal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         layer_b::vault_reveal_intent(&rel_string, &actor, unix_ts, args.id.as_deref())
             .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     // Commit the audit intent from the in-memory snapshot (FUSE) / disk walk
-    // (direct mode) — `commit_now` installs the `PriorTipGuard` and never
-    // self-reads the mount under `inner`.
-    crate::actions::commit_now(&mut inner, intent)?;
+    // (direct mode) — `commit_now_with` installs the `PriorTipGuard` and never
+    // self-reads the mount under `inner`. `Record`: a reveal writes only a temp
+    // file *outside* the garden, so its tree is identical to the tip by
+    // construction and the task-028 same-tree guard would skip it — erasing the
+    // very log entry this handler treats as a precondition for surfacing a
+    // plaintext path.
+    crate::actions::commit_now_with(&mut inner, intent, softfig_vcs::SameTreePolicy::Record)?;
     inner.last_reveal_at = Some(now);
 
     let expires_at = if idle_seconds == 0 {
@@ -1045,37 +1050,54 @@ pub fn vault_seal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     hook.reload(&state_dir)
         .map_err(err_to_response)?;
 
-    // Commit the schema_change from the in-memory snapshot (FUSE) / disk walk
-    // (direct mode) — `commit_now` installs the `PriorTipGuard` and never
-    // self-reads the mount under `inner`. The reloaded matcher already seals the
-    // newly-matched paths, so this commit re-encrypts them through Layer B.
-    let intent = layer_b::schema_change_intent(
-        "softfig-layer-b-impl",
-        layer_b::SEALED_PATHS_CHANGED_KIND,
-    )
-    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    let schema_commit = crate::actions::commit_now(&mut inner, intent)?;
-
+    // Which tracked files the enlarged glob set newly covers. Read from the
+    // working tree, before committing, so the commit this call mints can name
+    // them in its intent.
     let mut newly_sealed = Vec::new();
-    let mut seal_commit: Option<String> = None;
     if added {
         let snapshot = hook.snapshot();
         newly_sealed = enumerate_sealed(&inner, &snapshot)?;
-        if !newly_sealed.is_empty() {
-            // Re-snapshot the tree: the blob encryptor (this same hook)
-            // will route these paths through Layer B on this pass.
-            let seal_intent = layer_b::vault_seal_intent(
-                &newly_sealed,
-                "sealed-paths.toml glob added",
-            )
-            .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-            let hash = crate::actions::commit_now(&mut inner, seal_intent)?;
-            seal_commit = Some(hash.to_string());
-        }
     }
 
+    // ONE commit, from the in-memory snapshot (FUSE) / disk walk (direct mode)
+    // — `commit_now_with` installs the `PriorTipGuard` and never self-reads the
+    // mount under `inner`. The reloaded matcher seals the newly-matched paths on
+    // this pass, so this commit *is* the Layer-B migration.
+    //
+    // Task 028: it used to be two commits — a `schema_change` that did the
+    // re-encryption, then a `vault_seal` that re-snapshotted the already-sealed
+    // tree. `sealed-paths.toml` lives under `.softfig/` and is never in the
+    // tree, so that second commit was empty by construction: it carried the
+    // audit payload (which paths were newly sealed) and nothing else. The
+    // same-tree guard drops empty commits, which would have dropped the record
+    // with it — so the `vault_seal` intent now rides the commit that actually
+    // seals. `schema_change` is left for the nothing-to-seal case, where it is
+    // itself a no-op and is skipped.
+    let intent = if newly_sealed.is_empty() {
+        layer_b::schema_change_intent("softfig-layer-b-impl", layer_b::SEALED_PATHS_CHANGED_KIND)
+    } else {
+        layer_b::vault_seal_intent(&newly_sealed, "sealed-paths.toml glob added")
+    }
+    .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+    // `Record` when the glob set actually changed: `sealed-paths.toml` lives
+    // under `.softfig/` and is never in the tree, so a glob edit that seals no
+    // existing file changes no content — and the commit recording it is the only
+    // trace the history keeps. A repeat `seal` of a glob already present
+    // (`added == false`) records nothing and stays guarded.
+    let policy = if added {
+        softfig_vcs::SameTreePolicy::Record
+    } else {
+        softfig_vcs::SameTreePolicy::Skip
+    };
+    let outcome = crate::actions::commit_now_with(&mut inner, intent, policy)?;
+    let tip = outcome.hash.to_string();
+    // `seal_commit` is the migration commit — `None` when nothing was newly
+    // sealed. The `committed` check is belt-and-braces: never name a hash as a
+    // commit unless one was really written.
+    let seal_commit = (outcome.committed && !newly_sealed.is_empty()).then(|| tip.clone());
+
     Ok(serde_json::to_value(VaultSealReply {
-        schema_commit: schema_commit.to_string(),
+        schema_commit: tip,
         seal_commit,
         newly_sealed,
     })
@@ -1112,7 +1134,17 @@ pub fn vault_unseal(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         layer_b::SEALED_PATHS_CHANGED_KIND,
     )
     .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
-    let schema_commit = crate::actions::commit_now(&mut inner, intent)?;
+    // `Record` when a glob was actually removed. Unsealing deliberately re-seals
+    // every still-matching file to its identical blob, and `sealed-paths.toml`
+    // is not in the tree — so this commit is empty by construction and the
+    // same-tree guard would drop the audit record of a security downgrade. An
+    // unseal of a pattern that wasn't there records nothing and stays guarded.
+    let policy = if removed {
+        softfig_vcs::SameTreePolicy::Record
+    } else {
+        softfig_vcs::SameTreePolicy::Skip
+    };
+    let schema_commit = crate::actions::commit_now_with(&mut inner, intent, policy)?.hash;
 
     // Now swap the matcher to the new (smaller) glob set.
     inner.layer_b

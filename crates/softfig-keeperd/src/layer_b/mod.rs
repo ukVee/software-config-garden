@@ -620,7 +620,10 @@ impl Drop for PriorTipGuard<'_> {
     }
 }
 
-/// Convenience: snapshot prior tip → commit → clear, in one call.
+/// Convenience: snapshot prior tip → commit → clear, in one call. Returns the
+/// device chain's tip after the call, which the same-tree guard leaves
+/// unchanged when the working tree already matched it (task 028; see
+/// [`softfig_vcs::CommitOutcome`]).
 pub fn commit_with_regions(
     hook: &LayerBHook,
     repo: &mut Repo,

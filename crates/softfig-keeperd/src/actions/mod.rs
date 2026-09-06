@@ -76,6 +76,7 @@ use std::path::Path;
 use softfig_vcs::Intent;
 use softfig_ipc::ErrorKind;
 use softfig_store::Hash;
+use softfig_vcs::{CommitOutcome, SameTreePolicy};
 
 use crate::daemon::DaemonInner;
 use crate::layer_b::PriorTipGuard;
@@ -117,10 +118,44 @@ pub(crate) fn write_file(abs: &Path, bytes: &[u8]) -> Result<(), (ErrorKind, Str
 /// content didn't change. Returns the device commit hash when the device
 /// chain advanced (the common case, and always in `device_only`), else the
 /// last shared chain's.
+///
+/// The hash is the chain's tip **after** the call, which is not always a new
+/// commit: the vcs commit path skips a commit whose tree matches its parent's
+/// (task 028, [`softfig_vcs::CommitOutcome`]), so an action that rewrote a file
+/// with identical bytes — a same-day `set_reviewed` re-stamp is the canonical
+/// one — returns the untouched tip. Use [`commit_now_outcome`] when that
+/// difference matters.
 pub(crate) fn commit_now(
     inner: &mut DaemonInner,
     intent: Intent,
 ) -> Result<Hash, (ErrorKind, String)> {
+    Ok(commit_now_outcome(inner, intent)?.hash)
+}
+
+/// [`commit_now`], reporting whether any ref actually advanced. `committed` is
+/// the OR over every chain this call touched, so a call that minted nothing
+/// anywhere reads false and the replica push loop is left asleep.
+pub(crate) fn commit_now_outcome(
+    inner: &mut DaemonInner,
+    intent: Intent,
+) -> Result<CommitOutcome, (ErrorKind, String)> {
+    commit_now_with(inner, intent, SameTreePolicy::Skip)
+}
+
+/// [`commit_now_outcome`] with an explicit [`SameTreePolicy`]. `Record` is for
+/// the vault's audit intents — a `vault_reveal` log entry, a `sealed-paths.toml`
+/// edit — whose whole value is the record: they change no tracked content (the
+/// sealed-paths file lives under `.softfig/`, and a reveal writes only a temp
+/// file outside the garden), so the same-tree guard would erase the audit trail
+/// along with the churn. Everything else takes `Skip`.
+///
+/// The policy applies to the **device chain only**; a shared chain is always
+/// guarded, because an empty commit there is peer-synced churn.
+pub(crate) fn commit_now_with(
+    inner: &mut DaemonInner,
+    intent: Intent,
+    policy: SameTreePolicy,
+) -> Result<CommitOutcome, (ErrorKind, String)> {
     // Reborrow `inner.fuse` on its own (disjoint from `repo`/`session`/`hook`
     // below) and finish the snapshots into owned values before touching the
     // repo, so no two `DaemonInner` fields are borrowed at once.
@@ -165,47 +200,73 @@ pub(crate) fn commit_now(
         }
     }
     let hook = inner.layer_b.clone();
-    let hash = {
+    let outcome = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_mut().expect("unlocked");
         match fuse_snapshots {
             Some((device_snapshot, shared_snapshots)) => {
                 let mut last = None;
+                let mut advanced = false;
                 if let Some(snapshot) = device_snapshot {
                     let _guard =
                         PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
                     last = Some(
-                        repo.commit_snapshot(session, snapshot, intent.clone())
-                            .map_err(|e| err_to_response(e.into()))?,
+                        repo.commit_snapshot_to_with(
+                            softfig_vcs::TIP_REF,
+                            session,
+                            snapshot,
+                            intent.clone(),
+                            policy,
+                        )
+                        .map_err(|e| err_to_response(e.into()))?,
                     );
                 }
-                let device_hash = last;
+                let device_outcome = last;
+                advanced |= device_outcome.is_some_and(|o| o.committed);
                 for (ref_name, snap) in shared_snapshots {
                     // Quiesced on its write turn (a peer holds it) — leave the
                     // snapshot staged in the overlay for a later boundary.
                     if deferred_shared.contains(&ref_name) {
                         continue;
                     }
-                    last = Some(
-                        repo.commit_snapshot_to(&ref_name, session, snap, intent.clone())
-                            .map_err(|e| err_to_response(e.into()))?,
-                    );
+                    // Always `Skip` on a shared chain, whatever the device
+                    // policy: an audit record belongs to this device's own
+                    // chain, and an empty commit on a shared ref is exactly the
+                    // peer-synced churn the guard exists to stop.
+                    let o = repo
+                        .commit_snapshot_to_with(
+                            &ref_name,
+                            session,
+                            snap,
+                            intent.clone(),
+                            SameTreePolicy::Skip,
+                        )
+                        .map_err(|e| err_to_response(e.into()))?;
+                    advanced |= o.committed;
+                    last = Some(o);
                 }
-                match device_hash.or(last) {
-                    Some(h) => h,
+                match device_outcome.or(last) {
+                    // `hash` is the device tip when the device chain was in play,
+                    // else the last shared chain's — but `committed` is the OR over
+                    // every chain, so a device no-op alongside a real shared-chain
+                    // commit still reports an advance (task 028).
+                    Some(o) => CommitOutcome { hash: o.hash, committed: advanced },
                     // Every advancing chain was deferred on its write turn: nothing
                     // committed this call — return the device tip unchanged (the
                     // staged writes land on a later boundary once granted).
-                    None => repo
-                        .tip()
-                        .map_err(|e| err_to_response(e.into()))?
-                        .expect("device chain always has a genesis tip"),
+                    None => CommitOutcome {
+                        hash: repo
+                            .tip()
+                            .map_err(|e| err_to_response(e.into()))?
+                            .expect("device chain always has a genesis tip"),
+                        committed: false,
+                    },
                 }
             }
             None => {
                 let _guard =
                     PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
-                repo.commit_workdir(session, intent)
+                repo.commit_workdir_with(session, intent, policy)
                     .map_err(|e| err_to_response(e.into()))?
             }
         }
@@ -213,10 +274,14 @@ pub(crate) fn commit_now(
     // Slice 1 (M5b-hardening): a tip-advancing commit landed — wake the replica
     // push loop so it pushes to online granted hosts now, instead of on the next
     // ~20s reconcile tick. No-op when net is down or nothing is granted.
-    if let Some(net) = inner.net.as_ref() {
-        net.signal_commit();
+    // Task 028: a same-tree no-op advanced nothing and has nothing for a peer to
+    // pull, so it must not wake the loop either.
+    if outcome.committed {
+        if let Some(net) = inner.net.as_ref() {
+            net.signal_commit();
+        }
     }
-    Ok(hash)
+    Ok(outcome)
 }
 
 /// Commit a pre-built `snapshot` to an arbitrary chain `ref_name` under a fresh
@@ -233,19 +298,22 @@ pub(crate) fn commit_snapshot_to_now(
     intent: Intent,
 ) -> Result<Hash, (ErrorKind, String)> {
     let hook = inner.layer_b.clone();
-    let hash = {
+    let outcome = {
         let session = inner.session.as_ref().expect("unlocked");
         let repo = inner.repo.as_mut().expect("unlocked");
         let _guard = PriorTipGuard::install(&hook, repo, session).map_err(err_to_response)?;
-        repo.commit_snapshot_to(ref_name, session, snapshot, intent)
+        repo.commit_snapshot_to_outcome(ref_name, session, snapshot, intent)
             .map_err(|e| err_to_response(e.into()))?
     };
     // A genesis on a shared ref never advances the device tip, so the device-only
-    // replica push loop no-ops; wake it anyway for parity with `commit_now`.
-    if let Some(net) = inner.net.as_ref() {
-        net.signal_commit();
+    // replica push loop no-ops; wake it anyway for parity with `commit_now` —
+    // but only when the ref actually moved (task 028).
+    if outcome.committed {
+        if let Some(net) = inner.net.as_ref() {
+            net.signal_commit();
+        }
     }
-    Ok(hash)
+    Ok(outcome.hash)
 }
 
 #[cfg(test)]
