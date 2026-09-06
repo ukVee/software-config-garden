@@ -67,7 +67,7 @@ use crate::state::State;
 use crate::supervisor::{
     AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome, Supervisor,
 };
-use crate::usage::{UsageAggregator, UsageSample};
+use crate::usage::{UsageAggregator, UsageSample, WindowResets};
 
 /// How often the live drive loop ticks: schedule, observe health, honor control,
 /// re-roll. Agents run for minutes per session, so a ~1s cadence is ample — this
@@ -160,6 +160,16 @@ pub trait BudgetSampleSource: Send + Sync + fmt::Debug {
     fn rate_limit_reopen(&self, _agent: &str) -> Option<i64> {
         None
     }
+
+    /// The window boundaries `agent`'s latest reading was taken against (task 048),
+    /// folded into the sample so the aggregator can void a window that has
+    /// demonstrably reset since the read — a bound age alone cannot supply, because
+    /// the windows are anchored rather than rolling from the read. Defaulted to
+    /// [`WindowResets::UNKNOWN`] so a seam with no rate-limit signal opts out and
+    /// keeps the age bound alone; the live backend overrides it.
+    fn budget_resets(&self, _agent: &str) -> WindowResets {
+        WindowResets::UNKNOWN
+    }
 }
 
 impl BudgetSampleSource for Arc<ClaudeBackend> {
@@ -171,6 +181,10 @@ impl BudgetSampleSource for Arc<ClaudeBackend> {
 
     fn rate_limit_reopen(&self, agent: &str) -> Option<i64> {
         self.as_ref().rate_limit_reopen(agent)
+    }
+
+    fn budget_resets(&self, agent: &str) -> WindowResets {
+        self.as_ref().budget_resets(agent)
     }
 }
 
@@ -1150,9 +1164,14 @@ impl DriveLoop {
                 if let Some(budget) = self.samples.budget(agent) {
                     // Stamp the reading with the tick's `now`; an unchanged re-report
                     // keeps its prior age so a wedged agent's frozen sample ages out
-                    // of its window (task 046 window-staleness bound).
-                    self.aggregator
-                        .observe(UsageSample::new(agent.clone(), budget, now));
+                    // of its window (task 046 window-staleness bound). Carry the
+                    // window boundaries the reading was taken against too, so a
+                    // window whose `resets_at` has passed drops from the fold at once
+                    // even while the reading is younger than that window (task 048).
+                    self.aggregator.observe(
+                        UsageSample::new(agent.clone(), budget, now)
+                            .with_resets(self.samples.budget_resets(agent)),
+                    );
                 }
             } else {
                 self.aggregator.forget(agent);

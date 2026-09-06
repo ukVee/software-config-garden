@@ -65,6 +65,7 @@ use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
 use crate::supervisor::{AgentSpec, Supervisor};
+use crate::usage_file::UsageCapture;
 
 /// The `claude` binary the backend shells when the config omits `claude_bin`.
 pub const DEFAULT_CLAUDE_BIN: &str = "claude";
@@ -340,7 +341,16 @@ pub fn assemble_fleet(
         // `request_restart` reach the running agent. Shared by Arc with the
         // daemon (it owns the registry `hard_kill_agent` drains), like `live_scopes`.
         Arc::clone(&daemon.kill_handles),
-    ));
+    )
+    // The headless budget capture (task 048): every member's `rate_limit_event`
+    // reading is teed to the runtime `usage.json`, the file the loop protocol's §2b
+    // boot check and the human read. A headless `claude -p` has no statusline — the
+    // file's only other writer — so without this the fleet runs for days on a
+    // reading from the human's last interactive session
+    // (`incident-20260720-m5f-double-park`).
+    .with_usage_capture(Arc::new(UsageCapture::new(
+        runtime_growlight_dir().join(USAGE_FILE),
+    ))));
     let members: Vec<FleetMember> = fleet
         .members
         .iter()
@@ -441,6 +451,12 @@ const PILLAR: &str = "growlight";
 /// injects. growlightd only ever spawns fleet members, so this is the protocol
 /// every pre-approval it generates carries.
 const FLEET_PROTOCOL_FILE: &str = "protocol-fleet.md";
+
+/// The runtime budget file inside the growlight namespace — the ONE name the
+/// headless capture writes and every reader (the loop protocol's §2b boot check,
+/// the `--auto` governor, the human) reads. Named here rather than inline so the
+/// writer and `softfig growlight start`'s statusline tee cannot drift apart.
+const USAGE_FILE: &str = "usage.json";
 
 /// The garden path to the fleet-member protocol the SessionStart hook injects.
 /// Pure + named so the fleet/single-agent split is a tested choice, not an inline

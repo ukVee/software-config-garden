@@ -1034,7 +1034,13 @@ fn run_auto_loop(
                 .unwrap_or_else(|| "-".to_string()),
             status,
             if outcome.is_error { " (agent ERROR)" } else { "" },
-            outcome.usage.context_window.used_percentage,
+            // A reading with no context block reports its absence, never a `0` that
+            // reads as an empty window (the usage.json honesty rule, task 048).
+            outcome
+                .usage
+                .context_window
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |c| c.used_percentage.to_string()),
         );
         let _ = writeln!(log, "{line}");
         println!("  {line}");
@@ -2596,12 +2602,12 @@ mod tests {
                 is_error: self.is_error,
                 result_text: Some("done".to_string()),
                 usage: UsageSnapshot {
-                    context_window: ContextWindow {
+                    context_window: Some(ContextWindow {
                         used_percentage: self.ctx_pct,
                         remaining_percentage: 100 - self.ctx_pct,
                         context_window_size: 1_000_000,
                         current_tokens: 12_345,
-                    },
+                    }),
                     rate_limits: RateLimits {
                         five_hour: RateWindow {
                             used_percentage: None,
@@ -2643,7 +2649,14 @@ mod tests {
         // Baton fields read back through the seam.
         assert_eq!(view.status.as_deref(), Some("BLOCKED_ON_HUMAN"));
         assert!(!outcome.is_error);
-        assert_eq!(outcome.usage.context_window.used_percentage, 7);
+        assert_eq!(
+            outcome
+                .usage
+                .context_window
+                .as_ref()
+                .map(|c| c.used_percentage),
+            Some(7)
+        );
         assert_eq!(
             outcome.usage.rate_limits.five_hour.status.as_deref(),
             Some("allowed")
@@ -2703,12 +2716,12 @@ mod tests {
                 is_error: false,
                 result_text: Some(format!("iteration {i} done")),
                 usage: UsageSnapshot {
-                    context_window: ContextWindow {
+                    context_window: Some(ContextWindow {
                         used_percentage: 10,
                         remaining_percentage: 90,
                         context_window_size: 1_000_000,
                         current_tokens: 100_000,
-                    },
+                    }),
                     rate_limits: RateLimits::default(),
                     ts: 0.0,
                 },
@@ -2908,12 +2921,12 @@ mod tests {
             status: status.map(str::to_string),
         };
         UsageSnapshot {
-            context_window: ContextWindow {
+            context_window: Some(ContextWindow {
                 used_percentage: 10,
                 remaining_percentage: 90,
                 context_window_size: 1_000_000,
                 current_tokens: 100_000,
-            },
+            }),
             rate_limits: RateLimits {
                 five_hour: win(five),
                 seven_day: win(seven),
