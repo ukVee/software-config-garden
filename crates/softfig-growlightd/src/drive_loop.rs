@@ -62,6 +62,7 @@ use crate::config::RateLimits;
 use crate::daemon::Daemon;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
+use crate::opencode_backend::OpencodeBackend;
 use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
 use crate::state::State;
 use crate::supervisor::{
@@ -166,6 +167,23 @@ impl BudgetSampleSource for Arc<ClaudeBackend> {
     fn budget(&self, agent: &str) -> Option<BudgetUsage> {
         // Disambiguate from this trait method: call the inherent one on the
         // backed `ClaudeBackend`.
+        self.as_ref().budget(agent)
+    }
+
+    fn rate_limit_reopen(&self, agent: &str) -> Option<i64> {
+        self.as_ref().rate_limit_reopen(agent)
+    }
+}
+
+/// opencode contributes **nothing** to the Anthropic budget aggregate — both
+/// methods are structurally `None` (see [`OpencodeBackend::budget`]). The impl
+/// exists so the same `Arc` fills this seam like every other, not because there is
+/// a reading to fold: a synthetic percentage here would corrupt the admission gate
+/// that governs the claude members.
+impl BudgetSampleSource for Arc<OpencodeBackend> {
+    fn budget(&self, agent: &str) -> Option<BudgetUsage> {
+        // Disambiguate from this trait method: call the inherent one on the
+        // backed `OpencodeBackend`.
         self.as_ref().budget(agent)
     }
 
@@ -508,6 +526,14 @@ impl AgentHealthSource for Arc<ClaudeBackend> {
     }
 }
 
+impl AgentHealthSource for Arc<OpencodeBackend> {
+    fn health(&self, agent: &str) -> Option<AgentHealth> {
+        // Disambiguate from this trait method: call the inherent one on the
+        // backed `OpencodeBackend`.
+        self.as_ref().health(agent)
+    }
+}
+
 /// The seam the loop reads a crashed agent's **stderr tail** through, to enrich an
 /// [`NotifyEvent::AgentCrashed`] with the crash *reason* (crash-diagnostics slice
 /// 001). Implemented over the live [`ClaudeBackend`]'s bounded per-agent in-memory
@@ -521,6 +547,13 @@ pub trait AgentStderrSource: Send + Sync + fmt::Debug {
 }
 
 impl AgentStderrSource for Arc<ClaudeBackend> {
+    fn stderr_tail(&self, agent: &str) -> Vec<String> {
+        // Disambiguate from this trait method: call the inherent one.
+        self.as_ref().stderr_tail(agent)
+    }
+}
+
+impl AgentStderrSource for Arc<OpencodeBackend> {
     fn stderr_tail(&self, agent: &str) -> Vec<String> {
         // Disambiguate from this trait method: call the inherent one.
         self.as_ref().stderr_tail(agent)

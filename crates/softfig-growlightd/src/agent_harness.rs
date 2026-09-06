@@ -46,6 +46,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -273,8 +274,15 @@ pub trait LineObserver: Send {
 }
 
 /// What a specific agent CLI supplies to the shared [`Harness`] — the whole
-/// backend seam (spec-agents §10 phase 2). Three methods: the command after the
-/// scope wrapper's `--`, the fail-closed pre-approval, and the per-line fold.
+/// backend seam (spec-agents §10 phase 2). Five methods: the fail-closed
+/// pre-approval, the command after the scope wrapper's `--`, the child's extra
+/// environment and working directory, and the per-line fold.
+///
+/// Every method is REQUIRED, none defaulted, deliberately: the seam's whole
+/// hazard is that a backend which silently omits something a headless agent needs
+/// produces a spawned-but-doomed session rather than an error (§15). A flavor that
+/// wants nothing says so — see [`ClaudeFlavor`](crate::claude_backend)'s empty
+/// env / `None` cwd, which is a statement, not an omission.
 ///
 /// `Debug + Send + Sync` because the harness holds it behind an `Arc` shared with
 /// every spawn's reader thread.
@@ -287,10 +295,30 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
     fn generate_preapproval(&self, agent: &str) -> Result<AgentPaths, SpawnError>;
 
     /// The command argv (program first) that goes AFTER `systemd-run … --`, given
-    /// the paths this spawn's pre-approval just wrote. The scope wrapper half is
-    /// the harness's ([`scope_wrapper_argv`]) — this is only the backend's own
-    /// invocation.
-    fn command_argv(&self, paths: &AgentPaths) -> Vec<OsString>;
+    /// the agent being launched and the paths this spawn's pre-approval just
+    /// wrote. The scope wrapper half is the harness's ([`scope_wrapper_argv`]) —
+    /// this is only the backend's own invocation. `agent` is passed because a
+    /// backend may need to name the member on its own command line (opencode's
+    /// `--agent`), which the paths alone do not carry.
+    fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString>;
+
+    /// Extra environment variables this spawn's child needs, given the paths its
+    /// pre-approval just wrote. Applied on top of growlightd's own environment,
+    /// which the child inherits.
+    ///
+    /// `systemd-run --scope` runs the command as its **own child** in the new
+    /// scope (unlike `--service`, which goes through PID 1), so the environment
+    /// and working directory set here reach the real process.
+    ///
+    /// claude returns none — it carries its whole config on argv
+    /// (`--settings`/`--mcp-config`). opencode has no such flags: its single
+    /// generated config is named by `OPENCODE_CONFIG`, so for it this is as
+    /// load-bearing as the pre-approval it points at.
+    fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)>;
+
+    /// The directory the child runs in, or `None` to inherit growlightd's own.
+    /// Constant per backend, so it takes no per-spawn input.
+    fn working_dir(&self) -> Option<PathBuf>;
 
     /// Build this spawn's [`LineObserver`], installing any per-agent cell the
     /// flavor keeps (e.g. claude's account-wide reserve cell). Called once per
@@ -741,9 +769,13 @@ impl Harness {
         let generation = self.scope_gen.fetch_add(1, Ordering::Relaxed);
         let scope_base = scope_base_name_gen(&spec.agent, generation);
         let scope_unit = format!("{scope_base}.scope");
-        let argv = spawn_argv(&scope_base, &caps, self.flavor.command_argv(&paths));
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
+        let argv = spawn_argv(
+            &scope_base,
+            &caps,
+            self.flavor.command_argv(&spec.agent, &paths),
+        );
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             // stderr is PIPED and drained into a bounded in-memory ring
@@ -752,14 +784,25 @@ impl Harness {
             // inferable). The old deadlock worry (an *unread* pipe fills and blocks
             // the child) does not apply: the reader thread below drains it
             // continuously, the exact deadlock-safe shape the stdout `pump` uses.
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                SpawnError(format!(
-                    "failed to launch agent {} in a transient scope (systemd-run): {e}",
-                    spec.agent
-                ))
-            })?;
+            .stderr(Stdio::piped());
+        // The flavor's environment + cwd (spec-agents §10 phase 2): claude adds
+        // neither, so its spawn stays byte-identical; opencode names its generated
+        // config through `OPENCODE_CONFIG` and roots at the garden so garden docs
+        // are ordinary in-project reads. Applied to the `systemd-run` process,
+        // which `--scope` runs the real command as a direct child of, so both
+        // reach it.
+        for (key, value) in self.flavor.child_env(&paths) {
+            cmd.env(key, value);
+        }
+        if let Some(dir) = self.flavor.working_dir() {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            SpawnError(format!(
+                "failed to launch agent {} in a transient scope (systemd-run): {e}",
+                spec.agent
+            ))
+        })?;
 
         let stdout = child
             .stdout

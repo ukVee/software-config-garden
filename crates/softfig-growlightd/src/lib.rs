@@ -78,6 +78,7 @@ pub use notify_dispatch::{
     BusEmit, GuiNotifier, KeeperdBusEmit, LogNotifier, LogSink, Notifier, NotifyDispatcher,
     PhoneStub, StderrLog, ALERT_FROM, ALERT_KIND,
 };
+pub use opencode_backend::{AgentSpend, OpencodeBackend, OpencodeLaunch};
 pub use opencode_preapproval::{ModelSelection, OpencodePreApproval};
 pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};

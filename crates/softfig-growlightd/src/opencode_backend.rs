@@ -1,13 +1,15 @@
 //! The opencode backend — opencode's **flavor** of the backend-agnostic
 //! [`crate::agent_harness`] (spec-agents §10 phase 2).
 //!
-//! This module currently holds the wire-format half only: the NDJSON per-line fold
-//! that normalizes `opencode run --format json` output into growlightd's canonical
-//! [`Event::AgentDelta`] + heartbeat + rate pipeline (opencode-fleet-backend slice
-//! 002). The argv, the fail-closed pre-approval, and the [`BackendFlavor`] /
-//! `AgentBackend` wiring arrive in slices 003–004; everything structural — the
-//! transient systemd scope, health cells, stderr ring, rolling-minute meter, kill
-//! registries — is already the harness's and is not duplicated here.
+//! Two halves. The **wire format** (slice 002): the NDJSON per-line fold that
+//! normalizes `opencode run --format json` output into growlightd's canonical
+//! [`Event::AgentDelta`] + heartbeat + rate pipeline. And the **backend** (slice
+//! 004): [`OpencodeBackend`], a [`Harness`] bound to this module's
+//! [`BackendFlavor`], which the drive loop consumes through exactly the trait
+//! objects it already consumes claude through. Everything structural — the
+//! transient systemd scope, build caps, health cells, stderr ring, rolling-minute
+//! meter, and the `live_scopes` / `kill_handles` registries — is the harness's and
+//! is not duplicated here; the flavor is five methods.
 //!
 //! ## The wire format (PINNED against opencode 1.18.15, 2026-08-13)
 //!
@@ -49,21 +51,25 @@
 //! reading — each step really is a separate API call — so it is not a bug to
 //! "fix" into one-per-run.
 
-// Slice 002 lands this fold + its cells fully unit-proven, but nothing in
-// production *calls* it until slice 004 builds the `BackendFlavor` that installs
-// the observer — so every item below is legitimately unreachable for exactly one
-// commit. Scoped to this module and removed by slice 004, rather than eight
-// scattered attributes.
-#![allow(dead_code)]
-
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 
-use crate::agent_harness::{AgentRateState, LineObserver, TOOL_RENDER_MAX_CHARS, truncate_chars};
+use crate::admission::BudgetUsage;
+use crate::agent_harness::{
+    AgentRateState, BackendFlavor, Harness, LineObserver, TOOL_RENDER_MAX_CHARS, truncate_chars,
+};
+use crate::config::BuildCaps;
+use crate::control::{AgentChild, LiveKill};
 use crate::hub::EventHub;
+use crate::opencode_preapproval::{ModelSelection, OpencodePreApproval};
+use crate::preapproval::AgentPaths;
+use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
 
 // Imports for the test-only opencode-shaped `pump` seam below, which wires
 // borrowed cells into the harness's line loop so a fixture drives the real
@@ -338,11 +344,253 @@ fn pump<R: BufRead>(
     );
 }
 
+// ---- the backend ------------------------------------------------------------
+
+/// What an opencode member is launched *as*: the binary, the turn kick, the model
+/// it runs on, and the directory it runs in. Grouped rather than passed as four
+/// more positional arguments to [`OpencodeBackend::new`] — three of the four are
+/// strings, and a value in the wrong slot would spawn a plausible, wrong agent.
+#[derive(Debug, Clone)]
+pub struct OpencodeLaunch {
+    /// The `opencode` binary (a bare name is resolved on PATH).
+    pub bin: String,
+    /// The per-turn kick prompt. opencode's system prompt (the generated agent's
+    /// `prompt`) is the protocol + baton bootstrap; this is the turn's "go".
+    pub prompt: String,
+    /// The model/variant to run on, carried in the **generated config**, not on
+    /// argv — `opencode run` accepts `-m`/`--variant` too, and one source beats
+    /// two (slice 004: "pin whichever at build time and note it"). Pinned to the
+    /// config because the pre-approval must be written anyway and a member whose
+    /// model lived on argv could drift from the agent block that permits it.
+    pub model: ModelSelection,
+    /// The garden root — the member's cwd, so garden docs are ordinary in-project
+    /// reads (the finding that drove the interactive seam's slice 006) and the
+    /// same root a claude member works from.
+    pub garden_root: PathBuf,
+}
+
+/// opencode's [`BackendFlavor`]: the five things the shared harness cannot know —
+/// the fail-closed pre-approval, the argv, the child's env and cwd, and the NDJSON
+/// per-line fold.
+#[derive(Debug)]
+struct OpencodeFlavor {
+    launch: OpencodeLaunch,
+    hub: EventHub,
+    /// Per-member fail-closed pre-approval generator: each spawn writes this
+    /// member's `opencode.json` BEFORE exec, so a headless session — which cannot
+    /// answer a permission prompt — never dies on a missing rule. Generation
+    /// failure ⇒ no spawn (a [`SpawnError`]).
+    preapproval: OpencodePreApproval,
+    /// Per-agent spend accumulators, keyed by agent id; re-spawn replaces the cell,
+    /// the same lifecycle the harness gives its own health/rate/stderr cells.
+    spends: Mutex<BTreeMap<String, Arc<AgentSpendState>>>,
+}
+
+impl OpencodeFlavor {
+    /// `agent`'s accumulated session spend, or the zero reading if it was never
+    /// spawned by this backend.
+    fn spend(&self, agent: &str) -> AgentSpend {
+        self.spends
+            .lock()
+            .unwrap()
+            .get(agent)
+            .map(|s| s.observe())
+            .unwrap_or_default()
+    }
+}
+
+/// The `opencode run` invocation that goes AFTER the harness's `systemd-run … --`
+/// separator — the argv half that is genuinely opencode's. The wrapper half
+/// (scope, `--collect`, `--unit=`, the gentle build caps) is the harness's, shared
+/// byte-for-byte with claude.
+///
+/// No `-m` / `--variant`: the model lives in the generated config (see
+/// [`OpencodeLaunch::model`]). `--format json` is what makes the output the NDJSON
+/// this module's fold parses; without it there is nothing to observe.
+fn opencode_command_argv(bin: &str, prompt: &str, agent: &str) -> Vec<OsString> {
+    vec![
+        bin.into(),
+        "run".into(),
+        "--format".into(),
+        "json".into(),
+        "--agent".into(),
+        agent.into(),
+        prompt.into(),
+    ]
+}
+
+/// The environment variable naming the generated per-member config — opencode's
+/// analog of claude's `--settings` plus `--mcp-config`, except it is an env var
+/// rather than a flag, which is the whole reason [`BackendFlavor::child_env`]
+/// exists.
+const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG";
+
+impl BackendFlavor for OpencodeFlavor {
+    fn generate_preapproval(&self, agent: &str) -> Result<AgentPaths, SpawnError> {
+        self.preapproval
+            .generate(agent, &self.launch.model)
+            .map_err(|e| {
+                SpawnError(format!(
+                    "opencode pre-approval generation failed for agent {agent}: {e}"
+                ))
+            })
+    }
+
+    fn command_argv(&self, agent: &str, _paths: &AgentPaths) -> Vec<OsString> {
+        // The member id IS the opencode agent name the generated config keys its
+        // `agent.<name>` block on — one id names the runtime dir, the baton, and
+        // the agent block, so `--agent` can never point at a block that was not
+        // just written.
+        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent)
+    }
+
+    fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)> {
+        vec![(
+            OPENCODE_CONFIG_ENV.into(),
+            paths.opencode_config.clone().into_os_string(),
+        )]
+    }
+
+    fn working_dir(&self) -> Option<PathBuf> {
+        Some(self.launch.garden_root.clone())
+    }
+
+    fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
+        // Fresh spend cell for this spawn, overwriting any prior generation's — so
+        // `spend` always reads the CURRENT child's accumulation, the same
+        // replace-on-re-roll lifecycle as the harness's own cells.
+        let spend = Arc::new(AgentSpendState::default());
+        self.spends
+            .lock()
+            .unwrap()
+            .insert(agent.to_string(), Arc::clone(&spend));
+        Box::new(OpencodeSpawnObserver {
+            agent: agent.to_string(),
+            hub: self.hub.clone(),
+            spend,
+            rate,
+        })
+    }
+}
+
+/// The production opencode [`AgentBackend`]: a [`Harness`] bound to an
+/// [`OpencodeFlavor`], shelling `opencode run --format json` per member, tailing
+/// each child into [`Event::AgentDelta`]s on the shared [`EventHub`], and tracking
+/// the per-member state the drive loop reads.
+///
+/// Structurally identical to [`ClaudeBackend`](crate::claude_backend::ClaudeBackend)
+/// — same transient scope, same build caps, same `live_scopes`/`kill_handles`
+/// registration, so `force_stop --hard-kill`, `request_restart` and the boot
+/// reconciler address an opencode member exactly as they do a claude one. That is
+/// not a coincidence: all of it is the harness's, and this type adds only the
+/// flavor.
+///
+/// Implemented for `Arc<OpencodeBackend>` (mirroring claude) so the same `Arc` can
+/// be cloned into every seam the [`DriveLoop::new`](crate::drive_loop::DriveLoop)
+/// contract requires.
+#[derive(Debug)]
+pub struct OpencodeBackend {
+    /// The shared supervision machinery (scope, health, stderr, rate, registries).
+    harness: Harness,
+    /// The SAME flavor the harness holds behind its `Arc<dyn BackendFlavor>`, kept
+    /// concretely here so the opencode-only spend accessor reaches its cells.
+    flavor: Arc<OpencodeFlavor>,
+}
+
+impl OpencodeBackend {
+    /// A backend launching `launch.bin` per member, publishing deltas to `hub` and
+    /// generating each member's `opencode.json` via `preapproval`. The shared
+    /// `build_caps` / `live_scopes` / `kill_handles` cells are the daemon's — the
+    /// same ones a [`ClaudeBackend`](crate::claude_backend::ClaudeBackend) is given
+    /// — so `set_resources` and the kill paths reach an opencode member too.
+    pub fn new(
+        launch: OpencodeLaunch,
+        hub: EventHub,
+        preapproval: OpencodePreApproval,
+        build_caps: Arc<Mutex<BuildCaps>>,
+        live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
+        kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
+    ) -> Self {
+        let flavor = Arc::new(OpencodeFlavor {
+            launch,
+            hub,
+            preapproval,
+            spends: Mutex::new(BTreeMap::new()),
+        });
+        Self {
+            harness: Harness::new(
+                Arc::clone(&flavor) as Arc<dyn BackendFlavor>,
+                build_caps,
+                live_scopes,
+                kill_handles,
+            ),
+            flavor,
+        }
+    }
+
+    /// `agent`'s current health (heartbeat-or-exit), or `None` if this backend
+    /// never spawned it.
+    pub fn health(&self, agent: &str) -> Option<AgentHealth> {
+        self.harness.health(agent)
+    }
+
+    /// Always `None` — and this is the milestone's one irreversible mistake to
+    /// avoid, not an unimplemented stub.
+    ///
+    /// [`BudgetUsage`] is the **Anthropic account pool** (the 5h/7d subscription
+    /// reserve) that gates admission for the claude members. A metered DeepSeek run
+    /// has no such windows and opencode reports none, so `None` is the honest
+    /// answer: this member simply does not contribute to the fleet aggregate.
+    /// Synthesising a percentage here would corrupt the gate governing every other
+    /// member (opencode-fleet-backend locked decision 2).
+    ///
+    /// What opencode *does* report is metered instead: `step_finish.tokens.total`
+    /// feeds the harness's provider-neutral rolling-minute TPM/RPM meter, and
+    /// `step_finish.cost` accrues as [`spend`](Self::spend).
+    pub fn budget(&self, _agent: &str) -> Option<BudgetUsage> {
+        None
+    }
+
+    /// Always `None`: the reopen instant is the Anthropic rate-limit window's
+    /// `resetsAt`, and opencode emits no `rate_limit_event` at all — there is
+    /// structurally nothing to report. The metered-provider 429 `retry-after` hold
+    /// is spec-agents §7 phase 4, deliberately not invented here.
+    pub fn rate_limit_reopen(&self, _agent: &str) -> Option<i64> {
+        None
+    }
+
+    /// The **fleet-wide** rolling-minute `(tpm_used, rpm_used)` at `now`, summed
+    /// across this backend's members. The window is provider-neutral — tokens per
+    /// minute mean the same thing on either provider — so unlike `budget` this one
+    /// really does report.
+    pub fn rate_used(&self, now: i64) -> (u32, u32) {
+        self.harness.rate_used(now)
+    }
+
+    /// `agent`'s most recent stderr lines (oldest→newest), or empty if it was never
+    /// spawned or emitted nothing.
+    pub fn stderr_tail(&self, agent: &str) -> Vec<String> {
+        self.harness.stderr_tail(agent)
+    }
+
+    /// `agent`'s accumulated session spend (micro-USD + step count), or the zero
+    /// reading if it was never spawned. The accounting slice 006 surfaces.
+    pub fn spend(&self, agent: &str) -> AgentSpend {
+        self.flavor.spend(agent)
+    }
+}
+
+impl AgentBackend for Arc<OpencodeBackend> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+        self.harness.spawn(spec)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::AgentHealth;
     use std::io::Cursor;
+    use std::path::Path;
     use std::sync::atomic::AtomicI64;
 
     /// The real captured runs (see `tests/fixtures/README.md`) — the substitute for
@@ -602,5 +850,192 @@ mod tests {
                 steps: 5
             }
         );
+    }
+
+    // ---- slice 004: the backend ---------------------------------------------
+
+    /// Build a production [`OpencodeFlavor`] rooted at `tmp` — the real type the
+    /// harness holds, so these assertions are about what actually spawns.
+    fn flavor(tmp: &Path, garden: &Path) -> OpencodeFlavor {
+        OpencodeFlavor {
+            launch: OpencodeLaunch {
+                bin: "opencode".to_string(),
+                prompt: "kick".to_string(),
+                model: ModelSelection::model("deepseek/deepseek-v4-flash"),
+                garden_root: garden.to_path_buf(),
+            },
+            hub: EventHub::new(),
+            preapproval: OpencodePreApproval::new(
+                tmp.join("agents"),
+                garden.join("growlight/protocol-fleet.md"),
+                tmp.join("runtime"),
+                PathBuf::from("softfig-mcp"),
+                tmp.join(".claude"),
+            ),
+            spends: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn backend(tmp: &Path, garden: &Path) -> Arc<OpencodeBackend> {
+        let f = flavor(tmp, garden);
+        Arc::new(OpencodeBackend::new(
+            f.launch.clone(),
+            f.hub.clone(),
+            f.preapproval.clone(),
+            Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        ))
+    }
+
+    #[test]
+    fn the_spawn_argv_wraps_opencode_run_in_the_same_transient_user_scope_as_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = flavor(tmp.path(), Path::new("/garden"));
+        let paths = crate::preapproval::agent_paths(&tmp.path().join("agents"), "a1");
+        // Composed through the PRODUCTION combinator with the PRODUCTION halves —
+        // `Harness::spawn` shells exactly this join, so there is no second path
+        // that could drift. No `systemd-run` and no `opencode` are executed.
+        let argv = crate::agent_harness::spawn_argv(
+            &crate::agent_harness::scope_base_name_gen("a1", 7),
+            &BuildCaps::default(),
+            f.command_argv("a1", &paths),
+        );
+        let s: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+
+        // The wrapper half is the harness's, shared byte-for-byte with claude.
+        assert_eq!(s[0], "systemd-run");
+        assert!(s.contains(&"--user".to_string()));
+        assert!(s.contains(&"--scope".to_string()));
+        assert!(s.contains(&"--collect".to_string()));
+        assert!(s.contains(&"--unit=growlight-agent-a1-7".to_string()));
+
+        // The command half is opencode's, after the `--`.
+        let sep = s.iter().position(|a| a == "--").expect("a `--` separates wrapper from command");
+        assert_eq!(
+            &s[sep + 1..],
+            &[
+                "opencode".to_string(),
+                "run".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--agent".to_string(),
+                "a1".to_string(),
+                "kick".to_string(),
+            ],
+            "the opencode invocation, prompt last",
+        );
+        // The model is pinned in the generated config, NOT on argv — one source.
+        assert!(!s.contains(&"-m".to_string()), "model rides the config: {s:?}");
+        assert!(!s.contains(&"--variant".to_string()), "variant rides the config: {s:?}");
+    }
+
+    #[test]
+    fn the_child_carries_opencode_config_and_runs_in_the_garden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let garden = Path::new("/garden");
+        let f = flavor(tmp.path(), garden);
+        let paths = crate::preapproval::agent_paths(&tmp.path().join("agents"), "a1");
+
+        // OPENCODE_CONFIG names THIS member's generated file — opencode's analog of
+        // claude's `--settings`, and an env var rather than a flag, which is why
+        // the harness seam carries an env at all.
+        let env = f.child_env(&paths);
+        assert_eq!(env.len(), 1, "one variable, nothing incidental: {env:?}");
+        assert_eq!(env[0].0, OsString::from("OPENCODE_CONFIG"));
+        assert_eq!(env[0].1, paths.opencode_config.clone().into_os_string());
+        assert!(
+            paths.opencode_config.ends_with("agents/a1/opencode.json"),
+            "the per-member config, not a shared one: {}",
+            paths.opencode_config.display(),
+        );
+
+        // cwd is the garden root, so garden docs are ordinary in-project reads
+        // (interactive seam slice 006) and everything else needs an explicit
+        // `external_directory` grant.
+        assert_eq!(f.working_dir(), Some(garden.to_path_buf()));
+    }
+
+    #[test]
+    fn spawn_fails_closed_when_pre_approval_cannot_be_generated() {
+        // A FILE where the agents dir should be → the per-member dir can't be
+        // created → generation fails BEFORE `opencode` is ever exec'd, so the spawn
+        // returns a SpawnError and NO member is registered (no doomed headless
+        // session, which for opencode means one that dies on its first edit).
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let backend = Arc::new(OpencodeBackend::new(
+            OpencodeLaunch {
+                bin: "opencode".to_string(),
+                prompt: "kick".to_string(),
+                model: ModelSelection::default(),
+                garden_root: tmp.path().to_path_buf(),
+            },
+            EventHub::new(),
+            OpencodePreApproval::new(
+                &blocker, // agents_dir is a FILE → create_dir_all under it fails
+                tmp.path().join("growlight/protocol-fleet.md"),
+                tmp.path().to_path_buf(),
+                PathBuf::from("softfig-mcp"),
+                tmp.path().join(".claude"),
+            ),
+            Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        ));
+        let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
+
+        let err = backend.spawn(&spec).expect_err("generation failure ⇒ no spawn");
+        assert!(
+            err.0.contains("opencode pre-approval generation failed"),
+            "fail-closed spawn error names its own generator: {err}",
+        );
+        // Nothing was registered — the member never entered the fleet.
+        assert!(backend.health("a1").is_none(), "no doomed member registered");
+        assert!(
+            backend.spend("a1") == AgentSpend::default(),
+            "a fail-closed spawn accrues no spend",
+        );
+    }
+
+    #[test]
+    fn one_arc_fills_every_seam_the_drive_loop_consumes() {
+        use crate::drive_loop::{AgentHealthSource, AgentStderrSource, BudgetSampleSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = backend(tmp.path(), Path::new("/garden"));
+        // The `DriveLoop::new` contract: the SAME Arc behind every seam, so health,
+        // stderr and budget are read off the same cells the supervisor spawns
+        // through. Clones of one Arc, exactly as `assemble_fleet` wires claude.
+        let spawner: Box<dyn AgentBackend> = Box::new(Arc::clone(&backend));
+        let health: Box<dyn AgentHealthSource> = Box::new(Arc::clone(&backend));
+        let stderr: Box<dyn AgentStderrSource> = Box::new(Arc::clone(&backend));
+        let samples: Box<dyn BudgetSampleSource> = Box::new(Arc::clone(&backend));
+
+        // An unspawned member reads as absent through every seam rather than
+        // panicking or inventing a value.
+        assert!(health.health("a1").is_none());
+        assert!(stderr.stderr_tail("a1").is_empty());
+        assert!(samples.budget("a1").is_none());
+        assert!(samples.rate_limit_reopen("a1").is_none());
+        // The spawner is the same object; drop it explicitly so the binding is not
+        // merely unused.
+        drop(spawner);
+    }
+
+    #[test]
+    fn opencode_never_contributes_a_synthetic_anthropic_reserve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = backend(tmp.path(), Path::new("/garden"));
+        // The milestone's one irreversible mistake: a synthesized 5h/7d percentage
+        // here would corrupt the admission gate governing the CLAUDE members. There
+        // is no cell to read and no code path that could produce one — `None` is
+        // structural, not "not implemented yet".
+        assert!(backend.budget("a1").is_none());
+        assert!(backend.rate_limit_reopen("a1").is_none());
+        // What opencode does report IS metered: the provider-neutral rolling-minute
+        // window is live from the first spawn (zero until one meters).
+        assert_eq!(backend.rate_used(1_000), (0, 0));
     }
 }

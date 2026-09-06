@@ -44,7 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -649,13 +649,30 @@ impl BackendFlavor for ClaudeFlavor {
         })
     }
 
-    fn command_argv(&self, paths: &AgentPaths) -> Vec<OsString> {
+    fn command_argv(&self, _agent: &str, paths: &AgentPaths) -> Vec<OsString> {
+        // claude names nothing per-member on its own command line — the member's
+        // identity reaches it through the generated `--settings` (whose
+        // SessionStart hook cats THIS agent's baton), not through argv.
         claude_command_argv(
             &self.bin,
             &self.prompt,
             &paths.loop_settings,
             &paths.mcp_config,
         )
+    }
+
+    fn child_env(&self, _paths: &AgentPaths) -> Vec<(OsString, OsString)> {
+        // Nothing: claude carries its whole per-agent config on argv
+        // (`--settings` + `--mcp-config`), so the spawn's environment is
+        // growlightd's own, exactly as before the seam existed.
+        Vec::new()
+    }
+
+    fn working_dir(&self) -> Option<PathBuf> {
+        // Inherit growlightd's cwd — claude's own directory handling (its
+        // `additionalDirectories` grant + the agent cd-ing to the item's repo) is
+        // unchanged by the seam, and pinning one here would be a behavior change.
+        None
     }
 
     fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
