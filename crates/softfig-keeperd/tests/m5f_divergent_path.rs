@@ -26,7 +26,7 @@
 //! reachable from an integration test via public API; tracked in the m5f baton.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -509,9 +509,7 @@ fn push_edit_tagged(
     let sender_garden = sender.garden.clone();
     let new_tree_bytes = *new_tree.as_bytes();
     let sender_thread = thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let stream = softfig_net::testing::connect_within(addr, "the divergent-path receiver");
         let mut session = ik_initiator(stream, &sender_secret, &receiver_static, &sender_hello)
             .expect("sender IK handshake");
         session.send_frame(&frame).expect("send push frame");
@@ -521,9 +519,7 @@ fn push_edit_tagged(
     });
 
     let owner = sender.ring_entry();
-    let (conn, _) = listener.accept().unwrap();
-    let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = conn.set_write_timeout(Some(Duration::from_secs(10)));
+    let conn = softfig_net::testing::accept_within(&listener, "divergent-path push");
     let session = ik_responder(conn, &receiver.local.transport_secret, &receiver.local.hello())
         .expect("receiver IK handshake");
     serve_established(

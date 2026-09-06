@@ -109,7 +109,7 @@ fn relay_forwards_end_to_end_ik_session_between_two_clients() {
     let bob_local = bob.local.clone();
     let bob_addr = addr.clone();
     let bob_thread = thread::spawn(move || {
-        let conn = TcpStream::connect(&bob_addr).expect("bob connect relay");
+        let conn = softfig_net::testing::connect_within(&bob_addr, "the relay (bob)");
         let mut sess = relay_accept(conn, &relay_static, &bob_local).expect("bob relayed session");
         // Serve one ping/pong, end-to-end with alice (relay can't read it).
         let f = sess.recv_frame().expect("bob recv ping");
@@ -124,7 +124,7 @@ fn relay_forwards_end_to_end_ik_session_between_two_clients() {
     wait_until(|| relay.is_registered(&bob_id));
 
     // --- Alice connects through the relay (inner IK initiator). ---
-    let conn = TcpStream::connect(&addr).expect("alice connect relay");
+    let conn = softfig_net::testing::connect_within(&addr, "the relay (alice)");
     let mut alice_sess =
         relay_connect(conn, &relay_static, &alice.local, &bob_id, &bob_static).expect("alice session");
     alice_sess.send_frame(&Frame::ping(0xABCD)).expect("alice ping");
@@ -161,7 +161,7 @@ fn relay_recovers_after_a_target_timeout_without_a_restart() {
     // --- Bob registers, then his connection dies (the "timeout"). ---
     let bob_local = bob.local.clone();
     let dead_addr = addr.clone();
-    let dead_conn = TcpStream::connect(&dead_addr).expect("bob connect relay");
+    let dead_conn = softfig_net::testing::connect_within(&dead_addr, "the relay (bob, dead leg)");
     let kill = dead_conn.try_clone().expect("clone bob socket");
     let bob_dead = thread::spawn(move || {
         // Parks at the relay, then errors out when the socket is killed below.
@@ -182,7 +182,7 @@ fn relay_recovers_after_a_target_timeout_without_a_restart() {
     let bob_local2 = bob.local.clone();
     let fresh_addr = addr.clone();
     let bob_fresh = thread::spawn(move || {
-        let conn = TcpStream::connect(&fresh_addr).expect("fresh bob connect relay");
+        let conn = softfig_net::testing::connect_within(&fresh_addr, "the relay (bob, fresh leg)");
         let mut sess =
             relay_accept(conn, &relay_static, &bob_local2).expect("fresh bob relayed session");
         let f = sess.recv_frame().expect("fresh bob recv ping");
@@ -197,7 +197,7 @@ fn relay_recovers_after_a_target_timeout_without_a_restart() {
     wait_until(|| relay.is_registered(&bob_id));
 
     // --- Alice reaches the fresh bob through the relay — no restart needed. ---
-    let conn = TcpStream::connect(&addr).expect("alice connect relay");
+    let conn = softfig_net::testing::connect_within(&addr, "the relay (alice)");
     let mut alice_sess = relay_connect(conn, &relay_static, &alice.local, &bob_id, &bob_static)
         .expect("alice session after bob re-registered");
     alice_sess.send_frame(&Frame::ping(0x1234)).expect("alice ping");
@@ -222,7 +222,7 @@ fn relay_rejects_registration_from_a_non_ring_member() {
     let (_relay, addr) = start_relay(&relay_dev, &[&alice]);
     let relay_static = relay_dev.transport_pubkey;
 
-    let conn = TcpStream::connect(&addr).expect("stranger connect relay");
+    let conn = softfig_net::testing::connect_within(&addr, "the relay (stranger)");
     // The outer IK handshake itself may complete (the relay learns the static),
     // but authorization fails and the relay drops the connection, so the
     // stranger's attempt to register + accept a relayed peer fails.
