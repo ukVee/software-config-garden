@@ -88,4 +88,6 @@ pub use supervisor::{
     StartOutcome, Supervisor,
 };
 pub use thrash_bridge::{parse_target, KeeperThrashClear, TargetClear};
-pub use usage::{usage_alert_reached, UsageAggregator, UsageSample, USAGE_ALERT_PCT};
+pub use usage::{
+    usage_alert_reached, UsageAggregator, UsageSample, WindowResets, USAGE_ALERT_PCT,
+};

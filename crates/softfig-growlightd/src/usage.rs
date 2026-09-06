@@ -71,6 +71,27 @@
 //! **unchanged** re-report so a wedged peer's frozen sample actually ages out
 //! instead of being perpetually refreshed. The max-fold under-count safety is
 //! untouched *inside* a live window; only a demonstrably-reset reading is dropped.
+//!
+//! ## Why the bound must also honor **`resets_at`** (task 048)
+//!
+//! Age alone can only catch a reading that has outlived its *own window length*,
+//! and that is structurally too weak: the windows are **anchored**, not rolling
+//! from the moment of the read. A 7d reading taken 5d17h ago is younger than its
+//! 7-day window and so survives the age bound — yet its own `resets_at` may have
+//! passed five days earlier, meaning the window it describes reset long before the
+//! reading was even that old. That is exactly the fossil that held admission in
+//! [[incident-20260720-m5f-double-park]]: a 7d field of 86% gating the fleet on a
+//! window that had been fresh for five days.
+//!
+//! So a reading carries the boundary it was read against ([`WindowResets`], the
+//! wire's `rate_limit_event` `resetsAt`, present on every status — not just a
+//! `rejected` one), and [`aggregate_at`](UsageAggregator::aggregate_at) drops a
+//! window's field once `resets_at <= now`, **independently per window and
+//! alongside** the age bound — either one voids the field. A window whose boundary
+//! is unknown (a `result`-line reserve, a seam with no rate-limit signal) keeps the
+//! age bound alone, exactly as before. Under-count safety inside a live window is
+//! again untouched: a boundary that has not yet passed is a window that has not
+//! reset, and the max-fold still gates on it.
 
 use std::collections::BTreeMap;
 
@@ -93,6 +114,48 @@ pub const FIVE_H_WINDOW_SECS: i64 = 5 * 60 * 60;
 /// `session_7d_pct`, applied independently of the 5h bound (a reading can be stale
 /// on 5h while its 7d field is still live).
 pub const SEVEN_D_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// The **boundary** each budget window carried in one reading: the unix-seconds
+/// instant that window next resets (the wire's `rate_limit_event`
+/// `rate_limit_info.resetsAt`, which every status carries — `allowed` and
+/// `warning` as well as `rejected`).
+///
+/// This is what makes a reading falsifiable independently of its age. The windows
+/// are anchored to account time, not to when an agent happened to read them, so a
+/// reading younger than its window length can still describe a window that has
+/// demonstrably reset — see the module docs, "Why the bound must also honor
+/// `resets_at`". `None` means the reading never carried that window's boundary
+/// (a `result`-line reserve, or a backend with no rate-limit signal at all); such
+/// a window falls back to the age bound alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowResets {
+    /// When the 5h window this reading describes next resets, if known.
+    pub five_h: Option<i64>,
+    /// When the 7d window this reading describes next resets, if known.
+    pub seven_d: Option<i64>,
+}
+
+impl WindowResets {
+    /// A reading that carried no boundary for either window — the age bound alone
+    /// applies (the pre-048 behaviour).
+    pub const UNKNOWN: Self = Self {
+        five_h: None,
+        seven_d: None,
+    };
+
+    /// Both boundaries at once.
+    pub fn new(five_h: Option<i64>, seven_d: Option<i64>) -> Self {
+        Self { five_h, seven_d }
+    }
+
+    /// Whether a known boundary has already passed at `now` — i.e. the window this
+    /// reading describes has demonstrably reset since it was read, so the reading's
+    /// field for that window is void regardless of how young the reading is. An
+    /// unknown boundary is never "passed" (it defers to the age bound).
+    fn passed(boundary: Option<i64>, now: i64) -> bool {
+        boundary.is_some_and(|at| at <= now)
+    }
+}
 
 /// One agent's most-recent reading of the **shared account-wide** budget pool, and
 /// **when** it was read.
@@ -117,17 +180,30 @@ pub struct UsageSample {
     /// Unix-seconds instant this reading was taken (the drive loop stamps the
     /// tick's `now`). Anchors the window-staleness bound.
     pub read_at: i64,
+    /// The window boundaries this reading was taken against (task 048). A window
+    /// whose `resets_at` has passed is void no matter how young the reading is —
+    /// the age bound cannot see that, because the windows are anchored rather than
+    /// rolling from the read. Unknown boundaries fall back to the age bound.
+    pub resets_at: WindowResets,
 }
 
 impl UsageSample {
     /// Construct a sample of the shared pool as `agent` read it at `read_at`
-    /// (unix seconds).
+    /// (unix seconds), carrying no window boundaries — the age bound alone applies.
+    /// Add them with [`with_resets`](Self::with_resets) when the reading knows them.
     pub fn new(agent: impl Into<String>, budget: BudgetUsage, read_at: i64) -> Self {
         Self {
             agent: agent.into(),
             budget,
             read_at,
+            resets_at: WindowResets::UNKNOWN,
         }
+    }
+
+    /// The same reading, carrying the window boundaries it was read against.
+    pub fn with_resets(mut self, resets_at: WindowResets) -> Self {
+        self.resets_at = resets_at;
+        self
     }
 }
 
@@ -173,12 +249,14 @@ impl UsageAggregator {
     /// (a wedged agent re-emitting its last sample every tick), the stored
     /// `read_at` is retained so the sample keeps aging toward its window bound.
     /// Only a *changed* reading — a genuine fresh read, since a window reset shows
-    /// as a decayed value — resets the age. This is the age-preserving half of the
-    /// window-staleness bound; [`aggregate_at`](Self::aggregate_at) is the expiry
-    /// half.
+    /// as a decayed value or a new boundary — resets the age. "Unchanged" means the
+    /// **whole** reading: the percentages *and* the window boundaries it was read
+    /// against, so a re-report that carries a fresh [`WindowResets`] counts as the
+    /// new read it is. This is the age-preserving half of the window-staleness
+    /// bound; [`aggregate_at`](Self::aggregate_at) is the expiry half.
     pub fn observe(&mut self, mut sample: UsageSample) {
         if let Some(prev) = self.latest.get(&sample.agent) {
-            if prev.budget == sample.budget {
+            if prev.budget == sample.budget && prev.resets_at == sample.resets_at {
                 sample.read_at = prev.read_at;
             }
         }
@@ -202,11 +280,14 @@ impl UsageAggregator {
 
     /// The fleet-wide reserve as of `now` (unix seconds): the per-field **maximum**
     /// across every agent's latest reading of the shared pool, **excluding a field
-    /// whose reading has outlived its window** (5h reading `>= FIVE_H_WINDOW_SECS`
-    /// old, 7d reading `>= SEVEN_D_WINDOW_SECS` old — each independently). `None`
-    /// when no agent has reported at all; `Some((0, 0))` when every contributing
-    /// reading has aged out (an effectively fresh pool). See the module docs for
-    /// why max within a live window and why staleness bounds it.
+    /// whose window has demonstrably reset** since the reading was taken. A window
+    /// is void either because the reading has outlived it (5h reading
+    /// `>= FIVE_H_WINDOW_SECS` old, 7d reading `>= SEVEN_D_WINDOW_SECS` old) **or**
+    /// because the boundary the reading carried has passed (`resets_at <= now`,
+    /// task 048) — the two bounds are independent, and each window is judged on its
+    /// own. `None` when no agent has reported at all; `Some((0, 0))` when every
+    /// contributing reading is void (an effectively fresh pool). See the module docs
+    /// for why max within a live window and why these bounds are what void one.
     pub fn aggregate_at(&self, now: i64) -> Option<BudgetUsage> {
         if self.latest.is_empty() {
             return None;
@@ -215,10 +296,10 @@ impl UsageAggregator {
         let mut seven_d = 0u8;
         for s in self.latest.values() {
             let age = now.saturating_sub(s.read_at);
-            if age < FIVE_H_WINDOW_SECS {
+            if age < FIVE_H_WINDOW_SECS && !WindowResets::passed(s.resets_at.five_h, now) {
                 five_h = five_h.max(s.budget.session_5h_pct);
             }
-            if age < SEVEN_D_WINDOW_SECS {
+            if age < SEVEN_D_WINDOW_SECS && !WindowResets::passed(s.resets_at.seven_d, now) {
                 seven_d = seven_d.max(s.budget.session_7d_pct);
             }
         }
@@ -394,6 +475,122 @@ mod tests {
         assert_eq!(
             agg.aggregate_at(SEVEN_D_WINDOW_SECS),
             Some(BudgetUsage::new(0, 0))
+        );
+    }
+
+    /// TASK 048 (the m5f double-park fossil): a reading whose window boundary has
+    /// PASSED is void even though the reading is far younger than that window — the
+    /// exact case the 046 age bound structurally cannot catch. Reproduces the
+    /// incident's numbers: a 7d field of 86% read 5d17h ago, whose own `resets_at`
+    /// fell five days before the fold.
+    #[test]
+    fn a_reading_past_its_resets_at_is_void_even_though_it_is_younger_than_its_window() {
+        let g = AdmissionGovernor::new(Policy::default());
+        let mut agg = UsageAggregator::new();
+        let read_at = 1_000_000;
+        // The 7d window this reading describes reset a day after it was taken...
+        let boundary = read_at + 24 * 60 * 60;
+        // ...and the fold happens 5d17h after the read — well inside the 7-day age
+        // bound, so age alone keeps the field alive.
+        let now = read_at + 5 * 24 * 60 * 60 + 17 * 60 * 60;
+        assert!(
+            now - read_at < SEVEN_D_WINDOW_SECS,
+            "the reading is younger than its own window — age can never void it",
+        );
+
+        // Without the boundary the age bound is all there is, and the fossil folds.
+        agg.observe(UsageSample::new("fossil", BudgetUsage::new(0, 86), read_at));
+        assert_eq!(
+            agg.aggregate_at(now),
+            Some(BudgetUsage::new(0, 86)),
+            "age alone cannot see that the window already reset",
+        );
+
+        // Carrying the boundary it was read against, the same reading is void.
+        agg.observe(
+            UsageSample::new("fossil", BudgetUsage::new(0, 86), read_at)
+                .with_resets(WindowResets::new(None, Some(boundary))),
+        );
+        assert_eq!(
+            agg.aggregate_at(now),
+            Some(BudgetUsage::new(0, 0)),
+            "a passed resets_at voids the 7d field regardless of the reading's age",
+        );
+        assert!(
+            g.decide(Intent::Start, 0, agg.aggregate_or_fresh_at(now), fresh_rate())
+                .is_admit(),
+            "admission reopens — the m5f phantom hold does not recur",
+        );
+    }
+
+    /// The `resets_at` bound is per-window and complements (never replaces) the age
+    /// bound: a FUTURE boundary still folds, an unknown boundary defers to age, and
+    /// a passed boundary voids only its own window.
+    #[test]
+    fn the_resets_at_bound_is_per_window_and_complements_the_age_bound() {
+        let mut agg = UsageAggregator::new();
+        let t0 = 1_000;
+        let now = t0 + 60;
+        // 5h boundary already passed, 7d boundary still ahead.
+        agg.observe(
+            UsageSample::new("a", BudgetUsage::new(97, 44), t0)
+                .with_resets(WindowResets::new(Some(now), Some(now + 1))),
+        );
+        assert_eq!(
+            agg.aggregate_at(now),
+            Some(BudgetUsage::new(0, 44)),
+            "a boundary AT `now` has passed (inclusive); the future 7d one still folds",
+        );
+        // Both boundaries ahead: a young reading folds in full, exactly as before 048.
+        agg.observe(
+            UsageSample::new("a", BudgetUsage::new(97, 44), t0)
+                .with_resets(WindowResets::new(Some(now + 1), Some(now + 1))),
+        );
+        assert_eq!(
+            agg.aggregate_at(now),
+            Some(BudgetUsage::new(97, 44)),
+            "a live window is untouched — the max-fold under-count safety holds",
+        );
+        // Unknown boundaries: the age bound alone, so the same reading still folds
+        // now and still ages out at its 5h window.
+        agg.observe(UsageSample::new("a", BudgetUsage::new(97, 44), t0));
+        assert_eq!(agg.aggregate_at(now), Some(BudgetUsage::new(97, 44)));
+        assert_eq!(
+            agg.aggregate_at(t0 + FIVE_H_WINDOW_SECS),
+            Some(BudgetUsage::new(0, 44)),
+            "with no boundary the pre-048 age bound is unchanged",
+        );
+    }
+
+    /// A re-report carrying a NEW boundary is a genuine fresh read, so it resets the
+    /// reading's age even when the percentages happen to be identical — the case a
+    /// budget-only comparison would freeze forever (a window can reset to the same
+    /// low number every time).
+    #[test]
+    fn a_changed_boundary_counts_as_a_fresh_read_even_when_the_percentages_match() {
+        let mut agg = UsageAggregator::new();
+        let hour = 3_600;
+        let first = WindowResets::new(Some(hour), None);
+        agg.observe(UsageSample::new("a", BudgetUsage::new(40, 10), 0).with_resets(first));
+        // Same percentages AND the same boundary re-reported an hour later: a frozen
+        // wedged sample, so the age is preserved (read at 0, not at `hour`)...
+        agg.observe(UsageSample::new("a", BudgetUsage::new(40, 10), hour).with_resets(first));
+        // ...and at the boundary the 5h field is void on the resets_at bound alone —
+        // the reading is only an hour old, nowhere near its age bound.
+        assert_eq!(
+            agg.aggregate_at(hour),
+            Some(BudgetUsage::new(0, 10)),
+            "the frozen sample's 5h field is void at its own passed boundary",
+        );
+        // The next window opens: same percentages, NEW boundary — a fresh read, so
+        // the field is live again AND its age restarts from the new stamp (proved by
+        // folding at an instant the ORIGINAL stamp would have aged out of).
+        let second = WindowResets::new(Some(hour + FIVE_H_WINDOW_SECS), None);
+        agg.observe(UsageSample::new("a", BudgetUsage::new(40, 10), hour).with_resets(second));
+        assert_eq!(
+            agg.aggregate_at(hour + FIVE_H_WINDOW_SECS - 1),
+            Some(BudgetUsage::new(40, 10)),
+            "a new boundary is a new read: the field folds again from its own stamp",
         );
     }
 

@@ -56,6 +56,7 @@ use crate::control::{AgentChild, LiveKill};
 use crate::hub::EventHub;
 use crate::preapproval::PreApproval;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
+use crate::usage::WindowResets;
 
 /// Sentinel in [`AgentHealthState::exit_code`] meaning "still running".
 const NOT_EXITED: i64 = i64::MIN;
@@ -189,6 +190,16 @@ struct ReserveCell {
     /// sets this — a `warning` updates the pct but leaves the trip `None` (fix ②).
     five_h_trip: Option<WindowTrip>,
     seven_d_trip: Option<WindowTrip>,
+    /// Each window's `resetsAt` **as the latest event for that window reported it**
+    /// (task 048) — carried on every status, not just a `rejected` one, and kept
+    /// separately from [`WindowTrip`] because it is not a hold: it is the boundary
+    /// the reserve was read against, which the drive loop hands to the
+    /// [`UsageAggregator`](crate::usage::UsageAggregator) so a reading younger than
+    /// its window but past its own boundary drops from the fold. Overwritten by
+    /// whatever the newest event carried (including nothing): a reading only ever
+    /// vouches for the boundary it was actually read against.
+    five_h_resets_at: Option<i64>,
+    seven_d_resets_at: Option<i64>,
 }
 
 impl AgentBudgetState {
@@ -197,16 +208,27 @@ impl AgentBudgetState {
     /// (carrying its `resetsAt` if the wire gave one); a `warning`/`allowed` reading
     /// passes `None`, clearing any prior trip — the pct still gates via the aggregate
     /// while the reporting agent is live, but no timed hold latches (task 037 fix ②).
-    fn record_window(&self, window: BudgetWindow, pct: u8, trip: Option<WindowTrip>) {
+    /// `resets_at` is that window's boundary from the SAME event, recorded whatever
+    /// the status was (task 048): the trip is a hold, this is the reading's own
+    /// falsifiability — see [`ReserveCell::five_h_resets_at`].
+    fn record_window(
+        &self,
+        window: BudgetWindow,
+        pct: u8,
+        trip: Option<WindowTrip>,
+        resets_at: Option<i64>,
+    ) {
         let mut cell = self.inner.lock().unwrap();
         match window {
             BudgetWindow::FiveHour => {
                 cell.five_h_pct = Some(pct);
                 cell.five_h_trip = trip;
+                cell.five_h_resets_at = resets_at;
             }
             BudgetWindow::SevenDay => {
                 cell.seven_d_pct = Some(pct);
                 cell.seven_d_trip = trip;
+                cell.seven_d_resets_at = resets_at;
             }
         }
     }
@@ -244,6 +266,17 @@ impl AgentBudgetState {
             (None, None) => None,
             (five, seven) => Some(BudgetUsage::new(five.unwrap_or(0), seven.unwrap_or(0))),
         }
+    }
+
+    /// The window boundaries the latest per-window readings were taken against
+    /// (task 048) — handed to the [`UsageAggregator`](crate::usage::UsageAggregator)
+    /// with the sample so a reading whose window has demonstrably reset drops from
+    /// the fold no matter how young it is. Unknown for a window no
+    /// `rate_limit_event` has reported (the aggregator then applies its age bound
+    /// alone).
+    fn window_resets(&self) -> WindowResets {
+        let cell = *self.inner.lock().unwrap();
+        WindowResets::new(cell.five_h_resets_at, cell.seven_d_resets_at)
     }
 
     /// The instant admission may re-probe this member's rejected windows — the LATER
@@ -663,7 +696,7 @@ fn pump<R: BufRead>(
             let trip = rejected.then(|| WindowTrip {
                 reopen: resets_at.unwrap_or(at + RATE_LIMIT_FALLBACK_HOLD_SECS),
             });
-            budget.record_window(window, pct, trip);
+            budget.record_window(window, pct, trip, resets_at);
         }
         for (kind, text) in deltas_for_line(line) {
             hub.publish(Event::agent_delta(agent, kind, text));
@@ -819,6 +852,22 @@ impl ClaudeBackend {
             .unwrap()
             .get(agent)
             .and_then(|s| s.observe())
+    }
+
+    /// The window boundaries behind `agent`'s latest reading (task 048): each
+    /// window's `resetsAt` as the event that produced the reading reported it.
+    /// Sibling to [`budget`](Self::budget) and handed to the aggregator with the
+    /// same sample, so a reading past its own boundary drops from the fleet fold
+    /// even while it is younger than the window it describes — the fossil that held
+    /// admission in `incident-20260720-m5f-double-park`. Unknown windows (and an
+    /// agent that never reported) fall back to the aggregator's age bound.
+    pub fn budget_resets(&self, agent: &str) -> WindowResets {
+        self.budgets
+            .lock()
+            .unwrap()
+            .get(agent)
+            .map(|s| s.window_resets())
+            .unwrap_or(WindowResets::UNKNOWN)
     }
 
     /// The instant admission may re-probe any rate-limit window `agent` currently
@@ -1698,6 +1747,53 @@ mod tests {
                 reason: RefuseReason::Budget5h
             },
             "a tripped reserve refuses admission",
+        );
+    }
+
+    #[test]
+    fn pump_records_each_windows_boundary_whatever_its_status() {
+        // Task 048: `resetsAt` rides EVERY status, and the boundary is what makes a
+        // reading falsifiable independently of its age — so the cell records it for
+        // an `allowed`/`warning` window too, not just the `rejected` one the timed
+        // resume (task 037) latches a hold from.
+        let hub = EventHub::new();
+        let state = AgentHealthState::new(0);
+        let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
+        let now = || 100;
+
+        let stream = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"allowed","resetsAt":1782367800}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"warning","resetsAt":1782900000}}"#,
+            "\n",
+        );
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &now);
+
+        assert_eq!(
+            budget.window_resets(),
+            WindowResets::new(Some(1782367800), Some(1782900000)),
+            "both boundaries are recorded though neither window is rejected",
+        );
+        assert_eq!(
+            budget.rate_limit_reopen(),
+            None,
+            "neither window is rejected, so no hold latches (task 037 fix ②)",
+        );
+
+        // A later reading of the 5h window carrying NO boundary vouches for none:
+        // the cell records what THIS reading knew, so the aggregator falls back to
+        // its age bound rather than voiding the window on a boundary the fresh
+        // reading never confirmed.
+        let no_boundary = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"allowed"}}"#,
+            "\n",
+        );
+        pump(Cursor::new(no_boundary), "tab", &hub, &state, &budget, &rate_meter, &now);
+        assert_eq!(
+            budget.window_resets(),
+            WindowResets::new(None, Some(1782900000)),
+            "the re-read 5h window carries no boundary; the untouched 7d one keeps its",
         );
     }
 
