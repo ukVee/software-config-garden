@@ -35,6 +35,12 @@ pub enum VaultError {
     #[error("malformed relock blob: {0}")]
     RelockMalformed(&'static str),
 
+    #[error("escrow target {0} already exists and differs from this export (pass --force to replace it)")]
+    EscrowTargetExists(std::path::PathBuf),
+
+    #[error("malformed escrow bundle: {0}")]
+    EscrowMalformed(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

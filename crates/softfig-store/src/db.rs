@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::error::{Result, StoreError};
 use crate::hash::{Hash, HASH_LEN};
@@ -442,6 +442,73 @@ pub fn set_ref_cas(
     Ok(())
 }
 
+/// The garden's `repo_id`, read **without opening the store**.
+///
+/// Deliberately not [`Db::open`]: that constructor runs `configure()`, which
+/// sets `journal_mode = WAL` — a *write* into the state directory (and one the
+/// watcher notices) in service of a single-value lookup. This opens a
+/// read-only connection instead, so a caller that only wants the garden's
+/// label cannot perturb the store it is labelling.
+///
+/// Absent-tolerant on purpose: no database, an unreadable one, or a schema
+/// with no `meta` table all yield `None`. The first caller is `vault escrow
+/// export`, which must work on a bare vault directory — refusing to write the
+/// backup because the database beside it is missing would withhold the
+/// artifact exactly when the garden is already damaged.
+pub fn peek_repo_id(paths: &StorePaths) -> Option<String> {
+    let db = paths.db_path();
+    // First choice: `immutable=1`. It promises SQLite the file is not changing,
+    // so it skips locking and the WAL index entirely — the only way to read a
+    // WAL-mode database that materializes no `-shm`/`-wal` sidecars beside it,
+    // and the only way to read one that lives on read-only media (an archived
+    // garden on the SD card, which is precisely the kind of vault worth
+    // escrowing).
+    if let Some(path) = db.to_str() {
+        let uri = format!("file:{}?immutable=1", uri_escape(path));
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if let Some(id) = Connection::open_with_flags(&uri, flags)
+            .ok()
+            .and_then(|conn| read_repo_id(&conn))
+        {
+            return Some(id);
+        }
+    }
+    // Immutable mode is blind to an uncheckpointed WAL: a garden created
+    // moments ago, with the daemon still holding it open, can have its
+    // `repo_id` sitting in the journal rather than in the database file. A
+    // plain read-only connection reads through the WAL and gets it. This costs
+    // the sidecars the first branch avoids, which is the right trade only when
+    // the first branch already came back empty.
+    Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+    .and_then(|conn| read_repo_id(&conn))
+}
+
+fn read_repo_id(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'repo_id'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Percent-encode the characters SQLite's URI parser reads as syntax. A state
+/// path is normally boring, but a `#` in one would otherwise silently truncate
+/// the filename and peek the wrong (absent) database.
+fn uri_escape(path: &str) -> String {
+    path.replace('%', "%25")
+        .replace('?', "%3f")
+        .replace('#', "%23")
+}
+
 // ---- internal ----
 
 fn configure(conn: &Connection) -> Result<()> {
@@ -556,6 +623,47 @@ mod tests {
 
     fn h(seed: &[u8]) -> Hash {
         Hash::of(seed)
+    }
+
+    #[test]
+    fn peek_reads_the_repo_id_without_creating_wal_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StorePaths::for_garden(dir.path());
+        // Create the db, then drop the handle so nothing else holds it open.
+        drop(scratch_db(dir.path()));
+        let sidecars = |suffix: &str| paths.db_path().with_extension(format!("sqlite{suffix}"));
+        let _ = std::fs::remove_file(sidecars("-wal"));
+        let _ = std::fs::remove_file(sidecars("-shm"));
+
+        assert_eq!(peek_repo_id(&paths).as_deref(), Some("test-repo"));
+        // The peek is the read-only path precisely so it leaves no journal
+        // behind in the state dir for the watcher to notice.
+        assert!(!sidecars("-wal").exists(), "peek must not create a -wal");
+        assert!(!sidecars("-shm").exists(), "peek must not create a -shm");
+    }
+
+    #[test]
+    fn peek_reads_through_an_open_writers_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StorePaths::for_garden(dir.path());
+        // Handle deliberately held: this is the live-daemon case, where the
+        // value may still be in the WAL rather than the database file.
+        let _db = scratch_db(dir.path());
+        assert_eq!(peek_repo_id(&paths).as_deref(), Some("test-repo"));
+    }
+
+    #[test]
+    fn peek_is_none_when_there_is_no_database_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StorePaths::for_garden(dir.path());
+        // A vault directory with no store beside it still has to be escrowable,
+        // so this reports "unlabelled" rather than failing.
+        assert_eq!(peek_repo_id(&paths), None);
+
+        // Same for a file that is not a database at all.
+        std::fs::create_dir_all(paths.softfig_dir()).unwrap();
+        std::fs::write(paths.db_path(), b"not sqlite").unwrap();
+        assert_eq!(peek_repo_id(&paths), None);
     }
 
     #[test]

@@ -11,6 +11,7 @@
 
 pub mod blob;
 pub mod error;
+pub mod escrow;
 pub mod identity;
 pub mod kek;
 pub mod layer_b;
@@ -26,6 +27,7 @@ pub mod transport;
 mod vault;
 
 pub use error::{Result, VaultError};
+pub use escrow::{EscrowBundle, ExportSummary, Member, ESCROW_FORMAT_VERSION};
 pub use layer_b::{is_layer_b, LayerBKey};
 pub use shared::{is_shared, is_shared_blob, is_shared_layer_b};
 pub use recovery::RecoveryPhrase;

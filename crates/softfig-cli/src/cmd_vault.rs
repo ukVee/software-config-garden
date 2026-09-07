@@ -8,6 +8,8 @@ use softfig_ipc::{
         op, VaultListSealedReply, VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
     },
 };
+use softfig_store::StorePaths;
+use softfig_vault::escrow::{self, ExportSummary};
 use softfig_vault::recovery_policy::{self, RecoveryStatus, Wrappings};
 use softfig_vault::storage;
 use softfig_vault::{discover_garden, DeclaredPolicy, RecoveryPhrase, RecoveryPolicy, Vault};
@@ -40,6 +42,12 @@ pub enum VaultCmd {
     Recovery {
         #[command(subcommand)]
         cmd: RecoveryCmd,
+    },
+    /// Escrow the vault's key material: the small, inert bundle that makes a
+    /// passphrase-only garden recoverable.
+    Escrow {
+        #[command(subcommand)]
+        cmd: EscrowCmd,
     },
     /// Generate a new master-key generation and make it active.
     RotateKey {
@@ -93,12 +101,41 @@ pub enum RecoveryCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum EscrowCmd {
+    /// Write every wrapping of K, plus the parameters needed to use them, to
+    /// one file safe to copy anywhere.
+    ///
+    /// Takes **no passphrase and opens nothing** — every byte in the bundle is
+    /// already sealed ciphertext or non-secret parameters, so this works on a
+    /// vault you cannot currently unlock, which is when you most need it.
+    ///
+    /// The result is inert without the master passphrase and is about a
+    /// kilobyte. Copy it to excess: losing it is the one unrecoverable
+    /// failure a passphrase-only garden has.
+    Export {
+        #[arg(long)]
+        garden: Option<PathBuf>,
+        /// Where to write the bundle.
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Replace an existing bundle that differs from this export.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 pub fn run(cmd: VaultCmd) -> Result<()> {
     match cmd {
         VaultCmd::Init { garden } => init(resolve_for_init(garden)?),
         VaultCmd::Status { garden, identity } => status(resolve(garden)?, identity),
         VaultCmd::Recovery { cmd } => match cmd {
             RecoveryCmd::Declare { policy, garden } => declare(resolve(garden)?, &policy),
+        },
+        VaultCmd::Escrow { cmd } => match cmd {
+            EscrowCmd::Export { garden, out, force } => {
+                escrow_export(resolve(garden)?, out, force)
+            }
         },
         VaultCmd::RotateKey { garden } => rotate_key(resolve(garden)?),
         VaultCmd::Recover { garden } => recover(resolve(garden)?),
@@ -346,6 +383,54 @@ fn describe_wrappings(w: &Wrappings) -> String {
     } else {
         parts.join(", ")
     }
+}
+
+/// Copy-and-describe, never a crypto operation: no passphrase is read here,
+/// which is what lets the bundle be produced for a vault whose passphrase has
+/// been forgotten — the vault most worth escrowing.
+fn escrow_export(garden: PathBuf, out: PathBuf, force: bool) -> Result<()> {
+    let vault = Vault::at(&garden);
+    if !vault.is_initialized() {
+        return Err(anyhow!("no vault at {}", vault.paths().root.display()));
+    }
+    // The label, not the store: a read-only peek that leaves the database
+    // untouched, and an unlabelled bundle if there is no readable one. The
+    // vault crate stays free of the store dependency, so the id is passed in.
+    let garden_id = softfig_store::peek_repo_id(&StorePaths::for_garden(&garden));
+    let summary = escrow::export(vault.paths(), garden_id.as_deref(), &out, force)?;
+    print_export(&summary);
+    Ok(())
+}
+
+fn print_export(s: &ExportSummary) {
+    println!("Escrow bundle written: {}", s.dest.display());
+    println!();
+    if s.garden_id.is_empty() {
+        println!("  garden id            : (unlabelled — no readable store database)");
+    } else {
+        println!("  garden id            : {}", s.garden_id);
+    }
+    println!("  recovery policy      : {}  ({})", s.policy, s.policy_source);
+    if !s.policy_note.is_empty() {
+        println!("    ! {}", s.policy_note);
+    }
+    println!("  members ({})          :", s.members.len());
+    for m in &s.members {
+        println!("      {m}");
+    }
+    // Absence is the reportable fact on a passphrase-only garden: "no
+    // k.recovery" is why this bundle matters.
+    if !s.absent.is_empty() {
+        println!("  not present          : {}", s.absent.join(", "));
+    }
+    println!("  size                 : {} bytes", s.bytes);
+    println!("  blake3               : {}", s.bundle_blake3);
+    println!();
+    println!("  This file is inert without your master passphrase — no server holds a copy,");
+    println!("  and nothing in it opens on its own. Recovery needs the passphrase AND these");
+    println!("  bytes. It is small and it does not change until you rotate: copy it to every");
+    println!("  backup target you have. Re-exporting an unchanged vault gives byte-identical");
+    println!("  output, so copies can be compared by the hash above.");
 }
 
 fn rotate_key(garden: PathBuf) -> Result<()> {

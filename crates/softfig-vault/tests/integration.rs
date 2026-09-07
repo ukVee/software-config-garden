@@ -866,3 +866,146 @@ fn an_existing_undeclared_vault_reports_inferred_and_is_not_written_to() {
         "reading status must never write a declaration on the user's behalf"
     );
 }
+
+// ---------------------------------------------------------------------------
+// vault-recovery-policy 002 — `vault escrow export`
+//
+// The bundle is a file-copy-and-describe artifact: these tests run against a
+// real initialized vault (not a fixture of fake bytes) precisely to pin that
+// what lands in the bundle is byte-identical to what the vault holds, and that
+// nothing else does.
+// ---------------------------------------------------------------------------
+
+use softfig_vault::escrow;
+use softfig_vault::recovery_policy;
+
+fn b3(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+#[test]
+fn escrow_round_trips_every_member_byte_for_byte() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+
+    let summary = escrow::export(vault.paths(), Some("garden-abc"), &dest, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest).unwrap()).expect("parse");
+
+    assert_eq!(bundle.garden_id, "garden-abc");
+    assert_eq!(bundle.member_count, bundle.members.len());
+    assert_eq!(summary.members.len(), bundle.members.len());
+    assert!(
+        bundle.member("k.self").is_some() && bundle.member("master/1.key").is_some(),
+        "the wrapping and the key it opens both have to be in the bundle"
+    );
+
+    for m in &bundle.members {
+        let on_disk = fs::read(vault.paths().root.join(&m.name))
+            .unwrap_or_else(|e| panic!("member {} is not on disk: {e}", m.name));
+        let decoded = m.decoded().expect("base64");
+        assert_eq!(decoded, on_disk, "member {} differs from the vault", m.name);
+        assert_eq!(m.size, on_disk.len() as u64, "member {} size", m.name);
+        assert_eq!(b3(&on_disk), m.blake3, "member {} hash", m.name);
+    }
+}
+
+#[test]
+fn escrow_carries_every_master_generation_not_just_the_active_one() {
+    let (tmp, vault) = fresh_vault();
+    let mut session = vault.unlock(PASSPHRASE).expect("unlock");
+    let new_id = session.rotate_master_key().expect("rotate");
+    assert_eq!(new_id, 2);
+
+    let dest = tmp.path().join("escrow.toml");
+    escrow::export(vault.paths(), None, &dest, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest).unwrap()).expect("parse");
+
+    // Historical blobs name the generation that sealed them, so an escrow that
+    // dropped generation 1 would restore a vault that cannot read its own past.
+    assert!(bundle.member("master/1.key").is_some(), "gen 1 must survive rotation");
+    assert!(bundle.member("master/2.key").is_some(), "gen 2 must be present");
+}
+
+#[test]
+fn escrow_reports_a_declared_policy_as_declared_and_a_broken_one_as_inferred() {
+    let (tmp, vault) = fresh_vault();
+    recovery_policy::store_declared_policy(
+        vault.paths(),
+        &softfig_vault::RecoveryPolicy::passphrase_only(),
+    )
+    .expect("declare");
+
+    let dest = tmp.path().join("declared.toml");
+    escrow::export(vault.paths(), None, &dest, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest).unwrap()).expect("parse");
+    assert_eq!(bundle.policy, "passphrase-only");
+    assert_eq!(bundle.policy_source, escrow::SOURCE_DECLARED);
+    assert!(bundle.policy_note.is_empty());
+    assert!(
+        bundle.member("recovery.toml").is_some(),
+        "the declaration rides the bundle"
+    );
+
+    // A declaration that cannot be read must not stop the copy: export records
+    // the shape it could see, says the reading failed, and ships the broken
+    // file verbatim so the original is not lost with it.
+    let declaration = vault.paths().recovery_policy();
+    fs::write(&declaration, b"this is not a policy").unwrap();
+    let dest2 = tmp.path().join("unreadable.toml");
+    escrow::export(vault.paths(), None, &dest2, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest2).unwrap()).expect("parse");
+    assert_eq!(bundle.policy_source, escrow::SOURCE_INFERRED);
+    assert!(!bundle.policy_note.is_empty(), "say why it was inferred");
+    assert_eq!(
+        bundle.member("recovery.toml").unwrap().decoded().unwrap(),
+        b"this is not a policy"
+    );
+}
+
+#[test]
+fn escrow_leaks_no_garden_content_and_no_database() {
+    let (tmp, vault) = fresh_vault();
+    // A plaintext note in the vault directory and a database beside it: both
+    // are the leak class the allowlist exists to make structurally impossible.
+    fs::write(
+        vault.paths().root.join("sealed-paths.toml"),
+        b"globs = [\"CANARY-GLOB-STRING\"]",
+    )
+    .unwrap();
+    fs::write(vault.paths().root.join("notes.txt"), b"CANARY-PLAINTEXT-NOTE").unwrap();
+    fs::write(
+        tmp.path().join(".softfig").join("db.sqlite"),
+        b"SQLite format 3 CANARY-DATABASE-BYTES",
+    )
+    .unwrap();
+
+    let dest = tmp.path().join("escrow.toml");
+    escrow::export(vault.paths(), None, &dest, false).expect("export");
+    let raw = fs::read_to_string(&dest).unwrap();
+
+    for canary in ["CANARY-GLOB-STRING", "CANARY-PLAINTEXT-NOTE", "CANARY-DATABASE-BYTES"] {
+        assert!(!raw.contains(canary), "{canary} leaked into the bundle");
+    }
+    let bundle = escrow::parse(&raw).unwrap();
+    for name in ["sealed-paths.toml", "notes.txt", "db.sqlite"] {
+        assert!(bundle.member(name).is_none(), "{name} must not be a member");
+    }
+}
+
+#[test]
+fn escrow_of_a_whole_vault_stays_a_file_you_can_print() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let summary = escrow::export(vault.paths(), Some("garden-abc"), &dest, false).expect("export");
+
+    // The artifact's whole premise is that it is small enough to copy
+    // everywhere and put on paper. An order-of-magnitude guard: if this trips,
+    // something that is not key material has started riding along.
+    assert!(
+        summary.bytes < 16 * 1024,
+        "escrow bundle grew to {} bytes — check what got added",
+        summary.bytes
+    );
+    assert_eq!(summary.bytes, fs::metadata(&dest).unwrap().len());
+    assert_eq!(summary.bundle_blake3, b3(&fs::read(&dest).unwrap()));
+}
