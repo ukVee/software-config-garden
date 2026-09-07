@@ -1009,3 +1009,271 @@ fn escrow_of_a_whole_vault_stays_a_file_you_can_print() {
     assert_eq!(summary.bytes, fs::metadata(&dest).unwrap().len());
     assert_eq!(summary.bundle_blake3, b3(&fs::read(&dest).unwrap()));
 }
+
+// ---------------------------------------------------------------------------
+// vault-recovery-policy 003 — `vault escrow verify`
+//
+// Integrity is checkable on a fixture of fake bytes; **openability is not**.
+// These run against a real initialized vault with real Argon2 (at test cost)
+// because the question the verb exists to answer — "would this bundle actually
+// reopen my vault?" — is only answered by an unwrap that could fail.
+// ---------------------------------------------------------------------------
+
+/// Every file in the vault directory with its bytes and mtime, for proving
+/// verification changed nothing.
+fn vault_snapshot(root: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>, std::time::SystemTime)>) {
+        for entry in fs::read_dir(dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let meta = fs::metadata(&path).expect("metadata");
+                out.push((
+                    path.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
+                    fs::read(&path).expect("read"),
+                    meta.modified().expect("mtime"),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn export_and_parse(vault: &Vault, dest: &Path) -> softfig_vault::EscrowBundle {
+    escrow::export(vault.paths(), Some("garden-abc"), dest, true).expect("export");
+    escrow::parse(&fs::read_to_string(dest).unwrap()).expect("parse")
+}
+
+#[test]
+fn escrow_verify_proves_a_fresh_bundle_actually_opens() {
+    let (tmp, vault) = fresh_vault();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+
+    let report = escrow::check_integrity(&bundle);
+    assert!(report.is_intact(), "findings: {:?}", report.findings);
+
+    let proof = escrow::prove_openable(&bundle, PASSPHRASE).expect("the bundle must open");
+    assert_eq!(proof.active_master_key_id, 1);
+    assert_eq!(proof.generations_proved, vec![1]);
+    // A fresh vault has a phrase door, and this verb cannot test it: saying so
+    // is the difference between "the bundle is proved" and "the part of it
+    // this verb can prove is proved".
+    assert_eq!(proof.unproved_doors, vec!["k.recovery"]);
+}
+
+#[test]
+fn a_wrong_passphrase_is_distinguishable_from_a_damaged_bundle() {
+    let (tmp, vault) = fresh_vault();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+
+    // Right bytes, wrong secret: intact, does not open.
+    assert!(escrow::check_integrity(&bundle).is_intact());
+    match escrow::prove_openable(&bundle, WRONG_PASSPHRASE) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("a wrong passphrase must be AuthFailed, got {other:?}"),
+    }
+
+    // Wrong bytes, right secret: the failure is named before a passphrase is
+    // ever asked for. The two remedies are different — buy a new card, or
+    // remember the passphrase — so the two reports have to be.
+    let mut damaged = bundle.clone();
+    let m = damaged
+        .members
+        .iter_mut()
+        .find(|m| m.name == "master/1.key")
+        .unwrap();
+    m.blake3 = "0".repeat(64);
+    let findings = escrow::check_integrity(&damaged).findings;
+    assert!(
+        matches!(findings.as_slice(), [escrow::Finding::Corrupt { name, .. }] if name == "master/1.key"),
+        "got {findings:?}"
+    );
+}
+
+#[test]
+fn verification_needs_no_live_vault_and_cannot_reach_one() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let bundle = export_and_parse(&vault, &dest);
+
+    // Delete the vault entirely. If verification could touch a live vault it
+    // would need one; it does not, because the entry points hold no path.
+    fs::remove_dir_all(tmp.path().join(".softfig")).expect("remove vault");
+    assert!(!vault.is_initialized());
+
+    assert!(escrow::check_integrity(&bundle).is_intact());
+    let proof = escrow::prove_openable(&bundle, PASSPHRASE).expect("opens with no vault present");
+    assert_eq!(proof.generations_proved, vec![1]);
+}
+
+#[test]
+fn verifying_leaves_every_byte_of_the_live_vault_alone() {
+    let (tmp, vault) = fresh_vault();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+    let before = vault_snapshot(&vault.paths().root);
+
+    escrow::check_integrity(&bundle);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+    // Even the failure path must not touch it.
+    let _ = escrow::prove_openable(&bundle, WRONG_PASSPHRASE);
+
+    assert_eq!(before, vault_snapshot(&vault.paths().root), "verify mutated the vault");
+    assert!(
+        !vault.paths().escrow_record().exists(),
+        "a record is written by an explicit, separate call — never by verifying"
+    );
+}
+
+#[test]
+fn a_bundle_exported_before_a_rotation_still_verifies_and_repairs_nothing() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let stale = export_and_parse(&vault, &dest);
+
+    let mut session = vault.unlock(PASSPHRASE).expect("unlock");
+    assert_eq!(session.rotate_master_key().expect("rotate"), 2);
+    drop(session);
+
+    // The old bundle is a valid historical artifact: it verifies on its own
+    // terms, against its own active pointer.
+    assert!(escrow::check_integrity(&stale).is_intact());
+    let proof = escrow::prove_openable(&stale, PASSPHRASE).expect("the old copy still opens");
+    assert_eq!(proof.active_master_key_id, 1);
+    assert_eq!(proof.generations_proved, vec![1]);
+
+    // And the live vault is untouched — no "helpful" sync back to generation 1.
+    assert_eq!(
+        softfig_vault::storage::load_active(vault.paths()).unwrap().master_key_id,
+        2
+    );
+    assert!(vault.paths().master(2).exists());
+
+    // A fresh export of the rotated vault proves both generations.
+    let current = export_and_parse(&vault, &tmp.path().join("escrow2.toml"));
+    let proof = escrow::prove_openable(&current, PASSPHRASE).expect("opens");
+    assert_eq!(proof.active_master_key_id, 2);
+    assert_eq!(proof.generations_proved, vec![1, 2], "history must stay readable");
+}
+
+#[test]
+fn a_member_that_belongs_to_another_vault_is_not_a_wrong_passphrase() {
+    let (tmp_a, vault_a) = fresh_vault();
+    let (tmp_b, vault_b) = fresh_vault();
+    let mut bundle = export_and_parse(&vault_a, &tmp_a.path().join("a.toml"));
+    let other = export_and_parse(&vault_b, &tmp_b.path().join("b.toml"));
+
+    // Substitute B's master key into A's bundle, manifest and all, so integrity
+    // passes. The passphrase is right; the bundle is not.
+    let swapped = other.member("master/1.key").unwrap().clone();
+    let slot = bundle
+        .members
+        .iter_mut()
+        .find(|m| m.name == "master/1.key")
+        .unwrap();
+    *slot = swapped;
+    assert!(escrow::check_integrity(&bundle).is_intact(), "the swap is hash-consistent");
+
+    match escrow::prove_openable(&bundle, PASSPHRASE) {
+        Err(VaultError::EscrowMalformed(msg)) => {
+            assert!(msg.contains("master/1.key"), "{msg}");
+            assert!(msg.contains("passphrase was right"), "{msg}");
+        }
+        other => panic!("expected an EscrowMalformed naming the member, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_verification_record_survives_a_round_trip_and_stays_out_of_the_bundle() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let raw = {
+        escrow::export(vault.paths(), Some("garden-abc"), &dest, false).expect("export");
+        fs::read(&dest).unwrap()
+    };
+    let bundle = escrow::parse(std::str::from_utf8(&raw).unwrap()).expect("parse");
+    let report = escrow::check_integrity(&bundle);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+
+    let entry = escrow::VerificationRecord {
+        bundle_blake3: escrow::bundle_blake3(&raw),
+        self_blake3: report.self_blake3.clone(),
+        garden_id: bundle.garden_id.clone(),
+        policy: bundle.policy.clone(),
+        member_count: bundle.members.len(),
+        outcome: escrow::OUTCOME_OPENABLE.to_string(),
+        verified_at: 0,
+    };
+    escrow::record_verification(vault.paths(), entry, 1_700_000_000).expect("record");
+
+    let log = escrow::read_verifications(vault.paths()).expect("read back");
+    let latest = log.latest().expect("one row");
+    assert_eq!(latest.verified_at, 1_700_000_000);
+    assert_eq!(latest.outcome, escrow::OUTCOME_OPENABLE);
+    assert_eq!(latest.self_blake3, b3(&fs::read(vault.paths().kek_self()).unwrap()));
+    assert!(
+        log.verified(&escrow::bundle_blake3(&raw)).is_some(),
+        "the row is keyed by the bundle's own hash"
+    );
+    // It records hashes, never contents: no member's bytes appear in the file.
+    let record_raw = fs::read_to_string(vault.paths().escrow_record()).unwrap();
+    for m in &bundle.members {
+        assert!(!record_raw.contains(&m.data), "member {} leaked into the record", m.name);
+    }
+
+    // And recording must not change what the vault exports — otherwise
+    // verifying a copy would invalidate every copy.
+    let after = tmp.path().join("escrow-after.toml");
+    escrow::export(vault.paths(), Some("garden-abc"), &after, false).expect("re-export");
+    assert_eq!(raw, fs::read(&after).unwrap(), "the record must not enter the bundle");
+}
+
+#[test]
+fn a_recorded_proof_goes_stale_when_the_passphrase_door_is_replaced() {
+    let (tmp, vault, phrase) = fresh_vault_with_recovery();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+    let report = escrow::check_integrity(&bundle);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+    let recorded_self = report.self_blake3.clone();
+
+    assert_eq!(
+        escrow::current_self_blake3(vault.paths()).unwrap(),
+        recorded_self,
+        "the fresh proof matches the live door"
+    );
+
+    // `recover` re-wraps K under a new passphrase: same vault, new k.self. The
+    // old bundle is still a valid artifact of the old door, but it is no longer
+    // a proof that today's vault reopens — which is exactly the fact `drop`
+    // will have to gate on in slice 004.
+    vault.recover(&phrase, NEW_PASSPHRASE).expect("recover");
+    assert_ne!(
+        escrow::current_self_blake3(vault.paths()).unwrap(),
+        recorded_self,
+        "a replaced door must be visible as a stale proof"
+    );
+    // The old copy still opens under the old passphrase — it was never a lie.
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("the historical copy still opens");
+}
+
+#[test]
+fn recording_against_a_directory_that_is_not_a_vault_is_refused() {
+    let tmp = TempDir::new().expect("tempdir");
+    let paths = softfig_vault::VaultPaths::for_garden(tmp.path());
+    let entry = escrow::VerificationRecord {
+        bundle_blake3: "aaaa".into(),
+        self_blake3: "bbbb".into(),
+        garden_id: "garden-abc".into(),
+        policy: "passphrase-only".into(),
+        member_count: 5,
+        outcome: escrow::OUTCOME_OPENABLE.to_string(),
+        verified_at: 0,
+    };
+    match escrow::record_verification(&paths, entry, 1_000) {
+        Err(VaultError::NotInitialized(_)) => {}
+        other => panic!("expected NotInitialized, got {other:?}"),
+    }
+}

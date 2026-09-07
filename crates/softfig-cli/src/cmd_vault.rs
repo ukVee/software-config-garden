@@ -12,7 +12,9 @@ use softfig_store::StorePaths;
 use softfig_vault::escrow::{self, ExportSummary};
 use softfig_vault::recovery_policy::{self, RecoveryStatus, Wrappings};
 use softfig_vault::storage;
-use softfig_vault::{discover_garden, DeclaredPolicy, RecoveryPhrase, RecoveryPolicy, Vault};
+use softfig_vault::{
+    discover_garden, DeclaredPolicy, RecoveryPhrase, RecoveryPolicy, Vault, VaultError,
+};
 
 use crate::cmd_daemon::try_daemon_call;
 
@@ -123,6 +125,38 @@ pub enum EscrowCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Prove that an escrow bundle is intact AND that it opens — without
+    /// installing it over the live vault.
+    ///
+    /// Two stages. The first re-hashes every member against the manifest and
+    /// checks that the bundle carries every door its declared policy claims.
+    /// The second prompts for the master passphrase and actually unwraps K
+    /// from the bundle's own `k.self`, then every master generation it
+    /// carries: a bundle whose bytes are fine but whose passphrase is
+    /// misremembered is worthless, and only an unwrap catches that.
+    ///
+    /// This is what turns a copied file into a backup. It cannot modify the
+    /// vault — verification runs entirely on the bundle in memory — and
+    /// verifying an old bundle against a rotated vault is expected: it is a
+    /// valid historical artifact and is never "repaired".
+    Verify {
+        /// The bundle to verify.
+        path: PathBuf,
+        /// The vault to record the result against. Defaults to the garden
+        /// found from the current directory; recording is skipped when there
+        /// is none, or when the bundle belongs to a different garden.
+        #[arg(long)]
+        garden: Option<PathBuf>,
+        /// Check the bytes only: no passphrase prompt, and NO proof that the
+        /// bundle opens. Useful for checking a remote copy for rot without
+        /// typing the master passphrase — but it does not verify a backup,
+        /// and nothing is recorded.
+        #[arg(long)]
+        integrity_only: bool,
+        /// Verify without writing the verification record.
+        #[arg(long)]
+        no_record: bool,
+    },
 }
 
 pub fn run(cmd: VaultCmd) -> Result<()> {
@@ -136,6 +170,12 @@ pub fn run(cmd: VaultCmd) -> Result<()> {
             EscrowCmd::Export { garden, out, force } => {
                 escrow_export(resolve(garden)?, out, force)
             }
+            EscrowCmd::Verify {
+                path,
+                garden,
+                integrity_only,
+                no_record,
+            } => escrow_verify(path, garden, integrity_only, no_record),
         },
         VaultCmd::RotateKey { garden } => rotate_key(resolve(garden)?),
         VaultCmd::Recover { garden } => recover(resolve(garden)?),
@@ -268,6 +308,9 @@ fn status(garden: PathBuf, identity: bool) -> Result<()> {
         Ok(ids) => println!("  generations on disk  : {ids:?}"),
         Err(e) => println!("  generations on disk  : (unreadable: {e})"),
     }
+
+    println!();
+    print_escrow_status(vault.paths());
 
     if identity {
         let pass = prompt_passphrase("Passphrase: ")?;
@@ -431,6 +474,290 @@ fn print_export(s: &ExportSummary) {
     println!("  bytes. It is small and it does not change until you rotate: copy it to every");
     println!("  backup target you have. Re-exporting an unchanged vault gives byte-identical");
     println!("  output, so copies can be compared by the hash above.");
+}
+
+/// `status` observes, `verify` proves — and proving means unwrapping, which
+/// means a passphrase. Nothing on this path can write to the vault: the
+/// verification functions hold no vault path at all, and the one call that
+/// does write (the record) happens after the proof, only when the bundle is
+/// established to belong to this garden.
+fn escrow_verify(
+    path: PathBuf,
+    garden: Option<PathBuf>,
+    integrity_only: bool,
+    no_record: bool,
+) -> Result<()> {
+    let raw = std::fs::read(&path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let digest = escrow::bundle_blake3(&raw);
+    // A bundle is text by construction, so bytes that are not UTF-8 are a
+    // damaged copy or the wrong file — worth saying plainly rather than
+    // surfacing as an encoding error from three layers down.
+    let text = String::from_utf8(raw).map_err(|_| {
+        anyhow!(
+            "{} is not valid UTF-8 — this is not an escrow bundle, or the copy is damaged",
+            path.display()
+        )
+    })?;
+    let bundle = escrow::parse(&text)
+        .with_context(|| format!("{} is not a readable escrow bundle", path.display()))?;
+
+    let report = escrow::check_integrity(&bundle);
+    print_integrity(&path, &digest, &report);
+    if !report.is_intact() {
+        return Err(anyhow!(
+            "INTEGRITY FAILED — {} problem(s) above. The passphrase was not asked for and \
+             nothing was recorded: a bundle with a damaged member is not a backup, whether or \
+             not the rest of it would open. Verify another copy.",
+            report.findings.len()
+        ));
+    }
+
+    if integrity_only {
+        println!();
+        println!("  INTACT — every member hashes as the manifest says, and every door the");
+        println!("  declared policy names is carried.");
+        println!();
+        println!("  This is NOT a verified backup: --integrity-only skips the proof that the");
+        println!("  bundle opens, which is the half that catches a misremembered passphrase or");
+        println!("  inconsistent parameters. Nothing was recorded. Re-run without the flag.");
+        return Ok(());
+    }
+
+    println!();
+    let pass = prompt_passphrase("Master passphrase (to prove this bundle opens): ")?;
+    let proof = match escrow::prove_openable(&bundle, pass.as_bytes()) {
+        Ok(p) => p,
+        Err(VaultError::AuthFailed) => {
+            return Err(anyhow!(
+                "OPENABILITY FAILED — the bundle is intact, but K did not unwrap under that \
+                 passphrase.\nThe bytes are fine; the passphrase is wrong, or this bundle is an \
+                 escrow of a vault with a different one.\nNothing was recorded and nothing was \
+                 changed."
+            ))
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("openability proof failed")),
+    };
+    print_proof(&proof);
+
+    if no_record {
+        println!();
+        println!("  not recorded          : --no-record");
+        return Ok(());
+    }
+    record_verification(&garden, &bundle, &report, &digest)
+}
+
+/// Write the proof down, but only against the vault it is actually a proof
+/// for. A record naming another garden's bundle would be a lie that
+/// `vault recovery drop` later gates on.
+fn record_verification(
+    garden: &Option<PathBuf>,
+    bundle: &softfig_vault::EscrowBundle,
+    report: &escrow::IntegrityReport,
+    digest: &str,
+) -> Result<()> {
+    println!();
+    let Some(garden) = garden.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| discover_garden(&d))
+    }) else {
+        println!("  not recorded          : no garden here — pass --garden to record this proof");
+        return Ok(());
+    };
+    let vault = Vault::at(&garden);
+    if !vault.is_initialized() {
+        println!(
+            "  not recorded          : no vault at {}",
+            vault.paths().root.display()
+        );
+        return Ok(());
+    }
+    let live_id = softfig_store::peek_repo_id(&StorePaths::for_garden(&garden));
+    match (bundle.garden_id.as_str(), live_id.as_deref()) {
+        ("", _) => {
+            println!(
+                "  not recorded          : the bundle is unlabelled, so it cannot be tied to \
+                 this vault"
+            );
+            return Ok(());
+        }
+        (_, None) => {
+            println!(
+                "  not recorded          : this garden has no readable store database to check \
+                 the bundle's id against"
+            );
+            return Ok(());
+        }
+        (b, Some(l)) if b != l => {
+            println!("  not recorded          : this bundle escrows garden {b},");
+            println!("                          but {} is garden {l}", garden.display());
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let entry = escrow::VerificationRecord {
+        bundle_blake3: digest.to_string(),
+        self_blake3: report.self_blake3.clone(),
+        garden_id: bundle.garden_id.clone(),
+        policy: bundle.policy.clone(),
+        member_count: bundle.members.len(),
+        outcome: escrow::OUTCOME_OPENABLE.to_string(),
+        verified_at: 0,
+    };
+    let written = escrow::record_verification(vault.paths(), entry, now_unix())?;
+    println!(
+        "  recorded              : {}",
+        vault.paths().escrow_record().display()
+    );
+
+    // A stale-but-valid proof is the case `drop` will have to reason about, so
+    // say it here rather than leaving it to be discovered later.
+    match escrow::current_self_blake3(vault.paths()) {
+        Ok(live) if live == written.self_blake3 => {
+            println!("                          this bundle escrows the vault's current k.self");
+        }
+        Ok(_) => {
+            println!(
+                "    ! this bundle carries an OLDER k.self than the vault has now — it is a \
+                 valid"
+            );
+            println!(
+                "      historical copy, but it is not a proof that today's vault can be \
+                 reopened."
+            );
+            println!("      Re-export and verify the new bundle.");
+        }
+        Err(e) => println!("    ! could not read the live k.self to compare: {e}"),
+    }
+    Ok(())
+}
+
+fn print_integrity(path: &Path, digest: &str, r: &escrow::IntegrityReport) {
+    println!("Escrow bundle: {}", path.display());
+    println!();
+    println!("  blake3                : {digest}");
+    if r.garden_id.is_empty() {
+        println!("  garden id             : (unlabelled)");
+    } else {
+        println!("  garden id             : {}", r.garden_id);
+    }
+    println!(
+        "  recovery policy       : {}  ({})",
+        r.policy, r.policy_source
+    );
+    if !r.policy_note.is_empty() {
+        println!("    ! {}", r.policy_note);
+    }
+    println!(
+        "  members               : {} ({} bytes of key material)",
+        r.members.len(),
+        r.key_material_bytes
+    );
+    if !r.undeclared_doors.is_empty() {
+        println!(
+            "  undeclared doors      : {} (carried, but the declared policy does not name it)",
+            r.undeclared_doors.join(", ")
+        );
+    }
+    if r.findings.is_empty() {
+        println!("  integrity             : intact");
+    } else {
+        println!("  integrity             : FAILED");
+        for f in &r.findings {
+            println!("    ! {f}");
+        }
+    }
+}
+
+fn print_proof(p: &escrow::OpenProof) {
+    println!();
+    println!("  VERIFIED — this bundle opens.");
+    println!();
+    println!(
+        "  K unwrapped from the bundle's own k.self under its own Argon2 parameters, and"
+    );
+    let generations: Vec<String> = p
+        .generations_proved
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    println!(
+        "  master generation{} {} opened under it (active: {}).",
+        if generations.len() == 1 { "" } else { "s" },
+        generations.join(", "),
+        p.active_master_key_id
+    );
+    if !p.unproved_doors.is_empty() {
+        println!();
+        println!("  Not proved            : {}", p.unproved_doors.join(", "));
+        println!("                          Those doors open under the recovery phrase or a peer");
+        println!("                          key, not the master passphrase, so this verb cannot");
+        println!("                          test them. Their bytes are intact.");
+    }
+}
+
+/// Escrow freshness, for `vault status`. Reads a plaintext record and hashes
+/// `k.self`; opens nothing, so it stays usable on a locked vault.
+fn print_escrow_status(paths: &softfig_vault::VaultPaths) {
+    let log = match escrow::read_verifications(paths) {
+        Ok(log) => log,
+        Err(e) => {
+            println!("  escrow verified      : (unreadable: {e})");
+            return;
+        }
+    };
+    let Some(latest) = log.latest() else {
+        println!("  escrow verified      : never — no copy of this vault's key material has");
+        println!("                         been proved to open");
+        println!("      softfig vault escrow export -o <file>");
+        println!("      softfig vault escrow verify <file>");
+        return;
+    };
+    println!(
+        "  escrow verified      : {} ({} on record)",
+        age_phrase(now_unix() - latest.verified_at),
+        if log.entries.len() == 1 {
+            "1 copy".to_string()
+        } else {
+            format!("{} copies", log.entries.len())
+        }
+    );
+    println!("                         bundle {}", latest.bundle_blake3);
+    match escrow::current_self_blake3(paths) {
+        Ok(live) if live == latest.self_blake3 => {
+            println!("                         escrows the current k.self")
+        }
+        Ok(_) => println!(
+            "    ! the newest verified copy predates the current {} — re-export and re-verify",
+            storage::KEK_SELF_FILE
+        ),
+        Err(e) => println!("    ! could not read {} to compare: {e}", storage::KEK_SELF_FILE),
+    }
+}
+
+/// Whole days, because that is the resolution the fact deserves: "is my escrow
+/// copy months old" is the question, and no date library is worth pulling in
+/// to answer it more precisely.
+fn age_phrase(secs: i64) -> String {
+    if secs < 0 {
+        return "in the future (check the clock)".to_string();
+    }
+    match secs / 86_400 {
+        0 => "today".to_string(),
+        1 => "1 day ago".to_string(),
+        d => format!("{d} days ago"),
+    }
+}
+
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn rotate_key(garden: PathBuf) -> Result<()> {

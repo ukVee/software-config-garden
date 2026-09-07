@@ -21,6 +21,13 @@ pub const SHARED_KEYS_DIR: &str = "shared-keys";
 /// never be able to fail the params load that gates every unlock; see
 /// [`crate::recovery_policy`].
 pub const RECOVERY_POLICY_FILE: &str = "recovery.toml";
+/// Escrow verification record — which escrow bundles have been proved both
+/// intact and openable, and when. Hashes and timestamps only: never bundle
+/// contents, never a passphrase. Deliberately **not** an escrow member (see
+/// [`crate::escrow`]): a bundle that changed every time it was verified would
+/// lose the determinism that makes copies comparable.
+pub const ESCROW_RECORD_FILE: &str = "escrow-verified.toml";
+
 /// Reserved home for peer-path wrappings of `K` (`<peer-id>.key`), the
 /// trust-matrix door described in `meta/spec-vault.md`. **Nothing writes
 /// here yet** — the peer path is spec, not code. It exists so enumeration
@@ -79,6 +86,12 @@ impl VaultPaths {
     /// state rather than an error (see [`crate::recovery_policy`]).
     pub fn recovery_policy(&self) -> PathBuf {
         self.root.join(RECOVERY_POLICY_FILE)
+    }
+    /// The escrow verification record — see [`ESCROW_RECORD_FILE`]. Absent =
+    /// no escrow copy has ever been proved, which is itself the fact
+    /// `vault status` most needs to say on a passphrase-only garden.
+    pub fn escrow_record(&self) -> PathBuf {
+        self.root.join(ESCROW_RECORD_FILE)
     }
     /// Reserved directory for peer-path wrappings — see [`PEER_KEKS_DIR`].
     pub fn peer_keks_dir(&self) -> PathBuf {
