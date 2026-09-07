@@ -1277,3 +1277,298 @@ fn recording_against_a_directory_that_is_not_a_vault_is_refused() {
         other => panic!("expected NotInitialized, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// vault-recovery-policy 004 — `vault recovery add` / `drop`
+//
+// The slice that can make a garden *less* recoverable, so most of these tests
+// are about refusals. The ordering property they pin: every guard is evaluated
+// before anything on disk moves.
+// ---------------------------------------------------------------------------
+
+use std::os::unix::fs::PermissionsExt;
+
+use softfig_vault::recovery_policy::{Divergence, RecoveryPath, Wrappings};
+use softfig_vault::wrappings;
+
+/// Export → verify → record, i.e. what the human does with the SD card before
+/// they are allowed to remove a door.
+fn certify_escrow(tmp: &TempDir, vault: &Vault) -> softfig_vault::VerificationRecord {
+    let dest = tmp.path().join("certify.toml");
+    escrow::export(vault.paths(), Some("garden-abc"), &dest, true).expect("export");
+    let raw = fs::read(&dest).unwrap();
+    let bundle = escrow::parse(std::str::from_utf8(&raw).unwrap()).expect("parse");
+    let report = escrow::check_integrity(&bundle);
+    assert!(report.is_intact(), "{:?}", report.findings);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+    let entry = softfig_vault::VerificationRecord {
+        bundle_blake3: escrow::bundle_blake3(&raw),
+        self_blake3: report.self_blake3.clone(),
+        garden_id: bundle.garden_id.clone(),
+        policy: bundle.policy.clone(),
+        member_count: bundle.members.len(),
+        outcome: escrow::OUTCOME_OPENABLE.to_string(),
+        verified_at: 0,
+    };
+    escrow::record_verification(vault.paths(), entry, 1_700_000_000).expect("record")
+}
+
+/// The declaration and the disk have to agree after every successful
+/// operation — this milestone's own tool must never be the source of a
+/// divergence it would then report.
+fn assert_policy_matches_disk(vault: &Vault) {
+    let (policy, wrappings) = wrappings::shape_now(vault.paths());
+    assert_eq!(
+        policy,
+        wrappings.as_policy(),
+        "declared policy and the doors on disk disagree"
+    );
+    assert!(
+        softfig_vault::RecoveryStatus::read(vault.paths()).divergences.is_empty(),
+        "a successful operation must leave no divergence"
+    );
+}
+
+/// A vault whose only door is the master passphrase, with a proven escrow
+/// copy on record — the state slice 004 exists to make reachable.
+fn passphrase_only_vault() -> (TempDir, Vault) {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase)
+        .expect("the phrase door comes off");
+    (tmp, vault)
+}
+
+#[test]
+fn add_phrase_creates_a_door_that_actually_opens_and_declares_it() {
+    let (tmp, vault) = passphrase_only_vault();
+    assert!(!vault.paths().kek_recovery().exists());
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let phrase = wrappings::add_phrase(&session).expect("add");
+    drop(session);
+
+    // The phrase it printed has to be the phrase that works. Anything less
+    // makes `add` a verb that hands out a door key to nothing.
+    let recovered = vault
+        .unlock_with_recovery(&phrase)
+        .expect("the generated phrase must unwrap K");
+    assert_eq!(recovered.active_master_key_id(), 1);
+
+    let (policy, on_disk) = wrappings::shape_now(vault.paths());
+    assert!(policy.contains(RecoveryPath::Phrase), "the new door is declared");
+    assert!(on_disk.phrase, "and it is on disk");
+    assert_policy_matches_disk(&vault);
+    drop(tmp);
+}
+
+#[test]
+fn the_new_wrapping_is_private_and_atomically_published() {
+    let (_tmp, vault) = passphrase_only_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    wrappings::add_phrase(&session).expect("add");
+
+    let mode = fs::metadata(vault.paths().kek_recovery())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "a wrapping of K is key material");
+}
+
+#[test]
+fn add_refuses_to_silently_replace_a_live_door() {
+    let (_tmp, vault) = fresh_vault();
+    let before = fs::read(vault.paths().kek_recovery()).unwrap();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    match wrappings::add_phrase(&session) {
+        Err(VaultError::WrappingExists(RecoveryPath::Phrase)) => {}
+        other => panic!("expected WrappingExists, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read(vault.paths().kek_recovery()).unwrap(),
+        before,
+        "whoever wrote the old phrase down still has a working door"
+    );
+}
+
+#[test]
+fn drop_refuses_to_remove_the_last_way_into_the_vault() {
+    let (_tmp, vault) = passphrase_only_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    match wrappings::drop_wrapping(&session, RecoveryPath::Passphrase, RecoveryPath::Passphrase) {
+        Err(VaultError::LastWrapping(RecoveryPath::Passphrase)) => {}
+        other => panic!("expected LastWrapping, got {other:?}"),
+    }
+    assert!(vault.paths().kek_self().exists(), "nothing was removed");
+    assert_policy_matches_disk(&vault);
+}
+
+#[test]
+fn drop_refuses_without_a_verified_escrow_copy() {
+    let (_tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoVerifiedEscrow { removing, reason }) => {
+            assert_eq!(removing, RecoveryPath::Phrase);
+            assert!(reason.contains("escrow"), "{reason}");
+        }
+        other => panic!("expected NoVerifiedEscrow, got {other:?}"),
+    }
+    assert!(vault.paths().kek_recovery().exists(), "nothing was removed");
+}
+
+#[test]
+fn a_proof_of_a_replaced_door_does_not_license_a_removal() {
+    let (tmp, vault, phrase) = fresh_vault_with_recovery();
+    certify_escrow(&tmp, &vault);
+    // `recover` re-wraps K under a new passphrase: same vault, new k.self, so
+    // the record now proves a door that no longer exists.
+    vault.recover(&phrase, NEW_PASSPHRASE).expect("recover");
+
+    let session = vault.unlock(NEW_PASSPHRASE).expect("unlock");
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoVerifiedEscrow { reason, .. }) => {
+            assert!(reason.contains("older"), "{reason}");
+        }
+        other => panic!("a stale proof must not license a drop, got {other:?}"),
+    }
+    assert!(vault.paths().kek_recovery().exists());
+}
+
+#[test]
+fn drop_refuses_the_door_the_session_came_in_through() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    // Both doors exist and the escrow proof covers the passphrase one — but
+    // that is the door being removed, so nothing proven would remain.
+    match wrappings::drop_wrapping(&session, RecoveryPath::Passphrase, RecoveryPath::Passphrase) {
+        Err(VaultError::AuthenticatedWrapping(RecoveryPath::Passphrase)) => {}
+        other => panic!("expected AuthenticatedWrapping, got {other:?}"),
+    }
+    assert!(vault.paths().kek_self().exists(), "nothing was removed");
+    assert_policy_matches_disk(&vault);
+}
+
+#[test]
+fn drop_removes_a_dead_door_without_ever_asking_it_to_open() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+
+    // This device's actual state: a `k.recovery` whose phrase is lost. Make it
+    // genuinely unopenable — no phrase in existence unwraps this.
+    fs::write(vault.paths().kek_recovery(), b"garbage where a wrapping used to be").unwrap();
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let plan = wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase)
+        .expect("a dead door must be removable — requiring the lost phrase would be a catch-22");
+
+    assert_eq!(plan.removing, RecoveryPath::Phrase);
+    assert_eq!(plan.remaining, vec![RecoveryPath::Passphrase]);
+    assert!(!vault.paths().kek_recovery().exists());
+    let (policy, _) = wrappings::shape_now(vault.paths());
+    assert_eq!(policy.to_string(), "passphrase-only");
+    assert_policy_matches_disk(&vault);
+
+    // And the vault still opens the way it always did.
+    vault.unlock(PASSPHRASE).expect("the surviving door works");
+}
+
+#[test]
+fn a_drop_interrupted_between_the_unlink_and_the_declaration_reads_as_divergent() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+
+    // Exactly the window: the door is gone, the policy has not caught up. The
+    // requirement is not that this cannot happen — it is that slice 001 sees
+    // it, rather than reporting a vault that looks fine.
+    fs::remove_file(vault.paths().kek_recovery()).unwrap();
+
+    let status = softfig_vault::RecoveryStatus::read(vault.paths());
+    assert_eq!(
+        status.divergences,
+        vec![Divergence::Promised(RecoveryPath::Phrase)],
+        "an interrupted drop must be visible, never silently fine"
+    );
+}
+
+#[test]
+fn peer_wrappings_are_refused_cleanly_rather_than_half_managed() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    assert!(matches!(
+        wrappings::add_wrapping(&session, RecoveryPath::Peers),
+        Err(VaultError::PeerWrappingUnsupported)
+    ));
+    assert!(matches!(
+        wrappings::drop_wrapping(&session, RecoveryPath::Peers, RecoveryPath::Passphrase),
+        Err(VaultError::PeerWrappingUnsupported)
+    ));
+    assert!(matches!(
+        wrappings::add_wrapping(&session, RecoveryPath::Passphrase),
+        Err(VaultError::WrappingExists(RecoveryPath::Passphrase))
+    ));
+}
+
+#[test]
+fn dropping_a_door_that_is_not_there_is_not_a_silent_success() {
+    let (_tmp, vault) = passphrase_only_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::WrappingAbsent(RecoveryPath::Phrase)) => {}
+        other => panic!("expected WrappingAbsent, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_round_trip_makes_passphrase_only_a_reversible_choice() {
+    let (tmp, vault) = passphrase_only_vault();
+    assert_eq!(wrappings::shape_now(vault.paths()).0.to_string(), "passphrase-only");
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let phrase = wrappings::add_phrase(&session).expect("add");
+    drop(session);
+    assert_eq!(
+        wrappings::shape_now(vault.paths()).0.to_string(),
+        "passphrase+phrase"
+    );
+    vault.unlock_with_recovery(&phrase).expect("the new door opens");
+
+    // The escrow record still proves the *passphrase* door, which is what
+    // licenses taking the phrase door back off.
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase)
+        .expect("and back off again");
+    assert_eq!(wrappings::shape_now(vault.paths()).0.to_string(), "passphrase-only");
+    assert_policy_matches_disk(&vault);
+    drop(tmp);
+}
+
+#[test]
+fn plan_drop_names_what_goes_and_what_stays_without_touching_anything() {
+    let (tmp, vault) = fresh_vault();
+    let record = certify_escrow(&tmp, &vault);
+    let before = vault_snapshot(&vault.paths().root);
+
+    let plan = wrappings::plan_drop(
+        vault.paths(),
+        RecoveryPath::Phrase,
+        RecoveryPath::Passphrase,
+    )
+    .expect("plan");
+    assert_eq!(plan.removing, RecoveryPath::Phrase);
+    assert_eq!(plan.location, "k.recovery");
+    assert_eq!(plan.remaining, vec![RecoveryPath::Passphrase]);
+    assert_eq!(plan.certified_by.bundle_blake3, record.bundle_blake3);
+
+    assert_eq!(before, vault_snapshot(&vault.paths().root), "planning is read-only");
+    let _ = Wrappings::read(vault.paths());
+}

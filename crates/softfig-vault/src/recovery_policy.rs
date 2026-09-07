@@ -74,6 +74,14 @@ impl RecoveryPath {
         }
     }
 
+    /// The single path named by this token, if it names one. `RecoveryPolicy`
+    /// parses whole shapes (`passphrase+phrase`); this parses one door, which
+    /// is what `recovery add` / `recovery drop` take.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        Self::ALL.into_iter().find(|p| p.token() == s)
+    }
+
     /// Where this door lives inside the vault directory. Operator-facing: a
     /// divergence is far more actionable when it names the file.
     pub fn location(self) -> &'static str {

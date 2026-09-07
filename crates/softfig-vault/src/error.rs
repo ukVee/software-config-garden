@@ -41,6 +41,27 @@ pub enum VaultError {
     #[error("malformed escrow bundle: {0}")]
     EscrowMalformed(String),
 
+    #[error("a '{0}' wrapping of K already exists — remove it explicitly before adding another, so a live door is never silently replaced")]
+    WrappingExists(crate::recovery_policy::RecoveryPath),
+
+    #[error("there is no '{0}' wrapping of K in this vault to remove")]
+    WrappingAbsent(crate::recovery_policy::RecoveryPath),
+
+    #[error("refusing to remove '{0}': it is the only remaining way into this vault, and a vault with no way into K is unrecoverable")]
+    LastWrapping(crate::recovery_policy::RecoveryPath),
+
+    #[error("refusing to remove '{removing}': {reason}")]
+    NoVerifiedEscrow {
+        removing: crate::recovery_policy::RecoveryPath,
+        reason: String,
+    },
+
+    #[error("refusing to remove '{0}': it is the wrapping this session is authenticated through, and nothing verified would remain")]
+    AuthenticatedWrapping(crate::recovery_policy::RecoveryPath),
+
+    #[error("peer wrappings of K are managed by the trust-matrix ledger, not by this verb")]
+    PeerWrappingUnsupported,
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

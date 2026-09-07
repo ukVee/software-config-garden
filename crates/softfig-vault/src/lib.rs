@@ -24,6 +24,7 @@ pub mod session;
 pub mod shared;
 pub mod storage;
 pub mod transport;
+pub mod wrappings;
 mod vault;
 
 pub use error::{Result, VaultError};
@@ -40,6 +41,7 @@ pub use recovery_policy::{
 pub use relock::{RelockBlob, RelockToken, RELOCK_TTL_SECS};
 pub use session::VaultSession;
 pub use storage::{discover_garden, VaultPaths};
+pub use wrappings::DropPlan;
 pub use vault::Vault;
 
 /// 32 bytes of OS-sourced cryptographically secure randomness. The vault is

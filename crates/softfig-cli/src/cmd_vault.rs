@@ -10,7 +10,8 @@ use softfig_ipc::{
 };
 use softfig_store::StorePaths;
 use softfig_vault::escrow::{self, ExportSummary};
-use softfig_vault::recovery_policy::{self, RecoveryStatus, Wrappings};
+use softfig_vault::recovery_policy::{self, RecoveryPath, RecoveryStatus, Wrappings};
+use softfig_vault::wrappings;
 use softfig_vault::storage;
 use softfig_vault::{
     discover_garden, DeclaredPolicy, RecoveryPhrase, RecoveryPolicy, Vault, VaultError,
@@ -101,6 +102,34 @@ pub enum RecoveryCmd {
         #[arg(long)]
         garden: Option<PathBuf>,
     },
+    /// Add a wrapping of K — a new way into this vault.
+    ///
+    /// PATH is `phrase`: generate a fresh 12-word recovery phrase, wrap K
+    /// under it, and declare it. The phrase is displayed **once** and is not
+    /// stored anywhere.
+    ///
+    /// Refuses if that door already exists — replacing one is `drop` then
+    /// `add`, said explicitly, so a live door is never silently swapped out
+    /// from under whoever wrote the old phrase down.
+    Add {
+        /// The wrapping to add (`phrase`).
+        path: String,
+        #[arg(long)]
+        garden: Option<PathBuf>,
+    },
+    /// Remove a wrapping of K, and update the declared policy with it.
+    ///
+    /// Authorized by this session, never by the door being removed: a
+    /// `k.recovery` whose phrase is lost is removable without it. Refuses to
+    /// remove the last remaining wrapping, to remove one without a *verified*
+    /// escrow copy of what would remain, or to remove the door this session is
+    /// authenticated through.
+    Drop {
+        /// The wrapping to remove (`phrase` or `passphrase`).
+        path: String,
+        #[arg(long)]
+        garden: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -165,6 +194,8 @@ pub fn run(cmd: VaultCmd) -> Result<()> {
         VaultCmd::Status { garden, identity } => status(resolve(garden)?, identity),
         VaultCmd::Recovery { cmd } => match cmd {
             RecoveryCmd::Declare { policy, garden } => declare(resolve(garden)?, &policy),
+            RecoveryCmd::Add { path, garden } => recovery_add(resolve(garden)?, &path),
+            RecoveryCmd::Drop { path, garden } => recovery_drop(resolve(garden)?, &path),
         },
         VaultCmd::Escrow { cmd } => match cmd {
             EscrowCmd::Export { garden, out, force } => {
@@ -341,6 +372,107 @@ fn declare(garden: PathBuf, policy: &str) -> Result<()> {
     println!("Vault: {}", vault.paths().root.display());
     print_recovery_status(&RecoveryStatus::read(vault.paths()));
     Ok(())
+}
+
+/// Add a door. Today that means the recovery phrase: `k.self` always exists
+/// (changing the secret behind it is `vault recover`), and peer wrappings
+/// belong to the trust-matrix ledger.
+fn recovery_add(garden: PathBuf, path: &str) -> Result<()> {
+    let vault = Vault::at(&garden);
+    if !vault.is_initialized() {
+        return Err(anyhow!("no vault at {}", vault.paths().root.display()));
+    }
+    let target = parse_path(path)?;
+    // Refuse before the prompt: a passphrase typed only to be told the door
+    // already exists is a passphrase typed at a prompt nobody read.
+    wrappings::check_can_add(vault.paths(), target)?;
+
+    let pass = prompt_passphrase("Passphrase: ")?;
+    let session = vault.unlock(pass.as_bytes())?;
+    let phrase = wrappings::add_wrapping(&session, target)?;
+
+    print_recovery(&phrase);
+    println!();
+    println!("This phrase is a second way into this vault. It was shown once and is not");
+    println!("stored anywhere: nothing in soft-fig can print it again.");
+    println!();
+    println!("Vault: {}", vault.paths().root.display());
+    print_recovery_status(&RecoveryStatus::read(vault.paths()));
+    Ok(())
+}
+
+/// Remove a door.
+///
+/// Authorized by the live session, never by the door being removed — a
+/// `k.recovery` whose phrase is lost must still be removable, or the tool
+/// strands the exact state this milestone exists to fix. The guards are
+/// evaluated first and shown to the user before anything is typed, so a
+/// refusal costs no passphrase; `drop_wrapping` re-evaluates them all before
+/// it touches the filesystem.
+fn recovery_drop(garden: PathBuf, path: &str) -> Result<()> {
+    let vault = Vault::at(&garden);
+    if !vault.is_initialized() {
+        return Err(anyhow!("no vault at {}", vault.paths().root.display()));
+    }
+    let target = parse_path(path)?;
+    let plan = wrappings::plan_drop(vault.paths(), target, RecoveryPath::Passphrase)?;
+
+    println!("Vault: {}", vault.paths().root.display());
+    println!();
+    println!("  removing              : '{}' ({})", plan.removing, plan.location);
+    println!(
+        "  remaining afterwards  : {}",
+        plan.remaining
+            .iter()
+            .map(|p| format!("'{}' ({})", p.token(), p.location()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "  licensed by           : escrow bundle {}",
+        plan.certified_by.bundle_blake3
+    );
+    println!(
+        "                          verified {}, and it escrows the {} that remains",
+        age_phrase(now_unix() - plan.certified_by.verified_at),
+        storage::KEK_SELF_FILE
+    );
+    println!();
+    println!("  This removes a way into your garden. It cannot be undone from this side:");
+    println!("  re-adding a door mints a NEW secret, it does not restore the old one.");
+    println!();
+    print!("  Type '{}' to remove that door, anything else to cancel: ", plan.removing);
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    // Specific consent, not a blanket yes: the user names the door. A prompt
+    // that takes `y` is a prompt that gets answered without being read.
+    if read_line()?.trim() != plan.removing.token() {
+        println!("  cancelled — nothing was changed.");
+        return Ok(());
+    }
+
+    let pass = prompt_passphrase("Passphrase: ")?;
+    let session = vault.unlock(pass.as_bytes())?;
+    let done = wrappings::drop_wrapping(&session, target, RecoveryPath::Passphrase)?;
+
+    println!();
+    println!("Removed '{}' ({}).", done.removing, done.location);
+    println!();
+    print_recovery_status(&RecoveryStatus::read(vault.paths()));
+    Ok(())
+}
+
+fn parse_path(path: &str) -> Result<RecoveryPath> {
+    RecoveryPath::parse(path).ok_or_else(|| {
+        anyhow!(
+            "'{path}' is not a recovery path — expected one of: {}",
+            RecoveryPath::ALL
+                .iter()
+                .map(|p| p.token())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 fn print_recovery_status(st: &RecoveryStatus) {
