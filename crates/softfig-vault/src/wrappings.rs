@@ -30,7 +30,7 @@
 //! it.
 
 use crate::error::{Result, VaultError};
-use crate::escrow::{self, VerificationRecord, OUTCOME_OPENABLE};
+use crate::escrow::{self, VerificationRecord};
 use crate::kek;
 use crate::params::aad;
 use crate::recovery::RecoveryPhrase;
@@ -40,7 +40,7 @@ use crate::storage::{self, VaultPaths};
 
 /// Key material mode. `init` predates this and uses a bare `fs::write`; a door
 /// created now gets the atomic publish and the private mode both.
-const WRAPPING_MODE: u32 = 0o600;
+pub(crate) const WRAPPING_MODE: u32 = 0o600;
 
 /// What a removal would do, and what licenses it.
 ///
@@ -228,21 +228,13 @@ pub fn check_can_add(paths: &VaultPaths, target: RecoveryPath) -> Result<()> {
 /// remains a true statement about a copy that exists somewhere, and it is not
 /// a licence to remove anything today.
 fn current_escrow_proof(paths: &VaultPaths) -> Result<VerificationRecord> {
-    let live_self = escrow::current_self_blake3(paths)?;
-    let log = escrow::read_verifications(paths)?;
-    let mut stale = false;
-    for entry in &log.entries {
-        if entry.outcome != OUTCOME_OPENABLE {
-            continue;
-        }
-        if entry.self_blake3 == live_self {
-            return Ok(entry.clone());
-        }
-        stale = true;
+    let proof = escrow::current_proof(paths)?;
+    if let Some(record) = proof.record {
+        return Ok(record);
     }
     Err(VaultError::NoVerifiedEscrow {
         removing: RecoveryPath::Phrase,
-        reason: if stale {
+        reason: if proof.stale {
             format!(
                 "every verified escrow copy on record proves an older {} than this vault has \
                  now — re-export and re-verify before removing a door",

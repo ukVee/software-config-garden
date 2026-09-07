@@ -1572,3 +1572,227 @@ fn plan_drop_names_what_goes_and_what_stays_without_touching_anything() {
     assert_eq!(before, vault_snapshot(&vault.paths().root), "planning is read-only");
     let _ = Wrappings::read(vault.paths());
 }
+
+// ---------------------------------------------------------------------------
+// Slice 005 — `vault rewrap`
+//
+// The format-interoperation half of this slice (reading a genuine pre-embedding
+// blob, and the escrow bundles either side of a rewrap) lives in
+// `rewrap.rs`'s unit tests, because writing a real v1 wrapping is deliberately
+// crate-private. What is asserted here is the public contract: the door still
+// opens, the data never moved, and the floor cannot be crossed by accident.
+// ---------------------------------------------------------------------------
+
+use softfig_vault::params::OWASP_BASELINE;
+use softfig_vault::rewrap;
+
+/// A cheap-but-real step up in cost. Still far below the baseline — these
+/// tests are about the mechanism, and every one of them therefore passes
+/// `allow_downgrade`, which is exactly the flag a below-baseline vault needs.
+fn heavier() -> Argon2Params {
+    Argon2Params {
+        m_cost: 32,
+        t_cost: 2,
+        p_cost: 1,
+    }
+}
+
+fn rewrap_to(vault: &Vault, target: Argon2Params, new_passphrase: Option<&[u8]>) {
+    let plan = rewrap::plan(vault.paths(), target, true).expect("plan");
+    rewrap::apply(vault.paths(), &plan, PASSPHRASE, new_passphrase).expect("apply");
+}
+
+#[test]
+fn rewrapping_under_heavier_parameters_still_opens_with_the_same_passphrase() {
+    let (_tmp, vault) = fresh_vault();
+    rewrap_to(&vault, heavier(), None);
+
+    vault.unlock(PASSPHRASE).expect("the same passphrase opens it");
+    assert!(matches!(
+        vault.unlock(WRONG_PASSPHRASE),
+        Err(VaultError::AuthFailed)
+    ));
+
+    // And the new costs are the ones actually in force, read back off disk
+    // without opening anything.
+    let bytes = fs::read(vault.paths().kek_self()).unwrap();
+    let read = softfig_vault::kek::wrapping_params(&bytes, &fast_params().argon2);
+    assert!(read.embedded, "a rewrapped door carries its own costs");
+    assert_eq!(read.params, heavier());
+}
+
+#[test]
+fn rewrapping_with_a_new_passphrase_opens_with_the_new_one_and_not_the_old() {
+    let (_tmp, vault) = fresh_vault();
+    rewrap_to(&vault, heavier(), Some(NEW_PASSPHRASE));
+
+    vault.unlock(NEW_PASSPHRASE).expect("the new passphrase opens it");
+    assert!(
+        matches!(vault.unlock(PASSPHRASE), Err(VaultError::AuthFailed)),
+        "the old passphrase must stop working"
+    );
+}
+
+#[test]
+fn a_rewrap_leaves_every_key_and_the_active_pointer_byte_identical() {
+    // The scope fence, asserted rather than asserted-about: this milestone adds,
+    // removes, copies and describes *wrappings of K*. If a rewrap ever touched
+    // `M`, a generation, or the active pointer, it would have left scope — and
+    // in a garden that means every commit hash moved.
+    let (tmp, vault) = fresh_vault();
+    let root = tmp.path().join(".softfig/vault");
+    let watched = [
+        "master/1.key",
+        "active.toml",
+        "identity.key",
+        "transport.key",
+        "params.toml",
+        "k.recovery",
+        "recovery.toml",
+    ];
+    let before: Vec<Vec<u8>> = watched.iter().map(|f| fs::read(root.join(f)).unwrap()).collect();
+
+    rewrap_to(&vault, heavier(), Some(NEW_PASSPHRASE));
+
+    for (name, was) in watched.iter().zip(before) {
+        assert_eq!(fs::read(root.join(name)).unwrap(), was, "{name} moved");
+    }
+    // The session still reads the same master material through the new door.
+    let session = vault.unlock(NEW_PASSPHRASE).expect("unlock");
+    assert_eq!(session.active_master_key_id(), 1);
+    assert_eq!(session.known_master_key_ids(), vec![1]);
+}
+
+#[test]
+fn parameters_below_the_baseline_are_refused_without_the_downgrade_flag() {
+    let (_tmp, vault) = fresh_vault();
+    let err = rewrap::plan(vault.paths(), heavier(), false).expect_err("must refuse");
+    match err {
+        VaultError::WeakerParams { what, .. } => {
+            assert_eq!(what, "the recommended baseline");
+        }
+        other => panic!("wrong refusal: {other}"),
+    }
+    // And nothing was written on the way to refusing.
+    vault.unlock(PASSPHRASE).expect("still opens");
+}
+
+#[test]
+fn parameters_weaker_than_this_vaults_own_are_refused_by_their_own_message() {
+    // A vault someone already hardened must not be walked back by a command
+    // that only mentions the published baseline — "weaker than the baseline"
+    // would be the wrong sentence, and would let a 512 MiB vault drop to 64.
+    let tmp = TempDir::new().expect("tempdir");
+    let strong = VaultParams {
+        format_version: softfig_vault::params::CURRENT_FORMAT_VERSION,
+        argon2: Argon2Params {
+            m_cost: 1024,
+            t_cost: 4,
+            p_cost: 1,
+        },
+    };
+    let (vault, _s, _r) = Vault::init_with_params(tmp.path(), PASSPHRASE, strong).expect("init");
+
+    let err = rewrap::plan(
+        vault.paths(),
+        Argon2Params {
+            m_cost: 512,
+            t_cost: 2,
+            p_cost: 1,
+        },
+        false,
+    )
+    .expect_err("must refuse");
+    match err {
+        VaultError::WeakerParams { what, .. } => {
+            assert_eq!(what, "this vault's current parameters");
+        }
+        other => panic!("wrong refusal: {other}"),
+    }
+}
+
+#[test]
+fn a_downgrade_goes_through_only_when_it_is_asked_for() {
+    let (_tmp, vault) = fresh_vault();
+    let plan = rewrap::plan(vault.paths(), heavier(), true).expect("permitted");
+    assert!(plan.is_downgrade, "below the baseline is a downgrade");
+    rewrap::apply(vault.paths(), &plan, PASSPHRASE, None).expect("apply");
+    vault.unlock(PASSPHRASE).expect("opens");
+}
+
+#[test]
+fn a_rewrap_that_changes_nothing_is_recognisable_as_such() {
+    let (_tmp, vault) = fresh_vault();
+    rewrap_to(&vault, heavier(), None);
+    let plan = rewrap::plan(vault.paths(), heavier(), true).expect("plan");
+    assert!(plan.is_noop());
+
+    // ...but migrating a door into the embedded format at unchanged costs is
+    // NOT a no-op, which is what stops `rewrap` from declining to do the very
+    // migration it exists for.
+    let (_tmp2, legacy) = fresh_vault();
+    let plan = rewrap::plan(legacy.paths(), fast_params().argon2, true).expect("plan");
+    assert!(!plan.is_noop() || plan.current.embedded);
+}
+
+#[test]
+fn invalid_argon2_costs_are_refused_rather_than_panicking() {
+    // `to_argon2` panics on invalid costs and `rewrap` takes numbers from an
+    // operator, so the validation has to happen before the panic can.
+    let (_tmp, vault) = fresh_vault();
+    let err = rewrap::plan(
+        vault.paths(),
+        Argon2Params {
+            m_cost: 1,
+            t_cost: 0,
+            p_cost: 0,
+        },
+        true,
+    )
+    .expect_err("must refuse");
+    assert!(matches!(err, VaultError::InvalidArgon2Params(_)), "{err}");
+}
+
+#[test]
+fn the_wrapping_is_never_published_unless_it_has_been_opened() {
+    // `apply` proves the rewrapped bytes reproduce K *before* they replace the
+    // bytes that already do. The observable consequence is that a failed rewrap
+    // leaves the vault untouched — asserted here through the one failure a test
+    // can force, a wrong current passphrase.
+    let (_tmp, vault) = fresh_vault();
+    let before = fs::read(vault.paths().kek_self()).unwrap();
+    let plan = rewrap::plan(vault.paths(), heavier(), true).expect("plan");
+    assert!(matches!(
+        rewrap::apply(vault.paths(), &plan, WRONG_PASSPHRASE, None),
+        Err(VaultError::AuthFailed)
+    ));
+    assert_eq!(fs::read(vault.paths().kek_self()).unwrap(), before);
+    vault.unlock(PASSPHRASE).expect("untouched and still opening");
+}
+
+#[test]
+fn the_baseline_is_one_constant_shared_by_the_default_and_the_floor() {
+    // Two places that must never drift: what a fresh vault gets, and what
+    // `rewrap` refuses to go below.
+    assert_eq!(Argon2Params::default(), OWASP_BASELINE);
+    assert!(OWASP_BASELINE.at_least_as_strong_as(OWASP_BASELINE));
+}
+
+#[test]
+fn strength_is_area_and_memory_together_not_either_alone() {
+    let base = OWASP_BASELINE;
+    // More iterations at the same memory is stronger.
+    assert!(Argon2Params { t_cost: 4, ..base }.at_least_as_strong_as(base));
+    // Trading memory away for iterations is NOT: the area holds, but memory
+    // hardness is what makes GPU and ASIC attack expensive.
+    let traded = Argon2Params {
+        m_cost: base.m_cost / 2,
+        t_cost: base.t_cost * 2,
+        ..base
+    };
+    assert_eq!(traded.area(), base.area());
+    assert!(!traded.at_least_as_strong_as(base));
+    // Parallelism is not part of the comparison at all — it partitions the same
+    // `m x t` work rather than changing its total.
+    assert!(Argon2Params { p_cost: 1, ..base }.at_least_as_strong_as(base));
+}

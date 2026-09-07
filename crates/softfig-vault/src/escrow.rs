@@ -902,6 +902,43 @@ pub fn current_self_blake3(paths: &VaultPaths) -> Result<String> {
     Ok(bundle_blake3(&fs::read(paths.kek_self())?))
 }
 
+/// The state of this vault's escrow proof relative to the `k.self` on disk
+/// *right now*.
+#[derive(Debug, Clone, Default)]
+pub struct CurrentProof {
+    /// A verified-openable record whose `self_blake3` still matches the live
+    /// `k.self`. `Some` is a licence; `None` is not.
+    pub record: Option<VerificationRecord>,
+    /// A verified-openable record exists but describes an older `k.self`. The
+    /// difference matters in the message: "no verified escrow" sends someone
+    /// hunting for a record that is sitting right there.
+    pub stale: bool,
+}
+
+/// Resolve [`CurrentProof`] for a vault. Opens nothing.
+///
+/// A proof is current only while its `self_blake3` matches the live `k.self`.
+/// A record that proved the door a `recover` or `rewrap` replaced stays a true
+/// statement about a copy that exists somewhere, and licenses nothing today.
+/// `vault recovery drop` gates on this; `vault rewrap` warns that it is about
+/// to move a current proof into the historical column.
+pub fn current_proof(paths: &VaultPaths) -> Result<CurrentProof> {
+    let live_self = current_self_blake3(paths)?;
+    let log = read_verifications(paths)?;
+    let mut out = CurrentProof::default();
+    for entry in &log.entries {
+        if entry.outcome != OUTCOME_OPENABLE {
+            continue;
+        }
+        if entry.self_blake3 == live_self {
+            out.record = Some(entry.clone());
+            return Ok(out);
+        }
+        out.stale = true;
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // The verification record
 // ---------------------------------------------------------------------------

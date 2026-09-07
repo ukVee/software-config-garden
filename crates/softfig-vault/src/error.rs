@@ -62,6 +62,16 @@ pub enum VaultError {
     #[error("peer wrappings of K are managed by the trust-matrix ledger, not by this verb")]
     PeerWrappingUnsupported,
 
+    #[error("invalid Argon2 parameters {0}")]
+    InvalidArgon2Params(String),
+
+    #[error("refusing to rewrap under {target}: that is weaker than {what} ({floor}). Rehardening must never be able to quietly weaken a vault; pass --allow-downgrade to say you mean it")]
+    WeakerParams {
+        target: String,
+        floor: String,
+        what: &'static str,
+    },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

@@ -20,6 +20,7 @@ pub mod params;
 pub mod recovery;
 pub mod recovery_policy;
 pub mod relock;
+pub mod rewrap;
 pub mod session;
 pub mod shared;
 pub mod storage;
@@ -39,6 +40,7 @@ pub use recovery_policy::{
     DeclaredPolicy, Divergence, RecoveryPath, RecoveryPolicy, RecoveryStatus, Wrappings,
 };
 pub use relock::{RelockBlob, RelockToken, RELOCK_TTL_SECS};
+pub use rewrap::{Calibration, RewrapPlan};
 pub use session::VaultSession;
 pub use storage::{discover_garden, VaultPaths};
 pub use wrappings::DropPlan;

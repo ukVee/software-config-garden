@@ -11,6 +11,8 @@ use softfig_ipc::{
 use softfig_store::StorePaths;
 use softfig_vault::escrow::{self, ExportSummary};
 use softfig_vault::recovery_policy::{self, RecoveryPath, RecoveryStatus, Wrappings};
+use softfig_vault::params::{Argon2Params, OWASP_BASELINE};
+use softfig_vault::rewrap;
 use softfig_vault::wrappings;
 use softfig_vault::storage;
 use softfig_vault::{
@@ -51,6 +53,41 @@ pub enum VaultCmd {
     Escrow {
         #[command(subcommand)]
         cmd: EscrowCmd,
+    },
+    /// Re-derive k.self under heavier Argon2 parameters, without touching any
+    /// data.
+    ///
+    /// This rewrites about a hundred bytes. `M` is untouched, every blob is
+    /// untouched, every commit hash is untouched, and no replica resyncs —
+    /// that is what the KEK indirection is for. If you have been putting this
+    /// off because rehardening sounds like re-encrypting the garden: it is not,
+    /// and it takes a second.
+    ///
+    /// With no cost flags it measures this machine and picks `m_cost` to hit
+    /// `--target-ms`. It will not go below the recommended baseline or below
+    /// what this vault already uses.
+    Rewrap {
+        #[arg(long)]
+        garden: Option<PathBuf>,
+        /// Calibrate m_cost so unlocking takes roughly this long, in ms.
+        #[arg(long, default_value_t = 1000)]
+        target_ms: u64,
+        /// Set the memory cost in KiB explicitly, skipping calibration.
+        #[arg(long)]
+        m_cost: Option<u32>,
+        /// Set the iteration count. Defaults to this vault's current value.
+        #[arg(long)]
+        t_cost: Option<u32>,
+        /// Set the parallelism. Defaults to this vault's current value.
+        #[arg(long)]
+        p_cost: Option<u32>,
+        /// Also change the master passphrase in the same operation.
+        #[arg(long)]
+        new_passphrase: bool,
+        /// Permit parameters weaker than the baseline or than this vault's
+        /// current ones. Weakening a vault should be an explicit act.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Generate a new master-key generation and make it active.
     RotateKey {
@@ -208,6 +245,25 @@ pub fn run(cmd: VaultCmd) -> Result<()> {
                 no_record,
             } => escrow_verify(path, garden, integrity_only, no_record),
         },
+        VaultCmd::Rewrap {
+            garden,
+            target_ms,
+            m_cost,
+            t_cost,
+            p_cost,
+            new_passphrase,
+            allow_downgrade,
+        } => rewrap(
+            resolve(garden)?,
+            RewrapArgs {
+                target_ms,
+                m_cost,
+                t_cost,
+                p_cost,
+                new_passphrase,
+                allow_downgrade,
+            },
+        ),
         VaultCmd::RotateKey { garden } => rotate_key(resolve(garden)?),
         VaultCmd::Recover { garden } => recover(resolve(garden)?),
         VaultCmd::Seal { pattern, socket } => seal(pattern, socket),
@@ -339,6 +395,9 @@ fn status(garden: PathBuf, identity: bool) -> Result<()> {
         Ok(ids) => println!("  generations on disk  : {ids:?}"),
         Err(e) => println!("  generations on disk  : (unreadable: {e})"),
     }
+
+    println!();
+    print_kdf_status(vault.paths());
 
     println!();
     print_escrow_status(vault.paths());
@@ -868,6 +927,212 @@ fn print_escrow_status(paths: &softfig_vault::VaultPaths) {
         ),
         Err(e) => println!("    ! could not read {} to compare: {e}", storage::KEK_SELF_FILE),
     }
+}
+
+/// The Argon2 costs each door actually opens under, and where those costs come
+/// from. Parameters nobody can see are parameters nobody will raise, which is
+/// most of why this milestone found a vault still on its 2024 defaults.
+///
+/// Reads headers and a TOML file; opens nothing, so it stays usable on a locked
+/// vault like the rest of `status`.
+fn print_kdf_status(paths: &softfig_vault::VaultPaths) {
+    let fallback = match softfig_vault::storage::load_params(paths) {
+        Ok(p) => p.argon2,
+        Err(e) => {
+            println!("  key derivation       : (unreadable: {e})");
+            return;
+        }
+    };
+    let Ok(self_bytes) = std::fs::read(paths.kek_self()) else {
+        println!("  key derivation       : (no {} to read)", storage::KEK_SELF_FILE);
+        return;
+    };
+    let current = softfig_vault::kek::wrapping_params(&self_bytes, &fallback);
+    println!(
+        "  key derivation       : {}  ({})",
+        current.params,
+        if current.embedded {
+            format!("embedded in {}", storage::KEK_SELF_FILE)
+        } else {
+            format!("from {}", softfig_vault::storage::PARAMS_FILE)
+        }
+    );
+
+    // The plain-language read the slice asked for. Argon2 cost is not a number
+    // most people have a feel for, and "is this enough" is the only question
+    // being asked.
+    if current.params.at_least_as_strong_as(OWASP_BASELINE) {
+        println!(
+            "                         at or above the recommended baseline ({OWASP_BASELINE})"
+        );
+    } else {
+        println!("    ! below the recommended baseline ({OWASP_BASELINE}) — in a passphrase-only");
+        println!("      posture this cost is the whole brute-force defence of the garden:");
+        println!("          softfig vault rewrap");
+    }
+
+    // A door still in the pre-embedding format reads its costs from
+    // params.toml, and a rewrap deliberately leaves both alone. Saying so is
+    // the difference between a legible vault and a surprising one.
+    if let Ok(recovery_bytes) = std::fs::read(paths.kek_recovery()) {
+        let phrase = softfig_vault::kek::wrapping_params(&recovery_bytes, &fallback);
+        if !phrase.embedded {
+            println!(
+                "                         {} still derives from {} ({})",
+                storage::KEK_RECOVERY_FILE,
+                softfig_vault::storage::PARAMS_FILE,
+                phrase.params
+            );
+        } else if phrase.params != current.params {
+            println!(
+                "                         {} derives at {}",
+                storage::KEK_RECOVERY_FILE,
+                phrase.params
+            );
+        }
+    }
+}
+
+/// Flags for [`rewrap`], grouped so the function keeps a readable signature.
+struct RewrapArgs {
+    target_ms: u64,
+    m_cost: Option<u32>,
+    t_cost: Option<u32>,
+    p_cost: Option<u32>,
+    new_passphrase: bool,
+    allow_downgrade: bool,
+}
+
+/// Reharden the passphrase wrapping.
+///
+/// Structure mirrors slice 004's `drop`: the whole plan is computed and shown
+/// **before** a passphrase is typed, so a refusal never costs a prompt, and the
+/// library re-evaluates every guard before it writes.
+fn rewrap(garden: PathBuf, args: RewrapArgs) -> Result<()> {
+    let vault = Vault::at(&garden);
+    if !vault.is_initialized() {
+        return Err(anyhow!("no vault at {}", vault.paths().root.display()));
+    }
+    let paths = vault.paths();
+
+    let fallback = softfig_vault::storage::load_params(paths)?.argon2;
+    let current = softfig_vault::kek::wrapping_params(&std::fs::read(paths.kek_self())?, &fallback);
+
+    // Unspecified costs inherit from the vault rather than from a constant: a
+    // vault someone deliberately set to t=6 must not be quietly returned to the
+    // default because they only wanted to raise the memory.
+    let t_cost = args.t_cost.unwrap_or(current.params.t_cost);
+    let p_cost = args.p_cost.unwrap_or(current.params.p_cost);
+
+    println!("Vault: {}", paths.root.display());
+    println!();
+    println!(
+        "  current   : {}  ({})",
+        current.params,
+        if current.embedded {
+            format!("embedded in {}", storage::KEK_SELF_FILE)
+        } else {
+            format!("from {}", softfig_vault::storage::PARAMS_FILE)
+        }
+    );
+
+    let target = match args.m_cost {
+        Some(m_cost) => Argon2Params {
+            m_cost,
+            t_cost,
+            p_cost,
+        },
+        None => {
+            println!(
+                "  measuring this machine for a ~{} ms unlock...",
+                args.target_ms
+            );
+            let c = rewrap::calibrate(args.target_ms, t_cost, p_cost)?;
+            println!(
+                "  calibrated: {} in {} ms over {} probe(s){}",
+                c.params,
+                c.measured_ms,
+                c.probes,
+                if c.clamped {
+                    " — clamped, not the target"
+                } else {
+                    ""
+                }
+            );
+            c.params
+        }
+    };
+
+    let mut plan = rewrap::plan(paths, target, args.allow_downgrade)?;
+    plan.changes_passphrase = args.new_passphrase;
+
+    println!("  target    : {}", plan.target);
+    if plan.is_noop() {
+        println!();
+        println!("  Already at these parameters, and the passphrase is unchanged — nothing to");
+        println!("  do. Pass --m-cost/--target-ms to raise them, or --new-passphrase to change");
+        println!("  the secret.");
+        return Ok(());
+    }
+    if plan.is_downgrade {
+        println!("    ! this WEAKENS the vault, permitted by --allow-downgrade");
+    }
+    if args.new_passphrase {
+        println!("  the master passphrase will also be replaced");
+    }
+    println!();
+    println!("  This rewrites {} only — about a hundred bytes.", storage::KEK_SELF_FILE);
+    println!("  M, every blob, and every commit hash are untouched, and no replica resyncs.");
+
+    // Two consequences that must be announced rather than discovered. The
+    // relock one surfaces at the next `softfig daemon cycle`; the escrow one
+    // surfaces the next time a door is dropped. Both are bad moments.
+    println!();
+    println!("  Afterwards:");
+    println!(
+        "    - any outstanding growlight relock token becomes invalid (the vault fingerprint"
+    );
+    println!("      is a hash of {}), so the next daemon restart needs the passphrase", storage::KEK_SELF_FILE);
+    if plan.invalidates_escrow_proof {
+        println!("    - your verified escrow copy becomes HISTORICAL: it proves the old");
+        println!("      wrapping. Re-run 'vault escrow export' + 'vault escrow verify', or");
+        println!("      'vault recovery drop' will refuse until you do");
+    }
+    for door in &plan.legacy_doors {
+        println!(
+            "    - '{}' ({}) keeps its old cost and keeps reading {} — a rewrap cannot",
+            door.token(),
+            door.location(),
+            softfig_vault::storage::PARAMS_FILE
+        );
+        println!("      re-derive it, because opening it needs its own secret");
+    }
+
+    println!();
+    let pass = prompt_passphrase("Current passphrase: ")?;
+    let new_secret = if args.new_passphrase {
+        let p1 = prompt_passphrase("New passphrase: ")?;
+        let p2 = prompt_passphrase("Confirm new passphrase: ")?;
+        if p1 != p2 {
+            return Err(anyhow!("passphrases do not match — nothing was changed"));
+        }
+        Some(p1)
+    } else {
+        None
+    };
+
+    rewrap::apply(
+        paths,
+        &plan,
+        pass.as_bytes(),
+        new_secret.as_ref().map(|s| s.as_bytes()),
+    )?;
+
+    println!();
+    println!("Rewrapped. {} now derives at {}.", storage::KEK_SELF_FILE, plan.target);
+    println!();
+    print_kdf_status(paths);
+    Ok(())
 }
 
 /// Whole days, because that is the resolution the fact deserves: "is my escrow
