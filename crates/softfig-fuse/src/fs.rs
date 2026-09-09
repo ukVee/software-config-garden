@@ -518,6 +518,37 @@ impl SharedState {
         inner.inodes.intern(rel);
     }
 
+    /// Stage a mode change on `rel`. Returns `false` — staging **nothing** —
+    /// when `rel` is a directory.
+    ///
+    /// A directory has no versioned mode: `mkdir` reports a fixed `0o755` and a
+    /// tree's dir node records none, so there is nothing a `chmod` on one could
+    /// persist. Staging it anyway is not merely useless, it is destructive —
+    /// the only staging primitive available is `insert_file`, whose content for
+    /// a directory reads back empty, so the directory is **replaced by a
+    /// zero-byte file and every child is orphaned**.
+    ///
+    /// That is reachable from the most ordinary copy there is: `cp -r`, `cp -a`,
+    /// `rsync -a` and `tar -xp` all chmod each directory after filling it. Found
+    /// on 2026-09-09 importing a garden's first content, which lost eight
+    /// directories' worth of files this way. `setattr`'s pre-existing
+    /// mount-root `EBUSY` guard covered only the shared-graft-point instance of
+    /// this same hazard; this is the general case.
+    pub(crate) fn stage_mode(&self, rel: &Path, mode: u32, bytes: impl FnOnce() -> Vec<u8>) -> bool {
+        {
+            let inner = self.inner.lock().unwrap();
+            if entry_kind_of(&inner, rel) == Some(EntryKind::Dir) {
+                return false;
+            }
+        }
+        // Read outside the lock — `bytes` re-enters `inner` to reach the store.
+        let content = bytes();
+        let mut inner = self.inner.lock().unwrap();
+        inner.overlay.insert_file(rel.to_path_buf(), content, mode);
+        inner.inodes.intern(rel);
+        true
+    }
+
     /// Stage a rename into the overlay. Handles a single file and a directory
     /// (every live descendant — files re-keyed with their bytes, sub-directories
     /// moved as overlay markers). Each moved file's bytes are materialized into
@@ -1357,6 +1388,11 @@ impl Filesystem for FuseFs {
         // Truncate semantics: a setattr with size=0 + an O_TRUNC open
         // flag from the editor.
         if let Some(new_size) = size {
+            // Truncating a directory is meaningless, and the staging below
+            // would turn it into an empty file (see `SharedState::stage_mode`).
+            if self.path_kind(&path) == Some(EntryKind::Dir) {
+                return reply.error(libc::EISDIR);
+            }
             let mut bytes = self.read_bytes(&path).unwrap_or_default();
             bytes.resize(new_size as usize, 0);
             let cur_mode = self.mode_of(ino).unwrap_or(0o100644);
@@ -1369,14 +1405,18 @@ impl Filesystem for FuseFs {
             self.state.sink.modified(&rel);
             self.state.sink.nudge();
         } else if let Some(new_mode) = mode {
-            let bytes = self.read_bytes(&path).unwrap_or_default();
-            {
-                let mut inner = self.state.inner.lock().unwrap();
-                inner.overlay.insert_file(path.clone(), bytes, new_mode);
+            // `stage_mode` stages nothing for a directory and says so; a dir's
+            // mode is not versioned, so the chmod is accepted and ignored
+            // rather than refused — `cp -r` chmods every directory it creates,
+            // and erroring there would fail an otherwise valid copy.
+            let staged = self
+                .state
+                .stage_mode(&path, new_mode, || self.read_bytes(&path).unwrap_or_default());
+            if staged {
+                let rel = path_to_repo_rel(&path);
+                self.state.sink.modified(&rel);
+                self.state.sink.nudge();
             }
-            let rel = path_to_repo_rel(&path);
-            self.state.sink.modified(&rel);
-            self.state.sink.nudge();
         }
         match self.attr_for_inode(ino) {
             Some(a) => reply.attr(&TTL, &a),
