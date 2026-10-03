@@ -230,6 +230,37 @@ impl Editor {
         }
     }
 
+    /// Select a view directly — the touch toggle switch's left/right halves.
+    /// Idempotent (unlike [`Self::toggle_mode`]).
+    pub fn set_mode(&mut self, mode: EditorMode) {
+        if self.mode != mode {
+            self.toggle_mode();
+        }
+    }
+
+    /// Place the caret (a tap): clamped to a real line and a real char column.
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        self.row = row.min(self.lines.len() - 1);
+        self.col = col.min(self.lines[self.row].chars().count());
+    }
+
+    /// Free-scroll the reading view by `delta` lines (bionic mode), clamped to
+    /// the content. Raw mode scrolls by moving the caret instead — the renderer
+    /// keeps the caret in view.
+    pub fn scroll_by(&mut self, delta: i32) {
+        self.set_scroll((self.scroll as i32 + delta).max(0) as u16);
+    }
+
+    /// Set the first visible line, clamped to `[0, len - viewport]`.
+    pub fn set_scroll(&mut self, offset: u16) {
+        let v = self.viewport.max(1) as usize;
+        let max = self.lines.len().saturating_sub(v);
+        self.scroll = (offset as usize).min(max) as u16;
+    }
+
     /// The styled lines for the active view; the bionic cache is built lazily
     /// on first use (once per toggle — never per frame).
     pub fn doc(&mut self) -> &[Line<'static>] {

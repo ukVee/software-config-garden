@@ -72,15 +72,42 @@ pub fn parse_command(input: &str) -> Command {
 
 /// Names offered in the palette hint line.
 pub fn command_hints() -> String {
-    let mut names = vec![
-        "browse", "history", "vault", "peers", "reveal", "pair", "unpair", "backup", "grant",
-        "revoke", "deploy", "apply", "shares", "share", "unshare", "reload", "unlock", "quit",
-        "help",
+    command_menu()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// The palette's tappable rows: `(name, one-line description)` in a stable
+/// order, so a touch user can pick a command instead of typing it. Parsing the
+/// picked name goes through the same [`parse_command`] the typed path uses.
+pub fn command_menu() -> Vec<(&'static str, &'static str)> {
+    let mut rows: Vec<(&'static str, &'static str)> = vec![
+        ("browse", "switch to Browse"),
+        ("history", "switch to History"),
+        ("vault", "switch to Vault"),
+        ("peers", "switch to Peers"),
+        ("backup", "switch to Backup"),
+        ("deploy", "preview the deploy plan"),
+        ("shares", "switch to Shares"),
+        ("reveal", "reveal the selected sealed file"),
+        ("pair", "pair a device"),
+        ("unpair", "unpair the selected device"),
+        ("grant", "grant a host backup access"),
+        ("revoke", "revoke a host's backup grant"),
+        ("apply", "apply the deploy plan"),
+        ("share", "share a folder"),
+        ("unshare", "un-share the selected folder"),
+        ("reload", "refresh the current view"),
+        ("unlock", "unlock the vault"),
+        ("help", "show the key help"),
+        ("quit", "quit"),
     ];
     for k in ActionKind::ALL {
-        names.push(k.command_name());
+        rows.push((k.command_name(), k.title()));
     }
-    names.join("  ")
+    rows
 }
 
 #[cfg(test)]

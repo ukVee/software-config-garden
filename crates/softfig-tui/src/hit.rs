@@ -40,9 +40,9 @@ pub enum ListId {
 /// The action a tap performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
-    /// Replay this key through the normal key dispatcher (tabs, footer action
-    /// chips, overlay confirm/cancel chips, field-focus chips). This is what
-    /// gives touch full action parity without a second action vocabulary.
+    /// Replay this key through the normal key dispatcher (tabs, action-menu
+    /// rows, overlay confirm/cancel chips). This is what gives touch full
+    /// action parity without a second action vocabulary.
     Key(KeyEvent),
     /// Select `index` in `list`; tapping the already-selected row activates it
     /// (opens a file, expands a directory/milestone, confirms a pairing, …).
@@ -50,10 +50,32 @@ pub enum Hit {
     /// Select `index` in the open region picker; tapping the selected row again
     /// advances (Enter) to the masked reveal prompt.
     RegionRow(usize),
-    /// Dismiss the open overlay (help — tap anywhere).
+    /// Dismiss the open overlay (help card, menu backdrop — tap anywhere).
     Dismiss,
     /// The preview/detail pane: mouse-down starts a drag-scroll anchor.
     Preview,
+    /// The floating menu button: a press starts a drag (or, released without
+    /// motion, opens the action menu).
+    Fab,
+    /// Execute the action-menu row at `index` (the menu closes first).
+    MenuRow(usize),
+    /// Pick an editor view directly from the toggle switch: `true` = bionic,
+    /// `false` = raw source.
+    EditorView(bool),
+    /// The editor's text area: a press starts a drag-scroll anchor. Wheel
+    /// events over it scroll/move the editor.
+    EditorBody,
+    /// One visible editor line (raw mode): a tap places the cursor at the
+    /// tapped column. `x0` is the text's first screen column, so `column - x0`
+    /// is the char column within the line.
+    EditorLine { row: usize, x0: u16 },
+    /// A palette row: tap to pick a named command and run it.
+    PalettePick(&'static str),
+    /// The palette's list area (under the rows): wheel/drag scrolls the list,
+    /// so rows past the visible budget are still touch-reachable.
+    PaletteBody,
+    /// Focus the `index`-th field of the open action form.
+    FormField(usize),
 }
 
 /// One recorded clickable region. `rect` is in terminal cells.
@@ -62,6 +84,11 @@ pub struct HitZone {
     pub rect: Rect,
     pub hit: Hit,
 }
+
+/// The floating menu button's footprint: 6×3 cells — a deliberately large
+/// touch target, sized to sit above the footer without hiding content.
+pub const FAB_W: u16 = 6;
+pub const FAB_H: u16 = 3;
 
 /// The per-frame zone set. Small (a few hundred zones at most) and rebuilt
 /// from scratch on every draw; lookup is a reverse linear scan so the most

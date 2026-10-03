@@ -137,12 +137,23 @@ mouse click or a touchscreen tap works everywhere a key does: tap a header tab
 to switch views; tap a list/tree row to select it and tap it again to
 open/expand (a double-tap — a right click under the touch-pointer Wayfire
 plugin — activates directly); the wheel (two-finger drag) scrolls the pane
-under the cursor, and a held drag in the preview scrolls it. The footer shows
-the current view's actions as tappable chips (`[a apply]`, `[D unpair]`, …)
-and dialogs carry `[y confirm]` / `[n cancel]` chips, so every feature is
+under the cursor, and a held drag scrolls the preview or the editor.
+
+A floating **☰ menu button** replaces the old footer action chips. Tap it to
+open a large checklist of the current view's actions (tap a row to run it; tap
+outside or Esc closes), and press-and-move it to reposition it — the spot
+persists across runs in `$XDG_STATE_HOME/softfig/tui-ui.json` (interface
+geometry only; never garden content). Dialogs carry `[y confirm]` /
+`[n cancel]` / `[Enter …]` chips, forms focus the field you tap, and the
+palette's command rows are tappable (and scrollable), so every feature is
 reachable without a keyboard — text entry still needs the on-screen keyboard.
-Mouse capture stays on for this, so terminal-native text selection needs the
-terminal's Shift modifier (the usual full-screen-app trade-off).
+
+In the editor (`e` on a Browse file) a **raw ↔ bionic switch** sits at the top
+of the pane: tap either label or the track, and new files open in whichever
+view you last chose (persisted). Tap a line to place the caret, wheel/drag to
+scroll. Mouse capture stays on for all of this, so terminal-native text
+selection needs the terminal's Shift modifier (the usual full-screen-app
+trade-off).
 
 Browse content comes through the daemon's read-only `list_tree` /
 `read_file` verbs, which redact server-side: sealed files show

@@ -906,23 +906,8 @@ fn a_tap_on_a_visible_row_selects_and_a_second_tap_activates() {
     assert!(app.tree.is_expanded("meta"), "the second tap activates");
 }
 
-#[test]
-fn a_footer_chip_is_tappable_and_opens_its_overlay() {
-    let mut app = App::new();
-    app.locked = false;
-    app.view = View::Deploy;
-    draw(&mut app);
-
-    let (column, row) = point_at(&app, |h| {
-        matches!(h, Hit::Key(k) if k.code == KeyCode::Char('F'))
-    });
-    let mut ipc = dummy_ipc();
-    press(&mut app, &mut ipc, column, row);
-    assert!(
-        matches!(app.overlay, Overlay::DeployForce { .. }),
-        "the force chip runs the same path as the F key"
-    );
-}
+// (The old footer action-chip test is superseded by the floating-button menu
+// tests below: the chips moved into the menu button.)
 
 #[test]
 fn a_modal_blocks_page_taps_and_records_its_own_chips() {
@@ -971,6 +956,140 @@ fn a_tap_anywhere_dismisses_the_help_overlay() {
         !matches!(app.overlay, Overlay::Help),
         "the help card must dismiss on tap"
     );
+}
+
+// ---- floating menu button + editor switches -------------------------------
+
+fn release(app: &mut App, ipc: &mut IpcClient, column: u16, row: u16) {
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        ipc,
+    );
+}
+
+#[test]
+fn the_floating_button_opens_the_menu_and_outside_taps_close_it() {
+    let mut app = App::new();
+    app.locked = false;
+    draw(&mut app);
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::Fab));
+    let mut ipc = dummy_ipc();
+    // Press + release with no motion is a tap on the floating button.
+    press(&mut app, &mut ipc, column, row);
+    release(&mut app, &mut ipc, column, row);
+    assert!(
+        matches!(app.overlay, Overlay::Menu { .. }),
+        "a tap opens the action menu"
+    );
+
+    // Redraw so the menu's rows are recorded, then tap one: it runs and closes.
+    draw(&mut app);
+    let wanted = app
+        .menu_actions()
+        .iter()
+        .position(|(label, _)| *label == "? help")
+        .expect("help is always in the menu");
+    let (c, r) = point_at(&app, |h| matches!(h, Hit::MenuRow(i) if i == wanted));
+    press(&mut app, &mut ipc, c, r);
+    assert!(
+        matches!(app.overlay, Overlay::Help),
+        "the tapped row ran its key after closing the menu"
+    );
+
+    // Reopen, then tap the top-left cell (away from the card): outside closes.
+    app.overlay = Overlay::Menu { selected: 0 };
+    draw(&mut app);
+    press(&mut app, &mut ipc, 0, 0);
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "a tap outside the card closes the menu"
+    );
+}
+
+#[test]
+fn the_editor_view_switch_is_drawn_and_tappable() {
+    use softfig_tui::editor::{Editor, EditorMode};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    app.editor = Some(Editor::from_read(
+        "meta/x.md",
+        "# T\nbody\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::EditorView(true)));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(
+        app.editor.as_ref().unwrap().mode,
+        EditorMode::Bionic,
+        "the drawn switch selects bionic"
+    );
+}
+
+#[test]
+fn a_palette_row_runs_without_typing() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Deploy;
+    app.overlay = Overlay::Palette(String::new());
+    draw(&mut app);
+
+    // `browse` is the first row, always within the visible budget.
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::PalettePick("browse")));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(app.view, View::Browse, "the tapped row ran `browse`");
+    assert!(matches!(app.overlay, Overlay::None), "the palette closed");
+}
+
+#[test]
+fn the_palette_list_scrolls_for_rows_past_the_budget() {
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = Overlay::Palette(String::new());
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::PaletteBody));
+    let mut ipc = dummy_ipc();
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut ipc,
+    );
+    assert_eq!(app.palette_scroll, 3, "the wheel scrolls the command list");
+}
+
+#[test]
+fn tapping_a_form_field_focuses_it() {
+    use softfig_tui::forms::{ActionForm, ActionKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = Overlay::Form(ActionForm::for_kind(ActionKind::Archive));
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::FormField(1)));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    match &app.overlay {
+        Overlay::Form(form) => assert_eq!(form.focus, 1, "the tapped field is focused"),
+        other => panic!("form closed unexpectedly: {other:?}"),
+    }
 }
 
 // ---- M3c editor frames ----

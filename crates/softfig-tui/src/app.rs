@@ -10,6 +10,7 @@ use std::path::Path;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::Rect;
 use serde_json::{json, Value};
 use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
@@ -31,6 +32,7 @@ use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::ipc::{IpcClient, Reply, Tag};
+use crate::prefs::{self, UiPrefs};
 use crate::listpane::ListPane;
 use crate::tree::{
     derive_slice_status, parse_slice_index, BacklogItem, BacklogKind, BacklogTree, LoopContextNode,
@@ -65,6 +67,24 @@ pub enum View {
     /// Content is fetched with the existing read-only `read_file`; the save seam
     /// is not wired to a daemon verb in this prototype (see [`App::write_path`]).
     Editor,
+}
+
+impl View {
+    /// The lower-case view name used by the floating menu's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            View::Browse => "browse",
+            View::History => "history",
+            View::Vault => "vault",
+            View::Peers => "peers",
+            View::Backup => "backup",
+            View::Deploy => "deploy",
+            View::Shares => "shares",
+            View::Growlight => "growlight",
+            View::Coordination => "coordination",
+            View::Editor => "editor",
+        }
+    }
 }
 
 /// M5d slice 004: the collaborative-key ceremony state for one shared subtree,
@@ -259,6 +279,10 @@ pub enum Overlay {
     /// M3c: leaving the editor with unsaved edits — `s` save, `d` discard,
     /// `Esc` back to the editor.
     EditorDiscard,
+    /// The floating action menu (the ☰ button): a large checklist of the
+    /// current view's actions. Tapping a row runs it and closes the menu;
+    /// tapping outside or Esc closes without running anything.
+    Menu { selected: usize },
     Help,
 }
 
@@ -278,14 +302,33 @@ pub struct HistoryLine {
     pub summary: String,
 }
 
-/// An in-flight drag-scroll in the preview/detail pane. `row` is where the
-/// press landed, `scroll` the preview offset then; both stay fixed for the
-/// gesture so drag updates compute an absolute offset (a relative delta would
-/// re-apply on every motion event) and can never drift mid-drag.
+/// What an in-flight drag is scrolling: the preview/detail pane, or the editor
+/// (where the press also carries the line/col so a drag can move the cursor).
+#[derive(Debug, Clone, Copy)]
+enum DragTarget {
+    Preview,
+    Editor { line: usize, col: usize },
+}
+
+/// An in-flight drag-scroll. `row` is where the press landed, `scroll` the
+/// target's offset then; both stay fixed for the gesture so drag updates
+/// compute an absolute offset (a relative delta would re-apply on every motion
+/// event) and can never drift mid-drag.
 #[derive(Debug, Clone, Copy)]
 struct DragAnchor {
     row: u16,
     scroll: u16,
+    target: DragTarget,
+}
+
+/// An in-flight drag of the floating menu button. The grab offset keeps the
+/// button under the same finger cell; `moved` is what separates a tap (open
+/// the menu) from a drag (reposition and keep).
+#[derive(Debug, Clone, Copy)]
+struct FabDrag {
+    grab_dx: u16,
+    grab_dy: u16,
+    moved: bool,
 }
 
 #[derive(Debug)]
@@ -440,8 +483,18 @@ pub struct App {
     /// by [`Self::handle_mouse`]. Rebuilt on every draw; empty before the first
     /// frame (taps then fall through to no-ops / the preview-scroll default).
     pub hits: HitMap,
-    /// The preview drag-scroll anchor while a mouse button is held.
+    /// The preview/editor drag-scroll anchor while a mouse button is held.
     drag: Option<DragAnchor>,
+    /// The floating menu-button drag state while its button is held.
+    fab_drag: Option<FabDrag>,
+    /// The terminal area from the last frame. Drag clamping needs it before
+    /// any hit zone exists (zones are only recorded during render).
+    pub screen: Rect,
+    /// Persisted interface preferences: menu-button position + editor view.
+    pub prefs: UiPrefs,
+    /// First visible row of the palette's command list (wheel/drag scroll).
+    /// Reset whenever the palette opens.
+    pub palette_scroll: usize,
     /// The PROTOCOL half of the injected-context node (slice 006): `growlight/protocol.md`
     /// read through the resolver's garden arm on select and cached here. `None`
     /// until the first select's read lands; the detail pane assembles it with the
@@ -526,6 +579,10 @@ impl App {
             growlight_bus: Vec::new(),
             hits: HitMap::new(),
             drag: None,
+            fab_drag: None,
+            screen: Rect::new(0, 0, 0, 0),
+            prefs: UiPrefs::default(),
+            palette_scroll: 0,
             growlight_injected_protocol: None,
             editor: None,
             write_path: Box::new(UnwiredWritePath),
@@ -1171,13 +1228,18 @@ impl App {
             Tag::EditorReadFile { path } => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
-                        let ed = Editor::from_read(
+                        let mut ed = Editor::from_read(
                             &path,
                             &r.content,
                             Some(r.version.clone()).filter(|v| !v.is_empty()),
                             r.sealed,
                             &r.region_ids,
                         );
+                        // New files open in the view that was last selected
+                        // (persisted across runs).
+                        if self.prefs.editor_bionic {
+                            ed.set_mode(EditorMode::Bionic);
+                        }
                         let reason = ed.read_only.clone();
                         self.editor = Some(ed);
                         self.view = View::Editor;
@@ -1756,6 +1818,7 @@ impl App {
             Overlay::RemoveShare { .. } => self.handle_key_remove_share(key, ipc),
             // M3c: save/discard/back for an editor with unsaved edits.
             Overlay::EditorDiscard => self.handle_key_editor_discard(key),
+            Overlay::Menu { .. } => self.handle_key_menu(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -1787,8 +1850,12 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('m') => self.open_menu(),
             KeyCode::Char('?') => self.overlay = Overlay::Help,
-            KeyCode::Char(':') => self.overlay = Overlay::Palette(String::new()),
+            KeyCode::Char(':') => {
+                self.palette_scroll = 0;
+                self.overlay = Overlay::Palette(String::new());
+            }
             KeyCode::Char('u') if self.locked => {
                 self.overlay = Overlay::Unlock {
                     buf: String::new(),
@@ -1888,12 +1955,62 @@ impl App {
         }
     }
 
-    /// The contextual action chips on the footer — every view's key-driven
-    /// feature (pair/unpair, grant/revoke, apply/force, share/toggle/un-share,
-    /// reveal/copy/refresh) plus the global palette/help/quit. Returned as
-    /// `(label, key)`: the renderer draws each as a tappable chip and the
-    /// mouse path replays the key, so touch gets full action parity by
-    /// construction and never grows a second action vocabulary.
+    /// Load persisted interface preferences (once, at startup).
+    pub fn load_prefs(&mut self) {
+        self.prefs = prefs::load();
+    }
+
+    /// Persist interface preferences (best-effort; called when they change).
+    pub fn save_prefs(&self) {
+        prefs::save(&self.prefs);
+    }
+
+    /// Open the floating action menu (the ☰ button / `m`).
+    pub fn open_menu(&mut self) {
+        self.overlay = Overlay::Menu { selected: 0 };
+    }
+
+    /// The action menu's contents: the primary row action for list views, then
+    /// the current view's contextual actions, then the globals. Order is
+    /// stable (menu selection is positional) and every entry carries the key
+    /// it replays, so the menu never grows a second dispatch path.
+    pub fn menu_actions(&self) -> Vec<(&'static str, KeyEvent)> {
+        let mut actions: Vec<(&'static str, KeyEvent)> = Vec::new();
+        if !self.locked {
+            match self.view {
+                View::Browse => {
+                    actions.push(("Open file / expand folder", hit::key(KeyCode::Enter)));
+                    actions.push(("Edit this file", hit::key(KeyCode::Char('e'))));
+                    actions.push(("Collapse folder", hit::key(KeyCode::Left)));
+                }
+                View::History => {
+                    actions.push(("Show selected commit", hit::key(KeyCode::Enter)));
+                }
+                View::Vault => {
+                    actions.push(("Reveal selected file", hit::key(KeyCode::Enter)));
+                }
+                View::Peers => {
+                    actions.push(("Confirm / pair selected", hit::key(KeyCode::Enter)));
+                }
+                View::Growlight => {
+                    actions.push(("Expand milestone", hit::key(KeyCode::Enter)));
+                }
+                View::Coordination => {
+                    actions.push(("Preview conflict", hit::key(KeyCode::Enter)));
+                }
+                View::Backup | View::Deploy | View::Shares | View::Editor => {}
+            }
+        }
+        actions.extend(self.footer_actions());
+        actions
+    }
+
+    /// The per-view contextual action vocabulary — every key-driven feature
+    /// (pair/unpair, grant/revoke, apply/force, share/toggle/un-share,
+    /// reveal/copy/refresh, the editor's save/toggle/close) plus the global
+    /// palette/help/quit. Returned as `(label, key)`: the floating menu renders
+    /// each as a tappable row and the mouse path replays the key, so touch gets
+    /// full action parity by construction and never grows a second vocabulary.
     pub fn footer_actions(&self) -> Vec<(&'static str, KeyEvent)> {
         let mut actions: Vec<(&'static str, KeyEvent)> = Vec::new();
         if self.locked {
@@ -1965,9 +2082,22 @@ impl App {
             // The touch-pointer plugin maps a double-tap to a right click:
             // treat it as "activate the row under the finger" directly.
             MouseEventKind::Down(MouseButton::Right) => self.tap(ev.column, ev.row, true, ipc),
-            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(ev.row),
-            MouseEventKind::Up(_) => self.drag = None,
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(ev.column, ev.row),
+            MouseEventKind::Up(_) => self.release(),
             _ => {}
+        }
+    }
+
+    /// Button-up: ends any preview/editor drag and, for the floating button,
+    /// either opens the menu (a tap) or keeps the new position (a drag).
+    fn release(&mut self) {
+        self.drag = None;
+        if let Some(fab) = self.fab_drag.take() {
+            if fab.moved {
+                self.save_prefs();
+            } else {
+                self.open_menu();
+            }
         }
     }
 
@@ -1978,17 +2108,85 @@ impl App {
             return;
         };
         match hit {
-            // Tabs, footer action chips, and overlay confirm/cancel chips all
-            // replay a key, so they hit exactly the keyboard path — including
-            // its guards (locked, gated growlight tab, form focus state).
+            // Tabs, overlay confirm/cancel chips, and field-focus chips replay a
+            // key, so they hit exactly the keyboard path — including its guards
+            // (locked, gated growlight tab, form focus state).
             Hit::Key(key) => self.handle_key(key, ipc),
             Hit::Dismiss => self.overlay = Overlay::None,
+            Hit::MenuRow(index) => self.tap_menu_row(index, ipc),
+            Hit::Fab => {
+                // Press-and-move repositions the button; a press-release with
+                // no motion opens the menu (resolved on `Up`).
+                let (fab_x, fab_y) = self.prefs.fab.unwrap_or((column, row));
+                self.fab_drag = Some(FabDrag {
+                    grab_dx: column.saturating_sub(fab_x),
+                    grab_dy: row.saturating_sub(fab_y),
+                    moved: false,
+                });
+            }
             Hit::Preview => {
                 if !activate {
                     self.drag = Some(DragAnchor {
                         row,
                         scroll: self.preview_scroll,
+                        target: DragTarget::Preview,
                     });
+                }
+            }
+            Hit::EditorLine { row: line, x0 } => {
+                let col = column.saturating_sub(x0) as usize;
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.set_cursor(line, col);
+                }
+                if !activate {
+                    if let Some(scroll) = self.editor.as_ref().map(|e| e.scroll) {
+                        self.drag = Some(DragAnchor {
+                            row,
+                            scroll,
+                            target: DragTarget::Editor { line, col },
+                        });
+                    }
+                }
+            }
+            Hit::EditorBody => {
+                if !activate {
+                    if let Some(ed) = self.editor.as_mut() {
+                        let scroll = ed.scroll;
+                        let line = scroll as usize;
+                        self.drag = Some(DragAnchor {
+                            row,
+                            scroll,
+                            target: DragTarget::Editor { line, col: 0 },
+                        });
+                    }
+                }
+            }
+            Hit::EditorView(bionic) => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.set_mode(if bionic {
+                        EditorMode::Bionic
+                    } else {
+                        EditorMode::Raw
+                    });
+                }
+                if self.prefs.editor_bionic != bionic {
+                    self.prefs.editor_bionic = bionic;
+                    self.save_prefs();
+                }
+            }
+            Hit::PalettePick(name) => {
+                // Picking a row runs the same command parser the typed palette
+                // uses, so both paths share one vocabulary.
+                self.overlay = Overlay::None;
+                let cmd = parse_command(name);
+                self.run_command(cmd, ipc);
+            }
+            // The palette list's gaps: a tap there does nothing (the wheel is
+            // what scrolls it).
+            Hit::PaletteBody => {}
+            Hit::FormField(index) => {
+                if let Overlay::Form(form) = &mut self.overlay {
+                    form.set_focus(index);
                 }
             }
             Hit::RegionRow(index) => {
@@ -2014,15 +2212,56 @@ impl App {
     }
 
     /// Wheel routing: a list under the cursor moves its selection, the preview
-    /// looks after itself, and an open region picker moves its highlighted row.
+    /// and editor look after themselves, an open region picker or menu moves
+    /// its highlighted row.
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32, ipc: &mut IpcClient) {
         match self.hits.hit_at(column, row) {
             Some(Hit::Row { .. }) => self.move_selection(delta, ipc),
             Some(Hit::RegionRow(_)) => self.move_region_selection(delta),
+            Some(Hit::MenuRow(_)) => self.move_menu_selection(delta),
+            Some(Hit::PaletteBody | Hit::PalettePick(_)) => self.scroll_palette(delta),
+            Some(Hit::EditorBody | Hit::EditorLine { .. }) => self.editor_scroll(delta),
             Some(Hit::Preview) => self.scroll_preview(delta),
             // No zone (before the first frame, or a header/footer cell): the
             // pre-touch default, so the wheel always does something sensible.
             _ => self.scroll_preview(delta),
+        }
+    }
+
+    /// Move the floating menu's highlight by `delta` rows.
+    fn move_menu_selection(&mut self, delta: i32) {
+        let last = self.menu_actions().len().saturating_sub(1) as i32;
+        if let Overlay::Menu { selected } = &mut self.overlay {
+            *selected = (*selected as i32 + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// Wheel over the palette list: scroll the command rows. The renderer
+    /// clamps the offset to the real list length, so this only accumulates.
+    fn scroll_palette(&mut self, delta: i32) {
+        self.palette_scroll = if delta < 0 {
+            self.palette_scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.palette_scroll.saturating_add(delta as usize)
+        };
+    }
+
+    /// Wheel over the editor: raw mode moves the caret (the renderer keeps it
+    /// in view), bionic mode free-scrolls the reading view.
+    fn editor_scroll(&mut self, delta: i32) {
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        if ed.mode == EditorMode::Raw {
+            for _ in 0..delta.unsigned_abs() {
+                if delta < 0 {
+                    ed.move_up();
+                } else {
+                    ed.move_down();
+                }
+            }
+        } else {
+            ed.scroll_by(delta);
         }
     }
 
@@ -2045,16 +2284,53 @@ impl App {
         *selected = (*selected as i32 + delta).clamp(0, last) as usize;
     }
 
-    /// Drag in the preview: content follows the finger — dragging up reveals
-    /// lower lines. Computed from the fixed anchor, so an absolute target is
-    /// set on every motion event (a relative delta would compound).
-    fn drag_to(&mut self, row: u16) {
+    /// A held drag: the floating button moves, the preview/editor content
+    /// follows the finger. Everything is computed from the fixed press anchor,
+    /// so an absolute target is set on every motion event and a coalesced or
+    /// repeated drag can never compound.
+    fn drag_to(&mut self, column: u16, row: u16) {
+        if let Some(fab) = &mut self.fab_drag {
+            let max_x = self
+                .screen
+                .right()
+                .saturating_sub(hit::FAB_W)
+                .max(self.screen.x);
+            let max_y = self
+                .screen
+                .bottom()
+                .saturating_sub(hit::FAB_H)
+                .max(self.screen.y);
+            let x = column
+                .saturating_sub(fab.grab_dx)
+                .clamp(self.screen.x, max_x);
+            let y = row.saturating_sub(fab.grab_dy).clamp(self.screen.y, max_y);
+            if self.prefs.fab != Some((x, y)) {
+                fab.moved = true;
+                self.prefs.fab = Some((x, y));
+            }
+            return;
+        }
         let Some(anchor) = self.drag else {
             return;
         };
         let delta = anchor.row as i32 - row as i32;
-        let max = self.preview_max_scroll() as i32;
-        self.preview_scroll = (anchor.scroll as i32 + delta).clamp(0, max) as u16;
+        match anchor.target {
+            DragTarget::Preview => {
+                let max = self.preview_max_scroll() as i32;
+                self.preview_scroll = (anchor.scroll as i32 + delta).clamp(0, max) as u16;
+            }
+            DragTarget::Editor { line, col } => {
+                if let Some(ed) = self.editor.as_mut() {
+                    if ed.mode == EditorMode::Raw {
+                        let target =
+                            (line as i32 + delta).clamp(0, ed.line_count().saturating_sub(1) as i32);
+                        ed.set_cursor(target as usize, col);
+                    } else {
+                        ed.set_scroll((anchor.scroll as i32 + delta).max(0) as u16);
+                    }
+                }
+            }
+        }
     }
 
     /// The current selection of a primary list (tap-to-activate detection).
@@ -2342,6 +2618,45 @@ impl App {
         }
     }
 
+    /// The floating menu's keys: `j`/`k` move the checklist, `Enter` runs the
+    /// checked row (closing first, so the action lands on the page), `Esc`
+    /// closes. A tap runs a row through [`Self::tap_menu_row`].
+    fn handle_key_menu(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Some(current) = (match &self.overlay {
+            Overlay::Menu { selected } => Some(*selected),
+            _ => None,
+        }) else {
+            return;
+        };
+        let last = self.menu_actions().len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Overlay::Menu { selected } = &mut self.overlay {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Overlay::Menu { selected } = &mut self.overlay {
+                    *selected = (*selected + 1).min(last);
+                }
+            }
+            KeyCode::Enter => self.tap_menu_row(current, ipc),
+            _ => {}
+        }
+    }
+
+    /// Run the `index`-th menu action: close the menu first (so the replayed
+    /// key acts on the page, not on the menu), then dispatch it. Out-of-range
+    /// taps are no-ops.
+    fn tap_menu_row(&mut self, index: usize, ipc: &mut IpcClient) {
+        let Some((_, key)) = self.menu_actions().get(index).copied() else {
+            return;
+        };
+        self.overlay = Overlay::None;
+        self.handle_key(key, ipc);
+    }
+
     fn run_command(&mut self, cmd: Command, ipc: &mut IpcClient) {
         match cmd {
             Command::Browse => self.view = View::Browse,
@@ -2482,6 +2797,18 @@ impl App {
             }
         } else {
             exit = true;
+        }
+        // Keep the persisted "last selected view" in sync with the toggle, so
+        // the next file opens where the user last left off.
+        if let Some(bionic) = self
+            .editor
+            .as_ref()
+            .map(|e| e.mode == EditorMode::Bionic)
+        {
+            if self.prefs.editor_bionic != bionic {
+                self.prefs.editor_bionic = bionic;
+                self.save_prefs();
+            }
         }
         if save {
             self.editor_save();
@@ -3963,6 +4290,172 @@ mod tests {
         let locked = labels(&app);
         assert!(locked.contains(&"u unlock"));
         assert!(!locked.contains(&"a apply"));
+    }
+
+    fn left_down(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    fn left_up(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Up(MouseButton::Left), column, row)
+    }
+
+    fn left_drag(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Drag(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn the_floating_button_taps_open_the_menu_and_drags_reposition() {
+        let mut app = App::new();
+        app.locked = false;
+        app.screen = Rect::new(0, 0, 100, 30);
+        app.prefs.fab = Some((90, 26));
+        app.hits
+            .push(Rect::new(90, 26, hit::FAB_W, hit::FAB_H), Hit::Fab);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(left_down(92, 27), &mut ipc);
+        app.handle_mouse(left_up(92, 27), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::Menu { .. }),
+            "a tap opens the menu"
+        );
+
+        app.overlay = Overlay::None;
+        app.handle_mouse(left_down(92, 27), &mut ipc);
+        app.handle_mouse(left_drag(50, 10), &mut ipc);
+        assert_eq!(app.prefs.fab, Some((48, 9)), "the grab offset is preserved");
+        app.handle_mouse(left_up(50, 10), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "a drag must not open the menu"
+        );
+    }
+
+    #[test]
+    fn a_menu_row_tap_runs_the_action_and_closes_the_menu() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Deploy;
+        let index = app
+            .menu_actions()
+            .iter()
+            .position(|(label, _)| *label == "F force")
+            .expect("the deploy menu offers force");
+        app.overlay = Overlay::Menu { selected: 0 };
+        app.hits.push(Rect::new(10, 10, 30, 1), Hit::MenuRow(index));
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(12, 10), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::DeployForce { .. }),
+            "the row ran its key after closing the menu"
+        );
+    }
+
+    #[test]
+    fn menu_keyboard_moves_the_check_and_esc_closes() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Deploy;
+        app.open_menu();
+        let mut ipc = dummy_ipc();
+        app.handle_key(hit::key(KeyCode::Char('j')), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::Menu { selected: 1 }));
+        app.handle_key(hit::key(KeyCode::Esc), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn the_editor_view_switch_taps_and_persists_the_choice() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("# T\nbody", false, &[]));
+        app.hits.push(Rect::new(0, 1, 6, 1), Hit::EditorView(true));
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(2, 1), &mut ipc);
+        assert_eq!(
+            app.editor.as_ref().unwrap().mode,
+            EditorMode::Bionic,
+            "tapping 'bionic' selects it"
+        );
+        assert!(app.prefs.editor_bionic, "the choice becomes the default");
+        app.hits.push(Rect::new(0, 1, 6, 1), Hit::EditorView(false));
+        app.handle_mouse(tap(2, 1), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditorMode::Raw);
+        assert!(!app.prefs.editor_bionic);
+    }
+
+    #[test]
+    fn editor_taps_place_the_caret_and_the_wheel_moves_it() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        let content = (0..10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.editor = Some(editor_from(&content, false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 30, 1),
+            Hit::EditorLine { row: 2, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(14, 5), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().cursor(), (2, 4));
+        app.hits.clear();
+        app.hits.push(Rect::new(10, 5, 30, 10), Hit::EditorBody);
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 12, 8), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().cursor().0, 5);
+    }
+
+    #[test]
+    fn editor_drag_scrolls_the_bionic_view_from_the_anchor() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        let content = (0..60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut ed = editor_from(&content, false, &[]);
+        ed.toggle_mode();
+        ed.set_viewport(5);
+        app.editor = Some(ed);
+        app.hits.push(Rect::new(10, 5, 30, 10), Hit::EditorBody);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(12, 10), &mut ipc);
+        app.handle_mouse(left_drag(12, 6), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().scroll, 4);
+        app.handle_mouse(left_drag(12, 30), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().scroll, 0, "clamped at the top");
+    }
+
+    #[test]
+    fn new_files_open_in_the_last_selected_view() {
+        let mut app = App::new();
+        app.locked = false;
+        app.prefs.editor_bionic = true;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::EditorReadFile {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes/x.md",
+                    "content": "# Title\nbody",
+                    "sealed": false,
+                    "version": "v7",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().mode,
+            EditorMode::Bionic,
+            "the open honors the persisted view choice"
+        );
     }
 
     fn peer(name: &str, fp: &str) -> PairPeer {

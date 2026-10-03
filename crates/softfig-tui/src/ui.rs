@@ -13,7 +13,7 @@ use crate::app::{
     baton_headline, ceremony_state, runtime_baton_head, short_fp, App, BackupRow, BusRow,
     CeremonyState, CoordRow, FleetHeader, Overlay, PairField, PeerRow, View,
 };
-use crate::command::command_hints;
+use crate::command::command_menu;
 use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
@@ -26,6 +26,8 @@ fn sel_style() -> Style {
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    // Drag clamping needs the terminal size before render has recorded zones.
+    app.screen = area;
     // Geometry recording takes the previous frame's map out (and reuses its
     // allocation); every zone is rebuilt from this frame's layout.
     let mut hits = std::mem::take(&mut app.hits);
@@ -49,11 +51,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_header(f, app, page_hits, chunks[0]);
     render_body(f, app, page_hits, chunks[1]);
-    render_footer(f, app, page_hits, chunks[2]);
+    render_footer(f, app, chunks[2]);
+    // The floating menu button is page layer: it sits above content, below any
+    // modal, and holds still wherever the user left it.
+    render_fab(f, app, page_hits, area);
 
     match &app.overlay {
         Overlay::None => {}
-        Overlay::Palette(buf) => render_palette(f, buf, &mut hits, area),
+        Overlay::Menu { selected } => render_menu(f, app, *selected, &mut hits, area),
+        Overlay::Palette(buf) => {
+            render_palette(f, buf, app.palette_scroll, &mut hits, area)
+        }
         Overlay::Unlock { buf, error } => render_unlock(f, buf, error.as_deref(), &mut hits, area),
         Overlay::Reveal {
             path,
@@ -120,7 +128,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             error,
         } => render_remove_share(f, id, mount_path, error.as_deref(), &mut hits, area),
         // M3c: leaving a dirty editor asks save/discard first.
-        Overlay::EditorDiscard => render_editor_discard(f, area),
+        Overlay::EditorDiscard => render_editor_discard(f, &mut hits, area),
         Overlay::Help => render_help(f, &mut hits, area),
     }
 
@@ -136,6 +144,98 @@ fn pane_inner(area: Rect) -> Rect {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     }
+}
+
+/// A fixed-size rect centered in `area` (the percentage helper cannot express
+/// "as big as this content needs").
+fn centered_fixed(w: u16, h: u16, area: Rect) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
+}
+
+/// The floating menu button's default spot: bottom-right, one row above the
+/// footer.
+fn default_fab_pos(area: Rect) -> (u16, u16) {
+    let col = area.right().saturating_sub(hit::FAB_W + 2).max(area.x);
+    let row = area.bottom().saturating_sub(hit::FAB_H + 1).max(area.y);
+    (col, row)
+}
+
+/// The floating menu button: a deliberately large touch target that stays put.
+/// A tap (press-release, no motion) opens the action menu; press-and-move
+/// repositions it and the position persists in the UI prefs. Drawn on the page
+/// layer — above content, below modals.
+fn render_fab(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
+    let (col, row) = app.prefs.fab.unwrap_or_else(|| default_fab_pos(area));
+    let col = col.min(area.right().saturating_sub(hit::FAB_W).max(area.x));
+    let row = row.min(area.bottom().saturating_sub(hit::FAB_H).max(area.y));
+    if app.prefs.fab != Some((col, row)) {
+        app.prefs.fab = Some((col, row));
+    }
+    let rect = Rect::new(col, row, hit::FAB_W, hit::FAB_H);
+    if rect.right() > area.right() || rect.bottom() > area.bottom() {
+        // Terminal too small for the button; the keyboard path (`m`) remains.
+        return;
+    }
+    let button = Paragraph::new("menu")
+        .centered()
+        .style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(Color::Cyan)),
+        );
+    f.render_widget(Clear, rect);
+    f.render_widget(button, rect);
+    hits.push(rect, Hit::Fab);
+}
+
+/// The floating action menu: a large checklist of the current view's actions.
+/// Tap a row to run it (the menu closes first, so the action lands on the
+/// page), tap outside or Esc to close. `selected` is the keyboard highlight,
+/// shown as the checked row.
+fn render_menu(f: &mut Frame, app: &App, selected: usize, hits: &mut HitMap, area: Rect) {
+    // Backdrop first: any tap outside the card dismisses. Recorded before the
+    // card's own zones, so the card and its rows win the reverse scan.
+    hits.push(area, Hit::Dismiss);
+    let actions = app.menu_actions();
+    let width = 58u16.min(area.width);
+    let height = (actions.len() as u16 + 4).min(area.height * 4 / 5);
+    let rect = centered_fixed(width, height, area);
+    f.render_widget(Clear, rect);
+    let inner = pane_inner(rect);
+    let mut lines: Vec<Line> = Vec::new();
+    let row_budget = inner.height.saturating_sub(2) as usize;
+    for (i, (label, _)) in actions.iter().enumerate().take(row_budget) {
+        let checked = if i == selected { "[x]" } else { "[ ]" };
+        let style = if i == selected {
+            sel_style()
+        } else {
+            Style::default()
+        };
+        hits.push(
+            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            Hit::MenuRow(i),
+        );
+        lines.push(Line::styled(format!("{checked} {label}"), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "tap an action · tap outside or Esc closes",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let title = format!("actions — {}", app.view.title());
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
 }
 
 /// Record one tap zone per *visible* row of a selection list, so a tap lands
@@ -293,7 +393,7 @@ fn render_body(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
         }
         // M3c: the editor takes the full body width (a focused edit surface;
         // the Browse tree is one Esc away).
-        View::Editor => render_editor(f, app, area),
+        View::Editor => render_editor(f, app, hits, cols[1]),
     }
 }
 
@@ -1744,16 +1844,22 @@ fn render_remove_share(
 /// M3c: the full-body editor pane. Renders only the visible viewport slice of
 /// the cached styled lines (raw source or bionic), keeps the cursor row in
 /// view, and parks the terminal cursor on the editing position in raw mode.
-fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
-    let inner_h = area.height.saturating_sub(2);
+fn render_editor(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
+    let inner = pane_inner(area);
     let Some(ed) = app.editor.as_mut() else {
         let p = Paragraph::new("(no file open)")
             .block(Block::default().borders(Borders::ALL).title("editor"));
         f.render_widget(p, area);
         return;
     };
-    ed.set_viewport(inner_h);
-    ed.scroll_to_cursor();
+    // One pane row is the touch view switch; the rest is text. On a pane too
+    // short for both, the switch yields (keyboard `Tab` still toggles).
+    let switch_h: u16 = if inner.height >= 2 { 1 } else { 0 };
+    let text_h = inner.height.saturating_sub(switch_h);
+    ed.set_viewport(text_h);
+    if ed.mode == EditorMode::Raw {
+        ed.scroll_to_cursor();
+    }
 
     let mode = match ed.mode {
         EditorMode::Raw => "raw",
@@ -1770,42 +1876,129 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
     title.push_str(&format!("  · {row}:{col}  · Tab toggle · Ctrl+S save · Esc exit"));
 
     let start = ed.scroll as usize;
-    let lines: Vec<Line> = {
+    let shown: Vec<Line> = {
         let doc = ed.doc();
-        let end = (start + inner_h as usize).min(doc.len());
+        let end = (start + text_h as usize).min(doc.len());
         if start < end {
             doc[start..end].to_vec()
         } else {
             Vec::new()
         }
     };
-    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    let mut body: Vec<Line> = Vec::with_capacity(shown.len() + 1);
+    if switch_h == 1 {
+        body.push(Line::raw("")); // make room for the switch row
+    }
+    body.extend(shown);
+    let p = Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
+
+    // The touch view switch: `raw [█───] bionic` / `raw [───█] bionic`.
+    // Tapping either word selects that view directly; the track toggles.
+    let dim = Style::default().fg(Color::DarkGray);
+    if switch_h == 1 {
+        let y = inner.y;
+        let mut x = inner.x;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("view ", dim));
+        x += 5;
+        spans.push(Span::styled(
+            "raw",
+            if ed.mode == EditorMode::Raw {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            },
+        ));
+        hits.push(Rect::new(x, y, 3, 1), Hit::EditorView(false));
+        x += 3;
+        spans.push(Span::raw(" "));
+        x += 1;
+        let track = if ed.mode == EditorMode::Bionic {
+            "[───█]"
+        } else {
+            "[█───]"
+        };
+        spans.push(Span::styled(
+            track,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        hits.push(
+            Rect::new(x, y, 6, 1),
+            Hit::EditorView(ed.mode == EditorMode::Raw),
+        );
+        x += 6;
+        spans.push(Span::raw(" "));
+        x += 1;
+        spans.push(Span::styled(
+            "bionic",
+            if ed.mode == EditorMode::Bionic {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            },
+        ));
+        hits.push(Rect::new(x, y, 6, 1), Hit::EditorView(true));
+        f.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, y, inner.width, 1));
+    }
+
+    // Tap-to-place-caret zones (raw mode) + a drag/wheel body zone under them.
+    let text_top = inner.y + switch_h;
+    if text_h > 0 {
+        hits.push(
+            Rect::new(inner.x, text_top, inner.width, text_h),
+            Hit::EditorBody,
+        );
+        if ed.mode == EditorMode::Raw {
+            for i in 0..text_h {
+                let line = start + i as usize;
+                if line >= ed.line_count() {
+                    break;
+                }
+                hits.push(
+                    Rect::new(inner.x, text_top + i, inner.width, 1),
+                    Hit::EditorLine {
+                        row: line,
+                        x0: inner.x,
+                    },
+                );
+            }
+        }
+    }
 
     // Park the terminal cursor on the editing position in raw mode; bionic is
     // a read-only reading view.
-    if ed.mode == EditorMode::Raw && inner_h > 0 && area.width > 2 {
+    if ed.mode == EditorMode::Raw && text_h > 0 && area.width > 2 {
         let visible_row = ed.cursor().0.saturating_sub(ed.scroll as usize) as u16;
-        if visible_row < inner_h {
-            let x = area.x + 1 + (col.saturating_sub(1) as u16).min(area.width - 3);
-            let y = area.y + 1 + visible_row;
+        if visible_row < text_h {
+            let x = inner.x + (col.saturating_sub(1) as u16).min(inner.width.saturating_sub(1));
+            let y = text_top + visible_row;
             f.set_cursor_position((x, y));
         }
     }
 }
 
 /// M3c: the unsaved-changes confirm shown when leaving a dirty editor.
-fn render_editor_discard(f: &mut Frame, area: Rect) {
+fn render_editor_discard(f: &mut Frame, hits: &mut HitMap, area: Rect) {
     let rect = centered_rect(60, 30, area);
     f.render_widget(Clear, rect);
-    let lines: Vec<Line> = vec![
+    let mut lines: Vec<Line> = vec![
         Line::raw("This file has unsaved changes."),
         Line::raw(""),
-        Line::styled(
-            "s save · d discard · Esc back to the editor",
-            Style::default().fg(Color::DarkGray),
-        ),
     ];
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("s save", hit::key(KeyCode::Char('s'))),
+            ("d discard", hit::key(KeyCode::Char('d'))),
+            ("Esc back", hit::key(KeyCode::Esc)),
+        ],
+    ));
     let p = Paragraph::new(lines)
         .block(
             Block::default()
@@ -1837,30 +2030,21 @@ fn render_preview(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
     );
 }
 
-fn render_footer(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
-    let status = format!(" {} ", app.status);
-    let status_width = status.chars().count() as u16;
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(status, Style::default().fg(Color::Black).bg(Color::Gray)),
+fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    // The action chips moved into the floating menu button, so the footer is
+    // status + one dim hint again.
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {} ", app.status),
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
         Span::raw(" "),
-    ];
-    // Contextual action chips: every chip replays the key it names through the
-    // normal dispatcher, so the footer is simultaneously the touch action bar
-    // and the keyboard hint line (they can never drift apart).
-    let mut x = area.x + status_width + 1;
-    for (label, key) in app.footer_actions() {
-        let text = format!("[{label}] ");
-        let width = text.chars().count() as u16;
-        if x + width <= area.x + area.width {
-            hits.push(Rect::new(x, area.y, width, 1), Hit::Key(key));
-        }
-        spans.push(Span::styled(
-            text,
-            Style::default().fg(Color::Black).bg(Color::DarkGray),
-        ));
-        x += width;
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+        Span::styled(
+            "☰ menu — tap to open · hold & move to reposition",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn centered_rect(px: u16, py: u16, area: Rect) -> Rect {
@@ -1882,9 +2066,10 @@ fn centered_rect(px: u16, py: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
-fn render_palette(f: &mut Frame, buf: &str, hits: &mut HitMap, area: Rect) {
-    let rect = centered_rect(80, 30, area);
+fn render_palette(f: &mut Frame, buf: &str, scroll: usize, hits: &mut HitMap, area: Rect) {
+    let rect = centered_rect(80, 85, area);
     f.render_widget(Clear, rect);
+    let inner = pane_inner(rect);
     let mut lines: Vec<Line> = vec![Line::raw(format!(":{buf}")), Line::raw("")];
     let y = rect.y + 1 + lines.len() as u16;
     lines.push(chip_line(
@@ -1897,11 +2082,44 @@ fn render_palette(f: &mut Frame, buf: &str, hits: &mut HitMap, area: Rect) {
         ],
     ));
     lines.push(Line::raw(""));
-    for hint in command_hints().lines() {
-        lines.push(Line::raw(hint.to_string()));
+    // Tappable command rows: a touch user picks a command instead of typing.
+    // The list scrolls (wheel/drag) so rows past the visible budget stay
+    // reachable; the list-area zone is recorded first so row zones win taps.
+    let rows = command_menu();
+    let total = rows.len();
+    let budget = inner.height.saturating_sub(3) as usize;
+    let offset = scroll.min(total.saturating_sub(1));
+    if budget > 0 {
+        hits.push(
+            Rect::new(inner.x, inner.y + 3, inner.width, budget as u16),
+            Hit::PaletteBody,
+        );
     }
+    for (i, (name, description)) in rows.into_iter().skip(offset).take(budget).enumerate() {
+        let row_y = inner.y + 3 + i as u16;
+        hits.push(
+            Rect::new(inner.x, row_y, inner.width, 1),
+            Hit::PalettePick(name),
+        );
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {name:<12}"), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                description.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    let title = if total > budget {
+        format!(
+            "commands — type or tap · {}–{}/{total}",
+            offset + 1,
+            (offset + budget).min(total)
+        )
+    } else {
+        "commands — type or tap".to_string()
+    };
     let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("command"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
 }
@@ -2298,6 +2516,13 @@ fn render_form(f: &mut Frame, form: &ActionForm, hits: &mut HitMap, area: Rect) 
         } else {
             Style::default().fg(Color::Gray)
         };
+        // The field's first row is a tap target: tapping focuses that field
+        // (the same state Tab / ↑↓ move, so touch and keys agree).
+        let field_y = rect.y + 1 + lines.len() as u16;
+        hits.push(
+            Rect::new(rect.x + 1, field_y, rect.width.saturating_sub(2), 1),
+            Hit::FormField(i),
+        );
         match &field.value {
             FieldValue::Line(s) => {
                 lines.push(Line::from(vec![
@@ -2381,6 +2606,7 @@ soft-fig TUI — keys
   r            refresh view
   u            unlock (when locked)
   :            command palette
+  m            open the floating action menu (same as the ☰ button)
   ?            this help
   q            quit
 
@@ -2397,6 +2623,12 @@ short code on both devices before confirming (defeats a MITM)
 backup (M5b): grant a paired host to store this device's chain
 as verified ciphertext it cannot decrypt; revoke stops future
 pushes; chains I host for others show as read-only mirrors
+
+touch: tap a tab / row / action to act · tap a selected row again to
+open · the ☰ button floats anywhere (hold & move to reposition; tap
+to open a checklist of this view's actions; tap outside closes it) ·
+two-finger scroll or drag scrolls panes · the editor's raw/bionic
+switch is tappable and new files open in the view you last chose
 
 any key or tap closes this help";
     let p = Paragraph::new(body)
