@@ -150,10 +150,15 @@ reachable without a keyboard — text entry still needs the on-screen keyboard.
 
 In the editor (`e` on a Browse file) a **raw ↔ bionic switch** sits at the top
 of the pane: tap either label or the track, and new files open in whichever
-view you last chose (persisted). Tap a line to place the caret, wheel/drag to
-scroll. Mouse capture stays on for all of this, so terminal-native text
-selection needs the terminal's Shift modifier (the usual full-screen-app
-trade-off).
+view you last chose (persisted). Tap a line to place the caret, wheel to
+scroll, and drag to select text. A **text selection** is anchored by a
+double-tap on a word (or a right click), then extended by dragging — a
+**magnifier card follows above your finger** showing the caret and the
+selected span, so the finger never hides what is being selected, and the
+finished selection is **copied to the clipboard automatically** (Ctrl-C
+re-copies; the first Esc clears it, the next closes the editor). Mouse
+capture stays on for all of this, so terminal-native text selection needs the
+terminal's Shift modifier (the usual full-screen-app trade-off).
 
 Browse content comes through the daemon's read-only `list_tree` /
 `read_file` verbs, which redact server-side: sealed files show

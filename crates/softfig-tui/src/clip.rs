@@ -42,3 +42,27 @@ pub fn copy_file_to_clipboard(path: &Path) -> io::Result<()> {
         Err(io::Error::other(format!("wl-copy exited with {status}")))
     }
 }
+
+/// Pipe a string into `wl-copy`'s stdin — the editor's user-initiated "copy
+/// selection". Unlike the reveal flow the bytes are necessarily already in
+/// this process (they are the editor buffer, which the daemon already
+/// redacted before handing it over); this only fires on an explicit copy
+/// action, mirroring the reveal flow's clipboard posture.
+pub fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("wl-copy exited with {status}")))
+    }
+}

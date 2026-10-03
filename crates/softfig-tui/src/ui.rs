@@ -55,6 +55,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // The floating menu button is page layer: it sits above content, below any
     // modal, and holds still wherever the user left it.
     render_fab(f, app, page_hits, area);
+    // The selection magnifier is feedback, not a target: no hit zones, and any
+    // modal covers it.
+    render_magnifier(f, app, area);
 
     match &app.overlay {
         Overlay::None => {}
@@ -1885,6 +1888,21 @@ fn render_editor(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
             Vec::new()
         }
     };
+    // Selection highlight: patch the visible slice so the selected char range
+    // reads reversed. Only the visible lines are touched, and only while a
+    // selection exists.
+    let bounds = ed.selection_bounds();
+    let shown: Vec<Line> = shown
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let logical = start + i;
+            match bounds.and_then(|(s, e)| selection_in_line(logical, s, e)) {
+                Some((from, to)) => highlight_line(&line, from, to),
+                None => line,
+            }
+        })
+        .collect();
     let mut body: Vec<Line> = Vec::with_capacity(shown.len() + 1);
     if switch_h == 1 {
         body.push(Line::raw("")); // make room for the switch row
@@ -1978,6 +1996,122 @@ fn render_editor(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
             f.set_cursor_position((x, y));
         }
     }
+}
+
+/// The inclusive char range of the selection within `line`, if it intersects
+/// that line at all. `to_incl` is capped by the caller's `highlight_line`.
+fn selection_in_line(
+    line: usize,
+    (sr, sc): (usize, usize),
+    (er, ec): (usize, usize),
+) -> Option<(usize, usize)> {
+    if line < sr || line > er {
+        return None;
+    }
+    let from = if line == sr { sc } else { 0 };
+    let to_incl = if line == er { ec } else { usize::MAX };
+    Some((from, to_incl))
+}
+
+/// Rebuild a line's spans with the inclusive char range `from..=to_incl`
+/// marked REVERSED, splitting spans at the range edges so the raw/bionic
+/// syntax colours survive the patch.
+fn highlight_line(line: &Line<'static>, from: usize, to_incl: usize) -> Line<'static> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut idx = 0usize;
+    for span in &line.spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let start = idx;
+        let end = idx + chars.len(); // exclusive
+        idx = end;
+        let sel_end = to_incl.saturating_add(1); // exclusive
+        let pieces = [
+            (start, end.min(from), false),
+            (start.max(from), end.min(sel_end), true),
+            (start.max(sel_end), end, false),
+        ];
+        for (s, e, selected) in pieces {
+            let (s, e) = (s.max(start), e.min(end));
+            if e <= s {
+                continue;
+            }
+            let text: String = chars[s - start..e - start].iter().collect();
+            let style = if selected {
+                span.style.add_modifier(Modifier::REVERSED)
+            } else {
+                span.style
+            };
+            out.push(Span::styled(text, style));
+        }
+    }
+    Line::from(out)
+}
+
+/// The text-selection magnifier: while a finger is down and dragging a
+/// selection in the editor, a small card floats just above the touch point
+/// showing the line around the caret with the caret char marked and the
+/// selected chars reversed — so the finger never hides what is being
+/// selected. Feedback only: it records no hit zones.
+fn render_magnifier(f: &mut Frame, app: &App, area: Rect) {
+    if app.view != View::Editor {
+        return;
+    }
+    let Some((px, py)) = app.selection_pointer() else {
+        return;
+    };
+    let Some(ed) = app.editor.as_ref() else {
+        return;
+    };
+    let width = 34u16.min(area.width.saturating_sub(2)).max(12);
+    let height = 3u16;
+    let x = px
+        .saturating_sub(width / 2)
+        .min(area.right().saturating_sub(width))
+        .max(area.x);
+    // Float it above the finger; flip below only when there is no room above.
+    let above = py.saturating_sub(height + 1);
+    let y = if above > area.y {
+        above
+    } else {
+        (py + 2).min(area.bottom().saturating_sub(height))
+    };
+    let rect = Rect::new(x, y, width, height);
+    f.render_widget(Clear, rect);
+
+    let (row, col) = ed.cursor();
+    let chars: Vec<char> = ed.line_text(row).chars().collect();
+    let inner_w = width.saturating_sub(2) as usize;
+    let from = col.saturating_sub(inner_w / 2).min(chars.len());
+    let to = (from + inner_w).min(chars.len());
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, c) in chars.iter().enumerate().take(to).skip(from) {
+        let at_caret = i == col;
+        let selected = ed.selection_contains(row, i);
+        let mut style = Style::default();
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        if at_caret {
+            style = style.fg(Color::Black).bg(Color::Yellow);
+        }
+        spans.push(Span::styled(c.to_string(), style));
+    }
+    if col >= chars.len() {
+        spans.push(Span::styled("▏", Style::default().fg(Color::Yellow)));
+    }
+    let selected = ed.selected_text().map_or(0, |t| t.chars().count());
+    let title = if selected > 0 {
+        format!("cursor {}:{} · sel {selected}", row + 1, col + 1)
+    } else {
+        format!("cursor {}:{}", row + 1, col + 1)
+    };
+    let p = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(title),
+    );
+    f.render_widget(p, rect);
 }
 
 /// M3c: the unsaved-changes confirm shown when leaving a dirty editor.
@@ -2629,6 +2763,12 @@ open · the ☰ button floats anywhere (hold & move to reposition; tap
 to open a checklist of this view's actions; tap outside closes it) ·
 two-finger scroll or drag scrolls panes · the editor's raw/bionic
 switch is tappable and new files open in the view you last chose
+
+selecting text (editor, raw view): double-tap a word (or right-click)
+to select it, then drag to extend · a magnifier card follows above
+your finger showing the caret · the selection is copied to the
+clipboard automatically when it completes (Ctrl-C re-copies it) ·
+the first Esc clears it, the next closes the editor
 
 any key or tap closes this help";
     let p = Paragraph::new(body)

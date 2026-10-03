@@ -1092,6 +1092,51 @@ fn tapping_a_form_field_focuses_it() {
     }
 }
 
+#[test]
+fn the_selection_magnifier_follows_a_drag_in_the_editor() {
+    use softfig_tui::editor::Editor;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    app.editor = Some(Editor::from_read(
+        "notes/x.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::EditorLine { row: 0, .. }));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: column + 4,
+            row: row + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut ipc,
+    );
+    assert!(app.selection_pointer().is_some(), "gesture in progress");
+    assert!(
+        app.editor.as_ref().unwrap().has_selection(),
+        "the drag selected text"
+    );
+
+    // Redraw: the magnifier card must be part of the frame.
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| softfig_tui::ui::render(f, &mut app)).unwrap();
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("cursor "),
+        "magnifier card missing:\n{rendered}"
+    );
+}
+
 // ---- M3c editor frames ----
 
 #[test]
