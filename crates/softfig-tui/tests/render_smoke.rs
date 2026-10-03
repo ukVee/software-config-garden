@@ -2,11 +2,21 @@
 //! tree + preview and assert the key chrome and content appear. Proves the
 //! render path wires together without a real terminal (the live key
 //! handling is a manual smoke step).
+//!
+//! The pointer/touch tests at the bottom go one step further: they render a
+//! real frame, read a hit zone out of `App::hits`, and dispatch a synthetic
+//! mouse event at that zone — so the drawn geometry and the tap handling are
+//! proven to agree, not just each half in isolation.
 
+use std::path::PathBuf;
+
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use softfig_ipc::TreeEntry;
-use softfig_tui::app::App;
+use softfig_tui::app::{App, Overlay, View};
+use softfig_tui::hit::Hit;
+use softfig_tui::ipc::IpcClient;
 use softfig_tui::ui;
 
 fn entry(name: &str, is_dir: bool) -> TreeEntry {
@@ -823,5 +833,142 @@ fn growlight_tab_absent_when_disabled() {
     assert!(
         !rendered.contains("Growlight"),
         "growlight tab must be absent when disabled:\n{rendered}"
+    );
+}
+
+// ---- pointer/touch: drawn geometry drives the synthetic events ------------
+
+/// The top-left cell of the first recorded zone matching `wanted`.
+fn point_at(app: &App, wanted: impl Fn(Hit) -> bool) -> (u16, u16) {
+    let zone = app
+        .hits
+        .zones()
+        .iter()
+        .find(|z| wanted(z.hit))
+        .expect("zone not recorded");
+    (zone.rect.x, zone.rect.y)
+}
+
+/// A synthetic left-button press at a cell (what a tap / touch-pointer click
+/// delivers to the event loop).
+fn press(app: &mut App, ipc: &mut IpcClient, column: u16, row: u16) {
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        ipc,
+    );
+}
+
+fn dummy_ipc() -> IpcClient {
+    // A bogus socket: the worker idles/errors on connect and never blocks the
+    // test. State mutations happen synchronously before any send.
+    IpcClient::spawn(PathBuf::from("/nonexistent/softfig.sock"))
+}
+
+fn draw(app: &mut App) {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, app)).unwrap();
+}
+
+#[test]
+fn a_tap_on_the_history_tab_switches_view() {
+    let mut app = App::new();
+    app.locked = false;
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| {
+        matches!(h, Hit::Key(k) if k.code == KeyCode::Char('2'))
+    });
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(app.view, View::History);
+}
+
+#[test]
+fn a_tap_on_a_visible_row_selects_and_a_second_tap_activates() {
+    let mut app = App::new();
+    app.locked = false;
+    app.tree
+        .set_children("", vec![entry("CLAUDE.md", false), entry("meta", true)]);
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::Row { index: 1, .. }));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(app.tree.selected, 1, "the tap lands on the drawn row");
+    assert!(!app.tree.is_expanded("meta"), "one tap only selects");
+    press(&mut app, &mut ipc, column, row);
+    assert!(app.tree.is_expanded("meta"), "the second tap activates");
+}
+
+#[test]
+fn a_footer_chip_is_tappable_and_opens_its_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Deploy;
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| {
+        matches!(h, Hit::Key(k) if k.code == KeyCode::Char('F'))
+    });
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert!(
+        matches!(app.overlay, Overlay::DeployForce { .. }),
+        "the force chip runs the same path as the F key"
+    );
+}
+
+#[test]
+fn a_modal_blocks_page_taps_and_records_its_own_chips() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Peers;
+    app.tree.set_children("", vec![entry("meta", true)]);
+    app.overlay = Overlay::PairConfirm {
+        pairing_id: "pid-1".into(),
+        sas: "123 456".into(),
+        fingerprint: "f".repeat(64),
+        name: "laptop".into(),
+        error: None,
+    };
+    draw(&mut app);
+
+    assert!(
+        app.hits
+            .zones()
+            .iter()
+            .all(|z| !matches!(z.hit, Hit::Row { .. })),
+        "page rows must be inert while a modal is open"
+    );
+    let (column, row) = point_at(&app, |h| {
+        matches!(h, Hit::Key(k) if k.code == KeyCode::Char('y'))
+    });
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert!(app.status.contains("confirming"), "the y chip confirmed");
+    assert!(
+        matches!(app.overlay, Overlay::PairConfirm { .. }),
+        "the modal stays open until the daemon answers"
+    );
+}
+
+#[test]
+fn a_tap_anywhere_dismisses_the_help_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = Overlay::Help;
+    draw(&mut app);
+
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, 50, 15);
+    assert!(
+        !matches!(app.overlay, Overlay::Help),
+        "the help card must dismiss on tap"
     );
 }

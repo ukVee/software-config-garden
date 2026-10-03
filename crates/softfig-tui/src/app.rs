@@ -7,7 +7,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use serde_json::{json, Value};
 use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
@@ -25,6 +27,7 @@ use crate::clip;
 use crate::command::{parse_command, Command};
 use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
+use crate::hit::{self, Hit, HitMap, ListId};
 use crate::ipc::{IpcClient, Reply, Tag};
 use crate::listpane::ListPane;
 use crate::tree::{
@@ -265,6 +268,16 @@ pub struct HistoryLine {
     pub summary: String,
 }
 
+/// An in-flight drag-scroll in the preview/detail pane. `row` is where the
+/// press landed, `scroll` the preview offset then; both stay fixed for the
+/// gesture so drag updates compute an absolute offset (a relative delta would
+/// re-apply on every motion event) and can never drift mid-drag.
+#[derive(Debug, Clone, Copy)]
+struct DragAnchor {
+    row: u16,
+    scroll: u16,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub locked: bool,
@@ -413,6 +426,12 @@ pub struct App {
     /// down. Empty until the first reply (or genuinely no messages); the detail
     /// pane renders a calm placeholder then.
     pub growlight_bus: Vec<BusRow>,
+    /// Per-frame pointer/touch geometry, recorded by the renderer and consumed
+    /// by [`Self::handle_mouse`]. Rebuilt on every draw; empty before the first
+    /// frame (taps then fall through to no-ops / the preview-scroll default).
+    pub hits: HitMap,
+    /// The preview drag-scroll anchor while a mouse button is held.
+    drag: Option<DragAnchor>,
     /// The PROTOCOL half of the injected-context node (slice 006): `growlight/protocol.md`
     /// read through the resolver's garden arm on select and cached here. `None`
     /// until the first select's read lands; the detail pane assembles it with the
@@ -486,6 +505,8 @@ impl App {
             fleet: FleetHeader::Unknown,
             growlight_runtime_baton: None,
             growlight_bus: Vec::new(),
+            hits: HitMap::new(),
+            drag: None,
             growlight_injected_protocol: None,
             overlay: Overlay::None,
             status: "starting…".into(),
@@ -1783,12 +1804,229 @@ impl App {
         }
     }
 
-    /// Wheel events scroll the preview pane, three lines per notch.
-    pub fn handle_mouse(&mut self, ev: MouseEvent, _ipc: &mut IpcClient) {
+    /// The contextual action chips on the footer — every view's key-driven
+    /// feature (pair/unpair, grant/revoke, apply/force, share/toggle/un-share,
+    /// reveal/copy/refresh) plus the global palette/help/quit. Returned as
+    /// `(label, key)`: the renderer draws each as a tappable chip and the
+    /// mouse path replays the key, so touch gets full action parity by
+    /// construction and never grows a second action vocabulary.
+    pub fn footer_actions(&self) -> Vec<(&'static str, KeyEvent)> {
+        let mut actions: Vec<(&'static str, KeyEvent)> = Vec::new();
+        if self.locked {
+            actions.push(("u unlock", hit::key(KeyCode::Char('u'))));
+        } else {
+            match self.view {
+                View::Browse => {
+                    actions.push(("x reveal", hit::key(KeyCode::Char('x'))));
+                    actions.push(("c copy", hit::key(KeyCode::Char('c'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::History => actions.push(("r refresh", hit::key(KeyCode::Char('r')))),
+                View::Vault => {
+                    actions.push(("x reveal", hit::key(KeyCode::Char('x'))));
+                    actions.push(("c copy", hit::key(KeyCode::Char('c'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Peers => {
+                    actions.push(("p pair", hit::key(KeyCode::Char('p'))));
+                    actions.push(("D unpair", hit::key(KeyCode::Char('D'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Backup => {
+                    actions.push(("g grant", hit::key(KeyCode::Char('g'))));
+                    actions.push(("D revoke", hit::key(KeyCode::Char('D'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Deploy => {
+                    actions.push(("a apply", hit::key(KeyCode::Char('a'))));
+                    actions.push(("F force", hit::key(KeyCode::Char('F'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Shares => {
+                    actions.push(("a share", hit::key(KeyCode::Char('a'))));
+                    actions.push(("e on/off", hit::key(KeyCode::Char('e'))));
+                    actions.push(("D un-share", hit::key(KeyCode::Char('D'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Growlight | View::Coordination => {
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+            }
+        }
+        actions.push((":cmd", hit::key(KeyCode::Char(':'))));
+        actions.push(("? help", hit::key(KeyCode::Char('?'))));
+        actions.push(("q quit", hit::key(KeyCode::Char('q'))));
+        actions
+    }
+
+    /// Pointer/touch events. A tap replays the recorded hit's key or lands the
+    /// selection on a row; the wheel routes to whatever pane is under the
+    /// cursor (list panes move their selection, the preview scrolls); a held
+    /// left button in the preview drag-scrolls it. With no zones recorded
+    /// (e.g. before the first frame) the wheel keeps its original behaviour —
+    /// scroll the preview — so behaviour degrades gracefully, never silently.
+    pub fn handle_mouse(&mut self, ev: MouseEvent, ipc: &mut IpcClient) {
         match ev.kind {
-            MouseEventKind::ScrollDown => self.scroll_preview(3),
-            MouseEventKind::ScrollUp => self.scroll_preview(-3),
+            MouseEventKind::ScrollDown => self.scroll_at(ev.column, ev.row, 3, ipc),
+            MouseEventKind::ScrollUp => self.scroll_at(ev.column, ev.row, -3, ipc),
+            MouseEventKind::Down(MouseButton::Left) => self.tap(ev.column, ev.row, false, ipc),
+            // The touch-pointer plugin maps a double-tap to a right click:
+            // treat it as "activate the row under the finger" directly.
+            MouseEventKind::Down(MouseButton::Right) => self.tap(ev.column, ev.row, true, ipc),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(ev.row),
+            MouseEventKind::Up(_) => self.drag = None,
             _ => {}
+        }
+    }
+
+    /// One tap/click: dispatch the recorded hit. `activate` forces activation
+    /// even when the row was not already selected (right click / double-tap).
+    fn tap(&mut self, column: u16, row: u16, activate: bool, ipc: &mut IpcClient) {
+        let Some(hit) = self.hits.hit_at(column, row) else {
+            return;
+        };
+        match hit {
+            // Tabs, footer action chips, and overlay confirm/cancel chips all
+            // replay a key, so they hit exactly the keyboard path — including
+            // its guards (locked, gated growlight tab, form focus state).
+            Hit::Key(key) => self.handle_key(key, ipc),
+            Hit::Dismiss => self.overlay = Overlay::None,
+            Hit::Preview => {
+                if !activate {
+                    self.drag = Some(DragAnchor {
+                        row,
+                        scroll: self.preview_scroll,
+                    });
+                }
+            }
+            Hit::RegionRow(index) => {
+                let already = matches!(
+                    &self.overlay,
+                    Overlay::RevealRegion { selected, .. } if *selected == index
+                );
+                if let Overlay::RevealRegion { selected, .. } = &mut self.overlay {
+                    *selected = index;
+                }
+                if activate || already {
+                    self.handle_key(hit::key(KeyCode::Enter), ipc);
+                }
+            }
+            Hit::Row { list, index } => {
+                let already = self.list_selected(list) == Some(index);
+                self.select_list(list, index, ipc);
+                if activate || already {
+                    self.activate(ipc);
+                }
+            }
+        }
+    }
+
+    /// Wheel routing: a list under the cursor moves its selection, the preview
+    /// looks after itself, and an open region picker moves its highlighted row.
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32, ipc: &mut IpcClient) {
+        match self.hits.hit_at(column, row) {
+            Some(Hit::Row { .. }) => self.move_selection(delta, ipc),
+            Some(Hit::RegionRow(_)) => self.move_region_selection(delta),
+            Some(Hit::Preview) => self.scroll_preview(delta),
+            // No zone (before the first frame, or a header/footer cell): the
+            // pre-touch default, so the wheel always does something sensible.
+            _ => self.scroll_preview(delta),
+        }
+    }
+
+    /// Move the active view's selection by `delta` rows (a wheel notch = 3).
+    fn move_selection(&mut self, delta: i32, ipc: &mut IpcClient) {
+        for _ in 0..delta.unsigned_abs() {
+            if delta < 0 {
+                self.nav_up(ipc);
+            } else {
+                self.nav_down(ipc);
+            }
+        }
+    }
+
+    fn move_region_selection(&mut self, delta: i32) {
+        let Overlay::RevealRegion { ids, selected, .. } = &mut self.overlay else {
+            return;
+        };
+        let last = ids.len().saturating_sub(1) as i32;
+        *selected = (*selected as i32 + delta).clamp(0, last) as usize;
+    }
+
+    /// Drag in the preview: content follows the finger — dragging up reveals
+    /// lower lines. Computed from the fixed anchor, so an absolute target is
+    /// set on every motion event (a relative delta would compound).
+    fn drag_to(&mut self, row: u16) {
+        let Some(anchor) = self.drag else {
+            return;
+        };
+        let delta = anchor.row as i32 - row as i32;
+        let max = self.preview_max_scroll() as i32;
+        self.preview_scroll = (anchor.scroll as i32 + delta).clamp(0, max) as u16;
+    }
+
+    /// The current selection of a primary list (tap-to-activate detection).
+    fn list_selected(&self, list: ListId) -> Option<usize> {
+        match list {
+            ListId::Browse => Some(self.tree.selected),
+            ListId::History => Some(self.history_selected),
+            ListId::Vault => Some(self.vault.selected),
+            ListId::Peers => Some(self.peer_list.selected),
+            ListId::Backup => Some(self.backup.selected),
+            ListId::Deploy => Some(self.deploy.selected),
+            ListId::Shares => Some(self.shares_selected),
+            ListId::Growlight => Some(self.growlight_tree.selected),
+            ListId::Coordination => Some(self.coordination_selected),
+        }
+    }
+
+    /// Land the selection of a primary list exactly on a tapped row. The
+    /// index is already render-derived, so it is in range; the guards here
+    /// keep a stale zone from a mid-render resize harmless.
+    fn select_list(&mut self, list: ListId, index: usize, ipc: &mut IpcClient) {
+        match list {
+            ListId::Browse => self.tree.select(index),
+            ListId::History => {
+                if index < self.history.len() {
+                    self.history_selected = index;
+                }
+            }
+            ListId::Vault => {
+                if index < self.vault.items.len() {
+                    self.vault.selected = index;
+                }
+            }
+            ListId::Peers => {
+                if index < self.peer_list.items.len() {
+                    self.peer_list.selected = index;
+                }
+            }
+            ListId::Backup => {
+                if index < self.backup.items.len() {
+                    self.backup.selected = index;
+                }
+            }
+            ListId::Deploy => {
+                if index < self.deploy.items.len() {
+                    self.deploy.selected = index;
+                }
+            }
+            ListId::Shares => {
+                // Trailing offer rows are informational, not selectable.
+                if index < self.shares.len() {
+                    self.shares_selected = index;
+                }
+            }
+            ListId::Growlight => {
+                self.growlight_tree.select(index);
+                self.refresh_growlight_selection(ipc);
+            }
+            ListId::Coordination => {
+                if index < self.coordination_rows.len() {
+                    self.coordination_selected = index;
+                }
+                self.coordination_preview = None;
+            }
         }
     }
 
@@ -3028,6 +3266,7 @@ fn format_commit(r: &ShowReply) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Rect;
 
     #[test]
     fn locked_blocks_actions_and_nav() {
@@ -3313,6 +3552,8 @@ mod tests {
         app.preview_viewport = 5;
         app.preview_total = 100;
         let mut ipc = dummy_ipc();
+        // No zones recorded (e.g. before the first frame): the wheel keeps the
+        // pre-touch behaviour and scrolls the preview.
         let wheel = |kind| MouseEvent {
             kind,
             column: 0,
@@ -3325,6 +3566,193 @@ mod tests {
         assert_eq!(app.preview_scroll, 6);
         app.handle_mouse(wheel(MouseEventKind::ScrollUp), &mut ipc);
         assert_eq!(app.preview_scroll, 3);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn tap(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn tapping_a_row_selects_it_and_tapping_it_again_activates() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree.set_children(
+            "",
+            vec![tree_entry("a.md", "a.md", false), tree_entry("dir", "dir", true)],
+        );
+        app.hits
+            .push(Rect::new(5, 5, 20, 1), Hit::Row { list: ListId::Browse, index: 1 });
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(7, 5), &mut ipc);
+        assert_eq!(app.tree.selected, 1, "first tap lands the selection");
+        assert!(!app.tree.is_expanded("dir"), "first tap must not activate");
+        // The second tap on the already-selected row activates: a dir expands
+        // (and lazily loads its children).
+        app.handle_mouse(tap(7, 5), &mut ipc);
+        assert!(app.tree.is_expanded("dir"), "second tap activates the row");
+    }
+
+    #[test]
+    fn right_click_activates_a_row_directly() {
+        // The touch-pointer plugin maps a double-tap to a right click, so it
+        // must activate without needing a prior selecting tap.
+        let mut app = App::new();
+        app.locked = false;
+        app.tree
+            .set_children("", vec![tree_entry("dir", "dir", true)]);
+        app.hits
+            .push(Rect::new(0, 0, 5, 1), Hit::Row { list: ListId::Browse, index: 0 });
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 1, 0),
+            &mut ipc,
+        );
+        assert_eq!(app.tree.selected, 0);
+        assert!(app.tree.is_expanded("dir"));
+    }
+
+    #[test]
+    fn a_tap_outside_every_zone_is_a_no_op() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree
+            .set_children("", vec![tree_entry("a.md", "a.md", false)]);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(90, 30), &mut ipc);
+        assert_eq!(app.tree.selected, 0);
+    }
+
+    #[test]
+    fn wheel_over_a_list_moves_its_selection_instead_of_scrolling() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree.set_children(
+            "",
+            (0..6)
+                .map(|i| tree_entry(&format!("f{i}.md"), &format!("f{i}.md"), false))
+                .collect(),
+        );
+        app.hits
+            .push(Rect::new(0, 0, 10, 10), Hit::Row { list: ListId::Browse, index: 0 });
+        app.preview_viewport = 5;
+        app.preview_total = 100;
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 1), &mut ipc);
+        assert_eq!(app.tree.selected, 3, "wheel notch moves three rows");
+        assert_eq!(app.preview_scroll, 0, "the list consumed the wheel");
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 1), &mut ipc);
+        assert_eq!(app.tree.selected, 0);
+    }
+
+    #[test]
+    fn wheel_over_the_preview_zone_scrolls_the_preview() {
+        let mut app = App::new();
+        app.preview_viewport = 5;
+        app.preview_total = 100;
+        app.hits.push(Rect::new(40, 0, 60, 30), Hit::Preview);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 50, 10), &mut ipc);
+        assert_eq!(app.preview_scroll, 3);
+    }
+
+    #[test]
+    fn drag_in_the_preview_scrolls_from_the_fixed_anchor() {
+        let mut app = App::new();
+        app.preview_viewport = 5;
+        app.preview_total = 100;
+        app.hits.push(Rect::new(40, 0, 60, 30), Hit::Preview);
+        let mut ipc = dummy_ipc();
+        // Finger down at row 10, then dragged up to row 6 → content follows.
+        app.handle_mouse(tap(50, 10), &mut ipc);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 6), &mut ipc);
+        assert_eq!(app.preview_scroll, 4);
+        // Coalesced events compute from the anchor, not the previous event.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 6), &mut ipc);
+        assert_eq!(app.preview_scroll, 4, "a repeat must not compound");
+        // Dragging back down past the anchor clamps at the top.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 40), &mut ipc);
+        assert_eq!(app.preview_scroll, 0);
+        // Releasing ends the gesture: later motion is ignored.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, 40), &mut ipc);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 5), &mut ipc);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn a_modal_chip_replays_its_key_and_keeps_the_modal() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::PairConfirm {
+            pairing_id: "pid-1".into(),
+            sas: "123 456".into(),
+            fingerprint: "f".repeat(64),
+            name: "laptop".into(),
+            error: None,
+        };
+        app.hits
+            .push(Rect::new(10, 10, 8, 1), Hit::Key(hit::key(KeyCode::Char('y'))));
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(12, 10), &mut ipc);
+        assert!(app.status.contains("confirming"), "chip ran the confirm key");
+        assert!(
+            matches!(app.overlay, Overlay::PairConfirm { .. }),
+            "the modal stays until the daemon answers"
+        );
+    }
+
+    #[test]
+    fn region_rows_select_then_the_second_tap_advances() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::RevealRegion {
+            path: "config/db.toml".into(),
+            ids: vec!["db-pw".into(), "api-token".into()],
+            selected: 0,
+        };
+        app.hits.push(
+            Rect::new(3, 6, 30, 1),
+            Hit::RegionRow(1),
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(5, 6), &mut ipc);
+        assert!(
+            matches!(&app.overlay, Overlay::RevealRegion { selected, .. } if *selected == 1),
+            "first tap selects the region"
+        );
+        app.handle_mouse(tap(5, 6), &mut ipc);
+        assert!(
+            matches!(&app.overlay, Overlay::Reveal { id: Some(id), .. } if id == "api-token"),
+            "second tap advances to the masked prompt with that id"
+        );
+    }
+
+    #[test]
+    fn footer_chips_expose_each_views_actions() {
+        let mut app = App::new();
+        app.locked = false;
+        let labels = |app: &App| -> Vec<&'static str> {
+            app.footer_actions().into_iter().map(|(l, _)| l).collect()
+        };
+        app.view = View::Deploy;
+        let deploy = labels(&app);
+        assert!(deploy.contains(&"a apply") && deploy.contains(&"F force"));
+        app.view = View::Shares;
+        let shares = labels(&app);
+        assert!(shares.contains(&"a share") && shares.contains(&"D un-share"));
+        // While locked there are no page actions — just unlock + globals.
+        app.locked = true;
+        let locked = labels(&app);
+        assert!(locked.contains(&"u unlock"));
+        assert!(!locked.contains(&"a apply"));
     }
 
     fn peer(name: &str, fp: &str) -> PairPeer {

@@ -132,6 +132,18 @@ reveal's value · `u` unlock · `:` command palette (runs `log_decision`,
 `log_incident`, `archive`, `add_project`, `refresh_snapshot`, `propose`,
 `seal`, `unseal`) · `r` refresh · `?` help · `q` quit.
 
+**Pointer / touch.** The TUI records its on-screen geometry every frame, so a
+mouse click or a touchscreen tap works everywhere a key does: tap a header tab
+to switch views; tap a list/tree row to select it and tap it again to
+open/expand (a double-tap — a right click under the touch-pointer Wayfire
+plugin — activates directly); the wheel (two-finger drag) scrolls the pane
+under the cursor, and a held drag in the preview scrolls it. The footer shows
+the current view's actions as tappable chips (`[a apply]`, `[D unpair]`, …)
+and dialogs carry `[y confirm]` / `[n cancel]` chips, so every feature is
+reachable without a keyboard — text entry still needs the on-screen keyboard.
+Mouse capture stays on for this, so terminal-native text selection needs the
+terminal's Shift modifier (the usual full-screen-app trade-off).
+
 Browse content comes through the daemon's read-only `list_tree` /
 `read_file` verbs, which redact server-side: sealed files show
 `[sealed:<path>]`, inline `<vault id="…">` regions show `[encrypted]` —

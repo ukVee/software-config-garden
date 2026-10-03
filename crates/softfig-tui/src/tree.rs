@@ -116,6 +116,14 @@ impl TreeModel {
         }
     }
 
+    /// Jump the selection to a visible row (a tap), clamped into range.
+    pub fn select(&mut self, index: usize) {
+        let len = self.visible().len();
+        if len > 0 {
+            self.selected = index.min(len - 1);
+        }
+    }
+
     /// Keep `selected` inside the visible range after a structure change.
     pub fn clamp_selection(&mut self) {
         let len = self.visible().len();
@@ -668,6 +676,15 @@ impl BacklogTree {
     pub fn move_down(&mut self) {
         let len = self.visible().len();
         self.selected = wrapping_step(self.selected, len, true);
+    }
+
+    /// Jump the selection to a visible row (a tap), clamped into range —
+    /// unlike `move_*` which wraps, a tap lands exactly where it points.
+    pub fn select(&mut self, index: usize) {
+        let len = self.visible().len();
+        if len > 0 {
+            self.selected = index.min(len - 1);
+        }
     }
 
     /// Keep `selected` inside the visible range after a collapse/reload.
