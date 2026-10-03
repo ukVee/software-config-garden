@@ -1969,20 +1969,21 @@ fn render_editor(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
             Rect::new(inner.x, text_top, inner.width, text_h),
             Hit::EditorBody,
         );
-        if ed.mode == EditorMode::Raw {
-            for i in 0..text_h {
-                let line = start + i as usize;
-                if line >= ed.line_count() {
-                    break;
-                }
-                hits.push(
-                    Rect::new(inner.x, text_top + i, inner.width, 1),
-                    Hit::EditorLine {
-                        row: line,
-                        x0: inner.x,
-                    },
-                );
+        // Line zones exist in both modes: raw uses them for tap-to-caret and
+        // drag-select, bionic for the double-tap word selection + extend
+        // (plain bionic drags still free-scroll — decided in `drag_to`).
+        for i in 0..text_h {
+            let line = start + i as usize;
+            if line >= ed.line_count() {
+                break;
             }
+            hits.push(
+                Rect::new(inner.x, text_top + i, inner.width, 1),
+                Hit::EditorLine {
+                    row: line,
+                    x0: inner.x,
+                },
+            );
         }
     }
 
@@ -2758,13 +2759,14 @@ backup (M5b): grant a paired host to store this device's chain
 as verified ciphertext it cannot decrypt; revoke stops future
 pushes; chains I host for others show as read-only mirrors
 
-touch: tap a tab / row / action to act · tap a selected row again to
-open · the ☰ button floats anywhere (hold & move to reposition; tap
-to open a checklist of this view's actions; tap outside closes it) ·
-two-finger scroll or drag scrolls panes · the editor's raw/bionic
-switch is tappable and new files open in the view you last chose
+touch: tap a tab / row / action to act · tapping a file/folder row opens
+it immediately (other lists select first) · the ☰ button floats anywhere
+(hold & move to reposition; tap to open a checklist of this view's
+actions; tap outside closes it) · two-finger scroll or drag scrolls panes ·
+the editor's raw/bionic switch is tappable and new files open in the view
+you last chose
 
-selecting text (editor, raw view): double-tap a word (or right-click)
+selecting text (editor, raw or bionic): double-tap a word (or right-click)
 to select it, then drag to extend · a magnifier card follows above
 your finger showing the caret · the selection is copied to the
 clipboard automatically when it completes (Ctrl-C re-copies it) ·

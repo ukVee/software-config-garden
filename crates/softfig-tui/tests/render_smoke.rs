@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use ratatui::Terminal;
 use softfig_ipc::TreeEntry;
 use softfig_tui::app::{App, Overlay, View};
@@ -890,7 +891,7 @@ fn a_tap_on_the_history_tab_switches_view() {
 }
 
 #[test]
-fn a_tap_on_a_visible_row_selects_and_a_second_tap_activates() {
+fn a_tap_on_a_visible_row_selects_and_opens_it() {
     let mut app = App::new();
     app.locked = false;
     app.tree
@@ -901,9 +902,8 @@ fn a_tap_on_a_visible_row_selects_and_a_second_tap_activates() {
     let mut ipc = dummy_ipc();
     press(&mut app, &mut ipc, column, row);
     assert_eq!(app.tree.selected, 1, "the tap lands on the drawn row");
-    assert!(!app.tree.is_expanded("meta"), "one tap only selects");
-    press(&mut app, &mut ipc, column, row);
-    assert!(app.tree.is_expanded("meta"), "the second tap activates");
+    // Smoke: the file/folder trees open on the first tap.
+    assert!(app.tree.is_expanded("meta"), "one tap opens the folder");
 }
 
 // (The old footer action-chip test is superseded by the floating-button menu
@@ -1203,4 +1203,115 @@ fn renders_editor_bionic_frame() {
         "bionic text missing"
     );
     assert!(rendered.contains("API stays code"), "code line missing");
+}
+
+/// The selected span must actually render reversed in the frame — both for a
+/// double-tap word selection and mid-drag (manual smoke: selection state
+/// existed but was invisible on the device).
+#[test]
+fn editor_selection_renders_reversed_cells() {
+    use softfig_tui::editor::Editor;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    let mut ed = Editor::from_read(
+        "notes/sel.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    );
+    ed.select_word_at(0, 5); // selects "quick"
+    app.editor = Some(ed);
+    assert_reversed(&mut app, "quick");
+
+    // The live drag path must light up mid-gesture, not only at rest.
+    app.editor = Some(Editor::from_read(
+        "notes/sel.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    app.hits = softfig_tui::hit::HitMap::new();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::EditorLine { row: 0, .. }));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: column + 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut ipc,
+    );
+    assert!(
+        app.editor.as_ref().unwrap().has_selection(),
+        "drag created a selection"
+    );
+    assert_reversed(&mut app, "the q");
+}
+
+/// Bionic is the persisted default editor view; a double-tap word selection
+/// must highlight there too (smoke finding: selection looked impossible).
+#[test]
+fn bionic_editor_selection_renders_reversed_cells() {
+    use softfig_tui::editor::{Editor, EditorMode};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    let mut ed = Editor::from_read(
+        "notes/sel.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    );
+    ed.set_mode(EditorMode::Bionic);
+    ed.select_word_at(0, 5);
+    app.editor = Some(ed);
+    assert_reversed(&mut app, "quick");
+}
+
+/// Render `app` at the standard test size and assert every frame cell of
+/// `needle` carries the REVERSED modifier.
+fn assert_reversed(app: &mut App, needle: &str) {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let rows: Vec<Vec<char>> = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| {
+                    buf.cell((x, y))
+                        .and_then(|c| c.symbol().chars().next())
+                        .unwrap_or(' ')
+                })
+                .collect()
+        })
+        .collect();
+    let pat: Vec<char> = needle.chars().collect();
+    let (y, x) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, cs)| {
+            cs.windows(pat.len())
+                .position(|w| w == pat.as_slice())
+                .map(|x| (y, x))
+        })
+        .unwrap_or_else(|| panic!("{needle:?} not rendered"));
+    for i in 0..pat.len() as u16 {
+        let cell = buf.cell((x as u16 + i, y as u16)).unwrap();
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "{needle:?} char {i} is not reversed: {cell:?}"
+        );
+    }
 }

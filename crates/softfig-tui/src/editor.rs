@@ -8,21 +8,30 @@
 //! a line edit restyles just that line, and only a fence-marker edit re-walks
 //! the tail (the rare case).
 //!
-//! ## Save seam (the one non-wired piece)
+//! ## Save path (wired: one async `patch_file`)
 //!
-//! [`WritePath`] is the seam. The prototype ships [`UnwiredWritePath`] (the
-//! app default) and a test-only [`FakeWritePath`]. The locked real
-//! implementation is ONE `patch_file` IPC call —
+//! A save is ONE `patch_file` IPC call, sent over the app's worker-thread
+//! client so the UI thread never blocks on the round-trip:
 //!
 //! ```text
-//! patch_file { path, old: <exact read_file content>, new: <buffer>,
-//!              expected_version: <read_file.version> }
+//! patch_file { path, old: <pristine base>, new: <buffer>,
+//!              expected_version: <CAS token> }
 //! ```
 //!
-//! — which is daemon-mediated, mount-safe (`WorkTree`), vault-refusing
+//! The reply is routed back through `App::apply_reply` (tag
+//! `Tag::EditorSave`); a success calls [`Editor::mark_saved`], while a
+//! `Conflict` or vault refusal keeps the buffer and its dirty flag. This
+//! module stays pure — [`Editor::pending_write`] owns the operands
+//! ([`EditorWrite`]) and [`Editor::mark_saved`] the post-reply state
+//! transition; the wire lives in `app.rs`/`ipc.rs`.
+//!
+//! The verb is daemon-mediated, mount-safe (`WorkTree`), vault-refusing
 //! (`load_unprotected`) and whole-file CAS. `replace_file` is NOT the save
 //! verb: it skips the vault refusal, so writing a `[sealed:…]` projection
-//! through it would re-seal the marker over the secret. See
+//! through it would re-seal the marker over the secret. Empty-original files
+//! are the one edge v1 cannot patch (`old` must be non-empty and match); the
+//! app refuses them client-side with a clear status — the v2 `write_file`
+//! verb is the documented follow-up. See
 //! `journal/decisions/decision-tui-file-editor.md`.
 //!
 //! ## Client-side refusal gate
@@ -44,72 +53,15 @@ pub enum EditorMode {
     Bionic,
 }
 
-/// One pending save handed to a [`WritePath`].
+/// The exact `patch_file` operands for one save: `old` is the daemon content
+/// this editor based its buffer on (the pristine copy), `new` is the edited
+/// buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorWrite {
     pub path: String,
-    pub content: String,
+    pub old: String,
+    pub new: String,
     pub expected_version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WriteError {
-    /// No daemon bridge exists in this prototype (the intentional gap).
-    Unwired(String),
-    /// Whole-file CAS failed (`Conflict` from the daemon) — buffer kept.
-    Conflict(String),
-    /// The daemon refused a vault-protected target.
-    Refused(String),
-    Other(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SaveOutcome {
-    pub version: Option<String>,
-    pub message: String,
-}
-
-/// The save seam. A real implementation will bridge to the IPC worker and
-/// issue the locked `patch_file` composition documented in the module docs;
-/// the prototype's default is [`UnwiredWritePath`].
-pub trait WritePath: std::fmt::Debug {
-    fn save(&mut self, write: &EditorWrite) -> Result<SaveOutcome, WriteError>;
-}
-
-/// The prototype default: save is not wired to the daemon. The UI surfaces
-/// the error and keeps the buffer dirty (no edits are lost).
-#[derive(Debug, Default)]
-pub struct UnwiredWritePath;
-
-impl WritePath for UnwiredWritePath {
-    fn save(&mut self, _write: &EditorWrite) -> Result<SaveOutcome, WriteError> {
-        Err(WriteError::Unwired(
-            "the daemon save bridge is not shipped in this prototype; the locked path is one \
-             `patch_file` call (see editor.rs docs)"
-                .into(),
-        ))
-    }
-}
-
-/// Test double: records every call and returns a configured result (default:
-/// success), so the app's save behavior is provable without a daemon.
-#[derive(Debug, Default)]
-pub struct FakeWritePath {
-    pub calls: Vec<EditorWrite>,
-    pub result: Option<Result<SaveOutcome, WriteError>>,
-}
-
-impl WritePath for FakeWritePath {
-    fn save(&mut self, write: &EditorWrite) -> Result<SaveOutcome, WriteError> {
-        self.calls.push(write.clone());
-        match &self.result {
-            Some(r) => r.clone(),
-            None => Ok(SaveOutcome {
-                version: Some("fake-v2".into()),
-                message: "saved (fake)".into(),
-            }),
-        }
-    }
 }
 
 /// A single-file editing session over a `read_file` projection.
@@ -207,13 +159,14 @@ impl Editor {
         self.bionic_cache = None;
     }
 
-    /// The payload the real bridge will send. `old` (the pristine content) is
-    /// the caller's concern in v1: it equals the daemon content this editor
-    /// opened when the file has not been touched elsewhere.
+    /// The `patch_file` operands the async bridge sends: `old` is the
+    /// pristine base (the daemon content the buffer was read from), `new` the
+    /// edited buffer.
     pub fn pending_write(&self) -> EditorWrite {
         EditorWrite {
             path: self.path.clone(),
-            content: self.text(),
+            old: self.pristine_text(),
+            new: self.text(),
             expected_version: self.expected_version.clone(),
         }
     }
@@ -223,8 +176,18 @@ impl Editor {
         self.pristine.join("\n")
     }
 
+    /// True when the file was empty at read time — `patch_file` cannot address
+    /// an empty `old`; the v1 save path refuses these client-side.
+    pub fn is_empty_original(&self) -> bool {
+        self.pristine_text().is_empty()
+    }
+
+    /// Editing is raw-mode only: bionic is the documented read-only reading
+    /// view (the UI labels it so), and the read-only refusal gate (sealed /
+    /// region-projected / truncated) covers both modes. Selection and copy
+    /// stay available in both views.
     fn editable(&self) -> bool {
-        self.read_only.is_none()
+        self.read_only.is_none() && self.mode == EditorMode::Raw
     }
 
     // ---- views ----
@@ -521,11 +484,13 @@ impl Editor {
 
     // ---- outcomes ----
 
-    /// After a successful save: clear dirty, refresh the pristine copy and the
-    /// CAS token.
-    pub fn mark_saved(&mut self, version: Option<String>) {
-        self.dirty = false;
-        self.pristine = self.lines.clone();
+    /// After the daemon accepted a save: the file's daemon content is now
+    /// `saved_text` (the `new` we sent). Refresh the pristine base and the CAS
+    /// token; stay dirty iff the buffer has newer edits than what was sent
+    /// (the user can type while the reply is in flight).
+    pub fn mark_saved(&mut self, version: Option<String>, saved_text: &str) {
+        self.pristine = saved_text.split('\n').map(str::to_string).collect();
+        self.dirty = self.lines != self.pristine;
         if version.is_some() {
             self.expected_version = version;
         }
@@ -815,31 +780,41 @@ mod tests {
     }
 
     #[test]
-    fn fake_save_records_the_cas_token_and_clears_dirty() {
+    fn pending_write_carries_the_patch_operands() {
         let mut ed = open("hi");
         assert!(!ed.dirty);
         ed.insert_char('t');
-        let mut fake = FakeWritePath::default();
         let write = ed.pending_write();
         assert_eq!(write.path, "notes/test.md");
-        assert_eq!(write.content, "thi");
+        assert_eq!(write.old, "hi");
+        assert_eq!(write.new, "thi");
         assert_eq!(write.expected_version.as_deref(), Some("v1"));
-        let out = fake.save(&write).unwrap();
-        ed.mark_saved(out.version);
-        assert_eq!(fake.calls.len(), 1);
+        ed.mark_saved(Some("v2".into()), &write.new);
         assert!(!ed.dirty);
-        assert_eq!(ed.expected_version.as_deref(), Some("fake-v2"));
+        assert_eq!(ed.expected_version.as_deref(), Some("v2"));
     }
 
     #[test]
-    fn unwired_save_keeps_the_buffer_dirty() {
+    fn mark_saved_keeps_newer_edits_dirty_and_rebases_the_next_patch() {
         let mut ed = open("hi");
-        ed.insert_char('t');
-        let mut unwired = UnwiredWritePath;
-        let err = unwired.save(&ed.pending_write()).unwrap_err();
-        assert!(matches!(err, WriteError::Unwired(_)));
-        assert!(ed.dirty);
-        assert_eq!(ed.text(), "thi");
+        ed.insert_char('t'); // "thi" — the content that gets sent
+        let sent = ed.text();
+        ed.insert_char('o'); // typed while the round-trip was in flight
+        ed.mark_saved(Some("v2".into()), &sent);
+        assert!(ed.dirty, "post-send edits must stay dirty");
+        assert_eq!(ed.expected_version.as_deref(), Some("v2"));
+        // The next patch bases on what actually landed on the daemon, not the
+        // original read.
+        assert_eq!(ed.pending_write().old, sent);
+        assert_eq!(ed.text(), "tohi");
+    }
+
+    #[test]
+    fn empty_original_is_flagged_for_the_v1_refusal() {
+        let ed = Editor::from_read("notes/empty.md", "", Some("v".into()), false, &[]);
+        assert!(ed.is_empty_original());
+        let ed = Editor::from_read("notes/x.md", "x", Some("v".into()), false, &[]);
+        assert!(!ed.is_empty_original());
     }
 
     #[test]
@@ -859,6 +834,20 @@ mod tests {
         }
         ed.scroll_to_cursor();
         assert!(ed.scroll as usize + 10 <= ed.line_count().max(10));
+    }
+
+    #[test]
+    fn bionic_view_is_read_only_for_edits_but_selects() {
+        let mut ed = open("hello world");
+        ed.toggle_mode();
+        ed.insert_char('x');
+        ed.newline();
+        ed.backspace();
+        ed.delete();
+        assert_eq!(ed.text(), "hello world");
+        assert!(!ed.dirty, "bionic keystrokes must not dirty the buffer");
+        ed.select_word_at(0, 6);
+        assert_eq!(ed.selected_text().as_deref(), Some("world"));
     }
 
     #[test]
