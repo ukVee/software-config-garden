@@ -11,6 +11,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use serde_json::{json, Value};
 use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
@@ -25,9 +26,9 @@ use softfig_ipc::{
     StatusReply, TailBusReply, VaultListSealedReply, VaultRevealReply,
 };
 
+use crate::bionic;
 use crate::clip;
-use crate::command::{parse_command, Command};
-// M3c editor — additive imports (see `meta/spec-keeper.md` "M3c").
+use crate::command::{parse_command, Command};// M3c editor — additive imports (see `meta/spec-keeper.md` "M3c").
 use crate::editor::{Editor, EditorMode};
 use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
@@ -366,6 +367,13 @@ pub struct App {
     /// Total wrapped line count of the current preview at the last render
     /// width; written by the renderer so scrolling clamps to the real bottom.
     pub preview_total: u16,
+    /// Browse/History preview rendered as the bionic reading view. The
+    /// preview's `[ bionic ]` touch chip and the `b` key toggle it; the last
+    /// choice persists in [`crate::prefs::UiPrefs`].
+    pub preview_bionic: bool,
+    /// Bionic-styled preview lines, built lazily once per content. The length
+    /// guard catches direct `preview` swaps; the reply paths also clear it.
+    preview_bionic_cache: Option<(usize, Vec<Line<'static>>)>,
     pub history: Vec<HistoryLine>,
     pub history_selected: usize,
     pub vault_globs: Vec<String>,
@@ -556,6 +564,8 @@ impl App {
             preview_scroll: 0,
             preview_viewport: 0,
             preview_total: 0,
+            preview_bionic: false,
+            preview_bionic_cache: None,
             history: Vec::new(),
             history_selected: 0,
             vault_globs: Vec::new(),
@@ -1235,6 +1245,7 @@ impl App {
                         self.regions = r.region_ids;
                         self.regions_path = Some(path.clone());
                         self.preview = r.content;
+                        self.preview_bionic_cache = None;
                         self.preview_title = if r.sealed {
                             format!("{path}  [sealed]")
                         } else {
@@ -1304,6 +1315,7 @@ impl App {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<ShowReply>(v) {
                         self.preview = format_commit(&r);
+                        self.preview_bionic_cache = None;
                         self.preview_title = format!("commit {}", short_hash(&r.commit.hash));
                         self.preview_scroll = 0;
                     }
@@ -1956,6 +1968,11 @@ impl App {
             }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
+            // Preview reading view: `b` flips raw ↔ bionic (the preview's
+            // `[ bionic ]` chip is the touch path to the same toggle).
+            KeyCode::Char('b') if matches!(self.view, View::Browse | View::History) => {
+                self.toggle_preview_bionic()
+            }
             KeyCode::Char('p') if self.view == View::Peers => self.pair_selected(ipc),
             KeyCode::Char('D') if self.view == View::Peers => self.start_unpair(),
             KeyCode::Char('g') if self.view == View::Backup => self.open_grant(),
@@ -1986,6 +2003,7 @@ impl App {
     /// Load persisted interface preferences (once, at startup).
     pub fn load_prefs(&mut self) {
         self.prefs = prefs::load();
+        self.preview_bionic = self.prefs.preview_bionic;
     }
 
     /// Persist interface preferences (best-effort; called when they change).
@@ -2048,9 +2066,13 @@ impl App {
                 View::Browse => {
                     actions.push(("x reveal", hit::key(KeyCode::Char('x'))));
                     actions.push(("c copy", hit::key(KeyCode::Char('c'))));
+                    actions.push(("b bionic", hit::key(KeyCode::Char('b'))));
                     actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
                 }
-                View::History => actions.push(("r refresh", hit::key(KeyCode::Char('r')))),
+                View::History => {
+                    actions.push(("b bionic", hit::key(KeyCode::Char('b'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
                 View::Vault => {
                     actions.push(("x reveal", hit::key(KeyCode::Char('x'))));
                     actions.push(("c copy", hit::key(KeyCode::Char('c'))));
@@ -2178,6 +2200,7 @@ impl App {
                     });
                 }
             }
+            Hit::PreviewBionic => self.toggle_preview_bionic(),
             Hit::EditorLine { row: line, x0 } => {
                 let col = column.saturating_sub(x0) as usize;
                 let mut anchor = None;
@@ -2498,6 +2521,43 @@ impl App {
 
     fn preview_to_bottom(&mut self) {
         self.preview_scroll = self.preview_max_scroll();
+    }
+
+    /// Toggle the preview pane between the raw source and the bionic reading
+    /// view (the `b` key / the preview's `[ bionic ]` touch chip). The choice
+    /// persists across runs. The offset is kept: bionic styles the same
+    /// characters, so the wrapping — and therefore the scroll position — is
+    /// unchanged.
+    fn toggle_preview_bionic(&mut self) {
+        self.preview_bionic = !self.preview_bionic;
+        self.preview_bionic_cache = None;
+        self.prefs.preview_bionic = self.preview_bionic;
+        self.save_prefs();
+        self.status = if self.preview_bionic {
+            "preview: bionic".into()
+        } else {
+            "preview: raw".into()
+        };
+    }
+
+    /// The bionic-styled preview lines for the current content, building the
+    /// cache on first use (and after any content change). `None` while the
+    /// preview toggle is off. The length guard catches direct `preview`
+    /// swaps; the reply paths also clear the cache explicitly.
+    pub fn preview_bionic_lines(&mut self) -> Option<&[Line<'static>]> {
+        if !self.preview_bionic {
+            return None;
+        }
+        if self
+            .preview_bionic_cache
+            .as_ref()
+            .is_none_or(|(len, _)| *len != self.preview.len())
+        {
+            let lines: Vec<String> = self.preview.split('\n').map(str::to_string).collect();
+            let styled = bionic::render_bionic_lines(&lines, bionic::DEFAULT_BOLD_RATIO);
+            self.preview_bionic_cache = Some((self.preview.len(), styled));
+        }
+        self.preview_bionic_cache.as_ref().map(|(_, l)| l.as_slice())
     }
 
     fn nav_up(&mut self, ipc: &mut IpcClient) {
@@ -4275,6 +4335,47 @@ mod tests {
         assert_eq!(app.preview_scroll, 0);
         app.preview_to_bottom();
         assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn preview_bionic_toggles_from_key_and_chip_and_persists() {
+        let mut app = App::new();
+        app.locked = false;
+        app.preview = "# Title\n\nThe quick brown fox\n".into();
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE), &mut ipc);
+        assert!(app.preview_bionic);
+        assert!(app.prefs.preview_bionic, "the choice persists");
+        assert_eq!(app.status, "preview: bionic");
+        app.hits
+            .push(Rect::new(50, 5, 10, 1), Hit::PreviewBionic);
+        app.handle_mouse(tap(52, 5), &mut ipc);
+        assert!(!app.preview_bionic, "the chip toggles back");
+        assert!(!app.prefs.preview_bionic);
+        assert_eq!(app.status, "preview: raw");
+    }
+
+    #[test]
+    fn preview_bionic_lines_track_the_content() {
+        let mut app = App::new();
+        app.preview_bionic = true;
+        app.preview = "The API is great".into();
+        let text = |lines: &[Line<'static>]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(text(app.preview_bionic_lines().unwrap()), "The API is great");
+        // The cache rebuilds when the content changes under the same toggle.
+        app.preview = "Fresh body text".into();
+        assert_eq!(text(app.preview_bionic_lines().unwrap()), "Fresh body text");
     }
 
     #[test]

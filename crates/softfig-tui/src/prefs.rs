@@ -20,6 +20,9 @@ pub struct UiPrefs {
     /// The editor view new files open in (the last one the user selected):
     /// `true` = bionic reading view, `false` = raw source.
     pub editor_bionic: bool,
+    /// The Browse/History preview pane rendered as the bionic reading view
+    /// (the last toggle choice).
+    pub preview_bionic: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -28,6 +31,8 @@ struct Wire {
     fab_row: Option<u16>,
     #[serde(default)]
     editor_bionic: bool,
+    #[serde(default)]
+    preview_bionic: bool,
 }
 
 /// The state file path, when the environment gives us a home.
@@ -61,6 +66,7 @@ fn load_from(path: &Path) -> UiPrefs {
     UiPrefs {
         fab: wire.fab_col.zip(wire.fab_row),
         editor_bionic: wire.editor_bionic,
+        preview_bionic: wire.preview_bionic,
     }
 }
 
@@ -69,6 +75,7 @@ fn save_to(path: &Path, prefs: &UiPrefs) {
         fab_col: prefs.fab.map(|f| f.0),
         fab_row: prefs.fab.map(|f| f.1),
         editor_bionic: prefs.editor_bionic,
+        preview_bionic: prefs.preview_bionic,
     };
     let Ok(json) = serde_json::to_string_pretty(&wire) else {
         return;
@@ -101,6 +108,7 @@ mod tests {
         let prefs = UiPrefs {
             fab: Some((12, 7)),
             editor_bionic: true,
+            preview_bionic: true,
         };
         save_to(&p, &prefs);
         assert_eq!(load_from(&p), prefs);
@@ -123,6 +131,7 @@ mod tests {
         let prefs = load_from(&p);
         assert_eq!(prefs.fab, None, "a column without a row is not usable");
         assert!(prefs.editor_bionic, "the other field still loads");
+        assert!(!prefs.preview_bionic, "an absent field defaults off");
         let _ = std::fs::remove_file(&p);
     }
 }

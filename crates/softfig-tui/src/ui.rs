@@ -1262,6 +1262,7 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, hits: &mut HitMap, area
             &mut app.preview_scroll,
             &mut app.preview_viewport,
             &mut app.preview_total,
+            0,
             hits,
         );
         return;
@@ -1677,6 +1678,7 @@ fn render_scroll_body(
         scroll,
         viewport,
         total_out,
+        0,
         hits,
     );
 }
@@ -1685,7 +1687,8 @@ fn render_scroll_body(
 /// caller can colour individual lines (the bus history renders `alert` rows loud).
 /// Records the live viewport + wrapped-line total and clamps `scroll` to the real
 /// bottom exactly as the `&str` path does, so every scrollable pane pages
-/// identically.
+/// identically. `top_pad` reserves fixed control row(s) inside the border above
+/// the scrolling body (the preview's bionic toggle); callers without one pass 0.
 #[allow(clippy::too_many_arguments)]
 fn render_scroll_text(
     f: &mut Frame,
@@ -1695,15 +1698,23 @@ fn render_scroll_text(
     scroll: &mut u16,
     viewport: &mut u16,
     total_out: &mut u16,
+    top_pad: u16,
     hits: &mut HitMap,
 ) {
     // A press here starts a drag-scroll gesture (and a two-finger drag over
     // it arrives as wheel events, routed to the same offset).
     hits.push(area, Hit::Preview);
-    // Borders take one row/column on each side; wrapping + clamping work in
-    // terms of that inner content box.
-    let inner_w = area.width.saturating_sub(2);
-    let inner_h = area.height.saturating_sub(2);
+    // The border takes one row/column on each side; `top_pad` reserves the
+    // pane's fixed control row(s) above the scrolling body.
+    let inner = pane_inner(area);
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + top_pad.min(inner.height),
+        width: inner.width,
+        height: inner.height.saturating_sub(top_pad),
+    };
+    let inner_w = body.width;
+    let inner_h = body.height;
 
     let para = Paragraph::new(text).wrap(Wrap { trim: false });
     let total = para.line_count(inner_w) as u16;
@@ -1725,10 +1736,11 @@ fn render_scroll_text(
         title_base.to_string()
     };
 
-    let p = para
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((offset, 0));
-    f.render_widget(p, area);
+    // The frame is drawn separately from the body so the body can start below
+    // any reserved control row while sharing the outer border and title.
+    f.render_widget(Block::default().borders(Borders::ALL).title(title), area);
+    let p = para.scroll((offset, 0));
+    f.render_widget(p, body);
 }
 
 /// Build the styled history lines for the bus pane (slice 005): newest-first rows,
@@ -2153,16 +2165,65 @@ fn render_preview(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
         let plural = if n == 1 { "region" } else { "regions" };
         title.push_str(&format!("  · {n} vault {plural} (x)"));
     }
-    render_scroll_body(
+
+    // The touch toggle owns one fixed row just inside the top border; the
+    // body scrolls below it. A tiny pane yields no chip (the `b` key still
+    // toggles). The chip zone is recorded after the body's so it wins.
+    let inner = pane_inner(area);
+    let show_chip = inner.height >= 2 && inner.width >= 12;
+    let top_pad = u16::from(show_chip);
+    let chip = show_chip.then(|| {
+        let (label, style) = if app.preview_bionic {
+            (
+                "[ bionic ✓ ]",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("[ bionic ]", Style::default().fg(Color::DarkGray))
+        };
+        (
+            label,
+            style,
+            Rect::new(inner.x, inner.y, label.chars().count() as u16, 1),
+        )
+    });
+    if let Some((label, style, _)) = chip {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label, style),
+                Span::styled("  tap or b", Style::default().fg(Color::DarkGray)),
+            ])),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+
+    let text = if app.preview_bionic {
+        Text::from(
+            app.preview_bionic_lines()
+                .unwrap_or(&[])
+                .to_vec(),
+        )
+    } else {
+        Text::from(app.preview.as_str())
+    };
+    render_scroll_text(
         f,
         area,
-        &app.preview,
+        text,
         &title,
         &mut app.preview_scroll,
         &mut app.preview_viewport,
         &mut app.preview_total,
+        top_pad,
         hits,
     );
+    // Recorded after the body's whole-pane zone so a tap on the chip
+    // resolves to the toggle, not the drag-scroll anchor.
+    if let Some((_, _, rect)) = chip {
+        hits.push(rect, Hit::PreviewBionic);
+    }
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -2763,8 +2824,9 @@ touch: tap a tab / row / action to act · tapping a file/folder row opens
 it immediately (other lists select first) · the ☰ button floats anywhere
 (hold & move to reposition; tap to open a checklist of this view's
 actions; tap outside closes it) · two-finger scroll or drag scrolls panes ·
-the editor's raw/bionic switch is tappable and new files open in the view
-you last chose
+the preview's [ bionic ] chip (or b) renders the selected file as the
+bionic reading view — the editor's raw/bionic switch is tappable too, and
+new files open in the view you last chose
 
 selecting text (editor, raw or bionic): double-tap a word (or right-click)
 to select it, then drag to extend · a magnifier card follows above

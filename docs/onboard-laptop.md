@@ -139,7 +139,13 @@ open/expand it immediately, while the flat lists (Vault, Peers, Backup, Deploy,
 Shares, History, Coordination) still select on the first tap and act on the
 second (a double-tap — a right click under the touch-pointer Wayfire plugin —
 also activates directly); the wheel (two-finger drag) scrolls the pane under
-the cursor, and a held drag scrolls the preview or the editor.
+the cursor, and a held drag scrolls the preview or the editor. In Browse and
+History the preview carries a `[ bionic ]` chip at its top-left (it shows
+`bionic ✓` while active; `b` works too, also listed as "b bionic" in the ☰
+menu): it switches the selected file between raw source and the bionic reading
+view — bionic bolds the leading portion of words and colours acronyms purple,
+the editor's bionic styling — and the choice persists across runs in the same
+prefs file as the editor's last view. The preview stays read-only.
 
 A floating **☰ menu button** replaces the old footer action chips. Tap it to
 open a large checklist of the current view's actions (tap a row to run it; tap
