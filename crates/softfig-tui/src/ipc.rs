@@ -21,6 +21,10 @@ pub enum Tag {
     Unlock,
     ListTree { dir: String },
     ReadFile { path: String },
+    /// M3c: open a Browse file in the in-TUI editor (`read_file`); the reply
+    /// builds the editor buffer and switches the view. Kept distinct from
+    /// [`Tag::ReadFile`] so opening the editor never clobbers the preview pane.
+    EditorReadFile { path: String },
     History,
     Show,
     Action { title: String },

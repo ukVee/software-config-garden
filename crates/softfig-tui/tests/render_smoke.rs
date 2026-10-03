@@ -972,3 +972,71 @@ fn a_tap_anywhere_dismisses_the_help_overlay() {
         "the help card must dismiss on tap"
     );
 }
+
+// ---- M3c editor frames ----
+
+#[test]
+fn renders_editor_raw_frame() {
+    use softfig_tui::editor::Editor;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Editor;
+    app.editor = Some(Editor::from_read(
+        "meta/spec-keeper.md",
+        "# Keeper spec\n\nHello world API\n\n```\ncode line\n```\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    app.status = "editing".into();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("edit meta/spec-keeper.md"),
+        "editor title missing:\n{rendered}"
+    );
+    assert!(rendered.contains("raw"), "raw mode badge missing");
+    assert!(rendered.contains("Hello world API"), "source line missing");
+    assert!(rendered.contains("code line"), "fenced line missing");
+    assert!(rendered.contains("Tab toggle"), "key hint missing");
+}
+
+#[test]
+fn renders_editor_bionic_frame() {
+    use softfig_tui::editor::{Editor, EditorMode};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Editor;
+    let mut ed = Editor::from_read(
+        "meta/spec-keeper.md",
+        "# Keeper spec\n\nThe API reads plain text.\n\n```\nAPI stays code\n```\n",
+        Some("v1".into()),
+        false,
+        &[],
+    );
+    ed.toggle_mode();
+    assert_eq!(ed.mode, EditorMode::Bionic);
+    app.editor = Some(ed);
+    app.status = "reading".into();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("bionic (read-only)"),
+        "bionic badge missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("The API reads plain text."),
+        "bionic text missing"
+    );
+    assert!(rendered.contains("API stays code"), "code line missing");
+}

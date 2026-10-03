@@ -25,6 +25,8 @@ use softfig_ipc::{
 
 use crate::clip;
 use crate::command::{parse_command, Command};
+// M3c editor — additive imports (see `meta/spec-keeper.md` "M3c").
+use crate::editor::{Editor, EditorMode, UnwiredWritePath, WriteError, WritePath};
 use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
 use crate::hit::{self, Hit, HitMap, ListId};
@@ -58,6 +60,11 @@ pub enum View {
     /// probe gate); its content is live daemon state (`coordination_status`) plus
     /// `.conflict-` sidecars discovered via `list_tree`. Read-only — never mutates.
     Coordination,
+    /// M3c: the in-TUI file editor over the selected Browse file — raw markdown
+    /// source (editable, syntax-styled) ↔ bionic reading view (`Tab`; read-only).
+    /// Content is fetched with the existing read-only `read_file`; the save seam
+    /// is not wired to a daemon verb in this prototype (see [`App::write_path`]).
+    Editor,
 }
 
 /// M5d slice 004: the collaborative-key ceremony state for one shared subtree,
@@ -249,6 +256,9 @@ pub enum Overlay {
         mount_path: String,
         error: Option<String>,
     },
+    /// M3c: leaving the editor with unsaved edits — `s` save, `d` discard,
+    /// `Esc` back to the editor.
+    EditorDiscard,
     Help,
 }
 
@@ -439,6 +449,15 @@ pub struct App {
     /// context. The baton half soft-fails independently — with growlightd down the
     /// node still shows the protocol half + a placeholder (this stays garden-sourced).
     pub growlight_injected_protocol: Option<String>,
+    /// M3c: the open in-TUI editor (raw source ↔ bionic reading view). `None`
+    /// whenever the editor view is not active. The refusal gate lives in
+    /// [`Editor::from_read`]; sealed / region-projected / truncated projections
+    /// open read-only.
+    pub editor: Option<Editor>,
+    /// M3c save seam — default [`UnwiredWritePath`] (no daemon bridge in this
+    /// prototype; the locked path is one `patch_file` composition). Tests
+    /// inject a fake to prove save behavior.
+    pub write_path: Box<dyn WritePath>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -508,6 +527,8 @@ impl App {
             hits: HitMap::new(),
             drag: None,
             growlight_injected_protocol: None,
+            editor: None,
+            write_path: Box::new(UnwiredWritePath),
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -535,6 +556,32 @@ impl App {
             json!({ "path": path }),
             Tag::ReadFile { path: path.to_string() },
         );
+    }
+
+    /// M3c: open the selected Browse regular file in the in-TUI editor. Content
+    /// is fetched with the read-only `read_file` verb — daemon-side redaction
+    /// is the trust boundary; the TUI never reads the filesystem itself.
+    fn open_editor(&mut self, ipc: &mut IpcClient) {
+        if self.locked {
+            self.status = "locked — unlock before editing".into();
+            return;
+        }
+        let Some(row) = self.tree.selected_row() else {
+            self.status = "no file selected".into();
+            return;
+        };
+        if row.is_dir {
+            self.status = "select a regular file to edit (Enter previews a dir)".into();
+            return;
+        }
+        ipc.send(
+            "read_file",
+            json!({ "path": row.path }),
+            Tag::EditorReadFile {
+                path: row.path.clone(),
+            },
+        );
+        self.status = format!("opening {}…", row.path);
     }
 
     fn load_history(&self, ipc: &mut IpcClient) {
@@ -1119,6 +1166,31 @@ impl App {
                 }
                 Err((_, m)) => self.status = format!("read_file {path}: {m}"),
             },
+            // M3c: build the editor from the daemon's redacted projection and
+            // switch the view. Refused projections still open (read-only).
+            Tag::EditorReadFile { path } => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
+                        let ed = Editor::from_read(
+                            &path,
+                            &r.content,
+                            Some(r.version.clone()).filter(|v| !v.is_empty()),
+                            r.sealed,
+                            &r.region_ids,
+                        );
+                        let reason = ed.read_only.clone();
+                        self.editor = Some(ed);
+                        self.view = View::Editor;
+                        self.status = match reason {
+                            Some(reason) => format!("{path}: {reason} — read-only"),
+                            None => {
+                                format!("editing {path} — Tab bionic · Ctrl+S save · Esc exit")
+                            }
+                        };
+                    }
+                }
+                Err((_, m)) => self.status = format!("open {path}: {m}"),
+            },
             Tag::History => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<LogReply>(v) {
@@ -1682,6 +1754,8 @@ impl App {
             Overlay::DeployForce { .. } => self.handle_key_deploy_force(key, ipc),
             Overlay::AddShare { .. } => self.handle_key_add_share(key, ipc),
             Overlay::RemoveShare { .. } => self.handle_key_remove_share(key, ipc),
+            // M3c: save/discard/back for an editor with unsaved edits.
+            Overlay::EditorDiscard => self.handle_key_editor_discard(key),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -1689,6 +1763,12 @@ impl App {
     }
 
     fn handle_key_main(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        // M3c editor: the editor view owns every key while it is active, so
+        // typing never triggers global bindings (`q`, `r`, `e`, digits, …).
+        // Additive hook; the editor handles Tab/Ctrl+S/Esc itself.
+        if self.view == View::Editor {
+            return self.handle_key_editor(key);
+        }
         // Vim-style preview scrolling on the Ctrl chord, kept off the bare
         // h/j/k/l keys so list navigation is untouched. Half/full page sizes
         // come from the viewport the renderer recorded last frame.
@@ -1790,6 +1870,10 @@ impl App {
             KeyCode::Char('a') if self.view == View::Shares => self.open_add_share(),
             KeyCode::Char('D') if self.view == View::Shares => self.start_remove_share(),
             KeyCode::Char('e') if self.view == View::Shares => self.toggle_share(ipc),
+            // M3c: open the selected Browse regular file in the in-TUI editor.
+            // Guarded by the view, so the Shares `e` toggle and the Ctrl+e
+            // preview scroll above are untouched.
+            KeyCode::Char('e') if self.view == View::Browse => self.open_editor(ipc),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(ipc),
@@ -1850,6 +1934,14 @@ impl App {
                 }
                 View::Growlight | View::Coordination => {
                     actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Editor => {
+                    actions.push((
+                        "Ctrl-S save",
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    ));
+                    actions.push(("Tab toggle view", hit::key(KeyCode::Tab)));
+                    actions.push(("Esc close", hit::key(KeyCode::Esc)));
                 }
             }
         }
@@ -2075,6 +2167,9 @@ impl App {
                 // off it clears the stale body.
                 self.coordination_preview = None;
             }
+            // M3c: unreachable — `handle_key_main` routes the editor view to
+            // `handle_key_editor` before list navigation.
+            View::Editor => {}
         }
     }
 
@@ -2105,6 +2200,8 @@ impl App {
                 }
                 self.coordination_preview = None;
             }
+            // M3c: unreachable — see `nav_up`.
+            View::Editor => {}
         }
     }
 
@@ -2153,6 +2250,8 @@ impl App {
             // Coordination is read-only: Enter previews a conflict sidecar (a
             // read), else a no-op hint.
             View::Coordination => self.activate_coordination(ipc),
+            // M3c: unreachable — the editor routes its own keys.
+            View::Editor => {}
         }
     }
 
@@ -2344,6 +2443,116 @@ impl App {
         self.overlay = Overlay::Form(ActionForm::for_kind(kind));
     }
 
+    // ---- M3c editor key handling ----
+
+    /// The editor view's key path. Typing must never reach the global key
+    /// bindings, so `handle_key_main` diverts here first.
+    fn handle_key_editor(&mut self, key: KeyEvent) {
+        let mut save = false;
+        let mut exit = false;
+        let mut ask_discard = false;
+        if let Some(ed) = self.editor.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    if ed.dirty {
+                        ask_discard = true;
+                    } else {
+                        exit = true;
+                    }
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => save = true,
+                // `Tab` toggles in both modes; `v` also returns from bionic.
+                // `v` cannot toggle while editing raw — it must insert the
+                // character (documented M3c deviation).
+                KeyCode::Tab => ed.toggle_mode(),
+                KeyCode::Char('v') if ed.mode == EditorMode::Bionic => ed.toggle_mode(),
+                KeyCode::Enter => ed.newline(),
+                KeyCode::Backspace => ed.backspace(),
+                KeyCode::Delete => ed.delete(),
+                KeyCode::Left => ed.move_left(),
+                KeyCode::Right => ed.move_right(),
+                KeyCode::Up => ed.move_up(),
+                KeyCode::Down => ed.move_down(),
+                KeyCode::Home => ed.move_home(),
+                KeyCode::End => ed.move_end(),
+                KeyCode::PageUp => ed.page_up(),
+                KeyCode::PageDown => ed.page_down(),
+                KeyCode::Char(c) => ed.insert_char(c),
+                _ => {}
+            }
+        } else {
+            exit = true;
+        }
+        if save {
+            self.editor_save();
+        }
+        if ask_discard {
+            self.overlay = Overlay::EditorDiscard;
+        }
+        if exit {
+            self.editor = None;
+            self.view = View::Browse;
+        }
+    }
+
+    /// `Overlay::EditorDiscard` keys: `s` save, `d` discard, `Esc` back.
+    fn handle_key_editor_discard(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('s') => {
+                self.overlay = Overlay::None;
+                self.editor_save();
+                // Leave the editor only if the save actually landed (the
+                // unwired prototype keeps the buffer + dirty flag).
+                if self.editor.as_ref().is_some_and(|e| !e.dirty) {
+                    self.editor = None;
+                    self.view = View::Browse;
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.discard();
+                }
+                self.editor = None;
+                self.view = View::Browse;
+                self.overlay = Overlay::None;
+                self.status = "edits discarded".into();
+            }
+            KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Hand the buffer to the save seam. The prototype default is
+    /// [`UnwiredWritePath`], so the locked daemon bridge is the one
+    /// intentionally non-wired piece; the error is surfaced and the buffer is
+    /// kept dirty (nothing is lost).
+    fn editor_save(&mut self) {
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        if let Some(reason) = &ed.read_only {
+            self.status = format!("read-only: {reason} — save refused");
+            return;
+        }
+        if !ed.dirty {
+            self.status = "no changes to save".into();
+            return;
+        }
+        let write = ed.pending_write();
+        match self.write_path.save(&write) {
+            Ok(out) => {
+                ed.mark_saved(out.version);
+                self.status = out.message;
+            }
+            Err(WriteError::Unwired(m)) => self.status = format!("save not wired — {m}"),
+            Err(WriteError::Conflict(m)) => {
+                self.status = format!("save conflict: {m} — buffer kept");
+            }
+            Err(WriteError::Refused(m)) => self.status = format!("save refused: {m}"),
+            Err(WriteError::Other(m)) => self.status = format!("save failed: {m}"),
+        }
+    }
+
     fn handle_key_unlock(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         let Overlay::Unlock { buf, .. } = &mut self.overlay else {
             return;
@@ -2377,7 +2586,7 @@ impl App {
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
             View::History | View::Peers | View::Backup | View::Deploy | View::Shares
-            | View::Growlight | View::Coordination => None,
+            | View::Growlight | View::Coordination | View::Editor => None,
         };
         match target {
             // M2c: if the reveal target is the currently-open file and it
@@ -3266,6 +3475,7 @@ fn format_commit(r: &ShowReply) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::FakeWritePath;
     use ratatui::layout::Rect;
 
     #[test]
@@ -5842,5 +6052,222 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("divergence"));
+    }
+
+    // ---- M3c editor ----
+
+    fn editor_from(content: &str, sealed: bool, ids: &[String]) -> Editor {
+        Editor::from_read("notes/x.md", content, Some("v1".into()), sealed, ids)
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn editor_read_reply_opens_the_view_and_builds_the_buffer() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::EditorReadFile {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes/x.md",
+                    "content": "# Title\nbody",
+                    "sealed": false,
+                    "version": "v7",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Editor);
+        let ed = app.editor.as_ref().expect("editor open");
+        assert!(!ed.is_read_only());
+        assert_eq!(ed.text(), "# Title\nbody");
+        assert_eq!(ed.expected_version.as_deref(), Some("v7"));
+    }
+
+    #[test]
+    fn editor_read_reply_refuses_sealed_and_region_projections() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::EditorReadFile {
+                    path: "secrets/s.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "secrets/s.md",
+                    "content": "[sealed:secrets/s.md]",
+                    "sealed": true,
+                    "version": "v1",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Editor);
+        assert!(app.editor.as_ref().unwrap().is_read_only());
+        assert!(app.status.contains("read-only"));
+
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::EditorReadFile {
+                    path: "docs/r.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "docs/r.md",
+                    "content": "a <vault id=\"api\">[encrypted]</vault> b",
+                    "sealed": false,
+                    "version": "v1",
+                    "region_ids": ["api"],
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.editor.as_ref().unwrap().is_read_only());
+    }
+
+    #[test]
+    fn editor_open_key_rejects_directories() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree.set_children(
+            "",
+            vec![softfig_ipc::TreeEntry {
+                name: "meta".into(),
+                path: "meta".into(),
+                is_dir: true,
+            }],
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE), &mut ipc);
+        assert_ne!(app.view, View::Editor);
+        assert!(app.status.contains("regular file"));
+    }
+
+    #[test]
+    fn editor_without_a_selected_row_is_a_noop() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE), &mut ipc);
+        assert_ne!(app.view, View::Editor);
+        assert!(app.status.contains("no file selected"));
+    }
+
+    #[test]
+    fn editor_owns_keys_and_toggles_views() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("The API is great", false, &[]));
+        let mut ipc = dummy_ipc();
+        // Typing must insert, never trigger global bindings.
+        for c in "qv".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE), &mut ipc);
+        }
+        assert!(!app.should_quit, "q must type, not quit");
+        assert_eq!(app.editor.as_ref().unwrap().text(), "qvThe API is great");
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditorMode::Bionic);
+        // `v` returns from bionic; in raw mode it inserts.
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::NONE), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditorMode::Raw);
+        // The typed buffer is dirty → Esc asks before leaving; `d` discards.
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::EditorDiscard));
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE), &mut ipc);
+        assert_eq!(app.view, View::Browse);
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn editor_ctrl_s_goes_through_the_write_path_fake() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        app.write_path = Box::new(FakeWritePath::default());
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        assert!(app.editor.as_ref().unwrap().dirty);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert!(!app.editor.as_ref().unwrap().dirty);
+        assert_eq!(app.status, "saved (fake)");
+        // The fake hands back a fresh CAS token for chained saves.
+        assert_eq!(
+            app.editor.as_ref().unwrap().expected_version.as_deref(),
+            Some("fake-v2")
+        );
+    }
+
+    #[test]
+    fn editor_unwired_save_keeps_the_buffer_dirty() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert!(app.editor.as_ref().unwrap().dirty);
+        assert!(app.status.starts_with("save not wired"));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "xhi");
+    }
+
+    #[test]
+    fn read_only_editor_refuses_save_before_the_seam() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(Editor::from_read(
+            "secrets/s.md",
+            "[sealed:secrets/s.md]",
+            Some("v".into()),
+            true,
+            &[],
+        ));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert!(app.status.contains("read-only"));
+    }
+
+    #[test]
+    fn editor_esc_dirty_opens_discard_and_d_discards() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::EditorDiscard));
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.view, View::Browse);
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn editor_discard_overlay_s_saves_and_exits() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        app.write_path = Box::new(FakeWritePath::default());
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.view, View::Browse);
+        assert!(app.editor.is_none());
     }
 }

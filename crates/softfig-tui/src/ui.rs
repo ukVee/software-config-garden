@@ -14,6 +14,7 @@ use crate::app::{
     CeremonyState, CoordRow, FleetHeader, Overlay, PairField, PeerRow, View,
 };
 use crate::command::command_hints;
+use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
@@ -118,6 +119,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             mount_path,
             error,
         } => render_remove_share(f, id, mount_path, error.as_deref(), &mut hits, area),
+        // M3c: leaving a dirty editor asks save/discard first.
+        Overlay::EditorDiscard => render_editor_discard(f, area),
         Overlay::Help => render_help(f, &mut hits, area),
     }
 
@@ -288,6 +291,9 @@ fn render_body(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
             render_coordination(f, app, hits, cols[0]);
             render_coordination_detail(f, app, cols[1]);
         }
+        // M3c: the editor takes the full body width (a focused edit surface;
+        // the Browse tree is one Esc away).
+        View::Editor => render_editor(f, app, area),
     }
 }
 
@@ -1731,6 +1737,81 @@ fn render_remove_share(
 
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("un-share folder"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// M3c: the full-body editor pane. Renders only the visible viewport slice of
+/// the cached styled lines (raw source or bionic), keeps the cursor row in
+/// view, and parks the terminal cursor on the editing position in raw mode.
+fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
+    let inner_h = area.height.saturating_sub(2);
+    let Some(ed) = app.editor.as_mut() else {
+        let p = Paragraph::new("(no file open)")
+            .block(Block::default().borders(Borders::ALL).title("editor"));
+        f.render_widget(p, area);
+        return;
+    };
+    ed.set_viewport(inner_h);
+    ed.scroll_to_cursor();
+
+    let mode = match ed.mode {
+        EditorMode::Raw => "raw",
+        EditorMode::Bionic => "bionic (read-only)",
+    };
+    let (row, col) = ed.position();
+    let mut title = format!("edit {}  · {mode}", ed.path);
+    if ed.dirty {
+        title.push_str("  · modified");
+    }
+    if ed.read_only.is_some() {
+        title.push_str("  · READ-ONLY");
+    }
+    title.push_str(&format!("  · {row}:{col}  · Tab toggle · Ctrl+S save · Esc exit"));
+
+    let start = ed.scroll as usize;
+    let lines: Vec<Line> = {
+        let doc = ed.doc();
+        let end = (start + inner_h as usize).min(doc.len());
+        if start < end {
+            doc[start..end].to_vec()
+        } else {
+            Vec::new()
+        }
+    };
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+
+    // Park the terminal cursor on the editing position in raw mode; bionic is
+    // a read-only reading view.
+    if ed.mode == EditorMode::Raw && inner_h > 0 && area.width > 2 {
+        let visible_row = ed.cursor().0.saturating_sub(ed.scroll as usize) as u16;
+        if visible_row < inner_h {
+            let x = area.x + 1 + (col.saturating_sub(1) as u16).min(area.width - 3);
+            let y = area.y + 1 + visible_row;
+            f.set_cursor_position((x, y));
+        }
+    }
+}
+
+/// M3c: the unsaved-changes confirm shown when leaving a dirty editor.
+fn render_editor_discard(f: &mut Frame, area: Rect) {
+    let rect = centered_rect(60, 30, area);
+    f.render_widget(Clear, rect);
+    let lines: Vec<Line> = vec![
+        Line::raw("This file has unsaved changes."),
+        Line::raw(""),
+        Line::styled(
+            "s save · d discard · Esc back to the editor",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("unsaved changes"),
+        )
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
 }
