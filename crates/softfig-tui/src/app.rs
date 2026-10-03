@@ -16,8 +16,9 @@ use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
     ChatMessage, CoordinationStatusReply, DeployAction, DeployApplyReply, DeployPlanEntry,
     DeployPlanReply, DiscoverListReply,
-    DiscoveredDevice, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
-    PairListReply, PairPeer, PairRemoveReply, PendingPairing, PendingShareOfferInfo, ReadFileReply,
+    DiscoveredDevice, ErrorKind, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply,
+    PairConfirmReply, PairListReply, PairPeer, PairRemoveReply, PatchFileArgs, PatchFileReply,
+    PendingPairing, PendingShareOfferInfo, ReadFileReply,
     ReplicaGrantReply, ReplicaRevokeReply, ReplicaStatusReply, SharedSubtreeAddReply,
     SharedSubtreeInfo,
     SharedSubtreeListReply, SharedSubtreeRemoveReply, SharedSubtreeToggleReply, ShowReply,
@@ -27,7 +28,7 @@ use softfig_ipc::{
 use crate::clip;
 use crate::command::{parse_command, Command};
 // M3c editor — additive imports (see `meta/spec-keeper.md` "M3c").
-use crate::editor::{Editor, EditorMode, UnwiredWritePath, WriteError, WritePath};
+use crate::editor::{Editor, EditorMode};
 use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
 use crate::hit::{self, Hit, HitMap, ListId};
@@ -64,8 +65,8 @@ pub enum View {
     Coordination,
     /// M3c: the in-TUI file editor over the selected Browse file — raw markdown
     /// source (editable, syntax-styled) ↔ bionic reading view (`Tab`; read-only).
-    /// Content is fetched with the existing read-only `read_file`; the save seam
-    /// is not wired to a daemon verb in this prototype (see [`App::write_path`]).
+    /// Content is fetched with the existing read-only `read_file`; saves go
+    /// through the locked async `patch_file` bridge (see [`App::pending_save`]).
     Editor,
 }
 
@@ -331,6 +332,23 @@ struct FabDrag {
     moved: bool,
 }
 
+/// One editor save awaiting its daemon reply. The patch goes out on the
+/// worker-thread channel; [`App::apply_reply`] routes the `Tag::EditorSave`
+/// reply back here so the UI thread never blocks on the round-trip.
+#[derive(Debug)]
+pub struct PendingSave {
+    /// The `IpcClient::send` request id — a stale or reordered reply for a
+    /// superseded request is inert.
+    pub id: crate::ipc::ReqId,
+    /// The target path (also on the reply tag).
+    pub path: String,
+    /// The `new` content that was sent: the base a reply rebases the editor
+    /// onto when the user typed more while the round-trip was in flight.
+    pub sent: String,
+    /// Close the editor when this save lands (the dirty-Esc `s` path).
+    pub then_exit: bool,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub locked: bool,
@@ -510,10 +528,10 @@ pub struct App {
     /// [`Editor::from_read`]; sealed / region-projected / truncated projections
     /// open read-only.
     pub editor: Option<Editor>,
-    /// M3c save seam — default [`UnwiredWritePath`] (no daemon bridge in this
-    /// prototype; the locked path is one `patch_file` composition). Tests
-    /// inject a fake to prove save behavior.
-    pub write_path: Box<dyn WritePath>,
+    /// M3c save bridge: the one in-flight `patch_file` round-trip on the
+    /// worker channel (or `None`). The UI never blocks; the reply is routed
+    /// by [`Tag::EditorSave`].
+    pub pending_save: Option<PendingSave>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -589,7 +607,7 @@ impl App {
             palette_scroll: 0,
             growlight_injected_protocol: None,
             editor: None,
-            write_path: Box::new(UnwiredWritePath),
+            pending_save: None,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -1257,6 +1275,12 @@ impl App {
                 }
                 Err((_, m)) => self.status = format!("open {path}: {m}"),
             },
+            // M3c save bridge: the async `patch_file` reply. Success rebases
+            // the editor's CAS token + pristine copy; a conflict / refusal
+            // keeps the buffer + dirty flag.
+            Tag::EditorSave { path } => {
+                self.apply_editor_save_reply(reply.id, &path, reply.result)
+            }
             Tag::History => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<LogReply>(v) {
@@ -1821,7 +1845,7 @@ impl App {
             Overlay::AddShare { .. } => self.handle_key_add_share(key, ipc),
             Overlay::RemoveShare { .. } => self.handle_key_remove_share(key, ipc),
             // M3c: save/discard/back for an editor with unsaved edits.
-            Overlay::EditorDiscard => self.handle_key_editor_discard(key),
+            Overlay::EditorDiscard => self.handle_key_editor_discard(key, ipc),
             Overlay::Menu { .. } => self.handle_key_menu(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
@@ -1834,7 +1858,7 @@ impl App {
         // typing never triggers global bindings (`q`, `r`, `e`, digits, …).
         // Additive hook; the editor handles Tab/Ctrl+S/Esc itself.
         if self.view == View::Editor {
-            return self.handle_key_editor(key);
+            return self.handle_key_editor(key, ipc);
         }
         // Vim-style preview scrolling on the Ctrl chord, kept off the bare
         // h/j/k/l keys so list navigation is untouched. Half/full page sizes
@@ -2817,8 +2841,9 @@ impl App {
     // ---- M3c editor key handling ----
 
     /// The editor view's key path. Typing must never reach the global key
-    /// bindings, so `handle_key_main` diverts here first.
-    fn handle_key_editor(&mut self, key: KeyEvent) {
+    /// bindings, so `handle_key_main` diverts here first. `ipc` only leaves
+    /// this function on an explicit save (Ctrl+S) — the async `patch_file`.
+    fn handle_key_editor(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         let had_selection = self.editor.as_ref().is_some_and(|e| e.has_selection());
@@ -2882,7 +2907,7 @@ impl App {
             }
         }
         if save {
-            self.editor_save();
+            self.editor_save(ipc, false);
         }
         if ask_discard {
             self.overlay = Overlay::EditorDiscard;
@@ -2894,17 +2919,14 @@ impl App {
     }
 
     /// `Overlay::EditorDiscard` keys: `s` save, `d` discard, `Esc` back.
-    fn handle_key_editor_discard(&mut self, key: KeyEvent) {
+    fn handle_key_editor_discard(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         match key.code {
             KeyCode::Char('s') => {
+                // The save is async: close the confirm and keep the editor
+                // open; the reply closes it only when the save lands cleanly
+                // (`then_exit`).
                 self.overlay = Overlay::None;
-                self.editor_save();
-                // Leave the editor only if the save actually landed (the
-                // unwired prototype keeps the buffer + dirty flag).
-                if self.editor.as_ref().is_some_and(|e| !e.dirty) {
-                    self.editor = None;
-                    self.view = View::Browse;
-                }
+                self.editor_save(ipc, true);
             }
             KeyCode::Char('d') => {
                 if let Some(ed) = self.editor.as_mut() {
@@ -2960,11 +2982,14 @@ impl App {
         }
     }
 
-    /// Hand the buffer to the save seam. The prototype default is
-    /// [`UnwiredWritePath`], so the locked daemon bridge is the one
-    /// intentionally non-wired piece; the error is surfaced and the buffer is
-    /// kept dirty (nothing is lost).
-    fn editor_save(&mut self) {
+    /// Hand the buffer to the daemon: ONE async `patch_file` over the worker
+    /// channel. The UI never blocks — the reply routes back through
+    /// [`Self::apply_reply`] under [`Tag::EditorSave`].
+    ///
+    /// `then_exit` is the dirty-Esc `s` path: close the editor when this save
+    /// lands cleanly. Every refusal (read-only gate, empty original) leaves
+    /// the buffer + dirty flag exactly as they were.
+    fn editor_save(&mut self, ipc: &mut IpcClient, then_exit: bool) {
         let Some(ed) = self.editor.as_mut() else {
             return;
         };
@@ -2976,18 +3001,87 @@ impl App {
             self.status = "no changes to save".into();
             return;
         }
+        if self.pending_save.is_some() {
+            self.status = "save already in flight — waiting for the daemon".into();
+            return;
+        }
+        // Empty-original files are the one v1 edge `patch_file` cannot cover:
+        // `old` must be non-empty and match exactly once. `replace_file` is
+        // NOT the fallback (it skips the vault refusal); the v2 `write_file`
+        // verb is the documented follow-up.
+        if ed.is_empty_original() {
+            self.status =
+                "empty-file save not supported yet — patch_file needs a non-empty \
+                 original (v2 write_file is the follow-up)"
+                    .into();
+            return;
+        }
         let write = ed.pending_write();
-        match self.write_path.save(&write) {
-            Ok(out) => {
-                ed.mark_saved(out.version);
-                self.status = out.message;
+        let sent = write.new.clone();
+        let args = serde_json::to_value(PatchFileArgs {
+            path: write.path.clone(),
+            old: write.old,
+            new: write.new,
+            expected_version: write.expected_version,
+            anchor: None,
+            editor: None,
+        })
+        .expect("PatchFileArgs is a plain struct");
+        let id = ipc.send(
+            "patch_file",
+            args,
+            Tag::EditorSave { path: write.path.clone() },
+        );
+        self.pending_save = Some(PendingSave {
+            id,
+            path: write.path,
+            sent,
+            then_exit,
+        });
+        self.status = "saving…".into();
+    }
+
+    /// Route one editor-save reply. Success rebases the editor on what the
+    /// daemon actually stored (a fresh CAS token + pristine copy, still dirty
+    /// if the user typed while the round-trip was in flight); every failure
+    /// keeps the buffer + dirty flag so nothing is lost.
+    fn apply_editor_save_reply(
+        &mut self,
+        id: crate::ipc::ReqId,
+        path: &str,
+        result: Result<Value, (ErrorKind, String)>,
+    ) {
+        // Inert unless this is the one pending request (a stale or reordered
+        // reply must never rebase a newer save).
+        match &self.pending_save {
+            Some(p) if p.id == id && p.path == path => {}
+            _ => return,
+        }
+        let pending = self.pending_save.take().expect("checked above");
+        match result {
+            Ok(v) => {
+                let version = serde_json::from_value::<PatchFileReply>(v)
+                    .ok()
+                    .map(|r| r.version)
+                    .filter(|v| !v.is_empty());
+                let mut matched = false;
+                let mut still_dirty = false;
+                if let Some(ed) = self.editor.as_mut().filter(|e| e.path == path) {
+                    ed.mark_saved(version, &pending.sent);
+                    matched = true;
+                    still_dirty = ed.dirty;
+                }
+                if still_dirty {
+                    self.status = "saved — newer edits are still unsaved".into();
+                } else {
+                    self.status = "saved".into();
+                }
+                if pending.then_exit && matched && !still_dirty {
+                    self.editor = None;
+                    self.view = View::Browse;
+                }
             }
-            Err(WriteError::Unwired(m)) => self.status = format!("save not wired — {m}"),
-            Err(WriteError::Conflict(m)) => {
-                self.status = format!("save conflict: {m} — buffer kept");
-            }
-            Err(WriteError::Refused(m)) => self.status = format!("save refused: {m}"),
-            Err(WriteError::Other(m)) => self.status = format!("save failed: {m}"),
+            Err((kind, m)) => self.status = save_error_status(kind, &m),
         }
     }
 
@@ -3601,6 +3695,22 @@ fn short_hash(h: &str) -> String {
     h.chars().take(10).collect()
 }
 
+/// Map a daemon save failure onto the editor status line. `Conflict` /
+/// text-not-found are the "your base moved" class — the editor tells the user
+/// to re-read rather than silently retrying; the vault kinds are the refusal
+/// class the client-side gate should already have caught (defense in depth).
+fn save_error_status(kind: ErrorKind, message: &str) -> String {
+    match kind {
+        ErrorKind::Conflict | ErrorKind::TextNotFound | ErrorKind::TextAmbiguous => format!(
+            "save conflict — the file changed on the daemon; re-read and retry ({message})"
+        ),
+        ErrorKind::VaultProtected | ErrorKind::MalformedVaultTag => {
+            format!("save refused by the daemon (vault-protected): {message}")
+        }
+        _ => format!("save failed ({kind:?}): {message}"),
+    }
+}
+
 /// Build the `vault_reveal` IPC args. `id` is threaded in only when `Some`, so
 /// a whole-file (M2b) reveal's payload stays byte-identical to the pre-M2c
 /// caller (matching the `skip_serializing_if = "Option::is_none"` on the verb).
@@ -3913,7 +4023,6 @@ fn format_commit(r: &ShowReply) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::FakeWritePath;
     use ratatui::layout::Rect;
 
     #[test]
@@ -6965,27 +7074,79 @@ mod tests {
     }
 
     #[test]
-    fn editor_ctrl_s_goes_through_the_write_path_fake() {
+    fn editor_ctrl_s_sends_the_patch_and_the_reply_rebases_the_editor() {
         let mut app = App::new();
         app.locked = false;
         app.view = View::Editor;
         app.editor = Some(editor_from("hi", false, &[]));
-        app.write_path = Box::new(FakeWritePath::default());
         let mut ipc = dummy_ipc();
         app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
         assert!(app.editor.as_ref().unwrap().dirty);
         app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        // The save is in flight: nothing blocks, the buffer stays dirty.
+        assert!(app.pending_save.is_some(), "one async patch_file dispatched");
+        assert!(app.editor.as_ref().unwrap().dirty);
+        assert_eq!(app.status, "saving…");
+        // The daemon ack: fresh CAS token + pristine copy, dirty cleared.
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes/x.md",
+                    "hash": "h",
+                    "version": "v9",
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.pending_save.is_none());
         assert!(!app.editor.as_ref().unwrap().dirty);
-        assert_eq!(app.status, "saved (fake)");
-        // The fake hands back a fresh CAS token for chained saves.
+        assert_eq!(app.editor.as_ref().unwrap().text(), "xhi");
         assert_eq!(
             app.editor.as_ref().unwrap().expected_version.as_deref(),
-            Some("fake-v2")
+            Some("v9")
+        );
+        assert_eq!(app.status, "saved");
+    }
+
+    #[test]
+    fn editor_save_conflict_keeps_the_buffer_dirty_and_says_re_read() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Err((ErrorKind::Conflict, "stale base".into())),
+            },
+            &mut ipc,
+        );
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.dirty, "conflict keeps the dirty flag");
+        assert_eq!(ed.text(), "xhi", "conflict keeps the buffer");
+        assert_eq!(ed.expected_version.as_deref(), Some("v1"), "CAS token kept");
+        assert!(app.pending_save.is_none());
+        assert!(
+            app.status.contains("changed on the daemon") && app.status.contains("re-read"),
+            "status points at the re-read: {}",
+            app.status
         );
     }
 
     #[test]
-    fn editor_unwired_save_keeps_the_buffer_dirty() {
+    fn editor_save_vault_refusal_is_surfaced_and_keeps_the_buffer() {
         let mut app = App::new();
         app.locked = false;
         app.view = View::Editor;
@@ -6993,13 +7154,94 @@ mod tests {
         let mut ipc = dummy_ipc();
         app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
         app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Err((ErrorKind::VaultProtected, "sealed target".into())),
+            },
+            &mut ipc,
+        );
         assert!(app.editor.as_ref().unwrap().dirty);
-        assert!(app.status.starts_with("save not wired"));
-        assert_eq!(app.editor.as_ref().unwrap().text(), "xhi");
+        assert!(app.status.contains("refused"), "status: {}", app.status);
     }
 
     #[test]
-    fn read_only_editor_refuses_save_before_the_seam() {
+    fn edits_during_the_save_round_trip_stay_dirty_after_the_ack() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        // Type while the patch is in flight.
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({ "path": "notes/x.md", "hash": "h", "version": "v9" })),
+            },
+            &mut ipc,
+        );
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.dirty, "post-send edits are not what the daemon saved");
+        assert_eq!(ed.expected_version.as_deref(), Some("v9"));
+        assert!(app.status.contains("still unsaved"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn editor_save_already_in_flight_is_not_dispatched_twice() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert_eq!(app.pending_save.as_ref().unwrap().id, id, "one request only");
+        assert!(
+            app.status.contains("already in flight"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn empty_original_save_is_refused_client_side() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(Editor::from_read(
+            "notes/empty.md",
+            "",
+            Some("v1".into()),
+            false,
+            &[],
+        ));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert!(app.pending_save.is_none(), "no patch for an empty original");
+        assert!(
+            app.status.contains("empty-file save not supported yet"),
+            "status: {}",
+            app.status
+        );
+        assert!(app.editor.as_ref().unwrap().dirty, "buffer kept");
+    }
+
+    #[test]
+    fn read_only_editor_refuses_save_before_the_bridge() {
         let mut app = App::new();
         app.locked = false;
         app.view = View::Editor;
@@ -7013,6 +7255,7 @@ mod tests {
         let mut ipc = dummy_ipc();
         app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
         assert!(app.status.contains("read-only"));
+        assert!(app.pending_save.is_none(), "refused client-side, no IPC");
     }
 
     #[test]
@@ -7032,18 +7275,31 @@ mod tests {
     }
 
     #[test]
-    fn editor_discard_overlay_s_saves_and_exits() {
+    fn editor_discard_overlay_s_requests_save_and_exits_when_it_lands() {
         let mut app = App::new();
         app.locked = false;
         app.view = View::Editor;
         app.editor = Some(editor_from("hi", false, &[]));
-        app.write_path = Box::new(FakeWritePath::default());
         let mut ipc = dummy_ipc();
         app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::EditorDiscard));
         app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
         assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.editor.is_some(), "stays open until the daemon acks");
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({ "path": "notes/x.md", "version": "v2" })),
+            },
+            &mut ipc,
+        );
         assert_eq!(app.view, View::Browse);
-        assert!(app.editor.is_none());
+        assert!(app.editor.is_none(), "a clean save-and-exit closes the editor");
+        assert_eq!(app.status, "saved");
     }
 }

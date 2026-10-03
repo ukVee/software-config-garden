@@ -25,6 +25,10 @@ pub enum Tag {
     /// builds the editor buffer and switches the view. Kept distinct from
     /// [`Tag::ReadFile`] so opening the editor never clobbers the preview pane.
     EditorReadFile { path: String },
+    /// M3c slice 004: an editor save (`patch_file`); the reply carries the
+    /// daemon's new content version — the editor's next `expected_version`.
+    /// Kept distinct so a save reply never clobbers the preview or tree.
+    EditorSave { path: String },
     History,
     Show,
     Action { title: String },
