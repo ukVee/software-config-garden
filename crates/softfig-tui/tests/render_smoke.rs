@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use ratatui::Terminal;
 use softfig_ipc::TreeEntry;
@@ -1279,13 +1280,9 @@ fn bionic_editor_selection_renders_reversed_cells() {
     assert_reversed(&mut app, "quick");
 }
 
-/// Render `app` at the standard test size and assert every frame cell of
-/// `needle` carries the REVERSED modifier.
-fn assert_reversed(app: &mut App, needle: &str) {
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| ui::render(f, app)).unwrap();
-    let buf = terminal.backend().buffer();
+/// The top-left cell of the first frame occurrence of `needle`, scanned
+/// char-exact per row (border glyphs are multi-byte).
+fn find_text(buf: &Buffer, needle: &str) -> (u16, u16) {
     let rows: Vec<Vec<char>> = (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
@@ -1298,20 +1295,58 @@ fn assert_reversed(app: &mut App, needle: &str) {
         })
         .collect();
     let pat: Vec<char> = needle.chars().collect();
-    let (y, x) = rows
-        .iter()
+    rows.iter()
         .enumerate()
         .find_map(|(y, cs)| {
             cs.windows(pat.len())
                 .position(|w| w == pat.as_slice())
-                .map(|x| (y, x))
+                .map(|x| (x as u16, y as u16))
         })
-        .unwrap_or_else(|| panic!("{needle:?} not rendered"));
-    for i in 0..pat.len() as u16 {
-        let cell = buf.cell((x as u16 + i, y as u16)).unwrap();
+        .unwrap_or_else(|| panic!("{needle:?} not rendered"))
+}
+
+/// Render `app` at the standard test size and assert every frame cell of
+/// `needle` carries the REVERSED modifier.
+fn assert_reversed(app: &mut App, needle: &str) {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let (x, y) = find_text(buf, needle);
+    for (i, _) in needle.chars().enumerate() {
+        let cell = buf.cell((x + i as u16, y)).unwrap();
         assert!(
             cell.modifier.contains(Modifier::REVERSED),
             "{needle:?} char {i} is not reversed: {cell:?}"
         );
     }
+}
+
+/// The Browse preview's `[ bionic ]` chip toggles the reading view on tap and
+/// the frame then renders the bionic lead (bold) from the preview content.
+#[test]
+fn browse_preview_bionic_chip_toggles_and_bolds() {
+    let mut app = App::new();
+    app.locked = false;
+    app.preview = "# Title\n\nThe quick brown fox\n".into();
+    app.preview_title = "notes/x.md".into();
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::PreviewBionic));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert!(app.preview_bionic, "the chip tap toggled the bionic preview");
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let (x, y) = find_text(buf, "The quick");
+    let cell = buf.cell((x, y)).unwrap();
+    assert!(
+        cell.modifier.contains(Modifier::BOLD),
+        "the bionic lead 'T' is bold: {cell:?}"
+    );
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("bionic"), "the toggle chip is visible");
 }

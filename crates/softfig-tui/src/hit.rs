@@ -54,6 +54,9 @@ pub enum Hit {
     Dismiss,
     /// The preview/detail pane: mouse-down starts a drag-scroll anchor.
     Preview,
+    /// The preview pane's bionic-view touch toggle (the `[ bionic ]` chip):
+    /// a tap flips the preview between raw source and the bionic reading view.
+    PreviewBionic,
     /// The floating menu button: a press starts a drag (or, released without
     /// motion, opens the action menu).
     Fab,
