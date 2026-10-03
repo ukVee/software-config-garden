@@ -2360,7 +2360,11 @@ impl App {
             }
             DragTarget::Editor { line, col, x0 } => {
                 if let Some(ed) = self.editor.as_mut() {
-                    if ed.mode == EditorMode::Raw {
+                    // Raw drags select from the press point. Bionic is a
+                    // reading view where a plain drag free-scrolls, but a drag
+                    // that began with a double-tap word selection extends that
+                    // selection — the touch select gesture works in both views.
+                    if ed.mode == EditorMode::Raw || ed.has_selection() {
                         // The head follows the finger in two dimensions (note:
                         // the opposite sign of a scroll — dragging down moves
                         // the selection head down); the anchor is where the
@@ -2933,12 +2937,20 @@ impl App {
 
     /// The pointer cell while an editor selection gesture is in progress —
     /// the magnifier's anchor while the finger is down. `None` otherwise.
+    /// Bionic reports a gesture only once a selection exists, so a plain
+    /// free-scroll drag there gains no magnifier.
     pub fn selection_pointer(&self) -> Option<(u16, u16)> {
         match self.drag {
             Some(DragAnchor {
                 target: DragTarget::Editor { .. },
                 ..
-            }) => Some(self.pointer),
+            }) if self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.mode == EditorMode::Raw || e.has_selection()) =>
+            {
+                Some(self.pointer)
+            }
             _ => None,
         }
     }
@@ -4520,8 +4532,54 @@ mod tests {
         app.handle_mouse(tap(12, 10), &mut ipc);
         app.handle_mouse(left_drag(12, 6), &mut ipc);
         assert_eq!(app.editor.as_ref().unwrap().scroll, 4);
+        assert!(
+            !app.editor.as_ref().unwrap().has_selection(),
+            "a plain bionic drag free-scrolls, it does not select"
+        );
+        assert!(
+            app.selection_pointer().is_none(),
+            "a free-scroll drag gains no magnifier"
+        );
         app.handle_mouse(left_drag(12, 30), &mut ipc);
         assert_eq!(app.editor.as_ref().unwrap().scroll, 0, "clamped at the top");
+    }
+
+    #[test]
+    fn bionic_double_tap_selects_a_word_and_a_following_drag_extends_it() {
+        // Smoke finding: the persisted default view is bionic, and selection
+        // there did nothing. Double-tap (right click) + drag must work in
+        // both views; only a plain drag stays free-scroll.
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        let mut ed = editor_from("the quick brown\nsecond line", false, &[]);
+        ed.toggle_mode();
+        app.editor = Some(ed);
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        // Right click inside "quick" (display cols 4..8 → screen 14..18).
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 15, 5),
+            &mut ipc,
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().selected_text().as_deref(),
+            Some("quick")
+        );
+        // Press inside the selection and drag onto the next line: the word
+        // anchor stays put, the head follows, and the magnifier is live.
+        app.handle_mouse(left_down(14, 5), &mut ipc);
+        assert!(app.selection_pointer().is_some(), "magnifier follows");
+        app.handle_mouse(left_drag(18, 6), &mut ipc);
+        let text = app.editor.as_ref().unwrap().selected_text().unwrap();
+        assert!(text.starts_with("quick"), "word anchor kept: {text}");
+        assert!(
+            text.contains("second"),
+            "the drag extended onto the next line: {text}"
+        );
     }
 
     #[test]

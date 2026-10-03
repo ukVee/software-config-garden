@@ -1969,20 +1969,21 @@ fn render_editor(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
             Rect::new(inner.x, text_top, inner.width, text_h),
             Hit::EditorBody,
         );
-        if ed.mode == EditorMode::Raw {
-            for i in 0..text_h {
-                let line = start + i as usize;
-                if line >= ed.line_count() {
-                    break;
-                }
-                hits.push(
-                    Rect::new(inner.x, text_top + i, inner.width, 1),
-                    Hit::EditorLine {
-                        row: line,
-                        x0: inner.x,
-                    },
-                );
+        // Line zones exist in both modes: raw uses them for tap-to-caret and
+        // drag-select, bionic for the double-tap word selection + extend
+        // (plain bionic drags still free-scroll — decided in `drag_to`).
+        for i in 0..text_h {
+            let line = start + i as usize;
+            if line >= ed.line_count() {
+                break;
             }
+            hits.push(
+                Rect::new(inner.x, text_top + i, inner.width, 1),
+                Hit::EditorLine {
+                    row: line,
+                    x0: inner.x,
+                },
+            );
         }
     }
 

@@ -223,8 +223,12 @@ impl Editor {
         self.pristine.join("\n")
     }
 
+    /// Editing is raw-mode only: bionic is the documented read-only reading
+    /// view (the UI labels it so), and the read-only refusal gate (sealed /
+    /// region-projected / truncated) covers both modes. Selection and copy
+    /// stay available in both views.
     fn editable(&self) -> bool {
-        self.read_only.is_none()
+        self.read_only.is_none() && self.mode == EditorMode::Raw
     }
 
     // ---- views ----
@@ -859,6 +863,20 @@ mod tests {
         }
         ed.scroll_to_cursor();
         assert!(ed.scroll as usize + 10 <= ed.line_count().max(10));
+    }
+
+    #[test]
+    fn bionic_view_is_read_only_for_edits_but_selects() {
+        let mut ed = open("hello world");
+        ed.toggle_mode();
+        ed.insert_char('x');
+        ed.newline();
+        ed.backspace();
+        ed.delete();
+        assert_eq!(ed.text(), "hello world");
+        assert!(!ed.dirty, "bionic keystrokes must not dirty the buffer");
+        ed.select_word_at(0, 6);
+        assert_eq!(ed.selected_text().as_deref(), Some("world"));
     }
 
     #[test]
