@@ -2,6 +2,7 @@
 //! a header tab bar and a footer status line, with centered overlays for
 //! the palette, unlock prompt, action forms, and help.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -12,7 +13,9 @@ use crate::app::{
     baton_headline, ceremony_state, runtime_baton_head, short_fp, App, BackupRow, BusRow,
     CeremonyState, CoordRow, FleetHeader, Overlay, PairField, PeerRow, View,
 };
-use crate::command::command_hints;
+use crate::command::command_menu;
+use crate::editor::EditorMode;
+use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
@@ -23,6 +26,20 @@ fn sel_style() -> Style {
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    // Drag clamping needs the terminal size before render has recorded zones.
+    app.screen = area;
+    // Geometry recording takes the previous frame's map out (and reuses its
+    // allocation); every zone is rebuilt from this frame's layout.
+    let mut hits = std::mem::take(&mut app.hits);
+    hits.clear();
+
+    // While a modal overlay is open the page underneath must not receive
+    // taps (a tab chip replaying `1` would type into an open form): page
+    // zones go to a scratch map, overlay zones to the real one.
+    let modal = !matches!(app.overlay, Overlay::None);
+    let mut page_scratch = HitMap::new();
+    let page_hits: &mut HitMap = if modal { &mut page_scratch } else { &mut hits };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -32,107 +49,306 @@ pub fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    render_header(f, app, chunks[0]);
-    render_body(f, app, chunks[1]);
+    render_header(f, app, page_hits, chunks[0]);
+    render_body(f, app, page_hits, chunks[1]);
     render_footer(f, app, chunks[2]);
+    // The floating menu button is page layer: it sits above content, below any
+    // modal, and holds still wherever the user left it.
+    render_fab(f, app, page_hits, area);
 
     match &app.overlay {
         Overlay::None => {}
-        Overlay::Palette(buf) => render_palette(f, buf, area),
-        Overlay::Unlock { buf, error } => render_unlock(f, buf, error.as_deref(), area),
+        Overlay::Menu { selected } => render_menu(f, app, *selected, &mut hits, area),
+        Overlay::Palette(buf) => {
+            render_palette(f, buf, app.palette_scroll, &mut hits, area)
+        }
+        Overlay::Unlock { buf, error } => render_unlock(f, buf, error.as_deref(), &mut hits, area),
         Overlay::Reveal {
             path,
             buf,
             error,
             id,
-        } => render_reveal(f, path, id.as_deref(), buf, error.as_deref(), area),
+        } => render_reveal(f, path, id.as_deref(), buf, error.as_deref(), &mut hits, area),
         Overlay::RevealRegion {
             path,
             ids,
             selected,
-        } => render_reveal_region(f, path, ids, *selected, area),
-        Overlay::Form(form) => render_form(f, form, area),
+        } => render_reveal_region(f, path, ids, *selected, &mut hits, area),
+        Overlay::Form(form) => render_form(f, form, &mut hits, area),
         Overlay::PairBegin {
             fingerprint,
             endpoint,
             focus,
             error,
-        } => render_pair_begin(f, fingerprint, endpoint, *focus, error.as_deref(), area),
+        } => render_pair_begin(
+            f,
+            fingerprint,
+            endpoint,
+            *focus,
+            error.as_deref(),
+            &mut hits,
+            area,
+        ),
         Overlay::PairConfirm {
             sas,
             fingerprint,
             name,
             error,
             ..
-        } => render_pair_confirm(f, sas, fingerprint, name, error.as_deref(), area),
+        } => render_pair_confirm(f, sas, fingerprint, name, error.as_deref(), &mut hits, area),
         Overlay::Unpair {
             fingerprint,
             name,
             error,
-        } => render_unpair(f, fingerprint, name, error.as_deref(), area),
+        } => render_unpair(f, fingerprint, name, error.as_deref(), &mut hits, area),
         Overlay::ReplicaGrant { fingerprint, error } => {
-            render_replica_grant(f, fingerprint, error.as_deref(), area)
+            render_replica_grant(f, fingerprint, error.as_deref(), &mut hits, area)
         }
         Overlay::ReplicaRevoke {
             fingerprint,
             name,
             error,
-        } => render_replica_revoke(f, fingerprint, name.as_deref(), error.as_deref(), area),
-        Overlay::DeployForce { error } => render_deploy_force(f, error.as_deref(), area),
+        } => render_replica_revoke(
+            f,
+            fingerprint,
+            name.as_deref(),
+            error.as_deref(),
+            &mut hits,
+            area,
+        ),
+        Overlay::DeployForce { error } => {
+            render_deploy_force(f, error.as_deref(), &mut hits, area)
+        }
         Overlay::AddShare { mount_path, error } => {
-            render_add_share(f, mount_path, error.as_deref(), area)
+            render_add_share(f, mount_path, error.as_deref(), &mut hits, area)
         }
         Overlay::RemoveShare {
             id,
             mount_path,
             error,
-        } => render_remove_share(f, id, mount_path, error.as_deref(), area),
-        Overlay::Help => render_help(f, area),
+        } => render_remove_share(f, id, mount_path, error.as_deref(), &mut hits, area),
+        // M3c: leaving a dirty editor asks save/discard first.
+        Overlay::EditorDiscard => render_editor_discard(f, &mut hits, area),
+        Overlay::Help => render_help(f, &mut hits, area),
+    }
+
+    app.hits = hits;
+}
+
+/// The inner content rect of a bordered pane (the border takes one cell on
+/// each side) — where list rows actually start.
+fn pane_inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     }
 }
 
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
+/// A fixed-size rect centered in `area` (the percentage helper cannot express
+/// "as big as this content needs").
+fn centered_fixed(w: u16, h: u16, area: Rect) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
+}
+
+/// The floating menu button's default spot: bottom-right, one row above the
+/// footer.
+fn default_fab_pos(area: Rect) -> (u16, u16) {
+    let col = area.right().saturating_sub(hit::FAB_W + 2).max(area.x);
+    let row = area.bottom().saturating_sub(hit::FAB_H + 1).max(area.y);
+    (col, row)
+}
+
+/// The floating menu button: a deliberately large touch target that stays put.
+/// A tap (press-release, no motion) opens the action menu; press-and-move
+/// repositions it and the position persists in the UI prefs. Drawn on the page
+/// layer — above content, below modals.
+fn render_fab(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
+    let (col, row) = app.prefs.fab.unwrap_or_else(|| default_fab_pos(area));
+    let col = col.min(area.right().saturating_sub(hit::FAB_W).max(area.x));
+    let row = row.min(area.bottom().saturating_sub(hit::FAB_H).max(area.y));
+    if app.prefs.fab != Some((col, row)) {
+        app.prefs.fab = Some((col, row));
+    }
+    let rect = Rect::new(col, row, hit::FAB_W, hit::FAB_H);
+    if rect.right() > area.right() || rect.bottom() > area.bottom() {
+        // Terminal too small for the button; the keyboard path (`m`) remains.
+        return;
+    }
+    let button = Paragraph::new("menu")
+        .centered()
+        .style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(Color::Cyan)),
+        );
+    f.render_widget(Clear, rect);
+    f.render_widget(button, rect);
+    hits.push(rect, Hit::Fab);
+}
+
+/// The floating action menu: a large checklist of the current view's actions.
+/// Tap a row to run it (the menu closes first, so the action lands on the
+/// page), tap outside or Esc to close. `selected` is the keyboard highlight,
+/// shown as the checked row.
+fn render_menu(f: &mut Frame, app: &App, selected: usize, hits: &mut HitMap, area: Rect) {
+    // Backdrop first: any tap outside the card dismisses. Recorded before the
+    // card's own zones, so the card and its rows win the reverse scan.
+    hits.push(area, Hit::Dismiss);
+    let actions = app.menu_actions();
+    let width = 58u16.min(area.width);
+    let height = (actions.len() as u16 + 4).min(area.height * 4 / 5);
+    let rect = centered_fixed(width, height, area);
+    f.render_widget(Clear, rect);
+    let inner = pane_inner(rect);
+    let mut lines: Vec<Line> = Vec::new();
+    let row_budget = inner.height.saturating_sub(2) as usize;
+    for (i, (label, _)) in actions.iter().enumerate().take(row_budget) {
+        let checked = if i == selected { "[x]" } else { "[ ]" };
+        let style = if i == selected {
+            sel_style()
+        } else {
+            Style::default()
+        };
+        hits.push(
+            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            Hit::MenuRow(i),
+        );
+        lines.push(Line::styled(format!("{checked} {label}"), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "tap an action · tap outside or Esc closes",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let title = format!("actions — {}", app.view.title());
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// Record one tap zone per *visible* row of a selection list, so a tap lands
+/// on the row it points at for any scroll offset. `selectable` may be smaller
+/// than `len` when trailing rows are informational (shares' offers). Called
+/// after the list state has been offset by the same [`hit::list_window`] the
+/// renderer used, so drawing and hit-testing share one scroll rule.
+fn record_list_rows(
+    hits: &mut HitMap,
+    area: Rect,
+    list: ListId,
+    len: usize,
+    selectable: usize,
+    selected: usize,
+) {
+    let inner = pane_inner(area);
+    let window = hit::list_window(len, selected, inner.height as usize);
+    let end = (window + inner.height as usize).min(selectable);
+    for index in window..end {
+        hits.push(
+            Rect::new(inner.x, inner.y + (index - window) as u16, inner.width, 1),
+            Hit::Row { list, index },
+        );
+    }
+}
+
+/// A tappable overlay chip row: `[label] [label] …`, each bracketed span a hit
+/// zone replaying its key. Returns the composed line; `y` is the row the line
+/// will occupy, which the caller knows while assembling the overlay body.
+fn chip_line(hits: &mut HitMap, x: u16, y: u16, chips: &[(&'static str, KeyEvent)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cx = x;
+    for (label, key) in chips {
+        let text = format!("[{label}] ");
+        let width = text.chars().count() as u16;
+        hits.push(Rect::new(cx, y, width, 1), Hit::Key(*key));
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::DarkGray),
+        ));
+        cx += width;
+    }
+    Line::from(spans)
+}
+
+/// The standard confirm pair — a destructive/irreversible y/n prompt gets the
+/// same two chips everywhere, so touch users learn one shape.
+fn yes_no_chips(hits: &mut HitMap, x: u16, y: u16, yes: &'static str, no: &'static str) -> Line<'static> {
+    chip_line(
+        hits,
+        x,
+        y,
+        &[
+            (yes, hit::key(KeyCode::Char('y'))),
+            (no, hit::key(KeyCode::Esc)),
+        ],
+    )
+}
+
+fn render_header(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let active = Style::default()
         .fg(Color::Black)
         .bg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::Gray);
-    let tab = |label: &'static str, on: bool| -> Span<'static> {
-        if on {
-            Span::styled(format!(" {label} "), active)
-        } else {
-            Span::styled(format!(" {label} "), dim)
-        }
-    };
     let state = if app.locked { "locked" } else { "unlocked" };
     let tip = app
         .tip
         .as_deref()
         .map(|h| h.chars().take(10).collect::<String>())
         .unwrap_or_else(|| "—".into());
-    let mut spans = vec![
-        Span::styled("softfig-tui ", Style::default().add_modifier(Modifier::BOLD)),
-        tab("1:Browse", app.view == View::Browse),
-        tab("2:History", app.view == View::History),
-        tab("3:Vault", app.view == View::Vault),
-        tab("4:Peers", app.view == View::Peers),
-        tab("5:Backup", app.view == View::Backup),
-        tab("6:Deploy", app.view == View::Deploy),
-        tab("7:Shares", app.view == View::Shares),
-    ];
+    let mut spans = vec![Span::styled(
+        "softfig-tui ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    // Tabs are tappable: each drawn label records a zone replaying its number
+    // key, so touch switches views exactly the keyboard does (including the
+    // growlight gate — an absent tab records nothing, so it can't be reached).
+    let mut x = area.x + "softfig-tui ".len() as u16;
+    let mut record_tab = |spans: &mut Vec<Span<'static>>,
+                          label: &'static str,
+                          on: bool,
+                          digit: char| {
+        let text = format!(" {label} ");
+        let width = text.chars().count() as u16;
+        let style = if on { active } else { dim };
+        hits.push(
+            Rect::new(x, area.y, width, 1),
+            Hit::Key(hit::key(KeyCode::Char(digit))),
+        );
+        spans.push(Span::styled(text, style));
+        x += width;
+    };
+    record_tab(&mut spans, "1:Browse", app.view == View::Browse, '1');
+    record_tab(&mut spans, "2:History", app.view == View::History, '2');
+    record_tab(&mut spans, "3:Vault", app.view == View::Vault, '3');
+    record_tab(&mut spans, "4:Peers", app.view == View::Peers, '4');
+    record_tab(&mut spans, "5:Backup", app.view == View::Backup, '5');
+    record_tab(&mut spans, "6:Deploy", app.view == View::Deploy, '6');
+    record_tab(&mut spans, "7:Shares", app.view == View::Shares, '7');
     // The Growlight tab appears ONLY when growlight is enabled on this garden —
     // no tab, no empty pane, no error otherwise (the load-bearing gate).
     if app.growlight_enabled == Some(true) {
-        spans.push(tab("8:Growlight", app.view == View::Growlight));
+        record_tab(&mut spans, "8:Growlight", app.view == View::Growlight, '8');
     }
     // Coordination (M5e) is ungated — always shown, unlike the growlight tab.
-    spans.push(tab("9:Coord", app.view == View::Coordination));
+    record_tab(&mut spans, "9:Coord", app.view == View::Coordination, '9');
     spans.push(Span::raw("  "));
     spans.push(Span::styled(format!("[{state}] tip:{tip}"), dim));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_body(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -140,45 +356,48 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
 
     match app.view {
         View::Browse => {
-            render_tree(f, app, cols[0]);
-            render_preview(f, app, cols[1]);
+            render_tree(f, app, hits, cols[0]);
+            render_preview(f, app, hits, cols[1]);
         }
         View::History => {
-            render_history(f, app, cols[0]);
-            render_preview(f, app, cols[1]);
+            render_history(f, app, hits, cols[0]);
+            render_preview(f, app, hits, cols[1]);
         }
         View::Vault => {
-            render_vault(f, app, cols[0]);
+            render_vault(f, app, hits, cols[0]);
             render_vault_detail(f, app, cols[1]);
         }
         View::Peers => {
-            render_peers(f, app, cols[0]);
+            render_peers(f, app, hits, cols[0]);
             render_peers_detail(f, app, cols[1]);
         }
         View::Backup => {
-            render_backup(f, app, cols[0]);
+            render_backup(f, app, hits, cols[0]);
             render_backup_detail(f, app, cols[1]);
         }
         View::Deploy => {
-            render_deploy(f, app, cols[0]);
+            render_deploy(f, app, hits, cols[0]);
             render_deploy_detail(f, app, cols[1]);
         }
         View::Shares => {
-            render_shares(f, app, cols[0]);
+            render_shares(f, app, hits, cols[0]);
             render_shares_detail(f, app, cols[1]);
         }
         View::Growlight => {
-            render_growlight(f, app, cols[0]);
-            render_growlight_detail(f, app, cols[1]);
+            render_growlight(f, app, hits, cols[0]);
+            render_growlight_detail(f, app, hits, cols[1]);
         }
         View::Coordination => {
-            render_coordination(f, app, cols[0]);
+            render_coordination(f, app, hits, cols[0]);
             render_coordination_detail(f, app, cols[1]);
         }
+        // M3c: the editor takes the full body width (a focused edit surface;
+        // the Browse tree is one Esc away).
+        View::Editor => render_editor(f, app, hits, cols[1]),
     }
 }
 
-fn render_tree(f: &mut Frame, app: &App, area: Rect) {
+fn render_tree(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let rows = app.tree.visible();
     let items: Vec<ListItem> = rows
         .iter()
@@ -201,6 +420,11 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
     if !rows.is_empty() {
         st.select(Some(app.tree.selected.min(rows.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        rows.len(),
+        app.tree.selected,
+        pane_inner(area).height as usize,
+    );
     let title = if app.garden_root.is_empty() {
         "browse".to_string()
     } else {
@@ -210,9 +434,17 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::Browse,
+        rows.len(),
+        rows.len(),
+        app.tree.selected,
+    );
 }
 
-fn render_history(f: &mut Frame, app: &App, area: Rect) {
+fn render_history(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let items: Vec<ListItem> = app
         .history
         .iter()
@@ -225,13 +457,26 @@ fn render_history(f: &mut Frame, app: &App, area: Rect) {
     if !app.history.is_empty() {
         st.select(Some(app.history_selected.min(app.history.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        app.history.len(),
+        app.history_selected,
+        pane_inner(area).height as usize,
+    );
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("history"))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::History,
+        app.history.len(),
+        app.history.len(),
+        app.history_selected,
+    );
 }
 
-fn render_vault(f: &mut Frame, app: &App, area: Rect) {
+fn render_vault(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let items: Vec<ListItem> = if app.vault.items.is_empty() {
         vec![ListItem::new("(no sealed files — :seal a pattern to start)")]
     } else {
@@ -245,6 +490,11 @@ fn render_vault(f: &mut Frame, app: &App, area: Rect) {
     if !app.vault.items.is_empty() {
         st.select(Some(app.vault.selected.min(app.vault.items.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        app.vault.items.len(),
+        app.vault.selected,
+        pane_inner(area).height as usize,
+    );
     let list = List::new(items)
         .block(
             Block::default()
@@ -253,6 +503,14 @@ fn render_vault(f: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::Vault,
+        app.vault.items.len(),
+        app.vault.items.len(),
+        app.vault.selected,
+    );
 }
 
 fn render_vault_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -296,7 +554,7 @@ fn render_vault_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_peers(f: &mut Frame, app: &App, area: Rect) {
+fn render_peers(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let items: Vec<ListItem> = if app.peer_list.items.is_empty() {
         vec![ListItem::new("(no paired devices — p to pair)")]
     } else {
@@ -330,6 +588,11 @@ fn render_peers(f: &mut Frame, app: &App, area: Rect) {
     if !app.peer_list.items.is_empty() {
         st.select(Some(app.peer_list.selected.min(app.peer_list.items.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        app.peer_list.items.len(),
+        app.peer_list.selected,
+        pane_inner(area).height as usize,
+    );
     let title = format!(
         "peers — {} paired · {} pending · {} nearby",
         app.peers.len(),
@@ -340,6 +603,14 @@ fn render_peers(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::Peers,
+        app.peer_list.items.len(),
+        app.peer_list.items.len(),
+        app.peer_list.selected,
+    );
 }
 
 fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -432,7 +703,7 @@ fn render_peers_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_backup(f: &mut Frame, app: &App, area: Rect) {
+fn render_backup(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let items: Vec<ListItem> = if app.backup.items.is_empty() {
         vec![ListItem::new("(no backup grants — g to grant a paired host)")]
     } else {
@@ -463,6 +734,11 @@ fn render_backup(f: &mut Frame, app: &App, area: Rect) {
     if !app.backup.items.is_empty() {
         st.select(Some(app.backup.selected.min(app.backup.items.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        app.backup.items.len(),
+        app.backup.selected,
+        pane_inner(area).height as usize,
+    );
     let title = format!(
         "backup — {} host me · {} I host · host:{}",
         app.replica_push_to.len(),
@@ -473,6 +749,14 @@ fn render_backup(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::Backup,
+        app.backup.items.len(),
+        app.backup.items.len(),
+        app.backup.selected,
+    );
 }
 
 fn render_backup_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -573,7 +857,7 @@ fn deploy_action_style(a: DeployAction) -> (&'static str, Color) {
     (a.verb(), color)
 }
 
-fn render_deploy(f: &mut Frame, app: &App, area: Rect) {
+fn render_deploy(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let items: Vec<ListItem> = if app.deploy.items.is_empty() {
         vec![ListItem::new("(no dots in config/deploy.toml)")]
     } else {
@@ -593,6 +877,11 @@ fn render_deploy(f: &mut Frame, app: &App, area: Rect) {
     if !app.deploy.items.is_empty() {
         st.select(Some(app.deploy.selected.min(app.deploy.items.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        app.deploy.items.len(),
+        app.deploy.selected,
+        pane_inner(area).height as usize,
+    );
     let title = format!(
         "deploy — {} dot(s){}",
         app.deploy.items.len(),
@@ -606,6 +895,14 @@ fn render_deploy(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::Deploy,
+        app.deploy.items.len(),
+        app.deploy.items.len(),
+        app.deploy.selected,
+    );
 }
 
 fn render_deploy_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -664,7 +961,7 @@ fn ceremony_label(state: CeremonyState) -> (&'static str, Color) {
     }
 }
 
-fn render_shares(f: &mut Frame, app: &App, area: Rect) {
+fn render_shares(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let mut items: Vec<ListItem> = app
         .shares
         .iter()
@@ -700,6 +997,11 @@ fn render_shares(f: &mut Frame, app: &App, area: Rect) {
     if !app.shares.is_empty() {
         st.select(Some(app.shares_selected.min(app.shares.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        items.len(),
+        app.shares_selected,
+        pane_inner(area).height as usize,
+    );
     let title = if app.share_offers.is_empty() {
         format!("shares — {} folder(s)", app.shares.len())
     } else {
@@ -713,6 +1015,15 @@ fn render_shares(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    // Trailing offer rows are informational: only mounted shares are tappable.
+    record_list_rows(
+        hits,
+        area,
+        ListId::Shares,
+        app.shares.len() + app.share_offers.len(),
+        app.shares.len(),
+        app.shares_selected,
+    );
 }
 
 fn render_shares_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -852,7 +1163,7 @@ fn growlight_status_color(status: &str) -> Color {
 /// tree — milestone/task items in drain order, each milestone expandable to its
 /// slices (`+`/`-`), rows coloured by status (queue status, or a slice's
 /// derived status), the active item bold.
-fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
+fn render_growlight(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let rows = app.growlight_tree.visible();
     let items: Vec<ListItem> = if rows.is_empty() {
         vec![ListItem::new("(queue empty or not loaded)")]
@@ -884,17 +1195,30 @@ fn render_growlight(f: &mut Frame, app: &App, area: Rect) {
     if !rows.is_empty() {
         st.select(Some(app.growlight_tree.selected.min(rows.len() - 1)));
     }
+    *st.offset_mut() = hit::list_window(
+        rows.len(),
+        app.growlight_tree.selected,
+        pane_inner(area).height as usize,
+    );
     let title = format!("growlight — {} row(s)", rows.len());
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::Growlight,
+        rows.len(),
+        rows.len(),
+        app.growlight_tree.selected,
+    );
 }
 
 /// Right pane of the Growlight section: a fleet-header strip above a scrollable
 /// markdown viewer of the selected tree node. Read-only — this section never
 /// controls the loop.
-fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_growlight_detail(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
@@ -916,6 +1240,7 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
             &mut app.preview_scroll,
             &mut app.preview_viewport,
             &mut app.preview_total,
+            hits,
         );
         return;
     }
@@ -934,6 +1259,7 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
             &mut app.preview_scroll,
             &mut app.preview_viewport,
             &mut app.preview_total,
+            hits,
         );
         return;
     }
@@ -953,6 +1279,7 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
             &mut app.preview_scroll,
             &mut app.preview_viewport,
             &mut app.preview_total,
+            hits,
         );
         return;
     }
@@ -977,6 +1304,7 @@ fn render_growlight_detail(f: &mut Frame, app: &mut App, area: Rect) {
         &mut app.preview_scroll,
         &mut app.preview_viewport,
         &mut app.preview_total,
+        hits,
     );
 }
 
@@ -1120,7 +1448,7 @@ fn coord_state_color(state: &str) -> Color {
 /// device's live state in the title, then the flattened selection list — each
 /// peer's device state, each shared chain's write-turn holder, then the conflict
 /// sidecars. Read-only throughout.
-fn render_coordination(f: &mut Frame, app: &App, area: Rect) {
+fn render_coordination(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     let (title, items): (String, Vec<ListItem>) = match &app.coordination {
         None => (
             "coordination — (loading…)".to_string(),
@@ -1183,10 +1511,23 @@ fn render_coordination(f: &mut Frame, app: &App, area: Rect) {
                 .min(app.coordination_rows.len() - 1),
         ));
     }
+    *st.offset_mut() = hit::list_window(
+        app.coordination_rows.len(),
+        app.coordination_selected,
+        pane_inner(area).height as usize,
+    );
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(sel_style());
     f.render_stateful_widget(list, area, &mut st);
+    record_list_rows(
+        hits,
+        area,
+        ListId::Coordination,
+        app.coordination_rows.len(),
+        app.coordination_rows.len(),
+        app.coordination_selected,
+    );
 }
 
 /// Right pane of the read-only Coordination section: a summary line, then the
@@ -1280,7 +1621,7 @@ fn render_coordination_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
+fn render_deploy_force(f: &mut Frame, error: Option<&str>, hits: &mut HitMap, area: Rect) {
     let rect = centered_rect(70, 40, area);
     f.render_widget(Clear, rect);
     let mut lines: Vec<Line> = vec![
@@ -1299,10 +1640,8 @@ fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
         ));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "y force · n / Esc cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(yes_no_chips(hits, rect.x + 2, y, "y force", "n cancel"));
 
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("force deploy"))
@@ -1316,6 +1655,7 @@ fn render_deploy_force(f: &mut Frame, error: Option<&str>, area: Rect) {
 /// bottom. `title_base` gains a ` [NN%]` suffix when the content overflows the
 /// viewport. Shared by the Browse preview and the growlight detail body so both
 /// scroll byte-identically (the scroll keys drive the same `preview_*` fields).
+#[allow(clippy::too_many_arguments)]
 fn render_scroll_body(
     f: &mut Frame,
     area: Rect,
@@ -1324,6 +1664,7 @@ fn render_scroll_body(
     scroll: &mut u16,
     viewport: &mut u16,
     total_out: &mut u16,
+    hits: &mut HitMap,
 ) {
     render_scroll_text(
         f,
@@ -1333,6 +1674,7 @@ fn render_scroll_body(
         scroll,
         viewport,
         total_out,
+        hits,
     );
 }
 
@@ -1341,6 +1683,7 @@ fn render_scroll_body(
 /// Records the live viewport + wrapped-line total and clamps `scroll` to the real
 /// bottom exactly as the `&str` path does, so every scrollable pane pages
 /// identically.
+#[allow(clippy::too_many_arguments)]
 fn render_scroll_text(
     f: &mut Frame,
     area: Rect,
@@ -1349,7 +1692,11 @@ fn render_scroll_text(
     scroll: &mut u16,
     viewport: &mut u16,
     total_out: &mut u16,
+    hits: &mut HitMap,
 ) {
+    // A press here starts a drag-scroll gesture (and a two-finger drag over
+    // it arrives as wheel events, routed to the same offset).
+    hits.push(area, Hit::Preview);
     // Borders take one row/column on each side; wrapping + clamping work in
     // terms of that inner content box.
     let inner_w = area.width.saturating_sub(2);
@@ -1406,7 +1753,13 @@ fn bus_lines(rows: &[BusRow]) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn render_add_share(f: &mut Frame, mount_path: &str, error: Option<&str>, area: Rect) {
+fn render_add_share(
+    f: &mut Frame,
+    mount_path: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
     let rect = centered_rect(75, 40, area);
     f.render_widget(Clear, rect);
     let mut lines: Vec<Line> = vec![
@@ -1435,9 +1788,15 @@ fn render_add_share(f: &mut Frame, mount_path: &str, error: Option<&str>, area: 
             Style::default().fg(Color::Red),
         ));
     }
-    lines.push(Line::styled(
-        "Enter share · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter share", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
     ));
 
     let p = Paragraph::new(lines)
@@ -1451,6 +1810,7 @@ fn render_remove_share(
     id: &str,
     mount_path: &str,
     error: Option<&str>,
+    hits: &mut HitMap,
     area: Rect,
 ) {
     let rect = centered_rect(70, 40, area);
@@ -1472,10 +1832,8 @@ fn render_remove_share(
         ));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "y un-share · n / Esc cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(yes_no_chips(hits, rect.x + 2, y, "y un-share", "n cancel"));
 
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("un-share folder"))
@@ -1483,7 +1841,175 @@ fn render_remove_share(
     f.render_widget(p, rect);
 }
 
-fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
+/// M3c: the full-body editor pane. Renders only the visible viewport slice of
+/// the cached styled lines (raw source or bionic), keeps the cursor row in
+/// view, and parks the terminal cursor on the editing position in raw mode.
+fn render_editor(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
+    let inner = pane_inner(area);
+    let Some(ed) = app.editor.as_mut() else {
+        let p = Paragraph::new("(no file open)")
+            .block(Block::default().borders(Borders::ALL).title("editor"));
+        f.render_widget(p, area);
+        return;
+    };
+    // One pane row is the touch view switch; the rest is text. On a pane too
+    // short for both, the switch yields (keyboard `Tab` still toggles).
+    let switch_h: u16 = if inner.height >= 2 { 1 } else { 0 };
+    let text_h = inner.height.saturating_sub(switch_h);
+    ed.set_viewport(text_h);
+    if ed.mode == EditorMode::Raw {
+        ed.scroll_to_cursor();
+    }
+
+    let mode = match ed.mode {
+        EditorMode::Raw => "raw",
+        EditorMode::Bionic => "bionic (read-only)",
+    };
+    let (row, col) = ed.position();
+    let mut title = format!("edit {}  · {mode}", ed.path);
+    if ed.dirty {
+        title.push_str("  · modified");
+    }
+    if ed.read_only.is_some() {
+        title.push_str("  · READ-ONLY");
+    }
+    title.push_str(&format!("  · {row}:{col}  · Tab toggle · Ctrl+S save · Esc exit"));
+
+    let start = ed.scroll as usize;
+    let shown: Vec<Line> = {
+        let doc = ed.doc();
+        let end = (start + text_h as usize).min(doc.len());
+        if start < end {
+            doc[start..end].to_vec()
+        } else {
+            Vec::new()
+        }
+    };
+    let mut body: Vec<Line> = Vec::with_capacity(shown.len() + 1);
+    if switch_h == 1 {
+        body.push(Line::raw("")); // make room for the switch row
+    }
+    body.extend(shown);
+    let p = Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+
+    // The touch view switch: `raw [█───] bionic` / `raw [───█] bionic`.
+    // Tapping either word selects that view directly; the track toggles.
+    let dim = Style::default().fg(Color::DarkGray);
+    if switch_h == 1 {
+        let y = inner.y;
+        let mut x = inner.x;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("view ", dim));
+        x += 5;
+        spans.push(Span::styled(
+            "raw",
+            if ed.mode == EditorMode::Raw {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            },
+        ));
+        hits.push(Rect::new(x, y, 3, 1), Hit::EditorView(false));
+        x += 3;
+        spans.push(Span::raw(" "));
+        x += 1;
+        let track = if ed.mode == EditorMode::Bionic {
+            "[───█]"
+        } else {
+            "[█───]"
+        };
+        spans.push(Span::styled(
+            track,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        hits.push(
+            Rect::new(x, y, 6, 1),
+            Hit::EditorView(ed.mode == EditorMode::Raw),
+        );
+        x += 6;
+        spans.push(Span::raw(" "));
+        x += 1;
+        spans.push(Span::styled(
+            "bionic",
+            if ed.mode == EditorMode::Bionic {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            },
+        ));
+        hits.push(Rect::new(x, y, 6, 1), Hit::EditorView(true));
+        f.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, y, inner.width, 1));
+    }
+
+    // Tap-to-place-caret zones (raw mode) + a drag/wheel body zone under them.
+    let text_top = inner.y + switch_h;
+    if text_h > 0 {
+        hits.push(
+            Rect::new(inner.x, text_top, inner.width, text_h),
+            Hit::EditorBody,
+        );
+        if ed.mode == EditorMode::Raw {
+            for i in 0..text_h {
+                let line = start + i as usize;
+                if line >= ed.line_count() {
+                    break;
+                }
+                hits.push(
+                    Rect::new(inner.x, text_top + i, inner.width, 1),
+                    Hit::EditorLine {
+                        row: line,
+                        x0: inner.x,
+                    },
+                );
+            }
+        }
+    }
+
+    // Park the terminal cursor on the editing position in raw mode; bionic is
+    // a read-only reading view.
+    if ed.mode == EditorMode::Raw && text_h > 0 && area.width > 2 {
+        let visible_row = ed.cursor().0.saturating_sub(ed.scroll as usize) as u16;
+        if visible_row < text_h {
+            let x = inner.x + (col.saturating_sub(1) as u16).min(inner.width.saturating_sub(1));
+            let y = text_top + visible_row;
+            f.set_cursor_position((x, y));
+        }
+    }
+}
+
+/// M3c: the unsaved-changes confirm shown when leaving a dirty editor.
+fn render_editor_discard(f: &mut Frame, hits: &mut HitMap, area: Rect) {
+    let rect = centered_rect(60, 30, area);
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line> = vec![
+        Line::raw("This file has unsaved changes."),
+        Line::raw(""),
+    ];
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("s save", hit::key(KeyCode::Char('s'))),
+            ("d discard", hit::key(KeyCode::Char('d'))),
+            ("Esc back", hit::key(KeyCode::Esc)),
+        ],
+    ));
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("unsaved changes"),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+fn render_preview(f: &mut Frame, app: &mut App, hits: &mut HitMap, area: Rect) {
     let mut title = app.preview_title.clone();
     // M2c: flag inline `<vault id=…>` regions so the user knows `x` opens the
     // per-region reveal picker for this file.
@@ -1500,18 +2026,23 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
         &mut app.preview_scroll,
         &mut app.preview_viewport,
         &mut app.preview_total,
+        hits,
     );
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let hint = " :cmd  ?help  q quit ";
+    // The action chips moved into the floating menu button, so the footer is
+    // status + one dim hint again.
     let line = Line::from(vec![
         Span::styled(
             format!(" {} ", app.status),
             Style::default().fg(Color::Black).bg(Color::Gray),
         ),
         Span::raw(" "),
-        Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "☰ menu — tap to open · hold & move to reposition",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -1535,29 +2066,93 @@ fn centered_rect(px: u16, py: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
-fn render_palette(f: &mut Frame, buf: &str, area: Rect) {
-    let rect = centered_rect(80, 30, area);
+fn render_palette(f: &mut Frame, buf: &str, scroll: usize, hits: &mut HitMap, area: Rect) {
+    let rect = centered_rect(80, 85, area);
     f.render_widget(Clear, rect);
-    let body = format!(":{buf}\n\n{}", command_hints());
-    let p = Paragraph::new(body)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("command (Enter run · Esc cancel)"),
+    let inner = pane_inner(rect);
+    let mut lines: Vec<Line> = vec![Line::raw(format!(":{buf}")), Line::raw("")];
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter run", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
+    lines.push(Line::raw(""));
+    // Tappable command rows: a touch user picks a command instead of typing.
+    // The list scrolls (wheel/drag) so rows past the visible budget stay
+    // reachable; the list-area zone is recorded first so row zones win taps.
+    let rows = command_menu();
+    let total = rows.len();
+    let budget = inner.height.saturating_sub(3) as usize;
+    let offset = scroll.min(total.saturating_sub(1));
+    if budget > 0 {
+        hits.push(
+            Rect::new(inner.x, inner.y + 3, inner.width, budget as u16),
+            Hit::PaletteBody,
+        );
+    }
+    for (i, (name, description)) in rows.into_iter().skip(offset).take(budget).enumerate() {
+        let row_y = inner.y + 3 + i as u16;
+        hits.push(
+            Rect::new(inner.x, row_y, inner.width, 1),
+            Hit::PalettePick(name),
+        );
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {name:<12}"), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                description.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    let title = if total > budget {
+        format!(
+            "commands — type or tap · {}–{}/{total}",
+            offset + 1,
+            (offset + budget).min(total)
         )
+    } else {
+        "commands — type or tap".to_string()
+    };
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
 }
 
-fn render_unlock(f: &mut Frame, buf: &str, error: Option<&str>, area: Rect) {
+fn render_unlock(
+    f: &mut Frame,
+    buf: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
     let rect = centered_rect(60, 30, area);
     f.render_widget(Clear, rect);
     let masked: String = "*".repeat(buf.chars().count());
-    let mut body = format!("passphrase: {masked}\n\nEnter unlock · Esc cancel");
+    let mut lines: Vec<Line> = vec![Line::raw(format!("passphrase: {masked}")), Line::raw("")];
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter unlock", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
     if let Some(e) = error {
-        body.push_str(&format!("\n\nerror: {e}"));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
     }
-    let p = Paragraph::new(body)
+    let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("unlock vault"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
@@ -1569,6 +2164,7 @@ fn render_reveal(
     id: Option<&str>,
     buf: &str,
     error: Option<&str>,
+    hits: &mut HitMap,
     area: Rect,
 ) {
     let rect = centered_rect(70, 35, area);
@@ -1579,14 +2175,35 @@ fn render_reveal(
         Some(id) => format!("region <{id}> of {path}"),
         None => path.to_string(),
     };
-    let mut body = format!(
-        "reveal {target}\n\nmaster password: {masked}\n\nEnter reveal · Esc cancel\n\n\
-         plaintext is written to a 0600 temp file — never shown here"
-    );
+    let mut lines: Vec<Line> = vec![
+        Line::raw(format!("reveal {target}")),
+        Line::raw(""),
+        Line::raw(format!("master password: {masked}")),
+        Line::raw(""),
+    ];
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter reveal", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "plaintext is written to a 0600 temp file — never shown here",
+        Style::default().fg(Color::DarkGray),
+    ));
     if let Some(e) = error {
-        body.push_str(&format!("\n\nerror: {e}"));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        ));
     }
-    let p = Paragraph::new(body)
+    let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("reveal secret"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
@@ -1594,12 +2211,20 @@ fn render_reveal(
 
 /// M2c: the inline-region picker. Lists the file's `<vault id=…>` region ids;
 /// `Enter` on the highlighted one advances to the masked-password prompt.
-fn render_reveal_region(f: &mut Frame, path: &str, ids: &[String], selected: usize, area: Rect) {
+fn render_reveal_region(
+    f: &mut Frame,
+    path: &str,
+    ids: &[String],
+    selected: usize,
+    hits: &mut HitMap,
+    area: Rect,
+) {
     let rect = centered_rect(70, 45, area);
     f.render_widget(Clear, rect);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(format!("inline vault regions in {path}")));
     lines.push(Line::raw(""));
+    let inner = pane_inner(rect);
     for (i, id) in ids.iter().enumerate() {
         let marker = if i == selected { "› " } else { "  " };
         let style = if i == selected {
@@ -1607,12 +2232,24 @@ fn render_reveal_region(f: &mut Frame, path: &str, ids: &[String], selected: usi
         } else {
             Style::default()
         };
+        // One tappable zone per region row: tap selects, tapping the selected
+        // row again advances to the masked-password prompt.
+        hits.push(
+            Rect::new(inner.x, inner.y + 2 + i as u16, inner.width, 1),
+            Hit::RegionRow(i),
+        );
         lines.push(Line::styled(format!("{marker}<{id}>"), style));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "j/k select · Enter reveal region · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter reveal region", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
     ));
     let p = Paragraph::new(lines)
         .block(
@@ -1630,6 +2267,7 @@ fn render_pair_begin(
     endpoint: &str,
     focus: PairField,
     error: Option<&str>,
+    hits: &mut HitMap,
     area: Rect,
 ) {
     let rect = centered_rect(75, 45, area);
@@ -1640,6 +2278,22 @@ fn render_pair_begin(
     let mark = |on: bool| if on { "> " } else { "  " };
     let fp_on = focus == PairField::Fingerprint;
     let ep_on = focus == PairField::Endpoint;
+
+    // Tap the *other* field row to move focus (the same toggle as Tab), so a
+    // touch user never needs a keyboard to switch between the two inputs.
+    let inner = pane_inner(rect);
+    if !fp_on {
+        hits.push(
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            Hit::Key(hit::key(KeyCode::Tab)),
+        );
+    }
+    if !ep_on {
+        hits.push(
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            Hit::Key(hit::key(KeyCode::Tab)),
+        );
+    }
 
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
@@ -1668,9 +2322,16 @@ fn render_pair_begin(
             Style::default().fg(Color::Red),
         ));
     }
-    lines.push(Line::styled(
-        "Enter pair · Tab switch field · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter pair", hit::key(KeyCode::Enter)),
+            ("Tab field", hit::key(KeyCode::Tab)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
     ));
 
     let p = Paragraph::new(lines)
@@ -1689,6 +2350,7 @@ fn render_pair_confirm(
     fingerprint: &str,
     name: &str,
     error: Option<&str>,
+    hits: &mut HitMap,
     area: Rect,
 ) {
     let rect = centered_rect(70, 45, area);
@@ -1712,10 +2374,8 @@ fn render_pair_confirm(
         ));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "y confirm (codes match) · n / Esc abort",
-        Style::default().fg(Color::DarkGray),
-    ));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(yes_no_chips(hits, rect.x + 2, y, "y confirm", "n abort"));
 
     let p = Paragraph::new(lines)
         .block(
@@ -1727,7 +2387,14 @@ fn render_pair_confirm(
     f.render_widget(p, rect);
 }
 
-fn render_unpair(f: &mut Frame, fingerprint: &str, name: &str, error: Option<&str>, area: Rect) {
+fn render_unpair(
+    f: &mut Frame,
+    fingerprint: &str,
+    name: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
     let rect = centered_rect(65, 35, area);
     f.render_widget(Clear, rect);
     let mut lines: Vec<Line> = vec![
@@ -1742,10 +2409,8 @@ fn render_unpair(f: &mut Frame, fingerprint: &str, name: &str, error: Option<&st
         ));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "y unpair · n / Esc cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(yes_no_chips(hits, rect.x + 2, y, "y unpair", "n cancel"));
 
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("unpair device"))
@@ -1753,7 +2418,13 @@ fn render_unpair(f: &mut Frame, fingerprint: &str, name: &str, error: Option<&st
     f.render_widget(p, rect);
 }
 
-fn render_replica_grant(f: &mut Frame, fingerprint: &str, error: Option<&str>, area: Rect) {
+fn render_replica_grant(
+    f: &mut Frame,
+    fingerprint: &str,
+    error: Option<&str>,
+    hits: &mut HitMap,
+    area: Rect,
+) {
     let rect = centered_rect(75, 40, area);
     f.render_widget(Clear, rect);
     let mut lines: Vec<Line> = vec![
@@ -1778,9 +2449,15 @@ fn render_replica_grant(f: &mut Frame, fingerprint: &str, error: Option<&str>, a
             Style::default().fg(Color::Red),
         ));
     }
-    lines.push(Line::styled(
-        "Enter grant · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            ("Enter grant", hit::key(KeyCode::Enter)),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
     ));
 
     let p = Paragraph::new(lines)
@@ -1794,6 +2471,7 @@ fn render_replica_revoke(
     fingerprint: &str,
     name: Option<&str>,
     error: Option<&str>,
+    hits: &mut HitMap,
     area: Rect,
 ) {
     let rect = centered_rect(70, 40, area);
@@ -1816,10 +2494,8 @@ fn render_replica_revoke(
         ));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "y revoke · n / Esc cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(yes_no_chips(hits, rect.x + 2, y, "y revoke", "n cancel"));
 
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("revoke backup host"))
@@ -1827,7 +2503,7 @@ fn render_replica_revoke(
     f.render_widget(p, rect);
 }
 
-fn render_form(f: &mut Frame, form: &ActionForm, area: Rect) {
+fn render_form(f: &mut Frame, form: &ActionForm, hits: &mut HitMap, area: Rect) {
     let rect = centered_rect(80, 70, area);
     f.render_widget(Clear, rect);
 
@@ -1840,6 +2516,13 @@ fn render_form(f: &mut Frame, form: &ActionForm, area: Rect) {
         } else {
             Style::default().fg(Color::Gray)
         };
+        // The field's first row is a tap target: tapping focuses that field
+        // (the same state Tab / ↑↓ move, so touch and keys agree).
+        let field_y = rect.y + 1 + lines.len() as u16;
+        hits.push(
+            Rect::new(rect.x + 1, field_y, rect.width.saturating_sub(2), 1),
+            Hit::FormField(i),
+        );
         match &field.value {
             FieldValue::Line(s) => {
                 lines.push(Line::from(vec![
@@ -1865,8 +2548,21 @@ fn render_form(f: &mut Frame, form: &ActionForm, area: Rect) {
             Style::default().fg(Color::Red),
         ));
     }
+    let y = rect.y + 1 + lines.len() as u16;
+    lines.push(chip_line(
+        hits,
+        rect.x + 2,
+        y,
+        &[
+            (
+                "Ctrl-S submit",
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            ),
+            ("Esc cancel", hit::key(KeyCode::Esc)),
+        ],
+    ));
     lines.push(Line::styled(
-        "Ctrl-S submit · Tab/↑↓ field · Enter newline(body) · Esc cancel",
+        "Tab/↑↓ field · Enter newline in a body field",
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -1880,9 +2576,11 @@ fn render_form(f: &mut Frame, form: &ActionForm, area: Rect) {
     f.render_widget(p, rect);
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
+fn render_help(f: &mut Frame, hits: &mut HitMap, area: Rect) {
     let rect = centered_rect(82, 90, area);
     f.render_widget(Clear, rect);
+    // A tap anywhere on the help card dismisses it, exactly like any key.
+    hits.push(rect, Hit::Dismiss);
     let body = "\
 soft-fig TUI — keys
 
@@ -1908,6 +2606,7 @@ soft-fig TUI — keys
   r            refresh view
   u            unlock (when locked)
   :            command palette
+  m            open the floating action menu (same as the ☰ button)
   ?            this help
   q            quit
 
@@ -1925,7 +2624,13 @@ backup (M5b): grant a paired host to store this device's chain
 as verified ciphertext it cannot decrypt; revoke stops future
 pushes; chains I host for others show as read-only mirrors
 
-any key closes this help";
+touch: tap a tab / row / action to act · tap a selected row again to
+open · the ☰ button floats anywhere (hold & move to reposition; tap
+to open a checklist of this view's actions; tap outside closes it) ·
+two-finger scroll or drag scrolls panes · the editor's raw/bionic
+switch is tappable and new files open in the view you last chose
+
+any key or tap closes this help";
     let p = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title("help"))
         .wrap(Wrap { trim: false });
