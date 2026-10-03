@@ -134,10 +134,12 @@ reveal's value · `u` unlock · `:` command palette (runs `log_decision`,
 
 **Pointer / touch.** The TUI records its on-screen geometry every frame, so a
 mouse click or a touchscreen tap works everywhere a key does: tap a header tab
-to switch views; tap a list/tree row to select it and tap it again to
-open/expand (a double-tap — a right click under the touch-pointer Wayfire
-plugin — activates directly); the wheel (two-finger drag) scrolls the pane
-under the cursor, and a held drag scrolls the preview or the editor.
+to switch views; tap a Browse file/folder row (or a Growlight milestone) to
+open/expand it immediately, while the flat lists (Vault, Peers, Backup, Deploy,
+Shares, History, Coordination) still select on the first tap and act on the
+second (a double-tap — a right click under the touch-pointer Wayfire plugin —
+also activates directly); the wheel (two-finger drag) scrolls the pane under
+the cursor, and a held drag scrolls the preview or the editor.
 
 A floating **☰ menu button** replaces the old footer action chips. Tap it to
 open a large checklist of the current view's actions (tap a row to run it; tap
@@ -151,14 +153,25 @@ reachable without a keyboard — text entry still needs the on-screen keyboard.
 In the editor (`e` on a Browse file) a **raw ↔ bionic switch** sits at the top
 of the pane: tap either label or the track, and new files open in whichever
 view you last chose (persisted). Tap a line to place the caret, wheel to
-scroll, and drag to select text. A **text selection** is anchored by a
-double-tap on a word (or a right click), then extended by dragging — a
+scroll, and drag to select text. Selection works in **both** raw and bionic
+views (in bionic a plain drag still free-scrolls until a selection starts). A
+**text selection** is anchored by a double-tap on a word (or a right click),
+then extended by dragging — a
 **magnifier card follows above your finger** showing the caret and the
 selected span, so the finger never hides what is being selected, and the
 finished selection is **copied to the clipboard automatically** (Ctrl-C
 re-copies; the first Esc clears it, the next closes the editor). Mouse
 capture stays on for all of this, so terminal-native text selection needs the
 terminal's Shift modifier (the usual full-screen-app trade-off).
+
+**Saving.** `Ctrl-S` (and `s` on the unsaved-changes confirm) sends one
+guarded `patch_file` through the daemon — old = the read content, new = the
+edited buffer, `expected_version` = the version read from `read_file` — over
+the async worker channel, so the UI never blocks; the TUI never touches the
+filesystem itself. On success the editor clears dirty; on a conflict (the file
+changed on the daemon) your buffer and edits are kept, with a re-read-and-retry
+status. Sealed, inline-`<vault>`-region, and truncated files stay read-only,
+and empty files can't be saved yet (a v2 `write_file` verb is the follow-up).
 
 Browse content comes through the daemon's read-only `list_tree` /
 `read_file` verbs, which redact server-side: sealed files show
