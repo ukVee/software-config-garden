@@ -131,6 +131,9 @@ pub struct Editor {
     pristine: Vec<String>,
     row: usize,
     col: usize,
+    /// Selection anchor `(line, char col)`; the live head is `(row, col)`.
+    /// `Some` while a selection is active (head inclusive).
+    selection: Option<(usize, usize)>,
     raw_cache: Vec<Line<'static>>,
     fence_after: Vec<bool>,
     bionic_cache: Option<Vec<Line<'static>>>,
@@ -161,6 +164,7 @@ impl Editor {
             lines,
             row: 0,
             col: 0,
+            selection: None,
             raw_cache: Vec::new(),
             fence_after: Vec::new(),
             bionic_cache: None,
@@ -171,6 +175,11 @@ impl Editor {
 
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// The raw text of one line (the magnifier window's source).
+    pub fn line_text(&self, row: usize) -> String {
+        self.lines.get(row).cloned().unwrap_or_default()
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -239,12 +248,105 @@ impl Editor {
     }
 
     /// Place the caret (a tap): clamped to a real line and a real char column.
+    /// Deliberately does **not** touch the selection — the drag path reuses it
+    /// to move the selection head while the anchor stays put.
     pub fn set_cursor(&mut self, row: usize, col: usize) {
         if self.lines.is_empty() {
             return;
         }
         self.row = row.min(self.lines.len() - 1);
         self.col = col.min(self.lines[self.row].chars().count());
+    }
+
+    // ---- selection ----
+
+    /// Drop the selection (a plain tap, any edit, or Esc).
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Start a selection at `(row, col)` if none is active; idempotent, so the
+    /// drag path can call it on every motion. Moving the head stays with
+    /// [`Self::set_cursor`].
+    pub fn begin_selection(&mut self, row: usize, col: usize) {
+        if self.selection.is_none() {
+            let row = row.min(self.lines.len().saturating_sub(1));
+            let col = col.min(self.lines.get(row).map_or(0, |l| l.chars().count()));
+            self.selection = Some((row, col));
+        }
+    }
+
+    /// The selection as normalized inclusive `(start, end)` char positions.
+    /// `None` when there is no selection.
+    pub fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.selection?;
+        let head = (self.row, self.col);
+        Some(if anchor <= head { (anchor, head) } else { (head, anchor) })
+    }
+
+    /// The selected text, normalizing a backwards drag. `None` when nothing
+    /// non-empty is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((sr, sc), (er, ec)) = self.selection_bounds()?;
+        let mut out = String::new();
+        for row in sr..=er {
+            let chars: Vec<char> = self.lines.get(row)?.chars().collect();
+            let from = if row == sr { sc.min(chars.len()) } else { 0 };
+            // The head char is inclusive; a head at EOL selects through the
+            // last char (or nothing on an empty line).
+            let to = if row == er {
+                (ec + 1).min(chars.len())
+            } else {
+                chars.len()
+            };
+            if row > sr {
+                out.push('\n');
+            }
+            if to > from {
+                out.extend(&chars[from..to]);
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// Select the word at `(row, col)` (double-tap / right click): the anchor
+    /// lands on the word's first char, the head on its last (inclusive).
+    /// Non-word chars select just the char under the finger.
+    pub fn select_word_at(&mut self, row: usize, col: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        self.row = row.min(self.lines.len() - 1);
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        if chars.is_empty() {
+            self.col = 0;
+            self.selection = None;
+            return;
+        }
+        let at = col.min(chars.len() - 1);
+        let (mut start, mut end) = (at, at);
+        if is_word_char(chars[at]) {
+            while start > 0 && is_word_char(chars[start - 1]) {
+                start -= 1;
+            }
+            while end + 1 < chars.len() && is_word_char(chars[end + 1]) {
+                end += 1;
+            }
+        }
+        self.selection = Some((self.row, start));
+        self.col = end;
+    }
+
+    /// Is `(row, col)` inside the current selection (inclusive bounds)?
+    pub fn selection_contains(&self, row: usize, col: usize) -> bool {
+        match self.selection_bounds() {
+            Some(((sr, sc), (er, ec))) => (row, col) >= (sr, sc) && (row, col) <= (er, ec),
+            None => false,
+        }
     }
 
     /// Free-scroll the reading view by `delta` lines (bionic mode), clamped to
@@ -299,6 +401,8 @@ impl Editor {
         if !self.editable() || c == '\n' {
             return;
         }
+        // Any edit supersedes the selection (v1 does not replace it).
+        self.selection = None;
         let line = &mut self.lines[self.row];
         let byte = char_to_byte(line, self.col);
         line.insert(byte, c);
@@ -310,6 +414,7 @@ impl Editor {
         if !self.editable() {
             return;
         }
+        self.selection = None;
         let line = &mut self.lines[self.row];
         let byte = char_to_byte(line, self.col);
         let rest = line.split_off(byte);
@@ -323,6 +428,7 @@ impl Editor {
         if !self.editable() {
             return;
         }
+        self.selection = None;
         if self.col > 0 {
             let line = &mut self.lines[self.row];
             let start = char_to_byte(line, self.col - 1);
@@ -343,6 +449,7 @@ impl Editor {
         if !self.editable() {
             return;
         }
+        self.selection = None;
         let len = self.lines[self.row].chars().count();
         if self.col < len {
             let line = &mut self.lines[self.row];
@@ -428,6 +535,7 @@ impl Editor {
     pub fn discard(&mut self) {
         self.lines = self.pristine.clone();
         self.dirty = false;
+        self.selection = None;
         self.bionic_cache = None;
         self.rebuild_raw();
         self.row = self.row.min(self.lines.len().saturating_sub(1));
@@ -524,6 +632,12 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(b, _)| b)
         .unwrap_or(s.len())
+}
+
+/// Word characters for double-tap selection — the same set the bionic
+/// transform treats as a word (alphanumeric plus `_`, `'`, `-`).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '\'' | '-')
 }
 
 #[cfg(test)]
@@ -768,5 +882,66 @@ mod tests {
         ed.insert_char('X');
         let after = ed.doc()[19_999].clone();
         assert_eq!(before.spans[0].content, after.spans[0].content);
+    }
+
+    // ---- selection ----
+
+    #[test]
+    fn word_selection_picks_the_word_and_extracts_it() {
+        let mut ed = open("the quick brown fox");
+        ed.select_word_at(0, 5); // inside "quick"
+        assert_eq!(ed.selection_bounds(), Some(((0, 4), (0, 8))));
+        assert_eq!(ed.selected_text().as_deref(), Some("quick"));
+        // A non-word char (a space) selects just that char.
+        ed.select_word_at(0, 3);
+        assert_eq!(ed.selected_text().as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn selection_spans_lines_and_normalizes_a_backwards_drag() {
+        let mut ed = open("alpha\nbeta\ngamma");
+        ed.begin_selection(2, 2); // anchor on "gamma"
+        ed.set_cursor(0, 2); // head before the anchor → normalized
+        assert_eq!(ed.selected_text().as_deref(), Some("pha\nbeta\ngam"));
+    }
+
+    #[test]
+    fn selection_contains_uses_inclusive_bounds() {
+        let mut ed = open("one two");
+        ed.select_word_at(0, 0); // "one"
+        assert!(ed.selection_contains(0, 0));
+        assert!(ed.selection_contains(0, 2));
+        assert!(!ed.selection_contains(0, 3)); // the space after is outside
+        assert!(!ed.selection_contains(1, 0));
+    }
+
+    #[test]
+    fn edits_supersede_the_selection() {
+        let mut ed = open("hello world");
+        ed.select_word_at(0, 6);
+        assert!(ed.has_selection());
+        ed.insert_char('X');
+        assert!(!ed.has_selection(), "typing drops the selection");
+        ed.select_word_at(0, 0);
+        ed.backspace();
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn set_cursor_keeps_the_selection_for_drag_extension() {
+        let mut ed = open("alpha beta");
+        ed.begin_selection(0, 0);
+        ed.set_cursor(0, 4);
+        assert_eq!(ed.selected_text().as_deref(), Some("alpha"));
+        ed.clear_selection();
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn select_word_on_an_empty_line_is_a_safe_noop() {
+        let mut ed = open("");
+        ed.select_word_at(0, 3);
+        assert_eq!(ed.cursor(), (0, 0));
+        assert!(!ed.has_selection());
     }
 }

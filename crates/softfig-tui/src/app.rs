@@ -307,7 +307,7 @@ pub struct HistoryLine {
 #[derive(Debug, Clone, Copy)]
 enum DragTarget {
     Preview,
-    Editor { line: usize, col: usize },
+    Editor { line: usize, col: usize, x0: u16 },
 }
 
 /// An in-flight drag-scroll. `row` is where the press landed, `scroll` the
@@ -490,6 +490,9 @@ pub struct App {
     /// The terminal area from the last frame. Drag clamping needs it before
     /// any hit zone exists (zones are only recorded during render).
     pub screen: Rect,
+    /// The last pointer cell (updated on every mouse event) — the editor
+    /// magnifier anchors itself above this.
+    pub pointer: (u16, u16),
     /// Persisted interface preferences: menu-button position + editor view.
     pub prefs: UiPrefs,
     /// First visible row of the palette's command list (wheel/drag scroll).
@@ -581,6 +584,7 @@ impl App {
             drag: None,
             fab_drag: None,
             screen: Rect::new(0, 0, 0, 0),
+            pointer: (0, 0),
             prefs: UiPrefs::default(),
             palette_scroll: 0,
             growlight_injected_protocol: None,
@@ -2054,6 +2058,10 @@ impl App {
                 }
                 View::Editor => {
                     actions.push((
+                        "Ctrl-C copy selection",
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    ));
+                    actions.push((
                         "Ctrl-S save",
                         KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
                     ));
@@ -2075,6 +2083,7 @@ impl App {
     /// (e.g. before the first frame) the wheel keeps its original behaviour —
     /// scroll the preview — so behaviour degrades gracefully, never silently.
     pub fn handle_mouse(&mut self, ev: MouseEvent, ipc: &mut IpcClient) {
+        self.pointer = (ev.column, ev.row);
         match ev.kind {
             MouseEventKind::ScrollDown => self.scroll_at(ev.column, ev.row, 3, ipc),
             MouseEventKind::ScrollUp => self.scroll_at(ev.column, ev.row, -3, ipc),
@@ -2090,8 +2099,20 @@ impl App {
 
     /// Button-up: ends any preview/editor drag and, for the floating button,
     /// either opens the menu (a tap) or keeps the new position (a drag).
+    /// Finishing a text selection auto-copies it — selecting is the whole
+    /// gesture, so the clipboard should not need a second action.
     fn release(&mut self) {
+        let finished_selection = matches!(
+            self.drag,
+            Some(DragAnchor {
+                target: DragTarget::Editor { .. },
+                ..
+            })
+        ) && self.editor.as_ref().is_some_and(|e| e.has_selection());
         self.drag = None;
+        if finished_selection {
+            self.editor_copy_selection();
+        }
         if let Some(fab) = self.fab_drag.take() {
             if fab.moved {
                 self.save_prefs();
@@ -2135,17 +2156,35 @@ impl App {
             }
             Hit::EditorLine { row: line, x0 } => {
                 let col = column.saturating_sub(x0) as usize;
+                let mut anchor = None;
+                let mut copy_now = false;
                 if let Some(ed) = self.editor.as_mut() {
-                    ed.set_cursor(line, col);
-                }
-                if !activate {
-                    if let Some(scroll) = self.editor.as_ref().map(|e| e.scroll) {
-                        self.drag = Some(DragAnchor {
-                            row,
-                            scroll,
-                            target: DragTarget::Editor { line, col },
-                        });
+                    if activate {
+                        // Double-tap / right click selects the word under the
+                        // finger; a following drag extends it. The word is
+                        // copied immediately — no second action needed.
+                        ed.select_word_at(line, col);
+                        copy_now = true;
+                    } else if ed.selection_contains(line, col) {
+                        // Press inside the selection: keep the anchor and let a
+                        // drag move the head. A no-motion tap leaves it as is.
+                    } else {
+                        ed.clear_selection();
+                        ed.set_cursor(line, col);
                     }
+                    if !activate {
+                        anchor = Some(ed.scroll);
+                    }
+                }
+                if copy_now {
+                    self.editor_copy_selection();
+                }
+                if let Some(scroll) = anchor {
+                    self.drag = Some(DragAnchor {
+                        row,
+                        scroll,
+                        target: DragTarget::Editor { line, col, x0 },
+                    });
                 }
             }
             Hit::EditorBody => {
@@ -2156,7 +2195,7 @@ impl App {
                         self.drag = Some(DragAnchor {
                             row,
                             scroll,
-                            target: DragTarget::Editor { line, col: 0 },
+                            target: DragTarget::Editor { line, col: 0, x0: 0 },
                         });
                     }
                 }
@@ -2319,12 +2358,20 @@ impl App {
                 let max = self.preview_max_scroll() as i32;
                 self.preview_scroll = (anchor.scroll as i32 + delta).clamp(0, max) as u16;
             }
-            DragTarget::Editor { line, col } => {
+            DragTarget::Editor { line, col, x0 } => {
                 if let Some(ed) = self.editor.as_mut() {
                     if ed.mode == EditorMode::Raw {
-                        let target =
-                            (line as i32 + delta).clamp(0, ed.line_count().saturating_sub(1) as i32);
-                        ed.set_cursor(target as usize, col);
+                        // The head follows the finger in two dimensions (note:
+                        // the opposite sign of a scroll — dragging down moves
+                        // the selection head down); the anchor is where the
+                        // gesture (or the double-tap word) started.
+                        let vdelta = row as i32 - anchor.row as i32;
+                        let head_line = (line as i32 + vdelta)
+                            .clamp(0, ed.line_count().saturating_sub(1) as i32)
+                            as usize;
+                        let head_col = column.saturating_sub(x0) as usize;
+                        ed.begin_selection(line, col);
+                        ed.set_cursor(head_line, head_col);
                     } else {
                         ed.set_scroll((anchor.scroll as i32 + delta).max(0) as u16);
                     }
@@ -2763,6 +2810,21 @@ impl App {
     /// The editor view's key path. Typing must never reach the global key
     /// bindings, so `handle_key_main` diverts here first.
     fn handle_key_editor(&mut self, key: KeyEvent) {
+        let ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        let had_selection = self.editor.as_ref().is_some_and(|e| e.has_selection());
+        if ctrl_c {
+            self.editor_copy_selection();
+            return;
+        }
+        // Every other key supersedes the selection (v1 does not replace it),
+        // and the first Esc only drops the selection instead of exiting.
+        if let Some(ed) = self.editor.as_mut() {
+            ed.clear_selection();
+        }
+        if key.code == KeyCode::Esc && had_selection {
+            return;
+        }
         let mut save = false;
         let mut exit = false;
         let mut ask_discard = false;
@@ -2846,6 +2908,38 @@ impl App {
             }
             KeyCode::Esc => self.overlay = Overlay::None,
             _ => {}
+        }
+    }
+
+    /// Copy the editor's current selection to the Wayland clipboard
+    /// (`Ctrl-C` / the menu's copy row). The bytes are already this process's
+    /// heap (the editor buffer, daemon-redacted); this only fires on the
+    /// explicit user action, same posture as the reveal copy.
+    fn editor_copy_selection(&mut self) {
+        let Some(text) = self.editor.as_ref().and_then(|e| e.selected_text()) else {
+            self.status = "nothing selected — double-tap a word or drag".into();
+            return;
+        };
+        if !clip::clipboard_available() {
+            self.status = "no clipboard tool (wl-copy)".into();
+            return;
+        }
+        let chars = text.chars().count();
+        self.status = match clip::copy_text_to_clipboard(&text) {
+            Ok(()) => format!("copied {chars} char(s) to clipboard"),
+            Err(e) => format!("copy failed: {e}"),
+        };
+    }
+
+    /// The pointer cell while an editor selection gesture is in progress —
+    /// the magnifier's anchor while the finger is down. `None` otherwise.
+    pub fn selection_pointer(&self) -> Option<(u16, u16)> {
+        match self.drag {
+            Some(DragAnchor {
+                target: DragTarget::Editor { .. },
+                ..
+            }) => Some(self.pointer),
+            _ => None,
         }
     }
 
@@ -4456,6 +4550,112 @@ mod tests {
             EditorMode::Bionic,
             "the open honors the persisted view choice"
         );
+    }
+
+    #[test]
+    fn right_click_selects_a_word_and_a_following_drag_extends_it() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("the quick brown\nsecond line", false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        // Right click inside "quick" (display cols 4..8 → screen 14..18).
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 15, 5),
+            &mut ipc,
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().selected_text().as_deref(),
+            Some("quick")
+        );
+        // The word was auto-copied (the status reports the attempt; the exact
+        // wording depends on whether a clipboard tool is reachable).
+        assert!(
+            app.status.contains("copied")
+                || app.status.contains("clipboard")
+                || app.status.contains("copy failed"),
+            "auto-copy attempted: {}",
+            app.status
+        );
+        // Press inside the selection, drag down and right: the word anchor
+        // stays put and the head follows the finger.
+        app.handle_mouse(left_down(14, 5), &mut ipc);
+        app.handle_mouse(left_drag(18, 6), &mut ipc);
+        let text = app.editor.as_ref().unwrap().selected_text().unwrap();
+        assert!(text.starts_with("quick"), "word anchor kept: {text}");
+        assert!(
+            text.contains("second"),
+            "drag extended onto the next line: {text}"
+        );
+    }
+
+    #[test]
+    fn finishing_a_drag_auto_copies_the_selection() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hello world", false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        app.status = "editing".into();
+        app.handle_mouse(left_down(10, 5), &mut ipc);
+        app.handle_mouse(left_drag(15, 5), &mut ipc);
+        assert!(app.editor.as_ref().unwrap().has_selection());
+        app.handle_mouse(left_up(15, 5), &mut ipc);
+        assert!(
+            app.status.contains("copied")
+                || app.status.contains("clipboard")
+                || app.status.contains("copy failed"),
+            "release auto-copied the selection: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_plain_editor_drag_selects_from_the_press_point() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hello world", false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(left_down(10, 5), &mut ipc);
+        app.handle_mouse(left_drag(14, 5), &mut ipc); // head over 'o'
+        assert_eq!(
+            app.editor.as_ref().unwrap().selected_text().as_deref(),
+            Some("hello")
+        );
+        // A press-release with no motion is a caret tap, not a selection.
+        app.editor.as_mut().unwrap().clear_selection();
+        app.handle_mouse(left_down(12, 5), &mut ipc);
+        app.handle_mouse(left_up(12, 5), &mut ipc);
+        assert!(!app.editor.as_ref().unwrap().has_selection());
+        assert_eq!(app.editor.as_ref().unwrap().cursor(), (0, 2));
+    }
+
+    #[test]
+    fn esc_clears_the_selection_before_exiting_the_editor() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("one two", false, &[]));
+        app.editor.as_mut().unwrap().select_word_at(0, 0);
+        let mut ipc = dummy_ipc();
+        app.handle_key(hit::key(KeyCode::Esc), &mut ipc);
+        assert!(!app.editor.as_ref().unwrap().has_selection());
+        assert_eq!(app.view, View::Editor, "the first Esc only clears");
+        app.handle_key(hit::key(KeyCode::Esc), &mut ipc);
+        assert_eq!(app.view, View::Browse, "the second Esc exits");
     }
 
     fn peer(name: &str, fp: &str) -> PairPeer {
