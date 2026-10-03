@@ -891,7 +891,7 @@ fn a_tap_on_the_history_tab_switches_view() {
 }
 
 #[test]
-fn a_tap_on_a_visible_row_selects_and_a_second_tap_activates() {
+fn a_tap_on_a_visible_row_selects_and_opens_it() {
     let mut app = App::new();
     app.locked = false;
     app.tree
@@ -902,9 +902,8 @@ fn a_tap_on_a_visible_row_selects_and_a_second_tap_activates() {
     let mut ipc = dummy_ipc();
     press(&mut app, &mut ipc, column, row);
     assert_eq!(app.tree.selected, 1, "the tap lands on the drawn row");
-    assert!(!app.tree.is_expanded("meta"), "one tap only selects");
-    press(&mut app, &mut ipc, column, row);
-    assert!(app.tree.is_expanded("meta"), "the second tap activates");
+    // Smoke: the file/folder trees open on the first tap.
+    assert!(app.tree.is_expanded("meta"), "one tap opens the folder");
 }
 
 // (The old footer action-chip test is superseded by the floating-button menu

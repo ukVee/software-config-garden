@@ -2243,7 +2243,12 @@ impl App {
             Hit::Row { list, index } => {
                 let already = self.list_selected(list) == Some(index);
                 self.select_list(list, index, ipc);
-                if activate || already {
+                // The file/folder trees open on a single tap (smoke: tap to
+                // select then tap again was too slow on touch). The flat lists
+                // keep select-then-activate, since activation there can prompt
+                // (Vault reveal, pair confirm) or is just a hint.
+                let instant = matches!(list, ListId::Browse | ListId::Growlight);
+                if activate || already || instant {
                     self.activate(ipc);
                 }
             }
@@ -4225,7 +4230,7 @@ mod tests {
     }
 
     #[test]
-    fn tapping_a_row_selects_it_and_tapping_it_again_activates() {
+    fn tapping_a_browse_row_opens_it_on_the_first_tap() {
         let mut app = App::new();
         app.locked = false;
         app.tree.set_children(
@@ -4236,12 +4241,32 @@ mod tests {
             .push(Rect::new(5, 5, 20, 1), Hit::Row { list: ListId::Browse, index: 1 });
         let mut ipc = dummy_ipc();
         app.handle_mouse(tap(7, 5), &mut ipc);
-        assert_eq!(app.tree.selected, 1, "first tap lands the selection");
-        assert!(!app.tree.is_expanded("dir"), "first tap must not activate");
-        // The second tap on the already-selected row activates: a dir expands
-        // (and lazily loads its children).
+        assert_eq!(app.tree.selected, 1, "the tap lands the selection");
+        // Smoke: a single tap opens the row instantly (a dir expands and
+        // lazily loads its children); the old select-then-tap-again cost was
+        // the reported lag.
+        assert!(app.tree.is_expanded("dir"), "first tap opens the folder");
+    }
+
+    #[test]
+    fn tapping_a_flat_list_row_still_selects_only() {
+        // The non-tree lists keep select-then-activate: their activation can
+        // prompt (Vault reveal) or is a hint.
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Vault;
+        app.vault.set_items(vec![
+            "secrets/a.toml".into(),
+            "secrets/b.toml".into(),
+        ]);
+        let mut ipc = dummy_ipc();
+        app.hits.push(Rect::new(5, 5, 20, 1), Hit::Row { list: ListId::Vault, index: 1 });
         app.handle_mouse(tap(7, 5), &mut ipc);
-        assert!(app.tree.is_expanded("dir"), "second tap activates the row");
+        assert_eq!(app.vault.selected, 1);
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "no reveal prompt on the selecting tap"
+        );
     }
 
     #[test]

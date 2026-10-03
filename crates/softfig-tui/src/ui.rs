@@ -2759,13 +2759,14 @@ backup (M5b): grant a paired host to store this device's chain
 as verified ciphertext it cannot decrypt; revoke stops future
 pushes; chains I host for others show as read-only mirrors
 
-touch: tap a tab / row / action to act · tap a selected row again to
-open · the ☰ button floats anywhere (hold & move to reposition; tap
-to open a checklist of this view's actions; tap outside closes it) ·
-two-finger scroll or drag scrolls panes · the editor's raw/bionic
-switch is tappable and new files open in the view you last chose
+touch: tap a tab / row / action to act · tapping a file/folder row opens
+it immediately (other lists select first) · the ☰ button floats anywhere
+(hold & move to reposition; tap to open a checklist of this view's
+actions; tap outside closes it) · two-finger scroll or drag scrolls panes ·
+the editor's raw/bionic switch is tappable and new files open in the view
+you last chose
 
-selecting text (editor, raw view): double-tap a word (or right-click)
+selecting text (editor, raw or bionic): double-tap a word (or right-click)
 to select it, then drag to extend · a magnifier card follows above
 your finger showing the caret · the selection is copied to the
 clipboard automatically when it completes (Ctrl-C re-copies it) ·
