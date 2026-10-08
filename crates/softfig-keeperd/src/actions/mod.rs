@@ -28,7 +28,7 @@ mod archive;
 mod backlinks;
 mod batch;
 mod growlight;
-mod index;
+pub(crate) mod index;
 mod log_decision;
 mod log_incident;
 mod managed;

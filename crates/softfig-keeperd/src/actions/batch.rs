@@ -228,16 +228,24 @@ pub fn batch(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // write to that same file composes with them instead of clobbering
         // (the interleave would also invalidate the simulated content the
         // later op validated against). Deduped, first-touch order.
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut seen_dirs: BTreeSet<&str> = BTreeSet::new();
+        let mut seen_paths: BTreeSet<&str> = BTreeSet::new();
         for s in &staged {
-            let dir_rel = match &s.mutation {
+            match &s.mutation {
                 Mutation::AddNote { dir_rel, .. } | Mutation::ReviseNote { dir_rel, .. } => {
-                    dir_rel.as_str()
+                    if seen_dirs.insert(dir_rel.as_str()) {
+                        super::index::refresh_folder_index(&wt, &inner, dir_rel);
+                    }
                 }
-                Mutation::Write { .. } => continue,
-            };
-            if seen.insert(dir_rel) {
-                super::index::refresh_folder_index(&wt, &inner, dir_rel);
+                // Task 060: a batched `set_reviewed` / section edit / patch is
+                // a plain `Write`, and any of them can move a note's
+                // `Last reviewed:` header — route those through the path-keyed
+                // arm so the derived `Reviewed` cell follows.
+                Mutation::Write { rel, .. } => {
+                    if seen_paths.insert(rel.as_str()) {
+                        super::index::refresh_index_for(&wt, &inner, rel);
+                    }
+                }
             }
         }
         // A batch can add/remove `[[…]]` refs across any of its writes, so

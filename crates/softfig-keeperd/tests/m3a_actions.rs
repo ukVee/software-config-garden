@@ -976,6 +976,74 @@ fn revise_note_updates_index_reviewed_column() {
     );
 }
 
+/// Task 060: `set_reviewed` bumps the note's `> Last reviewed:` header, and
+/// the index's `Reviewed` cell is *derived* from that header — so the cell must
+/// follow in the same commit, with no second call. The observed bug: only
+/// `add_note` stamped the cell, so `storage/CLAUDE.md` claimed 2026-09-06 while
+/// the note itself said 2026-09-25, and calling `set_reviewed` left the gap.
+#[test]
+fn set_reviewed_updates_index_reviewed_column() {
+    let fx = Fixture::start();
+    write_doc(&fx, "input/CLAUDE.md", "# input/\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "input/notes", "slug": "tilt", "title": "Stylus tilt", "body": "b" }),
+    );
+    // Backdate note header *and* index cell — the state an ordinary revision
+    // weeks ago leaves behind, so neither side is already correct by accident.
+    let today = conventions::today_hyphen();
+    for rel in ["input/notes/001-tilt.md", "input/CLAUDE.md"] {
+        let p = fx.garden.join(rel);
+        let stale = std::fs::read_to_string(&p).unwrap().replace(&today, "2020-01-01");
+        std::fs::write(&p, stale).unwrap();
+    }
+
+    let resp = fx.call(
+        op::SET_REVIEWED,
+        serde_json::json!({ "path": "input/notes/001-tilt.md" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "set_reviewed: {resp:?}");
+
+    let note = std::fs::read_to_string(fx.garden.join("input/notes/001-tilt.md")).unwrap();
+    assert!(note.contains(&format!("Last reviewed: {today}")), "{note}");
+    let claude = std::fs::read_to_string(fx.garden.join("input/CLAUDE.md")).unwrap();
+    assert!(
+        claude.contains(&format!("| 001 | [Stylus tilt](notes/001-tilt.md) | {today} |")),
+        "index cell must equal the note's header: {claude}"
+    );
+    assert!(!claude.contains("2020-01-01"), "stale cell survived: {claude}");
+}
+
+/// Task 060: the `Reviewed` cell is derived, so a value typed straight into the
+/// managed region is corrected by the next write rather than persisted. The
+/// `ir-face-root-cause` loop hand-patched two of these cells (`hardware/` and
+/// `storage/`) — exactly what the structural verbs exist to prevent.
+#[test]
+fn hand_patched_index_cell_is_re_derived() {
+    let fx = Fixture::start();
+    write_doc(&fx, "storage/CLAUDE.md", "# storage/\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "storage/notes", "slug": "zram", "title": "zram", "body": "b" }),
+    );
+    let today = conventions::today_hyphen();
+    let row = |date: &str| format!("| 001 | [zram](notes/001-zram.md) | {date} |");
+
+    let resp = fx.call(
+        op::PATCH_FILE,
+        serde_json::json!({
+            "path": "storage/CLAUDE.md",
+            "old": row(&today),
+            "new": row("2026-09-06"),
+        }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "patch_file: {resp:?}");
+
+    let claude = std::fs::read_to_string(fx.garden.join("storage/CLAUDE.md")).unwrap();
+    assert!(claude.contains(&row(&today)), "cell re-derived from the note: {claude}");
+    assert!(!claude.contains("2026-09-06"), "hand-set cell persisted: {claude}");
+}
+
 /// Archiving the only note empties the folder, so its index region is
 /// dropped from the routing doc; a re-added note recreates it.
 #[test]

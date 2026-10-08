@@ -66,6 +66,10 @@ pub fn patch_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     {
         let wt = WorkTree::new(daemon, &inner);
         wt.write(&rel, new_content.as_bytes())?;
+        // Task 060: a patch is the one verb that can rewrite a note's
+        // `Last reviewed:` header *or* an index cell in a host doc by hand, so
+        // re-derive the owning table into the same commit.
+        super::index::refresh_index_for(&wt, &inner, &rel);
         // A patch can add/remove `[[…]]` refs like any section edit, so keep
         // the backlink graph consistent before committing (best-effort).
         super::backlinks::refresh_all(&wt, &inner);

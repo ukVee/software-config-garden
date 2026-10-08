@@ -612,6 +612,12 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // Phase 3 CAS: the read rides the worktree (no mount I/O under `inner`).
         cas_check_whole_file(&wt, &rel, &args.expected_version)?;
         wt.write(&rel, args.content.as_bytes())?;
+        // Task 060: the one maintenance pass a *verbatim* write still owes the
+        // garden. An index table's `Reviewed` cell is derived state, not
+        // content, so a break-glass rewrite of a note (new `Last reviewed:`)
+        // or of a host doc (a hand-typed cell) must re-derive it — otherwise
+        // this verb is the remaining way to make an index lie.
+        crate::actions::index::refresh_index_for(&wt, &inner, &rel);
     }
 
     let version = softfig_store::Hash::of(args.content.as_bytes()).to_hex();

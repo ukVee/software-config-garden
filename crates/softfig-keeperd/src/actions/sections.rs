@@ -191,6 +191,10 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             format!("{rel}: no 'Last reviewed:' line to stamp"),
         ))?;
         wt.write(&rel, new.as_bytes())?;
+        // Task 060: the stamp this verb moves *is* the index's `Reviewed`
+        // cell, so re-derive the owning table into the same commit — else the
+        // index starts lying the moment a note is re-reviewed.
+        super::index::refresh_index_for(&wt, &inner, &rel);
         // set_reviewed isn't section-addressed, so its CAS handle is the
         // whole-file version (informational here — date bumps rarely contend).
         edit::content_version(&new)
@@ -323,6 +327,10 @@ fn write_and_commit(
     {
         let wt = WorkTree::new(daemon, inner);
         wt.write(rel, new_content.as_bytes())?;
+        // Task 060: a section edit can move a note's `Last reviewed:` header
+        // (or land inside a host doc that carries index tables), so re-derive
+        // the owning table into the same commit.
+        super::index::refresh_index_for(&wt, inner, rel);
         // Slice 5: a section edit can add/remove `[[…]]` refs in any doc, so
         // recompute the backlink graph before committing (best-effort).
         super::backlinks::refresh_all(&wt, inner);
