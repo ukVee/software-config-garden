@@ -167,6 +167,14 @@ impl ActionForm {
         }
     }
 
+    /// Focus a field directly — a tap on the field's row, the touch analogue
+    /// of tabbing to it.
+    pub fn set_focus(&mut self, index: usize) {
+        if index < self.fields.len() {
+            self.focus = index;
+        }
+    }
+
     fn focused(&mut self) -> &mut Field {
         &mut self.fields[self.focus]
     }

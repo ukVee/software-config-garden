@@ -132,6 +132,53 @@ reveal's value · `u` unlock · `:` command palette (runs `log_decision`,
 `log_incident`, `archive`, `add_project`, `refresh_snapshot`, `propose`,
 `seal`, `unseal`) · `r` refresh · `?` help · `q` quit.
 
+**Pointer / touch.** The TUI records its on-screen geometry every frame, so a
+mouse click or a touchscreen tap works everywhere a key does: tap a header tab
+to switch views; tap a Browse file/folder row (or a Growlight milestone) to
+open/expand it immediately, while the flat lists (Vault, Peers, Backup, Deploy,
+Shares, History, Coordination) still select on the first tap and act on the
+second (a double-tap — a right click under the touch-pointer Wayfire plugin —
+also activates directly); the wheel (two-finger drag) scrolls the pane under
+the cursor, and a held drag scrolls the preview or the editor. In Browse and
+History the preview carries a `[ bionic ]` chip at its top-left (it shows
+`bionic ✓` while active; `b` works too, also listed as "b bionic" in the ☰
+menu): it switches the selected file between raw source and the bionic reading
+view — bionic bolds the leading portion of words and colours acronyms purple,
+the editor's bionic styling — and the choice persists across runs in the same
+prefs file as the editor's last view. The preview stays read-only.
+
+A floating **☰ menu button** replaces the old footer action chips. Tap it to
+open a large checklist of the current view's actions (tap a row to run it; tap
+outside or Esc closes), and press-and-move it to reposition it — the spot
+persists across runs in `$XDG_STATE_HOME/softfig/tui-ui.json` (interface
+geometry only; never garden content). Dialogs carry `[y confirm]` /
+`[n cancel]` / `[Enter …]` chips, forms focus the field you tap, and the
+palette's command rows are tappable (and scrollable), so every feature is
+reachable without a keyboard — text entry still needs the on-screen keyboard.
+
+In the editor (`e` on a Browse file) a **raw ↔ bionic switch** sits at the top
+of the pane: tap either label or the track, and new files open in whichever
+view you last chose (persisted). Tap a line to place the caret, wheel to
+scroll, and drag to select text. Selection works in **both** raw and bionic
+views (in bionic a plain drag still free-scrolls until a selection starts). A
+**text selection** is anchored by a double-tap on a word (or a right click),
+then extended by dragging — a
+**magnifier card follows above your finger** showing the caret and the
+selected span, so the finger never hides what is being selected, and the
+finished selection is **copied to the clipboard automatically** (Ctrl-C
+re-copies; the first Esc clears it, the next closes the editor). Mouse
+capture stays on for all of this, so terminal-native text selection needs the
+terminal's Shift modifier (the usual full-screen-app trade-off).
+
+**Saving.** `Ctrl-S` (and `s` on the unsaved-changes confirm) sends one
+guarded `patch_file` through the daemon — old = the read content, new = the
+edited buffer, `expected_version` = the version read from `read_file` — over
+the async worker channel, so the UI never blocks; the TUI never touches the
+filesystem itself. On success the editor clears dirty; on a conflict (the file
+changed on the daemon) your buffer and edits are kept, with a re-read-and-retry
+status. Sealed, inline-`<vault>`-region, and truncated files stay read-only,
+and empty files can't be saved yet (a v2 `write_file` verb is the follow-up).
+
 Browse content comes through the daemon's read-only `list_tree` /
 `read_file` verbs, which redact server-side: sealed files show
 `[sealed:<path>]`, inline `<vault id="…">` regions show `[encrypted]` —

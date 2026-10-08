@@ -28,7 +28,7 @@
 //! arm). It converges (all three root trees == the edit tree) and terminates
 //! (C→A is `AlreadyPresent` — A authored the tree — so A does not re-push).
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -248,9 +248,7 @@ fn push_edit(
     let sender_garden = sender.garden.clone();
     let new_tree_bytes = *new_tree.as_bytes();
     let sender_thread = thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let stream = softfig_net::testing::connect_within(addr, "the shared-subtree receiver");
         let mut session = ik_initiator(stream, &sender_secret, &receiver_static, &sender_hello)
             .expect("sender IK handshake");
         session.send_frame(&frame).expect("send push frame");
@@ -263,9 +261,7 @@ fn push_edit(
     // Receiver (responder) on the main thread: accept, IK reconnect, then the
     // real inbound dispatch on the first frame.
     let owner = sender.ring_entry();
-    let (conn, _) = listener.accept().unwrap();
-    let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = conn.set_write_timeout(Some(Duration::from_secs(10)));
+    let conn = softfig_net::testing::accept_within(&listener, "shared-subtree push");
     let session = ik_responder(conn, &receiver.local.transport_secret, &receiver.local.hello())
         .expect("receiver IK handshake");
     serve_established(

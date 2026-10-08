@@ -258,6 +258,17 @@ impl MountHandle {
         self.state.stage_write(std::path::Path::new(rel), content)
     }
 
+    /// Stage a mode change on `rel`; `false` when `rel` is a directory, in
+    /// which case nothing is staged. See [`fs::SharedState::stage_mode`] — a
+    /// directory's mode is not versioned, and staging one destroys the
+    /// directory.
+    pub fn stage_mode(&self, rel: &str, mode: u32) -> bool {
+        let path = std::path::Path::new(rel);
+        self.state.stage_mode(path, mode, || {
+            self.state.read_workfile(path).ok().flatten().unwrap_or_default()
+        })
+    }
+
     /// Stage a file-or-directory rename into the overlay.
     pub fn stage_rename(&self, from: &str, to: &str) -> Result<()> {
         self.state

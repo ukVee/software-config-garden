@@ -4331,9 +4331,7 @@ mod tests {
         let host_thread = {
             let relay_addr = relay_addr.clone();
             thread::spawn(move || {
-                let conn = TcpStream::connect(&relay_addr).expect("host connect relay");
-                let _ = conn.set_read_timeout(Some(Duration::from_secs(15)));
-                let _ = conn.set_write_timeout(Some(Duration::from_secs(15)));
+                let conn = softfig_net::testing::connect_within(&relay_addr, "the relay");
                 let mut session = match softfig_net::relay::relay_accept(conn, &relay_static, &host_ld)
                 {
                     Ok(s) => s,
@@ -4520,7 +4518,7 @@ mod tests {
             let local_b = local_b.clone();
             let ring_b = ring_b.clone();
             thread::spawn(move || {
-                let (conn, _) = listener.accept().unwrap();
+                let conn = softfig_net::testing::accept_within(&listener, "ceremony");
                 serve_inbound(daemon_b, &local_b, &ring_b, conn);
             })
         };
@@ -4950,7 +4948,7 @@ mod tests {
             let local_b = local_b.clone();
             let ring_b = ring_b.clone();
             thread::spawn(move || {
-                let (conn, _) = listener.accept().unwrap();
+                let conn = softfig_net::testing::accept_within(&listener, "rekey ceremony");
                 serve_inbound(daemon_b, &local_b, &ring_b, conn);
             })
         };
@@ -5146,7 +5144,7 @@ mod tests {
             let local_a = local_a.clone();
             let ring_a = ring_a.clone();
             thread::spawn(move || {
-                let (conn, _) = listener.accept().unwrap();
+                let conn = softfig_net::testing::accept_within(&listener, "handoff ceremony");
                 serve_inbound(daemon_a, &local_a, &ring_a, conn);
             })
         };
@@ -5719,7 +5717,7 @@ mod tests {
             let higher_local = higher_local.clone();
             let ring = higher_inbound_ring.clone();
             thread::spawn(move || {
-                let (conn, _) = listener.accept().unwrap();
+                let conn = softfig_net::testing::accept_within(&listener, "dual-add ceremony");
                 serve_inbound(higher_daemon, &higher_local, &ring, conn);
             })
         };

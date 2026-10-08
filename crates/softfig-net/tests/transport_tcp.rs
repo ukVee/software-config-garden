@@ -2,7 +2,7 @@
 //! substrate). Internals-poking tests (tamper, wrong-key) live in the
 //! transport module's unit tests.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::thread;
 
 use softfig_net::proto::frame;
@@ -10,11 +10,7 @@ use softfig_net::{ik_initiator, ik_responder, xx_initiator, xx_responder, Frame,
 
 /// A connected pair of loopback TCP streams: `(client, server)`.
 fn tcp_pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let addr = listener.local_addr().expect("local addr");
-    let client = TcpStream::connect(addr).expect("connect");
-    let (server, _) = listener.accept().expect("accept");
-    (client, server)
+    softfig_net::testing::loopback_pair("transport peer")
 }
 
 fn hello(name: &str) -> HelloPayload {

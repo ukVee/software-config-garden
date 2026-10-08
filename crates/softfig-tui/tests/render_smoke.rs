@@ -2,11 +2,23 @@
 //! tree + preview and assert the key chrome and content appear. Proves the
 //! render path wires together without a real terminal (the live key
 //! handling is a manual smoke step).
+//!
+//! The pointer/touch tests at the bottom go one step further: they render a
+//! real frame, read a hit zone out of `App::hits`, and dispatch a synthetic
+//! mouse event at that zone — so the drawn geometry and the tap handling are
+//! proven to agree, not just each half in isolation.
 
+use std::path::PathBuf;
+
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::Modifier;
 use ratatui::Terminal;
 use softfig_ipc::TreeEntry;
-use softfig_tui::app::App;
+use softfig_tui::app::{App, Overlay, View};
+use softfig_tui::hit::Hit;
+use softfig_tui::ipc::IpcClient;
 use softfig_tui::ui;
 
 fn entry(name: &str, is_dir: bool) -> TreeEntry {
@@ -837,4 +849,517 @@ fn growlight_tab_absent_when_disabled() {
         !rendered.contains("Growlight"),
         "growlight tab must be absent when disabled:\n{rendered}"
     );
+}
+
+// ---- pointer/touch: drawn geometry drives the synthetic events ------------
+
+/// The top-left cell of the first recorded zone matching `wanted`.
+fn point_at(app: &App, wanted: impl Fn(Hit) -> bool) -> (u16, u16) {
+    let zone = app
+        .hits
+        .zones()
+        .iter()
+        .find(|z| wanted(z.hit))
+        .expect("zone not recorded");
+    (zone.rect.x, zone.rect.y)
+}
+
+/// A synthetic left-button press at a cell (what a tap / touch-pointer click
+/// delivers to the event loop).
+fn press(app: &mut App, ipc: &mut IpcClient, column: u16, row: u16) {
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        ipc,
+    );
+}
+
+fn dummy_ipc() -> IpcClient {
+    // A bogus socket: the worker idles/errors on connect and never blocks the
+    // test. State mutations happen synchronously before any send.
+    IpcClient::spawn(PathBuf::from("/nonexistent/softfig.sock"))
+}
+
+fn draw(app: &mut App) {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, app)).unwrap();
+}
+
+#[test]
+fn a_tap_on_the_history_tab_switches_view() {
+    let mut app = App::new();
+    app.locked = false;
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| {
+        matches!(h, Hit::Key(k) if k.code == KeyCode::Char('2'))
+    });
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(app.view, View::History);
+}
+
+#[test]
+fn a_tap_on_a_visible_row_selects_and_opens_it() {
+    let mut app = App::new();
+    app.locked = false;
+    app.tree
+        .set_children("", vec![entry("CLAUDE.md", false), entry("meta", true)]);
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::Row { index: 1, .. }));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(app.tree.selected, 1, "the tap lands on the drawn row");
+    // Smoke: the file/folder trees open on the first tap.
+    assert!(app.tree.is_expanded("meta"), "one tap opens the folder");
+}
+
+// (The old footer action-chip test is superseded by the floating-button menu
+// tests below: the chips moved into the menu button.)
+
+#[test]
+fn a_modal_blocks_page_taps_and_records_its_own_chips() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Peers;
+    app.tree.set_children("", vec![entry("meta", true)]);
+    app.overlay = Overlay::PairConfirm {
+        pairing_id: "pid-1".into(),
+        sas: "123 456".into(),
+        fingerprint: "f".repeat(64),
+        name: "laptop".into(),
+        error: None,
+    };
+    draw(&mut app);
+
+    assert!(
+        app.hits
+            .zones()
+            .iter()
+            .all(|z| !matches!(z.hit, Hit::Row { .. })),
+        "page rows must be inert while a modal is open"
+    );
+    let (column, row) = point_at(&app, |h| {
+        matches!(h, Hit::Key(k) if k.code == KeyCode::Char('y'))
+    });
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert!(app.status.contains("confirming"), "the y chip confirmed");
+    assert!(
+        matches!(app.overlay, Overlay::PairConfirm { .. }),
+        "the modal stays open until the daemon answers"
+    );
+}
+
+#[test]
+fn a_tap_anywhere_dismisses_the_help_overlay() {
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = Overlay::Help;
+    draw(&mut app);
+
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, 50, 15);
+    assert!(
+        !matches!(app.overlay, Overlay::Help),
+        "the help card must dismiss on tap"
+    );
+}
+
+// ---- floating menu button + editor switches -------------------------------
+
+fn release(app: &mut App, ipc: &mut IpcClient, column: u16, row: u16) {
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        ipc,
+    );
+}
+
+#[test]
+fn the_floating_button_opens_the_menu_and_outside_taps_close_it() {
+    let mut app = App::new();
+    app.locked = false;
+    draw(&mut app);
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::Fab));
+    let mut ipc = dummy_ipc();
+    // Press + release with no motion is a tap on the floating button.
+    press(&mut app, &mut ipc, column, row);
+    release(&mut app, &mut ipc, column, row);
+    assert!(
+        matches!(app.overlay, Overlay::Menu { .. }),
+        "a tap opens the action menu"
+    );
+
+    // Redraw so the menu's rows are recorded, then tap one: it runs and closes.
+    draw(&mut app);
+    let wanted = app
+        .menu_actions()
+        .iter()
+        .position(|(label, _)| *label == "? help")
+        .expect("help is always in the menu");
+    let (c, r) = point_at(&app, |h| matches!(h, Hit::MenuRow(i) if i == wanted));
+    press(&mut app, &mut ipc, c, r);
+    assert!(
+        matches!(app.overlay, Overlay::Help),
+        "the tapped row ran its key after closing the menu"
+    );
+
+    // Reopen, then tap the top-left cell (away from the card): outside closes.
+    app.overlay = Overlay::Menu { selected: 0 };
+    draw(&mut app);
+    press(&mut app, &mut ipc, 0, 0);
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "a tap outside the card closes the menu"
+    );
+}
+
+#[test]
+fn the_editor_view_switch_is_drawn_and_tappable() {
+    use softfig_tui::editor::{Editor, EditorMode};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    app.editor = Some(Editor::from_read(
+        "meta/x.md",
+        "# T\nbody\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::EditorView(true)));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(
+        app.editor.as_ref().unwrap().mode,
+        EditorMode::Bionic,
+        "the drawn switch selects bionic"
+    );
+}
+
+#[test]
+fn a_palette_row_runs_without_typing() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Deploy;
+    app.overlay = Overlay::Palette(String::new());
+    draw(&mut app);
+
+    // `browse` is the first row, always within the visible budget.
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::PalettePick("browse")));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert_eq!(app.view, View::Browse, "the tapped row ran `browse`");
+    assert!(matches!(app.overlay, Overlay::None), "the palette closed");
+}
+
+#[test]
+fn the_palette_list_scrolls_for_rows_past_the_budget() {
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = Overlay::Palette(String::new());
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::PaletteBody));
+    let mut ipc = dummy_ipc();
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut ipc,
+    );
+    assert_eq!(app.palette_scroll, 3, "the wheel scrolls the command list");
+}
+
+#[test]
+fn tapping_a_form_field_focuses_it() {
+    use softfig_tui::forms::{ActionForm, ActionKind};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.overlay = Overlay::Form(ActionForm::for_kind(ActionKind::Archive));
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::FormField(1)));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    match &app.overlay {
+        Overlay::Form(form) => assert_eq!(form.focus, 1, "the tapped field is focused"),
+        other => panic!("form closed unexpectedly: {other:?}"),
+    }
+}
+
+#[test]
+fn the_selection_magnifier_follows_a_drag_in_the_editor() {
+    use softfig_tui::editor::Editor;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    app.editor = Some(Editor::from_read(
+        "notes/x.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::EditorLine { row: 0, .. }));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: column + 4,
+            row: row + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut ipc,
+    );
+    assert!(app.selection_pointer().is_some(), "gesture in progress");
+    assert!(
+        app.editor.as_ref().unwrap().has_selection(),
+        "the drag selected text"
+    );
+
+    // Redraw: the magnifier card must be part of the frame.
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| softfig_tui::ui::render(f, &mut app)).unwrap();
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("cursor "),
+        "magnifier card missing:\n{rendered}"
+    );
+}
+
+// ---- M3c editor frames ----
+
+#[test]
+fn renders_editor_raw_frame() {
+    use softfig_tui::editor::Editor;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Editor;
+    app.editor = Some(Editor::from_read(
+        "meta/spec-keeper.md",
+        "# Keeper spec\n\nHello world API\n\n```\ncode line\n```\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    app.status = "editing".into();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("edit meta/spec-keeper.md"),
+        "editor title missing:\n{rendered}"
+    );
+    assert!(rendered.contains("raw"), "raw mode badge missing");
+    assert!(rendered.contains("Hello world API"), "source line missing");
+    assert!(rendered.contains("code line"), "fenced line missing");
+    assert!(rendered.contains("Tab toggle"), "key hint missing");
+}
+
+#[test]
+fn renders_editor_bionic_frame() {
+    use softfig_tui::editor::{Editor, EditorMode};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Editor;
+    let mut ed = Editor::from_read(
+        "meta/spec-keeper.md",
+        "# Keeper spec\n\nThe API reads plain text.\n\n```\nAPI stays code\n```\n",
+        Some("v1".into()),
+        false,
+        &[],
+    );
+    ed.toggle_mode();
+    assert_eq!(ed.mode, EditorMode::Bionic);
+    app.editor = Some(ed);
+    app.status = "reading".into();
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("bionic (read-only)"),
+        "bionic badge missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("The API reads plain text."),
+        "bionic text missing"
+    );
+    assert!(rendered.contains("API stays code"), "code line missing");
+}
+
+/// The selected span must actually render reversed in the frame — both for a
+/// double-tap word selection and mid-drag (manual smoke: selection state
+/// existed but was invisible on the device).
+#[test]
+fn editor_selection_renders_reversed_cells() {
+    use softfig_tui::editor::Editor;
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    let mut ed = Editor::from_read(
+        "notes/sel.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    );
+    ed.select_word_at(0, 5); // selects "quick"
+    app.editor = Some(ed);
+    assert_reversed(&mut app, "quick");
+
+    // The live drag path must light up mid-gesture, not only at rest.
+    app.editor = Some(Editor::from_read(
+        "notes/sel.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    ));
+    app.hits = softfig_tui::hit::HitMap::new();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::EditorLine { row: 0, .. }));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: column + 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut ipc,
+    );
+    assert!(
+        app.editor.as_ref().unwrap().has_selection(),
+        "drag created a selection"
+    );
+    assert_reversed(&mut app, "the q");
+}
+
+/// Bionic is the persisted default editor view; a double-tap word selection
+/// must highlight there too (smoke finding: selection looked impossible).
+#[test]
+fn bionic_editor_selection_renders_reversed_cells() {
+    use softfig_tui::editor::{Editor, EditorMode};
+
+    let mut app = App::new();
+    app.locked = false;
+    app.view = View::Editor;
+    let mut ed = Editor::from_read(
+        "notes/sel.md",
+        "the quick brown fox\nsecond line\n",
+        Some("v1".into()),
+        false,
+        &[],
+    );
+    ed.set_mode(EditorMode::Bionic);
+    ed.select_word_at(0, 5);
+    app.editor = Some(ed);
+    assert_reversed(&mut app, "quick");
+}
+
+/// The top-left cell of the first frame occurrence of `needle`, scanned
+/// char-exact per row (border glyphs are multi-byte).
+fn find_text(buf: &Buffer, needle: &str) -> (u16, u16) {
+    let rows: Vec<Vec<char>> = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| {
+                    buf.cell((x, y))
+                        .and_then(|c| c.symbol().chars().next())
+                        .unwrap_or(' ')
+                })
+                .collect()
+        })
+        .collect();
+    let pat: Vec<char> = needle.chars().collect();
+    rows.iter()
+        .enumerate()
+        .find_map(|(y, cs)| {
+            cs.windows(pat.len())
+                .position(|w| w == pat.as_slice())
+                .map(|x| (x as u16, y as u16))
+        })
+        .unwrap_or_else(|| panic!("{needle:?} not rendered"))
+}
+
+/// Render `app` at the standard test size and assert every frame cell of
+/// `needle` carries the REVERSED modifier.
+fn assert_reversed(app: &mut App, needle: &str) {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let (x, y) = find_text(buf, needle);
+    for (i, _) in needle.chars().enumerate() {
+        let cell = buf.cell((x + i as u16, y)).unwrap();
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "{needle:?} char {i} is not reversed: {cell:?}"
+        );
+    }
+}
+
+/// The Browse preview's `[ bionic ]` chip toggles the reading view on tap and
+/// the frame then renders the bionic lead (bold) from the preview content.
+#[test]
+fn browse_preview_bionic_chip_toggles_and_bolds() {
+    let mut app = App::new();
+    app.locked = false;
+    app.preview = "# Title\n\nThe quick brown fox\n".into();
+    app.preview_title = "notes/x.md".into();
+    draw(&mut app);
+
+    let (column, row) = point_at(&app, |h| matches!(h, Hit::PreviewBionic));
+    let mut ipc = dummy_ipc();
+    press(&mut app, &mut ipc, column, row);
+    assert!(app.preview_bionic, "the chip tap toggled the bionic preview");
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let (x, y) = find_text(buf, "The quick");
+    let cell = buf.cell((x, y)).unwrap();
+    assert!(
+        cell.modifier.contains(Modifier::BOLD),
+        "the bionic lead 'T' is bold: {cell:?}"
+    );
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("bionic"), "the toggle chip is visible");
 }

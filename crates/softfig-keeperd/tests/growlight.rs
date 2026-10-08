@@ -338,6 +338,52 @@ fn add_slice_numbers_and_indexes_under_milestone() {
     assert_eq!(intent, "slice_added");
 }
 
+/// Task 060: the slices index's `Reviewed` cell is derived from each slice
+/// doc's own `> Last reviewed:` header, so `set_reviewed` on a slice must
+/// re-derive the milestone's table in the same commit — the growlight half of
+/// the same drift (in the live garden every `fid-gate` / `psy-commerce` slice
+/// row sat a day or two behind its own doc).
+#[test]
+fn set_reviewed_on_a_slice_refreshes_the_milestone_index() {
+    let fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    fx.call(
+        op::ADD_SLICE,
+        serde_json::json!({
+            "milestone": "m5b", "slug": "secure-pipe",
+            "title": "Secure pipe", "body": "Build the Noise channel.",
+        }),
+    );
+    let slice_rel = "growlight/backlog/milestones/m5b/slices/001-secure-pipe.md";
+    let host_rel = "growlight/backlog/milestones/m5b/CLAUDE.md";
+
+    // Today's stamp, read off the doc the daemon just stamped — no clock import.
+    let today = fx
+        .read(slice_rel)
+        .lines()
+        .find_map(|l| l.split("Last reviewed:").nth(1))
+        .map(|d| d.trim().to_string())
+        .expect("slice carries a reviewed header");
+    // Backdate both sides, so neither is already correct by accident.
+    for rel in [slice_rel, host_rel] {
+        let p = fx.garden.join(rel);
+        let stale = std::fs::read_to_string(&p).unwrap().replace(&today, "2020-01-01");
+        std::fs::write(&p, stale).unwrap();
+    }
+
+    let resp = fx.call(op::SET_REVIEWED, serde_json::json!({ "path": slice_rel }));
+    assert!(matches!(resp, Response::Ok { .. }), "set_reviewed: {resp:?}");
+
+    let slice = fx.read(slice_rel);
+    assert!(slice.contains(&format!("Last reviewed: {today}")), "{slice}");
+    let host = fx.read(host_rel);
+    assert!(
+        host.contains(&format!("[Secure pipe](slices/001-secure-pipe.md) | {today} |")),
+        "slices index cell must equal the slice's header: {host}"
+    );
+    assert!(!host.contains("2020-01-01"), "stale cell survived: {host}");
+}
+
 #[test]
 fn add_slice_rejects_unknown_milestone() {
     let fx = Fixture::start();

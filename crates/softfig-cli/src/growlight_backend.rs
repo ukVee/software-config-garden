@@ -25,7 +25,6 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
-use serde::Serialize;
 use serde_json::Value;
 
 /// Which agent the human-driven semi-auto loop (`softfig growlight start`) runs
@@ -487,52 +486,12 @@ pub trait AgentBackend {
     fn run_iteration(&self, req: &IterationRequest) -> Result<IterationOutcome>;
 }
 
-/// Budgets in the same shape the statusline tees to `usage.json` (§6), so
-/// downstream loop code is backend-agnostic across semi-auto and full-auto.
-#[derive(Serialize)]
-pub struct UsageSnapshot {
-    pub context_window: ContextWindow,
-    pub rate_limits: RateLimits,
-    /// Unix seconds, matching the statusline tee's `ts`.
-    pub ts: f64,
-}
-
-#[derive(Serialize)]
-pub struct ContextWindow {
-    /// Derived: `round(100 * current_tokens / context_window_size)`, clamped to
-    /// a saturating `0..=100` (0 when the window size is unknown). The clamp
-    /// matters because `current_tokens` is cumulative — see its note — so the
-    /// raw ratio can exceed 100 in a long session.
-    pub used_percentage: u8,
-    pub remaining_percentage: u8,
-    pub context_window_size: u64,
-    /// The token figure the percentage was derived from: `input + cache_read +
-    /// cache_creation`. This is cumulative across the session (cache reads
-    /// accrue per request), NOT the exact live prompt footprint, so it can run
-    /// past `context_window_size` — hence the clamp on `used_percentage`.
-    pub current_tokens: u64,
-}
-
-#[derive(Serialize, Default)]
-pub struct RateLimits {
-    pub five_hour: RateWindow,
-    pub seven_day: RateWindow,
-}
-
-/// One rolling rate-limit window. Headless mode learns the `resets_at` time and
-/// a coarse `status` ("allowed"/"warning"/"rejected") from the
-/// `rate_limit_event`, but **not** a used-percentage — so the §6 full-auto
-/// governor (slice 003) must key off `status`, not a number. `used_percentage`
-/// stays `None` headlessly (and is omitted from `usage.json`).
-#[derive(Serialize, Default)]
-pub struct RateWindow {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub used_percentage: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-}
+/// The `usage.json` shape — defined once in [`softfig_ipc::usage`] and re-exported
+/// here, because this driver is only one of its writers: the interactive
+/// statusline and (task 048) growlightd's headless capture write the same file, and
+/// a per-writer copy of the shape is exactly how those three drift apart. See that
+/// module for what a reading may and may not claim.
+pub use softfig_ipc::usage::{ContextWindow, RateLimits, RateWindow, UsageSnapshot};
 
 /// Parse a `claude -p --output-format stream-json` event stream (newline-
 /// delimited JSON) into an [`IterationOutcome`]. Pure — no process spawn — so
@@ -579,7 +538,7 @@ pub fn parse_stream(stream: &str, now_unix: f64) -> Result<IterationOutcome> {
             .and_then(Value::as_str)
             .map(str::to_string),
         usage: UsageSnapshot {
-            context_window: derive_context(&result),
+            context_window: Some(derive_context(&result)),
             rate_limits,
             ts: now_unix,
         },
@@ -821,7 +780,11 @@ mod tests {
         assert!(!out.is_error);
         assert_eq!(out.result_text.as_deref(), Some("OK"));
 
-        let cw = &out.usage.context_window;
+        let cw = out
+            .usage
+            .context_window
+            .as_ref()
+            .expect("a result line carries a context window");
         assert_eq!(cw.context_window_size, 1_000_000);
         assert_eq!(cw.current_tokens, 2539 + 7891 + 1930); // 12_360
         assert_eq!(cw.used_percentage, 1); // round(1.236)
@@ -840,9 +803,9 @@ mod tests {
     fn parse_stream_accepts_plain_json_single_result_without_rate_events() {
         let single = r#"{"type":"result","is_error":false,"result":"hi","usage":{"input_tokens":100},"modelUsage":{"m":{"contextWindow":200000}}}"#;
         let out = parse_stream(single, 0.0).unwrap();
-        assert_eq!(out.usage.context_window.context_window_size, 200_000);
-        assert_eq!(out.usage.context_window.current_tokens, 100);
-        assert_eq!(out.usage.context_window.used_percentage, 0); // round(0.05)
+        assert_eq!(out.usage.context_window.as_ref().unwrap().context_window_size, 200_000);
+        assert_eq!(out.usage.context_window.as_ref().unwrap().current_tokens, 100);
+        assert_eq!(out.usage.context_window.as_ref().unwrap().used_percentage, 0); // round(0.05)
         // No rate_limit_event → windows stay empty.
         assert!(out.usage.rate_limits.five_hour.resets_at.is_none());
         assert!(out.usage.rate_limits.five_hour.status.is_none());
@@ -859,9 +822,9 @@ mod tests {
         let no_window = r#"{"type":"result","is_error":true,"usage":{"input_tokens":50}}"#;
         let out = parse_stream(no_window, 0.0).unwrap();
         assert!(out.is_error);
-        assert_eq!(out.usage.context_window.context_window_size, 0);
-        assert_eq!(out.usage.context_window.used_percentage, 0);
-        assert_eq!(out.usage.context_window.remaining_percentage, 100);
+        assert_eq!(out.usage.context_window.as_ref().unwrap().context_window_size, 0);
+        assert_eq!(out.usage.context_window.as_ref().unwrap().used_percentage, 0);
+        assert_eq!(out.usage.context_window.as_ref().unwrap().remaining_percentage, 100);
     }
 
     #[test]
@@ -872,7 +835,7 @@ mod tests {
         // clamp must floor it at exactly 100, with remaining 0.
         let over = r#"{"type":"result","is_error":false,"usage":{"input_tokens":30000,"cache_read_input_tokens":3800000,"cache_creation_input_tokens":100000},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#;
         let out = parse_stream(over, 0.0).unwrap();
-        let cw = &out.usage.context_window;
+        let cw = out.usage.context_window.as_ref().unwrap();
         assert_eq!(cw.current_tokens, 3_930_000);
         assert_eq!(cw.used_percentage, 100, "must saturate, never wrap to 255");
         assert_eq!(cw.remaining_percentage, 0);
@@ -881,8 +844,8 @@ mod tests {
         // let slip through unchanged — also floors at 100.
         let mild = r#"{"type":"result","usage":{"input_tokens":1350000},"modelUsage":{"m":{"contextWindow":1000000}}}"#;
         let mild_out = parse_stream(mild, 0.0).unwrap();
-        assert_eq!(mild_out.usage.context_window.used_percentage, 100);
-        assert_eq!(mild_out.usage.context_window.remaining_percentage, 0);
+        assert_eq!(mild_out.usage.context_window.as_ref().unwrap().used_percentage, 100);
+        assert_eq!(mild_out.usage.context_window.as_ref().unwrap().remaining_percentage, 0);
     }
 
     #[test]

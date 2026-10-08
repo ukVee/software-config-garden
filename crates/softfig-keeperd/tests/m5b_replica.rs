@@ -13,7 +13,7 @@
 //!   `replica_status` against a live daemon with a forged ring peer, mirroring
 //!   `m5a4_pairing.rs`'s daemon harness.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -160,9 +160,7 @@ fn replicate_with(
     let garden = garden.to_path_buf();
 
     let owner_thread = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let stream = softfig_net::testing::accept_within(&listener, "replica pull");
         let hello = HelloPayload::new(owner_device_id.to_vec(), "owner");
         let mut session = xx_responder(stream, &owner_transport, &hello).unwrap();
         let repo = Repo::open(&garden).unwrap();
@@ -170,9 +168,7 @@ fn replicate_with(
         let _ = serve_replication(&mut session, &source);
     });
 
-    let stream = TcpStream::connect(endpoint).unwrap();
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let stream = softfig_net::testing::connect_within(endpoint, "the replica owner");
     let hello = HelloPayload::new(b"host-device".to_vec(), "host");
     let mut session = xx_initiator(stream, &[9u8; 32], &hello).unwrap();
     let result = match driver {

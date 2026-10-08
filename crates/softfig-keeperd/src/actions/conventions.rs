@@ -61,6 +61,27 @@ pub fn is_accretive_dir(dir_rel: &str) -> bool {
     dir_basename_in(dir_rel, &ACCRETIVE_FOLDERS)
 }
 
+/// Folder basenames whose parent concept-dir `CLAUDE.md` carries a
+/// daemon-derived `<!-- softfig:index <folder> -->` region — the
+/// [`ACCRETIVE_FOLDERS`] plus growlight's `slices`, which has the same
+/// numbered-doc shape and the same derived index but is not a garden-wide
+/// reserved name (it lives only under a backlog milestone), so the add /
+/// revise verbs stay out of it.
+///
+/// This is the set [`index::refresh_index_for`](super::index::refresh_index_for)
+/// consults to decide whether a write into a folder can have invalidated an
+/// index table. Task 060: the `Reviewed` cell is *derived*, so every verb that
+/// can touch a note's `Last reviewed:` line must re-derive it — keeping that
+/// decision keyed on one list is what stops the next genre from re-opening the
+/// drift.
+pub const INDEXED_FOLDERS: [&str; 4] = ["notes", "troubleshooting", "code-reviews", "slices"];
+
+/// Whether `dir_rel`'s basename names a folder with a derived index table in
+/// its parent `CLAUDE.md`. See [`INDEXED_FOLDERS`].
+pub fn is_indexed_dir(dir_rel: &str) -> bool {
+    dir_basename_in(dir_rel, &INDEXED_FOLDERS)
+}
+
 /// Whether `dir_rel`'s basename is one of `allowed` — the genre gate the
 /// add verbs apply on top of the accretive-folder machinery.
 pub fn dir_basename_in(dir_rel: &str, allowed: &[&str]) -> bool {
@@ -483,6 +504,22 @@ mod tests {
             ACCRETIVE_FOLDERS.len()
         );
         assert!(!NOTE_FOLDERS.iter().any(|n| CODE_REVIEW_FOLDERS.contains(n)));
+    }
+
+    /// Every accretive folder carries a derived index, so the index set is a
+    /// strict superset — a new genre added to `ACCRETIVE_FOLDERS` without an
+    /// `INDEXED_FOLDERS` entry would silently stop re-deriving its `Reviewed`
+    /// cells (task 060's drift, re-opened).
+    #[test]
+    fn indexed_folders_superset_accretive_set() {
+        for name in ACCRETIVE_FOLDERS.iter() {
+            assert!(INDEXED_FOLDERS.contains(name), "{name} has no index entry");
+        }
+        assert!(INDEXED_FOLDERS.contains(&"slices"));
+        assert!(is_indexed_dir("growlight/backlog/milestones/m5b/slices"));
+        assert!(is_indexed_dir("services/waydroid/notes"));
+        assert!(!is_indexed_dir("journal/decisions"));
+        assert!(!is_indexed_dir(""));
     }
 
     #[test]

@@ -426,10 +426,16 @@ impl DirtySetAccumulator {
                 }
             };
             hook.install_prior_tip(prior_snap);
-            let result = repo.commit_snapshot(&session, snapshot, intent);
+            let result =
+                repo.commit_snapshot_to_outcome(softfig_vcs::TIP_REF, &session, snapshot, intent);
             hook.clear_prior_tip();
             match result {
-                Ok(_) => committed = true,
+                // Task 028: a flush whose ignore-filtered tree matches the tip
+                // mints nothing (a change confined to a user-`.softfigignore`'d
+                // path rides the built-in hot-path predicate to here). That is
+                // not a failure — nothing to retry, and nothing to wake the
+                // replica push loop for either, so `committed` stays false.
+                Ok(outcome) => committed |= outcome.committed,
                 Err(e) => {
                     eprintln!("keeperd: watcher: commit failed: {e}");
                     failed_refs.push(softfig_vcs::TIP_REF.to_string());
@@ -483,8 +489,8 @@ impl DirtySetAccumulator {
                 failed_refs.push(ref_name);
                 continue;
             }
-            match repo.commit_snapshot_to(&ref_name, &session, snap, intent) {
-                Ok(_) => committed = true,
+            match repo.commit_snapshot_to_outcome(&ref_name, &session, snap, intent) {
+                Ok(outcome) => committed |= outcome.committed,
                 Err(e) => {
                     eprintln!("keeperd: watcher: shared-chain commit to {ref_name} failed: {e}");
                     failed_refs.push(ref_name);

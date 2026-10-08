@@ -116,10 +116,27 @@ fn layer_b_seal_writes_layer_b_blob() {
     let log: LogReply =
         serde_json::from_value(unwrap_ok(rpc(&socket, op::LOG, json!({"limit": 0}))))
             .unwrap();
-    // Genesis (init) + schema_change + vault_seal = 3 commits, newest first.
-    assert!(log.commits.len() >= 3, "expected ≥3 commits, got {:?}", log.commits.iter().map(|c| &c.intent).collect::<Vec<_>>());
+    // Genesis (init) + ONE `vault_seal` migration commit, newest first.
+    //
+    // Task 028: sealing used to mint two commits — a `schema_change` that did
+    // the Layer-B re-encryption, then a `vault_seal` over the already-sealed
+    // (byte-identical) tree. `sealed-paths.toml` lives under `.softfig/` and is
+    // never in the tree, so that second commit was empty by construction; the
+    // same-tree guard now skips empty commits, so the audit intent rides the
+    // commit that actually seals.
+    assert_eq!(
+        log.commits.len(),
+        2,
+        "expected genesis + one seal commit, got {:?}",
+        log.commits.iter().map(|c| &c.intent).collect::<Vec<_>>()
+    );
     assert_eq!(log.commits[0].intent, "vault_seal");
-    assert_eq!(log.commits[1].intent, "schema_change");
+    assert_eq!(log.commits[1].intent, "init");
+    assert_eq!(
+        seal_reply.seal_commit.as_deref(),
+        Some(log.commits[0].hash.as_str()),
+        "the reply's seal_commit is that one commit"
+    );
 
     // Read the secrets/foo.toml blob directly out of the object store
     // and check the marker byte.
@@ -242,9 +259,14 @@ fn auto_migrate_on_glob_add() {
 fn reveal_writes_temp_file_and_audits() {
     let tmp = tempfile::tempdir().unwrap();
     let garden = tmp.path();
-    let runtime = tmp.path().join("runtime");
-    fs::create_dir_all(&runtime).unwrap();
-    // Constrain XDG_RUNTIME_DIR to a tempdir so test output is contained.
+    // Constrain XDG_RUNTIME_DIR to a tempdir so test output is contained —
+    // one *outside* the garden, as in production. Inside it, the revealed
+    // plaintext temp file would land in the working tree and make the audit
+    // commit below a content change, hiding what this test now pins: a reveal
+    // changes no tracked content, and its audit commit is minted anyway
+    // (`SameTreePolicy::Record`, task 028).
+    let runtime_tmp = tempfile::tempdir().unwrap();
+    let runtime = runtime_tmp.path().to_path_buf();
     // SAFETY: tests run single-threaded by default for this binary.
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &runtime);
@@ -314,11 +336,25 @@ fn reveal_writes_temp_file_and_audits() {
     let pt = fs::read_to_string(&tp).unwrap();
     assert!(pt.contains("PLAINTEXT_TOKEN_42"));
 
-    // Top of the log is `vault_reveal`.
+    // Top of the log is `vault_reveal` — the audit record the handler treats as
+    // a precondition for surfacing the plaintext path. It carries no tree
+    // change (the temp file is outside the garden), so this also pins that the
+    // same-tree guard does not swallow it.
     let log: LogReply =
         serde_json::from_value(unwrap_ok(rpc(&socket, op::LOG, json!({"limit": 0}))))
             .unwrap();
     assert_eq!(log.commits[0].intent, "vault_reveal");
+    {
+        let store_paths = softfig_store::StorePaths::for_garden(garden);
+        let db = softfig_store::Db::open(&store_paths).unwrap();
+        let tip = db.try_get_ref(softfig_vcs::TIP_REF).unwrap().unwrap();
+        let reveal_row = db.get_commit(&tip).unwrap();
+        let parent_row = db.get_commit(&reveal_row.parent.unwrap()).unwrap();
+        assert_eq!(
+            reveal_row.root_tree, parent_row.root_tree,
+            "the reveal commit is a pure audit record — same tree as its parent"
+        );
+    }
 
     handle.shutdown();
     handle.join().unwrap();

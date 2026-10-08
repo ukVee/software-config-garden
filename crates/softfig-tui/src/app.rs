@@ -7,25 +7,34 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
 use serde_json::{json, Value};
 use softfig_ipc::growlightd::{BatonReply, FleetStatusReply};
 use softfig_ipc::{
     ChatMessage, CoordinationStatusReply, DeployAction, DeployApplyReply, DeployPlanEntry,
     DeployPlanReply, DiscoverListReply,
-    DiscoveredDevice, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply, PairConfirmReply,
-    PairListReply, PairPeer, PairRemoveReply, PendingPairing, PendingShareOfferInfo, ReadFileReply,
+    DiscoveredDevice, ErrorKind, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply,
+    PairConfirmReply, PairListReply, PairPeer, PairRemoveReply, PatchFileArgs, PatchFileReply,
+    PendingPairing, PendingShareOfferInfo, ReadFileReply,
     ReplicaGrantReply, ReplicaRevokeReply, ReplicaStatusReply, SharedSubtreeAddReply,
     SharedSubtreeInfo,
     SharedSubtreeListReply, SharedSubtreeRemoveReply, SharedSubtreeToggleReply, ShowReply,
     StatusReply, TailBusReply, VaultListSealedReply, VaultRevealReply,
 };
 
+use crate::bionic;
 use crate::clip;
-use crate::command::{parse_command, Command};
+use crate::command::{parse_command, Command};// M3c editor — additive imports (see `meta/spec-keeper.md` "M3c").
+use crate::editor::{Editor, EditorMode};
 use crate::forms::{ActionForm, ActionKind};
 use crate::growlight_source::{GrowlightArtifact, GrowlightRead, GrowlightSource};
+use crate::hit::{self, Hit, HitMap, ListId};
 use crate::ipc::{IpcClient, Reply, Tag};
+use crate::prefs::{self, UiPrefs};
 use crate::listpane::ListPane;
 use crate::tree::{
     derive_slice_status, parse_slice_index, BacklogItem, BacklogKind, BacklogTree, LoopContextNode,
@@ -55,6 +64,29 @@ pub enum View {
     /// probe gate); its content is live daemon state (`coordination_status`) plus
     /// `.conflict-` sidecars discovered via `list_tree`. Read-only — never mutates.
     Coordination,
+    /// M3c: the in-TUI file editor over the selected Browse file — raw markdown
+    /// source (editable, syntax-styled) ↔ bionic reading view (`Tab`; read-only).
+    /// Content is fetched with the existing read-only `read_file`; saves go
+    /// through the locked async `patch_file` bridge (see [`App::pending_save`]).
+    Editor,
+}
+
+impl View {
+    /// The lower-case view name used by the floating menu's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            View::Browse => "browse",
+            View::History => "history",
+            View::Vault => "vault",
+            View::Peers => "peers",
+            View::Backup => "backup",
+            View::Deploy => "deploy",
+            View::Shares => "shares",
+            View::Growlight => "growlight",
+            View::Coordination => "coordination",
+            View::Editor => "editor",
+        }
+    }
 }
 
 /// M5d slice 004: the collaborative-key ceremony state for one shared subtree,
@@ -246,6 +278,13 @@ pub enum Overlay {
         mount_path: String,
         error: Option<String>,
     },
+    /// M3c: leaving the editor with unsaved edits — `s` save, `d` discard,
+    /// `Esc` back to the editor.
+    EditorDiscard,
+    /// The floating action menu (the ☰ button): a large checklist of the
+    /// current view's actions. Tapping a row runs it and closes the menu;
+    /// tapping outside or Esc closes without running anything.
+    Menu { selected: usize },
     Help,
 }
 
@@ -265,6 +304,52 @@ pub struct HistoryLine {
     pub summary: String,
 }
 
+/// What an in-flight drag is scrolling: the preview/detail pane, or the editor
+/// (where the press also carries the line/col so a drag can move the cursor).
+#[derive(Debug, Clone, Copy)]
+enum DragTarget {
+    Preview,
+    Editor { line: usize, col: usize, x0: u16 },
+}
+
+/// An in-flight drag-scroll. `row` is where the press landed, `scroll` the
+/// target's offset then; both stay fixed for the gesture so drag updates
+/// compute an absolute offset (a relative delta would re-apply on every motion
+/// event) and can never drift mid-drag.
+#[derive(Debug, Clone, Copy)]
+struct DragAnchor {
+    row: u16,
+    scroll: u16,
+    target: DragTarget,
+}
+
+/// An in-flight drag of the floating menu button. The grab offset keeps the
+/// button under the same finger cell; `moved` is what separates a tap (open
+/// the menu) from a drag (reposition and keep).
+#[derive(Debug, Clone, Copy)]
+struct FabDrag {
+    grab_dx: u16,
+    grab_dy: u16,
+    moved: bool,
+}
+
+/// One editor save awaiting its daemon reply. The patch goes out on the
+/// worker-thread channel; [`App::apply_reply`] routes the `Tag::EditorSave`
+/// reply back here so the UI thread never blocks on the round-trip.
+#[derive(Debug)]
+pub struct PendingSave {
+    /// The `IpcClient::send` request id — a stale or reordered reply for a
+    /// superseded request is inert.
+    pub id: crate::ipc::ReqId,
+    /// The target path (also on the reply tag).
+    pub path: String,
+    /// The `new` content that was sent: the base a reply rebases the editor
+    /// onto when the user typed more while the round-trip was in flight.
+    pub sent: String,
+    /// Close the editor when this save lands (the dirty-Esc `s` path).
+    pub then_exit: bool,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub locked: bool,
@@ -282,6 +367,13 @@ pub struct App {
     /// Total wrapped line count of the current preview at the last render
     /// width; written by the renderer so scrolling clamps to the real bottom.
     pub preview_total: u16,
+    /// Browse/History preview rendered as the bionic reading view. The
+    /// preview's `[ bionic ]` touch chip and the `b` key toggle it; the last
+    /// choice persists in [`crate::prefs::UiPrefs`].
+    pub preview_bionic: bool,
+    /// Bionic-styled preview lines, built lazily once per content. The length
+    /// guard catches direct `preview` swaps; the reply paths also clear it.
+    preview_bionic_cache: Option<(usize, Vec<Line<'static>>)>,
     pub history: Vec<HistoryLine>,
     pub history_selected: usize,
     pub vault_globs: Vec<String>,
@@ -413,6 +505,25 @@ pub struct App {
     /// down. Empty until the first reply (or genuinely no messages); the detail
     /// pane renders a calm placeholder then.
     pub growlight_bus: Vec<BusRow>,
+    /// Per-frame pointer/touch geometry, recorded by the renderer and consumed
+    /// by [`Self::handle_mouse`]. Rebuilt on every draw; empty before the first
+    /// frame (taps then fall through to no-ops / the preview-scroll default).
+    pub hits: HitMap,
+    /// The preview/editor drag-scroll anchor while a mouse button is held.
+    drag: Option<DragAnchor>,
+    /// The floating menu-button drag state while its button is held.
+    fab_drag: Option<FabDrag>,
+    /// The terminal area from the last frame. Drag clamping needs it before
+    /// any hit zone exists (zones are only recorded during render).
+    pub screen: Rect,
+    /// The last pointer cell (updated on every mouse event) — the editor
+    /// magnifier anchors itself above this.
+    pub pointer: (u16, u16),
+    /// Persisted interface preferences: menu-button position + editor view.
+    pub prefs: UiPrefs,
+    /// First visible row of the palette's command list (wheel/drag scroll).
+    /// Reset whenever the palette opens.
+    pub palette_scroll: usize,
     /// The PROTOCOL half of the injected-context node (slice 006): `growlight/protocol.md`
     /// read through the resolver's garden arm on select and cached here. `None`
     /// until the first select's read lands; the detail pane assembles it with the
@@ -420,6 +531,15 @@ pub struct App {
     /// context. The baton half soft-fails independently — with growlightd down the
     /// node still shows the protocol half + a placeholder (this stays garden-sourced).
     pub growlight_injected_protocol: Option<String>,
+    /// M3c: the open in-TUI editor (raw source ↔ bionic reading view). `None`
+    /// whenever the editor view is not active. The refusal gate lives in
+    /// [`Editor::from_read`]; sealed / region-projected / truncated projections
+    /// open read-only.
+    pub editor: Option<Editor>,
+    /// M3c save bridge: the one in-flight `patch_file` round-trip on the
+    /// worker channel (or `None`). The UI never blocks; the reply is routed
+    /// by [`Tag::EditorSave`].
+    pub pending_save: Option<PendingSave>,
     pub overlay: Overlay,
     pub status: String,
     pub should_quit: bool,
@@ -444,6 +564,8 @@ impl App {
             preview_scroll: 0,
             preview_viewport: 0,
             preview_total: 0,
+            preview_bionic: false,
+            preview_bionic_cache: None,
             history: Vec::new(),
             history_selected: 0,
             vault_globs: Vec::new(),
@@ -486,7 +608,16 @@ impl App {
             fleet: FleetHeader::Unknown,
             growlight_runtime_baton: None,
             growlight_bus: Vec::new(),
+            hits: HitMap::new(),
+            drag: None,
+            fab_drag: None,
+            screen: Rect::new(0, 0, 0, 0),
+            pointer: (0, 0),
+            prefs: UiPrefs::default(),
+            palette_scroll: 0,
             growlight_injected_protocol: None,
+            editor: None,
+            pending_save: None,
             overlay: Overlay::None,
             status: "starting…".into(),
             should_quit: false,
@@ -514,6 +645,32 @@ impl App {
             json!({ "path": path }),
             Tag::ReadFile { path: path.to_string() },
         );
+    }
+
+    /// M3c: open the selected Browse regular file in the in-TUI editor. Content
+    /// is fetched with the read-only `read_file` verb — daemon-side redaction
+    /// is the trust boundary; the TUI never reads the filesystem itself.
+    fn open_editor(&mut self, ipc: &mut IpcClient) {
+        if self.locked {
+            self.status = "locked — unlock before editing".into();
+            return;
+        }
+        let Some(row) = self.tree.selected_row() else {
+            self.status = "no file selected".into();
+            return;
+        };
+        if row.is_dir {
+            self.status = "select a regular file to edit (Enter previews a dir)".into();
+            return;
+        }
+        ipc.send(
+            "read_file",
+            json!({ "path": row.path }),
+            Tag::EditorReadFile {
+                path: row.path.clone(),
+            },
+        );
+        self.status = format!("opening {}…", row.path);
     }
 
     fn load_history(&self, ipc: &mut IpcClient) {
@@ -1088,6 +1245,7 @@ impl App {
                         self.regions = r.region_ids;
                         self.regions_path = Some(path.clone());
                         self.preview = r.content;
+                        self.preview_bionic_cache = None;
                         self.preview_title = if r.sealed {
                             format!("{path}  [sealed]")
                         } else {
@@ -1098,6 +1256,42 @@ impl App {
                 }
                 Err((_, m)) => self.status = format!("read_file {path}: {m}"),
             },
+            // M3c: build the editor from the daemon's redacted projection and
+            // switch the view. Refused projections still open (read-only).
+            Tag::EditorReadFile { path } => match reply.result {
+                Ok(v) => {
+                    if let Ok(r) = serde_json::from_value::<ReadFileReply>(v) {
+                        let mut ed = Editor::from_read(
+                            &path,
+                            &r.content,
+                            Some(r.version.clone()).filter(|v| !v.is_empty()),
+                            r.sealed,
+                            &r.region_ids,
+                        );
+                        // New files open in the view that was last selected
+                        // (persisted across runs).
+                        if self.prefs.editor_bionic {
+                            ed.set_mode(EditorMode::Bionic);
+                        }
+                        let reason = ed.read_only.clone();
+                        self.editor = Some(ed);
+                        self.view = View::Editor;
+                        self.status = match reason {
+                            Some(reason) => format!("{path}: {reason} — read-only"),
+                            None => {
+                                format!("editing {path} — Tab bionic · Ctrl+S save · Esc exit")
+                            }
+                        };
+                    }
+                }
+                Err((_, m)) => self.status = format!("open {path}: {m}"),
+            },
+            // M3c save bridge: the async `patch_file` reply. Success rebases
+            // the editor's CAS token + pristine copy; a conflict / refusal
+            // keeps the buffer + dirty flag.
+            Tag::EditorSave { path } => {
+                self.apply_editor_save_reply(reply.id, &path, reply.result)
+            }
             Tag::History => match reply.result {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<LogReply>(v) {
@@ -1121,6 +1315,7 @@ impl App {
                 Ok(v) => {
                     if let Ok(r) = serde_json::from_value::<ShowReply>(v) {
                         self.preview = format_commit(&r);
+                        self.preview_bionic_cache = None;
                         self.preview_title = format!("commit {}", short_hash(&r.commit.hash));
                         self.preview_scroll = 0;
                     }
@@ -1661,6 +1856,9 @@ impl App {
             Overlay::DeployForce { .. } => self.handle_key_deploy_force(key, ipc),
             Overlay::AddShare { .. } => self.handle_key_add_share(key, ipc),
             Overlay::RemoveShare { .. } => self.handle_key_remove_share(key, ipc),
+            // M3c: save/discard/back for an editor with unsaved edits.
+            Overlay::EditorDiscard => self.handle_key_editor_discard(key, ipc),
+            Overlay::Menu { .. } => self.handle_key_menu(key, ipc),
             Overlay::Help => {
                 self.overlay = Overlay::None;
             }
@@ -1668,6 +1866,12 @@ impl App {
     }
 
     fn handle_key_main(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        // M3c editor: the editor view owns every key while it is active, so
+        // typing never triggers global bindings (`q`, `r`, `e`, digits, …).
+        // Additive hook; the editor handles Tab/Ctrl+S/Esc itself.
+        if self.view == View::Editor {
+            return self.handle_key_editor(key, ipc);
+        }
         // Vim-style preview scrolling on the Ctrl chord, kept off the bare
         // h/j/k/l keys so list navigation is untouched. Half/full page sizes
         // come from the viewport the renderer recorded last frame.
@@ -1686,8 +1890,12 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('m') => self.open_menu(),
             KeyCode::Char('?') => self.overlay = Overlay::Help,
-            KeyCode::Char(':') => self.overlay = Overlay::Palette(String::new()),
+            KeyCode::Char(':') => {
+                self.palette_scroll = 0;
+                self.overlay = Overlay::Palette(String::new());
+            }
             KeyCode::Char('u') if self.locked => {
                 self.overlay = Overlay::Unlock {
                     buf: String::new(),
@@ -1760,6 +1968,11 @@ impl App {
             }
             KeyCode::Char('r') if !self.locked => self.refresh_view(ipc),
             _ if self.locked => {}
+            // Preview reading view: `b` flips raw ↔ bionic (the preview's
+            // `[ bionic ]` chip is the touch path to the same toggle).
+            KeyCode::Char('b') if matches!(self.view, View::Browse | View::History) => {
+                self.toggle_preview_bionic()
+            }
             KeyCode::Char('p') if self.view == View::Peers => self.pair_selected(ipc),
             KeyCode::Char('D') if self.view == View::Peers => self.start_unpair(),
             KeyCode::Char('g') if self.view == View::Backup => self.open_grant(),
@@ -1769,6 +1982,10 @@ impl App {
             KeyCode::Char('a') if self.view == View::Shares => self.open_add_share(),
             KeyCode::Char('D') if self.view == View::Shares => self.start_remove_share(),
             KeyCode::Char('e') if self.view == View::Shares => self.toggle_share(ipc),
+            // M3c: open the selected Browse regular file in the in-TUI editor.
+            // Guarded by the view, so the Shares `e` toggle and the Ctrl+e
+            // preview scroll above are untouched.
+            KeyCode::Char('e') if self.view == View::Browse => self.open_editor(ipc),
             KeyCode::Char('x') => self.start_reveal(ipc),
             KeyCode::Char('c') => self.copy_reveal(),
             KeyCode::Up | KeyCode::Char('k') => self.nav_up(ipc),
@@ -1783,12 +2000,504 @@ impl App {
         }
     }
 
-    /// Wheel events scroll the preview pane, three lines per notch.
-    pub fn handle_mouse(&mut self, ev: MouseEvent, _ipc: &mut IpcClient) {
+    /// Load persisted interface preferences (once, at startup).
+    pub fn load_prefs(&mut self) {
+        self.prefs = prefs::load();
+        self.preview_bionic = self.prefs.preview_bionic;
+    }
+
+    /// Persist interface preferences (best-effort; called when they change).
+    pub fn save_prefs(&self) {
+        prefs::save(&self.prefs);
+    }
+
+    /// Open the floating action menu (the ☰ button / `m`).
+    pub fn open_menu(&mut self) {
+        self.overlay = Overlay::Menu { selected: 0 };
+    }
+
+    /// The action menu's contents: the primary row action for list views, then
+    /// the current view's contextual actions, then the globals. Order is
+    /// stable (menu selection is positional) and every entry carries the key
+    /// it replays, so the menu never grows a second dispatch path.
+    pub fn menu_actions(&self) -> Vec<(&'static str, KeyEvent)> {
+        let mut actions: Vec<(&'static str, KeyEvent)> = Vec::new();
+        if !self.locked {
+            match self.view {
+                View::Browse => {
+                    actions.push(("Open file / expand folder", hit::key(KeyCode::Enter)));
+                    actions.push(("Edit this file", hit::key(KeyCode::Char('e'))));
+                    actions.push(("Collapse folder", hit::key(KeyCode::Left)));
+                }
+                View::History => {
+                    actions.push(("Show selected commit", hit::key(KeyCode::Enter)));
+                }
+                View::Vault => {
+                    actions.push(("Reveal selected file", hit::key(KeyCode::Enter)));
+                }
+                View::Peers => {
+                    actions.push(("Confirm / pair selected", hit::key(KeyCode::Enter)));
+                }
+                View::Growlight => {
+                    actions.push(("Expand milestone", hit::key(KeyCode::Enter)));
+                }
+                View::Coordination => {
+                    actions.push(("Preview conflict", hit::key(KeyCode::Enter)));
+                }
+                View::Backup | View::Deploy | View::Shares | View::Editor => {}
+            }
+        }
+        actions.extend(self.footer_actions());
+        actions
+    }
+
+    /// The per-view contextual action vocabulary — every key-driven feature
+    /// (pair/unpair, grant/revoke, apply/force, share/toggle/un-share,
+    /// reveal/copy/refresh, the editor's save/toggle/close) plus the global
+    /// palette/help/quit. Returned as `(label, key)`: the floating menu renders
+    /// each as a tappable row and the mouse path replays the key, so touch gets
+    /// full action parity by construction and never grows a second vocabulary.
+    pub fn footer_actions(&self) -> Vec<(&'static str, KeyEvent)> {
+        let mut actions: Vec<(&'static str, KeyEvent)> = Vec::new();
+        if self.locked {
+            actions.push(("u unlock", hit::key(KeyCode::Char('u'))));
+        } else {
+            match self.view {
+                View::Browse => {
+                    actions.push(("x reveal", hit::key(KeyCode::Char('x'))));
+                    actions.push(("c copy", hit::key(KeyCode::Char('c'))));
+                    actions.push(("b bionic", hit::key(KeyCode::Char('b'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::History => {
+                    actions.push(("b bionic", hit::key(KeyCode::Char('b'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Vault => {
+                    actions.push(("x reveal", hit::key(KeyCode::Char('x'))));
+                    actions.push(("c copy", hit::key(KeyCode::Char('c'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Peers => {
+                    actions.push(("p pair", hit::key(KeyCode::Char('p'))));
+                    actions.push(("D unpair", hit::key(KeyCode::Char('D'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Backup => {
+                    actions.push(("g grant", hit::key(KeyCode::Char('g'))));
+                    actions.push(("D revoke", hit::key(KeyCode::Char('D'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Deploy => {
+                    actions.push(("a apply", hit::key(KeyCode::Char('a'))));
+                    actions.push(("F force", hit::key(KeyCode::Char('F'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Shares => {
+                    actions.push(("a share", hit::key(KeyCode::Char('a'))));
+                    actions.push(("e on/off", hit::key(KeyCode::Char('e'))));
+                    actions.push(("D un-share", hit::key(KeyCode::Char('D'))));
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Growlight | View::Coordination => {
+                    actions.push(("r refresh", hit::key(KeyCode::Char('r'))));
+                }
+                View::Editor => {
+                    actions.push((
+                        "Ctrl-C copy selection",
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    ));
+                    actions.push((
+                        "Ctrl-S save",
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    ));
+                    actions.push(("Tab toggle view", hit::key(KeyCode::Tab)));
+                    actions.push(("Esc close", hit::key(KeyCode::Esc)));
+                }
+            }
+        }
+        actions.push((":cmd", hit::key(KeyCode::Char(':'))));
+        actions.push(("? help", hit::key(KeyCode::Char('?'))));
+        actions.push(("q quit", hit::key(KeyCode::Char('q'))));
+        actions
+    }
+
+    /// Pointer/touch events. A tap replays the recorded hit's key or lands the
+    /// selection on a row; the wheel routes to whatever pane is under the
+    /// cursor (list panes move their selection, the preview scrolls); a held
+    /// left button in the preview drag-scrolls it. With no zones recorded
+    /// (e.g. before the first frame) the wheel keeps its original behaviour —
+    /// scroll the preview — so behaviour degrades gracefully, never silently.
+    pub fn handle_mouse(&mut self, ev: MouseEvent, ipc: &mut IpcClient) {
+        self.pointer = (ev.column, ev.row);
         match ev.kind {
-            MouseEventKind::ScrollDown => self.scroll_preview(3),
-            MouseEventKind::ScrollUp => self.scroll_preview(-3),
+            MouseEventKind::ScrollDown => self.scroll_at(ev.column, ev.row, 3, ipc),
+            MouseEventKind::ScrollUp => self.scroll_at(ev.column, ev.row, -3, ipc),
+            MouseEventKind::Down(MouseButton::Left) => self.tap(ev.column, ev.row, false, ipc),
+            // The touch-pointer plugin maps a double-tap to a right click:
+            // treat it as "activate the row under the finger" directly.
+            MouseEventKind::Down(MouseButton::Right) => self.tap(ev.column, ev.row, true, ipc),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(ev.column, ev.row),
+            MouseEventKind::Up(_) => self.release(),
             _ => {}
+        }
+    }
+
+    /// Button-up: ends any preview/editor drag and, for the floating button,
+    /// either opens the menu (a tap) or keeps the new position (a drag).
+    /// Finishing a text selection auto-copies it — selecting is the whole
+    /// gesture, so the clipboard should not need a second action.
+    fn release(&mut self) {
+        let finished_selection = matches!(
+            self.drag,
+            Some(DragAnchor {
+                target: DragTarget::Editor { .. },
+                ..
+            })
+        ) && self.editor.as_ref().is_some_and(|e| e.has_selection());
+        self.drag = None;
+        if finished_selection {
+            self.editor_copy_selection();
+        }
+        if let Some(fab) = self.fab_drag.take() {
+            if fab.moved {
+                self.save_prefs();
+            } else {
+                self.open_menu();
+            }
+        }
+    }
+
+    /// One tap/click: dispatch the recorded hit. `activate` forces activation
+    /// even when the row was not already selected (right click / double-tap).
+    fn tap(&mut self, column: u16, row: u16, activate: bool, ipc: &mut IpcClient) {
+        let Some(hit) = self.hits.hit_at(column, row) else {
+            return;
+        };
+        match hit {
+            // Tabs, overlay confirm/cancel chips, and field-focus chips replay a
+            // key, so they hit exactly the keyboard path — including its guards
+            // (locked, gated growlight tab, form focus state).
+            Hit::Key(key) => self.handle_key(key, ipc),
+            Hit::Dismiss => self.overlay = Overlay::None,
+            Hit::MenuRow(index) => self.tap_menu_row(index, ipc),
+            Hit::Fab => {
+                // Press-and-move repositions the button; a press-release with
+                // no motion opens the menu (resolved on `Up`).
+                let (fab_x, fab_y) = self.prefs.fab.unwrap_or((column, row));
+                self.fab_drag = Some(FabDrag {
+                    grab_dx: column.saturating_sub(fab_x),
+                    grab_dy: row.saturating_sub(fab_y),
+                    moved: false,
+                });
+            }
+            Hit::Preview => {
+                if !activate {
+                    self.drag = Some(DragAnchor {
+                        row,
+                        scroll: self.preview_scroll,
+                        target: DragTarget::Preview,
+                    });
+                }
+            }
+            Hit::PreviewBionic => self.toggle_preview_bionic(),
+            Hit::EditorLine { row: line, x0 } => {
+                let col = column.saturating_sub(x0) as usize;
+                let mut anchor = None;
+                let mut copy_now = false;
+                if let Some(ed) = self.editor.as_mut() {
+                    if activate {
+                        // Double-tap / right click selects the word under the
+                        // finger; a following drag extends it. The word is
+                        // copied immediately — no second action needed.
+                        ed.select_word_at(line, col);
+                        copy_now = true;
+                    } else if ed.selection_contains(line, col) {
+                        // Press inside the selection: keep the anchor and let a
+                        // drag move the head. A no-motion tap leaves it as is.
+                    } else {
+                        ed.clear_selection();
+                        ed.set_cursor(line, col);
+                    }
+                    if !activate {
+                        anchor = Some(ed.scroll);
+                    }
+                }
+                if copy_now {
+                    self.editor_copy_selection();
+                }
+                if let Some(scroll) = anchor {
+                    self.drag = Some(DragAnchor {
+                        row,
+                        scroll,
+                        target: DragTarget::Editor { line, col, x0 },
+                    });
+                }
+            }
+            Hit::EditorBody => {
+                if !activate {
+                    if let Some(ed) = self.editor.as_mut() {
+                        let scroll = ed.scroll;
+                        let line = scroll as usize;
+                        self.drag = Some(DragAnchor {
+                            row,
+                            scroll,
+                            target: DragTarget::Editor { line, col: 0, x0: 0 },
+                        });
+                    }
+                }
+            }
+            Hit::EditorView(bionic) => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.set_mode(if bionic {
+                        EditorMode::Bionic
+                    } else {
+                        EditorMode::Raw
+                    });
+                }
+                if self.prefs.editor_bionic != bionic {
+                    self.prefs.editor_bionic = bionic;
+                    self.save_prefs();
+                }
+            }
+            Hit::PalettePick(name) => {
+                // Picking a row runs the same command parser the typed palette
+                // uses, so both paths share one vocabulary.
+                self.overlay = Overlay::None;
+                let cmd = parse_command(name);
+                self.run_command(cmd, ipc);
+            }
+            // The palette list's gaps: a tap there does nothing (the wheel is
+            // what scrolls it).
+            Hit::PaletteBody => {}
+            Hit::FormField(index) => {
+                if let Overlay::Form(form) = &mut self.overlay {
+                    form.set_focus(index);
+                }
+            }
+            Hit::RegionRow(index) => {
+                let already = matches!(
+                    &self.overlay,
+                    Overlay::RevealRegion { selected, .. } if *selected == index
+                );
+                if let Overlay::RevealRegion { selected, .. } = &mut self.overlay {
+                    *selected = index;
+                }
+                if activate || already {
+                    self.handle_key(hit::key(KeyCode::Enter), ipc);
+                }
+            }
+            Hit::Row { list, index } => {
+                let already = self.list_selected(list) == Some(index);
+                self.select_list(list, index, ipc);
+                // The file/folder trees open on a single tap (smoke: tap to
+                // select then tap again was too slow on touch). The flat lists
+                // keep select-then-activate, since activation there can prompt
+                // (Vault reveal, pair confirm) or is just a hint.
+                let instant = matches!(list, ListId::Browse | ListId::Growlight);
+                if activate || already || instant {
+                    self.activate(ipc);
+                }
+            }
+        }
+    }
+
+    /// Wheel routing: a list under the cursor moves its selection, the preview
+    /// and editor look after themselves, an open region picker or menu moves
+    /// its highlighted row.
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32, ipc: &mut IpcClient) {
+        match self.hits.hit_at(column, row) {
+            Some(Hit::Row { .. }) => self.move_selection(delta, ipc),
+            Some(Hit::RegionRow(_)) => self.move_region_selection(delta),
+            Some(Hit::MenuRow(_)) => self.move_menu_selection(delta),
+            Some(Hit::PaletteBody | Hit::PalettePick(_)) => self.scroll_palette(delta),
+            Some(Hit::EditorBody | Hit::EditorLine { .. }) => self.editor_scroll(delta),
+            Some(Hit::Preview) => self.scroll_preview(delta),
+            // No zone (before the first frame, or a header/footer cell): the
+            // pre-touch default, so the wheel always does something sensible.
+            _ => self.scroll_preview(delta),
+        }
+    }
+
+    /// Move the floating menu's highlight by `delta` rows.
+    fn move_menu_selection(&mut self, delta: i32) {
+        let last = self.menu_actions().len().saturating_sub(1) as i32;
+        if let Overlay::Menu { selected } = &mut self.overlay {
+            *selected = (*selected as i32 + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// Wheel over the palette list: scroll the command rows. The renderer
+    /// clamps the offset to the real list length, so this only accumulates.
+    fn scroll_palette(&mut self, delta: i32) {
+        self.palette_scroll = if delta < 0 {
+            self.palette_scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.palette_scroll.saturating_add(delta as usize)
+        };
+    }
+
+    /// Wheel over the editor: raw mode moves the caret (the renderer keeps it
+    /// in view), bionic mode free-scrolls the reading view.
+    fn editor_scroll(&mut self, delta: i32) {
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        if ed.mode == EditorMode::Raw {
+            for _ in 0..delta.unsigned_abs() {
+                if delta < 0 {
+                    ed.move_up();
+                } else {
+                    ed.move_down();
+                }
+            }
+        } else {
+            ed.scroll_by(delta);
+        }
+    }
+
+    /// Move the active view's selection by `delta` rows (a wheel notch = 3).
+    fn move_selection(&mut self, delta: i32, ipc: &mut IpcClient) {
+        for _ in 0..delta.unsigned_abs() {
+            if delta < 0 {
+                self.nav_up(ipc);
+            } else {
+                self.nav_down(ipc);
+            }
+        }
+    }
+
+    fn move_region_selection(&mut self, delta: i32) {
+        let Overlay::RevealRegion { ids, selected, .. } = &mut self.overlay else {
+            return;
+        };
+        let last = ids.len().saturating_sub(1) as i32;
+        *selected = (*selected as i32 + delta).clamp(0, last) as usize;
+    }
+
+    /// A held drag: the floating button moves, the preview/editor content
+    /// follows the finger. Everything is computed from the fixed press anchor,
+    /// so an absolute target is set on every motion event and a coalesced or
+    /// repeated drag can never compound.
+    fn drag_to(&mut self, column: u16, row: u16) {
+        if let Some(fab) = &mut self.fab_drag {
+            let max_x = self
+                .screen
+                .right()
+                .saturating_sub(hit::FAB_W)
+                .max(self.screen.x);
+            let max_y = self
+                .screen
+                .bottom()
+                .saturating_sub(hit::FAB_H)
+                .max(self.screen.y);
+            let x = column
+                .saturating_sub(fab.grab_dx)
+                .clamp(self.screen.x, max_x);
+            let y = row.saturating_sub(fab.grab_dy).clamp(self.screen.y, max_y);
+            if self.prefs.fab != Some((x, y)) {
+                fab.moved = true;
+                self.prefs.fab = Some((x, y));
+            }
+            return;
+        }
+        let Some(anchor) = self.drag else {
+            return;
+        };
+        let delta = anchor.row as i32 - row as i32;
+        match anchor.target {
+            DragTarget::Preview => {
+                let max = self.preview_max_scroll() as i32;
+                self.preview_scroll = (anchor.scroll as i32 + delta).clamp(0, max) as u16;
+            }
+            DragTarget::Editor { line, col, x0 } => {
+                if let Some(ed) = self.editor.as_mut() {
+                    // Raw drags select from the press point. Bionic is a
+                    // reading view where a plain drag free-scrolls, but a drag
+                    // that began with a double-tap word selection extends that
+                    // selection — the touch select gesture works in both views.
+                    if ed.mode == EditorMode::Raw || ed.has_selection() {
+                        // The head follows the finger in two dimensions (note:
+                        // the opposite sign of a scroll — dragging down moves
+                        // the selection head down); the anchor is where the
+                        // gesture (or the double-tap word) started.
+                        let vdelta = row as i32 - anchor.row as i32;
+                        let head_line = (line as i32 + vdelta)
+                            .clamp(0, ed.line_count().saturating_sub(1) as i32)
+                            as usize;
+                        let head_col = column.saturating_sub(x0) as usize;
+                        ed.begin_selection(line, col);
+                        ed.set_cursor(head_line, head_col);
+                    } else {
+                        ed.set_scroll((anchor.scroll as i32 + delta).max(0) as u16);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The current selection of a primary list (tap-to-activate detection).
+    fn list_selected(&self, list: ListId) -> Option<usize> {
+        match list {
+            ListId::Browse => Some(self.tree.selected),
+            ListId::History => Some(self.history_selected),
+            ListId::Vault => Some(self.vault.selected),
+            ListId::Peers => Some(self.peer_list.selected),
+            ListId::Backup => Some(self.backup.selected),
+            ListId::Deploy => Some(self.deploy.selected),
+            ListId::Shares => Some(self.shares_selected),
+            ListId::Growlight => Some(self.growlight_tree.selected),
+            ListId::Coordination => Some(self.coordination_selected),
+        }
+    }
+
+    /// Land the selection of a primary list exactly on a tapped row. The
+    /// index is already render-derived, so it is in range; the guards here
+    /// keep a stale zone from a mid-render resize harmless.
+    fn select_list(&mut self, list: ListId, index: usize, ipc: &mut IpcClient) {
+        match list {
+            ListId::Browse => self.tree.select(index),
+            ListId::History => {
+                if index < self.history.len() {
+                    self.history_selected = index;
+                }
+            }
+            ListId::Vault => {
+                if index < self.vault.items.len() {
+                    self.vault.selected = index;
+                }
+            }
+            ListId::Peers => {
+                if index < self.peer_list.items.len() {
+                    self.peer_list.selected = index;
+                }
+            }
+            ListId::Backup => {
+                if index < self.backup.items.len() {
+                    self.backup.selected = index;
+                }
+            }
+            ListId::Deploy => {
+                if index < self.deploy.items.len() {
+                    self.deploy.selected = index;
+                }
+            }
+            ListId::Shares => {
+                // Trailing offer rows are informational, not selectable.
+                if index < self.shares.len() {
+                    self.shares_selected = index;
+                }
+            }
+            ListId::Growlight => {
+                self.growlight_tree.select(index);
+                self.refresh_growlight_selection(ipc);
+            }
+            ListId::Coordination => {
+                if index < self.coordination_rows.len() {
+                    self.coordination_selected = index;
+                }
+                self.coordination_preview = None;
+            }
         }
     }
 
@@ -1814,6 +2523,43 @@ impl App {
         self.preview_scroll = self.preview_max_scroll();
     }
 
+    /// Toggle the preview pane between the raw source and the bionic reading
+    /// view (the `b` key / the preview's `[ bionic ]` touch chip). The choice
+    /// persists across runs. The offset is kept: bionic styles the same
+    /// characters, so the wrapping — and therefore the scroll position — is
+    /// unchanged.
+    fn toggle_preview_bionic(&mut self) {
+        self.preview_bionic = !self.preview_bionic;
+        self.preview_bionic_cache = None;
+        self.prefs.preview_bionic = self.preview_bionic;
+        self.save_prefs();
+        self.status = if self.preview_bionic {
+            "preview: bionic".into()
+        } else {
+            "preview: raw".into()
+        };
+    }
+
+    /// The bionic-styled preview lines for the current content, building the
+    /// cache on first use (and after any content change). `None` while the
+    /// preview toggle is off. The length guard catches direct `preview`
+    /// swaps; the reply paths also clear the cache explicitly.
+    pub fn preview_bionic_lines(&mut self) -> Option<&[Line<'static>]> {
+        if !self.preview_bionic {
+            return None;
+        }
+        if self
+            .preview_bionic_cache
+            .as_ref()
+            .is_none_or(|(len, _)| *len != self.preview.len())
+        {
+            let lines: Vec<String> = self.preview.split('\n').map(str::to_string).collect();
+            let styled = bionic::render_bionic_lines(&lines, bionic::DEFAULT_BOLD_RATIO);
+            self.preview_bionic_cache = Some((self.preview.len(), styled));
+        }
+        self.preview_bionic_cache.as_ref().map(|(_, l)| l.as_slice())
+    }
+
     fn nav_up(&mut self, ipc: &mut IpcClient) {
         match self.view {
             View::Browse => self.tree.move_up(),
@@ -1837,6 +2583,9 @@ impl App {
                 // off it clears the stale body.
                 self.coordination_preview = None;
             }
+            // M3c: unreachable — `handle_key_main` routes the editor view to
+            // `handle_key_editor` before list navigation.
+            View::Editor => {}
         }
     }
 
@@ -1867,6 +2616,8 @@ impl App {
                 }
                 self.coordination_preview = None;
             }
+            // M3c: unreachable — see `nav_up`.
+            View::Editor => {}
         }
     }
 
@@ -1915,6 +2666,8 @@ impl App {
             // Coordination is read-only: Enter previews a conflict sidecar (a
             // read), else a no-op hint.
             View::Coordination => self.activate_coordination(ipc),
+            // M3c: unreachable — the editor routes its own keys.
+            View::Editor => {}
         }
     }
 
@@ -2003,6 +2756,45 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The floating menu's keys: `j`/`k` move the checklist, `Enter` runs the
+    /// checked row (closing first, so the action lands on the page), `Esc`
+    /// closes. A tap runs a row through [`Self::tap_menu_row`].
+    fn handle_key_menu(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let Some(current) = (match &self.overlay {
+            Overlay::Menu { selected } => Some(*selected),
+            _ => None,
+        }) else {
+            return;
+        };
+        let last = self.menu_actions().len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Overlay::Menu { selected } = &mut self.overlay {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Overlay::Menu { selected } = &mut self.overlay {
+                    *selected = (*selected + 1).min(last);
+                }
+            }
+            KeyCode::Enter => self.tap_menu_row(current, ipc),
+            _ => {}
+        }
+    }
+
+    /// Run the `index`-th menu action: close the menu first (so the replayed
+    /// key acts on the page, not on the menu), then dispatch it. Out-of-range
+    /// taps are no-ops.
+    fn tap_menu_row(&mut self, index: usize, ipc: &mut IpcClient) {
+        let Some((_, key)) = self.menu_actions().get(index).copied() else {
+            return;
+        };
+        self.overlay = Overlay::None;
+        self.handle_key(key, ipc);
     }
 
     fn run_command(&mut self, cmd: Command, ipc: &mut IpcClient) {
@@ -2106,6 +2898,253 @@ impl App {
         self.overlay = Overlay::Form(ActionForm::for_kind(kind));
     }
 
+    // ---- M3c editor key handling ----
+
+    /// The editor view's key path. Typing must never reach the global key
+    /// bindings, so `handle_key_main` diverts here first. `ipc` only leaves
+    /// this function on an explicit save (Ctrl+S) — the async `patch_file`.
+    fn handle_key_editor(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        let ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        let had_selection = self.editor.as_ref().is_some_and(|e| e.has_selection());
+        if ctrl_c {
+            self.editor_copy_selection();
+            return;
+        }
+        // Every other key supersedes the selection (v1 does not replace it),
+        // and the first Esc only drops the selection instead of exiting.
+        if let Some(ed) = self.editor.as_mut() {
+            ed.clear_selection();
+        }
+        if key.code == KeyCode::Esc && had_selection {
+            return;
+        }
+        let mut save = false;
+        let mut exit = false;
+        let mut ask_discard = false;
+        if let Some(ed) = self.editor.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    if ed.dirty {
+                        ask_discard = true;
+                    } else {
+                        exit = true;
+                    }
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => save = true,
+                // `Tab` toggles in both modes; `v` also returns from bionic.
+                // `v` cannot toggle while editing raw — it must insert the
+                // character (documented M3c deviation).
+                KeyCode::Tab => ed.toggle_mode(),
+                KeyCode::Char('v') if ed.mode == EditorMode::Bionic => ed.toggle_mode(),
+                KeyCode::Enter => ed.newline(),
+                KeyCode::Backspace => ed.backspace(),
+                KeyCode::Delete => ed.delete(),
+                KeyCode::Left => ed.move_left(),
+                KeyCode::Right => ed.move_right(),
+                KeyCode::Up => ed.move_up(),
+                KeyCode::Down => ed.move_down(),
+                KeyCode::Home => ed.move_home(),
+                KeyCode::End => ed.move_end(),
+                KeyCode::PageUp => ed.page_up(),
+                KeyCode::PageDown => ed.page_down(),
+                KeyCode::Char(c) => ed.insert_char(c),
+                _ => {}
+            }
+        } else {
+            exit = true;
+        }
+        // Keep the persisted "last selected view" in sync with the toggle, so
+        // the next file opens where the user last left off.
+        if let Some(bionic) = self
+            .editor
+            .as_ref()
+            .map(|e| e.mode == EditorMode::Bionic)
+        {
+            if self.prefs.editor_bionic != bionic {
+                self.prefs.editor_bionic = bionic;
+                self.save_prefs();
+            }
+        }
+        if save {
+            self.editor_save(ipc, false);
+        }
+        if ask_discard {
+            self.overlay = Overlay::EditorDiscard;
+        }
+        if exit {
+            self.editor = None;
+            self.view = View::Browse;
+        }
+    }
+
+    /// `Overlay::EditorDiscard` keys: `s` save, `d` discard, `Esc` back.
+    fn handle_key_editor_discard(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
+        match key.code {
+            KeyCode::Char('s') => {
+                // The save is async: close the confirm and keep the editor
+                // open; the reply closes it only when the save lands cleanly
+                // (`then_exit`).
+                self.overlay = Overlay::None;
+                self.editor_save(ipc, true);
+            }
+            KeyCode::Char('d') => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.discard();
+                }
+                self.editor = None;
+                self.view = View::Browse;
+                self.overlay = Overlay::None;
+                self.status = "edits discarded".into();
+            }
+            KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Copy the editor's current selection to the Wayland clipboard
+    /// (`Ctrl-C` / the menu's copy row). The bytes are already this process's
+    /// heap (the editor buffer, daemon-redacted); this only fires on the
+    /// explicit user action, same posture as the reveal copy.
+    fn editor_copy_selection(&mut self) {
+        let Some(text) = self.editor.as_ref().and_then(|e| e.selected_text()) else {
+            self.status = "nothing selected — double-tap a word or drag".into();
+            return;
+        };
+        if !clip::clipboard_available() {
+            self.status = "no clipboard tool (wl-copy)".into();
+            return;
+        }
+        let chars = text.chars().count();
+        self.status = match clip::copy_text_to_clipboard(&text) {
+            Ok(()) => format!("copied {chars} char(s) to clipboard"),
+            Err(e) => format!("copy failed: {e}"),
+        };
+    }
+
+    /// The pointer cell while an editor selection gesture is in progress —
+    /// the magnifier's anchor while the finger is down. `None` otherwise.
+    /// Bionic reports a gesture only once a selection exists, so a plain
+    /// free-scroll drag there gains no magnifier.
+    pub fn selection_pointer(&self) -> Option<(u16, u16)> {
+        match self.drag {
+            Some(DragAnchor {
+                target: DragTarget::Editor { .. },
+                ..
+            }) if self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.mode == EditorMode::Raw || e.has_selection()) =>
+            {
+                Some(self.pointer)
+            }
+            _ => None,
+        }
+    }
+
+    /// Hand the buffer to the daemon: ONE async `patch_file` over the worker
+    /// channel. The UI never blocks — the reply routes back through
+    /// [`Self::apply_reply`] under [`Tag::EditorSave`].
+    ///
+    /// `then_exit` is the dirty-Esc `s` path: close the editor when this save
+    /// lands cleanly. Every refusal (read-only gate, empty original) leaves
+    /// the buffer + dirty flag exactly as they were.
+    fn editor_save(&mut self, ipc: &mut IpcClient, then_exit: bool) {
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        if let Some(reason) = &ed.read_only {
+            self.status = format!("read-only: {reason} — save refused");
+            return;
+        }
+        if !ed.dirty {
+            self.status = "no changes to save".into();
+            return;
+        }
+        if self.pending_save.is_some() {
+            self.status = "save already in flight — waiting for the daemon".into();
+            return;
+        }
+        // Empty-original files are the one v1 edge `patch_file` cannot cover:
+        // `old` must be non-empty and match exactly once. `replace_file` is
+        // NOT the fallback (it skips the vault refusal); the v2 `write_file`
+        // verb is the documented follow-up.
+        if ed.is_empty_original() {
+            self.status =
+                "empty-file save not supported yet — patch_file needs a non-empty \
+                 original (v2 write_file is the follow-up)"
+                    .into();
+            return;
+        }
+        let write = ed.pending_write();
+        let sent = write.new.clone();
+        let args = serde_json::to_value(PatchFileArgs {
+            path: write.path.clone(),
+            old: write.old,
+            new: write.new,
+            expected_version: write.expected_version,
+            anchor: None,
+            editor: None,
+        })
+        .expect("PatchFileArgs is a plain struct");
+        let id = ipc.send(
+            "patch_file",
+            args,
+            Tag::EditorSave { path: write.path.clone() },
+        );
+        self.pending_save = Some(PendingSave {
+            id,
+            path: write.path,
+            sent,
+            then_exit,
+        });
+        self.status = "saving…".into();
+    }
+
+    /// Route one editor-save reply. Success rebases the editor on what the
+    /// daemon actually stored (a fresh CAS token + pristine copy, still dirty
+    /// if the user typed while the round-trip was in flight); every failure
+    /// keeps the buffer + dirty flag so nothing is lost.
+    fn apply_editor_save_reply(
+        &mut self,
+        id: crate::ipc::ReqId,
+        path: &str,
+        result: Result<Value, (ErrorKind, String)>,
+    ) {
+        // Inert unless this is the one pending request (a stale or reordered
+        // reply must never rebase a newer save).
+        match &self.pending_save {
+            Some(p) if p.id == id && p.path == path => {}
+            _ => return,
+        }
+        let pending = self.pending_save.take().expect("checked above");
+        match result {
+            Ok(v) => {
+                let version = serde_json::from_value::<PatchFileReply>(v)
+                    .ok()
+                    .map(|r| r.version)
+                    .filter(|v| !v.is_empty());
+                let mut matched = false;
+                let mut still_dirty = false;
+                if let Some(ed) = self.editor.as_mut().filter(|e| e.path == path) {
+                    ed.mark_saved(version, &pending.sent);
+                    matched = true;
+                    still_dirty = ed.dirty;
+                }
+                if still_dirty {
+                    self.status = "saved — newer edits are still unsaved".into();
+                } else {
+                    self.status = "saved".into();
+                }
+                if pending.then_exit && matched && !still_dirty {
+                    self.editor = None;
+                    self.view = View::Browse;
+                }
+            }
+            Err((kind, m)) => self.status = save_error_status(kind, &m),
+        }
+    }
+
     fn handle_key_unlock(&mut self, key: KeyEvent, ipc: &mut IpcClient) {
         let Overlay::Unlock { buf, .. } = &mut self.overlay else {
             return;
@@ -2139,7 +3178,7 @@ impl App {
                 .filter(|r| !r.is_dir)
                 .map(|r| r.path.clone()),
             View::History | View::Peers | View::Backup | View::Deploy | View::Shares
-            | View::Growlight | View::Coordination => None,
+            | View::Growlight | View::Coordination | View::Editor => None,
         };
         match target {
             // M2c: if the reveal target is the currently-open file and it
@@ -2716,6 +3755,22 @@ fn short_hash(h: &str) -> String {
     h.chars().take(10).collect()
 }
 
+/// Map a daemon save failure onto the editor status line. `Conflict` /
+/// text-not-found are the "your base moved" class — the editor tells the user
+/// to re-read rather than silently retrying; the vault kinds are the refusal
+/// class the client-side gate should already have caught (defense in depth).
+fn save_error_status(kind: ErrorKind, message: &str) -> String {
+    match kind {
+        ErrorKind::Conflict | ErrorKind::TextNotFound | ErrorKind::TextAmbiguous => format!(
+            "save conflict — the file changed on the daemon; re-read and retry ({message})"
+        ),
+        ErrorKind::VaultProtected | ErrorKind::MalformedVaultTag => {
+            format!("save refused by the daemon (vault-protected): {message}")
+        }
+        _ => format!("save failed ({kind:?}): {message}"),
+    }
+}
+
 /// Build the `vault_reveal` IPC args. `id` is threaded in only when `Some`, so
 /// a whole-file (M2b) reveal's payload stays byte-identical to the pre-M2c
 /// caller (matching the `skip_serializing_if = "Option::is_none"` on the verb).
@@ -3028,6 +4083,7 @@ fn format_commit(r: &ShowReply) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Rect;
 
     #[test]
     fn locked_blocks_actions_and_nav() {
@@ -3282,6 +4338,47 @@ mod tests {
     }
 
     #[test]
+    fn preview_bionic_toggles_from_key_and_chip_and_persists() {
+        let mut app = App::new();
+        app.locked = false;
+        app.preview = "# Title\n\nThe quick brown fox\n".into();
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE), &mut ipc);
+        assert!(app.preview_bionic);
+        assert!(app.prefs.preview_bionic, "the choice persists");
+        assert_eq!(app.status, "preview: bionic");
+        app.hits
+            .push(Rect::new(50, 5, 10, 1), Hit::PreviewBionic);
+        app.handle_mouse(tap(52, 5), &mut ipc);
+        assert!(!app.preview_bionic, "the chip toggles back");
+        assert!(!app.prefs.preview_bionic);
+        assert_eq!(app.status, "preview: raw");
+    }
+
+    #[test]
+    fn preview_bionic_lines_track_the_content() {
+        let mut app = App::new();
+        app.preview_bionic = true;
+        app.preview = "The API is great".into();
+        let text = |lines: &[Line<'static>]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(text(app.preview_bionic_lines().unwrap()), "The API is great");
+        // The cache rebuilds when the content changes under the same toggle.
+        app.preview = "Fresh body text".into();
+        assert_eq!(text(app.preview_bionic_lines().unwrap()), "Fresh body text");
+    }
+
+    #[test]
     fn preview_scroll_resets_on_new_file() {
         let mut app = App::new();
         app.locked = false;
@@ -3313,6 +4410,8 @@ mod tests {
         app.preview_viewport = 5;
         app.preview_total = 100;
         let mut ipc = dummy_ipc();
+        // No zones recorded (e.g. before the first frame): the wheel keeps the
+        // pre-touch behaviour and scrolls the preview.
         let wheel = |kind| MouseEvent {
             kind,
             column: 0,
@@ -3325,6 +4424,531 @@ mod tests {
         assert_eq!(app.preview_scroll, 6);
         app.handle_mouse(wheel(MouseEventKind::ScrollUp), &mut ipc);
         assert_eq!(app.preview_scroll, 3);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn tap(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn tapping_a_browse_row_opens_it_on_the_first_tap() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree.set_children(
+            "",
+            vec![tree_entry("a.md", "a.md", false), tree_entry("dir", "dir", true)],
+        );
+        app.hits
+            .push(Rect::new(5, 5, 20, 1), Hit::Row { list: ListId::Browse, index: 1 });
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(7, 5), &mut ipc);
+        assert_eq!(app.tree.selected, 1, "the tap lands the selection");
+        // Smoke: a single tap opens the row instantly (a dir expands and
+        // lazily loads its children); the old select-then-tap-again cost was
+        // the reported lag.
+        assert!(app.tree.is_expanded("dir"), "first tap opens the folder");
+    }
+
+    #[test]
+    fn tapping_a_flat_list_row_still_selects_only() {
+        // The non-tree lists keep select-then-activate: their activation can
+        // prompt (Vault reveal) or is a hint.
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Vault;
+        app.vault.set_items(vec![
+            "secrets/a.toml".into(),
+            "secrets/b.toml".into(),
+        ]);
+        let mut ipc = dummy_ipc();
+        app.hits.push(Rect::new(5, 5, 20, 1), Hit::Row { list: ListId::Vault, index: 1 });
+        app.handle_mouse(tap(7, 5), &mut ipc);
+        assert_eq!(app.vault.selected, 1);
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "no reveal prompt on the selecting tap"
+        );
+    }
+
+    #[test]
+    fn right_click_activates_a_row_directly() {
+        // The touch-pointer plugin maps a double-tap to a right click, so it
+        // must activate without needing a prior selecting tap.
+        let mut app = App::new();
+        app.locked = false;
+        app.tree
+            .set_children("", vec![tree_entry("dir", "dir", true)]);
+        app.hits
+            .push(Rect::new(0, 0, 5, 1), Hit::Row { list: ListId::Browse, index: 0 });
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 1, 0),
+            &mut ipc,
+        );
+        assert_eq!(app.tree.selected, 0);
+        assert!(app.tree.is_expanded("dir"));
+    }
+
+    #[test]
+    fn a_tap_outside_every_zone_is_a_no_op() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree
+            .set_children("", vec![tree_entry("a.md", "a.md", false)]);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(90, 30), &mut ipc);
+        assert_eq!(app.tree.selected, 0);
+    }
+
+    #[test]
+    fn wheel_over_a_list_moves_its_selection_instead_of_scrolling() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree.set_children(
+            "",
+            (0..6)
+                .map(|i| tree_entry(&format!("f{i}.md"), &format!("f{i}.md"), false))
+                .collect(),
+        );
+        app.hits
+            .push(Rect::new(0, 0, 10, 10), Hit::Row { list: ListId::Browse, index: 0 });
+        app.preview_viewport = 5;
+        app.preview_total = 100;
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 1), &mut ipc);
+        assert_eq!(app.tree.selected, 3, "wheel notch moves three rows");
+        assert_eq!(app.preview_scroll, 0, "the list consumed the wheel");
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 1), &mut ipc);
+        assert_eq!(app.tree.selected, 0);
+    }
+
+    #[test]
+    fn wheel_over_the_preview_zone_scrolls_the_preview() {
+        let mut app = App::new();
+        app.preview_viewport = 5;
+        app.preview_total = 100;
+        app.hits.push(Rect::new(40, 0, 60, 30), Hit::Preview);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 50, 10), &mut ipc);
+        assert_eq!(app.preview_scroll, 3);
+    }
+
+    #[test]
+    fn drag_in_the_preview_scrolls_from_the_fixed_anchor() {
+        let mut app = App::new();
+        app.preview_viewport = 5;
+        app.preview_total = 100;
+        app.hits.push(Rect::new(40, 0, 60, 30), Hit::Preview);
+        let mut ipc = dummy_ipc();
+        // Finger down at row 10, then dragged up to row 6 → content follows.
+        app.handle_mouse(tap(50, 10), &mut ipc);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 6), &mut ipc);
+        assert_eq!(app.preview_scroll, 4);
+        // Coalesced events compute from the anchor, not the previous event.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 6), &mut ipc);
+        assert_eq!(app.preview_scroll, 4, "a repeat must not compound");
+        // Dragging back down past the anchor clamps at the top.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 40), &mut ipc);
+        assert_eq!(app.preview_scroll, 0);
+        // Releasing ends the gesture: later motion is ignored.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, 40), &mut ipc);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 5), &mut ipc);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn a_modal_chip_replays_its_key_and_keeps_the_modal() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::PairConfirm {
+            pairing_id: "pid-1".into(),
+            sas: "123 456".into(),
+            fingerprint: "f".repeat(64),
+            name: "laptop".into(),
+            error: None,
+        };
+        app.hits
+            .push(Rect::new(10, 10, 8, 1), Hit::Key(hit::key(KeyCode::Char('y'))));
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(12, 10), &mut ipc);
+        assert!(app.status.contains("confirming"), "chip ran the confirm key");
+        assert!(
+            matches!(app.overlay, Overlay::PairConfirm { .. }),
+            "the modal stays until the daemon answers"
+        );
+    }
+
+    #[test]
+    fn region_rows_select_then_the_second_tap_advances() {
+        let mut app = App::new();
+        app.locked = false;
+        app.overlay = Overlay::RevealRegion {
+            path: "config/db.toml".into(),
+            ids: vec!["db-pw".into(), "api-token".into()],
+            selected: 0,
+        };
+        app.hits.push(
+            Rect::new(3, 6, 30, 1),
+            Hit::RegionRow(1),
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(5, 6), &mut ipc);
+        assert!(
+            matches!(&app.overlay, Overlay::RevealRegion { selected, .. } if *selected == 1),
+            "first tap selects the region"
+        );
+        app.handle_mouse(tap(5, 6), &mut ipc);
+        assert!(
+            matches!(&app.overlay, Overlay::Reveal { id: Some(id), .. } if id == "api-token"),
+            "second tap advances to the masked prompt with that id"
+        );
+    }
+
+    #[test]
+    fn footer_chips_expose_each_views_actions() {
+        let mut app = App::new();
+        app.locked = false;
+        let labels = |app: &App| -> Vec<&'static str> {
+            app.footer_actions().into_iter().map(|(l, _)| l).collect()
+        };
+        app.view = View::Deploy;
+        let deploy = labels(&app);
+        assert!(deploy.contains(&"a apply") && deploy.contains(&"F force"));
+        app.view = View::Shares;
+        let shares = labels(&app);
+        assert!(shares.contains(&"a share") && shares.contains(&"D un-share"));
+        // While locked there are no page actions — just unlock + globals.
+        app.locked = true;
+        let locked = labels(&app);
+        assert!(locked.contains(&"u unlock"));
+        assert!(!locked.contains(&"a apply"));
+    }
+
+    fn left_down(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    fn left_up(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Up(MouseButton::Left), column, row)
+    }
+
+    fn left_drag(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Drag(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn the_floating_button_taps_open_the_menu_and_drags_reposition() {
+        let mut app = App::new();
+        app.locked = false;
+        app.screen = Rect::new(0, 0, 100, 30);
+        app.prefs.fab = Some((90, 26));
+        app.hits
+            .push(Rect::new(90, 26, hit::FAB_W, hit::FAB_H), Hit::Fab);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(left_down(92, 27), &mut ipc);
+        app.handle_mouse(left_up(92, 27), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::Menu { .. }),
+            "a tap opens the menu"
+        );
+
+        app.overlay = Overlay::None;
+        app.handle_mouse(left_down(92, 27), &mut ipc);
+        app.handle_mouse(left_drag(50, 10), &mut ipc);
+        assert_eq!(app.prefs.fab, Some((48, 9)), "the grab offset is preserved");
+        app.handle_mouse(left_up(50, 10), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "a drag must not open the menu"
+        );
+    }
+
+    #[test]
+    fn a_menu_row_tap_runs_the_action_and_closes_the_menu() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Deploy;
+        let index = app
+            .menu_actions()
+            .iter()
+            .position(|(label, _)| *label == "F force")
+            .expect("the deploy menu offers force");
+        app.overlay = Overlay::Menu { selected: 0 };
+        app.hits.push(Rect::new(10, 10, 30, 1), Hit::MenuRow(index));
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(12, 10), &mut ipc);
+        assert!(
+            matches!(app.overlay, Overlay::DeployForce { .. }),
+            "the row ran its key after closing the menu"
+        );
+    }
+
+    #[test]
+    fn menu_keyboard_moves_the_check_and_esc_closes() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Deploy;
+        app.open_menu();
+        let mut ipc = dummy_ipc();
+        app.handle_key(hit::key(KeyCode::Char('j')), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::Menu { selected: 1 }));
+        app.handle_key(hit::key(KeyCode::Esc), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn the_editor_view_switch_taps_and_persists_the_choice() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("# T\nbody", false, &[]));
+        app.hits.push(Rect::new(0, 1, 6, 1), Hit::EditorView(true));
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(2, 1), &mut ipc);
+        assert_eq!(
+            app.editor.as_ref().unwrap().mode,
+            EditorMode::Bionic,
+            "tapping 'bionic' selects it"
+        );
+        assert!(app.prefs.editor_bionic, "the choice becomes the default");
+        app.hits.push(Rect::new(0, 1, 6, 1), Hit::EditorView(false));
+        app.handle_mouse(tap(2, 1), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditorMode::Raw);
+        assert!(!app.prefs.editor_bionic);
+    }
+
+    #[test]
+    fn editor_taps_place_the_caret_and_the_wheel_moves_it() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        let content = (0..10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.editor = Some(editor_from(&content, false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 30, 1),
+            Hit::EditorLine { row: 2, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(14, 5), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().cursor(), (2, 4));
+        app.hits.clear();
+        app.hits.push(Rect::new(10, 5, 30, 10), Hit::EditorBody);
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 12, 8), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().cursor().0, 5);
+    }
+
+    #[test]
+    fn editor_drag_scrolls_the_bionic_view_from_the_anchor() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        let content = (0..60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut ed = editor_from(&content, false, &[]);
+        ed.toggle_mode();
+        ed.set_viewport(5);
+        app.editor = Some(ed);
+        app.hits.push(Rect::new(10, 5, 30, 10), Hit::EditorBody);
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(tap(12, 10), &mut ipc);
+        app.handle_mouse(left_drag(12, 6), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().scroll, 4);
+        assert!(
+            !app.editor.as_ref().unwrap().has_selection(),
+            "a plain bionic drag free-scrolls, it does not select"
+        );
+        assert!(
+            app.selection_pointer().is_none(),
+            "a free-scroll drag gains no magnifier"
+        );
+        app.handle_mouse(left_drag(12, 30), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().scroll, 0, "clamped at the top");
+    }
+
+    #[test]
+    fn bionic_double_tap_selects_a_word_and_a_following_drag_extends_it() {
+        // Smoke finding: the persisted default view is bionic, and selection
+        // there did nothing. Double-tap (right click) + drag must work in
+        // both views; only a plain drag stays free-scroll.
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        let mut ed = editor_from("the quick brown\nsecond line", false, &[]);
+        ed.toggle_mode();
+        app.editor = Some(ed);
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        // Right click inside "quick" (display cols 4..8 → screen 14..18).
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 15, 5),
+            &mut ipc,
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().selected_text().as_deref(),
+            Some("quick")
+        );
+        // Press inside the selection and drag onto the next line: the word
+        // anchor stays put, the head follows, and the magnifier is live.
+        app.handle_mouse(left_down(14, 5), &mut ipc);
+        assert!(app.selection_pointer().is_some(), "magnifier follows");
+        app.handle_mouse(left_drag(18, 6), &mut ipc);
+        let text = app.editor.as_ref().unwrap().selected_text().unwrap();
+        assert!(text.starts_with("quick"), "word anchor kept: {text}");
+        assert!(
+            text.contains("second"),
+            "the drag extended onto the next line: {text}"
+        );
+    }
+
+    #[test]
+    fn new_files_open_in_the_last_selected_view() {
+        let mut app = App::new();
+        app.locked = false;
+        app.prefs.editor_bionic = true;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::EditorReadFile {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes/x.md",
+                    "content": "# Title\nbody",
+                    "sealed": false,
+                    "version": "v7",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().mode,
+            EditorMode::Bionic,
+            "the open honors the persisted view choice"
+        );
+    }
+
+    #[test]
+    fn right_click_selects_a_word_and_a_following_drag_extends_it() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("the quick brown\nsecond line", false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        // Right click inside "quick" (display cols 4..8 → screen 14..18).
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 15, 5),
+            &mut ipc,
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().selected_text().as_deref(),
+            Some("quick")
+        );
+        // The word was auto-copied (the status reports the attempt; the exact
+        // wording depends on whether a clipboard tool is reachable).
+        assert!(
+            app.status.contains("copied")
+                || app.status.contains("clipboard")
+                || app.status.contains("copy failed"),
+            "auto-copy attempted: {}",
+            app.status
+        );
+        // Press inside the selection, drag down and right: the word anchor
+        // stays put and the head follows the finger.
+        app.handle_mouse(left_down(14, 5), &mut ipc);
+        app.handle_mouse(left_drag(18, 6), &mut ipc);
+        let text = app.editor.as_ref().unwrap().selected_text().unwrap();
+        assert!(text.starts_with("quick"), "word anchor kept: {text}");
+        assert!(
+            text.contains("second"),
+            "drag extended onto the next line: {text}"
+        );
+    }
+
+    #[test]
+    fn finishing_a_drag_auto_copies_the_selection() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hello world", false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        app.status = "editing".into();
+        app.handle_mouse(left_down(10, 5), &mut ipc);
+        app.handle_mouse(left_drag(15, 5), &mut ipc);
+        assert!(app.editor.as_ref().unwrap().has_selection());
+        app.handle_mouse(left_up(15, 5), &mut ipc);
+        assert!(
+            app.status.contains("copied")
+                || app.status.contains("clipboard")
+                || app.status.contains("copy failed"),
+            "release auto-copied the selection: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_plain_editor_drag_selects_from_the_press_point() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hello world", false, &[]));
+        app.hits.push(
+            Rect::new(10, 5, 40, 1),
+            Hit::EditorLine { row: 0, x0: 10 },
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_mouse(left_down(10, 5), &mut ipc);
+        app.handle_mouse(left_drag(14, 5), &mut ipc); // head over 'o'
+        assert_eq!(
+            app.editor.as_ref().unwrap().selected_text().as_deref(),
+            Some("hello")
+        );
+        // A press-release with no motion is a caret tap, not a selection.
+        app.editor.as_mut().unwrap().clear_selection();
+        app.handle_mouse(left_down(12, 5), &mut ipc);
+        app.handle_mouse(left_up(12, 5), &mut ipc);
+        assert!(!app.editor.as_ref().unwrap().has_selection());
+        assert_eq!(app.editor.as_ref().unwrap().cursor(), (0, 2));
+    }
+
+    #[test]
+    fn esc_clears_the_selection_before_exiting_the_editor() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("one two", false, &[]));
+        app.editor.as_mut().unwrap().select_word_at(0, 0);
+        let mut ipc = dummy_ipc();
+        app.handle_key(hit::key(KeyCode::Esc), &mut ipc);
+        assert!(!app.editor.as_ref().unwrap().has_selection());
+        assert_eq!(app.view, View::Editor, "the first Esc only clears");
+        app.handle_key(hit::key(KeyCode::Esc), &mut ipc);
+        assert_eq!(app.view, View::Browse, "the second Esc exits");
     }
 
     fn peer(name: &str, fp: &str) -> PairPeer {
@@ -5414,5 +7038,369 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("divergence"));
+    }
+
+    // ---- M3c editor ----
+
+    fn editor_from(content: &str, sealed: bool, ids: &[String]) -> Editor {
+        Editor::from_read("notes/x.md", content, Some("v1".into()), sealed, ids)
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn editor_read_reply_opens_the_view_and_builds_the_buffer() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::EditorReadFile {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes/x.md",
+                    "content": "# Title\nbody",
+                    "sealed": false,
+                    "version": "v7",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Editor);
+        let ed = app.editor.as_ref().expect("editor open");
+        assert!(!ed.is_read_only());
+        assert_eq!(ed.text(), "# Title\nbody");
+        assert_eq!(ed.expected_version.as_deref(), Some("v7"));
+    }
+
+    #[test]
+    fn editor_read_reply_refuses_sealed_and_region_projections() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.apply_reply(
+            Reply {
+                id: 1,
+                tag: Tag::EditorReadFile {
+                    path: "secrets/s.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "secrets/s.md",
+                    "content": "[sealed:secrets/s.md]",
+                    "sealed": true,
+                    "version": "v1",
+                })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Editor);
+        assert!(app.editor.as_ref().unwrap().is_read_only());
+        assert!(app.status.contains("read-only"));
+
+        app.apply_reply(
+            Reply {
+                id: 2,
+                tag: Tag::EditorReadFile {
+                    path: "docs/r.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "docs/r.md",
+                    "content": "a <vault id=\"api\">[encrypted]</vault> b",
+                    "sealed": false,
+                    "version": "v1",
+                    "region_ids": ["api"],
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.editor.as_ref().unwrap().is_read_only());
+    }
+
+    #[test]
+    fn editor_open_key_rejects_directories() {
+        let mut app = App::new();
+        app.locked = false;
+        app.tree.set_children(
+            "",
+            vec![softfig_ipc::TreeEntry {
+                name: "meta".into(),
+                path: "meta".into(),
+                is_dir: true,
+            }],
+        );
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE), &mut ipc);
+        assert_ne!(app.view, View::Editor);
+        assert!(app.status.contains("regular file"));
+    }
+
+    #[test]
+    fn editor_without_a_selected_row_is_a_noop() {
+        let mut app = App::new();
+        app.locked = false;
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE), &mut ipc);
+        assert_ne!(app.view, View::Editor);
+        assert!(app.status.contains("no file selected"));
+    }
+
+    #[test]
+    fn editor_owns_keys_and_toggles_views() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("The API is great", false, &[]));
+        let mut ipc = dummy_ipc();
+        // Typing must insert, never trigger global bindings.
+        for c in "qv".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE), &mut ipc);
+        }
+        assert!(!app.should_quit, "q must type, not quit");
+        assert_eq!(app.editor.as_ref().unwrap().text(), "qvThe API is great");
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditorMode::Bionic);
+        // `v` returns from bionic; in raw mode it inserts.
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::NONE), &mut ipc);
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditorMode::Raw);
+        // The typed buffer is dirty → Esc asks before leaving; `d` discards.
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::EditorDiscard));
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE), &mut ipc);
+        assert_eq!(app.view, View::Browse);
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn editor_ctrl_s_sends_the_patch_and_the_reply_rebases_the_editor() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        assert!(app.editor.as_ref().unwrap().dirty);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        // The save is in flight: nothing blocks, the buffer stays dirty.
+        assert!(app.pending_save.is_some(), "one async patch_file dispatched");
+        assert!(app.editor.as_ref().unwrap().dirty);
+        assert_eq!(app.status, "saving…");
+        // The daemon ack: fresh CAS token + pristine copy, dirty cleared.
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({
+                    "path": "notes/x.md",
+                    "hash": "h",
+                    "version": "v9",
+                })),
+            },
+            &mut ipc,
+        );
+        assert!(app.pending_save.is_none());
+        assert!(!app.editor.as_ref().unwrap().dirty);
+        assert_eq!(app.editor.as_ref().unwrap().text(), "xhi");
+        assert_eq!(
+            app.editor.as_ref().unwrap().expected_version.as_deref(),
+            Some("v9")
+        );
+        assert_eq!(app.status, "saved");
+    }
+
+    #[test]
+    fn editor_save_conflict_keeps_the_buffer_dirty_and_says_re_read() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Err((ErrorKind::Conflict, "stale base".into())),
+            },
+            &mut ipc,
+        );
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.dirty, "conflict keeps the dirty flag");
+        assert_eq!(ed.text(), "xhi", "conflict keeps the buffer");
+        assert_eq!(ed.expected_version.as_deref(), Some("v1"), "CAS token kept");
+        assert!(app.pending_save.is_none());
+        assert!(
+            app.status.contains("changed on the daemon") && app.status.contains("re-read"),
+            "status points at the re-read: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn editor_save_vault_refusal_is_surfaced_and_keeps_the_buffer() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Err((ErrorKind::VaultProtected, "sealed target".into())),
+            },
+            &mut ipc,
+        );
+        assert!(app.editor.as_ref().unwrap().dirty);
+        assert!(app.status.contains("refused"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn edits_during_the_save_round_trip_stay_dirty_after_the_ack() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        // Type while the patch is in flight.
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({ "path": "notes/x.md", "hash": "h", "version": "v9" })),
+            },
+            &mut ipc,
+        );
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.dirty, "post-send edits are not what the daemon saved");
+        assert_eq!(ed.expected_version.as_deref(), Some("v9"));
+        assert!(app.status.contains("still unsaved"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn editor_save_already_in_flight_is_not_dispatched_twice() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert_eq!(app.pending_save.as_ref().unwrap().id, id, "one request only");
+        assert!(
+            app.status.contains("already in flight"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn empty_original_save_is_refused_client_side() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(Editor::from_read(
+            "notes/empty.md",
+            "",
+            Some("v1".into()),
+            false,
+            &[],
+        ));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert!(app.pending_save.is_none(), "no patch for an empty original");
+        assert!(
+            app.status.contains("empty-file save not supported yet"),
+            "status: {}",
+            app.status
+        );
+        assert!(app.editor.as_ref().unwrap().dirty, "buffer kept");
+    }
+
+    #[test]
+    fn read_only_editor_refuses_save_before_the_bridge() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(Editor::from_read(
+            "secrets/s.md",
+            "[sealed:secrets/s.md]",
+            Some("v".into()),
+            true,
+            &[],
+        ));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut ipc);
+        assert!(app.status.contains("read-only"));
+        assert!(app.pending_save.is_none(), "refused client-side, no IPC");
+    }
+
+    #[test]
+    fn editor_esc_dirty_opens_discard_and_d_discards() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::EditorDiscard));
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.view, View::Browse);
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn editor_discard_overlay_s_requests_save_and_exits_when_it_lands() {
+        let mut app = App::new();
+        app.locked = false;
+        app.view = View::Editor;
+        app.editor = Some(editor_from("hi", false, &[]));
+        let mut ipc = dummy_ipc();
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut ipc);
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::EditorDiscard));
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE), &mut ipc);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.editor.is_some(), "stays open until the daemon acks");
+        let id = app.pending_save.as_ref().unwrap().id;
+        app.apply_reply(
+            Reply {
+                id,
+                tag: Tag::EditorSave {
+                    path: "notes/x.md".into(),
+                },
+                result: Ok(json!({ "path": "notes/x.md", "version": "v2" })),
+            },
+            &mut ipc,
+        );
+        assert_eq!(app.view, View::Browse);
+        assert!(app.editor.is_none(), "a clean save-and-exit closes the editor");
+        assert_eq!(app.status, "saved");
     }
 }

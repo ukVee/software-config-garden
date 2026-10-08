@@ -13,10 +13,20 @@ protocol is fixed; the baton changes each iteration.
    atomic step, then hand off. At ~60%: hand off NOW, recording a precise resume
    point in NEXT ACTION. NEVER /compact — a curated baton beats a lossy summary.
 
-2b. SESSION BUDGET. Read usage.json at boot. Before starting any new step, if 5h
-   used >= 85% (or 7d >= 90%): do not start it — write the baton, set status
-   HALTED_RATE_LIMIT with the reset time, stop. Plan each chunk to fit the
-   remaining 5h window; don't leave a started window idle.
+2b. SESSION BUDGET. Read usage.json at boot and judge each rate window by its own
+   `resets_at`, never by the file's age: a window whose `resets_at` has already
+   passed describes a window that no longer exists, and a window carrying no
+   `used_percentage` at all never held a measurement to begin with (a headless
+   capture writes `status` + `resets_at` only, by design). Either way that window
+   has NO usable percentage — OMIT `session_5h_pct` / `session_7d_pct` from the
+   baton head instead of carrying the previous baton's number forward, and say in
+   prose which window you could not read. Halt only on a percentage you can vouch
+   for: before starting any new step, if a vouchable 5h reading is >= 85% (or a
+   vouchable 7d >= 90%): do not start it — write the baton, set status
+   HALTED_RATE_LIMIT with the reset time, stop. An unusable reading is not a halt
+   and not a licence to burn: proceed, flag the gap. (`RateWindow::vouchable_pct_at`
+   in `softfig-ipc::usage` is this same judgement in code.) Plan each chunk to fit
+   the remaining 5h window; don't leave a started window idle.
 
 3. WORK. Execute NEXT ACTION as one coherent chunk. Obey all standing feedback
    (garden edits only via softfig-mcp; commit code on the active item's branch

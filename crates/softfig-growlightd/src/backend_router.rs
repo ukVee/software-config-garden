@@ -38,6 +38,7 @@ use crate::agent_harness::sum_rate_windows;
 use crate::claude_backend::ClaudeBackend;
 use crate::control::AgentChild;
 use crate::drive_loop::{AgentHealthSource, AgentStderrSource, BudgetSampleSource, RateMeter};
+use crate::usage::WindowResets;
 use crate::opencode_backend::{AgentSpend, OpencodeBackend};
 use crate::preapproval::AgentPaths;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
@@ -116,6 +117,16 @@ impl BackendHandle {
         match self {
             Self::Claude(b) => b.rate_limit_reopen(agent),
             Self::Opencode(b) => b.rate_limit_reopen(agent),
+        }
+    }
+
+    /// The window boundaries behind `agent`'s latest Anthropic reserve reading
+    /// (task 048). Structurally [`WindowResets::UNKNOWN`] for opencode — it has no
+    /// 5h/7d window, and a synthetic boundary would void claude readings with it.
+    fn budget_resets(&self, agent: &str) -> WindowResets {
+        match self {
+            Self::Claude(b) => b.budget_resets(agent),
+            Self::Opencode(_) => WindowResets::UNKNOWN,
         }
     }
 
@@ -276,6 +287,15 @@ impl BudgetSampleSource for Arc<BackendRouter> {
         self.backend_for(agent)
             .and_then(|b| b.rate_limit_reopen(agent))
     }
+
+    /// Forwarded per member (task 048), the same fail-closed shape as the reads
+    /// above: an unrouted agent contributes no boundary — the aggregator falls
+    /// back to its age bound — rather than another member's.
+    fn budget_resets(&self, agent: &str) -> WindowResets {
+        self.backend_for(agent)
+            .map(|b| b.budget_resets(agent))
+            .unwrap_or(WindowResets::UNKNOWN)
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +326,10 @@ mod tests {
         assert!(AgentStderrSource::stderr_tail(&router, "ghost").is_empty());
         assert_eq!(BudgetSampleSource::budget(&router, "ghost"), None);
         assert_eq!(BudgetSampleSource::rate_limit_reopen(&router, "ghost"), None);
+        assert_eq!(
+            BudgetSampleSource::budget_resets(&router, "ghost"),
+            WindowResets::UNKNOWN,
+        );
         // Spend included: a stranger must not read as a $0.00 metered member
         // either — `None` here means "no metered accounting", which is what keeps
         // the status surface from drawing a dollar figure it cannot justify.

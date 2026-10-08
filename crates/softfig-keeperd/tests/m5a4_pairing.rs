@@ -193,7 +193,7 @@ fn spawn_responder(device: LocalDevice) -> (String, mpsc::Receiver<String>) {
     let endpoint = listener.local_addr().unwrap().to_string();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept");
+        let stream = softfig_net::testing::accept_within(&listener, "pairing");
         match pair_responder(stream, &device) {
             Ok(pending) => {
                 let _ = tx.send(pending.sas().grouped());

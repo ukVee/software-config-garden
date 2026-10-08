@@ -282,6 +282,56 @@ mod template_tests {
         assert_eq!(s, f, "the shared protocol prefix must stay byte-identical");
     }
 
+    /// Task 048 leg C: §2b's budget rule must stay a `resets_at` judgement, not
+    /// an age one. The prose is the only thing that makes a *member* refuse to
+    /// echo a fossil's percentage into its baton head (there is no code path
+    /// between the file and the member), so an edit that drops the rule is a
+    /// silent regression of the 048 fix — this pins it.
+    #[test]
+    fn session_budget_step_judges_a_window_by_its_reset_boundary() {
+        // §2b lives in the shared prefix, so asserting once per protocol keeps
+        // both honest even if the drift guard above is ever relaxed.
+        for (name, doc) in [("single-agent", PROTOCOL_MD), ("fleet", PROTOCOL_FLEET_MD)] {
+            let step = doc
+                .split_once("2b. SESSION BUDGET")
+                .unwrap_or_else(|| panic!("{name} protocol has a step 2b"))
+                .1
+                .split_once("\n\n3. ")
+                .unwrap_or_else(|| panic!("{name} step 2b is followed by step 3"))
+                .0;
+
+            // The judgement: per-window boundary, explicitly not the file's age.
+            assert!(
+                step.contains("`resets_at`") && step.contains("never by the file's age"),
+                "{name} §2b must judge a window by its own resets_at, not the reading's age",
+            );
+            // The honesty rule: an unusable window is omitted, never carried over.
+            assert!(
+                step.contains("OMIT `session_5h_pct` / `session_7d_pct`"),
+                "{name} §2b must tell the member to omit an unvouchable percentage",
+            );
+            assert!(
+                step.contains("instead of carrying the previous baton's number forward"),
+                "{name} §2b must name the fossil-echo it is forbidding",
+            );
+            // Halting is gated on a vouchable reading, and only on that.
+            assert!(
+                step.contains("vouchable 5h reading is >= 85%") && step.contains("vouchable 7d >= 90%"),
+                "{name} §2b must gate the halt thresholds on a vouchable reading",
+            );
+            assert!(
+                step.contains("An unusable reading is not a halt"),
+                "{name} §2b must say an unusable reading does not itself halt the loop",
+            );
+            // And the prose points at the same judgement in code, so the two
+            // cannot drift apart unnoticed.
+            assert!(
+                step.contains("`RateWindow::vouchable_pct_at`"),
+                "{name} §2b must name the code that implements the same rule",
+            );
+        }
+    }
+
     #[test]
     fn only_the_single_agent_step_7_self_pulls() {
         let single_tail = &PROTOCOL_MD[PROTOCOL_MD.find(STEP_7).unwrap()..];

@@ -147,6 +147,21 @@ pub enum ErrorKind {
     /// should re-read the current content (+ version) and re-apply. No lock is
     /// ever held, so a crashed agent strands nothing.
     Conflict,
+    /// mcp-surgical-writes slice 002 (`patch_file`): the `old` text (or the
+    /// `anchor`, when given) occurred zero times in the search window — the
+    /// caller's ground truth is stale or misremembered; re-read and retry.
+    TextNotFound,
+    /// mcp-surgical-writes slice 002 (`patch_file`): the `old` text (or the
+    /// `anchor`, when given) occurred more than once in the search window —
+    /// add/narrow an `anchor` to disambiguate. Distinct from `TextNotFound`
+    /// because an agent's retry strategy differs.
+    TextAmbiguous,
+    /// mcp-surgical-writes slice 004 (`unlink`): the file is referenced
+    /// elsewhere — listed in a daemon-managed `<!-- softfig:index … -->`
+    /// region or linked by inbound `[[…]]` backlinks — so it is not an
+    /// unreferenced leaf. Use `archive` instead (it rewrites the
+    /// references); `unlink` can only cut what nothing points at.
+    ReferencedElsewhere,
     /// M5f slice 001 (key-before-content): a write verb targeted a path under
     /// an enabled shared subtree whose key ceremony has not run yet (`key_id`
     /// empty). Pre-ceremony content would seal under the per-device `M` —

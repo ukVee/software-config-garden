@@ -1,8 +1,8 @@
 //! Slice 4 of the small-files redesign — daemon-maintained TOC tables for
 //! accretive note folders.
 //!
-//! After every note mutation (`add_note` / `revise_note` / `archive` of a
-//! numbered note) the daemon regenerates a terse index table in a managed
+//! After every write that can touch a numbered note the daemon regenerates a
+//! terse index table in a managed
 //! region inside the folder's **parent concept-dir `CLAUDE.md`** — the
 //! routing doc Claude already reads, so the index is discoverable where it
 //! matters. The table is a TOC (number, linked title, reviewed date), never
@@ -22,6 +22,25 @@
 //! primary op, folded into the same commit, so a missing or vault-protected
 //! host `CLAUDE.md` is silently skipped rather than failing the write. The
 //! daemon never fabricates a routing doc.
+//!
+//! **Who owns the table (task 060).** Every cell is *derived* — the number and
+//! link from the filename, the title from the note's `# ` heading, the
+//! `Reviewed` date from its own `> Last reviewed:` line. No verb sets a cell;
+//! the daemon re-derives the whole region on any write that could have moved
+//! one, and a value typed into the region by hand is overwritten on the next
+//! write rather than kept. Two entry points:
+//!
+//! - [`refresh_folder_index`] — the folder-keyed call, for verbs that already
+//!   know the folder (`add_note` / `add_code_review` / `revise_note` /
+//!   `add_slice` / `archive` / `split` / `batch`'s note ops).
+//! - [`refresh_index_for`] — the path-keyed call, for the generic doc-edit
+//!   verbs that know only a path (`set_reviewed`, the section verbs,
+//!   `patch_file`, `replace_file`, `batch`'s plain writes).
+//!
+//! Before 060 only the add verbs and `revise_note` refreshed, so `set_reviewed`
+//! — the verb whose entire job is moving that date — left the index behind, and
+//! every index in the garden drifted a little further from the notes it
+//! summarizes.
 
 use std::path::{Path, PathBuf};
 
@@ -89,6 +108,94 @@ pub fn refresh_folder_index(
     Some(host_rel)
 }
 
+/// Re-derive every index table a write to `rel` can have invalidated, writing
+/// the host doc(s) so the caller's in-flight `commit_workdir` folds them into
+/// the same commit. Returns the host paths actually rewritten (empty when
+/// nothing was keyed to `rel`, or nothing changed).
+///
+/// Task 060: the `Reviewed` cell is **derived** from each note's own
+/// `> Last reviewed:` header, so it is only honest if *every* verb that can
+/// move that header re-derives the table. `add_note` / `revise_note` /
+/// `add_slice` / `archive` / `split` call [`refresh_folder_index`] directly
+/// because they already know the folder; this is the arm for the generic
+/// doc-edit verbs (`set_reviewed`, the section verbs, `patch_file`,
+/// `replace_file`, `batch`), which know only a path. Two arms, because a path
+/// reaches the table from either side:
+///
+/// 1. `rel` is a numbered doc inside an indexed folder (`…/notes/001-x.md`) →
+///    refresh that folder's table.
+/// 2. `rel` **is** a host `CLAUDE.md` → re-derive each `index <folder>` region
+///    it already carries, so a `Reviewed` cell patched by hand straight into
+///    the managed region is corrected rather than persisted.
+///
+/// Best-effort like the rest of index upkeep: never errors, never fabricates a
+/// region (arm 2 only touches regions whose backing folder exists), and
+/// silently skips vault-protected hosts.
+pub fn refresh_index_for(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Vec<String> {
+    let path = Path::new(rel);
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    // `""` for a doc at the garden root — a valid folder_rel prefix, not a miss.
+    let dir = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+
+    let mut hosts = Vec::new();
+    if let Some(folder_rel) = indexed_folder_of(rel) {
+        hosts.extend(refresh_folder_index(wt, inner, folder_rel));
+    }
+    if name == "CLAUDE.md" {
+        hosts.extend(refresh_host_regions(wt, inner, rel, dir));
+    }
+    hosts
+}
+
+/// Arm 1's keying: the indexed folder a write to `rel` belongs to, i.e. `rel`'s
+/// parent iff `rel` is a `NNN-slug.md` numbered doc directly inside an
+/// [`INDEXED_FOLDERS`](conventions::INDEXED_FOLDERS) folder. `None` for a
+/// `.seq`, a non-numbered name, or any other folder. Split out from
+/// [`refresh_index_for`] so the keying is unit-testable without a worktree.
+fn indexed_folder_of(rel: &str) -> Option<&str> {
+    let path = Path::new(rel);
+    let name = path.file_name()?.to_str()?;
+    conventions::parse_note_number(name)?;
+    let dir = path.parent()?.to_str()?;
+    conventions::is_indexed_dir(dir).then_some(dir)
+}
+
+/// Arm 2 of [`refresh_index_for`]: re-derive the `index <folder>` regions host
+/// doc `host_rel` already carries. Each [`refresh_folder_index`] call re-reads
+/// the host, so a doc with both a `notes/` and a `troubleshooting/` table lands
+/// both. Regions whose backing folder is absent are left untouched — dropping
+/// one is `archive`'s job, not an unrelated edit's.
+fn refresh_host_regions(
+    wt: &WorkTree,
+    inner: &DaemonInner,
+    host_rel: &str,
+    host_dir: &str,
+) -> Vec<String> {
+    let Some(content) = super::sections::read_if_unprotected(wt, inner, host_rel) else {
+        return Vec::new();
+    };
+    let folders: Vec<String> = managed::regions(&content)
+        .into_iter()
+        .filter_map(|(tag, _)| tag.strip_prefix("index ").map(|f| f.trim().to_string()))
+        .filter(|folder| !folder.is_empty())
+        .map(|folder| {
+            if host_dir.is_empty() {
+                folder
+            } else {
+                format!("{host_dir}/{folder}")
+            }
+        })
+        .filter(|folder_rel| conventions::is_indexed_dir(folder_rel) && wt.is_dir(folder_rel))
+        .collect();
+
+    folders
+        .iter()
+        .filter_map(|folder_rel| refresh_folder_index(wt, inner, folder_rel))
+        .collect()
+}
+
 /// Enumerate the numbered notes in accretive folder `folder_rel`, newest-number
 /// last. Each row carries the note's number, `# ` title (falling back to its
 /// filename slug), and `Last reviewed:` date (empty if unstamped). Reads run
@@ -147,6 +254,65 @@ fn escape_cell(s: &str) -> String {
 /// title can't break the `[text](target)` link syntax.
 fn escape_link_text(s: &str) -> String {
     s.replace('|', "\\|").replace('[', "(").replace(']', ")")
+}
+
+// ---- unlink reference refusal ------------------------------------------
+
+/// Host docs whose managed `<!-- softfig:index … -->` regions list `rel` —
+/// the `unlink` reference refusal's index arm (a `.seq` slot / TOC row /
+/// slice row is history; deleting through it would corrupt the table's
+/// invariants — `archive` is the tool that does it right). Each entry names
+/// the host + region tag, e.g. `services/waydroid/CLAUDE.md (softfig:index
+/// notes)`. Index rows link targets **relative to the host doc**, so both
+/// the repo-relative and the host-relative form of `rel` are checked.
+/// Whole-garden walk, best-effort like the maintenance itself:
+/// vault-protected or unreadable hosts are skipped.
+pub fn index_listings(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for host in super::backlinks::collect_md(wt) {
+        let Some(content) = super::sections::read_if_unprotected(wt, inner, &host) else {
+            continue;
+        };
+        let host_dir = Path::new(&host)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        let host_rel = rel.strip_prefix(host_dir).and_then(|s| s.strip_prefix('/'));
+        for (tag, body) in managed::regions(&content) {
+            if !tag.starts_with("index ") {
+                continue;
+            }
+            let listed = mentions(&body, rel)
+                || host_rel.is_some_and(|r| !r.is_empty() && mentions(&body, r));
+            if listed {
+                out.push(format!("{host} (softfig:{tag})"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether a managed-region body lists `rel` — a path-shaped mention bounded
+/// by non-path characters on both sides, so `notes/002-gpu.md` doesn't match
+/// inside `notes/002-gpu.md.backup`. Region bodies are daemon-rendered:
+/// index rows link `[title](<rel>)`, so both `(`/`)` delimit — the boundary
+/// check is exact.
+fn mentions(body: &str, rel: &str) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    let path_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
+    let mut rest = body;
+    while let Some(i) = rest.find(rel) {
+        let before = rest[..i].chars().next_back();
+        let after = rest[i + rel.len()..].chars().next();
+        if before.is_none_or(|c| !path_char(c)) && after.is_none_or(|c| !path_char(c)) {
+            return true;
+        }
+        rest = &rest[i + rel.len()..];
+    }
+    false
 }
 
 #[cfg(test)]
@@ -210,5 +376,44 @@ mod tests {
         assert!(table.contains("[a\\|b (v2)](notes/001-a.md)"), "{table}");
         // Empty reviewed renders as an empty cell, not a panic.
         assert!(table.ends_with("|  |"));
+    }
+
+    /// Task 060: arm 1 keys a plain doc-edit write back to the folder whose
+    /// index derives from it — numbered docs in an indexed folder only.
+    #[test]
+    fn indexed_folder_of_keys_numbered_docs_in_indexed_folders() {
+        assert_eq!(
+            indexed_folder_of("services/waydroid/notes/001-a.md"),
+            Some("services/waydroid/notes")
+        );
+        assert_eq!(
+            indexed_folder_of("projects/p/code-reviews/012-sweep.md"),
+            Some("projects/p/code-reviews")
+        );
+        assert_eq!(
+            indexed_folder_of("growlight/backlog/milestones/m5b/slices/003-x.md"),
+            Some("growlight/backlog/milestones/m5b/slices")
+        );
+        assert_eq!(indexed_folder_of("notes/001-a.md"), Some("notes"));
+        // Not a numbered doc, or not an indexed folder → no index keys to it.
+        assert_eq!(indexed_folder_of("services/waydroid/notes/.seq"), None);
+        assert_eq!(indexed_folder_of("services/waydroid/notes/README.md"), None);
+        assert_eq!(indexed_folder_of("journal/decisions/001-a.md"), None);
+        assert_eq!(indexed_folder_of("services/waydroid/CLAUDE.md"), None);
+        assert_eq!(indexed_folder_of(""), None);
+    }
+
+    #[test]
+    fn mentions_requires_path_shaped_boundaries() {
+        // Link-target form (index rows) and backtick form (backlink rows).
+        assert!(mentions("| 001 | [A](notes/002-gpu.md) | 2026 |", "notes/002-gpu.md"));
+        assert!(mentions("- `notes/002-gpu.md`", "notes/002-gpu.md"));
+        // A bare token at the start / end of the body counts too.
+        assert!(mentions("notes/002-gpu.md\n", "notes/002-gpu.md"));
+        // Substring-of-a-path mentions don't: the neighbor is a path char.
+        assert!(!mentions("(notes/002-gpu.md.backup)", "notes/002-gpu.md"));
+        assert!(!mentions("(xnotes/002-gpu.md)", "notes/002-gpu.md"));
+        // Only `index *` tags are scanned, so the empty needle never loops.
+        assert!(!mentions("anything", ""));
     }
 }

@@ -8,12 +8,16 @@
 //! never receives sealed plaintext.
 
 pub mod app;
+pub mod bionic;
 pub mod clip;
 pub mod command;
+pub mod editor;
 pub mod forms;
 pub mod growlight_source;
+pub mod hit;
 pub mod ipc;
 pub mod listpane;
+pub mod prefs;
 pub mod textarea;
 pub mod tree;
 pub mod ui;

@@ -208,6 +208,14 @@ fn op_is_local_write(op: &str) -> bool {
             | op::REFRESH_SNAPSHOT
             | op::VAULT_SEAL
             | op::VAULT_UNSEAL
+            // mcp-surgical-writes: the surgical write verbs are local writes
+            // like every other authoring op — they must stamp the activity
+            // window too (slices 002–004 predate the batch slice, which closes
+            // this gap for the whole family at once).
+            | op::PATCH_FILE
+            | op::REMOVE_SECTION
+            | op::UNLINK
+            | op::BATCH
     )
 }
 
@@ -265,6 +273,11 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::REFRESH_SNAPSHOT => crate::actions::refresh_snapshot(daemon, req.args),
         op::LIST_TREE => crate::reads::list_tree(daemon, req.args),
         op::READ_FILE => crate::reads::read_file(daemon, req.args),
+        op::READ_VERSIONS => crate::reads::read_versions(daemon, req.args),
+        op::PATCH_FILE => crate::actions::patch_file(daemon, req.args),
+        op::REMOVE_SECTION => crate::actions::sections::remove_section(daemon, req.args),
+        op::UNLINK => crate::actions::unlink(daemon, req.args),
+        op::BATCH => crate::actions::batch(daemon, req.args),
         op::FILE_PROVENANCE => crate::reads::file_provenance(daemon, req.args),
         op::GROWLIGHT_QUEUE => crate::reads::growlight_queue(daemon, req.args),
         op::PAIR_BEGIN => handlers::pair_begin(daemon, req.args),

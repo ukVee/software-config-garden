@@ -13,6 +13,7 @@ pub mod client;
 pub mod growlightd;
 pub mod proto;
 pub mod socket;
+pub mod usage;
 pub mod verbs;
 
 pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};

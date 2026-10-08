@@ -37,11 +37,15 @@ fn main() -> Result<()> {
     let growlightd_socket = softfig_ipc::growlightd_runtime_socket_path();
     let mut growlightd = IpcClient::spawn(growlightd_socket);
     let mut app = App::new();
+    // Interface preferences (menu-button position, last editor view) are
+    // best-effort and live outside the garden; load once, persist on exit.
+    app.load_prefs();
     app.bootstrap(&mut ipc);
 
     install_panic_hook();
     let mut terminal = setup_terminal()?;
     let res = run(&mut terminal, &mut app, &mut ipc, &mut growlightd);
+    app.save_prefs();
     restore_terminal(&mut terminal)?;
     res
 }

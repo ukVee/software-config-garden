@@ -17,6 +17,70 @@ use crate::walk::{self, WalkSnapshot};
 
 pub const TIP_REF: &str = "tip";
 
+/// Whether a commit whose tree already matches its parent's is skipped.
+///
+/// [`SameTreePolicy::Skip`] is the default and the point of the guard: a write
+/// that changed no content advances nothing, so it mints nothing.
+/// [`SameTreePolicy::Record`] is the deliberate exception — a commit whose
+/// value is the *record it carries*, not the tree it lands. The vault's audit
+/// intents are the whole set: `vault_reveal` (the log entry the reveal handler
+/// treats as a precondition for surfacing a plaintext path) and the
+/// `sealed-paths.toml` edits, whose file lives under `.softfig/` and is
+/// therefore never in the tree at all. Reach for it only when the absence of a
+/// commit would lose a record nothing else holds — never to keep a caller that
+/// merely assumes commits are always minted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameTreePolicy {
+    /// Skip the commit when the tree is unchanged.
+    Skip,
+    /// Write the commit even when the tree is unchanged.
+    Record,
+}
+
+/// What a commit call left behind on the chain it targeted.
+///
+/// **The no-op return contract.** Every commit path here is guarded against
+/// minting a commit whose `root_tree` is byte-identical to its parent's: an
+/// unchanged tree writes nothing and reports `committed == false`, with `hash`
+/// carrying the **untouched parent tip**. So `hash` always answers "where is
+/// this chain now?" — never "here is a commit I just wrote". A caller that must
+/// distinguish the two (narration, peer-push wakeups, anything counting
+/// commits) reads `committed`; a caller that only wants the current tip reads
+/// `hash` and can keep using the `Hash`-returning wrappers.
+///
+/// The guard lives at the writer ([`write_commit_tx`] / [`write_reauthor_tx`])
+/// so *every* caller inherits it — the FUSE dirty-set flush, the action verbs
+/// (`set_reviewed`, the section verbs), and the m5e `shared_pull` apply alike.
+/// Two independent empty-commit sources motivated it: a same-day
+/// `set_reviewed` re-stamp (identical bytes, committed unconditionally), and a
+/// change confined to a user-`.softfigignore`'d path, which the hot-path
+/// built-in ignore predicate lets through `flush()` even though the
+/// ignore-filtered snapshot is identical to the tip (task 028).
+///
+/// On a no-op the `tip_changed` callback does **not** fire. That is load-bearing,
+/// not an optimization: the FUSE rotation absorbs the overlay entries a commit
+/// captured, and an ignored path is never captured by any commit — firing the
+/// callback would drop a staged write that exists nowhere else (the m5c/m5e
+/// absorption data-loss family).
+///
+/// The one deliberate exception is [`SameTreePolicy::Record`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitOutcome {
+    /// The chain's tip after the call: the new commit when one was written,
+    /// the unchanged parent when the tree was identical.
+    pub hash: Hash,
+    /// `true` when a commit row was actually written and the ref advanced.
+    pub committed: bool,
+}
+
+impl CommitOutcome {
+    /// The tree was unchanged, so nothing was written and [`Self::hash`] is the
+    /// parent tip.
+    pub fn is_no_op(&self) -> bool {
+        !self.committed
+    }
+}
+
 /// Subscriber called after a successful commit advances a chain's ref. It
 /// receives the `ref_name` that moved and the new tip hash, so a consumer can
 /// invalidate **per chain** (M5c slice 002 union mount): the device chain
@@ -124,6 +188,7 @@ impl Repo {
         let blueprint = tree::build(&objects, session, &snapshot.root)?;
 
         let intent = Intent::init("garden initialized");
+        // Genesis has no parent, so the same-tree guard never fires here.
         let commit_hash = write_commit_tx(
             &mut db,
             session,
@@ -132,7 +197,9 @@ impl Repo {
             &blueprint,
             intent,
             now,
-        )?;
+            SameTreePolicy::Skip,
+        )?
+        .hash;
 
         Ok((
             Self {
@@ -186,7 +253,18 @@ impl Repo {
         let blueprint = tree::build(&objects, session, &snapshot.root)?;
 
         let intent = Intent::init("garden initialized");
-        let commit_hash = write_commit_tx(&mut db, session, TIP_REF, None, &blueprint, intent, now)?;
+        // Genesis has no parent, so the same-tree guard never fires here.
+        let commit_hash = write_commit_tx(
+            &mut db,
+            session,
+            TIP_REF,
+            None,
+            &blueprint,
+            intent,
+            now,
+            SameTreePolicy::Skip,
+        )?
+        .hash;
 
         Ok((
             Self {
@@ -261,8 +339,10 @@ impl Repo {
     }
 
     /// Walk the working tree at `garden_root`, build a blueprint, and write
-    /// a new commit whose parent is the current tip. Returns the new commit
-    /// hash.
+    /// a new commit whose parent is the current tip. Returns the device
+    /// chain's tip after the call — the new commit, or the unchanged parent
+    /// when the walked tree matched it (see [`CommitOutcome`]); use
+    /// [`Repo::commit_snapshot_to_outcome`] when the difference matters.
     ///
     /// This reads the working tree from disk via [`walk::walk`]. A FUSE
     /// daemon must NOT use this for a mounted garden: `garden_root` is the
@@ -276,15 +356,39 @@ impl Repo {
         session: &VaultSession,
         intent: Intent,
     ) -> Result<Hash> {
+        Ok(self.commit_workdir_outcome(session, intent)?.hash)
+    }
+
+    /// [`Repo::commit_workdir`], reporting whether a commit was minted — the
+    /// disk-walk twin of [`Repo::commit_snapshot_to_outcome`]. A working tree
+    /// whose only changes are `.softfigignore`'d walks to the tree already
+    /// committed, so this reports a no-op rather than an empty commit.
+    pub fn commit_workdir_outcome(
+        &mut self,
+        session: &VaultSession,
+        intent: Intent,
+    ) -> Result<CommitOutcome> {
+        self.commit_workdir_with(session, intent, SameTreePolicy::Skip)
+    }
+
+    /// [`Repo::commit_workdir_outcome`] with an explicit [`SameTreePolicy`] —
+    /// the disk-walk twin of [`Repo::commit_snapshot_to_with`].
+    pub fn commit_workdir_with(
+        &mut self,
+        session: &VaultSession,
+        intent: Intent,
+        policy: SameTreePolicy,
+    ) -> Result<CommitOutcome> {
         let snapshot = walk::walk(&self.garden_root)?;
-        self.commit_snapshot(session, snapshot, intent)
+        self.commit_snapshot_to_with(TIP_REF, session, snapshot, intent, policy)
     }
 
     /// Commit a pre-built working-tree `snapshot` against the current tip,
-    /// returning the new commit hash. Identical to [`Repo::commit_workdir`]
-    /// except the caller supplies the tree rather than walking
-    /// `garden_root` — letting the FUSE daemon commit from its in-memory
-    /// state without self-reading the mount it serves.
+    /// returning the device chain's tip after the call (the new commit, or the
+    /// unchanged parent on a same-tree no-op — see [`CommitOutcome`]).
+    /// Identical to [`Repo::commit_workdir`] except the caller supplies the
+    /// tree rather than walking `garden_root` — letting the FUSE daemon commit
+    /// from its in-memory state without self-reading the mount it serves.
     pub fn commit_snapshot(
         &mut self,
         session: &VaultSession,
@@ -313,6 +417,37 @@ impl Repo {
         snapshot: WalkSnapshot,
         intent: Intent,
     ) -> Result<Hash> {
+        Ok(self
+            .commit_snapshot_to_outcome(ref_name, session, snapshot, intent)?
+            .hash)
+    }
+
+    /// [`Repo::commit_snapshot_to`], reporting whether a commit was actually
+    /// minted. This is the primitive the `Hash`-returning wrappers delegate to;
+    /// reach for it when a same-tree no-op must not be narrated, counted, or
+    /// signalled onward (the watcher's replica-push wakeup, the action verbs'
+    /// commit reporting). See [`CommitOutcome`] for the contract.
+    pub fn commit_snapshot_to_outcome(
+        &mut self,
+        ref_name: &str,
+        session: &VaultSession,
+        snapshot: WalkSnapshot,
+        intent: Intent,
+    ) -> Result<CommitOutcome> {
+        self.commit_snapshot_to_with(ref_name, session, snapshot, intent, SameTreePolicy::Skip)
+    }
+
+    /// [`Repo::commit_snapshot_to_outcome`] with an explicit
+    /// [`SameTreePolicy`]. `Record` writes the commit even on an unchanged tree
+    /// — see the policy's docs for the one class of caller that wants it.
+    pub fn commit_snapshot_to_with(
+        &mut self,
+        ref_name: &str,
+        session: &VaultSession,
+        snapshot: WalkSnapshot,
+        intent: Intent,
+        policy: SameTreePolicy,
+    ) -> Result<CommitOutcome> {
         let parent = self.tip_of(ref_name)?;
         let default_enc = LayerAEncryptor;
         let encryptor: &dyn BlobEncryptor = match self.blob_encryptor.as_ref() {
@@ -322,11 +457,24 @@ impl Repo {
         let overlay_generation = snapshot.overlay_generation;
         let blueprint = tree::build_with(&self.objects, session, &snapshot.root, encryptor, ref_name)?;
         let now = unix_seconds();
-        let hash = write_commit_tx(&mut self.db, session, ref_name, parent, &blueprint, intent, now)?;
-        if let Some(cb) = &self.tip_changed {
-            cb(ref_name, &hash, overlay_generation);
+        let outcome = write_commit_tx(
+            &mut self.db,
+            session,
+            ref_name,
+            parent,
+            &blueprint,
+            intent,
+            now,
+            policy,
+        )?;
+        // A no-op advanced nothing, so the FUSE view is already correct and its
+        // overlay must keep every staged entry (see `CommitOutcome`).
+        if outcome.committed {
+            if let Some(cb) = &self.tip_changed {
+                cb(ref_name, &outcome.hash, overlay_generation);
+            }
         }
-        Ok(hash)
+        Ok(outcome)
     }
 
     /// Re-author a commit over an **existing** `root_tree` hash on `ref_name`,
@@ -358,14 +506,33 @@ impl Repo {
         root_tree: Hash,
         intent: Intent,
     ) -> Result<Hash> {
+        Ok(self
+            .commit_over_tree_outcome(ref_name, session, root_tree, intent)?
+            .hash)
+    }
+
+    /// [`Repo::commit_over_tree`], reporting whether a commit was minted. The
+    /// same-tree guard applies here too: an apply whose peer tree already
+    /// equals the local tip's writes nothing and reports `committed == false`.
+    /// Upstream normally makes that call first (the fast-forward / content
+    /// dedup decision), so this is a backstop, not the primary dedup.
+    pub fn commit_over_tree_outcome(
+        &mut self,
+        ref_name: &str,
+        session: &VaultSession,
+        root_tree: Hash,
+        intent: Intent,
+    ) -> Result<CommitOutcome> {
         let parent = self.tip_of(ref_name)?;
         let now = unix_seconds();
-        let hash =
+        let outcome =
             write_reauthor_tx(&mut self.db, session, ref_name, parent, root_tree, intent, now)?;
-        if let Some(cb) = &self.tip_changed {
-            cb(ref_name, &hash, None);
+        if outcome.committed {
+            if let Some(cb) = &self.tip_changed {
+                cb(ref_name, &outcome.hash, None);
+            }
         }
-        Ok(hash)
+        Ok(outcome)
     }
 
     /// The tip of **every ref physically present** in the store
@@ -467,8 +634,36 @@ fn author_commit_row(
     Ok((row, hash))
 }
 
+/// True when `root_tree` is byte-identical to the tree `parent` already
+/// commits — i.e. writing this commit would advance the chain by nothing.
+///
+/// This is the same-tree guard's one question, asked once at the writer so both
+/// commit paths (snapshot-built trees and re-authored ones) share the answer.
+/// Genesis (`parent == None`) is never a no-op. The parent's row is looked up
+/// rather than cached: a ref always points at a stored commit (every writer
+/// inserts the row inside the tx that CASes the ref), so a missing row means a
+/// corrupt store and propagates as such instead of being papered over with an
+/// extra empty commit.
+///
+/// Comparing against the **immediate parent only** is deliberate: a revert to
+/// some older tree differs from its parent and still commits, as it must.
+fn is_same_tree(db: &Db, parent: Option<Hash>, root_tree: &Hash) -> Result<bool> {
+    match parent {
+        None => Ok(false),
+        Some(p) => Ok(&db.get_commit(&p)?.root_tree == root_tree),
+    }
+}
+
 /// Transactional commit writer: insert all new tree rows + the commit
 /// row + CAS the ref, all in one sqlite tx.
+///
+/// Guarded by [`is_same_tree`]: an unchanged tree writes **nothing** and
+/// returns the parent as a no-op [`CommitOutcome`]. Skipping the tree rows with
+/// it is safe by content-addressing — an identical root hash means every
+/// subtree row is already stored (the parent commit wrote them), and the
+/// blueprint's blobs were written to the object store before this call, where
+/// an identical blob is an idempotent re-put.
+#[allow(clippy::too_many_arguments)]
 fn write_commit_tx(
     db: &mut Db,
     session: &VaultSession,
@@ -477,7 +672,14 @@ fn write_commit_tx(
     blueprint: &Blueprint,
     intent: Intent,
     timestamp: i64,
-) -> Result<Hash> {
+    policy: SameTreePolicy,
+) -> Result<CommitOutcome> {
+    if policy == SameTreePolicy::Skip && is_same_tree(db, parent, &blueprint.root)? {
+        return Ok(CommitOutcome {
+            hash: parent.expect("is_same_tree is false without a parent"),
+            committed: false,
+        });
+    }
     let (row, hash) =
         author_commit_row(session, ref_name, parent, blueprint.root, intent, timestamp)?;
 
@@ -494,7 +696,7 @@ fn write_commit_tx(
         Ok(())
     })?;
 
-    Ok(hash)
+    Ok(CommitOutcome { hash, committed: true })
 }
 
 /// Transactional re-author writer: insert the commit row + CAS the ref, with
@@ -502,6 +704,10 @@ fn write_commit_tx(
 /// already present in the store. The m5e `shared_pull` apply: a peer's
 /// shared-chain tree, fetched content-addressed into this store, is
 /// re-committed as this device's own commit over the local chain tip.
+///
+/// Carries the same [`is_same_tree`] guard as [`write_commit_tx`]: re-authoring
+/// a tree the local tip already holds would mint an empty commit, so it returns
+/// the parent as a no-op instead.
 fn write_reauthor_tx(
     db: &mut Db,
     session: &VaultSession,
@@ -510,7 +716,13 @@ fn write_reauthor_tx(
     root_tree: Hash,
     intent: Intent,
     timestamp: i64,
-) -> Result<Hash> {
+) -> Result<CommitOutcome> {
+    if is_same_tree(db, parent, &root_tree)? {
+        return Ok(CommitOutcome {
+            hash: parent.expect("is_same_tree is false without a parent"),
+            committed: false,
+        });
+    }
     let (row, hash) = author_commit_row(session, ref_name, parent, root_tree, intent, timestamp)?;
 
     db.with_tx(|conn| {
@@ -522,7 +734,7 @@ fn write_reauthor_tx(
         Ok(())
     })?;
 
-    Ok(hash)
+    Ok(CommitOutcome { hash, committed: true })
 }
 
 fn unix_seconds() -> i64 {

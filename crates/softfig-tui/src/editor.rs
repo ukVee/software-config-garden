@@ -1,0 +1,936 @@
+//! The M3c in-TUI file editor.
+//!
+//! A pure, single-buffer line editor plus the save seam. The buffer is a
+//! `Vec<String>` (one entry per raw line, `'\n'`-split) with a char-indexed
+//! cursor; each open keeps one pristine copy for dirty-check + discard, and
+//! keystrokes mutate a single line — the whole file is never cloned per
+//! keystroke. Raw/bionic view spans are cached per line ([`crate::bionic`]):
+//! a line edit restyles just that line, and only a fence-marker edit re-walks
+//! the tail (the rare case).
+//!
+//! ## Save path (wired: one async `patch_file`)
+//!
+//! A save is ONE `patch_file` IPC call, sent over the app's worker-thread
+//! client so the UI thread never blocks on the round-trip:
+//!
+//! ```text
+//! patch_file { path, old: <pristine base>, new: <buffer>,
+//!              expected_version: <CAS token> }
+//! ```
+//!
+//! The reply is routed back through `App::apply_reply` (tag
+//! `Tag::EditorSave`); a success calls [`Editor::mark_saved`], while a
+//! `Conflict` or vault refusal keeps the buffer and its dirty flag. This
+//! module stays pure — [`Editor::pending_write`] owns the operands
+//! ([`EditorWrite`]) and [`Editor::mark_saved`] the post-reply state
+//! transition; the wire lives in `app.rs`/`ipc.rs`.
+//!
+//! The verb is daemon-mediated, mount-safe (`WorkTree`), vault-refusing
+//! (`load_unprotected`) and whole-file CAS. `replace_file` is NOT the save
+//! verb: it skips the vault refusal, so writing a `[sealed:…]` projection
+//! through it would re-seal the marker over the secret. Empty-original files
+//! are the one edge v1 cannot patch (`old` must be non-empty and match); the
+//! app refuses them client-side with a clear status — the v2 `write_file`
+//! verb is the documented follow-up. See
+//! `journal/decisions/decision-tui-file-editor.md`.
+//!
+//! ## Client-side refusal gate
+//!
+//! [`Editor::from_read`] refuses editing (read-only viewing still works) when
+//! the daemon projection is sealed, carries `[sealed:`/`[encrypted]`, has
+//! non-empty `region_ids`, is binary, or is truncated — the last because
+//! `read_file` caps at 512 KiB and saving a truncated view would drop the
+//! tail. The daemon refuses these targets again on write.
+
+use ratatui::text::Line;
+
+use crate::bionic;
+
+/// Which view of the buffer is shown. Bionic is read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    Raw,
+    Bionic,
+}
+
+/// The exact `patch_file` operands for one save: `old` is the daemon content
+/// this editor based its buffer on (the pristine copy), `new` is the edited
+/// buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorWrite {
+    pub path: String,
+    pub old: String,
+    pub new: String,
+    pub expected_version: Option<String>,
+}
+
+/// A single-file editing session over a `read_file` projection.
+#[derive(Debug)]
+pub struct Editor {
+    pub path: String,
+    pub mode: EditorMode,
+    pub dirty: bool,
+    /// `Some(reason)` = read-only: viewing allowed, editing + saving refused.
+    pub read_only: Option<String>,
+    /// Whole-file CAS token from `read_file.version`, refreshed after a save.
+    pub expected_version: Option<String>,
+    /// First visible line (renderer-managed; cursor kept in view on render).
+    pub scroll: u16,
+    /// Visible content rows from the last render (page math).
+    pub viewport: u16,
+    ratio: f32,
+    lines: Vec<String>,
+    pristine: Vec<String>,
+    row: usize,
+    col: usize,
+    /// Selection anchor `(line, char col)`; the live head is `(row, col)`.
+    /// `Some` while a selection is active (head inclusive).
+    selection: Option<(usize, usize)>,
+    raw_cache: Vec<Line<'static>>,
+    fence_after: Vec<bool>,
+    bionic_cache: Option<Vec<Line<'static>>>,
+}
+
+impl Editor {
+    /// Build an editor from a daemon `read_file` reply. Applies the
+    /// client-side refusal gate; refused files still open (read-only).
+    pub fn from_read(
+        path: &str,
+        content: &str,
+        version: Option<String>,
+        sealed: bool,
+        region_ids: &[String],
+    ) -> Editor {
+        let lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+        let read_only = refusal_reason(sealed, content, region_ids);
+        let mut ed = Editor {
+            path: path.to_string(),
+            mode: EditorMode::Raw,
+            dirty: false,
+            read_only,
+            expected_version: version.filter(|v| !v.is_empty()),
+            scroll: 0,
+            viewport: 0,
+            ratio: bionic::DEFAULT_BOLD_RATIO,
+            pristine: lines.clone(),
+            lines,
+            row: 0,
+            col: 0,
+            selection: None,
+            raw_cache: Vec::new(),
+            fence_after: Vec::new(),
+            bionic_cache: None,
+        };
+        ed.rebuild_raw();
+        ed
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// The raw text of one line (the magnifier window's source).
+    pub fn line_text(&self, row: usize) -> String {
+        self.lines.get(row).cloned().unwrap_or_default()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.is_some()
+    }
+
+    /// 0-based (row, char-column) cursor.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.row, self.col)
+    }
+
+    /// 1-based (line, column) for the title/status display.
+    pub fn position(&self) -> (usize, usize) {
+        (self.row + 1, self.col + 1)
+    }
+
+    /// The full buffer as text (only used for save / tests — never per frame).
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Replace the bionic bold fraction (configurable; CLI default 0.4).
+    pub fn set_ratio(&mut self, ratio: f32) {
+        self.ratio = ratio;
+        self.bionic_cache = None;
+    }
+
+    /// The `patch_file` operands the async bridge sends: `old` is the
+    /// pristine base (the daemon content the buffer was read from), `new` the
+    /// edited buffer.
+    pub fn pending_write(&self) -> EditorWrite {
+        EditorWrite {
+            path: self.path.clone(),
+            old: self.pristine_text(),
+            new: self.text(),
+            expected_version: self.expected_version.clone(),
+        }
+    }
+
+    /// The pristine content as first read (the `patch_file.old` operand).
+    pub fn pristine_text(&self) -> String {
+        self.pristine.join("\n")
+    }
+
+    /// True when the file was empty at read time — `patch_file` cannot address
+    /// an empty `old`; the v1 save path refuses these client-side.
+    pub fn is_empty_original(&self) -> bool {
+        self.pristine_text().is_empty()
+    }
+
+    /// Editing is raw-mode only: bionic is the documented read-only reading
+    /// view (the UI labels it so), and the read-only refusal gate (sealed /
+    /// region-projected / truncated) covers both modes. Selection and copy
+    /// stay available in both views.
+    fn editable(&self) -> bool {
+        self.read_only.is_none() && self.mode == EditorMode::Raw
+    }
+
+    // ---- views ----
+
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            EditorMode::Raw => EditorMode::Bionic,
+            EditorMode::Bionic => EditorMode::Raw,
+        };
+        if self.mode == EditorMode::Bionic && self.bionic_cache.is_none() {
+            self.bionic_cache = Some(bionic::render_bionic_lines(&self.lines, self.ratio));
+        }
+    }
+
+    /// Select a view directly — the touch toggle switch's left/right halves.
+    /// Idempotent (unlike [`Self::toggle_mode`]).
+    pub fn set_mode(&mut self, mode: EditorMode) {
+        if self.mode != mode {
+            self.toggle_mode();
+        }
+    }
+
+    /// Place the caret (a tap): clamped to a real line and a real char column.
+    /// Deliberately does **not** touch the selection — the drag path reuses it
+    /// to move the selection head while the anchor stays put.
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        self.row = row.min(self.lines.len() - 1);
+        self.col = col.min(self.lines[self.row].chars().count());
+    }
+
+    // ---- selection ----
+
+    /// Drop the selection (a plain tap, any edit, or Esc).
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Start a selection at `(row, col)` if none is active; idempotent, so the
+    /// drag path can call it on every motion. Moving the head stays with
+    /// [`Self::set_cursor`].
+    pub fn begin_selection(&mut self, row: usize, col: usize) {
+        if self.selection.is_none() {
+            let row = row.min(self.lines.len().saturating_sub(1));
+            let col = col.min(self.lines.get(row).map_or(0, |l| l.chars().count()));
+            self.selection = Some((row, col));
+        }
+    }
+
+    /// The selection as normalized inclusive `(start, end)` char positions.
+    /// `None` when there is no selection.
+    pub fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.selection?;
+        let head = (self.row, self.col);
+        Some(if anchor <= head { (anchor, head) } else { (head, anchor) })
+    }
+
+    /// The selected text, normalizing a backwards drag. `None` when nothing
+    /// non-empty is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((sr, sc), (er, ec)) = self.selection_bounds()?;
+        let mut out = String::new();
+        for row in sr..=er {
+            let chars: Vec<char> = self.lines.get(row)?.chars().collect();
+            let from = if row == sr { sc.min(chars.len()) } else { 0 };
+            // The head char is inclusive; a head at EOL selects through the
+            // last char (or nothing on an empty line).
+            let to = if row == er {
+                (ec + 1).min(chars.len())
+            } else {
+                chars.len()
+            };
+            if row > sr {
+                out.push('\n');
+            }
+            if to > from {
+                out.extend(&chars[from..to]);
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// Select the word at `(row, col)` (double-tap / right click): the anchor
+    /// lands on the word's first char, the head on its last (inclusive).
+    /// Non-word chars select just the char under the finger.
+    pub fn select_word_at(&mut self, row: usize, col: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        self.row = row.min(self.lines.len() - 1);
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        if chars.is_empty() {
+            self.col = 0;
+            self.selection = None;
+            return;
+        }
+        let at = col.min(chars.len() - 1);
+        let (mut start, mut end) = (at, at);
+        if is_word_char(chars[at]) {
+            while start > 0 && is_word_char(chars[start - 1]) {
+                start -= 1;
+            }
+            while end + 1 < chars.len() && is_word_char(chars[end + 1]) {
+                end += 1;
+            }
+        }
+        self.selection = Some((self.row, start));
+        self.col = end;
+    }
+
+    /// Is `(row, col)` inside the current selection (inclusive bounds)?
+    pub fn selection_contains(&self, row: usize, col: usize) -> bool {
+        match self.selection_bounds() {
+            Some(((sr, sc), (er, ec))) => (row, col) >= (sr, sc) && (row, col) <= (er, ec),
+            None => false,
+        }
+    }
+
+    /// Free-scroll the reading view by `delta` lines (bionic mode), clamped to
+    /// the content. Raw mode scrolls by moving the caret instead — the renderer
+    /// keeps the caret in view.
+    pub fn scroll_by(&mut self, delta: i32) {
+        self.set_scroll((self.scroll as i32 + delta).max(0) as u16);
+    }
+
+    /// Set the first visible line, clamped to `[0, len - viewport]`.
+    pub fn set_scroll(&mut self, offset: u16) {
+        let v = self.viewport.max(1) as usize;
+        let max = self.lines.len().saturating_sub(v);
+        self.scroll = (offset as usize).min(max) as u16;
+    }
+
+    /// The styled lines for the active view; the bionic cache is built lazily
+    /// on first use (once per toggle — never per frame).
+    pub fn doc(&mut self) -> &[Line<'static>] {
+        match self.mode {
+            EditorMode::Raw => &self.raw_cache,
+            EditorMode::Bionic => {
+                if self.bionic_cache.is_none() {
+                    self.bionic_cache = Some(bionic::render_bionic_lines(&self.lines, self.ratio));
+                }
+                self.bionic_cache.as_deref().unwrap_or(&[])
+            }
+        }
+    }
+
+    pub fn set_viewport(&mut self, rows: u16) {
+        self.viewport = rows;
+    }
+
+    /// Keep the cursor row inside the visible window (render calls this).
+    pub fn scroll_to_cursor(&mut self) {
+        let v = self.viewport.max(1) as usize;
+        if self.row < self.scroll as usize {
+            self.scroll = self.row as u16;
+        } else if self.row >= self.scroll as usize + v {
+            self.scroll = (self.row + 1 - v).min(u16::MAX as usize) as u16;
+        }
+        let max = self.lines.len().saturating_sub(v);
+        if self.scroll as usize > max {
+            self.scroll = max as u16;
+        }
+    }
+
+    // ---- editing ----
+
+    pub fn insert_char(&mut self, c: char) {
+        if !self.editable() || c == '\n' {
+            return;
+        }
+        // Any edit supersedes the selection (v1 does not replace it).
+        self.selection = None;
+        let line = &mut self.lines[self.row];
+        let byte = char_to_byte(line, self.col);
+        line.insert(byte, c);
+        self.col += 1;
+        self.after_line_edit(self.row);
+    }
+
+    pub fn newline(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        self.selection = None;
+        let line = &mut self.lines[self.row];
+        let byte = char_to_byte(line, self.col);
+        let rest = line.split_off(byte);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+        self.structural_change(self.row - 1);
+    }
+
+    pub fn backspace(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        self.selection = None;
+        if self.col > 0 {
+            let line = &mut self.lines[self.row];
+            let start = char_to_byte(line, self.col - 1);
+            let end = char_to_byte(line, self.col);
+            line.replace_range(start..end, "");
+            self.col -= 1;
+            self.after_line_edit(self.row);
+        } else if self.row > 0 {
+            let cur = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+            self.lines[self.row].push_str(&cur);
+            self.structural_change(self.row);
+        }
+    }
+
+    pub fn delete(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        self.selection = None;
+        let len = self.lines[self.row].chars().count();
+        if self.col < len {
+            let line = &mut self.lines[self.row];
+            let start = char_to_byte(line, self.col);
+            let end = char_to_byte(line, self.col + 1);
+            line.replace_range(start..end, "");
+            self.after_line_edit(self.row);
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+            self.structural_change(self.row);
+        }
+    }
+
+    // ---- cursor movement ----
+
+    pub fn move_left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        let len = self.lines[self.row].chars().count();
+        if self.col < len {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            self.col = self.col.min(self.lines[self.row].chars().count());
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = self.col.min(self.lines[self.row].chars().count());
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.col = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.col = self.lines[self.row].chars().count();
+    }
+
+    pub fn page_up(&mut self) {
+        let step = self.viewport.max(1) as usize;
+        self.row = self.row.saturating_sub(step);
+        self.col = self.col.min(self.lines[self.row].chars().count());
+    }
+
+    pub fn page_down(&mut self) {
+        let step = self.viewport.max(1) as usize;
+        self.row = (self.row + step).min(self.lines.len().saturating_sub(1));
+        self.col = self.col.min(self.lines[self.row].chars().count());
+    }
+
+    // ---- outcomes ----
+
+    /// After the daemon accepted a save: the file's daemon content is now
+    /// `saved_text` (the `new` we sent). Refresh the pristine base and the CAS
+    /// token; stay dirty iff the buffer has newer edits than what was sent
+    /// (the user can type while the reply is in flight).
+    pub fn mark_saved(&mut self, version: Option<String>, saved_text: &str) {
+        self.pristine = saved_text.split('\n').map(str::to_string).collect();
+        self.dirty = self.lines != self.pristine;
+        if version.is_some() {
+            self.expected_version = version;
+        }
+    }
+
+    /// Revert to the pristine content (discard).
+    pub fn discard(&mut self) {
+        self.lines = self.pristine.clone();
+        self.dirty = false;
+        self.selection = None;
+        self.bionic_cache = None;
+        self.rebuild_raw();
+        self.row = self.row.min(self.lines.len().saturating_sub(1));
+        self.col = self.col.min(self.lines[self.row].chars().count());
+    }
+
+    // ---- caches ----
+
+    fn rebuild_raw(&mut self) {
+        self.raw_cache = Vec::with_capacity(self.lines.len());
+        self.fence_after = Vec::with_capacity(self.lines.len());
+        let mut state = false;
+        for line in &self.lines {
+            let (styled, after) = bionic::markdown_line(line, state);
+            self.raw_cache.push(styled);
+            self.fence_after.push(after);
+            state = after;
+        }
+    }
+
+    fn rebuild_raw_from(&mut self, start: usize) {
+        if start >= self.lines.len() {
+            return;
+        }
+        let mut state = if start == 0 {
+            false
+        } else {
+            self.fence_after[start - 1]
+        };
+        for i in start..self.lines.len() {
+            let (styled, after) = bionic::markdown_line(&self.lines[i], state);
+            self.raw_cache[i] = styled;
+            self.fence_after[i] = after;
+            state = after;
+        }
+    }
+
+    /// In-line edit: restyle the edited line, and re-walk the tail only when
+    /// that line's fence state changed (the rare, marker-typed case).
+    fn after_line_edit(&mut self, row: usize) {
+        self.dirty = true;
+        self.bionic_cache = None;
+        let before = if row == 0 {
+            false
+        } else {
+            self.fence_after[row - 1]
+        };
+        let (styled, after) = bionic::markdown_line(&self.lines[row], before);
+        self.raw_cache[row] = styled;
+        let old_after = self.fence_after[row];
+        self.fence_after[row] = after;
+        if after != old_after {
+            self.rebuild_raw_from(row + 1);
+        }
+    }
+
+    /// Structural edit (line inserted/removed): resize the caches and rebuild
+    /// from the affected row.
+    fn structural_change(&mut self, row: usize) {
+        self.dirty = true;
+        self.bionic_cache = None;
+        let start = row.min(self.lines.len().saturating_sub(1));
+        self.raw_cache.resize(self.lines.len(), Line::default());
+        self.fence_after.resize(self.lines.len(), false);
+        self.rebuild_raw_from(start);
+    }
+}
+
+/// The client-side refusal gate. Order matters only for message readability.
+fn refusal_reason(sealed: bool, content: &str, region_ids: &[String]) -> Option<String> {
+    if sealed {
+        return Some("file is sealed ([sealed])".into());
+    }
+    if !region_ids.is_empty() {
+        return Some("file contains sealed <vault> region(s)".into());
+    }
+    if content.contains("[sealed:") {
+        return Some("projected sealed-file placeholder".into());
+    }
+    if content.contains("[encrypted]") {
+        return Some("projected [encrypted] vault region".into());
+    }
+    if content.starts_with("[binary file:") {
+        return Some("binary content (no editor)".into());
+    }
+    if content.contains("[… truncated]") {
+        return Some("projection was truncated; saving could drop the tail".into());
+    }
+    None
+}
+
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+/// Word characters for double-tap selection — the same set the bionic
+/// transform treats as a word (alphanumeric plus `_`, `'`, `-`).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '\'' | '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(content: &str) -> Editor {
+        Editor::from_read("notes/test.md", content, Some("v1".into()), false, &[])
+    }
+
+    #[test]
+    fn insert_backspace_newline_roundtrip() {
+        let mut ed = open("hello");
+        ed.move_end();
+        for c in " world".chars() {
+            ed.insert_char(c);
+        }
+        assert_eq!(ed.text(), "hello world");
+        ed.newline();
+        ed.insert_char('x');
+        assert_eq!(ed.text(), "hello world\nx");
+        ed.backspace();
+        ed.backspace();
+        assert_eq!(ed.text(), "hello world");
+        assert_eq!(ed.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn delete_forward_joins_lines() {
+        let mut ed = open("ab\ncd");
+        ed.move_home();
+        ed.move_down();
+        ed.move_home();
+        ed.delete(); // remove 'c'
+        assert_eq!(ed.text(), "ab\nd");
+        ed.move_home();
+        ed.move_up();
+        ed.move_end();
+        ed.delete(); // cursor at end of "ab": join with "d"
+        assert_eq!(ed.text(), "abd");
+        assert_eq!(ed.cursor(), (0, 2));
+    }
+
+    #[test]
+    fn cursor_wraps_and_clamps() {
+        let mut ed = open("ab\ncdef");
+        assert_eq!(ed.cursor(), (0, 0));
+        ed.move_left(); // no-op at head
+        assert_eq!(ed.cursor(), (0, 0));
+        ed.move_end();
+        ed.move_right(); // wraps to next line head
+        assert_eq!(ed.cursor(), (1, 0));
+        ed.move_end(); // col 4
+        ed.move_up(); // clamp to len 2
+        assert_eq!(ed.cursor(), (0, 2));
+        ed.page_down();
+        assert_eq!(ed.cursor().0, 1);
+    }
+
+    #[test]
+    fn unicode_cursor_is_char_indexed() {
+        let mut ed = open("é日");
+        ed.move_end();
+        ed.backspace();
+        assert_eq!(ed.text(), "é");
+        ed.backspace();
+        assert_eq!(ed.text(), "");
+    }
+
+    #[test]
+    fn dirty_tracks_edits_and_discard_restores() {
+        let mut ed = open("# Title\nbody");
+        assert!(!ed.dirty);
+        ed.insert_char('x');
+        assert!(ed.dirty);
+        assert_eq!(ed.text(), "x# Title\nbody");
+        ed.discard();
+        assert!(!ed.dirty);
+        assert_eq!(ed.text(), "# Title\nbody");
+    }
+
+    #[test]
+    fn toggle_builds_bionic_cache_once_and_shows_the_same_text() {
+        let mut ed = open("The API is great");
+        assert_eq!(ed.mode, EditorMode::Raw);
+        let raw_text: String = ed
+            .doc()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        ed.toggle_mode();
+        assert_eq!(ed.mode, EditorMode::Bionic);
+        let bionic_text: String = ed
+            .doc()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(raw_text, bionic_text);
+        // Toggling back and forth keeps the text identical (cache reuse).
+        ed.toggle_mode();
+        assert_eq!(ed.mode, EditorMode::Raw);
+        ed.toggle_mode();
+        assert!(ed.bionic_cache.is_some());
+    }
+
+    #[test]
+    fn edit_invalidates_the_bionic_cache() {
+        let mut ed = open("hello");
+        ed.toggle_mode(); // build bionic cache
+        assert!(ed.bionic_cache.is_some());
+        ed.toggle_mode(); // back to raw, edit
+        ed.insert_char('X');
+        assert!(ed.bionic_cache.is_none());
+    }
+
+    #[test]
+    fn fence_edit_rewalks_the_tail() {
+        let mut ed = open("a\nb\nc");
+        ed.move_end();
+        ed.newline(); // cursor at start of the new line 1
+        for c in "```".chars() {
+            ed.insert_char(c);
+        }
+        // The opening fence flips every following line into code.
+        ed.move_down();
+        ed.newline();
+        ed.insert_char('x');
+        assert!(ed.fence_after.contains(&true));
+        let last = ed.doc().last().unwrap();
+        assert_eq!(last.spans[0].style.fg, Some(ratatui::style::Color::Yellow));
+    }
+
+    #[test]
+    fn refusal_gate_covers_every_projection_shape() {
+        let cases: Vec<(bool, &str, Vec<String>)> = vec![
+            (true, "anything", vec![]),
+            (false, "[sealed:secrets/x]", vec![]),
+            (false, "a <vault id=\"x\">[encrypted]</vault> b", vec![]),
+            (false, "plain", vec!["region".into()]),
+            (false, "[binary file: 42 bytes]", vec![]),
+            (false, "body\n[… truncated]", vec![]),
+        ];
+        for (sealed, content, ids) in cases {
+            let ed = Editor::from_read("p", content, Some("v".into()), sealed, &ids);
+            assert!(
+                ed.is_read_only(),
+                "must refuse: sealed={sealed} content={content}"
+            );
+        }
+        let ed = Editor::from_read("p", "normal **markdown**", Some("v".into()), false, &[]);
+        assert!(!ed.is_read_only());
+    }
+
+    #[test]
+    fn read_only_edits_are_noops_but_viewing_works() {
+        let mut ed = Editor::from_read("p", "[sealed:p]", None, true, &[]);
+        ed.insert_char('x');
+        ed.newline();
+        ed.backspace();
+        ed.delete();
+        assert_eq!(ed.text(), "[sealed:p]");
+        assert!(!ed.dirty);
+        ed.toggle_mode();
+        assert_eq!(ed.mode, EditorMode::Bionic);
+    }
+
+    #[test]
+    fn pending_write_carries_the_patch_operands() {
+        let mut ed = open("hi");
+        assert!(!ed.dirty);
+        ed.insert_char('t');
+        let write = ed.pending_write();
+        assert_eq!(write.path, "notes/test.md");
+        assert_eq!(write.old, "hi");
+        assert_eq!(write.new, "thi");
+        assert_eq!(write.expected_version.as_deref(), Some("v1"));
+        ed.mark_saved(Some("v2".into()), &write.new);
+        assert!(!ed.dirty);
+        assert_eq!(ed.expected_version.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn mark_saved_keeps_newer_edits_dirty_and_rebases_the_next_patch() {
+        let mut ed = open("hi");
+        ed.insert_char('t'); // "thi" — the content that gets sent
+        let sent = ed.text();
+        ed.insert_char('o'); // typed while the round-trip was in flight
+        ed.mark_saved(Some("v2".into()), &sent);
+        assert!(ed.dirty, "post-send edits must stay dirty");
+        assert_eq!(ed.expected_version.as_deref(), Some("v2"));
+        // The next patch bases on what actually landed on the daemon, not the
+        // original read.
+        assert_eq!(ed.pending_write().old, sent);
+        assert_eq!(ed.text(), "tohi");
+    }
+
+    #[test]
+    fn empty_original_is_flagged_for_the_v1_refusal() {
+        let ed = Editor::from_read("notes/empty.md", "", Some("v".into()), false, &[]);
+        assert!(ed.is_empty_original());
+        let ed = Editor::from_read("notes/x.md", "x", Some("v".into()), false, &[]);
+        assert!(!ed.is_empty_original());
+    }
+
+    #[test]
+    fn scroll_to_cursor_keeps_the_row_visible() {
+        let lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        let mut ed = open(&lines.join("\n"));
+        ed.set_viewport(10);
+        for _ in 0..30 {
+            ed.move_down();
+        }
+        ed.scroll_to_cursor();
+        assert!(ed.scroll as usize <= ed.row);
+        assert!(ed.row < ed.scroll as usize + 10);
+        // Clamp at the bottom.
+        for _ in 0..100 {
+            ed.move_down();
+        }
+        ed.scroll_to_cursor();
+        assert!(ed.scroll as usize + 10 <= ed.line_count().max(10));
+    }
+
+    #[test]
+    fn bionic_view_is_read_only_for_edits_but_selects() {
+        let mut ed = open("hello world");
+        ed.toggle_mode();
+        ed.insert_char('x');
+        ed.newline();
+        ed.backspace();
+        ed.delete();
+        assert_eq!(ed.text(), "hello world");
+        assert!(!ed.dirty, "bionic keystrokes must not dirty the buffer");
+        ed.select_word_at(0, 6);
+        assert_eq!(ed.selected_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn cursor_position_is_one_based() {
+        let ed = open("a\nbc");
+        assert_eq!(ed.position(), (1, 1));
+        let mut ed = ed;
+        ed.move_end();
+        ed.move_down();
+        // move_end puts col at 1; move_down clamps to the same col on line 2.
+        assert_eq!(ed.position(), (2, 2));
+    }
+
+    #[test]
+    fn large_buffer_edits_stay_line_local() {
+        // 20k lines; a char insert at the top must not disturb other lines'
+        // caches (they keep identity by content-equality of rendered text).
+        let lines: Vec<String> = (0..20_000).map(|i| format!("line {i}")).collect();
+        let mut ed = open(&lines.join("\n"));
+        let before = ed.doc()[19_999].clone();
+        ed.insert_char('X');
+        let after = ed.doc()[19_999].clone();
+        assert_eq!(before.spans[0].content, after.spans[0].content);
+    }
+
+    // ---- selection ----
+
+    #[test]
+    fn word_selection_picks_the_word_and_extracts_it() {
+        let mut ed = open("the quick brown fox");
+        ed.select_word_at(0, 5); // inside "quick"
+        assert_eq!(ed.selection_bounds(), Some(((0, 4), (0, 8))));
+        assert_eq!(ed.selected_text().as_deref(), Some("quick"));
+        // A non-word char (a space) selects just that char.
+        ed.select_word_at(0, 3);
+        assert_eq!(ed.selected_text().as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn selection_spans_lines_and_normalizes_a_backwards_drag() {
+        let mut ed = open("alpha\nbeta\ngamma");
+        ed.begin_selection(2, 2); // anchor on "gamma"
+        ed.set_cursor(0, 2); // head before the anchor → normalized
+        assert_eq!(ed.selected_text().as_deref(), Some("pha\nbeta\ngam"));
+    }
+
+    #[test]
+    fn selection_contains_uses_inclusive_bounds() {
+        let mut ed = open("one two");
+        ed.select_word_at(0, 0); // "one"
+        assert!(ed.selection_contains(0, 0));
+        assert!(ed.selection_contains(0, 2));
+        assert!(!ed.selection_contains(0, 3)); // the space after is outside
+        assert!(!ed.selection_contains(1, 0));
+    }
+
+    #[test]
+    fn edits_supersede_the_selection() {
+        let mut ed = open("hello world");
+        ed.select_word_at(0, 6);
+        assert!(ed.has_selection());
+        ed.insert_char('X');
+        assert!(!ed.has_selection(), "typing drops the selection");
+        ed.select_word_at(0, 0);
+        ed.backspace();
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn set_cursor_keeps_the_selection_for_drag_extension() {
+        let mut ed = open("alpha beta");
+        ed.begin_selection(0, 0);
+        ed.set_cursor(0, 4);
+        assert_eq!(ed.selected_text().as_deref(), Some("alpha"));
+        ed.clear_selection();
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn select_word_on_an_empty_line_is_a_safe_noop() {
+        let mut ed = open("");
+        ed.select_word_at(0, 3);
+        assert_eq!(ed.cursor(), (0, 0));
+        assert!(!ed.has_selection());
+    }
+}
