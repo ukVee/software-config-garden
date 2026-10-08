@@ -578,6 +578,14 @@ impl OpencodeBackend {
     pub fn spend(&self, agent: &str) -> AgentSpend {
         self.flavor.spend(agent)
     }
+
+    /// The argv this backend would exec for `agent` after the `systemd-run … --`
+    /// separator, given the paths a spawn's pre-approval writes — `opencode run
+    /// --format json --agent <id> <prompt>`, wrapper excluded. The routing seam
+    /// (slice 005) asserts an opencode-backed member through it.
+    pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
+        self.harness.command_argv(agent, paths)
+    }
 }
 
 impl AgentBackend for Arc<OpencodeBackend> {

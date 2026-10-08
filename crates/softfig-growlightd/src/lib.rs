@@ -20,6 +20,7 @@
 
 pub mod admission;
 pub mod agent_harness;
+pub mod backend_router;
 pub mod baton_store;
 pub mod bus;
 pub mod claim;
@@ -52,6 +53,7 @@ pub mod usage;
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
 };
+pub use backend_router::{BackendHandle, BackendRouter};
 pub use baton_store::FsBatonStore;
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
@@ -61,14 +63,14 @@ pub use config::{BuildCaps, GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
-    spawn_drive_loop, AgentHealthSource, Assignment, BatonRead, BatonSeeder, BatonStatusSource,
-    BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus, DeferredQueues, DriveLoop,
-    FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource, RateSource, TickReport,
-    DRIVE_POLL_MS,
+    spawn_drive_loop, AgentHealthSource, AgentStderrSource, Assignment, BatonRead, BatonSeeder,
+    BatonStatusSource, BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus,
+    DeferredQueues, DriveLoop, FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource,
+    RateMeter, RateSource, TickReport, DRIVE_POLL_MS,
 };
 pub use fleet::{
-    assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig,
-    DEFAULT_CLAUDE_BIN, DEFAULT_PROMPT,
+    assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig, MemberBackend,
+    DEFAULT_CLAUDE_BIN, DEFAULT_OPENCODE_BIN, DEFAULT_PROMPT,
 };
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};

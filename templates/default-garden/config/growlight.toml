@@ -25,12 +25,14 @@ fleet_enabled = false
 # unbounded run (the normal armed fleet); `0` is rejected. Read once at arm time.
 # max_iterations = 1
 
-# The `claude` binary growlightd's backend shells. Defaults to `claude` on PATH.
-# claude_bin = "claude"
+# The binary each backend shells. Both default to the bare name on PATH. Two keys
+# rather than one because a mixed roster runs both at once.
+# claude_bin   = "claude"
+# opencode_bin = "opencode"
 
-# The generic per-agent turn kick passed as `claude -p <prompt>`. Defaults to the
-# built-in "begin this iteration" kick; the SessionStart hook injects the
-# protocol + baton regardless.
+# The generic per-agent turn kick passed as `claude -p <prompt>` / the trailing
+# argument of `opencode run`. Defaults to the built-in "begin this iteration"
+# kick; the boot hook injects the protocol + baton regardless, on either backend.
 # prompt = "..."
 
 # The roster: one [[fleet]] block per agent. `agent` is the work-stream id
@@ -38,6 +40,25 @@ fleet_enabled = false
 # fallback-only member). growlightd OWNS each agent's pre-approval paths — the
 # config never names file paths.
 #
+# `backend` says which agent backend the member runs on and defaults to `claude`,
+# so a roster written before per-member selection existed keeps running exactly as
+# it did. `model` / `variant` are opencode-only and ride the generated opencode
+# config rather than argv; omit either to leave opencode its own default.
+#
+# Three mistakes here are REFUSED at arm time rather than defaulted, because all
+# three end with a member burning a pool the operator did not choose: an unknown
+# `backend` value, `model`/`variant` on a claude member, and any unknown key (a
+# dropped `backends = "opencode"` typo would silently mean claude). A refusal
+# fails closed — the fleet stays disarmed.
+#
+# Full reference: docs/growlight-fleet-backends.md.
+#
 # [[fleet]]
-# agent = "a"
+# agent = "a"                              # backend omitted ⇒ claude
 # # pin = "<queue-name>"
+#
+# [[fleet]]
+# agent   = "b"
+# backend = "opencode"                     # claude (default) | opencode
+# model   = "deepseek/deepseek-v4-flash"   # opencode only
+# variant = "high"                         # opencode only, optional

@@ -792,6 +792,15 @@ impl ClaudeBackend {
     pub fn stderr_tail(&self, agent: &str) -> Vec<String> {
         self.harness.stderr_tail(agent)
     }
+
+    /// The argv this backend would exec for `agent` after the `systemd-run … --`
+    /// separator, given the paths a spawn's pre-approval writes — claude's own
+    /// invocation, wrapper excluded. The routing seam (slice 005) asserts a
+    /// claude-backed member through it; the wrapper half is pinned separately by
+    /// `the_claude_argv_is_byte_identical_to_the_pre_harness_invocation`.
+    pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
+        self.harness.command_argv(agent, paths)
+    }
 }
 
 impl AgentBackend for Arc<ClaudeBackend> {

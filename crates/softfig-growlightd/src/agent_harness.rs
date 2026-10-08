@@ -736,6 +736,20 @@ impl Harness {
             .unwrap_or_default()
     }
 
+    /// The backend-half argv this harness would exec for `agent`, given the paths
+    /// its pre-approval writes — the flavor's own invocation, WITHOUT the
+    /// `systemd-run` wrapper (that half is [`scope_wrapper_argv`]'s).
+    ///
+    /// Exposed so an assembly can be *asserted* rather than eyeballed: once members
+    /// choose their own backend (opencode-fleet-backend slice 005), "which member
+    /// runs on what" is a routing decision, and the only honest proof that a member
+    /// routes where the operator asked is the command line it would be launched
+    /// with. Pure: it spawns nothing and writes nothing (the paths are an input,
+    /// not a generation).
+    pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
+        self.flavor.command_argv(agent, paths)
+    }
+
     /// Spawn `spec`'s agent: generate its pre-approval fail-closed, launch the
     /// flavor's command inside a fresh transient user scope, install this spawn's
     /// observation cells, register its scope + kill handle, and start the two
