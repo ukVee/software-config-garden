@@ -2781,7 +2781,12 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
 /// `AlreadyPresent` (one round-trip), so re-pushing the current tip every tick is
 /// safe (the same posture as `reconcile_replicas`). All snapshotting is under the
 /// daemon lock; every dial runs off it.
-fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
+#[doc(hidden)] // test seam — see `serve_established`. One tick, driven directly:
+               // "a refused sender stops pushing on the NEXT tick" (task 059) is
+               // a claim about this function's target resolution, so
+               // `tests/chain_rejection.rs` calls it rather than waiting on the
+               // live net runtime's timer + mDNS.
+pub fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
     struct SharedPush {
         chain: String,
         new_tree: [u8; 32],
