@@ -503,16 +503,32 @@ mod tests {
             doc.push_str(fence);
         }
         let expected_lines = doc.split('\n').count();
-        let start = std::time::Instant::now();
+        let start = thread_cpu_time();
         let lines = render_bionic(&doc, DEFAULT_BOLD_RATIO);
-        let elapsed = start.elapsed();
+        let end = thread_cpu_time();
         assert_eq!(lines.len(), expected_lines);
         // Generous bound: a quadratic transform on ~1 MB would blow far past
-        // this in a debug build; O(n) stays well under it.
-        assert!(
-            elapsed.as_secs() < 10,
-            "1 MB transform took {elapsed:?} — expected near-linear"
-        );
+        // this in a debug build; O(n) takes ~0.3 s on a Surface Go 3. It is
+        // measured in this thread's CPU time, not wall time: under a parallel
+        // workspace run the wall clock also counts the time the thread sat
+        // descheduled, which once pushed a 0.3 s transform past 10 s.
+        if let (Some(start), Some(end)) = (start, end) {
+            let spent = end - start;
+            assert!(
+                spent.as_secs() < 10,
+                "1 MB transform used {spent:?} of CPU — expected near-linear"
+            );
+        }
+    }
+
+    /// This thread's time on the CPU, from `/proc/thread-self/schedstat`
+    /// (first field, nanoseconds). `None` where procfs doesn't expose it — the
+    /// bound above is a complexity guard, not the correctness check, so it is
+    /// skipped rather than falling back to the wall clock it replaced.
+    fn thread_cpu_time() -> Option<std::time::Duration> {
+        let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+        let ns = stat.split_whitespace().next()?.parse().ok()?;
+        Some(std::time::Duration::from_nanos(ns))
     }
 
     #[test]
