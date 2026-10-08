@@ -2627,7 +2627,58 @@ pub fn shared_subtree_list(daemon: &Daemon, _args: serde_json::Value) -> Handler
         &member_ids,
     );
 
-    Ok(serde_json::to_value(SharedSubtreeListReply { subtrees, offers }).unwrap())
+    // Task 059: a membership split used to be visible only in the journal of the
+    // side that could not fix it, so it could run for 27 days unnoticed. Names
+    // are cosmetic, so a ring that will not load costs hex ids, not the surface.
+    let ring = {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        crate::net::load_ring(&wt, &state_dir).unwrap_or_default()
+    };
+    let divergences = marshal_chain_divergences(
+        &inner.chain_health.divergences(crate::net::now_secs()),
+        &ring,
+    );
+
+    Ok(serde_json::to_value(SharedSubtreeListReply {
+        subtrees,
+        offers,
+        divergences,
+    })
+    .unwrap())
+}
+
+/// Project the daemon's live membership-divergence rows onto the wire surface
+/// (task 059). Pure over its inputs (this crate's pure-vs-daemon idiom, e.g.
+/// [`marshal_coordination_status`]) so the shape the CLI and TUI render is
+/// unit-testable without a live session, and so the staleness/terminality
+/// judgement stays the daemon's rather than being re-derived per frontend.
+///
+/// `chain_health::divergences` already sorted the rows and already dropped the
+/// healthy ones, so an empty vec here means "no disagreement", which is exactly
+/// what both surfaces key their silence on.
+fn marshal_chain_divergences(
+    divergences: &[crate::chain_health::Divergence],
+    ring: &softfig_net::ring::Ring,
+) -> Vec<softfig_ipc::verbs::ChainDivergenceInfo> {
+    divergences
+        .iter()
+        .map(|d| softfig_ipc::verbs::ChainDivergenceInfo {
+            chain: d.chain.clone(),
+            peer: hex::encode(d.peer),
+            peer_name: ring
+                .peers()
+                .iter()
+                .find(|p| p.device_id == d.peer)
+                .map(|p| p.name.clone()),
+            role: d.role.slug().to_string(),
+            verb: d.role.verb().to_string(),
+            reason: d.class.slug(),
+            since: d.since,
+            age_secs: d.age_secs.max(0) as u64,
+            count: d.count,
+            terminal: d.class.is_terminal(),
+        })
+        .collect()
 }
 
 /// Map device-local pending offers onto the wire surface (M5f slice 006),
@@ -2926,6 +2977,55 @@ mod tests {
     // A device id filled with a single byte, so its hex is easy to eyeball.
     fn dev(b: u8) -> [u8; 32] {
         [b; 32]
+    }
+
+    /// Task 059: the surface must carry the daemon's judgement, not re-derive it.
+    /// A terminal reason (`unknown-chain`) is the one that suppresses pushing, so
+    /// `terminal` is what both frontends key their alarm on.
+    #[test]
+    fn chain_divergences_marshal_with_the_daemons_own_verdict() {
+        use crate::chain_health::{Class, Divergence, Role};
+        use softfig_net::ChainRejectReason;
+
+        let peer = [0x11u8; 32];
+        let rows = vec![
+            Divergence {
+                role: Role::Outbound,
+                chain: "chain/personal".to_string(),
+                peer,
+                class: Class::Rejected(ChainRejectReason::UnknownChain),
+                since: 100,
+                age_secs: 27 * 86_400,
+                count: 12_854,
+            },
+            Divergence {
+                role: Role::Inbound,
+                chain: "chain/work".to_string(),
+                peer,
+                class: Class::Rejected(ChainRejectReason::NotReady),
+                since: 200,
+                age_secs: 30,
+                count: 1,
+            },
+        ];
+        // An empty ring is the honest default here: names are cosmetic, and the
+        // surface must still name the peer when the ring will not load.
+        let out = marshal_chain_divergences(&rows, &softfig_net::ring::Ring::default());
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].chain, "chain/personal");
+        assert_eq!(out[0].role, "outbound");
+        assert_eq!(out[0].reason, "unknown-chain");
+        assert_eq!(out[0].age_secs, 27 * 86_400);
+        assert_eq!(out[0].count, 12_854);
+        assert!(out[0].terminal, "a membership verdict must read as terminal");
+        assert_eq!(out[0].peer, hex::encode(peer));
+        assert_eq!(out[0].peer_name, None);
+
+        // Transient: real, worth showing, but NOT the thing that stops a push.
+        assert_eq!(out[1].role, "inbound");
+        assert_eq!(out[1].reason, "not-ready");
+        assert!(!out[1].terminal);
     }
 
     #[test]

@@ -75,7 +75,15 @@ pub enum Role {
 }
 
 impl Role {
-    fn verb(self) -> &'static str {
+    /// A stable slug for the wire, the CLI and the TUI.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Role::Inbound => "inbound",
+            Role::Outbound => "outbound",
+        }
+    }
+
+    pub fn verb(self) -> &'static str {
         match self {
             Role::Inbound => "rejecting pushes from",
             Role::Outbound => "being rejected by",
@@ -324,20 +332,12 @@ fn short(device_id: &[u8; 32]) -> String {
     hex::encode(&device_id[..4])
 }
 
-/// Coarse age for human prose ("27d", "4h", "90s"). Deliberately local and
-/// coarse: this renders into journal lines, where a precise number would imply a
-/// precision the hourly latch does not have.
+/// Render a divergence age for the journal, sharing the one renderer the CLI and
+/// TUI use ([`softfig_ipc::verbs::human_age_secs`]) so a split's length reads the
+/// same everywhere. Takes `i64` because `since` arithmetic is signed; a clock
+/// that went backwards reads as `0s` rather than wrapping to a century.
 pub fn human_secs(secs: i64) -> String {
-    let s = secs.max(0);
-    if s >= 86_400 {
-        format!("{}d", s / 86_400)
-    } else if s >= 3_600 {
-        format!("{}h", s / 3_600)
-    } else if s >= 60 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{s}s")
-    }
+    softfig_ipc::verbs::human_age_secs(secs.max(0) as u64)
 }
 
 #[cfg(test)]
@@ -626,6 +626,9 @@ mod tests {
         assert_eq!(human_secs(45), "45s");
         assert_eq!(human_secs(90), "1m");
         assert_eq!(human_secs(3_600), "1h");
-        assert_eq!(human_secs(27 * 86_400), "27d");
+        // Delegates to the shared ladder, which carries on into weeks — the live
+        // 27-day split reads as "3w" here, in `shared-subtree list` and in the
+        // TUI alike.
+        assert_eq!(human_secs(27 * 86_400), "3w");
     }
 }

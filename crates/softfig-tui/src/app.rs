@@ -19,7 +19,7 @@ use softfig_ipc::{
     DeployPlanReply, DiscoverListReply,
     DiscoveredDevice, ErrorKind, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply,
     PairConfirmReply, PairListReply, PairPeer, PairRemoveReply, PatchFileArgs, PatchFileReply,
-    PendingPairing, PendingShareOfferInfo, ReadFileReply,
+    ChainDivergenceInfo, PendingPairing, PendingShareOfferInfo, ReadFileReply,
     ReplicaGrantReply, ReplicaRevokeReply, ReplicaStatusReply, SharedSubtreeAddReply,
     SharedSubtreeInfo,
     SharedSubtreeListReply, SharedSubtreeRemoveReply, SharedSubtreeToggleReply, ShowReply,
@@ -420,6 +420,12 @@ pub struct App {
     /// the Shares tab as read-only rows below the mounted shares (accept stays a
     /// CLI verb in v1). Rides the same `shared_subtree_list` reply as `shares`.
     pub share_offers: Vec<PendingShareOfferInfo>,
+    /// Task 059: live shared-chain membership disagreements, surfaced on the
+    /// Shares tab. Rides the same `shared_subtree_list` reply as `shares`. Empty
+    /// in the healthy case — a non-empty vec is itself the alarm, which is the
+    /// point: before this, a split was visible only in the daemon journal of the
+    /// device that could not fix it.
+    pub share_divergences: Vec<ChainDivergenceInfo>,
     /// M5d slice 006: the daemon's most recent shared-key ceremony divergence
     /// message (`status.shared_key_divergence`), surfaced as a banner on the
     /// Shares tab. `None` in the healthy case.
@@ -587,6 +593,7 @@ impl App {
             shares_selected: 0,
             shares_loaded: false,
             share_offers: Vec::new(),
+            share_divergences: Vec::new(),
             shared_key_divergence: None,
             coordination: None,
             coordination_sidecars: Vec::new(),
@@ -1718,6 +1725,7 @@ impl App {
                     Ok(r) => {
                         self.shares = r.subtrees;
                         self.share_offers = r.offers;
+                        self.share_divergences = r.divergences;
                         self.shares_loaded = true;
                         if self.shares_selected >= self.shares.len() {
                             self.shares_selected = self.shares.len().saturating_sub(1);

@@ -19,10 +19,11 @@ use clap::{Args, Subcommand};
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{
-        op, MigrateIntoShareArgs, MigrateIntoShareReply, PendingShareOfferInfo,
-        SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply, SharedSubtreeAddArgs,
-        SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply, SharedSubtreeRemoveArgs,
-        SharedSubtreeRemoveReply, SharedSubtreeToggleArgs, SharedSubtreeToggleReply,
+        human_age_secs, op, ChainDivergenceInfo, MigrateIntoShareArgs, MigrateIntoShareReply,
+        PendingShareOfferInfo, SharedSubtreeAcceptArgs, SharedSubtreeAcceptReply,
+        SharedSubtreeAddArgs, SharedSubtreeAddReply, SharedSubtreeInfo, SharedSubtreeListReply,
+        SharedSubtreeRemoveArgs, SharedSubtreeRemoveReply, SharedSubtreeToggleArgs,
+        SharedSubtreeToggleReply,
     },
     Request,
 };
@@ -210,7 +211,7 @@ fn list(args: ListArgs) -> Result<()> {
         serde_json::Value::Null,
     )?)?;
 
-    if reply.subtrees.is_empty() && reply.offers.is_empty() {
+    if reply.subtrees.is_empty() && reply.offers.is_empty() && reply.divergences.is_empty() {
         println!("no shared subtrees and no pending offers (sharing off)");
         return Ok(());
     }
@@ -230,6 +231,16 @@ fn list(args: ListArgs) -> Result<()> {
         println!("pending share offers ({}):", reply.offers.len());
         for o in &reply.offers {
             print_offer(o);
+        }
+    }
+
+    // Task 059: the membership split that cannot heal itself. It goes last and
+    // unconditionally, because the whole defect was that the only record lived
+    // in the journal of the device that could not fix it.
+    if !reply.divergences.is_empty() {
+        println!("membership disagreements ({}):", reply.divergences.len());
+        for d in &reply.divergences {
+            print_divergence(d);
         }
     }
     Ok(())
@@ -271,6 +282,63 @@ fn print_offer(o: &PendingShareOfferInfo) {
     println!("      accept: softfig shared-subtree accept {}", o.id);
 }
 
+fn print_divergence(d: &ChainDivergenceInfo) {
+    let peer = d
+        .peer_name
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}…", d.peer.get(..12).unwrap_or(&d.peer)));
+    println!("  {}", divergence_line(d, &peer));
+    println!("      {}", divergence_hint(d));
+}
+
+/// One disagreement as a single line. Three facts, because each answers a
+/// different question a reader actually has: how long (is this a blip?), how
+/// many (is this a retry storm?), and the reason slug (whose device holds the
+/// fix?).
+fn divergence_line(d: &ChainDivergenceInfo, peer: &str) -> String {
+    let mark = if d.terminal { "⚠ " } else { "" };
+    format!(
+        "{mark}{}  {} {peer} for {} ({}, {} {})",
+        d.chain,
+        d.verb,
+        human_age_secs(d.age_secs),
+        d.reason,
+        d.count,
+        if d.count == 1 { "push" } else { "pushes" },
+    )
+}
+
+/// What to actually do about it. The reason slug and the role together pin down
+/// which device holds the fix, and getting that backwards is how a split
+/// survives for weeks: the side with the loud journal is usually not the side
+/// that can end it.
+fn divergence_hint(d: &ChainDivergenceInfo) -> String {
+    match (d.role.as_str(), d.reason.as_str()) {
+        ("outbound", "unknown-chain") => {
+            "they hold no row for this chain: either re-share it to them \
+             (shared-subtree add + offer) or stop sharing it here \
+             (softfig shared-subtree remove)"
+                .to_string()
+        }
+        ("outbound", "not-a-member") => {
+            "they removed us from this chain: run a ceremony to re-add this \
+             device, or stop sharing it here (softfig shared-subtree remove)"
+                .to_string()
+        }
+        ("inbound", _) => {
+            "we hold no membership for this chain, so their pushes are refused: \
+             accept the offer if this share is wanted here, else they should run \
+             softfig shared-subtree remove"
+                .to_string()
+        }
+        ("outbound", "not-ready") => {
+            "their daemon was locked or mid-write; this one retries on its own".to_string()
+        }
+        _ => "transient or unrecognized reason; pushes continue".to_string(),
+    }
+}
+
 /// Call the daemon, surfacing an absent daemon as an error (shared-subtree state
 /// lives in the daemon; there is no direct-mode fallback).
 fn daemon_call(socket: &Path, op: &str, args: serde_json::Value) -> Result<serde_json::Value> {
@@ -286,5 +354,60 @@ fn daemon_call(socket: &Path, op: &str, args: serde_json::Value) -> Result<serde
     match resp.into_result() {
         Ok(v) => Ok(v),
         Err((kind, message)) => Err(anyhow!("{message}").context(format!("daemon error ({kind:?})"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn div(role: &str, reason: &str, terminal: bool) -> ChainDivergenceInfo {
+        ChainDivergenceInfo {
+            chain: "chain/personal".to_string(),
+            peer: "ecdde932aabb0011223344556677889900aabbccddeeff00112233445566778899"
+                .to_string(),
+            peer_name: None,
+            role: role.to_string(),
+            verb: "being rejected by".to_string(),
+            reason: reason.to_string(),
+            since: 0,
+            age_secs: 27 * 86_400,
+            count: 12_854,
+            terminal,
+        }
+    }
+
+    #[test]
+    fn divergence_line_carries_age_count_and_reason() {
+        // The live case this task exists for, in one line.
+        let line = divergence_line(&div("outbound", "unknown-chain", true), "sillyguy76");
+        assert!(line.starts_with("⚠ chain/personal"), "line was: {line}");
+        assert!(line.contains("being rejected by sillyguy76"), "line was: {line}");
+        assert!(line.contains("for 3w"), "line was: {line}");
+        assert!(line.contains("(unknown-chain, 12854 pushes)"), "line was: {line}");
+    }
+
+    #[test]
+    fn a_retryable_reason_is_not_flagged_and_says_so() {
+        let d = div("outbound", "not-ready", false);
+        let line = divergence_line(&d, "sillyguy76");
+        assert!(!line.starts_with('⚠'), "line was: {line}");
+        assert!(divergence_hint(&d).contains("retries on its own"));
+    }
+
+    #[test]
+    fn the_hint_names_the_device_that_holds_the_fix() {
+        // Outbound: they refuse us, so the fix is a re-share or a local remove.
+        assert!(divergence_hint(&div("outbound", "unknown-chain", true))
+            .contains("shared-subtree remove"));
+        // Inbound: we refuse them, so accepting is on this device.
+        assert!(divergence_hint(&div("inbound", "unknown-chain", true)).contains("accept"));
+    }
+
+    #[test]
+    fn one_push_is_singular() {
+        let mut d = div("outbound", "unknown-chain", true);
+        d.count = 1;
+        assert!(divergence_line(&d, "p").contains("1 push)"), "{}", divergence_line(&d, "p"));
     }
 }

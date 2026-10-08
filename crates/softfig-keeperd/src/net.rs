@@ -796,7 +796,7 @@ pub struct PeerAnnounce {
 /// reads the clock itself (every transition takes `now`), so the daemon stamps it
 /// here at handler time. Seconds are the same unit as the signed edit timestamps
 /// the conflict fallback (slice 003) compares.
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
