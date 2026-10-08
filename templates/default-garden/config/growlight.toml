@@ -51,6 +51,12 @@ fleet_enabled = false
 # dropped `backends = "opencode"` typo would silently mean claude). A refusal
 # fails closed — the fleet stays disarmed.
 #
+# An opencode member is METERED, so `growlight status` and the TUI fleet panel show
+# it as "opencode · <model> · $0.14 this session" rather than against the Anthropic
+# 5h/7d reserve, which it does not draw on. A claude member shows no per-member
+# dollar figure: its cost IS that shared reserve. Spend is accounted per session in
+# memory and is not a cap — see the doc below.
+#
 # Full reference: docs/growlight-fleet-backends.md.
 #
 # [[fleet]]
