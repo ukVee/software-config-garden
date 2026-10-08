@@ -16,7 +16,7 @@ use softfig_ipc::verbs::{
     LogArgs, LogEntry, LogReply, PeerCoordRow, TurnCoordRow,
     MigrateFinalizeArgs, MigrateFinalizeReply, MigrateIntoShareArgs, MigrateIntoShareReply,
     PairBeginArgs, PairBeginReply,
-    PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs,
+    PairConfirmArgs, PairConfirmReply, PairListReply, PairPeer, PairRemoveArgs, PushTarget,
     PairRemoveReply, PendingPairing, PendingShareOfferInfo, RelockMintArgs, RelockMintReply,
     RelockRedeemArgs,
     RelockRedeemReply, ReplaceFileArgs, ReplaceFileReply,
@@ -1468,6 +1468,14 @@ pub fn replica_revoke(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     .unwrap())
 }
 
+/// `replica_status({}) -> {host, push_to, hosted}`.
+///
+/// Backup *health*, not just backup membership (task `058`). Each granted host
+/// carries the reconcile loop's recorded push state and the daemon's staleness
+/// judgement, and each hosted mirror the same judgement over its inbound syncs,
+/// so no frontend has to age a raw unix timestamp by hand — which is how a chain
+/// that stopped replicating three weeks ago came to look identical to one that
+/// synced a minute ago.
 pub fn replica_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
     let inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
@@ -1475,9 +1483,42 @@ pub fn replica_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResul
     let replica_root = inner.config.replica_root();
     let host = inner.config.replica.host;
 
-    let push_to = crate::replica::GrantLedger::load(&state_dir)
+    let granted = crate::replica::GrantLedger::load(&state_dir)
         .map_err(|e| (ErrorKind::Io, format!("load replica ledger: {e}")))?
         .push_to;
+
+    let now = crate::actions::conventions::now_unix_secs();
+    let health = crate::replica_health::PushHealth::load(&state_dir);
+    // Names are a display nicety the ring supplies; a grant carries only a
+    // fingerprint. Best-effort — an unloadable ring just means unnamed rows.
+    let ring = {
+        let wt = crate::actions::WorkTree::new(daemon, &inner);
+        crate::net::load_ring(&wt, &state_dir).unwrap_or_default()
+    };
+    let push_to = granted
+        .into_iter()
+        .map(|fingerprint| {
+            let h = health.get(&fingerprint);
+            PushTarget {
+                name: ring
+                    .peers()
+                    .iter()
+                    .find(|p| p.fingerprint() == fingerprint)
+                    .map(|p| p.name.clone())
+                    .filter(|n| !n.is_empty()),
+                last_ok: h.and_then(|h| h.last_ok),
+                last_ok_age_secs: h.and_then(|h| h.ok_age_secs(now)),
+                // A host the daemon has never observed (just granted, or the
+                // reconcile loop has not ticked yet) has no successful push on
+                // record, which is exactly what `stale` means.
+                stale: h.is_none_or(|h| h.is_stale(now)),
+                state: h.map(|h| h.state.as_str().to_string()).unwrap_or_default(),
+                state_since: h.map(|h| h.since),
+                detail: h.and_then(|h| h.detail.clone()),
+                fingerprint,
+            }
+        })
+        .collect();
 
     // Reading the mirror dirs is filesystem-only (no network, no decryption), so
     // it is fine under the lock; the trees are tiny metadata reads.
@@ -1491,6 +1532,8 @@ pub fn replica_status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResul
             objects: m.objects,
             bytes: m.bytes,
             last_sync: m.last_sync,
+            last_sync_age_secs: m.last_sync.map(|t| now.saturating_sub(t).max(0) as u64),
+            stale: crate::replica_health::is_stale_at(m.last_sync, now),
         })
         .collect();
 

@@ -18,6 +18,7 @@ use softfig_ipc::{
     ChatMessage, CoordinationStatusReply, DeployAction, DeployApplyReply, DeployPlanEntry,
     DeployPlanReply, DiscoverListReply,
     DiscoveredDevice, ErrorKind, GrowlightQueueReply, HostedChain, LogReply, PairBeginReply,
+    PushTarget,
     PairConfirmReply, PairListReply, PairPeer, PairRemoveReply, PatchFileArgs, PatchFileReply,
     PendingPairing, PendingShareOfferInfo, ReadFileReply,
     ReplicaGrantReply, ReplicaRevokeReply, ReplicaStatusReply, SharedSubtreeAddReply,
@@ -393,9 +394,10 @@ pub struct App {
     pub peer_list: ListPane<PeerRow>,
     /// M5b Backup tab (`replica_status`): whether this device hosts backups.
     pub replica_host: bool,
-    /// Device-id fingerprints this device pushes its chain to (the hosts that
-    /// back *me* up — the `push_to` allow-list).
-    pub replica_push_to: Vec<String>,
+    /// The hosts this device pushes its chain to (the hosts that back *me* up
+    /// — the `push_to` allow-list), each with the daemon's recorded push health
+    /// so a backup that quietly stopped reads differently from a live one.
+    pub replica_push_to: Vec<PushTarget>,
     /// Per-peer mirror stats for chains *I* host for others (empty unless
     /// `replica_host`). Opaque ciphertext metadata only.
     pub hosted: Vec<HostedChain>,
@@ -3489,10 +3491,14 @@ impl App {
         }
         match self.selected_backup_row() {
             Some(BackupRow::PushTo(i)) => {
-                if let Some(fp) = self.replica_push_to.get(i) {
-                    let name = self.peer_name_for(fp).map(str::to_string);
+                if let Some(target) = self.replica_push_to.get(i) {
+                    let fp = target.fingerprint.clone();
+                    let name = target
+                        .name
+                        .clone()
+                        .or_else(|| self.peer_name_for(&fp).map(str::to_string));
                     self.overlay = Overlay::ReplicaRevoke {
-                        fingerprint: fp.clone(),
+                        fingerprint: fp,
                         name,
                         error: None,
                     };
@@ -5189,6 +5195,20 @@ mod tests {
 
     // ---- M5b Backup tab ----
 
+    /// A healthy push target: synced 90s ago, nothing to flag.
+    fn push_target(fp: &str) -> PushTarget {
+        PushTarget {
+            fingerprint: fp.into(),
+            name: None,
+            last_ok: Some(1_700_000_000),
+            last_ok_age_secs: Some(90),
+            stale: false,
+            state: "ok".into(),
+            state_since: Some(1_700_000_000),
+            detail: None,
+        }
+    }
+
     fn hosted_chain(fp: &str, name: &str, height: u64) -> HostedChain {
         HostedChain {
             fingerprint: fp.into(),
@@ -5198,6 +5218,8 @@ mod tests {
             objects: height * 3,
             bytes: height * 1024,
             last_sync: Some(1_700_000_000),
+            last_sync_age_secs: Some(90),
+            stale: false,
         }
     }
 
@@ -5212,7 +5234,7 @@ mod tests {
                 tag: Tag::ReplicaStatus,
                 result: Ok(serde_json::to_value(softfig_ipc::ReplicaStatusReply {
                     host: true,
-                    push_to: vec!["11".repeat(32)],
+                    push_to: vec![push_target(&"11".repeat(32))],
                     hosted: vec![hosted_chain(&"22".repeat(32), "tablet", 4)],
                 })
                 .unwrap()),
@@ -5253,7 +5275,7 @@ mod tests {
         let mut app = App::new();
         app.locked = false;
         app.view = View::Backup;
-        app.replica_push_to = vec!["11".repeat(32)];
+        app.replica_push_to = vec![push_target(&"11".repeat(32))];
         app.hosted = vec![hosted_chain(&"22".repeat(32), "tablet", 4)];
         app.rebuild_backup_rows();
 
@@ -5282,7 +5304,7 @@ mod tests {
         let mut app = App::new();
         app.locked = true;
         app.view = View::Backup;
-        app.replica_push_to = vec!["11".repeat(32)];
+        app.replica_push_to = vec![push_target(&"11".repeat(32))];
         app.rebuild_backup_rows();
         app.backup.selected = 0;
         app.start_revoke();

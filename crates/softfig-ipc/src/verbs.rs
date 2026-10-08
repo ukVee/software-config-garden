@@ -1391,10 +1391,50 @@ pub struct ReplicaStatusArgs {}
 pub struct ReplicaStatusReply {
     /// Whether this device hosts backups (`[replica] host`).
     pub host: bool,
-    /// Device-id fingerprints this device pushes its chain to (`push_to`).
-    pub push_to: Vec<String>,
+    /// The hosts this device pushes its chain to (`push_to`), each with the
+    /// push health the daemon has recorded for it (task `058`).
+    pub push_to: Vec<PushTarget>,
     /// Per-peer mirror stats for chains this device hosts (empty unless `host`).
     pub hosted: Vec<HostedChain>,
+}
+
+/// One granted host this device pushes its chain to, with backup health.
+///
+/// Health, not just membership: a grant alone says nothing about whether the
+/// backup is actually running, and a host that quietly stopped being reachable
+/// used to be indistinguishable from one that synced a second ago (task `058`).
+/// The staleness judgement is the **daemon's** — the threshold lives beside the
+/// reconcile loop that feeds it, so every frontend agrees on what "stale" means.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushTarget {
+    /// The host's device-id fingerprint (lowercase hex).
+    pub fingerprint: String,
+    /// The host's advertised name, if it is a loaded ring member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Unix seconds of the last successful push, or null if there has never
+    /// been one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok: Option<i64>,
+    /// Seconds since `last_ok` — null when it has never succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_age_secs: Option<u64>,
+    /// True when no successful push is on record, or the last one is older than
+    /// the daemon's staleness threshold.
+    #[serde(default)]
+    pub stale: bool,
+    /// Current reachability class: `ok` | `no-route` | `unpaired` | `error`.
+    /// `no-route`/`unpaired` mean we never dialed (fix discovery, the endpoint,
+    /// or the pairing); `error` means a route existed and the push failed (fix
+    /// transport or auth). Empty when the daemon has not yet observed the host.
+    #[serde(default)]
+    pub state: String,
+    /// Unix seconds at which `state` began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_since: Option<i64>,
+    /// For `error`, the last failure text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// One peer chain this device mirrors, as surfaced to `softfig replica status`.
@@ -1418,6 +1458,14 @@ pub struct HostedChain {
     /// Unix seconds of the last successful sync, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<i64>,
+    /// Seconds since `last_sync` — null when nothing has ever synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_age_secs: Option<u64>,
+    /// True when nothing has ever synced, or the last sync is older than the
+    /// daemon's staleness threshold — a mirror nobody has updated in weeks
+    /// should say so rather than print a timestamp the reader must age by hand.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 // ---- M5e slice 004: coordination-status read ------------------------------
@@ -2116,4 +2164,48 @@ pub struct DeployApplyReply {
     /// Conflicts overridden with `force` (target backed up first).
     pub forced: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+// ---- shared display helpers ------------------------------------------------
+
+/// Render an age in seconds as a short human phrase ("3w", "4h", "40s").
+///
+/// It lives here, beside the wire types, because both frontends render the same
+/// numbers: `softfig replica status` and the TUI's Backup tab each turn a
+/// daemon-supplied age into a staleness phrase, and two copies of this would
+/// drift into disagreeing about the same backup. Deliberately calendar-free
+/// (no chrono dep): the units are fixed-length — a week is 7×24h — because the
+/// question it answers is "how long has this been silent", not "what date".
+pub fn human_age_secs(secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    match secs {
+        s if s < MINUTE => format!("{s}s"),
+        s if s < HOUR => format!("{}m", s / MINUTE),
+        s if s < DAY => format!("{}h", s / HOUR),
+        s if s < WEEK => format!("{}d", s / DAY),
+        s => format!("{}w", s / WEEK),
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::human_age_secs;
+
+    #[test]
+    fn age_scales_through_every_unit() {
+        assert_eq!(human_age_secs(0), "0s");
+        assert_eq!(human_age_secs(59), "59s");
+        assert_eq!(human_age_secs(60), "1m");
+        assert_eq!(human_age_secs(3_599), "59m");
+        assert_eq!(human_age_secs(3_600), "1h");
+        assert_eq!(human_age_secs(86_399), "23h");
+        assert_eq!(human_age_secs(86_400), "1d");
+        assert_eq!(human_age_secs(6 * 86_400), "6d");
+        assert_eq!(human_age_secs(7 * 86_400), "1w");
+        // The case that motivated task 058: a backup that stopped 27 days ago.
+        assert_eq!(human_age_secs(27 * 86_400), "3w");
+    }
 }

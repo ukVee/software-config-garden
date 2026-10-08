@@ -65,6 +65,7 @@ use softfig_store::Hash;
 use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo};
 
+use crate::actions::conventions::now_unix_secs;
 use crate::actions::{
     apply_shared_pull, resolve_sync_conflict, ConflictResolution, ConflictSides, SharedPullInput,
     SharedPullOutcome, WorkTree,
@@ -77,6 +78,7 @@ use crate::config::KeeperConfig;
 use crate::daemon::{Daemon, DaemonInner};
 use crate::keeper_toml::CONFIG_DIR;
 use crate::replica::{self, MirrorStore, RepoSource};
+use crate::replica_health::{PushHealth, PushOutcome};
 use crate::state::State;
 
 /// How long a parked (initiator- or responder-side) pairing lives before it is
@@ -2575,6 +2577,15 @@ fn spawn_replica_loop(
 /// One reconcile pass: snapshot the signed announce + per-host grants under the
 /// daemon lock, then push to each granted, reachable host with the lock
 /// released (never hold the mutex across network IO).
+///
+/// Every granted host gets an outcome recorded in
+/// [`PushHealth`](crate::replica_health::PushHealth), including the ones we
+/// never dial. That is task `058`'s fix: a host with no route at all used to
+/// `continue` in silence, so the one failure mode that can persist indefinitely
+/// was the only one that logged nothing — a backup that stops without ever
+/// failing. The health record is edge-triggered (one line entering the state,
+/// one leaving), so a month-long outage costs two journal lines rather than one
+/// every [`REPLICA_RECONCILE_INTERVAL`].
 fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
     let snapshot = {
         let inner = daemon.inner.lock().unwrap();
@@ -2586,7 +2597,17 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
         };
         let state_dir = inner.config.state_dir().to_path_buf();
         let ledger = replica::GrantLedger::load(&state_dir).unwrap_or_default();
+        let mut health = PushHealth::load(&state_dir);
         if ledger.push_to.is_empty() {
+            // Nothing granted — no pushes to judge. Still drop any rows a
+            // revoke left behind so `replica status` shows no ghost hosts. One
+            // small write in `state_dir` (where the ledger already lives), only
+            // on the revoke-all edge.
+            if health.retain_granted(&ledger.push_to) {
+                if let Err(e) = health.save(&state_dir) {
+                    eprintln!("keeperd: net: replica health save failed: {e}");
+                }
+            }
             return;
         }
         let announce = match replica::build_announce(repo, session) {
@@ -2606,25 +2627,63 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
         let relay_client = relay_client_config(&inner.config);
         let relay_available = relay_client.is_some();
         let mut targets: Vec<(RingEntry, ReplicaGrant)> = Vec::new();
+        // Granted hosts we will not dial this tick, and why. Kept apart from a
+        // dial failure on purpose: these two need different fixes (discovery or
+        // pairing vs. transport or auth), so they must not read alike.
+        let mut undialed: Vec<(String, PushOutcome)> = Vec::new();
         for fp in &ledger.push_to {
-            if let Some(host) = ring.peers().iter().find(|p| &p.fingerprint() == fp) {
-                if plan_routes(host, relay_available).is_empty() {
-                    // No LAN endpoint and no relay — unreachable this tick; the
-                    // reconcile loop catches it up once a route appears.
-                    continue;
+            match ring.peers().iter().find(|p| &p.fingerprint() == fp) {
+                // Granted to a device that is not in the ring at all —
+                // decommissioned, un-paired, or never paired. The grant can
+                // never be satisfied until it is re-paired or revoked.
+                None => undialed.push((fp.clone(), PushOutcome::Unpaired)),
+                // No LAN endpoint and no relay — nothing to dial this tick; the
+                // reconcile loop catches it up once a route appears.
+                Some(host) if plan_routes(host, relay_available).is_empty() => {
+                    undialed.push((fp.clone(), PushOutcome::NoRoute))
                 }
-                let grant = replica::mint_grant(&host.device_id, &announce.chain_id, session);
-                targets.push((host.clone(), grant));
+                Some(host) => {
+                    let grant = replica::mint_grant(&host.device_id, &announce.chain_id, session);
+                    targets.push((host.clone(), grant));
+                }
             }
         }
         let garden_root = inner.config.garden_root.clone();
         let state_root = inner.config.state_root.clone();
-        (announce, garden_root, state_root, targets, relay_client)
+        (
+            announce,
+            garden_root,
+            state_root,
+            targets,
+            relay_client,
+            health,
+            undialed,
+            ledger.push_to,
+            state_dir,
+        )
     };
-    let (announce, garden_root, state_root, targets, relay_client) = snapshot;
+    let (
+        announce,
+        garden_root,
+        state_root,
+        targets,
+        relay_client,
+        mut health,
+        undialed,
+        granted,
+        state_dir,
+    ) = snapshot;
+
+    // One `now` for the undialed hosts: they were all classified from the same
+    // locked snapshot, so dating them apart would be fiction.
+    let now = now_unix_secs();
+    let mut edges = Vec::new();
+    for (fp, outcome) in undialed {
+        edges.extend(health.record(&fp, outcome, now));
+    }
 
     for (host, grant) in targets {
-        match push_to_host(
+        let outcome = match push_to_host(
             local,
             &host,
             &announce,
@@ -2633,17 +2692,31 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
             state_root.as_deref(),
             relay_client.as_ref(),
         ) {
-            Ok(summary) if summary.commits_served > 0 => eprintln!(
-                "keeperd: net: pushed chain to {}: served {} commits",
-                host.fingerprint(),
-                summary.commits_served
-            ),
-            Ok(_) => {} // host already up to date
-            Err(e) => eprintln!(
-                "keeperd: net: replica push to {} skipped: {e}",
-                host.fingerprint()
-            ),
-        }
+            Ok(summary) if summary.commits_served > 0 => {
+                eprintln!(
+                    "keeperd: net: pushed chain to {}: served {} commits",
+                    host.fingerprint(),
+                    summary.commits_served
+                );
+                PushOutcome::Ok
+            }
+            // Host already up to date — no commits to serve, but the round-trip
+            // happened, so it is as much proof of a live backup as a push is.
+            Ok(_) => PushOutcome::Ok,
+            // The per-tick `skipped` line this used to print is now the edge
+            // line below: a push that keeps failing the same way every 20s was
+            // its own kind of journal flood.
+            Err(e) => PushOutcome::Error(e.to_string()),
+        };
+        edges.extend(health.record(&host.fingerprint(), outcome, now_unix_secs()));
+    }
+
+    health.retain_granted(&granted);
+    for edge in &edges {
+        eprintln!("keeperd: net: {}", edge.message());
+    }
+    if let Err(e) = health.save(&state_dir) {
+        eprintln!("keeperd: net: replica health save failed: {e}");
     }
 }
 

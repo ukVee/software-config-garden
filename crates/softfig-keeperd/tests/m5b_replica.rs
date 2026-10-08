@@ -857,10 +857,19 @@ fn replica_grant_revoke_status_round_trip() {
     .unwrap();
     assert!(!again.granted);
 
-    // Status now lists the grant.
+    // Status now lists the grant — with the health fields task `058` added. The
+    // reconcile loop has never pushed to this forged peer, so the row must read
+    // as a backup that has never run rather than as a silent success: `stale`
+    // set, no `last_ok`, and the name resolved off the ring.
     let status: ReplicaStatusReply =
         serde_json::from_value(unwrap_ok(rpc(&socket, op::REPLICA_STATUS, json!({})))).unwrap();
-    assert_eq!(status.push_to, vec![peer_fp.clone()]);
+    assert_eq!(status.push_to.len(), 1);
+    let target = &status.push_to[0];
+    assert_eq!(target.fingerprint, peer_fp);
+    assert_eq!(target.name.as_deref(), Some("backup-host"));
+    assert_eq!(target.last_ok, None);
+    assert_eq!(target.last_ok_age_secs, None);
+    assert!(target.stale, "a never-pushed grant must not look healthy");
 
     // Revoke removes it.
     let revoked: ReplicaRevokeReply = serde_json::from_value(unwrap_ok(rpc(
