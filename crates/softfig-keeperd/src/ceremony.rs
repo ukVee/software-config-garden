@@ -491,6 +491,10 @@ pub fn persist_ceremony_outcome(
     // and the encrypt router now, so its very next write seals under `S`
     // instead of riding the pre-ceremony M path until a restart.
     if membership_update.is_some() {
+        // A ceremony is what makes a chain genuinely shared with a peer, so any
+        // push-health verdict latched before it ran describes a world that no
+        // longer exists (task 059).
+        inner.chain_health.forget_chain(&chain_id);
         let state_dir = inner.config.state_dir().to_path_buf();
         crate::handlers::refresh_mount_registry(&inner, &state_dir);
     }
@@ -658,6 +662,11 @@ pub fn rotate_shared_key(
     )
     .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let audit_hash = commit_now(&mut inner, intent)?;
+
+    // A rekey's transcript carries the POST-rotation member set, so a rotation
+    // can itself be the membership change that resolves the disagreement
+    // (task 059).
+    inner.chain_health.forget_chain(&chain_id);
 
     // Re-point the router to S' (derives from the now-committed membership), so
     // the chain's next write — including the re-encrypt below — seals under S'.

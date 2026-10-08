@@ -2081,6 +2081,11 @@ pub fn shared_subtree_add(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     crate::actions::commit_now(&mut inner, intent)?;
 
+    // A re-add of a previously-removed id resumes the SAME chain ref, so a
+    // verdict latched before the removal is reachable here, not theoretical
+    // (task 059).
+    inner.chain_health.forget_chain(&ref_name);
+
     refresh_mount_registry(&inner, &state_dir);
 
     Ok(serde_json::to_value(SharedSubtreeAddReply {
@@ -2224,6 +2229,10 @@ pub fn shared_subtree_accept(daemon: &Daemon, args: serde_json::Value) -> Handle
     let intent = Intent::new("shared_subtrees_changed", payload)
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     crate::actions::commit_now(&mut inner, intent)?;
+
+    // The canonical case (task 059): the peer refused our push because we held
+    // no membership row, and now we do.
+    inner.chain_health.forget_chain(&ref_name);
 
     refresh_mount_registry(&inner, &state_dir);
 
@@ -2449,6 +2458,15 @@ pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> Handle
         read_committed_shared_subtrees_for_mutation(repo, session)?
     };
     let before = membership.subtrees.len();
+    // Capture the chain ref before dropping the row: the push-health latch is
+    // keyed on the ref, not the share id (task 059), and after `retain` the row
+    // that knew the ref is gone.
+    let removed_refs: Vec<String> = membership
+        .subtrees
+        .iter()
+        .filter(|s| s.id == id)
+        .map(|s| s.ref_name.clone())
+        .collect();
     membership.subtrees.retain(|s| s.id != id);
     let removed = membership.subtrees.len() != before;
 
@@ -2471,6 +2489,13 @@ pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> Handle
         let intent = Intent::new("shared_subtrees_changed", payload)
             .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
         crate::actions::commit_now(&mut inner, intent)?;
+
+        // We are no longer a member, so there is nothing left to suppress — and a
+        // later re-add resumes this same ref and must start from a clean slate
+        // (task 059).
+        for chain in &removed_refs {
+            inner.chain_health.forget_chain(chain);
+        }
 
         // Slice 007 (finding 9): purge the id from the local-toggle sidecar so
         // disable → remove → re-add is never born disabled. The membership
