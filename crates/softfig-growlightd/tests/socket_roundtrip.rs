@@ -56,7 +56,10 @@ fn boots_serves_status_and_shuts_down_cleanly() {
     let reply = call_status(&socket);
     assert_eq!(reply.state, "running");
     assert_eq!(reply.garden_root, garden.display().to_string());
-    assert!(reply.agents.is_empty(), "phase 1 has no agents");
+    // No live rows: this daemon's fleet is disarmed, so nothing is assembled and
+    // there is no per-agent runtime state to report (the armed case is proven in
+    // the server unit tests, which can register a router).
+    assert!(reply.agents.is_empty(), "a disarmed fleet has no live rows");
     assert_eq!(reply.policy, Policy::default().summary());
     assert_eq!(reply.protocol_version, softfig_ipc::PROTOCOL_VERSION);
 

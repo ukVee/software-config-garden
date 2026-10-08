@@ -59,6 +59,15 @@ pub struct AgentPaths {
     pub loop_settings: PathBuf,
     /// `mcp.json` — the softfig-mcp attach config.
     pub mcp_config: PathBuf,
+    /// `opencode.json` — the opencode-native equivalent of `loop.json` + `mcp.json`
+    /// (the single file `OPENCODE_CONFIG` points at). Written by
+    /// [`OpencodePreApproval::generate`] and shelled by the opencode backend;
+    /// a claude member's generation never touches it. It lives in `AgentPaths`
+    /// rather than a parallel scheme so there stays exactly ONE source of the
+    /// per-agent layout — the reason this struct exists.
+    ///
+    /// [`OpencodePreApproval::generate`]: crate::opencode_preapproval::OpencodePreApproval::generate
+    pub opencode_config: PathBuf,
     /// `inject.sh` — the SessionStart hook body (protocol + this agent's baton).
     pub inject: PathBuf,
     /// `baton.md` — this agent's carried state (referenced by `inject.sh`).
@@ -76,6 +85,7 @@ pub fn agent_paths(agents_dir: &Path, agent_id: &str) -> AgentPaths {
     AgentPaths {
         loop_settings: dir.join("loop.json"),
         mcp_config: dir.join("mcp.json"),
+        opencode_config: dir.join("opencode.json"),
         inject: dir.join("inject.sh"),
         baton: dir.join("baton.md"),
         dir,
@@ -179,7 +189,7 @@ pub enum GenError {
 }
 
 impl GenError {
-    fn io(what: &str, path: &Path, source: io::Error) -> Self {
+    pub(crate) fn io(what: &str, path: &Path, source: io::Error) -> Self {
         Self::Io {
             what: what.to_string(),
             path: path.to_path_buf(),
@@ -216,8 +226,10 @@ impl std::error::Error for GenError {
 }
 
 /// Reject an agent id that isn't a safe single path component, so it can never
-/// escape the `agents/` namespace or break the runtime layout.
-fn validate_agent_id(id: &str) -> Result<(), GenError> {
+/// escape the `agents/` namespace or break the runtime layout. Shared with the
+/// opencode generator ([`crate::opencode_preapproval`]) so both backends fail
+/// closed on exactly the same ids — one rule, not two that can drift.
+pub(crate) fn validate_agent_id(id: &str) -> Result<(), GenError> {
     let bad =
         id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']);
     if bad {
@@ -328,7 +340,7 @@ fn shell_quote(p: &Path) -> String {
 
 // ---- fail-closed file writers ------------------------------------------------
 
-fn write_file(path: &Path, content: &str) -> Result<(), GenError> {
+pub(crate) fn write_file(path: &Path, content: &str) -> Result<(), GenError> {
     fs::write(path, content).map_err(|e| GenError::io("write", path, e))
 }
 
@@ -415,6 +427,14 @@ mod tests {
         assert!(paths.loop_settings.exists(), "loop.json written");
         assert!(paths.mcp_config.exists(), "mcp.json written");
         assert!(paths.inject.exists(), "inject.sh written");
+        // The opencode config path is DERIVED from the same layout (one source,
+        // no parallel scheme) but writing it belongs to the opencode generator —
+        // a claude spawn must never lay one down.
+        assert_eq!(paths.opencode_config, paths.dir.join("opencode.json"));
+        assert!(
+            !paths.opencode_config.exists(),
+            "claude generation writes no opencode.json",
+        );
 
         // The settings carry the pre-approval + a hook pointing at THIS agent's
         // inject.sh, which in turn references the per-agent baton + the protocol.

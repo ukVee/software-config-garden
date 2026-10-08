@@ -62,6 +62,7 @@ use crate::config::RateLimits;
 use crate::daemon::Daemon;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
+use crate::opencode_backend::OpencodeBackend;
 use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
 use crate::state::State;
 use crate::supervisor::{
@@ -188,6 +189,23 @@ impl BudgetSampleSource for Arc<ClaudeBackend> {
     }
 }
 
+/// opencode contributes **nothing** to the Anthropic budget aggregate — both
+/// methods are structurally `None` (see [`OpencodeBackend::budget`]). The impl
+/// exists so the same `Arc` fills this seam like every other, not because there is
+/// a reading to fold: a synthetic percentage here would corrupt the admission gate
+/// that governs the claude members.
+impl BudgetSampleSource for Arc<OpencodeBackend> {
+    fn budget(&self, agent: &str) -> Option<BudgetUsage> {
+        // Disambiguate from this trait method: call the inherent one on the
+        // backed `OpencodeBackend`.
+        self.as_ref().budget(agent)
+    }
+
+    fn rate_limit_reopen(&self, agent: &str) -> Option<i64> {
+        self.as_ref().rate_limit_reopen(agent)
+    }
+}
+
 /// The seam the loop reads the per-minute **rate** (TPM/RPM) through, admission's
 /// second gate alongside the budget aggregate. The loop is the clock authority —
 /// it passes the tick's `now` so the source can sum its **rolling** trailing
@@ -219,32 +237,68 @@ impl RateSource for PermissiveRate {
     }
 }
 
+/// The fleet-wide rolling-minute meter [`LiveRate`] reads its numerator from.
+///
+/// A separate trait from [`RateSource`] because the two answer different
+/// questions: this one is "how many tokens/requests did the fleet actually burn in
+/// the trailing minute", with no notion of a *limit* — the limits are the device's
+/// ([`RateLimits`]), not the backend's. Introduced by opencode-fleet-backend slice
+/// 005: with a per-member backend the meter is no longer one concrete
+/// [`ClaudeBackend`], and admission must sum EVERY backend's window or a mixed
+/// roster under-reports its own burn. Tokens per minute mean the same thing on
+/// either provider, so unlike the 5h/7d account budget this window really is
+/// provider-neutral and really does aggregate.
+pub trait RateMeter: Send + Sync + fmt::Debug {
+    /// The fleet-wide `(tpm_used, rpm_used)` in the minute trailing `now` (unix
+    /// seconds). Saturating, never panicking, on a pathological sum.
+    fn rate_used(&self, now: i64) -> (u32, u32);
+}
+
+impl RateMeter for ClaudeBackend {
+    fn rate_used(&self, now: i64) -> (u32, u32) {
+        // Disambiguate from this trait method: call the inherent one.
+        ClaudeBackend::rate_used(self, now)
+    }
+}
+
+impl RateMeter for OpencodeBackend {
+    fn rate_used(&self, now: i64) -> (u32, u32) {
+        // Disambiguate from this trait method: call the inherent one.
+        OpencodeBackend::rate_used(self, now)
+    }
+}
+
 /// The live [`RateSource`] (slice 006): admission's second window from real data.
-/// Reads the **fleet-wide** rolling-minute `(tpm_used, rpm_used)` off the
-/// [`ClaudeBackend`]'s per-agent meters (each fed from its agents' `result`-line
-/// `usage` tokens + a request tick — see [`ClaudeBackend::rate_used`]) and pairs
-/// it with the per-device [`RateLimits`]. This is what replaces [`PermissiveRate`]
-/// in [`crate::fleet::assemble_fleet`], so the TPM/RPM burst gate actually gates
-/// (spec §7 "two windows, not one"; §15). Holds an `Arc` clone of the same backend
-/// the supervisor spawns through and the budget/health sources read — one backend,
-/// one set of cells.
+/// Reads the **fleet-wide** rolling-minute `(tpm_used, rpm_used)` off a
+/// [`RateMeter`] — the per-agent meters each backend's harness keeps, fed from
+/// whatever that backend's wire format reports as a completed turn's token cost —
+/// and pairs it with the per-device [`RateLimits`]. This is what replaces
+/// [`PermissiveRate`] in [`crate::fleet::assemble_fleet`], so the TPM/RPM burst
+/// gate actually gates (spec §7 "two windows, not one"; §15).
+///
+/// The meter is held behind an `Arc` shared with whatever the supervisor spawns
+/// through and the budget/health sources read — one set of cells, read from every
+/// seam. Since slice 005 that is normally the
+/// [`BackendRouter`](crate::backend_router::BackendRouter), which sums each
+/// distinct backend exactly once.
 #[derive(Debug)]
 pub struct LiveRate {
-    backend: Arc<ClaudeBackend>,
+    meter: Arc<dyn RateMeter>,
     limits: RateLimits,
 }
 
 impl LiveRate {
-    /// Build the live rate source over `backend`'s meters and the per-device
-    /// `limits` (the account TPM/RPM ceilings + per-agent burst headroom).
-    pub fn new(backend: Arc<ClaudeBackend>, limits: RateLimits) -> Self {
-        Self { backend, limits }
+    /// Build the live rate source over `meter`'s fleet-wide window and the
+    /// per-device `limits` (the account TPM/RPM ceilings + per-agent burst
+    /// headroom).
+    pub fn new(meter: Arc<dyn RateMeter>, limits: RateLimits) -> Self {
+        Self { meter, limits }
     }
 }
 
 impl RateSource for LiveRate {
     fn rate(&self, now: i64) -> RateState {
-        let (tpm_used, rpm_used) = self.backend.rate_used(now);
+        let (tpm_used, rpm_used) = self.meter.rate_used(now);
         RateState {
             tpm_used,
             rpm_used,
@@ -522,6 +576,14 @@ impl AgentHealthSource for Arc<ClaudeBackend> {
     }
 }
 
+impl AgentHealthSource for Arc<OpencodeBackend> {
+    fn health(&self, agent: &str) -> Option<AgentHealth> {
+        // Disambiguate from this trait method: call the inherent one on the
+        // backed `OpencodeBackend`.
+        self.as_ref().health(agent)
+    }
+}
+
 /// The seam the loop reads a crashed agent's **stderr tail** through, to enrich an
 /// [`NotifyEvent::AgentCrashed`] with the crash *reason* (crash-diagnostics slice
 /// 001). Implemented over the live [`ClaudeBackend`]'s bounded per-agent in-memory
@@ -535,6 +597,13 @@ pub trait AgentStderrSource: Send + Sync + fmt::Debug {
 }
 
 impl AgentStderrSource for Arc<ClaudeBackend> {
+    fn stderr_tail(&self, agent: &str) -> Vec<String> {
+        // Disambiguate from this trait method: call the inherent one.
+        self.as_ref().stderr_tail(agent)
+    }
+}
+
+impl AgentStderrSource for Arc<OpencodeBackend> {
     fn stderr_tail(&self, agent: &str) -> Vec<String> {
         // Disambiguate from this trait method: call the inherent one.
         self.as_ref().stderr_tail(agent)

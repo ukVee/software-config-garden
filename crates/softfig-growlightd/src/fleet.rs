@@ -52,16 +52,19 @@ use serde::Deserialize;
 use softfig_ipc as ipc;
 
 use crate::admission::AdmissionGovernor;
+use crate::backend_router::{BackendHandle, BackendRouter};
 use crate::baton_store::FsBatonStore;
 use crate::config::BuildCaps;
 use crate::claim::{KeeperdItemParker, KeeperdPartClaimer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
-    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RouteConnectivity, SystemExeProbe,
-    DRIVE_POLL_MS,
+    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RateMeter, RouteConnectivity,
+    SystemExeProbe, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
+use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
+use crate::opencode_preapproval::{ModelSelection, OpencodePreApproval};
 use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
 use crate::supervisor::{AgentSpec, Supervisor};
@@ -70,25 +73,137 @@ use crate::usage_file::UsageCapture;
 /// The `claude` binary the backend shells when the config omits `claude_bin`.
 pub const DEFAULT_CLAUDE_BIN: &str = "claude";
 
+/// The `opencode` binary an opencode member shells when the config omits
+/// `opencode_bin` (slice 005). Resolved on PATH, like `claude`.
+pub const DEFAULT_OPENCODE_BIN: &str = "opencode";
+
 /// The generic per-agent turn kick when the config omits `prompt`. The
 /// SessionStart hook in each agent's `--settings` injects the protocol + baton;
 /// this is the bare "go" the backend passes as `claude -p <prompt>`.
 pub const DEFAULT_PROMPT: &str = "Begin this growlight iteration. The operating protocol and your current baton have been injected above — boot per protocol step 1, execute NEXT ACTION as one coherent chunk, then hand off by rewriting the baton.";
 
-/// One configured fleet member as read from a `[[fleet]]` table. The
-/// human declares only the agent's id + (optional) pinned queue; growlightd OWNS
-/// the per-agent pre-approval paths — it GENERATES `loop.json`/`mcp.json` into the
-/// runtime namespace `$XDG_CONFIG_HOME/softfig/growlight/agents/<id>/` (slice 004,
-/// fail-closed) rather than letting the config name arbitrary paths (which could
-/// point at the harness-sensitive `~/.claude`). The `AgentSpec` paths are derived
-/// from `agent` at assembly via [`agent_paths`], not configured.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The `backend` value naming the claude backend — also the default when the key
+/// is omitted, so an unchanged `config/growlight.toml` keeps running as it did.
+const BACKEND_CLAUDE: &str = "claude";
+/// The `backend` value naming the opencode backend.
+const BACKEND_OPENCODE: &str = "opencode";
+
+/// Which agent backend a member runs on, as the operator declared it:
+/// `backend = "claude" | "opencode"` on a `[[fleet]]` entry
+/// (opencode-fleet-backend slice 005). Without this the backend slice 004 built is
+/// unreachable code.
+///
+/// The opencode variant carries the member's [`ModelSelection`] because that is
+/// where the choice belongs: model + variant ride the GENERATED opencode config,
+/// never argv (the milestone's locked decision — one source beats two), and that
+/// config is written per member at every spawn.
+///
+/// This is the first minimal seed of the spec-agents §3 **agent profile**
+/// (`backend` + `model` + `variant` on a member). The full
+/// `(backend, provider, model, credential-ref, trust_level, caps)` profile with its
+/// own registry belongs to phases 1/3 — deliberately NOT invented here, with the
+/// field names left compatible with that shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberBackend {
+    /// `claude -p` — the default, and byte-identical to the pre-slice-005 spawn.
+    Claude,
+    /// `opencode run` on the given model/variant. Either may be unset, which leaves
+    /// opencode its own default rather than pinning a name we invented.
+    Opencode(ModelSelection),
+}
+
+/// One configured fleet member, **validated** — what [`FleetConfig`] carries and
+/// [`assemble_fleet`] builds from. The human declares the agent's id, an optional
+/// pinned queue, and (slice 005) which backend it runs on; growlightd OWNS the
+/// per-agent pre-approval paths — it GENERATES them into the runtime namespace
+/// `$XDG_CONFIG_HOME/softfig/growlight/agents/<id>/` (slice 004, fail-closed)
+/// rather than letting the config name arbitrary paths (which could point at the
+/// harness-sensitive `~/.claude`). The `AgentSpec` paths are derived from `agent`
+/// at assembly via [`agent_paths`], not configured.
+///
+/// Deliberately NOT `Deserialize`: TOML parses into [`FleetMemberDoc`] and only
+/// [`FleetMemberDoc::validate`] produces this type, so a value carrying an
+/// unchecked backend cannot exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetMemberConfig {
     /// The agent's bus address / work-stream id (the `@`-stripped name).
     pub agent: String,
     /// The queue this member is pinned to, or `None` for a fallback-only member.
-    #[serde(default)]
     pub pin: Option<String>,
+    /// The backend this member runs on. [`MemberBackend::Claude`] when the key is
+    /// omitted; an unknown value never reaches here — it is refused at parse.
+    pub backend: MemberBackend,
+}
+
+/// The raw `[[fleet]]` table as TOML spells it, BEFORE validation.
+///
+/// `deny_unknown_fields` because the silent-typo case is precisely what this slice
+/// exists to prevent: `backends = "opencode"` (or a misspelled `varient`) would
+/// otherwise be dropped on the floor and the member would quietly spawn `claude
+/// -p`, burning the Anthropic pool the operator believed they had moved it off. An
+/// unknown key is an `Err`, which the loader turns into a disabled fleet — loud and
+/// fail-closed, the same treatment a bad agent id gets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetMemberDoc {
+    /// The agent's bus address / work-stream id.
+    agent: String,
+    /// The queue this member is pinned to.
+    #[serde(default)]
+    pin: Option<String>,
+    /// `claude` (default) | `opencode`. Anything else is refused, never defaulted.
+    #[serde(default)]
+    backend: Option<String>,
+    /// The opencode model id (`provider/model`) — opencode-only.
+    #[serde(default)]
+    model: Option<String>,
+    /// The model's variant — opencode-only.
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+impl FleetMemberDoc {
+    /// Validate this raw entry into a [`FleetMemberConfig`], or explain to the
+    /// operator what is wrong with it. Both failure modes are the SAME hazard seen
+    /// from two sides — a member running on a backend the operator did not choose —
+    /// so neither is silently repaired.
+    fn validate(self) -> Result<FleetMemberConfig, String> {
+        let agent = self.agent;
+        let backend = match self.backend.as_deref() {
+            None | Some(BACKEND_CLAUDE) => {
+                // The likelier slip, and the mirror of the unknown-backend refusal:
+                // a `model` written WITHOUT `backend = "opencode"` reads as "this
+                // member is on DeepSeek" but would spawn `claude -p` on the
+                // Anthropic pool. Refuse it rather than ignore the key.
+                if self.model.is_some() || self.variant.is_some() {
+                    return Err(format!(
+                        "fleet member {agent:?} sets model/variant but runs on the \
+                         {BACKEND_CLAUDE} backend — those keys are {BACKEND_OPENCODE}-only. \
+                         Add backend = \"{BACKEND_OPENCODE}\" if that is what you meant, or \
+                         drop them"
+                    ));
+                }
+                MemberBackend::Claude
+            }
+            Some(BACKEND_OPENCODE) => MemberBackend::Opencode(ModelSelection {
+                model: self.model,
+                variant: self.variant,
+            }),
+            Some(other) => {
+                return Err(format!(
+                    "fleet member {agent:?} declares unknown backend {other:?} — expected \
+                     {BACKEND_CLAUDE:?} or {BACKEND_OPENCODE:?}. Refused rather than defaulted: \
+                     a member the operator believes is on {BACKEND_OPENCODE} must never quietly \
+                     spawn claude and burn the Anthropic pool"
+                ))
+            }
+        };
+        Ok(FleetMemberConfig {
+            agent,
+            pin: self.pin,
+            backend,
+        })
+    }
 }
 
 impl FleetMemberConfig {
@@ -112,8 +227,12 @@ impl FleetMemberConfig {
 pub struct FleetConfig {
     /// `fleet_enabled` — off by default; the live-capability gate.
     pub enabled: bool,
-    /// `claude_bin` — the backend's `claude` binary.
+    /// `claude_bin` — the `claude` binary a claude member shells.
     pub bin: String,
+    /// `opencode_bin` — the `opencode` binary an opencode member shells (slice
+    /// 005). Its own key rather than a reuse of `bin`: a mixed roster runs both,
+    /// so one binary path cannot serve both backends.
+    pub opencode_bin: String,
     /// `prompt` — the generic per-agent turn kick.
     pub prompt: String,
     /// `[[fleet]]` members, in config order. Raw `{agent, pin}` — the runtime
@@ -141,6 +260,7 @@ impl FleetConfig {
         Self {
             enabled: false,
             bin: DEFAULT_CLAUDE_BIN.to_string(),
+            opencode_bin: DEFAULT_OPENCODE_BIN.to_string(),
             prompt: DEFAULT_PROMPT.to_string(),
             members: Vec::new(),
             build_caps: BuildCaps::default(),
@@ -158,9 +278,10 @@ impl FleetConfig {
             #[serde(default)]
             fleet_enabled: bool,
             claude_bin: Option<String>,
+            opencode_bin: Option<String>,
             prompt: Option<String>,
             #[serde(default)]
-            fleet: Vec<FleetMemberConfig>,
+            fleet: Vec<FleetMemberDoc>,
             #[serde(default)]
             build_caps: BuildCaps,
             /// The bounded-run knob (task 040). Absent ⇒ `None` ⇒ unbounded.
@@ -189,11 +310,24 @@ impl FleetConfig {
                     .to_string(),
             );
         }
+        // Validate each member's backend declaration (slice 005) — an unknown
+        // backend, or an opencode-only key on a claude member, is REPORTED AND
+        // REFUSED here rather than defaulted, because both mistakes end the same
+        // way: a member quietly running on a pool the operator did not choose. The
+        // `?` propagates to the loader, which fails closed to a disabled fleet.
+        let members = doc
+            .fleet
+            .into_iter()
+            .map(FleetMemberDoc::validate)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             enabled: doc.fleet_enabled,
             bin: doc.claude_bin.unwrap_or_else(|| DEFAULT_CLAUDE_BIN.to_string()),
+            opencode_bin: doc
+                .opencode_bin
+                .unwrap_or_else(|| DEFAULT_OPENCODE_BIN.to_string()),
             prompt: doc.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
-            members: doc.fleet,
+            members,
             build_caps: doc.build_caps,
             max_iterations: doc.max_iterations,
         })
@@ -207,7 +341,7 @@ impl FleetConfig {
 /// `-` mapping). Duplicates are rejected because two members would share a scope
 /// unit AND a per-agent map key. Fail-closed: any violation is an `Err` the loader
 /// turns into a disabled fleet.
-fn validate_fleet_member_ids(members: &[FleetMemberConfig]) -> Result<(), String> {
+fn validate_fleet_member_ids(members: &[FleetMemberDoc]) -> Result<(), String> {
     let mut seen = std::collections::BTreeSet::new();
     for m in members {
         let id = &m.agent;
@@ -259,10 +393,13 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
 
 /// Assemble the live [`DriveLoop`] — **iff `fleet.enabled`**. Gate off ⇒ `None`
 /// having constructed nothing (no backend, no supervisor, no dispatcher). Gate on
-/// ⇒ one shared `Arc<ClaudeBackend>` placed behind BOTH the
-/// [`AgentHealthSource`](crate::drive_loop::AgentHealthSource) and
-/// [`BudgetSampleSource`](crate::drive_loop::BudgetSampleSource) *and* given to
-/// the [`Supervisor`] as its backend — all three clones of the one Arc, as the
+/// ⇒ each member's configured backend built by [`build_member_backends`] behind one
+/// shared `Arc<BackendRouter>`, which is placed behind the
+/// [`AgentHealthSource`](crate::drive_loop::AgentHealthSource),
+/// [`AgentStderrSource`](crate::drive_loop::AgentStderrSource),
+/// [`BudgetSampleSource`](crate::drive_loop::BudgetSampleSource) and
+/// [`RateSource`](crate::drive_loop::RateSource) seams *and* given to the
+/// [`Supervisor`] as its backend — all clones of the one Arc, as the
 /// [`DriveLoop::new`] contract requires. Production notifiers (the GUI hub +
 /// stderr audit log) are registered on the owned dispatcher.
 ///
@@ -291,24 +428,14 @@ pub fn assemble_fleet(
     let garden_root = daemon.garden_root();
     let agents_dir = runtime_agents_dir();
     // The garden's directory name — a cosmetic `loop:` tag in the seed baton,
-    // matching the single-agent baton's frontmatter. Derived before `garden_root`
-    // is moved into the pre-approval context below.
+    // matching the single-agent baton's frontmatter.
     let garden_name = garden_root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| PILLAR.to_string());
-    let preapproval = PreApproval::new(
-        agents_dir.clone(),
-        // The FLEET variant (no self-pull) — every member growlightd spawns is a
-        // fleet member; the orchestrator owns continuation (slice 002).
-        fleet_protocol(&garden_root),
-        garden_root,
-        softfig_mcp_path(),
-        claude_dir(),
-    );
 
     // One per-member baton store over the SAME runtime `agents/` namespace the
-    // pre-approval generator writes each agent's `loop.json` into (and `inject.sh`
+    // pre-approval generators write each agent's config into (and the boot hook
     // cats `baton.md` from). It is BOTH the seeder (the fresh-start baton write, so
     // a member boots with its baton, not `(no baton yet)`) AND the
     // `BatonStatusSource` slice 001 reads on exit — one store cloned into both
@@ -316,48 +443,29 @@ pub fn assemble_fleet(
     // drift. `FsBatonStore` is a cheap `Clone` (two paths + a name), so no `Arc`.
     let baton_store = FsBatonStore::new(agents_dir.clone(), garden_name);
 
-    // One backend, shared many ways (the `DriveLoop::new` contract): the
-    // supervisor spawns through it, and health + stderr + budget + rate are read
-    // off the SAME per-agent cells it populates.
-    let backend = Arc::new(ClaudeBackend::new(
-        fleet.bin.clone(),
-        fleet.prompt.clone(),
-        hub.clone(),
-        preapproval,
-        // The GENTLE per-agent build throttle (slice 002): every spawn's scope is
-        // capped to slow — never kill — a building agent. Shared by Arc with the
-        // daemon (peer-isolation slice 003) so `set_resources` adjusts the
-        // next-spawn throttle live; the daemon's cell was seeded from
-        // `fleet.build_caps` at `set_fleet_config`, so the backend reads the
-        // configured value (and any subsequent live change) off this same cell.
-        Arc::clone(&daemon.build_caps),
-        // The live agent→running-scope registry (peer-isolation hardening slice
-        // 002): each spawn records its generation-suffixed `.scope` unit here so
-        // `set_resources` pushes onto the actually-running scopes. Shared by Arc
-        // with the daemon, like `build_caps`.
-        Arc::clone(&daemon.live_scopes),
-        // The live agent→kill-handle registry (audit slice 005): each spawn
-        // records its kill handle here so `force_stop --hard-kill` /
-        // `request_restart` reach the running agent. Shared by Arc with the
-        // daemon (it owns the registry `hard_kill_agent` drains), like `live_scopes`.
-        Arc::clone(&daemon.kill_handles),
-    )
-    // The headless budget capture (task 048): every member's `rate_limit_event`
-    // reading is teed to the runtime `usage.json`, the file the loop protocol's §2b
-    // boot check and the human read. A headless `claude -p` has no statusline — the
-    // file's only other writer — so without this the fleet runs for days on a
-    // reading from the human's last interactive session
-    // (`incident-20260720-m5f-double-park`).
-    .with_usage_capture(Arc::new(UsageCapture::new(
-        runtime_growlight_dir().join(USAGE_FILE),
-    ))));
+    // Each member's own backend, behind ONE router (slice 005). The `DriveLoop::new`
+    // contract is unchanged — it still receives a single backend-shaped thing cloned
+    // into every seam — but that thing now dispatches per agent id, so health,
+    // stderr, budget and spawn all reach the SAME backend for a given member. The
+    // shared registries stay fleet-wide inside `build_member_backends`, or the
+    // daemon's kill / `set_resources` paths would stop reaching some members.
+    let router = Arc::new(build_member_backends(daemon, fleet, &agents_dir, &garden_root));
+    // Let `status` see the SAME router (slice 006). Registered here rather than in
+    // `main` so the observation seam cannot be forgotten or built twice: the view
+    // the operator reads is literally the table the loop routes through.
+    daemon.set_backend_router(Arc::clone(&router));
     let members: Vec<FleetMember> = fleet
         .members
         .iter()
         .map(|m| m.to_member(&agents_dir))
         .collect();
+    // `router.clone()`, not `Arc::clone(&router)`: the latter would infer its own
+    // type parameter from the annotation and try to clone an `Arc<dyn RateMeter>`
+    // that does not exist yet. Method syntax clones the concrete Arc and unsizes it
+    // here, once, instead of in argument position.
+    let rate_meter: Arc<dyn RateMeter> = router.clone();
     let governor = AdmissionGovernor::new(daemon.policy());
-    let supervisor = Supervisor::new(Box::new(Arc::clone(&backend)), governor);
+    let supervisor = Supervisor::new(Box::new(Arc::clone(&router)), governor);
 
     let mut dispatcher = NotifyDispatcher::new();
     dispatcher.register(Box::new(GuiNotifier::new(hub)));
@@ -366,15 +474,15 @@ pub fn assemble_fleet(
     Some(DriveLoop::new(
         daemon.clone(),
         supervisor,
-        Box::new(Arc::clone(&backend)), // health  — live ClaudeBackend (slice 001)
-        Box::new(Arc::clone(&backend)), // stderr — live in-memory ring (crash-diagnostics slice 001)
+        Box::new(Arc::clone(&router)), // health  — the member's own backend (slice 001; routed by slice 005)
+        Box::new(Arc::clone(&router)), // stderr — live in-memory ring (crash-diagnostics slice 001)
         Box::new(baton_store.clone()), // baton  — live per-member read-back (fleet-loop-spin slice 002)
         Box::new(baton_store), // seeder — fresh-start baton seed (fleet-loop-spin slice 002)
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)
         Box::new(KeeperdPartClaimer::new(keeperd_socket.to_path_buf())), // claimer — live (slice 003)
         Box::new(KeeperdItemParker::new(keeperd_socket.to_path_buf())), // parker — live item-park (fleet-member-model slice 003)
-        Box::new(Arc::clone(&backend)), // samples — live budget cell (drive-loop 003)
-        Box::new(LiveRate::new(Arc::clone(&backend), daemon.rate_limits())), // rate — live TPM/RPM meter (slice 006)
+        Box::new(Arc::clone(&router)), // samples — live budget cell, claude-only by construction (drive-loop 003)
+        Box::new(LiveRate::new(rate_meter, daemon.rate_limits())), // rate — live TPM/RPM meter summed over every backend (slice 006)
         Box::new(RouteConnectivity), // connectivity — live kernel routing-table probe (network-failsafe slice 001)
         Box::new(SystemExeProbe::capture()), // exe_probe — re-stat growlightd's own launch binary (stale-binary guard, task 039)
         dispatcher,
@@ -386,6 +494,135 @@ pub fn assemble_fleet(
     .with_max_iterations(fleet.max_iterations))
 }
 
+/// Build each member's configured backend and route the roster to it (slice 005).
+///
+/// Three properties this function exists to hold:
+///
+/// 1. **One claude backend, shared.** Every claude member routes to the SAME
+///    `Arc<ClaudeBackend>` — its per-agent cells already keep members apart, and
+///    sharing keeps the claude path byte-identical to the pre-slice-005 assembly.
+///    It is built lazily, so an all-opencode roster constructs none at all.
+/// 2. **One opencode backend per member.** The model and variant a member runs on
+///    live in that backend's [`OpencodeLaunch`], so two members on different models
+///    are genuinely two backends. (Two members on the same model get two backends
+///    too — cheap, and it keeps "a member's backend" a 1:1 fact rather than a
+///    cache-key question.)
+/// 3. **The registries stay fleet-wide.** `build_caps`, `live_scopes` and
+///    `kill_handles` are the DAEMON's cells, cloned by `Arc` into every backend. If
+///    a backend got its own, `set_resources` would adjust a throttle nobody reads
+///    and `force_stop --hard-kill` would fail to find half the fleet.
+fn build_member_backends(
+    daemon: &Daemon,
+    fleet: &FleetConfig,
+    agents_dir: &Path,
+    garden_root: &Path,
+) -> BackendRouter {
+    let mut router = BackendRouter::new();
+    let mut claude: Option<Arc<ClaudeBackend>> = None;
+    for member in &fleet.members {
+        let handle = match &member.backend {
+            MemberBackend::Claude => BackendHandle::Claude(Arc::clone(claude.get_or_insert_with(
+                || Arc::new(build_claude_backend(daemon, fleet, agents_dir, garden_root)),
+            ))),
+            MemberBackend::Opencode(model) => BackendHandle::Opencode(Arc::new(
+                build_opencode_backend(daemon, fleet, agents_dir, garden_root, model),
+            )),
+        };
+        router.insert(member.agent.clone(), handle);
+    }
+    router
+}
+
+/// The fleet's single `claude -p` backend — the pre-slice-005 construction,
+/// unchanged: the §15 fail-closed [`PreApproval`] over the runtime `agents/`
+/// namespace (never under `~/.claude`), anchored to THIS garden's FLEET protocol
+/// (growlightd only ever spawns fleet members, so never the single-agent
+/// self-pull `protocol.md`), plus the three daemon-shared registries.
+fn build_claude_backend(
+    daemon: &Daemon,
+    fleet: &FleetConfig,
+    agents_dir: &Path,
+    garden_root: &Path,
+) -> ClaudeBackend {
+    ClaudeBackend::new(
+        fleet.bin.clone(),
+        fleet.prompt.clone(),
+        daemon.hub.clone(),
+        PreApproval::new(
+            agents_dir.to_path_buf(),
+            fleet_protocol(garden_root),
+            garden_root.to_path_buf(),
+            softfig_mcp_path(),
+            claude_dir(),
+        ),
+        // The GENTLE per-agent build throttle (peer-isolation slice 002): every
+        // spawn's scope is capped to slow — never kill — a building agent. Shared by
+        // Arc with the daemon so `set_resources` adjusts the next-spawn throttle
+        // live; the daemon's cell was seeded from `fleet.build_caps` at
+        // `set_fleet_config`, so the backend reads the configured value (and any
+        // subsequent live change) off this same cell.
+        Arc::clone(&daemon.build_caps),
+        // The live agent→running-scope registry (peer-isolation hardening slice
+        // 002): each spawn records its generation-suffixed `.scope` unit here so
+        // `set_resources` pushes onto the actually-running scopes.
+        Arc::clone(&daemon.live_scopes),
+        // The live agent→kill-handle registry (audit slice 005): each spawn records
+        // its kill handle here so `force_stop --hard-kill` / `request_restart` reach
+        // the running agent.
+        Arc::clone(&daemon.kill_handles),
+    )
+    // The headless budget capture (task 048): every claude member's
+    // `rate_limit_event` reading is teed to the runtime `usage.json`, the file the
+    // loop protocol's §2b boot check and the human read. A headless `claude -p` has
+    // no statusline — the file's only other writer — so without this the fleet runs
+    // for days on a reading from the human's last interactive session
+    // (`incident-20260720-m5f-double-park`). Claude-only by construction: the
+    // capture describes the Anthropic pool, and opencode members contribute no
+    // reserve (the milestone's locked no-synthetic-budget decision).
+    .with_usage_capture(Arc::new(UsageCapture::new(
+        runtime_growlight_dir().join(USAGE_FILE),
+    )))
+}
+
+/// One member's `opencode run` backend on `model` (slice 005).
+///
+/// Deliberately the same shape as [`build_claude_backend`] — same registries, same
+/// runtime `agents/` namespace, same fleet protocol — because everything except
+/// argv, pre-approval and the wire parser IS shared machinery. The two differences
+/// are opencode's: its pre-approval grants the runtime **grant root** (the parent of
+/// the pillar dir, so the baton and its sibling runtime state ride one rule), and
+/// its cwd is the garden so garden docs are ordinary in-project reads.
+fn build_opencode_backend(
+    daemon: &Daemon,
+    fleet: &FleetConfig,
+    agents_dir: &Path,
+    garden_root: &Path,
+    model: &ModelSelection,
+) -> OpencodeBackend {
+    OpencodeBackend::new(
+        OpencodeLaunch {
+            bin: fleet.opencode_bin.clone(),
+            // The same per-agent turn kick claude gets: the generated config's
+            // prompt carries the protocol + baton bootstrap, so this is only the
+            // turn's "go" and is backend-neutral.
+            prompt: fleet.prompt.clone(),
+            model: model.clone(),
+            garden_root: garden_root.to_path_buf(),
+        },
+        daemon.hub.clone(),
+        OpencodePreApproval::new(
+            agents_dir.to_path_buf(),
+            fleet_protocol(garden_root),
+            runtime_grant_root(),
+            softfig_mcp_path(),
+            claude_dir(),
+        ),
+        Arc::clone(&daemon.build_caps),
+        Arc::clone(&daemon.live_scopes),
+        Arc::clone(&daemon.kill_handles),
+    )
+}
+
 /// The runtime growlight namespace root `$XDG_CONFIG_HOME/softfig/growlight`
 /// (fallback `~/.config/...`) — the churny-runtime space `softfig growlight start`
 /// owns (the runtime baton, `usage.json`, per-agent `agents/`), NOT the garden.
@@ -394,11 +631,25 @@ pub fn assemble_fleet(
 /// same way, independent of an assembled fleet (the verb answers even when the
 /// fleet is disarmed).
 pub fn runtime_growlight_dir() -> PathBuf {
+    runtime_grant_root().join(PILLAR)
+}
+
+/// The growlight runtime **grant root** `$XDG_CONFIG_HOME/softfig` (fallback
+/// `~/.config/softfig`) — the PARENT of [`runtime_growlight_dir`], and what an
+/// opencode member's pre-approval grants through `external_directory`.
+///
+/// The parent rather than the pillar dir so sibling runtime state (`usage.json`,
+/// the per-agent `agents/` tree, anything the daemon adds later) rides ONE rule
+/// instead of needing a new grant each time — the same choice, and the same root,
+/// the interactive launcher's `runtime_grant_root` makes. [`runtime_growlight_dir`]
+/// is derived from this rather than the other way round so the grant can never
+/// drift from the directory it is supposed to cover.
+fn runtime_grant_root() -> PathBuf {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => home_dir().join(".config"),
     };
-    base.join("softfig").join(PILLAR)
+    base.join("softfig")
 }
 
 /// The runtime per-agent namespace `$XDG_CONFIG_HOME/softfig/growlight/agents`
@@ -489,7 +740,11 @@ pub fn spawn_fleet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::BudgetUsage;
     use crate::config::GrowlightdConfig;
+    use crate::drive_loop::BudgetSampleSource;
+    use crate::opencode_backend::AgentSpend;
+    use crate::usage::{UsageAggregator, UsageSample};
 
     fn daemon() -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
@@ -596,10 +851,19 @@ agent = "reviewer"
         assert_eq!(
             cfg.members,
             vec![
-                FleetMemberConfig { agent: "builder".into(), pin: Some("queue:build".into()) },
-                FleetMemberConfig { agent: "reviewer".into(), pin: None },
+                FleetMemberConfig {
+                    agent: "builder".into(),
+                    pin: Some("queue:build".into()),
+                    backend: MemberBackend::Claude,
+                },
+                FleetMemberConfig {
+                    agent: "reviewer".into(),
+                    pin: None,
+                    backend: MemberBackend::Claude,
+                },
             ],
-            "the table parses a pinned + an unpinned member, in order",
+            "the table parses a pinned + an unpinned member, in order, both on the \
+             default claude backend",
         );
 
         // The runtime AgentSpec paths are DERIVED under the agents namespace (the
@@ -790,5 +1054,356 @@ agent = "reviewer"
         );
         let cfg = FleetConfig::from_growlight_toml(toml).expect("a clean slug roster is valid");
         assert_eq!(cfg.members.len(), 3);
+    }
+
+    // ---- per-member backend selection (slice 005) ---------------------------
+
+    /// A roster whose ids are `a` (default) + `b`/`c` (opencode, different models)
+    /// + `d` (explicitly claude) — the mixed case the routing tests assert over.
+    fn mixed_roster() -> FleetConfig {
+        FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "claude_bin = \"claude\"\n",
+            "opencode_bin = \"opencode\"\n",
+            "prompt = \"kick\"\n",
+            "[[fleet]]\nagent = \"a\"\n",
+            "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\n",
+            "model = \"deepseek/deepseek-v4-flash\"\nvariant = \"high\"\n",
+            "[[fleet]]\nagent = \"c\"\nbackend = \"opencode\"\n",
+            "model = \"deepseek/deepseek-v4-pro\"\n",
+            "[[fleet]]\nagent = \"d\"\nbackend = \"claude\"\n",
+        ))
+        .expect("a mixed roster is valid")
+    }
+
+    #[test]
+    fn a_member_without_a_backend_key_is_a_claude_member() {
+        // The no-migration guarantee: the shipped `config/growlight.toml` says only
+        // `agent = "a"`, and it must keep meaning exactly what it meant before this
+        // slice — `claude -p`, on the default binary.
+        let cfg = FleetConfig::from_growlight_toml(&format!(
+            "fleet_enabled = true\n{}",
+            member_toml()
+        ))
+        .unwrap();
+        assert_eq!(cfg.members[0].backend, MemberBackend::Claude);
+        assert_eq!(cfg.bin, DEFAULT_CLAUDE_BIN);
+        assert_eq!(cfg.opencode_bin, DEFAULT_OPENCODE_BIN, "unused, still defaulted");
+    }
+
+    #[test]
+    fn an_opencode_member_carries_its_model_and_variant() {
+        let cfg = mixed_roster();
+        assert_eq!(
+            cfg.members[1].backend,
+            MemberBackend::Opencode(
+                ModelSelection::model("deepseek/deepseek-v4-flash").with_variant("high")
+            ),
+        );
+        // `variant` is optional — omitting it leaves opencode the model's own
+        // default rather than pinning a name we invented.
+        assert_eq!(
+            cfg.members[2].backend,
+            MemberBackend::Opencode(ModelSelection::model("deepseek/deepseek-v4-pro")),
+        );
+        // `backend = "opencode"` with neither key is legal: run opencode, let it
+        // pick.
+        let bare = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            bare.members[0].backend,
+            MemberBackend::Opencode(ModelSelection::default()),
+        );
+    }
+
+    #[test]
+    fn an_unknown_backend_is_refused_at_arm_time_never_defaulted() {
+        // THE clause this slice exists for: a member the operator believes is on
+        // DeepSeek must never quietly spawn `claude -p` and burn the Anthropic pool.
+        // A typo'd backend is a loud config error, not a silent default.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"opencde\"\n",
+        );
+        let err = FleetConfig::from_growlight_toml(toml).unwrap_err();
+        assert!(err.contains("\"a\""), "the message names the member: {err}");
+        assert!(err.contains("opencde"), "the message quotes the bad value: {err}");
+        assert!(
+            err.contains("claude") && err.contains("opencode"),
+            "the message names the valid backends: {err}",
+        );
+
+        // And the loader turns that Err into a DISABLED fleet — a config problem can
+        // never enable one, let alone one running on the wrong pool.
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), toml);
+        assert_eq!(load_fleet_config(dir.path()), FleetConfig::disabled());
+    }
+
+    #[test]
+    fn opencode_only_keys_on_a_claude_member_are_refused() {
+        // The same hazard from the other side, and the likelier slip: `model` written
+        // without `backend = "opencode"` READS as "this member is on DeepSeek" while
+        // spawning claude. Refused, not ignored — both with the key absent (the
+        // default) and with it explicitly claude.
+        for member in [
+            "[[fleet]]\nagent = \"a\"\nmodel = \"deepseek/deepseek-v4-flash\"\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\nvariant = \"high\"\n",
+        ] {
+            let err = FleetConfig::from_growlight_toml(&format!("fleet_enabled = true\n{member}"))
+                .unwrap_err();
+            assert!(
+                err.contains("opencode-only"),
+                "the message explains the keys are opencode's: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_member_key_is_refused_rather_than_dropped() {
+        // A misspelled key is the silent-wrong-pool failure wearing a different hat:
+        // `backends = "opencode"` would otherwise be dropped and the member would run
+        // claude. `deny_unknown_fields` makes it a config error.
+        let err = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackends = \"opencode\"\n",
+        ))
+        .unwrap_err();
+        assert!(err.contains("backends"), "the message names the stray key: {err}");
+    }
+
+    #[test]
+    fn a_mixed_roster_routes_each_member_to_its_own_backend() {
+        let d = daemon();
+        let cfg = mixed_roster();
+        let agents = Path::new("/cfg/agents");
+        let router = build_member_backends(&d, &cfg, agents, Path::new("/garden"));
+
+        // 1. Each member's argv is its OWN backend's — the only honest proof that a
+        //    member routes where the operator asked, short of spawning it.
+        let argv = |agent: &str| -> Vec<String> {
+            router
+                .command_argv(agent, &agent_paths(agents, agent))
+                .unwrap_or_else(|| panic!("{agent} is in the roster"))
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            argv("a"),
+            vec![
+                "claude",
+                "-p",
+                "kick",
+                "--settings",
+                "/cfg/agents/a/loop.json",
+                "--mcp-config",
+                "/cfg/agents/a/mcp.json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ],
+            "a member with no backend key is exec'd exactly as before slice 005",
+        );
+        assert_eq!(
+            argv("b"),
+            vec!["opencode", "run", "--format", "json", "--agent", "b", "kick"],
+            "an opencode member is exec'd as opencode, naming itself as the agent",
+        );
+
+        // 2. One member, one backend, EVERY seam: health/stderr/budget/spawn all
+        //    dispatch through `backend_for`, so pointer identity here is the routing
+        //    guarantee for all four.
+        let claude_a = match router.backend_for("a").unwrap() {
+            BackendHandle::Claude(b) => Arc::clone(b),
+            other => panic!("member a must route to claude, got {other:?}"),
+        };
+        let claude_d = match router.backend_for("d").unwrap() {
+            BackendHandle::Claude(b) => Arc::clone(b),
+            other => panic!("member d must route to claude, got {other:?}"),
+        };
+        assert!(
+            Arc::ptr_eq(&claude_a, &claude_d),
+            "every claude member shares ONE backend — its per-agent cells keep them \
+             apart, and sharing keeps the claude path identical to before",
+        );
+        let (b, c) = match (router.backend_for("b").unwrap(), router.backend_for("c").unwrap()) {
+            (BackendHandle::Opencode(b), BackendHandle::Opencode(c)) => (Arc::clone(b), Arc::clone(c)),
+            other => panic!("members b and c must route to opencode, got {other:?}"),
+        };
+        assert!(
+            !Arc::ptr_eq(&b, &c),
+            "two opencode members on different models are two backends — the model \
+             rides the backend's generated config, so sharing one would run c on b's \
+             model",
+        );
+
+        // 3. The fleet-wide rate window folds over DISTINCT backends: 4 members, 3
+        //    backends. Folding per member would count the shared claude backend's
+        //    whole window twice and over-report the fleet's burn into admission.
+        assert_eq!(router.distinct().len(), 3, "4 members, 3 distinct backends");
+    }
+
+    #[test]
+    fn every_backend_shares_the_daemons_fleet_wide_registries() {
+        // build_caps / live_scopes / kill_handles must be ONE instance cloned into
+        // every backend: they are how `set_resources` reaches the next spawn and how
+        // `force_stop --hard-kill` / `request_restart` reach a running agent. A
+        // backend holding its own cells would drop half the fleet off those paths —
+        // silently, since nothing else observes them. Counting the daemon's Arc is
+        // the structural proof: a fresh cell would not bump it.
+        let d = daemon();
+        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
+        let backends = router.distinct().len();
+        for (name, count) in [
+            ("build_caps", Arc::strong_count(&d.build_caps)),
+            ("live_scopes", Arc::strong_count(&d.live_scopes)),
+            ("kill_handles", Arc::strong_count(&d.kill_handles)),
+        ] {
+            assert_eq!(
+                count,
+                1 + backends,
+                "{name}: the daemon's cell plus one clone in each of the {backends} \
+                 backends — no backend built its own",
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_opencode_roster_builds_no_claude_backend() {
+        // The claude backend is built lazily, so a fleet that uses none constructs
+        // none — and, more to the point, a roster's backends are exactly what it asked
+        // for rather than "the ones we always build plus".
+        let d = daemon();
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\n",
+            "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\n",
+        ))
+        .unwrap();
+        let router = build_member_backends(&d, &cfg, Path::new("/cfg/agents"), Path::new("/garden"));
+        assert_eq!(router.distinct().len(), 2);
+        assert!(
+            router
+                .distinct()
+                .iter()
+                .all(|b| matches!(b, BackendHandle::Opencode(_))),
+            "no claude backend is constructed for an all-opencode roster",
+        );
+    }
+
+    /// Reach a mixed roster's opencode backend for `agent` — the metered half of
+    /// the router, which the spend seam is the only reader of.
+    fn opencode_backend_for(router: &BackendRouter, agent: &str) -> Arc<OpencodeBackend> {
+        match router.backend_for(agent).expect("a roster member is routed") {
+            BackendHandle::Opencode(b) => Arc::clone(b),
+            BackendHandle::Claude(_) => panic!("{agent} is configured as an opencode member"),
+        }
+    }
+
+    #[test]
+    fn a_metered_members_spend_never_becomes_a_claude_members_accounting() {
+        // Slice 006's first invariant: making a metered member legible must not give
+        // a subscription member a spend figure. The two are different accountings,
+        // and the seam says so structurally — `spend` is `None` for every claude
+        // route, no matter how much the opencode members alongside it have billed.
+        // A `Some(0)` here would render as "$0.00 this session" against a claude
+        // member that is in fact burning the shared reserve: a precise inversion of
+        // the bug this slice exists to fix.
+        let d = daemon();
+        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
+
+        // Both metered members do real work (folded through the same
+        // `AgentSpendState::record` a `step_finish` drives).
+        opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.000_043);
+        opencode_backend_for(&router, "c").accrue_spend_for_test("c", 0.12);
+
+        // The metered members read as metered...
+        let b = router.spend("b").expect("an opencode member is metered");
+        assert_eq!(b, AgentSpend { micro_usd: 43, steps: 1 }, "b's accrual is its own");
+        let c = router.spend("c").expect("an opencode member is metered");
+        assert_eq!(c, AgentSpend { micro_usd: 120_000, steps: 1 }, "c's accrual is its own");
+
+        // ...and the claude members read as NOT metered — `None`, not zero.
+        for claude_member in ["a", "d"] {
+            assert_eq!(
+                router.spend(claude_member),
+                None,
+                "{claude_member} is a subscription member: it has no metered spend, \
+                 which is not the same as having spent nothing",
+            );
+        }
+    }
+
+    #[test]
+    fn the_subscription_aggregate_is_unaffected_by_a_metered_members_activity() {
+        // Slice 006's hard constraint: the `UsageAggregator` is the ANTHROPIC
+        // subscription pool, and a metered member must contribute nothing to it —
+        // the admission gate governing the claude members is computed from this
+        // aggregate, so one synthetic reading from a DeepSeek run would mis-gate the
+        // whole fleet.
+        //
+        // Driven through the REAL seam (`BudgetSampleSource::budget` over the real
+        // router) and the real fold the tick performs, with the metered members
+        // actively billing at the time — so what is proven is the mechanism, not a
+        // restatement of the posture.
+        let d = daemon();
+        let router = Arc::new(build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden")));
+        opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.07);
+        opencode_backend_for(&router, "c").accrue_spend_for_test("c", 2.5);
+        assert!(
+            router.spend("b").is_some_and(|s| s.micro_usd > 0),
+            "the metered member really has billed — otherwise this proves nothing",
+        );
+
+        let now = 1_700_000_000;
+        // The control: one claude member's reading of the shared pool, folded in the
+        // way `DriveLoop::tick` step 0 folds it.
+        let claude_reading = BudgetUsage::new(42, 17);
+        let mut aggregate = UsageAggregator::new();
+        aggregate.observe(UsageSample::new("a", claude_reading, now));
+        let claude_only = aggregate.aggregate_at(now);
+
+        // Now offer EVERY member to the same fold, exactly as the tick does: the
+        // aggregate takes whatever `budget(agent)` yields, and nothing else.
+        for member in ["a", "b", "c", "d"] {
+            if let Some(budget) = BudgetSampleSource::budget(&router, member) {
+                aggregate.observe(UsageSample::new(member.to_string(), budget, now));
+            }
+        }
+
+        assert_eq!(
+            aggregate.agent_count(),
+            1,
+            "only the claude member that actually read the pool contributes a sample \
+             — a metered member never enters the aggregate at all",
+        );
+        assert_eq!(
+            aggregate.aggregate_at(now),
+            claude_only,
+            "the aggregate is byte-identical to the claude member's reading alone",
+        );
+        assert_eq!(aggregate.aggregate_at(now), Some(claude_reading));
+
+        // And the seam itself: no metered member offers a reading to offer.
+        for metered in ["b", "c"] {
+            assert_eq!(BudgetSampleSource::budget(&router, metered), None);
+            assert_eq!(BudgetSampleSource::rate_limit_reopen(&router, metered), None);
+        }
+    }
+
+    #[test]
+    fn gate_on_assembles_a_mixed_roster() {
+        // The end-to-end shape: a mixed roster assembles a live DriveLoop, with the
+        // router filling every seam the contract requires. (No `tick` — see
+        // `gate_on_assembles_a_loop_over_the_live_keeperd_queue_source`.)
+        let d = daemon();
+        assert!(
+            assemble_fleet(&d, &mixed_roster(), keeperd_socket()).is_some(),
+            "a claude+opencode roster assembles",
+        );
     }
 }

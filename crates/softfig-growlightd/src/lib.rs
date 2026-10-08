@@ -19,6 +19,8 @@
 #![warn(missing_debug_implementations)]
 
 pub mod admission;
+pub mod agent_harness;
+pub mod backend_router;
 pub mod baton_store;
 pub mod bus;
 pub mod claim;
@@ -33,6 +35,8 @@ pub mod hub;
 pub mod leases;
 pub mod notifications;
 pub mod notify_dispatch;
+pub mod opencode_backend;
+pub mod opencode_preapproval;
 pub mod peer;
 pub mod persist;
 pub mod preapproval;
@@ -50,22 +54,24 @@ pub mod usage_file;
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
 };
+pub use backend_router::{BackendHandle, BackendRouter};
 pub use baton_store::FsBatonStore;
 pub use bus::{spawn_bus_tailer, BusBridge, BusError, BusSource, KeeperdBusSource, BUS_POLL_MS};
 pub use claim::KeeperdPartClaimer;
-pub use claude_backend::{AgentHealthState, ClaudeBackend};
+pub use agent_harness::{AgentHealthState, BackendFlavor, Harness, LineObserver};
+pub use claude_backend::ClaudeBackend;
 pub use config::{BuildCaps, GrowlightdConfig, Policy};
 pub use control::{AgentChild, Control};
 pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
-    spawn_drive_loop, AgentHealthSource, Assignment, BatonRead, BatonSeeder, BatonStatusSource,
-    BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus, DeferredQueues, DriveLoop,
-    FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource, RateSource, TickReport,
-    DRIVE_POLL_MS,
+    spawn_drive_loop, AgentHealthSource, AgentStderrSource, Assignment, BatonRead, BatonSeeder,
+    BatonStatusSource, BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus,
+    DeferredQueues, DriveLoop, FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource,
+    RateMeter, RateSource, TickReport, DRIVE_POLL_MS,
 };
 pub use fleet::{
-    assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig,
-    DEFAULT_CLAUDE_BIN, DEFAULT_PROMPT,
+    assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig, MemberBackend,
+    DEFAULT_CLAUDE_BIN, DEFAULT_OPENCODE_BIN, DEFAULT_PROMPT,
 };
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
@@ -75,6 +81,8 @@ pub use notify_dispatch::{
     BusEmit, GuiNotifier, KeeperdBusEmit, LogNotifier, LogSink, Notifier, NotifyDispatcher,
     PhoneStub, StderrLog, ALERT_FROM, ALERT_KIND,
 };
+pub use opencode_backend::{AgentSpend, OpencodeBackend, OpencodeLaunch};
+pub use opencode_preapproval::{ModelSelection, OpencodePreApproval};
 pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_QUEUE_NAME};

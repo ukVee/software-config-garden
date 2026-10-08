@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::claim::write_item_status;
-use crate::claude_backend::scope_kill_argv;
+use crate::agent_harness::scope_kill_argv;
 use crate::queue_source::{parse_snapshot, BacklogReader, KeeperdBacklogReader};
 use crate::scheduler::{PartStatus, Snapshot};
 

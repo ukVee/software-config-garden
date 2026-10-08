@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use softfig_ipc::growlightd::{Event, LeaseReply, RestartReply, SetResourcesArgs};
 
+use crate::backend_router::BackendRouter;
 use crate::config::{BuildCaps, GrowlightdConfig, Policy};
 use crate::control::{Control, LiveKill};
 use crate::hub::EventHub;
@@ -137,6 +138,17 @@ pub struct Daemon {
     /// silent no-op (the audit-005 finding). The handles now live where the live
     /// backend writes them.
     pub kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
+    /// The live agent→backend routing table (opencode-fleet-backend slice 005),
+    /// registered by [`assemble_fleet`](crate::fleet::assemble_fleet) — the SAME
+    /// `Arc` the drive loop routes spawn/health/stderr/budget through, so the
+    /// `status` verb observes exactly what the fleet is running rather than a
+    /// second reconstruction of the roster that could drift from it.
+    ///
+    /// `None` while the fleet is DISARMED: nothing is assembled then, so there is
+    /// no live state and `status` reports the configured roster alone. Lives
+    /// *outside* `inner` (like `kill_handles`) so the read never contends on the
+    /// daemon lock. Read-only from here — the daemon never routes, it only looks.
+    pub backends: Arc<Mutex<Option<Arc<BackendRouter>>>>,
 }
 
 impl Daemon {
@@ -150,7 +162,24 @@ impl Daemon {
             build_caps: Arc::new(Mutex::new(BuildCaps::default())),
             live_scopes: Arc::new(Mutex::new(BTreeMap::new())),
             kill_handles: Arc::new(Mutex::new(BTreeMap::new())),
+            backends: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Register the assembled fleet's backend router, so `status` can read each
+    /// member's live health + metered spend off the very backend serving it.
+    /// Called by [`assemble_fleet`](crate::fleet::assemble_fleet) with the one
+    /// `Arc` it also hands the drive loop — never built separately, or the two
+    /// views could disagree about which backend a member runs on.
+    pub fn set_backend_router(&self, router: Arc<BackendRouter>) {
+        *self.backends.lock().unwrap() = Some(router);
+    }
+
+    /// The assembled fleet's backend router, or `None` on a disarmed fleet.
+    /// Brief-lock clone of the `Arc` — callers must not hold the registry lock
+    /// across a backend read.
+    pub fn backend_router(&self) -> Option<Arc<BackendRouter>> {
+        self.backends.lock().unwrap().clone()
     }
 
     /// Install the §4d thrash-clear hook (builder-style). Phase 6 binds this to

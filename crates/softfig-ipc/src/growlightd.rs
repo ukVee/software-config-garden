@@ -173,8 +173,13 @@ pub struct FleetStatusReply {
     /// back-compat. Distinct from `agents` (the *live* per-agent runtime state).
     #[serde(default)]
     pub roster: Vec<FleetMemberSummary>,
-    /// Per-agent summaries. Empty in phase 1 — the fleet arrives with the
-    /// scheduler/concurrency milestones.
+    /// Per-agent summaries — one row per roster member of an **armed** fleet,
+    /// carrying its live lifecycle, its backend, and its metered spend
+    /// (opencode-fleet-backend slice 006). Empty while the fleet is disarmed:
+    /// nothing is assembled then, so there is no live state to report and
+    /// [`roster`](Self::roster) is the whole truth. A client that wants a count of
+    /// *running* members filters on [`AgentSummary::running`] — an armed-but-idle
+    /// member is a row here without being live.
     #[serde(default)]
     pub agents: Vec<AgentSummary>,
     /// The transient-scope unit names of every CURRENTLY-RUNNING agent —
@@ -198,14 +203,128 @@ pub struct FleetMemberSummary {
     pub pin: Option<String>,
 }
 
-/// Per-agent line in [`FleetStatusReply::agents`]. Intentionally minimal for
-/// phase 1 (the fleet is empty); fleshed out by the observe + scheduler slices.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-agent line in [`FleetStatusReply::agents`] — one row per ARMED roster
+/// member, carrying the live lifecycle plus which backend serves it and (for a
+/// metered backend) what it has spent.
+///
+/// ## Why spend is an `Option` and there is no per-member reserve field
+///
+/// The two provider postures are not two values of one field, they are two
+/// different accountings, and the surface has to say which one a member is under
+/// or it misleads:
+///
+/// - A **claude** member draws on the Anthropic *subscription* pool. Its cost is
+///   the shared 5h/7d reserve — a FLEET-level reading
+///   ([`FleetStatusReply::policy`]'s halt rails gate it), not a per-member number
+///   — so `spend` is [`None`]. `None` reads as "not metered", which is the truth;
+///   a `0` would read as "metered, spent nothing", which is false.
+/// - An **opencode** member is metered per step. Its cost IS a per-member number
+///   and nothing it does touches the subscription reserve, so it carries
+///   `Some(spend)` and the surface shows that instead.
+///
+/// Deliberately there is no per-member reserve/5h field to be empty: that gauge
+/// was never per-member, and rendering an empty one against a metered member is
+/// exactly the "looks broken" bug the accounting slice exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSummary {
     /// Stable agent id (queue/work-stream tag).
     pub id: String,
-    /// Coarse lifecycle label (e.g. "idle", "running", "paused").
+    /// Coarse lifecycle label for display (e.g. "idle", "running", "exited",
+    /// "crashed (1)"). Human-facing — never matched on across the wire; that is
+    /// what [`running`](Self::running) is for.
     pub status: String,
+    /// Whether this member has a LIVE child right now. The machine-readable twin
+    /// of [`status`](Self::status), so a client counts running agents without
+    /// string-matching a display label (an armed-but-idle member is a row here
+    /// and must not be counted as running). Additive/defaulted for wire
+    /// back-compat.
+    #[serde(default)]
+    pub running: bool,
+    /// Which backend serves this member — `"claude"` or `"opencode"`. From the
+    /// configured roster, so it is known even before the member first spawns.
+    /// Defaults to `"claude"` for a pre-field decoder, which is what every member
+    /// was before the backend became plural.
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    /// The model/variant this member is pinned to, when its backend pins one
+    /// (`"deepseek/deepseek-v4-flash"`, or `"<model> (<variant>)"`). [`None`] for
+    /// claude — the model rides the harness there and is not growlightd's to
+    /// name — and for an opencode member left on opencode's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// This member's accumulated metered spend, or [`None`] when its backend is
+    /// not metered (see the type docs). Never `Some(0)` for a subscription member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<AgentSpendSummary>,
+}
+
+/// The default [`AgentSummary::backend`] for a decoder that predates the field:
+/// `"claude"`, the only backend that existed then.
+fn default_backend() -> String {
+    BACKEND_CLAUDE.to_string()
+}
+
+/// [`AgentSummary::backend`] for a `claude -p` member.
+pub const BACKEND_CLAUDE: &str = "claude";
+/// [`AgentSummary::backend`] for an `opencode run` member.
+pub const BACKEND_OPENCODE: &str = "opencode";
+
+impl AgentSummary {
+    /// A row for a member on the default (claude, unmetered) backend: an id, a
+    /// display label, and whether it is live. [`on_opencode`](Self::on_opencode)
+    /// re-points it at a metered backend.
+    pub fn new(id: impl Into<String>, status: impl Into<String>, running: bool) -> Self {
+        Self {
+            id: id.into(),
+            status: status.into(),
+            running,
+            backend: BACKEND_CLAUDE.to_string(),
+            model: None,
+            spend: None,
+        }
+    }
+
+    /// Re-point this row at the `opencode` backend, on `model` (its pinned
+    /// model/variant label, or `None` for opencode's own default) and carrying
+    /// `spend`.
+    pub fn on_opencode(mut self, model: Option<String>, spend: AgentSpendSummary) -> Self {
+        self.backend = BACKEND_OPENCODE.to_string();
+        self.model = model;
+        self.spend = Some(spend);
+        self
+    }
+}
+
+/// One metered member's accumulated session cost, as carried on
+/// [`AgentSummary::spend`].
+///
+/// **Session-scoped and in-memory.** These counters live in the backend's cells
+/// and are lost on a growlightd restart — deliberately: there is no per-event
+/// spend log on this device (eMMC wear). A durable rollup, if ever wanted, belongs
+/// in the garden's snapshots, not here.
+///
+/// **Accounting, not a gate — and that is deliberate.** Nothing enforces a limit
+/// on this number. The spend *cap* and its enforcement, the metered-provider 429
+/// `retry-after` hold, and per-provider pool separation are all spec-agents §7
+/// phase 4. This type is the data phase 4 arrives to rather than has to backfill;
+/// a reader finding no cap here has found a stub, not an oversight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AgentSpendSummary {
+    /// Accumulated cost in micro-USD (1e-6 USD). Integer, not a float: the cost
+    /// is accumulated in fixed point so a long run of sub-cent steps cannot drift.
+    pub micro_usd: u64,
+    /// Completed model steps billed into `micro_usd`.
+    pub steps: u64,
+}
+
+impl AgentSpendSummary {
+    /// Render as the operator-facing dollar amount, e.g. `$0.14`. Rounds to the
+    /// cent for display only — `micro_usd` stays the authority. A non-zero spend
+    /// below half a cent renders `$0.00`, which is honest at this precision; the
+    /// step count alongside it is what shows the member is actually working.
+    pub fn dollars(&self) -> String {
+        format!("${:.2}", self.micro_usd as f64 / 1_000_000.0)
+    }
 }
 
 /// The per-device policy growlightd runs under, echoed in `status`. Mirrors
@@ -1038,7 +1157,13 @@ mod tests {
                 FleetMemberSummary { agent: "builder".into(), pin: Some("queue:build".into()) },
                 FleetMemberSummary { agent: "reviewer".into(), pin: None },
             ],
-            agents: Vec::new(),
+            agents: vec![
+                AgentSummary::new("builder", "running", true),
+                AgentSummary::new("reviewer", "idle", false).on_opencode(
+                    Some("deepseek/deepseek-v4-flash (high)".into()),
+                    AgentSpendSummary { micro_usd: 140_000, steps: 3 },
+                ),
+            ],
             live_scopes: vec!["growlight-agent-builder-1.scope".into()],
         };
         let back: FleetStatusReply =
@@ -1049,6 +1174,61 @@ mod tests {
         assert_eq!(back.roster[0].pin.as_deref(), Some("queue:build"));
         assert_eq!(back.roster[1].pin, None);
         assert_eq!(back.live_scopes, vec!["growlight-agent-builder-1.scope".to_string()]);
+        assert_eq!(back.agents, reply.agents, "the live rows round-trip whole");
+    }
+
+    #[test]
+    fn an_agent_summary_distinguishes_unmetered_from_zero_spend_on_the_wire() {
+        // The distinction the status surface is built on, and it has to survive the
+        // wire: a subscription member carries NO spend (its cost is the shared
+        // 5h/7d reserve), a metered member that has billed nothing carries a spend
+        // of zero. A decoder that collapsed those would reintroduce exactly the
+        // display the accounting slice removed — a $0.00 metered figure against a
+        // claude member burning the pool, or an empty gauge against a working
+        // opencode one.
+        let unmetered = AgentSummary::new("a", "running", true);
+        let json = serde_json::to_value(&unmetered).unwrap();
+        assert_eq!(json.get("spend"), None, "an unmetered row omits spend entirely");
+        assert_eq!(json.get("model"), None, "and names no model it did not choose");
+        assert_eq!(json["backend"], BACKEND_CLAUDE);
+
+        let metered = AgentSummary::new("b", "idle", false)
+            .on_opencode(None, AgentSpendSummary::default());
+        let json = serde_json::to_value(&metered).unwrap();
+        assert_eq!(json["backend"], BACKEND_OPENCODE);
+        assert_eq!(json["spend"]["micro_usd"], 0, "a metered zero is still present");
+        assert_eq!(json.get("model"), None, "opencode on its own default names none");
+
+        for row in [unmetered, metered] {
+            let back: AgentSummary =
+                serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+            assert_eq!(back, row);
+        }
+    }
+
+    #[test]
+    fn a_pre_field_agent_summary_decodes_as_an_unmetered_claude_member() {
+        // Wire back-compat: a decoder meeting a row from before the backend became
+        // plural reads it as what every member was then — claude, unmetered, and
+        // (absent the flag) not asserted to be running.
+        let back: AgentSummary =
+            serde_json::from_str(r#"{"id":"a","status":"running"}"#).unwrap();
+        assert_eq!(back.backend, BACKEND_CLAUDE);
+        assert_eq!(back.model, None);
+        assert_eq!(back.spend, None);
+        assert!(!back.running);
+    }
+
+    #[test]
+    fn spend_renders_as_dollars_from_integer_micro_usd() {
+        // The accumulation is fixed-point; only the display rounds.
+        assert_eq!(AgentSpendSummary { micro_usd: 140_000, steps: 3 }.dollars(), "$0.14");
+        assert_eq!(AgentSpendSummary::default().dollars(), "$0.00");
+        assert_eq!(AgentSpendSummary { micro_usd: 2_500_000, steps: 9 }.dollars(), "$2.50");
+        // A real `deepseek-v4-flash` step is ~43 µUSD: below the cent, so it renders
+        // `$0.00` — honest at this precision, and the step count alongside it is
+        // what shows the member is working. `micro_usd` stays the authority.
+        assert_eq!(AgentSpendSummary { micro_usd: 43, steps: 1 }.dollars(), "$0.00");
     }
 
     #[test]

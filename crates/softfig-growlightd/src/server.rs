@@ -7,24 +7,30 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use std::path::Path;
 
 use softfig_ipc::growlightd::{
-    op, BatonArgs, BatonReply, FleetStatusReply, ForceStopArgs, InjectMessageArgs, InjectReply,
-    PausedReply, ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs,
-    ResumeItemReply, SetPolicyArgs, SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs,
-    StopLevel, StopReply,
+    op, AgentSpendSummary, AgentSummary, BatonArgs, BatonReply, FleetStatusReply, ForceStopArgs,
+    InjectMessageArgs, InjectReply, PausedReply, ReleaseLeaseArgs, RequestLeaseArgs,
+    RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs, SetResourcesArgs,
+    SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
-use crate::claude_backend::apply_set_property;
+use crate::agent_harness::apply_set_property;
+use crate::backend_router::BackendRouter;
 use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
+use crate::drive_loop::AgentHealthSource;
+use crate::fleet::{FleetMemberConfig, MemberBackend};
+use crate::opencode_preapproval::ModelSelection;
 use crate::resume::ResumeOutcome;
 use crate::state::State;
+use crate::supervisor::AgentHealth;
 
 const ACCEPT_POLL_MS: u64 = 100;
 /// How often a `subscribe` stream wakes between events to re-check `Stopping`.
@@ -204,34 +210,130 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
-/// `status`: the fleet snapshot. Phase 1 — empty fleet, just identity, policy,
-/// and the admission-gate (`paused`) state.
+/// `status`: the fleet snapshot — identity, policy, the admission gate (`paused`),
+/// the configured roster, and (on an ARMED fleet) one live row per member.
+///
+/// The live rows come from the registered [`BackendRouter`](crate::backend_router::BackendRouter)
+/// — the same table the drive loop routes through — so a member's reported health
+/// and spend are read off the backend actually serving it. A disarmed fleet has no
+/// router and therefore no live rows; `roster` is the whole truth then.
+///
+/// Snapshots the daemon lock and **releases it** before building the per-member
+/// rows: those read each backend's own cells, and taking a second lock under the
+/// daemon mutex is the shape that reintroduced the keeperd deadlock class
+/// (incident 20260622). The roster is a handful of members, so cloning it out is
+/// cheaper than the hazard.
 fn status(daemon: &Daemon) -> Response {
-    let inner = daemon.inner.lock().unwrap();
-    let roster = inner
-        .fleet
-        .members
+    let router = daemon.backend_router();
+    // Everything the daemon lock owns, taken in one brief hold.
+    let (state, garden_root, policy, paused, fleet_enabled, members) = {
+        let inner = daemon.inner.lock().unwrap();
+        (
+            inner.state.label().to_string(),
+            inner.config.garden_root.display().to_string(),
+            inner.config.policy.summary(),
+            inner.control.paused,
+            inner.fleet.enabled,
+            inner.fleet.members.clone(),
+        )
+    };
+    let roster = members
         .iter()
         .map(|m| softfig_ipc::growlightd::FleetMemberSummary {
             agent: m.agent.clone(),
             pin: m.pin.clone(),
         })
         .collect();
+    // One row per member of an armed fleet. `None` (disarmed) ⇒ no rows at all,
+    // rather than a roster echo with invented liveness.
+    let agents = match &router {
+        Some(router) => members.iter().map(|m| agent_summary(m, router)).collect(),
+        None => Vec::new(),
+    };
     let reply = FleetStatusReply {
-        state: inner.state.label().to_string(),
-        garden_root: inner.config.garden_root.display().to_string(),
+        state,
+        garden_root,
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
-        policy: inner.config.policy.summary(),
+        policy,
         build_caps: daemon.build_caps().summary(),
-        paused: inner.control.paused,
-        fleet_enabled: inner.fleet.enabled,
+        paused,
+        fleet_enabled,
         roster,
-        agents: Vec::new(),
+        agents,
         // The genuinely-running scope units (slice 006) — independent leaf lock,
         // like build_caps above; never reconstructed CLI-side.
         live_scopes: daemon.live_scope_units(),
     };
     ok_reply(&reply, "status")
+}
+
+/// One armed member's live `status` row: its lifecycle read off the backend
+/// serving it, plus — for a metered backend — that backend's spend accounting.
+///
+/// The backend and model come from the CONFIG (`m.backend`), not from the router:
+/// they are what the operator declared, and they are known even before the member
+/// first spawns. Only health and spend are live readings. Both views are built
+/// from the same `fleet.members`, so they cannot name different backends.
+fn agent_summary(m: &FleetMemberConfig, router: &Arc<BackendRouter>) -> AgentSummary {
+    let health = AgentHealthSource::health(router, &m.agent);
+    let row = AgentSummary::new(
+        &m.agent,
+        health_label(health),
+        matches!(health, Some(AgentHealth::Alive { .. })),
+    );
+    match &m.backend {
+        // A subscription member: no per-member dollar figure exists, and the row
+        // deliberately carries no spend rather than a $0.00 that would read as
+        // "metered, spent nothing" (see `AgentSummary`'s docs).
+        MemberBackend::Claude => row,
+        // A metered member: show what it has actually cost. `spend` is `Some` for
+        // every opencode route, but the config has ALREADY established this member
+        // is metered, so a missing reading is the zero accounting — never a silent
+        // demotion to the unmetered posture, which would misdescribe the member.
+        MemberBackend::Opencode(selection) => row.on_opencode(
+            model_label(selection),
+            router
+                .spend(&m.agent)
+                .map(|s| AgentSpendSummary {
+                    micro_usd: s.micro_usd,
+                    steps: s.steps,
+                })
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// The display label for an observed [`AgentHealth`]. Pure, so it is unit-proven
+/// directly.
+///
+/// `None` is `"idle"` — an armed member the backend has never spawned (or has
+/// forgotten), which is genuinely idle rather than missing. Note what is NOT here:
+/// `"hung"`. Classifying a stale `last_active` as hung needs the hang window and
+/// the current instant, which are the drive loop's (it owns the clock and acts on
+/// the verdict); `status` reports what it can see without re-deriving a judgement
+/// it would make with different inputs.
+fn health_label(health: Option<AgentHealth>) -> String {
+    match health {
+        None => "idle".to_string(),
+        Some(AgentHealth::Alive { .. }) => "running".to_string(),
+        // A clean exit is the normal baton-boundary roll, not a fault.
+        Some(AgentHealth::Exited { code: 0 }) => "exited".to_string(),
+        Some(AgentHealth::Exited { code }) => format!("crashed ({code})"),
+    }
+}
+
+/// The operator-facing label for an opencode member's [`ModelSelection`], or
+/// `None` when it pins neither half (opencode runs on its own default, and
+/// growlightd will not print a model name it did not choose).
+fn model_label(selection: &ModelSelection) -> Option<String> {
+    match (&selection.model, &selection.variant) {
+        (Some(model), Some(variant)) => Some(format!("{model} ({variant})")),
+        (Some(model), None) => Some(model.clone()),
+        // A variant pinned over opencode's default model: say so explicitly rather
+        // than printing a bare variant that looks like a model id.
+        (None, Some(variant)) => Some(format!("default ({variant})")),
+        (None, None) => None,
+    }
 }
 
 /// `baton`: read the LIVE runtime baton (read-only, transitional bridge). No
@@ -712,6 +814,175 @@ mod tests {
     fn test_daemon_with(persister: Arc<SpyPersister>) -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
             .with_resource_persister(persister)
+    }
+
+    /// A claude + opencode roster, the shape slice 006's status surface has to make
+    /// legible: `a`/`d` on the subscription pool, `b`/`c` metered on their own
+    /// models.
+    fn mixed_fleet() -> crate::fleet::FleetConfig {
+        crate::fleet::FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "claude_bin = \"claude\"\n",
+            "opencode_bin = \"opencode\"\n",
+            "prompt = \"kick\"\n",
+            "[[fleet]]\nagent = \"a\"\n",
+            "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\n",
+            "model = \"deepseek/deepseek-v4-flash\"\nvariant = \"high\"\n",
+            "[[fleet]]\nagent = \"c\"\nbackend = \"opencode\"\n",
+            "model = \"deepseek/deepseek-v4-pro\"\n",
+            "[[fleet]]\nagent = \"d\"\nbackend = \"claude\"\n",
+        ))
+        .expect("a mixed roster is valid")
+    }
+
+    /// Decode a `status` response's reply payload.
+    fn status_reply(daemon: &Daemon) -> FleetStatusReply {
+        let data = status(daemon)
+            .into_result()
+            .expect("status succeeds");
+        serde_json::from_value(data).expect("the reply decodes")
+    }
+
+    #[test]
+    fn status_renders_a_metered_member_with_its_spend_and_no_reserve_gauge() {
+        // Slice 006's user-visible deliverable, and the end of the long-standing
+        // `agents (none)` display: `agents` was a hardcoded `Vec::new()`, so an armed
+        // fleet reported "0 agent(s) running (roster: a)" however many members were
+        // live, and a metered member had nowhere to show what it had cost — the
+        // operator saw an Anthropic reserve surface with nothing in it and read the
+        // member as broken.
+        //
+        // Goes through `assemble_fleet`, so what `status` reads is the router the
+        // drive loop routes through — not a second reconstruction that could name a
+        // different backend for the same member.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        daemon.set_fleet_config(mixed_fleet());
+        let _loop = crate::fleet::assemble_fleet(&daemon, &mixed_fleet(), Path::new("/run/k.sock"))
+            .expect("an armed mixed roster assembles");
+
+        // `b` bills some real work; `c` stays untouched, so it is a metered member
+        // that has not billed yet (a distinct case from `b` — see below).
+        let router = daemon.backend_router().expect("assembly registered the router");
+        match router.backend_for("b").expect("a roster member is routed") {
+            crate::backend_router::BackendHandle::Opencode(b) => {
+                b.accrue_spend_for_test("b", 0.14)
+            }
+            crate::backend_router::BackendHandle::Claude(_) => {
+                unreachable!("b is configured as an opencode member")
+            }
+        }
+
+        let reply = status_reply(&daemon);
+        assert_eq!(reply.agents.len(), 4, "every armed member gets a row");
+        assert_eq!(
+            reply.agents.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c", "d"],
+            "rows follow config order, like the roster",
+        );
+
+        // The metered member reads as "opencode · <model> · $0.14".
+        let b = &reply.agents[1];
+        assert_eq!(b.backend, softfig_ipc::growlightd::BACKEND_OPENCODE);
+        assert_eq!(b.model.as_deref(), Some("deepseek/deepseek-v4-flash (high)"));
+        let spend = b.spend.expect("a metered member carries its spend");
+        assert_eq!(spend.micro_usd, 140_000);
+        assert_eq!(spend.steps, 1);
+        assert_eq!(spend.dollars(), "$0.14");
+
+        // A metered member that has never billed still shows the METERED posture —
+        // `$0.00`, zero steps. That is not the empty reserve gauge: it is a correct
+        // reading of a member that has not spent anything, and it names the pool it
+        // *will* spend from. (Zero steps, not one: a zero-cost `step_finish` would
+        // still count a step, so `steps == 0` means genuinely nothing observed.)
+        let c = &reply.agents[2];
+        assert_eq!(c.backend, softfig_ipc::growlightd::BACKEND_OPENCODE);
+        assert_eq!(c.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(c.spend, Some(AgentSpendSummary::default()));
+
+        // And the subscription members carry NO spend field at all — not a $0.00.
+        // Their cost is the shared 5h/7d reserve on the policy line, which is a
+        // fleet-level reading; a per-member dollar figure there would be invented.
+        for claude_member in [&reply.agents[0], &reply.agents[3]] {
+            assert_eq!(claude_member.backend, softfig_ipc::growlightd::BACKEND_CLAUDE);
+            assert_eq!(claude_member.model, None);
+            assert_eq!(
+                claude_member.spend, None,
+                "{} is on the subscription pool: no metered spend, which is not \
+                 the same as $0.00",
+                claude_member.id,
+            );
+        }
+
+        // Nothing has spawned, so nothing is running — the row exists without
+        // claiming liveness, which is what keeps the "N agent(s) running" count
+        // honest now that idle members are rows too.
+        assert!(
+            reply.agents.iter().all(|a| !a.running),
+            "an un-spawned member is a row, not a running agent",
+        );
+        assert_eq!(
+            reply.agents.iter().map(|a| a.status.as_str()).collect::<Vec<_>>(),
+            ["idle"; 4],
+        );
+    }
+
+    #[test]
+    fn a_disarmed_fleet_reports_its_roster_and_no_live_rows() {
+        // The complement: with the gate off growlightd assembles nothing, so there is
+        // no router and no live state to report. `agents` stays empty — the honest
+        // answer — and `roster` carries the configured fleet, exactly as it did
+        // before this slice. A roster echo under `agents` would claim liveness the
+        // daemon cannot observe.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        let mut disarmed = mixed_fleet();
+        disarmed.enabled = false;
+        daemon.set_fleet_config(disarmed);
+
+        let reply = status_reply(&daemon);
+        assert!(!reply.fleet_enabled);
+        assert!(reply.agents.is_empty(), "a disarmed fleet has no live rows");
+        assert_eq!(reply.roster.len(), 4, "the configured roster still reports");
+    }
+
+    #[test]
+    fn health_label_reports_what_it_observed_and_never_guesses_hung() {
+        // `None` is "idle" (an armed member the backend has not spawned), a clean
+        // exit is the normal baton-boundary roll rather than a fault, and a non-zero
+        // exit names its code so the operator can match it to the stderr tail.
+        assert_eq!(health_label(None), "idle");
+        assert_eq!(health_label(Some(AgentHealth::Alive { last_active: 7 })), "running");
+        assert_eq!(health_label(Some(AgentHealth::Exited { code: 0 })), "exited");
+        assert_eq!(health_label(Some(AgentHealth::Exited { code: 1 })), "crashed (1)");
+        // Deliberately absent: "hung". Classifying a stale `last_active` needs the
+        // hang window and the current instant, which are the drive loop's — a
+        // second, differently-fed judgement here could disagree with the one the
+        // fleet actually acts on.
+        assert_eq!(
+            health_label(Some(AgentHealth::Alive { last_active: 0 })),
+            "running",
+            "status reports liveness, it does not re-derive the hang verdict",
+        );
+    }
+
+    #[test]
+    fn model_label_names_only_what_the_config_pinned() {
+        assert_eq!(
+            model_label(&ModelSelection::model("deepseek/deepseek-v4-flash")),
+            Some("deepseek/deepseek-v4-flash".to_string()),
+        );
+        assert_eq!(
+            model_label(&ModelSelection::model("deepseek/deepseek-v4-flash").with_variant("high")),
+            Some("deepseek/deepseek-v4-flash (high)".to_string()),
+        );
+        // Neither half pinned: opencode runs on its own default, and growlightd will
+        // not print a model name it did not choose.
+        assert_eq!(model_label(&ModelSelection::default()), None);
+        // A variant over that default is said explicitly, so it cannot be misread as
+        // a model id.
+        assert_eq!(
+            model_label(&ModelSelection { model: None, variant: Some("high".into()) }),
+            Some("default (high)".to_string()),
+        );
     }
 
     fn call_set_resources(daemon: &Daemon, args: SetResourcesArgs) -> Response {
