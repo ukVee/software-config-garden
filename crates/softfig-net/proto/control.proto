@@ -73,6 +73,12 @@ message Frame {
     // recipient's real placement is per-device state that never crosses the wire
     // (the mount_path tripwire). See softfig-net's `offer` helpers.
     ShareOffer share_offer = 208;                    // sharer -> ring: "here is a share you may accept + place"
+    // Task 059 (membership-split convergence): the receiver's answer to a
+    // shared-chain push it will not adopt. Before 209 a rejection was a silent
+    // session close, which the sender's serve loop read as a clean EOF — i.e.
+    // indistinguishable from SUCCESS, let alone from a transport failure. This
+    // frame makes the refusal legible and carries the machine-readable reason.
+    ChainRejected chain_rejected = 209;              // receiver -> pusher: "I will not adopt this; here is why"
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
@@ -80,7 +86,7 @@ message Frame {
   // plane; 200-201 is the M5d shared-key ceremony; 202 is the M5d slice-008
   // recovery hand-off; 203-206 is the M5e write-turn coordination; 207 is the
   // M5e shared-chain push (slice 002); 208 is the M5f share-offer (slice 003);
-  // 209+ stays open for later sync slices.
+  // 209 is the task-059 push rejection; 210+ stays open for later sync slices.
   reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
@@ -396,4 +402,28 @@ message ShareOffer {
   string recommended_path = 3; // the sharer's advisory placement (empty = none); advisory ONLY, not the recipient's placement
   bytes device_id = 4;         // the offering device's Ed25519 identity (32 bytes); must match the session peer
   bytes signature = 5;         // Ed25519 (64 bytes) over share_offer_signing_bytes(...)
+}
+
+// --- Task 059: shared-chain push rejection --------------------------------
+//
+// receiver -> pusher: "I am not adopting this push, and this is the reason."
+// Sent on the same session the push arrived on, immediately before the receiver
+// closes, so the pusher reads it in place of the GetTree it was expecting.
+//
+// WHAT AUTHORITY THIS FRAME CARRIES, exactly: it is a statement about the
+// SENDER'S OWN local state, authenticated two ways (the Noise session is bound
+// to the dialed peer's static key, and the frame is Ed25519-signed over
+// chain_rejected_signing_bytes(...) by that same identity). It is therefore
+// honoured ONLY as a reason to stop pushing THIS chain to THAT peer and to
+// surface the divergence to a human. It is NEVER authority to mutate the
+// receiving side's membership ledger: membership is a committed security
+// boundary, and converging by trusting whichever side is more insistent is how
+// a removed member gets re-added. A forged NOT_A_MEMBER can therefore do no
+// more than a real S-member could already do by ignoring our pushes — withhold
+// its own sync. See the keeperd `chain_health` module.
+message ChainRejected {
+  bytes chain_id = 1;  // the chain ref name (utf-8 "chain/<subtree>") being refused, echoed from the push
+  uint32 reason = 2;   // ChainRejectReason discriminant (1 = not-a-member, 2 = unknown-chain, 3 = not-ready); an unknown value is read as "other", never as success
+  bytes device_id = 3; // the REJECTING device's Ed25519 identity (32 bytes); must match the session peer
+  bytes signature = 4; // Ed25519 (64 bytes) over chain_rejected_signing_bytes(...)
 }

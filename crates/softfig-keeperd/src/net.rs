@@ -46,21 +46,24 @@ use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 use softfig_net::proto::{
-    frame, DeviceStateAnnounce, Frame, ReplicaGrant, ShareOffer, SharedChainPush, SharedKeyCommit,
-    SharedKeyHandoff, TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
+    frame, ChainRejected, DeviceStateAnnounce, Frame, ReplicaGrant, ShareOffer, SharedChainPush,
+    SharedKeyCommit, SharedKeyHandoff, TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
 };
 use softfig_net::connect::{plan_routes, Route};
 use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
-    device_state_signing_bytes, pull_replication_pipelined, pull_subtree, serve_replication,
+    chain_rejected_signing_bytes, device_state_signing_bytes, pull_replication_pipelined,
+    pull_subtree, serve_replication,
     share_offer_signing_bytes, shared_chain_push_signing_bytes, static_attestation_message,
     turn_request_signing_bytes, turn_revoke_signing_bytes,
     turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_share_offer_sig,
     verify_shared_chain_push_sig, verify_turn_request_sig, verify_turn_revoke_sig,
-    verify_turn_yield_sig, DeviceState, LeaseEvent, LeaseScope, NetError, ServeSummary, WriteTurn,
+    verify_turn_yield_sig, ChainRejectReason, DeviceState, LeaseEvent, LeaseScope, NetError,
+    ServeSummary, WriteTurn,
 };
+use crate::chain_health::{Class as HealthClass, Role as HealthRole};
 use softfig_store::Hash;
 use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo};
@@ -1985,6 +1988,67 @@ fn serve_replica_ingest(
 }
 
 /// Serve an inbound `SharedChainPush` (M5e slice 002, part 2b): a chain
+/// Refuse a shared-chain push *out loud* (task 059): answer the sender with a
+/// signed [`ChainRejected`] frame carrying the machine-readable reason, and
+/// record the refusal in the membership-health latch so the journal gets one
+/// transition line plus hourly summaries instead of one line per push forever.
+///
+/// Before this, a refusal was a bare `return`: the session closed, and the
+/// sender's serve loop read that as `UnexpectedEof` → "peer closed cleanly" →
+/// **success**. So the only failure mode that can persist indefinitely was also
+/// the only one invisible to the side that could fix it.
+///
+/// Best-effort on the wire — the sender may already be gone, and a send failure
+/// here must not stop us latching the log line. The reply is signed with this
+/// device's identity (the vault session); if the daemon is locked we cannot
+/// sign, so we still latch and simply close, which is the pre-059 behaviour.
+fn reject_chain_push(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    session: &mut NoiseSession<TcpStream>,
+    chain: &str,
+    sender: &[u8; 32],
+    reason: ChainRejectReason,
+) {
+    let (line, frame) = {
+        let mut inner = daemon.inner.lock().unwrap();
+        let line = inner.chain_health.observe(
+            HealthRole::Inbound,
+            chain,
+            *sender,
+            HealthClass::Rejected(reason),
+            now_secs(),
+        );
+        let frame = inner.session.as_ref().map(|vault| {
+            let local_id = local.device_id;
+            let signature = vault
+                .sign(&chain_rejected_signing_bytes(
+                    chain.as_bytes(),
+                    &local_id,
+                    reason,
+                ))
+                .to_bytes()
+                .to_vec();
+            Frame::chain_rejected(ChainRejected {
+                chain_id: chain.as_bytes().to_vec(),
+                reason: reason.as_u32(),
+                device_id: local_id.to_vec(),
+                signature,
+            })
+        });
+        (line, frame)
+    };
+    // Lock released before any network IO (the serve path's standing discipline).
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+    if let Some(frame) = frame {
+        if let Err(e) = session.send_frame(&frame) {
+            eprintln!("keeperd: net: shared-chain {chain}: could not send the rejection: {e}");
+        }
+    }
+}
+
 /// S-member pushed a committed edit for us to adopt. The choreography mirrors
 /// [`serve_replica_ingest`] — the sender dialed, sent this frame, and is now
 /// serving [`serve_replication`] on the same session — so we receive-then-pull:
@@ -2042,14 +2106,49 @@ fn serve_shared_chain_push(
         return;
     }
     let Some((membership, members)) = resolve_chain_members(daemon, ring, local, &chain) else {
-        return; // locked mid-serve — the sender retries on its next tick
-    };
-    if !turn_sender_is_member(&membership, &chain, &members, &sender) {
-        eprintln!(
-            "keeperd: net: shared-chain-push for {chain} from non-member {}; rejecting",
-            hex::encode(sender)
+        // Locked mid-serve, or committed membership unreadable. TRANSIENT — say
+        // exactly that on the wire (task 059) so the sender keeps retrying; a
+        // lock window must never latch as a membership verdict.
+        reject_chain_push(
+            daemon,
+            local,
+            &mut session,
+            &chain,
+            &sender,
+            ChainRejectReason::NotReady,
         );
         return;
+    };
+    if !turn_sender_is_member(&membership, &chain, &members, &sender) {
+        // Task 059: tell the sender WHY, distinguishably from a transport
+        // failure, and bound the log. The two verdicts are kept apart because
+        // their fixes differ — `UnknownChain` means this device holds no row for
+        // the chain at all (the live 2026-08 case: `subtree = []` here while the
+        // peer still held its own membership), `NotAMember` means the chain
+        // exists here but this sender is not in its S-member set.
+        let reason = if membership.subtrees.iter().any(|r| r.ref_name == chain) {
+            ChainRejectReason::NotAMember
+        } else {
+            ChainRejectReason::UnknownChain
+        };
+        reject_chain_push(daemon, local, &mut session, &chain, &sender, reason);
+        return;
+    }
+    // An accepted push is the recovery edge for the inbound latch: if we were
+    // refusing this peer on this chain, the journal says so once, here.
+    {
+        let mut inner = daemon.inner.lock().unwrap();
+        let line = inner.chain_health.observe(
+            HealthRole::Inbound,
+            &chain,
+            sender,
+            HealthClass::Ok,
+            now_secs(),
+        );
+        drop(inner);
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
     }
 
     // Pull the edit's tree closure into the LIVE store OFF the daemon lock: read

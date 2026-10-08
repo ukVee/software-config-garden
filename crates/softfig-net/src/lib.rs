@@ -68,16 +68,17 @@ pub use error::{NetError, Result};
 pub use offer::{share_offer_signing_bytes, verify_share_offer_sig};
 pub use pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 pub use proto::{
-    CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload,
-    ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant, ShareOffer,
-    SharedChainPush, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke,
-    TurnYield,
+    ChainRejected, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree,
+    HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant,
+    ShareOffer, SharedChainPush, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg, TurnRequest,
+    TurnRevoke, TurnYield,
 };
 pub use turn::{
-    device_state_signing_bytes, shared_chain_push_signing_bytes, turn_request_signing_bytes,
-    turn_revoke_signing_bytes, turn_yield_signing_bytes, verify_device_state_sig,
-    verify_shared_chain_push_sig, verify_turn_request_sig, verify_turn_revoke_sig,
-    verify_turn_yield_sig, DeviceState, LeaseConfig, LeaseEvent, LeaseScope, WriteTurn,
+    chain_rejected_signing_bytes, device_state_signing_bytes, shared_chain_push_signing_bytes,
+    turn_request_signing_bytes, turn_revoke_signing_bytes, turn_yield_signing_bytes,
+    verify_chain_rejected_sig, verify_device_state_sig, verify_shared_chain_push_sig,
+    verify_turn_request_sig, verify_turn_revoke_sig, verify_turn_yield_sig, ChainRejectReason,
+    ChainRejection, DeviceState, LeaseConfig, LeaseEvent, LeaseScope, WriteTurn,
 };
 pub use relay::{relay_accept, relay_connect, Relay, RelayStream};
 pub use replica::{

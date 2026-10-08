@@ -11,10 +11,10 @@ mod generated {
 }
 
 pub use generated::{
-    frame, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip, GetTree,
-    HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone, ReplicaGrant,
-    ShareOffer, SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal, StateAnnounce,
-    TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+    frame, ChainRejected, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip,
+    GetTree, HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone,
+    ReplicaGrant, ShareOffer, SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal,
+    StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
 };
 
 /// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
@@ -222,6 +222,18 @@ impl Frame {
     pub fn share_offer(offer: ShareOffer) -> Self {
         Self {
             kind: Some(frame::Kind::ShareOffer(offer)),
+        }
+    }
+
+    // --- Task 059 push-rejection frame constructor -------------------------
+
+    /// A `ChainRejected` frame (receiver -> pusher): "I will not adopt this
+    /// push to this chain, and here is the reason." Sent in place of the
+    /// `GetTree` the pusher is waiting for, so a refusal is distinguishable
+    /// from both a clean transfer and a dropped connection.
+    pub fn chain_rejected(rejected: ChainRejected) -> Self {
+        Self {
+            kind: Some(frame::Kind::ChainRejected(rejected)),
         }
     }
 }

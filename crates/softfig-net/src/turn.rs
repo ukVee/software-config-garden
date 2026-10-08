@@ -119,6 +119,97 @@ impl LeaseScope {
     }
 }
 
+/// Why a receiver refused a shared-chain push (task 059, `ChainRejected.reason`).
+///
+/// The point of the enum — rather than a bare "rejected" — is that the three
+/// cases have different fixes and only one of them is the sender's to make:
+/// `NotAMember` means the sender's membership row is stale and no retry will
+/// ever succeed, while `NotReady` is transient and SHOULD be retried. Before
+/// this existed a rejection was a silent session close that the pusher's serve
+/// loop read as a clean EOF, so "you are not a member" and "the push worked"
+/// were the same observation — which is why a 12,854-rejection split could run
+/// for 27 days with neither side learning anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainRejectReason {
+    /// The receiver holds no S-membership row naming the sender for this chain.
+    /// Terminal for the sender: retrying cannot change the answer, because the
+    /// receiver's membership is committed state only a ceremony (or the human)
+    /// changes. This is the 059 live case.
+    NotAMember,
+    /// The receiver has no membership row for this chain AT ALL — it doesn't
+    /// participate. Kept distinct from `NotAMember` because the fix differs: the
+    /// chain is dead here, not merely missing one member.
+    UnknownChain,
+    /// The receiver could not decide right now (locked mid-serve, membership
+    /// unreadable). TRANSIENT — the sender must keep retrying; treating this as
+    /// terminal would turn a brief lock window into a permanent sync outage.
+    NotReady,
+    /// A reason this build does not know. Treated as non-terminal (retry), never
+    /// as success: a newer peer must not be able to silence us with a reason we
+    /// can't reason about, and must not have its refusal read as an adoption.
+    Other(u32),
+}
+
+impl ChainRejectReason {
+    /// The wire encoding (`ChainRejected.reason`). `0` is deliberately unused so
+    /// a default-constructed / truncated frame cannot read as a real reason.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            ChainRejectReason::NotAMember => 1,
+            ChainRejectReason::UnknownChain => 2,
+            ChainRejectReason::NotReady => 3,
+            ChainRejectReason::Other(v) => v,
+        }
+    }
+
+    /// Decode the wire value. Unlike [`LeaseScope::from_u32`] this is infallible:
+    /// an unknown reason becomes [`ChainRejectReason::Other`] rather than `None`,
+    /// because dropping an unparseable rejection would restore exactly the bug
+    /// being fixed (a refusal indistinguishable from a success). Fail-closed here
+    /// means "keep retrying + stay visible", not "assume the push landed".
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => ChainRejectReason::NotAMember,
+            2 => ChainRejectReason::UnknownChain,
+            3 => ChainRejectReason::NotReady,
+            other => ChainRejectReason::Other(other),
+        }
+    }
+
+    /// Whether this reason is the sender's to act on by *stopping*. `true` only
+    /// for the two membership verdicts: the receiver is authoritative over its
+    /// own membership, so no amount of retrying will change the answer. Every
+    /// other reason — including one this build cannot parse — keeps retrying.
+    pub fn is_terminal_for_sender(self) -> bool {
+        matches!(
+            self,
+            ChainRejectReason::NotAMember | ChainRejectReason::UnknownChain
+        )
+    }
+
+    /// A short stable slug for the journal, the health file, and the CLI.
+    pub fn slug(self) -> String {
+        match self {
+            ChainRejectReason::NotAMember => "not-a-member".to_string(),
+            ChainRejectReason::UnknownChain => "unknown-chain".to_string(),
+            ChainRejectReason::NotReady => "not-ready".to_string(),
+            ChainRejectReason::Other(v) => format!("unknown-reason-{v}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ChainRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            ChainRejectReason::NotAMember => "not an S-member of that chain there",
+            ChainRejectReason::UnknownChain => "that chain is unknown there",
+            ChainRejectReason::NotReady => "peer could not decide (locked / unreadable)",
+            ChainRejectReason::Other(_) => "refused for a reason this build does not know",
+        };
+        f.write_str(text)
+    }
+}
+
 /// Timing knobs for a chain's lease. `lease_ttl` is the liveness window — a
 /// holder must renew (heartbeat) within it or its lease is presumed dead and
 /// revoked (the crash/partition path). `max_lease` is the hard ceiling on any
@@ -447,6 +538,11 @@ const TURN_REVOKE_DOMAIN: &[u8] = b"softfig/turn/revoke/v1";
 /// Domain-separation prefix for a `shared-chain-push` signature (M5e slice 002).
 const SHARED_CHAIN_PUSH_DOMAIN: &[u8] = b"softfig/turn/shared-chain-push/v1";
 
+/// Domain separator for the task-059 push rejection. Distinct from the push's
+/// own domain so a captured push signature can never be replayed as a rejection
+/// (or the reverse).
+const CHAIN_REJECTED_DOMAIN: &[u8] = b"softfig/turn/chain-rejected/v1";
+
 /// The exact bytes a device's Ed25519 identity signs to announce its state.
 /// Binds the device id, the state code, the unlocked flag, and the per-device
 /// logical clock `seq` so a stale announce can be ordered against a fresh one and
@@ -584,6 +680,79 @@ pub fn shared_chain_push_signing_bytes(
     m
 }
 
+/// A decoded, length-checked `ChainRejected` frame (task 059).
+///
+/// Decoding is split from verification on purpose: the replication serve loop
+/// (`serve_replication`) sees the frame but does not know which peer it dialed,
+/// while the caller that planned the dial does. So the loop decodes and hands
+/// this up as a typed error, and the caller calls [`ChainRejection::verified`]
+/// with the device id it expected to be talking to. A rejection that fails
+/// either check is NOT acted on — but it is also not read as success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRejection {
+    /// The chain ref the peer refused, as it echoed it back.
+    pub chain: String,
+    /// Why, decoded (unknown values survive as [`ChainRejectReason::Other`]).
+    pub reason: ChainRejectReason,
+    /// The rejecting device's claimed Ed25519 identity.
+    pub device_id: [u8; 32],
+    /// Ed25519 over [`chain_rejected_signing_bytes`].
+    pub signature: Vec<u8>,
+}
+
+impl ChainRejection {
+    /// Decode a wire frame. Fails only on a malformed `device_id` length — a
+    /// chain ref is taken as lossy utf-8 (it is only ever compared and printed)
+    /// and an unknown reason decodes to `Other`.
+    pub fn from_wire(chain_id: &[u8], device_id: &[u8], reason: u32, signature: &[u8]) -> Option<Self> {
+        let device_id = <[u8; 32]>::try_from(device_id).ok()?;
+        Some(Self {
+            chain: String::from_utf8_lossy(chain_id).into_owned(),
+            reason: ChainRejectReason::from_u32(reason),
+            device_id,
+            signature: signature.to_vec(),
+        })
+    }
+
+    /// Whether this rejection may be acted on: it must be signed by the identity
+    /// it claims, AND that identity must be the peer we actually dialed. The
+    /// second half is what stops a relay or a third ring device from refusing on
+    /// a member's behalf.
+    pub fn verified(&self, expected_peer: &[u8; 32]) -> bool {
+        &self.device_id == expected_peer
+            && verify_chain_rejected_sig(
+                self.chain.as_bytes(),
+                &self.device_id,
+                self.reason,
+                &self.signature,
+            )
+    }
+}
+
+/// The exact bytes a REJECTING device's Ed25519 identity signs to refuse a
+/// shared-chain push (task 059). The chain ref is length-prefixed and the
+/// rejecter's own id + the reason discriminant are bound in, so a rejection for
+/// one chain cannot be replayed as a rejection for another, and a `NotReady`
+/// (retry) cannot be edited into a `NotAMember` (stop) in flight.
+///
+/// Deliberately NOT bound: the pushed tree hashes. A rejection answers "may you
+/// push this chain to me at all", which is tree-independent — binding the tree
+/// would let a peer's refusal be replayed against a later push, and would make
+/// the sender's latch key depend on content it is being told not to send.
+pub fn chain_rejected_signing_bytes(
+    chain_id: &[u8],
+    device_id: &[u8; 32],
+    reason: ChainRejectReason,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(CHAIN_REJECTED_DOMAIN.len() + 4 + chain_id.len() + 32 + 4);
+    m.extend_from_slice(CHAIN_REJECTED_DOMAIN);
+    m.extend_from_slice(&(chain_id.len() as u32).to_be_bytes());
+    m.extend_from_slice(chain_id);
+    m.extend_from_slice(device_id);
+    m.extend_from_slice(&reason.as_u32().to_be_bytes());
+    m
+}
+
 /// Verify a `device-state-announce` signature against the announcing device's
 /// Ed25519 identity key. Never panics — a bad key, wrong-length signature, or a
 /// non-verifying signature all return `false` (the `ceremony`/`replica` shape).
@@ -681,6 +850,27 @@ pub fn verify_shared_chain_push_sig(
             files,
             timestamp,
         ),
+        sig,
+    )
+}
+
+/// Verify a `chain-rejected` signature against the REJECTING device's Ed25519
+/// identity key (task 059). Never panics.
+///
+/// A valid signature proves the refusal came from that device and was not edited
+/// in flight. It proves nothing about whether the refusal is *correct* — see the
+/// authority note on `ChainRejected` in `control.proto`: the frame is honoured
+/// only as a reason to stop pushing that chain to that peer and to surface the
+/// divergence, never as authority to mutate local membership.
+pub fn verify_chain_rejected_sig(
+    chain_id: &[u8],
+    device_id: &[u8; 32],
+    reason: ChainRejectReason,
+    sig: &[u8],
+) -> bool {
+    verify_sig(
+        device_id,
+        &chain_rejected_signing_bytes(chain_id, device_id, reason),
         sig,
     )
 }

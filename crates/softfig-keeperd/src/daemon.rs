@@ -167,6 +167,16 @@ pub struct DaemonInner {
     /// snapshot-under-lock / IO-off-lock discipline as the expiry-revoke path.
     /// In-memory; cleared on soft lock alongside [`Self::write_turns`].
     pub pending_turn_broadcasts: Vec<crate::net::PendingTurnBroadcast>,
+    /// Task 059 — the shared-chain membership-health latch: what each peer and
+    /// this device disagree about per chain, which direction, and for how long.
+    /// Three jobs: it bounds the rejection log to a transition plus hourly
+    /// summaries (the live bug was 12,854 identical lines over 27 days), it
+    /// gates the outbound fan-out so a chain a peer says we are not a member of
+    /// stops being pushed every 50s, and it is the read model the health
+    /// surface renders. In-memory on purpose — see the module docs on why this
+    /// one is NOT persisted the way task 058's replica health is. Cleared on
+    /// soft lock alongside [`Self::write_turns`].
+    pub chain_health: crate::chain_health::ChainHealth,
 }
 
 impl DaemonInner {
@@ -193,6 +203,7 @@ impl DaemonInner {
             peer_states: HashMap::new(),
             write_turns: HashMap::new(),
             pending_turn_broadcasts: Vec::new(),
+            chain_health: crate::chain_health::ChainHealth::new(),
         }
     }
 }
@@ -335,6 +346,7 @@ impl Daemon {
             inner.write_turns.clear();
             inner.pending_turn_broadcasts.clear();
             inner.peer_states.clear();
+            inner.chain_health.clear();
             inner.session = None;
             inner.repo = None;
             (fuse, net, supervise, resume_pending)
