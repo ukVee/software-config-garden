@@ -1,7 +1,7 @@
 # growlight fleet backends — putting a member on opencode
 
 > Applies to `config/growlight.toml` in the garden, read by growlightd at arm time.
-> Added by the `opencode-fleet-backend` milestone (spec-agents phase 2), slice 005.
+> Added by the `opencode-fleet-backend` milestone (spec-agents phase 2), slices 005-006.
 
 A growlight fleet member runs on `claude -p` by default. It can instead run on
 `opencode run` (over a metered provider such as DeepSeek), chosen **per member**, so
@@ -63,8 +63,60 @@ The two providers are not symmetric, and the asymmetry is deliberate:
   distinct backends, not over members: several claude members share one backend, whose
   window is already fleet-wide across them.
 
-Per-member USD spend on a metered provider is accumulated (`step_finish.cost`) and
-surfaced by slice 006.
+- **Per-member USD spend** is the mirror image of the budget: only an opencode member
+  reports it (accumulated from each `step_finish.cost`), and a claude member contributes
+  **nothing** — its cost *is* the 5h/7d reserve above. The spend seam is structurally
+  `None` for claude for the same reason `budget()` is structurally `None` for opencode.
+
+Each seam answers `None` for the provider it does not describe, and nothing invents the
+other reading. That symmetry is what makes the status surface honest — see below.
+
+## Reading a mixed fleet: `growlight status`
+
+`growlight status` reports two lists, and the difference matters:
+
+- **`roster`** — what `config/growlight.toml` declares. Always present, even while the
+  fleet is disarmed.
+- **`agents`** — one live row per member of an **armed** fleet. Empty while disarmed:
+  nothing is assembled then, so there is no runtime state to report and inventing a
+  roster echo here would claim liveness the daemon cannot observe.
+
+```
+roster:
+  a                pin=queue:default
+  b                (fallback)
+agents:
+  a                running      claude
+  b                running      opencode · deepseek/deepseek-v4-flash (high) · $0.14 this session (3 steps)
+```
+
+The TUI fleet panel carries the same reading, terser (`b:running · opencode ·
+deepseek/deepseek-v4-flash · $0.14`).
+
+Note what a **claude** row does *not* show: a dollar figure. There is no per-member
+reserve or spend column at all, and that is the design, not an omission. A claude
+member's cost is the shared 5h/7d subscription reserve — a fleet-level reading, shown on
+the `policy` line — so there is no per-member number to print. Before this, `agents` was
+hardcoded empty, so an armed fleet read `0 agent(s) running (roster: a)` however many
+members were live, and a working metered member appeared against an empty Anthropic
+reserve gauge and looked broken. Two consequences of the fix are worth knowing:
+
+- A metered member that has billed nothing shows `$0.00 … (0 steps)` — the metered
+  posture at zero, naming the pool it spends from. A claude member shows **no** spend
+  field. `$0.00` and absent are different readings and are not collapsed, on the wire or
+  on screen.
+- `agents` now lists **idle** members too, so a client counting running agents must
+  filter on the row's `running` flag rather than counting rows.
+
+### Spend accounting is session-scoped, and it is not a cap
+
+- **In memory only.** The counters live in the backend's cells and are lost on a
+  growlightd restart. Deliberate: there is no per-event spend log on this device (eMMC
+  wear). A durable rollup, if ever wanted, belongs in `snapshots/growlight/`.
+- **Nothing enforces a limit on it.** The spend *cap* and its enforcement, the metered
+  429 `retry-after` hold, and per-provider pool separation are all **spec-agents §7
+  phase 4**. What exists today is the accounting phase 4 will arrive to rather than have
+  to backfill. A reader finding no cap has found a stub, not an oversight.
 
 ## What is shared regardless of backend
 
@@ -83,7 +135,11 @@ Two differences worth knowing when reading logs:
 - An opencode member's config is handed over in the `OPENCODE_CONFIG` environment
   variable rather than on argv, because opencode has no `--settings` equivalent.
 
-## Known gap
+## Known gaps
+
+The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent
+row carries id/status/ctx only. `growlight status` and the TUI do. Surfacing it there is
+its own change.
 
 A headless opencode member cannot write to a **code repo**. Its cwd is the garden, and
 opencode's `external_directory` governs every path outside cwd, so an ungranted repo

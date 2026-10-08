@@ -217,7 +217,10 @@ impl App {
         self.policy = Some(r.policy);
         self.build_caps = Some(r.build_caps);
         self.paused = r.paused;
-        for AgentSummary { id, status } in r.agents {
+        // `..`: the GUI's per-agent row carries id/status/ctx only. The backend +
+        // metered-spend fields slice 006 added are rendered by `growlight status`
+        // and the TUI fleet panel; surfacing them in this panel is its own change.
+        for AgentSummary { id, status, .. } in r.agents {
             match self.agents.iter_mut().find(|row| row.id == id) {
                 Some(row) => row.status = status,
                 None => self.agents.push(AgentRow {
@@ -381,14 +384,8 @@ mod tests {
             fleet_enabled: false,
             roster: Vec::new(),
             agents: vec![
-                AgentSummary {
-                    id: "a".into(),
-                    status: "running".into(),
-                },
-                AgentSummary {
-                    id: "b".into(),
-                    status: "idle".into(),
-                },
+                AgentSummary::new("a", "running", true),
+                AgentSummary::new("b", "idle", false),
             ],
             live_scopes: Vec::new(),
         };

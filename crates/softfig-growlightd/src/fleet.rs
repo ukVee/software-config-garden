@@ -449,6 +449,10 @@ pub fn assemble_fleet(
     // shared registries stay fleet-wide inside `build_member_backends`, or the
     // daemon's kill / `set_resources` paths would stop reaching some members.
     let router = Arc::new(build_member_backends(daemon, fleet, &agents_dir, &garden_root));
+    // Let `status` see the SAME router (slice 006). Registered here rather than in
+    // `main` so the observation seam cannot be forgotten or built twice: the view
+    // the operator reads is literally the table the loop routes through.
+    daemon.set_backend_router(Arc::clone(&router));
 
     let members: Vec<FleetMember> = fleet
         .members
@@ -719,7 +723,11 @@ pub fn spawn_fleet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::BudgetUsage;
     use crate::config::GrowlightdConfig;
+    use crate::drive_loop::BudgetSampleSource;
+    use crate::opencode_backend::AgentSpend;
+    use crate::usage::{UsageAggregator, UsageSample};
 
     fn daemon() -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
@@ -1268,6 +1276,106 @@ agent = "reviewer"
                 .all(|b| matches!(b, BackendHandle::Opencode(_))),
             "no claude backend is constructed for an all-opencode roster",
         );
+    }
+
+    /// Reach a mixed roster's opencode backend for `agent` — the metered half of
+    /// the router, which the spend seam is the only reader of.
+    fn opencode_backend_for(router: &BackendRouter, agent: &str) -> Arc<OpencodeBackend> {
+        match router.backend_for(agent).expect("a roster member is routed") {
+            BackendHandle::Opencode(b) => Arc::clone(b),
+            BackendHandle::Claude(_) => panic!("{agent} is configured as an opencode member"),
+        }
+    }
+
+    #[test]
+    fn a_metered_members_spend_never_becomes_a_claude_members_accounting() {
+        // Slice 006's first invariant: making a metered member legible must not give
+        // a subscription member a spend figure. The two are different accountings,
+        // and the seam says so structurally — `spend` is `None` for every claude
+        // route, no matter how much the opencode members alongside it have billed.
+        // A `Some(0)` here would render as "$0.00 this session" against a claude
+        // member that is in fact burning the shared reserve: a precise inversion of
+        // the bug this slice exists to fix.
+        let d = daemon();
+        let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
+
+        // Both metered members do real work (folded through the same
+        // `AgentSpendState::record` a `step_finish` drives).
+        opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.000_043);
+        opencode_backend_for(&router, "c").accrue_spend_for_test("c", 0.12);
+
+        // The metered members read as metered...
+        let b = router.spend("b").expect("an opencode member is metered");
+        assert_eq!(b, AgentSpend { micro_usd: 43, steps: 1 }, "b's accrual is its own");
+        let c = router.spend("c").expect("an opencode member is metered");
+        assert_eq!(c, AgentSpend { micro_usd: 120_000, steps: 1 }, "c's accrual is its own");
+
+        // ...and the claude members read as NOT metered — `None`, not zero.
+        for claude_member in ["a", "d"] {
+            assert_eq!(
+                router.spend(claude_member),
+                None,
+                "{claude_member} is a subscription member: it has no metered spend, \
+                 which is not the same as having spent nothing",
+            );
+        }
+    }
+
+    #[test]
+    fn the_subscription_aggregate_is_unaffected_by_a_metered_members_activity() {
+        // Slice 006's hard constraint: the `UsageAggregator` is the ANTHROPIC
+        // subscription pool, and a metered member must contribute nothing to it —
+        // the admission gate governing the claude members is computed from this
+        // aggregate, so one synthetic reading from a DeepSeek run would mis-gate the
+        // whole fleet.
+        //
+        // Driven through the REAL seam (`BudgetSampleSource::budget` over the real
+        // router) and the real fold the tick performs, with the metered members
+        // actively billing at the time — so what is proven is the mechanism, not a
+        // restatement of the posture.
+        let d = daemon();
+        let router = Arc::new(build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden")));
+        opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.07);
+        opencode_backend_for(&router, "c").accrue_spend_for_test("c", 2.5);
+        assert!(
+            router.spend("b").is_some_and(|s| s.micro_usd > 0),
+            "the metered member really has billed — otherwise this proves nothing",
+        );
+
+        let now = 1_700_000_000;
+        // The control: one claude member's reading of the shared pool, folded in the
+        // way `DriveLoop::tick` step 0 folds it.
+        let claude_reading = BudgetUsage::new(42, 17);
+        let mut aggregate = UsageAggregator::new();
+        aggregate.observe(UsageSample::new("a", claude_reading, now));
+        let claude_only = aggregate.aggregate_at(now);
+
+        // Now offer EVERY member to the same fold, exactly as the tick does: the
+        // aggregate takes whatever `budget(agent)` yields, and nothing else.
+        for member in ["a", "b", "c", "d"] {
+            if let Some(budget) = BudgetSampleSource::budget(&router, member) {
+                aggregate.observe(UsageSample::new(member.to_string(), budget, now));
+            }
+        }
+
+        assert_eq!(
+            aggregate.agent_count(),
+            1,
+            "only the claude member that actually read the pool contributes a sample \
+             — a metered member never enters the aggregate at all",
+        );
+        assert_eq!(
+            aggregate.aggregate_at(now),
+            claude_only,
+            "the aggregate is byte-identical to the claude member's reading alone",
+        );
+        assert_eq!(aggregate.aggregate_at(now), Some(claude_reading));
+
+        // And the seam itself: no metered member offers a reading to offer.
+        for metered in ["b", "c"] {
+            assert_eq!(BudgetSampleSource::budget(&router, metered), None);
+            assert_eq!(BudgetSampleSource::rate_limit_reopen(&router, metered), None);
+        }
     }
 
     #[test]

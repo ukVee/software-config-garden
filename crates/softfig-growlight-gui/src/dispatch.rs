@@ -283,10 +283,7 @@ mod tests {
             paused: false,
             fleet_enabled: false,
             roster: Vec::new(),
-            agents: vec![AgentSummary {
-                id: "loop-1".into(),
-                status: "running".into(),
-            }],
+            agents: vec![AgentSummary::new("loop-1", "running", true)],
             live_scopes: Vec::new(),
         };
 

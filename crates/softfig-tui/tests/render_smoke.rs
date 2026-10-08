@@ -565,7 +565,14 @@ fn renders_live_fleet_header_from_status_poll() {
         },
         "fleet_enabled": true,
         "paused": false,
-        "agents": [{ "id": "a", "status": "running" }]
+        "agents": [
+            { "id": "a", "status": "running", "running": true },
+            {
+                "id": "b", "status": "running", "running": true,
+                "backend": "opencode", "model": "deepseek/deepseek-v4-flash",
+                "spend": { "micro_usd": 140000, "steps": 3 }
+            }
+        ]
     }))
     .unwrap();
     app.fleet = FleetHeader::Live(reply);
@@ -576,8 +583,14 @@ fn renders_live_fleet_header_from_status_poll() {
 
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("armed"), "fleet gate missing:\n{rendered}");
-    assert!(rendered.contains("agent(s) running"), "agent count missing");
+    assert!(rendered.contains("2 agent(s) running"), "agent count missing");
     assert!(rendered.contains("a:running"), "agent roster line missing");
+    // The metered member reads as its backend + model + spend rather than sitting
+    // against an empty Anthropic reserve (opencode-fleet-backend slice 006). The
+    // claude member alongside it shows no dollar figure at all — its cost is the
+    // fleet-level 5h/7d reserve on the `budgets` line.
+    assert!(rendered.contains("a:running · claude"), "claude member's backend missing");
+    assert!(rendered.contains("$0.14"), "metered spend missing:\n{rendered}");
     assert!(rendered.contains("budgets"), "policy budget line missing");
     assert!(rendered.contains("halt 5h 85%"), "budget thresholds missing");
 }

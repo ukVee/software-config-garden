@@ -17,6 +17,32 @@ use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
 use softfig_ipc::DeployAction;
 
+/// One member's cell on the fleet panel's `agents ·` line: `id:status`, the
+/// backend serving it, and — only when that backend is metered — its model and
+/// what it has cost this session.
+///
+/// A claude member ends at its backend name. Its cost is the shared Anthropic
+/// 5h/7d reserve, a FLEET-level reading already on the `budgets` line below, not a
+/// per-member figure; so this line carries no reserve column that a metered member
+/// would then show empty. That empty gauge against a working opencode member — the
+/// "looks broken" display — is what the spend accounting replaces.
+///
+/// Deliberately terser than `growlight status`: no step count, no "this session".
+/// This is a one-line panel on a small screen, and the dollar figure is the part
+/// the operator scans for.
+fn fleet_agent_cell(a: &softfig_ipc::growlightd::AgentSummary) -> String {
+    let mut cell = format!("{}:{} · {}", a.id, a.status, a.backend);
+    if let Some(model) = &a.model {
+        cell.push_str(" · ");
+        cell.push_str(model);
+    }
+    if let Some(spend) = &a.spend {
+        cell.push_str(" · ");
+        cell.push_str(&spend.dollars());
+    }
+    cell
+}
+
 fn sel_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
@@ -1016,16 +1042,23 @@ fn render_growlight_header(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw(" · "),
                 Span::styled(gate, Style::default().fg(gate_color)),
-                Span::raw(format!(" · {} agent(s) running", s.agents.len())),
+                // Count the LIVE members, not the rows: an armed fleet lists every
+                // roster member here, including ones that are idle (never spawned)
+                // or exited, and calling those "running" is the overcount the
+                // machine-readable `running` flag exists to prevent.
+                Span::raw(format!(
+                    " · {} agent(s) running",
+                    s.agents.iter().filter(|a| a.running).count()
+                )),
             ]));
             // Line 2: which agents are running (or the configured roster when the
             // fleet is idle/disarmed and nothing has spawned).
             let agents = if !s.agents.is_empty() {
                 s.agents
                     .iter()
-                    .map(|a| format!("{}:{}", a.id, a.status))
+                    .map(fleet_agent_cell)
                     .collect::<Vec<_>>()
-                    .join(" · ")
+                    .join("  |  ")
             } else if !s.roster.is_empty() {
                 let names = s
                     .roster
@@ -1944,6 +1977,35 @@ mod tests {
             body: body.into(),
             is_alert: kind == "alert",
         }
+    }
+
+    #[test]
+    fn a_fleet_agent_cell_shows_metered_spend_and_no_reserve_column() {
+        use softfig_ipc::growlightd::{AgentSpendSummary, AgentSummary};
+
+        // The fleet panel's half of slice 006: a metered member carries its model
+        // and dollar figure, so it no longer sits against an empty Anthropic
+        // reserve looking broken.
+        let metered = AgentSummary::new("b", "running", true).on_opencode(
+            Some("deepseek/deepseek-v4-flash".into()),
+            AgentSpendSummary { micro_usd: 140_000, steps: 3 },
+        );
+        assert_eq!(
+            fleet_agent_cell(&metered),
+            "b:running · opencode · deepseek/deepseek-v4-flash · $0.14",
+        );
+
+        // A subscription member ends at its backend. Its cost is the shared 5h/7d
+        // reserve on the `budgets` line below — fleet-level, not per-member — so
+        // this line has no reserve column at all, which is what stops a metered
+        // member from being rendered into a blank one.
+        assert_eq!(fleet_agent_cell(&AgentSummary::new("a", "idle", false)), "a:idle · claude");
+
+        // Terser than `growlight status` on purpose: no step count, no "this
+        // session". One line, small screen.
+        let fresh = AgentSummary::new("c", "exited", false)
+            .on_opencode(None, AgentSpendSummary::default());
+        assert_eq!(fleet_agent_cell(&fresh), "c:exited · opencode · $0.00");
     }
 
     #[test]

@@ -1726,15 +1726,41 @@ fn print_fleet_status(r: &FleetStatusReply) {
             }
         }
     }
-    // The live per-agent runtime state (empty until the fleet spawns agents).
+    // The live per-agent runtime state — one row per member of an ARMED fleet
+    // (empty while disarmed, when `roster` above is the whole truth).
     if r.agents.is_empty() {
         println!("agents        (none)");
     } else {
         println!("agents:");
         for a in &r.agents {
-            println!("  {:<16} {}", a.id, a.status);
+            println!("  {:<16} {:<12} {}", a.id, a.status, agent_accounting(a));
         }
     }
+}
+
+/// The accounting half of an `agents:` row: which backend serves the member and —
+/// when that backend is metered — the model and what it has cost this session.
+///
+/// A subscription (claude) member shows its backend and nothing more. That absence
+/// is the point: its cost is the shared 5h/7d reserve printed on the `policy` line
+/// above, not a per-member figure, so there is no dollar column to leave blank and
+/// no empty reserve gauge drawn against a metered member either. Pure over the
+/// reply, so it is unit-proven without a daemon.
+fn agent_accounting(a: &growlightd::AgentSummary) -> String {
+    let mut out = a.backend.clone();
+    if let Some(model) = &a.model {
+        out.push_str(" · ");
+        out.push_str(model);
+    }
+    if let Some(spend) = &a.spend {
+        out.push_str(&format!(
+            " · {} this session ({} step{})",
+            spend.dollars(),
+            spend.steps,
+            if spend.steps == 1 { "" } else { "s" },
+        ));
+    }
+    out
 }
 
 fn client_pause(args: ClientArgs) -> Result<()> {
@@ -3167,6 +3193,42 @@ mod tests {
     }
 
     #[test]
+    fn an_agents_row_shows_metered_spend_and_leaves_a_subscription_member_bare() {
+        use softfig_ipc::growlightd::{AgentSpendSummary, AgentSummary};
+
+        // The operator-facing line slice 006 exists for: a metered member reads as
+        // "opencode · <model> · $0.14 this session" instead of showing an empty
+        // Anthropic reserve gauge and looking broken.
+        let metered = AgentSummary::new("b", "running", true).on_opencode(
+            Some("deepseek/deepseek-v4-flash (high)".into()),
+            AgentSpendSummary { micro_usd: 140_000, steps: 3 },
+        );
+        assert_eq!(
+            agent_accounting(&metered),
+            "opencode · deepseek/deepseek-v4-flash (high) · $0.14 this session (3 steps)",
+        );
+
+        // A subscription member ends at its backend name. The absence is the point:
+        // its cost is the shared 5h/7d reserve on the `policy` line above, a
+        // FLEET-level reading — so there is no per-member dollar column to leave
+        // blank, and nothing invites a reader to compare "$0.14" against a blank.
+        assert_eq!(agent_accounting(&AgentSummary::new("a", "running", true)), "claude");
+
+        // A metered member yet to bill still names its pool, at zero.
+        let fresh = AgentSummary::new("c", "idle", false)
+            .on_opencode(Some("deepseek/deepseek-v4-pro".into()), AgentSpendSummary::default());
+        assert_eq!(
+            agent_accounting(&fresh),
+            "opencode · deepseek/deepseek-v4-pro · $0.00 this session (0 steps)",
+        );
+
+        // One step is singular — the line is read by a human.
+        let one = AgentSummary::new("d", "running", true)
+            .on_opencode(None, AgentSpendSummary { micro_usd: 43, steps: 1 });
+        assert_eq!(agent_accounting(&one), "opencode · $0.00 this session (1 step)");
+    }
+
+    #[test]
     fn status_client_reads_the_fleet_over_the_socket() {
         let (handle, socket, dir) = boot_growlightd("client-status");
         // The typed reply path the `status` subcommand decodes.
@@ -3176,7 +3238,9 @@ mod tests {
         assert!(reply.garden_root.ends_with("garden"));
         assert!(!reply.paused, "starts un-paused");
         assert_eq!(reply.policy.max_concurrent_agents, 2);
-        assert!(reply.agents.is_empty(), "phase-1 fleet is empty");
+        // No live rows: this daemon boots with the fleet DISARMED, so nothing is
+        // assembled and there is no per-agent runtime state to report.
+        assert!(reply.agents.is_empty(), "a disarmed fleet has no live rows");
         // The whole subcommand entry point dispatches + decodes without error.
         client_status(ClientArgs { socket: Some(socket.clone()) }).unwrap();
         handle.shutdown();

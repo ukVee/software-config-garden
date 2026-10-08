@@ -38,7 +38,7 @@ use crate::agent_harness::sum_rate_windows;
 use crate::claude_backend::ClaudeBackend;
 use crate::control::AgentChild;
 use crate::drive_loop::{AgentHealthSource, AgentStderrSource, BudgetSampleSource, RateMeter};
-use crate::opencode_backend::OpencodeBackend;
+use crate::opencode_backend::{AgentSpend, OpencodeBackend};
 use crate::preapproval::AgentPaths;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
 
@@ -119,6 +119,24 @@ impl BackendHandle {
         }
     }
 
+    /// `agent`'s accumulated metered spend on this backend, or [`None`] when this
+    /// backend is not metered.
+    ///
+    /// The exact mirror of [`budget`](Self::budget), which is structurally `None`
+    /// for opencode: the two providers are accounted differently, and each seam
+    /// answers `None` for the provider the seam does not describe. A claude member
+    /// draws on the Anthropic *subscription* pool — its cost is the shared 5h/7d
+    /// reserve that `budget` reports, so there is no per-member dollar figure to
+    /// return and inventing a `0` would read as "metered, spent nothing" rather
+    /// than the truth, "not metered". An opencode member is the converse: metered
+    /// per step, contributing nothing to that reserve.
+    fn spend(&self, agent: &str) -> Option<AgentSpend> {
+        match self {
+            Self::Claude(_) => None,
+            Self::Opencode(b) => Some(b.spend(agent)),
+        }
+    }
+
     /// This backend's fleet-wide rolling-minute window at `now`.
     fn rate_used(&self, now: i64) -> (u32, u32) {
         match self {
@@ -188,6 +206,20 @@ impl BackendRouter {
     /// backend without spawning one.
     pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Option<Vec<OsString>> {
         self.backend_for(agent).map(|b| b.command_argv(agent, paths))
+    }
+
+    /// `agent`'s accumulated metered spend, or [`None`] when its backend is not
+    /// metered (claude) *or* it is not in the roster at all.
+    ///
+    /// Both of those are `None` on purpose and the surface treats them alike: an
+    /// unrouted agent is the same fail-closed posture every other read seam here
+    /// takes (never another member's reading), and "no metered spend" is precisely
+    /// what the status surface needs in order to show a reserve-pool member as a
+    /// reserve-pool member instead of a $0.00 metered one. Nothing downstream
+    /// needs to tell the two apart — a row is only built for a roster member, so
+    /// the unrouted case cannot reach a render.
+    pub fn spend(&self, agent: &str) -> Option<AgentSpend> {
+        self.backend_for(agent).and_then(|b| b.spend(agent))
     }
 }
 
@@ -274,6 +306,10 @@ mod tests {
         assert!(AgentStderrSource::stderr_tail(&router, "ghost").is_empty());
         assert_eq!(BudgetSampleSource::budget(&router, "ghost"), None);
         assert_eq!(BudgetSampleSource::rate_limit_reopen(&router, "ghost"), None);
+        // Spend included: a stranger must not read as a $0.00 metered member
+        // either — `None` here means "no metered accounting", which is what keeps
+        // the status surface from drawing a dollar figure it cannot justify.
+        assert_eq!(router.spend("ghost"), None);
         assert_eq!(
             router.command_argv("ghost", &crate::preapproval::agent_paths(Path::new("/cfg/agents"), "ghost")),
             None,

@@ -588,6 +588,27 @@ impl OpencodeBackend {
     }
 }
 
+/// Test-only: accrue spend into a member's cell WITHOUT spawning a child.
+///
+/// No `opencode` process is ever spawned in tests (the fixtures are the substitute
+/// for a live one), and the spend cells are created at spawn — so without this a
+/// test can only ever ask the other seams about a member that has never worked.
+/// What needs proving is the opposite case: that a member which has genuinely been
+/// billed still reports no Anthropic budget and still contributes nothing to the
+/// subscription aggregate. This folds through the real
+/// [`AgentSpendState::record`], so what accrues here is what a `step_finish`
+/// accrues.
+#[cfg(test)]
+impl OpencodeBackend {
+    pub(crate) fn accrue_spend_for_test(&self, agent: &str, cost_usd: f64) {
+        let mut spends = self.flavor.spends.lock().unwrap();
+        spends
+            .entry(agent.to_string())
+            .or_default()
+            .record(cost_usd);
+    }
+}
+
 impl AgentBackend for Arc<OpencodeBackend> {
     fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
         self.harness.spawn(spec)
