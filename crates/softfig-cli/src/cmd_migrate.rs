@@ -25,7 +25,7 @@ use softfig_ipc::{
     runtime_socket_path,
     verbs::{
         op, MigrateConfigArgs, MigrateConfigReply, MigrateFinalizeArgs, MigrateFinalizeReply,
-        MigrateSplitArgs, MigrateSplitReply,
+        MigrateReindexArgs, MigrateReindexReply, MigrateSplitArgs, MigrateSplitReply,
     },
     ClientError,
 };
@@ -54,6 +54,11 @@ pub enum MigrateCmd {
     /// backed-up `config/keeper.toml` inside the garden. Dry-run unless
     /// `--apply`.
     Config(ConfigArgs),
+    /// Re-derive every daemon-managed `softfig:index` table (number, linked
+    /// title, `Reviewed` date) from the notes it summarizes, and report the
+    /// rows that drifted. Re-runnable: a clean garden reports nothing. Dry-run
+    /// unless `--apply`.
+    Reindex(ReindexArgs),
 }
 
 #[derive(Args, Debug)]
@@ -99,6 +104,18 @@ pub struct ConfigArgs {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct ReindexArgs {
+    /// Write + commit the re-derived tables. Without it, only the drift report
+    /// is printed.
+    #[arg(long)]
+    pub apply: bool,
+    /// Override the socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+}
+
 #[derive(Args, Debug, Default)]
 pub struct StatusArgs {
     #[arg(long)]
@@ -111,6 +128,7 @@ pub fn run(cmd: Option<MigrateCmd>, status: StatusArgs) -> Result<()> {
         Some(MigrateCmd::Finalize(args)) => finalize(args),
         Some(MigrateCmd::Split(args)) => split(args),
         Some(MigrateCmd::Config(args)) => config(args),
+        Some(MigrateCmd::Reindex(args)) => reindex(args),
         None => print_status(status),
     }
 }
@@ -255,6 +273,45 @@ fn split(args: SplitArgs) -> Result<()> {
             if !reply.applied && !reply.splits.is_empty() {
                 println!();
                 println!("re-run with --apply to commit.");
+            }
+            Ok(())
+        }
+        Ok(None) => Err(anyhow!(
+            "no daemon at {} — start one first (`softfig daemon start`)",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("daemon error ({:?}): {message}", kind))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+fn reindex(args: ReindexArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let req_args = serde_json::to_value(MigrateReindexArgs { apply: args.apply })?;
+    match try_daemon_call(&socket, op::MIGRATE_REINDEX, req_args) {
+        Ok(Some(value)) => {
+            let reply: MigrateReindexReply = serde_json::from_value(value)?;
+            for r in &reply.regions {
+                println!("{} ({})", r.host, r.region);
+                for row in &r.removed {
+                    println!("  - {row}");
+                }
+                for row in &r.added {
+                    println!("  + {row}");
+                }
+            }
+            for s in &reply.skipped {
+                println!("skipped {} ({}): {}", s.host, s.region, s.reason);
+            }
+            if reply.regions.is_empty() {
+                println!("every index table matches its folder.");
+            } else if let Some(hash) = reply.hash.as_deref() {
+                println!("reindexed {} region(s) [{}]", reply.regions.len(), short_hash(hash));
+            } else {
+                println!();
+                println!("{} region(s) drifted — re-run with --apply to commit.", reply.regions.len());
             }
             Ok(())
         }

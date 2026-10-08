@@ -25,6 +25,12 @@ pub mod op {
     /// sibling accretive folder of numbered notes, archive the monolith, and
     /// commit one `monolith_split` per file. Dry-run unless `apply`.
     pub const MIGRATE_SPLIT: &str = "migrate_split";
+    /// Task 060: re-derive every `<!-- softfig:index … -->` table in every host
+    /// `CLAUDE.md` from the numbered docs it summarizes (number, linked title,
+    /// `Reviewed` from each doc's own `> Last reviewed:` line), committing one
+    /// `index_reindexed` over every host that drifted. Re-runnable: a second run
+    /// reports nothing. Dry-run unless `apply`.
+    pub const MIGRATE_REINDEX: &str = "migrate_reindex";
     /// Config-in-garden: one-time migration that lifts the post-unlock policy
     /// (`[net]`/`[relay]`/`[replica]`/`[reveal]`) out of the local `.softfig/`
     /// pointer into the encrypted, versioned, backed-up `config/keeper.toml`
@@ -1658,6 +1664,51 @@ pub struct SplitOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitSkip {
     pub path: String,
+    pub reason: String,
+}
+
+/// `migrate reindex [--apply]` — re-derive every daemon-managed index table
+/// (task 060). Dry-run (no writes) unless `apply` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MigrateReindexArgs {
+    /// Write + commit the re-derived tables. Without it the daemon only reports
+    /// the drift.
+    #[serde(default)]
+    pub apply: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrateReindexReply {
+    /// True when `apply` was requested (a commit happens only if something
+    /// drifted — see `hash`); false for a dry-run report.
+    pub applied: bool,
+    /// One entry per index region whose rendered rows differ from the derived
+    /// ones. Empty means every table already matches its folder.
+    pub regions: Vec<ReindexRegion>,
+    /// Index regions the sweep found but will not touch, with the reason.
+    pub skipped: Vec<ReindexSkip>,
+    /// The `index_reindexed` commit. `None` in a dry run or when nothing drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+/// One drifted index region: the stale rows the table carries and the rows
+/// derived from the folder, each in document order. A changed `Reviewed` cell
+/// shows up as one row in each list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReindexRegion {
+    /// Garden-relative host doc, e.g. `storage/CLAUDE.md`.
+    pub host: String,
+    /// The region tag, e.g. `index notes`.
+    pub region: String,
+    pub removed: Vec<String>,
+    pub added: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReindexSkip {
+    pub host: String,
+    pub region: String,
     pub reason: String,
 }
 

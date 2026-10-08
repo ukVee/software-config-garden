@@ -16,7 +16,7 @@ use softfig_ipc::verbs::{
     AddProjectReply, AddSectionArgs,
     AppendToSectionArgs, ArchiveArgs, ArchiveReply, DocEditReply, EditSectionArgs,
     LogDecisionArgs, LogDecisionReply, LogIncidentArgs, LogIncidentReply, MigrateConfigReply,
-    MigrateSplitReply,
+    MigrateReindexReply, MigrateSplitReply,
     RefreshSnapshotArgs, RefreshSnapshotReply, ReviseNoteArgs, ReviseNoteReply, SetReviewedArgs,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
@@ -1042,6 +1042,84 @@ fn hand_patched_index_cell_is_re_derived() {
     let claude = std::fs::read_to_string(fx.garden.join("storage/CLAUDE.md")).unwrap();
     assert!(claude.contains(&row(&today)), "cell re-derived from the note: {claude}");
     assert!(!claude.contains("2026-09-06"), "hand-set cell persisted: {claude}");
+}
+
+/// Task 060's backfill: `migrate_reindex` finds an index cell that drifted by a
+/// path no verb sees (here a direct disk edit — a pre-060 daemon's revision, or
+/// a hand edit through the mount), reports it without writing on a dry run,
+/// re-derives it on `apply` in one `index_reindexed` commit, and reports nothing
+/// on a second run. Asserted on the rendered host file, against the note's own
+/// header.
+#[test]
+fn migrate_reindex_backfills_drift_and_reruns_clean() {
+    let fx = Fixture::start();
+    write_doc(&fx, "storage/CLAUDE.md", "# storage/\n");
+    for (slug, title) in [("debloat", "Debloat"), ("zram", "zram")] {
+        fx.call(
+            op::ADD_NOTE,
+            serde_json::json!({ "dir": "storage/notes", "slug": slug, "title": title, "body": "b" }),
+        );
+    }
+    // The observed shape: the note was revised to 2026-09-25, the index still
+    // claims 2026-09-06. Note 002 stays in step, so only one row may move.
+    let today = conventions::today_hyphen();
+    let row1 = |date: &str| format!("| 001 | [Debloat](notes/001-debloat.md) | {date} |");
+    for (rel, date) in [("storage/notes/001-debloat.md", "2026-09-25"), ("storage/CLAUDE.md", "2026-09-06")] {
+        let p = fx.garden.join(rel);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let text = if rel.ends_with("CLAUDE.md") {
+            text.replace(&row1(&today), &row1(date))
+        } else {
+            text.replace(&today, date)
+        };
+        std::fs::write(&p, text).unwrap();
+    }
+    // A hand-written region with no backing folder is reported, never touched.
+    write_doc(
+        &fx,
+        "audio/CLAUDE.md",
+        "# audio/\n\n<!-- softfig:index notes -->\n\n| 001 | [x](notes/001-x.md) | 2026-01-01 |\n\n\
+         <!-- /softfig:index notes -->\n",
+    );
+    let audio_before = std::fs::read_to_string(fx.garden.join("audio/CLAUDE.md")).unwrap();
+    let host = || std::fs::read_to_string(fx.garden.join("storage/CLAUDE.md")).unwrap();
+
+    // Dry run: the drift is reported row by row; nothing is written.
+    let resp = fx.call(op::MIGRATE_REINDEX, serde_json::json!({ "apply": false }));
+    let reply: MigrateReindexReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(!reply.applied && reply.hash.is_none());
+    assert_eq!(reply.regions.len(), 1, "{:?}", reply.regions);
+    let r = &reply.regions[0];
+    assert_eq!((r.host.as_str(), r.region.as_str()), ("storage/CLAUDE.md", "index notes"));
+    assert_eq!(r.removed, vec![row1("2026-09-06")]);
+    assert_eq!(r.added, vec![row1("2026-09-25")]);
+    assert_eq!(reply.skipped.len(), 1, "{:?}", reply.skipped);
+    assert_eq!(reply.skipped[0].host, "audio/CLAUDE.md");
+    assert!(host().contains(&row1("2026-09-06")), "dry run wrote: {}", host());
+
+    // Apply: the cell now equals the note's header, in one commit.
+    let resp = fx.call(op::MIGRATE_REINDEX, serde_json::json!({ "apply": true }));
+    let reply: MigrateReindexReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.applied && reply.hash.is_some());
+    let note = std::fs::read_to_string(fx.garden.join("storage/notes/001-debloat.md")).unwrap();
+    assert!(note.contains("> Last reviewed: 2026-09-25"), "{note}");
+    assert!(host().contains(&row1("2026-09-25")), "cell not re-derived: {}", host());
+    assert!(host().contains(&format!("| 002 | [zram](notes/002-zram.md) | {today} |")));
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "index_reindexed");
+    assert_eq!(payload["hosts"], serde_json::json!(["storage/CLAUDE.md"]));
+    assert_eq!(
+        std::fs::read_to_string(fx.garden.join("audio/CLAUDE.md")).unwrap(),
+        audio_before
+    );
+
+    // Re-runnable: a second pass finds nothing and commits nothing.
+    let tip = fx.tip();
+    let resp = fx.call(op::MIGRATE_REINDEX, serde_json::json!({ "apply": true }));
+    let reply: MigrateReindexReply = serde_json::from_value(ok_data(resp)).unwrap();
+    assert!(reply.regions.is_empty(), "second run drifted: {:?}", reply.regions);
+    assert!(reply.hash.is_none());
+    assert_eq!(fx.tip(), tip, "a clean re-run must not commit");
 }
 
 /// Archiving the only note empties the folder, so its index region is

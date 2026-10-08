@@ -44,6 +44,8 @@
 
 use std::path::{Path, PathBuf};
 
+use softfig_ipc::verbs::{ReindexRegion, ReindexSkip};
+
 use crate::actions::{conventions, managed, WorkTree};
 use crate::daemon::DaemonInner;
 
@@ -85,27 +87,34 @@ pub fn refresh_folder_index(
     inner: &DaemonInner,
     folder_rel: &str,
 ) -> Option<String> {
-    let folder_name = Path::new(folder_rel).file_name()?.to_str()?.to_string();
     let host_rel = host_rel(folder_rel)?;
     // Read the host CLAUDE.md only if it exists and is safe to rewrite (not
     // vault-protected). A missing host yields `None` — index maintenance
     // never fabricates a routing doc nor clobbers ciphertext.
     let content = super::sections::read_if_unprotected(wt, inner, &host_rel)?;
-
-    let rows = collect_rows(wt, folder_rel);
-    let tag = region_tag(&folder_name);
-    let new = if rows.is_empty() {
-        // Folder emptied (last note archived) → drop the region entirely so
-        // the routing doc stays clean; re-adding a note recreates it.
-        managed::remove(&content, &tag)
-    } else {
-        managed::upsert(&content, &tag, &render_table(&folder_name, &rows))
-    };
+    let new = rederive(wt, &content, folder_rel)?;
     if new == content {
         return None;
     }
     wt.write(&host_rel, new.as_bytes()).ok()?;
     Some(host_rel)
+}
+
+/// `content` (a host doc) with folder `folder_rel`'s `index <folder>` region
+/// re-derived from the numbered docs in the folder — upserted, or dropped when
+/// the folder holds none (last note archived → the routing doc stays clean;
+/// re-adding a note recreates it). The only I/O is reading the folder, so the
+/// write-time refresh and the [`plan_reindex`] sweep share one derivation and
+/// cannot render different tables.
+fn rederive(wt: &WorkTree, content: &str, folder_rel: &str) -> Option<String> {
+    let folder_name = Path::new(folder_rel).file_name()?.to_str()?;
+    let rows = collect_rows(wt, folder_rel);
+    let tag = region_tag(folder_name);
+    Some(if rows.is_empty() {
+        managed::remove(content, &tag)
+    } else {
+        managed::upsert(content, &tag, &render_table(folder_name, &rows))
+    })
 }
 
 /// Re-derive every index table a write to `rel` can have invalidated, writing
@@ -176,24 +185,146 @@ fn refresh_host_regions(
     let Some(content) = super::sections::read_if_unprotected(wt, inner, host_rel) else {
         return Vec::new();
     };
-    let folders: Vec<String> = managed::regions(&content)
+    host_region_folders(wt, &content, host_dir)
         .into_iter()
-        .filter_map(|(tag, _)| tag.strip_prefix("index ").map(|f| f.trim().to_string()))
-        .filter(|folder| !folder.is_empty())
-        .map(|folder| {
-            if host_dir.is_empty() {
+        .filter_map(|(_, folder)| folder.ok())
+        .filter_map(|folder_rel| refresh_folder_index(wt, inner, &folder_rel))
+        .collect()
+}
+
+/// Classify every `index <folder>` region in host doc `content` (whose dir is
+/// `host_dir`) as `(tag, Ok(folder_rel))` — derivable, because the folder is an
+/// [`INDEXED_FOLDERS`](conventions::INDEXED_FOLDERS) genre and exists — or
+/// `(tag, Err(reason))`, left exactly as it is. The one gate both arm 2 and the
+/// [`plan_reindex`] sweep apply, so neither re-derives a region the other
+/// would leave alone.
+fn host_region_folders(
+    wt: &WorkTree,
+    content: &str,
+    host_dir: &str,
+) -> Vec<(String, Result<String, &'static str>)> {
+    managed::regions(content)
+        .into_iter()
+        .filter_map(|(tag, _)| {
+            let folder = tag.strip_prefix("index ")?.trim().to_string();
+            if folder.is_empty() {
+                return None;
+            }
+            let folder_rel = if host_dir.is_empty() {
                 folder
             } else {
                 format!("{host_dir}/{folder}")
-            }
+            };
+            let verdict = if !conventions::is_indexed_dir(&folder_rel) {
+                Err("not an indexed folder genre — left as-is")
+            } else if !wt.is_dir(&folder_rel) {
+                Err("backing folder absent — left as-is (dropping a region is `archive`'s job)")
+            } else {
+                Ok(folder_rel)
+            };
+            Some((tag, verdict))
         })
-        .filter(|folder_rel| conventions::is_indexed_dir(folder_rel) && wt.is_dir(folder_rel))
-        .collect();
-
-    folders
-        .iter()
-        .filter_map(|folder_rel| refresh_folder_index(wt, inner, folder_rel))
         .collect()
+}
+
+// ---- migrate_reindex sweep ------------------------------------------------
+
+/// One host doc the [`plan_reindex`] sweep would rewrite: its re-derived
+/// content plus the row-level drift per region, for the report.
+pub struct HostReindex {
+    pub host: String,
+    pub content: String,
+    pub regions: Vec<ReindexRegion>,
+}
+
+/// Task 060's backfill and repair sweep: re-derive every `index <folder>`
+/// region in every host `CLAUDE.md` the garden walk reaches (the same walk the
+/// `unlink` refusal uses — `journal/archive/` and growlight's audit trees are
+/// frozen history and skipped), **without writing**. Returns the hosts whose
+/// derived content differs from what is on disk, plus the regions it would not
+/// touch and why. Re-running after the caller writes `content` back yields no
+/// hosts — the derivation is a fixed point — which is what makes the sweep safe
+/// to run any time drift may have crept in by a path no verb sees (a hand edit
+/// straight through the FUSE mount, or a garden last written by a pre-060
+/// daemon).
+pub fn plan_reindex(wt: &WorkTree, inner: &DaemonInner) -> (Vec<HostReindex>, Vec<ReindexSkip>) {
+    let mut hosts = Vec::new();
+    let mut skipped = Vec::new();
+    for host in super::backlinks::collect_md(wt) {
+        if Path::new(&host).file_name().and_then(|s| s.to_str()) != Some("CLAUDE.md") {
+            continue;
+        }
+        // A vault-protected host is unreadable here, so its regions (if any)
+        // are invisible to the sweep exactly as they are to the write path.
+        let Some(original) = super::sections::read_if_unprotected(wt, inner, &host) else {
+            continue;
+        };
+        let host_dir = Path::new(&host)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        let mut content = original.clone();
+        let mut regions = Vec::new();
+        for (tag, folder) in host_region_folders(wt, &original, host_dir) {
+            let folder_rel = match folder {
+                Ok(f) => f,
+                Err(reason) => {
+                    skipped.push(ReindexSkip {
+                        host: host.clone(),
+                        region: tag,
+                        reason: reason.into(),
+                    });
+                    continue;
+                }
+            };
+            let Some(next) = rederive(wt, &content, &folder_rel) else {
+                continue;
+            };
+            let (removed, added) = row_drift(
+                managed::region_body(&content, &tag).as_deref(),
+                managed::region_body(&next, &tag).as_deref(),
+            );
+            if !removed.is_empty() || !added.is_empty() {
+                regions.push(ReindexRegion {
+                    host: host.clone(),
+                    region: tag,
+                    removed,
+                    added,
+                });
+            }
+            content = next;
+        }
+        if content != original {
+            hosts.push(HostReindex {
+                host,
+                content,
+                regions,
+            });
+        }
+    }
+    (hosts, skipped)
+}
+
+/// The table rows only in `before` (stale) and only in `after` (derived), each
+/// in document order. Header, separator and blank lines are identical on both
+/// sides of any re-derivation and are dropped, so a region removed outright
+/// reports just its rows.
+fn row_drift(before: Option<&str>, after: Option<&str>) -> (Vec<String>, Vec<String>) {
+    fn rows(body: Option<&str>) -> Vec<&str> {
+        body.unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != TABLE_HEADER && *l != TABLE_RULE)
+            .collect()
+    }
+    let (b, a) = (rows(before), rows(after));
+    let only = |xs: &[&str], ys: &[&str]| -> Vec<String> {
+        xs.iter()
+            .filter(|x| !ys.contains(x))
+            .map(|x| x.to_string())
+            .collect()
+    };
+    (only(&b, &a), only(&a, &b))
 }
 
 /// Enumerate the numbered notes in accretive folder `folder_rel`, newest-number
@@ -223,11 +354,15 @@ fn collect_rows(wt: &WorkTree, folder_rel: &str) -> Vec<Row> {
     rows
 }
 
+/// The fixed first two lines of every rendered index table.
+const TABLE_HEADER: &str = "| # | Note | Reviewed |";
+const TABLE_RULE: &str = "|---|------|----------|";
+
 /// Render the TOC table body (no surrounding newlines — `managed::upsert`
 /// owns the blank padding). Links are relative to the host `CLAUDE.md`, i.e.
 /// `<folder_name>/<filename>`.
 fn render_table(folder_name: &str, rows: &[Row]) -> String {
-    let mut s = String::from("| # | Note | Reviewed |\n|---|------|----------|");
+    let mut s = format!("{TABLE_HEADER}\n{TABLE_RULE}");
     for r in rows {
         let link = format!(
             "[{}]({}/{})",
@@ -401,6 +536,22 @@ mod tests {
         assert_eq!(indexed_folder_of("journal/decisions/001-a.md"), None);
         assert_eq!(indexed_folder_of("services/waydroid/CLAUDE.md"), None);
         assert_eq!(indexed_folder_of(""), None);
+    }
+
+    #[test]
+    fn row_drift_reports_only_changed_rows() {
+        let before = "| # | Note | Reviewed |\n|---|------|----------|\n\
+                      | 001 | [a](notes/001-a.md) | 2026-09-06 |\n| 002 | [b](notes/002-b.md) | 2026-09-01 |";
+        let after = "| # | Note | Reviewed |\n|---|------|----------|\n\
+                     | 001 | [a](notes/001-a.md) | 2026-09-25 |\n| 002 | [b](notes/002-b.md) | 2026-09-01 |";
+        let (removed, added) = row_drift(Some(before), Some(after));
+        assert_eq!(removed, vec!["| 001 | [a](notes/001-a.md) | 2026-09-06 |"]);
+        assert_eq!(added, vec!["| 001 | [a](notes/001-a.md) | 2026-09-25 |"]);
+        assert_eq!(row_drift(Some(after), Some(after)), (vec![], vec![]));
+        // A region dropped outright (folder emptied) reports its rows, not its header.
+        let (removed, added) = row_drift(Some(after), None);
+        assert_eq!(removed.len(), 2);
+        assert!(added.is_empty());
     }
 
     #[test]

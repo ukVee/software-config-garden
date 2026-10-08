@@ -741,9 +741,17 @@ fn unlink_refuses_when_listed_in_a_managed_index() {
     assert_eq!(err_kind(resp), ErrorKind::ReferencedElsewhere);
     assert_eq!(read(&fx, "folder/notes/001-a.md").content, "# A note\n\nbody\n");
 
-    // A file NOT listed in the index is a plain leaf → deletable.
+    // The table is derived from the folder (task 060), so a numbered note that
+    // lands there by any verb — even break-glass `replace_file` — is listed by
+    // that same write, and is no longer a leaf.
     fx.write_file("folder/notes/002-b.md", "# B\n");
     let resp = unlink(&fx, "folder/notes/002-b.md", serde_json::json!({}));
+    assert_eq!(err_kind(resp), ErrorKind::ReferencedElsewhere);
+
+    // A file the index never derives a row from (not `NNN-slug.md`) is a plain
+    // leaf → deletable.
+    fx.write_file("folder/notes/scratch.md", "# scratch\n");
+    let resp = unlink(&fx, "folder/notes/scratch.md", serde_json::json!({}));
     assert!(matches!(resp, Response::Ok { .. }), "unlisted leaf: {resp:?}");
 }
 
