@@ -4130,16 +4130,16 @@ pub fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
     root_tree: &[u8; 32],
     garden_root: &std::path::Path,
     state_root: Option<&std::path::Path>,
-) -> Result<PushOutcome, String> {
+) -> Result<ChainPushOutcome, String> {
     let repo = Repo::open_with(garden_root, state_root).map_err(|e| format!("open repo: {e}"))?;
     let source =
         RepoSource::for_subtree(repo, *root_tree).map_err(|e| format!("scope source: {e}"))?;
     match serve_replication(session, &source) {
-        Ok(_) => Ok(PushOutcome::Accepted),
+        Ok(_) => Ok(ChainPushOutcome::Accepted),
         // A refusal is an ANSWER, not a failure — the whole bug (task 059) was
         // that this arm did not exist, so a `NotAMember` verdict arrived as an
         // `UnexpectedEof` and was indistinguishable from a clean `Ok(())`.
-        Err(NetError::ChainRejected(r)) => Ok(PushOutcome::Rejected(*r)),
+        Err(NetError::ChainRejected(r)) => Ok(ChainPushOutcome::Rejected(*r)),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -4151,7 +4151,7 @@ pub fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
 /// the caller must read. Collapsing the two is what let 12,854 rejections read
 /// as 12,854 successes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PushOutcome {
+pub enum ChainPushOutcome {
     /// The member pulled the closure and applied it (or already had it).
     Accepted,
     /// The member answered with a signed refusal. NOT yet verified — the caller
@@ -4177,11 +4177,11 @@ fn observe_push_outcome(
     chain: &str,
     host: &RingEntry,
     what: &str,
-    outcome: Result<PushOutcome, String>,
+    outcome: Result<ChainPushOutcome, String>,
 ) {
     let class = match outcome {
-        Ok(PushOutcome::Accepted) => HealthClass::Ok,
-        Ok(PushOutcome::Rejected(r)) => {
+        Ok(ChainPushOutcome::Accepted) => HealthClass::Ok,
+        Ok(ChainPushOutcome::Rejected(r)) => {
             // Act only on a refusal the peer we actually dialed signed, FOR the
             // chain we actually pushed. `chain_rejected_signing_bytes` binds the
             // chain ref, so a legitimately-signed refusal of chain X cannot be
@@ -4232,7 +4232,7 @@ fn observe_push_outcome(
 /// dial/handshake/send failure falls through to the next route; once serving
 /// begins the result is returned (a mid-serve error is not retried elsewhere).
 ///
-/// `Ok` means the member ANSWERED — see [`PushOutcome`], which distinguishes an
+/// `Ok` means the member ANSWERED — see [`ChainPushOutcome`], which distinguishes an
 /// accepted push from a signed refusal. `Err` is reserved for "no round-trip
 /// happened at all". Feed the result to [`observe_push_outcome`] rather than
 /// testing it for `Err`: a refusal is an `Ok`, by design.
@@ -4248,7 +4248,7 @@ pub fn push_shared_chain_to_host(
     garden_root: &std::path::Path,
     state_root: Option<&std::path::Path>,
     relay_client: Option<&(String, [u8; 32])>,
-) -> Result<PushOutcome, String> {
+) -> Result<ChainPushOutcome, String> {
     let routes = plan_routes(host, relay_client.is_some());
     if routes.is_empty() {
         return Err("no route to member (no LAN endpoint, no relay)".to_string());

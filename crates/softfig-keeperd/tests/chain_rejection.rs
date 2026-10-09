@@ -11,7 +11,7 @@
 //!
 //! 1. [`a_push_for_a_chain_with_no_membership_row_is_refused_with_unknown_chain`]
 //!    — the reason crosses the wire, signed by the refusing device, and arrives
-//!    as `Ok(PushOutcome::Rejected)` rather than an `Err` or a silent `Ok`.
+//!    as `Ok(ChainPushOutcome::Rejected)` rather than an `Err` or a silent `Ok`.
 //! 2. [`a_refused_sender_stops_pushing_on_the_next_tick`] — driven through the
 //!    production reconcile tick ([`reconcile_shared_pushes`]), so the assertion
 //!    is that the real fan-out resolves no target, not that the latch would have
@@ -44,7 +44,7 @@ use softfig_ipc::{
 use softfig_keeperd::chain_health::{Class, Role};
 use softfig_keeperd::net::{
     build_local_device, build_shared_chain_push_frame, push_shared_chain_to_host,
-    reconcile_shared_pushes, serve_established, PushOutcome,
+    reconcile_shared_pushes, serve_established, ChainPushOutcome,
 };
 use softfig_keeperd::{Daemon, DaemonHandle, KeeperConfig};
 use softfig_net::ring::{ring_path, Ring, RingEntry};
@@ -303,7 +303,7 @@ impl Drop for Receiver {
 
 /// One outbound push through the production primitive, to a receiver reachable at
 /// `addr`. Returns what the round-trip MEANT — the distinction the bug erased.
-fn push_once(sender: &Node, receiver: &Node, addr: SocketAddr) -> Result<PushOutcome, String> {
+fn push_once(sender: &Node, receiver: &Node, addr: SocketAddr) -> Result<ChainPushOutcome, String> {
     let (base_tree, new_tree) = sender_tip_trees(sender);
     let host = receiver.ring_entry(Some(addr));
     let frame = build_shared_chain_push_frame(
@@ -340,7 +340,7 @@ fn sender_tip_trees(sender: &Node) -> (Hash, Hash) {
 }
 
 /// Behaviour 1 — the reason crosses the wire. A push for a chain the receiver
-/// holds **no membership row for** comes back as `Ok(PushOutcome::Rejected)`
+/// holds **no membership row for** comes back as `Ok(ChainPushOutcome::Rejected)`
 /// carrying `UnknownChain`, signed by the device that refused it and naming the
 /// chain that was pushed. Pre-fix this same round-trip returned `Ok(())`: the
 /// session closed, `serve_replication` read it as `UnexpectedEof`, and the sender
@@ -354,7 +354,7 @@ fn a_push_for_a_chain_with_no_membership_row_is_refused_with_unknown_chain() {
 
     let outcome = push_once(&sender, &receiver, rx.addr).expect("the member ANSWERED — not an Err");
 
-    let PushOutcome::Rejected(rejection) = outcome else {
+    let ChainPushOutcome::Rejected(rejection) = outcome else {
         panic!("a non-member receiver must refuse, not accept: {outcome:?}");
     };
     assert_eq!(
@@ -466,7 +466,7 @@ fn n_consecutive_refused_pushes_cost_o1_journal_lines() {
         let outcome = push_once(&sender, &receiver, rx.addr)
             .unwrap_or_else(|e| panic!("push {i} did not complete a round-trip: {e}"));
         assert!(
-            matches!(outcome, PushOutcome::Rejected(_)),
+            matches!(outcome, ChainPushOutcome::Rejected(_)),
             "push {i} must be refused, not accepted"
         );
     }

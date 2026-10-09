@@ -14,7 +14,6 @@ use crate::app::{
     CeremonyState, CoordRow, FleetHeader, Overlay, PairField, PeerRow, View,
 };
 use crate::command::command_menu;
-use softfig_ipc::verbs::human_age_secs;
 use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
