@@ -466,6 +466,50 @@ fn renders_shares_divergence_banner() {
     );
 }
 
+/// Task 059: the membership split must be legible on this tab, because the
+/// journal of the device that can fix it is the one place it was NOT visible.
+/// Renders the live case: 12,854 rejections over 27 days.
+#[test]
+fn renders_a_membership_disagreement_with_its_age_and_count() {
+    let mut app = App::new();
+    app.locked = false;
+    app.view = softfig_tui::app::View::Shares;
+    app.share_divergences = vec![softfig_ipc::verbs::ChainDivergenceInfo {
+        chain: "chain/personal".into(),
+        peer: "ecdde9321122334455667788990011223344556677889900aabbccddeeff0011".into(),
+        peer_name: Some("sillyguy76".into()),
+        role: "outbound".into(),
+        verb: "being rejected by".into(),
+        reason: "unknown-chain".into(),
+        since: 0,
+        age_secs: 27 * 86_400,
+        count: 12_854,
+        terminal: true,
+    }];
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    let rendered = format!("{}", terminal.backend());
+    assert!(
+        rendered.contains("membership disagreement"),
+        "disagreement banner missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("chain/personal"),
+        "chain missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("sillyguy76"),
+        "peer name missing:\n{rendered}"
+    );
+    // The two numbers that make it read as a standing fault, not a blip. The age
+    // comes from the one shared renderer, so "3w" here is also what the CLI prints.
+    assert!(rendered.contains("3w"), "age missing:\n{rendered}");
+    assert!(rendered.contains("12854"), "count missing:\n{rendered}");
+}
+
 #[test]
 fn renders_add_share_overlay() {
     let mut app = App::new();

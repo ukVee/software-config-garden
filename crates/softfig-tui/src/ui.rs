@@ -14,6 +14,7 @@ use crate::app::{
     CeremonyState, CoordRow, FleetHeader, Overlay, PairField, PeerRow, View,
 };
 use crate::command::command_menu;
+use softfig_ipc::verbs::human_age_secs;
 use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
@@ -1137,6 +1138,36 @@ fn render_shares_detail(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::styled(
             format!("  {msg}"),
             Style::default().fg(Color::Red),
+        ));
+        lines.push(Line::raw(""));
+    }
+
+    // Task 059: a membership split, shown regardless of the selection for the
+    // same reason as the key divergence above — it is a property of the ring, not
+    // of the row under the cursor, and it is the one failure here that can run
+    // for weeks without anything else looking wrong.
+    for d in &app.share_divergences {
+        let colour = if d.terminal { Color::Red } else { Color::Yellow };
+        lines.push(Line::styled(
+            format!(
+                "{}membership disagreement · {}",
+                if d.terminal { "⚠ " } else { "" },
+                d.chain
+            ),
+            Style::default().add_modifier(Modifier::BOLD).fg(colour),
+        ));
+        lines.push(Line::styled(
+            format!(
+                "  {} {} for {} ({}, {} pushes)",
+                d.verb,
+                d.peer_name
+                    .as_deref()
+                    .unwrap_or_else(|| d.peer.get(..12).unwrap_or(&d.peer)),
+                human_age_secs(d.age_secs),
+                d.reason,
+                d.count,
+            ),
+            Style::default().fg(colour),
         ));
         lines.push(Line::raw(""));
     }

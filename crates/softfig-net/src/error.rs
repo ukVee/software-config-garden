@@ -34,6 +34,14 @@ pub enum NetError {
     #[error("protocol: {0}")]
     Protocol(&'static str),
 
+    /// Task 059: the peer answered a shared-chain push with a signed
+    /// `ChainRejected` frame instead of pulling the tree — a *decision*, not a
+    /// transport failure. Boxed to keep `NetError` small. The caller must
+    /// distinguish this from every other variant: the rest mean "try again",
+    /// this one may mean "you are not a member and never will be by retrying".
+    #[error("peer refused chain {}: {}", .0.chain, .0.reason)]
+    ChainRejected(Box<crate::turn::ChainRejection>),
+
     /// M5b: a replication sink/source failure carrying a dynamic message —
     /// a storage error, a malformed wire row, or a security-relevant check the
     /// host rejected (bad commit signature, wrong author, content-address

@@ -1580,6 +1580,11 @@ pub struct SharedSubtreeListReply {
     /// `#[serde(default)]` so a pre-m5f reply (subtrees only) still decodes.
     #[serde(default)]
     pub offers: Vec<PendingShareOfferInfo>,
+    /// Live membership disagreements the daemon has observed for these chains
+    /// (task `059`). Empty in the healthy case, so a non-empty vec is itself the
+    /// signal. `#[serde(default)]` so a pre-059 reply still decodes.
+    #[serde(default)]
+    pub divergences: Vec<ChainDivergenceInfo>,
 }
 
 /// One shared-subtree member as surfaced to `softfig shared-subtree list`.
@@ -1619,6 +1624,49 @@ pub struct PendingShareOfferInfo {
     /// The offering peer's device fingerprint (lowercase hex) — provenance only,
     /// not an authorization input.
     pub offered_by: String,
+}
+
+/// One live shared-chain membership disagreement, as surfaced to `softfig
+/// shared-subtree list` and the TUI's Shares tab (task `059`).
+///
+/// The split this reports is the one that cannot heal itself: two ring devices
+/// disagree about whether one of them is a member of a chain, so one keeps
+/// pushing and the other keeps refusing, forever, because neither side's
+/// journal is read by the side able to fix it. The live case ran 12,854
+/// identical rejections over 27 days.
+///
+/// The judgement is the **daemon's** — `terminal`, the reason slug and the age
+/// all come from the same module that gates the pushing, so no frontend has to
+/// re-derive when a disagreement is waiting on a human.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainDivergenceInfo {
+    /// The chain ref (`chain/<id>`) the two devices disagree about.
+    pub chain: String,
+    /// The peer on the other side of the disagreement (lowercase hex id).
+    pub peer: String,
+    /// The peer's advertised name, when it is a loaded ring member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_name: Option<String>,
+    /// Which side we are on: `inbound` = we are refusing their pushes (the fix
+    /// is on their device), `outbound` = they are refusing ours (the fix is
+    /// here). Both can hold at once, as two rows.
+    pub role: String,
+    /// Short phrase for the surface, e.g. `being rejected by`.
+    pub verb: String,
+    /// The reason slug the wire carried: `unknown-chain` | `not-a-member` |
+    /// `not-ready` | `other`.
+    pub reason: String,
+    /// Unix seconds at which this disagreement began.
+    pub since: i64,
+    /// Seconds it has held — render with [`human_age_secs`].
+    pub age_secs: u64,
+    /// Refusals observed since `since`. The flood size, and the reason a
+    /// four-figure count reads as "this is not a blip".
+    pub count: u64,
+    /// True when the reason means "stop and ask a human" rather than "retry":
+    /// pushes to this peer for this chain are being suppressed.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 /// `shared_subtree_accept({id, mount_path?}) -> {id, mount_path, ref_name,

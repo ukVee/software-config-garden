@@ -48,6 +48,7 @@ use crate::proto::{
     frame, CommitData, Frame, ObjectData, ReplicaGrant, TipAnnounce, TreeData,
 };
 use crate::transport::{NoiseReader, NoiseSession, NoiseWriter, SplitIo};
+use crate::turn::ChainRejection;
 
 /// Domain-separation prefix for the [`TipAnnounce`] signature. Versioned and
 /// distinct from every other context the identity key signs (commits, the
@@ -787,6 +788,20 @@ pub fn serve_replication<S: Read + Write>(
                 summary.objects_served += 1;
             }
             Some(frame::Kind::ReplicaDone(_)) => return Ok(summary),
+            // Task 059: the peer is refusing what we pushed rather than pulling
+            // it. This arm is the whole reason a refusal is now legible — the
+            // receiver used to just close, which the `UnexpectedEof` arm above
+            // reads as "peer closed cleanly" and reports as SUCCESS. Surfaced
+            // as a typed error; the caller verifies it against the peer it
+            // dialed (`ChainRejection::verified`) before acting.
+            Some(frame::Kind::ChainRejected(r)) => {
+                let Some(rejection) =
+                    ChainRejection::from_wire(&r.chain_id, &r.device_id, r.reason, &r.signature)
+                else {
+                    return Err(NetError::Protocol("chain-rejected device_id is not 32 bytes"));
+                };
+                return Err(NetError::ChainRejected(Box::new(rejection)));
+            }
             _ => {
                 return Err(NetError::Protocol(
                     "unexpected frame during replication serve",

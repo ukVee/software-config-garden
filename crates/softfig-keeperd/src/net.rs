@@ -54,21 +54,24 @@ use softfig_net::discovery::{self, Advertisement};
 use softfig_net::endpoint_cache::{endpoint_cache_path, EndpointCache};
 use softfig_net::pairing::{pair_initiator, pair_responder, LocalDevice, PendingPair};
 use softfig_net::proto::{
-    frame, DeviceStateAnnounce, Frame, ReplicaGrant, ShareOffer, SharedChainPush, SharedKeyCommit,
-    SharedKeyHandoff, TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
+    frame, ChainRejected, DeviceStateAnnounce, Frame, ReplicaGrant, ShareOffer, SharedChainPush,
+    SharedKeyCommit, SharedKeyHandoff, TipAnnounce, TurnRequest, TurnRevoke, TurnYield,
 };
 use softfig_net::connect::{plan_routes, Route};
 use softfig_net::relay::{relay_connect, Relay, RelayStream};
 use softfig_net::ring::{ring_path, Ring, RingEntry, RING_FILE};
 use softfig_net::transport::{ik_initiator, ik_responder, NoiseSession};
 use softfig_net::{
-    device_state_signing_bytes, pull_replication_pipelined, pull_subtree, serve_replication,
+    chain_rejected_signing_bytes, device_state_signing_bytes, pull_replication_pipelined,
+    pull_subtree, serve_replication,
     share_offer_signing_bytes, shared_chain_push_signing_bytes, static_attestation_message,
     turn_request_signing_bytes, turn_revoke_signing_bytes,
     turn_yield_signing_bytes, verify_device_state_sig, verify_grant, verify_share_offer_sig,
     verify_shared_chain_push_sig, verify_turn_request_sig, verify_turn_revoke_sig,
-    verify_turn_yield_sig, DeviceState, LeaseEvent, LeaseScope, NetError, ServeSummary, WriteTurn,
+    verify_turn_yield_sig, ChainRejectReason, ChainRejection, DeviceState, LeaseEvent, LeaseScope,
+    NetError, ServeSummary, WriteTurn,
 };
+use crate::chain_health::{ChainHealth, Class as HealthClass, Role as HealthRole};
 use softfig_store::Hash;
 use softfig_vault::VaultSession;
 use softfig_vcs::{Intent, Repo};
@@ -1002,7 +1005,7 @@ pub struct PeerAnnounce {
 /// reads the clock itself (every transition takes `now`), so the daemon stamps it
 /// here at handler time. Seconds are the same unit as the signed edit timestamps
 /// the conflict fallback (slice 003) compares.
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1524,11 +1527,19 @@ fn fan_turn_frame(
 }
 
 /// The reachable ring peers to fan a chain's turn frame to: its `S`-members
-/// minus this device, each with a viable route ([`plan_routes`]). Shared by the
-/// expiry-revoke and the commit-boundary request/yield fan-outs so every turn
-/// message targets the same set derived from the same committed membership. An
-/// empty result ⇒ nothing to send (the caller skips the frame — e.g. a solo
-/// device whose chain has no online peer).
+/// minus this device, each with a viable route ([`plan_routes`]) and no latched
+/// membership verdict against us ([`ChainHealth::pushes_suppressed`]). Shared by
+/// the expiry-revoke and the commit-boundary request/yield fan-outs AND by the
+/// shared-push reconcile, so every outbound message for a chain targets the same
+/// set derived from the same committed membership. An empty result ⇒ nothing to
+/// send (the caller skips the frame — e.g. a solo device whose chain has no
+/// online peer).
+///
+/// Filtering here rather than in each fan-out is the point (task 059): a peer
+/// that refused our push with a terminal reason is also the peer whose
+/// `turn-request` / `turn-revoke` floods the evidence note recorded alongside the
+/// push one — it cannot grant a turn on a chain it holds no membership row for.
+/// One choke point means one place to be right about it.
 #[allow(clippy::too_many_arguments)]
 fn resolve_turn_targets(
     membership: &softfig_vcs::SharedSubtreesConfig,
@@ -1539,6 +1550,8 @@ fn resolve_turn_targets(
     local_id: &[u8; 32],
     relay_available: bool,
     chain: &str,
+    health: &ChainHealth,
+    now: i64,
 ) -> Vec<RingEntry> {
     let members = chain_members(membership, ring_members, repo, session, chain);
     members
@@ -1546,6 +1559,7 @@ fn resolve_turn_targets(
         .filter(|id| *id != local_id)
         .filter_map(|id| ring.peers().iter().find(|p| &p.device_id == id).cloned())
         .filter(|host| !plan_routes(host, relay_available).is_empty())
+        .filter(|host| !health.pushes_suppressed(chain, &host.device_id, now))
         .collect()
 }
 
@@ -1730,6 +1744,8 @@ fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
                             &local.device_id,
                             relay_available,
                             &chain,
+                            &inner.chain_health,
+                            now,
                         );
                         if targets.is_empty() {
                             continue;
@@ -1807,6 +1823,8 @@ fn reconcile_write_turns(daemon: &Daemon, local: &LocalDevice) {
                             &local.device_id,
                             relay_available,
                             &chain,
+                            &inner.chain_health,
+                            now,
                         );
                         if targets.is_empty() {
                             continue;
@@ -2194,6 +2212,67 @@ fn serve_replica_ingest(
 }
 
 /// Serve an inbound `SharedChainPush` (M5e slice 002, part 2b): a chain
+/// Refuse a shared-chain push *out loud* (task 059): answer the sender with a
+/// signed [`ChainRejected`] frame carrying the machine-readable reason, and
+/// record the refusal in the membership-health latch so the journal gets one
+/// transition line plus hourly summaries instead of one line per push forever.
+///
+/// Before this, a refusal was a bare `return`: the session closed, and the
+/// sender's serve loop read that as `UnexpectedEof` → "peer closed cleanly" →
+/// **success**. So the only failure mode that can persist indefinitely was also
+/// the only one invisible to the side that could fix it.
+///
+/// Best-effort on the wire — the sender may already be gone, and a send failure
+/// here must not stop us latching the log line. The reply is signed with this
+/// device's identity (the vault session); if the daemon is locked we cannot
+/// sign, so we still latch and simply close, which is the pre-059 behaviour.
+fn reject_chain_push(
+    daemon: &Daemon,
+    local: &LocalDevice,
+    session: &mut NoiseSession<TcpStream>,
+    chain: &str,
+    sender: &[u8; 32],
+    reason: ChainRejectReason,
+) {
+    let (line, frame) = {
+        let mut inner = daemon.inner.lock().unwrap();
+        let line = inner.chain_health.observe(
+            HealthRole::Inbound,
+            chain,
+            *sender,
+            HealthClass::Rejected(reason),
+            now_secs(),
+        );
+        let frame = inner.session.as_ref().map(|vault| {
+            let local_id = local.device_id;
+            let signature = vault
+                .sign(&chain_rejected_signing_bytes(
+                    chain.as_bytes(),
+                    &local_id,
+                    reason,
+                ))
+                .to_bytes()
+                .to_vec();
+            Frame::chain_rejected(ChainRejected {
+                chain_id: chain.as_bytes().to_vec(),
+                reason: reason.as_u32(),
+                device_id: local_id.to_vec(),
+                signature,
+            })
+        });
+        (line, frame)
+    };
+    // Lock released before any network IO (the serve path's standing discipline).
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+    if let Some(frame) = frame {
+        if let Err(e) = session.send_frame(&frame) {
+            eprintln!("keeperd: net: shared-chain {chain}: could not send the rejection: {e}");
+        }
+    }
+}
+
 /// S-member pushed a committed edit for us to adopt. The choreography mirrors
 /// [`serve_replica_ingest`] — the sender dialed, sent this frame, and is now
 /// serving [`serve_replication`] on the same session — so we receive-then-pull:
@@ -2251,14 +2330,49 @@ fn serve_shared_chain_push(
         return;
     }
     let Some((membership, members)) = resolve_chain_members(daemon, ring, local, &chain) else {
-        return; // locked mid-serve — the sender retries on its next tick
-    };
-    if !turn_sender_is_member(&membership, &chain, &members, &sender) {
-        eprintln!(
-            "keeperd: net: shared-chain-push for {chain} from non-member {}; rejecting",
-            hex::encode(sender)
+        // Locked mid-serve, or committed membership unreadable. TRANSIENT — say
+        // exactly that on the wire (task 059) so the sender keeps retrying; a
+        // lock window must never latch as a membership verdict.
+        reject_chain_push(
+            daemon,
+            local,
+            &mut session,
+            &chain,
+            &sender,
+            ChainRejectReason::NotReady,
         );
         return;
+    };
+    if !turn_sender_is_member(&membership, &chain, &members, &sender) {
+        // Task 059: tell the sender WHY, distinguishably from a transport
+        // failure, and bound the log. The two verdicts are kept apart because
+        // their fixes differ — `UnknownChain` means this device holds no row for
+        // the chain at all (the live 2026-08 case: `subtree = []` here while the
+        // peer still held its own membership), `NotAMember` means the chain
+        // exists here but this sender is not in its S-member set.
+        let reason = if membership.subtrees.iter().any(|r| r.ref_name == chain) {
+            ChainRejectReason::NotAMember
+        } else {
+            ChainRejectReason::UnknownChain
+        };
+        reject_chain_push(daemon, local, &mut session, &chain, &sender, reason);
+        return;
+    }
+    // An accepted push is the recovery edge for the inbound latch: if we were
+    // refusing this peer on this chain, the journal says so once, here.
+    {
+        let mut inner = daemon.inner.lock().unwrap();
+        let line = inner.chain_health.observe(
+            HealthRole::Inbound,
+            &chain,
+            sender,
+            HealthClass::Ok,
+            now_secs(),
+        );
+        drop(inner);
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
     }
 
     // Pull the edit's tree closure into the LIVE store OFF the daemon lock: read
@@ -2469,12 +2583,23 @@ fn serve_shared_chain_push(
     if let Some((session, relay_client, garden_root, state_root)) = repush {
         let relay_available = relay_client.is_some();
         let ring_snapshot = ring.lock().unwrap().clone();
-        let targets: Vec<RingEntry> = members
-            .iter()
-            .filter(|id| **id != local.device_id && **id != sender)
-            .filter_map(|id| ring_snapshot.peers().iter().find(|p| &p.device_id == id).cloned())
-            .filter(|host| !plan_routes(host, relay_available).is_empty())
-            .collect();
+        // The re-push derives its own targets (it must also exclude the sender
+        // the edit arrived from, which `resolve_turn_targets` knows nothing
+        // about), so it applies the suppression filter itself — otherwise a
+        // chain latched as refused by a member would still be re-pushed to that
+        // member on every inbound apply. The daemon lock is held only for the
+        // filter; every dial below still runs off it.
+        let now = now_secs();
+        let targets: Vec<RingEntry> = {
+            let inner = daemon.inner.lock().unwrap();
+            members
+                .iter()
+                .filter(|id| **id != local.device_id && **id != sender)
+                .filter_map(|id| ring_snapshot.peers().iter().find(|p| &p.device_id == id).cloned())
+                .filter(|host| !plan_routes(host, relay_available).is_empty())
+                .filter(|host| !inner.chain_health.pushes_suppressed(&chain, &host.device_id, now))
+                .collect()
+        };
         if !targets.is_empty() {
             let frame = build_shared_chain_push_frame(
                 &session,
@@ -2488,7 +2613,7 @@ fn serve_shared_chain_push(
                 repush_timestamp,
             );
             for host in &targets {
-                if let Err(e) = push_shared_chain_to_host(
+                let outcome = push_shared_chain_to_host(
                     local,
                     host,
                     &frame,
@@ -2496,12 +2621,8 @@ fn serve_shared_chain_push(
                     &garden_root,
                     state_root.as_deref(),
                     relay_client.as_ref(),
-                ) {
-                    eprintln!(
-                        "keeperd: net: shared-chain re-push of {chain} to {} skipped: {e}",
-                        host.fingerprint()
-                    );
-                }
+                );
+                observe_push_outcome(daemon, &chain, host, "re-push", outcome);
             }
         }
     }
@@ -2940,7 +3061,12 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
 /// `AlreadyPresent` (one round-trip), so re-pushing the current tip every tick is
 /// safe (the same posture as `reconcile_replicas`). All snapshotting is under the
 /// daemon lock; every dial runs off it.
-fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
+#[doc(hidden)] // test seam — see `serve_established`. One tick, driven directly:
+               // "a refused sender stops pushing on the NEXT tick" (task 059) is
+               // a claim about this function's target resolution, so
+               // `tests/chain_rejection.rs` calls it rather than waiting on the
+               // live net runtime's timer + mDNS.
+pub fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
     struct SharedPush {
         chain: String,
         new_tree: [u8; 32],
@@ -2974,6 +3100,7 @@ fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
         let ring_members = assemble_member_set(&ring, local.device_id);
         let relay_client = relay_client_config(&inner.config);
         let relay_available = relay_client.is_some();
+        let now = now_secs();
 
         let mut pushes: Vec<SharedPush> = Vec::new();
         for entry in &membership.subtrees {
@@ -3004,9 +3131,11 @@ fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
                 &local.device_id,
                 relay_available,
                 &chain,
+                &inner.chain_health,
+                now,
             );
             if targets.is_empty() {
-                continue; // no reachable S-member this tick
+                continue; // no reachable S-member, or all of them latched-refusing
             }
             let (writer_device, files) = shared_push_provenance(&tip_row.payload, &local.device_name);
             // Placement never crosses the wire (m5f slice 002): the frame names
@@ -3042,7 +3171,7 @@ fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
     // Lock released — every dial + serve runs off the daemon mutex.
     for push in pushes {
         for host in &push.targets {
-            if let Err(e) = push_shared_chain_to_host(
+            let outcome = push_shared_chain_to_host(
                 local,
                 host,
                 &push.frame,
@@ -3050,13 +3179,8 @@ fn reconcile_shared_pushes(daemon: &Daemon, local: &LocalDevice) {
                 &garden_root,
                 state_root.as_deref(),
                 relay_client.as_ref(),
-            ) {
-                eprintln!(
-                    "keeperd: net: shared-chain push of {} to {} skipped: {e}",
-                    push.chain,
-                    host.fingerprint()
-                );
-            }
+            );
+            observe_push_outcome(daemon, &push.chain, host, "push", outcome);
         }
     }
 }
@@ -4006,13 +4130,98 @@ pub fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
     root_tree: &[u8; 32],
     garden_root: &std::path::Path,
     state_root: Option<&std::path::Path>,
-) -> Result<(), String> {
+) -> Result<PushOutcome, String> {
     let repo = Repo::open_with(garden_root, state_root).map_err(|e| format!("open repo: {e}"))?;
     let source =
         RepoSource::for_subtree(repo, *root_tree).map_err(|e| format!("scope source: {e}"))?;
-    serve_replication(session, &source)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    match serve_replication(session, &source) {
+        Ok(_) => Ok(PushOutcome::Accepted),
+        // A refusal is an ANSWER, not a failure — the whole bug (task 059) was
+        // that this arm did not exist, so a `NotAMember` verdict arrived as an
+        // `UnexpectedEof` and was indistinguishable from a clean `Ok(())`.
+        Err(NetError::ChainRejected(r)) => Ok(PushOutcome::Rejected(*r)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// What a completed shared-chain push round-trip actually MEANT — the
+/// distinction task 059 exists to restore. `Err` from the push primitives stays
+/// reserved for "we could not complete a round-trip" (no route, dial, handshake,
+/// mid-serve IO); a peer that answered us, even to refuse, is an `Ok` outcome
+/// the caller must read. Collapsing the two is what let 12,854 rejections read
+/// as 12,854 successes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The member pulled the closure and applied it (or already had it).
+    Accepted,
+    /// The member answered with a signed refusal. NOT yet verified — the caller
+    /// must call [`ChainRejection::verified`] with the device id it dialed
+    /// before acting on it (see [`observe_push_outcome`]).
+    Rejected(ChainRejection),
+}
+
+/// Record one completed outbound push attempt in the latch, printing whatever
+/// journal edge it produces. The single place every outbound push path (the
+/// reconcile fan-out, the mesh re-push) agrees on what an outcome means, so a
+/// verdict latched by one suppresses the others via [`resolve_turn_targets`].
+///
+/// Three outcomes, three different things:
+/// - **Accepted** → `Ok`, which also CLEARS a stale verdict (a recovery edge).
+/// - **Rejected and verified** → the typed reason, which may latch + suppress.
+/// - **Rejected but unverifiable, or a transport error** → the latch is left
+///   exactly as it was. Loud, but never a verdict — and crucially never read as
+///   success either, because recording `Ok` here would clear a real verdict on
+///   nothing better than a dropped connection.
+fn observe_push_outcome(
+    daemon: &Daemon,
+    chain: &str,
+    host: &RingEntry,
+    what: &str,
+    outcome: Result<PushOutcome, String>,
+) {
+    let class = match outcome {
+        Ok(PushOutcome::Accepted) => HealthClass::Ok,
+        Ok(PushOutcome::Rejected(r)) => {
+            // Act only on a refusal the peer we actually dialed signed, FOR the
+            // chain we actually pushed. `chain_rejected_signing_bytes` binds the
+            // chain ref, so a legitimately-signed refusal of chain X cannot be
+            // forged into one for Y — but it could still be echoed back during a
+            // push of Y, and suppressing Y on a verdict about X is the same bug
+            // wearing a valid signature.
+            if !r.verified(&host.device_id) || r.chain != chain {
+                eprintln!(
+                    "keeperd: net: shared-chain {chain}: {} answered our push with an \
+                     UNVERIFIABLE rejection ({} for {:?}) — ignored; membership here is \
+                     unchanged and pushes continue",
+                    host.fingerprint(),
+                    r.reason,
+                    r.chain,
+                );
+                return;
+            }
+            HealthClass::Rejected(r.reason)
+        }
+        Err(e) => {
+            eprintln!(
+                "keeperd: net: shared-chain {what} of {chain} to {} skipped: {e}",
+                host.fingerprint()
+            );
+            return;
+        }
+    };
+    let line = {
+        let mut inner = daemon.inner.lock().unwrap();
+        inner.chain_health.observe(
+            HealthRole::Outbound,
+            chain,
+            host.device_id,
+            class,
+            now_secs(),
+        )
+    };
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
 }
 
 /// Push one shared-chain edit to one `S`-member, preferring a LAN-direct dial and
@@ -4022,6 +4231,11 @@ pub fn serve_shared_subtree<S: std::io::Read + std::io::Write>(
 /// receiver pulls + applies it as a local `shared_pull` commit. A
 /// dial/handshake/send failure falls through to the next route; once serving
 /// begins the result is returned (a mid-serve error is not retried elsewhere).
+///
+/// `Ok` means the member ANSWERED — see [`PushOutcome`], which distinguishes an
+/// accepted push from a signed refusal. `Err` is reserved for "no round-trip
+/// happened at all". Feed the result to [`observe_push_outcome`] rather than
+/// testing it for `Err`: a refusal is an `Ok`, by design.
 #[doc(hidden)] // test seam — see `serve_established`. Drives the outbound push
                // primitive directly so the 3-daemon mesh test can seed A→B over
                // a real dial (the same path the `Applied`-arm re-push uses).
@@ -4034,7 +4248,7 @@ pub fn push_shared_chain_to_host(
     garden_root: &std::path::Path,
     state_root: Option<&std::path::Path>,
     relay_client: Option<&(String, [u8; 32])>,
-) -> Result<(), String> {
+) -> Result<PushOutcome, String> {
     let routes = plan_routes(host, relay_client.is_some());
     if routes.is_empty() {
         return Err("no route to member (no LAN endpoint, no relay)".to_string());

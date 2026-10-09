@@ -13,6 +13,7 @@
 
 pub mod actions;
 pub mod ceremony;
+pub mod chain_health;
 pub mod classify;
 pub mod config;
 pub mod daemon;
