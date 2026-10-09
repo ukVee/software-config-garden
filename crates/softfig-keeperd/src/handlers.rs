@@ -1229,7 +1229,22 @@ pub fn pair_begin(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         created: Instant::now(),
         pending,
     };
-    let pairing_id = daemon.inner.lock().unwrap().pending_pairs.park(parked);
+    // Capacity is shared with inbound pairings; refuse rather than silently
+    // dropping a pairing the user deliberately started.
+    let pairing_id = daemon
+        .inner
+        .lock()
+        .unwrap()
+        .pending_pairs
+        .park(parked)
+        .ok_or_else(|| (
+            ErrorKind::PairFailed,
+            format!(
+                "paired with {actual_fp} but cannot park the result: too many unconfirmed \
+                 pairings are already held. Confirm or let the stale ones expire \
+                 (`softfig pair list`), then retry"
+            ),
+        ))?;
 
     Ok(serde_json::to_value(PairBeginReply {
         pairing_id,

@@ -4,13 +4,21 @@
 //! X25519 transport secret + the Ed25519 identity + a freshly-signed transport
 //! attestation), then — if `[net] enabled` — starts the live networking:
 //!
-//! * an **inbound TCP listener** for Noise sessions. A device whose ring is
-//!   still empty (a *fresh* device being added) serves the pairing *responder*
-//!   role ([`pair_responder`]); once it has at least one peer it serves the
-//!   *reconnect* role ([`ik_responder`]) and a `Ping`/`Pong` liveness echo for
-//!   authenticated ring members. This derives the responder/initiator split
-//!   straight from ring state, so it needs no extra wire discriminator (none
-//!   exists in `softfig-net`, and M5a-4 adds no new protocol).
+//! * an **inbound TCP listener** for Noise sessions. The responder role is read
+//!   per-connection from the peer's own first handshake message
+//!   ([`peek_inbound_role`]): a bare 32-byte Noise `XX` `-> e` is a *pairing*
+//!   ([`pair_responder`]); anything else is a steady-state `IK` *reconnect*
+//!   ([`ik_responder`]) plus a `Ping`/`Pong` liveness echo for authenticated
+//!   ring members. The two shapes are disjoint on the wire, and the role is
+//!   decided by `peek`ing the length prefix *without consuming a byte* — so
+//!   pairing and reconnect need no wire discriminator and no
+//!   try-IK-then-fall-back-to-XX retry.
+//!
+//!   This role used to be derived from *ring state* (empty ring ⇒ pairing),
+//!   which meant a device holding even one peer answered every inbound
+//!   connection as a reconnect, and so could never be paired *to*; two devices
+//!   that each already held a peer could never pair in either direction
+//!   (task 057).
 //! * the **mDNS responder** — announce `_softfig._tcp` and a browse loop that
 //!   folds resolved peers' endpoints into the ring ([`refresh_ring_endpoints`])
 //!   and a discovery cache that `pair_begin` consults to resolve a fingerprint
@@ -83,6 +91,20 @@ use crate::state::State;
 /// pruned. The user confirms the SAS out of band; this bounds the live socket a
 /// parked pairing holds open so a half-finished pairing can't leak forever.
 const PAIRING_TTL: Duration = Duration::from_secs(300);
+
+/// Ceiling on simultaneously parked (unconfirmed) inbound pairings.
+///
+/// Each [`ParkedPairing`] holds a live socket, so an unbounded map is an fd/memory
+/// exposure for anyone who can reach the listener. Before task 057 only a
+/// *fresh* (empty-ring) device ever served pairings, which kept the blast radius
+/// tiny; now that any device answers a pairing XX, every device inherits that
+/// exposure and it has to be bounded.
+///
+/// At capacity new pairings are **refused rather than evicting the oldest**: a
+/// flood must not be able to knock out a pending pairing the user is in the
+/// middle of confirming. The refusal is bounded by [`PAIRING_TTL`] and says what
+/// to do about it.
+const MAX_PARKED_PAIRINGS: usize = 16;
 
 /// Poll cadence for the interruptible accept / browse loops, so a lock (drop of
 /// the runtime) is honoured promptly without a blocking accept.
@@ -258,14 +280,21 @@ impl std::fmt::Debug for PendingPairs {
 impl PendingPairs {
     /// Drop parked pairings older than [`PAIRING_TTL`], then park `parked`
     /// under a fresh id (returned).
-    pub fn park(&mut self, parked: ParkedPairing) -> String {
+    ///
+    /// Returns `None` — parking nothing — when [`MAX_PARKED_PAIRINGS`] live
+    /// pairings are already held, so a flood of inbound pairings can neither
+    /// grow unbounded nor displace one the user is mid-confirmation on.
+    pub fn park(&mut self, parked: ParkedPairing) -> Option<String> {
         self.prune();
+        if self.map.len() >= MAX_PARKED_PAIRINGS {
+            return None;
+        }
         let id = {
             self.next_id += 1;
             format!("pair-{:x}", self.next_id)
         };
         self.map.insert(id.clone(), parked);
-        id
+        Some(id)
     }
 
     pub fn take(&mut self, id: &str) -> Option<ParkedPairing> {
@@ -303,6 +332,11 @@ impl PendingPairs {
 /// Dial `endpoint`, run the Noise `XX` pairing handshake as the **initiator**,
 /// and return the [`PendingPair`] (attestation already verified inside
 /// `softfig-net`). The caller surfaces the SAS and parks the result.
+///
+/// A handshake that dies before the peer answers is re-worded by
+/// [`explain_pairing_handshake_failure`] — on this path the overwhelmingly
+/// likely cause is a peer running a pre-057 build, and a bare transport error
+/// gives the user nothing to act on.
 pub fn initiate_pairing(local: &LocalDevice, endpoint: &str) -> Result<PendingPair<TcpStream>, NetError> {
     let addr: SocketAddr = endpoint
         .to_socket_addrs()?
@@ -311,7 +345,42 @@ pub fn initiate_pairing(local: &LocalDevice, endpoint: &str) -> Result<PendingPa
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.set_write_timeout(Some(Duration::from_secs(20)))?;
-    pair_initiator(stream, local)
+    pair_initiator(stream, local).map_err(explain_pairing_handshake_failure)
+}
+
+/// Turn a failed *outbound pairing* handshake into something the user can act
+/// on, naming the role we took and the most likely cause.
+///
+/// Task 057's symptom cut both ways. The responder-side wording is fixed in
+/// [`serve_inbound`]; this is the initiator half. We always open a pairing with
+/// Noise `XX`, so if the peer accepted the TCP connection and then closed or
+/// stalled without answering, it almost certainly mis-roled us — which is
+/// exactly what a **pre-057 build with a non-empty ring** does: it serves every
+/// inbound connection as an `IK` reconnect, cannot parse our `XX -> e`, and
+/// drops the connection.
+///
+/// That is the compat story for an un-upgraded peer: the fix is local to the
+/// *responder*, so a device still running the old build must either be upgraded
+/// or be the one to dial (its outbound path was never broken).
+fn explain_pairing_handshake_failure(e: NetError) -> NetError {
+    let truncated = match &e {
+        NetError::Io(io_err) => matches!(
+            io_err.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+        ),
+        _ => false,
+    };
+    if !truncated {
+        return e;
+    }
+    NetError::Replica(format!(
+        "we opened the PAIRING role (Noise XX) and the peer accepted the connection but never          answered the handshake ({e}). The peer is most likely running a build older than the          057 responder-role fix: such a build only answers pairings while its own ring is          empty, and serves every other inbound connection as an IK reconnect. Upgrade the          peer, or pair in the other direction (have the peer run `softfig pair` against this          device — its outbound path works on any build)"
+    ))
 }
 
 // --- Ring persistence: split membership (garden) from endpoints (sidecar) ----
@@ -656,45 +725,183 @@ fn spawn_inbound_loop(
         .expect("spawn net accept thread")
 }
 
-/// Handle one inbound connection per the ring-state role split.
+/// The exact on-wire length of a Noise `XX` first message (`-> e`): the 32-byte
+/// ephemeral public key, with an empty payload and no AEAD tag (no key is
+/// established yet at that point in the pattern). An `IK` first message
+/// (`-> e, es, s, ss`) carries the encrypted static **and** the `HelloPayload`,
+/// so it never lands below ~112 bytes. That gap is what makes the inbound role
+/// readable from the length prefix alone.
+///
+/// `softfig-net`'s `handshake_role_prefix` integration test pins both halves of
+/// this invariant; if it ever breaks, this discriminator must change with it.
+const XX_FIRST_MESSAGE_LEN: u16 = 32;
+
+/// How long to wait for the 2 length-prefix bytes that reveal the inbound role.
+/// Only reached when a peer dribbles a single byte and stalls — a connection
+/// that sends nothing blocks in `peek` on the socket read timeout instead.
+const ROLE_PEEK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause between `peek` retries while exactly one of the two length bytes is
+/// buffered. `peek` returns that byte immediately rather than blocking for the
+/// second, so without a pause this would spin.
+const ROLE_PEEK_RETRY: Duration = Duration::from_millis(20);
+
+/// Which responder role an inbound connection is asking for, decided from its
+/// first handshake message before any of it is consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundRole {
+    /// A Noise `XX` pairing attempt (first contact).
+    Pairing,
+    /// A Noise `IK` reconnect from a device that already holds our static key.
+    Reconnect,
+}
+
+impl InboundRole {
+    /// How the role reads in an operator-facing log line.
+    fn label(self) -> &'static str {
+        match self {
+            InboundRole::Pairing => "PAIRING (Noise XX)",
+            InboundRole::Reconnect => "RECONNECT (Noise IK)",
+        }
+    }
+}
+
+/// Read the inbound role off the peer's first handshake message **without
+/// consuming it**, via `MSG_PEEK`.
+///
+/// This is the fix for task 057. The role must be knowable before the bytes are
+/// read: a "try IK, fall back to XX" retry cannot work (the failed attempt
+/// consumes the first frame, and a silent fallback would make a genuine IK
+/// failure indistinguishable from a pairing), and deriving it from ring state is
+/// the bug — a non-empty ring does not mean the next connection is a reconnect.
+///
+/// Peeking sidesteps both: `XX` and `IK` first messages have disjoint lengths
+/// (see [`XX_FIRST_MESSAGE_LEN`]), so two peeked bytes settle the role while the
+/// handshake itself stays untouched for the real responder. Nothing on the wire
+/// changes, so this needs no protocol version and no compat negotiation.
+///
+/// Returns the role plus the peeked first-message length (for logging). `Err`
+/// carries a reason that distinguishes "no handshake at all" (a port probe, the
+/// case that used to masquerade as a handshake failure) from a real IO fault.
+fn peek_inbound_role(conn: &TcpStream) -> std::io::Result<(InboundRole, u16)> {
+    let deadline = Instant::now() + ROLE_PEEK_TIMEOUT;
+    let mut buf = [0u8; 2];
+    loop {
+        match conn.peek(&mut buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed without sending a handshake",
+                ))
+            }
+            Ok(n) if n >= 2 => {
+                let len = u16::from_be_bytes(buf);
+                let role = if len == XX_FIRST_MESSAGE_LEN {
+                    InboundRole::Pairing
+                } else {
+                    InboundRole::Reconnect
+                };
+                return Ok((role, len));
+            }
+            // Exactly one byte buffered: pace the retry rather than spin.
+            Ok(_) => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "peer sent 1 byte then stalled before the handshake length prefix",
+                    ));
+                }
+                thread::sleep(ROLE_PEEK_RETRY);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Handle one inbound connection, roled from its own first handshake message.
 fn serve_inbound(daemon: Daemon, local: &LocalDevice, ring: &Arc<Mutex<Ring>>, conn: TcpStream) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = conn.set_write_timeout(Some(Duration::from_secs(30)));
-    let ring_empty = ring.lock().map(|r| r.is_empty()).unwrap_or(true);
+    let from = conn
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<unknown peer>".into());
 
-    if ring_empty {
-        // Fresh device: serve the pairing responder role and park the result
-        // for the user to confirm (surfaced via `pair_list`).
-        match pair_responder(conn, local) {
-            Ok(pending) => {
-                let peer = pending.peer();
-                let parked = ParkedPairing {
-                    sas: pending.sas().grouped(),
-                    fingerprint: peer.fingerprint(),
-                    name: peer.name.clone(),
-                    created: Instant::now(),
-                    pending,
-                };
-                let (fp, sas) = (parked.fingerprint.clone(), parked.sas.clone());
-                let id = daemon.inner.lock().unwrap().pending_pairs.park(parked);
-                eprintln!(
-                    "keeperd: net: incoming pairing {id} from {fp}; SAS {sas}; \
-                     confirm with `softfig pair {fp}` once the codes match"
-                );
-            }
-            Err(e) => eprintln!("keeperd: net: inbound pairing failed: {e}"),
+    // Decide the role from the peer's first bytes, NOT from our ring state —
+    // a device with peers must still be able to answer a new pairing (057).
+    let (role, first_len) = match peek_inbound_role(&conn) {
+        Ok(decided) => decided,
+        Err(e) => {
+            // Never report this as a handshake failure: no role was ever
+            // chosen. This is the line that used to read
+            // `inbound IK handshake failed: io: failed to fill whole buffer`
+            // for an ordinary port probe.
+            eprintln!(
+                "keeperd: net: inbound connection from {from} sent no usable handshake, \
+                 so no responder role was chosen (a port probe or a stalled dial, \
+                 not a pairing or reconnect failure): {e}"
+            );
+            return;
         }
-    } else {
-        // Established device: IK reconnect, authorize against the ring, then
-        // dispatch on the first frame (liveness ping vs. a replication push).
-        match ik_responder(conn, &local.transport_secret, &local.hello()) {
-            Ok(session) => match ring_member_entry(ring, session.peer_static()) {
-                Some(owner) => serve_established(&daemon, local, &owner, ring, session),
-                None => {
-                    eprintln!("keeperd: net: rejecting reconnect from unknown transport key")
+    };
+
+    match role {
+        InboundRole::Pairing => {
+            // Serve the pairing responder role and park the result for the user
+            // to confirm (surfaced via `pair_list`). Parking is the consent
+            // gate: nothing joins the ring until the SAS is matched by hand.
+            match pair_responder(conn, local) {
+                Ok(pending) => {
+                    let peer = pending.peer();
+                    let parked = ParkedPairing {
+                        sas: pending.sas().grouped(),
+                        fingerprint: peer.fingerprint(),
+                        name: peer.name.clone(),
+                        created: Instant::now(),
+                        pending,
+                    };
+                    let (fp, sas) = (parked.fingerprint.clone(), parked.sas.clone());
+                    match daemon.inner.lock().unwrap().pending_pairs.park(parked) {
+                        Some(id) => eprintln!(
+                            "keeperd: net: incoming pairing {id} from {fp} ({from}); SAS {sas}; \
+                             confirm with `softfig pair {fp}` once the codes match"
+                        ),
+                        None => eprintln!(
+                            "keeperd: net: dropping pairing from {fp} ({from}): already holding \
+                             {MAX_PARKED_PAIRINGS} unconfirmed pairings; confirm or ignore those \
+                             (`softfig pair list`) and have the peer retry"
+                        ),
+                    }
                 }
-            },
-            Err(e) => eprintln!("keeperd: net: inbound IK handshake failed: {e}"),
+                Err(e) => eprintln!(
+                    "keeperd: net: inbound pairing from {from} failed in the {} responder role \
+                     (chosen because its first handshake message was a {first_len}-byte XX \
+                     `-> e`): {e}",
+                    role.label()
+                ),
+            }
+        }
+        InboundRole::Reconnect => {
+            // Established peer: IK reconnect, authorize against the ring, then
+            // dispatch on the first frame (liveness ping vs. a replication push).
+            match ik_responder(conn, &local.transport_secret, &local.hello()) {
+                Ok(session) => match ring_member_entry(ring, session.peer_static()) {
+                    Some(owner) => serve_established(&daemon, local, &owner, ring, session),
+                    None => eprintln!(
+                        "keeperd: net: rejecting reconnect from {from}: its transport key is in \
+                         no ring entry. It spoke IK, so it believes it is already paired with \
+                         us; if it means to pair afresh it must dial with `softfig pair` (which \
+                         speaks XX) or be re-added here"
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "keeperd: net: inbound reconnect from {from} failed in the {} responder role \
+                     (chosen because its first handshake message was {first_len} bytes, not the \
+                     {XX_FIRST_MESSAGE_LEN}-byte XX `-> e` a pairing opens with): {e}",
+                    role.label()
+                ),
+            }
         }
     }
 }
@@ -5973,5 +6180,295 @@ mod tests {
             &local.device_id,
             &offer.signature,
         ));
+    }
+
+    // --- Task 057: the inbound role comes from the wire, not from ring state --
+    //
+    // The bug: `serve_inbound` chose the responder role from whether the local
+    // ring was empty, so a device with even one peer answered EVERY inbound
+    // connection as an IK reconnect. A pairing XX from a new device died as a
+    // bare `failed to fill whole buffer`, and two devices that each held a peer
+    // could never pair in either direction.
+    //
+    // The fix peeks the first handshake message's length prefix. These tests
+    // pin the discriminator, the no-consumption property it depends on, and
+    // both behavioural halves the task's finish criteria name.
+
+    /// Serve one raw connection's worth of `peek_inbound_role` against bytes a
+    /// client writes, returning the decision and the still-unread stream.
+    fn role_of_first_bytes(first: &[u8]) -> (std::io::Result<(InboundRole, u16)>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = first.to_vec();
+        let client = thread::spawn(move || {
+            let mut c = softfig_net::testing::connect_within(addr, "057 role peek");
+            if !payload.is_empty() {
+                use std::io::Write;
+                c.write_all(&payload).unwrap();
+                c.flush().unwrap();
+            }
+            // Hold the socket open so an empty write is "sent nothing", not EOF.
+            thread::sleep(Duration::from_millis(300));
+            c
+        });
+        let conn = softfig_net::testing::accept_within(&listener, "057 role peek");
+        conn.set_read_timeout(Some(Duration::from_millis(600))).unwrap();
+        let decided = peek_inbound_role(&conn);
+        let _ = client.join();
+        (decided, conn)
+    }
+
+    #[test]
+    fn peek_role_reads_pairing_from_a_32_byte_first_message() {
+        // A Noise XX `-> e`: length prefix 32, then the ephemeral key.
+        let mut msg = vec![0x00, 0x20];
+        msg.extend_from_slice(&[0xAB; 32]);
+        let (decided, _conn) = role_of_first_bytes(&msg);
+        let (role, len) = decided.expect("a role is decided");
+        assert_eq!(role, InboundRole::Pairing);
+        assert_eq!(len, XX_FIRST_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn peek_role_reads_reconnect_from_an_ik_sized_first_message() {
+        // A Noise IK `-> e, es, s, ss` is never 32 bytes (it carries the hello).
+        let mut msg = vec![0x00, 0x90]; // 144
+        msg.extend_from_slice(&[0xCD; 144]);
+        let (decided, _conn) = role_of_first_bytes(&msg);
+        let (role, len) = decided.expect("a role is decided");
+        assert_eq!(role, InboundRole::Reconnect);
+        assert_eq!(len, 144);
+    }
+
+    /// A port probe that opens a connection and sends nothing must NOT be
+    /// reported as a handshake failure — it is the symptom that made the
+    /// original bug unreadable (the same log line as a mis-roled pairing).
+    #[test]
+    fn peek_role_declines_to_choose_for_a_connection_that_sends_nothing() {
+        let (decided, _conn) = role_of_first_bytes(&[]);
+        let err = decided.expect_err("no role can be chosen without bytes");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            "expected a no-handshake signal, got {err:?}"
+        );
+    }
+
+    /// The property that makes this fix possible at all: deciding the role
+    /// consumes nothing, so the real responder still reads the whole first
+    /// message. (A try-IK-then-retry-XX fallback cannot claim this — hence the
+    /// task's explicit ban on it.)
+    #[test]
+    fn peek_role_leaves_every_handshake_byte_for_the_responder() {
+        let mut msg = vec![0x00, 0x20];
+        msg.extend_from_slice(&[0x5A; 32]);
+        let (decided, mut conn) = role_of_first_bytes(&msg);
+        assert_eq!(decided.unwrap().0, InboundRole::Pairing);
+
+        use std::io::Read;
+        let mut got = vec![0u8; msg.len()];
+        conn.read_exact(&mut got).expect("the bytes are still queued");
+        assert_eq!(got, msg, "peeking must not consume the handshake");
+    }
+
+    /// **The regression.** A responder whose ring is NON-EMPTY completes a
+    /// pairing as the responder, without unpairing anything — the first finish
+    /// criterion, and exactly what the old ring-state gate made impossible.
+    #[test]
+    fn responder_with_a_non_empty_ring_accepts_a_pairing() {
+        let (daemon, _tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "established");
+
+        // The ring already holds a peer, so the old code would have taken IK.
+        let ring = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(forged_peer(9));
+            r
+        }));
+        assert!(!ring.lock().unwrap().is_empty(), "ring must be non-empty");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A brand-new device dials in with a pairing XX.
+        let (newcomer, newcomer_entry) = transport_device(77, 78, "newcomer");
+        let newcomer_fp = newcomer_entry.fingerprint();
+        let dialer = thread::spawn(move || {
+            let stream = softfig_net::testing::connect_within(addr, "057 pairing");
+            pair_initiator(stream, &newcomer).expect("newcomer pairs")
+        });
+
+        let conn = softfig_net::testing::accept_within(&listener, "057 pairing");
+        serve_inbound(daemon.clone(), &local, &ring, conn);
+        let initiator_pending = dialer.join().expect("dialer thread");
+
+        // The pairing was served and parked for human confirmation.
+        let parked = daemon.inner.lock().unwrap().pending_pairs.list();
+        assert_eq!(parked.len(), 1, "the pairing must be parked for confirmation");
+        let (_id, sas, fp, name) = &parked[0];
+        assert_eq!(name, "newcomer");
+        // The responder parks the *newcomer's* fingerprint; the initiator's
+        // `peer()` is this established device — they are different by design.
+        assert_eq!(fp, &newcomer_fp, "the parked peer is the device that dialed in");
+        assert_eq!(
+            sas,
+            &initiator_pending.sas().grouped(),
+            "both sides must show the same SAS"
+        );
+        // Nothing was unpaired to make room.
+        assert_eq!(ring.lock().unwrap().len(), 1, "the existing peer survives");
+    }
+
+    /// The other half of the criterion: a genuine IK reconnect from a ring
+    /// member still takes the established path (served here by the `Ping`/`Pong`
+    /// liveness echo), so fixing pairing did not break steady state.
+    #[test]
+    fn ring_member_reconnect_still_takes_the_established_path() {
+        let (daemon, _tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "established");
+        let local_static =
+            x25519_dalek::x25519(local.transport_secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+
+        // A real ring member reconnects.
+        let (member, member_entry) = transport_device(55, 56, "member");
+        let ring = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(member_entry);
+            r
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let prober = thread::spawn(move || {
+            let stream = softfig_net::testing::connect_within(addr, "057 reconnect");
+            let mut session = ik_initiator(
+                stream,
+                &member.transport_secret,
+                &local_static,
+                &member.hello(),
+            )
+            .expect("IK reconnect handshake");
+            session.send_frame(&Frame::ping(1234)).expect("send ping");
+            session.recv_frame().expect("receive pong")
+        });
+
+        let conn = softfig_net::testing::accept_within(&listener, "057 reconnect");
+        serve_inbound(daemon.clone(), &local, &ring, conn);
+        let reply = prober.join().expect("prober thread");
+
+        match reply.kind {
+            Some(frame::Kind::Pong(p)) => assert_eq!(p.nonce, 1234, "liveness echo answers"),
+            other => panic!("expected a Pong from the established path, got {other:?}"),
+        }
+        // A reconnect must never be mistaken for a pairing.
+        assert!(
+            daemon.inner.lock().unwrap().pending_pairs.list().is_empty(),
+            "an IK reconnect must not park a pairing"
+        );
+    }
+
+    /// The second finish criterion: two devices that EACH already hold peers can
+    /// pair with each other. Under the old gate neither side would answer, so no
+    /// direction worked; now either direction does.
+    #[test]
+    fn two_devices_that_each_hold_peers_can_pair() {
+        let (daemon_b, _tmp_b) = ceremony_daemon();
+        let local_b = device_of(&daemon_b, "dev-b");
+
+        // Both rings are non-empty. A dials B.
+        let (local_a, _) = transport_device(31, 32, "dev-a");
+        let ring_b = Arc::new(Mutex::new({
+            let mut r = Ring::default();
+            r.upsert(forged_peer(11));
+            r
+        }));
+        let a_ring_holds_a_peer = {
+            let mut r = Ring::default();
+            r.upsert(forged_peer(12));
+            !r.is_empty()
+        };
+        assert!(a_ring_holds_a_peer && !ring_b.lock().unwrap().is_empty());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dialer = thread::spawn(move || {
+            let stream = softfig_net::testing::connect_within(addr, "057 mutual pair");
+            pair_initiator(stream, &local_a).expect("dev-a pairs with an established dev-b")
+        });
+
+        let conn = softfig_net::testing::accept_within(&listener, "057 mutual pair");
+        serve_inbound(daemon_b.clone(), &local_b, &ring_b, conn);
+        let a_pending = dialer.join().expect("dialer thread");
+
+        let parked = daemon_b.inner.lock().unwrap().pending_pairs.list();
+        assert_eq!(parked.len(), 1, "B parks the pairing despite holding a peer");
+        assert_eq!(
+            parked[0].1,
+            a_pending.sas().grouped(),
+            "the SAS matches on both sides, so the humans can confirm"
+        );
+    }
+
+    /// Parked pairings are bounded: now that any device answers a pairing, an
+    /// unbounded map would be an fd/memory exposure to anyone who can reach the
+    /// listener. At capacity, new pairings are refused rather than evicting one
+    /// the user may be mid-confirmation on.
+    #[test]
+    fn parked_pairings_are_capped_and_refuse_rather_than_evict() {
+        let (daemon, _tmp) = ceremony_daemon();
+        let local = device_of(&daemon, "established");
+        let ring = Arc::new(Mutex::new(Ring::default()));
+
+        // Fill to capacity with real parked pairings.
+        for seed in 0..MAX_PARKED_PAIRINGS {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (peer, _) = transport_device(100 + seed as u8, 150 + seed as u8, "flooder");
+            let dialer = thread::spawn(move || {
+                let stream = softfig_net::testing::connect_within(addr, "057 flood");
+                pair_initiator(stream, &peer)
+            });
+            let conn = softfig_net::testing::accept_within(&listener, "057 flood");
+            serve_inbound(daemon.clone(), &local, &ring, conn);
+            let _ = dialer.join();
+        }
+        let at_cap = daemon.inner.lock().unwrap().pending_pairs.list();
+        assert_eq!(at_cap.len(), MAX_PARKED_PAIRINGS, "filled to the cap");
+        let first_id = at_cap.iter().map(|(id, ..)| id.clone()).min().unwrap();
+
+        // One more must be refused, and must not displace an existing entry.
+        let extra = ParkedPairing {
+            sas: "000 000".into(),
+            fingerprint: "ff".into(),
+            name: "overflow".into(),
+            created: Instant::now(),
+            pending: {
+                // Park a real PendingPair so the type is honest; it is refused
+                // before it is ever stored.
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let (peer, _) = transport_device(200, 201, "overflow");
+                let dialer = thread::spawn(move || {
+                    let stream = softfig_net::testing::connect_within(addr, "057 overflow");
+                    pair_initiator(stream, &peer)
+                });
+                let conn = softfig_net::testing::accept_within(&listener, "057 overflow");
+                let served = pair_responder(conn, &local).expect("overflow pairing handshake");
+                let _ = dialer.join();
+                served
+            },
+        };
+        let refused = daemon.inner.lock().unwrap().pending_pairs.park(extra);
+        assert!(refused.is_none(), "a pairing past the cap is refused");
+        let after = daemon.inner.lock().unwrap().pending_pairs.list();
+        assert_eq!(after.len(), MAX_PARKED_PAIRINGS, "the cap holds");
+        assert!(
+            after.iter().any(|(id, ..)| id == &first_id),
+            "refusal must not evict an entry the user may be confirming"
+        );
     }
 }

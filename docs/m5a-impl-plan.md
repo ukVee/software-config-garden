@@ -425,6 +425,16 @@ require unlock). No `softfig-net` change — this slice only *wires* it.
   the peer against the ring, and runs a `Ping`/`Pong` liveness echo. This maps
   the decision doc's "fresh device announces / paired device initiates" exactly
   onto ring state, so no connection-type byte was added (M5a-4 adds no protocol).
+  > **SUPERSEDED by task 057 (2026-10-08).** Deriving the role from ring state
+  > was a bug: a device holding even one peer answered *every* inbound
+  > connection as an `IK` reconnect, so it could never be paired *to*, and two
+  > devices that each held a peer could never pair in either direction. The role
+  > is now read per-connection off the peer's own first handshake message —
+  > `peek`ing the 2-byte length prefix, which is **32 for an `XX` `-> e`** and
+  > never below ~112 for an `IK` first message. The conclusion above still
+  > holds, though: no connection-type byte was added, because the role was
+  > already legible on the wire. See `meta/spec-sync.md` § "Responder role
+  > selection — read off the wire, not off ring state".
 - **Bind port / config keys (recorded):** `keeper.toml` gains `[net] enabled`
   (default `true`), `[net] listen` (default `0.0.0.0:9100` — the inbound Noise
   listener, also the mDNS port), `[net] device_name` (override; default = the
