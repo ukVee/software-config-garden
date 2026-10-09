@@ -29,6 +29,7 @@ pub mod pending_offers;
 pub mod reads;
 pub mod relock;
 pub mod replica;
+pub mod replica_health;
 pub mod server;
 pub mod state;
 pub mod watcher;

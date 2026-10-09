@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 use softfig_ipc::{
-    runtime_socket_path,
+    human_age_secs, runtime_socket_path,
     verbs::{
         op, ReplicaGrantArgs, ReplicaGrantReply, ReplicaRevokeArgs, ReplicaRevokeReply,
         ReplicaStatusReply,
@@ -108,9 +108,24 @@ fn status(args: StatusArgs) -> Result<()> {
     if reply.push_to.is_empty() {
         println!("pushing chain to: (no granted hosts)");
     } else {
-        println!("pushing chain to ({}):", reply.push_to.len());
-        for fp in &reply.push_to {
-            println!("  {}", short_fp(fp));
+        let stopped = reply.push_to.iter().filter(|t| t.stale).count();
+        println!(
+            "pushing chain to ({}{}):",
+            reply.push_to.len(),
+            if stopped > 0 {
+                format!(", {stopped} STALE")
+            } else {
+                String::new()
+            }
+        );
+        for t in &reply.push_to {
+            let label = t.name.as_deref().unwrap_or("(unnamed)");
+            println!(
+                "  {}  {label}  last push {}{}",
+                short_fp(&t.fingerprint),
+                last_sync_phrase(t.last_ok, t.last_ok_age_secs, t.stale),
+                push_state_phrase(&t.state, t.detail.as_deref()),
+            );
         }
     }
 
@@ -128,14 +143,40 @@ fn status(args: StatusArgs) -> Result<()> {
                     h.height,
                     h.objects,
                     human_bytes(h.bytes),
-                    h.last_sync
-                        .map(format_unix)
-                        .unwrap_or_else(|| "never".to_string()),
+                    last_sync_phrase(h.last_sync, h.last_sync_age_secs, h.stale),
                 );
             }
         }
     }
     Ok(())
+}
+
+/// How long since the last successful sync, with the daemon's staleness verdict
+/// spelled out. The point of task `058`: a reader must not have to subtract a
+/// raw unix timestamp from the current time to find out their backup stopped.
+fn last_sync_phrase(at: Option<i64>, age_secs: Option<u64>, stale: bool) -> String {
+    let mark = if stale { "  ⚠ STALE" } else { "" };
+    match (at, age_secs) {
+        (Some(t), Some(age)) => format!("{} ago ({}){mark}", human_age_secs(age), format_unix(t)),
+        (Some(t), None) => format!("{}{mark}", format_unix(t)),
+        _ => format!("never{mark}"),
+    }
+}
+
+/// The reachability class, named so the two fixes stay apart: `no-route` /
+/// `unpaired` are discovery or pairing problems (we never dialed), `error` is a
+/// transport or auth problem (we dialed and it failed).
+fn push_state_phrase(state: &str, detail: Option<&str>) -> String {
+    match state {
+        "" | "ok" => String::new(),
+        "no-route" => "  [no route: no LAN endpoint and no relay]".to_string(),
+        "unpaired" => "  [unpaired: granted but not a ring member]".to_string(),
+        "error" => format!(
+            "  [push failing: {}]",
+            detail.unwrap_or("route exists, push failed")
+        ),
+        other => format!("  [{other}]"),
+    }
 }
 
 /// First 16 hex chars of a fingerprint for compact display.
@@ -193,6 +234,32 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(2048), "2.0 KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    #[test]
+    fn last_sync_phrase_ages_and_marks() {
+        // The case task 058 was found on: a backup that stopped 27 days ago.
+        let s = last_sync_phrase(Some(1_700_000_000), Some(27 * 86_400), true);
+        assert!(s.starts_with("3w ago"), "{s}");
+        assert!(s.contains("⚠ STALE"), "{s}");
+        // Healthy: an age, no marker.
+        let s = last_sync_phrase(Some(1_700_000_000), Some(90), false);
+        assert_eq!(s, "1m ago (@1700000000)");
+        // Never synced is itself the signal.
+        assert_eq!(last_sync_phrase(None, None, true), "never  ⚠ STALE");
+    }
+
+    #[test]
+    fn push_state_phrase_keeps_the_two_fixes_apart() {
+        assert_eq!(push_state_phrase("ok", None), "");
+        assert_eq!(push_state_phrase("", None), "");
+        assert!(push_state_phrase("no-route", None).contains("no LAN endpoint"));
+        assert!(push_state_phrase("unpaired", None).contains("not a ring member"));
+        let e = push_state_phrase("error", Some("handshake rejected"));
+        assert!(e.contains("push failing"), "{e}");
+        assert!(e.contains("handshake rejected"), "{e}");
+        // An unknown class from a newer daemon still renders, never panics.
+        assert_eq!(push_state_phrase("future", None), "  [future]");
     }
 
     #[test]

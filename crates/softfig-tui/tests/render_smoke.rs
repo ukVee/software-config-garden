@@ -117,13 +117,28 @@ fn renders_peers_frame() {
 
 #[test]
 fn renders_backup_frame() {
-    use softfig_ipc::HostedChain;
+    use softfig_ipc::{HostedChain, PushTarget};
+
+    // Task 058: the stale push target must show its ⚠ marker and its reason in
+    // the list itself, without the user opening the detail pane.
+    fn push_target(fp: &str) -> PushTarget {
+        PushTarget {
+            fingerprint: fp.into(),
+            name: Some("otg-travel".into()),
+            last_ok: Some(1_700_000_000),
+            last_ok_age_secs: Some(27 * 86_400),
+            stale: true,
+            state: "no-route".into(),
+            state_since: Some(1_700_000_000),
+            detail: None,
+        }
+    }
 
     let mut app = App::new();
     app.locked = false;
     app.view = softfig_tui::app::View::Backup;
     app.replica_host = true;
-    app.replica_push_to = vec!["1".repeat(64)];
+    app.replica_push_to = vec![push_target(&"1".repeat(64))];
     app.hosted = vec![HostedChain {
         fingerprint: "2".repeat(64),
         name: Some("tablet".into()),
@@ -132,6 +147,8 @@ fn renders_backup_frame() {
         objects: 21,
         bytes: 8192,
         last_sync: Some(1_700_000_000),
+        last_sync_age_secs: Some(90),
+        stale: false,
     }];
     app.backup.loaded = true;
     app.backup.items = vec![
@@ -152,6 +169,7 @@ fn renders_backup_frame() {
     assert!(rendered.contains("tablet"), "hosted owner name missing");
     assert!(rendered.contains("hosted chain"), "detail header missing");
     assert!(rendered.contains("height"), "mirror stats missing");
+    assert!(rendered.contains("STALE"), "stale push target unmarked:\n{rendered}");
 }
 
 #[test]

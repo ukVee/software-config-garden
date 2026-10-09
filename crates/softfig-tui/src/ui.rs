@@ -18,7 +18,7 @@ use crate::editor::EditorMode;
 use crate::hit::{self, Hit, HitMap, ListId};
 use crate::tree::BacklogKind;
 use crate::forms::{ActionForm, FieldValue};
-use softfig_ipc::DeployAction;
+use softfig_ipc::{human_age_secs, DeployAction};
 
 /// One member's cell on the fleet panel's `agents ·` line: `id:status`, the
 /// backend serving it, and — only when that backend is metered — its model and
@@ -741,19 +741,26 @@ fn render_backup(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
             .iter()
             .map(|row| match row {
                 BackupRow::PushTo(i) => {
-                    let fp = &app.replica_push_to[*i];
-                    let label = app.peer_name_for(fp).unwrap_or_else(|| short_fp(fp));
+                    let t = &app.replica_push_to[*i];
+                    let label = t
+                        .name
+                        .as_deref()
+                        .or_else(|| app.peer_name_for(&t.fingerprint))
+                        .unwrap_or_else(|| short_fp(&t.fingerprint));
+                    // A stopped backup must be visible without opening the
+                    // detail pane — it is the failure a user otherwise finds
+                    // out about at the worst possible moment (task 058).
                     ListItem::new(Line::styled(
-                        format!("⬆ {label}  hosts me"),
-                        Style::default().fg(Color::Cyan),
+                        format!("⬆ {label}  hosts me{}", stale_tag(t.stale)),
+                        Style::default().fg(if t.stale { Color::Red } else { Color::Cyan }),
                     ))
                 }
                 BackupRow::Hosted(i) => {
                     let c = &app.hosted[*i];
                     let label = c.name.as_deref().unwrap_or_else(|| short_fp(&c.fingerprint));
                     ListItem::new(Line::styled(
-                        format!("⬇ {label}  I host  (h{})", c.height),
-                        Style::default().fg(Color::Green),
+                        format!("⬇ {label}  I host  (h{}){}", c.height, stale_tag(c.stale)),
+                        Style::default().fg(if c.stale { Color::Red } else { Color::Green }),
                     ))
                 }
             })
@@ -768,11 +775,18 @@ fn render_backup(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
         app.backup.selected,
         pane_inner(area).height as usize,
     );
+    let stale = app.replica_push_to.iter().filter(|t| t.stale).count()
+        + app.hosted.iter().filter(|h| h.stale).count();
     let title = format!(
-        "backup — {} host me · {} I host · host:{}",
+        "backup — {} host me · {} I host · host:{}{}",
         app.replica_push_to.len(),
         app.hosted.len(),
         if app.replica_host { "on" } else { "off" },
+        if stale > 0 {
+            format!(" · {stale} STALE")
+        } else {
+            String::new()
+        },
     );
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -788,19 +802,75 @@ fn render_backup(f: &mut Frame, app: &App, hits: &mut HitMap, area: Rect) {
     );
 }
 
+/// `  ⚠ STALE` when a backup has gone quiet past the daemon's threshold — the
+/// row-level marker, so a stopped backup is visible in the list itself (task
+/// `058`). The judgement is the daemon's; this only renders it.
+fn stale_tag(stale: bool) -> &'static str {
+    if stale {
+        "  ⚠ STALE"
+    } else {
+        ""
+    }
+}
+
+fn stale_style(stale: bool) -> Style {
+    if stale {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    }
+}
+
+/// "4h ago" / "3w ago" / "never" — a sync age a reader can judge at a glance,
+/// instead of a raw unix number they have to age by hand.
+fn age_phrase(age_secs: Option<u64>) -> String {
+    match age_secs {
+        Some(age) => format!("{} ago", human_age_secs(age)),
+        None => "never".to_string(),
+    }
+}
+
+/// The unhealthy reachability classes, spelled out with their fix. `None` for a
+/// healthy host (or one the daemon has not observed yet) — nothing to explain.
+fn push_state_reason(state: &str, detail: Option<&str>) -> Option<String> {
+    match state {
+        "" | "ok" => None,
+        "no-route" => Some("no route — no LAN endpoint and no relay".into()),
+        "unpaired" => Some("unpaired — granted but not a ring member".into()),
+        "error" => Some(format!(
+            "push failing — {}",
+            detail.unwrap_or("route exists, push failed")
+        )),
+        other => Some(other.to_string()),
+    }
+}
+
 fn render_backup_detail(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     match app.selected_backup_row() {
         Some(BackupRow::PushTo(i)) => {
-            let fp = &app.replica_push_to[i];
+            let t = &app.replica_push_to[i];
+            let fp = &t.fingerprint;
             lines.push(Line::styled(
                 "host — backs up my chain",
                 Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
             ));
-            if let Some(name) = app.peer_name_for(fp) {
+            if let Some(name) = t.name.as_deref().or_else(|| app.peer_name_for(fp)) {
                 lines.push(Line::raw(format!("  name:        {name}")));
             }
             lines.push(Line::raw(format!("  fingerprint: {fp}")));
+            lines.push(Line::styled(
+                format!("  last push:   {}", age_phrase(t.last_ok_age_secs)),
+                stale_style(t.stale),
+            ));
+            // Named, not just flagged: "no route" is fixed in discovery or the
+            // endpoint cache, "push failing" in transport or auth.
+            if let Some(reason) = push_state_reason(&t.state, t.detail.as_deref()) {
+                lines.push(Line::styled(
+                    format!("  state:       {reason}"),
+                    stale_style(true),
+                ));
+            }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 "  I push my signed ciphertext here; this host verifies + stores",
@@ -827,11 +897,10 @@ fn render_backup_detail(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::raw(format!("  height:      {}", c.height)));
             lines.push(Line::raw(format!("  objects:     {}", c.objects)));
             lines.push(Line::raw(format!("  bytes:       {}", c.bytes)));
-            let last = c
-                .last_sync
-                .map(|t| format!("{t} (unix)"))
-                .unwrap_or_else(|| "never".into());
-            lines.push(Line::raw(format!("  last sync:   {last}")));
+            lines.push(Line::styled(
+                format!("  last sync:   {}", age_phrase(c.last_sync_age_secs)),
+                stale_style(c.stale),
+            ));
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 "  ciphertext only — I verify + store it but cannot read it",
