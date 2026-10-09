@@ -2957,6 +2957,50 @@ pub fn build_share_offer_frame(
     })
 }
 
+/// The M5d tie-break defer, spelled out with both device ids so a reader can
+/// re-check the comparison themselves — this line is the measurement that
+/// confirmed task 056.
+fn defer_reason(local: &LocalDevice, host: &RingEntry, ref_name: &str) -> String {
+    format!(
+        "{ref_name}: this device {} sorts above the peer {} and the chain was not seen on a \
+         prior pass — deferring one tick (M5d tie-break)",
+        short_device_id(&local.device_id),
+        short_device_id(&host.device_id),
+    )
+}
+
+/// The in-flight guard decline — another leg for this chain is already running.
+fn in_flight_reason(ref_name: &str) -> String {
+    format!("{ref_name}: a ceremony for this chain is already in flight on this device")
+}
+
+/// A device id's leading 8 bytes in hex — enough to tell two ids apart and to
+/// order them by eye, without a 64-char wall in every log line.
+fn short_device_id(id: &[u8; 32]) -> String {
+    hex::encode(&id[..8])
+}
+
+/// Narrate why a reconcile sweep declined to dial (task 056). Every early return
+/// between a sweep's entry and its dial used to return without a word, so a
+/// failure could only ever report "nothing dialled" and never *which*
+/// precondition stopped it — and a silent wedge is indistinguishable from a
+/// hang, which is how a 50/50 tie-break coin flip passed for a suite-correlated
+/// environmental flake for weeks.
+///
+/// `steady_state` marks a decline that is *normal operation* and recurs on every
+/// tick of the replica loop (the vault is locked, nothing awaits a key, no peer
+/// is paired yet). Narrating those in production would be pure journal spam, so
+/// they speak under `cfg(test)` only. The exceptional declines — the M5d
+/// tie-break defer and the in-flight guard — always speak: each is at most one
+/// line per chain per tick, and each is exactly what someone debugging a missing
+/// dial needs to read.
+fn narrate_sweep_decline(sweep: &str, why: impl std::fmt::Display, steady_state: bool) {
+    if steady_state && !cfg!(test) {
+        return;
+    }
+    eprintln!("keeperd: net: {sweep} sweep declined to dial: {why}");
+}
+
 /// Tie-break for concurrent dual-initiation (M5d slice 006 part 2). When both
 /// devices add the same mount path — the designed onboarding flow — both derive
 /// the same `chain/<id>`, both get a pending row, and both sweeps would initiate
@@ -3058,9 +3102,11 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
     let snapshot = {
         let inner = daemon.inner.lock().unwrap();
         if inner.state != State::Unlocked {
+            narrate_sweep_decline("ceremony", "the vault is locked", true);
             return;
         }
         let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
+            narrate_sweep_decline("ceremony", "no live session/repo", true);
             return;
         };
         let pending: Vec<String> = match chains_awaiting_key(repo, session) {
@@ -3071,6 +3117,7 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
             }
         };
         if pending.is_empty() {
+            narrate_sweep_decline("ceremony", "no shared subtree awaits a key", true);
             return;
         }
         let state_dir = inner.config.state_dir().to_path_buf();
@@ -3086,8 +3133,18 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
 
     let members = assemble_member_set(&ring, local.device_id);
     if members.len() < 2 {
-        // No paired peer yet — a collaborative key has no collaborator. Quiet:
-        // this is the normal share-before-pairing state, resolved by pairing.
+        // No paired peer yet — a collaborative key has no collaborator. Quiet in
+        // production: this is the normal share-before-pairing state, resolved by
+        // pairing.
+        narrate_sweep_decline(
+            "ceremony",
+            format!(
+                "{} chain(s) await a key but the ring has no second member — nothing to \
+                 ceremony with",
+                pending.len()
+            ),
+            true,
+        );
         return;
     }
     if members.len() > 2 {
@@ -3120,12 +3177,14 @@ fn reconcile_ceremonies(daemon: &Daemon, local: &LocalDevice) {
         // asymmetric flow still converges: the sole row-holder initiates once it
         // has seen the chain pending before, higher or not (`should_initiate_now`).
         if !should_initiate_now(&local.device_id, &host.device_id, seen_before.contains(&ref_name)) {
+            narrate_sweep_decline("ceremony", defer_reason(local, &host, &ref_name), false);
             continue;
         }
         // In-flight dedup: never run a second concurrent ceremony for this chain
         // on this device (an inbound responder leg, or an overlapping tick). The
         // guard drops at the end of the iteration, after persist.
         let Some(_guard) = CeremonyGuard::try_acquire(daemon, &ref_name) else {
+            narrate_sweep_decline("ceremony", in_flight_reason(&ref_name), false);
             continue;
         };
         match ceremony_with_host(local, &host, relay_client.as_ref(), &signer, &members, &ref_name)
@@ -3280,9 +3339,11 @@ fn reconcile_rekeys(daemon: &Daemon, local: &LocalDevice) {
     let snapshot = {
         let inner = daemon.inner.lock().unwrap();
         if inner.state != State::Unlocked {
+            narrate_sweep_decline("rekey", "the vault is locked", true);
             return;
         }
         let (Some(session), Some(repo)) = (inner.session.as_ref(), inner.repo.as_ref()) else {
+            narrate_sweep_decline("rekey", "no live session/repo", true);
             return;
         };
         let state_dir = inner.config.state_dir().to_path_buf();
@@ -3299,6 +3360,7 @@ fn reconcile_rekeys(daemon: &Daemon, local: &LocalDevice) {
             }
         };
         if stale.is_empty() {
+            narrate_sweep_decline("rekey", "no keyed chain's membership went stale", true);
             return;
         }
         let relay_client = relay_client_config(&inner.config);
@@ -3313,7 +3375,15 @@ fn reconcile_rekeys(daemon: &Daemon, local: &LocalDevice) {
         // Stale but now solo (a 2→1 leave): a collaborative rekey has no
         // collaborator. The honest custody limit (`spec-sync.md` §Crypto) — the
         // departed member keeps only ciphertext it already held, we cannot rotate
-        // alone. Quiet: resolved if a member re-pairs.
+        // alone. Quiet in production: resolved if a member re-pairs.
+        narrate_sweep_decline(
+            "rekey",
+            format!(
+                "{} stale chain(s) but the ring has no second member — cannot rotate alone",
+                stale.len()
+            ),
+            true,
+        );
         return;
     }
     if members.len() > 2 {
@@ -3346,11 +3416,13 @@ fn reconcile_rekeys(daemon: &Daemon, local: &LocalDevice) {
         // first — one rotation per chain per window, so both sides converge on one
         // `S'` instead of racing to two.
         if !should_initiate_now(&local.device_id, &host.device_id, seen_before.contains(&ref_name)) {
+            narrate_sweep_decline("rekey", defer_reason(local, &host, &ref_name), false);
             continue;
         }
         // In-flight dedup: never run a second concurrent ceremony for this chain
         // on this device (an inbound responder leg, or an overlapping tick).
         let Some(_guard) = CeremonyGuard::try_acquire(daemon, &ref_name) else {
+            narrate_sweep_decline("rekey", in_flight_reason(&ref_name), false);
             continue;
         };
         match ceremony_with_host(local, &host, relay_client.as_ref(), &signer, &members, &ref_name) {
@@ -4560,7 +4632,23 @@ mod tests {
             assert!(membership.subtrees[0].key_id.is_none());
         }
 
-        // The production initiator path (what the replica loop tick runs).
+        // The production initiator path (what the replica loop tick runs) — TWO
+        // passes, because one tick cannot guarantee a dial. `ceremony_daemon`
+        // mints a fresh random identity per vault, so A sorts below B only half
+        // the time, and the M5d slice-006-pt2 tie-break defers a freshly-pending
+        // chain by exactly one pass on the lexically-higher device
+        // (`should_initiate_now`). A single pass therefore dialled on a coin
+        // flip — task 056, which read as an environmental flake for weeks
+        // because a silent wedge looks exactly like a hang.
+        //
+        // Two passes model the real sweep (which runs every tick) and cover BOTH
+        // orderings: A lower dials on pass 1 and pass 2 finds nothing pending; A
+        // higher defers on pass 1 and dials on pass 2 with `seen_before` set.
+        // Exactly one dial either way — what the single-connection responder
+        // expects. The siblings take the other route: `rekey_…` and `handoff_…`
+        // pre-seed the tie-break clock, `symmetric_dual_add_…` orients the two
+        // identities explicitly. All three are green by construction, not luck.
+        reconcile_ceremonies(&daemon_a, &local_a);
         reconcile_ceremonies(&daemon_a, &local_a);
         b_thread.join().unwrap();
 
