@@ -56,7 +56,10 @@ pub const DEEPSEEK_REASONING: &str = "deepseek/deepseek-v4-pro";
 /// DeepSeek's fast model — picker option 3 / `--model flash`, and the fallback
 /// whenever "let growlight decide" finds no `> Model:` declaration on the active
 /// backlog item (cheap by default; reasoning is opt-in).
-pub const DEEPSEEK_FLASH: &str = "deepseek/deepseek-v4-flash";
+///
+/// V4.1 Flash. The earlier `deepseek/deepseek-v4-flash` id is gone from opencode
+/// 2.x's catalog (opencode-v2-repin slice 001, finding 12).
+pub const DEEPSEEK_FLASH: &str = "deepseek/deepseek-flash";
 
 /// A resolved interactive launch target: which backend, and (for opencode) which
 /// model + variant to generate the agent config with.
@@ -98,6 +101,25 @@ impl ModelChoice {
     /// [`DEEPSEEK_FLASH`] for a choice that names none.
     pub fn opencode_model(&self) -> &str {
         self.model.as_deref().unwrap_or(DEEPSEEK_FLASH)
+    }
+
+    /// The model + variant as opencode 2.x spells one value:
+    /// `provider/model`, or `provider/model#variant`. This is what the generated
+    /// config's top-level `model` carries (see [`opencode_config`]).
+    pub fn opencode_model_ref(&self) -> String {
+        opencode_model_ref(self.opencode_model(), self.variant.as_deref())
+    }
+}
+
+/// `provider/model` or `provider/model#variant`: opencode 2.x's one-string model
+/// reference. 2.x has no separate variant key on an agent and no `--variant` flag;
+/// the variant rides the `#` suffix, which opencode parses into
+/// `{providerID, model, variant}` (checked against a private server's
+/// `/api/config`, opencode-v2-repin slice 002).
+fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
+    match variant {
+        Some(variant) => format!("{model}#{variant}"),
+        None => model.to_string(),
     }
 }
 
@@ -153,6 +175,11 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
             "variant" | "effort" if value.is_empty() => {
                 bail!("model spec: `{key}=` has no value in `{spec}`")
             }
+            // The variant is rendered after a `#` (`provider/model#variant`), so
+            // one carrying its own `#` could not be read back unambiguously.
+            "variant" | "effort" if value.contains('#') => {
+                bail!("model spec: `{key}={value}` contains '#' in `{spec}`")
+            }
             "variant" | "effort" => variant = Some(value.to_string()),
             _ => bail!("model spec: unknown key `{key}` in `{spec}` (expected `variant=`)"),
         }
@@ -168,6 +195,14 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
         "claude" => ModelChoice::claude(),
         "reasoning" | "deepseek-reasoning" => ModelChoice::opencode(DEEPSEEK_REASONING),
         "flash" | "deepseek-flash" => ModelChoice::opencode(DEEPSEEK_FLASH),
+        // A `#variant` suffix on the id is opencode's own spelling, but here the
+        // variant has exactly one home (`variant=`), so the two cannot disagree.
+        other if other.contains('#') => bail!(
+            "model spec: `{token}` carries a '#variant' suffix — write it as \
+             `{} variant={}` instead",
+            token.split_once('#').map_or(token, |(m, _)| m),
+            token.split_once('#').map_or("", |(_, v)| v),
+        ),
         // A raw `provider/model` passthrough — anything else is a typo, not a model.
         other if other.contains('/') => ModelChoice::opencode(token),
         other => bail!(
@@ -258,7 +293,8 @@ impl Backend {
     ///   (`launch.garden_root`, slice 005's auto-cd) instead of wherever the human
     ///   invoked it from. It still sets no env.
     /// - **opencode** launches the TUI on the generated agent —
-    ///   `opencode --agent <name> --prompt <boot>` — with `OPENCODE_CONFIG`
+    ///   `opencode --standalone --agent <name> --prompt <boot>` (see
+    ///   [`opencode_interactive_args`] for why `--standalone`) — with `OPENCODE_CONFIG`
     ///   pointing at the generated `opencode.json` (opencode's analog of claude's
     ///   `--settings`; the agent, its permission map, and the softfig-mcp block
     ///   all live in that one file, so there is no separate `--mcp-config`) and
@@ -281,8 +317,7 @@ impl Backend {
                     .current_dir(launch.garden_root);
             }
             Backend::Opencode => {
-                cmd.arg("--agent")
-                    .arg(launch.agent_name)
+                cmd.args(opencode_interactive_args(launch.agent_name))
                     .arg("--prompt")
                     .arg(launch.boot_prompt)
                     .env("OPENCODE_CONFIG", launch.opencode_config)
@@ -291,6 +326,21 @@ impl Backend {
         }
         Ok(cmd)
     }
+}
+
+/// The interactive opencode argv up to (not including) the first-turn `--prompt`:
+/// `--standalone --agent <name>`. Shared by the real launch and the `--no-launch`
+/// hint, so the command a human copy-pastes cannot lose a flag the launcher has.
+///
+/// `--standalone` is a correctness flag on opencode 2.x, not hygiene. Without it
+/// the TUI attaches to the per-user shared service, and a running one **ignores
+/// the client's `OPENCODE_CONFIG`** (opencode-v2-repin slice 001, finding 1): the
+/// session silently becomes the built-in `build` agent, with no protocol prompt,
+/// no baton boot, allow-all permissions and every global grant. `--standalone`
+/// gives the session a private server that loads this launch's config and exits
+/// with it.
+pub fn opencode_interactive_args(agent_name: &str) -> [&str; 3] {
+    ["--standalone", "--agent", agent_name]
 }
 
 /// The inputs [`opencode_config`] renders into an `opencode.json`: where the
@@ -322,7 +372,8 @@ pub struct OpencodeConfigInputs<'a> {
     pub claude_projects: &'a Path,
     /// The resolved opencode model id (`provider/model`).
     pub model: &'a str,
-    /// The resolved opencode `variant`, omitted from the config when `None`.
+    /// The resolved opencode `variant`, rendered as the model's `#variant` suffix
+    /// and omitted when `None`.
     pub variant: Option<&'a str>,
 }
 
@@ -373,10 +424,14 @@ pub struct OpencodeConfigInputs<'a> {
 ///   the claude `mcp.json` (`softfig_mcp_path` — the sibling of the running exe).
 /// - **model / variant.** Both are passed in, never inlined — the slice-005
 ///   resolution (picker choice, `--model` flag, or the active backlog item's
-///   `> Model:` declaration) decides them and hands the answer down. `variant` maps
-///   to opencode's `AgentConfig.variant` ("default model variant for this agent")
-///   and is omitted entirely when unset, so the agent keeps the model's own
-///   default rather than being pinned to a name we invented.
+///   `> Model:` declaration) decides them and hands the answer down. They land in
+///   the config's **top-level** `model` as one `provider/model[#variant]` string,
+///   not on the agent: on opencode 2.x the agent block's `model` is ignored and
+///   the top-level one wins (opencode-v2-repin slice 001, L7), and the interactive
+///   root command has no `--model` flag. The catch is that a bad top-level id
+///   silently falls back to `opencode/exo-free` and sends the prompt there, so
+///   the launcher checks the id against the live catalog before it launches
+///   (`crate::opencode_catalog`).
 pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> String {
     let OpencodeConfigInputs {
         agent_name,
@@ -429,22 +484,19 @@ pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> String {
     permission.insert("external_directory".to_string(), Value::Object(external));
     permission.insert("softfig-mcp*".to_string(), Value::from("allow"));
 
-    let mut agent = serde_json::json!({
+    let agent = serde_json::json!({
         "mode": "primary",
-        "model": model,
         "prompt": prompt,
         "permission": Value::Object(permission),
     });
-    // Only emit `variant` when one was declared — an absent key leaves the model
-    // on its own default, which is not the same as pinning a guessed name.
-    if let Some(variant) = variant {
-        agent["variant"] = Value::from(variant);
-    }
     let mut agents = serde_json::Map::new();
     agents.insert(agent_name.to_string(), agent);
 
     let v = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
+        // Top-level, where 2.x honors it (see the doc above). No variant → the bare
+        // id, which leaves the model on its own default variant.
+        "model": opencode_model_ref(model, variant),
         "mcp": {
             "softfig-mcp": {
                 "type": "local",
@@ -955,14 +1007,17 @@ mod tests {
         // slice-002 on-device check; here we assert structure).
         let v: Value = serde_json::from_str(&cfg).expect("generated opencode config is valid JSON");
 
-        // The agent: primary, DeepSeek model held as config (the passed-in param,
-        // never inlined), selectable as `softfig-loop`.
+        // The agent: primary, selectable as `softfig-loop`. The model is the
+        // passed-in param (never inlined) at the TOP level, where opencode 2.x
+        // honors it; the agent block's `model` is ignored on 2.x (slice 001 L7),
+        // so it is not emitted there at all.
         let agent = &v["agent"]["softfig-loop"];
         assert_eq!(agent["mode"], "primary");
-        assert_eq!(agent["model"], "deepseek/deepseek-reasoner");
-        // No variant declared → the key is absent, leaving the model's own default
-        // rather than pinning a guessed name.
-        assert!(agent["variant"].is_null(), "variant omitted when unset");
+        assert_eq!(v["model"], "deepseek/deepseek-reasoner");
+        assert!(agent["model"].is_null(), "no dead agent-level model");
+        // No variant declared → the bare id, no `#` suffix, leaving the model's own
+        // default rather than pinning a guessed name.
+        assert!(agent["variant"].is_null(), "v2 agent blocks have no variant key");
 
         // inject_baton: protocol reused BY REFERENCE (no duplicated text) + a
         // step-0 line naming the runtime baton path (the reseed bootstrap).
@@ -1028,11 +1083,14 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        // Selects the generated primary agent + kicks the first turn (the reseed
-        // roll, since opencode has no SessionStart hook).
+        // A private server (`--standalone`: the shared service would ignore
+        // OPENCODE_CONFIG, slice 001 finding 1), the generated primary agent, and
+        // the first-turn kick (the reseed roll, since opencode has no SessionStart
+        // hook).
         assert_eq!(
             args,
             vec![
+                "--standalone",
                 "--agent",
                 "softfig-loop",
                 "--prompt",
@@ -1058,11 +1116,36 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_emits_a_declared_variant() {
-        let cfg = opencode_config(&opencode_inputs(DEEPSEEK_FLASH, Some("thinking")));
+    fn opencode_config_emits_a_declared_variant_as_the_model_suffix() {
+        // 2.x spells model + variant as one `provider/model#variant` string; an
+        // agent-level `variant` key does not exist in the v2 schema.
+        let cfg = opencode_config(&opencode_inputs(DEEPSEEK_FLASH, Some("high")));
         let v: Value = serde_json::from_str(&cfg).expect("valid JSON");
-        assert_eq!(v["agent"]["softfig-loop"]["model"], DEEPSEEK_FLASH);
-        assert_eq!(v["agent"]["softfig-loop"]["variant"], "thinking");
+        assert_eq!(v["model"], "deepseek/deepseek-flash#high");
+        assert!(v["agent"]["softfig-loop"]["variant"].is_null());
+
+        let choice = match parse_model_spec("flash variant=high").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => panic!("fixed spec"),
+        };
+        assert_eq!(choice.opencode_model_ref(), "deepseek/deepseek-flash#high");
+        assert_eq!(
+            ModelChoice::opencode(DEEPSEEK_REASONING).opencode_model_ref(),
+            "deepseek/deepseek-v4-pro",
+            "no variant → no trailing '#'",
+        );
+    }
+
+    #[test]
+    fn a_hash_in_a_model_spec_is_refused_so_the_suffix_stays_unambiguous() {
+        // The variant has one home (`variant=`) and is rendered after a `#`, so an
+        // id or variant carrying its own `#` could not be read back.
+        let err = parse_model_spec("deepseek/deepseek-flash#high").unwrap_err().to_string();
+        assert!(
+            err.contains("deepseek/deepseek-flash variant=high"),
+            "suggests the right spelling: {err}",
+        );
+        assert!(parse_model_spec("flash variant=hi#gh").is_err());
     }
 
     #[test]
@@ -1080,9 +1163,10 @@ mod tests {
             Some("deepseek/deepseek-v4-pro")
         );
         assert_eq!(fixed("deepseek-reasoning"), fixed("reasoning"));
+        // `deepseek-v4-flash` left opencode 2.x's catalog (slice 001 finding 12).
         assert_eq!(
             fixed("flash").model.as_deref(),
-            Some("deepseek/deepseek-v4-flash")
+            Some("deepseek/deepseek-flash")
         );
         assert_eq!(fixed("deepseek-flash"), fixed("flash"));
         assert_eq!(fixed("Flash"), fixed("flash"), "aliases are case-insensitive");

@@ -67,7 +67,7 @@ use crate::agent_harness::{
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
 use crate::hub::EventHub;
-use crate::opencode_preapproval::{ModelSelection, OpencodePreApproval};
+use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::AgentPaths;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
 
@@ -346,6 +346,52 @@ fn pump<R: BufRead>(
 
 // ---- the backend ------------------------------------------------------------
 
+/// The model an opencode member runs on, as the operator declared it on its
+/// `[[fleet]]` entry. It reaches opencode as argv `--model`, never the generated
+/// config: on 2.x `run` ignores `agent.<id>.model` entirely, and argv `--model` is
+/// the only path that fails closed on a bad id (opencode-v2-repin slice 001, L5 +
+/// L7; a config-borne bad id silently fell back to `opencode/exo-free` and SENT the
+/// prompt there).
+///
+/// `model` is required, not optional. A member with no model would leave opencode
+/// to pick its own default, which is the same silent fallback seen from the other
+/// side, so [`crate::fleet`] refuses such a member at parse time and this type
+/// cannot express one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSelection {
+    /// The opencode model id (`provider/model`), e.g. `deepseek/deepseek-flash`.
+    pub model: String,
+    /// The model's variant (one of the catalog's `variants[].id`, e.g. `high` on
+    /// DeepSeek), or `None` to run the model's own default.
+    pub variant: Option<String>,
+}
+
+impl ModelSelection {
+    /// A selection pinning `model`, with the model's own default variant.
+    pub fn model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            variant: None,
+        }
+    }
+
+    /// Pin a `variant` alongside the model.
+    pub fn with_variant(mut self, variant: impl Into<String>) -> Self {
+        self.variant = Some(variant.into());
+        self
+    }
+
+    /// The `--model` argv value: `provider/model`, or `provider/model#variant`.
+    /// 2.x has no separate `--variant` flag; the variant rides the `#` suffix
+    /// (`opencode run --help`: "provider/model#variant").
+    pub fn argv_value(&self) -> String {
+        match &self.variant {
+            Some(variant) => format!("{}#{variant}", self.model),
+            None => self.model.clone(),
+        }
+    }
+}
+
 /// What an opencode member is launched *as*: the binary, the turn kick, the model
 /// it runs on, and the directory it runs in. Grouped rather than passed as four
 /// more positional arguments to [`OpencodeBackend::new`] — three of the four are
@@ -357,11 +403,10 @@ pub struct OpencodeLaunch {
     /// The per-turn kick prompt. opencode's system prompt (the generated agent's
     /// `prompt`) is the protocol + baton bootstrap; this is the turn's "go".
     pub prompt: String,
-    /// The model/variant to run on, carried in the **generated config**, not on
-    /// argv — `opencode run` accepts `-m`/`--variant` too, and one source beats
-    /// two (slice 004: "pin whichever at build time and note it"). Pinned to the
-    /// config because the pre-approval must be written anyway and a member whose
-    /// model lived on argv could drift from the agent block that permits it.
+    /// The model/variant to run on, carried on **argv** (`--model`). This reverses
+    /// the 1.18-era choice to pin it in the generated config: 2.x `run` ignores the
+    /// agent block's model, so the config copy was never the source. See
+    /// [`ModelSelection`].
     pub model: ModelSelection,
     /// The garden root — the member's cwd, so garden docs are ordinary in-project
     /// reads (the finding that drove the interactive seam's slice 006) and the
@@ -404,17 +449,34 @@ impl OpencodeFlavor {
 /// (scope, `--collect`, `--unit=`, the gentle build caps) is the harness's, shared
 /// byte-for-byte with claude.
 ///
-/// No `-m` / `--variant`: the model lives in the generated config (see
-/// [`OpencodeLaunch::model`]). `--format json` is what makes the output the NDJSON
-/// this module's fold parses; without it there is nothing to observe.
-fn opencode_command_argv(bin: &str, prompt: &str, agent: &str) -> Vec<OsString> {
+/// Each flag is load-bearing on opencode 2.x (opencode-v2-repin slice 001):
+///
+/// - `--standalone` gives the member a **private** server, a child that sits in the
+///   member's own scope and dies with it (L6). Without it, `run` attaches to the
+///   per-user shared service, which **ignores the child's `OPENCODE_CONFIG`**
+///   (finding 1). The member would then run as the built-in `build` agent with
+///   allow-all plus every global grant, outside its scope, its build caps and the
+///   kill path. This is a correctness flag, not hygiene.
+/// - `--model` is the only model source `run` honors that fails closed on a bad id
+///   (see [`ModelSelection`]).
+/// - `--format json` is what makes the output the NDJSON this module's fold parses;
+///   without it there is nothing to observe.
+fn opencode_command_argv(
+    bin: &str,
+    prompt: &str,
+    agent: &str,
+    model: &ModelSelection,
+) -> Vec<OsString> {
     vec![
         bin.into(),
         "run".into(),
+        "--standalone".into(),
         "--format".into(),
         "json".into(),
         "--agent".into(),
         agent.into(),
+        "--model".into(),
+        model.argv_value().into(),
         prompt.into(),
     ]
 }
@@ -428,7 +490,7 @@ const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG";
 impl BackendFlavor for OpencodeFlavor {
     fn generate_preapproval(&self, agent: &str) -> Result<AgentPaths, SpawnError> {
         self.preapproval
-            .generate(agent, &self.launch.model)
+            .generate(agent)
             .map_err(|e| {
                 SpawnError(format!(
                     "opencode pre-approval generation failed for agent {agent}: {e}"
@@ -441,7 +503,7 @@ impl BackendFlavor for OpencodeFlavor {
         // `agent.<name>` block on — one id names the runtime dir, the baton, and
         // the agent block, so `--agent` can never point at a block that was not
         // just written.
-        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent)
+        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent, &self.launch.model)
     }
 
     fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)> {
@@ -581,7 +643,8 @@ impl OpencodeBackend {
 
     /// The argv this backend would exec for `agent` after the `systemd-run … --`
     /// separator, given the paths a spawn's pre-approval writes — `opencode run
-    /// --format json --agent <id> <prompt>`, wrapper excluded. The routing seam
+    /// --standalone --format json --agent <id> --model <m> <prompt>`, wrapper
+    /// excluded. The routing seam
     /// (slice 005) asserts an opencode-backed member through it.
     pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
         self.harness.command_argv(agent, paths)
@@ -890,7 +953,7 @@ mod tests {
             launch: OpencodeLaunch {
                 bin: "opencode".to_string(),
                 prompt: "kick".to_string(),
-                model: ModelSelection::model("deepseek/deepseek-v4-flash"),
+                model: ModelSelection::model("deepseek/deepseek-flash").with_variant("high"),
                 garden_root: garden.to_path_buf(),
             },
             hub: EventHub::new(),
@@ -946,17 +1009,60 @@ mod tests {
             &[
                 "opencode".to_string(),
                 "run".to_string(),
+                "--standalone".to_string(),
                 "--format".to_string(),
                 "json".to_string(),
                 "--agent".to_string(),
                 "a1".to_string(),
+                "--model".to_string(),
+                "deepseek/deepseek-flash#high".to_string(),
                 "kick".to_string(),
             ],
             "the opencode invocation, prompt last",
         );
-        // The model is pinned in the generated config, NOT on argv — one source.
-        assert!(!s.contains(&"-m".to_string()), "model rides the config: {s:?}");
-        assert!(!s.contains(&"--variant".to_string()), "variant rides the config: {s:?}");
+    }
+
+    #[test]
+    fn a_member_runs_on_a_private_server_or_its_config_is_ignored() {
+        // opencode 2.x (slice 001 finding 1): without `--standalone`, `run` attaches
+        // to the per-user shared service, which IGNORES the child's OPENCODE_CONFIG.
+        // The member would silently run as the built-in `build` agent (allow-all +
+        // every global grant), in a server outside its scope and the kill path.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = flavor(tmp.path(), Path::new("/garden"));
+        let paths = crate::preapproval::agent_paths(&tmp.path().join("agents"), "a1");
+        let argv = f.command_argv("a1", &paths);
+        assert_eq!(argv[1], "run");
+        assert_eq!(argv[2], "--standalone", "the flag sits right after the subcommand");
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--server").count(),
+            0,
+            "never pointed at a shared server: {argv:?}",
+        );
+    }
+
+    #[test]
+    fn the_model_rides_argv_because_run_ignores_the_agent_block() {
+        // slice 001 L7: `run` ignores `agent.<id>.model`, even a valid one, and a
+        // config-borne bad id silently falls back to opencode/exo-free and SENDS
+        // the prompt. argv `--model` is the only path that fails closed (L5).
+        let tmp = tempfile::tempdir().unwrap();
+        let f = flavor(tmp.path(), Path::new("/garden"));
+        let paths = crate::preapproval::agent_paths(&tmp.path().join("agents"), "a1");
+        let argv: Vec<String> = f
+            .command_argv("a1", &paths)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = argv.iter().position(|a| a == "--model").expect("--model on argv");
+        assert_eq!(argv[at + 1], "deepseek/deepseek-flash#high", "variant rides the # suffix");
+        assert!(!argv.contains(&"--variant".to_string()), "2.x has no --variant flag");
+
+        // A selection with no variant passes the bare id: no trailing `#`.
+        assert_eq!(
+            ModelSelection::model("deepseek/deepseek-v4-pro").argv_value(),
+            "deepseek/deepseek-v4-pro",
+        );
     }
 
     #[test]
@@ -998,7 +1104,7 @@ mod tests {
             OpencodeLaunch {
                 bin: "opencode".to_string(),
                 prompt: "kick".to_string(),
-                model: ModelSelection::default(),
+                model: ModelSelection::model("deepseek/deepseek-flash"),
                 garden_root: tmp.path().to_path_buf(),
             },
             EventHub::new(),

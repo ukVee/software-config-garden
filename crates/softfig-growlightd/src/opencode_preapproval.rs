@@ -41,8 +41,10 @@
 //! - `agent.<id>.permission` — the headless map (`read`/`edit`/`write`/`bash`),
 //!   `softfig-mcp*`, and the `external_directory` grants the loop's own state
 //!   needs.
-//! - `agent.<id>.model` / `.variant` — emitted only when the caller resolved
-//!   them ([`ModelSelection`]); slice 005 fills them from the member's config.
+//! - **No model.** opencode 2.x `run` ignores `agent.<id>.model` (probe-proven,
+//!   opencode-v2-repin slice 001 L7: even a valid id fell back to opencode's own
+//!   default), so the member's model rides argv `--model` instead, the one path
+//!   that fails closed on a bad id. See [`crate::opencode_backend::ModelSelection`].
 //! - `mcp.softfig-mcp` — the explicit project-scoped attach, resolved exactly as
 //!   the claude `mcp.json` is, so the garden verbs exist regardless of the user's
 //!   global `~/.config/opencode` registration.
@@ -89,39 +91,6 @@ const HEADLESS_TOOLS: &[&str] = &["read", "edit", "write", "bash"];
 /// garden is mutated only through them (house rule), so a member that could not
 /// call them could not do its job.
 const MCP_PERMISSION: &str = "softfig-mcp*";
-
-/// The per-member model the generated agent block pins, as resolved by the
-/// caller. Owned (not borrowed) so the backend flavor can hold one across spawns,
-/// and a distinct type rather than two adjacent `Option<String>` arguments —
-/// exactly the call site where a value lands in the wrong slot silently.
-///
-/// Both fields absent (the [`Default`]) is the honest "not resolved yet" state:
-/// the keys are then omitted entirely and opencode keeps its own defaults, which
-/// is not the same as pinning a name we invented. Slice 005 fills them from
-/// `config/growlight.toml`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModelSelection {
-    /// The opencode model id (`provider/model`), e.g. `deepseek/deepseek-v4-flash`.
-    pub model: Option<String>,
-    /// The model's `variant` (opencode's `AgentConfig.variant`).
-    pub variant: Option<String>,
-}
-
-impl ModelSelection {
-    /// A selection pinning `model`, with the model's own default variant.
-    pub fn model(model: impl Into<String>) -> Self {
-        Self {
-            model: Some(model.into()),
-            variant: None,
-        }
-    }
-
-    /// Pin a `variant` alongside the model.
-    pub fn with_variant(mut self, variant: impl Into<String>) -> Self {
-        self.variant = Some(variant.into());
-        self
-    }
-}
 
 /// The context growlightd generates each **opencode** member's pre-approval from
 /// — the mirror of [`PreApproval`](crate::preapproval::PreApproval), differing
@@ -183,11 +152,7 @@ impl OpencodePreApproval {
     /// The agent id doubles as the opencode **agent name** (`agent.<id>`, and
     /// what slice 004's argv passes to `--agent`), so one member id names its
     /// runtime dir, its baton, and its agent block.
-    pub fn generate(
-        &self,
-        agent: &str,
-        model: &ModelSelection,
-    ) -> Result<AgentPaths, GenError> {
+    pub fn generate(&self, agent: &str) -> Result<AgentPaths, GenError> {
         validate_agent_id(agent)?;
         let paths = agent_paths(&self.agents_dir, agent);
         // Defense-in-depth on the locked decision: never write under ~/.claude,
@@ -206,7 +171,6 @@ impl OpencodePreApproval {
                 runtime_root: &self.runtime_root,
                 claude_projects: &self.claude_projects(),
                 mcp_bin: &self.mcp_bin,
-                model,
             }),
         )?;
         Ok(paths)
@@ -233,8 +197,6 @@ struct AgentInputs<'a> {
     claude_projects: &'a Path,
     /// The `softfig-mcp` binary the project-scoped `mcp` block runs.
     mcp_bin: &'a Path,
-    /// The resolved model/variant, each omitted when unset.
-    model: &'a ModelSelection,
 }
 
 /// Render a headless member's `opencode.json`. Pure — builds the string, never
@@ -278,19 +240,14 @@ fn opencode_json(cfg: &AgentInputs<'_>) -> String {
     permission.insert("external_directory".to_string(), Value::Object(external));
     permission.insert(MCP_PERMISSION.to_string(), Value::from("allow"));
 
-    let mut agent = serde_json::json!({
+    // No `model` / `variant` key: `run` ignores the agent's model on 2.x, so the
+    // member's model rides argv (see the module doc). A key here would be dead
+    // config that reads as if it pinned something.
+    let agent = serde_json::json!({
         "mode": AGENT_MODE,
         "prompt": prompt,
         "permission": Value::Object(permission),
     });
-    // Only emit what was actually resolved — an absent key leaves opencode on its
-    // own default, which is not the same as pinning a guessed name.
-    if let Some(model) = cfg.model.model.as_deref() {
-        agent["model"] = Value::from(model);
-    }
-    if let Some(variant) = cfg.model.variant.as_deref() {
-        agent["variant"] = Value::from(variant);
-    }
     let mut agents = serde_json::Map::new();
     agents.insert(cfg.agent_name.to_string(), agent);
 
@@ -328,10 +285,10 @@ mod tests {
         )
     }
 
-    fn generated(agent: &str, model: &ModelSelection) -> (Value, AgentPaths, tempfile::TempDir) {
+    fn generated(agent: &str) -> (Value, AgentPaths, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let agents = tmp.path().join("softfig/growlight/agents");
-        let paths = pre(&agents).generate(agent, model).expect("generates");
+        let paths = pre(&agents).generate(agent).expect("generates");
         let raw = fs::read_to_string(&paths.opencode_config).unwrap();
         (serde_json::from_str(&raw).expect("emitted JSON parses"), paths, tmp)
     }
@@ -342,7 +299,7 @@ mod tests {
 
     #[test]
     fn the_headless_permission_map_allows_edit_and_write() {
-        let (v, _paths, _tmp) = generated("a", &ModelSelection::default());
+        let (v, _paths, _tmp) = generated("a");
         let perm = &agent_block(&v, "a")["permission"];
 
         // THE delta from the interactive config, and the whole point of the slice:
@@ -359,7 +316,7 @@ mod tests {
 
     #[test]
     fn external_directory_grants_the_runtime_root_and_claude_memory_only() {
-        let (v, _paths, _tmp) = generated("a", &ModelSelection::default());
+        let (v, _paths, _tmp) = generated("a");
         let ext = agent_block(&v, "a")["permission"]["external_directory"]
             .as_object()
             .expect("external_directory is a map");
@@ -379,7 +336,7 @@ mod tests {
 
     #[test]
     fn the_prompt_boots_from_the_fleet_protocol_and_this_members_baton() {
-        let (v, paths, _tmp) = generated("b", &ModelSelection::default());
+        let (v, paths, _tmp) = generated("b");
         let prompt = agent_block(&v, "b")["prompt"].as_str().unwrap();
 
         // The FLEET protocol, by reference — never the single-agent protocol.md,
@@ -407,7 +364,7 @@ mod tests {
 
     #[test]
     fn the_mcp_block_names_the_resolved_binary() {
-        let (v, _paths, _tmp) = generated("a", &ModelSelection::default());
+        let (v, _paths, _tmp) = generated("a");
         let mcp = &v["mcp"]["softfig-mcp"];
         assert_eq!(mcp["command"][0], "/usr/bin/softfig-mcp");
         assert_eq!(mcp["type"], "local");
@@ -415,23 +372,14 @@ mod tests {
     }
 
     #[test]
-    fn model_and_variant_are_emitted_only_when_resolved() {
-        // Unresolved (the slice-005-pending default): both keys absent, so
-        // opencode keeps its own default rather than a name we invented.
-        let (bare, _p, _t) = generated("a", &ModelSelection::default());
-        assert!(agent_block(&bare, "a").get("model").is_none());
-        assert!(agent_block(&bare, "a").get("variant").is_none());
-
-        // Resolved: exactly what the caller pinned.
-        let sel = ModelSelection::model("deepseek/deepseek-v4-flash").with_variant("thinking");
-        let (pinned, _p, _t) = generated("a", &sel);
-        assert_eq!(agent_block(&pinned, "a")["model"], "deepseek/deepseek-v4-flash");
-        assert_eq!(agent_block(&pinned, "a")["variant"], "thinking");
-
-        // A model with no variant pins only the model.
-        let (model_only, _p, _t) = generated("a", &ModelSelection::model("deepseek/deepseek-v4-pro"));
-        assert_eq!(agent_block(&model_only, "a")["model"], "deepseek/deepseek-v4-pro");
-        assert!(agent_block(&model_only, "a").get("variant").is_none());
+    fn the_model_never_rides_the_config() {
+        // opencode 2.x `run` ignores `agent.<id>.model` (slice 001 L7), so a model
+        // key here would be dead config that reads as if it pinned the member.
+        // The model is argv's job (`opencode_backend::ModelSelection`).
+        let (v, _paths, _tmp) = generated("a");
+        assert!(agent_block(&v, "a").get("model").is_none(), "no agent model: {v}");
+        assert!(agent_block(&v, "a").get("variant").is_none(), "no agent variant: {v}");
+        assert!(v.get("model").is_none(), "no top-level model either: {v}");
     }
 
     #[test]
@@ -439,7 +387,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agents = tmp.path().join("softfig/growlight/agents");
         let paths = pre(&agents)
-            .generate("builder", &ModelSelection::default())
+            .generate("builder")
             .expect("generates");
 
         assert_eq!(paths.dir, agents.join("builder"));
@@ -460,10 +408,9 @@ mod tests {
     fn generate_is_idempotent_so_a_reroll_relays_the_pre_approval() {
         let tmp = tempfile::tempdir().unwrap();
         let g = pre(&tmp.path().join("agents"));
-        let sel = ModelSelection::model("deepseek/deepseek-v4-flash");
-        let first = g.generate("a1", &sel).unwrap();
+        let first = g.generate("a1").unwrap();
         let before = fs::read_to_string(&first.opencode_config).unwrap();
-        let second = g.generate("a1", &sel).unwrap();
+        let second = g.generate("a1").unwrap();
         assert_eq!(first, second);
         assert_eq!(before, fs::read_to_string(&second.opencode_config).unwrap());
     }
@@ -475,7 +422,7 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "../escape", "x\0y"] {
             assert!(
                 matches!(
-                    g.generate(bad, &ModelSelection::default()),
+                    g.generate(bad),
                     Err(GenError::BadAgentId(_))
                 ),
                 "an unsafe id {bad:?} is rejected, not written",
@@ -497,7 +444,7 @@ mod tests {
         );
         assert!(
             matches!(
-                g.generate("a1", &ModelSelection::default()),
+                g.generate("a1"),
                 Err(GenError::ClaudeDir(_))
             ),
             "a target under ~/.claude is refused, not written",
@@ -514,7 +461,7 @@ mod tests {
         let g = pre(&blocker);
         assert!(
             matches!(
-                g.generate("a1", &ModelSelection::default()),
+                g.generate("a1"),
                 Err(GenError::Io { .. })
             ),
             "an un-creatable dir fails closed",

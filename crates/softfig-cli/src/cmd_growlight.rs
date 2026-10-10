@@ -42,8 +42,9 @@ use crate::growlight_backend::{
     AgentBackend, Backend, ClaudeBackend, Clock, DEEPSEEK_FLASH, DEEPSEEK_REASONING, ExeIdentity,
     ExeProbe, InteractiveLaunch, IterationOutcome, IterationRequest, ModelChoice, ModelSpec,
     OpencodeConfigInputs, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, item_model_field,
-    opencode_config, parse_model_spec,
+    opencode_config, opencode_interactive_args, parse_model_spec,
 };
+use crate::opencode_catalog;
 
 /// Agent backend (spec §12: a documented, swappable seam). Claude Code is the
 /// supported backend; `--name` tags the loop session, `--settings` loads the
@@ -479,6 +480,13 @@ fn start(args: StartArgs) -> Result<()> {
     // "let growlight decide" can read the active item's declaration.
     let choice = resolve_model_choice(&args, &garden_root, &baton_path)?;
     let backend = choice.backend;
+    // Refused before any opencode work (the catalog check below starts a server).
+    if args.auto && backend == Backend::Opencode {
+        bail!(
+            "`--auto` headless mode is only implemented for the claude backend so far; \
+             opencode `--auto` is deferred to the semi-auto-backend-seam milestone (slice 004)"
+        );
+    }
 
     // The opencode-native equivalent of loop.json + mcp.json (`softfig-loop` agent
     // = protocol-by-reference + step-0 baton boot; garden guarded via
@@ -486,19 +494,48 @@ fn start(args: StartArgs) -> Result<()> {
     // the claude files, on both backends (self-heal; inert for a claude run) — and
     // written HERE, after resolution, because the resolved model + variant go into
     // it.
-    write_file(
-        &opencode_path,
-        &opencode_config(&OpencodeConfigInputs {
-            agent_name: AGENT_NAME,
-            protocol: &protocol,
-            baton: &baton_path,
-            runtime_root: runtime_grant_root(&runtime),
-            mcp_bin: &softfig_mcp_path(),
-            claude_projects: &claude_projects,
-            model: choice.opencode_model(),
-            variant: choice.variant.as_deref(),
-        }),
-    )?;
+    let opencode_cfg = opencode_config(&OpencodeConfigInputs {
+        agent_name: AGENT_NAME,
+        protocol: &protocol,
+        baton: &baton_path,
+        runtime_root: runtime_grant_root(&runtime),
+        mcp_bin: &softfig_mcp_path(),
+        claude_projects: &claude_projects,
+        model: choice.opencode_model(),
+        variant: choice.variant.as_deref(),
+    });
+    match backend {
+        Backend::Claude => write_file(&opencode_path, &opencode_cfg)?,
+        // An opencode launch carries its model in the config's top-level `model`,
+        // which 2.x does NOT fail closed on: a bad id silently runs on
+        // opencode/exo-free (opencode-v2-repin slice 001, L7). So the config is
+        // staged, checked against opencode's live catalog, and only then moved to
+        // the path a launch (or the --no-launch hint) reads. A refused config never
+        // lands where a human could start it by hand.
+        Backend::Opencode => {
+            let staged = runtime.join("opencode.json.unverified");
+            write_file(&staged, &opencode_cfg)?;
+            println!(
+                "checking {} against opencode's model catalog …",
+                choice.opencode_model_ref()
+            );
+            let checked = opencode_catalog::verify_model(
+                backend.agent_bin(),
+                &staged,
+                &garden_root,
+                choice.opencode_model(),
+                choice.variant.as_deref(),
+                opencode_catalog::CATALOG_DEADLINE,
+            );
+            if let Err(e) = checked {
+                let _ = fs::remove_file(&staged);
+                return Err(e);
+            }
+            fs::rename(&staged, &opencode_path).with_context(|| {
+                format!("moving the checked config into {}", opencode_path.display())
+            })?;
+        }
+    }
 
     // Built BEFORE the `--no-launch` branch, not just before the spawn, so the
     // printed hint and the real launch are derived from the same value and cannot
@@ -521,16 +558,11 @@ fn start(args: StartArgs) -> Result<()> {
         return Ok(());
     }
     if args.auto {
-        // Headless `--auto` is claude-only so far; the opencode `-p` event
-        // parser + non-subscription budget model are deferred to slice 004.
-        // Keep the claude construction byte-identical.
-        let backend = match backend {
-            Backend::Claude => ClaudeBackend::new(AGENT_BIN),
-            Backend::Opencode => bail!(
-                "`--auto` headless mode is only implemented for the claude backend so far; \
-                 opencode `--auto` is deferred to the semi-auto-backend-seam milestone (slice 004)"
-            ),
-        };
+        // Headless `--auto` is claude-only so far (opencode was refused above,
+        // before the catalog check); the opencode `-p` event parser +
+        // non-subscription budget model are deferred to slice 004. Keep the claude
+        // construction byte-identical.
+        let backend = ClaudeBackend::new(AGENT_BIN);
         let clock = SystemClock;
         // Captured before the loop, while our own binary is still the live inode;
         // re-statted between iterations to catch a mid-run reinstall (task 007).
@@ -585,13 +617,16 @@ fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
         // claude's `--settings`), so there is no `--settings`/`--mcp-config` here.
         // `growlight start --opencode` does the cd + first-turn kick for you; this
         // is the manual equivalent minus the `--prompt`, which the human types
-        // instead. The model is already baked into the config just written.
+        // instead. The model is already baked into the config just written, and
+        // the args come from the same function the launch uses, so the hint keeps
+        // `--standalone` (without it the shared service would ignore the config).
         Backend::Opencode => format!(
             "(--no-launch) runtime ready ({}). launch with:\n  cd {garden} && OPENCODE_CONFIG={} \
-             {} --agent {AGENT_NAME}",
-            choice.opencode_model(),
+             {} {}",
+            choice.opencode_model_ref(),
             launch.opencode_config.display(),
             choice.backend.agent_bin(),
+            opencode_interactive_args(launch.agent_name).join(" "),
         ),
     }
 }
@@ -1342,7 +1377,8 @@ fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> 
                 .map(|v| format!(" ({v})"))
                 .unwrap_or_default();
             println!(
-                "\nlaunching {bin} --agent {AGENT_NAME} on {}{variant} …\n",
+                "\nlaunching {bin} {} on {}{variant} …\n",
+                opencode_interactive_args(AGENT_NAME).join(" "),
                 choice.opencode_model()
             );
         }
@@ -3667,6 +3703,30 @@ mod tests {
         assert!(opencode.contains("OPENCODE_CONFIG=/rt/opencode.json"));
         assert!(opencode.contains(DEEPSEEK_REASONING), "name the model: {opencode}");
         assert!(!opencode.contains("--settings") && !opencode.contains("--mcp-config"));
+
+        // opencode-v2-repin slice 002: the hint must keep `--standalone`, or the
+        // pasted command attaches to the shared service, which ignores
+        // OPENCODE_CONFIG (slice 001 finding 1). The hint's argv is the launch's
+        // argv minus the trailing `--prompt <kick>`, which the human types instead.
+        let spawned: Vec<String> = Backend::Opencode
+            .interactive_command(&launch)
+            .unwrap()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let prompt_at = spawned.iter().position(|a| a == "--prompt").expect("a kick");
+        assert_eq!(&spawned[prompt_at..], ["--prompt", OPENCODE_KICK]);
+        let hinted = format!("opencode {}", spawned[..prompt_at].join(" "));
+        assert!(
+            opencode.ends_with(&hinted),
+            "hint argv == launch argv minus the kick: {opencode:?} vs {hinted:?}",
+        );
+        assert!(hinted.contains("--standalone"), "{hinted}");
+
+        // A declared variant is shown the way the config spells it.
+        let mut high = ModelChoice::opencode(DEEPSEEK_FLASH);
+        high.variant = Some("high".into());
+        assert!(no_launch_hint(&high, &launch).contains("deepseek/deepseek-flash#high"));
 
         // The claude hint keeps the settings pair it always had.
         let claude = no_launch_hint(&ModelChoice::claude(), &launch);
