@@ -271,6 +271,16 @@ pub(crate) fn drain_stderr<R: BufRead>(reader: R, buf: &AgentStderrState) {
 pub trait LineObserver: Send {
     /// Fold one non-empty, trimmed stdout line that arrived at `at` (unix secs).
     fn observe(&self, line: &str, at: i64);
+
+    /// The child's stdout reached EOF at `at`: the run is over. Called once, after
+    /// the last [`observe`](Self::observe) and BEFORE the reader thread records the
+    /// exit, so whatever this settles is in place by the time the drive loop sees
+    /// the agent `Exited` and reads its crash reason.
+    ///
+    /// Required, not defaulted, like every [`BackendFlavor`] method: a format whose
+    /// run-end carries no line (opencode 2.x streams no final `step_finish`) must
+    /// say what it does here, and one that needs nothing says so.
+    fn finish(&self, at: i64);
 }
 
 /// What a specific agent CLI supplies to the shared [`Harness`] — the whole
@@ -337,6 +347,10 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
 /// renderable delta. The arrival is stamped ONCE per line and shared with the
 /// observer, so the heartbeat and whatever the observer meters agree on one clock
 /// reading (and a test clock advances once per line).
+///
+/// At EOF (or a read error, which ends the stream the same way) the observer's
+/// [`finish`](LineObserver::finish) runs, stamped with one more clock reading. It
+/// is not a heartbeat: the child is ending, not alive.
 pub(crate) fn pump<R: BufRead>(
     reader: R,
     health: &AgentHealthState,
@@ -353,6 +367,7 @@ pub(crate) fn pump<R: BufRead>(
         health.touch(at);
         observer.observe(line, at);
     }
+    observer.finish(now());
 }
 
 /// Fold each agent's `(tokens, requests)` trailing-minute window into the
@@ -913,7 +928,8 @@ impl Harness {
                 observer.as_ref(),
                 &|| unix_now(),
             );
-            // stdout closed → the child is ending; reap it for the exit code.
+            // stdout closed → the child is ending (`pump` has already run the
+            // observer's `finish`); reap it for the exit code.
             let code = reader_child
                 .lock()
                 .unwrap()

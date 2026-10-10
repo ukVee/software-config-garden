@@ -113,9 +113,24 @@ The two providers are not symmetric, and the asymmetry is deliberate:
   window is already fleet-wide across them.
 
 - **Per-member USD spend** is the mirror image of the budget: only an opencode member
-  reports it (accumulated from each `step_finish.cost`), and a claude member contributes
-  **nothing** — its cost *is* the 5h/7d reserve above. The spend seam is structurally
-  `None` for claude for the same reason `budget()` is structurally `None` for opencode.
+  reports it, and a claude member contributes **nothing** — its cost *is* the 5h/7d
+  reserve above. The spend seam is structurally `None` for claude for the same reason
+  `budget()` is structurally `None` for opencode.
+
+On opencode 2.x the stream never carries a run's **final** step: there is no closing
+`step_finish`. So while a member runs, its spend and its rolling-minute tokens are what
+streamed, a lower bound. When its output closes, growlightd reads the run's totals from
+opencode's own session store (`$XDG_DATA_HOME/opencode/opencode.db`, read-only) and
+settles:
+
+- **Spend** is raised to the recorded total, which includes any subagent sessions the
+  member started. It is never lowered.
+- **Rate**: the tokens the stream never showed are metered as one more request, the
+  final step's. Without this, a one-step text run would meter nothing at all.
+
+If the store can't be read (missing, locked, or a schema opencode has since changed), the
+member keeps the streamed figures and growlightd logs
+`spend stays the streamed lower bound: …` to its journal. Accounting never fails a member.
 
 Each seam answers `None` for the provider it does not describe, and nothing invents the
 other reading. That symmetry is what makes the status surface honest — see below.
@@ -162,6 +177,9 @@ reserve gauge and looked broken. Two consequences of the fix are worth knowing:
 - **In memory only.** The counters live in the backend's cells and are lost on a
   growlightd restart. Deliberate: there is no per-event spend log on this device (eMMC
   wear). A durable rollup, if ever wanted, belongs in `snapshots/growlight/`.
+- **A step is counted when it starts**, since the final one never reports finishing. A
+  member's subagent steps are not in its stream, so they are not counted, though their
+  cost and tokens are in the settled totals.
 - **Nothing enforces a limit on it.** The spend *cap* and its enforcement, the metered
   429 `retry-after` hold, and per-provider pool separation are all **spec-agents §7
   phase 4**. What exists today is the accounting phase 4 will arrive to rather than have
@@ -176,13 +194,19 @@ kill-handle registries. So `growlight force-stop --hard-kill`, `request_restart`
 backend-specific parts are argv, the pre-approval it generates, and the wire format it
 parses.
 
-Two differences worth knowing when reading logs:
+Three differences worth knowing when reading logs:
 
 - An opencode member's **cwd is the garden**, so garden docs are ordinary in-project
   reads; a claude member inherits growlightd's cwd and finds the garden through its
   baton.
 - An opencode member's config is handed over in the `OPENCODE_CONFIG` environment
   variable rather than on argv, because opencode has no `--settings` equivalent.
+- An opencode member's **crash reason** is not only its stderr. opencode reports a
+  failed run (an unavailable model, a provider rejection, an interrupted session) as an
+  `error` event on stdout, exits 1, and writes nothing to stderr. growlightd appends those
+  events to the member's stderr tail as `opencode error [<type>]: <message>`, so the
+  `AgentCrashed` alert carries them. A network error reported this way also counts toward
+  the transient-network classification, the same as one on stderr.
 
 ## Known gaps
 

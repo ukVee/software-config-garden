@@ -65,6 +65,7 @@ use crate::drive_loop::{
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
 use crate::opencode_backend::ModelSelection;
+use crate::opencode_ledger::OpencodeDb;
 use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
@@ -631,10 +632,12 @@ fn build_claude_backend(
 ///
 /// Deliberately the same shape as [`build_claude_backend`] — same registries, same
 /// runtime `agents/` namespace, same fleet protocol — because everything except
-/// argv, pre-approval and the wire parser IS shared machinery. The two differences
-/// are opencode's: its pre-approval grants the runtime **grant root** (the parent of
-/// the pillar dir, so the baton and its sibling runtime state ride one rule), and
-/// its cwd is the garden so garden docs are ordinary in-project reads.
+/// argv, pre-approval and the wire parser IS shared machinery. The differences are
+/// opencode's: its pre-approval grants the runtime **grant root** (the parent of
+/// the pillar dir, so the baton and its sibling runtime state ride one rule), its
+/// cwd is the garden so garden docs are ordinary in-project reads, and each run's
+/// spend settles against opencode's own session store in the same data dir the
+/// pre-approval's floor names.
 fn build_opencode_backend(
     daemon: &Daemon,
     fleet: &FleetConfig,
@@ -642,6 +645,8 @@ fn build_opencode_backend(
     garden_root: &Path,
     model: &ModelSelection,
 ) -> OpencodeBackend {
+    let opencode_data =
+        ipc::opencode::opencode_data_dir(std::env::var_os("XDG_DATA_HOME").as_deref(), &home_dir());
     OpencodeBackend::new(
         OpencodeLaunch {
             bin: fleet.opencode_bin.clone(),
@@ -659,11 +664,9 @@ fn build_opencode_backend(
             runtime_grant_root(),
             softfig_mcp_path(),
             claude_dir(),
-            ipc::opencode::opencode_data_dir(
-                std::env::var_os("XDG_DATA_HOME").as_deref(),
-                &home_dir(),
-            ),
+            opencode_data.clone(),
         ),
+        Arc::new(OpencodeDb::in_data_dir(&opencode_data)),
         Arc::clone(&daemon.build_caps),
         Arc::clone(&daemon.live_scopes),
         Arc::clone(&daemon.kill_handles),
@@ -1417,7 +1420,7 @@ agent = "reviewer"
         let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
 
         // Both metered members do real work (folded through the same
-        // `AgentSpendState::record` a `step_finish` drives).
+        // `AgentSpendState` methods a streamed step drives).
         opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.000_043);
         opencode_backend_for(&router, "c").accrue_spend_for_test("c", 0.12);
 

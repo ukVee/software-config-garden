@@ -36,6 +36,7 @@ pub mod leases;
 pub mod notifications;
 pub mod notify_dispatch;
 pub mod opencode_backend;
+pub mod opencode_ledger;
 pub mod opencode_preapproval;
 pub mod peer;
 pub mod persist;

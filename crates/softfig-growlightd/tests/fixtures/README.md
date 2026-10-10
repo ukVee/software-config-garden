@@ -40,8 +40,8 @@ percentage. claude's parser keys on exactly those four, which is why opencode re
 Captured from `opencode run --standalone --format json --agent member [--model …]`
 on `deepseek/deepseek-flash`. Paths were redacted: the fake garden cwd became `/garden`,
 the runtime root became `/runtime`, and other scratch paths became `/probe`. Nothing else was edited.
-The 1.18.15 files above stay as the historical baseline. Slice 004 re-pins the parser
-onto these.
+The 1.18.15 files above stay as the historical baseline, and the parser's tests run
+over both. Slice 004 re-pinned the parser onto these.
 
 | file | captured from |
 |---|---|
@@ -71,3 +71,24 @@ onto these.
   stderr carries `permission requested: external_directory (…); auto-rejecting`.
 
 Still absent: `rate_limit_event`, a `result` line, `rate_limits`, and any context-window %.
+
+### Session records (what the run-end settlement reads)
+
+Because the stream never carries the final step, the parser settles each run against
+opencode's own session record (`crate::opencode_ledger`). The tests settle against the
+records opencode wrote for these exact runs, read back read-only from the device's
+`~/.local/share/opencode/opencode.db` `session_v2` on 2026-10-10. Tokens are
+`input + output + reasoning + cache_read + cache_write`. None of these runs had subagent
+sessions.
+
+| file | `sessionID` | `cost` (USD) | tokens | streamed `step_finish` cost |
+|---|---|---|---|---|
+| `opencode2-text-run.jsonl` | `ses_edb4e6137ffevobqsOjPLb2ShB` | 0.000118278 | 5652 | 0 (no `step_finish` at all) |
+| `opencode2-tool-run.jsonl` | `ses_edb507527ffeDOLsUIum3cdXE1` | 0.000429444 | 12751 | 0.000193578 |
+| `opencode2-denied-run.jsonl` | `ses_edb4f3774ffeeZNTSGtzwiLk1s` | 0.001026492 | 39469 | 0.000738288 |
+| `opencode2-ask-rejected-run.jsonl` | `ses_edb4ed3e5ffe1zQESYhNhl1VlN` | 0.000221442 | 11963 | 0.000078978 |
+| `opencode2-error-run.jsonl` | `ses_edb4eb51cffeuHdYNxtm7br913` | 0 | 0 | — |
+
+Every row also had `time_idle` set (`idle_outcome` `succeeded`, or `failed` for the error
+run) at most 20 ms after the run's last streamed line. That idle marker is what the ledger
+waits for before trusting the totals.
