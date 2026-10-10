@@ -27,7 +27,7 @@ use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::drive_loop::AgentHealthSource;
 use crate::fleet::{FleetMemberConfig, MemberBackend};
-use crate::opencode_preapproval::ModelSelection;
+use crate::opencode_backend::ModelSelection;
 use crate::resume::ResumeOutcome;
 use crate::state::State;
 use crate::supervisor::AgentHealth;
@@ -291,7 +291,7 @@ fn agent_summary(m: &FleetMemberConfig, router: &Arc<BackendRouter>) -> AgentSum
         // is metered, so a missing reading is the zero accounting — never a silent
         // demotion to the unmetered posture, which would misdescribe the member.
         MemberBackend::Opencode(selection) => row.on_opencode(
-            model_label(selection),
+            Some(model_label(selection)),
             router
                 .spend(&m.agent)
                 .map(|s| AgentSpendSummary {
@@ -322,17 +322,14 @@ fn health_label(health: Option<AgentHealth>) -> String {
     }
 }
 
-/// The operator-facing label for an opencode member's [`ModelSelection`], or
-/// `None` when it pins neither half (opencode runs on its own default, and
-/// growlightd will not print a model name it did not choose).
-fn model_label(selection: &ModelSelection) -> Option<String> {
-    match (&selection.model, &selection.variant) {
-        (Some(model), Some(variant)) => Some(format!("{model} ({variant})")),
-        (Some(model), None) => Some(model.clone()),
-        // A variant pinned over opencode's default model: say so explicitly rather
-        // than printing a bare variant that looks like a model id.
-        (None, Some(variant)) => Some(format!("default ({variant})")),
-        (None, None) => None,
+/// The operator-facing label for an opencode member's [`ModelSelection`]:
+/// `<model>` or `<model> (<variant>)`. Always present, because a member cannot
+/// exist without a model (the fleet refuses one at parse; opencode-v2-repin slice
+/// 002).
+fn model_label(selection: &ModelSelection) -> String {
+    match &selection.variant {
+        Some(variant) => format!("{} ({variant})", selection.model),
+        None => selection.model.clone(),
     }
 }
 
@@ -827,7 +824,7 @@ mod tests {
             "prompt = \"kick\"\n",
             "[[fleet]]\nagent = \"a\"\n",
             "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\n",
-            "model = \"deepseek/deepseek-v4-flash\"\nvariant = \"high\"\n",
+            "model = \"deepseek/deepseek-flash\"\nvariant = \"high\"\n",
             "[[fleet]]\nagent = \"c\"\nbackend = \"opencode\"\n",
             "model = \"deepseek/deepseek-v4-pro\"\n",
             "[[fleet]]\nagent = \"d\"\nbackend = \"claude\"\n",
@@ -883,7 +880,7 @@ mod tests {
         // The metered member reads as "opencode · <model> · $0.14".
         let b = &reply.agents[1];
         assert_eq!(b.backend, softfig_ipc::growlightd::BACKEND_OPENCODE);
-        assert_eq!(b.model.as_deref(), Some("deepseek/deepseek-v4-flash (high)"));
+        assert_eq!(b.model.as_deref(), Some("deepseek/deepseek-flash (high)"));
         let spend = b.spend.expect("a metered member carries its spend");
         assert_eq!(spend.micro_usd, 140_000);
         assert_eq!(spend.steps, 1);
@@ -965,23 +962,14 @@ mod tests {
     }
 
     #[test]
-    fn model_label_names_only_what_the_config_pinned() {
+    fn model_label_names_the_model_and_any_variant() {
         assert_eq!(
-            model_label(&ModelSelection::model("deepseek/deepseek-v4-flash")),
-            Some("deepseek/deepseek-v4-flash".to_string()),
+            model_label(&ModelSelection::model("deepseek/deepseek-flash")),
+            "deepseek/deepseek-flash",
         );
         assert_eq!(
-            model_label(&ModelSelection::model("deepseek/deepseek-v4-flash").with_variant("high")),
-            Some("deepseek/deepseek-v4-flash (high)".to_string()),
-        );
-        // Neither half pinned: opencode runs on its own default, and growlightd will
-        // not print a model name it did not choose.
-        assert_eq!(model_label(&ModelSelection::default()), None);
-        // A variant over that default is said explicitly, so it cannot be misread as
-        // a model id.
-        assert_eq!(
-            model_label(&ModelSelection { model: None, variant: Some("high".into()) }),
-            Some("default (high)".to_string()),
+            model_label(&ModelSelection::model("deepseek/deepseek-flash").with_variant("high")),
+            "deepseek/deepseek-flash (high)",
         );
     }
 

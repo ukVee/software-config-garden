@@ -759,12 +759,14 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
 
     assert!(reply.committed);
-    // All ten pillar files + the in-garden fleet config are created on a fresh
+    // All twelve pillar files + the in-garden fleet config are created on a fresh
     // garden.
     for rel in [
         "growlight/CLAUDE.md",
         "growlight/protocol.md",
         "growlight/protocol-fleet.md",
+        "growlight/memory-read.md",
+        "growlight/memory-write.md",
         "growlight/session-policy.md",
         "growlight/backlog/CLAUDE.md",
         "growlight/backlog/tasks/.seq",
@@ -788,6 +790,9 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     let fleet = fx.read("growlight/protocol-fleet.md");
     assert!(fleet.contains("SOFT-FIG GROWLIGHT — operating protocol"));
     assert!(!fleet.contains("pull the next"), "fleet protocol must not self-pull");
+    // The opencode memory rules ship as two halves (opencode-v2-repin slice 005).
+    assert!(fx.read("growlight/memory-read.md").starts_with("CLAUDE MEMORY — reading"));
+    assert!(fx.read("growlight/memory-write.md").starts_with("CLAUDE MEMORY — writing"));
     assert!(fx
         .read("growlight/session-policy.md")
         .contains("## The two budgets"));
@@ -812,8 +817,8 @@ fn growlight_init_is_idempotent_without_an_empty_commit() {
     assert!(!reply.committed, "re-run must not commit");
     assert!(reply.created.is_empty());
     assert_eq!(reply.hash, tip_before, "re-run returns the current tip");
-    // The ten pillar files + config/growlight.toml are reported kept, not recreated.
-    assert_eq!(reply.skipped.len(), 11);
+    // The twelve pillar files + config/growlight.toml are reported kept, not recreated.
+    assert_eq!(reply.skipped.len(), 13);
 
     let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
     assert_eq!(tip_after, tip_before, "no new commit on a no-op init");

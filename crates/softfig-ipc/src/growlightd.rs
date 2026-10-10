@@ -247,9 +247,10 @@ pub struct AgentSummary {
     #[serde(default = "default_backend")]
     pub backend: String,
     /// The model/variant this member is pinned to, when its backend pins one
-    /// (`"deepseek/deepseek-v4-flash"`, or `"<model> (<variant>)"`). [`None`] for
+    /// (`"deepseek/deepseek-flash"`, or `"<model> (<variant>)"`). [`None`] for
     /// claude — the model rides the harness there and is not growlightd's to
-    /// name — and for an opencode member left on opencode's own default.
+    /// name. Always `Some` for an opencode member: a member with no model is
+    /// refused at fleet parse (opencode-v2-repin slice 002).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// This member's accumulated metered spend, or [`None`] when its backend is
@@ -1160,7 +1161,7 @@ mod tests {
             agents: vec![
                 AgentSummary::new("builder", "running", true),
                 AgentSummary::new("reviewer", "idle", false).on_opencode(
-                    Some("deepseek/deepseek-v4-flash (high)".into()),
+                    Some("deepseek/deepseek-flash (high)".into()),
                     AgentSpendSummary { micro_usd: 140_000, steps: 3 },
                 ),
             ],

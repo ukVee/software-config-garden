@@ -26,6 +26,9 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use serde_json::Value;
+use softfig_ipc::opencode::{
+    Context as SessionContext, Floor, MemoryPolicy, Posture, context, file_ref, floor,
+};
 
 /// Which agent the human-driven semi-auto loop (`softfig growlight start`) runs
 /// on — the CLI-side interactive-first landing of the AgentBackend seam
@@ -56,7 +59,10 @@ pub const DEEPSEEK_REASONING: &str = "deepseek/deepseek-v4-pro";
 /// DeepSeek's fast model — picker option 3 / `--model flash`, and the fallback
 /// whenever "let growlight decide" finds no `> Model:` declaration on the active
 /// backlog item (cheap by default; reasoning is opt-in).
-pub const DEEPSEEK_FLASH: &str = "deepseek/deepseek-v4-flash";
+///
+/// V4.1 Flash. The earlier `deepseek/deepseek-v4-flash` id is gone from opencode
+/// 2.x's catalog (opencode-v2-repin slice 001, finding 12).
+pub const DEEPSEEK_FLASH: &str = "deepseek/deepseek-flash";
 
 /// A resolved interactive launch target: which backend, and (for opencode) which
 /// model + variant to generate the agent config with.
@@ -98,6 +104,25 @@ impl ModelChoice {
     /// [`DEEPSEEK_FLASH`] for a choice that names none.
     pub fn opencode_model(&self) -> &str {
         self.model.as_deref().unwrap_or(DEEPSEEK_FLASH)
+    }
+
+    /// The model + variant as opencode 2.x spells one value:
+    /// `provider/model`, or `provider/model#variant`. This is what the generated
+    /// config's top-level `model` carries (see [`opencode_config`]).
+    pub fn opencode_model_ref(&self) -> String {
+        opencode_model_ref(self.opencode_model(), self.variant.as_deref())
+    }
+}
+
+/// `provider/model` or `provider/model#variant`: opencode 2.x's one-string model
+/// reference. 2.x has no separate variant key on an agent and no `--variant` flag;
+/// the variant rides the `#` suffix, which opencode parses into
+/// `{providerID, model, variant}` (checked against a private server's
+/// `/api/config`, opencode-v2-repin slice 002).
+fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
+    match variant {
+        Some(variant) => format!("{model}#{variant}"),
+        None => model.to_string(),
     }
 }
 
@@ -153,6 +178,11 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
             "variant" | "effort" if value.is_empty() => {
                 bail!("model spec: `{key}=` has no value in `{spec}`")
             }
+            // The variant is rendered after a `#` (`provider/model#variant`), so
+            // one carrying its own `#` could not be read back unambiguously.
+            "variant" | "effort" if value.contains('#') => {
+                bail!("model spec: `{key}={value}` contains '#' in `{spec}`")
+            }
             "variant" | "effort" => variant = Some(value.to_string()),
             _ => bail!("model spec: unknown key `{key}` in `{spec}` (expected `variant=`)"),
         }
@@ -168,6 +198,14 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
         "claude" => ModelChoice::claude(),
         "reasoning" | "deepseek-reasoning" => ModelChoice::opencode(DEEPSEEK_REASONING),
         "flash" | "deepseek-flash" => ModelChoice::opencode(DEEPSEEK_FLASH),
+        // A `#variant` suffix on the id is opencode's own spelling, but here the
+        // variant has exactly one home (`variant=`), so the two cannot disagree.
+        other if other.contains('#') => bail!(
+            "model spec: `{token}` carries a '#variant' suffix — write it as \
+             `{} variant={}` instead",
+            token.split_once('#').map_or(token, |(m, _)| m),
+            token.split_once('#').map_or("", |(_, v)| v),
+        ),
         // A raw `provider/model` passthrough — anything else is a typo, not a model.
         other if other.contains('/') => ModelChoice::opencode(token),
         other => bail!(
@@ -227,11 +265,13 @@ pub struct InteractiveLaunch<'a> {
     ///
     /// For opencode this is slice 006. It used to root at the runtime dir so the
     /// garden would be "external" and deniable — but the loop then had no way to
-    /// READ the garden at all (softfig-mcp has no read verb), and the deny turned
-    /// out to be unenforceable anyway (see [`opencode_config`]). Rooting at the
+    /// READ the garden at all (softfig-mcp has no read verb), and on opencode
+    /// 1.18.15 the deny turned out to be unenforceable anyway. Rooting at the
     /// garden makes garden docs ordinary in-project reads, which is what the loop
-    /// actually needs; the baton is granted back via `external_directory`.
-    /// softfig-mcp is attached explicitly, so it resolves regardless of cwd.
+    /// actually needs; the baton is granted back via `external_directory`. On 2.x
+    /// the garden write guard is the config's universal `edit` deny instead (see
+    /// [`opencode_config`]). softfig-mcp is attached explicitly, so it resolves
+    /// regardless of cwd.
     pub garden_root: &'a Path,
     /// opencode first-turn kick (`--prompt`): tells the fresh session to begin
     /// its iteration (step 0 = read the baton, then follow the protocol).
@@ -258,7 +298,8 @@ impl Backend {
     ///   (`launch.garden_root`, slice 005's auto-cd) instead of wherever the human
     ///   invoked it from. It still sets no env.
     /// - **opencode** launches the TUI on the generated agent —
-    ///   `opencode --agent <name> --prompt <boot>` — with `OPENCODE_CONFIG`
+    ///   `opencode --standalone --agent <name> --prompt <boot>` (see
+    ///   [`opencode_interactive_args`] for why `--standalone`) — with `OPENCODE_CONFIG`
     ///   pointing at the generated `opencode.json` (opencode's analog of claude's
     ///   `--settings`; the agent, its permission map, and the softfig-mcp block
     ///   all live in that one file, so there is no separate `--mcp-config`) and
@@ -281,8 +322,7 @@ impl Backend {
                     .current_dir(launch.garden_root);
             }
             Backend::Opencode => {
-                cmd.arg("--agent")
-                    .arg(launch.agent_name)
+                cmd.args(opencode_interactive_args(launch.agent_name))
                     .arg("--prompt")
                     .arg(launch.boot_prompt)
                     .env("OPENCODE_CONFIG", launch.opencode_config)
@@ -293,10 +333,46 @@ impl Backend {
     }
 }
 
+/// The interactive opencode argv up to (not including) the first-turn `--prompt`:
+/// `--standalone --agent <name>`. Shared by the real launch and the `--no-launch`
+/// hint, so the command a human copy-pastes cannot lose a flag the launcher has.
+///
+/// `--standalone` is a correctness flag on opencode 2.x, not hygiene. Without it
+/// the TUI attaches to the per-user shared service, and a running one **ignores
+/// the client's `OPENCODE_CONFIG`** (opencode-v2-repin slice 001, finding 1): the
+/// session silently becomes the built-in `build` agent, with no protocol prompt,
+/// no baton boot, allow-all permissions and every global grant. `--standalone`
+/// gives the session a private server that loads this launch's config and exits
+/// with it.
+pub fn opencode_interactive_args(agent_name: &str) -> [&str; 3] {
+    ["--standalone", "--agent", agent_name]
+}
+
+/// The interactive loop's claude-memory policy: **read and write**, as Claude Code
+/// sessions have it (`decision-opencode-v2-fleet-safety-order` § Memory). The
+/// human is at the keyboard, unlike a fleet member (growlightd's
+/// `MEMBER_MEMORY`). Drives both the floor's memory `edit` rule and whether
+/// [`opencode_context`] injects the write rules.
+pub const INTERACTIVE_MEMORY: MemoryPolicy = MemoryPolicy::ReadWrite;
+
+/// The session context the interactive loop's `system` prompt carries after the
+/// step-0 line ([`softfig_ipc::opencode::context`] under [`INTERACTIVE_MEMORY`]):
+/// the garden root `CLAUDE.md`, both memory-rule halves, and the memory index,
+/// each by `{file:}` reference and only if it exists now. opencode 2.x reads
+/// neither `CLAUDE.md` nor claude-memory on its own (opencode-v2-repin slice 005).
+/// Checked at every launch, so a relaunch sees the memory as it is then.
+pub fn opencode_context(garden_root: &Path, claude_projects: &Path) -> Result<String> {
+    Ok(context(&SessionContext {
+        garden_root,
+        claude_projects,
+        memory: INTERACTIVE_MEMORY,
+    })?)
+}
+
 /// The inputs [`opencode_config`] renders into an `opencode.json`: where the
-/// garden's fixed pieces live (`protocol`, `garden_root`, `claude_projects`),
-/// where this run's churny pieces live (`baton`, `mcp_bin`), and what the launch
-/// resolved to (`model`, `variant`). Grouped for the same reason
+/// fixed pieces live (`protocol`, `claude_projects`, `opencode_data`),
+/// where this run's churny pieces live (`baton`, `mcp_bin`, `context`), and what
+/// the launch resolved to (`model`, `variant`). Grouped for the same reason
 /// [`InteractiveLaunch`] is — the generator's inputs accrete as the seam grows
 /// (slice 005 added two on its own), and a widening positional argument list is
 /// the kind of call site where a `&Path` lands in the wrong slot silently.
@@ -311,6 +387,9 @@ pub struct OpencodeConfigInputs<'a> {
     pub protocol: &'a Path,
     /// The runtime baton the step-0 boot line names.
     pub baton: &'a Path,
+    /// The rendered session context ([`opencode_context`]), appended after the
+    /// step-0 line; empty when there is nothing to inject.
+    pub context: &'a str,
     /// The growlight runtime root (`$XDG_CONFIG_HOME/softfig`), granted via
     /// `external_directory` so the loop can read and rewrite its baton. The garden
     /// root is deliberately absent: it is the launch cwd, so it needs no grant.
@@ -320,9 +399,14 @@ pub struct OpencodeConfigInputs<'a> {
     /// The claude-memory tree (`~/.claude/projects`), granted so the loop's own
     /// memory pointers stay reachable + editable.
     pub claude_projects: &'a Path,
+    /// opencode's data dir (`softfig_ipc::opencode::opencode_data_dir`); the floor
+    /// re-grants its `shell/` + `tool-output/` subdirs read-only so truncated tool
+    /// output stays readable.
+    pub opencode_data: &'a Path,
     /// The resolved opencode model id (`provider/model`).
     pub model: &'a str,
-    /// The resolved opencode `variant`, omitted from the config when `None`.
+    /// The resolved opencode `variant`, rendered as the model's `#variant` suffix
+    /// and omitted when `None`.
     pub variant: Option<&'a str>,
 }
 
@@ -332,129 +416,125 @@ pub struct OpencodeConfigInputs<'a> {
 /// three interactive legs of the seam for opencode (spec-agents §4.1 /
 /// decision-semi-auto-backend-seam's mapping table): `inject_baton`,
 /// `preapprove`, and `attach_mcp`. Pure (builds the string, never writes/spawns)
-/// so it's unit-testable like the claude generators. Slice 003 wires the launch
-/// that consumes it.
+/// so it's unit-testable like the claude generators. Native opencode 2.x keys
+/// only (`agents`, `system`, `permissions`, `mcp.servers`).
 ///
 /// - **inject_baton (the reseed bootstrap).** opencode has no SessionStart hook,
 ///   so the roll can't re-cat a baton the way claude's `/clear` does. Instead the
-///   agent's `prompt` = the garden `protocol.md` (pulled in by opencode's
+///   agent's `system` prompt = the garden `protocol.md` (pulled in by opencode's
 ///   `{file:…}` reference, so the protocol text is *reused*, never duplicated) +
 ///   a step-0 line naming the baton path. A fresh session (`/new` / relaunch)
 ///   rebuilds the system prompt → reloads the protocol → step 0 re-reads the
-///   current baton. The protocol *is* the bootstrap.
-/// - **preapprove.** `read`/`bash`/`softfig-mcp*` are allowed, mirroring claude's
-///   `loop.json` allow-list, so the loop's ordinary work never prompts. There are
-///   deliberately **no `edit` rules at all** — see the next bullet for why the
-///   garden write-deny that used to live here was removed rather than reshaped.
-/// - **the garden is the cwd (slice 006).** It was previously external and DENIED,
-///   on the theory that the agent should reach garden content only through
-///   softfig-mcp verbs. Two on-device findings killed that model:
-///   1. **There is no read verb.** softfig-mcp is entirely write/structure verbs,
-///      so "reach it through softfig-mcp" was never actually possible. A live loop
-///      session ended up reading garden docs through a bash hole instead — literal
-///      garden paths were refused, but `cat "$(ls -d …)"` sailed through, because
-///      the bash gate is a static-path check.
-///   2. **The deny was not expressible anyway.** On opencode 1.18.15 the only
-///      `edit` pattern that actually denies is a universal `*`/`**`, and that same
-///      pattern matches the absolute baton path too — so every shape that blocks
-///      garden writes also blocks the loop's own handoff write. Narrower patterns
-///      (relative globs, absolute globs) simply never match; four probes, and a
-///      full generated per-directory deny list let every garden write through.
-/// - **the landing.** The garden is now the launch **cwd**, so reads are ordinary
-///   in-project reads — what the loop actually needs. Raw garden *writes* are
-///   governed by the protocol ("garden mutations via softfig-mcp only") rather than
-///   by config, which is where they effectively already were: `bash: allow` always
-///   reached them. A real enforcement boundary needs a keeperd-side guard, not a
-///   config knob.
-/// - **attach_mcp.** Emits an explicit project-scoped `mcp.softfig-mcp` block
-///   (mirroring why claude gets an explicit `--mcp-config`) so the garden verbs
-///   exist regardless of launch cwd, without depending on the user's global
+///   current baton. The protocol *is* the bootstrap. The session context follows
+///   (the garden map, the memory rules and the memory index; see
+///   [`opencode_context`]).
+/// - **preapprove.** The top-level `permissions` are the shared floor
+///   ([`softfig_ipc::opencode::floor`]) in the **interactive** posture, the same
+///   builder growlightd's fleet members use, so the two can never drift. Read,
+///   shell and the softfig-mcp verbs never prompt. Everything the floor does not
+///   grant is put to the human (`ask`) rather than denied: an outside directory
+///   (the global `~/projects/**`-style grants are reset to `ask`, so the human
+///   approves a code repo instead of the loop silently reaching it) and an edit
+///   outside the garden.
+/// - **the garden write guard is back.** On opencode 1.18.15 no garden write-deny
+///   was expressible without also blocking the loop's own baton write (semi-auto
+///   slice 006 removed it after four probes). 2.x can express it
+///   (opencode-v2-repin slice 001, L3c): the floor's universal `edit * deny`
+///   refuses every raw garden write, and the later absolute allows re-open the
+///   runtime root (the baton) and the memory tree ([`INTERACTIVE_MEMORY`]:
+///   writable). In-cwd resources are matched
+///   cwd-relative, so the interactive `edit /* ask` that re-opens code repos to the
+///   human never reaches the garden. Garden mutations go through softfig-mcp.
+/// - **top level, not on the agent.** Top-level rules govern every agent the
+///   private server loads: a `subagent` call's built-in `general` / `explore`, and
+///   the `build` / `plan` primaries a human can Tab to. Rules on `softfig-loop`
+///   alone would leave every global grant one agent switch away.
+/// - **the garden is the cwd (slice 006).** Garden docs are ordinary in-project
+///   reads, which is what the loop needs (softfig-mcp has no read verb).
+/// - **attach_mcp.** Emits an explicit project-scoped `mcp.servers.softfig-mcp`
+///   block (mirroring why claude gets an explicit `--mcp-config`) so the garden
+///   verbs exist regardless of launch cwd, without depending on the user's global
 ///   `~/.config/opencode` registration. The binary is resolved the same way as
 ///   the claude `mcp.json` (`softfig_mcp_path` — the sibling of the running exe).
 /// - **model / variant.** Both are passed in, never inlined — the slice-005
 ///   resolution (picker choice, `--model` flag, or the active backlog item's
-///   `> Model:` declaration) decides them and hands the answer down. `variant` maps
-///   to opencode's `AgentConfig.variant` ("default model variant for this agent")
-///   and is omitted entirely when unset, so the agent keeps the model's own
-///   default rather than being pinned to a name we invented.
-pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> String {
+///   `> Model:` declaration) decides them and hands the answer down. They land in
+///   the config's **top-level** `model` as one `provider/model[#variant]` string,
+///   not on the agent: on opencode 2.x the agent block's `model` is ignored and
+///   the top-level one wins (opencode-v2-repin slice 001, L7), and the interactive
+///   root command has no `--model` flag. The catch is that a bad top-level id
+///   silently falls back to `opencode/exo-free` and sends the prompt there, so
+///   the launcher checks the id against the live catalog before it launches
+///   (`crate::opencode_catalog`).
+///
+/// **Fail-closed:** a floor directory the shared builder refuses (relative,
+/// non-UTF-8, a pattern metacharacter, or `/`), or a protocol path opencode's
+/// `{file:}` cannot carry, is an error, and no config is written.
+pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> Result<String> {
     let OpencodeConfigInputs {
         agent_name,
         protocol,
         baton,
+        context,
         runtime_root,
         mcp_bin,
         claude_projects,
+        opencode_data,
         model,
         variant,
     } = *cfg;
 
     // The system prompt: the protocol by reference (opencode expands `{file:…}`
-    // at prompt-build time — verified to resolve an absolute path) + the step-0
-    // baton-boot line that makes every fresh session re-read the live baton.
-    let prompt = format!(
-        "{{file:{protocol}}}\n\n\
+    // at config load — verified to resolve an absolute path) + the step-0
+    // baton-boot line that makes every fresh session re-read the live baton +
+    // the session context.
+    let mut system = format!(
+        "{protocol}\n\n\
          STEP 0 (every session, first): Read your baton at `{baton}` and follow the \
          operating protocol above — the baton is your only carried state. opencode has \
          no SessionStart hook, so a fresh session (`/new` or a relaunch) re-reads the \
          baton here; that reread IS the roll.",
-        protocol = protocol.display(),
+        protocol = file_ref("protocol", protocol)?,
         baton = baton.display(),
     );
-
-    let runtime_glob = format!("{}/**", runtime_root.display());
-    let memory_glob = format!("{}/**", claude_projects.display());
-
-    // `external_directory` grants what lives OUTSIDE the garden (the cwd). Two
-    // entries, both required by the loop itself:
-    //
-    // - the **growlight runtime** (`$XDG_CONFIG_HOME/softfig/`) — the baton is the
-    //   loop's only carried state and every handoff rewrites it, so this grant is
-    //   load-bearing, not a convenience. Granted at the `softfig/` level rather
-    //   than `softfig/growlight/` so sibling runtime state (usage, questions, the
-    //   per-member agent dirs) is reachable by the same rule.
-    // - the **claude-memory tree**, so the loop's own memory pointers stay
-    //   reachable + editable.
-    //
-    // Surgical, never a bare `allow`: the ~/.claude OAuth token and harness
-    // settings stay out of reach, and code repos fall through to opencode's default
-    // (the interactive human approves them per-prompt).
-    let mut external = serde_json::Map::new();
-    external.insert(runtime_glob, Value::from("allow"));
-    external.insert(memory_glob, Value::from("allow"));
-
-    let mut permission = serde_json::Map::new();
-    permission.insert("read".to_string(), Value::from("allow"));
-    permission.insert("bash".to_string(), Value::from("allow"));
-    permission.insert("external_directory".to_string(), Value::Object(external));
-    permission.insert("softfig-mcp*".to_string(), Value::from("allow"));
-
-    let mut agent = serde_json::json!({
-        "mode": "primary",
-        "model": model,
-        "prompt": prompt,
-        "permission": Value::Object(permission),
-    });
-    // Only emit `variant` when one was declared — an absent key leaves the model
-    // on its own default, which is not the same as pinning a guessed name.
-    if let Some(variant) = variant {
-        agent["variant"] = Value::from(variant);
+    if !context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(context);
     }
+
+    let permissions = floor(
+        Posture::Interactive,
+        &Floor {
+            runtime_root,
+            claude_projects,
+            opencode_data,
+            memory: INTERACTIVE_MEMORY,
+        },
+    )?;
+
     let mut agents = serde_json::Map::new();
-    agents.insert(agent_name.to_string(), agent);
+    agents.insert(
+        agent_name.to_string(),
+        serde_json::json!({ "mode": "primary", "system": system }),
+    );
 
     let v = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
+        // Top-level, where 2.x honors it (see the doc above). No variant → the bare
+        // id, which leaves the model on its own default variant.
+        "model": opencode_model_ref(model, variant),
+        "permissions": permissions,
         "mcp": {
-            "softfig-mcp": {
-                "type": "local",
-                "command": [ mcp_bin.display().to_string() ],
-                "enabled": true,
+            "servers": {
+                "softfig-mcp": {
+                    "type": "local",
+                    "command": [ mcp_bin.display().to_string() ],
+                }
             }
         },
-        "agent": Value::Object(agents),
+        "agents": Value::Object(agents),
     });
-    format!("{}\n", serde_json::to_string_pretty(&v).unwrap())
+    Ok(format!("{}\n", serde_json::to_string_pretty(&v).unwrap()))
 }
 
 /// What the driver hands a backend for one iteration: the generated loop
@@ -940,69 +1020,173 @@ mod tests {
             agent_name: "softfig-loop",
             protocol: Path::new("/g/growlight/protocol.md"),
             baton: Path::new("/rt/baton.md"),
+            context: "",
             runtime_root: Path::new("/rt"),
             mcp_bin: Path::new("/usr/bin/softfig-mcp"),
             claude_projects: Path::new("/home/u/.claude/projects"),
+            opencode_data: Path::new("/home/u/.local/share/opencode"),
             model,
             variant,
         }
     }
 
+    /// The emitted top-level rules as `action resource effect` lines.
+    fn rule_lines(v: &Value) -> Vec<String> {
+        v["permissions"]
+            .as_array()
+            .expect("top-level permissions is an array")
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} {}",
+                    r["action"].as_str().unwrap(),
+                    r["resource"].as_str().unwrap(),
+                    r["effect"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn opencode_config_wires_agent_runtime_grant_mcp_and_model() {
-        let cfg = opencode_config(&opencode_inputs("deepseek/deepseek-reasoner", None));
+        let cfg = opencode_config(&opencode_inputs("deepseek/deepseek-reasoner", None))
+            .expect("generates");
         // Must be valid JSON that opencode can load (real-config validation is the
-        // slice-002 on-device check; here we assert structure).
+        // on-device check; here we assert structure).
         let v: Value = serde_json::from_str(&cfg).expect("generated opencode config is valid JSON");
 
-        // The agent: primary, DeepSeek model held as config (the passed-in param,
-        // never inlined), selectable as `softfig-loop`.
-        let agent = &v["agent"]["softfig-loop"];
+        // Native 2.x keys only, never the v1 spellings opencode auto-translates.
+        for v1 in ["agent", "permission"] {
+            assert!(v.get(v1).is_none(), "v1 key `{v1}` emitted: {v}");
+        }
+
+        // The agent: primary, selectable as `softfig-loop`. The model is the
+        // passed-in param (never inlined) at the TOP level, where opencode 2.x
+        // honors it; the agent block's `model` is ignored on 2.x (slice 001 L7),
+        // so it is not emitted there at all.
+        let agent = &v["agents"]["softfig-loop"];
         assert_eq!(agent["mode"], "primary");
-        assert_eq!(agent["model"], "deepseek/deepseek-reasoner");
-        // No variant declared → the key is absent, leaving the model's own default
-        // rather than pinning a guessed name.
-        assert!(agent["variant"].is_null(), "variant omitted when unset");
+        assert_eq!(v["model"], "deepseek/deepseek-reasoner");
+        assert!(agent["model"].is_null(), "no dead agent-level model");
+        // No variant declared → the bare id, no `#` suffix, leaving the model's own
+        // default rather than pinning a guessed name.
+        assert!(agent["variant"].is_null(), "v2 agent blocks have no variant key");
 
         // inject_baton: protocol reused BY REFERENCE (no duplicated text) + a
         // step-0 line naming the runtime baton path (the reseed bootstrap).
-        let prompt = agent["prompt"].as_str().expect("prompt is a string");
+        let system = agent["system"].as_str().expect("system is a string");
         assert!(
-            prompt.contains("{file:/g/growlight/protocol.md}"),
-            "protocol must be pulled in by reference, not duplicated: {prompt}"
+            system.contains("{file:/g/growlight/protocol.md}"),
+            "protocol must be pulled in by reference, not duplicated: {system}"
         );
         assert!(
-            prompt.contains("STEP 0") && prompt.contains("/rt/baton.md"),
-            "step-0 boot must name the baton path: {prompt}"
+            system.contains("STEP 0") && system.contains("/rt/baton.md"),
+            "step-0 boot must name the baton path: {system}"
         );
-
-        // preapprove: NO `edit` key at all (slice 006). The garden write-deny that
-        // used to be implied here was removed rather than reshaped — on opencode
-        // 1.18.15 the only pattern that actually denies is a universal `*`/`**`,
-        // which also matches the absolute baton path and would block the loop's own
-        // handoff write. A half-working deny is worse than none; raw garden writes
-        // are governed by the protocol, and a real boundary needs a keeperd guard.
-        assert!(agent["permission"]["edit"].is_null(), "no edit key (see slice 006)");
-        assert!(agent["permission"]["write"].is_null(), "no separate write key");
-        assert_eq!(agent["permission"]["softfig-mcp*"], "allow");
-        assert_eq!(agent["permission"]["read"], "allow");
-
-        // external_directory grants only what lives OUTSIDE the garden and the loop
-        // genuinely needs: the runtime root (the baton — load-bearing, every handoff
-        // rewrites it) and the claude-memory tree. The GARDEN IS ABSENT because it
-        // is the cwd, so it needs no grant. Nothing else granted, so code repos +
-        // ~/.claude credentials stay gated.
-        let ext = &agent["permission"]["external_directory"];
-        assert!(ext["/g/**"].is_null(), "garden is the cwd — never an external entry");
-        assert_eq!(ext["/rt/**"], "allow", "baton readable + rewritable");
-        assert_eq!(ext["/home/u/.claude/projects/**"], "allow", "memory reachable + editable");
-        assert_eq!(ext.as_object().unwrap().len(), 2, "only runtime + memory");
 
         // attach_mcp: explicit project-scoped softfig-mcp block, binary resolved
         // like the claude mcp.json (cwd-independent).
-        assert_eq!(v["mcp"]["softfig-mcp"]["type"], "local");
-        assert_eq!(v["mcp"]["softfig-mcp"]["command"][0], "/usr/bin/softfig-mcp");
-        assert_eq!(v["mcp"]["softfig-mcp"]["enabled"], true);
+        let mcp = &v["mcp"]["servers"]["softfig-mcp"];
+        assert_eq!(mcp["type"], "local");
+        assert_eq!(mcp["command"][0], "/usr/bin/softfig-mcp");
+    }
+
+    #[test]
+    fn opencode_config_carries_exactly_the_interactive_floor_at_top_level() {
+        let cfg = opencode_config(&opencode_inputs(DEEPSEEK_FLASH, None)).expect("generates");
+        let v: Value = serde_json::from_str(&cfg).expect("valid JSON");
+        // Pinned in full: the order is the design (last match wins).
+        // - The reset is `ask`, not deny: the global `~/projects/**`-style grants
+        //   stop applying, and the human approves each outside directory instead.
+        // - On 2.x the base is `* * allow`, so without the `edit` rules the loop
+        //   would edit anything unasked. The garden guard (`edit * deny`) is back
+        //   (slice 001 L3c); `edit /* ask` re-opens only ABSOLUTE resources (outside
+        //   the garden cwd) to the human; the runtime root (the baton) and the memory
+        //   tree are re-opened last.
+        assert_eq!(
+            rule_lines(&v),
+            vec![
+                "external_directory * ask",
+                "external_directory /rt/** allow",
+                "external_directory /home/u/.claude/projects/** allow",
+                "external_directory /home/u/.local/share/opencode/shell/*/* allow",
+                "external_directory /home/u/.local/share/opencode/tool-output/* allow",
+                "read * allow",
+                "read *.env ask",
+                "read *.env.* ask",
+                "read *.env.example allow",
+                "shell * allow",
+                "softfig-mcp* * allow",
+                "edit * deny",
+                "edit /* ask",
+                "edit /rt/** allow",
+                "edit /home/u/.claude/projects/** allow",
+            ],
+        );
+        // Top level, NOT on the agent, so a subagent or a Tab to `build` cannot
+        // step outside it.
+        assert!(v["agents"]["softfig-loop"].get("permissions").is_none(), "{v}");
+    }
+
+    #[test]
+    fn the_interactive_loop_reads_and_writes_memory() {
+        // The human's 2026-10-10 call: interactive sessions read and write; only
+        // fleet members are read-only. The floor's last rule re-opens the memory
+        // tree, and the context carries both rule halves.
+        assert_eq!(INTERACTIVE_MEMORY, MemoryPolicy::ReadWrite);
+        let v: Value =
+            serde_json::from_str(&opencode_config(&opencode_inputs(DEEPSEEK_FLASH, None)).unwrap())
+                .unwrap();
+        assert_eq!(
+            rule_lines(&v).last().map(String::as_str),
+            Some("edit /home/u/.claude/projects/** allow"),
+        );
+
+        let dir = std::env::temp_dir().join(format!("softfig-ctx-{}", std::process::id()));
+        let garden = dir.join("garden");
+        let projects = dir.join(".claude/projects");
+        for f in ["CLAUDE.md", "growlight/memory-read.md", "growlight/memory-write.md"] {
+            let p = garden.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x\n").unwrap();
+        }
+        let ctx = opencode_context(&garden, &projects).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        for f in ["CLAUDE.md", "growlight/memory-read.md", "growlight/memory-write.md"] {
+            assert!(ctx.contains(&format!("{{file:{}}}", garden.join(f).display())), "{f}: {ctx}");
+        }
+    }
+
+    #[test]
+    fn the_context_lands_after_the_step_0_line() {
+        let mut inputs = opencode_inputs(DEEPSEEK_FLASH, None);
+        inputs.context = "Contents of `/g/CLAUDE.md` …:\n\n{file:/g/CLAUDE.md}";
+        let v: Value = serde_json::from_str(&opencode_config(&inputs).unwrap()).unwrap();
+        let system = v["agents"]["softfig-loop"]["system"].as_str().unwrap();
+        assert!(system.ends_with("that reread IS the roll.\n\nContents of `/g/CLAUDE.md` …:\n\n{file:/g/CLAUDE.md}"), "{system}");
+        // Empty context → the system prompt ends at step 0, no dangling blank lines.
+        let v: Value =
+            serde_json::from_str(&opencode_config(&opencode_inputs(DEEPSEEK_FLASH, None)).unwrap())
+                .unwrap();
+        assert!(v["agents"]["softfig-loop"]["system"].as_str().unwrap().ends_with("IS the roll."));
+    }
+
+    #[test]
+    fn opencode_config_fails_closed_on_a_protocol_path_file_cannot_carry() {
+        let mut inputs = opencode_inputs(DEEPSEEK_FLASH, None);
+        inputs.protocol = Path::new("/g}/growlight/protocol.md");
+        let err = opencode_config(&inputs).expect_err("a `}` would cut the {file:} short");
+        assert!(err.to_string().starts_with("opencode session context: protocol "), "{err}");
+    }
+
+    #[test]
+    fn opencode_config_fails_closed_on_an_unsafe_floor() {
+        // A relative runtime root would render `edit rt/** allow`, which matches the
+        // garden's own cwd-relative resources: a hole straight through the guard.
+        let mut inputs = opencode_inputs(DEEPSEEK_FLASH, None);
+        inputs.runtime_root = Path::new("rt");
+        let err = opencode_config(&inputs).expect_err("a relative floor root is refused");
+        assert!(err.to_string().contains("runtime_root"), "{err}");
     }
 
     #[test]
@@ -1028,11 +1212,14 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        // Selects the generated primary agent + kicks the first turn (the reseed
-        // roll, since opencode has no SessionStart hook).
+        // A private server (`--standalone`: the shared service would ignore
+        // OPENCODE_CONFIG, slice 001 finding 1), the generated primary agent, and
+        // the first-turn kick (the reseed roll, since opencode has no SessionStart
+        // hook).
         assert_eq!(
             args,
             vec![
+                "--standalone",
                 "--agent",
                 "softfig-loop",
                 "--prompt",
@@ -1058,11 +1245,36 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_emits_a_declared_variant() {
-        let cfg = opencode_config(&opencode_inputs(DEEPSEEK_FLASH, Some("thinking")));
+    fn opencode_config_emits_a_declared_variant_as_the_model_suffix() {
+        // 2.x spells model + variant as one `provider/model#variant` string; an
+        // agent-level `variant` key does not exist in the v2 schema.
+        let cfg = opencode_config(&opencode_inputs(DEEPSEEK_FLASH, Some("high"))).expect("generates");
         let v: Value = serde_json::from_str(&cfg).expect("valid JSON");
-        assert_eq!(v["agent"]["softfig-loop"]["model"], DEEPSEEK_FLASH);
-        assert_eq!(v["agent"]["softfig-loop"]["variant"], "thinking");
+        assert_eq!(v["model"], "deepseek/deepseek-flash#high");
+        assert!(v["agents"]["softfig-loop"]["variant"].is_null());
+
+        let choice = match parse_model_spec("flash variant=high").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => panic!("fixed spec"),
+        };
+        assert_eq!(choice.opencode_model_ref(), "deepseek/deepseek-flash#high");
+        assert_eq!(
+            ModelChoice::opencode(DEEPSEEK_REASONING).opencode_model_ref(),
+            "deepseek/deepseek-v4-pro",
+            "no variant → no trailing '#'",
+        );
+    }
+
+    #[test]
+    fn a_hash_in_a_model_spec_is_refused_so_the_suffix_stays_unambiguous() {
+        // The variant has one home (`variant=`) and is rendered after a `#`, so an
+        // id or variant carrying its own `#` could not be read back.
+        let err = parse_model_spec("deepseek/deepseek-flash#high").unwrap_err().to_string();
+        assert!(
+            err.contains("deepseek/deepseek-flash variant=high"),
+            "suggests the right spelling: {err}",
+        );
+        assert!(parse_model_spec("flash variant=hi#gh").is_err());
     }
 
     #[test]
@@ -1080,9 +1292,10 @@ mod tests {
             Some("deepseek/deepseek-v4-pro")
         );
         assert_eq!(fixed("deepseek-reasoning"), fixed("reasoning"));
+        // `deepseek-v4-flash` left opencode 2.x's catalog (slice 001 finding 12).
         assert_eq!(
             fixed("flash").model.as_deref(),
-            Some("deepseek/deepseek-v4-flash")
+            Some("deepseek/deepseek-flash")
         );
         assert_eq!(fixed("deepseek-flash"), fixed("flash"));
         assert_eq!(fixed("Flash"), fixed("flash"), "aliases are case-insensitive");

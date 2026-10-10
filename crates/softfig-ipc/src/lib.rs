@@ -11,6 +11,7 @@
 pub mod baton;
 pub mod client;
 pub mod growlightd;
+pub mod opencode;
 pub mod proto;
 pub mod socket;
 pub mod usage;

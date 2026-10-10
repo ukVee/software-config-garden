@@ -2995,12 +2995,12 @@ mod tests {
         // and dollar figure, so it no longer sits against an empty Anthropic
         // reserve looking broken.
         let metered = AgentSummary::new("b", "running", true).on_opencode(
-            Some("deepseek/deepseek-v4-flash".into()),
+            Some("deepseek/deepseek-flash".into()),
             AgentSpendSummary { micro_usd: 140_000, steps: 3 },
         );
         assert_eq!(
             fleet_agent_cell(&metered),
-            "b:running · opencode · deepseek/deepseek-v4-flash · $0.14",
+            "b:running · opencode · deepseek/deepseek-flash · $0.14",
         );
 
         // A subscription member ends at its backend. Its cost is the shared 5h/7d

@@ -36,6 +36,7 @@ pub mod leases;
 pub mod notifications;
 pub mod notify_dispatch;
 pub mod opencode_backend;
+pub mod opencode_ledger;
 pub mod opencode_preapproval;
 pub mod peer;
 pub mod persist;
@@ -81,8 +82,8 @@ pub use notify_dispatch::{
     BusEmit, GuiNotifier, KeeperdBusEmit, LogNotifier, LogSink, Notifier, NotifyDispatcher,
     PhoneStub, StderrLog, ALERT_FROM, ALERT_KIND,
 };
-pub use opencode_backend::{AgentSpend, OpencodeBackend, OpencodeLaunch};
-pub use opencode_preapproval::{ModelSelection, OpencodePreApproval};
+pub use opencode_backend::{AgentSpend, ModelSelection, OpencodeBackend, OpencodeLaunch};
+pub use opencode_preapproval::OpencodePreApproval;
 pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
 pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_QUEUE_NAME};

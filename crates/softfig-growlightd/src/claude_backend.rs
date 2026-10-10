@@ -591,6 +591,10 @@ impl LineObserver for ClaudeSpawnObserver {
             &self.usage,
         );
     }
+
+    /// Nothing to settle: claude's terminal `result` line already carried the
+    /// turn's usage, metered in [`observe`](Self::observe).
+    fn finish(&self, _at: i64) {}
 }
 
 /// The borrowing [`LineObserver`] the unit tests drive — the SAME
@@ -619,6 +623,8 @@ impl LineObserver for ClaudeBorrowedObserver<'_> {
             self.usage,
         );
     }
+
+    fn finish(&self, _at: i64) {}
 }
 
 /// Tail an agent's `claude -p --output-format stream-json` output to EOF through

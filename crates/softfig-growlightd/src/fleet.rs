@@ -64,7 +64,9 @@ use crate::drive_loop::{
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
-use crate::opencode_preapproval::{ModelSelection, OpencodePreApproval};
+use crate::opencode_backend::ModelSelection;
+use crate::opencode_ledger::OpencodeDb;
+use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
 use crate::supervisor::{AgentSpec, Supervisor};
@@ -93,10 +95,11 @@ const BACKEND_OPENCODE: &str = "opencode";
 /// (opencode-fleet-backend slice 005). Without this the backend slice 004 built is
 /// unreachable code.
 ///
-/// The opencode variant carries the member's [`ModelSelection`] because that is
-/// where the choice belongs: model + variant ride the GENERATED opencode config,
-/// never argv (the milestone's locked decision — one source beats two), and that
-/// config is written per member at every spawn.
+/// The opencode variant carries the member's [`ModelSelection`], which reaches
+/// opencode as argv `--model`. The opencode-fleet-backend milestone originally
+/// pinned it in the generated config instead ("one source beats two"); opencode
+/// 2.x `run` ignores the agent block's model, so opencode-v2-repin slice 002 moved
+/// it to argv, the only path that fails closed on a bad id.
 ///
 /// This is the first minimal seed of the spec-agents §3 **agent profile**
 /// (`backend` + `model` + `variant` on a member). The full
@@ -107,8 +110,9 @@ const BACKEND_OPENCODE: &str = "opencode";
 pub enum MemberBackend {
     /// `claude -p` — the default, and byte-identical to the pre-slice-005 spawn.
     Claude,
-    /// `opencode run` on the given model/variant. Either may be unset, which leaves
-    /// opencode its own default rather than pinning a name we invented.
+    /// `opencode run` on the given model/variant. The model is required: an
+    /// opencode member with none is refused at parse (see
+    /// [`FleetMemberDoc::validate`]), never left to opencode's own default.
     Opencode(ModelSelection),
 }
 
@@ -185,10 +189,9 @@ impl FleetMemberDoc {
                 }
                 MemberBackend::Claude
             }
-            Some(BACKEND_OPENCODE) => MemberBackend::Opencode(ModelSelection {
-                model: self.model,
-                variant: self.variant,
-            }),
+            Some(BACKEND_OPENCODE) => {
+                MemberBackend::Opencode(opencode_selection(&agent, self.model, self.variant)?)
+            }
             Some(other) => {
                 return Err(format!(
                     "fleet member {agent:?} declares unknown backend {other:?} — expected \
@@ -204,6 +207,47 @@ impl FleetMemberDoc {
             backend,
         })
     }
+}
+
+/// Validate an opencode member's `model` + `variant` into the [`ModelSelection`]
+/// its argv carries, or explain the refusal.
+///
+/// A missing model is refused, not defaulted. opencode would otherwise pick its
+/// own, and on 2.x that default is a provider the operator never chose
+/// (opencode-v2-repin slice 001, L7: an unresolved model ran on
+/// `opencode/exo-free` and sent the prompt there). The shape checks cover only
+/// what would make the `--model provider/model#variant` value ambiguous. Whether
+/// the id is real is opencode's call, and argv `--model` fails closed on a bad one.
+fn opencode_selection(
+    agent: &str,
+    model: Option<String>,
+    variant: Option<String>,
+) -> Result<ModelSelection, String> {
+    let token_ok = |s: &str| !s.is_empty() && !s.contains('#') && !s.contains(char::is_whitespace);
+    let Some(model) = model else {
+        return Err(format!(
+            "fleet member {agent:?} runs on {BACKEND_OPENCODE} but declares no model. Set \
+             model = \"provider/model\" (e.g. \"deepseek/deepseek-flash\"): without one, \
+             opencode picks its own default provider, which the operator never chose"
+        ));
+    };
+    let well_formed = token_ok(&model)
+        && model
+            .split_once('/')
+            .is_some_and(|(provider, id)| !provider.is_empty() && !id.is_empty());
+    if !well_formed {
+        return Err(format!(
+            "fleet member {agent:?} declares model {model:?}, expected \"provider/model\" with \
+             no spaces and no '#' (put the variant in variant = \"…\")"
+        ));
+    }
+    if let Some(v) = variant.as_deref().filter(|v| !token_ok(v)) {
+        return Err(format!(
+            "fleet member {agent:?} declares variant {v:?}, expected a non-empty name with no \
+             spaces and no '#'"
+        ));
+    }
+    Ok(ModelSelection { model, variant })
 }
 
 impl FleetMemberConfig {
@@ -588,10 +632,12 @@ fn build_claude_backend(
 ///
 /// Deliberately the same shape as [`build_claude_backend`] — same registries, same
 /// runtime `agents/` namespace, same fleet protocol — because everything except
-/// argv, pre-approval and the wire parser IS shared machinery. The two differences
-/// are opencode's: its pre-approval grants the runtime **grant root** (the parent of
-/// the pillar dir, so the baton and its sibling runtime state ride one rule), and
-/// its cwd is the garden so garden docs are ordinary in-project reads.
+/// argv, pre-approval and the wire parser IS shared machinery. The differences are
+/// opencode's: its pre-approval grants the runtime **grant root** (the parent of
+/// the pillar dir, so the baton and its sibling runtime state ride one rule), its
+/// cwd is the garden so garden docs are ordinary in-project reads, and each run's
+/// spend settles against opencode's own session store in the same data dir the
+/// pre-approval's floor names.
 fn build_opencode_backend(
     daemon: &Daemon,
     fleet: &FleetConfig,
@@ -599,6 +645,8 @@ fn build_opencode_backend(
     garden_root: &Path,
     model: &ModelSelection,
 ) -> OpencodeBackend {
+    let opencode_data =
+        ipc::opencode::opencode_data_dir(std::env::var_os("XDG_DATA_HOME").as_deref(), &home_dir());
     OpencodeBackend::new(
         OpencodeLaunch {
             bin: fleet.opencode_bin.clone(),
@@ -612,11 +660,14 @@ fn build_opencode_backend(
         daemon.hub.clone(),
         OpencodePreApproval::new(
             agents_dir.to_path_buf(),
+            garden_root.to_path_buf(),
             fleet_protocol(garden_root),
             runtime_grant_root(),
             softfig_mcp_path(),
             claude_dir(),
+            opencode_data.clone(),
         ),
+        Arc::new(OpencodeDb::in_data_dir(&opencode_data)),
         Arc::clone(&daemon.build_caps),
         Arc::clone(&daemon.live_scopes),
         Arc::clone(&daemon.kill_handles),
@@ -636,7 +687,7 @@ pub fn runtime_growlight_dir() -> PathBuf {
 
 /// The growlight runtime **grant root** `$XDG_CONFIG_HOME/softfig` (fallback
 /// `~/.config/softfig`) — the PARENT of [`runtime_growlight_dir`], and what an
-/// opencode member's pre-approval grants through `external_directory`.
+/// opencode member's permission floor grants (reach and write).
 ///
 /// The parent rather than the pillar dir so sibling runtime state (`usage.json`,
 /// the per-agent `agents/` tree, anything the daemon adds later) rides ONE rule
@@ -1068,7 +1119,7 @@ agent = "reviewer"
             "prompt = \"kick\"\n",
             "[[fleet]]\nagent = \"a\"\n",
             "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\n",
-            "model = \"deepseek/deepseek-v4-flash\"\nvariant = \"high\"\n",
+            "model = \"deepseek/deepseek-flash\"\nvariant = \"high\"\n",
             "[[fleet]]\nagent = \"c\"\nbackend = \"opencode\"\n",
             "model = \"deepseek/deepseek-v4-pro\"\n",
             "[[fleet]]\nagent = \"d\"\nbackend = \"claude\"\n",
@@ -1097,7 +1148,7 @@ agent = "reviewer"
         assert_eq!(
             cfg.members[1].backend,
             MemberBackend::Opencode(
-                ModelSelection::model("deepseek/deepseek-v4-flash").with_variant("high")
+                ModelSelection::model("deepseek/deepseek-flash").with_variant("high")
             ),
         );
         // `variant` is optional — omitting it leaves opencode the model's own
@@ -1106,17 +1157,58 @@ agent = "reviewer"
             cfg.members[2].backend,
             MemberBackend::Opencode(ModelSelection::model("deepseek/deepseek-v4-pro")),
         );
-        // `backend = "opencode"` with neither key is legal: run opencode, let it
-        // pick.
-        let bare = FleetConfig::from_growlight_toml(concat!(
+    }
+
+    #[test]
+    fn an_opencode_member_without_a_model_is_refused_never_left_to_opencodes_default() {
+        // opencode-v2-repin slice 002. On 2.x an unresolved model ran on
+        // opencode/exo-free and SENT the prompt there (slice 001 L7), so "let
+        // opencode pick" means a provider the operator never chose. Refused at parse,
+        // and the loader turns the refusal into a disabled fleet.
+        let toml = concat!(
             "fleet_enabled = true\n",
             "[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\n",
-        ))
-        .unwrap();
-        assert_eq!(
-            bare.members[0].backend,
-            MemberBackend::Opencode(ModelSelection::default()),
         );
+        let err = FleetConfig::from_growlight_toml(toml).unwrap_err();
+        assert!(err.contains("\"a\"") && err.contains("no model"), "names member + cause: {err}");
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), toml);
+        assert_eq!(load_fleet_config(dir.path()), FleetConfig::disabled());
+
+        // A variant alone does not rescue it: there is still no model to run.
+        let variant_only = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\nvariant = \"high\"\n",
+        );
+        assert!(FleetConfig::from_growlight_toml(variant_only).is_err());
+    }
+
+    #[test]
+    fn an_opencode_model_that_would_make_an_ambiguous_argv_is_refused() {
+        // The argv value is `provider/model#variant`, so a model carrying its own
+        // `#`, missing its provider, or with whitespace cannot be passed through
+        // unambiguously. Each is a loud config error, not a guess.
+        for (model, variant) in [
+            ("deepseek-flash", None),
+            ("/deepseek-flash", None),
+            ("deepseek/", None),
+            ("deepseek/deepseek-flash#high", None),
+            ("deepseek/deepseek flash", None),
+            ("", None),
+            ("deepseek/deepseek-flash", Some("")),
+            ("deepseek/deepseek-flash", Some("hi#gh")),
+        ] {
+            let mut member =
+                format!("[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\nmodel = {model:?}\n");
+            if let Some(v) = variant {
+                member.push_str(&format!("variant = {v:?}\n"));
+            }
+            assert!(
+                FleetConfig::from_growlight_toml(&format!("fleet_enabled = true\n{member}"))
+                    .is_err(),
+                "model {model:?} variant {variant:?} must be refused",
+            );
+        }
     }
 
     #[test]
@@ -1150,7 +1242,7 @@ agent = "reviewer"
         // spawning claude. Refused, not ignored — both with the key absent (the
         // default) and with it explicitly claude.
         for member in [
-            "[[fleet]]\nagent = \"a\"\nmodel = \"deepseek/deepseek-v4-flash\"\n",
+            "[[fleet]]\nagent = \"a\"\nmodel = \"deepseek/deepseek-flash\"\n",
             "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\nvariant = \"high\"\n",
         ] {
             let err = FleetConfig::from_growlight_toml(&format!("fleet_enabled = true\n{member}"))
@@ -1210,8 +1302,20 @@ agent = "reviewer"
         );
         assert_eq!(
             argv("b"),
-            vec!["opencode", "run", "--format", "json", "--agent", "b", "kick"],
-            "an opencode member is exec'd as opencode, naming itself as the agent",
+            vec![
+                "opencode",
+                "run",
+                "--standalone",
+                "--format",
+                "json",
+                "--agent",
+                "b",
+                "--model",
+                "deepseek/deepseek-flash#high",
+                "kick",
+            ],
+            "an opencode member is exec'd as opencode on a private server, naming itself \
+             as the agent and its model on argv",
         );
 
         // 2. One member, one backend, EVERY seam: health/stderr/budget/spawn all
@@ -1280,8 +1384,8 @@ agent = "reviewer"
         let d = daemon();
         let cfg = FleetConfig::from_growlight_toml(concat!(
             "fleet_enabled = true\n",
-            "[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\n",
-            "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\nmodel = \"deepseek/deepseek-flash\"\n",
+            "[[fleet]]\nagent = \"b\"\nbackend = \"opencode\"\nmodel = \"deepseek/deepseek-flash\"\n",
         ))
         .unwrap();
         let router = build_member_backends(&d, &cfg, Path::new("/cfg/agents"), Path::new("/garden"));
@@ -1317,7 +1421,7 @@ agent = "reviewer"
         let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
 
         // Both metered members do real work (folded through the same
-        // `AgentSpendState::record` a `step_finish` drives).
+        // `AgentSpendState` methods a streamed step drives).
         opencode_backend_for(&router, "b").accrue_spend_for_test("b", 0.000_043);
         opencode_backend_for(&router, "c").accrue_spend_for_test("c", 0.12);
 
