@@ -659,6 +659,10 @@ fn build_opencode_backend(
             runtime_grant_root(),
             softfig_mcp_path(),
             claude_dir(),
+            ipc::opencode::opencode_data_dir(
+                std::env::var_os("XDG_DATA_HOME").as_deref(),
+                &home_dir(),
+            ),
         ),
         Arc::clone(&daemon.build_caps),
         Arc::clone(&daemon.live_scopes),
@@ -679,7 +683,7 @@ pub fn runtime_growlight_dir() -> PathBuf {
 
 /// The growlight runtime **grant root** `$XDG_CONFIG_HOME/softfig` (fallback
 /// `~/.config/softfig`) — the PARENT of [`runtime_growlight_dir`], and what an
-/// opencode member's pre-approval grants through `external_directory`.
+/// opencode member's permission floor grants (reach and write).
 ///
 /// The parent rather than the pillar dir so sibling runtime state (`usage.json`,
 /// the per-agent `agents/` tree, anything the daemon adds later) rides ONE rule

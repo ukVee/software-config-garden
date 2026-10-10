@@ -963,6 +963,7 @@ mod tests {
                 tmp.join("runtime"),
                 PathBuf::from("softfig-mcp"),
                 tmp.join(".claude"),
+                tmp.join("opencode-data"),
             ),
             spends: Mutex::new(BTreeMap::new()),
         }
@@ -1114,6 +1115,7 @@ mod tests {
                 tmp.path().to_path_buf(),
                 PathBuf::from("softfig-mcp"),
                 tmp.path().join(".claude"),
+                tmp.path().join("opencode-data"),
             ),
             Arc::new(Mutex::new(BuildCaps::default())),
             Arc::new(Mutex::new(BTreeMap::new())),

@@ -59,6 +59,46 @@ member's tools would run in the per-user shared service, which ignores the clien
 `OPENCODE_CONFIG` — the member would silently run as the built-in `build` agent with
 allow-all permissions and every global grant (opencode-v2-repin slice 001, finding 1).
 
+## What an opencode member may touch
+
+Each member's `opencode.json` carries an ordered list of opencode 2.x permission rules at
+the config's **top level**. The same builder (`softfig_ipc::opencode::floor`) writes the
+interactive `growlight start --opencode` config, so the two never drift. The last
+matching rule wins, which makes the order the design:
+
+| # | Rule | Why |
+|---|---|---|
+| 1 | `external_directory * deny` | resets the global `~/.config/opencode` grants (`~/projects/**`, `~/dotfiles/**`, `/tmp/**`, …) and opencode's built-in allow on its own config dir |
+| 2 | `external_directory <runtime>/**`, `<~/.claude/projects>/** allow` | the baton and the memory tree |
+| 3 | `external_directory <opencode data>/shell/*/*`, `…/tool-output/* allow` | truncated tool output stays readable (read-only: no `edit` rule opens them) |
+| 4 | `read * allow`, then `read *.env` / `*.env.*` deny, `*.env.example` allow | opencode's own `.env` caution, restated because `read *` would override it |
+| 5 | `shell * allow`, `softfig-mcp* * allow` | the member's tools and the garden verbs |
+| 6 | `edit * deny` | the garden write guard: garden mutations go through softfig-mcp |
+| 7 | *(interactive config only)* `edit /* ask` | see below |
+| 8 | `edit <runtime>/**`, `<~/.claude/projects>/** allow` | the baton write and memory pointers |
+
+Three facts make this shape work, all probe-proven on 2.0.24 (opencode-v2-repin slice 001):
+
+- A path inside the garden (the member's cwd) is matched as a **cwd-relative** resource, so
+  an absolute garden glob never matches. The guard has to be the universal deny, with
+  everything writable re-opened after it.
+- Top-level rules govern **every** agent the member's private server loads, including the
+  `general` / `explore` subagents a `subagent` call spawns. A subagent runs on its own
+  agent's rules, so rules placed only on the member's agent would leave every global grant
+  one subagent call away.
+- A headless member cannot answer a prompt, so nothing here asks. The interactive config
+  differs only where a human can answer: rule 1 and the `.env` rules `ask`, and rule 7,
+  `edit /* ask`, puts code-repo edits (absolute resources) to the human without
+  reaching the garden (relative resources).
+
+Generation fails **closed**: a floor directory that is relative, non-UTF-8, carries a `*`
+or `?`, or is `/` refuses the spawn. A relative root would render `edit <rel>/** allow`,
+which matches the garden's own resources and opens a hole through the guard.
+
+The **shell is not a boundary.** `shell * allow` runs with full host authority, so these
+rules stop well-behaved tool calls, not a determined command line. The OS-level boundary is
+the Landlock step of `decision-opencode-v2-fleet-safety-order`.
+
 ## What each backend contributes to admission
 
 The two providers are not symmetric, and the asymmetry is deliberate:
@@ -150,9 +190,9 @@ The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its
 row carries id/status/ctx only. `growlight status` and the TUI do. Surfacing it there is
 its own change.
 
-A headless opencode member cannot write to a **code repo**. Its cwd is the garden, and
-opencode's `external_directory` governs every path outside cwd, so an ungranted repo
-yields a permission refusal a headless session cannot answer. growlightd does not model
-repos at all today (the queue→repo binding is dropped when the registry is parsed), so
-there is nothing to grant from. Until that is closed, an opencode member is limited to
-garden work.
+A headless opencode member cannot write to a **code repo**. The permission floor reaches
+only the loop's own state, so an ungranted repo yields a refusal a headless session cannot
+answer. growlightd does not model repos at all today (the queue→repo binding is dropped
+when the registry is parsed), so there is nothing to grant from. Until the folder grants
+land (step 2 of `decision-opencode-v2-fleet-safety-order`, appended after rule 8), an
+opencode member is limited to garden work through the softfig-mcp verbs.

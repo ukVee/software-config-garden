@@ -489,8 +489,8 @@ fn start(args: StartArgs) -> Result<()> {
     }
 
     // The opencode-native equivalent of loop.json + mcp.json (`softfig-loop` agent
-    // = protocol-by-reference + step-0 baton boot; garden guarded via
-    // external_directory; explicit softfig-mcp block). Refreshed every launch like
+    // = protocol-by-reference + step-0 baton boot; the shared permission floor,
+    // garden write guard included; explicit softfig-mcp block). Refreshed every launch like
     // the claude files, on both backends (self-heal; inert for a claude run) — and
     // written HERE, after resolution, because the resolved model + variant go into
     // it.
@@ -501,11 +501,20 @@ fn start(args: StartArgs) -> Result<()> {
         runtime_root: runtime_grant_root(&runtime),
         mcp_bin: &softfig_mcp_path(),
         claude_projects: &claude_projects,
+        opencode_data: &softfig_ipc::opencode::opencode_data_dir(
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            &home_dir()?,
+        ),
         model: choice.opencode_model(),
         variant: choice.variant.as_deref(),
     });
     match backend {
-        Backend::Claude => write_file(&opencode_path, &opencode_cfg)?,
+        // Inert for a claude run, so a permission floor it cannot build (say, a
+        // relative `--config-dir`) is reported, not allowed to block claude.
+        Backend::Claude => match opencode_cfg {
+            Ok(cfg) => write_file(&opencode_path, &cfg)?,
+            Err(e) => eprintln!("warning: opencode config not refreshed: {e:#}"),
+        },
         // An opencode launch carries its model in the config's top-level `model`,
         // which 2.x does NOT fail closed on: a bad id silently runs on
         // opencode/exo-free (opencode-v2-repin slice 001, L7). So the config is
@@ -513,6 +522,8 @@ fn start(args: StartArgs) -> Result<()> {
         // the path a launch (or the --no-launch hint) reads. A refused config never
         // lands where a human could start it by hand.
         Backend::Opencode => {
+            // Fail-closed: no floor, no launch.
+            let opencode_cfg = opencode_cfg?;
             let staged = runtime.join("opencode.json.unverified");
             write_file(&staged, &opencode_cfg)?;
             println!(

@@ -35,6 +35,8 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use softfig_ipc::opencode::FloorError;
+
 /// The tools every fleet agent pre-approves (§15 "pre-approve its full
 /// toolset"). Mirrors the single-agent `growlight start` grant: the garden is
 /// worked through `softfig-mcp` (raw `Edit`/`Write` INTO the garden tree are
@@ -186,6 +188,9 @@ pub enum GenError {
         /// The underlying error.
         source: io::Error,
     },
+    /// An opencode permission-floor directory could not be turned into a safe
+    /// rule (relative, non-UTF-8, a pattern metacharacter, or `/`). opencode only.
+    Floor(FloorError),
 }
 
 impl GenError {
@@ -212,6 +217,7 @@ impl fmt::Display for GenError {
             GenError::Io { what, path, source } => {
                 write!(f, "{what} {}: {source}", path.display())
             }
+            GenError::Floor(e) => write!(f, "{e}"),
         }
     }
 }
@@ -220,6 +226,7 @@ impl std::error::Error for GenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             GenError::Io { source, .. } => Some(source),
+            GenError::Floor(e) => Some(e),
             _ => None,
         }
     }
