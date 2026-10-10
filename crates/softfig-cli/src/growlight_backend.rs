@@ -26,7 +26,9 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use serde_json::Value;
-use softfig_ipc::opencode::{Floor, Posture, floor};
+use softfig_ipc::opencode::{
+    Context as SessionContext, Floor, MemoryPolicy, Posture, context, file_ref, floor,
+};
 
 /// Which agent the human-driven semi-auto loop (`softfig growlight start`) runs
 /// on — the CLI-side interactive-first landing of the AgentBackend seam
@@ -346,10 +348,31 @@ pub fn opencode_interactive_args(agent_name: &str) -> [&str; 3] {
     ["--standalone", "--agent", agent_name]
 }
 
+/// The interactive loop's claude-memory policy: **read and write**, as Claude Code
+/// sessions have it (`decision-opencode-v2-fleet-safety-order` § Memory). The
+/// human is at the keyboard, unlike a fleet member (growlightd's
+/// `MEMBER_MEMORY`). Drives both the floor's memory `edit` rule and whether
+/// [`opencode_context`] injects the write rules.
+pub const INTERACTIVE_MEMORY: MemoryPolicy = MemoryPolicy::ReadWrite;
+
+/// The session context the interactive loop's `system` prompt carries after the
+/// step-0 line ([`softfig_ipc::opencode::context`] under [`INTERACTIVE_MEMORY`]):
+/// the garden root `CLAUDE.md`, both memory-rule halves, and the memory index,
+/// each by `{file:}` reference and only if it exists now. opencode 2.x reads
+/// neither `CLAUDE.md` nor claude-memory on its own (opencode-v2-repin slice 005).
+/// Checked at every launch, so a relaunch sees the memory as it is then.
+pub fn opencode_context(garden_root: &Path, claude_projects: &Path) -> Result<String> {
+    Ok(context(&SessionContext {
+        garden_root,
+        claude_projects,
+        memory: INTERACTIVE_MEMORY,
+    })?)
+}
+
 /// The inputs [`opencode_config`] renders into an `opencode.json`: where the
 /// fixed pieces live (`protocol`, `claude_projects`, `opencode_data`),
-/// where this run's churny pieces live (`baton`, `mcp_bin`), and what the launch
-/// resolved to (`model`, `variant`). Grouped for the same reason
+/// where this run's churny pieces live (`baton`, `mcp_bin`, `context`), and what
+/// the launch resolved to (`model`, `variant`). Grouped for the same reason
 /// [`InteractiveLaunch`] is — the generator's inputs accrete as the seam grows
 /// (slice 005 added two on its own), and a widening positional argument list is
 /// the kind of call site where a `&Path` lands in the wrong slot silently.
@@ -364,6 +387,9 @@ pub struct OpencodeConfigInputs<'a> {
     pub protocol: &'a Path,
     /// The runtime baton the step-0 boot line names.
     pub baton: &'a Path,
+    /// The rendered session context ([`opencode_context`]), appended after the
+    /// step-0 line; empty when there is nothing to inject.
+    pub context: &'a str,
     /// The growlight runtime root (`$XDG_CONFIG_HOME/softfig`), granted via
     /// `external_directory` so the loop can read and rewrite its baton. The garden
     /// root is deliberately absent: it is the launch cwd, so it needs no grant.
@@ -399,7 +425,9 @@ pub struct OpencodeConfigInputs<'a> {
 ///   `{file:…}` reference, so the protocol text is *reused*, never duplicated) +
 ///   a step-0 line naming the baton path. A fresh session (`/new` / relaunch)
 ///   rebuilds the system prompt → reloads the protocol → step 0 re-reads the
-///   current baton. The protocol *is* the bootstrap.
+///   current baton. The protocol *is* the bootstrap. The session context follows
+///   (the garden map, the memory rules and the memory index; see
+///   [`opencode_context`]).
 /// - **preapprove.** The top-level `permissions` are the shared floor
 ///   ([`softfig_ipc::opencode::floor`]) in the **interactive** posture, the same
 ///   builder growlightd's fleet members use, so the two can never drift. Read,
@@ -413,7 +441,8 @@ pub struct OpencodeConfigInputs<'a> {
 ///   slice 006 removed it after four probes). 2.x can express it
 ///   (opencode-v2-repin slice 001, L3c): the floor's universal `edit * deny`
 ///   refuses every raw garden write, and the later absolute allows re-open the
-///   runtime root (the baton) and the memory tree. In-cwd resources are matched
+///   runtime root (the baton) and the memory tree ([`INTERACTIVE_MEMORY`]:
+///   writable). In-cwd resources are matched
 ///   cwd-relative, so the interactive `edit /* ask` that re-opens code repos to the
 ///   human never reaches the garden. Garden mutations go through softfig-mcp.
 /// - **top level, not on the agent.** Top-level rules govern every agent the
@@ -439,13 +468,14 @@ pub struct OpencodeConfigInputs<'a> {
 ///   (`crate::opencode_catalog`).
 ///
 /// **Fail-closed:** a floor directory the shared builder refuses (relative,
-/// non-UTF-8, a pattern metacharacter, or `/`) is an error, and no config is
-/// written.
+/// non-UTF-8, a pattern metacharacter, or `/`), or a protocol path opencode's
+/// `{file:}` cannot carry, is an error, and no config is written.
 pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> Result<String> {
     let OpencodeConfigInputs {
         agent_name,
         protocol,
         baton,
+        context,
         runtime_root,
         mcp_bin,
         claude_projects,
@@ -456,16 +486,21 @@ pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> Result<String> {
 
     // The system prompt: the protocol by reference (opencode expands `{file:…}`
     // at config load — verified to resolve an absolute path) + the step-0
-    // baton-boot line that makes every fresh session re-read the live baton.
-    let system = format!(
-        "{{file:{protocol}}}\n\n\
+    // baton-boot line that makes every fresh session re-read the live baton +
+    // the session context.
+    let mut system = format!(
+        "{protocol}\n\n\
          STEP 0 (every session, first): Read your baton at `{baton}` and follow the \
          operating protocol above — the baton is your only carried state. opencode has \
          no SessionStart hook, so a fresh session (`/new` or a relaunch) re-reads the \
          baton here; that reread IS the roll.",
-        protocol = protocol.display(),
+        protocol = file_ref("protocol", protocol)?,
         baton = baton.display(),
     );
+    if !context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(context);
+    }
 
     let permissions = floor(
         Posture::Interactive,
@@ -473,6 +508,7 @@ pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> Result<String> {
             runtime_root,
             claude_projects,
             opencode_data,
+            memory: INTERACTIVE_MEMORY,
         },
     )?;
 
@@ -984,6 +1020,7 @@ mod tests {
             agent_name: "softfig-loop",
             protocol: Path::new("/g/growlight/protocol.md"),
             baton: Path::new("/rt/baton.md"),
+            context: "",
             runtime_root: Path::new("/rt"),
             mcp_bin: Path::new("/usr/bin/softfig-mcp"),
             claude_projects: Path::new("/home/u/.claude/projects"),
@@ -1089,6 +1126,57 @@ mod tests {
         // Top level, NOT on the agent, so a subagent or a Tab to `build` cannot
         // step outside it.
         assert!(v["agents"]["softfig-loop"].get("permissions").is_none(), "{v}");
+    }
+
+    #[test]
+    fn the_interactive_loop_reads_and_writes_memory() {
+        // The human's 2026-10-10 call: interactive sessions read and write; only
+        // fleet members are read-only. The floor's last rule re-opens the memory
+        // tree, and the context carries both rule halves.
+        assert_eq!(INTERACTIVE_MEMORY, MemoryPolicy::ReadWrite);
+        let v: Value =
+            serde_json::from_str(&opencode_config(&opencode_inputs(DEEPSEEK_FLASH, None)).unwrap())
+                .unwrap();
+        assert_eq!(
+            rule_lines(&v).last().map(String::as_str),
+            Some("edit /home/u/.claude/projects/** allow"),
+        );
+
+        let dir = std::env::temp_dir().join(format!("softfig-ctx-{}", std::process::id()));
+        let garden = dir.join("garden");
+        let projects = dir.join(".claude/projects");
+        for f in ["CLAUDE.md", "growlight/memory-read.md", "growlight/memory-write.md"] {
+            let p = garden.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x\n").unwrap();
+        }
+        let ctx = opencode_context(&garden, &projects).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        for f in ["CLAUDE.md", "growlight/memory-read.md", "growlight/memory-write.md"] {
+            assert!(ctx.contains(&format!("{{file:{}}}", garden.join(f).display())), "{f}: {ctx}");
+        }
+    }
+
+    #[test]
+    fn the_context_lands_after_the_step_0_line() {
+        let mut inputs = opencode_inputs(DEEPSEEK_FLASH, None);
+        inputs.context = "Contents of `/g/CLAUDE.md` …:\n\n{file:/g/CLAUDE.md}";
+        let v: Value = serde_json::from_str(&opencode_config(&inputs).unwrap()).unwrap();
+        let system = v["agents"]["softfig-loop"]["system"].as_str().unwrap();
+        assert!(system.ends_with("that reread IS the roll.\n\nContents of `/g/CLAUDE.md` …:\n\n{file:/g/CLAUDE.md}"), "{system}");
+        // Empty context → the system prompt ends at step 0, no dangling blank lines.
+        let v: Value =
+            serde_json::from_str(&opencode_config(&opencode_inputs(DEEPSEEK_FLASH, None)).unwrap())
+                .unwrap();
+        assert!(v["agents"]["softfig-loop"]["system"].as_str().unwrap().ends_with("IS the roll."));
+    }
+
+    #[test]
+    fn opencode_config_fails_closed_on_a_protocol_path_file_cannot_carry() {
+        let mut inputs = opencode_inputs(DEEPSEEK_FLASH, None);
+        inputs.protocol = Path::new("/g}/growlight/protocol.md");
+        let err = opencode_config(&inputs).expect_err("a `}` would cut the {file:} short");
+        assert!(err.to_string().starts_with("opencode session context: protocol "), "{err}");
     }
 
     #[test]

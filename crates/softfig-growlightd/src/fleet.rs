@@ -660,6 +660,7 @@ fn build_opencode_backend(
         daemon.hub.clone(),
         OpencodePreApproval::new(
             agents_dir.to_path_buf(),
+            garden_root.to_path_buf(),
             fleet_protocol(garden_root),
             runtime_grant_root(),
             softfig_mcp_path(),

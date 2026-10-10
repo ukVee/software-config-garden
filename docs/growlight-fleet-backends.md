@@ -75,7 +75,7 @@ matching rule wins, which makes the order the design:
 | 5 | `shell * allow`, `softfig-mcp* * allow` | the member's tools and the garden verbs |
 | 6 | `edit * deny` | the garden write guard: garden mutations go through softfig-mcp |
 | 7 | *(interactive config only)* `edit /* ask` | see below |
-| 8 | `edit <runtime>/**`, `<~/.claude/projects>/** allow` | the baton write and memory pointers |
+| 8 | `edit <runtime>/** allow`, then `edit <~/.claude/projects>/** deny` | the baton write; the memory tree stays read-only (see below) |
 
 Three facts make this shape work, all probe-proven on 2.0.24 (opencode-v2-repin slice 001):
 
@@ -91,6 +91,14 @@ Three facts make this shape work, all probe-proven on 2.0.24 (opencode-v2-repin 
   `edit /* ask`, puts code-repo edits (absolute resources) to the human without
   reaching the garden (relative resources).
 
+**Memory is read-only for a fleet member.** The interactive config ends rule 8 on
+`edit <~/.claude/projects>/** allow`; a member's ends on `deny`. The human's call
+(2026-10-10, `decision-opencode-v2-fleet-safety-order` § Memory): unattended members get
+memory write access only once every write is tracked and revertable. One constant,
+`MEMBER_MEMORY` in `opencode_preapproval`, sets both this rule and whether the member's
+prompt carries the write rules, so the flip is one line. The deny is explicit rather
+than left to rule 6, so read-only would hold even under the interactive `edit /* ask`.
+
 Generation fails **closed**: a floor directory that is relative, non-UTF-8, carries a `*`
 or `?`, or is `/` refuses the spawn. A relative root would render `edit <rel>/** allow`,
 which matches the garden's own resources and opens a hole through the guard.
@@ -98,6 +106,40 @@ which matches the garden's own resources and opens a hole through the guard.
 The **shell is not a boundary.** `shell * allow` runs with full host authority, so these
 rules stop well-behaved tool calls, not a determined command line. The OS-level boundary is
 the Landlock step of `decision-opencode-v2-fleet-safety-order`.
+
+## What an opencode member is told
+
+opencode 2.x loads `AGENTS.md` only. It never falls back to `CLAUDE.md`, ignores the
+`instructions` field, and has no notion of claude-memory. So the member's
+`agents.<id>.system` carries everything a Claude Code session would have been handed, in
+this order, every piece by `{file:}` reference (house rule 1: never copied):
+
+1. the fleet protocol, `growlight/protocol-fleet.md`;
+2. the step-0 line naming this member's own `agents/<id>/baton.md`;
+3. the garden root `CLAUDE.md` (the map and the house rules);
+4. `growlight/memory-read.md`, the read half of the memory rules;
+5. `growlight/memory-write.md`, the write half, **only** where memory is writable
+   (the interactive loop, never a member today);
+6. the memory directory and its index, `MEMORY.md`.
+
+The memory directory is the one Claude Code itself keeps for the garden:
+`~/.claude/projects/<slug>/memory`, where the slug is the garden path with every
+character outside `[A-Za-z0-9]` replaced by `-` (`/home/u/soft-fig_garden` →
+`-home-u-soft-fig-garden`). A path whose slug passes 200 characters, which Claude Code
+would hash, gets no memory section.
+
+The builder is `softfig_ipc::opencode::context`, shared with the interactive config.
+It references a file **only if it exists and is readable at spawn**: opencode fails the
+whole location (HTTP 500 on every call) on a `{file:}` naming a missing file, so a fresh
+install with no `MEMORY.md`, or a garden whose pillar predates the memory rules, still
+generates. Since generation runs per spawn, each member sees memory as it is when it
+starts.
+
+Also probe-proven on 2.0.24 (slice 005): `{file:}` expands by position in one pass over
+the raw config text. The content is trimmed and lands verbatim, and a `{file:}` or
+`{env:}` literal inside an injected file is never expanded. Because the path is read out
+of the raw JSON text, a path containing `{`, `}`, `"`, `\` or a control character
+refuses the spawn rather than naming the wrong file.
 
 ## What each backend contributes to admission
 

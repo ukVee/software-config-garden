@@ -1515,6 +1515,7 @@ mod tests {
             hub: EventHub::new(),
             preapproval: OpencodePreApproval::new(
                 tmp.join("agents"),
+                garden,
                 garden.join("growlight/protocol-fleet.md"),
                 tmp.join("runtime"),
                 PathBuf::from("softfig-mcp"),
@@ -1669,6 +1670,7 @@ mod tests {
             EventHub::new(),
             OpencodePreApproval::new(
                 &blocker, // agents_dir is a FILE → create_dir_all under it fails
+                tmp.path(),
                 tmp.path().join("growlight/protocol-fleet.md"),
                 tmp.path().to_path_buf(),
                 PathBuf::from("softfig-mcp"),

@@ -35,7 +35,8 @@
 //!
 //! - `permissions` (top level) — the headless floor: reset every global grant,
 //!   reach the loop's own state, guard the garden against raw writes, re-open the
-//!   runtime root and memory tree. **Top level, not on the agent**: top-level rules
+//!   runtime root, and leave the memory tree read-only ([`MEMBER_MEMORY`]).
+//!   **Top level, not on the agent**: top-level rules
 //!   govern every agent the member's private server loads, including the built-in
 //!   `general` / `explore` subagents a `subagent` call spawns, which run on their
 //!   own agent's rules. Rules placed on the member's agent alone would leave every
@@ -47,7 +48,11 @@
 //!   plus a step-0 line naming **this member's** `agents/<id>/baton.md`. opencode
 //!   has no SessionStart hook, so the prompt IS the boot injection: a fresh
 //!   session rebuilds the system prompt, reloads the protocol, and step 0
-//!   re-reads the live baton.
+//!   re-reads the live baton. After those comes the session context
+//!   ([`softfig_ipc::opencode::context`], slice 005): the garden root `CLAUDE.md`,
+//!   the memory read rules, and the memory index `MEMORY.md`, each by `{file:}`
+//!   reference and each only if it exists at spawn. opencode 2.x reads neither
+//!   `CLAUDE.md` nor claude-memory on its own.
 //! - **No model.** opencode 2.x `run` ignores `agents.<id>.model` (probe-proven,
 //!   opencode-v2-repin slice 001 L7: even a valid id fell back to opencode's own
 //!   default), so the member's model rides argv `--model` instead, the one path
@@ -69,7 +74,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use softfig_ipc::opencode::{floor, Floor, Posture};
+use softfig_ipc::opencode::{context, file_ref, floor, Context, Floor, MemoryPolicy, Posture};
 
 use crate::preapproval::{agent_paths, validate_agent_id, write_file, AgentPaths, GenError};
 
@@ -77,6 +82,14 @@ use crate::preapproval::{agent_paths, validate_agent_id, write_file, AgentPaths,
 /// interactive `softfig-loop` agent uses — the member IS the session, not a
 /// subagent it delegates to.
 const AGENT_MODE: &str = "primary";
+
+/// A fleet member's claude-memory write policy. **Read-only for now**
+/// (`decision-opencode-v2-fleet-safety-order` § Memory, resolved 2026-10-10): an
+/// unattended member gets write access only once the keeperd memory chain makes
+/// every write tracked and revertable. This one value drives both halves, the
+/// floor's memory `edit` rule and whether the write rules are injected, so the
+/// flip is this line.
+const MEMBER_MEMORY: MemoryPolicy = MemoryPolicy::ReadOnly;
 
 /// The context growlightd generates each **opencode** member's pre-approval from
 /// — the mirror of [`PreApproval`](crate::preapproval::PreApproval), differing
@@ -86,6 +99,9 @@ const AGENT_MODE: &str = "primary";
 #[derive(Debug, Clone)]
 pub struct OpencodePreApproval {
     agents_dir: PathBuf,
+    /// The garden root: the member's cwd, the home of the injected `CLAUDE.md`
+    /// and memory rules, and what its claude-memory dir is derived from.
+    garden_root: PathBuf,
     protocol: PathBuf,
     runtime_root: PathBuf,
     mcp_bin: PathBuf,
@@ -100,13 +116,15 @@ pub struct OpencodePreApproval {
 }
 
 impl OpencodePreApproval {
-    /// Build the generation context. `protocol` is the **fleet** protocol
+    /// Build the generation context. `garden_root` is the member's cwd;
+    /// `protocol` is the **fleet** protocol
     /// (`growlight/protocol-fleet.md`); `runtime_root` is the growlight runtime
     /// grant root (`$XDG_CONFIG_HOME/softfig`, the parent of the pillar dir, so
     /// sibling runtime state is covered by one rule); `claude_dir` is `~/.claude`;
     /// `opencode_data` is opencode's data dir.
     pub fn new(
         agents_dir: impl Into<PathBuf>,
+        garden_root: impl Into<PathBuf>,
         protocol: impl Into<PathBuf>,
         runtime_root: impl Into<PathBuf>,
         mcp_bin: impl Into<PathBuf>,
@@ -115,6 +133,7 @@ impl OpencodePreApproval {
     ) -> Self {
         Self {
             agents_dir: agents_dir.into(),
+            garden_root: garden_root.into(),
             protocol: protocol.into(),
             runtime_root: runtime_root.into(),
             mcp_bin: mcp_bin.into(),
@@ -132,7 +151,8 @@ impl OpencodePreApproval {
     /// Generate `agent`'s `opencode.json` under `agents/<id>/`, returning the
     /// paths the backend shells. **Fail-closed** — an `Err` means the caller must
     /// NOT spawn the member: an un-expressable id, a target that would land under
-    /// `~/.claude`, a floor directory that cannot be a safe rule, an un-creatable
+    /// `~/.claude`, a floor directory that cannot be a safe rule, a context file
+    /// opencode's `{file:}` cannot name, an un-creatable
     /// dir, or a write error all abort the spawn, exactly as they do for claude,
     /// because a headless session that starts without its rules runs on whatever
     /// the global config grants. Idempotent: it overwrites on every call, so a
@@ -149,12 +169,22 @@ impl OpencodePreApproval {
         if paths.dir.starts_with(&self.claude_dir) {
             return Err(GenError::ClaudeDir(paths.dir.clone()));
         }
+        // Checked per spawn, so a fresh member sees the memory as it is now and
+        // never names a file that has since gone (which would fail opencode's
+        // whole location).
+        let context = context(&Context {
+            garden_root: &self.garden_root,
+            claude_projects: &self.claude_projects(),
+            memory: MEMBER_MEMORY,
+        })
+        .map_err(GenError::Context)?;
         // Rendered before anything touches the filesystem, so a bad floor leaves
         // no half-written member dir behind.
         let config = opencode_json(&AgentInputs {
             agent_name: agent,
             protocol: &self.protocol,
             baton: &paths.baton,
+            context: &context,
             runtime_root: &self.runtime_root,
             claude_projects: &self.claude_projects(),
             opencode_data: &self.opencode_data,
@@ -181,6 +211,9 @@ struct AgentInputs<'a> {
     protocol: &'a Path,
     /// **This member's** `agents/<id>/baton.md`, named by the step-0 boot line.
     baton: &'a Path,
+    /// The rendered session context ([`softfig_ipc::opencode::context`]), appended
+    /// after the step-0 line; empty when there is nothing to inject.
+    context: &'a str,
     /// The growlight runtime grant root (`$XDG_CONFIG_HOME/softfig`).
     runtime_root: &'a Path,
     /// The claude-memory tree (`~/.claude/projects`).
@@ -194,7 +227,8 @@ struct AgentInputs<'a> {
 /// Render a headless member's `opencode.json`. Pure — builds the string, never
 /// writes or spawns — so the whole rule list, prompt, and mcp attach are
 /// unit-testable without touching a filesystem or a real `opencode`. Fails closed
-/// on a floor directory the shared builder refuses.
+/// on a floor directory the shared builder refuses, or a protocol path `{file:}`
+/// cannot name.
 fn opencode_json(cfg: &AgentInputs<'_>) -> Result<String, GenError> {
     // The system prompt IS the boot injection (opencode has no SessionStart
     // hook): the fleet protocol by reference + a step-0 line naming this member's
@@ -202,16 +236,20 @@ fn opencode_json(cfg: &AgentInputs<'_>) -> Result<String, GenError> {
     // from the claude `inject.sh` — a member that is only *seeded* with a baton
     // path can misroute its handoff write to the legacy root `baton.md`, which is
     // how the fleet once stalled for four hours.
-    let system = format!(
-        "{{file:{protocol}}}\n\n\
+    let mut system = format!(
+        "{protocol}\n\n\
          STEP 0 (every session, first): read YOUR BATON FILE — the exact path \
          `{baton}` — and follow the fleet operating protocol above. That file is \
          your only carried state AND the exact path you rewrite at handoff; never \
          the legacy root `baton.md`. opencode has no SessionStart hook, so a fresh \
          session (`/new` or a relaunch) re-reads it here; that reread IS the roll.",
-        protocol = cfg.protocol.display(),
+        protocol = file_ref("protocol", cfg.protocol).map_err(GenError::Context)?,
         baton = cfg.baton.display(),
     );
+    if !cfg.context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(cfg.context);
+    }
 
     let permissions = floor(
         Posture::Headless,
@@ -219,6 +257,7 @@ fn opencode_json(cfg: &AgentInputs<'_>) -> Result<String, GenError> {
             runtime_root: cfg.runtime_root,
             claude_projects: cfg.claude_projects,
             opencode_data: cfg.opencode_data,
+            memory: MEMBER_MEMORY,
         },
     )
     .map_err(GenError::Floor)?;
@@ -256,6 +295,7 @@ mod tests {
     fn pre(agents_dir: &Path) -> OpencodePreApproval {
         OpencodePreApproval::new(
             agents_dir,
+            "/garden",
             "/garden/growlight/protocol-fleet.md",
             "/home/u/.config/softfig",
             "/usr/bin/softfig-mcp",
@@ -292,7 +332,8 @@ mod tests {
         // Pinned in full: the order is the design (last match wins). The reset
         // first, so no global `~/projects/**`-style grant survives; the garden
         // guard (`edit * deny`) before every edit allow; nothing that asks, since
-        // a headless member cannot answer.
+        // a headless member cannot answer; and the memory tree reachable and
+        // readable but not writable (MEMBER_MEMORY, the human's 2026-10-10 call).
         assert_eq!(
             rule_lines(&v),
             vec![
@@ -309,7 +350,7 @@ mod tests {
                 "softfig-mcp* * allow",
                 "edit * deny",
                 "edit /home/u/.config/softfig/** allow",
-                "edit /home/u/.claude/projects/** allow",
+                "edit /home/u/.claude/projects/** deny",
             ],
         );
         // Top level, NOT on the agent: top-level rules govern every agent the
@@ -357,6 +398,122 @@ mod tests {
             "the named baton is the per-member one, not the root: {}",
             paths.baton.display(),
         );
+    }
+
+    /// A real (temporary) garden + `~/.claude`, so the context's existence checks
+    /// see files. `with_files` lays down the garden map, both memory-rule halves
+    /// and the member's `MEMORY.md`.
+    struct Garden {
+        tmp: tempfile::TempDir,
+    }
+
+    impl Garden {
+        fn new(with_files: bool) -> Self {
+            let g = Self { tmp: tempfile::tempdir().unwrap() };
+            fs::create_dir_all(g.root().join("growlight")).unwrap();
+            if with_files {
+                for f in ["CLAUDE.md", "growlight/memory-read.md", "growlight/memory-write.md"] {
+                    fs::write(g.root().join(f), "x\n").unwrap();
+                }
+                fs::create_dir_all(g.memory_dir()).unwrap();
+                fs::write(g.memory_dir().join("MEMORY.md"), "- [a](a.md) — index-line-marker\n").unwrap();
+            }
+            g
+        }
+        fn root(&self) -> PathBuf {
+            self.tmp.path().join("garden")
+        }
+        fn claude(&self) -> PathBuf {
+            self.tmp.path().join(".claude")
+        }
+        fn memory_dir(&self) -> PathBuf {
+            softfig_ipc::opencode::claude_memory_dir(&self.claude().join("projects"), &self.root())
+                .unwrap()
+        }
+        fn pre(&self) -> OpencodePreApproval {
+            OpencodePreApproval::new(
+                self.tmp.path().join("agents"),
+                self.root(),
+                self.root().join("growlight/protocol-fleet.md"),
+                "/home/u/.config/softfig",
+                "/usr/bin/softfig-mcp",
+                self.claude(),
+                "/home/u/.local/share/opencode",
+            )
+        }
+        fn system(&self, agent: &str) -> String {
+            let paths = self.pre().generate(agent).expect("generates");
+            let v: Value =
+                serde_json::from_str(&fs::read_to_string(&paths.opencode_config).unwrap()).unwrap();
+            v["agents"][agent]["system"].as_str().unwrap().to_string()
+        }
+    }
+
+    #[test]
+    fn the_prompt_injects_the_garden_map_and_the_memory_index_after_step_0() {
+        let g = Garden::new(true);
+        let system = g.system("a");
+        let at = |needle: &str| {
+            system.find(needle).unwrap_or_else(|| panic!("missing {needle:?} in {system}"))
+        };
+        let refs = [
+            format!("{{file:{}}}", g.root().join("growlight/protocol-fleet.md").display()),
+            "STEP 0".to_string(),
+            format!("{{file:{}}}", g.root().join("CLAUDE.md").display()),
+            format!("{{file:{}}}", g.root().join("growlight/memory-read.md").display()),
+            format!("{{file:{}}}", g.memory_dir().join("MEMORY.md").display()),
+        ];
+        // All by reference (house rule 1), in boot order: the protocol and step 0
+        // stay first, then the map, the memory rules, and the index.
+        let order: Vec<usize> = refs.iter().map(|r| at(r)).collect();
+        assert!(order.is_sorted(), "{order:?} in {system}");
+        assert!(!system.contains("index-line-marker"), "the index is referenced, never copied: {system}");
+        // The memory dir is the one Claude Code itself uses for this garden.
+        assert!(g.memory_dir().ends_with(format!(
+            "projects/{}/memory",
+            g.root().display().to_string().replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+        )));
+    }
+
+    #[test]
+    fn a_member_reads_memory_but_never_gets_the_write_rules() {
+        // The write half exists in the garden; a read-only member still never
+        // sees it, and its floor refuses the write (pinned above). One constant
+        // drives both, so the day tracking lands they flip together.
+        let g = Garden::new(true);
+        let system = g.system("a");
+        assert!(system.contains("growlight/memory-read.md}"), "{system}");
+        assert!(!system.contains("memory-write.md"), "{system}");
+        assert_eq!(MEMBER_MEMORY, MemoryPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn a_fresh_install_without_memory_still_generates_and_names_nothing_missing() {
+        // opencode fails the whole location on a `{file:}` naming a missing file,
+        // so only the protocol may be referenced here.
+        let g = Garden::new(false);
+        let system = g.system("a");
+        assert_eq!(system.matches("{file:").count(), 1, "{system}");
+        assert!(system.contains("has no `MEMORY.md` yet"), "{system}");
+    }
+
+    #[test]
+    fn a_protocol_path_file_cannot_name_fails_closed_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        let g = OpencodePreApproval::new(
+            &agents,
+            "/garden",
+            "/gar}den/growlight/protocol-fleet.md",
+            "/home/u/.config/softfig",
+            "/usr/bin/softfig-mcp",
+            "/home/u/.claude",
+            "/home/u/.local/share/opencode",
+        );
+        let err = g.generate("a1").expect_err("a `}` would cut the {file:} short");
+        assert!(matches!(err, GenError::Context(_)), "{err}");
+        assert!(err.to_string().starts_with("opencode session context: protocol "), "{err}");
+        assert!(!agents.exists(), "no member dir is left behind");
     }
 
     #[test]
@@ -433,6 +590,7 @@ mod tests {
         // agents_dir maliciously under ~/.claude — the guard refuses it.
         let g = OpencodePreApproval::new(
             claude.join("projects/agents"),
+            "/garden",
             "/garden/growlight/protocol-fleet.md",
             "/home/u/.config/softfig",
             "/usr/bin/softfig-mcp",
@@ -457,6 +615,7 @@ mod tests {
         let agents = tmp.path().join("agents");
         let g = OpencodePreApproval::new(
             &agents,
+            "/garden",
             "/garden/growlight/protocol-fleet.md",
             "growlight",
             "/usr/bin/softfig-mcp",

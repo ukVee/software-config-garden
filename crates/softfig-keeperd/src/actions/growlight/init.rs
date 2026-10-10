@@ -2,7 +2,8 @@
 //!
 //! Idempotent retrofit (mirrors `migrate split`): materializes the `growlight/`
 //! pillar via the same write/commit machinery as the Phase-1 MCP verbs, writes
-//! the two embedded templates (`protocol.md`, `session-policy.md`), and performs
+//! the embedded templates (`protocol.md`, `protocol-fleet.md`, `memory-read.md`,
+//! `memory-write.md`, `session-policy.md`), and performs
 //! the spec §14 nav wiring (root `CLAUDE.md` top-level map + boundary row,
 //! `meta/reserved-filenames.md`, `meta/conventions.md`). The garden/runtime
 //! split is honoured: only the durable garden pillar is created here — the
@@ -39,6 +40,13 @@ const PROTOCOL_FLEET_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../templates/growlight/protocol-fleet.md"
 ));
+/// The claude-memory rules opencode sessions get by `{file:}` reference: the read
+/// half always, the write half only where memory is writable (opencode-v2-repin
+/// slice 005).
+const MEMORY_READ_MD: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/growlight/memory-read.md"));
+const MEMORY_WRITE_MD: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/growlight/memory-write.md"));
 /// The editable two-budget policy (spec §8).
 const SESSION_POLICY_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -105,10 +113,12 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
         // never clobbered if the MCP verbs already seeded it). The numbered
         // folders get a `.seq` seed so their first entry counts from 001,
         // materializing the dir as a tracked entity at the same time.
-        let pillar: [(String, String); 10] = [
+        let pillar: [(String, String); 12] = [
             (paths::pillar_claude(), paths::pillar_claude_stub()),
             (paths::protocol_md(), PROTOCOL_MD.to_string()),
             (paths::protocol_fleet_md(), PROTOCOL_FLEET_MD.to_string()),
+            (paths::memory_read_md(), MEMORY_READ_MD.to_string()),
+            (paths::memory_write_md(), MEMORY_WRITE_MD.to_string()),
             (paths::session_policy_md(), SESSION_POLICY_MD.to_string()),
             (paths::backlog_claude(), paths::backlog_claude_stub()),
             (format!("{}/.seq", paths::tasks_dir()), "0\n".to_string()),

@@ -42,7 +42,7 @@ use crate::growlight_backend::{
     AgentBackend, Backend, ClaudeBackend, Clock, DEEPSEEK_FLASH, DEEPSEEK_REASONING, ExeIdentity,
     ExeProbe, InteractiveLaunch, IterationOutcome, IterationRequest, ModelChoice, ModelSpec,
     OpencodeConfigInputs, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, item_model_field,
-    opencode_config, opencode_interactive_args, parse_model_spec,
+    opencode_config, opencode_context, opencode_interactive_args, parse_model_spec,
 };
 use crate::opencode_catalog;
 
@@ -489,28 +489,34 @@ fn start(args: StartArgs) -> Result<()> {
     }
 
     // The opencode-native equivalent of loop.json + mcp.json (`softfig-loop` agent
-    // = protocol-by-reference + step-0 baton boot; the shared permission floor,
-    // garden write guard included; explicit softfig-mcp block). Refreshed every launch like
+    // = protocol-by-reference + step-0 baton boot + the session context (garden
+    // map, memory rules, memory index); the shared permission floor, garden write
+    // guard included; explicit softfig-mcp block). Refreshed every launch like
     // the claude files, on both backends (self-heal; inert for a claude run) — and
     // written HERE, after resolution, because the resolved model + variant go into
     // it.
-    let opencode_cfg = opencode_config(&OpencodeConfigInputs {
-        agent_name: AGENT_NAME,
-        protocol: &protocol,
-        baton: &baton_path,
-        runtime_root: runtime_grant_root(&runtime),
-        mcp_bin: &softfig_mcp_path(),
-        claude_projects: &claude_projects,
-        opencode_data: &softfig_ipc::opencode::opencode_data_dir(
-            std::env::var_os("XDG_DATA_HOME").as_deref(),
-            &home_dir()?,
-        ),
-        model: choice.opencode_model(),
-        variant: choice.variant.as_deref(),
+    let opencode_data = softfig_ipc::opencode::opencode_data_dir(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        &home_dir()?,
+    );
+    let opencode_cfg = opencode_context(&garden_root, &claude_projects).and_then(|context| {
+        opencode_config(&OpencodeConfigInputs {
+            agent_name: AGENT_NAME,
+            protocol: &protocol,
+            baton: &baton_path,
+            context: &context,
+            runtime_root: runtime_grant_root(&runtime),
+            mcp_bin: &softfig_mcp_path(),
+            claude_projects: &claude_projects,
+            opencode_data: &opencode_data,
+            model: choice.opencode_model(),
+            variant: choice.variant.as_deref(),
+        })
     });
     match backend {
         // Inert for a claude run, so a permission floor it cannot build (say, a
-        // relative `--config-dir`) is reported, not allowed to block claude.
+        // relative `--config-dir`) or a context path it cannot reference is
+        // reported, not allowed to block claude.
         Backend::Claude => match opencode_cfg {
             Ok(cfg) => write_file(&opencode_path, &cfg)?,
             Err(e) => eprintln!("warning: opencode config not refreshed: {e:#}"),

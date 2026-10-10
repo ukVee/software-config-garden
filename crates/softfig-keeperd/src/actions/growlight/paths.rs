@@ -64,6 +64,21 @@ pub fn protocol_fleet_md() -> String {
     format!("{PILLAR}/protocol-fleet.md")
 }
 
+/// The claude-memory rules, read half (embedded-template-sourced): injected into
+/// every opencode session after the garden map (opencode-v2-repin slice 005). The
+/// path is [`softfig_ipc::opencode::MEMORY_READ_RULES`], the one the generators
+/// reference; a test pins the two together.
+pub fn memory_read_md() -> String {
+    format!("{PILLAR}/memory-read.md")
+}
+
+/// The claude-memory rules, write half (embedded-template-sourced): injected only
+/// into opencode sessions that may write memory
+/// ([`softfig_ipc::opencode::MEMORY_WRITE_RULES`]).
+pub fn memory_write_md() -> String {
+    format!("{PILLAR}/memory-write.md")
+}
+
 /// The editable two-budget policy (embedded-template-sourced).
 pub fn session_policy_md() -> String {
     format!("{PILLAR}/session-policy.md")
@@ -228,6 +243,9 @@ pub fn pillar_claude_stub() -> String {
          - `protocol-fleet.md` — the fleet-member variant of the protocol: identical \
          through step 6, but step 7 does NOT self-pull (the orchestrator owns the \
          queue and claims each member's next part). Injected into fleet members.\n\
+         - `memory-read.md` / `memory-write.md` — the claude-memory rules opencode \
+         sessions get (Claude Code has its own): the read half always, the write half \
+         only where memory is writable (interactive, not fleet members).\n\
          - `session-policy.md` — the two budget numbers + value-max strategy. Tune here.\n\
          - `backlog/` — the work queue: milestones (→ ordered slices) and standalone \
          tasks. Status + order live in the managed queue table in `backlog/CLAUDE.md`.\n\
@@ -336,13 +354,26 @@ mod tests {
         assert_eq!(slices_dir("m5b"), "growlight/backlog/milestones/m5b/slices");
         assert_eq!(tasks_dir(), "growlight/backlog/tasks");
         assert_eq!(baton_log_dir(), "growlight/baton-log");
+        // The opencode generators reference these by the ipc constants; init
+        // scaffolds them here. One path, or the injection silently skips them.
+        assert_eq!(memory_read_md(), softfig_ipc::opencode::MEMORY_READ_RULES);
+        assert_eq!(memory_write_md(), softfig_ipc::opencode::MEMORY_WRITE_RULES);
     }
 
     #[test]
     fn routing_stubs_map_their_children() {
         let pillar = pillar_claude_stub();
         assert!(pillar.starts_with("# growlight/\n"));
-        for child in ["protocol.md", "protocol-fleet.md", "session-policy.md", "backlog/", "baton-log/", "reports/"] {
+        for child in [
+            "protocol.md",
+            "protocol-fleet.md",
+            "memory-read.md",
+            "memory-write.md",
+            "session-policy.md",
+            "backlog/",
+            "baton-log/",
+            "reports/",
+        ] {
             assert!(pillar.contains(child), "pillar map missing {child}");
         }
         // Navigators carry no reviewed stamp.
