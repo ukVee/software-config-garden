@@ -232,10 +232,15 @@ pub fn pillar_claude_stub() -> String {
          - `backlog/` — the work queue: milestones (→ ordered slices) and standalone \
          tasks. Status + order live in the managed queue table in `backlog/CLAUDE.md`.\n\
          - `baton-log/` — append-only, numbered iteration entries (audit only; never \
-         injected). Added via `log_baton`.\n\n\
+         injected). Added via `log_baton`.\n\
+         - `reports/` — semantically tagged reports agents and the human file about \
+         bugs, flakes, security gaps, doc drift, findings, questions, blockers, and \
+         ideas. Filed with `file_report`, moved with `update_report`, queried with \
+         `list_reports`.\n\n\
          ## How to behave here\n\n\
          - Mutate this pillar only through the softfig-mcp growlight verbs (`log_baton`, \
-         `add_backlog_item`, `add_slice`, `set_item_status`) — never by hand.\n\
+         `add_backlog_item`, `add_slice`, `set_item_status`, `file_report`, \
+         `update_report`) — never by hand.\n\
          - The runtime baton/usage/questions are NOT in the garden; find them under \
          `$XDG_CONFIG_HOME/softfig/growlight/`.\n\
          - Status + queue order are owned by the queue table; change them with \
@@ -337,7 +342,7 @@ mod tests {
     fn routing_stubs_map_their_children() {
         let pillar = pillar_claude_stub();
         assert!(pillar.starts_with("# growlight/\n"));
-        for child in ["protocol.md", "protocol-fleet.md", "session-policy.md", "backlog/", "baton-log/"] {
+        for child in ["protocol.md", "protocol-fleet.md", "session-policy.md", "backlog/", "baton-log/", "reports/"] {
             assert!(pillar.contains(child), "pillar map missing {child}");
         }
         // Navigators carry no reviewed stamp.

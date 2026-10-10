@@ -203,6 +203,8 @@ fn op_is_local_write(op: &str) -> bool {
             | op::REORDER_BACKLOG_ITEM
             | op::GROWLIGHT_SET_RESOURCES
             | op::POST_MESSAGE
+            | op::FILE_REPORT
+            | op::UPDATE_REPORT
             | op::ARCHIVE
             | op::ADD_PROJECT
             | op::REFRESH_SNAPSHOT
@@ -265,6 +267,9 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::POST_MESSAGE => crate::actions::post_message(daemon, req.args),
         op::READ_INBOX => crate::actions::read_inbox(daemon, req.args),
         op::TAIL_BUS => crate::actions::tail_bus(daemon, req.args),
+        op::FILE_REPORT => crate::actions::file_report(daemon, req.args),
+        op::UPDATE_REPORT => crate::actions::update_report(daemon, req.args),
+        op::LIST_REPORTS => crate::actions::list_reports(daemon, req.args),
         op::REQUEST_LEASE => crate::actions::request_lease(daemon, req.args),
         op::RELEASE_LEASE => crate::actions::release_lease(daemon, req.args),
         op::RELOCK_MINT => handlers::relock_mint(daemon, req.args),

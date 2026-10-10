@@ -271,6 +271,20 @@ pub mod op {
     /// slug, `@all`, or `@human`. The daemon numbers it + stamps the wall-clock
     /// `ts`. Mirrors `log_baton`; one `chat_message_posted` commit.
     pub const POST_MESSAGE: &str = "post_message";
+    /// growlight reports: file a semantically tagged report (a bug, flake,
+    /// security gap, doc drift, finding, question, blocker, or idea) as a
+    /// numbered doc under `growlight/reports/`. Exactly one `type:` tag; the
+    /// daemon stamps `status:open`, `by:`, the header, and re-derives the
+    /// reports index. Blocker / security / critical reports also alert
+    /// `@human` on the bus. Commit `report_filed`.
+    pub const FILE_REPORT: &str = "file_report";
+    /// growlight reports: move a report's status, add/remove tags, and append a
+    /// dated line to its `## Log`. Closing statuses need a `note`. Commit
+    /// `report_updated`.
+    pub const UPDATE_REPORT: &str = "update_report";
+    /// growlight reports: list reports matching every given tag (`ns:*` matches
+    /// any value in a namespace). Read-only; require Unlocked.
+    pub const LIST_REPORTS: &str = "list_reports";
     /// growlight Phase 2: read an agent's unread bus inbox — its lane messages
     /// numbered above its stored cursor, in order — and advance the cursor past
     /// them. One `inbox_read` commit when the cursor moves; none if empty.
@@ -2197,6 +2211,102 @@ pub struct TailBusArgs {
 pub struct TailBusReply {
     /// Matching messages in total order (ascending number).
     pub messages: Vec<ChatMessage>,
+}
+
+// ---- growlight reports --------------------------------------------------
+
+/// `file_report({title, body, tags, slug?, item?, from?}) -> FileReportReply`.
+/// Tags are `namespace:value` (or a bare word), lowercased by the daemon.
+/// Exactly one `type:` from the daemon's vocabulary (bug, regression, flake,
+/// security, doc-drift, finding, question, blocker, idea); at most one
+/// `severity:` (critical, high, medium, low); `status:` and `by:` are stamped
+/// by the daemon and refused from the caller. Every other namespace
+/// (`area:`, `verb:`, `repo:`, …) is free-form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileReportArgs {
+    /// One-line title (becomes the `# ` header).
+    pub title: String,
+    /// Markdown body under `## Report`: what happened, how to reproduce, and
+    /// the evidence (paths, commits, test names).
+    pub body: String,
+    pub tags: Vec<String>,
+    /// Filename slug; defaults to a slug of the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// The backlog item the report concerns, stamped as an `item:<id>` tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    /// Who is filing (an agent slug or `human`), stamped as a `by:<from>` tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileReportReply {
+    /// Garden-relative path of the new report.
+    pub path: String,
+    pub number: u32,
+    pub hash: String,
+    /// The report's full, normalized tag set as written.
+    pub tags: Vec<String>,
+    /// Whether an `@human` alert was posted to the coordination bus.
+    #[serde(default)]
+    pub alerted: bool,
+}
+
+/// `update_report({number, status?, add_tags?, remove_tags?, note?, from?})`.
+/// `status` is one of open, triaged, resolved, wontfix, duplicate; moving to a
+/// closed status (resolved / wontfix / duplicate) requires a `note` saying
+/// why. Adding a `type:` or `severity:` tag replaces the current one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateReportArgs {
+    pub number: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_tags: Vec<String>,
+    /// One line for the report's `## Log`: the fixing commit, the task it
+    /// moved to, the duplicate's number, or any other context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Who is updating (an agent slug or `human`), recorded in the log line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateReportReply {
+    pub path: String,
+    pub hash: String,
+    /// The report's tag set after the update.
+    pub tags: Vec<String>,
+}
+
+/// `list_reports({tags?}) -> ListReportsReply`. Returns every report carrying
+/// all of `tags`; `ns:*` matches any value in that namespace. No tags → all.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListReportsArgs {
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportRow {
+    pub number: u32,
+    pub path: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    /// The `> Filed:` date (`YYYY-MM-DD`), empty if absent.
+    #[serde(default)]
+    pub filed: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListReportsReply {
+    /// Matching reports, ascending by number.
+    pub reports: Vec<ReportRow>,
 }
 
 // ---- M4 deploy (TUI Deploy tab) ---------------------------------------

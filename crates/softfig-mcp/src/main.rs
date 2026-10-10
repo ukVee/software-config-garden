@@ -20,10 +20,10 @@ use softfig_ipc::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, BatchArgs, EditSectionArgs, FileProvenanceArgs,
-        LogBatonArgs, LogDecisionArgs, LogIncidentArgs, PatchFileArgs, PostMessageArgs,
-        ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
+        FileReportArgs, ListReportsArgs, LogBatonArgs, LogDecisionArgs, LogIncidentArgs,
+        PatchFileArgs, PostMessageArgs, ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
         RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
-        SetItemStatusArgs, SetReviewedArgs, UnlinkArgs,
+        SetItemStatusArgs, SetReviewedArgs, UnlinkArgs, UpdateReportArgs,
     },
     Request, Response,
 };
@@ -483,6 +483,73 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "file_report",
+            "description": "growlight: flag something you noticed but should not silently fix or \
+                            bury in the baton — a verb misbehaving, a flaky test, a security gap, \
+                            docs that drifted, a question or blocker for the human, an idea. Files \
+                            a numbered report under growlight/reports/ whose facts are SEMANTIC \
+                            TAGS ('namespace:value' or a bare word, lowercase). Exactly one type: \
+                            tag — bug (broken: wrong output, crash, lost data), regression (worked \
+                            before), flake (intermittent), security (exposure, leak, trust gap), \
+                            doc-drift (docs/spec disagree with code or device), finding (worth \
+                            keeping, not yet a defect), question (needs a human answer), blocker \
+                            (work can't proceed without a human/external action), idea \
+                            (improvement). Optional severity: critical | high | medium | low. Add \
+                            any free tags that help find it later: area:<component> (e.g. \
+                            area:softfig-mcp), verb:<name>, repo:<name>, a bare 'regression'. The \
+                            daemon stamps status:open and by:<from>, writes the header, and \
+                            re-derives the reports index. A blocker, a security report, or \
+                            anything severity:critical also alerts @human on the bus. Search \
+                            list_reports first to avoid duplicates.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["title", "body", "tags"],
+                "properties": {
+                    "title": { "type": "string", "description": "one-line summary of the defect/finding" },
+                    "body": { "type": "string", "description": "markdown: what happened vs. expected, how to reproduce, evidence (paths, commits, test names, exact errors)" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "semantic tags: exactly one type:<…>, optional severity:<…>, plus free tags like area:<component>" },
+                    "item": { "type": "string", "description": "the backlog item this concerns (stamped as item:<id>)" },
+                    "from": { "type": "string", "description": "your agent slug, or 'human' (stamped as by:<from>)" },
+                    "slug": { "type": "string", "description": "filename slug; defaults to one derived from the title" },
+                },
+            },
+        }),
+        json!({
+            "name": "update_report",
+            "description": "growlight: move a report along — change its status (open → triaged \
+                            when it has a home such as a backlog item → resolved | wontfix | \
+                            duplicate), add or remove tags (adding a type: or severity: tag \
+                            replaces the current one), and/or append a dated line to its ## Log. \
+                            Closing (resolved/wontfix/duplicate) requires a note: the fixing \
+                            commit, the task it moved to, or the report it duplicates.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["number"],
+                "properties": {
+                    "number": { "type": "integer", "description": "the report's number (NNN in its filename)" },
+                    "status": { "type": "string", "description": "open | triaged | resolved | wontfix | duplicate" },
+                    "add_tags": { "type": "array", "items": { "type": "string" }, "description": "tags to add (type:/severity: replace the current value)" },
+                    "remove_tags": { "type": "array", "items": { "type": "string" }, "description": "free or severity: tags to remove" },
+                    "note": { "type": "string", "description": "one line for the report's log; required when closing" },
+                    "from": { "type": "string", "description": "your agent slug, or 'human'" },
+                },
+            },
+        }),
+        json!({
+            "name": "list_reports",
+            "description": "growlight: list filed reports carrying ALL of the given tags, \
+                            ascending by number; 'ns:*' matches any value in a namespace \
+                            (e.g. ['type:bug', 'status:open', 'area:*']). No tags lists every \
+                            report. Read-only. Use it before file_report to avoid filing a \
+                            duplicate, and at boot to see open blockers/questions in your area.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "tag filters, all must match" },
+                },
+            },
+        }),
+        json!({
             "name": "read_inbox",
             "description": "growlight: read an agent's unread coordination-bus inbox — its lane \
                             messages (direct + @all, minus its own posts) numbered above its cursor, \
@@ -795,6 +862,18 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: ReadInboxArgs = serde_json::from_value(args)?;
             (op::READ_INBOX, serde_json::to_value(a)?)
         }
+        "file_report" => {
+            let a: FileReportArgs = serde_json::from_value(args)?;
+            (op::FILE_REPORT, serde_json::to_value(a)?)
+        }
+        "update_report" => {
+            let a: UpdateReportArgs = serde_json::from_value(args)?;
+            (op::UPDATE_REPORT, serde_json::to_value(a)?)
+        }
+        "list_reports" => {
+            let a: ListReportsArgs = serde_json::from_value(args)?;
+            (op::LIST_REPORTS, serde_json::to_value(a)?)
+        }
         "file_provenance" => {
             let a: FileProvenanceArgs = serde_json::from_value(args)?;
             (op::FILE_PROVENANCE, serde_json::to_value(a)?)
@@ -859,6 +938,45 @@ fn summarize(name: &str, data: &Value) -> String {
             }
             _ => "read_inbox: inbox empty".to_string(),
         };
+    }
+    if name == "list_reports" {
+        let rows = data.get("reports").and_then(|v| v.as_array());
+        return match rows {
+            Some(rs) if !rs.is_empty() => {
+                let lines: Vec<String> = rs
+                    .iter()
+                    .map(|r| {
+                        let n = r.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                        let path = r.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                        let tags: Vec<&str> = r
+                            .get("tags")
+                            .and_then(|v| v.as_array())
+                            .map(|ts| ts.iter().filter_map(|t| t.as_str()).collect())
+                            .unwrap_or_default();
+                        format!("#{n:03} {title} [{}] {path}", tags.join(" "))
+                    })
+                    .collect();
+                format!("list_reports: {} report(s)\n{}", rs.len(), lines.join("\n"))
+            }
+            _ => "list_reports: no matching reports".to_string(),
+        };
+    }
+    if name == "file_report" || name == "update_report" {
+        let g = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+        let tags: Vec<&str> = data
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|ts| ts.iter().filter_map(|t| t.as_str()).collect())
+            .unwrap_or_default();
+        let alerted = data.get("alerted").and_then(|v| v.as_bool()) == Some(true);
+        return format!(
+            "{name}: {} [{}]; commit {}{}",
+            g("path"),
+            tags.join(" "),
+            g("hash"),
+            if alerted { "; @human alerted on the bus" } else { "" }
+        );
     }
     if name == "file_provenance" {
         let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1018,9 +1136,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_twenty_nine() {
+    fn tools_list_has_thirty_two() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 29);
+        assert_eq!(defs.len(), 32);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -1052,6 +1170,9 @@ mod tests {
             "batch",
             "request_lease",
             "release_lease",
+            "file_report",
+            "update_report",
+            "list_reports",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -1061,7 +1182,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 32);
     }
 
     #[test]
@@ -1156,6 +1277,17 @@ mod tests {
                 op::READ_INBOX,
             ),
             (
+                "file_report",
+                json!({ "title": "t", "body": "b", "tags": ["type:bug"], "from": "a" }),
+                op::FILE_REPORT,
+            ),
+            (
+                "update_report",
+                json!({ "number": 3, "status": "resolved", "note": "fixed in abc" }),
+                op::UPDATE_REPORT,
+            ),
+            ("list_reports", json!({ "tags": ["type:bug"] }), op::LIST_REPORTS),
+            (
                 "file_provenance",
                 json!({ "path": "meta/conventions.md" }),
                 op::FILE_PROVENANCE,
@@ -1213,6 +1345,21 @@ mod tests {
     #[test]
     fn resolve_tool_rejects_unknown() {
         assert!(resolve_tool("nope", Value::Null).is_err());
+    }
+
+    #[test]
+    fn summarize_renders_reports() {
+        let s = summarize(
+            "list_reports",
+            &json!({ "reports": [{ "number": 7, "title": "T", "path": "growlight/reports/007-t.md", "tags": ["type:bug", "status:open"] }] }),
+        );
+        assert!(s.contains("1 report(s)") && s.contains("#007 T [type:bug status:open]"), "{s}");
+        assert_eq!(summarize("list_reports", &json!({ "reports": [] })), "list_reports: no matching reports");
+        let s = summarize(
+            "file_report",
+            &json!({ "path": "p", "number": 1, "hash": "h", "tags": ["type:blocker"], "alerted": true }),
+        );
+        assert!(s.contains("[type:blocker]") && s.contains("@human alerted"), "{s}");
     }
 
     #[test]

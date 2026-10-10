@@ -184,6 +184,10 @@ pub fn refresh_index_for(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Vec<S
     if name == "CLAUDE.md" {
         hosts.extend(refresh_host_regions(wt, inner, rel, dir));
     }
+    // The growlight reports folder keeps its own derived index (a different
+    // table, in its own routing doc): a generic edit of a report or of that doc
+    // re-derives it the same way.
+    hosts.extend(super::growlight::reports::refresh_index_for(wt, inner, rel));
     hosts
 }
 
@@ -495,7 +499,7 @@ pub fn index_listings(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Vec<Stri
             .unwrap_or("");
         let host_rel = rel.strip_prefix(host_dir).and_then(|s| s.strip_prefix('/'));
         for (tag, body) in managed::regions(&content) {
-            if !tag.starts_with("index ") {
+            if !tag.starts_with("index ") && tag != super::growlight::reports::REPORTS_TAG {
                 continue;
             }
             let listed = mentions(&body, rel)

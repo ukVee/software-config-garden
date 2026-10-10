@@ -11,6 +11,8 @@
 //!   slices index (reuses [`super::index`]).
 //! - [`set_item_status`] — flip one cell in the authoritative queue table
 //!   (reuses [`super::managed`]).
+//! - [`file_report`] / [`update_report`] / [`list_reports`] — the
+//!   semantically tagged report folder `reports/` (see [`reports`]).
 //!
 //! Like `add_project`, the verbs self-materialize the leaf structure they own
 //! (folders, `.seq` seeds, the backlog routing doc) so they run before the
@@ -27,11 +29,13 @@ mod leases;
 mod paths;
 mod queue;
 mod queues;
+pub(crate) mod reports;
 mod set_resources;
 
 pub use holders::{ClaimGate, HolderStore};
 pub use init::growlight_init;
 pub use leases::{release_lease, request_lease};
+pub use reports::{file_report, list_reports, update_report};
 pub use set_resources::growlight_set_resources;
 
 use softfig_vcs::Intent;

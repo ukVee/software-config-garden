@@ -64,6 +64,9 @@ pub fn archive(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
                 if conventions::is_accretive_dir(parent) {
                     super::index::refresh_folder_index(&wt, &inner, parent);
                 }
+                if parent == super::growlight::reports::reports_dir() {
+                    super::growlight::reports::refresh_index(&wt, &inner);
+                }
             }
         }
         // Slice 5: repoint inbound `[[…]]` references at the archived location so

@@ -49,6 +49,17 @@ protocol is fixed; the baton changes each iteration.
    status BLOCKED_ON_HUMAN ("needs daemon restart; relock disabled"), stop. Never
    attempt a cold unlock (you don't have the passphrase).
 
+3c. REPORT. Something you notice but should not fix inside this chunk — a
+   softfig verb misbehaving, a flaky test, docs that disagree with the code, a
+   security gap, a question only the human can answer — goes into a growlight
+   report, not only the baton. `list_reports` first (no duplicates), then
+   `file_report` with exactly one `type:` tag (bug, regression, flake, security,
+   doc-drift, finding, question, blocker, idea), a `severity:` for a defect,
+   `area:<component>`, the item id, and `from` = your slug; name the report
+   number in the baton. A blocker, security, or critical report also alerts the
+   human on the bus. When your chunk fixes a reported defect, `update_report` it
+   to resolved with the commit in the note.
+
 4. HUMAN CHECKPOINTS. For choices that are genuinely the user's (direction,
    scope, irreversible/outward-facing, ambiguous requirements): append to FOR
    THE HUMAN with a proposed default. Semi: proceed on the default but flag it;

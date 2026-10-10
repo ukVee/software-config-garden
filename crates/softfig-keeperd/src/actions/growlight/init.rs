@@ -105,7 +105,7 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
         // never clobbered if the MCP verbs already seeded it). The numbered
         // folders get a `.seq` seed so their first entry counts from 001,
         // materializing the dir as a tracked entity at the same time.
-        let pillar: [(String, String); 8] = [
+        let pillar: [(String, String); 10] = [
             (paths::pillar_claude(), paths::pillar_claude_stub()),
             (paths::protocol_md(), PROTOCOL_MD.to_string()),
             (paths::protocol_fleet_md(), PROTOCOL_FLEET_MD.to_string()),
@@ -114,6 +114,8 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
             (format!("{}/.seq", paths::tasks_dir()), "0\n".to_string()),
             (paths::baton_log_claude(), paths::baton_log_claude_stub()),
             (format!("{}/.seq", paths::baton_log_dir()), "0\n".to_string()),
+            (super::reports::reports_claude(), super::reports::reports_claude_stub()),
+            (format!("{}/.seq", super::reports::reports_dir()), "0\n".to_string()),
         ];
         for (rel, content) in &pillar {
             create_if_absent(&wt, rel, content, &mut created, &mut skipped)?;

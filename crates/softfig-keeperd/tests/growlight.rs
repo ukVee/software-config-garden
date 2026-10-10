@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use softfig_ipc::verbs::{
-    op, AddBacklogItemReply, AddQueueReply, AddSliceReply, GrowlightInitReply,
+    op, AddBacklogItemReply, AddQueueReply, AddSliceReply, FileReportReply, GrowlightInitReply,
+    ListReportsReply,
     GrowlightSetResourcesReply, LogBatonReply, PostMessageReply, ReadInboxReply,
     ReorderBacklogItemReply, SetItemStatusReply, StatusReply, TailBusReply,
 };
@@ -758,7 +759,7 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
     let reply: GrowlightInitReply = serde_json::from_value(ok_data(resp)).unwrap();
 
     assert!(reply.committed);
-    // All eight pillar files + the in-garden fleet config are created on a fresh
+    // All ten pillar files + the in-garden fleet config are created on a fresh
     // garden.
     for rel in [
         "growlight/CLAUDE.md",
@@ -769,6 +770,8 @@ fn growlight_init_scaffolds_the_pillar_and_commits() {
         "growlight/backlog/tasks/.seq",
         "growlight/baton-log/CLAUDE.md",
         "growlight/baton-log/.seq",
+        "growlight/reports/CLAUDE.md",
+        "growlight/reports/.seq",
         "config/growlight.toml",
     ] {
         assert!(reply.created.contains(&rel.to_string()), "missing {rel}");
@@ -809,8 +812,8 @@ fn growlight_init_is_idempotent_without_an_empty_commit() {
     assert!(!reply.committed, "re-run must not commit");
     assert!(reply.created.is_empty());
     assert_eq!(reply.hash, tip_before, "re-run returns the current tip");
-    // The eight pillar files + config/growlight.toml are reported kept, not recreated.
-    assert_eq!(reply.skipped.len(), 9);
+    // The ten pillar files + config/growlight.toml are reported kept, not recreated.
+    assert_eq!(reply.skipped.len(), 11);
 
     let tip_after = Repo::open(&fx.garden).unwrap().tip().unwrap().unwrap().to_string();
     assert_eq!(tip_after, tip_before, "no new commit on a no-op init");
@@ -1325,4 +1328,190 @@ fn status_reply_carries_the_fail_closed_growlight_gate() {
     let s: StatusReply =
         serde_json::from_value(ok_data(fx.call(op::STATUS, serde_json::json!({})))).unwrap();
     assert!(s.growlight_enabled, "armed gate reads true through status");
+}
+
+// ---- growlight reports ------------------------------------------------------
+
+fn file(fx: &Fixture, args: serde_json::Value) -> FileReportReply {
+    serde_json::from_value(ok_data(fx.call(op::FILE_REPORT, args))).unwrap()
+}
+
+#[test]
+fn file_report_numbers_tags_and_indexes() {
+    let fx = Fixture::start();
+    let reply = file(
+        &fx,
+        serde_json::json!({
+            "title": "edit_section eats a trailing index",
+            "body": "Editing the last section dropped the region.",
+            "tags": ["Type:Bug", "severity:high", "area:softfig-mcp"],
+            "item": "060",
+            "from": "fleet-a",
+        }),
+    );
+    assert_eq!(reply.number, 1);
+    assert_eq!(reply.path, "growlight/reports/001-edit-section-eats-a-trailing-index.md");
+    assert_eq!(
+        reply.tags,
+        ["type:bug", "severity:high", "status:open", "by:fleet-a", "item:060", "area:softfig-mcp"]
+    );
+    assert!(!reply.alerted, "a high bug does not page the human");
+
+    let doc = fx.read(&reply.path);
+    assert!(doc.starts_with("# edit_section eats a trailing index\n"), "{doc}");
+    assert!(doc.contains(
+        "> Tags: type:bug severity:high status:open by:fleet-a item:060 area:softfig-mcp"
+    ));
+    assert!(doc.contains("## Report\n\nEditing the last section dropped the region.\n"));
+
+    let index = fx.read("growlight/reports/CLAUDE.md");
+    assert!(index.contains("## Tags"), "routing doc scaffolded: {index}");
+    assert!(index.contains("_1 report(s) — open 1_"), "{index}");
+    assert!(
+        index.contains(
+            "| 001 | [edit_section eats a trailing index](001-edit-section-eats-a-trailing-index.md) \
+             | bug | high | open | by:fleet-a item:060 area:softfig-mcp |"
+        ),
+        "{index}"
+    );
+
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "report_filed");
+    assert_eq!(payload["number"], 1);
+    assert_eq!(payload["type"], "bug");
+    assert_eq!(payload["severity"], "high");
+}
+
+#[test]
+fn file_report_enforces_the_tag_rules() {
+    let fx = Fixture::start();
+    let try_tags = |tags: serde_json::Value| {
+        err_kind(fx.call(
+            op::FILE_REPORT,
+            serde_json::json!({ "title": "t", "body": "b", "tags": tags }),
+        ))
+    };
+    assert_eq!(try_tags(serde_json::json!(["area:x"])), ErrorKind::BadArgs, "no type");
+    assert_eq!(try_tags(serde_json::json!(["type:typo"])), ErrorKind::BadArgs, "unknown type");
+    assert_eq!(try_tags(serde_json::json!(["type:bug", "type:flake"])), ErrorKind::BadArgs);
+    assert_eq!(try_tags(serde_json::json!(["type:bug", "status:resolved"])), ErrorKind::BadArgs);
+    assert_eq!(try_tags(serde_json::json!(["type:bug", "has space"])), ErrorKind::BadArgs);
+    assert!(!fx.garden.join("growlight/reports/001-t.md").exists(), "nothing filed");
+}
+
+#[test]
+fn blocker_report_alerts_the_human_on_the_bus() {
+    let fx = Fixture::start();
+    let reply = file(
+        &fx,
+        serde_json::json!({
+            "title": "needs the root password",
+            "body": "The install step needs sudo.",
+            "tags": ["type:blocker"],
+            "from": "fleet-b",
+        }),
+    );
+    assert!(reply.alerted);
+    let (intent, _) = fx.tip_intent();
+    assert_eq!(intent, "chat_message_posted", "the alert is its own commit");
+    let bus = tail(&fx, 0);
+    let alert = bus.messages.last().expect("one alert");
+    assert_eq!(alert.from, "fleet-b");
+    assert_eq!(alert.to, "@human");
+    assert_eq!(alert.kind, "alert");
+    assert!(alert.body.contains("report #001"), "{}", alert.body);
+}
+
+#[test]
+fn update_report_moves_status_and_keeps_a_log() {
+    let fx = Fixture::start();
+    let reply = file(
+        &fx,
+        serde_json::json!({ "title": "flaky ceremony test", "body": "1 in 3", "tags": ["type:flake"] }),
+    );
+
+    let r = ok_data(fx.call(
+        op::UPDATE_REPORT,
+        serde_json::json!({
+            "number": 1, "status": "triaged", "add_tags": ["item:061", "severity:medium"],
+            "note": "queued as task 061", "from": "claude",
+        }),
+    ));
+    assert_eq!(r["tags"], serde_json::json!(["type:flake", "severity:medium", "status:triaged", "item:061"]));
+
+    // Closing needs a reason.
+    assert_eq!(
+        err_kind(fx.call(op::UPDATE_REPORT, serde_json::json!({ "number": 1, "status": "resolved" }))),
+        ErrorKind::BadArgs
+    );
+    ok_data(fx.call(
+        op::UPDATE_REPORT,
+        serde_json::json!({ "number": 1, "status": "resolved", "note": "fixed in abc123" }),
+    ));
+
+    let doc = fx.read(&reply.path);
+    assert!(doc.contains("> Tags: type:flake severity:medium status:resolved item:061"), "{doc}");
+    assert!(doc.contains("## Log\n\n- "), "{doc}");
+    assert!(doc.contains("· claude · +item:061; +severity:medium; status open → triaged: queued as task 061"), "{doc}");
+    assert!(doc.contains("· anon · status triaged → resolved: fixed in abc123"), "{doc}");
+    let index = fx.read("growlight/reports/CLAUDE.md");
+    assert!(index.contains("| flake | medium | resolved | item:061 |"), "{index}");
+    let (intent, payload) = fx.tip_intent();
+    assert_eq!(intent, "report_updated");
+    assert_eq!(payload["status"], "resolved");
+
+    // Daemon namespaces and a lone type can't be removed; no-op updates refused.
+    for args in [
+        serde_json::json!({ "number": 1, "remove_tags": ["type:flake"] }),
+        serde_json::json!({ "number": 1, "remove_tags": ["status:resolved"] }),
+        serde_json::json!({ "number": 1, "add_tags": ["by:mallory"] }),
+        serde_json::json!({ "number": 1 }),
+    ] {
+        assert_eq!(err_kind(fx.call(op::UPDATE_REPORT, args)), ErrorKind::BadArgs);
+    }
+    assert_eq!(
+        err_kind(fx.call(op::UPDATE_REPORT, serde_json::json!({ "number": 9, "note": "x" }))),
+        ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn list_reports_matches_every_tag_and_namespace_wildcards() {
+    let fx = Fixture::start();
+    file(&fx, serde_json::json!({ "title": "a", "body": "b", "tags": ["type:bug", "area:fuse"] }));
+    file(&fx, serde_json::json!({ "title": "b", "body": "b", "tags": ["type:bug"] }));
+    file(&fx, serde_json::json!({ "title": "c", "body": "b", "tags": ["type:idea", "area:tui"] }));
+
+    let list = |tags: serde_json::Value| -> Vec<u32> {
+        let r: ListReportsReply =
+            serde_json::from_value(ok_data(fx.call(op::LIST_REPORTS, serde_json::json!({ "tags": tags }))))
+                .unwrap();
+        r.reports.into_iter().map(|r| r.number).collect()
+    };
+    assert_eq!(list(serde_json::json!([])), [1, 2, 3]);
+    assert_eq!(list(serde_json::json!(["type:bug"])), [1, 2]);
+    assert_eq!(list(serde_json::json!(["area:*"])), [1, 3]);
+    assert_eq!(list(serde_json::json!(["type:bug", "area:*"])), [1]);
+    assert_eq!(list(serde_json::json!(["status:open", "type:idea"])), [3]);
+    assert_eq!(
+        err_kind(fx.call(op::LIST_REPORTS, serde_json::json!({ "tags": ["type:nope"] }))),
+        ErrorKind::BadArgs
+    );
+}
+
+/// The index is derived: a generic edit of a report re-derives it, and a
+/// listed report is a referenced record (archive it, don't unlink it).
+#[test]
+fn reports_index_follows_generic_edits_and_refuses_unlink() {
+    let fx = Fixture::start();
+    let reply = file(&fx, serde_json::json!({ "title": "x", "body": "b", "tags": ["type:finding"] }));
+    ok_data(fx.call(
+        op::PATCH_FILE,
+        serde_json::json!({ "path": reply.path, "old": "status:open", "new": "status:triaged" }),
+    ));
+    assert!(fx.read("growlight/reports/CLAUDE.md").contains("| finding |  | triaged |"));
+    assert_eq!(
+        err_kind(fx.call(op::UNLINK, serde_json::json!({ "path": reply.path }))),
+        ErrorKind::ReferencedElsewhere
+    );
 }

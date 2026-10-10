@@ -29,7 +29,10 @@ use softfig_ipc::{
         PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
         StopLevel, StopReply,
     },
-    verbs::{GrowlightInitArgs, GrowlightInitReply, PostMessageArgs, PostMessageReply, StatusReply, op},
+    verbs::{
+        GrowlightInitArgs, GrowlightInitReply, ListReportsArgs, ListReportsReply, PostMessageArgs,
+        PostMessageReply, ReportRow, StatusReply, op,
+    },
 };
 
 use softfig_growlightd_client::{decode_frame, Frame};
@@ -111,6 +114,13 @@ pub enum GrowlightCmd {
     /// (which owns the bus store), unlike the growlightd client verbs above.
     Say(SayArgs),
 
+    /// List the filed growlight reports (`growlight/reports/`) — bugs, flakes,
+    /// security gaps, doc drift, findings, questions, blockers, ideas — that
+    /// carry every `--tag` given (`ns:*` matches any value in a namespace).
+    /// Without tags, lists the reports that are still open or triaged; pass
+    /// `--all` for closed ones too. Routes to keeperd, which owns the folder.
+    Reports(ReportsArgs),
+
     /// Inspect or adjust the GENTLE per-agent build-resource caps LIVE
     /// (peer-isolation slice 003): the SOFT throttle (`CARGO_BUILD_JOBS` /
     /// `MemoryHigh` / `CPUWeight`) each agent's transient scope is capped with. A
@@ -160,6 +170,21 @@ pub struct ResourcesSetArgs {
 
 #[derive(Args, Debug)]
 pub struct InitArgs {
+    /// Override the socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ReportsArgs {
+    /// A tag every listed report must carry, e.g. `type:bug`, `area:*`.
+    /// Repeatable.
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
+    /// Include resolved / wontfix / duplicate reports.
+    #[arg(long)]
+    pub all: bool,
     /// Override the socket path. Defaults to
     /// `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
     #[arg(long)]
@@ -309,6 +334,7 @@ pub fn run(cmd: GrowlightCmd) -> Result<()> {
         GrowlightCmd::Pause(args) => client_pause(args),
         GrowlightCmd::Resume(args) => client_resume(args),
         GrowlightCmd::Say(args) => client_say(args),
+        GrowlightCmd::Reports(args) => client_reports(args),
         GrowlightCmd::Resources(args) => client_resources(args),
     }
 }
@@ -2112,6 +2138,51 @@ fn client_say(args: SayArgs) -> Result<()> {
     }
 }
 
+fn client_reports(args: ReportsArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    let req = ListReportsArgs { tags: args.tags.clone() };
+    match try_daemon_call(&socket, op::LIST_REPORTS, serde_json::to_value(req)?) {
+        Ok(Some(value)) => {
+            let reply: ListReportsReply = serde_json::from_value(value)?;
+            let shown = unresolved_unless_all(reply.reports, args.all || has_status_tag(&args.tags));
+            if shown.is_empty() {
+                println!("no matching reports");
+            }
+            for r in &shown {
+                println!("{}", report_line(r));
+            }
+            Ok(())
+        }
+        Ok(None) => Err(anyhow!(
+            "no daemon at {} — unlock the garden first (`softfig daemon unlock`)",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { kind, message }) => {
+            Err(anyhow!("daemon error ({kind:?}): {message}"))
+        }
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// Whether the caller already filtered on status (then `--all` is implied).
+fn has_status_tag(tags: &[String]) -> bool {
+    tags.iter().any(|t| t.trim().to_ascii_lowercase().starts_with("status:"))
+}
+
+/// Drop closed reports (`resolved` / `wontfix` / `duplicate`) unless `all`.
+fn unresolved_unless_all(reports: Vec<ReportRow>, all: bool) -> Vec<ReportRow> {
+    const CLOSED: [&str; 3] = ["status:resolved", "status:wontfix", "status:duplicate"];
+    reports
+        .into_iter()
+        .filter(|r| all || !r.tags.iter().any(|t| CLOSED.contains(&t.as_str())))
+        .collect()
+}
+
+/// One report as a terminal line: number, title, then its tags.
+fn report_line(r: &ReportRow) -> String {
+    format!("#{:03}  {}  [{}]", r.number, r.title, r.tags.join(" "))
+}
+
 /// Build the `post_message` args for a human-originated bus post: the sender is
 /// ALWAYS `@human` (the human is a first-class member, never an agent slug); the
 /// CLI only chooses the recipient, kind, and body. Pure, so the human-post seam
@@ -2136,6 +2207,23 @@ fn delta_kind_label(kind: AgentDeltaKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reports_listing_hides_closed_reports_unless_asked() {
+        let row = |n: u32, status: &str| ReportRow {
+            number: n,
+            path: format!("growlight/reports/{n:03}-x.md"),
+            title: "x".into(),
+            tags: vec!["type:bug".into(), format!("status:{status}")],
+            filed: String::new(),
+        };
+        let rows = || vec![row(1, "open"), row(2, "resolved"), row(3, "triaged")];
+        let open: Vec<u32> = unresolved_unless_all(rows(), false).iter().map(|r| r.number).collect();
+        assert_eq!(open, [1, 3]);
+        assert_eq!(unresolved_unless_all(rows(), true).len(), 3);
+        assert!(has_status_tag(&["Status:resolved".to_string()]));
+        assert_eq!(report_line(&row(7, "open")), "#007  x  [type:bug status:open]");
+    }
+
     use super::*;
 
     fn unique_tmp(tag: &str) -> PathBuf {
