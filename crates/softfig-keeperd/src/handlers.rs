@@ -607,7 +607,7 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // Write through the worktree: in FUSE mode this stages into the overlay
     // (no self-write of the mount under `inner`); in disk mode it suppresses
     // the watcher event + writes. Scoped so its borrow ends before the commit.
-    {
+    let (version, rederived) = {
         let wt = crate::actions::WorkTree::new(daemon, &inner);
         // Phase 3 CAS: the read rides the worktree (no mount I/O under `inner`).
         cas_check_whole_file(&wt, &rel, &args.expected_version)?;
@@ -618,9 +618,25 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // or of a host doc (a hand-typed cell) must re-derive it — otherwise
         // this verb is the remaining way to make an index lie.
         crate::actions::index::refresh_index_for(&wt, &inner, &rel);
-    }
+        // Review 031 D1: that re-derivation can rewrite this very file, so
+        // the reply's version hashes what is on disk now, and `rederived`
+        // names the regions where it differs from the caller's bytes. (A
+        // non-UTF-8 write can't host a region; its own bytes stand.)
+        match (
+            std::str::from_utf8(args.content.as_bytes()).ok(),
+            wt.read(&rel),
+        ) {
+            (Some(written), Some(on_disk)) => (
+                softfig_store::Hash::of(&on_disk).to_hex(),
+                crate::actions::managed::changed_regions(
+                    written,
+                    &String::from_utf8_lossy(&on_disk),
+                ),
+            ),
+            _ => (softfig_store::Hash::of(args.content.as_bytes()).to_hex(), Vec::new()),
+        }
+    };
 
-    let version = softfig_store::Hash::of(args.content.as_bytes()).to_hex();
     let payload = serde_json::json!({ "path": args.path });
     let intent =
         Intent::new("memory_edit", payload).map_err(|e| (ErrorKind::Internal, e.to_string()))?;
@@ -633,6 +649,7 @@ pub fn replace_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         path: args.path,
         hash: hash.to_string(),
         version,
+        rederived,
     })
     .unwrap())
 }

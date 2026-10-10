@@ -1014,12 +1014,14 @@ fn set_reviewed_updates_index_reviewed_column() {
     assert!(!claude.contains("2020-01-01"), "stale cell survived: {claude}");
 }
 
-/// Task 060: the `Reviewed` cell is derived, so a value typed straight into the
-/// managed region is corrected by the next write rather than persisted. The
-/// `ir-face-root-cause` loop hand-patched two of these cells (`hardware/` and
-/// `storage/`) — exactly what the structural verbs exist to prevent.
+/// Task 060 + review 031 D1: the `Reviewed` cell is derived. A hand edit of
+/// it through `patch_file` used to be silently re-derived while the verb
+/// reported Ok; it is refused now. The break-glass `replace_file` still lands,
+/// re-derives the cell, and says so — its reply's version hashes the bytes on
+/// disk, and `rederived` names the region. The `ir-face-root-cause` loop
+/// hand-patched two of these cells (`hardware/` and `storage/`).
 #[test]
-fn hand_patched_index_cell_is_re_derived() {
+fn hand_patched_index_cell_is_refused_or_re_derived() {
     let fx = Fixture::start();
     write_doc(&fx, "storage/CLAUDE.md", "# storage/\n");
     fx.call(
@@ -1037,11 +1039,154 @@ fn hand_patched_index_cell_is_re_derived() {
             "new": row("2026-09-06"),
         }),
     );
-    assert!(matches!(resp, Response::Ok { .. }), "patch_file: {resp:?}");
+    assert_eq!(err_kind(resp), ErrorKind::BadArgs, "a managed cell is not patchable");
 
+    let host = std::fs::read_to_string(fx.garden.join("storage/CLAUDE.md")).unwrap();
+    let resp = fx.call(
+        op::REPLACE_FILE,
+        serde_json::json!({ "path": "storage/CLAUDE.md", "content": host.replace(&today, "2026-09-06") }),
+    );
+    let reply = ok_data(resp);
     let claude = std::fs::read_to_string(fx.garden.join("storage/CLAUDE.md")).unwrap();
     assert!(claude.contains(&row(&today)), "cell re-derived from the note: {claude}");
     assert!(!claude.contains("2026-09-06"), "hand-set cell persisted: {claude}");
+    assert_eq!(
+        reply["version"].as_str().unwrap(),
+        softfig_store::Hash::of(claude.as_bytes()).to_hex(),
+        "replace_file's version must name the bytes on disk"
+    );
+    assert_eq!(reply["rederived"], serde_json::json!(["index notes"]));
+}
+
+/// Review 031 D1's deferred check: a chained `patch_file` → `patch_file` on a
+/// host doc whose index cell had drifted. The first patch's upkeep re-derives
+/// the cell, so the bytes on disk are not the patch's output — the reply's
+/// version must still name them, or the chained call gets a spurious
+/// `Conflict`.
+#[test]
+fn chained_patch_on_a_drifted_host_does_not_conflict() {
+    let fx = Fixture::start();
+    write_doc(&fx, "hardware/CLAUDE.md", "# hardware/\n\nlead prose\n");
+    fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({ "dir": "hardware/notes", "slug": "ipu3", "title": "IPU3", "body": "b" }),
+    );
+    // Drift the cell behind the daemon's back (a pre-060 garden, a FUSE hand edit).
+    let host_abs = fx.garden.join("hardware/CLAUDE.md");
+    let today = conventions::today_hyphen();
+    let drifted = std::fs::read_to_string(&host_abs).unwrap().replace(&today, "2026-09-06");
+    std::fs::write(&host_abs, drifted).unwrap();
+
+    let first = ok_data(fx.call(
+        op::PATCH_FILE,
+        serde_json::json!({ "path": "hardware/CLAUDE.md", "old": "lead prose", "new": "lead" }),
+    ));
+    let on_disk = std::fs::read_to_string(&host_abs).unwrap();
+    assert!(!on_disk.contains("2026-09-06"), "the upkeep re-derived the cell: {on_disk}");
+    assert_eq!(
+        first["version"].as_str().unwrap(),
+        softfig_store::Hash::of(on_disk.as_bytes()).to_hex()
+    );
+    assert_eq!(first["rederived"], serde_json::json!(["index notes"]));
+
+    let second = fx.call(
+        op::PATCH_FILE,
+        serde_json::json!({
+            "path": "hardware/CLAUDE.md",
+            "old": "lead",
+            "new": "lead, chained",
+            "expected_version": first["version"],
+        }),
+    );
+    assert!(matches!(second, Response::Ok { .. }), "chained patch: {second:?}");
+}
+
+/// Review 031 D2: an `index <folder>` tag is file *content*, so a tag naming
+/// `../../<elsewhere>/notes` must not steer the derivation outside the garden
+/// — neither reading notes there nor rewriting the `CLAUDE.md` beside them.
+#[test]
+fn index_region_tag_cannot_reach_outside_the_garden() {
+    let fx = Fixture::start();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join("notes")).unwrap();
+    std::fs::write(
+        outside.path().join("notes/001-secret.md"),
+        "# OUTSIDE-SECRET\n\n> Last reviewed: 2026-01-01\n\nx\n",
+    )
+    .unwrap();
+    let outside_claude = outside.path().join("CLAUDE.md");
+    std::fs::write(&outside_claude, "# outside\n").unwrap();
+
+    // garden/h/../../<outside>/notes == <outside>/notes (sibling temp dirs).
+    let name = outside.path().file_name().unwrap().to_str().unwrap();
+    let tag = format!("index ../../{name}/notes");
+    let host = format!(
+        "# h/\n\n<!-- softfig:{tag} -->\n\nstale\n\n<!-- /softfig:{tag} -->\n"
+    );
+    write_doc(&fx, "h/CLAUDE.md", "# h/\n");
+    ok_data(fx.call(op::REPLACE_FILE, serde_json::json!({ "path": "h/CLAUDE.md", "content": host })));
+
+    assert_eq!(
+        std::fs::read_to_string(&outside_claude).unwrap(),
+        "# outside\n",
+        "a CLAUDE.md outside the garden was rewritten"
+    );
+    let written = std::fs::read_to_string(fx.garden.join("h/CLAUDE.md")).unwrap();
+    assert!(!written.contains("OUTSIDE-SECRET"), "outside note read into the index: {written}");
+}
+
+/// Review 031 posture 3: the host `CLAUDE.md` is usually unsealed, so a
+/// sealed note's title must not be copied into its index row.
+#[test]
+fn sealed_note_title_stays_out_of_the_index() {
+    let fx = Fixture::start();
+    write_doc(&fx, "personal/CLAUDE.md", "# personal/\n");
+    ok_data(fx.call(op::VAULT_SEAL, serde_json::json!({ "pattern": "personal/notes/**" })));
+    ok_data(fx.call(
+        op::ADD_NOTE,
+        serde_json::json!({
+            "dir": "personal/notes", "slug": "salary", "title": "Salary at ACME-CONFIDENTIAL", "body": "b"
+        }),
+    ));
+    let host = std::fs::read_to_string(fx.garden.join("personal/CLAUDE.md")).unwrap();
+    assert!(!host.contains("ACME-CONFIDENTIAL"), "sealed title leaked: {host}");
+    assert!(host.contains("| 001 | [(sealed)](notes/001-salary.md) |  |"), "{host}");
+}
+
+/// Review 031 gap 3: an edit elsewhere in a host doc must not drop the index
+/// region of a folder that is present but empty — dropping a region is the
+/// folder lifecycle's job (`archive` of its last note), not a section edit's.
+#[test]
+fn unrelated_host_edit_keeps_an_empty_folder_region() {
+    let fx = Fixture::start();
+    let region = "<!-- softfig:index notes -->\n\n| # | Note | Reviewed |\n|---|------|----------|\n\n<!-- /softfig:index notes -->";
+    write_doc(&fx, "audio/CLAUDE.md", &format!("# audio/\n\n## Routing\n\nold\n\n{region}\n"));
+    std::fs::create_dir_all(fx.garden.join("audio/notes")).unwrap();
+    ok_data(fx.call(
+        op::ADD_SECTION,
+        serde_json::json!({ "path": "audio/CLAUDE.md", "heading": "Later", "body": "new" }),
+    ));
+    let host = std::fs::read_to_string(fx.garden.join("audio/CLAUDE.md")).unwrap();
+    assert!(host.contains("<!-- softfig:index notes -->"), "region dropped: {host}");
+}
+
+/// `revise_note` swaps a note's body wholesale. A caller only ever reads
+/// inline `<vault>` regions as `[encrypted]`, so on a note carrying one the
+/// swap could only destroy the secret — refused like the section verbs.
+#[test]
+fn revise_note_refuses_a_note_with_inline_vault_regions() {
+    let fx = Fixture::start();
+    write_doc(&fx, "users/CLAUDE.md", "# users/\n");
+    write_doc(
+        &fx,
+        "users/notes/001-keys.md",
+        "# Keys\n\n> Last reviewed: 2026-01-01\n\n<vault id=\"k\">s3cret</vault>\n",
+    );
+    let resp = fx.call(
+        op::REVISE_NOTE,
+        serde_json::json!({ "dir": "users/notes", "id": 1, "body": "<vault id=\"k\">[encrypted]</vault>" }),
+    );
+    assert_eq!(err_kind(resp), ErrorKind::VaultProtected);
 }
 
 /// Task 060's backfill: `migrate_reindex` finds an index cell that drifted by a

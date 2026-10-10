@@ -201,6 +201,16 @@ pub fn batch(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         validate_op(daemon, &inner, &garden_root, op, &mut sim, &mut staged).map_err(
             |(kind, msg)| (kind, format!("batch op[{i}] ({}) failed: {msg}", op.op)),
         )?;
+        // The worktree's own write refusals (path shape, key-before-content
+        // under an unkeyed shared subtree) are validation too: checked here,
+        // a refused target fails the batch with nothing staged instead of
+        // after the ops before it already landed in the overlay.
+        if let Some(s) = staged.last() {
+            let wt = WorkTree::new(daemon, &inner);
+            wt.check_write(staged_target(&s.mutation)).map_err(|(kind, msg)| {
+                (kind, format!("batch op[{i}] ({}) failed: {msg}", op.op))
+            })?;
+        }
     }
 
     // ---- phase 2: stage the mutations in order, then one commit -----------
@@ -283,6 +293,15 @@ pub fn batch(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         paths,
     })
     .unwrap())
+}
+
+/// The file a staged mutation writes (an `add_note`'s `.seq` sits beside it in
+/// the same folder, so the doc path speaks for both).
+fn staged_target(m: &Mutation) -> &str {
+    match m {
+        Mutation::Write { rel, .. } => rel,
+        Mutation::AddNote { note_rel, .. } | Mutation::ReviseNote { note_rel, .. } => note_rel,
+    }
 }
 
 /// Validate one sub-op against the simulation and append its staged mutation.
@@ -527,10 +546,8 @@ fn validate_op(
                         ErrorKind::NotFound,
                         format!("{dir_rel}: no note numbered {:03}", a.id),
                     ))?;
-                    let existing = wt.read_to_string(&rel).ok_or((
-                        ErrorKind::Io,
-                        format!("read {rel}: not found"),
-                    ))?;
+                    // Same vault refusal as the standalone verb.
+                    let existing = super::sections::load_for_body_swap(&wt, inner, &rel)?;
                     (rel, existing)
                 }
             };

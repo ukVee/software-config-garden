@@ -176,7 +176,12 @@ edited buffer, `expected_version` = the version read from `read_file` — over
 the async worker channel, so the UI never blocks; the TUI never touches the
 filesystem itself. On success the editor clears dirty; on a conflict (the file
 changed on the daemon) your buffer and edits are kept, with a re-read-and-retry
-status. Sealed, inline-`<vault>`-region, and truncated files stay read-only,
+status. Daemon-managed `<!-- softfig:… -->` regions (index tables, backlinks,
+growlight queue tables) are not editable by hand: a save that changes one is
+refused. When the daemon re-derives a region under a save (a stale index cell
+it corrected), the reply names it and a clean editor reloads from the daemon,
+so the next save patches what is actually on disk. Sealed,
+inline-`<vault>`-region, and truncated files stay read-only,
 and empty files can't be saved yet (a v2 `write_file` verb is the follow-up).
 
 Browse content comes through the daemon's read-only `list_tree` /

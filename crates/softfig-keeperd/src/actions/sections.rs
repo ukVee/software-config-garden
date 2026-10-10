@@ -20,7 +20,22 @@
 //! (ambiguous → `BadArgs`). For `add_section` the level comes from any
 //! leading `#`s in the argument (`## Foo` → level 2), defaulting to `##`.
 //! A section spans its heading line through the line before the next
-//! heading of the same-or-higher level (subsections are part of it).
+//! heading of the same-or-higher level (subsections are part of it) — the
+//! span `remove_section` deletes and section versions hash. `edit_section`
+//! replaces less when it can: a body with **no headings of its own** replaces
+//! only the section's own text, up to its first subsection, so editing a
+//! `# Title`'s intro can no longer wipe every `##` below it; a body that
+//! carries headings replaces the whole span (a deliberate restructure).
+//!
+//! ## Managed regions are daemon-owned
+//!
+//! No section verb changes a `<!-- softfig:… -->` region. `edit_section`
+//! keeps the regions inside the text it replaces (re-appended after the new
+//! body unless the caller re-emitted them verbatim), `append_to_section`
+//! inserts above a trailing region, and any edit that would change, split, or
+//! introduce a region is refused — so a region at the end of a doc's last
+//! section survives an edit of that section. A trailing `---` separator is
+//! kept the same way: it belongs to the boundary, not to the body.
 //!
 //! ## Vault refusal
 //!
@@ -60,15 +75,15 @@ pub fn add_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    let (new, version) = {
+    let new = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
-        let new = edit::add_section(&content, &args.heading, &args.body)
-            .map_err(|e| section_err(&rel, &args.heading, e))?;
-        let version = edit::section_version(&new, &args.heading).unwrap_or_default();
-        (new, version)
+        edit::add_section(&content, &args.heading, &args.body)
+            .map_err(|e| section_err(&rel, &args.heading, e))?
     };
-    write_and_commit(daemon, &mut inner, &rel, new, "section_added", &args.heading, version)
+    let heading = args.heading.clone();
+    let version_of = move |c: &str| edit::section_version(c, &heading).unwrap_or_default();
+    write_and_commit(daemon, &mut inner, &rel, new, "section_added", &args.heading, &version_of)
 }
 
 pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -82,17 +97,24 @@ pub fn edit_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    let (new, version) = {
+    let new = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
         cas_check_section(&content, &args.heading, &args.expected_version)?;
-        let new = edit::edit_section(&content, &args.heading, &args.body)
-            .map_err(|e| section_err(&rel, &args.heading, e))?;
-        let version = edit::section_version(&new, &args.heading).unwrap_or_default();
-        (new, version)
+        edit::edit_section(&content, &args.heading, &args.body)
+            .map_err(|e| section_err(&rel, &args.heading, e))?
     };
-    let reply =
-        write_and_commit(daemon, &mut inner, &rel, new, "section_edited", &args.heading, version)?;
+    let heading = args.heading.clone();
+    let version_of = move |c: &str| edit::section_version(c, &heading).unwrap_or_default();
+    let reply = write_and_commit(
+        daemon,
+        &mut inner,
+        &rel,
+        new,
+        "section_edited",
+        &args.heading,
+        &version_of,
+    )?;
     note_section_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
     Ok(reply)
 }
@@ -108,15 +130,15 @@ pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    let (new, version) = {
+    let new = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
         cas_check_section(&content, &args.heading, &args.expected_version)?;
-        let new = edit::append_to_section(&content, &args.heading, &args.text)
-            .map_err(|e| section_err(&rel, &args.heading, e))?;
-        let version = edit::section_version(&new, &args.heading).unwrap_or_default();
-        (new, version)
+        edit::append_to_section(&content, &args.heading, &args.text)
+            .map_err(|e| section_err(&rel, &args.heading, e))?
     };
+    let heading = args.heading.clone();
+    let version_of = move |c: &str| edit::section_version(c, &heading).unwrap_or_default();
     let reply = write_and_commit(
         daemon,
         &mut inner,
@@ -124,7 +146,7 @@ pub fn append_to_section(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
         new,
         "section_appended",
         &args.heading,
-        version,
+        &version_of,
     )?;
     note_section_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
     Ok(reply)
@@ -161,7 +183,6 @@ pub fn remove_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     };
     // The section no longer exists, so the reply carries the new whole-file
     // version — there is no post-delete section version to chain.
-    let version = edit::content_version(&new);
     let reply = write_and_commit(
         daemon,
         &mut inner,
@@ -169,7 +190,7 @@ pub fn remove_section(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
         new,
         "section_removed",
         &args.heading,
-        version,
+        &edit::content_version,
     )?;
     note_section_edit_for_thrash(daemon, &mut inner, &rel, &args.heading, args.editor.as_deref());
     Ok(reply)
@@ -183,7 +204,7 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let garden_root = inner.config.garden_root.clone();
     let rel = resolve(&garden_root, &args.path)?;
 
-    let version = {
+    let (version, rederived) = {
         let wt = WorkTree::new(daemon, &inner);
         let content = load_unprotected(&wt, &inner, &rel)?;
         let new = edit::set_reviewed(&content, &conventions::today_hyphen()).ok_or((
@@ -196,8 +217,10 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // index starts lying the moment a note is re-reviewed.
         super::index::refresh_index_for(&wt, &inner, &rel);
         // set_reviewed isn't section-addressed, so its CAS handle is the
-        // whole-file version (informational here — date bumps rarely contend).
-        edit::content_version(&new)
+        // whole-file version (informational here — date bumps rarely contend),
+        // hashed over what is on disk after the upkeep (review 031 D1).
+        let on_disk = on_disk_after_upkeep(&wt, &rel, &new);
+        (edit::content_version(&on_disk), super::managed::changed_regions(&new, &on_disk))
     };
 
     let payload = serde_json::json!({ "path": rel });
@@ -205,7 +228,13 @@ pub fn set_reviewed(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
     let inner = &mut *inner;
     let hash = commit_now(inner, intent)?;
-    Ok(serde_json::to_value(DocEditReply { path: rel, hash: hash.to_string(), version }).unwrap())
+    Ok(serde_json::to_value(DocEditReply {
+        path: rel,
+        hash: hash.to_string(),
+        version,
+        rederived,
+    })
+    .unwrap())
 }
 
 /// Optimistic-concurrency guard for the section verbs: when the caller supplied
@@ -273,6 +302,25 @@ pub(crate) fn read_if_unprotected(wt: &WorkTree, inner: &DaemonInner, rel: &str)
     String::from_utf8(bytes).ok()
 }
 
+/// The read for a verb that swaps a doc's body **wholesale** (`revise_note`):
+/// a whole-file-sealed doc is fine — the caller supplies the complete new
+/// body, and the commit re-seals it by glob — but a doc carrying inline
+/// `<vault>` regions is refused like [`load_unprotected`] does, because the
+/// caller only ever saw those regions as `[encrypted]` and the swap can only
+/// destroy them.
+pub(crate) fn load_for_body_swap(
+    wt: &WorkTree,
+    inner: &DaemonInner,
+    rel: &str,
+) -> Result<String, (ErrorKind, String)> {
+    if inner.layer_b.snapshot().is_sealed(rel) {
+        return wt
+            .read_to_string(rel)
+            .ok_or((ErrorKind::NotFound, format!("{rel}: not found")));
+    }
+    load_unprotected(wt, inner, rel)
+}
+
 /// Read the working-tree bytes of `rel` as plaintext, refusing any vault
 /// target so a plaintext rewrite can never clobber ciphertext (see module
 /// docs). Returns the UTF-8 content on success. Reads through the
@@ -309,11 +357,23 @@ pub(crate) fn load_unprotected(
     String::from_utf8(bytes).map_err(|_| (ErrorKind::BadArgs, format!("{rel}: not UTF-8 text")))
 }
 
-/// Common tail for the section verbs (edit/append/remove): write the rebuilt
-/// content + refresh
-/// backlinks through a scoped [`WorkTree`] (mount-safe in FUSE mode), then
-/// commit `intent` with a `{path, heading}` payload and reply `{path, hash}`.
-/// The worktree is dropped before the `&mut inner` commit so its shared borrow
+/// The bytes of `rel` as they stand after a verb's write **and** the daemon's
+/// region upkeep (index re-derivation, backlinks) — what a reply's CAS
+/// `version` must hash. Hashing the verb's own content instead named bytes
+/// that were never on disk whenever the upkeep rewrote the same file, so the
+/// next chained `expected_version` call hit a spurious `Conflict` (review 031
+/// D1). Falls back to `written` only if the read-back fails, which a write
+/// that just succeeded through the same worktree does not do.
+pub(crate) fn on_disk_after_upkeep(wt: &WorkTree, rel: &str, written: &str) -> String {
+    wt.read_to_string(rel).unwrap_or_else(|| written.to_string())
+}
+
+/// Common tail for the section verbs (add/edit/append/remove): write the
+/// rebuilt content + refresh index and backlinks through a scoped
+/// [`WorkTree`] (mount-safe in FUSE mode), then commit `intent` with a
+/// `{path, heading}` payload and reply `{path, hash, version, rederived}` —
+/// `version` is `version_of` over the on-disk bytes after the upkeep. The
+/// worktree is dropped before the `&mut inner` commit so its shared borrow
 /// of `inner` doesn't collide with `commit_now`.
 fn write_and_commit(
     daemon: &Daemon,
@@ -322,9 +382,9 @@ fn write_and_commit(
     new_content: String,
     intent_name: &str,
     heading_arg: &str,
-    version: String,
+    version_of: &dyn Fn(&str) -> String,
 ) -> HandlerResult {
-    {
+    let (version, rederived) = {
         let wt = WorkTree::new(daemon, inner);
         wt.write(rel, new_content.as_bytes())?;
         // Task 060: a section edit can move a note's `Last reviewed:` header
@@ -334,7 +394,9 @@ fn write_and_commit(
         // Slice 5: a section edit can add/remove `[[…]]` refs in any doc, so
         // recompute the backlink graph before committing (best-effort).
         super::backlinks::refresh_all(&wt, inner);
-    }
+        let on_disk = on_disk_after_upkeep(&wt, rel, &new_content);
+        (version_of(&on_disk), super::managed::changed_regions(&new_content, &on_disk))
+    };
     let (_level, heading_text) = edit::parse_heading_arg(heading_arg);
     let payload = serde_json::json!({ "path": rel, "heading": heading_text });
     let intent = Intent::new(intent_name, payload)
@@ -345,6 +407,7 @@ fn write_and_commit(
         path: rel.to_string(),
         hash: hash.to_string(),
         version,
+        rederived,
     })
     .unwrap())
 }
@@ -447,6 +510,14 @@ pub(crate) fn section_err(rel: &str, heading: &str, e: edit::SectionError) -> (E
                  any heading — unlink the file instead if it should be empty"
             ),
         ),
+        ManagedRegion => (
+            ErrorKind::BadArgs,
+            format!(
+                "{rel}: editing section {heading:?} would change, split, or introduce a \
+                 daemon-managed <!-- softfig:… --> region — leave regions out of the body \
+                 (the daemon keeps them in place) and change their source instead"
+            ),
+        ),
     }
 }
 
@@ -474,6 +545,9 @@ pub mod edit {
         /// headings at all (a parent whose span swallows every subsection
         /// counts) — an agent that truly wants an empty file unlinks it.
         LastSection,
+        /// The edit would change, split, drop, or introduce a daemon-managed
+        /// `<!-- softfig:… -->` region.
+        ManagedRegion,
     }
 
     struct Heading {
@@ -566,6 +640,57 @@ pub mod edit {
         v
     }
 
+    /// The end of `target`'s **own** text: the line of its first subsection,
+    /// or `span_end` when it has none. `[body_start, own_end)` is what a
+    /// heading-free `edit_section` body replaces.
+    fn own_body_end(hs: &[Heading], target: &Heading, span_end: usize) -> usize {
+        hs.iter()
+            .find(|h| h.line > target.line)
+            .map(|h| h.line.min(span_end))
+            .unwrap_or(span_end)
+    }
+
+    /// A markdown thematic break — three or more `-`, `*`, or `_` (spaces
+    /// allowed between) and nothing else.
+    fn is_thematic_break(line: &str) -> bool {
+        let t: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        t.len() >= 3
+            && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '*') || t.chars().all(|c| c == '_'))
+    }
+
+    /// The index of the last non-blank line in `lines[start..end]` that is a
+    /// separator (a thematic break preceded by a blank line, so not a setext
+    /// heading's underline) — `None` when the range ends in anything else.
+    fn trailing_rule(lines: &[&str], start: usize, end: usize) -> Option<usize> {
+        let last = (start..end).rev().find(|&i| !lines[i].trim().is_empty())?;
+        let preceded_by_blank = last == 0 || lines[last - 1].trim().is_empty();
+        (is_thematic_break(lines[last]) && preceded_by_blank).then_some(last)
+    }
+
+    /// `body` without a first line that repeats the addressed heading. The
+    /// daemon stamps the heading itself, so a body that opens with it again
+    /// (`## Status` passed as both heading and body's first line) would
+    /// produce a duplicate heading — and an ambiguous address for every later
+    /// edit of it.
+    fn strip_repeated_heading<'a>(body: &'a str, want: &str) -> &'a str {
+        let trimmed = body.trim_start_matches(['\n', '\r']);
+        let first_end = trimmed.find('\n').unwrap_or(trimmed.len());
+        match parse_heading_line(&trimmed[..first_end]) {
+            Some((_, text)) if text == want => &trimmed[first_end..],
+            _ => body,
+        }
+    }
+
+    /// The managed-region invariant every non-break-glass edit honours: the
+    /// result carries exactly the regions `before` did, bodies unchanged.
+    fn keep_regions(before: &str, after: String) -> Result<String, SectionError> {
+        if crate::actions::managed::changed_regions(before, &after).is_empty() {
+            Ok(after)
+        } else {
+            Err(SectionError::ManagedRegion)
+        }
+    }
+
     pub fn edit_section(content: &str, heading_arg: &str, body: &str) -> Result<String, SectionError> {
         let (_level, want) = parse_heading_arg(heading_arg);
         if want.is_empty() {
@@ -574,12 +699,50 @@ pub mod edit {
         let lines: Vec<&str> = content.split('\n').collect();
         let hs = headings(&lines);
         let target = find_unique(&hs, &want)?;
-        let (bstart, bend) = body_range(lines.len(), &hs, target);
+        let body = strip_repeated_heading(body, &want);
+        let body_lines: Vec<&str> = body.split('\n').collect();
+
+        // A heading-free body replaces the section's own text only; a body
+        // with headings is a restructure and replaces the whole span.
+        let (bstart, span_end) = body_range(lines.len(), &hs, target);
+        let bend = if headings(&body_lines).is_empty() {
+            own_body_end(&hs, target, span_end)
+        } else {
+            span_end
+        };
+
+        // Regions inside the replaced window are kept: re-appended after the
+        // new body unless the caller re-emitted them (then `keep_regions`
+        // checks the copy is verbatim). One straddling the window edge can't
+        // be kept whole — refused.
+        let spans = crate::actions::managed::spans_of(&lines);
+        if spans
+            .iter()
+            .any(|s| (s.open < bstart && s.close >= bstart) || (s.open < bend && s.close >= bend))
+        {
+            return Err(SectionError::ManagedRegion);
+        }
+        let mut text = body.trim_start_matches('\n').trim_end().to_string();
+        for s in spans.iter().filter(|s| s.open >= bstart && s.close < bend) {
+            if !crate::actions::managed::has_region(body, &s.tag) {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&lines[s.open..=s.close].join("\n"));
+            }
+        }
+        // A separator closing the replaced text survives a body that doesn't
+        // bring its own.
+        let body_has_rule = trailing_rule(&body_lines, 0, body_lines.len()).is_some();
+        if let Some(rule) = trailing_rule(&lines, bstart, bend).filter(|_| !body_has_rule) {
+            text.push_str("\n\n");
+            text.push_str(lines[rule].trim());
+        }
 
         let mut out: Vec<String> = lines[..bstart].iter().map(|s| s.to_string()).collect();
-        out.extend(body_block(body));
+        out.extend(body_block(&text));
         out.extend(lines[bend..].iter().map(|s| s.to_string()));
-        Ok(out.join("\n"))
+        keep_regions(content, out.join("\n"))
     }
 
     pub fn append_to_section(
@@ -598,15 +761,33 @@ pub mod edit {
 
         let text = text.trim_matches('\n');
         let text_lines = || text.split('\n').map(str::to_string);
-        let last_nonblank = (bstart..bend).rev().find(|&i| !lines[i].trim().is_empty());
+        // Append after the section's last *content* line: a managed region
+        // and a closing `---` separator are boundaries, so new text lands
+        // above them rather than after a daemon table or past the rule.
+        let spans = crate::actions::managed::spans_of(&lines);
+        let in_region = |i: usize| spans.iter().any(|s| i >= s.open && i <= s.close);
+        let rule = trailing_rule(&lines, bstart, bend);
+        let last_content = (bstart..bend)
+            .rev()
+            .find(|&i| !lines[i].trim().is_empty() && !in_region(i) && Some(i) != rule);
+        let has_boundary = rule.is_some() || spans.iter().any(|s| s.open >= bstart && s.open < bend);
 
-        let out: Vec<String> = match last_nonblank {
+        let out: Vec<String> = match last_content {
             // Insert right after the last content line, before any trailing
-            // blanks / the next heading — the "add a row" behaviour.
+            // blanks / region / separator / the next heading — the "add a
+            // row" behaviour.
             Some(idx) => {
                 let mut v: Vec<String> = lines[..=idx].iter().map(|s| s.to_string()).collect();
                 v.extend(text_lines());
                 v.extend(lines[idx + 1..].iter().map(|s| s.to_string()));
+                v
+            }
+            // No prose, but a region or separator: open the body above it.
+            None if has_boundary => {
+                let mut v: Vec<String> = lines[..bstart].iter().map(|s| s.to_string()).collect();
+                v.push(String::new());
+                v.extend(text_lines());
+                v.extend(lines[bstart..].iter().map(|s| s.to_string()));
                 v
             }
             // Empty section: same as setting its body.
@@ -617,7 +798,7 @@ pub mod edit {
                 v
             }
         };
-        Ok(out.join("\n"))
+        keep_regions(content, out.join("\n"))
     }
 
     pub fn add_section(content: &str, heading_arg: &str, body: &str) -> Result<String, SectionError> {
@@ -631,7 +812,9 @@ pub mod edit {
         }
         let level = level_opt.unwrap_or(2);
         let heading_line = format!("{} {}", "#".repeat(level), want);
-        let body = body.trim_start_matches('\n').trim_end();
+        let body = strip_repeated_heading(body, &want)
+            .trim_start_matches('\n')
+            .trim_end();
         let core = content.trim_end_matches('\n');
 
         let mut s = String::new();
@@ -643,7 +826,7 @@ pub mod edit {
         s.push_str("\n\n");
         s.push_str(body);
         s.push('\n');
-        Ok(s)
+        keep_regions(content, s)
     }
 
     /// The `[start, end)` line range the uniquely-addressed section occupies —
@@ -811,11 +994,110 @@ pub mod edit {
         }
 
         #[test]
-        fn edit_section_spans_subsections() {
-            // Editing a level-2 section replaces its level-3 subsection too.
+        fn heading_free_body_replaces_only_the_own_text() {
+            // A body with no headings rewrites the section's own text and
+            // keeps its subsections.
             let doc = "## A\n\nintro\n\n### sub\n\ndetail\n\n## B\n\nb\n";
             let out = edit_section(doc, "A", "replaced").unwrap();
-            assert_eq!(out, "## A\n\nreplaced\n\n## B\n\nb\n");
+            assert_eq!(out, "## A\n\nreplaced\n\n### sub\n\ndetail\n\n## B\n\nb\n");
+        }
+
+        /// The 2026-08-01 incident: editing an H1 to change its intro wiped
+        /// every `##` below it. A heading-free body now touches the intro only.
+        #[test]
+        fn editing_the_h1_intro_keeps_every_section() {
+            let doc = "# Title\n\nold intro\n\n## Symptom\n\ns\n\n## Fix\n\nf\n";
+            let out = edit_section(doc, "Title", "new intro").unwrap();
+            assert_eq!(out, "# Title\n\nnew intro\n\n## Symptom\n\ns\n\n## Fix\n\nf\n");
+        }
+
+        #[test]
+        fn body_with_headings_restructures_the_whole_span() {
+            let doc = "## A\n\nintro\n\n### sub\n\ndetail\n\n## B\n\nb\n";
+            let out = edit_section(doc, "A", "lead\n\n### renamed\n\nnew detail").unwrap();
+            assert_eq!(out, "## A\n\nlead\n\n### renamed\n\nnew detail\n\n## B\n\nb\n");
+        }
+
+        /// The 2026-07-09 incident: editing a doc's last section ate the
+        /// `softfig:index` region that trailed it. The region is kept.
+        #[test]
+        fn edit_keeps_a_trailing_managed_region() {
+            let doc = "# M\n\n## Finish criteria\n\nold\n\n\
+                       <!-- softfig:index slices -->\n\n| 001 | x |\n\n<!-- /softfig:index slices -->\n";
+            let out = edit_section(doc, "Finish criteria", "new criteria").unwrap();
+            assert_eq!(
+                out,
+                "# M\n\n## Finish criteria\n\nnew criteria\n\n\
+                 <!-- softfig:index slices -->\n\n| 001 | x |\n\n<!-- /softfig:index slices -->\n"
+            );
+        }
+
+        #[test]
+        fn edit_accepts_a_verbatim_region_and_refuses_a_changed_one() {
+            let region = "<!-- softfig:index notes -->\n\n| 001 | x |\n\n<!-- /softfig:index notes -->";
+            let doc = format!("## A\n\nold\n\n{region}\n\n## B\n\nb\n");
+            // Re-emitted verbatim (moved above the prose): accepted, not doubled.
+            let out = edit_section(&doc, "A", &format!("{region}\n\nnew")).unwrap();
+            assert_eq!(out.matches("<!-- softfig:index notes -->").count(), 1, "{out}");
+            assert!(out.contains("new"));
+            // A hand-edited cell is refused, not silently reverted later.
+            let tampered = region.replace("| 001 | x |", "| 001 | y |");
+            assert_eq!(
+                edit_section(&doc, "A", &format!("new\n\n{tampered}")),
+                Err(SectionError::ManagedRegion)
+            );
+            // So is introducing a region by hand.
+            assert_eq!(
+                edit_section(&doc, "B", "<!-- softfig:queue -->\n\n| q |\n\n<!-- /softfig:queue -->"),
+                Err(SectionError::ManagedRegion)
+            );
+        }
+
+        /// The root `CLAUDE.md` separates sections with `---`; an edit that
+        /// doesn't re-emit it keeps it.
+        #[test]
+        fn edit_keeps_a_trailing_separator() {
+            let doc = "## A\n\nold\n\n---\n\n## B\n\nb\n";
+            let out = edit_section(doc, "A", "new").unwrap();
+            assert_eq!(out, "## A\n\nnew\n\n---\n\n## B\n\nb\n");
+            // A body that brings its own separator doesn't get a second one.
+            let out = edit_section(doc, "A", "new\n\n---").unwrap();
+            assert_eq!(out.matches("---").count(), 1, "{out}");
+            // A setext underline is not a separator.
+            let setext = "## A\n\nTitle\n---\n\n## B\n";
+            assert!(!edit_section(setext, "A", "x").unwrap().contains("---"));
+        }
+
+        #[test]
+        fn a_body_that_repeats_the_heading_does_not_duplicate_it() {
+            let doc = "# T\n\n## Status\n\nold\n";
+            let out = edit_section(doc, "Status", "## Status\n\nnew").unwrap();
+            assert_eq!(out, "# T\n\n## Status\n\nnew\n");
+            let out = add_section("# T\n", "## Notes", "## Notes\n\nfirst").unwrap();
+            assert_eq!(out, "# T\n\n## Notes\n\nfirst\n");
+            assert_eq!(out.matches("## Notes").count(), 1);
+        }
+
+        #[test]
+        fn append_lands_above_a_trailing_region_and_separator() {
+            let doc = "## Refs\n\n- a\n\n<!-- softfig:backlinks -->\n\n_x_\n\n<!-- /softfig:backlinks -->\n";
+            let out = append_to_section(doc, "Refs", "- b").unwrap();
+            assert!(out.starts_with("## Refs\n\n- a\n- b\n\n<!-- softfig:backlinks -->"), "{out}");
+            let doc = "## A\n\n- a\n\n---\n\n## B\n";
+            let out = append_to_section(doc, "A", "- b").unwrap();
+            assert_eq!(out, "## A\n\n- a\n- b\n\n---\n\n## B\n");
+            // A section holding only a region opens its body above it.
+            let doc = "## Idx\n\n<!-- softfig:index notes -->\n\nT\n\n<!-- /softfig:index notes -->\n";
+            let out = append_to_section(doc, "Idx", "lead").unwrap();
+            assert!(out.starts_with("## Idx\n\nlead\n\n<!-- softfig:index notes -->"), "{out}");
+        }
+
+        #[test]
+        fn add_section_refuses_to_introduce_a_region() {
+            assert_eq!(
+                add_section("# T\n", "X", "<!-- softfig:queue -->\n\nq\n\n<!-- /softfig:queue -->"),
+                Err(SectionError::ManagedRegion)
+            );
         }
 
         #[test]

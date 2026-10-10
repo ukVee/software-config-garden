@@ -31,7 +31,7 @@ mod growlight;
 pub(crate) mod index;
 mod log_decision;
 mod log_incident;
-mod managed;
+pub(crate) mod managed;
 mod migrate_config;
 mod numbering;
 mod patch_file;

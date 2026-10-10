@@ -185,7 +185,10 @@ fn tool_defs() -> Vec<Value> {
             "description": "Replace the body of an existing numbered note in place, re-stamping \
                             its '> Last reviewed:' date. Title, slug, and number are immutable — \
                             to 'rename' a note, archive it and add_note a new one. Identify the \
-                            note by its folder + number.",
+                            note by its folder + number. Refused on a note carrying inline \
+                            <vault> regions (you only ever read them as [encrypted], so a \
+                            wholesale swap would destroy them) — edit around them with \
+                            patch_file / edit_section instead.",
             "inputSchema": {
                 "type": "object",
                 "required": ["dir", "id", "body"],
@@ -222,11 +225,19 @@ fn tool_defs() -> Vec<Value> {
             "name": "edit_section",
             "description": "Replace the body of an existing heading-addressed section in ANY \
                             markdown doc (note, CLAUDE.md, decision), keeping the heading line. \
-                            You emit only the new body — never the rest of the file. Address the \
-                            section by its heading text (case-sensitive, level-agnostic): 'Cross-refs' \
-                            or '## Cross-refs' both match; the match must be unique. Refused on \
-                            vault-sealed targets. Prefer this over replace_file for editing one \
-                            section.",
+                            You emit only the new body — never the rest of the file, and never the \
+                            heading itself (a body that opens with it again has it stripped). \
+                            Address the section by its heading text (case-sensitive, \
+                            level-agnostic): 'Cross-refs' or '## Cross-refs' both match; the match \
+                            must be unique. SCOPE: a body with no headings replaces only the \
+                            section's own text, up to its first subsection — subsections are kept, \
+                            so editing a '# Title' intro is safe. A body that contains headings \
+                            replaces the whole section including its subsections (a restructure). \
+                            Daemon-managed <!-- softfig:… --> regions (index tables, backlinks, \
+                            queue tables) inside the replaced text are kept in place — leave them \
+                            out of the body; changing one is refused. A trailing '---' separator \
+                            is kept too. Refused on vault-protected targets. Prefer this over \
+                            replace_file for editing one section.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "heading", "body"],
@@ -243,8 +254,9 @@ fn tool_defs() -> Vec<Value> {
             "name": "append_to_section",
             "description": "Add a row/bullet/line to the end of an existing section's body (before \
                             the next heading) in any markdown doc — the cheap 'add one item' op. \
-                            You emit only the new line(s). Same heading addressing + vault refusal \
-                            as edit_section.",
+                            You emit only the new line(s); they land after the section's last \
+                            content line, above any trailing managed region or '---' separator. \
+                            Same heading addressing + vault refusal as edit_section.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "heading", "text"],
@@ -260,9 +272,11 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "add_section",
             "description": "Append a brand-new section to the end of any markdown doc. The daemon \
-                            stamps the heading line; you emit the heading text + body. Include \
+                            stamps the heading line; you emit the heading text + body (don't repeat \
+                            the heading in the body — a repeated first line is stripped). Include \
                             leading '#'s to set the level ('## Foo' → level 2), else it defaults to \
-                            '##'. The heading must not already exist. Refused on vault-sealed targets.",
+                            '##'. The heading must not already exist. Refused on vault-protected \
+                            targets, and when the body would introduce a managed region.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "heading", "body"],
@@ -532,7 +546,11 @@ fn tool_defs() -> Vec<Value> {
                             set_reviewed (date bumps), log_decision/log_incident/archive/\
                             add_project/refresh_snapshot (their kinds). Reach for replace_file \
                             only when no structural verb fits — e.g. creating or rewriting a \
-                            monolithic CLAUDE.md/instructions.md/refs.md. Commits memory_edit.",
+                            monolithic CLAUDE.md/instructions.md/refs.md. Commits memory_edit. \
+                            Derived managed regions (index tables) are re-derived after the write, \
+                            so the bytes on disk can differ from yours there: the reply's version \
+                            hashes what is on disk, and `rederived` lists any region the daemon \
+                            rewrote — re-read before another whole-file edit.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "content"],
@@ -587,8 +605,13 @@ fn tool_defs() -> Vec<Value> {
                             (narrow it with `anchor`). Exact match only, no whitespace \
                             normalization. `new` may be empty to delete the matched text. \
                             Whole-file CAS via `expected_version` (seed it from read_versions / a \
-                            prior reply). Refused on vault-sealed targets. Whole-section deletion \
-                            is remove_section's job; whole-file deletion is unlink's.",
+                            prior reply). Refused on vault-protected targets, and when the patch \
+                            would change a daemon-managed <!-- softfig:… --> region (index tables \
+                            are derived — change the note they come from; queue tables move only \
+                            through the growlight verbs). The reply's version hashes the bytes on \
+                            disk after the daemon's region upkeep, so chaining it is safe. \
+                            Whole-section deletion is remove_section's job; whole-file deletion \
+                            is unlink's.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "old", "new"],
@@ -942,10 +965,22 @@ fn summarize(name: &str, data: &Value) -> String {
     if let Some(p) = data.get("path").and_then(|v| v.as_str()) {
         // CAS verbs also hand back the post-edit content version (feed it as the
         // next `expected_version`); surface it when present.
-        return match data.get("version").and_then(|v| v.as_str()) {
+        let mut out = match data.get("version").and_then(|v| v.as_str()) {
             Some(v) if !v.is_empty() => format!("{name}: wrote {p}; commit {hash}; version {v}"),
             _ => format!("{name}: wrote {p}; commit {hash}"),
         };
+        // The bytes on disk differ from what was sent in these managed
+        // regions (the daemon re-derived them) — the caller's copy is stale.
+        if let Some(tags) = data.get("rederived").and_then(|v| v.as_array()) {
+            let tags: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
+            if !tags.is_empty() {
+                out.push_str(&format!(
+                    "; daemon re-derived region(s) {} — re-read before a whole-file edit",
+                    tags.join(", ")
+                ));
+            }
+        }
+        return out;
     }
     format!("{name}: commit {hash}")
 }
@@ -1178,6 +1213,18 @@ mod tests {
     #[test]
     fn resolve_tool_rejects_unknown() {
         assert!(resolve_tool("nope", Value::Null).is_err());
+    }
+
+    #[test]
+    fn summarize_names_rederived_regions() {
+        let s = summarize(
+            "replace_file",
+            &json!({ "path": "a/CLAUDE.md", "hash": "h", "version": "v", "rederived": ["index notes"] }),
+        );
+        assert!(s.contains("version v"), "{s}");
+        assert!(s.contains("re-derived region(s) index notes"), "{s}");
+        let s = summarize("patch_file", &json!({ "path": "p", "hash": "h", "version": "v" }));
+        assert!(!s.contains("re-derived"), "{s}");
     }
 
     #[test]

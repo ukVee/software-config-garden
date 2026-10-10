@@ -14,7 +14,10 @@
 //! ```
 //!
 //! Marker lines are HTML comments (invisible when rendered) matched by their
-//! trimmed text. Everything outside the region is byte-preserved across an
+//! trimmed text, and only **outside fenced code blocks** — a spec doc that
+//! shows the marker syntax in a ```` ``` ```` example is documenting a region,
+//! not hosting one, so its example is never rewritten, preserved, or guarded
+//! as daemon state. Everything outside the region is byte-preserved across an
 //! `upsert`/`remove` — the same `split('\n')` / `join("\n")` round-trip
 //! invariant `sections.rs` relies on. The region body is wrapped in one
 //! blank line on each side so the markdown inside still renders.
@@ -29,18 +32,64 @@ pub fn close_marker(tag: &str) -> String {
     format!("<!-- /softfig:{tag} -->")
 }
 
+/// One well-formed region: its tag and the line indices of its two marker
+/// lines (0-based, inclusive).
+pub struct Span {
+    pub tag: String,
+    pub open: usize,
+    pub close: usize,
+}
+
+/// `true` for every line inside a fenced code block, fence lines included.
+fn fence_mask(lines: &[&str]) -> Vec<bool> {
+    let mut in_fence = false;
+    lines
+        .iter()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("```") || t.starts_with("~~~") {
+                in_fence = !in_fence;
+                true
+            } else {
+                in_fence
+            }
+        })
+        .collect()
+}
+
+/// Every well-formed region in `lines`, in document order: an open marker
+/// outside a fence, closed by the first matching close marker outside a
+/// fence. An unterminated open marker isn't a region and is skipped; scanning
+/// resumes after each region's close, so regions never nest. The one scanner
+/// every other function here builds on, so they agree on what a region is.
+pub fn spans_of(lines: &[&str]) -> Vec<Span> {
+    let fenced = fence_mask(lines);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(tag) = (!fenced[i]).then(|| open_tag(lines[i])).flatten() else {
+            i += 1;
+            continue;
+        };
+        let close = close_marker(&tag);
+        let Some(j) = (i + 1..lines.len()).find(|&j| !fenced[j] && lines[j].trim() == close) else {
+            i += 1;
+            continue;
+        };
+        out.push(Span { tag, open: i, close: j });
+        i = j + 1;
+    }
+    out
+}
+
 /// Locate the `(open_line, close_line)` indices of the region tagged `tag`
 /// in `lines` (0-based, the marker lines themselves). `None` unless a
 /// well-formed open line is followed by a matching close line.
 fn locate(lines: &[&str], tag: &str) -> Option<(usize, usize)> {
-    let open = open_marker(tag);
-    let close = close_marker(tag);
-    let open_idx = lines.iter().position(|l| l.trim() == open)?;
-    let close_idx = lines[open_idx + 1..]
-        .iter()
-        .position(|l| l.trim() == close)
-        .map(|rel| open_idx + 1 + rel)?;
-    Some((open_idx, close_idx))
+    spans_of(lines)
+        .into_iter()
+        .find(|s| s.tag == tag)
+        .map(|s| (s.open, s.close))
 }
 
 /// Whether `content` already hosts a region tagged `tag`.
@@ -84,20 +133,10 @@ fn open_tag(line: &str) -> Option<String> {
 /// isn't a region and is skipped, like [`locate`].
 pub fn overlapping_region(content: &str, start: usize, end: usize) -> Option<String> {
     let lines: Vec<&str> = content.split('\n').collect();
-    for (i, line) in lines.iter().enumerate() {
-        let Some(tag) = open_tag(line) else {
-            continue;
-        };
-        let close = close_marker(&tag);
-        let Some(j) = lines[i + 1..].iter().position(|l| l.trim() == close) else {
-            continue;
-        };
-        let close_idx = i + 1 + j;
-        if start < close_idx + 1 && end > i {
-            return Some(tag);
-        }
-    }
-    None
+    spans_of(&lines)
+        .into_iter()
+        .find(|s| start < s.close + 1 && end > s.open)
+        .map(|s| s.tag)
 }
 
 /// Enumerate every well-formed managed region as `(tag, body)` in document
@@ -107,28 +146,55 @@ pub fn overlapping_region(content: &str, start: usize, end: usize) -> Option<Str
 /// open marker isn't a region and is skipped, like [`locate`].
 pub fn regions(content: &str) -> Vec<(String, String)> {
     let lines: Vec<&str> = content.split('\n').collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let Some(tag) = open_tag(lines[i]) else {
-            i += 1;
-            continue;
-        };
-        let close = close_marker(&tag);
-        let Some(j) = lines[i + 1..].iter().position(|l| l.trim() == close) else {
-            i += 1;
-            continue;
-        };
-        let close_idx = i + 1 + j;
-        let mut body = &lines[i + 1..close_idx];
-        while body.first().is_some_and(|l| l.trim().is_empty()) {
-            body = &body[1..];
+    spans_of(&lines)
+        .into_iter()
+        .map(|s| {
+            let mut body = &lines[s.open + 1..s.close];
+            while body.first().is_some_and(|l| l.trim().is_empty()) {
+                body = &body[1..];
+            }
+            while body.last().is_some_and(|l| l.trim().is_empty()) {
+                body = &body[..body.len() - 1];
+            }
+            (s.tag, body.join("\n"))
+        })
+        .collect()
+}
+
+/// The tags whose region differs between `before` and `after` — a body that
+/// changed, or a region present on one side only — in first-seen order. Empty
+/// iff both carry the same regions with the same bodies in the same order.
+///
+/// The managed-region invariant behind every non-break-glass write verb
+/// (`patch_file`, the section verbs, `batch`'s sub-ops): an edit may move text
+/// around a region, never change one — its content belongs to the daemon
+/// machinery that derives it (index, backlinks) or owns it (the growlight
+/// queue tables). `replace_file` uses it the other way round, to report which
+/// regions the daemon re-derived under a verbatim write.
+pub fn changed_regions(before: &str, after: &str) -> Vec<String> {
+    let (b, a) = (regions(before), regions(after));
+    if b == a {
+        return Vec::new();
+    }
+    let bodies = |rs: &[(String, String)], tag: &str| -> Vec<String> {
+        rs.iter()
+            .filter(|(t, _)| t == tag)
+            .map(|(_, body)| body.clone())
+            .collect()
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (tag, _) in b.iter().chain(a.iter()) {
+        if !out.contains(tag) && bodies(&b, tag) != bodies(&a, tag) {
+            out.push(tag.clone());
         }
-        while body.last().is_some_and(|l| l.trim().is_empty()) {
-            body = &body[..body.len() - 1];
+    }
+    if out.is_empty() {
+        // Same bodies per tag, different order: every region moved.
+        for (tag, _) in &b {
+            if !out.contains(tag) {
+                out.push(tag.clone());
+            }
         }
-        out.push((tag, body.join("\n")));
-        i = close_idx + 1;
     }
     out
 }
@@ -306,6 +372,37 @@ mod tests {
     fn overlapping_region_ignores_unterminated_markers() {
         let doc = "# T\n\n<!-- softfig:index notes -->\n\nno close\n";
         assert_eq!(overlapping_region(doc, 0, 6), None);
+    }
+
+    /// A spec doc that *shows* the marker syntax in a fenced example hosts no
+    /// region: it is neither enumerated, guarded, nor rewritten by `upsert`.
+    #[test]
+    fn markers_inside_fences_are_examples_not_regions() {
+        let doc = "# Spec\n\n```text\n<!-- softfig:index notes -->\n\nEXAMPLE\n\n\
+                   <!-- /softfig:index notes -->\n```\n\nprose\n";
+        assert!(regions(doc).is_empty());
+        assert_eq!(overlapping_region(doc, 0, 12), None);
+        assert!(!has_region(doc, TAG));
+        // upsert appends a real region instead of rewriting the example.
+        let out = upsert(doc, TAG, "REAL");
+        assert!(out.contains("EXAMPLE"), "{out}");
+        assert_eq!(regions(&out), vec![(TAG.to_string(), "REAL".to_string())]);
+    }
+
+    #[test]
+    fn changed_regions_names_edited_added_and_dropped_tags() {
+        let base = upsert(&upsert("# D\n\nx\n", TAG, "A"), "queue", "Q");
+        assert!(changed_regions(&base, &base).is_empty());
+        // Prose around a region may move freely.
+        let moved_prose = base.replace("x\n", "y\n");
+        assert!(changed_regions(&base, &moved_prose).is_empty());
+        // A body change names that tag only.
+        let edited = upsert(&base, "queue", "Q2");
+        assert_eq!(changed_regions(&base, &edited), vec!["queue".to_string()]);
+        // Dropping or introducing a region names it.
+        let dropped = remove(&base, TAG);
+        assert_eq!(changed_regions(&base, &dropped), vec![TAG.to_string()]);
+        assert_eq!(changed_regions(&dropped, &base), vec![TAG.to_string()]);
     }
 
     #[test]

@@ -19,6 +19,13 @@
 //!
 //! ## Guards (shared with the section verbs)
 //!
+//! A patch may never change a daemon-managed `<!-- softfig:… -->` region
+//! (`ManagedRegion` → `BadArgs`): index and backlink tables are re-derived on
+//! every write, so an edit inside one was silently reverted while the verb
+//! reported Ok, and the growlight queue tables are state only their verbs
+//! move. Text around a region is fair game, and a whole-file `old` that
+//! carries the region through unchanged (the TUI editor's save) is fine.
+//!
 //! Same write posture as `sections.rs`: `WorkTree` (mount-safe), vault
 //! refusal via [`load_unprotected`](super::sections::load_unprotected) (a
 //! plaintext rewrite must never clobber ciphertext), whole-file CAS via the
@@ -63,7 +70,7 @@ pub fn patch_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             .map_err(|e| patch_err(&rel, &args.old, args.anchor.as_deref(), e))?
     };
 
-    {
+    let (version, rederived) = {
         let wt = WorkTree::new(daemon, &inner);
         wt.write(&rel, new_content.as_bytes())?;
         // Task 060: a patch is the one verb that can rewrite a note's
@@ -73,9 +80,15 @@ pub fn patch_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // A patch can add/remove `[[…]]` refs like any section edit, so keep
         // the backlink graph consistent before committing (best-effort).
         super::backlinks::refresh_all(&wt, &inner);
-    }
+        // Review 031 D1: the reply's version names the bytes on disk after
+        // that upkeep, not the patch's own output.
+        let on_disk = super::sections::on_disk_after_upkeep(&wt, &rel, &new_content);
+        (
+            edit::content_version(&on_disk),
+            super::managed::changed_regions(&new_content, &on_disk),
+        )
+    };
 
-    let version = edit::content_version(&new_content);
     let mut payload = serde_json::json!({ "path": rel });
     if let Some(summary) = preview(&args.new) {
         payload["summary"] = serde_json::json!(summary);
@@ -89,6 +102,7 @@ pub fn patch_file(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         path: rel.clone(),
         hash: hash.to_string(),
         version,
+        rederived,
     })
     .unwrap();
     note_edit_for_thrash(daemon, inner, &rel, None, args.editor.as_deref());
@@ -130,6 +144,14 @@ pub(crate) fn patch_err(
                 snippet(anchor.unwrap_or(""))
             ),
         ),
+        ManagedRegion => (
+            ErrorKind::BadArgs,
+            format!(
+                "{rel}: the patch would change a daemon-managed <!-- softfig:… --> region — \
+                 index and backlink tables are derived (change the note or link they come \
+                 from), and queue tables move only through the growlight verbs"
+            ),
+        ),
     }
 }
 
@@ -166,6 +188,9 @@ pub mod core {
         AnchorNotFound,
         /// The anchor string occurred more than once in the file.
         AnchorAmbiguous,
+        /// The replacement would change, drop, or introduce a daemon-managed
+        /// `<!-- softfig:… -->` region.
+        ManagedRegion,
     }
 
     /// Replace the single occurrence of `old` with `new` inside the search
@@ -213,6 +238,9 @@ pub mod core {
         out.push_str(&content[..abs_start]);
         out.push_str(new);
         out.push_str(&content[abs_end..]);
+        if !crate::actions::managed::changed_regions(content, &out).is_empty() {
+            return Err(PatchError::ManagedRegion);
+        }
         Ok(out)
     }
 }
@@ -221,6 +249,21 @@ pub mod core {
 mod tests {
     use super::core::PatchError::*;
     use super::core::*;
+
+    /// Review 031 D1: a cell patched inside an index table used to be
+    /// silently re-derived while the verb reported Ok. It is refused now —
+    /// but text around a region, and a whole-file `old` that carries the
+    /// region through unchanged (the TUI save), still patch.
+    #[test]
+    fn managed_regions_are_refused_but_surroundings_patch() {
+        let doc = "# H\n\nprose\n\n<!-- softfig:index notes -->\n\n| 001 | 2026-09-06 |\n\n\
+                   <!-- /softfig:index notes -->\n";
+        assert_eq!(patch(doc, "2026-09-06", "2000-01-01", None), Err(ManagedRegion));
+        assert_eq!(patch(doc, "<!-- /softfig:index notes -->\n", "", None), Err(ManagedRegion));
+        assert!(patch(doc, "prose", "better prose", None).is_ok());
+        let whole_new = doc.replace("prose", "edited");
+        assert_eq!(patch(doc, doc, &whole_new, None).unwrap(), whole_new);
+    }
 
     #[test]
     fn replaces_a_unique_single_line_occurrence() {

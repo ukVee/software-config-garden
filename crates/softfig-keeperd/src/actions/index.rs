@@ -44,6 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
+use softfig_fuse::SealedQuery;
 use softfig_ipc::verbs::{ReindexRegion, ReindexSkip};
 
 use crate::actions::{conventions, managed, WorkTree};
@@ -87,12 +88,34 @@ pub fn refresh_folder_index(
     inner: &DaemonInner,
     folder_rel: &str,
 ) -> Option<String> {
+    refresh_folder_index_with(wt, inner, folder_rel, EmptyFolder::Drop)
+}
+
+/// What a re-derivation does with the region of a folder that holds no
+/// numbered docs. The folder-keyed callers (`archive` of the last note, an add
+/// or revise into the folder) `Drop` it — they are the folder's own lifecycle.
+/// An unrelated edit to the host doc (`refresh_index_for` arm 2) `Keep`s it:
+/// dropping a region is the folder lifecycle's job, so a section edit
+/// elsewhere in a `CLAUDE.md` must not delete a table the caller never
+/// touched. The `migrate reindex` sweep is the explicit repair and drops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmptyFolder {
+    Drop,
+    Keep,
+}
+
+fn refresh_folder_index_with(
+    wt: &WorkTree,
+    inner: &DaemonInner,
+    folder_rel: &str,
+    empty: EmptyFolder,
+) -> Option<String> {
     let host_rel = host_rel(folder_rel)?;
     // Read the host CLAUDE.md only if it exists and is safe to rewrite (not
     // vault-protected). A missing host yields `None` — index maintenance
     // never fabricates a routing doc nor clobbers ciphertext.
     let content = super::sections::read_if_unprotected(wt, inner, &host_rel)?;
-    let new = rederive(wt, &content, folder_rel)?;
+    let new = rederive(wt, inner, &content, folder_rel, empty)?;
     if new == content {
         return None;
     }
@@ -106,14 +129,20 @@ pub fn refresh_folder_index(
 /// re-adding a note recreates it). The only I/O is reading the folder, so the
 /// write-time refresh and the [`plan_reindex`] sweep share one derivation and
 /// cannot render different tables.
-fn rederive(wt: &WorkTree, content: &str, folder_rel: &str) -> Option<String> {
+fn rederive(
+    wt: &WorkTree,
+    inner: &DaemonInner,
+    content: &str,
+    folder_rel: &str,
+    empty: EmptyFolder,
+) -> Option<String> {
     let folder_name = Path::new(folder_rel).file_name()?.to_str()?;
-    let rows = collect_rows(wt, folder_rel);
+    let rows = collect_rows(wt, inner, folder_rel);
     let tag = region_tag(folder_name);
-    Some(if rows.is_empty() {
-        managed::remove(content, &tag)
-    } else {
-        managed::upsert(content, &tag, &render_table(folder_name, &rows))
+    Some(match (rows.is_empty(), empty) {
+        (true, EmptyFolder::Drop) => managed::remove(content, &tag),
+        (true, EmptyFolder::Keep) => content.to_string(),
+        (false, _) => managed::upsert(content, &tag, &render_table(folder_name, &rows)),
     })
 }
 
@@ -138,8 +167,8 @@ fn rederive(wt: &WorkTree, content: &str, folder_rel: &str) -> Option<String> {
 ///    the managed region is corrected rather than persisted.
 ///
 /// Best-effort like the rest of index upkeep: never errors, never fabricates a
-/// region (arm 2 only touches regions whose backing folder exists), and
-/// silently skips vault-protected hosts.
+/// region (arm 2 only touches regions whose backing folder exists and holds
+/// numbered docs), and silently skips vault-protected hosts.
 pub fn refresh_index_for(wt: &WorkTree, inner: &DaemonInner, rel: &str) -> Vec<String> {
     let path = Path::new(rel);
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
@@ -172,10 +201,11 @@ fn indexed_folder_of(rel: &str) -> Option<&str> {
 }
 
 /// Arm 2 of [`refresh_index_for`]: re-derive the `index <folder>` regions host
-/// doc `host_rel` already carries. Each [`refresh_folder_index`] call re-reads
-/// the host, so a doc with both a `notes/` and a `troubleshooting/` table lands
-/// both. Regions whose backing folder is absent are left untouched — dropping
-/// one is `archive`'s job, not an unrelated edit's.
+/// doc `host_rel` already carries. Each refresh re-reads the host, so a doc
+/// with both a `notes/` and a `troubleshooting/` table lands both. Regions
+/// whose backing folder is absent or empty are left untouched
+/// ([`EmptyFolder::Keep`]) — dropping one is `archive`'s job, not an unrelated
+/// edit's.
 fn refresh_host_regions(
     wt: &WorkTree,
     inner: &DaemonInner,
@@ -188,7 +218,9 @@ fn refresh_host_regions(
     host_region_folders(wt, &content, host_dir)
         .into_iter()
         .filter_map(|(_, folder)| folder.ok())
-        .filter_map(|folder_rel| refresh_folder_index(wt, inner, &folder_rel))
+        .filter_map(|folder_rel| {
+            refresh_folder_index_with(wt, inner, &folder_rel, EmptyFolder::Keep)
+        })
         .collect()
 }
 
@@ -211,11 +243,18 @@ fn host_region_folders(
                 return None;
             }
             let folder_rel = if host_dir.is_empty() {
-                folder
+                folder.clone()
             } else {
                 format!("{host_dir}/{folder}")
             };
-            let verdict = if !conventions::is_indexed_dir(&folder_rel) {
+            // The tag comes from file *content*, so it is untrusted: an index
+            // region only ever names a sibling folder of its host, i.e. one
+            // plain path component. `../../x/notes` passes the basename genre
+            // check below and would otherwise steer the derivation's reads and
+            // the host rewrite outside the concept dir (review 031 D2).
+            let verdict = if !is_single_component(&folder) {
+                Err("folder is not a single path component — left as-is")
+            } else if !conventions::is_indexed_dir(&folder_rel) {
                 Err("not an indexed folder genre — left as-is")
             } else if !wt.is_dir(&folder_rel) {
                 Err("backing folder absent — left as-is (dropping a region is `archive`'s job)")
@@ -227,12 +266,21 @@ fn host_region_folders(
         .collect()
 }
 
+/// Whether `s` is exactly one normal path component — no separator, not `.`
+/// or `..`. The shape of an `index <folder>` tag's folder.
+fn is_single_component(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\')
+}
+
 // ---- migrate_reindex sweep ------------------------------------------------
 
 /// One host doc the [`plan_reindex`] sweep would rewrite: its re-derived
 /// content plus the row-level drift per region, for the report.
 pub struct HostReindex {
     pub host: String,
+    /// The host's bytes as planned against — what an interrupted apply
+    /// restores, so a refused write can't leave half the sweep staged.
+    pub original: String,
     pub content: String,
     pub regions: Vec<ReindexRegion>,
 }
@@ -263,6 +311,22 @@ pub fn plan_reindex(wt: &WorkTree, inner: &DaemonInner) -> (Vec<HostReindex>, Ve
             .parent()
             .and_then(|p| p.to_str())
             .unwrap_or("");
+        // A host the worktree would refuse to write (e.g. inside a shared
+        // subtree whose key ceremony hasn't run) is reported, not planned —
+        // planning it would make `--apply` fail after staging the hosts
+        // before it.
+        if let Err((_, why)) = wt.check_write(&host) {
+            for (tag, _) in managed::regions(&original) {
+                if tag.starts_with("index ") {
+                    skipped.push(ReindexSkip {
+                        host: host.clone(),
+                        region: tag,
+                        reason: format!("host not writable — {why}"),
+                    });
+                }
+            }
+            continue;
+        }
         let mut content = original.clone();
         let mut regions = Vec::new();
         for (tag, folder) in host_region_folders(wt, &original, host_dir) {
@@ -277,7 +341,7 @@ pub fn plan_reindex(wt: &WorkTree, inner: &DaemonInner) -> (Vec<HostReindex>, Ve
                     continue;
                 }
             };
-            let Some(next) = rederive(wt, &content, &folder_rel) else {
+            let Some(next) = rederive(wt, inner, &content, &folder_rel, EmptyFolder::Drop) else {
                 continue;
             };
             let (removed, added) = row_drift(
@@ -297,6 +361,7 @@ pub fn plan_reindex(wt: &WorkTree, inner: &DaemonInner) -> (Vec<HostReindex>, Ve
         if content != original {
             hosts.push(HostReindex {
                 host,
+                original,
                 content,
                 regions,
             });
@@ -331,18 +396,30 @@ fn row_drift(before: Option<&str>, after: Option<&str>) -> (Vec<String>, Vec<Str
 /// last. Each row carries the note's number, `# ` title (falling back to its
 /// filename slug), and `Last reviewed:` date (empty if unstamped). Reads run
 /// through the [`WorkTree`] so a FUSE-mode commit never stats the mount.
-fn collect_rows(wt: &WorkTree, folder_rel: &str) -> Vec<Row> {
+///
+/// Rows are derived from the **read projection**, not the working-tree
+/// plaintext: the host `CLAUDE.md` is usually unsealed, so a title copied out
+/// of a sealed note would publish it in the clear (review 031 posture 3). A
+/// whole-file-sealed note renders as [`SEALED_TITLE`] with no date; a note
+/// with inline `<vault>` regions is read through the same redaction
+/// `read_file` applies, so a title inside a region shows as `[encrypted]`.
+fn collect_rows(wt: &WorkTree, inner: &DaemonInner, folder_rel: &str) -> Vec<Row> {
     let mut rows = Vec::new();
     for entry in wt.read_dir(folder_rel) {
         let Some(number) = conventions::parse_note_number(&entry.name) else {
             continue;
         };
-        let content = wt
-            .read_to_string(&format!("{folder_rel}/{}", entry.name))
-            .unwrap_or_default();
-        let title = conventions::note_title(&content)
-            .unwrap_or_else(|| conventions::slug_from_note_name(&entry.name));
-        let reviewed = conventions::note_reviewed(&content).unwrap_or_default();
+        let note_rel = format!("{folder_rel}/{}", entry.name);
+        let (title, reviewed) = if inner.layer_b.snapshot().is_sealed(&note_rel) {
+            (SEALED_TITLE.to_string(), String::new())
+        } else {
+            let bytes = wt.read(&note_rel).unwrap_or_default();
+            let content =
+                String::from_utf8(inner.layer_b.redact_regions(&note_rel, bytes)).unwrap_or_default();
+            let title = conventions::note_title(&content)
+                .unwrap_or_else(|| conventions::slug_from_note_name(&entry.name));
+            (title, conventions::note_reviewed(&content).unwrap_or_default())
+        };
         rows.push(Row {
             number,
             title,
@@ -353,6 +430,10 @@ fn collect_rows(wt: &WorkTree, folder_rel: &str) -> Vec<Row> {
     rows.sort_by_key(|r| r.number);
     rows
 }
+
+/// The index title of a whole-file-sealed note — its number and link still
+/// render (filenames are not sealed), its heading does not.
+const SEALED_TITLE: &str = "(sealed)";
 
 /// The fixed first two lines of every rendered index table.
 const TABLE_HEADER: &str = "| # | Note | Reviewed |";
@@ -536,6 +617,20 @@ mod tests {
         assert_eq!(indexed_folder_of("journal/decisions/001-a.md"), None);
         assert_eq!(indexed_folder_of("services/waydroid/CLAUDE.md"), None);
         assert_eq!(indexed_folder_of(""), None);
+    }
+
+    /// Review 031 D2: an index tag's folder is content, so it must be one
+    /// plain component before it is joined onto the host dir.
+    #[test]
+    fn region_folder_must_be_a_single_component() {
+        assert!(is_single_component("notes"));
+        assert!(is_single_component("code-reviews"));
+        assert!(!is_single_component(""));
+        assert!(!is_single_component("."));
+        assert!(!is_single_component(".."));
+        assert!(!is_single_component("../../etc/notes"));
+        assert!(!is_single_component("a/notes"));
+        assert!(!is_single_component("..\\notes"));
     }
 
     #[test]

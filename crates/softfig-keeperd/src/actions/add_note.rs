@@ -197,10 +197,11 @@ pub fn revise_note(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         ))?;
 
         // Preserve the title (immutable). Re-stamp the reviewed date and swap
-        // the body wholesale — header/slug/number are left untouched.
-        let existing = wt
-            .read_to_string(&note_rel)
-            .ok_or((ErrorKind::Io, format!("read {note_rel}: not found")))?;
+        // the body wholesale — header/slug/number are left untouched. A note
+        // with inline `<vault>` regions is refused: the caller only ever read
+        // them as `[encrypted]`, so a wholesale body swap can only destroy
+        // them.
+        let existing = super::sections::load_for_body_swap(&wt, &inner, &note_rel)?;
         let filename = Path::new(&note_rel)
             .file_name()
             .and_then(|s| s.to_str())

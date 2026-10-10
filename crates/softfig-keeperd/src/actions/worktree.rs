@@ -63,16 +63,45 @@ impl<'a> WorkTree<'a> {
         }
     }
 
-    fn abs(garden_root: &Path, rel: &str) -> PathBuf {
-        garden_root.join(rel)
+    /// `rel` joined onto the garden root, or `None` when `rel` is not a plain
+    /// garden-relative path (see [`is_garden_rel`]). Every `Disk` touch goes
+    /// through here, so no caller-supplied string — a verb arg, or a folder
+    /// name read out of a managed-region tag — can reach outside the garden.
+    fn abs(garden_root: &Path, rel: &str) -> Option<PathBuf> {
+        is_garden_rel(rel).then(|| garden_root.join(rel))
+    }
+
+    /// The write-side refusal for a non-garden-relative `rel` (both backends:
+    /// the FUSE overlay is keyed by the string, so a `..` there would stage a
+    /// tree entry no path can name).
+    fn require_garden_rel(rel: &str) -> ActionResult {
+        if is_garden_rel(rel) {
+            Ok(())
+        } else {
+            Err((
+                ErrorKind::BadArgs,
+                format!("{rel:?}: not a garden-relative path (no `..`, root, or prefix components)"),
+            ))
+        }
+    }
+
+    /// Every check [`write`](Self::write) applies before it touches anything —
+    /// the path shape and the key-before-content refusal — without writing.
+    /// Multi-file verbs (`batch`, the reindex sweep) run this over every target
+    /// before the first write, so a refusal can't land half their writes.
+    pub fn check_write(&self, rel: &str) -> ActionResult {
+        Self::require_garden_rel(rel)?;
+        self.refuse_unkeyed_shared(rel)
     }
 
     /// Working-tree bytes for repo-relative `rel`, or `None` if absent /
     /// unreadable / a directory.
     pub fn read(&self, rel: &str) -> Option<Vec<u8>> {
         match self {
-            WorkTree::Disk { garden_root, .. } => std::fs::read(Self::abs(garden_root, rel)).ok(),
-            WorkTree::Fuse { mount } => mount.read_workfile(rel).ok().flatten(),
+            WorkTree::Disk { garden_root, .. } => std::fs::read(Self::abs(garden_root, rel)?).ok(),
+            WorkTree::Fuse { mount } => {
+                is_garden_rel(rel).then(|| mount.read_workfile(rel).ok().flatten())?
+            }
         }
     }
 
@@ -84,26 +113,36 @@ impl<'a> WorkTree<'a> {
     /// Whether `rel` resolves to a live file or directory.
     pub fn exists(&self, rel: &str) -> bool {
         match self {
-            WorkTree::Disk { garden_root, .. } => Self::abs(garden_root, rel).exists(),
-            WorkTree::Fuse { mount } => mount.path_exists(rel),
+            WorkTree::Disk { garden_root, .. } => {
+                Self::abs(garden_root, rel).is_some_and(|p| p.exists())
+            }
+            WorkTree::Fuse { mount } => is_garden_rel(rel) && mount.path_exists(rel),
         }
     }
 
     /// Whether `rel` is a directory.
     pub fn is_dir(&self, rel: &str) -> bool {
         match self {
-            WorkTree::Disk { garden_root, .. } => Self::abs(garden_root, rel).is_dir(),
-            WorkTree::Fuse { mount } => mount.path_is_dir(rel),
+            WorkTree::Disk { garden_root, .. } => {
+                Self::abs(garden_root, rel).is_some_and(|p| p.is_dir())
+            }
+            WorkTree::Fuse { mount } => is_garden_rel(rel) && mount.path_is_dir(rel),
         }
     }
 
     /// One-level children of directory `rel` (`""` = garden root). Empty when
     /// the directory is absent. Order is unspecified — callers sort.
     pub fn read_dir(&self, rel: &str) -> Vec<DirEntry> {
+        if !is_garden_rel(rel) {
+            return Vec::new();
+        }
         match self {
             WorkTree::Disk { garden_root, .. } => {
                 let mut out = Vec::new();
-                if let Ok(rd) = std::fs::read_dir(Self::abs(garden_root, rel)) {
+                let Some(abs) = Self::abs(garden_root, rel) else {
+                    return out;
+                };
+                if let Ok(rd) = std::fs::read_dir(abs) {
                     for e in rd.flatten() {
                         let Ok(name) = e.file_name().into_string() else {
                             continue;
@@ -150,10 +189,10 @@ impl<'a> WorkTree<'a> {
     /// register the path for self-write suppression so the watcher drops the
     /// event, then write. FUSE: stage into the overlay (no kernel event).
     pub fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
-        self.refuse_unkeyed_shared(rel)?;
+        self.check_write(rel)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
-                let abs = Self::abs(garden_root, rel);
+                let abs = garden_root.join(rel);
                 daemon.mark_self_write(abs.clone());
                 super::write_file(&abs, bytes)
             }
@@ -170,11 +209,12 @@ impl<'a> WorkTree<'a> {
     /// key-before-content refusal (m5f slice 001); the source side stays
     /// unguarded — moving *out* of an unkeyed share adds no blob to it.
     pub fn rename(&self, from: &str, to: &str) -> ActionResult {
-        self.refuse_unkeyed_shared(to)?;
+        Self::require_garden_rel(from)?;
+        self.check_write(to)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
-                let from_abs = Self::abs(garden_root, from);
-                let to_abs = Self::abs(garden_root, to);
+                let from_abs = garden_root.join(from);
+                let to_abs = garden_root.join(to);
                 daemon.mark_self_write(from_abs.clone());
                 daemon.mark_self_write(to_abs.clone());
                 if let Some(parent) = to_abs.parent() {
@@ -198,9 +238,10 @@ impl<'a> WorkTree<'a> {
     /// caller today; a removal carries no key-before-content concern (it strips
     /// a blob, never adds one), so no `refuse_unkeyed_shared` guard is needed.
     pub fn remove(&self, rel: &str) -> ActionResult {
+        Self::require_garden_rel(rel)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
-                let abs = Self::abs(garden_root, rel);
+                let abs = garden_root.join(rel);
                 daemon.mark_self_write(abs.clone());
                 if abs.is_dir() {
                     std::fs::remove_dir_all(&abs)
@@ -219,6 +260,21 @@ impl<'a> WorkTree<'a> {
             }
         }
     }
+}
+
+/// Whether `rel` is a plain garden-relative path: `""` (the garden root) or
+/// only normal components (`.` allowed). `..`, an absolute path, or a Windows
+/// prefix is refused. Verb args are validated upstream by
+/// `validate_repo_path`, but not every `rel` a verb touches comes from an arg —
+/// task 060's index upkeep reads folder names out of `<!-- softfig:index … -->`
+/// tags in file *content* — so the worktree enforces the shape itself (review
+/// 031 D2: a `../../x/notes` tag read and wrote outside the garden in Disk
+/// mode).
+pub fn is_garden_rel(rel: &str) -> bool {
+    use std::path::Component;
+    Path::new(rel)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 /// The minimal working-tree surface a `.seq`-numbered doc store needs: read a

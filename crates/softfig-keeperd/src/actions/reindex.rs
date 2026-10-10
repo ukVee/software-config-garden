@@ -39,9 +39,19 @@ pub fn migrate_reindex(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
     let mut hash = None;
     if args.apply && !hosts.is_empty() {
         {
+            // Planning already ran `check_write` over every host, so a write
+            // here can only fail on I/O. If one does, restore the hosts
+            // written before it: the sweep is all-or-nothing, and a staged
+            // half would otherwise ride the next unrelated commit under the
+            // wrong intent (review 031 gap 3).
             let wt = WorkTree::new(daemon, &inner);
-            for h in &hosts {
-                wt.write(&h.host, h.content.as_bytes())?;
+            for (i, h) in hosts.iter().enumerate() {
+                if let Err(e) = wt.write(&h.host, h.content.as_bytes()) {
+                    for done in &hosts[..i] {
+                        let _ = wt.write(&done.host, done.original.as_bytes());
+                    }
+                    return Err(e);
+                }
             }
         }
         let payload = serde_json::json!({

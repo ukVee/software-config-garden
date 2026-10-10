@@ -1299,7 +1299,7 @@ impl App {
             // the editor's CAS token + pristine copy; a conflict / refusal
             // keeps the buffer + dirty flag.
             Tag::EditorSave { path } => {
-                self.apply_editor_save_reply(reply.id, &path, reply.result)
+                self.apply_editor_save_reply(reply.id, &path, reply.result, ipc)
             }
             Tag::History => match reply.result {
                 Ok(v) => {
@@ -3120,6 +3120,7 @@ impl App {
         id: crate::ipc::ReqId,
         path: &str,
         result: Result<Value, (ErrorKind, String)>,
+        ipc: &mut IpcClient,
     ) {
         // Inert unless this is the one pending request (a stale or reordered
         // reply must never rebase a newer save).
@@ -3130,10 +3131,12 @@ impl App {
         let pending = self.pending_save.take().expect("checked above");
         match result {
             Ok(v) => {
-                let version = serde_json::from_value::<PatchFileReply>(v)
-                    .ok()
-                    .map(|r| r.version)
+                let reply = serde_json::from_value::<PatchFileReply>(v).ok();
+                let version = reply
+                    .as_ref()
+                    .map(|r| r.version.clone())
                     .filter(|v| !v.is_empty());
+                let rederived = reply.map(|r| r.rederived).unwrap_or_default();
                 let mut matched = false;
                 let mut still_dirty = false;
                 if let Some(ed) = self.editor.as_mut().filter(|e| e.path == path) {
@@ -3149,6 +3152,26 @@ impl App {
                 if pending.then_exit && matched && !still_dirty {
                     self.editor = None;
                     self.view = View::Browse;
+                } else if matched && !rederived.is_empty() {
+                    // The daemon re-derived managed regions under the save, so
+                    // the file on disk is not what was sent: the editor's
+                    // pristine copy is stale and the next whole-file patch
+                    // would miss. Reload a clean buffer; keep a dirty one and
+                    // say why its next save will need a re-open.
+                    let tags = rederived.join(", ");
+                    if still_dirty {
+                        self.status = format!(
+                            "saved — the daemon re-derived {tags}; newer edits sit on a stale \
+                             copy, so copy them out and reopen before saving again"
+                        );
+                    } else {
+                        self.status = format!("saved — the daemon re-derived {tags}; reloading");
+                        ipc.send(
+                            "read_file",
+                            json!({ "path": path }),
+                            Tag::EditorReadFile { path: path.to_string() },
+                        );
+                    }
                 }
             }
             Err((kind, m)) => self.status = save_error_status(kind, &m),

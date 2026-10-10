@@ -535,10 +535,18 @@ pub struct ReplaceFileReply {
     /// Garden-relative path the daemon wrote.
     pub path: String,
     pub hash: String,
-    /// The whole-file content version after the write — feed it back as the
-    /// next `expected_version` to chain CAS-guarded rewrites without re-reading.
+    /// The whole-file content version of the bytes on disk after the write
+    /// (managed regions re-derived included) — feed it back as the next
+    /// `expected_version` to chain CAS-guarded rewrites without re-reading.
     #[serde(default)]
-    pub version: String,
+    pub version: String,    /// Managed `<!-- softfig:… -->` regions (by tag) the daemon re-derived
+    /// under this write, so the bytes on disk differ from what the caller
+    /// wrote in exactly these regions. `version` already hashes the on-disk
+    /// bytes; a caller holding its own copy of the file re-reads before its
+    /// next whole-file edit. Empty (and omitted on the wire) in the common
+    /// case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rederived: Vec<String>,
 }
 
 /// Daemon-orchestrated phase 3 of `softfig migrate`. Empty args; the
@@ -850,7 +858,14 @@ pub struct DocEditReply {
     /// the whole-file version. `#[serde(default)]` keeps older clients
     /// wire-compatible.
     #[serde(default)]
-    pub version: String,
+    pub version: String,    /// Managed `<!-- softfig:… -->` regions (by tag) the daemon re-derived
+    /// under this write, so the bytes on disk differ from what the caller
+    /// wrote in exactly these regions. `version` already hashes the on-disk
+    /// bytes; a caller holding its own copy of the file re-reads before its
+    /// next whole-file edit. Empty (and omitted on the wire) in the common
+    /// case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rederived: Vec<String>,
 }
 
 /// `archive({src, archive_name?}) -> {from, to, hash}`.
@@ -1057,11 +1072,18 @@ pub struct PatchFileReply {
     /// Garden-relative path the daemon patched.
     pub path: String,
     pub hash: String,
-    /// Phase 3 CAS: the whole-file content version after the patch — feed it
-    /// back as the next `expected_version` to chain patches without
-    /// re-reading.
+    /// Phase 3 CAS: the whole-file content version of the bytes on disk after
+    /// the patch and the daemon's region upkeep — feed it back as the next
+    /// `expected_version` to chain patches without re-reading.
     #[serde(default)]
-    pub version: String,
+    pub version: String,    /// Managed `<!-- softfig:… -->` regions (by tag) the daemon re-derived
+    /// under this write, so the bytes on disk differ from what the caller
+    /// wrote in exactly these regions. `version` already hashes the on-disk
+    /// bytes; a caller holding its own copy of the file re-reads before its
+    /// next whole-file edit. Empty (and omitted on the wire) in the common
+    /// case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rederived: Vec<String>,
 }
 
 /// `remove_section({path, heading, expected_version?, editor?}) ->
