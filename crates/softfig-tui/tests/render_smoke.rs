@@ -643,7 +643,7 @@ fn renders_live_fleet_header_from_status_poll() {
             { "id": "a", "status": "running", "running": true },
             {
                 "id": "b", "status": "running", "running": true,
-                "backend": "opencode", "model": "deepseek/deepseek-v4-flash",
+                "backend": "opencode", "model": "deepseek/deepseek-flash",
                 "spend": { "micro_usd": 140000, "steps": 3 }
             }
         ]

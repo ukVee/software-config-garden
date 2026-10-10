@@ -22,33 +22,42 @@ agent = "a"                              # backend omitted ⇒ claude
 [[fleet]]
 agent   = "b"
 backend = "opencode"                     # claude (default) | opencode
-model   = "deepseek/deepseek-v4-flash"   # opencode only; omit to let opencode choose
+model   = "deepseek/deepseek-flash"      # opencode only; REQUIRED — no model ⇒ refused
 variant = "high"                         # opencode only; optional
 ```
 
 `backend` defaults to `claude`, so a config written before this existed keeps running
 exactly as it did — there is no migration.
 
-`model` / `variant` ride the **generated opencode config**, not argv. growlightd writes
-each opencode member's `opencode.json` fresh on every spawn, so the model a member runs
-on and the permission map that member was granted are written by one act and cannot
-drift apart.
+`model` / `variant` ride **argv** (`--model provider/model[#variant]`), not the generated
+config. opencode 2.x `run` ignores `agent.<id>.model` entirely, and argv is the one model
+source that fails closed on a bad id (opencode-v2-repin slice 001, L5 + L7), so the config
+carries no model key at all. The member's `opencode.json` (still written fresh per spawn,
+still holding the permission map) and the argv are built by the same spawn path, so the
+model a member runs on and the permission map that member was granted cannot drift apart.
 
 ## What is refused
 
-Three config mistakes are reported and refused at arm time rather than defaulted. All
-three are the same hazard — **a member running on a pool the operator did not choose** —
+Four config mistakes are reported and refused at arm time rather than defaulted. All
+four are the same hazard — **a member running on a pool the operator did not choose** —
 and a fleet that silently ran claude while its operator believed it was on DeepSeek would
 burn the Anthropic subscription without anyone noticing:
 
 | Written | Result |
 |---|---|
 | `backend = "opencde"` (any unknown value) | refused, naming the member and the valid backends |
+| `backend = "opencode"` with no `model` | refused — on 2.x a member with no model would run on opencode's own default provider, which the operator never chose |
 | `model = "…"` with no `backend = "opencode"` | refused — those keys are opencode-only |
 | `backends = "opencode"` (any unknown key) | refused — a dropped typo would silently mean claude |
 
 A refusal fails **closed**: growlightd logs the message and the fleet stays disarmed. A
 config problem can never arm a fleet, let alone arm one onto the wrong provider.
+
+Each opencode member also launches on a **private server** (`opencode run --standalone`),
+a child that lives and dies inside the member's own transient scope. Without the flag the
+member's tools would run in the per-user shared service, which ignores the client's
+`OPENCODE_CONFIG` — the member would silently run as the built-in `build` agent with
+allow-all permissions and every global grant (opencode-v2-repin slice 001, finding 1).
 
 ## What each backend contributes to admission
 
@@ -87,11 +96,11 @@ roster:
   b                (fallback)
 agents:
   a                running      claude
-  b                running      opencode · deepseek/deepseek-v4-flash (high) · $0.14 this session (3 steps)
+  b                running      opencode · deepseek/deepseek-flash (high) · $0.14 this session (3 steps)
 ```
 
 The TUI fleet panel carries the same reading, terser (`b:running · opencode ·
-deepseek/deepseek-v4-flash · $0.14`).
+deepseek/deepseek-flash · $0.14`).
 
 Note what a **claude** row does *not* show: a dollar figure. There is no per-member
 reserve or spend column at all, and that is the design, not an omission. A claude

@@ -3337,12 +3337,12 @@ mod tests {
         // "opencode · <model> · $0.14 this session" instead of showing an empty
         // Anthropic reserve gauge and looking broken.
         let metered = AgentSummary::new("b", "running", true).on_opencode(
-            Some("deepseek/deepseek-v4-flash (high)".into()),
+            Some("deepseek/deepseek-flash (high)".into()),
             AgentSpendSummary { micro_usd: 140_000, steps: 3 },
         );
         assert_eq!(
             agent_accounting(&metered),
-            "opencode · deepseek/deepseek-v4-flash (high) · $0.14 this session (3 steps)",
+            "opencode · deepseek/deepseek-flash (high) · $0.14 this session (3 steps)",
         );
 
         // A subscription member ends at its backend name. The absence is the point:

@@ -186,7 +186,7 @@ softfig growlight init                                           # growlight Pha
 softfig growlight start [--no-launch] [--garden-root P] [--config-dir P]  # growlight Phase 2b — set up the runtime + launch the loop agent
 softfig growlight start [--backend claude|opencode] [--opencode] [--model <spec>]  # semi-auto-backend-seam — choose backend + model
     # <spec> = claude | reasoning | flash | auto | provider/model, with an optional ` variant=<v>` tail (alias ` effort=<v>`; opencode only).
-    #   reasoning = deepseek/deepseek-v4-pro · flash = deepseek/deepseek-v4-flash (the default whenever opencode is chosen without a model).
+    #   reasoning = deepseek/deepseek-v4-pro · flash = deepseek/deepseek-flash (the default whenever opencode is chosen without a model).
     #   auto ("let growlight decide") = use the model the ACTIVE backlog item declares in its `> Model:` line — the active slice doc, else the
     #     milestone doc, else flash. A malformed declaration is reported and defaulted, never a launch failure.
     # No selector on a TTY brings up the 1/2/3/4 picker; the three selectors are mutually exclusive; non-TTY / --auto / --no-launch never prompt

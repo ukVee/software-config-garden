@@ -66,5 +66,5 @@ fleet_enabled = false
 # [[fleet]]
 # agent   = "b"
 # backend = "opencode"                     # claude (default) | opencode
-# model   = "deepseek/deepseek-v4-flash"   # opencode only
+# model   = "deepseek/deepseek-flash"      # opencode only; REQUIRED (no model ⇒ refused)
 # variant = "high"                         # opencode only, optional
