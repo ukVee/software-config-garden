@@ -145,7 +145,7 @@ fn read_view_host(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::actions::growlight::v2::{state, views};
     use crate::actions::WorkTree;
@@ -163,8 +163,8 @@ mod tests {
     /// An unlocked Disk-mode daemon over a fresh tempdir garden: no FUSE, so
     /// the worktree reads/writes go to disk and `commit_now` walks the
     /// working tree. Built through the real unlock path, like the ceremony
-    /// tests.
-    fn unlocked(garden: &std::path::Path) -> Daemon {
+    /// tests. Shared by the slice-004 verb tests (`queue_verbs`).
+    pub(crate) fn unlocked(garden: &std::path::Path) -> Daemon {
         let mut params = VaultParams::default();
         params.argon2.m_cost = 8;
         params.argon2.t_cost = 1;

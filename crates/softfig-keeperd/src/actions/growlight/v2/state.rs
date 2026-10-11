@@ -23,9 +23,7 @@ use softfig_store::Hash;
 use crate::actions::{sections, WorkTree};
 use crate::daemon::DaemonInner;
 
-pub use softfig_ipc::queue_v2::{
-    milestone_path, slices_file, MILESTONES_DIR, QUEUE_ARCHIVE_FILE, QUEUE_FILE,
-};
+pub use softfig_ipc::queue_v2::{milestone_path, slices_file, QUEUE_ARCHIVE_FILE, QUEUE_FILE};
 /// A v2 file that exists but could not be loaded. Every variant is typed and
 /// carries the file's path. The verbs (slices 004–006) map these onto an
 /// internal-error refusal: the §6.8 codes describe state the verb can *act
@@ -121,6 +119,9 @@ pub fn load_queue_state(
 
 /// Load one milestone's `slices.toml` (§3.3). `Ok(None)` = the file does not
 /// exist (a milestone with no slices yet — and no view, §3.4).
+// Slice 006's `slice_insert`/`slice_update` are its first non-test callers;
+// until then only the slice-004 tests load slices back.
+#[allow(dead_code)]
 pub fn load_slices(
     wt: &WorkTree,
     inner: &DaemonInner,

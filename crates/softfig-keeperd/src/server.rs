@@ -201,6 +201,8 @@ fn op_is_local_write(op: &str) -> bool {
             | op::ADD_SLICE
             | op::SET_ITEM_STATUS
             | op::REORDER_BACKLOG_ITEM
+            | op::QUEUE_ADD_PROJECT
+            | op::QUEUE_ADD_ENTRY
             | op::GROWLIGHT_SET_RESOURCES
             | op::POST_MESSAGE
             | op::FILE_REPORT
@@ -262,6 +264,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::ADD_SLICE => crate::actions::add_slice(daemon, req.args),
         op::SET_ITEM_STATUS => crate::actions::set_item_status(daemon, req.args),
         op::REORDER_BACKLOG_ITEM => crate::actions::reorder_backlog_item(daemon, req.args),
+        op::QUEUE_ADD_PROJECT => crate::actions::queue_add_project(daemon, req.args),
+        op::QUEUE_ADD_ENTRY => crate::actions::queue_add_entry(daemon, req.args),
         op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
         op::GROWLIGHT_SET_RESOURCES => crate::actions::growlight_set_resources(daemon, req.args),
         op::POST_MESSAGE => crate::actions::post_message(daemon, req.args),

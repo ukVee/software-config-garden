@@ -11,32 +11,21 @@
 //! - [`views`] — the §3.4 derived-view renderers (managed regions in the
 //!   backlog and milestone docs), rendered only when their TOML exists.
 //!
-//! No verbs live here yet — they arrive in slices 004–006, live beside this
-//! module in `actions::growlight`, and call these three. Until then nothing
-//! creates a v2 file, so nothing v2-shaped appears in the live garden (§11)
-//! and the legacy verbs keep running unchanged.
-//!
-//! Staging note: with the verbs still unwritten, every item here is reachable
-//! only from the slice-003 tests, so `dead_code` would flag the lot. The
-//! module-scoped allow below is the same staging pattern `paths.rs` uses for
-//! its scaffolder-only helpers — drop it (and the re-export allows) when the
-//! first verb lands in slice 004.
+//! The §6.8 verbs live beside this module in
+//! [`super::queue_verbs`](super::queue_verbs) (slice 004 onward) and call
+//! these three. Nothing else creates a v2 file, so nothing v2-shaped appears
+//! in the live garden before the first v2 verb runs (§11), and the legacy
+//! verbs keep running unchanged.
 
-#[allow(dead_code)]
 mod state;
-#[allow(dead_code)]
 mod views;
-#[allow(dead_code)]
-mod write;
+// `pub(crate)` (instead of `mod`) so the slice-004 tests reuse the
+// temp-garden harness in `write::tests::unlocked` — keeperd-internal either
+// way.
+pub(crate) mod write;
 
-#[allow(unused_imports)]
-pub use state::{
-    load_queue_state, load_slices, milestone_path, slices_file, LoadedFile, QueueState,
-    V2FileError, MILESTONES_DIR, QUEUE_ARCHIVE_FILE, QUEUE_FILE,
-};
-#[allow(unused_imports)]
+pub use state::{load_queue_state, milestone_path, slices_file, QUEUE_FILE};
 pub use views::{
     queue_view, queue_view_host, slices_view, slices_view_host, QUEUE_V2_TAG, SLICES_V2_TAG,
 };
-#[allow(unused_imports)]
 pub use write::{apply, FileWrite, ViewWrite};

@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::queue_v2::{EntryKind, Lane};
+
 pub mod op {
     pub const STATUS: &str = "status";
     pub const UNLOCK: &str = "unlock";
@@ -246,6 +248,17 @@ pub mod op {
     /// match. Idempotent (a no-op move makes no commit). Commit
     /// `backlog_item_reordered`.
     pub const REORDER_BACKLOG_ITEM: &str = "reorder_backlog_item";
+    /// queue v2 (§6.8 human verb): append a `[[project]]` row to
+    /// `growlight/backlog/queue.toml` — the first v2 file creation, so the
+    /// `softfig:queue-v2` view renders from here on (§3.4). One commit,
+    /// `queue_v2_updated`. `--dry-run` computes + renders, writes nothing.
+    pub const QUEUE_ADD_PROJECT: &str = "queue_add_project";
+    /// queue v2 (§6.8 human verb): create a backlog entry (milestone kind in
+    /// this slice) with its docs, `slices.toml`, the generated `001-plan` slice
+    /// (§4) when no slices are given, and its lane-placed row in
+    /// `queue.toml`. One commit, `queue_v2_updated`. `--dry-run` computes +
+    /// renders, writes nothing.
+    pub const QUEUE_ADD_ENTRY: &str = "queue_add_entry";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2069,6 +2082,109 @@ pub struct ReorderBacklogItemReply {
     pub index: usize,
     /// The queue doc the daemon rewrote (`growlight/backlog/CLAUDE.md`).
     pub path: String,
+    pub hash: String,
+}
+
+/// `queue_add_project({name, repo, main = "main", dry_run}) -> {name, view,
+/// hash}` — queue v2 §6.8. Appends a `[[project]]` row to `queue.toml`; on a
+/// fresh garden this creates the first v2 file, so the `softfig:queue-v2`
+/// view renders from then on (§3.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueAddProjectArgs {
+    /// `[a-z0-9-]+` — the project name entries reference. Refused `bad_name`
+    /// outside the charset, `exists` when already present.
+    pub name: String,
+    /// A local path (`~` allowed) or `host:path`. Non-empty.
+    pub repo: String,
+    /// The branch merges land on; defaults to `"main"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing (§6.9).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueAddProjectReply {
+    pub name: String,
+    /// The projects table after the write (the would-be state on a dry run) —
+    /// what the §6.9 CLI prints. Projects appear in no §3.4 derived view, so
+    /// the reply renders its own.
+    pub view: String,
+    /// Commit hash; on a dry run the untouched tip.
+    pub hash: String,
+}
+
+/// One slice passed to [`QueueAddEntryArgs::slices`] — the §7 sub-milestone
+/// slice shape `{slug, title, body}` (the §6.8 signature leaves the shape
+/// unstated; finding 2 in the milestone doc). Written as the next numbered
+/// slice doc plus its `slices.toml` item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueSliceSpec {
+    /// `[a-z0-9-]+`; the slice's terse filename address (`NNN-<slug>.md`).
+    pub slug: String,
+    /// Slice heading title. Defaults to the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The slice's plan/spec markdown body.
+    pub body: String,
+}
+
+/// `queue_add_entry({kind, slug, title, mission, finish_criteria, project,
+/// lane = "normal", after = [], position = "back", ref?, slices = [],
+/// dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates the docs as
+/// the legacy `add_backlog_item` does, the `slices.toml` (plus the generated
+/// `001-plan` slice when `slices` is empty, §4), and the lane-placed entry
+/// row in `queue.toml` — one commit. This build implements `kind = milestone`
+/// only; `task` and `restack` arrive with the next slice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueAddEntryArgs {
+    /// `milestone | task | restack` (this build: `milestone` only).
+    pub kind: EntryKind,
+    /// `[a-z0-9-]+` — the entry id and, for a milestone, its dir name
+    /// (`milestones/<slug>/`).
+    pub slug: String,
+    /// Human title shown in the queue view + the doc heading.
+    pub title: String,
+    /// Why this entry exists (the doc's `## Mission`).
+    pub mission: String,
+    /// Checkable completion criteria (the doc's `## Finish criteria`).
+    pub finish_criteria: String,
+    /// The owning project's name — must already exist.
+    pub project: String,
+    /// `urgent | normal`; defaults to `normal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
+    /// Ids that must finish first. Each must resolve to a live entry or a
+    /// `done` archive row.
+    #[serde(default)]
+    pub after: Vec<String>,
+    /// `front | back | before | after` (with `ref` for the last two), inside
+    /// the entry's lane. Defaults to `back`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// The reference entry for `before`/`after` placement.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub ref_id: Option<String>,
+    /// Slices to seed `slices.toml` with (each `{slug, title, body}`). Empty
+    /// generates the `001-plan` slice (§4).
+    #[serde(default)]
+    pub slices: Vec<QueueSliceSpec>,
+    /// Compute + validate + render the would-be state, write nothing (§6.9).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueAddEntryReply {
+    /// The entry id (the milestone slug).
+    pub id: String,
+    /// Garden-relative path of the entry's main doc.
+    pub path: String,
+    /// The `softfig:queue-v2` view region body after the write (the would-be
+    /// state on a dry run) — what the §6.9 CLI prints.
+    pub view: String,
+    /// Commit hash; on a dry run the untouched tip.
     pub hash: String,
 }
 
