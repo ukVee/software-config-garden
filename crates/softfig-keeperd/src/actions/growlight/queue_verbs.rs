@@ -1,6 +1,7 @@
 //! The queue v2 §6.8 human verbs — `queue_add_project`, `queue_add_entry`
-//! (all three kinds) and `queue_update_entry` — the v2 writers end to end
-//! (milestone `queue-v2-state`, slices 004–005).
+//! (all three kinds), `queue_update_entry`, `slice_insert`, `slice_update`
+//! and `queue_drop` — the v2 writers end to end (milestone `queue-v2-state`,
+//! slices 004–006).
 //!
 //! Each verb follows [`super::v2::write`]'s contract: load
 //! ([`super::v2::state`]), mutate the in-memory models, validate (the
@@ -22,18 +23,20 @@
 use std::collections::HashSet;
 
 use softfig_ipc::queue_v2::{
-    ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project, QueueArchiveToml,
-    QueueRefusal, QueueToml, SliceItem, SliceKind, SliceStatus, SlicesToml, QUEUE_ARCHIVE_FILE,
+    sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
+    QueueArchiveToml, QueueRefusal, QueueToml, SliceItem, SliceKind, SliceStatus, SlicesToml,
+    QUEUE_ARCHIVE_FILE,
 };
 use softfig_ipc::verbs::{
     QueueAddEntryArgs, QueueAddEntryReply, QueueAddProjectArgs, QueueAddProjectReply,
-    QueueStatusArg, QueueUpdateEntryArgs, QueueUpdateEntryReply,
+    QueueDropArgs, QueueDropReply, QueueStatusArg, QueueUpdateEntryArgs, QueueUpdateEntryReply,
+    SliceInsertArgs, SliceInsertReply, SliceUpdateArgs, SliceUpdateReply,
 };
 use softfig_ipc::ErrorKind;
 
 use super::super::numbering;
 use super::v2::{
-    apply, load_queue_state, milestone_path, queue_view, queue_view_host, slices_file,
+    apply, load_queue_state, load_slices, milestone_path, queue_view, queue_view_host, slices_file,
     slices_view, slices_view_host, FileWrite, ViewWrite, QUEUE_FILE, QUEUE_V2_TAG, SLICES_V2_TAG,
 };
 use super::{conventions, paths, queue, WorkTree};
@@ -495,6 +498,65 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     .unwrap())
 }
 
+/// A restack row built into the live list plus its pending doc write.
+struct RestackStaged {
+    id: String,
+    number: u32,
+    rel: String,
+    content: String,
+}
+
+/// The restack-creation core (§8), shared by `add_restack` (slice 005) and
+/// `queue_drop`'s drop→restack path (slice 006): build the urgent no-branch
+/// row for `project` and insert it at the urgent lane's back, numbered `n`
+/// (the caller numbers, so one verb enqueuing several restacks hands out
+/// distinct numbers before any `.seq` write lands). The doc itself is staged
+/// by the caller (so a dry run can compute the row without writing anything).
+/// The caller proves the project exists before calling — its entry rows
+/// validated on load.
+fn restack_core(
+    wt: &WorkTree,
+    queue: &mut QueueToml,
+    project: &str,
+    number: u32,
+) -> Result<RestackStaged, (ErrorKind, String)> {
+    let tasks_dir = paths::tasks_dir();
+    let slug = format!("restack-{project}");
+    let rel = format!("{tasks_dir}/{}", conventions::note_filename(number, &slug));
+    if wt.exists(&rel) {
+        // A corrupt `.seq` squatting a live slot (write_numbered refuses the
+        // same way); surface it as the spec's `exists` refusal.
+        return Err(refuse(QueueRefusal::Exists {
+            id: format!("{number:03}"),
+        }));
+    }
+    let id = format!("{number:03}");
+    let entry = Entry {
+        id: id.clone(),
+        kind: EntryKind::Restack,
+        title: format!("Restack {project}"),
+        project: project.to_string(),
+        lane: Lane::Urgent,
+        status: EntryStatus::Queued,
+        after: vec![],
+        added: conventions::now_rfc3339(),
+        branch: String::new(),
+        parent: String::new(),
+        base: String::new(),
+        claimed: String::new(),
+        follow_ups: 0,
+    };
+    // §6.8/§8: urgent lane, appended at the urgent lane's back.
+    let idx = place_entry(&queue.entries, Lane::Urgent, &V2Position::Back).map_err(refuse)?;
+    queue.entries.insert(idx, entry);
+    Ok(RestackStaged {
+        id,
+        number,
+        content: restack_doc(project, &conventions::today_hyphen()),
+        rel,
+    })
+}
+
 /// `queue_add_entry`, restack kind (§8): keeperd's half of the auto-restack
 /// enqueue — `project` only, every other arg refused as `BadArgs` (finding 5:
 /// the §6.8 state-refusal list has no code for a shape mismatch). The doc is
@@ -527,45 +589,16 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
-    let tasks_dir = paths::tasks_dir();
-    let (number, task_rel) = {
-        let wt = WorkTree::new(daemon, &inner);
-        let number = numbering::next_number(&wt, &tasks_dir);
-        let slug = format!("restack-{}", args.project);
-        let task_rel = format!("{tasks_dir}/{}", conventions::note_filename(number, &slug));
-        if wt.exists(&task_rel) {
-            return Err(refuse(QueueRefusal::Exists {
-                id: format!("{number:03}"),
-            }));
-        }
-        (number, task_rel)
-    };
-    let id = format!("{number:03}");
-
     let (mut queue, queue_version, archive) = {
         let wt = WorkTree::new(daemon, &inner);
         load_for_add(&wt, &inner, &args.project, &[])?
     };
 
-    let entry = Entry {
-        id: id.clone(),
-        kind: EntryKind::Restack,
-        title: format!("Restack {}", args.project),
-        project: args.project.clone(),
-        lane: Lane::Urgent,
-        status: EntryStatus::Queued,
-        after: vec![],
-        added: conventions::now_rfc3339(),
-        branch: String::new(),
-        parent: String::new(),
-        base: String::new(),
-        claimed: String::new(),
-        follow_ups: 0,
+    let restack = {
+        let wt = WorkTree::new(daemon, &inner);
+        let number = numbering::next_number(&wt, &paths::tasks_dir());
+        restack_core(&wt, &mut queue, &args.project, number)?
     };
-    // §6.8/§8: urgent lane, appended at the urgent lane's back — the
-    // position args were refused above, so the placement is fixed.
-    let idx = place_entry(&queue.entries, Lane::Urgent, &V2Position::Back).map_err(refuse)?;
-    queue.entries.insert(idx, entry);
     queue.validate(&archive).map_err(refuse)?;
 
     let files = [FileWrite {
@@ -581,8 +614,8 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     if args.dry_run {
         let hash = current_tip(&inner)?;
         return Ok(serde_json::to_value(QueueAddEntryReply {
-            id: id.clone(),
-            path: task_rel,
+            id: restack.id,
+            path: restack.rel,
             view,
             hash,
         })
@@ -591,8 +624,13 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
 
     {
         let wt = WorkTree::new(daemon, &inner);
-        let content = restack_doc(&args.project, &conventions::today_hyphen());
-        numbering::write_numbered(&wt, &tasks_dir, number, &task_rel, &content)?;
+        numbering::write_numbered(
+            &wt,
+            &paths::tasks_dir(),
+            restack.number,
+            &restack.rel,
+            &restack.content,
+        )?;
         backlinks::refresh_all(&wt, &inner);
     }
 
@@ -602,7 +640,7 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         "queue_v2_updated",
         serde_json::json!({
             "verb": "queue_add_entry",
-            "id": id,
+            "id": restack.id,
             "kind": "restack",
             "project": args.project,
         }),
@@ -615,8 +653,8 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     )?;
 
     Ok(serde_json::to_value(QueueAddEntryReply {
-        id,
-        path: task_rel,
+        id: restack.id,
+        path: restack.rel,
         view,
         hash: hash.to_string(),
     })
@@ -845,6 +883,438 @@ fn idx_of(queue: &QueueToml, id: &str) -> usize {
         .expect("the entry exists")
 }
 
+// ---- slice_insert -------------------------------------------------------
+
+/// `slice_insert` (§6.8): a numbered slice doc plus its `slices.toml` item,
+/// for a milestone or sub-milestone (`"<parent>/<sub>"`, ≤ 2 deep — §3.3's
+/// nesting bound via `sub_depth`, which refuses deeper as `bad_name`). The
+/// milestone must already have a `slices.toml` (every milestone is born with
+/// one, §4 — a sub-milestone gets its own at its creation); anything else is
+/// `unknown_id`. The item lands at `front | back | before | after` in file
+/// order, which §3.3 defines as the slice order; the `NNN-` filename number
+/// is a stable id only (from the folder's `.seq`, as `add_slice` does today).
+pub fn slice_insert(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: SliceInsertArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("slice_insert args: {e}")))?;
+    if conventions::validate_slug(&args.slug).is_err() {
+        return Err(refuse(QueueRefusal::BadName { name: args.slug.clone() }));
+    }
+    if args.body.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "body must be non-empty".to_string()));
+    }
+    if args.milestone.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "milestone must be non-empty".to_string()));
+    }
+    sub_depth(&args.milestone).map_err(refuse)?;
+    let position = parse_position(args.position.as_deref(), args.ref_id.as_deref())?;
+    let title = args.title.as_deref().unwrap_or(&args.slug);
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let milestone = args.milestone.clone();
+    let slices_dir = format!("{}/slices", milestone_path(&milestone));
+    let (mut model, version) = {
+        let wt = WorkTree::new(daemon, &inner);
+        match load_slices(&wt, &inner, &milestone) {
+            Ok(Some(loaded)) => (loaded.model, loaded.version),
+            Ok(None) => {
+                return Err(refuse(QueueRefusal::UnknownId { id: milestone.clone() }))
+            }
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+
+    let (number, slice_rel) = {
+        let wt = WorkTree::new(daemon, &inner);
+        let number = numbering::next_number(&wt, &slices_dir);
+        let slice_rel = format!("{slices_dir}/{}", conventions::note_filename(number, &args.slug));
+        if wt.exists(&slice_rel) {
+            // A corrupt `.seq` squatting a live slot (write_numbered refuses
+            // the same way); surface it as the spec's `exists` refusal.
+            return Err(refuse(QueueRefusal::Exists {
+                id: format!("{number:03}"),
+            }));
+        }
+        (number, slice_rel)
+    };
+    let id = format!("{number:03}");
+
+    let idx = place_item(&model.items, &position).map_err(refuse)?;
+    model.items.insert(idx, slice_item(number));
+    // Backstop: a corrupt `.seq` whose number collides with a live item id
+    // only surfaces here (item ids are unique per file, §3.3).
+    model.validate(&milestone).map_err(refuse)?;
+
+    let view = slices_view(&model);
+    if args.dry_run {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(SliceInsertReply {
+            milestone,
+            id,
+            path: slice_rel,
+            view,
+            hash,
+        })
+        .unwrap());
+    }
+
+    {
+        let wt = WorkTree::new(daemon, &inner);
+        let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
+        numbering::write_numbered(&wt, &slices_dir, number, &slice_rel, &content)?;
+        backlinks::refresh_all(&wt, &inner);
+    }
+
+    let files = [FileWrite {
+        rel: slices_file(&milestone),
+        expected: version,
+        bytes: model
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+            .into_bytes(),
+    }];
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_updated",
+        serde_json::json!({ "verb": "slice_insert", "milestone": milestone, "id": id }),
+        &files,
+        &[ViewWrite {
+            host: slices_view_host(&milestone),
+            tag: SLICES_V2_TAG,
+            body: Some(view.clone()),
+        }],
+    )?;
+
+    Ok(serde_json::to_value(SliceInsertReply {
+        milestone,
+        id,
+        path: slice_rel,
+        view,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+// ---- slice_update -------------------------------------------------------
+
+/// `slice_update` (§6.8): one atomic edit on a `slices.toml` item — `move`
+/// within file order and/or `status`, applied in that order. The move is
+/// refused `started` for `active`/`done`/`split` items (§6.8: the slice order
+/// is the run order) — the check reads the pre-edit status, so a `status`
+/// change cannot launder a move. `status` takes the human statuses
+/// (`queued` also unblocks and un-defers; `done` resets `follow_ups` to 0,
+/// §3.3); `active`/`split` are refused `daemon_owned`.
+pub fn slice_update(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: SliceUpdateArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("slice_update args: {e}")))?;
+    if args.milestone.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "milestone must be non-empty".to_string()));
+    }
+    if args.id.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "id must be non-empty".to_string()));
+    }
+    // The move's shape (the position keyword + its ref rule) checks before
+    // the lock, like the entry verbs'.
+    let move_pos = match &args.move_spec {
+        Some(m) => Some(parse_position(Some(&m.to), m.ref_id.as_deref())?),
+        None => None,
+    };
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let milestone = args.milestone.clone();
+    let (mut model, version, loaded) = {
+        let wt = WorkTree::new(daemon, &inner);
+        match load_slices(&wt, &inner, &milestone) {
+            Ok(Some(loaded)) => (loaded.model.clone(), loaded.version, loaded.model),
+            Ok(None) => {
+                return Err(refuse(QueueRefusal::UnknownId { id: milestone.clone() }))
+            }
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+    if !model.items.iter().any(|i| i.id == args.id) {
+        return Err(refuse(QueueRefusal::UnknownId { id: args.id.clone() }));
+    }
+
+    // 1. move: within `slices.toml` file order. A self-ref is a shape error
+    // (the legacy reorder RefIsSelf rule).
+    if let Some(pos) = move_pos {
+        if matches!(
+            &pos,
+            V2Position::Before(r) | V2Position::After(r) if r == &args.id
+        ) {
+            return Err((
+                ErrorKind::BadArgs,
+                format!("cannot move slice {:?} relative to itself", args.id),
+            ));
+        }
+        let idx = slice_idx(&model, &args.id);
+        if matches!(
+            model.items[idx].status,
+            SliceStatus::Active | SliceStatus::Done | SliceStatus::Split
+        ) {
+            return Err(refuse(QueueRefusal::Started { id: args.id.clone() }));
+        }
+        let item = model.items.remove(idx);
+        let at = place_item(&model.items, &pos).map_err(refuse)?;
+        model.items.insert(at, item);
+    }
+
+    // 2. status: the human statuses.
+    if let Some(status) = args.status {
+        match status {
+            SliceStatus::Active | SliceStatus::Split => {
+                return Err(refuse(QueueRefusal::DaemonOwned { id: args.id.clone() }))
+            }
+            SliceStatus::Done => {
+                let idx = slice_idx(&model, &args.id);
+                model.items[idx].status = SliceStatus::Done;
+                // §3.3: follow_ups reset to 0 on done.
+                model.items[idx].follow_ups = Some(0);
+            }
+            SliceStatus::Queued | SliceStatus::Blocked | SliceStatus::Deferred => {
+                let idx = slice_idx(&model, &args.id);
+                model.items[idx].status = status; // queued also unblocks and un-defers
+            }
+        }
+    }
+
+    // No-op guard: an edit that changed nothing (same position, same status)
+    // mints no commit — the legacy reorder verb's idempotence.
+    if model == loaded {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(SliceUpdateReply {
+            milestone,
+            id: args.id,
+            view: slices_view(&model),
+            hash,
+        })
+        .unwrap());
+    }
+
+    // Backstop: the mutated file must still satisfy every §3.3 rule.
+    model.validate(&milestone).map_err(refuse)?;
+
+    let view = slices_view(&model);
+    if args.dry_run {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(SliceUpdateReply {
+            milestone,
+            id: args.id,
+            view,
+            hash,
+        })
+        .unwrap());
+    }
+
+    let files = [FileWrite {
+        rel: slices_file(&milestone),
+        expected: version,
+        bytes: model
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+            .into_bytes(),
+    }];
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_updated",
+        serde_json::json!({ "verb": "slice_update", "milestone": milestone, "id": args.id }),
+        &files,
+        &[ViewWrite {
+            host: slices_view_host(&milestone),
+            tag: SLICES_V2_TAG,
+            body: Some(view.clone()),
+        }],
+    )?;
+
+    Ok(serde_json::to_value(SliceUpdateReply {
+        milestone,
+        id: args.id,
+        view,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+// ---- queue_drop ---------------------------------------------------------
+
+/// `queue_drop` (§6.8, §8): the only way abandoned work leaves the stack. The
+/// row moves to the archive as `dropped` with `finished` + `reason` — a
+/// `dropped` row satisfies no `after` links (§3.2). Refused `linked_from`
+/// while a live entry's `after` names the id (the link would resolve to
+/// nothing), and `running` for an `active` entry (the running session is
+/// never killed; a paused/blocked/deferred/queued entry has none). If a live
+/// entry's `parent` is the dropped id — a stacked branch was cut from it,
+/// §8 — one restack is enqueued per distinct child project (the restack
+/// covers a repo's stack; its doc names `queue-v2-git` for the rebase steps).
+pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueDropArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_drop args: {e}")))?;
+    if args.id.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "id must be non-empty".to_string()));
+    }
+    if args.reason.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "reason must be non-empty".to_string()));
+    }
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (mut queue, queue_version, mut archive, archive_version) = {
+        let wt = WorkTree::new(daemon, &inner);
+        match load_queue_state(&wt, &inner) {
+            Ok(Some(qs)) => (
+                qs.queue.model,
+                qs.queue.version,
+                qs.archive.model,
+                qs.archive.version,
+            ),
+            Ok(None) => return Err(refuse(QueueRefusal::UnknownId { id: args.id.clone() })),
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+    if !queue.entries.iter().any(|e| e.id == args.id) {
+        return Err(refuse(QueueRefusal::UnknownId { id: args.id.clone() }));
+    }
+    if queue.entries.iter().any(|e| e.after.contains(&args.id)) {
+        return Err(refuse(QueueRefusal::LinkedFrom { id: args.id.clone() }));
+    }
+    let idx = idx_of(&queue, &args.id);
+    if queue.entries[idx].status == EntryStatus::Active {
+        return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
+    }
+
+    // The drop→restack path (§8): live children cut from the dropped entry,
+    // one restack per distinct child project. Collected before the row leaves
+    // the list.
+    let child_projects: HashSet<String> = queue
+        .entries
+        .iter()
+        .filter(|e| e.parent == args.id)
+        .map(|e| e.project.clone())
+        .collect();
+
+    let row = queue.entries.remove(idx);
+    archive.entries.push(ArchivedEntry {
+        row,
+        finished: conventions::now_rfc3339(),
+        final_status: FinalStatus::Dropped,
+        reason: Some(args.reason.clone()),
+    });
+
+    // Dry runs compute the restack rows too (the would-be view shows them)
+    // but stage no docs. Numbers come from one high-water read plus the
+    // range's own bump, so several restacks in this one verb get distinct
+    // numbers even before any `.seq` write lands.
+    let restacks: Vec<RestackStaged> = {
+        let wt = WorkTree::new(daemon, &inner);
+        (numbering::next_number(&wt, &paths::tasks_dir())..)
+            .zip(child_projects.iter())
+            .map(|(number, p)| restack_core(&wt, &mut queue, p, number))
+            .collect::<Result<_, _>>()?
+    };
+
+    // Backstop: every §3.1 invariant still holds (the restack rows are
+    // urgent-lane, fresh task-NNN ids — a milestone id colliding with one
+    // only surfaces here).
+    queue.validate(&archive).map_err(refuse)?;
+
+    let view = queue_view(&queue);
+    if args.dry_run {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(QueueDropReply {
+            id: args.id,
+            view,
+            hash,
+        })
+        .unwrap());
+    }
+
+    if !restacks.is_empty() {
+        let wt = WorkTree::new(daemon, &inner);
+        for r in &restacks {
+            numbering::write_numbered(&wt, &paths::tasks_dir(), r.number, &r.rel, &r.content)?;
+        }
+        backlinks::refresh_all(&wt, &inner);
+    }
+
+    let files = [
+        FileWrite {
+            rel: QUEUE_FILE.to_string(),
+            expected: queue_version,
+            bytes: queue
+                .to_toml()
+                .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+                .into_bytes(),
+        },
+        FileWrite {
+            rel: QUEUE_ARCHIVE_FILE.to_string(),
+            expected: archive_version,
+            bytes: archive
+                .to_toml()
+                .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+                .into_bytes(),
+        },
+    ];
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_updated",
+        serde_json::json!({
+            "verb": "queue_drop",
+            "id": args.id,
+            "reason": args.reason,
+            "restacks": restacks.len(),
+        }),
+        &files,
+        &[ViewWrite {
+            host: queue_view_host(),
+            tag: QUEUE_V2_TAG,
+            body: Some(view.clone()),
+        }],
+    )?;
+
+    Ok(serde_json::to_value(QueueDropReply {
+        id: args.id,
+        view,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+/// The item's index; the verb proved the id exists, so this never misses.
+fn slice_idx(slices: &SlicesToml, id: &str) -> usize {
+    slices
+        .items
+        .iter()
+        .position(|i| i.id == id)
+        .expect("the item exists")
+}
+
+/// The index where a new `slices.toml` item lands for `position`, within file
+/// order (§3.3: file order is slice order — no lanes here, unlike the entry
+/// list).
+fn place_item(items: &[SliceItem], position: &V2Position) -> Result<usize, QueueRefusal> {
+    match position {
+        V2Position::Front => Ok(0),
+        V2Position::Back => Ok(items.len()),
+        V2Position::Before(r) => item_index(items, r),
+        V2Position::After(r) => Ok(item_index(items, r)? + 1),
+    }
+}
+
+fn item_index(items: &[SliceItem], id: &str) -> Result<usize, QueueRefusal> {
+    items
+        .iter()
+        .position(|i| i.id == id)
+        .ok_or_else(|| QueueRefusal::UnknownId { id: id.to_string() })
+}
+
 // ---- shared helpers ----------------------------------------------------
 
 /// A §6.8 state refusal as a wire error: the most semantic [`ErrorKind`] for
@@ -1064,7 +1534,7 @@ mod tests {
     use softfig_ipc::queue_v2::{
         ArchivedEntry, FinalStatus, Project, QueueArchiveToml, SlicesToml, QUEUE_ARCHIVE_FILE,
     };
-    use softfig_vcs::{log, TIP_REF};
+    use softfig_vcs::{log, Intent, TIP_REF};
 
     fn commit_count(daemon: &Daemon) -> usize {
         let inner = daemon.inner.lock().unwrap();
@@ -2056,5 +2526,597 @@ mod tests {
             qs.queue.model.entries.iter().all(|e| e.status == EntryStatus::Queued),
             "queued unblocks and un-defers"
         );
+    }
+
+    // ---- slice 006: slice_insert, slice_update, queue_drop -------------
+
+    fn insert_slice(
+        daemon: &Daemon,
+        args: serde_json::Value,
+    ) -> Result<SliceInsertReply, (ErrorKind, String)> {
+        slice_insert(daemon, args).map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    fn update_slice(
+        daemon: &Daemon,
+        args: serde_json::Value,
+    ) -> Result<SliceUpdateReply, (ErrorKind, String)> {
+        slice_update(daemon, args).map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    fn drop_entry(
+        daemon: &Daemon,
+        args: serde_json::Value,
+    ) -> Result<QueueDropReply, (ErrorKind, String)> {
+        queue_drop(daemon, args).map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    /// Seed one milestone's `slices.toml` straight through the real writer
+    /// (overwriting under the real CAS token when the file already exists),
+    /// with its view, so the next verb's CAS lines up — e.g. the hand-seeded
+    /// sub-milestone and the started-slice rows the slice refusals need
+    /// (finding 7: no claim machinery exists until queue-v2-scheduling).
+    fn seed_slices(daemon: &Daemon, milestone: &str, items: Vec<SliceItem>) {
+        let model = SlicesToml::new(milestone.to_string(), items);
+        let mut inner = daemon.inner.lock().unwrap();
+        let expected = {
+            let wt = WorkTree::new(daemon, &inner);
+            load_slices(&wt, &inner, milestone)
+                .expect("load")
+                .and_then(|l| l.version)
+        };
+        apply(
+            daemon,
+            &mut inner,
+            "queue_v2_updated",
+            serde_json::json!({ "test": true }),
+            &[FileWrite {
+                rel: slices_file(milestone),
+                expected,
+                bytes: model.to_toml().unwrap().into_bytes(),
+            }],
+            &[ViewWrite {
+                host: slices_view_host(milestone),
+                tag: SLICES_V2_TAG,
+                body: Some(slices_view(&model)),
+            }],
+        )
+        .expect("seed slices");
+    }
+
+    fn loaded_slices(daemon: &Daemon, milestone: &str) -> SlicesToml {
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(daemon, &inner);
+        load_slices(&wt, &inner, milestone)
+            .expect("load")
+            .expect("slices exist")
+            .model
+    }
+
+    #[test]
+    fn slice_insert_numbers_writes_and_places_the_item() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(
+            &daemon,
+            milestone_args(
+                "m1",
+                "softfig",
+                serde_json::json!({
+                    "slices": [
+                        { "slug": "types", "body": "build the types" },
+                        { "slug": "verbs", "body": "build the verbs" }
+                    ]
+                }),
+            ),
+        )
+        .expect("milestone with two slices");
+        let before = commit_count(&daemon);
+
+        // Default placement is back (appends), and the NNN comes from the
+        // folder's .seq — the filename number is a stable id, never order.
+        let reply = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "slug": "ui", "body": "build the ui" }),
+        )
+        .expect("insert");
+        assert_eq!(commit_count(&daemon), before + 1, "exactly one commit per verb");
+        assert_eq!(reply.id, "003");
+        assert!(reply.path.ends_with("m1/slices/003-ui.md"), "{:?}", reply.path);
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let doc = wt
+            .read_to_string("growlight/backlog/milestones/m1/slices/003-ui.md")
+            .expect("slice doc");
+        assert!(doc.starts_with("# ui\n"), "default title = slug, {doc}");
+        assert!(doc.contains("> Last reviewed:"), "{doc}");
+        assert!(doc.contains("build the ui"), "{doc}");
+        assert_eq!(
+            wt.read_to_string("growlight/backlog/milestones/m1/slices/.seq").unwrap(),
+            "3\n"
+        );
+
+        // Load through the same worktree — the guard is already held (the
+        // mutex is not reentrant, so no verb/loader call that locks again).
+        let s = load_slices(&wt, &inner, "m1")
+            .expect("load")
+            .expect("slices exist")
+            .model;
+        let ids: Vec<&str> = s.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["001", "002", "003"], "back appends in file order");
+        assert_eq!(s.items[2].status, SliceStatus::Queued);
+        assert_eq!(s.items[2].follow_ups, Some(0));
+
+        // The view re-rendered in the milestone doc's managed region.
+        let host = wt
+            .read_to_string("growlight/backlog/milestones/m1/CLAUDE.md")
+            .unwrap();
+        let body = managed::region_body(&host, SLICES_V2_TAG).expect("slices region");
+        assert!(body.contains("| 3 | slice | 003 | queued | 0 |"), "{body}");
+        drop(inner);
+
+        // Placement keywords: front, then before a ref.
+        insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "slug": "first", "body": "x", "position": "front" }),
+        )
+        .expect("front");
+        insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "slug": "mid", "body": "x", "position": "before", "ref": "002" }),
+        )
+        .expect("before");
+        let s = loaded_slices(&daemon, "m1");
+        let ids: Vec<&str> = s.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["004", "001", "005", "002", "003"],
+            "front leads; before lands ahead of the ref"
+        );
+    }
+
+    #[test]
+    fn slice_insert_targets_a_sub_milestone_through_the_subs_path() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        // Finding 10: a sub-milestone lives at milestones/<parent>/subs/<sub>/,
+        // and its slices.toml carries the "<parent>/<sub>" identity. Seed its
+        // doc + file (the verb that creates a sub belongs to a later slice's
+        // split flow).
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            {
+                let wt = WorkTree::new(&daemon, &inner);
+                wt.write("growlight/backlog/milestones/m/subs/s/CLAUDE.md", b"# backlog: m/s\n")
+                    .unwrap();
+                // A real sub-milestone is born with its own slices dir, .seq
+                // and first slice doc (the split flow creates them together);
+                // seed the consistent state so slice_insert numbers onward
+                // instead of colliding fail-closed.
+                wt.write("growlight/backlog/milestones/m/subs/s/slices/.seq", b"1\n")
+                    .unwrap();
+                wt.write(
+                    "growlight/backlog/milestones/m/subs/s/slices/001-plan.md",
+                    b"# Plan\n",
+                )
+                .unwrap();
+            }
+            crate::actions::commit_now(&mut inner, Intent::init("seed sub doc")).unwrap();
+        }
+        seed_slices(&daemon, "m/s", vec![slice_item(1)]);
+
+        let reply = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m/s", "slug": "types", "body": "x" }),
+        )
+        .expect("insert into the sub-milestone");
+        assert_eq!(reply.id, "002");
+        assert!(
+            reply
+                .path
+                .contains("milestones/m/subs/s/slices/002-types.md"),
+            "{:?}",
+            reply.path
+        );
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        assert!(
+            wt.exists("growlight/backlog/milestones/m/subs/s/slices/002-types.md"),
+            "the doc landed in the sub's slices dir"
+        );
+        assert_eq!(
+            wt.read_to_string("growlight/backlog/milestones/m/subs/s/slices/.seq").unwrap(),
+            "2\n",
+            "the sub's own .seq numbered"
+        );
+        let s = SlicesToml::parse(
+            &wt.read_to_string(&slices_file("m/s")).expect("slices.toml"),
+        )
+        .expect("parses");
+        assert_eq!(s.milestone, "m/s", "the file carries the sub identity");
+        assert_eq!(s.items.len(), 2);
+    }
+
+    #[test]
+    fn slice_insert_refuses_each_failure_path() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({}))).unwrap();
+        let before = commit_count(&daemon);
+
+        // Unknown milestone → unknown_id.
+        let err = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "ghost", "slug": "x", "body": "y" }),
+        )
+        .unwrap_err();
+        assert!(err.1.starts_with("unknown_id:"), "{err:?}");
+        // Bad slug → bad_name; empty body is a shape error.
+        let err = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "slug": "Bad Slug", "body": "y" }),
+        )
+        .unwrap_err();
+        assert!(err.1.starts_with("bad_name:"), "{err:?}");
+        let err = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "slug": "x", "body": "   " }),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        // An unknown placement ref → unknown_id.
+        let err = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "slug": "x", "body": "y", "position": "before", "ref": "ghost" }),
+        )
+        .unwrap_err();
+        assert!(err.1.starts_with("unknown_id:"), "{err:?}");
+        // Deeper than §3.3's nesting bound → bad_name (sub_depth).
+        let err = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1/a/b/c", "slug": "x", "body": "y" }),
+        )
+        .unwrap_err();
+        assert!(err.1.starts_with("bad_name:"), "{err:?}");
+
+        assert_eq!(commit_count(&daemon), before, "refusals mint no commit");
+        // The milestone's file was untouched: still just the generated plan.
+        let s = loaded_slices(&daemon, "m1");
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn slice_insert_dry_run_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({}))).unwrap();
+        let before = commit_count(&daemon);
+
+        let reply = insert_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "slug": "ui", "body": "x", "dry_run": true }),
+        )
+        .expect("dry run computes");
+        assert_eq!(commit_count(&daemon), before, "no commit on a dry run");
+        assert_eq!(reply.id, "002");
+        assert!(
+            !garden.path().join("growlight/backlog/milestones/m1/slices/002-ui.md").exists(),
+            "no doc written"
+        );
+        assert!(reply.view.contains("| 2 | slice | 002 |"), "{reply:?}");
+        let s = loaded_slices(&daemon, "m1");
+        assert_eq!(s.items.len(), 1, "nothing landed");
+    }
+
+    #[test]
+    fn slice_update_moves_and_sets_status_atomically() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(
+            &daemon,
+            milestone_args(
+                "m1",
+                "softfig",
+                serde_json::json!({
+                    "slices": [
+                        { "slug": "a", "body": "x" },
+                        { "slug": "b", "body": "x" },
+                        { "slug": "c", "body": "x" },
+                        { "slug": "d", "body": "x" }
+                    ]
+                }),
+            ),
+        )
+        .unwrap();
+        let before = commit_count(&daemon);
+
+        let reply = update_slice(
+            &daemon,
+            serde_json::json!({
+                "milestone": "m1",
+                "id": "004",
+                "move": { "to": "before", "ref": "002" },
+                "status": "blocked",
+            }),
+        )
+        .expect("update");
+        assert_eq!(commit_count(&daemon), before + 1, "one atomic edit, one commit");
+
+        let s = loaded_slices(&daemon, "m1");
+        let ids: Vec<&str> = s.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["001", "004", "002", "003"], "the move landed in file order");
+        let moved = s.items.iter().find(|i| i.id == "004").unwrap();
+        assert_eq!(moved.status, SliceStatus::Blocked);
+        assert!(reply.view.contains("| 2 | slice | 004 | blocked | 0 |"), "{reply:?}");
+    }
+
+    #[test]
+    fn slice_update_refuses_each_failure_path() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({}))).unwrap();
+        // Hand-seed the started statuses no human verb can set (finding 7).
+        let mut active = slice_item(1);
+        active.status = SliceStatus::Active;
+        let mut done = slice_item(2);
+        done.status = SliceStatus::Done;
+        let mut split = slice_item(3);
+        split.status = SliceStatus::Split;
+        seed_slices(&daemon, "m1", vec![active, done, split, slice_item(4)]);
+        let before = commit_count(&daemon);
+
+        // Unknown milestone → unknown_id; unknown item → unknown_id.
+        let err = update_slice(&daemon, serde_json::json!({ "milestone": "ghost", "id": "001", "status": "queued" }))
+            .unwrap_err();
+        assert!(err.1.starts_with("unknown_id:"), "{err:?}");
+        let err = update_slice(&daemon, serde_json::json!({ "milestone": "m1", "id": "ghost", "status": "queued" }))
+            .unwrap_err();
+        assert!(err.1.starts_with("unknown_id:"), "{err:?}");
+        // Moves on active/done/split items → started (the slice order is the
+        // run order).
+        for id in ["001", "002", "003"] {
+            let err = update_slice(&daemon, serde_json::json!({ "milestone": "m1", "id": id, "move": { "to": "front" } }))
+                .unwrap_err();
+            assert!(err.1.starts_with("started:"), "{id}: {err:?}");
+        }
+        // Daemon-owned statuses → daemon_owned.
+        for status in ["active", "split"] {
+            let err = update_slice(&daemon, serde_json::json!({ "milestone": "m1", "id": "004", "status": status }))
+                .unwrap_err();
+            assert!(err.1.starts_with("daemon_owned:"), "{status}: {err:?}");
+        }
+        // A self-ref move → shape error; an unknown ref → unknown_id.
+        let err = update_slice(&daemon, serde_json::json!({ "milestone": "m1", "id": "004", "move": { "to": "before", "ref": "004" } }))
+            .unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        let err = update_slice(&daemon, serde_json::json!({ "milestone": "m1", "id": "004", "move": { "to": "before", "ref": "ghost" } }))
+            .unwrap_err();
+        assert!(err.1.starts_with("unknown_id:"), "{err:?}");
+
+        assert_eq!(commit_count(&daemon), before, "refusals mint no commit");
+    }
+
+    #[test]
+    fn slice_update_done_resets_follow_ups_and_noop_mints_no_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({}))).unwrap();
+        let mut item = slice_item(1);
+        item.follow_ups = Some(3);
+        seed_slices(&daemon, "m1", vec![item]);
+        let before = commit_count(&daemon);
+
+        // A no-op edit mints no commit (the legacy reorder idempotence).
+        update_slice(&daemon, serde_json::json!({ "milestone": "m1", "id": "001", "status": "queued" }))
+            .expect("no-op computes");
+        assert_eq!(commit_count(&daemon), before, "a no-op edit mints no commit");
+
+        // done resets follow_ups to 0 (§3.3).
+        update_slice(&daemon, serde_json::json!({ "milestone": "m1", "id": "001", "status": "done" }))
+            .expect("done");
+        assert_eq!(commit_count(&daemon), before + 1);
+        let s = loaded_slices(&daemon, "m1");
+        assert_eq!(s.items[0].status, SliceStatus::Done);
+        assert_eq!(s.items[0].follow_ups, Some(0), "reset to 0 on done");
+    }
+
+    #[test]
+    fn slice_update_dry_run_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({}))).unwrap();
+        let before = commit_count(&daemon);
+
+        let reply = update_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "id": "001", "status": "blocked", "dry_run": true }),
+        )
+        .expect("dry run computes");
+        assert_eq!(commit_count(&daemon), before, "no commit on a dry run");
+        assert!(reply.view.contains("| 1 | slice | 001 | blocked |"), "{reply:?}");
+        let s = loaded_slices(&daemon, "m1");
+        assert_eq!(s.items[0].status, SliceStatus::Queued, "nothing landed");
+    }
+
+    #[test]
+    fn queue_drop_archives_the_row_and_enqueues_a_restack_for_the_child() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        // A stacked child b was cut from a (finding 7: hand-seeded parent —
+        // claims are not file state, and no claim machinery exists yet).
+        let mut a = entry("a");
+        a.claimed = "2026-10-11T12:00:00Z".to_string();
+        let mut b = entry("b");
+        b.parent = "a".to_string();
+        b.base = "abc123".to_string();
+        b.claimed = "2026-10-11T12:10:00Z".to_string();
+        seed_queue(&daemon, vec![project()], vec![a, b, entry("c")], None);
+        let before = commit_count(&daemon);
+
+        let reply = drop_entry(
+            &daemon,
+            serde_json::json!({ "id": "a", "reason": "superseded by the rewrite" }),
+        )
+        .expect("drop");
+        assert_eq!(commit_count(&daemon), before + 1, "exactly one commit per verb");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        // The drop→restack path (§8): one restack for the child's project,
+        // urgent lane, no branch — ahead of the remaining normal rows.
+        let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["001", "b", "c"], "restack enqueued, a left the list");
+        let r = &qs.queue.model.entries[0];
+        assert_eq!(r.kind, EntryKind::Restack);
+        assert_eq!(r.lane, Lane::Urgent);
+        assert_eq!(r.branch, "", "a restack has no branch of its own");
+        assert_eq!(r.project, "softfig");
+        // The child keeps its recorded parent as history (the restack itself
+        // computes the rebase in queue-v2-git).
+        let b = qs.queue.model.entries.iter().find(|e| e.id == "b").unwrap();
+        assert_eq!(b.parent, "a");
+
+        // The archive row: dropped, stamped, with the reason.
+        assert_eq!(qs.archive.model.entries.len(), 1);
+        let archived = &qs.archive.model.entries[0];
+        assert_eq!(archived.row.id, "a");
+        assert_eq!(archived.final_status, FinalStatus::Dropped);
+        assert_eq!(archived.reason.as_deref(), Some("superseded by the rewrite"));
+        assert!(!archived.finished.is_empty());
+        assert!(wt.exists(QUEUE_ARCHIVE_FILE));
+
+        // The minimal restack doc landed through the shared tasks .seq.
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        assert!(doc.starts_with("# Restack softfig\n"), "{doc}");
+        assert_eq!(wt.read_to_string("growlight/backlog/tasks/.seq").unwrap(), "1\n");
+        // The dropped entry left the list view.
+        assert!(!reply.view.contains("| a | milestone"), "{reply:?}");
+        assert!(reply.view.contains("| 001 | restack"), "{reply:?}");
+        drop(inner);
+
+        // Dropping c (no children) appends to the archive and enqueues
+        // nothing further.
+        let reply = drop_entry(&daemon, serde_json::json!({ "id": "c", "reason": "merged away" }))
+            .expect("drop");
+        assert!(!reply.view.contains("| c | milestone"), "{reply:?}");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["001", "b"], "no second restack for a childless drop");
+        let archived: Vec<&str> = qs
+            .archive
+            .model
+            .entries
+            .iter()
+            .map(|a| a.row.id.as_str())
+            .collect();
+        assert_eq!(archived, ["a", "c"], "archive rows keep arrival order");
+    }
+
+    #[test]
+    fn queue_drop_dedupes_restacks_per_project() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        // Two children of a in the same project: one restack covers the
+        // repo's stack (§8).
+        let mut a = entry("a");
+        a.claimed = "2026-10-11T12:00:00Z".to_string();
+        let mut b = entry("b");
+        b.parent = "a".to_string();
+        let mut c = entry("c");
+        c.parent = "a".to_string();
+        seed_queue(&daemon, vec![project()], vec![a, b, c], None);
+
+        drop_entry(&daemon, serde_json::json!({ "id": "a", "reason": "gone" })).expect("drop");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["001", "b", "c"], "exactly one restack per project");
+        assert!(!wt.exists("growlight/backlog/tasks/002-restack-softfig.md"));
+    }
+
+    #[test]
+    fn queue_drop_refuses_each_failure_path() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut linked = entry("linked");
+        linked.after = vec!["victim".to_string()];
+        let mut active = entry("running");
+        active.status = EntryStatus::Active;
+        active.claimed = "2026-10-11T12:00:00Z".to_string();
+        seed_queue(
+            &daemon,
+            vec![project()],
+            vec![entry("victim"), linked, active],
+            None,
+        );
+        let before = commit_count(&daemon);
+
+        // Unknown id.
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "ghost", "reason": "x" }))
+            .unwrap_err();
+        assert!(err.1.starts_with("unknown_id:"), "{err:?}");
+        // A live after-link still names the id → linked_from.
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "victim", "reason": "x" }))
+            .unwrap_err();
+        assert!(err.1.starts_with("linked_from:"), "{err:?}");
+        // An active entry's session is never killed → running.
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "running", "reason": "x" }))
+            .unwrap_err();
+        assert!(err.1.starts_with("running:"), "{err:?}");
+        // An empty reason is a shape error.
+        let err = drop_entry(&daemon, serde_json::json!({ "id": "victim", "reason": "   " }))
+            .unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+
+        assert_eq!(commit_count(&daemon), before, "refusals mint no commit");
+    }
+
+    #[test]
+    fn queue_drop_dry_run_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a");
+        a.claimed = "2026-10-11T12:00:00Z".to_string();
+        let mut b = entry("b");
+        b.parent = "a".to_string();
+        seed_queue(&daemon, vec![project()], vec![a, b], None);
+        let before = commit_count(&daemon);
+
+        let reply = drop_entry(
+            &daemon,
+            serde_json::json!({ "id": "a", "reason": "x", "dry_run": true }),
+        )
+        .expect("dry run computes");
+        assert_eq!(commit_count(&daemon), before, "no commit on a dry run");
+        assert!(!garden.path().join(QUEUE_ARCHIVE_FILE).exists(), "no archive written");
+        assert!(
+            !garden.path().join("growlight/backlog/tasks/001-restack-softfig.md").exists(),
+            "no restack doc staged"
+        );
+        // The would-be list: a is gone, the restack row shows.
+        assert!(!reply.view.contains("| a | milestone"), "{reply:?}");
+        assert!(reply.view.contains("| 001 | restack"), "{reply:?}");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"], "nothing landed");
+        assert!(qs.archive.model.entries.is_empty());
     }
 }

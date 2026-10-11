@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::queue_v2::{EntryKind, Lane};
+use crate::queue_v2::{EntryKind, Lane, SliceStatus};
 
 pub mod op {
     pub const STATUS: &str = "status";
@@ -266,6 +266,26 @@ pub mod op {
     /// One commit, `queue_v2_updated`; a no-op edit mints none. `--dry-run`
     /// computes + renders, writes nothing.
     pub const QUEUE_UPDATE_ENTRY: &str = "queue_update_entry";
+    /// queue v2 (§6.8 human verb): insert a slice into a milestone's (or
+    /// sub-milestone's, `<parent>/<sub>` ≤ 2 deep) `slices.toml` — writes
+    /// `slices/NNN-<slug>.md` (NNN from the folder's `.seq`) and inserts the
+    /// queued item at `front | back | before | after`. One commit,
+    /// `queue_v2_updated`. `--dry-run` computes + renders, writes nothing.
+    pub const SLICE_INSERT: &str = "slice_insert";
+    /// queue v2 (§6.8 human verb): patch one slice item — `move` (within
+    /// `slices.toml` file order; refused `started` for `active`/`done`/`split`
+    /// items) and/or `status` (human statuses `queued | blocked | deferred |
+    /// done`; `active`/`split` refused `daemon_owned`), one atomic edit. One
+    /// commit, `queue_v2_updated`; a no-op edit mints none. `--dry-run`
+    /// computes + renders, writes nothing.
+    pub const SLICE_UPDATE: &str = "slice_update";
+    /// queue v2 (§6.8 human verb): drop an entry — the row moves to
+    /// `queue-archive.toml` as `dropped` with `finished` + `reason`. Refused
+    /// `linked_from` while a live `after` names it, `running` for an `active`
+    /// entry. A live child's `parent == id` enqueues one restack per child
+    /// project (§8). One commit, `queue_v2_updated`. `--dry-run` computes +
+    /// renders, writes nothing.
+    pub const QUEUE_DROP: &str = "queue_drop";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2276,6 +2296,121 @@ pub struct QueueUpdateEntryReply {
     /// state on a dry run) — what the §6.9 CLI prints.
     pub view: String,
     /// Commit hash; on a dry run or a no-op edit the untouched tip.
+    pub hash: String,
+}
+
+/// `slice_insert({milestone, slug, title?, body, position = "back", ref?,
+/// dry_run}) -> {milestone, id, path, view, hash}` — queue v2 §6.8. Writes
+/// `slices/NNN-<slug>.md` (NNN from the milestone's `slices/.seq`) and inserts
+/// the queued `{kind = slice, id = NNN, follow_ups = 0}` item into the
+/// milestone's `slices.toml` at the given position in file order. `milestone`
+/// is a top-level id or a sub-milestone `"<parent>/<sub>"` (≤ 2 deep, §3.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceInsertArgs {
+    /// The owning milestone: a top-level id, or `"<parent>/<sub>"` for a
+    /// sub-milestone. Must resolve to an existing `slices.toml` (refused
+    /// `unknown_id` otherwise); deeper than 2 levels is refused `bad_name`.
+    pub milestone: String,
+    /// `[a-z0-9-]+`; the slice's terse filename address (`NNN-<slug>.md`).
+    pub slug: String,
+    /// Slice heading title. Defaults to the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The slice's plan/spec markdown body. Non-empty.
+    pub body: String,
+    /// `front | back | before | after` (with `ref` for the last two), inside
+    /// `slices.toml` file order. Defaults to `back`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// The reference item for `before`/`after` placement.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub ref_id: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing (§6.9).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceInsertReply {
+    /// The owning milestone identity, as given.
+    pub milestone: String,
+    /// The new item's id (`NNN`).
+    pub id: String,
+    /// Garden-relative path of the slice doc.
+    pub path: String,
+    /// The `softfig:slices-v2` view region body after the write (the
+    /// would-be state on a dry run) — what the §6.9 CLI prints.
+    pub view: String,
+    /// Commit hash; on a dry run the untouched tip.
+    pub hash: String,
+}
+
+/// `slice_update({milestone, id, move = {to, ref?}?, status?, dry_run}) ->
+/// {milestone, id, view, hash}` — queue v2 §6.8. One atomic edit applied in
+/// the order move → status. `move` stays within `slices.toml` file order and
+/// is refused `started` for `active`/`done`/`split` items (§6.8: the slice
+/// order is the run order). `status` takes the human statuses
+/// `queued | blocked | deferred | done` (a `done` reset of `follow_ups` to 0,
+/// §3.3); `active`/`split` are refused `daemon_owned`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceUpdateArgs {
+    /// The owning milestone identity (see [`SliceInsertArgs::milestone`]).
+    pub milestone: String,
+    /// The `[[item]]` id to edit (the `NNN`, or a sub-milestone slug).
+    pub id: String,
+    /// A move within `slices.toml` file order.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "move")]
+    pub move_spec: Option<QueueMoveSpec>,
+    /// The human statuses, `queued` (also unblocks and un-defers) |
+    /// `blocked` | `deferred` | `done`. `active`/`split` are refused
+    /// `daemon_owned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SliceStatus>,
+    /// Compute + validate + render the would-be state, write nothing (§6.9).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceUpdateReply {
+    /// The owning milestone identity, as given.
+    pub milestone: String,
+    /// The edited item's id.
+    pub id: String,
+    /// The `softfig:slices-v2` view region body after the write (the
+    /// would-be state on a dry run) — what the §6.9 CLI prints.
+    pub view: String,
+    /// Commit hash; on a dry run or a no-op edit the untouched tip.
+    pub hash: String,
+}
+
+/// `queue_drop({id, reason, dry_run}) -> {id, view, hash}` — queue v2 §6.8.
+/// Moves the row to `queue-archive.toml` as `dropped` with `finished` +
+/// `reason` (a dropped row satisfies no `after` links, §3.2). Refused
+/// `linked_from` while a live entry's `after` names the id, `running` for an
+/// `active` entry. If a live entry's `parent` is the dropped id (§8: a
+/// stacked branch was cut from it), one restack entry is enqueued per child
+/// project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueDropArgs {
+    /// The live entry id to drop.
+    pub id: String,
+    /// Why the work is abandoned — recorded on the archived row. Non-empty.
+    pub reason: String,
+    /// Compute + validate + render the would-be state, write nothing (§6.9).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueDropReply {
+    /// The dropped entry's id.
+    pub id: String,
+    /// The `softfig:queue-v2` view region body after the write (the would-be
+    /// state on a dry run) — the dropped entry has left the list — what the
+    /// §6.9 CLI prints.
+    pub view: String,
+    /// Commit hash; on a dry run the untouched tip.
     pub hash: String,
 }
 

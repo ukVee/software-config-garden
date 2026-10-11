@@ -24,7 +24,7 @@ mod views;
 // way.
 pub(crate) mod write;
 
-pub use state::{load_queue_state, milestone_path, slices_file, QUEUE_FILE};
+pub use state::{load_queue_state, load_slices, milestone_path, slices_file, QUEUE_FILE};
 pub use views::{
     queue_view, queue_view_host, slices_view, slices_view_host, QUEUE_V2_TAG, SLICES_V2_TAG,
 };

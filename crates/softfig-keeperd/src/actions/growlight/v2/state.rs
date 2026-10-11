@@ -119,9 +119,6 @@ pub fn load_queue_state(
 
 /// Load one milestone's `slices.toml` (§3.3). `Ok(None)` = the file does not
 /// exist (a milestone with no slices yet — and no view, §3.4).
-// Slice 006's `slice_insert`/`slice_update` are its first non-test callers;
-// until then only the slice-004 tests load slices back.
-#[allow(dead_code)]
 pub fn load_slices(
     wt: &WorkTree,
     inner: &DaemonInner,

@@ -204,6 +204,9 @@ fn op_is_local_write(op: &str) -> bool {
             | op::QUEUE_ADD_PROJECT
             | op::QUEUE_ADD_ENTRY
             | op::QUEUE_UPDATE_ENTRY
+            | op::SLICE_INSERT
+            | op::SLICE_UPDATE
+            | op::QUEUE_DROP
             | op::GROWLIGHT_SET_RESOURCES
             | op::POST_MESSAGE
             | op::FILE_REPORT
@@ -268,6 +271,9 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::QUEUE_ADD_PROJECT => crate::actions::queue_add_project(daemon, req.args),
         op::QUEUE_ADD_ENTRY => crate::actions::queue_add_entry(daemon, req.args),
         op::QUEUE_UPDATE_ENTRY => crate::actions::queue_update_entry(daemon, req.args),
+        op::SLICE_INSERT => crate::actions::slice_insert(daemon, req.args),
+        op::SLICE_UPDATE => crate::actions::slice_update(daemon, req.args),
+        op::QUEUE_DROP => crate::actions::queue_drop(daemon, req.args),
         op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
         op::GROWLIGHT_SET_RESOURCES => crate::actions::growlight_set_resources(daemon, req.args),
         op::POST_MESSAGE => crate::actions::post_message(daemon, req.args),
