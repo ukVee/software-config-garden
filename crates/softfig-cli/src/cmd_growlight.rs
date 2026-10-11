@@ -643,7 +643,7 @@ fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
             choice.opencode_model_ref(),
             launch.opencode_config.display(),
             choice.backend.agent_bin(),
-            opencode_interactive_args(launch.agent_name).join(" "),
+            opencode_interactive_args().join(" "),
         ),
     }
 }
@@ -1395,7 +1395,7 @@ fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> 
                 .unwrap_or_default();
             println!(
                 "\nlaunching {bin} {} on {}{variant} …\n",
-                opencode_interactive_args(AGENT_NAME).join(" "),
+                opencode_interactive_args().join(" "),
                 choice.opencode_model()
             );
         }

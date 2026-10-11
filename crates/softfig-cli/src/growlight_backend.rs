@@ -298,11 +298,12 @@ impl Backend {
     ///   (`launch.garden_root`, slice 005's auto-cd) instead of wherever the human
     ///   invoked it from. It still sets no env.
     /// - **opencode** launches the TUI on the generated agent —
-    ///   `opencode --standalone --agent <name> --prompt <boot>` (see
-    ///   [`opencode_interactive_args`] for why `--standalone`) — with `OPENCODE_CONFIG`
+    ///   `opencode --standalone --prompt <boot>` (see [`opencode_interactive_args`]
+    ///   for why `--standalone`, and why no `--agent`) — with `OPENCODE_CONFIG`
     ///   pointing at the generated `opencode.json` (opencode's analog of claude's
-    ///   `--settings`; the agent, its permission map, and the softfig-mcp block
-    ///   all live in that one file, so there is no separate `--mcp-config`) and
+    ///   `--settings`; the agent, its selection as `default_agent`, its permission
+    ///   map, and the softfig-mcp block all live in that one file, so there is no
+    ///   separate `--mcp-config`) and
     ///   cwd set to the **garden** (`launch.garden_root`) — the same root claude
     ///   gets — so garden docs are ordinary in-project reads; see
     ///   [`InteractiveLaunch::garden_root`]. The `--prompt`
@@ -322,7 +323,7 @@ impl Backend {
                     .current_dir(launch.garden_root);
             }
             Backend::Opencode => {
-                cmd.args(opencode_interactive_args(launch.agent_name))
+                cmd.args(opencode_interactive_args())
                     .arg("--prompt")
                     .arg(launch.boot_prompt)
                     .env("OPENCODE_CONFIG", launch.opencode_config)
@@ -334,8 +335,8 @@ impl Backend {
 }
 
 /// The interactive opencode argv up to (not including) the first-turn `--prompt`:
-/// `--standalone --agent <name>`. Shared by the real launch and the `--no-launch`
-/// hint, so the command a human copy-pastes cannot lose a flag the launcher has.
+/// just `--standalone`. Shared by the real launch and the `--no-launch` hint, so
+/// the command a human copy-pastes cannot lose a flag the launcher has.
 ///
 /// `--standalone` is a correctness flag on opencode 2.x, not hygiene. Without it
 /// the TUI attaches to the per-user shared service, and a running one **ignores
@@ -344,8 +345,14 @@ impl Backend {
 /// no baton boot, allow-all permissions and every global grant. `--standalone`
 /// gives the session a private server that loads this launch's config and exits
 /// with it.
-pub fn opencode_interactive_args(agent_name: &str) -> [&str; 3] {
-    ["--standalone", "--agent", agent_name]
+///
+/// There is no `--agent`: the 2.x root (TUI) command has neither `--agent` nor
+/// `--model` (only `run` and `mini` do), and refuses the launch with
+/// `unrecognized flag: --agent`. The agent is selected by the config's top-level
+/// `default_agent` instead ([`opencode_config`]), as the model is by its top-level
+/// `model`.
+pub fn opencode_interactive_args() -> [&'static str; 1] {
+    ["--standalone"]
 }
 
 /// The interactive loop's claude-memory policy: **read and write**, as Claude Code
@@ -523,6 +530,10 @@ pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> Result<String> {
         // Top-level, where 2.x honors it (see the doc above). No variant → the bare
         // id, which leaves the model on its own default variant.
         "model": opencode_model_ref(model, variant),
+        // The TUI's agent selection: the 2.x root command has no `--agent` flag
+        // (see `opencode_interactive_args`), so a fresh session starts on the
+        // config's default primary agent. Without this it starts on `build`.
+        "default_agent": agent_name,
         "permissions": permissions,
         "mcp": {
             "servers": {
@@ -1066,6 +1077,8 @@ mod tests {
         // so it is not emitted there at all.
         let agent = &v["agents"]["softfig-loop"];
         assert_eq!(agent["mode"], "primary");
+        // ...and selected by the config, not argv: the 2.x TUI has no `--agent`.
+        assert_eq!(v["default_agent"], "softfig-loop");
         assert_eq!(v["model"], "deepseek/deepseek-reasoner");
         assert!(agent["model"].is_null(), "no dead agent-level model");
         // No variant declared → the bare id, no `#` suffix, leaving the model's own
@@ -1213,19 +1226,19 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         // A private server (`--standalone`: the shared service would ignore
-        // OPENCODE_CONFIG, slice 001 finding 1), the generated primary agent, and
-        // the first-turn kick (the reseed roll, since opencode has no SessionStart
-        // hook).
+        // OPENCODE_CONFIG, slice 001 finding 1) and the first-turn kick (the reseed
+        // roll, since opencode has no SessionStart hook). No `--agent`: the 2.x TUI
+        // refuses it (`unrecognized flag`); the config's `default_agent` selects
+        // the generated agent instead.
         assert_eq!(
             args,
             vec![
                 "--standalone",
-                "--agent",
-                "softfig-loop",
                 "--prompt",
                 "Begin your growlight iteration."
             ]
         );
+        assert!(!args.iter().any(|a| a == "--agent" || a == "--model"), "{args:?}");
 
         // The generated config is handed over via OPENCODE_CONFIG (opencode's
         // analog of claude's --settings), not a flag — and no --settings/
