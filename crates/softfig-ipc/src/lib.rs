@@ -13,6 +13,7 @@ pub mod client;
 pub mod growlightd;
 pub mod opencode;
 pub mod proto;
+pub mod queue_v2;
 pub mod socket;
 pub mod usage;
 pub mod verbs;
@@ -22,6 +23,10 @@ pub use client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };
 pub use proto::{ErrorKind, Request, Response};
+pub use queue_v2::{
+    ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project, QueueArchiveToml,
+    QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus, SlicesToml,
+};
 pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};
 pub use verbs::*;
 
