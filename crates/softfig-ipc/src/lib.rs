@@ -24,8 +24,9 @@ pub use client::{
 };
 pub use proto::{ErrorKind, Request, Response};
 pub use queue_v2::{
-    ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project, QueueArchiveToml,
-    QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus, SlicesToml,
+    sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
+    QueueArchiveToml, QueueRefusal, QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus,
+    SlicesToml,
 };
 pub use socket::{growlightd_runtime_socket_path, runtime_socket_path};
 pub use verbs::*;

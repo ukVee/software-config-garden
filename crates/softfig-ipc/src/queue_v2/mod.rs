@@ -31,7 +31,11 @@
 //! **File order is list order** (§3.1, §3.3): the vectors here preserve it and
 //! nothing in this module ever sorts. The *writer invariants* (unique ids,
 //! urgent-before-normal, link integrity, …) are validation, not this file —
-//! they live with the milestone's slice 002.
+//! they live in [`validate`], the milestone's slice 002.
+
+mod validate;
+
+pub use validate::{sub_depth, QueueRefusal};
 
 use serde::{Deserialize, Serialize};
 
@@ -668,5 +672,17 @@ follow_ups = 0
             SlicesToml::new("m".into(), vec![]).schema,
             SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn spec_examples_pass_validation() {
+        // The verbatim §3.1 and §3.3 examples must be valid files: slice
+        // 002's invariants accept what the spec itself writes.
+        let q = QueueToml::parse(SPEC_QUEUE).expect("the §3.1 example parses");
+        q.validate(&QueueArchiveToml::new(vec![]))
+            .expect("the §3.1 example is valid");
+        let s = SlicesToml::parse(SPEC_SLICES).expect("the §3.3 example parses");
+        s.validate("folder-grants")
+            .expect("the §3.3 example is valid");
     }
 }
