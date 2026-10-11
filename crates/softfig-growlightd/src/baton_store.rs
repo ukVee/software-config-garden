@@ -1,6 +1,13 @@
-//! The per-member baton store (`fleet-loop-spin` slice 002) — the WRITE + READ
-//! sides of `agents/<id>/baton.md`, the durable carried state slice 001 reads on
-//! exit.
+//! The growlight runtime baton stores — two sibling namespaces under
+//! `$XDG_CONFIG_HOME/softfig/growlight/`:
+//!
+//! - [`FsBatonStore`] — the per-MEMBER store (`fleet-loop-spin` slice 002): the
+//!   WRITE + READ sides of `agents/<id>/baton.md`, the durable carried state
+//!   slice 001 reads on exit.
+//! - [`FsEntryBatonStore`] — queue v2's per-ENTRY store
+//!   (`entries/<entry-id>/baton.md`, spec §3.6), keyed to the work rather than
+//!   the worker, because a paused entry may be resumed by a different member
+//!   (spec §2). The legacy member store is untouched — v2 ADDS this beside it.
 //!
 //! ## The gap this closes
 //!
@@ -297,6 +304,157 @@ fn seed_baton(garden_name: &str, agent: &str, queue: &str, part: &str, baton_pat
          - `growlight/protocol.md` — your operating contract\n\n\
          # STATE\n\
          Seeded by growlightd on spawn (fleet member `{agent}`, item `{part}`).\n"
+    )
+}
+
+/// The runtime **entries** dir — `$XDG_CONFIG_HOME/softfig/growlight/entries/`
+/// in production — the per-entry baton namespace (queue v2 spec §3.6), sibling
+/// to the runtime `agents/` dir [`FsBatonStore`] covers. Public (like
+/// [`crate::fleet::runtime_growlight_dir`], the dir it extends) so
+/// queue-v2-scheduling — and any verb that resolves a runtime baton path
+/// without an assembled fleet — derives the SAME directory the store was built
+/// over, and so the `entries/` tree can ride the same runtime-grant-root rule
+/// the `agents/` tree already does.
+pub fn runtime_entries_dir() -> PathBuf {
+    crate::fleet::runtime_growlight_dir().join("entries")
+}
+
+/// The filesystem-backed **per-entry** baton store (queue v2 §3.6) over the
+/// runtime `entries/` namespace — the sibling of [`FsBatonStore`] that v2 adds
+/// WITHOUT touching the legacy per-member store. Where the member store keys
+/// batons by agent id, this keys them by ENTRY id, because a paused entry may
+/// be resumed by a different member (spec §2): the carried state follows the
+/// work, not the worker. The member's own `agents/<id>/baton.md` still exists
+/// and still feeds the SessionStart hook — at spawn, growlightd copies this
+/// store's baton into it (spec §3.6). That copy is queue-v2-scheduling's job,
+/// not this store's; and growlightd is this store's only writer (the §6.3 roll
+/// verbs), a member never touches `entries/` directly.
+#[derive(Debug, Clone)]
+pub struct FsEntryBatonStore {
+    entries_dir: PathBuf,
+    garden_name: String,
+}
+
+impl FsEntryBatonStore {
+    /// Build a store over `entries_dir` (the runtime per-entry namespace)
+    /// tagging seeds with `garden_name` (the garden root's file name, purely
+    /// cosmetic — the same `loop:` tag as the member store).
+    pub fn new(entries_dir: impl Into<PathBuf>, garden_name: impl Into<String>) -> Self {
+        Self {
+            entries_dir: entries_dir.into(),
+            garden_name: garden_name.into(),
+        }
+    }
+
+    /// This entry's baton path under `entries/<entry-id>/baton.md` (§3.6) — the
+    /// one file `seed`, `read` and `write` share. The entry id is the TOP-LEVEL
+    /// entry's id (a milestone dir name or a task NNN) — never a
+    /// `<parent>/<sub>` path, because sub-milestones run inside their top-level
+    /// entry and share its baton (§3.6).
+    fn entry_path(&self, entry_id: &str) -> PathBuf {
+        self.entries_dir.join(entry_id).join("baton.md")
+    }
+
+    /// Seed (or re-seed) an entry's baton from the template. Unlike the member
+    /// store's same-item keep, a re-seed OVERWRITES: the entry baton is
+    /// growlightd's template state, not a member's curated write-back, so a
+    /// fresh template is always the correct contents when the caller says
+    /// "seed". The entry dir is created here, mirroring the member store's
+    /// create-dir-on-seed convention (idempotent with [`Self::write`]'s
+    /// create), and a failed create errors fail-closed.
+    ///
+    /// `branch`/`base` carry the §8 base line's FIELDS — the concrete values
+    /// are queue-v2-scheduling's, computed at first claim, where §8 says
+    /// growlightd puts `create <branch> from <base>` in the seeded baton. A
+    /// never-claimed entry's seed passes `None` and gets the literal
+    /// `<branch>`/`<base>` tokens; this store never computes git state.
+    pub fn seed(
+        &self,
+        entry_id: &str,
+        branch: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<(), String> {
+        let path = self.entry_path(entry_id);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("create entry dir {}: {e}", dir.display()))?;
+        }
+        let body = seed_entry_baton(&self.garden_name, entry_id, branch, base, &path);
+        fs::write(&path, body).map_err(|e| format!("write baton {}: {e}", path.display()))
+    }
+
+    /// Read an entry's baton. Fails closed: a missing dir, a missing file or an
+    /// unreadable file all read as `None` (no baton — the caller's
+    /// never-claimed signal), and `read` NEVER creates anything (seed is the
+    /// only creator). Same convention as the member store's missing-baton read.
+    pub fn read(&self, entry_id: &str) -> Option<String> {
+        fs::read_to_string(self.entry_path(entry_id)).ok()
+    }
+
+    /// Write an entry's baton — the §6.3 handshake's store step ("growlightd
+    /// stores the baton as the entry's baton"). Creates the entry dir when
+    /// absent (idempotent with [`Self::seed`]'s create); a failed create or
+    /// write errors fail-closed — the handshake turns that into a refusal,
+    /// never a silent loss of the baton.
+    pub fn write(&self, entry_id: &str, baton: &str) -> Result<(), String> {
+        let path = self.entry_path(entry_id);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("create entry dir {}: {e}", dir.display()))?;
+        }
+        fs::write(&path, baton).map_err(|e| format!("write baton {}: {e}", path.display()))
+    }
+}
+
+/// The per-entry seed baton (pure) — queue v2 §3.6's "seeded from the
+/// template": today's member seed, re-keyed from the member to the ENTRY and
+/// stripped of the member-specific fields (no `agent:`, no `queue:` — an entry
+/// has neither; `item:` is the entry id, so the shared [`parse_baton`] still
+/// reads it). `status: IN_PROGRESS` (a continue status, as in the member seed);
+/// the NEXT ACTION is a placeholder — the entry's doc holds the real mission
+/// and finish criteria, and the working member reseeds this baton from it on
+/// its first iteration (growlightd does not embed them, matching the member
+/// seed). The §8 base line carries the `branch`/`base` fields: `None` renders
+/// the literal `<branch>`/`<base>` tokens; the concrete values are
+/// queue-v2-scheduling's, passed in at first claim (spec §8).
+fn seed_entry_baton(
+    garden_name: &str,
+    entry_id: &str,
+    branch: Option<&str>,
+    base: Option<&str>,
+    baton_path: &Path,
+) -> String {
+    let baton_path = baton_path.display().to_string();
+    let branch = branch.unwrap_or("<branch>");
+    let base = base.unwrap_or("<base>");
+    format!(
+        "---\n\
+         loop: {garden_name}\n\
+         mode: fleet\n\
+         status: IN_PROGRESS\n\
+         item: {entry_id}\n\
+         iteration: 0\n\
+         baton-path: {baton_path}\n\
+         ---\n\n\
+         > ENTRY BATON for `{entry_id}` — growlightd's stored copy at `{baton_path}`. A member\n\
+         > hands off through the roll verb's `baton` field (spec §6.3), which growlightd stores\n\
+         > here; at spawn this file is copied into the member's own `agents/<id>/baton.md`, the\n\
+         > file the SessionStart hook reads.\n\n\
+         # NEXT ACTION\n\
+         (placeholder — reseed this baton from the entry's doc on your first iteration)\n\n\
+         # FIRST STEP\n\
+         create {branch} from {base}\n\n\
+         # MISSION\n\
+         Drive backlog entry `{entry_id}` to completion, handing off via this baton instead of\n\
+         `/compact`.\n\n\
+         # FINISH CRITERIA\n\
+         (reseed from the entry's spec on your first iteration)\n\n\
+         # READ FIRST\n\
+         - the entry doc for `{entry_id}` (its mission + finish criteria)\n\
+         - `growlight/backlog/CLAUDE.md` — the queue table (status + order)\n\
+         - `growlight/protocol-fleet-v2.md` — your operating contract\n\n\
+         # STATE\n\
+         Seeded by growlightd (entry `{entry_id}`).\n"
     )
 }
 
@@ -670,5 +828,140 @@ mod tests {
             "a status-less legacy baton falls through to the per-member file, not a re-roll",
         );
         assert!(read.misroute.is_none(), "a status-less legacy baton is not honored as a misroute");
+    }
+
+    // --- queue v2 §3.6: the per-entry store (slice 007) -----------------------
+
+    fn entry_store(dir: &Path) -> FsEntryBatonStore {
+        FsEntryBatonStore::new(dir.join("entries"), "garden")
+    }
+
+    /// The seed→read round-trip: a never-claimed entry's template reads back
+    /// with its continue status, the entry id, the literal §8 base-line tokens,
+    /// and the stamped baton path; a read of a DIFFERENT entry stays `None`.
+    #[test]
+    fn seed_then_read_round_trips_the_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = entry_store(tmp.path());
+
+        // No baton yet → `None` (the caller's never-claimed signal).
+        assert_eq!(s.read("queue-v2-state"), None, "no baton yet reads as None");
+
+        s.seed("queue-v2-state", None, None).expect("seeds");
+        let raw = s.read("queue-v2-state").expect("reads back the seed");
+        let view = parse_baton(&raw);
+        assert_eq!(
+            view.status.as_deref(),
+            Some("IN_PROGRESS"),
+            "a seeded entry reads back its continue status",
+        );
+        assert_eq!(
+            view.item.as_deref(),
+            Some("queue-v2-state"),
+            "the seed names the entry in the `item:` field",
+        );
+        assert!(raw.contains("loop: garden"), "the seed tags the garden");
+        assert!(
+            raw.contains("create <branch> from <base>"),
+            "an unclaimed seed carries the literal §8 base-line tokens",
+        );
+        assert!(
+            raw.contains("# NEXT ACTION"),
+            "the seed has a NEXT ACTION section (the placeholder)",
+        );
+        let abs = s.entry_path("queue-v2-state").to_str().unwrap().to_string();
+        assert!(abs.ends_with("/entries/queue-v2-state/baton.md"), "sanity: per-entry baton path");
+        assert!(
+            raw.contains(&format!("baton-path: {abs}")),
+            "the seed stamps the entry baton path in a `baton-path:` frontmatter field",
+        );
+        assert_eq!(
+            s.read("other-entry"),
+            None,
+            "entries are isolated by id — another entry's read stays None",
+        );
+    }
+
+    /// §8 at first claim: scheduling computes the branch/base values and
+    /// re-seeds, so the stored baton carries the CONCRETE line, not the tokens.
+    #[test]
+    fn seed_renders_the_concrete_base_line_when_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = entry_store(tmp.path());
+        s.seed("queue-v2-state", Some("feat/queue-v2-state"), Some("main"))
+            .expect("seeds");
+        let raw = s.read("queue-v2-state").unwrap();
+        assert!(
+            raw.contains("create feat/queue-v2-state from main"),
+            "the concrete §8 base line lands in the baton",
+        );
+        assert!(
+            !raw.contains("<branch>"),
+            "no placeholder tokens when concrete values are given",
+        );
+    }
+
+    /// Unlike the member store's same-item keep, an entry re-seed OVERWRITES:
+    /// the entry baton is growlightd's template state, so a same-entry re-seed
+    /// (e.g. §8's first-claim re-seed with the base line) lands the new
+    /// template, not the member's stored handoff.
+    #[test]
+    fn reseed_overwrites_the_stored_baton() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = entry_store(tmp.path());
+        s.seed("e1", None, None).expect("seeds");
+
+        s.write("e1", "---\nstatus: ITEM_COMPLETE\nitem: e1\n---\n# NEXT ACTION\ndone\n")
+            .expect("writes");
+        assert_eq!(
+            parse_baton(&s.read("e1").unwrap()).status.as_deref(),
+            Some("ITEM_COMPLETE"),
+            "the handoff write lands",
+        );
+
+        s.seed("e1", None, None).expect("re-seeds");
+        assert_eq!(
+            parse_baton(&s.read("e1").unwrap()).status.as_deref(),
+            Some("IN_PROGRESS"),
+            "a re-seed overwrites the stored baton with the fresh template",
+        );
+    }
+
+    /// §6.3's store step: growlightd writes the handoff baton verbatim, and the
+    /// read back is byte-for-byte what was stored (write creates the dir when
+    /// the entry was never seeded).
+    #[test]
+    fn write_round_trips_exactly_and_creates_the_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = entry_store(tmp.path());
+        let baton =
+            "---\nstatus: ITEM_DEFERRED\nitem: t9\niteration: 3\n---\n# NEXT ACTION\ndeferred\n";
+        s.write("t9", baton).expect("write creates the dir + file");
+        assert_eq!(s.read("t9").unwrap(), baton, "read returns the stored baton verbatim");
+    }
+
+    /// A FILE where the entries dir should be → `create_dir_all` under it fails
+    /// → both writers error (the §6.3 handshake turns that into a refusal,
+    /// never a silent loss of the baton).
+    #[test]
+    fn seed_and_write_fail_closed_when_the_dir_cannot_be_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("entries");
+        fs::write(&blocker, b"x").unwrap();
+        let s = FsEntryBatonStore::new(&blocker, "garden");
+        assert!(s.seed("e1", None, None).is_err(), "an un-creatable dir fails the seed");
+        assert!(s.write("e1", "x").is_err(), "an un-creatable dir fails the write");
+    }
+
+    /// A missing dir reads fail-closed as `None` — and read NEVER creates it
+    /// (seed is the only creator, so a read can never fabricate state).
+    #[test]
+    fn read_fails_closed_on_a_missing_dir_and_never_creates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = entry_store(tmp.path());
+        let parent = s.entry_path("e1").parent().unwrap().to_path_buf();
+        assert!(!parent.exists(), "fresh tempdir: no entries dir yet");
+        assert_eq!(s.read("e1"), None, "a missing dir reads as no baton");
+        assert!(!parent.exists(), "read never creates the entry dir — seed is the only creator");
     }
 }
