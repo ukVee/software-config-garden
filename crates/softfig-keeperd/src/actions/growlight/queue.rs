@@ -133,8 +133,10 @@ fn ref_index(rest: &[QueueRow], ref_id: &str, moved_id: &str) -> Result<usize, R
 }
 
 /// Escape a literal `|` so it doesn't split a table cell. Shared with the
-/// queue *registry* table ([`super::queues`]), which round-trips the same way.
-pub(super) fn escape(s: &str) -> String {
+/// queue *registry* table ([`super::queues`]), which round-trips the same way,
+/// and with the v2 derived views ([`super::v2::views`]), which render
+/// TOML-held titles through the same rule.
+pub(crate) fn escape(s: &str) -> String {
     s.replace('|', "\\|")
 }
 

@@ -37,6 +37,8 @@ mod validate;
 
 pub use validate::{sub_depth, QueueRefusal};
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// The schema version every file writes and the only version parsing accepts.
@@ -55,10 +57,26 @@ pub const QUEUE_ARCHIVE_FILE: &str = "growlight/backlog/queue-archive.toml";
 /// `milestones/<id>/` (§3.3).
 pub const MILESTONES_DIR: &str = "growlight/backlog/milestones";
 
+/// The physical directory a milestone or sub-milestone identity owns (§3.3).
+/// A top-level milestone is `milestones/<id>`; a sub-milestone
+/// `"<parent>/<sub-slug>"` lives at `milestones/<parent>/subs/<sub-slug>/`
+/// (the `subs/` segment is part of the on-disk layout — §3.3 twice, and §7).
+/// Every v2 path derived from the identity funnels through here so the
+/// directory naming can never drift between the files and their views.
+pub fn milestone_path(milestone: &str) -> String {
+    let mut parts = milestone.split('/');
+    let top = parts.next().expect("split yields at least one component");
+    let mut path = format!("{MILESTONES_DIR}/{top}");
+    for sub in parts {
+        path.push_str(&format!("/subs/{sub}"));
+    }
+    path
+}
+
 /// The `slices.toml` path for a milestone or sub-milestone (§3.3). A
 /// sub-milestone passes `"<parent>/<sub-slug>"`.
 pub fn slices_file(milestone: &str) -> String {
-    format!("{MILESTONES_DIR}/{milestone}/slices.toml")
+    format!("{}/slices.toml", milestone_path(milestone))
 }
 
 /// A v2-file read or write that failed. All failures are typed; there is no
@@ -263,6 +281,71 @@ pub struct SliceItem {
     /// item omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_ups: Option<u64>,
+}
+
+// The closed vocabularies render into the §3.4 derived views and into alert
+// text, so each has a `Display` that is exactly its TOML wire name — the name
+// serde reads and writes. `display_matches_wire_names` pins the lockstep.
+impl fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Milestone => "milestone",
+            Self::Task => "task",
+            Self::Restack => "restack",
+        })
+    }
+}
+
+impl fmt::Display for Lane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Urgent => "urgent",
+            Self::Normal => "normal",
+        })
+    }
+}
+
+impl fmt::Display for EntryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Queued => "queued",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::Deferred => "deferred",
+        })
+    }
+}
+
+impl fmt::Display for FinalStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Done => "done",
+            Self::Dropped => "dropped",
+        })
+    }
+}
+
+impl fmt::Display for SliceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Slice => "slice",
+            Self::Sub => "sub",
+        })
+    }
+}
+
+impl fmt::Display for SliceStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Queued => "queued",
+            Self::Active => "active",
+            Self::Done => "done",
+            Self::Split => "split",
+            Self::Blocked => "blocked",
+            Self::Deferred => "deferred",
+        })
+    }
 }
 
 impl QueueToml {
@@ -684,5 +767,78 @@ follow_ups = 0
         let s = SlicesToml::parse(SPEC_SLICES).expect("the §3.3 example parses");
         s.validate("folder-grants")
             .expect("the §3.3 example is valid");
+    }
+
+    #[test]
+    fn slices_file_routes_sub_milestones_through_subs() {
+        // Finding 10: §3.3 places a sub-milestone at
+        // milestones/<parent>/subs/<sub-slug>/ — the `subs/` segment is part
+        // of the on-disk layout, so the path built from the identity must
+        // insert it (slice 001 flattened it away).
+        assert_eq!(
+            slices_file("folder-grants"),
+            "growlight/backlog/milestones/folder-grants/slices.toml"
+        );
+        assert_eq!(
+            slices_file("folder-grants/fid-pam"),
+            "growlight/backlog/milestones/folder-grants/subs/fid-pam/slices.toml"
+        );
+        // The §3.3 nesting bound (2 deep) keeps working through the path.
+        assert_eq!(
+            slices_file("top/a/b"),
+            "growlight/backlog/milestones/top/subs/a/subs/b/slices.toml"
+        );
+        assert_eq!(
+            milestone_path("top/a"),
+            "growlight/backlog/milestones/top/subs/a"
+        );
+    }
+
+    #[test]
+    fn display_matches_wire_names() {
+        // A `Display` drifting from the serde wire name would render a view
+        // cell that no longer matches the TOML it derives from. Pin both
+        // directions for every vocabulary.
+        assert_eq!(EntryKind::Milestone.to_string(), "milestone");
+        assert_eq!(EntryKind::Task.to_string(), "task");
+        assert_eq!(EntryKind::Restack.to_string(), "restack");
+        assert_eq!(Lane::Urgent.to_string(), "urgent");
+        assert_eq!(Lane::Normal.to_string(), "normal");
+        assert_eq!(EntryStatus::Queued.to_string(), "queued");
+        assert_eq!(EntryStatus::Active.to_string(), "active");
+        assert_eq!(EntryStatus::Paused.to_string(), "paused");
+        assert_eq!(EntryStatus::Blocked.to_string(), "blocked");
+        assert_eq!(EntryStatus::Deferred.to_string(), "deferred");
+        assert_eq!(FinalStatus::Done.to_string(), "done");
+        assert_eq!(FinalStatus::Dropped.to_string(), "dropped");
+        assert_eq!(SliceKind::Slice.to_string(), "slice");
+        assert_eq!(SliceKind::Sub.to_string(), "sub");
+        assert_eq!(SliceStatus::Queued.to_string(), "queued");
+        assert_eq!(SliceStatus::Active.to_string(), "active");
+        assert_eq!(SliceStatus::Done.to_string(), "done");
+        assert_eq!(SliceStatus::Split.to_string(), "split");
+        assert_eq!(SliceStatus::Blocked.to_string(), "blocked");
+        assert_eq!(SliceStatus::Deferred.to_string(), "deferred");
+        // And the serialize direction uses the same names (a spot-check: the
+        // wire name is what serde emits).
+        let entry = Entry {
+            id: "x".into(),
+            kind: EntryKind::Task,
+            title: "t".into(),
+            project: "p".into(),
+            lane: Lane::Normal,
+            status: EntryStatus::Queued,
+            after: vec![],
+            added: "2026-10-11T15:04:00Z".into(),
+            branch: String::new(),
+            parent: String::new(),
+            base: String::new(),
+            claimed: String::new(),
+            follow_ups: 0,
+        };
+        let text = toml::to_string(&entry).expect("serialize");
+        assert!(text.contains("kind = \"task\""), "{text}");
+        assert!(text.contains("status = \"queued\""), "{text}");
+        assert!(text.contains("lane = \"normal\""), "{text}");
     }
 }

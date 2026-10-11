@@ -31,6 +31,7 @@ mod queue;
 mod queues;
 pub(crate) mod reports;
 mod set_resources;
+mod v2;
 
 pub use holders::{ClaimGate, HolderStore};
 pub use init::growlight_init;

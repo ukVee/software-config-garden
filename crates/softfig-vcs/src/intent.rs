@@ -60,6 +60,11 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "rollback",
     "vault_seal",
     "vault_reveal",
+    // growlight queue v2 (queue-v2-state slice 003): the one commit a v2 verb
+    // folds all its file + view writes into. The six verbs (slices 004–006)
+    // name themselves with this shape; register the generic name now and the
+    // per-verb names as those slices land.
+    "queue_v2_updated",
 ];
 
 /// A name + payload pair, validated against the closed enum.
@@ -123,7 +128,7 @@ const KNOWN_INTENTS_LIST: &str =
      chat_message_posted, inbox_read, report_filed, report_updated, \
      config_migrated, \
      peers_changed, shared_subtrees_changed, shared_ceremony, shared_rekey, shared_pull, \
-     migrate_into_share, migrate_into_share_carve, sync_conflict, schema_change, rollback, vault_seal, vault_reveal";
+     migrate_into_share, migrate_into_share_carve, sync_conflict, schema_change, rollback, vault_seal, vault_reveal, queue_v2_updated";
 
 fn type_name(v: &Value) -> &'static str {
     match v {
