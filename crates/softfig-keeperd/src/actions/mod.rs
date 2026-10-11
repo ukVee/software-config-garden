@@ -52,9 +52,9 @@ pub use archive::archive;
 pub use batch::batch;
 pub use growlight::{
     add_backlog_item, add_queue, add_slice, file_report, growlight_init, growlight_set_resources,
-    list_reports, log_baton, post_message, queue_add_entry, queue_add_project, read_inbox,
-    release_lease, reorder_backlog_item, request_lease, set_item_status, tail_bus, update_report,
-    HolderStore,
+    list_reports, log_baton, post_message, queue_add_entry, queue_add_project, queue_update_entry,
+    read_inbox, release_lease, reorder_backlog_item, request_lease, set_item_status, tail_bus,
+    update_report, HolderStore,
 };
 // Crate-internal helpers behind the `growlight_queue` read verb (020 slice 002):
 // the queue-grammar parser + the backlog-doc path. `pub(crate)`, so they can't

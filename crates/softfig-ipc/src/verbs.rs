@@ -253,12 +253,19 @@ pub mod op {
     /// `softfig:queue-v2` view renders from here on (§3.4). One commit,
     /// `queue_v2_updated`. `--dry-run` computes + renders, writes nothing.
     pub const QUEUE_ADD_PROJECT: &str = "queue_add_project";
-    /// queue v2 (§6.8 human verb): create a backlog entry (milestone kind in
-    /// this slice) with its docs, `slices.toml`, the generated `001-plan` slice
-    /// (§4) when no slices are given, and its lane-placed row in
-    /// `queue.toml`. One commit, `queue_v2_updated`. `--dry-run` computes +
-    /// renders, writes nothing.
+    /// queue v2 (§6.8 human verb): create a backlog entry — a milestone with
+    /// its docs, `slices.toml` and the generated `001-plan` slice (§4) when no
+    /// slices are given, a numbered task (`fix/<NNN>` branch), or an urgent
+    /// no-branch restack — plus its lane-placed row in `queue.toml`. One
+    /// commit, `queue_v2_updated`. `--dry-run` computes + renders, writes
+    /// nothing.
     pub const QUEUE_ADD_ENTRY: &str = "queue_add_entry";
+    /// queue v2 (§6.8 human verb): patch an entry — `lane`, `move` (within the
+    /// lane), `after` (replaces the link list) and/or `status` (human statuses;
+    /// `done` archives the row), applied in that order as one atomic edit.
+    /// One commit, `queue_v2_updated`; a no-op edit mints none. `--dry-run`
+    /// computes + renders, writes nothing.
+    pub const QUEUE_UPDATE_ENTRY: &str = "queue_update_entry";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2130,26 +2137,39 @@ pub struct QueueSliceSpec {
     pub body: String,
 }
 
-/// `queue_add_entry({kind, slug, title, mission, finish_criteria, project,
-/// lane = "normal", after = [], position = "back", ref?, slices = [],
-/// dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates the docs as
-/// the legacy `add_backlog_item` does, the `slices.toml` (plus the generated
-/// `001-plan` slice when `slices` is empty, §4), and the lane-placed entry
-/// row in `queue.toml` — one commit. This build implements `kind = milestone`
-/// only; `task` and `restack` arrive with the next slice.
+/// `queue_add_entry({kind, slug?, title?, mission?, finish_criteria?,
+/// project, lane = "normal", after = [], position = "back", ref?,
+/// slices = [], dry_run}) -> {id, path, view, hash}` — queue v2 §6.8. Creates
+/// the docs as the legacy `add_backlog_item` does and places the lane row in
+/// `queue.toml` — one commit:
+///
+/// - `milestone`: `milestones/<slug>/CLAUDE.md`, `slices/`, `slices.toml`
+///   (plus the generated `001-plan` slice when `slices` is empty, §4);
+///   `slug`/`title`/`mission`/`finish_criteria` required.
+/// - `task`: `tasks/NNN-<slug>.md` (NNN from the tasks `.seq`), id = the NNN,
+///   `branch = fix/<NNN>` (§3.1: the id exists only after numbering, finding
+///   4). `slices` refused — tasks have no `slices.toml` (§4).
+/// - `restack`: generated `tasks/NNN-restack-<project>.md`, urgent lane, no
+///   branch. `project` only — every other arg is refused as `BadArgs`
+///   (finding 5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueAddEntryArgs {
-    /// `milestone | task | restack` (this build: `milestone` only).
+    /// `milestone | task | restack`.
     pub kind: EntryKind,
-    /// `[a-z0-9-]+` — the entry id and, for a milestone, its dir name
-    /// (`milestones/<slug>/`).
-    pub slug: String,
+    /// The entry id; for a milestone also its dir name
+    /// (`milestones/<slug>/`). Required for `milestone`/`task`; forbidden for
+    /// `restack` (its slug is `restack-<project>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
     /// Human title shown in the queue view + the doc heading.
-    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Why this entry exists (the doc's `## Mission`).
-    pub mission: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission: Option<String>,
     /// Checkable completion criteria (the doc's `## Finish criteria`).
-    pub finish_criteria: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_criteria: Option<String>,
     /// The owning project's name — must already exist.
     pub project: String,
     /// `urgent | normal`; defaults to `normal`.
@@ -2177,7 +2197,7 @@ pub struct QueueAddEntryArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueAddEntryReply {
-    /// The entry id (the milestone slug).
+    /// The entry id (the milestone slug, or a task's/restack's NNN).
     pub id: String,
     /// Garden-relative path of the entry's main doc.
     pub path: String,
@@ -2185,6 +2205,77 @@ pub struct QueueAddEntryReply {
     /// state on a dry run) — what the §6.9 CLI prints.
     pub view: String,
     /// Commit hash; on a dry run the untouched tip.
+    pub hash: String,
+}
+
+/// The `queue_update_entry` `status` argument (§6.8): the human statuses plus
+/// the daemon-owned ones as parseable wire values, so `done` reaches the verb
+/// as an explicit archive move and `active`/`paused`/`split` produce the
+/// `daemon_owned` refusal instead of a serde shape error. The live entry
+/// status vocabulary ([`crate::queue_v2::EntryStatus`]) has no `done` or
+/// `split` — both exist only on this wire enum, where `done` means "archive
+/// the row" and `split` (a slice-status word) is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueStatusArg {
+    Queued,
+    Blocked,
+    Deferred,
+    Done,
+    Active,
+    Paused,
+    Split,
+}
+
+/// The `queue_update_entry` `move` argument (§6.8): `front | back | before |
+/// after` (with `ref` for the last two), inside the entry's own lane. The
+/// keyword is kept as a string so keeperd owns the closed-vocabulary check
+/// (like `position` on `queue_add_entry`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueMoveSpec {
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub ref_id: Option<String>,
+}
+
+/// `queue_update_entry({id, lane?, move = {to, ref?}?, after?, status?,
+/// dry_run}) -> {id, view, hash}` — queue v2 §6.8. One atomic edit applied in
+/// the order lane → move → after → status, committed once with the queue view
+/// re-rendered. A no-op edit mints no commit (the legacy reorder verb's
+/// idempotence).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueUpdateEntryArgs {
+    /// The live entry id to edit.
+    pub id: String,
+    /// To `urgent` appends at the urgent lane's back; to `normal` puts it at
+    /// the normal lane's front (§6.8). `parent`/`base`/`claimed` stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
+    /// A within-lane move; refused `started` once the entry is claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "move")]
+    pub move_spec: Option<QueueMoveSpec>,
+    /// Replaces the whole link list (`[]` clears it); every id must resolve
+    /// and the links must stay acyclic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<Vec<String>>,
+    /// `queued` (also unblocks and un-defers) | `blocked` | `deferred` |
+    /// `done` (human override → archive, no open-items check; refused
+    /// `running` on an `active` entry). `active`/`paused`/`split` are refused
+    /// `daemon_owned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<QueueStatusArg>,
+    /// Compute + validate + render the would-be state, write nothing (§6.9).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueUpdateEntryReply {
+    pub id: String,
+    /// The `softfig:queue-v2` view region body after the write (the would-be
+    /// state on a dry run) — what the §6.9 CLI prints.
+    pub view: String,
+    /// Commit hash; on a dry run or a no-op edit the untouched tip.
     pub hash: String,
 }
 

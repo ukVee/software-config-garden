@@ -37,7 +37,7 @@ mod v2;
 pub use holders::{ClaimGate, HolderStore};
 pub use init::growlight_init;
 pub use leases::{release_lease, request_lease};
-pub use queue_verbs::{queue_add_entry, queue_add_project};
+pub use queue_verbs::{queue_add_entry, queue_add_project, queue_update_entry};
 pub use reports::{file_report, list_reports, update_report};
 pub use set_resources::growlight_set_resources;
 
