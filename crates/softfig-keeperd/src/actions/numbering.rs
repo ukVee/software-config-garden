@@ -11,8 +11,9 @@
 //! raise the next id.
 
 use softfig_ipc::ErrorKind;
+use softfig_store::Hash;
 
-use super::{conventions, Tree};
+use super::{conventions, Tree, WorkTree};
 
 /// The next note number for accretive folder `dir_rel`: one past the larger of
 /// the `.seq` high-water mark and the highest live `NNN-*.md` file. Reads run
@@ -43,6 +44,15 @@ pub fn find_by_id<T: Tree>(wt: &T, dir_rel: &str, id: u32) -> Option<String> {
         (e.name.starts_with(&prefix) && e.name.ends_with(".md"))
             .then(|| format!("{dir_rel}/{}", e.name))
     })
+}
+
+/// The current `.seq` content version for folder `dir_rel` — the whole-file
+/// CAS token a verb passes with its own `.seq` bump, so a hand-edited counter
+/// can't be silently clobbered between numbering and the write's CAS pass.
+/// `None` when the file is absent — a first-creation bump.
+pub fn seq_version(wt: &WorkTree, dir_rel: &str) -> Option<String> {
+    let rel = format!("{dir_rel}/{}", conventions::SEQ_FILE);
+    wt.read(&rel).map(|b| Hash::of(&b).to_hex())
 }
 
 /// Stamp the next numbered doc into `dir_rel`: bump `.seq` to `number` and

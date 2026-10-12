@@ -2,27 +2,30 @@
 //!
 //! A verb's write half is: load ([`super::state`]), mutate the in-memory
 //! models, validate (its own refusal vocabulary), then call [`apply`] once
-//! with every file it changed and every view that must re-render. `apply`
-//! does the whole-file CAS checks, stages the writes through the worktree,
-//! upserts/removes the managed regions, and commits **exactly once** with an
-//! intent naming the verb — all files a verb touches land in one commit, no
-//! partial writes. Any other writes the verb staged earlier (entry docs, a
-//! backlink refresh) ride that same commit; the verb must never commit itself.
+//! with every file it changed, every view that must re-render, and — as
+//! `extras` — every companion doc it creates (the entry doc, its `.seq`
+//! bump, slice docs). `apply` does the whole-file CAS checks on `files` and
+//! `extras` alike, stages everything through the worktree, upserts/removes
+//! the managed regions, refreshes backlinks when asked, and commits
+//! **exactly once** with an intent naming the verb — all files a verb
+//! touches land in one commit, no partial writes; the verb must never stage
+//! or commit itself.
 //!
 //! The CAS token is the load's [`LoadedFile::version`]: `Some(hash)` means
 //! the file must still read those bytes; `None` means this is the first
 //! creation and the file must not exist. Either drift refuses the write with
 //! `Conflict` before anything is staged, so a stale or hand-edited file is
-//! never clobbered. First creation writes `schema = 1` + the mutated rows —
-//! the model constructors stamp the schema and the serializer refuses to
-//! emit anything else.
+//! never clobbered, a refused verb strands no orphan docs and burns no `.seq`
+//! number. First creation writes `schema = 1` + the mutated rows — the model
+//! constructors stamp the schema and the serializer refuses to emit anything
+//! else.
 
 use softfig_ipc::ErrorKind;
 use softfig_store::Hash;
 use softfig_vcs::Intent;
 
 use crate::actions::growlight::paths;
-use crate::actions::{managed, sections, WorkTree};
+use crate::actions::{backlinks, managed, sections, WorkTree};
 use crate::daemon::{Daemon, DaemonInner};
 
 /// One v2 file to write: the path, the CAS token from the load, and the
@@ -45,15 +48,43 @@ pub struct ViewWrite {
     pub body: Option<String>,
 }
 
-/// Stage every [`FileWrite`] (CAS-checked) and [`ViewWrite`] through the
-/// worktree, then commit once with `intent_name` naming the verb. Returns the
-/// commit hash (the untouched tip when nothing changed on disk — same-tree
-/// writes mint no commit).
+/// The verb's companion doc writes — the entry doc, the `.seq` bump, the
+/// slice docs — carried inside [`apply`]'s single commit. `refresh_backlinks`
+/// is true exactly when those writes are new numbered docs whose `[[…]]`
+/// refs the whole-garden backlink refresh must resolve.
+pub struct ExtraWrites<'a> {
+    pub writes: &'a [FileWrite],
+    pub refresh_backlinks: bool,
+}
+
+impl ExtraWrites<'static> {
+    /// No companion docs (the entry/slice-update verbs): nothing extra to
+    /// stage and no backlink refresh.
+    pub const NONE: ExtraWrites<'static> = ExtraWrites {
+        writes: &[],
+        refresh_backlinks: false,
+    };
+}
+
+/// Stage every [`FileWrite`] (CAS-checked), every companion
+/// [`ExtraWrites`] doc, and every [`ViewWrite`] through the worktree, then
+/// commit once with `intent_name` naming the verb. Returns the commit hash
+/// (the untouched tip when nothing changed on disk — same-tree writes mint no
+/// commit).
+///
+/// The `extras` bundle carries the verb's own doc writes — the entry doc, the
+/// `.seq` bump, the slice docs — inside the same envelope: pass 1 runs their
+/// checks (`check_write` + the same CAS/absent rule as `files`), pass 2
+/// stages them after `files` and before the views, so a view host that is one
+/// of the extras (the milestone doc hosting the slices view) reads its staged
+/// bytes. `extras.refresh_backlinks` runs the whole-garden backlink refresh
+/// after everything is staged, so the new docs' `[[…]]` refs resolve; set it
+/// exactly when the extras stage new numbered docs.
 ///
 /// All-or-nothing: every check runs before the first write, so a refusal
 /// (a stale CAS token, a file that appeared, an unreadable view host) stages
-/// nothing — no partial writes, and the single commit only ever fires with
-/// the whole verb's state ready.
+/// nothing — no partial writes, no orphaned docs, no burned `.seq` number —
+/// and the single commit only ever fires with the whole verb's state ready.
 pub fn apply(
     daemon: &Daemon,
     inner: &mut DaemonInner,
@@ -61,12 +92,13 @@ pub fn apply(
     payload: serde_json::Value,
     files: &[FileWrite],
     views: &[ViewWrite],
+    extras: &ExtraWrites,
 ) -> Result<Hash, (ErrorKind, String)> {
     crate::handlers::require_unlocked(inner)?;
     {
         let wt = WorkTree::new(daemon, inner);
         // Pass 1 — refuse everything that could fail, before anything lands.
-        for f in files {
+        for f in files.iter().chain(extras.writes) {
             wt.check_write(&f.rel)?;
             match &f.expected {
                 Some(_) => crate::handlers::cas_check_whole_file(&wt, &f.rel, &f.expected)?,
@@ -87,11 +119,17 @@ pub fn apply(
         }
         let hosts: Result<Vec<Option<String>>, (ErrorKind, String)> = views
             .iter()
-            .map(|v| read_view_host(&wt, inner, &v.host, v.body.is_some()))
+            .map(|v| read_view_host(&wt, inner, &v.host, v.body.is_some(), extras.writes))
             .collect();
         let hosts = hosts?;
-        // Pass 2 — stage every write.
+        // Pass 2 — stage every write. Extras land before the views so a view
+        // host that is itself an extra gets the region upserted on top of its
+        // staged doc, and before the backlink refresh so the new docs' refs
+        // resolve.
         for f in files {
+            wt.write(&f.rel, &f.bytes)?;
+        }
+        for f in extras.writes {
             wt.write(&f.rel, &f.bytes)?;
         }
         for (v, host) in views.iter().zip(hosts) {
@@ -107,6 +145,9 @@ pub fn apply(
                 wt.write(&v.host, new.as_bytes())?;
             }
         }
+        if extras.refresh_backlinks {
+            backlinks::refresh_all(&wt, inner);
+        }
     }
     let intent = Intent::new(intent_name, payload)
         .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
@@ -116,15 +157,23 @@ pub fn apply(
 /// Read a view's host doc through the same guard the legacy verbs use. A
 /// missing host is created from the backlog stub only for the queue view
 /// (mirroring `add_backlog_item` self-materializing its routing doc); any
-/// other missing host is the verb's bug — refuse, never fabricate a doc.
+/// other missing host is the verb's bug — refuse, never fabricate a doc —
+/// unless the verb itself stages it this commit (`extras`, e.g. the milestone
+/// doc hosting the slices view), whose bytes stand in for the disk read.
 fn read_view_host(
     wt: &WorkTree,
     inner: &DaemonInner,
     host: &str,
     upserting: bool,
+    extras: &[FileWrite],
 ) -> Result<Option<String>, (ErrorKind, String)> {
     if let Some(content) = sections::read_if_unprotected(wt, inner, host) {
         return Ok(Some(content));
+    }
+    if let Some(extra) = extras.iter().find(|f| f.rel == host) {
+        return String::from_utf8(extra.bytes.clone())
+            .map(Some)
+            .map_err(|_| (ErrorKind::Internal, format!("{host}: staged bytes are not UTF-8")));
     }
     if wt.exists(host) {
         return Err((
@@ -243,6 +292,7 @@ pub(crate) mod tests {
                 tag: views::QUEUE_V2_TAG,
                 body: Some(views::queue_view(queue)),
             }],
+            &ExtraWrites::NONE,
         )
         .expect("apply");
     }
@@ -387,6 +437,7 @@ pub(crate) mod tests {
                 tag: views::QUEUE_V2_TAG,
                 body: Some(views::queue_view(&q)),
             }],
+            &ExtraWrites::NONE,
         )
         .expect("identical re-apply");
         drop(inner);
@@ -428,6 +479,7 @@ pub(crate) mod tests {
                     .into_bytes(),
             }],
             &[],
+            &ExtraWrites::NONE,
         )
         .unwrap_err();
         assert_eq!(err.0, ErrorKind::Conflict, "{err:?}");
@@ -458,6 +510,7 @@ pub(crate) mod tests {
                     .into_bytes(),
             }],
             &[],
+            &ExtraWrites::NONE,
         )
         .unwrap_err();
         assert_eq!(err.0, ErrorKind::Conflict, "{err:?}");
@@ -525,6 +578,7 @@ pub(crate) mod tests {
                         body: Some(views::slices_view(&s)),
                     },
                 ],
+                &ExtraWrites::NONE,
             )
             .expect("apply");
         }
@@ -568,6 +622,7 @@ pub(crate) mod tests {
                     tag: views::QUEUE_V2_TAG,
                     body: None,
                 }],
+                &ExtraWrites::NONE,
             )
             .expect("apply removal");
         }
@@ -596,6 +651,7 @@ pub(crate) mod tests {
                 tag: views::SLICES_V2_TAG,
                 body: Some("x".to_string()),
             }],
+            &ExtraWrites::NONE,
         )
         .unwrap_err();
         assert_eq!(err.0, ErrorKind::NotFound, "{err:?}");
@@ -643,6 +699,7 @@ pub(crate) mod tests {
                 },
             ],
             &[],
+            &ExtraWrites::NONE,
         )
         .unwrap_err();
         assert_eq!(err.0, ErrorKind::Conflict, "{err:?}");
@@ -662,6 +719,199 @@ pub(crate) mod tests {
             commit_count(&daemon),
             commits_before,
             "a refused apply mints no commit"
+        );
+    }
+
+    #[test]
+    fn extras_never_land_when_a_file_cas_refuses() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let q = QueueToml::new(vec![project()], vec![entry("a", Lane::Normal)]);
+        create_queue(&daemon, &q, None);
+
+        // Load, then a hand-edit lands; apply carries a stale CAS token plus
+        // extras (a numbered doc + its .seq bump). The refusal must strand
+        // neither the doc nor the bumped .seq — no orphan docs, no burned
+        // number.
+        let version = {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(&daemon, &inner);
+            state::load_queue_state(&wt, &inner)
+                .unwrap()
+                .unwrap()
+                .queue
+                .version
+                .unwrap()
+        };
+        hand_write(garden.path(), QUEUE_FILE, "schema = 1\n[[entry]]\n");
+        let doc_rel = "growlight/backlog/tasks/001-x.md";
+        let seq_rel = "growlight/backlog/tasks/.seq";
+        hand_write(garden.path(), seq_rel, "0\n");
+
+        let mut inner = daemon.inner.lock().unwrap();
+        let seq_expected = {
+            let wt = WorkTree::new(&daemon, &inner);
+            crate::actions::numbering::seq_version(&wt, "growlight/backlog/tasks")
+        };
+        let err = apply(
+            &daemon,
+            &mut inner,
+            "queue_v2_updated",
+            serde_json::json!({}),
+            &[FileWrite {
+                rel: state::QUEUE_FILE.to_string(),
+                expected: Some(version),
+                bytes: QueueToml::new(vec![project()], vec![entry("stale-wins", Lane::Urgent)])
+                    .to_toml()
+                    .unwrap()
+                    .into_bytes(),
+            }],
+            &[],
+            &ExtraWrites {
+                writes: &[
+                    FileWrite {
+                        rel: doc_rel.to_string(),
+                        expected: None,
+                        bytes: b"# X\n".to_vec(),
+                    },
+                    FileWrite {
+                        rel: seq_rel.to_string(),
+                        expected: seq_expected,
+                        bytes: b"1\n".to_vec(),
+                    },
+                ],
+                refresh_backlinks: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.0, ErrorKind::Conflict, "{err:?}");
+        drop(inner);
+
+        assert!(
+            !garden.path().join(doc_rel).exists(),
+            "no orphan doc on refusal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(garden.path().join(seq_rel)).unwrap(),
+            "0\n",
+            "no burned .seq number on refusal"
+        );
+    }
+
+    #[test]
+    fn extras_are_checked_before_any_file_write_lands() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let q = QueueToml::new(vec![project()], vec![entry("a", Lane::Normal)]);
+        create_queue(&daemon, &q, None);
+
+        // The extra doc already exists (a .seq burned by an earlier crash —
+        // the refuse-don't-clobber case). The file's CAS passes, so only the
+        // extra's own absent-check can refuse — and it must do so before the
+        // file bytes land.
+        let doc_rel = "growlight/backlog/tasks/001-x.md";
+        hand_write(garden.path(), doc_rel, "# occupied\n");
+        let before = commit_count(&daemon);
+
+        let mut inner = daemon.inner.lock().unwrap();
+        let version = {
+            let wt = WorkTree::new(&daemon, &inner);
+            state::load_queue_state(&wt, &inner)
+                .unwrap()
+                .unwrap()
+                .queue
+                .version
+                .unwrap()
+        };
+        let err = apply(
+            &daemon,
+            &mut inner,
+            "queue_v2_updated",
+            serde_json::json!({}),
+            &[FileWrite {
+                rel: state::QUEUE_FILE.to_string(),
+                expected: Some(version),
+                bytes: QueueToml::new(vec![project()], vec![entry("a", Lane::Normal), entry("b", Lane::Urgent)])
+                    .to_toml()
+                    .unwrap()
+                    .into_bytes(),
+            }],
+            &[],
+            &ExtraWrites {
+                writes: &[FileWrite {
+                    rel: doc_rel.to_string(),
+                    expected: None,
+                    bytes: b"# X\n".to_vec(),
+                }],
+                refresh_backlinks: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.0, ErrorKind::Conflict, "{err:?}");
+        drop(inner);
+
+        assert_eq!(commit_count(&daemon), before, "refused: no commit");
+        assert_eq!(
+            std::fs::read_to_string(garden.path().join(doc_rel)).unwrap(),
+            "# occupied\n",
+            "the occupied doc stands"
+        );
+        let on_disk = std::fs::read_to_string(garden.path().join(QUEUE_FILE)).unwrap();
+        assert!(
+            !on_disk.contains("id = \"b\"") && on_disk.contains("id = \"a\""),
+            "the file's bytes never landed: {on_disk}"
+        );
+    }
+
+    #[test]
+    fn extras_stage_in_applys_single_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let q = QueueToml::new(vec![project()], vec![entry("a", Lane::Normal)]);
+        create_queue(&daemon, &q, None);
+        hand_write(garden.path(), "growlight/backlog/tasks/.seq", "0\n");
+        let before = commit_count(&daemon);
+
+        let mut inner = daemon.inner.lock().unwrap();
+        let seq_expected = {
+            let wt = WorkTree::new(&daemon, &inner);
+            crate::actions::numbering::seq_version(&wt, "growlight/backlog/tasks")
+        };
+        apply(
+            &daemon,
+            &mut inner,
+            "queue_v2_updated",
+            serde_json::json!({}),
+            &[],
+            &[],
+            &ExtraWrites {
+                writes: &[
+                    FileWrite {
+                        rel: "growlight/backlog/tasks/001-x.md".to_string(),
+                        expected: None,
+                        bytes: b"# X\n".to_vec(),
+                    },
+                    FileWrite {
+                        rel: "growlight/backlog/tasks/.seq".to_string(),
+                        expected: seq_expected,
+                        bytes: b"1\n".to_vec(),
+                    },
+                ],
+                refresh_backlinks: true,
+            },
+        )
+        .expect("extras apply");
+        drop(inner);
+
+        assert_eq!(
+            commit_count(&daemon),
+            before + 1,
+            "one commit carries files, extras and the backlink refresh"
+        );
+        assert!(garden.path().join("growlight/backlog/tasks/001-x.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(garden.path().join("growlight/backlog/tasks/.seq")).unwrap(),
+            "1\n"
         );
     }
 

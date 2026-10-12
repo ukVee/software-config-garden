@@ -28,4 +28,4 @@ pub use state::{load_queue_state, load_slices, milestone_path, slices_file, QUEU
 pub use views::{
     queue_view, queue_view_host, slices_view, slices_view_host, QUEUE_V2_TAG, SLICES_V2_TAG,
 };
-pub use write::{apply, FileWrite, ViewWrite};
+pub use write::{apply, ExtraWrites, FileWrite, ViewWrite};

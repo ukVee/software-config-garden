@@ -5,14 +5,15 @@
 //!
 //! Each verb follows [`super::v2::write`]'s contract: load
 //! ([`super::v2::state`]), mutate the in-memory models, validate (the
-//! slice-002 [`QueueRefusal`] vocabulary), stage the entry's docs through
-//! the worktree, then call [`apply`] once with every changed TOML file and
-//! every view that must re-render — the whole-file CAS checks, the view
-//! upserts, and exactly one commit land together; the verb never commits
-//! itself. A `dry_run` stops before `apply`: everything is computed,
-//! validated and rendered, nothing is committed, and the reply carries the
-//! would-be queue view so the §6.9 CLI can print it. A no-op
-//! `queue_update_entry` edit mints no commit, like the legacy reorder verb.
+//! slice-002 [`QueueRefusal`] vocabulary), then call [`apply`] once with
+//! every changed TOML file, every view that must re-render, and every
+//! companion doc it creates passed as `extras` — the whole-file CAS checks,
+//! the view upserts, the backlink refresh, and exactly one commit land
+//! together; the verb never stages or commits itself. A `dry_run` stops
+//! before `apply`: everything is computed, validated and rendered, nothing
+//! is committed, and the reply carries the would-be queue view so the §6.9
+//! CLI can print it. A no-op `queue_update_entry` edit mints no commit, like
+//! the legacy reorder verb.
 //!
 //! Refusals leave as wire errors whose message is the [`QueueRefusal`]
 //! display — which leads with the wire code ([`QueueRefusal::code`]), the
@@ -37,10 +38,10 @@ use softfig_ipc::ErrorKind;
 use super::super::numbering;
 use super::v2::{
     apply, load_queue_state, load_slices, milestone_path, queue_view, queue_view_host, slices_file,
-    slices_view, slices_view_host, FileWrite, ViewWrite, QUEUE_FILE, QUEUE_V2_TAG, SLICES_V2_TAG,
+    slices_view, slices_view_host, ExtraWrites, FileWrite, ViewWrite, QUEUE_FILE, QUEUE_V2_TAG,
+    SLICES_V2_TAG,
 };
 use super::{conventions, paths, queue, WorkTree};
-use crate::actions::backlinks;
 use crate::daemon::{Daemon, DaemonInner};
 use crate::handlers::{require_unlocked, HandlerResult};
 use crate::server::err_to_response;
@@ -126,6 +127,7 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
             tag: QUEUE_V2_TAG,
             body: Some(view.clone()),
         }],
+        &ExtraWrites::NONE,
     )?;
 
     Ok(serde_json::to_value(QueueAddProjectReply {
@@ -343,16 +345,26 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         .unwrap());
     }
 
-    // Stage the entry's docs through the worktree (like `add_backlog_item`),
-    // refresh backlinks, then let `apply` carry everything in its one commit.
-    {
-        let wt = WorkTree::new(daemon, &inner);
-        wt.write(&doc_rel, doc_content.as_bytes())?;
-        wt.write(&format!("{slices_dir}/{}", conventions::SEQ_FILE), format!("{seq}\n").as_bytes())?;
-        for (rel, content) in &slice_docs {
-            wt.write(rel, content.as_bytes())?;
-        }
-        backlinks::refresh_all(&wt, &inner);
+    // The entry's docs ride `apply`'s one commit as extras — checked in its
+    // pass 1 (first-creation: each must still be absent) and staged in its
+    // pass 2 with the backlink refresh, so a refusal leaves no orphan docs
+    // and no burned `.seq` number.
+    let mut extras = vec![FileWrite {
+        rel: doc_rel.clone(),
+        expected: None,
+        bytes: doc_content.into_bytes(),
+    }];
+    extras.push(FileWrite {
+        rel: format!("{slices_dir}/{}", conventions::SEQ_FILE),
+        expected: None,
+        bytes: format!("{seq}\n").into_bytes(),
+    });
+    for (rel, content) in slice_docs {
+        extras.push(FileWrite {
+            rel,
+            expected: None,
+            bytes: content.into_bytes(),
+        });
     }
 
     let hash = apply(
@@ -367,6 +379,10 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         }),
         &files,
         &views,
+        &ExtraWrites {
+            writes: &extras,
+            refresh_backlinks: true,
+        },
     )?;
 
     Ok(serde_json::to_value(QueueAddEntryReply {
@@ -465,11 +481,25 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         .unwrap());
     }
 
-    {
+    // The task doc + its `.seq` bump ride `apply`'s one commit as extras; the
+    // `.seq` carries its pre-bump content version so a hand-edited counter
+    // refuses the verb instead of being silently clobbered.
+    let seq_expected = {
         let wt = WorkTree::new(daemon, &inner);
-        numbering::write_numbered(&wt, &tasks_dir, number, &task_rel, &doc_content)?;
-        backlinks::refresh_all(&wt, &inner);
-    }
+        numbering::seq_version(&wt, &tasks_dir)
+    };
+    let extras = [
+        FileWrite {
+            rel: task_rel.clone(),
+            expected: None,
+            bytes: doc_content.into_bytes(),
+        },
+        FileWrite {
+            rel: format!("{tasks_dir}/{}", conventions::SEQ_FILE),
+            expected: seq_expected,
+            bytes: format!("{number}\n").into_bytes(),
+        },
+    ];
 
     let hash = apply(
         daemon,
@@ -487,6 +517,10 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
             tag: QUEUE_V2_TAG,
             body: Some(view.clone()),
         }],
+        &ExtraWrites {
+            writes: &extras,
+            refresh_backlinks: true,
+        },
     )?;
 
     Ok(serde_json::to_value(QueueAddEntryReply {
@@ -622,17 +656,24 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         .unwrap());
     }
 
-    {
+    // The restack doc + its `.seq` bump ride `apply`'s one commit as extras
+    // (same envelope as the task kind).
+    let seq_expected = {
         let wt = WorkTree::new(daemon, &inner);
-        numbering::write_numbered(
-            &wt,
-            &paths::tasks_dir(),
-            restack.number,
-            &restack.rel,
-            &restack.content,
-        )?;
-        backlinks::refresh_all(&wt, &inner);
-    }
+        numbering::seq_version(&wt, &paths::tasks_dir())
+    };
+    let extras = [
+        FileWrite {
+            rel: restack.rel.clone(),
+            expected: None,
+            bytes: restack.content.clone().into_bytes(),
+        },
+        FileWrite {
+            rel: format!("{}/{}", paths::tasks_dir(), conventions::SEQ_FILE),
+            expected: seq_expected,
+            bytes: format!("{}\n", restack.number).into_bytes(),
+        },
+    ];
 
     let hash = apply(
         daemon,
@@ -650,6 +691,10 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
             tag: QUEUE_V2_TAG,
             body: Some(view.clone()),
         }],
+        &ExtraWrites {
+            writes: &extras,
+            refresh_backlinks: true,
+        },
     )?;
 
     Ok(serde_json::to_value(QueueAddEntryReply {
@@ -864,6 +909,7 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
             tag: QUEUE_V2_TAG,
             body: Some(view.clone()),
         }],
+        &ExtraWrites::NONE,
     )?;
 
     Ok(serde_json::to_value(QueueUpdateEntryReply {
@@ -959,12 +1005,25 @@ pub fn slice_insert(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         .unwrap());
     }
 
-    {
+    // The slice doc + its `.seq` bump ride `apply`'s one commit as extras
+    // (same envelope as the milestone/task kinds).
+    let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
+    let seq_expected = {
         let wt = WorkTree::new(daemon, &inner);
-        let content = conventions::note_doc(title, &conventions::today_hyphen(), &args.body);
-        numbering::write_numbered(&wt, &slices_dir, number, &slice_rel, &content)?;
-        backlinks::refresh_all(&wt, &inner);
-    }
+        numbering::seq_version(&wt, &slices_dir)
+    };
+    let extras = [
+        FileWrite {
+            rel: slice_rel.clone(),
+            expected: None,
+            bytes: content.into_bytes(),
+        },
+        FileWrite {
+            rel: format!("{slices_dir}/{}", conventions::SEQ_FILE),
+            expected: seq_expected,
+            bytes: format!("{number}\n").into_bytes(),
+        },
+    ];
 
     let files = [FileWrite {
         rel: slices_file(&milestone),
@@ -985,6 +1044,10 @@ pub fn slice_insert(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             tag: SLICES_V2_TAG,
             body: Some(view.clone()),
         }],
+        &ExtraWrites {
+            writes: &extras,
+            refresh_backlinks: true,
+        },
     )?;
 
     Ok(serde_json::to_value(SliceInsertReply {
@@ -1073,8 +1136,12 @@ pub fn slice_update(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             SliceStatus::Done => {
                 let idx = slice_idx(&model, &args.id);
                 model.items[idx].status = SliceStatus::Done;
-                // §3.3: follow_ups reset to 0 on done.
-                model.items[idx].follow_ups = Some(0);
+                // §3.3: follow_ups resets to 0 on done — slice rows only. A
+                // `sub` omits the field, so setting it would trip the shape
+                // backstop below and refuse a human's `done` on a sub.
+                if model.items[idx].kind == SliceKind::Slice {
+                    model.items[idx].follow_ups = Some(0);
+                }
             }
             SliceStatus::Queued | SliceStatus::Blocked | SliceStatus::Deferred => {
                 let idx = slice_idx(&model, &args.id);
@@ -1130,6 +1197,7 @@ pub fn slice_update(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             tag: SLICES_V2_TAG,
             body: Some(view.clone()),
         }],
+        &ExtraWrites::NONE,
     )?;
 
     Ok(serde_json::to_value(SliceUpdateReply {
@@ -1235,12 +1303,26 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         .unwrap());
     }
 
+    // The restack docs + one `.seq` bump ride `apply`'s one commit as extras
+    // (the drop→restack path stages no docs outside the envelope).
+    let mut extras = Vec::new();
     if !restacks.is_empty() {
-        let wt = WorkTree::new(daemon, &inner);
+        let seq_expected = {
+            let wt = WorkTree::new(daemon, &inner);
+            numbering::seq_version(&wt, &paths::tasks_dir())
+        };
         for r in &restacks {
-            numbering::write_numbered(&wt, &paths::tasks_dir(), r.number, &r.rel, &r.content)?;
+            extras.push(FileWrite {
+                rel: r.rel.clone(),
+                expected: None,
+                bytes: r.content.clone().into_bytes(),
+            });
         }
-        backlinks::refresh_all(&wt, &inner);
+        extras.push(FileWrite {
+            rel: format!("{}/{}", paths::tasks_dir(), conventions::SEQ_FILE),
+            expected: seq_expected,
+            bytes: format!("{}\n", restacks.last().expect("non-empty").number).into_bytes(),
+        });
     }
 
     let files = [
@@ -1277,6 +1359,10 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
             tag: QUEUE_V2_TAG,
             body: Some(view.clone()),
         }],
+        &ExtraWrites {
+            writes: &extras,
+            refresh_backlinks: !extras.is_empty(),
+        },
     )?;
 
     Ok(serde_json::to_value(QueueDropReply {
@@ -1921,6 +2007,7 @@ mod tests {
                     },
                 ],
                 &[],
+                &ExtraWrites::NONE,
             )
             .expect("seed");
         }
@@ -1962,6 +2049,7 @@ mod tests {
                     bytes: q.to_toml().unwrap().into_bytes(),
                 }],
                 &[],
+                &ExtraWrites::NONE,
             )
             .expect("seed");
         }
@@ -2061,6 +2149,7 @@ mod tests {
             serde_json::json!({ "test": true }),
             &files,
             &[],
+            &ExtraWrites::NONE,
         )
         .expect("seed");
     }
@@ -2580,6 +2669,7 @@ mod tests {
                 tag: SLICES_V2_TAG,
                 body: Some(slices_view(&model)),
             }],
+            &ExtraWrites::NONE,
         )
         .expect("seed slices");
     }
@@ -2926,6 +3016,42 @@ mod tests {
         let s = loaded_slices(&daemon, "m1");
         assert_eq!(s.items[0].status, SliceStatus::Done);
         assert_eq!(s.items[0].follow_ups, Some(0), "reset to 0 on done");
+    }
+
+    #[test]
+    fn slice_update_done_on_a_sub_keeps_the_sub_shape() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({}))).unwrap();
+        // A sub item carries no follow_ups (§3.3: slice only).
+        seed_slices(
+            &daemon,
+            "m1",
+            vec![SliceItem {
+                kind: SliceKind::Sub,
+                id: "sub-a".into(),
+                status: SliceStatus::Queued,
+                follow_ups: None,
+            }],
+        );
+
+        // done on a sub sets the status and leaves the shape alone — the
+        // reset is slice-only, and a `Some(0)` here would trip the §3.3
+        // shape backstop and refuse the edit.
+        let reply = update_slice(
+            &daemon,
+            serde_json::json!({ "milestone": "m1", "id": "sub-a", "status": "done" }),
+        )
+        .expect("a human can mark a sub done");
+        assert!(
+            reply.view.contains("| 1 | sub | sub-a | done | — |"),
+            "the sub row renders done with no follow_ups: {:?}",
+            reply.view
+        );
+        let s = loaded_slices(&daemon, "m1");
+        assert_eq!(s.items[0].status, SliceStatus::Done);
+        assert_eq!(s.items[0].follow_ups, None, "a sub never gains follow_ups");
     }
 
     #[test]
