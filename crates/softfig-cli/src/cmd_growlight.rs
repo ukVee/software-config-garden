@@ -22,16 +22,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
-    ClientError, Request, growlightd_runtime_socket_path, runtime_socket_path,
+    ClientError, ErrorKind, Request, growlightd_runtime_socket_path, runtime_socket_path,
     baton::{parse_baton, BatonDisposition, BatonView},
     growlightd::{
         self, AgentDeltaKind, BuildCapsSummary, Event, FleetStatusReply, ForceStopArgs,
         PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
         StopLevel, StopReply,
     },
+    queue_v2::{Entry, EntryKind, Lane as QueueLane, QueueToml, SliceStatus, QUEUE_FILE},
     verbs::{
         GrowlightInitArgs, GrowlightInitReply, ListReportsArgs, ListReportsReply, PostMessageArgs,
-        PostMessageReply, ReportRow, StatusReply, op,
+        PostMessageReply, QueueAddEntryReply, QueueAddProjectReply, QueueDropReply, QueueMoveSpec,
+        QueueStatusArg, QueueUpdateEntryReply, ReadFileArgs, ReadFileReply, ReportRow,
+        SliceInsertReply, SliceUpdateReply, StatusReply, op,
     },
 };
 
@@ -128,6 +131,20 @@ pub enum GrowlightCmd {
     /// live `set` adjusts a running fleet without a daemon restart and stays
     /// throttle-not-kill (no hard `MemoryMax` cap).
     Resources(ResourcesArgs),
+
+    /// The queue v2 human surface (§6.9): `queue show` and the mutating forms —
+    /// `project add`, `add`, `move`, `lane`, `after`, `status`, `drop`. Each is
+    /// a thin client over the matching §6.8 keeperd verb, with `--dry-run`
+    /// (compute + validate + render the would-be list, write nothing). These
+    /// verbs touch only the v2 files; the live loop still runs on the legacy
+    /// queue (§11). `queue pick` lands with queue-v2-scheduling (it needs
+    /// `pick_v2`).
+    Queue(QueueArgs),
+
+    /// The queue v2 slice surface (§6.9): `insert`, `move` and `status` inside a
+    /// milestone's `slices.toml`, each a thin client over the matching §6.8
+    /// keeperd verb with `--dry-run`.
+    Slice(SliceArgs),
 }
 
 /// `growlight resources {show, set}` — the live build-resource-cap surface.
@@ -337,6 +354,8 @@ pub fn run(cmd: GrowlightCmd) -> Result<()> {
         GrowlightCmd::Say(args) => client_say(args),
         GrowlightCmd::Reports(args) => client_reports(args),
         GrowlightCmd::Resources(args) => client_resources(args),
+        GrowlightCmd::Queue(args) => client_queue(args),
+        GrowlightCmd::Slice(args) => client_slice(args),
     }
 }
 
@@ -2258,6 +2277,675 @@ fn delta_kind_label(kind: AgentDeltaKind) -> &'static str {
     }
 }
 
+// ---- queue v2 §6.9 CLI forms (queue-v2-state slice 009) ----------------
+
+/// The queue v2 human surface (§6.9): `show` and the mutating forms — `project
+/// add`, `add`, `move`, `lane`, `after`, `status`, `drop`. Each mutating form
+/// is a thin client over the matching §6.8 keeperd verb, with `--dry-run`
+/// (compute + validate + render the would-be list, write nothing). `queue pick`
+/// lands with queue-v2-scheduling (it needs `pick_v2`). The verbs touch only
+/// the v2 files; the live loop still runs on the legacy queue (§11).
+#[derive(Args, Debug)]
+pub struct QueueArgs {
+    /// keeperd socket. Defaults to `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    #[command(subcommand)]
+    pub cmd: Option<QueueSub>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QueueSub {
+    /// (default) show the live v2 list from `queue.toml` — both lanes, one row
+    /// per entry in file order: id, kind, title, project, lane, status, the
+    /// `after` links, and the stack columns (branch/base/claimed) verbatim
+    /// from the TOML. TOML state only — the live git-stack annotations
+    /// (merge-base / restack flags) are queue-v2-git's (finding 3).
+    Show,
+
+    /// Append a `[[project]]` row — `queue project add`.
+    Project {
+        #[command(subcommand)]
+        cmd: QueueProjectSub,
+    },
+
+    /// Create a backlog entry — a milestone (docs + `slices.toml` + the
+    /// generated `001-plan` slice), a numbered task (`fix/<NNN>` branch), or an
+    /// urgent no-branch restack — plus its lane-placed row in `queue.toml`.
+    Add(QueueAddArgs),
+
+    /// Move an entry within its own lane (`front | back | before <ref> |
+    /// behind <ref>`).
+    Move(QueueMoveArgs),
+
+    /// Change an entry's lane (`urgent | normal`).
+    Lane(QueueLaneArgs),
+
+    /// Replace an entry's `after` links; no ids clears them.
+    After(QueueAfterArgs),
+
+    /// Set an entry's status (`queued | blocked | deferred | done`).
+    Status(QueueStatusArgs),
+
+    /// Drop an entry — its row moves to `queue-archive.toml` as `dropped`.
+    Drop(QueueDropArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QueueProjectSub {
+    /// Append a `[[project]]` row: a name bound to a repo and its merge branch.
+    Add(QueueProjectAddArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QueueProjectAddArgs {
+    /// `[a-z0-9-]+` — the project name entries reference.
+    pub name: String,
+    /// A local path (`~` allowed) or `host:path`.
+    pub repo: String,
+    /// The branch merges land on; defaults to `main`.
+    #[arg(long)]
+    pub main: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The `queue add` kinds (§6.9): milestone | task | restack.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AddKind {
+    Milestone,
+    Task,
+    Restack,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueAddArgs {
+    /// milestone | task | restack. A milestone gets its docs + `slices.toml` +
+    /// the generated `001-plan` slice; a task its numbered doc; a restack a
+    /// generated urgent doc (project only — every other arg is refused).
+    pub kind: AddKind,
+    /// The entry id / dir name — required for milestone and task; forbidden
+    /// for restack (its slug is `restack-<project>`).
+    pub slug: Option<String>,
+    /// The owning project's name — must already exist (`queue project add`).
+    #[arg(long)]
+    pub project: String,
+    /// Human title shown in the queue view + the doc heading.
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Why this entry exists (the doc's `## Mission`). A `@file` value is read
+    /// from that file.
+    #[arg(long)]
+    pub mission: Option<String>,
+    /// Checkable completion criteria (the doc's `## Finish criteria`). A
+    /// `@file` value is read from that file.
+    #[arg(long)]
+    pub criteria: Option<String>,
+    /// Place the entry in the urgent lane (default: normal).
+    #[arg(long)]
+    pub urgent: bool,
+    /// Entry ids that must finish first; comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    pub after: Vec<String>,
+    /// Place at the front of the lane (default: back).
+    #[arg(long, conflicts_with_all = ["before", "behind"])]
+    pub front: bool,
+    /// Place before this entry id.
+    #[arg(long, conflicts_with_all = ["front", "behind"])]
+    pub before: Option<String>,
+    /// Place after this entry id (`behind` is the CLI spelling of the verbs'
+    /// `after` position, §6.9).
+    #[arg(long, conflicts_with_all = ["front", "before"])]
+    pub behind: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The placement words (§6.9): front | back | before | behind. `behind` is the
+/// CLI spelling of the verbs' `after` position, so it can't be confused with
+/// `after` links (§6.9).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum MoveTarget {
+    Front,
+    Back,
+    Before,
+    Behind,
+}
+
+/// The human lane words (§6.9).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LaneArg {
+    Urgent,
+    Normal,
+}
+
+/// The human status words (§6.9): queued | blocked | deferred | done.
+/// `active`/`paused`/`split` are daemon-owned, so they are not CLI words.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum HumanStatus {
+    Queued,
+    Blocked,
+    Deferred,
+    Done,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueMoveArgs {
+    /// The live entry id to move.
+    pub id: String,
+    /// Where to move it, inside its own lane. `before`/`behind` place relative
+    /// to <ref>.
+    pub to: MoveTarget,
+    /// The reference entry id for `before`/`behind`.
+    pub ref_id: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueLaneArgs {
+    /// The live entry id.
+    pub id: String,
+    /// urgent appends at the urgent lane's back; normal puts the entry at the
+    /// normal lane's front (§6.8).
+    pub lane: LaneArg,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueAfterArgs {
+    /// The live entry id.
+    pub id: String,
+    /// The new link list — replaces the whole list; no ids clears it.
+    pub ids: Vec<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueStatusArgs {
+    /// The live entry id.
+    pub id: String,
+    /// queued (also unblocks/un-defers) | blocked | deferred | done (archives
+    /// the row).
+    pub status: HumanStatus,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueDropArgs {
+    /// The live entry id to drop.
+    pub id: String,
+    /// Why the work is abandoned — recorded on the archived row. A `@file`
+    /// value is read from that file.
+    #[arg(long)]
+    pub reason: String,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The queue v2 slice surface (§6.9): `insert`, `move` and `status` inside a
+/// milestone's `slices.toml`, thin clients over the §6.8 keeperd verbs, each
+/// with `--dry-run`.
+#[derive(Args, Debug)]
+pub struct SliceArgs {
+    /// keeperd socket. Defaults to `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    #[command(subcommand)]
+    pub cmd: SliceSub,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SliceSub {
+    /// Append a numbered slice — writes `slices/NNN-<slug>.md` (NNN from the
+    /// milestone's `.seq`) and inserts the queued item into `slices.toml`.
+    Insert(SliceInsertArgs),
+    /// Move a slice item within `slices.toml` file order.
+    Move(SliceMoveArgs),
+    /// Set a slice item's status.
+    Status(SliceStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SliceInsertArgs {
+    /// The owning milestone: a top-level id, or `<parent>/<sub>` for a
+    /// sub-milestone (≤ 2 deep).
+    pub milestone: String,
+    /// `[a-z0-9-]+` — the slice's terse filename address (`NNN-<slug>.md`).
+    pub slug: String,
+    /// Slice heading title; defaults to the slug.
+    #[arg(long)]
+    pub title: Option<String>,
+    /// The slice's plan/spec markdown body. A `@file` value is read from that
+    /// file.
+    #[arg(long)]
+    pub body: String,
+    /// Where to insert (default: back). `before`/`behind` place relative to
+    /// <ref>.
+    pub position: Option<MoveTarget>,
+    /// The reference item for `before`/`behind`.
+    pub ref_id: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SliceMoveArgs {
+    /// The owning milestone (a top-level id, or `<parent>/<sub>`).
+    pub milestone: String,
+    /// The `[[item]]` id to move (the NNN, or a sub-milestone slug).
+    pub id: String,
+    /// Where to move it, within `slices.toml` file order.
+    pub to: MoveTarget,
+    /// The reference item for `before`/`behind`.
+    pub ref_id: Option<String>,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SliceStatusArgs {
+    /// The owning milestone (a top-level id, or `<parent>/<sub>`).
+    pub milestone: String,
+    /// The `[[item]]` id (the NNN, or a sub-milestone slug).
+    pub id: String,
+    /// queued (also unblocks/un-defers) | blocked | deferred | done (resets
+    /// follow_ups).
+    pub status: HumanStatus,
+    /// Compute + validate + render the would-be state, write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+fn client_queue(args: QueueArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    match args.cmd.unwrap_or(QueueSub::Show) {
+        QueueSub::Show => queue_show(&socket),
+        QueueSub::Project { cmd } => match cmd {
+            QueueProjectSub::Add(a) => queue_project_add(&socket, a),
+        },
+        QueueSub::Add(a) => queue_add(&socket, a),
+        QueueSub::Move(a) => queue_move(&socket, a),
+        QueueSub::Lane(a) => queue_lane(&socket, a),
+        QueueSub::After(a) => queue_after(&socket, a),
+        QueueSub::Status(a) => queue_status(&socket, a),
+        QueueSub::Drop(a) => queue_drop(&socket, a),
+    }
+}
+
+fn client_slice(args: SliceArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(runtime_socket_path);
+    match args.cmd {
+        SliceSub::Insert(a) => slice_insert(&socket, a),
+        SliceSub::Move(a) => slice_move(&socket, a),
+        SliceSub::Status(a) => slice_status(&socket, a),
+    }
+}
+
+/// The shared daemon-reply handling for the mutating forms: `Ok(None)` means
+/// no daemon; a daemon error's message already leads with the refusal code
+/// ([`softfig_ipc::queue_v2::QueueRefusal::code`]), so it is surfaced as-is
+/// without a `kind:` decoration.
+fn queue_call(socket: &Path, op_name: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+    match try_daemon_call(socket, op_name, args) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Err(anyhow!(
+            "no daemon at {} — unlock the garden first (`softfig daemon unlock`)",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { message, .. }) => Err(anyhow!("{message}")),
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// Print a verb reply the way §6.9 wants: the rendered view, plus a dry-run
+/// marker (nothing was written) or the commit on a real write. The view is the
+/// same body the §6.9 MCP verbs render in their summaries.
+fn print_verb_reply(dry_run: bool, view: &str, hash: &str) {
+    if dry_run {
+        println!("dry run — nothing written; would-be list:");
+    }
+    print!("{view}");
+    if !dry_run {
+        println!("commit {}", short_hash(hash));
+    }
+}
+
+/// §6.9: a value starting with `@` is read from that file. Anything else
+/// passes through unchanged.
+fn value_or_file(value: &str) -> Result<String> {
+    match value.strip_prefix('@') {
+        Some(path) if !path.is_empty() => {
+            Ok(fs::read_to_string(path).with_context(|| format!("reading {path}"))?)
+        }
+        Some(_) => bail!("`@` needs a file path after it (`@path/to/file`)"),
+        None => Ok(value.to_string()),
+    }
+}
+
+/// The placement words → the verbs' `position`/`to` vocabulary (§6.9):
+/// `behind` is the CLI spelling of the verbs' `after` position, so it can't be
+/// confused with `after` links. `before`/`behind` need a `<ref>`; `front`/`back`
+/// take none.
+fn placement(to: MoveTarget, ref_id: Option<String>) -> Result<(String, Option<String>)> {
+    match (to, ref_id) {
+        (MoveTarget::Front, None) => Ok(("front".to_string(), None)),
+        (MoveTarget::Back, None) => Ok(("back".to_string(), None)),
+        (MoveTarget::Before, Some(r)) => Ok(("before".to_string(), Some(r))),
+        (MoveTarget::Behind, Some(r)) => Ok(("after".to_string(), Some(r))),
+        (MoveTarget::Before, None) | (MoveTarget::Behind, None) => {
+            bail!("`before`/`behind` need a <ref> to place relative to")
+        }
+        (MoveTarget::Front, Some(_)) | (MoveTarget::Back, Some(_)) => {
+            bail!("`front`/`back` take no <ref>")
+        }
+    }
+}
+
+fn queue_show(socket: &Path) -> Result<()> {
+    let read = try_daemon_call(
+        socket,
+        op::READ_FILE,
+        serde_json::to_value(ReadFileArgs {
+            path: QUEUE_FILE.to_string(),
+        })?,
+    );
+    match read {
+        Ok(Some(value)) => {
+            let reply: ReadFileReply = serde_json::from_value(value)?;
+            let queue = QueueToml::parse(&reply.content).map_err(|e| {
+                anyhow!("{QUEUE_FILE} does not parse ({e}) — keeperd writes it, so this is corruption")
+            })?;
+            print!("{}", render_queue_show(&queue));
+            Ok(())
+        }
+        // §3.4: the view renders only when the TOML file exists. A missing
+        // file is the expected fresh-garden state, not an error.
+        Err(ClientError::Daemon { kind: ErrorKind::NotFound, .. }) => {
+            println!(
+                "no {QUEUE_FILE} — the v2 queue is empty (§3.4: the view renders only \
+                 when the file exists)"
+            );
+            Ok(())
+        }
+        Ok(None) => Err(anyhow!(
+            "no daemon at {} — unlock the garden first (`softfig daemon unlock`)",
+            socket.display()
+        )),
+        Err(ClientError::Daemon { message, .. }) => Err(anyhow!("{message}")),
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+const SHOW_HEADER: &str =
+    "| # | id | kind | title | project | lane | status | after | branch | base | claimed |";
+const SHOW_SEPARATOR: &str =
+    "|---|----|------|-------|---------|------|--------|-------|--------|------|---------|";
+
+/// The `queue show` rendering (§6.9): both lanes, one row per entry in file
+/// order, with the stack columns verbatim from the TOML. TOML state only — the
+/// live git-stack annotations (merge-base / restack flags) are queue-v2-git's
+/// (finding 3). Same cell rules as the §3.4 derived view (literal `|` escaped,
+/// empty cells an em-dash).
+fn render_queue_show(queue: &QueueToml) -> String {
+    let mut out = String::from("queue.toml (schema ");
+    out.push_str(&queue.schema.to_string());
+    out.push_str(")\n");
+    show_lane(
+        &mut out,
+        "Urgent",
+        queue.entries.iter().filter(|e| e.lane == QueueLane::Urgent),
+    );
+    show_lane(
+        &mut out,
+        "Normal",
+        queue.entries.iter().filter(|e| e.lane == QueueLane::Normal),
+    );
+    out
+}
+
+fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a Entry>) {
+    let cell = |s: &str| {
+        if s.is_empty() {
+            "—".to_string()
+        } else {
+            s.replace('|', "\\|")
+        }
+    };
+    out.push_str(&format!("\n### {name}\n\n"));
+    out.push_str(SHOW_HEADER);
+    out.push('\n');
+    out.push_str(SHOW_SEPARATOR);
+    for (i, e) in rows.enumerate() {
+        let after = if e.after.is_empty() {
+            String::new()
+        } else {
+            e.after.join(", ")
+        };
+        out.push_str(&format!(
+            "\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            i + 1,
+            cell(&e.id),
+            cell(&e.kind.to_string()),
+            cell(&e.title),
+            cell(&e.project),
+            cell(&e.lane.to_string()),
+            cell(&e.status.to_string()),
+            cell(&after),
+            cell(&e.branch),
+            cell(&e.base),
+            cell(&e.claimed),
+        ));
+    }
+    out.push('\n');
+}
+
+fn queue_project_add(socket: &Path, args: QueueProjectAddArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueAddProjectArgs {
+        name: args.name,
+        repo: args.repo,
+        main: args.main,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_ADD_PROJECT, serde_json::to_value(wire)?)?;
+    let reply: QueueAddProjectReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_add(socket: &Path, args: QueueAddArgs) -> Result<()> {
+    // The CLI grammar (§6.9): a milestone/task carries its slug positionally;
+    // a restack takes `--project` only. keeperd still owns the full arg rules
+    // (it refuses the restack extras as BadArgs, finding 5).
+    let slug = match (args.kind, args.slug) {
+        (AddKind::Restack, Some(_)) => {
+            bail!("`queue add restack` takes no <slug> (its slug is restack-<project>)")
+        }
+        (AddKind::Restack, None) => None,
+        (_, Some(s)) => Some(s),
+        (_, None) => bail!("`queue add` needs a <slug> for the milestone and task kinds"),
+    };
+    let (position, ref_id) = match (args.front, args.before, args.behind) {
+        (true, None, None) => (Some("front".to_string()), None),
+        (false, Some(r), None) => (Some("before".to_string()), Some(r)),
+        (false, None, Some(r)) => (Some("after".to_string()), Some(r)),
+        (false, None, None) => (None, None),
+        _ => bail!("choose at most one of --front / --before / --behind"),
+    };
+    let wire = softfig_ipc::verbs::QueueAddEntryArgs {
+        kind: match args.kind {
+            AddKind::Milestone => EntryKind::Milestone,
+            AddKind::Task => EntryKind::Task,
+            AddKind::Restack => EntryKind::Restack,
+        },
+        slug,
+        title: args.title,
+        mission: args.mission.as_deref().map(value_or_file).transpose()?,
+        finish_criteria: args.criteria.as_deref().map(value_or_file).transpose()?,
+        project: args.project,
+        lane: args.urgent.then_some(QueueLane::Urgent),
+        after: args.after,
+        position,
+        ref_id,
+        slices: Vec::new(),
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_ADD_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueAddEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_move(socket: &Path, args: QueueMoveArgs) -> Result<()> {
+    let (to, ref_id) = placement(args.to, args.ref_id)?;
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: Some(QueueMoveSpec { to, ref_id }),
+        after: None,
+        status: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_lane(socket: &Path, args: QueueLaneArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: Some(match args.lane {
+            LaneArg::Urgent => QueueLane::Urgent,
+            LaneArg::Normal => QueueLane::Normal,
+        }),
+        move_spec: None,
+        after: None,
+        status: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_after(socket: &Path, args: QueueAfterArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: Some(args.ids),
+        status: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_status(socket: &Path, args: QueueStatusArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueUpdateEntryArgs {
+        id: args.id,
+        lane: None,
+        move_spec: None,
+        after: None,
+        status: Some(match args.status {
+            HumanStatus::Queued => QueueStatusArg::Queued,
+            HumanStatus::Blocked => QueueStatusArg::Blocked,
+            HumanStatus::Deferred => QueueStatusArg::Deferred,
+            HumanStatus::Done => QueueStatusArg::Done,
+        }),
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_UPDATE_ENTRY, serde_json::to_value(wire)?)?;
+    let reply: QueueUpdateEntryReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn queue_drop(socket: &Path, args: QueueDropArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::QueueDropArgs {
+        id: args.id,
+        reason: value_or_file(&args.reason)?,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::QUEUE_DROP, serde_json::to_value(wire)?)?;
+    let reply: QueueDropReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn slice_insert(socket: &Path, args: SliceInsertArgs) -> Result<()> {
+    let (position, ref_id) = match args.position {
+        None => (None, None),
+        Some(to) => {
+            let (p, r) = placement(to, args.ref_id)?;
+            (Some(p), r)
+        }
+    };
+    let wire = softfig_ipc::verbs::SliceInsertArgs {
+        milestone: args.milestone,
+        slug: args.slug,
+        title: args.title,
+        body: value_or_file(&args.body)?,
+        position,
+        ref_id,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::SLICE_INSERT, serde_json::to_value(wire)?)?;
+    let reply: SliceInsertReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn slice_move(socket: &Path, args: SliceMoveArgs) -> Result<()> {
+    let (to, ref_id) = placement(args.to, args.ref_id)?;
+    let wire = softfig_ipc::verbs::SliceUpdateArgs {
+        milestone: args.milestone,
+        id: args.id,
+        move_spec: Some(QueueMoveSpec { to, ref_id }),
+        status: None,
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::SLICE_UPDATE, serde_json::to_value(wire)?)?;
+    let reply: SliceUpdateReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
+fn slice_status(socket: &Path, args: SliceStatusArgs) -> Result<()> {
+    let wire = softfig_ipc::verbs::SliceUpdateArgs {
+        milestone: args.milestone,
+        id: args.id,
+        move_spec: None,
+        status: Some(match args.status {
+            HumanStatus::Queued => SliceStatus::Queued,
+            HumanStatus::Blocked => SliceStatus::Blocked,
+            HumanStatus::Deferred => SliceStatus::Deferred,
+            HumanStatus::Done => SliceStatus::Done,
+        }),
+        dry_run: args.dry_run,
+    };
+    let value = queue_call(socket, op::SLICE_UPDATE, serde_json::to_value(wire)?)?;
+    let reply: SliceUpdateReply = serde_json::from_value(value)?;
+    print_verb_reply(args.dry_run, &reply.view, &reply.hash);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -3882,5 +4570,696 @@ mod tests {
         assert_eq!(declared_model(&root, &baton_at(&root, "m-bare", "002")), flash);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- queue v2 §6.9 CLI forms (queue-v2-state slice 009) ------------
+
+    #[test]
+    fn queue_v2_forms_parse_exactly_as_the_spec_spells_them() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: GrowlightCmd,
+        }
+
+        // `queue` with no subcommand defaults to show.
+        match TestCli::try_parse_from(["g", "queue"]).unwrap().cmd {
+            GrowlightCmd::Queue(a) => assert!(a.cmd.is_none(), "bare queue = show"),
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        assert!(matches!(
+            TestCli::try_parse_from(["g", "queue", "show"]).unwrap().cmd,
+            GrowlightCmd::Queue(_)
+        ));
+
+        // project add
+        match TestCli::try_parse_from([
+            "g",
+            "queue",
+            "project",
+            "add",
+            "softfig",
+            "~/p",
+            "--main",
+            "main",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Project { cmd } => match cmd {
+                    QueueProjectSub::Add(p) => {
+                        assert_eq!(p.name, "softfig");
+                        assert_eq!(p.repo, "~/p");
+                        assert_eq!(p.main.as_deref(), Some("main"));
+                        assert!(!p.dry_run);
+                    }
+                },
+                other => panic!("expected project add, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+
+        // add milestone with every flag — @file values, urgent, comma-separated
+        // after links, behind placement, dry-run.
+        match TestCli::try_parse_from([
+            "g",
+            "queue",
+            "add",
+            "milestone",
+            "folder-grants",
+            "--project",
+            "softfig",
+            "--title",
+            "Folder grants",
+            "--mission",
+            "@m.md",
+            "--criteria",
+            "none",
+            "--urgent",
+            "--after",
+            "a,b",
+            "--behind",
+            "m1",
+            "--dry-run",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Add(q) => {
+                    assert_eq!(q.kind, AddKind::Milestone);
+                    assert_eq!(q.slug.as_deref(), Some("folder-grants"));
+                    assert_eq!(q.project, "softfig");
+                    assert_eq!(q.mission.as_deref(), Some("@m.md"));
+                    assert!(q.urgent);
+                    assert_eq!(q.after, ["a", "b"]);
+                    assert_eq!(q.behind.as_deref(), Some("m1"));
+                    assert!(q.dry_run);
+                }
+                other => panic!("expected add, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+
+        // add restack — project only, no slug.
+        match TestCli::try_parse_from(["g", "queue", "add", "restack", "--project", "softfig"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Add(q) => {
+                    assert_eq!(q.kind, AddKind::Restack);
+                    assert!(q.slug.is_none());
+                }
+                other => panic!("expected add, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+
+        // move / lane / after / status / drop.
+        match TestCli::try_parse_from(["g", "queue", "move", "m1", "behind", "m2"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Move(m) => {
+                    assert_eq!(m.id, "m1");
+                    assert_eq!(m.to, MoveTarget::Behind);
+                    assert_eq!(m.ref_id.as_deref(), Some("m2"));
+                }
+                other => panic!("expected move, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "queue", "lane", "m1", "urgent"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Lane(l) => {
+                    assert_eq!(l.id, "m1");
+                    assert_eq!(l.lane, LaneArg::Urgent);
+                }
+                other => panic!("expected lane, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "queue", "after", "m1", "a", "b"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::After(l) => {
+                    assert_eq!(l.id, "m1");
+                    assert_eq!(l.ids, ["a", "b"]);
+                }
+                other => panic!("expected after, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "queue", "status", "m1", "done"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Status(s) => {
+                    assert_eq!(s.id, "m1");
+                    assert_eq!(s.status, HumanStatus::Done);
+                }
+                other => panic!("expected status, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "queue", "drop", "m1", "--reason", "@why.md"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Queue(a) => match a.cmd.unwrap() {
+                QueueSub::Drop(d) => {
+                    assert_eq!(d.id, "m1");
+                    assert_eq!(d.reason, "@why.md");
+                }
+                other => panic!("expected drop, got {other:?}"),
+            },
+            other => panic!("expected Queue, got {other:?}"),
+        }
+
+        // slice insert with positional placement + @file body.
+        match TestCli::try_parse_from([
+            "g",
+            "slice",
+            "insert",
+            "m1",
+            "002",
+            "--title",
+            "t",
+            "--body",
+            "@b.md",
+            "behind",
+            "001",
+        ])
+        .unwrap()
+        .cmd
+        {
+            GrowlightCmd::Slice(a) => match a.cmd {
+                SliceSub::Insert(s) => {
+                    assert_eq!(s.milestone, "m1");
+                    assert_eq!(s.slug, "002");
+                    assert_eq!(s.body, "@b.md");
+                    assert_eq!(s.position, Some(MoveTarget::Behind));
+                    assert_eq!(s.ref_id.as_deref(), Some("001"));
+                }
+                other => panic!("expected insert, got {other:?}"),
+            },
+            other => panic!("expected Slice, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "slice", "move", "m1", "001", "front"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Slice(a) => match a.cmd {
+                SliceSub::Move(m) => {
+                    assert_eq!(m.milestone, "m1");
+                    assert_eq!(m.id, "001");
+                    assert_eq!(m.to, MoveTarget::Front);
+                    assert!(m.ref_id.is_none());
+                }
+                other => panic!("expected move, got {other:?}"),
+            },
+            other => panic!("expected Slice, got {other:?}"),
+        }
+        match TestCli::try_parse_from(["g", "slice", "status", "m1", "001", "deferred"])
+            .unwrap()
+            .cmd
+        {
+            GrowlightCmd::Slice(a) => match a.cmd {
+                SliceSub::Status(s) => {
+                    assert_eq!(s.milestone, "m1");
+                    assert_eq!(s.id, "001");
+                    assert_eq!(s.status, HumanStatus::Deferred);
+                }
+                other => panic!("expected status, got {other:?}"),
+            },
+            other => panic!("expected Slice, got {other:?}"),
+        }
+
+        // The CLI grammar refuses what the spec refuses to spell.
+        assert!(
+            TestCli::try_parse_from([
+                "g", "queue", "add", "milestone", "x", "--project", "p", "--front", "--behind", "y"
+            ])
+            .is_err(),
+            "the position flags are exclusive"
+        );
+        assert!(
+            TestCli::try_parse_from(["g", "queue", "lane", "m1", "active"]).is_err(),
+            "daemon-owned words are not CLI words"
+        );
+        assert!(
+            TestCli::try_parse_from(["g", "slice", "status", "m1", "001", "split"]).is_err(),
+            "daemon-owned words are not CLI words"
+        );
+    }
+
+    #[test]
+    fn placement_maps_behind_to_the_verbs_after_position() {
+        assert_eq!(
+            placement(MoveTarget::Front, None).unwrap(),
+            ("front".to_string(), None)
+        );
+        assert_eq!(
+            placement(MoveTarget::Back, None).unwrap(),
+            ("back".to_string(), None)
+        );
+        assert_eq!(
+            placement(MoveTarget::Before, Some("m1".into())).unwrap(),
+            ("before".to_string(), Some("m1".to_string()))
+        );
+        // `behind` is the CLI spelling of the verbs' `after` position (§6.9).
+        assert_eq!(
+            placement(MoveTarget::Behind, Some("m1".into())).unwrap(),
+            ("after".to_string(), Some("m1".to_string()))
+        );
+        assert!(placement(MoveTarget::Before, None).is_err());
+        assert!(placement(MoveTarget::Behind, None).is_err());
+        assert!(placement(MoveTarget::Front, Some("x".into())).is_err());
+        assert!(placement(MoveTarget::Back, Some("x".into())).is_err());
+    }
+
+    #[test]
+    fn at_values_read_from_files_and_plain_values_pass_through() {
+        let dir = unique_tmp("queue-at-file");
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("mission.md");
+        fs::write(&f, "the mission\n").unwrap();
+        assert_eq!(
+            value_or_file(&format!("@{}", f.display())).unwrap(),
+            "the mission\n"
+        );
+        assert_eq!(value_or_file("plain text").unwrap(), "plain text");
+        assert!(value_or_file("@").is_err(), "bare @ has no path");
+        assert!(value_or_file("@/nonexistent/x").is_err(), "missing file errors");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queue_show_renders_both_lanes_and_the_stack_columns_verbatim() {
+        use softfig_ipc::queue_v2::{EntryStatus, Lane, Project};
+        let e = |id: &str, lane: Lane, branch: &str, base: &str| Entry {
+            id: id.into(),
+            kind: EntryKind::Milestone,
+            title: format!("{id} title"),
+            project: "softfig".into(),
+            lane,
+            status: EntryStatus::Queued,
+            after: vec![],
+            added: "2026-10-11T15:04:00Z".into(),
+            branch: branch.into(),
+            parent: String::new(),
+            base: base.into(),
+            claimed: String::new(),
+            follow_ups: 0,
+        };
+        let mut linked = e("normal-a", Lane::Normal, "feat/normal-a", "");
+        linked.after = vec!["u1".into()];
+        let mut claimed = e("u1", Lane::Urgent, "", "abc123");
+        claimed.claimed = "2026-10-11T15:04:00Z".into();
+        let queue = QueueToml::new(
+            vec![Project {
+                name: "softfig".into(),
+                repo: "~/p".into(),
+                main: "main".into(),
+            }],
+            vec![claimed, linked],
+        );
+        let body = render_queue_show(&queue);
+        // The schema line heads the rendering; both lanes follow, urgent first
+        // (the validator's invariant — the renderer never re-sorts).
+        assert!(body.starts_with("queue.toml (schema 1)\n"), "{body}");
+        let urgent = body.find("### Urgent").expect("urgent lane");
+        let normal = body.find("### Normal").expect("normal lane");
+        assert!(urgent < normal);
+        // The stack columns are the TOML's own values: branch/base/claimed
+        // verbatim, dashes for the empty cells.
+        assert!(
+            body.contains(
+                "| u1 | milestone | u1 title | softfig | urgent | queued | — | — | abc123 | 2026-10-11T15:04:00Z |"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "| normal-a | milestone | normal-a title | softfig | normal | queued | u1 | feat/normal-a | — | — |"
+            ),
+            "{body}"
+        );
+        // Literal pipes are escaped, like the §3.4 view.
+        let mut piped = e("p|1", Lane::Normal, "", "");
+        piped.title = "a | b".into();
+        let piped_body = render_queue_show(&QueueToml::new(vec![], vec![piped]));
+        assert!(piped_body.contains("a \\| b"), "{piped_body}");
+        assert!(piped_body.contains("p\\|1"), "{piped_body}");
+    }
+
+    // The e2e fixture: a REAL keeperd on a temp garden (no FUSE, no watcher,
+    // temp socket) — the same shape keeperd's own e2e suite boots — so the
+    // §6.9 forms are exercised over the wire exactly as the binary sends them,
+    // without ever touching the live garden (spec §11). The installed-binary
+    // sweep happens at close-out, when the human reviews.
+
+    use softfig_keeperd::{Daemon as KeeperDaemon, DaemonHandle as KeeperDaemonHandle, KeeperConfig};
+    use softfig_vault::{Vault, params::VaultParams};
+    use softfig_vcs::Repo;
+
+    const E2E_PASS: &str = "pw-test-12345";
+
+    /// Boot keeperd on a fresh temp garden + unlock it; return (handle,
+    /// socket, dir).
+    fn boot_keeperd(tag: &str) -> (KeeperDaemonHandle, PathBuf, PathBuf) {
+        let dir = unique_tmp(tag);
+        let garden = dir.join("garden");
+        fs::create_dir_all(&garden).unwrap();
+
+        // Minimum-cost Argon2 so the fixture stays fast (the keeperd suite's
+        // convention).
+        let mut params = VaultParams::default();
+        params.argon2.m_cost = 8;
+        params.argon2.t_cost = 1;
+        params.argon2.p_cost = 1;
+        let (_v, session, _r) = Vault::init_with_params(&garden, E2E_PASS.as_bytes(), params).unwrap();
+        Repo::init(&garden, &session).unwrap();
+        drop(session);
+
+        let socket = dir.join("keeperd.sock");
+        let config = KeeperConfig::new(&garden)
+            .with_socket(&socket)
+            .without_watcher()
+            .without_net()
+            .without_fuse();
+        let daemon = KeeperDaemon::new(config);
+        let handle = daemon.start().expect("keeperd boots");
+        wait_until(|| socket.exists());
+
+        let mut stream = connect(&socket).expect("connect");
+        let req = Request::new(op::UNLOCK, serde_json::json!({ "passphrase": E2E_PASS }));
+        let resp = softfig_ipc::call(&mut stream, &req).expect("unlock call");
+        assert!(matches!(resp, softfig_ipc::Response::Ok { .. }), "unlock: {resp:?}");
+        (handle, socket, dir)
+    }
+
+    /// Read a garden file back through the daemon (the same `read_file` seam
+    /// `queue show` uses), for asserting on the resulting v2 state.
+    fn e2e_read(socket: &Path, path: &str) -> String {
+        let mut stream = connect(socket).expect("connect");
+        let req = Request::new(op::READ_FILE, serde_json::json!({ "path": path }));
+        match softfig_ipc::call(&mut stream, &req).expect("read") {
+            softfig_ipc::Response::Ok { data, .. } => {
+                let reply: ReadFileReply = serde_json::from_value(data).unwrap();
+                reply.content
+            }
+            other => panic!("read {path}: {other:?}"),
+        }
+    }
+
+    fn e2e_queue(socket: &Path) -> QueueToml {
+        QueueToml::parse(&e2e_read(socket, QUEUE_FILE)).expect("queue.toml parses")
+    }
+
+    fn e2e_archive(socket: &Path) -> softfig_ipc::queue_v2::QueueArchiveToml {
+        softfig_ipc::queue_v2::QueueArchiveToml::parse(&e2e_read(
+            socket,
+            softfig_ipc::queue_v2::QUEUE_ARCHIVE_FILE,
+        ))
+        .expect("queue-archive.toml parses")
+    }
+
+    fn milestone_args(
+        slug: &str,
+        mission: &str,
+        criteria: &str,
+        dry_run: bool,
+    ) -> QueueAddArgs {
+        QueueAddArgs {
+            kind: AddKind::Milestone,
+            slug: Some(slug.into()),
+            project: "softfig".into(),
+            title: Some(format!("{slug} title")),
+            mission: Some(mission.into()),
+            criteria: Some(criteria.into()),
+            urgent: false,
+            after: vec![],
+            front: false,
+            before: None,
+            behind: None,
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn queue_v2_forms_round_trip_against_a_real_keeperd() {
+        let (handle, socket, dir) = boot_keeperd("queue-v2-forms");
+
+        // Fresh garden: no queue.toml — `queue show` exits clean with the
+        // §3.4 "renders only when the file exists" message.
+        queue_show(&socket).unwrap();
+
+        // project add → ok; a duplicate is refused and the wire code leads.
+        queue_project_add(
+            &socket,
+            QueueProjectAddArgs {
+                name: "softfig".into(),
+                repo: "~/p".into(),
+                main: None,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        let err = queue_project_add(
+            &socket,
+            QueueProjectAddArgs {
+                name: "softfig".into(),
+                repo: "~/p".into(),
+                main: None,
+                dry_run: false,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("exists"), "{err:#}");
+
+        // A dry-run project add writes nothing (the projects list is unchanged
+        // one row).
+        queue_project_add(
+            &socket,
+            QueueProjectAddArgs {
+                name: "roadeye".into(),
+                repo: "phone:roadeye".into(),
+                main: None,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(e2e_queue(&socket).projects.len(), 1, "dry run wrote nothing");
+
+        // milestone add — the row lands with its branch seed.
+        queue_add(&socket, milestone_args("m1", "do the thing", "done when done", false)).unwrap();
+        let q = e2e_queue(&socket);
+        assert_eq!(q.entries.len(), 1);
+        assert_eq!(q.entries[0].id, "m1");
+        assert_eq!(q.entries[0].branch, "feat/m1");
+        assert_eq!(q.entries[0].lane, QueueLane::Normal);
+
+        // task add DRY RUN → nothing written.
+        let task = QueueAddArgs {
+            kind: AddKind::Task,
+            slug: Some("t1".into()),
+            project: "softfig".into(),
+            title: Some("T1".into()),
+            mission: Some("m".into()),
+            criteria: Some("c".into()),
+            urgent: false,
+            after: vec![],
+            front: false,
+            before: None,
+            behind: None,
+            dry_run: true,
+        };
+        queue_add(&socket, task).unwrap();
+        assert_eq!(e2e_queue(&socket).entries.len(), 1, "task dry run wrote nothing");
+
+        // restack add — urgent lane, no branch of its own.
+        queue_add(
+            &socket,
+            QueueAddArgs {
+                kind: AddKind::Restack,
+                slug: None,
+                project: "softfig".into(),
+                title: None,
+                mission: None,
+                criteria: None,
+                urgent: false,
+                after: vec![],
+                front: false,
+                before: None,
+                behind: None,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        let q = e2e_queue(&socket);
+        let restack = q.entries.iter().find(|e| e.kind == EntryKind::Restack).expect("restack row");
+        assert_eq!(restack.lane, QueueLane::Urgent);
+        assert!(restack.branch.is_empty());
+        let restack_id = restack.id.clone();
+
+        // lane change → urgent lane.
+        queue_lane(
+            &socket,
+            QueueLaneArgs { id: "m1".into(), lane: LaneArg::Urgent, dry_run: false },
+        )
+        .unwrap();
+        assert_eq!(
+            e2e_queue(&socket).entries.iter().find(|e| e.id == "m1").unwrap().lane,
+            QueueLane::Urgent
+        );
+
+        // after links: replace the whole list (the restack's NNN resolves).
+        queue_after(
+            &socket,
+            QueueAfterArgs { id: "m1".into(), ids: vec![restack_id.clone()], dry_run: false },
+        )
+        .unwrap();
+        assert_eq!(
+            e2e_queue(&socket).entries.iter().find(|e| e.id == "m1").unwrap().after,
+            vec![restack_id.clone()],
+            "the link list is replaced, not merged"
+        );
+
+        // move within the lane (behind → the verbs' after position).
+        queue_move(
+            &socket,
+            QueueMoveArgs {
+                id: "m1".into(),
+                to: MoveTarget::Behind,
+                ref_id: Some(restack_id),
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        // A dry-run status edit leaves the state untouched.
+        queue_status(
+            &socket,
+            QueueStatusArgs { id: "m1".into(), status: HumanStatus::Blocked, dry_run: true },
+        )
+        .unwrap();
+        assert_eq!(
+            e2e_queue(&socket).entries.iter().find(|e| e.id == "m1").unwrap().status,
+            softfig_ipc::queue_v2::EntryStatus::Queued,
+            "dry run wrote nothing"
+        );
+
+        // slice insert (the generated 001-plan exists; 002 appends), then move
+        // and status inside slices.toml.
+        slice_insert(
+            &socket,
+            SliceInsertArgs {
+                milestone: "m1".into(),
+                slug: "002".into(),
+                title: Some("the second slice".into()),
+                body: "do the second thing".into(),
+                position: None,
+                ref_id: None,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        let s = softfig_ipc::queue_v2::SlicesToml::parse(&e2e_read(
+            &socket,
+            &softfig_ipc::queue_v2::slices_file("m1"),
+        ))
+        .expect("slices.toml parses");
+        assert_eq!(s.items.len(), 2);
+        assert_eq!(s.items[0].id, "001");
+        assert_eq!(s.items[1].id, "002");
+
+        slice_move(
+            &socket,
+            SliceMoveArgs {
+                milestone: "m1".into(),
+                id: "002".into(),
+                to: MoveTarget::Front,
+                ref_id: None,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        let s = softfig_ipc::queue_v2::SlicesToml::parse(&e2e_read(
+            &socket,
+            &softfig_ipc::queue_v2::slices_file("m1"),
+        ))
+        .expect("slices.toml parses");
+        assert_eq!(s.items[0].id, "002", "front move reorders");
+
+        slice_status(
+            &socket,
+            SliceStatusArgs {
+                milestone: "m1".into(),
+                id: "002".into(),
+                status: HumanStatus::Done,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        let s = softfig_ipc::queue_v2::SlicesToml::parse(&e2e_read(
+            &socket,
+            &softfig_ipc::queue_v2::slices_file("m1"),
+        ))
+        .expect("slices.toml parses");
+        assert_eq!(s.items[0].status, SliceStatus::Done);
+
+        // `done` archives the milestone; the archive row is `done` with no
+        // reason, and the live list loses the row.
+        queue_status(
+            &socket,
+            QueueStatusArgs { id: "m1".into(), status: HumanStatus::Done, dry_run: false },
+        )
+        .unwrap();
+        assert!(
+            e2e_queue(&socket).entries.iter().all(|e| e.id != "m1"),
+            "done leaves the live list"
+        );
+        let arch = e2e_archive(&socket);
+        let m1 = arch.entries.iter().find(|e| e.row.id == "m1").expect("m1 archived");
+        assert_eq!(m1.final_status, softfig_ipc::queue_v2::FinalStatus::Done);
+        assert!(m1.reason.is_none(), "done rows omit reason");
+
+        // drop archives a second entry as `dropped` with the reason.
+        queue_add(&socket, milestone_args("m2", "later work", "never", false)).unwrap();
+        queue_drop(
+            &socket,
+            QueueDropArgs {
+                id: "m2".into(),
+                reason: "superseded".into(),
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        let arch = e2e_archive(&socket);
+        let m2 = arch.entries.iter().find(|e| e.row.id == "m2").expect("m2 archived");
+        assert_eq!(m2.final_status, softfig_ipc::queue_v2::FinalStatus::Dropped);
+        assert_eq!(m2.reason.as_deref(), Some("superseded"));
+
+        // A bad slug surfaces the wire refusal code, unadorned.
+        let err = queue_add(&socket, milestone_args("Bad_Name!", "x", "y", false)).unwrap_err();
+        assert!(format!("{err:#}").contains("bad_name"), "{err:#}");
+
+        // `queue show` still renders the surviving state end to end.
+        queue_show(&socket).unwrap();
+
+        handle.shutdown();
+        handle.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -33,3 +33,8 @@ toml.workspace = true
 # for the slice-004 client + e2e tests (spec §13). Dev-only — the CLI client
 # code depends solely on the shared wire types in softfig-ipc::growlightd.
 softfig-growlightd.workspace = true
+# queue-v2-state slice 009: the §6.9 CLI-form e2e test boots a real keeperd on
+# a temp garden + socket (no FUSE) and drives the forms over the wire exactly
+# as the binary sends them — the same fixture shape keeperd's own e2e suite
+# uses. Dev-only — the CLI's command code talks to keeperd over IPC only.
+softfig-keeperd.workspace = true

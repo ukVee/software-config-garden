@@ -30,6 +30,7 @@ softfig-vault   = { path = "crates/softfig-vault" }
 softfig-store   = { path = "crates/softfig-store" }
 softfig-vcs    = { path = "crates/softfig-vcs" }
 softfig-ipc     = { path = "crates/softfig-ipc" }
+softfig-keeperd = { path = "crates/softfig-keeperd" }
 softfig-growlightd = { path = "crates/softfig-growlightd" }
 softfig-growlightd-client = { path = "crates/softfig-growlightd-client" }
 softfig-growlight-gui = { path = "crates/softfig-growlight-gui" }
