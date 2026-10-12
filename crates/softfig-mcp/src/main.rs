@@ -21,9 +21,11 @@ use softfig_ipc::{
         AddSectionArgs, AddSliceArgs,
         AppendToSectionArgs, ArchiveArgs, BatchArgs, EditSectionArgs, FileProvenanceArgs,
         FileReportArgs, ListReportsArgs, LogBatonArgs, LogDecisionArgs, LogIncidentArgs,
-        PatchFileArgs, PostMessageArgs, ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
+        PatchFileArgs, PostMessageArgs, QueueAddEntryArgs, QueueAddProjectArgs, QueueDropArgs,
+        QueueUpdateEntryArgs, ReadInboxArgs, ReadVersionsArgs, RemoveSectionArgs,
         RefreshSnapshotArgs, ReorderBacklogItemArgs, ReplaceFileArgs, ReviseNoteArgs,
-        SetItemStatusArgs, SetReviewedArgs, UnlinkArgs, UpdateReportArgs,
+        SetItemStatusArgs, SetReviewedArgs, SliceInsertArgs, SliceUpdateArgs, UnlinkArgs,
+        UpdateReportArgs,
     },
     Request, Response,
 };
@@ -403,6 +405,135 @@ fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "[a-z0-9-]+, 1-64; the queue name (not `default`)" },
                     "repo": { "type": "string", "description": "the repo path the queue's parts build against (non-empty)" },
+                },
+            },
+        }),
+        json!({
+            "name": "queue_add_project",
+            "description": "growlight queue v2: append a [[project]] row to queue.toml (name, repo, \
+                            merge branch). On a fresh garden this creates the first v2 file, so the \
+                            softfig:queue-v2 view renders from then on. A HUMAN verb today — member \
+                            gating (§6.7) lands with queue-v2-scheduling; agents call it only under \
+                            the human's direction. Refusal codes surface as-is from keeperd.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name", "repo"],
+                "properties": {
+                    "name": { "type": "string", "description": "[a-z0-9-]+; the project name entries reference (refused bad_name; exists when already present)" },
+                    "repo": { "type": "string", "description": "local path (~ allowed) or host:path; non-empty" },
+                    "main": { "type": "string", "description": "the branch merges land on; defaults to main" },
+                    "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
+                },
+            },
+        }),
+        json!({
+            "name": "queue_add_entry",
+            "description": "growlight queue v2: create a backlog entry and its docs in one commit. \
+                            milestone kind writes milestones/<slug>/ (CLAUDE.md, slices/, slices.toml \
+                            plus the generated 001-plan slice when no slices are given); task kind \
+                            writes tasks/NNN-<slug>.md (branch fix/<NNN>); restack kind writes a \
+                            generated doc into the urgent lane (project only — every other arg is \
+                            refused BadArgs). A HUMAN verb today — member gating (§6.7) lands with \
+                            queue-v2-scheduling. Refusal codes surface as-is from keeperd.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["kind", "project"],
+                "properties": {
+                    "kind": { "type": "string", "description": "milestone | task | restack" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+; the entry id / dir name. Required for milestone and task; forbidden for restack (its slug is restack-<project>)" },
+                    "title": { "type": "string", "description": "human title shown in the queue view + the doc heading" },
+                    "mission": { "type": "string", "description": "why this entry exists (## Mission)" },
+                    "finish_criteria": { "type": "string", "description": "checkable completion criteria (## Finish criteria)" },
+                    "project": { "type": "string", "description": "the owning project's name — must already exist (queue_add_project)" },
+                    "lane": { "type": "string", "description": "urgent | normal; defaults to normal" },
+                    "after": { "type": "array", "items": { "type": "string" }, "description": "entry ids that must finish first; each live or a done archive row" },
+                    "position": { "type": "string", "description": "front | back | before | after (with ref for the last two), inside the entry's lane; defaults to back" },
+                    "ref": { "type": "string", "description": "the reference entry id for before/after placement" },
+                    "slices": { "type": "array", "items": { "type": "object" }, "description": "slices to seed slices.toml with, each {slug, title?, body}; empty generates the 001-plan slice. Refused for the task kind" },
+                    "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
+                },
+            },
+        }),
+        json!({
+            "name": "queue_update_entry",
+            "description": "growlight queue v2: one atomic edit of a live entry, applied in the order \
+                            lane → move → after → status — patch-style, pass only the fields you \
+                            change. status takes the human statuses queued | blocked | deferred | \
+                            done (done archives the row; refused running on an active entry); \
+                            active/paused/split are daemon-owned and refused. A HUMAN verb today — \
+                            member gating (§6.7) lands with queue-v2-scheduling. Refusal codes \
+                            surface as-is from keeperd.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": { "type": "string", "description": "the live entry id to edit" },
+                    "lane": { "type": "string", "description": "urgent | normal. To urgent appends at the urgent lane's back; to normal puts it at the normal lane's front" },
+                    "move": { "type": "object", "description": "{to: front|back|before|after, ref?: id} — a within-lane move; refused started once the entry is claimed" },
+                    "after": { "type": "array", "items": { "type": "string" }, "description": "replaces the whole link list ([] clears it); every id must resolve and the links stay acyclic" },
+                    "status": { "type": "string", "description": "queued | blocked | deferred | done. queued also unblocks and un-defers" },
+                    "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
+                },
+            },
+        }),
+        json!({
+            "name": "queue_drop",
+            "description": "growlight queue v2: drop a live entry — its row moves to queue-archive.toml \
+                            as dropped with the reason. Refused linked_from while a live entry's after \
+                            names it, running for an active entry; if a stacked branch was cut from \
+                            it, one restack is enqueued per child project. A HUMAN verb today — \
+                            member gating (§6.7) lands with queue-v2-scheduling. Refusal codes \
+                            surface as-is from keeperd.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id", "reason"],
+                "properties": {
+                    "id": { "type": "string", "description": "the live entry id to drop" },
+                    "reason": { "type": "string", "description": "why the work is abandoned — recorded on the archived row; non-empty" },
+                    "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
+                },
+            },
+        }),
+        json!({
+            "name": "slice_insert",
+            "description": "growlight queue v2: append a numbered slice under a milestone — writes \
+                            slices/NNN-<slug>.md (NNN from the milestone's slices/.seq) and inserts \
+                            the queued item into its slices.toml at the given position in file order. \
+                            milestone is a top-level id or <parent>/<sub> (≤ 2 deep). A HUMAN verb \
+                            today — member gating (§6.7) lands with queue-v2-scheduling. Refusal \
+                            codes surface as-is from keeperd.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["milestone", "slug", "body"],
+                "properties": {
+                    "milestone": { "type": "string", "description": "the owning milestone: a top-level id, or <parent>/<sub> for a sub-milestone (must resolve to an existing slices.toml)" },
+                    "slug": { "type": "string", "description": "[a-z0-9-]+; the slice's terse filename address (NNN-<slug>.md)" },
+                    "title": { "type": "string", "description": "slice heading; defaults to slug" },
+                    "body": { "type": "string", "description": "the slice's plan/spec markdown body; non-empty" },
+                    "position": { "type": "string", "description": "front | back | before | after (with ref for the last two), in slices.toml file order; defaults to back" },
+                    "ref": { "type": "string", "description": "the reference item for before/after placement" },
+                    "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
+                },
+            },
+        }),
+        json!({
+            "name": "slice_update",
+            "description": "growlight queue v2: one atomic edit of a slice item, applied in the order \
+                            move → status — patch-style, pass only the fields you change. move is \
+                            refused started for active/done/split items (the slice order is the run \
+                            order); status takes queued | blocked | deferred | done (done resets \
+                            follow_ups; active/split are daemon-owned and refused). A HUMAN verb \
+                            today — member gating (§6.7) lands with queue-v2-scheduling. Refusal \
+                            codes surface as-is from keeperd.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["milestone", "id"],
+                "properties": {
+                    "milestone": { "type": "string", "description": "the owning milestone identity (a top-level id, or <parent>/<sub>)" },
+                    "id": { "type": "string", "description": "the [[item]] id to edit (the NNN, or a sub-milestone slug)" },
+                    "move": { "type": "object", "description": "{to: front|back|before|after, ref?: id} — a move within slices.toml file order" },
+                    "status": { "type": "string", "description": "queued | blocked | deferred | done" },
+                    "dry_run": { "type": "boolean", "description": "compute + validate + render the would-be state, write nothing" },
                 },
             },
         }),
@@ -842,6 +973,30 @@ fn resolve_tool(name: &str, args: Value) -> Result<(&'static str, Value)> {
             let a: AddQueueArgs = serde_json::from_value(args)?;
             (op::ADD_QUEUE, serde_json::to_value(a)?)
         }
+        "queue_add_project" => {
+            let a: QueueAddProjectArgs = serde_json::from_value(args)?;
+            (op::QUEUE_ADD_PROJECT, serde_json::to_value(a)?)
+        }
+        "queue_add_entry" => {
+            let a: QueueAddEntryArgs = serde_json::from_value(args)?;
+            (op::QUEUE_ADD_ENTRY, serde_json::to_value(a)?)
+        }
+        "queue_update_entry" => {
+            let a: QueueUpdateEntryArgs = serde_json::from_value(args)?;
+            (op::QUEUE_UPDATE_ENTRY, serde_json::to_value(a)?)
+        }
+        "queue_drop" => {
+            let a: QueueDropArgs = serde_json::from_value(args)?;
+            (op::QUEUE_DROP, serde_json::to_value(a)?)
+        }
+        "slice_insert" => {
+            let a: SliceInsertArgs = serde_json::from_value(args)?;
+            (op::SLICE_INSERT, serde_json::to_value(a)?)
+        }
+        "slice_update" => {
+            let a: SliceUpdateArgs = serde_json::from_value(args)?;
+            (op::SLICE_UPDATE, serde_json::to_value(a)?)
+        }
         "add_slice" => {
             let a: AddSliceArgs = serde_json::from_value(args)?;
             (op::ADD_SLICE, serde_json::to_value(a)?)
@@ -1073,6 +1228,35 @@ fn summarize(name: &str, data: &Value) -> String {
             .unwrap_or_default();
         return format!("batch: {ops} op(s) applied to {paths}; commit {hash}");
     }
+    if matches!(
+        name,
+        "queue_add_project"
+            | "queue_add_entry"
+            | "queue_update_entry"
+            | "queue_drop"
+            | "slice_insert"
+            | "slice_update"
+    ) {
+        // The v2 verbs' payload is the re-rendered list — the view is the point,
+        // not the commit. Surface it in full (the §6.9 CLI prints the same body).
+        let g = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let hash = g("hash");
+        let path = g("path");
+        let id = if g("id").is_empty() { g("name") } else { g("id") };
+        let mut head = name.to_string();
+        if !id.is_empty() {
+            head.push_str(&format!(" {id}"));
+        }
+        if !path.is_empty() {
+            head.push_str(&format!(" -> {path}"));
+        }
+        head.push_str(&format!("; commit {}", if hash.is_empty() { "?" } else { hash }));
+        let view = g("view");
+        if view.is_empty() {
+            return head;
+        }
+        return format!("{head}\n{view}");
+    }
     let hash = data.get("hash").and_then(|v| v.as_str()).unwrap_or("?");
     if let (Some(from), Some(to)) = (
         data.get("from").and_then(|v| v.as_str()),
@@ -1136,9 +1320,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_thirty_two() {
+    fn tools_list_has_thirty_eight() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 32);
+        assert_eq!(defs.len(), 38);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -1157,6 +1341,12 @@ mod tests {
             "log_baton",
             "add_backlog_item",
             "add_queue",
+            "queue_add_project",
+            "queue_add_entry",
+            "queue_update_entry",
+            "queue_drop",
+            "slice_insert",
+            "slice_update",
             "add_slice",
             "set_item_status",
             "reorder_backlog_item",
@@ -1182,7 +1372,7 @@ mod tests {
     fn tools_list_via_handle_line() {
         let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 32);
+        assert_eq!(tools.len(), 38);
     }
 
     #[test]
@@ -1250,6 +1440,36 @@ mod tests {
                 "add_queue",
                 json!({ "name": "softfig", "repo": "~/projects/software-config_garden" }),
                 op::ADD_QUEUE,
+            ),
+            (
+                "queue_add_project",
+                json!({ "name": "p", "repo": "~/r", "main": "main" }),
+                op::QUEUE_ADD_PROJECT,
+            ),
+            (
+                "queue_add_entry",
+                json!({ "kind": "milestone", "slug": "m9", "project": "p" }),
+                op::QUEUE_ADD_ENTRY,
+            ),
+            (
+                "queue_update_entry",
+                json!({ "id": "m9", "status": "blocked" }),
+                op::QUEUE_UPDATE_ENTRY,
+            ),
+            (
+                "queue_drop",
+                json!({ "id": "m9", "reason": "obsolete" }),
+                op::QUEUE_DROP,
+            ),
+            (
+                "slice_insert",
+                json!({ "milestone": "m9", "slug": "wire", "body": "b" }),
+                op::SLICE_INSERT,
+            ),
+            (
+                "slice_update",
+                json!({ "milestone": "m9", "id": "001", "status": "done" }),
+                op::SLICE_UPDATE,
             ),
             (
                 "add_slice",
@@ -1466,6 +1686,29 @@ mod tests {
         assert_eq!(
             summarize("release_lease", &json!({ "key": "k", "state": "denied", "reason": "only the lease holder may release it" })),
             "release_lease k: denied — only the lease holder may release it"
+        );
+    }
+
+    #[test]
+    fn summarize_shows_queue_v2_views() {
+        // The v2 verbs' payload is the re-rendered list; the summary must carry
+        // it in full (it is what the §6.9 CLI prints), not a bare "commit ?".
+        let s = summarize(
+            "queue_update_entry",
+            &json!({ "id": "m9", "view": "## urgent\n(empty)\n## normal\n- m9", "hash": "abc" }),
+        );
+        assert!(s.contains("queue_update_entry m9; commit abc"), "{s}");
+        assert!(s.contains("## urgent") && s.contains("- m9"), "{s}");
+        // queue_add_project has no id — the project name stands in.
+        let s = summarize(
+            "queue_add_project",
+            &json!({ "name": "softfig", "view": "- softfig", "hash": "abc" }),
+        );
+        assert_eq!(s, "queue_add_project softfig; commit abc\n- softfig");
+        // A view-less reply (shouldn't happen) degrades to the head line only.
+        assert_eq!(
+            summarize("queue_drop", &json!({ "id": "m9", "hash": "abc" })),
+            "queue_drop m9; commit abc"
         );
     }
 }
