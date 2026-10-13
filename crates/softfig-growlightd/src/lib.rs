@@ -52,6 +52,7 @@ pub mod supervisor;
 pub mod thrash_bridge;
 pub mod usage;
 pub mod usage_file;
+pub mod v2_source;
 
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
@@ -102,3 +103,4 @@ pub use thrash_bridge::{parse_target, KeeperThrashClear, TargetClear};
 pub use usage::{
     usage_alert_reached, UsageAggregator, UsageSample, WindowResets, USAGE_ALERT_PCT,
 };
+pub use v2_source::{assemble, V2Load, V2Source, V2SourceError};
