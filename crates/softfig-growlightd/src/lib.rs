@@ -74,7 +74,7 @@ pub use drive_loop::{
 };
 pub use fleet::{
     assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig, MemberBackend,
-    DEFAULT_CLAUDE_BIN, DEFAULT_OPENCODE_BIN, DEFAULT_PROMPT,
+    QueueMode, DEFAULT_CLAUDE_BIN, DEFAULT_OPENCODE_BIN, DEFAULT_PROMPT,
 };
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};

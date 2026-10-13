@@ -264,6 +264,32 @@ impl FleetMemberConfig {
     }
 }
 
+/// Which queue model growlightd schedules from — the §11 switch
+/// (`config/growlight.toml` `queue = "legacy" | "v2"`, default `legacy`).
+///
+/// The key parses as a serde snake_case enum, so an **unknown value is a TOML
+/// parse error**: [`FleetConfig::from_growlight_toml`] returns `Err` and the
+/// loader fails closed to a disabled fleet — that IS the arm-time refusal §11
+/// requires. The `Doc` deliberately has no `deny_unknown_fields` (recorded as a
+/// planning finding): an unknown VALUE is caught here, by the enum parse, so a
+/// typo'd switch can never silently mean legacy.
+///
+/// Under `legacy` (the default) growlightd behaves exactly as today. Under
+/// `v2` it schedules from the v2 files via the [`V2Source`](crate::v2_source)
+/// — wired in slice 006, so this slice only parses and stores the mode; it
+/// changes no scheduling. The v2 growlight verbs operate on the v2 files
+/// whatever this says (§11). The dedicated migration session flips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueMode {
+    /// Today's backlog tables + named queues — unchanged behavior.
+    #[default]
+    Legacy,
+    /// Schedule from the v2 files (`queue.toml` / `queue-archive.toml` /
+    /// per-milestone `slices.toml`).
+    V2,
+}
+
 /// The parsed `config/growlight.toml` fleet config: the off-by-default `enabled`
 /// gate, the shared-backend `bin`/`prompt`, and the configured `members`. The
 /// keys are top-level (this is a dedicated file, not a table inside a shared one).
@@ -295,6 +321,12 @@ pub struct FleetConfig {
     /// [`DriveLoop`] at [`assemble_fleet`]; a `0` is rejected at parse (fail-closed to a
     /// disabled fleet) since it would stop before any work runs.
     pub max_iterations: Option<u64>,
+    /// `queue` — the §11 switch: which queue model growlightd schedules from.
+    /// [`QueueMode::Legacy`] (the default, and every pre-v2 config's meaning)
+    /// keeps today's behavior byte-identical; [`QueueMode::V2`] turns the v2
+    /// source on (slice 006). Parsed and stored here; an unknown value never
+    /// reaches this struct — it is refused at parse, fail-closed.
+    pub queue: QueueMode,
 }
 
 impl FleetConfig {
@@ -309,6 +341,7 @@ impl FleetConfig {
             members: Vec::new(),
             build_caps: BuildCaps::default(),
             max_iterations: None,
+            queue: QueueMode::Legacy,
         }
     }
 
@@ -330,6 +363,10 @@ impl FleetConfig {
             build_caps: BuildCaps,
             /// The bounded-run knob (task 040). Absent ⇒ `None` ⇒ unbounded.
             max_iterations: Option<u64>,
+            /// The §11 queue switch. Absent ⇒ [`QueueMode::Legacy`]; an unknown
+            /// value is a TOML parse error (fail-closed at the loader).
+            #[serde(default)]
+            queue: QueueMode,
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
@@ -374,6 +411,7 @@ impl FleetConfig {
             members,
             build_caps: doc.build_caps,
             max_iterations: doc.max_iterations,
+            queue: doc.queue,
         })
     }
 }
@@ -988,6 +1026,51 @@ agent = "reviewer"
         assert!(
             err.contains("max_iterations"),
             "the error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn queue_switch_defaults_to_legacy_and_parses_v2() {
+        // Absent ⇒ legacy: the default, what every pre-v2 config already means, and
+        // the mode the live garden runs on today.
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\n").unwrap();
+        assert_eq!(cfg.queue, QueueMode::Legacy, "the key omitted ⇒ legacy");
+        assert_eq!(FleetConfig::disabled().queue, QueueMode::Legacy);
+
+        // `queue = "v2"` parses — growlightd schedules from the v2 files (slice 006
+        // consumes it; this slice only parses and stores the mode).
+        let v2 = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"v2\"\n")
+            .unwrap();
+        assert_eq!(v2.queue, QueueMode::V2);
+
+        // `queue = "legacy"` is explicit-but-equivalent.
+        let legacy =
+            FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"legacy\"\n")
+                .unwrap();
+        assert_eq!(legacy.queue, QueueMode::Legacy);
+    }
+
+    #[test]
+    fn queue_switch_unknown_value_is_refused_fail_closed() {
+        // An unknown VALUE is a serde enum parse error → Err → the loader turns it
+        // into a disabled fleet. This is the arm-time refusal §11 wants: the `Doc`
+        // deliberately has no `deny_unknown_fields` (planning finding 5), so the
+        // enum parse is what keeps a typo'd switch from silently meaning legacy.
+        let err = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"bogus\"\n")
+            .unwrap_err();
+        assert!(
+            err.contains("bogus"),
+            "the refusal names the offending value: {err}"
+        );
+
+        // Through the loader: the parse error is surfaced to the arming human (the
+        // `eprintln!` in `load_fleet_config`) and the fleet stays OFF.
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "fleet_enabled = true\nqueue = \"bogus\"\n");
+        assert_eq!(
+            load_fleet_config(dir.path()),
+            FleetConfig::disabled(),
+            "an unknown queue value fails closed to a disabled fleet",
         );
     }
 

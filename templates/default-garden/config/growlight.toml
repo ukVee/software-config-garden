@@ -17,6 +17,15 @@
 # journal/decisions/decision-growlight-config-in-garden.md.)
 fleet_enabled = false
 
+# Which queue model growlightd schedules from (spec-growlight-queue §11). Default
+# `legacy`: today's backlog tables + named queues, unchanged. `v2` reads the v2
+# files instead — growlight/backlog/queue.toml + queue-archive.toml + each
+# milestone's slices.toml. An unknown value is REFUSED at arm time (the fleet
+# stays disarmed), so a typo can never silently mean legacy. Keep `legacy`
+# through the v2 build; the dedicated migration session flips it. (The v2
+# growlight verbs operate on the v2 files whatever this says.)
+# queue = "legacy"
+
 # Bounded-run knob for controlled debugging — the growlightd equivalent of the
 # retired `--auto --max-iterations`. Stops the fleet CLEANLY after this many
 # completed member work-chunks (clean continue / item-boundary handoffs), then

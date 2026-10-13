@@ -185,6 +185,8 @@ mod tests {
 # The gate.\n\
 fleet_enabled = false\n\
 \n\
+# queue = \"legacy\"\n\
+\n\
 # claude_bin = \"claude\"\n\
 \n\
 # [[fleet]]\n\

@@ -12,6 +12,11 @@ a roster can mix the two.
 ```toml
 fleet_enabled = true
 
+# Which queue model growlightd schedules from (spec-growlight-queue §11).
+# Default `legacy` (today's backlog tables + queues); `v2` reads the v2 files.
+# Unknown values are refused at arm time. The migration session flips it.
+# queue = "legacy"
+
 # The binaries each backend shells. Both are resolved on PATH when omitted.
 # claude_bin   = "claude"
 # opencode_bin = "opencode"
@@ -28,6 +33,10 @@ variant = "high"                         # opencode only; optional
 
 `backend` defaults to `claude`, so a config written before this existed keeps running
 exactly as it did — there is no migration.
+
+`queue` defaults to `legacy`, so scheduling is unchanged until the v2 migration flips
+it (spec-growlight-queue §11). An unknown value is a parse error — growlightd logs it
+and stays disarmed, never silently meaning legacy.
 
 `model` / `variant` ride **argv** (`--model provider/model[#variant]`), not the generated
 config. opencode 2.x `run` ignores `agent.<id>.model` entirely, and argv is the one model
