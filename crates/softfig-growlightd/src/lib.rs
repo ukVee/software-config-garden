@@ -45,6 +45,7 @@ pub mod queue_source;
 pub mod reconcile;
 pub mod resume;
 pub mod scheduler;
+pub mod scheduler_v2;
 pub mod server;
 pub mod state;
 pub mod supervisor;
