@@ -44,8 +44,9 @@ use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
     AgentBackend, Backend, ClaudeBackend, Clock, DEEPSEEK_FLASH, DEEPSEEK_REASONING, ExeIdentity,
     ExeProbe, InteractiveLaunch, IterationOutcome, IterationRequest, ModelChoice, ModelSpec,
-    OpencodeConfigInputs, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, item_model_field,
-    opencode_config, opencode_context, opencode_interactive_args, parse_model_spec,
+    OpencodeConfigInputs, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, agent_bin,
+    interactive_command, item_doc_candidates, opencode_config, opencode_context,
+    opencode_interactive_args, parse_model_spec, resolve_item_models,
 };
 use crate::opencode_catalog;
 
@@ -244,7 +245,7 @@ pub struct StartArgs {
     /// `opencode` runs the same human-driven loop on opencode — interactive-first,
     /// so headless `--auto` opencode is not yet implemented (deferred to slice
     /// 004). Omitting it on a TTY brings up the picker instead.
-    #[arg(long, value_enum)]
+    #[arg(long, value_parser = parse_backend_arg)]
     pub backend: Option<Backend>,
     /// Shorthand for `--backend opencode`.
     #[arg(long, conflicts_with = "backend")]
@@ -556,7 +557,7 @@ fn start(args: StartArgs) -> Result<()> {
                 choice.opencode_model_ref()
             );
             let checked = opencode_catalog::verify_model(
-                backend.agent_bin(),
+                agent_bin(backend),
                 &staged,
                 &garden_root,
                 choice.opencode_model(),
@@ -661,7 +662,7 @@ fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
              {} {}",
             choice.opencode_model_ref(),
             launch.opencode_config.display(),
-            choice.backend.agent_bin(),
+            agent_bin(choice.backend),
             opencode_interactive_args().join(" "),
         ),
     }
@@ -698,6 +699,14 @@ fn resolve_model_choice(
         ModelSpec::Fixed(choice) => choice,
         ModelSpec::Auto => declared_model(garden_root, baton_path),
     })
+}
+
+/// The `--backend` value parser. `Backend` moved to `softfig-ipc` (queue v2
+/// §6.4) and no longer derives clap's `ValueEnum`, so this maps the word with
+/// the same spelling the flag always accepted.
+fn parse_backend_arg(s: &str) -> Result<Backend, String> {
+    s.parse()
+        .map_err(|_| format!("expected `claude` or `opencode`, got `{s}`"))
 }
 
 /// The spec the command line asked for, if any. `--opencode` is shorthand for
@@ -780,72 +789,35 @@ fn declared_model(garden_root: &Path, baton_path: &Path) -> ModelChoice {
         return default();
     };
 
-    for doc_path in item_doc_candidates(garden_root, item, view.slice.as_deref()) {
-        let Ok(doc) = fs::read_to_string(&doc_path) else {
-            continue;
-        };
-        let Some(field) = item_model_field(&doc) else {
-            continue;
-        };
-        let label = doc_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| item.to_string());
-        match parse_model_spec(field) {
-            // A doc declaring `auto` would be circular — treat it as no
-            // declaration and keep looking up the chain.
-            Ok(ModelSpec::Auto) => continue,
-            Ok(ModelSpec::Fixed(choice)) => {
-                println!("growlight decides: {field} (declared by {label})");
-                return choice;
-            }
-            Err(e) => {
-                println!("growlight decides: {DEFAULT_OPENCODE_MODEL} — ignoring {label}: {e}");
-                return default();
-            }
-        }
-    }
-
-    println!("growlight decides: {DEFAULT_OPENCODE_MODEL} (no `> Model:` declared by {item})");
-    default()
-}
-
-/// Where an active item's `> Model:` declaration may live, nearest-first: the
-/// active slice's own doc, then the milestone doc that owns it. A standalone task
-/// has just the one doc.
-///
-/// Filenames carry a slug we don't know (`005-backend-model-picker.md`), so each
-/// is found by its numeric prefix rather than reconstructed.
-fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) -> Vec<PathBuf> {
-    let backlog = garden_root.join(PILLAR).join("backlog");
-    let milestone = backlog.join("milestones").join(item);
-    if milestone.is_dir() {
-        let mut candidates = Vec::new();
-        // Baton slices are written `6` or `006`; the files are always zero-padded.
-        if let Some(slice) = slice {
-            let padded = format!("{:0>3}", slice.trim());
-            if let Some(doc) = find_by_number(&milestone.join("slices"), &padded) {
-                candidates.push(doc);
-            }
-        }
-        candidates.push(milestone.join("CLAUDE.md"));
-        return candidates;
-    }
-    find_by_number(&backlog.join("tasks"), item)
+    let docs = item_doc_candidates(garden_root, item, view.slice.as_deref())
         .into_iter()
-        .collect()
-}
-
-/// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`.
-fn find_by_number(dir: &Path, number: &str) -> Option<PathBuf> {
-    let prefix = format!("{number}-");
-    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".md"))
-            .then_some(path)
-    })
+        .map(|doc_path| {
+            let label = doc_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| item.to_string());
+            let content = fs::read_to_string(&doc_path).ok();
+            (label, content)
+        });
+    match resolve_item_models(docs) {
+        Ok(Some(resolved)) => {
+            println!(
+                "growlight decides: {} (declared by {})",
+                resolved.field, resolved.origin
+            );
+            // §6.4 legacy trap: a comma list resolves to its first entry here
+            // (single-entry lines behave exactly as before).
+            resolved.list.first().clone()
+        }
+        Ok(None) => {
+            println!("growlight decides: {DEFAULT_OPENCODE_MODEL} (no `> Model:` declared by {item})");
+            default()
+        }
+        Err(e) => {
+            println!("growlight decides: {DEFAULT_OPENCODE_MODEL} — ignoring: {e}");
+            default()
+        }
+    }
 }
 
 // ---- headless orchestrator (full-auto, slices 001-002) -----------------
@@ -1400,8 +1372,8 @@ fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> 
     // `opencode` it wires `OPENCODE_CONFIG` + the runtime cwd + the first-turn
     // kick (slice 003).
     let backend = choice.backend;
-    let mut cmd = backend.interactive_command(launch)?;
-    let bin = backend.agent_bin();
+    let mut cmd = interactive_command(backend, launch)?;
+    let bin = agent_bin(backend);
     match backend {
         Backend::Claude => println!("\nlaunching {bin} --name {AGENT_NAME} …\n"),
         // Name the model: with four ways to pick one, the human should never have
@@ -4388,9 +4360,7 @@ mod tests {
             ModelChoice::opencode(DEEPSEEK_FLASH),
         ] {
             let hint = no_launch_hint(&choice, &launch);
-            let cwd = choice
-                .backend
-                .interactive_command(&launch)
+            let cwd = interactive_command(choice.backend, &launch)
                 .unwrap()
                 .get_current_dir()
                 .map(Path::to_path_buf)
@@ -4413,8 +4383,7 @@ mod tests {
         // pasted command attaches to the shared service, which ignores
         // OPENCODE_CONFIG (slice 001 finding 1). The hint's argv is the launch's
         // argv minus the trailing `--prompt <kick>`, which the human types instead.
-        let spawned: Vec<String> = Backend::Opencode
-            .interactive_command(&launch)
+        let spawned: Vec<String> = interactive_command(Backend::Opencode, &launch)
             .unwrap()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -4505,6 +4474,38 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    #[test]
+    fn growlight_decides_takes_a_comma_lists_first_entry() {
+        // §6.4 legacy trap: semi-auto's "let growlight decide" runs the first
+        // entry of a comma list (single-entry lines behave as before), and a
+        // malformed list still never fails the launch.
+        let root = declaring_garden("list");
+        let slices = root
+            .join(PILLAR)
+            .join("backlog")
+            .join("milestones")
+            .join("m-x")
+            .join("slices");
+        fs::write(
+            slices.join("007-list.md"),
+            "# List\n\n> Model: reasoning, claude\n",
+        )
+        .unwrap();
+
+        // The list's first entry wins: reasoning (opencode v4-pro).
+        let on_007 = declared_model(&root, &baton_at(&root, "m-x", "007"));
+        assert_eq!(on_007, ModelChoice::opencode(DEEPSEEK_REASONING));
+
+        // A malformed comma list is reported and defaulted, never a launch error.
+        fs::write(slices.join("008-bad.md"), "# Bad\n\n> Model: reasoning,\n").unwrap();
+        assert_eq!(
+            declared_model(&root, &baton_at(&root, "m-x", "008")),
+            ModelChoice::opencode(DEFAULT_OPENCODE_MODEL)
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     fn baton_at(root: &Path, item: &str, slice: &str) -> PathBuf {

@@ -24,216 +24,39 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::ValueEnum;
 use serde_json::Value;
 use softfig_ipc::opencode::{
     Context as SessionContext, Floor, MemoryPolicy, Posture, context, file_ref, floor,
 };
 
-/// Which agent the human-driven semi-auto loop (`softfig growlight start`) runs
-/// on — the CLI-side interactive-first landing of the AgentBackend seam
-/// (spec-agents §4.1 / decision-semi-auto-backend-seam). `Claude` is
-/// byte-for-byte identical to the original hardwired path; `Opencode` is being
-/// wired up across the `semi-auto-backend-seam` milestone (generated config =
-/// slice 002, interactive launch = slice 003, headless `--auto` = slice 004).
-///
-/// Distinct from the [`AgentBackend`] trait below: that is the headless `-p`
-/// per-iteration seam the `--auto` driver shells; this enum is the CLI selector
-/// that *chooses* which agent (and which interactive argv) to run. The fleet
-/// (growlightd) has its own backend config and is intentionally untouched.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Backend {
-    /// Claude Code (`claude`) — the default; behaviour unchanged.
-    #[default]
-    Claude,
-    /// opencode — interactive-first; headless `--auto` deferred to slice 004.
-    Opencode,
-}
+/// The model grammar + resolution now live in `softfig-ipc` (queue v2 §6.4 —
+/// also needed by the grants spec): re-exported here so this crate's call sites
+/// and tests keep their names. The **launch** machinery (argv/env/cwd
+/// construction) stays in this crate, as free functions below.
+pub use softfig_ipc::model_choice::{
+    Backend, DEEPSEEK_FLASH, DEEPSEEK_REASONING, ModelChoice, ModelSpec, item_doc_candidates,
+    parse_model_spec, resolve_item_models,
+};
 
-/// DeepSeek's reasoning model — picker option 2 / `--model reasoning`. The
-/// version-pinned top-tier V4 rather than the floating `deepseek/deepseek-reasoner`
-/// alias (the human's call, 2026-08-08, closing the slice-005 open sub-question),
-/// so the loop's model can't move under it without a code change.
-pub const DEEPSEEK_REASONING: &str = "deepseek/deepseek-v4-pro";
-
-/// DeepSeek's fast model — picker option 3 / `--model flash`, and the fallback
-/// whenever "let growlight decide" finds no `> Model:` declaration on the active
-/// backlog item (cheap by default; reasoning is opt-in).
-///
-/// V4.1 Flash. The earlier `deepseek/deepseek-v4-flash` id is gone from opencode
-/// 2.x's catalog (opencode-v2-repin slice 001, finding 12).
-pub const DEEPSEEK_FLASH: &str = "deepseek/deepseek-flash";
-
-/// A resolved interactive launch target: which backend, and (for opencode) which
-/// model + variant to generate the agent config with.
-///
-/// `model`/`variant` are opencode-only. claude's model + effort are the harness's
-/// own (there is no interactive flag for them), so a claude choice carries `None`
-/// and a `variant=` on a claude spec is inert — see [`parse_model_spec`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelChoice {
-    pub backend: Backend,
-    /// The opencode model id (`provider/model`), e.g. [`DEEPSEEK_FLASH`].
-    pub model: Option<String>,
-    /// The opencode agent's `variant` (opencode `AgentConfig.variant`: "default
-    /// model variant for this agent") — the effort/variant knob a backlog item
-    /// can declare alongside its model.
-    pub variant: Option<String>,
-}
-
-impl ModelChoice {
-    /// The claude backend: no model/variant of our choosing (the harness owns them).
-    pub fn claude() -> Self {
-        Self {
-            backend: Backend::Claude,
-            model: None,
-            variant: None,
-        }
-    }
-
-    /// The opencode backend on a given model id.
-    pub fn opencode(model: &str) -> Self {
-        Self {
-            backend: Backend::Opencode,
-            model: Some(model.to_string()),
-            variant: None,
-        }
-    }
-
-    /// The model id to generate the opencode config with, falling back to
-    /// [`DEEPSEEK_FLASH`] for a choice that names none.
-    pub fn opencode_model(&self) -> &str {
-        self.model.as_deref().unwrap_or(DEEPSEEK_FLASH)
-    }
-
-    /// The model + variant as opencode 2.x spells one value:
-    /// `provider/model`, or `provider/model#variant`. This is what the generated
-    /// config's top-level `model` carries (see [`opencode_config`]).
-    pub fn opencode_model_ref(&self) -> String {
-        opencode_model_ref(self.opencode_model(), self.variant.as_deref())
+/// The launcher binary name for a backend, for the spawn and user-facing
+/// messages. (Formerly `Backend::agent_bin`; the enum moved to `softfig-ipc`,
+/// the launch side stayed here.)
+pub fn agent_bin(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Claude => "claude",
+        Backend::Opencode => "opencode",
     }
 }
 
 /// `provider/model` or `provider/model#variant`: opencode 2.x's one-string model
-/// reference. 2.x has no separate variant key on an agent and no `--variant` flag;
-/// the variant rides the `#` suffix, which opencode parses into
-/// `{providerID, model, variant}` (checked against a private server's
-/// `/api/config`, opencode-v2-repin slice 002).
+/// reference — the generated config's top-level `model` spelling.
+/// `ModelChoice::opencode_model_ref` covers the same spelling from a choice;
+/// this render helper serves the config path that holds model + variant loose.
 fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
     match variant {
         Some(variant) => format!("{model}#{variant}"),
         None => model.to_string(),
     }
-}
-
-/// What a `--model` flag or a picker choice resolves to *before* the active
-/// backlog item is consulted.
-///
-/// `Auto` is "let growlight decide": rather than guessing from the work's shape,
-/// growlight reads the model the **active backlog item declares for itself** — the
-/// optional `> Model: <spec>` line on its slice doc (falling back to the milestone
-/// doc, then to [`DEEPSEEK_FLASH`]). The human writes the field when they queue the
-/// work, where the judgement actually belongs; the launcher only obeys it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ModelSpec {
-    /// Resolve from the active backlog item's declared `> Model:` field.
-    Auto,
-    /// A choice made outright, with no item lookup.
-    Fixed(ModelChoice),
-}
-
-/// Parse a model spec — the shared grammar behind `--model <spec>`, the picker,
-/// and a backlog item's `> Model:` line, so all three accept exactly the same
-/// words. Pure.
-///
-/// `<token> [key=value …]` where `<token>` is one of:
-///   - `claude` — the claude backend.
-///   - `reasoning` / `deepseek-reasoning` → opencode on [`DEEPSEEK_REASONING`].
-///   - `flash` / `deepseek-flash` → opencode on [`DEEPSEEK_FLASH`].
-///   - `auto` → [`ModelSpec::Auto`] (only meaningful from the CLI/picker; an item
-///     doc that declares `auto` would be circular, so callers treat it as absent).
-///   - any `provider/model` id → opencode on that id verbatim (an escape hatch for
-///     a model neither alias covers; opencode validates it at launch).
-///
-/// The optional `key=value` tail carries the effort/variant knob: `variant=<v>`
-/// (or its alias `effort=<v>`) sets the opencode agent's `variant`. It is inert on
-/// a `claude` spec — claude's effort isn't settable from this launch path — so it
-/// parses without error and is simply not carried.
-pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
-    let mut words = spec.split_whitespace();
-    let Some(token) = words.next() else {
-        bail!("empty model spec");
-    };
-
-    let mut variant: Option<String> = None;
-    for pair in words {
-        let (key, value) = pair
-            .split_once('=')
-            .ok_or_else(|| anyhow!("model spec: expected `key=value`, got `{pair}` in `{spec}`"))?;
-        match key {
-            // `effort` is accepted as an alias so the field reads naturally for
-            // either mental model; both land on opencode's one `variant` knob.
-            // An empty value is a typo, not "no variant" — emitting `"variant": ""`
-            // would pin the agent to a nameless variant.
-            "variant" | "effort" if value.is_empty() => {
-                bail!("model spec: `{key}=` has no value in `{spec}`")
-            }
-            // The variant is rendered after a `#` (`provider/model#variant`), so
-            // one carrying its own `#` could not be read back unambiguously.
-            "variant" | "effort" if value.contains('#') => {
-                bail!("model spec: `{key}={value}` contains '#' in `{spec}`")
-            }
-            "variant" | "effort" => variant = Some(value.to_string()),
-            _ => bail!("model spec: unknown key `{key}` in `{spec}` (expected `variant=`)"),
-        }
-    }
-
-    let mut choice = match token.to_ascii_lowercase().as_str() {
-        "auto" => {
-            if variant.is_some() {
-                bail!("model spec: `auto` takes no `variant=` — declare it on the item instead");
-            }
-            return Ok(ModelSpec::Auto);
-        }
-        "claude" => ModelChoice::claude(),
-        "reasoning" | "deepseek-reasoning" => ModelChoice::opencode(DEEPSEEK_REASONING),
-        "flash" | "deepseek-flash" => ModelChoice::opencode(DEEPSEEK_FLASH),
-        // A `#variant` suffix on the id is opencode's own spelling, but here the
-        // variant has exactly one home (`variant=`), so the two cannot disagree.
-        other if other.contains('#') => bail!(
-            "model spec: `{token}` carries a '#variant' suffix — write it as \
-             `{} variant={}` instead",
-            token.split_once('#').map_or(token, |(m, _)| m),
-            token.split_once('#').map_or("", |(_, v)| v),
-        ),
-        // A raw `provider/model` passthrough — anything else is a typo, not a model.
-        other if other.contains('/') => ModelChoice::opencode(token),
-        other => bail!(
-            "unknown model `{other}` — expected claude | reasoning | flash | auto | provider/model"
-        ),
-    };
-    // Inert on claude (the harness owns its effort), carried on opencode.
-    if choice.backend == Backend::Opencode {
-        choice.variant = variant;
-    }
-    Ok(ModelSpec::Fixed(choice))
-}
-
-/// Pull a backlog item's optional `> Model: <spec>` declaration out of its doc.
-///
-/// The field rides the same leading blockquote metadata block the item docs
-/// already use for `> Last reviewed:` / `> Design:`, so declaring a model is one
-/// line and needs no new file. Only a blockquote line counts — prose mentioning a
-/// model can't be mistaken for a declaration — and the first one wins. Pure.
-pub fn item_model_field(doc: &str) -> Option<&str> {
-    doc.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix('>')?;
-        let (key, value) = rest.trim().split_once(':')?;
-        key.trim()
-            .eq_ignore_ascii_case("model")
-            .then(|| value.trim())
-            .filter(|v| !v.is_empty())
-    })
 }
 
 /// The inputs an interactive launch needs, across backends. Each backend
@@ -280,58 +103,50 @@ pub struct InteractiveLaunch<'a> {
     pub boot_prompt: &'a str,
 }
 
-impl Backend {
-    /// The launcher binary name, for the spawn and user-facing messages.
-    pub fn agent_bin(&self) -> &'static str {
-        match self {
-            Backend::Claude => "claude",
-            Backend::Opencode => "opencode",
+/// Build the interactive loop command for a backend. Pure (constructs,
+/// never spawns) so the argv/env/cwd are unit-testable. (Formerly
+/// `Backend::interactive_command`; the enum moved to `softfig-ipc`, the launch
+/// side stayed here.)
+///
+/// - **claude** reproduces the original hardwired argv exactly —
+///   `claude --name <name> --settings <loop.json> --mcp-config <mcp.json>` —
+///   inheriting the caller's environment, and rooted at the garden
+///   (`launch.garden_root`, slice 005's auto-cd) instead of wherever the human
+///   invoked it from. It still sets no env.
+/// - **opencode** launches the TUI on the generated agent —
+///   `opencode --standalone --prompt <boot>` (see [`opencode_interactive_args`]
+///   for why `--standalone`, and why no `--agent`) — with `OPENCODE_CONFIG`
+///   pointing at the generated `opencode.json` (opencode's analog of claude's
+///   `--settings`; the agent, its selection as `default_agent`, its permission
+///   map, and the softfig-mcp block all live in that one file, so there is no
+///   separate `--mcp-config`) and
+///   cwd set to the **garden** (`launch.garden_root`) — the same root claude
+///   gets — so garden docs are ordinary in-project reads; see
+///   [`InteractiveLaunch::garden_root`]. The `--prompt`
+///   is the reseed kick: opencode has no SessionStart hook, so the roll is the
+///   agent prompt's step-0 baton read, and this first turn nudges the fresh
+///   session into it.
+pub fn interactive_command(backend: Backend, launch: &InteractiveLaunch) -> Result<Command> {
+    let mut cmd = Command::new(agent_bin(backend));
+    match backend {
+        Backend::Claude => {
+            cmd.arg("--name")
+                .arg(launch.agent_name)
+                .arg("--settings")
+                .arg(launch.loop_settings)
+                .arg("--mcp-config")
+                .arg(launch.mcp_config)
+                .current_dir(launch.garden_root);
+        }
+        Backend::Opencode => {
+            cmd.args(opencode_interactive_args())
+                .arg("--prompt")
+                .arg(launch.boot_prompt)
+                .env("OPENCODE_CONFIG", launch.opencode_config)
+                .current_dir(launch.garden_root);
         }
     }
-
-    /// Build the interactive loop command for this backend. Pure (constructs,
-    /// never spawns) so the argv/env/cwd are unit-testable.
-    ///
-    /// - **claude** reproduces the original hardwired argv exactly —
-    ///   `claude --name <name> --settings <loop.json> --mcp-config <mcp.json>` —
-    ///   inheriting the caller's environment, and rooted at the garden
-    ///   (`launch.garden_root`, slice 005's auto-cd) instead of wherever the human
-    ///   invoked it from. It still sets no env.
-    /// - **opencode** launches the TUI on the generated agent —
-    ///   `opencode --standalone --prompt <boot>` (see [`opencode_interactive_args`]
-    ///   for why `--standalone`, and why no `--agent`) — with `OPENCODE_CONFIG`
-    ///   pointing at the generated `opencode.json` (opencode's analog of claude's
-    ///   `--settings`; the agent, its selection as `default_agent`, its permission
-    ///   map, and the softfig-mcp block all live in that one file, so there is no
-    ///   separate `--mcp-config`) and
-    ///   cwd set to the **garden** (`launch.garden_root`) — the same root claude
-    ///   gets — so garden docs are ordinary in-project reads; see
-    ///   [`InteractiveLaunch::garden_root`]. The `--prompt`
-    ///   is the reseed kick: opencode has no SessionStart hook, so the roll is the
-    ///   agent prompt's step-0 baton read, and this first turn nudges the fresh
-    ///   session into it.
-    pub fn interactive_command(&self, launch: &InteractiveLaunch) -> Result<Command> {
-        let mut cmd = Command::new(self.agent_bin());
-        match self {
-            Backend::Claude => {
-                cmd.arg("--name")
-                    .arg(launch.agent_name)
-                    .arg("--settings")
-                    .arg(launch.loop_settings)
-                    .arg("--mcp-config")
-                    .arg(launch.mcp_config)
-                    .current_dir(launch.garden_root);
-            }
-            Backend::Opencode => {
-                cmd.args(opencode_interactive_args())
-                    .arg("--prompt")
-                    .arg(launch.boot_prompt)
-                    .env("OPENCODE_CONFIG", launch.opencode_config)
-                    .current_dir(launch.garden_root);
-            }
-        }
-        Ok(cmd)
-    }
+    Ok(cmd)
 }
 
 /// The interactive opencode argv up to (not including) the first-turn `--prompt`:
@@ -856,6 +671,8 @@ impl AgentBackend for ClaudeBackend {
 mod tests {
     use super::*;
 
+    use softfig_ipc::model_choice::item_model_field;
+
     // A realistic stream-json run: init + assistant + a five_hour rate event +
     // the terminal result (token totals + the model's context window).
     const STREAM: &str = r#"
@@ -997,9 +814,8 @@ mod tests {
             opencode_config: Path::new("/run/softfig/growlight/opencode.json"),
             boot_prompt: "begin",
         };
-        let cmd = Backend::Claude
-            .interactive_command(&launch)
-            .expect("claude backend builds a command");
+        let cmd =
+            interactive_command(Backend::Claude, &launch).expect("claude backend builds a command");
         assert_eq!(cmd.get_program(), OsStr::new("claude"));
         let args: Vec<OsString> = cmd.get_args().map(OsStr::to_owned).collect();
         assert_eq!(
@@ -1216,8 +1032,7 @@ mod tests {
             opencode_config: opencode_cfg,
             boot_prompt: "Begin your growlight iteration.",
         };
-        let cmd = Backend::Opencode
-            .interactive_command(&launch)
+        let cmd = interactive_command(Backend::Opencode, &launch)
             .expect("opencode backend builds a command");
 
         assert_eq!(cmd.get_program(), OsStr::new("opencode"));
