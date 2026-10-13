@@ -17,6 +17,7 @@
 //! in the live garden before the first v2 verb runs (§11), and the legacy
 //! verbs keep running unchanged.
 
+mod ops;
 mod state;
 mod views;
 // `pub(crate)` (instead of `mod`) so the slice-004 tests reuse the
@@ -24,6 +25,7 @@ mod views;
 // way.
 pub(crate) mod write;
 
+pub use ops::{queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups, queue_v2_session_log, queue_v2_set_status};
 pub use state::{load_queue_state, load_slices, milestone_path, slices_file, QUEUE_FILE};
 pub use views::{
     queue_view, queue_view_host, slices_view, slices_view_host, QUEUE_V2_TAG, SLICES_V2_TAG,

@@ -189,6 +189,17 @@ pub struct Entry {
     /// Consecutive follow-ups — task, restack and a milestone's close-out
     /// only (§7); slices keep theirs in `slices.toml`.
     pub follow_ups: u64,
+    /// A human status change on an `active` entry, recorded by keeperd's
+    /// `queue_update_entry` and applied by the daemon `queue_v2_set_status`
+    /// op at the session's next handshake (§6.8: the running session is
+    /// never killed, so the change waits for the boundary —
+    /// `queue-v2-scheduling` slice 005's mechanism). Omitted when none is
+    /// pending. Written and cleared only by keeperd verbs; not a §3.1 file
+    /// invariant, so a hand-written value on a non-`active` row parses and
+    /// simply never applies (the boundary ops act on it only at the
+    /// `active → …` transition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_status: Option<EntryStatus>,
 }
 
 /// The archive's outcome (§3.2): `done` satisfies `after` links, `dropped`
@@ -486,6 +497,7 @@ follow_ups = 0
             base: String::new(),
             claimed: String::new(),
             follow_ups: 0,
+            pending_status: None,
         }
     }
 
@@ -835,6 +847,7 @@ follow_ups = 0
             base: String::new(),
             claimed: String::new(),
             follow_ups: 0,
+            pending_status: None,
         };
         let text = toml::to_string(&entry).expect("serialize");
         assert!(text.contains("kind = \"task\""), "{text}");

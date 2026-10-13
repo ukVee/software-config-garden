@@ -423,6 +423,7 @@ mod tests {
             base: String::new(),
             claimed: String::new(),
             follow_ups: 0,
+            pending_status: None,
         }
     }
 

@@ -4882,6 +4882,7 @@ mod tests {
             base: base.into(),
             claimed: String::new(),
             follow_ups: 0,
+            pending_status: None,
         };
         let mut linked = e("normal-a", Lane::Normal, "feat/normal-a", "");
         linked.after = vec!["u1".into()];
