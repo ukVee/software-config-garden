@@ -177,6 +177,14 @@ member keeps the streamed figures and growlightd logs
 Each seam answers `None` for the provider it does not describe, and nothing invents the
 other reading. That symmetry is what makes the status surface honest — see below.
 
+The interactive `growlight start --opencode` loop has no admission at all. Its only budget
+source is protocol §2b's `usage.json`, and only Claude Code's statusline writes that file.
+So the generated agent prompt carries a §2b override ahead of the step-0 line
+(`OPENCODE_BUDGET_NOTE`): the Claude windows do not bind an opencode session, it never
+halts on them, and it omits the 5h/7d percentages from the baton. Without that override, a
+session started while the Claude window was spent would halt immediately, and that is
+exactly when the human reaches for opencode.
+
 ## Reading a mixed fleet: `growlight status`
 
 `growlight status` reports two lists, and the difference matters:

@@ -417,6 +417,18 @@ pub struct OpencodeConfigInputs<'a> {
     pub variant: Option<&'a str>,
 }
 
+/// The protocol §2b override an opencode session gets ahead of its step-0 line.
+/// `usage.json` is written only by Claude Code's statusline, so here it reports
+/// the Claude subscription's rate windows and says nothing about this session's
+/// provider.
+pub const OPENCODE_BUDGET_NOTE: &str = "§2b ON THIS BACKEND: `usage.json` is written by \
+    Claude Code's statusline, so it holds the Claude subscription's rate windows, not this \
+    opencode session's. They do not bind you: never halt on them, and omit `session_5h_pct` \
+    / `session_7d_pct` from the baton head, saying in prose that this backend's rate windows \
+    are not read. A baton a Claude session left HALTED_RATE_LIMIT on a Claude window is \
+    resumable here immediately; set it IN_PROGRESS and run its NEXT ACTION. The context \
+    budget (§2) still applies.";
+
 /// Generate the opencode-native equivalent of claude's `loop.json` + `mcp.json`:
 /// an `opencode.json` (loaded via `OPENCODE_CONFIG=<path>` — opencode's analog of
 /// claude's `--settings`) defining a `softfig-loop` **agent**. This carries the
@@ -492,11 +504,17 @@ pub fn opencode_config(cfg: &OpencodeConfigInputs<'_>) -> Result<String> {
     } = *cfg;
 
     // The system prompt: the protocol by reference (opencode expands `{file:…}`
-    // at config load — verified to resolve an absolute path) + the step-0
-    // baton-boot line that makes every fresh session re-read the live baton +
-    // the session context.
+    // at config load — verified to resolve an absolute path) + the §2b budget
+    // override + the step-0 baton-boot line that makes every fresh session
+    // re-read the live baton + the session context.
+    //
+    // §2b reads `usage.json`, which only Claude Code's statusline writes, so on
+    // this backend it holds the Claude subscription's windows, never this
+    // session's. Without the override an opencode session halts on a Claude
+    // window, which is exactly when the human reaches for opencode.
     let mut system = format!(
         "{protocol}\n\n\
+         {OPENCODE_BUDGET_NOTE}\n\n\
          STEP 0 (every session, first): Read your baton at `{baton}` and follow the \
          operating protocol above — the baton is your only carried state. opencode has \
          no SessionStart hook, so a fresh session (`/new` or a relaunch) re-reads the \
@@ -1096,6 +1114,10 @@ mod tests {
             system.contains("STEP 0") && system.contains("/rt/baton.md"),
             "step-0 boot must name the baton path: {system}"
         );
+        // §2b: usage.json is Claude's, so the override sits between the protocol
+        // and step 0, where a session reads it before acting on the baton.
+        let note = system.find(OPENCODE_BUDGET_NOTE).expect("budget override present");
+        assert!(note > system.find("{file:").unwrap() && note < system.find("STEP 0").unwrap(), "{system}");
 
         // attach_mcp: explicit project-scoped softfig-mcp block, binary resolved
         // like the claude mcp.json (cwd-independent).
