@@ -122,8 +122,27 @@ impl BatonSeeder for FsBatonStore {
     }
 }
 
-impl BatonStatusSource for FsBatonStore {
-    fn status(&self, agent: &str) -> BatonRead {
+/// The v2 member-baton copy (queue-v2-scheduling slice 006): write an entry
+/// baton's contents VERBATIM into the member's baton path at spawn (§3.6 "At
+/// spawn, growlightd copies the entry's baton into the member's baton path").
+/// Unlike [`BatonSeeder::seed`] — the legacy template seed keyed to a
+/// `(queue, part)` — this carries the exact per-entry state a paused entry
+/// hands to its (possibly different) resuming member, with no re-templating.
+impl crate::drive_loop::MemberBatonWriter for FsBatonStore {
+    fn write(&self, agent: &str, baton: &str) -> Result<(), String> {
+        let path = self.baton_path(agent);
+        // The agent dir is created by the pre-approval generator on spawn, but
+        // this write happens BEFORE that spawn (the SessionStart hook must find
+        // it) — idempotent with `generate`'s create, same as the seeder.
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("create agent dir {}: {e}", dir.display()))?;
+        }
+        fs::write(&path, baton).map_err(|e| format!("write baton {}: {e}", path.display()))
+    }
+}
+
+impl BatonStatusSource for FsBatonStore {    fn status(&self, agent: &str) -> BatonRead {
         let per_member_path = self.baton_path(agent);
         let per_member_raw = fs::read_to_string(&per_member_path).ok();
 

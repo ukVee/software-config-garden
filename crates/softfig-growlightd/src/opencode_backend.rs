@@ -721,12 +721,24 @@ impl BackendFlavor for OpencodeFlavor {
             })
     }
 
-    fn command_argv(&self, agent: &str, _paths: &AgentPaths) -> Vec<OsString> {
+    fn command_argv(
+        &self,
+        agent: &str,
+        _paths: &AgentPaths,
+        model: Option<&ModelSelection>,
+    ) -> Vec<OsString> {
         // The member id IS the opencode agent name the generated config keys its
         // `agent.<name>` block on — one id names the runtime dir, the baton, and
         // the agent block, so `--agent` can never point at a block that was not
-        // just written.
-        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent, &self.launch.model)
+        // just written. `model` overrides the roster default for THIS spawn
+        // (queue-v2-scheduling slice 006 — the assignment's resolved `> Model:`
+        // choice rides argv `--model`, the one path `run` honors fail-closed).
+        opencode_command_argv(
+            &self.launch.bin,
+            &self.launch.prompt,
+            agent,
+            model.unwrap_or(&self.launch.model),
+        )
     }
 
     fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)> {
@@ -882,9 +894,15 @@ impl OpencodeBackend {
     /// separator, given the paths a spawn's pre-approval writes — `opencode run
     /// --standalone --format json --agent <id> --model <m> <prompt>`, wrapper
     /// excluded. The routing seam
-    /// (slice 005) asserts an opencode-backed member through it.
-    pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
-        self.harness.command_argv(agent, paths)
+    /// (slice 005) asserts an opencode-backed member through it. `model` is the
+    /// per-spawn override (slice 006), `None` = the roster default.
+    pub fn command_argv(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+        model: Option<&ModelSelection>,
+    ) -> Vec<OsString> {
+        self.harness.command_argv(agent, paths, model)
     }
 }
 
@@ -1551,7 +1569,7 @@ mod tests {
         let argv = crate::agent_harness::spawn_argv(
             &crate::agent_harness::scope_base_name_gen("a1", 7),
             &BuildCaps::default(),
-            f.command_argv("a1", &paths),
+            f.command_argv("a1", &paths, None),
         );
         let s: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
 
@@ -1591,7 +1609,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = flavor(tmp.path(), Path::new("/garden"));
         let paths = crate::preapproval::agent_paths(&tmp.path().join("agents"), "a1");
-        let argv = f.command_argv("a1", &paths);
+        let argv = f.command_argv("a1", &paths, None);
         assert_eq!(argv[1], "run");
         assert_eq!(argv[2], "--standalone", "the flag sits right after the subcommand");
         assert_eq!(
@@ -1610,7 +1628,7 @@ mod tests {
         let f = flavor(tmp.path(), Path::new("/garden"));
         let paths = crate::preapproval::agent_paths(&tmp.path().join("agents"), "a1");
         let argv: Vec<String> = f
-            .command_argv("a1", &paths)
+            .command_argv("a1", &paths, None)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
@@ -1622,6 +1640,32 @@ mod tests {
         assert_eq!(
             ModelSelection::model("deepseek/deepseek-v4-pro").argv_value(),
             "deepseek/deepseek-v4-pro",
+        );
+    }
+
+    #[test]
+    fn a_per_spawn_model_override_replaces_the_roster_default_on_argv() {
+        // queue-v2-scheduling slice 006: the assignment's resolved `> Model:`
+        // choice overrides the roster default for THIS spawn — the override rides
+        // the same argv `--model` slot, so `run`'s model source stays the one that
+        // fails closed. `None` keeps the roster default (proven above).
+        let tmp = tempfile::tempdir().unwrap();
+        let f = flavor(tmp.path(), Path::new("/garden"));
+        let paths = crate::preapproval::agent_paths(&tmp.path().join("agents"), "a1");
+        let argv: Vec<String> = f
+            .command_argv(
+                "a1",
+                &paths,
+                Some(&ModelSelection::model("deepseek/deepseek-v4-pro")),
+            )
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = argv.iter().position(|a| a == "--model").expect("--model on argv");
+        assert_eq!(
+            argv[at + 1],
+            "deepseek/deepseek-v4-pro",
+            "the override replaces the roster default (deepseek/deepseek-flash#high)",
         );
     }
 

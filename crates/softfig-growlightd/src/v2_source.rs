@@ -176,6 +176,16 @@ impl V2Source {
     }
 }
 
+/// The drive loop's [`V2QueueSource`](crate::drive_loop::V2QueueSource) seam
+/// (queue-v2-scheduling slice 006): the concrete source IS the seam — `load` is
+/// the same per-tick method, including the `&mut self` alert memory. The
+/// explicit inherent call disambiguates from the trait method of the same name.
+impl crate::drive_loop::V2QueueSource for V2Source {
+    fn load(&mut self) -> V2Load {
+        V2Source::load(self)
+    }
+}
+
 /// Read + parse + validate the v2 state under `garden_root` and assemble the
 /// snapshot slice 002's `pick_v2` consumes. `Ok(None)` = no `queue.toml` (no
 /// v2 state yet); any `Err` is fail-closed — the caller schedules nothing and

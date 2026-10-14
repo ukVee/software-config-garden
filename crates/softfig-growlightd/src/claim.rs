@@ -37,10 +37,10 @@
 
 use std::path::{Path, PathBuf};
 
-use softfig_ipc::verbs::{op, SetItemStatusArgs};
+use softfig_ipc::verbs::{op, DaemonStatusArg, QueueV2ClaimArgs, QueueV2SetStatusArgs, SetItemStatusArgs};
 use softfig_ipc::{call_reconnecting, ReconnectError, Request, Response, RetryPolicy};
 
-use crate::drive_loop::{ItemParker, PartClaimer};
+use crate::drive_loop::{ItemParker, PartClaimer, V2Claimer, V2ItemParker};
 
 /// The status a claim writes. keeperd enforces single-active scoped to the
 /// queue's region, so this marks exactly one part `active` per queue.
@@ -157,6 +157,75 @@ impl ItemParker for KeeperdItemParker {
         // An item-park flips the part out of `active`; it carries no holder (the
         // CAS guards writes TO `active` only).
         write_item_status(&self.keeperd_socket, "block", queue, part, BLOCK_STATUS, None)
+    }
+}
+
+/// The live v2 [`V2Claimer`] (queue-v2-scheduling slice 006): claim the picked
+/// v2 unit by issuing keeperd's `queue_v2_claim` op — the WRITE that closes the
+/// double-assignment window for v2 exactly as [`KeeperdPartClaimer`] does for
+/// legacy. Same socket, same [`call_reconnecting`] ride-out, same
+/// [`classify_status_write`] fail-closed mapping: only a `Response::Ok` claims
+/// (a fresh write OR the idempotent re-claim of an already-`active` unit);
+/// a refusal (a second active unit in the tree, or a Locked keeperd) and a
+/// transport failure both abort the spawn.
+#[derive(Debug, Clone)]
+pub struct KeeperdV2Claimer {
+    /// keeperd's listen socket (the same path the v2 source / legacy claimer read).
+    keeperd_socket: PathBuf,
+}
+
+impl KeeperdV2Claimer {
+    /// Bind the v2 claimer to keeperd's listen socket.
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self { keeperd_socket }
+    }
+}
+
+impl V2Claimer for KeeperdV2Claimer {
+    fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
+        let args = serde_json::to_value(QueueV2ClaimArgs {
+            entry: entry.to_string(),
+            unit: unit.map(str::to_string),
+        })
+        .map_err(|e| format!("encode queue_v2_claim args: {e}"))?;
+        let req = Request::new(op::QUEUE_V2_CLAIM, args);
+        let result = call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default());
+        classify_status_write("v2 claim", &self.keeperd_socket, result)
+    }
+}
+
+/// The live v2 [`V2ItemParker`] (queue-v2-scheduling slice 006): the v2 sibling
+/// of [`KeeperdItemParker`] — when a v2 member exits on a human-block
+/// (`BLOCKED_ON_HUMAN` / `STUCK`), park its ENTRY via keeperd's
+/// `queue_v2_set_status(entry, blocked)` so `pick_v2` skips it (`NotEligible`)
+/// and the freed member pivots, exactly as the legacy `blocked` write makes the
+/// next snapshot park the queue. Fail-soft in the drive loop (the member is
+/// already released); an `active → blocked` entry-level write is always
+/// accepted by the op (the from-status guard refuses only impossible pairs).
+#[derive(Debug, Clone)]
+pub struct KeeperdV2ItemParker {
+    /// keeperd's listen socket (the same path the v2 claimer / source use).
+    keeperd_socket: PathBuf,
+}
+
+impl KeeperdV2ItemParker {
+    /// Bind the v2 item-parker to keeperd's listen socket.
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self { keeperd_socket }
+    }
+}
+
+impl V2ItemParker for KeeperdV2ItemParker {
+    fn park_entry_v2(&self, entry: &str) -> Result<(), String> {
+        let args = serde_json::to_value(QueueV2SetStatusArgs {
+            entry: entry.to_string(),
+            unit: None,
+            new: DaemonStatusArg::Blocked,
+        })
+        .map_err(|e| format!("encode queue_v2_set_status args: {e}"))?;
+        let req = Request::new(op::QUEUE_V2_SET_STATUS, args);
+        let result = call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default());
+        classify_status_write("v2 block", &self.keeperd_socket, result)
     }
 }
 

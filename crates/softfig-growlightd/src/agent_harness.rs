@@ -309,8 +309,17 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
     /// wrote. The scope wrapper half is the harness's ([`scope_wrapper_argv`]) —
     /// this is only the backend's own invocation. `agent` is passed because a
     /// backend may need to name the member on its own command line (opencode's
-    /// `--agent`), which the paths alone do not carry.
-    fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString>;
+    /// `--agent`), which the paths alone do not carry. `model` is the per-spawn
+    /// override the [`crate::supervisor::AgentSpec`] carries (queue-v2-scheduling
+    /// slice 006): `Some` pins an opencode member's `--model` argv for THIS
+    /// spawn; `None` runs the backend's roster default (claude ignores it — its
+    /// model is the harness's own).
+    fn command_argv(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+        model: Option<&crate::opencode_backend::ModelSelection>,
+    ) -> Vec<OsString>;
 
     /// Extra environment variables this spawn's child needs, given the paths its
     /// pre-approval just wrote. Applied on top of growlightd's own environment,
@@ -760,9 +769,15 @@ impl Harness {
     /// runs on what" is a routing decision, and the only honest proof that a member
     /// routes where the operator asked is the command line it would be launched
     /// with. Pure: it spawns nothing and writes nothing (the paths are an input,
-    /// not a generation).
-    pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
-        self.flavor.command_argv(agent, paths)
+    /// not a generation). `model` is the per-spawn override the caller (a
+    /// [`crate::supervisor::AgentSpec`]) carries, `None` = the roster default.
+    pub fn command_argv(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+        model: Option<&crate::opencode_backend::ModelSelection>,
+    ) -> Vec<OsString> {
+        self.flavor.command_argv(agent, paths, model)
     }
 
     /// Spawn `spec`'s agent: generate its pre-approval fail-closed, launch the
@@ -801,7 +816,8 @@ impl Harness {
         let argv = spawn_argv(
             &scope_base,
             &caps,
-            self.flavor.command_argv(&spec.agent, &paths),
+            self.flavor
+                .command_argv(&spec.agent, &paths, spec.model.as_ref()),
         );
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])

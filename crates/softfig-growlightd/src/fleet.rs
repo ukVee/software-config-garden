@@ -53,14 +53,14 @@ use softfig_ipc as ipc;
 
 use crate::admission::AdmissionGovernor;
 use crate::backend_router::{BackendHandle, BackendRouter};
-use crate::baton_store::FsBatonStore;
+use crate::baton_store::{runtime_entries_dir, FsBatonStore, FsEntryBatonStore};
 use crate::config::BuildCaps;
-use crate::claim::{KeeperdItemParker, KeeperdPartClaimer};
+use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2Claimer, KeeperdV2ItemParker};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
     spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RateMeter, RouteConnectivity,
-    SystemExeProbe, DRIVE_POLL_MS,
+    SystemExeProbe, V2Seams, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
@@ -71,6 +71,7 @@ use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
 use crate::supervisor::{AgentSpec, Supervisor};
 use crate::usage_file::UsageCapture;
+use crate::v2_source::V2Source;
 
 /// The `claude` binary the backend shells when the config omits `claude_bin`.
 pub const DEFAULT_CLAUDE_BIN: &str = "claude";
@@ -114,6 +115,35 @@ pub enum MemberBackend {
     /// opencode member with none is refused at parse (see
     /// [`FleetMemberDoc::validate`]), never left to opencode's own default.
     Opencode(ModelSelection),
+}
+
+impl MemberBackend {
+    /// The [`softfig_ipc::model_choice::Backend`] this member runs on — the
+    /// §6.4 backend-match input v2 scheduling (slice 006) needs to build the
+    /// per-member [`crate::scheduler_v2::Member`].
+    pub fn ipc_backend(&self) -> softfig_ipc::model_choice::Backend {
+        match self {
+            MemberBackend::Claude => softfig_ipc::model_choice::Backend::Claude,
+            MemberBackend::Opencode(_) => softfig_ipc::model_choice::Backend::Opencode,
+        }
+    }
+
+    /// The roster's `model` — the opencode member's default for undeclared work
+    /// (§6.4). `None` for a claude member.
+    pub fn roster_model(&self) -> Option<&str> {
+        match self {
+            MemberBackend::Claude => None,
+            MemberBackend::Opencode(sel) => Some(&sel.model),
+        }
+    }
+
+    /// The roster's `variant` (opencode-only).
+    pub fn roster_variant(&self) -> Option<&str> {
+        match self {
+            MemberBackend::Claude => None,
+            MemberBackend::Opencode(sel) => sel.variant.as_deref(),
+        }
+    }
 }
 
 /// One configured fleet member, **validated** — what [`FleetConfig`] carries and
@@ -257,10 +287,11 @@ impl FleetMemberConfig {
     fn to_member(&self, agents_dir: &Path) -> FleetMember {
         let paths = agent_paths(agents_dir, &self.agent);
         let spec = AgentSpec::new(&self.agent, paths.loop_settings, paths.mcp_config);
-        match &self.pin {
+        let member = match &self.pin {
             Some(pin) => FleetMember::pinned(spec, pin.clone()),
             None => FleetMember::unpinned(spec),
-        }
+        };
+        member.with_backend(self.backend.clone())
     }
 }
 
@@ -523,7 +554,7 @@ pub fn assemble_fleet(
     // `BatonStatusSource` slice 001 reads on exit — one store cloned into both
     // boxes, so the file the seeder writes and the file the reader parses can never
     // drift. `FsBatonStore` is a cheap `Clone` (two paths + a name), so no `Arc`.
-    let baton_store = FsBatonStore::new(agents_dir.clone(), garden_name);
+    let baton_store = FsBatonStore::new(agents_dir.clone(), garden_name.clone());
 
     // Each member's own backend, behind ONE router (slice 005). The `DriveLoop::new`
     // contract is unchanged — it still receives a single backend-shaped thing cloned
@@ -574,6 +605,21 @@ pub fn assemble_fleet(
     // (`None` = unbounded, the default). Read once here at arm time — a bounded run's
     // bound must not move mid-run.
     .with_max_iterations(fleet.max_iterations))
+    .map(|drive| {
+        // The queue-v2 scheduling seams (queue-v2-scheduling slice 006): installed
+        // whatever the mode — the tick consults them ONLY when `queue = "v2"`, so a
+        // legacy fleet carries them inert. Built over the SAME runtime `agents/`
+        // store (the member writer is the §3.6 copy target the SessionStart hook
+        // reads) and the SAME keeperd socket the legacy claimer rides.
+        let baton_writer = FsBatonStore::new(agents_dir.clone(), garden_name.clone());
+        drive.with_v2(V2Seams {
+            source: Box::new(V2Source::new(garden_root.clone())),
+            entries: FsEntryBatonStore::new(runtime_entries_dir(), garden_name),
+            member_writer: Box::new(baton_writer),
+            claimer: Box::new(KeeperdV2Claimer::new(keeperd_socket.to_path_buf())),
+            parker: Box::new(KeeperdV2ItemParker::new(keeperd_socket.to_path_buf())),
+        })
+    })
 }
 
 /// Build each member's configured backend and route the roster to it (slice 005).

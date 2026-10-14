@@ -250,6 +250,15 @@ impl Daemon {
         self.inner.lock().unwrap().config.policy
     }
 
+    /// Which queue model the drive loop schedules from — the §11 switch
+    /// (`config/growlight.toml` `queue`), set at boot with the fleet config and
+    /// read each tick like [`policy`](Self::policy) so a future live switch takes
+    /// effect at the next boundary (queue-v2-scheduling slice 006). Brief-lock
+    /// read ([`QueueMode`](crate::fleet::QueueMode) is `Copy`).
+    pub fn queue_mode(&self) -> crate::fleet::QueueMode {
+        self.inner.lock().unwrap().fleet.queue
+    }
+
     /// Replace the runtime per-device [`Policy`] (the `set_policy` verb). The
     /// caller validates the value first ([`Policy::from_summary`]); this stores it
     /// under the daemon lock so `status` and the drive loop's next admission

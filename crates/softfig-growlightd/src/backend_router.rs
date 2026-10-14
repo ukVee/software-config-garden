@@ -159,11 +159,18 @@ impl BackendHandle {
     /// The argv `agent` would be exec'd with on this backend (after the
     /// `systemd-run … --` separator). The routing assertion: a member's backend is
     /// only *really* the one the operator asked for if this is that backend's
-    /// command line.
-    fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
+    /// command line. `model` is the per-spawn override the
+    /// [`crate::supervisor::AgentSpec`] carries (slice 006), `None` = the roster
+    /// default.
+    fn command_argv(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+        model: Option<&crate::opencode_backend::ModelSelection>,
+    ) -> Vec<OsString> {
         match self {
-            Self::Claude(b) => b.command_argv(agent, paths),
-            Self::Opencode(b) => b.command_argv(agent, paths),
+            Self::Claude(b) => b.command_argv(agent, paths, model),
+            Self::Opencode(b) => b.command_argv(agent, paths, model),
         }
     }
 }
@@ -214,9 +221,12 @@ impl BackendRouter {
 
     /// The argv `agent` would be exec'd with, or `None` if it is not in the roster.
     /// The observation the assembly tests assert routing through — it names a
-    /// backend without spawning one.
+    /// backend without spawning one. Observes the ROSTER DEFAULT (`None` model
+    /// override): this seam has no spawn context, so the per-spawn override
+    /// (slice 006) is a spawn-time fact, asserted through the harness instead.
     pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Option<Vec<OsString>> {
-        self.backend_for(agent).map(|b| b.command_argv(agent, paths))
+        self.backend_for(agent)
+            .map(|b| b.command_argv(agent, paths, None))
     }
 
     /// `agent`'s accumulated metered spend, or [`None`] when its backend is not
