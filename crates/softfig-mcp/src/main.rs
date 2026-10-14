@@ -7,6 +7,11 @@
 //! MCP wire shape (subset of JSON-RPC 2.0): one request per stdin line,
 //! one response per stdout line. We implement the minimum the Claude
 //! Code MCP client invokes: `initialize`, `tools/list`, `tools/call`.
+//!
+//! The caller's identity is read once, at startup, from `SOFTFIG_MEMBER` in
+//! this process's launch env (spec-growlight-queue §6; growlightd writes it into
+//! every fleet member's generated MCP config) — never from a tool argument.
+//! Unset means a human-directed or semi-auto session, served as before.
 
 use std::io::{self, BufRead, Write};
 
@@ -16,6 +21,7 @@ use serde_json::{json, Value};
 use softfig_ipc::{
     self,
     growlightd::{ReleaseLeaseArgs, RequestLeaseArgs},
+    MemberIdentity,
     verbs::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
         AddSectionArgs, AddSliceArgs,
@@ -84,6 +90,7 @@ fn err(id: Value, code: i32, message: impl Into<String>) -> Value {
 }
 
 fn main() -> Result<()> {
+    let caller = MemberIdentity::from_process_env();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -93,7 +100,7 @@ fn main() -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let resp = handle_line(&line);
+        let resp = handle_line(&caller, &line);
         let mut bytes = serde_json::to_vec(&resp)?;
         bytes.push(b'\n');
         out.write_all(&bytes)?;
@@ -102,7 +109,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_line(line: &str) -> Value {
+fn handle_line(caller: &MemberIdentity, line: &str) -> Value {
     let rpc: Rpc = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return err(Value::Null, -32700, format!("parse: {e}")),
@@ -120,7 +127,7 @@ fn handle_line(line: &str) -> Value {
         ),
         "notifications/initialized" => Value::Null, // notification; no reply
         "tools/list" => ok(id, json!({ "tools": tool_defs() })),
-        "tools/call" => match call_tool(&rpc.params) {
+        "tools/call" => match call_tool(caller, &rpc.params) {
             Ok(v) => ok(id, v),
             Err(e) => err(id, -32000, e.to_string()),
         },
@@ -1287,7 +1294,14 @@ fn summarize(name: &str, data: &Value) -> String {
     format!("{name}: commit {hash}")
 }
 
-fn call_tool(params: &Value) -> Result<Value> {
+fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
+    // Fail closed on a garbled identity: a member whose `SOFTFIG_MEMBER` can't
+    // be read must not be served with a human's reach. growlightd never writes
+    // one (it validates the id with the same rule before generating), so this
+    // fires only on a hand-made launch env.
+    if let MemberIdentity::Invalid(why) = caller {
+        anyhow::bail!("softfig-mcp refuses every verb: {why}");
+    }
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -1370,9 +1384,43 @@ mod tests {
 
     #[test]
     fn tools_list_via_handle_line() {
-        let resp = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let resp = handle_line(
+            &MemberIdentity::NotAMember,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 38);
+    }
+
+    /// A `tools/call` for a tool that doesn't exist: dispatch refuses it before
+    /// any socket is touched, so a test can see how far a caller gets.
+    fn call_unknown_tool(caller: &MemberIdentity) -> String {
+        let resp = handle_line(
+            caller,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#,
+        );
+        assert_eq!(resp["error"]["code"], -32000, "{resp}");
+        resp["error"]["message"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_member_or_a_human_reaches_dispatch_unchanged() {
+        // The identity is carried, not yet acted on (the member verbs + their
+        // gate are slice 008's): both reach the same dispatch as before.
+        for caller in [MemberIdentity::NotAMember, MemberIdentity::Member("a".into())] {
+            let msg = call_unknown_tool(&caller);
+            assert!(msg.contains("unknown tool \"no_such_tool\""), "{caller:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_garbled_identity_refuses_every_verb_before_dispatch() {
+        let caller = MemberIdentity::from_env_value(Some(std::ffi::OsStr::new("../x")));
+        let msg = call_unknown_tool(&caller);
+        assert!(msg.starts_with("softfig-mcp refuses every verb: SOFTFIG_MEMBER="), "{msg}");
+        // Listing the tools stays harmless.
+        let resp = handle_line(&caller, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 38);
     }
 
     #[test]

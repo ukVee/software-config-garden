@@ -161,7 +161,7 @@ impl PreApproval {
             &paths.loop_settings,
             &loop_json(&paths.inject, &self.garden_root, &self.claude_projects()),
         )?;
-        write_file(&paths.mcp_config, &mcp_json(&self.mcp_bin))?;
+        write_file(&paths.mcp_config, &mcp_json(&self.mcp_bin, agent))?;
         Ok(paths)
     }
 }
@@ -241,14 +241,14 @@ impl std::error::Error for GenError {
 /// Reject an agent id that isn't a safe single path component, so it can never
 /// escape the `agents/` namespace or break the runtime layout. Shared with the
 /// opencode generator ([`crate::opencode_preapproval`]) so both backends fail
-/// closed on exactly the same ids — one rule, not two that can drift.
+/// closed on exactly the same ids — one rule, not two that can drift. The rule
+/// itself is softfig-ipc's, which softfig-mcp applies to the `SOFTFIG_MEMBER`
+/// it reads back, so no id is written that the reader would refuse.
 pub(crate) fn validate_agent_id(id: &str) -> Result<(), GenError> {
-    let bad =
-        id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']);
-    if bad {
-        Err(GenError::BadAgentId(id.to_string()))
-    } else {
+    if softfig_ipc::is_safe_member_id(id) {
         Ok(())
+    } else {
+        Err(GenError::BadAgentId(id.to_string()))
     }
 }
 
@@ -305,15 +305,19 @@ fn loop_json(inject: &Path, garden_root: &Path, claude_projects: &Path) -> Strin
 /// The per-agent `mcp.json` (`--mcp-config`): attach `softfig-mcp` so the garden
 /// verbs exist for this agent regardless of its launch cwd (the project-scoped
 /// `~/.claude.json` registration only loads with cwd in the garden, but a fleet
-/// agent is shelled from growlightd). Mirrors the single-agent generator.
-fn mcp_json(mcp_bin: &Path) -> String {
+/// agent is shelled from growlightd). Mirrors the single-agent generator, plus
+/// the server `env` carrying `SOFTFIG_MEMBER=<agent>` — the member identity
+/// softfig-mcp reads at startup (spec-growlight-queue §6, [`softfig_ipc::member`]).
+/// Claude Code layers `env` over the env it already passes the server, so this
+/// adds the one key and nothing else about the launch changes (§13).
+fn mcp_json(mcp_bin: &Path, agent: &str) -> String {
     let v = serde_json::json!({
         "mcpServers": {
             "softfig-mcp": {
                 "type": "stdio",
                 "command": mcp_bin.display().to_string(),
                 "args": [],
-                "env": {}
+                "env": { softfig_ipc::MEMBER_ENV: agent }
             }
         }
     });
@@ -422,10 +426,46 @@ mod tests {
 
     #[test]
     fn mcp_json_attaches_softfig_mcp() {
-        let s = mcp_json(Path::new("/usr/bin/softfig-mcp"));
+        let s = mcp_json(Path::new("/usr/bin/softfig-mcp"), "a1");
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mcpServers"]["softfig-mcp"]["command"], "/usr/bin/softfig-mcp");
         assert_eq!(v["mcpServers"]["softfig-mcp"]["type"], "stdio");
+    }
+
+    #[test]
+    fn mcp_json_carries_exactly_this_members_identity_and_nothing_else_changes() {
+        let v: Value =
+            serde_json::from_str(&mcp_json(Path::new("/usr/bin/softfig-mcp"), "a1")).unwrap();
+        // The whole file, pinned: one server, the same four keys it always had,
+        // and an `env` holding the member id under the shared key — once.
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "mcpServers": {
+                    "softfig-mcp": {
+                        "type": "stdio",
+                        "command": "/usr/bin/softfig-mcp",
+                        "args": [],
+                        "env": { "SOFTFIG_MEMBER": "a1" }
+                    }
+                }
+            }),
+        );
+        assert_eq!(softfig_ipc::MEMBER_ENV, "SOFTFIG_MEMBER");
+    }
+
+    #[test]
+    fn each_member_gets_its_own_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = pre(&tmp.path().join("agents"));
+        for agent in ["a", "b"] {
+            let paths = g.generate(agent).unwrap();
+            let v: Value =
+                serde_json::from_str(&fs::read_to_string(&paths.mcp_config).unwrap()).unwrap();
+            let env = v["mcpServers"]["softfig-mcp"]["env"].as_object().unwrap();
+            assert_eq!(env.len(), 1, "{agent}: {env:?}");
+            assert_eq!(env["SOFTFIG_MEMBER"], agent);
+        }
     }
 
     #[test]

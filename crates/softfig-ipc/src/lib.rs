@@ -11,6 +11,7 @@
 pub mod baton;
 pub mod client;
 pub mod growlightd;
+pub mod member;
 pub mod model_choice;
 pub mod opencode;
 pub mod proto;
@@ -23,6 +24,7 @@ pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};
 pub use client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };
+pub use member::{is_safe_member_id, MemberIdentity, MEMBER_ENV};
 pub use model_choice::{
     Backend, Declaration, DeclaredModels, ModelChoice, ModelList, ModelRuleError, ModelSpec,
     item_doc_candidates, item_model_field, member_default, parse_declaration, parse_model_spec,
