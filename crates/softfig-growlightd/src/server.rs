@@ -766,16 +766,14 @@ fn request_restart(daemon: &Daemon, req: &Request) -> Response {
     )
 }
 
-/// Encode a typed reply as a one-shot `Response::ok`, mapping a serialization
-/// failure to an `Internal` error (`what` names the verb for the message).
-/// A queue-v2 member verb (spec-growlight-queue §6.3 step 2 — validation, in
-/// the spec's order): the identity from the envelope, the caller's live v2
-/// assignment (the drive loop's mirror), then [`member_verbs::validate`] over a
-/// fresh read of the v2 list. Every refusal is an ok [`MemberVerbReply`] with
-/// `state: refused` and leaves the calling session untouched — nothing here
-/// signals, kills or rolls it. A pass replies `validated` with the entry and
-/// unit; executing the handshake (commit, store the baton, terminate after
-/// grace, pick) is not built yet.
+/// A queue-v2 member verb (spec-growlight-queue §6.3): the identity from the
+/// envelope, the caller's live v2 assignment (the drive loop's mirror), then
+/// [`member_verbs::validate`] over a fresh read of the v2 list. Every refusal
+/// is an ok [`MemberVerbReply`] with `state: refused` and leaves the calling
+/// session untouched — nothing here signals, kills or rolls it. A pass runs
+/// step 3 ([`crate::member_handoff::execute`]: keeperd commits, the baton is
+/// stored as the entry's) and replies `ok` with what runs next; the drive loop
+/// then ends the session after the grace and picks (steps 4–5).
 ///
 /// The v2 list is read through the mount without the daemon lock (the drive
 /// loop's own read path), so a slow read never blocks another verb.
@@ -818,12 +816,6 @@ pub(crate) fn member_verb(daemon: &Daemon, req: &Request) -> Response {
         }
     };
     let unit = member_verbs::unit_label(&v.assignment.unit);
-    // The sub-milestone's execution (keeperd creating the sub, `split`,
-    // placement) is the cap slice's; until then a valid call is reported as
-    // validated and executes nothing, so the session keeps running.
-    if matches!(v.verb, member_verbs::MemberVerb::AddSubMilestone(_)) {
-        return ok_reply(&MemberVerbReply::validated(name, v.assignment.entry.clone(), unit), name);
-    }
     let Some(seams) = daemon.v2_handoff_seams() else {
         return Response::err(
             ErrorKind::Internal,
@@ -892,6 +884,8 @@ fn decode_member_verb(
     }
 }
 
+/// Encode a typed reply as a one-shot `Response::ok`, mapping a serialization
+/// failure to an `Internal` error (`what` names the verb for the message).
 fn ok_reply<T: serde::Serialize>(reply: &T, what: &str) -> Response {
     match serde_json::to_value(reply) {
         Ok(v) => Response::ok(v),

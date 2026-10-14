@@ -72,6 +72,9 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "queue_v2_follow_ups_set",
     "queue_v2_session_logged",
     "queue_v2_deferred_set",
+    // queue-v2-scheduling slice 010: growlight_add_sub_milestone's commit —
+    // the sub-milestone's docs + slices.toml, the split, the placement.
+    "queue_v2_sub_added",
 ];
 
 /// A name + payload pair, validated against the closed enum.
@@ -135,7 +138,7 @@ const KNOWN_INTENTS_LIST: &str =
      chat_message_posted, inbox_read, report_filed, report_updated, \
      config_migrated, \
      peers_changed, shared_subtrees_changed, shared_ceremony, shared_rekey, shared_pull, \
-     migrate_into_share, migrate_into_share_carve, sync_conflict, schema_change, rollback, vault_seal, vault_reveal, queue_v2_updated, queue_v2_claimed, queue_v2_status_set, queue_v2_follow_ups_set, queue_v2_session_logged, queue_v2_deferred_set";
+     migrate_into_share, migrate_into_share_carve, sync_conflict, schema_change, rollback, vault_seal, vault_reveal, queue_v2_updated, queue_v2_claimed, queue_v2_status_set, queue_v2_follow_ups_set, queue_v2_session_logged, queue_v2_deferred_set, queue_v2_sub_added";
 
 fn type_name(v: &Value) -> &'static str {
     match v {

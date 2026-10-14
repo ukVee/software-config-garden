@@ -36,12 +36,20 @@
 //! - Each handoff's baton status is fixed by the verb: a session that continues
 //!   the work hands on `IN_PROGRESS`; `complete_entry` carries `ITEM_COMPLETE`
 //!   (`done`) or `ITEM_DEFERRED` (`deferred`) as §6.5 says; `block` carries the
-//!   protocol's own `BLOCKED_ON_HUMAN` / `STUCK`.
+//!   protocol's own `BLOCKED_ON_HUMAN` / `STUCK`. One exception (slice 010):
+//!   `complete_entry` on a sub-milestone's close-out continues the entry, so
+//!   it hands on `IN_PROGRESS`.
 //! - `model_change` without `model` has no code of its own in §6.3; it is
 //!   refused `model_not_allowed` (the request names no allowed model).
 //! - A `preempted` follow-up never counts, so it is never capped.
 //! - `depth_limit` is checked here with the rest of the cap step (§7's code in
-//!   §6.3's list); building the sub-milestone stays with the cap slice.
+//!   §6.3's list); building the sub-milestone is [`crate::member_handoff`]'s.
+//! - Slice 010: §6.7's `field_not_allowed` for a sub-milestone's text is
+//!   checked here, in the write-limits step — its one placement on the
+//!   member path (011 does not add another). Slugs keeperd would refuse (bad
+//!   shape, a sub slug already in the parent's list) are refused here as
+//!   malformed arguments, because keeperd's refusal would come after the
+//!   handshake's commit point and end the session with nothing filed.
 
 use softfig_ipc::baton::validate_head;
 use softfig_ipc::growlightd::{
@@ -52,7 +60,9 @@ use softfig_ipc::model_choice::{
     item_model_field, parse_declaration, parse_model_spec, validate_declared_subset,
     validate_model_change, Declaration, ModelChoice, ModelList, ModelSpec,
 };
-use softfig_ipc::queue_v2::{sub_depth, EntryKind, EntryStatus, SliceKind, SliceStatus};
+use softfig_ipc::queue_v2::{
+    sub_depth, sub_doc_violation, EntryKind, EntryStatus, SliceKind, SliceStatus, SubSliceText,
+};
 
 use crate::drive_loop::V2Assignment;
 use crate::scheduler_v2::{EntryView, TreeView, Unit, V2Snapshot};
@@ -199,14 +209,17 @@ pub fn validate(
     // The reason (and the verb's own unit-kind rules, which §5/§6.2/§6.5 file
     // under it).
     let reason = check_reason(&verb, &ctx)?;
-    // The cap (§7).
+    // The cap (§7), then where a sub-milestone would go.
     check_cap(&verb, reason, &ctx)?;
+    check_sub_placement(&verb, &ctx)?;
     // The model rule (§6.4).
     let next_model = match &verb {
         MemberVerb::AddFollowUpSession(a) => check_model(a, reason, assignment, &ctx)?,
         _ => None,
     };
-    // The member write limits on any slice body (§6.7 subset rule).
+    // The member write limits (§6.7): the sub-milestone text's reserved
+    // lines, then the subset rule on any slice body.
+    check_sub_fields(&verb)?;
     check_slice_bodies(&verb, &ctx)?;
     // The baton parses with its required head fields.
     check_baton(&verb, &ctx)?;
@@ -239,6 +252,17 @@ struct Ctx<'a> {
     tree: Option<(&'a str, &'a TreeView)>,
 }
 
+/// keeperd's slug rule (`conventions::validate_slug`: 1–64 bytes of
+/// `[a-z0-9-]`), checked here so a slug keeperd would refuse is refused
+/// before the handshake commits rather than after its commit point.
+const SLUG_MAX: usize = 64;
+
+fn is_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= SLUG_MAX
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Arguments the closed code list doesn't name: refused as malformed.
 fn check_shape(verb: &MemberVerb) -> Result<(), VerbError> {
     fn non_empty(field: &str, value: &str) -> Result<(), VerbError> {
@@ -248,8 +272,17 @@ fn check_shape(verb: &MemberVerb) -> Result<(), VerbError> {
             Ok(())
         }
     }
+    fn slug(field: &str, value: &str) -> Result<(), VerbError> {
+        if is_slug(value) {
+            Ok(())
+        } else {
+            Err(VerbError::BadArgs(format!(
+                "`{field}` must be a slug: 1–{SLUG_MAX} of [a-z0-9-], got {value:?}"
+            )))
+        }
+    }
     fn slice(prefix: &str, s: &NewSliceArgs) -> Result<(), VerbError> {
-        non_empty(&format!("{prefix}.slug"), &s.slug)?;
+        slug(&format!("{prefix}.slug"), &s.slug)?;
         non_empty(&format!("{prefix}.title"), &s.title)?;
         non_empty(&format!("{prefix}.body"), &s.body)
     }
@@ -289,7 +322,7 @@ fn check_shape(verb: &MemberVerb) -> Result<(), VerbError> {
         }
         MemberVerb::Block(a) => non_empty("reason", &a.reason)?,
         MemberVerb::AddSubMilestone(a) => {
-            non_empty("slug", &a.slug)?;
+            slug("slug", &a.slug)?;
             non_empty("title", &a.title)?;
             non_empty("mission", &a.mission)?;
             non_empty("finish_criteria", &a.finish_criteria)?;
@@ -549,6 +582,49 @@ fn check_cap(verb: &MemberVerb, reason: Option<RollReason>, ctx: &Ctx<'_>) -> Re
     }
 }
 
+/// A sub-milestone's slug becomes an item id in the parent's list, so it must
+/// be free there: keeperd refuses a taken one (`exists`), and that refusal
+/// would land after the handshake's commit point. The closed code list has no
+/// name for it, so it is malformed arguments.
+fn check_sub_placement(verb: &MemberVerb, ctx: &Ctx<'_>) -> Result<(), VerbError> {
+    let MemberVerb::AddSubMilestone(a) = verb else {
+        return Ok(());
+    };
+    let (milestone, tree) = ctx.tree.expect("a slice unit carries its tree");
+    if tree.items.iter().any(|i| i.id == a.slug) {
+        return Err(VerbError::BadArgs(format!(
+            "`slug` {:?} is already an item of {milestone}'s slice list; pick a slug no \
+             slice or sub-milestone there uses",
+            a.slug
+        )));
+    }
+    Ok(())
+}
+
+/// §6.7, sub-milestone docs: keeperd writes them from the structured fields,
+/// so a member's mission, criteria and slice titles may carry no `> Model:`,
+/// `> Grants:` or `> Worktree:` line, and its slice bodies no `> Grants:` or
+/// `> Worktree:` (a body's `> Model:` is the subset rule's, next). The rule is
+/// `softfig_ipc::queue_v2::sub_doc_violation`, which keeperd's
+/// `queue_v2_add_sub` re-checks as the writer's backstop.
+fn check_sub_fields(verb: &MemberVerb) -> Result<(), VerbError> {
+    let MemberVerb::AddSubMilestone(a) = verb else {
+        return Ok(());
+    };
+    let slices: Vec<SubSliceText<'_>> = a
+        .slices
+        .iter()
+        .map(|s| SubSliceText {
+            title: &s.title,
+            body: &s.body,
+        })
+        .collect();
+    match sub_doc_violation(&a.mission, &a.finish_criteria, &slices) {
+        Some(v) => refuse(RefusalCode::FieldNotAllowed, v.message()),
+        None => Ok(()),
+    }
+}
+
 /// The model rule (§6.4) for a follow-up's `model`/`variant`: the next
 /// session's model, `None` when it keeps the current one.
 fn check_model(
@@ -682,7 +758,16 @@ fn check_slice_bodies(verb: &MemberVerb, ctx: &Ctx<'_>) -> Result<(), VerbError>
 /// The baton step: the head parses with its required fields, its status is the
 /// one this handoff carries, and its `item:` names this session's entry.
 fn check_baton(verb: &MemberVerb, ctx: &Ctx<'_>) -> Result<(), VerbError> {
-    let view = match validate_head(verb.baton(), verb.baton_statuses()) {
+    // A sub-milestone's close-out completes the sub, not the entry, which runs
+    // on into its parent's next unit: its baton is for that work, so it hands
+    // on IN_PROGRESS like every handoff that continues the entry.
+    let statuses = match (verb, ctx.unit) {
+        (MemberVerb::CompleteEntry(_), Unit::CloseOut { milestone }) if milestone.contains('/') => {
+            &["IN_PROGRESS"][..]
+        }
+        _ => verb.baton_statuses(),
+    };
+    let view = match validate_head(verb.baton(), statuses) {
         Ok(view) => view,
         Err(e) => return refuse(RefusalCode::BadBaton, e.to_string()),
     };
@@ -1245,5 +1330,153 @@ mod tests {
             baton: baton("IN_PROGRESS", "042"),
         })));
         assert!(bad(add_sub("rest", &[])));
+    }
+
+    // ---- slice 010: the cap's ends, the sub-milestone's slug and text ----
+
+    /// §7: at the cap, a milestone slice files its remaining work as a
+    /// sub-milestone — the refusal names that move, and the verb validates.
+    #[test]
+    fn at_the_cap_a_milestone_slice_files_a_sub_milestone() {
+        let mut s = snapshot();
+        s.trees.get_mut("m").unwrap().items[1].follow_ups = FOLLOW_UP_CAP;
+        let a = on_slice("m", "002");
+        let msg = refused(
+            run(&a, &s, MemberVerb::AddFollowUpSession(follow_up("context_full"))),
+            RefusalCode::CapReached,
+        );
+        assert!(msg.contains("growlight_add_sub_milestone"), "{msg}");
+        run(&a, &s, add_sub("rest", &["body"])).unwrap();
+    }
+
+    /// §7: a task, a restack or a close-out at the cap has nothing to split
+    /// into — the refusal names `growlight_block kind = stuck`, a sub-milestone
+    /// is refused, and the stuck block validates and executes as a block (the
+    /// entry `blocked`, @human alerted).
+    #[test]
+    fn at_the_cap_a_task_restack_or_close_out_ends_in_a_stuck_block() {
+        let mut s = snapshot();
+        s.entries.push(entry("043", EntryKind::Restack, EntryStatus::Active));
+        s.entries.push(entry("c", EntryKind::Milestone, EntryStatus::Active));
+        s.trees.insert(
+            "c".into(),
+            TreeView {
+                items: vec![slice("001", SliceStatus::Done)],
+                models: None,
+            },
+        );
+        for e in &mut s.entries {
+            e.follow_ups = FOLLOW_UP_CAP;
+        }
+        for (a, item) in [(on_task("042"), "042"), (on_task("043"), "043"), (on_close_out("c"), "c")] {
+            let mut f = follow_up("session_fault");
+            f.baton = baton("IN_PROGRESS", item);
+            let msg = refused(run(&a, &s, MemberVerb::AddFollowUpSession(f)), RefusalCode::CapReached);
+            assert!(msg.contains("growlight_block kind = stuck"), "{item}: {msg}");
+            refused(run(&a, &s, add_sub("rest", &["b"])), RefusalCode::TaskHasNoSlices);
+
+            let stuck = MemberVerb::Block(BlockArgs {
+                kind: BlockKind::Stuck,
+                reason: "the cap is spent; left: the parser".into(),
+                baton: baton("STUCK", item),
+            });
+            let v = run(&a, &s, stuck).unwrap();
+            let p = crate::member_handoff::plan(&v, &s).unwrap();
+            assert_eq!(
+                p.ops.last(),
+                Some(&crate::member_handoff::KeeperOp::SetStatus {
+                    entry: item.into(),
+                    unit: None,
+                    new: softfig_ipc::verbs::DaemonStatusArg::Blocked,
+                }),
+                "{item}",
+            );
+            assert!(p.alert.is_some_and(|t| t.contains("stuck: the cap is spent")), "{item}");
+        }
+    }
+
+    fn with_sub(edit: impl FnOnce(&mut AddSubMilestoneArgs)) -> MemberVerb {
+        let MemberVerb::AddSubMilestone(mut args) = add_sub("rest", &["work"]) else {
+            unreachable!()
+        };
+        edit(&mut args);
+        MemberVerb::AddSubMilestone(args)
+    }
+
+    /// §6.7: keeperd writes the sub's docs from its fields, so the member's
+    /// text may set no model, grants or worktree there; a slice body's
+    /// `> Model:` is the subset rule's instead.
+    #[test]
+    fn a_sub_milestones_text_may_not_carry_reserved_lines() {
+        let s = snapshot();
+        let a = on_slice("m", "002");
+        let msg = refused(
+            run(&a, &s, with_sub(|x| x.mission.push_str("\n> Model: claude"))),
+            RefusalCode::FieldNotAllowed,
+        );
+        assert!(msg.contains("`mission` carries a `> Model:` line"), "{msg}");
+        refused(
+            run(&a, &s, with_sub(|x| x.finish_criteria = "> Worktree: /tmp/w".into())),
+            RefusalCode::FieldNotAllowed,
+        );
+        refused(
+            run(&a, &s, with_sub(|x| x.slices[0].title = "> Grants: ~/projects".into())),
+            RefusalCode::FieldNotAllowed,
+        );
+        let msg = refused(
+            run(&a, &s, with_sub(|x| x.slices[0].body = "> Grants: ~/projects\n\nwork".into())),
+            RefusalCode::FieldNotAllowed,
+        );
+        assert!(msg.contains("`slices[0].body`"), "{msg}");
+        // m declares nothing, so a body may declare nothing (the subset rule).
+        refused(
+            run(&a, &s, with_sub(|x| x.slices[0].body = "> Model: flash\n\nwork".into())),
+            RefusalCode::ModelNotAllowed,
+        );
+    }
+
+    /// A slug keeperd would refuse is refused here, before the handshake's
+    /// commit point: a bad shape, or a sub slug some item of the parent's list
+    /// already uses.
+    #[test]
+    fn a_slug_keeperd_would_refuse_is_bad_args_before_anything_commits() {
+        let s = snapshot();
+        let a = on_slice("m", "002");
+        let bad = |r: Result<Validated, VerbError>, needle: &str| match r {
+            Err(VerbError::BadArgs(m)) => assert!(m.contains(needle), "{m}"),
+            other => panic!("expected bad args naming {needle}, got {other:?}"),
+        };
+        bad(run(&a, &s, add_sub("The_Rest", &["b"])), "`slug`");
+        bad(run(&a, &s, add_sub("003", &["b"])), "already an item of m's slice list");
+        bad(run(&a, &s, with_sub(|x| x.slices[0].slug = "two words".into())), "`slices[0].slug`");
+        let mut f = follow_up("new_scope");
+        f.new_slice = Some(NewSliceArgs {
+            slug: "x".repeat(SLUG_MAX + 1),
+            ..new_slice("b")
+        });
+        bad(run(&a, &s, MemberVerb::AddFollowUpSession(f)), "`new_slice.slug`");
+    }
+
+    /// A sub-milestone's close-out completes the sub and the entry runs on, so
+    /// its baton hands on IN_PROGRESS — a terminal one is refused.
+    #[test]
+    fn a_sub_close_out_hands_on_an_in_progress_baton() {
+        let mut s = snapshot();
+        s.trees.get_mut("m").unwrap().items[1] = slice("002", SliceStatus::Split);
+        s.trees.get_mut("m").unwrap().items.insert(2, sub("rest", SliceStatus::Queued));
+        s.trees.insert(
+            "m/rest".into(),
+            TreeView {
+                items: vec![slice("001", SliceStatus::Done)],
+                models: None,
+            },
+        );
+        let a = on_close_out("m/rest");
+        refused(run(&a, &s, complete_entry(EntryOutcome::Done, "m")), RefusalCode::BadBaton);
+        let MemberVerb::CompleteEntry(mut args) = complete_entry(EntryOutcome::Done, "m") else {
+            unreachable!()
+        };
+        args.baton = baton("IN_PROGRESS", "m");
+        run(&a, &s, MemberVerb::CompleteEntry(args)).unwrap();
     }
 }

@@ -6891,6 +6891,20 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 .collect();
             self.write(&slices_file(m), &SlicesToml::new(m.into(), items).to_toml().unwrap());
         }
+        /// `m`'s `slices.toml` with slices and sub-milestones mixed:
+        /// `(kind, id, status, follow_ups)`, a sub's count ignored.
+        fn tree(&self, m: &str, items: &[(SliceKind, &str, SliceStatus, u64)]) {
+            let items = items
+                .iter()
+                .map(|(kind, id, status, follow_ups)| SliceItem {
+                    kind: *kind,
+                    id: (*id).into(),
+                    status: *status,
+                    follow_ups: (*kind == SliceKind::Slice).then_some(*follow_ups),
+                })
+                .collect();
+            self.write(&slices_file(m), &SlicesToml::new(m.into(), items).to_toml().unwrap());
+        }
     }
 
     impl Drop for TestGarden {
@@ -7328,5 +7342,128 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(r.v2_handoffs[0].alert.as_deref(), Some("m1 (human: which license?)"));
         assert!(r.v2_started.is_empty() && r.v2_paused.is_empty(), "{r:?}");
         assert!(parker.paused.lock().unwrap().is_empty());
+    }
+
+    /// SLICE 010 — the cap's full path on a milestone slice (§7), end to end:
+    /// the 6th follow-up is refused `cap_reached` with the session left up;
+    /// the agent files the rest as a sub-milestone, which keeperd places in
+    /// front of the parent's remaining items with the slice `split`; the
+    /// member re-picks into the sub's first slice, runs it and its close-out,
+    /// and the sub's close-out completes the SUB (never the entry), so the
+    /// member rolls on into the parent's next slice.
+    #[test]
+    fn v2_a_capped_slice_files_a_sub_milestone_that_runs_next_then_closes_into_its_parent() {
+        use SliceKind::{Slice as S, Sub};
+        let garden = TestGarden::new("sub-milestone");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0), ("002", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        // Slice 001 has spent the cap.
+        garden.slices("m1", &[("001", SliceStatus::Active, 5), ("002", SliceStatus::Queued, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "again"),
+            }),
+        );
+        assert_eq!(reply.code, Some(RefusalCode::CapReached), "{reply:?}");
+        assert!(reply.message.unwrap().contains("growlight_add_sub_milestone"));
+        assert!(keeper.ops.lock().unwrap().is_empty(), "a refusal writes nothing");
+        assert!(d.v2_assignment("a1").is_some(), "and the session keeps its work");
+
+        let baton = handoff_baton("m1", "IN_PROGRESS", "start the sub");
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_SUB_MILESTONE,
+            serde_json::json!({
+                "slug": "rest",
+                "title": "The rest of 001",
+                "mission": "finish the parser",
+                "finish_criteria": "- [ ] it parses",
+                "slices": [{ "slug": "finish", "title": "Finish", "body": "the remaining work" }],
+                "baton": baton,
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        assert_eq!(reply.next, Some(NextUnit { entry: "m1/rest".into(), unit: "001".into() }));
+        let ops = keeper.ops.lock().unwrap().clone();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(
+            matches!(&ops[0], KeeperOp::SessionLog { entry, unit: Some(u), line }
+                if entry == "m1" && u == "001" && line.starts_with("split · ")),
+            "{ops:?}"
+        );
+        assert!(
+            matches!(&ops[1], KeeperOp::AddSub { milestone, slice, slug, at_end: false, .. }
+                if milestone == "m1" && slice == "001" && slug == "rest"),
+            "{ops:?}"
+        );
+        // keeperd's commit, as the files show it.
+        garden.tree("m1", &[(S, "001", SliceStatus::Split, 5), (Sub, "rest", SliceStatus::Queued, 0), (S, "002", SliceStatus::Queued, 0)]);
+        garden.slices("m1/rest", &[("001", SliceStatus::Queued, 0)]);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.entry.as_str(), &a.unit)).collect::<Vec<_>>(),
+            vec![("m1", &Unit::Slice { milestone: "m1/rest".into(), slice: "001".into() })],
+            "the sub runs next",
+        );
+        assert_eq!(claimer.claims.lock().unwrap().last(), Some(&("m1/rest".to_string(), Some("001".to_string()))));
+        assert_eq!(backend.member_writes().last(), Some(&("a1".to_string(), baton)), "the sub shares the entry's baton");
+
+        // The sub's slice completes: its close-out is next.
+        garden.slices("m1/rest", &[("001", SliceStatus::Active, 0)]);
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_SLICE,
+            serde_json::json!({ "summary": "finished", "baton": handoff_baton("m1", "IN_PROGRESS", "close the sub") }),
+        );
+        assert_eq!(reply.next, Some(NextUnit { entry: "m1/rest".into(), unit: "close-out".into() }));
+        garden.slices("m1/rest", &[("001", SliceStatus::Done, 0)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(2);
+        assert_eq!(r.v2_started[0].unit, Unit::CloseOut { milestone: "m1/rest".into() });
+
+        // The sub's close-out completes the sub; the entry runs on.
+        keeper.ops.lock().unwrap().clear();
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "the parser is done",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "start 002"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        assert_eq!(reply.next, Some(NextUnit { entry: "m1".into(), unit: "002".into() }));
+        assert_eq!(
+            keeper.ops.lock().unwrap().last(),
+            Some(&KeeperOp::SetStatus {
+                entry: "m1".into(),
+                unit: Some("rest".into()),
+                new: DaemonStatusArg::Done,
+            }),
+            "the sub's item closes; nothing archives the entry",
+        );
+        garden.tree("m1", &[(S, "001", SliceStatus::Split, 5), (Sub, "rest", SliceStatus::Done, 0), (S, "002", SliceStatus::Queued, 0)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(3);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.entry.as_str(), &a.unit)).collect::<Vec<_>>(),
+            vec![("m1", &Unit::Slice { milestone: "m1".into(), slice: "002".into() })],
+        );
+        assert!(parker.paused.lock().unwrap().is_empty(), "the member never left its entry");
     }
 }

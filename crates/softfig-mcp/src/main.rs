@@ -798,7 +798,9 @@ fn tool_defs() -> Vec<Value> {
                             milestone, task or restack (spec §6.5) — done (built + verified; the \
                             loop never merges) or deferred (manual tests pending). A milestone is \
                             refused open_items unless every slice is done, split or deferred. \
-                            Call it LAST. A refusal leaves this session running.",
+                            On a sub-milestone's close-out it completes the SUB and the entry \
+                            runs on, so the baton hands on IN_PROGRESS for the parent's next \
+                            unit. Call it LAST. A refusal leaves this session running.",
             "inputSchema": {
                 "type": "object",
                 "required": ["outcome", "summary", "baton"],
@@ -817,7 +819,7 @@ fn tool_defs() -> Vec<Value> {
                             },
                         },
                     },
-                    "baton": { "type": "string", "description": "a short terminal baton: status ITEM_COMPLETE (done) or ITEM_DEFERRED (deferred)" },
+                    "baton": { "type": "string", "description": "a short terminal baton: status ITEM_COMPLETE (done) or ITEM_DEFERRED (deferred) — or IN_PROGRESS on a sub-milestone's close-out, whose entry runs on" },
                 },
             },
         }),
@@ -846,13 +848,16 @@ fn tool_defs() -> Vec<Value> {
                             cap_reached on a milestone slice. The current slice becomes split; \
                             the sub runs next (front of the parent's list) unless \
                             do_not_prioritize. At 2 levels deep it is refused depth_limit: end \
-                            with growlight_block kind = stuck. Call it LAST. A refusal leaves \
-                            this session running.",
+                            with growlight_block kind = stuck. keeperd writes the sub's docs \
+                            from these fields, so no `> Model:` / `> Grants:` / `> Worktree:` \
+                            line in mission, finish_criteria or a slice title, and no \
+                            `> Grants:` / `> Worktree:` in a slice body (field_not_allowed). \
+                            Call it LAST. A refusal leaves this session running.",
             "inputSchema": {
                 "type": "object",
                 "required": ["slug", "title", "mission", "finish_criteria", "slices", "baton"],
                 "properties": {
-                    "slug": { "type": "string" },
+                    "slug": { "type": "string", "description": "[a-z0-9-], 1–64; the sub's folder, and an id no item of the parent's list uses" },
                     "title": { "type": "string" },
                     "mission": { "type": "string" },
                     "finish_criteria": { "type": "string" },
@@ -863,9 +868,9 @@ fn tool_defs() -> Vec<Value> {
                             "type": "object",
                             "required": ["slug", "title", "body"],
                             "properties": {
-                                "slug": { "type": "string" },
+                                "slug": { "type": "string", "description": "[a-z0-9-], 1–64" },
                                 "title": { "type": "string" },
-                                "body": { "type": "string", "description": "may declare `> Model:` only as a subset of what the slice would inherit" },
+                                "body": { "type": "string", "description": "may declare `> Model:` only as a subset of what the slice would inherit; no `> Grants:` / `> Worktree:`" },
                             },
                         },
                     },
@@ -1135,9 +1140,11 @@ fn summarize_member_verb(data: &Value) -> String {
         }
         return out;
     }
+    // A state this build doesn't know (a newer growlightd): say so rather than
+    // guess whether the handoff committed.
     format!(
-        "{verb}: {} for {entry} / {unit} — every §6.3 check passed, but this verb's execution \
-         is not built yet: nothing was written and this session keeps running.",
+        "{verb}: growlightd replied `{}` for {entry} / {unit}, a state this softfig-mcp \
+         doesn't know — check `softfig growlight status` before ending the session.",
         reply.state
     )
 }
@@ -1704,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn member_verb_replies_render_refusal_and_validation() {
+    fn member_verb_replies_render_refusal_handoff_and_unknown_states() {
         let refused = serde_json::to_value(MemberVerbReply::refused(
             "growlight_add_follow_up_session",
             RefusalCode::CapReached,
@@ -1716,11 +1723,13 @@ mod tests {
             text.starts_with("growlight_add_follow_up_session: REFUSED (cap_reached) — slice 003"),
             "{text}"
         );
-        let validated =
-            serde_json::to_value(MemberVerbReply::validated("growlight_complete_slice", "m", "003"))
-                .unwrap();
-        let text = summarize("growlight_complete_slice", &validated);
-        assert!(text.starts_with("growlight_complete_slice: validated for m / 003"), "{text}");
+        // A state this build doesn't know is reported, never guessed at.
+        let mut unknown = MemberVerbReply::refused("growlight_complete_slice", RefusalCode::BadBaton, "x");
+        unknown.state = "later".into();
+        unknown.entry = Some("m".into());
+        unknown.unit = Some("003".into());
+        let text = summarize("growlight_complete_slice", &serde_json::to_value(unknown).unwrap());
+        assert!(text.starts_with("growlight_complete_slice: growlightd replied `later` for m / 003"), "{text}");
         // The handoff (slice 009): committed, what runs next, stop now.
         let ok = serde_json::to_value(MemberVerbReply::ok(
             "growlight_complete_slice",

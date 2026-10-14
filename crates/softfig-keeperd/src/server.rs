@@ -279,6 +279,7 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::QUEUE_V2_FOLLOW_UPS => crate::actions::queue_v2_follow_ups(daemon, req.args),
         op::QUEUE_V2_SESSION_LOG => crate::actions::queue_v2_session_log(daemon, req.args),
         op::QUEUE_V2_DEFERRED => crate::actions::queue_v2_deferred(daemon, req.args),
+        op::QUEUE_V2_ADD_SUB => crate::actions::queue_v2_add_sub(daemon, req.args),
         op::GROWLIGHT_INIT => crate::actions::growlight_init(daemon, req.args),
         op::GROWLIGHT_SET_RESOURCES => crate::actions::growlight_set_resources(daemon, req.args),
         op::POST_MESSAGE => crate::actions::post_message(daemon, req.args),

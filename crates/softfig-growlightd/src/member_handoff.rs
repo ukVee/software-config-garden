@@ -31,7 +31,10 @@
 
 use std::fmt;
 
-use softfig_ipc::growlightd::{BlockKind, EntryOutcome, NextUnit, RollReason};
+use softfig_ipc::growlightd::{
+    AddSubMilestoneArgs, BlockKind, CompleteEntryArgs, EntryOutcome, NewSliceArgs, NextUnit,
+    RollReason,
+};
 use softfig_ipc::model_choice::ModelChoice;
 use softfig_ipc::queue_v2::{EntryStatus, SliceKind, SliceStatus};
 use softfig_ipc::verbs::{DaemonStatusArg, DeferredTestSpec};
@@ -39,7 +42,7 @@ use softfig_ipc::verbs::{DaemonStatusArg, DeferredTestSpec};
 use crate::baton_store::FsEntryBatonStore;
 use crate::drive_loop::{model_ref_label, V2Assignment};
 use crate::member_verbs::{unit_label, MemberVerb, Validated};
-use crate::scheduler_v2::{next_unit, Unit, V2Snapshot, WalkOutcome};
+use crate::scheduler_v2::{next_unit, ItemView, TreeView, Unit, V2Snapshot, WalkOutcome};
 
 /// The cost field of a §3.5 session-log line. The verb ends the session from
 /// inside it, so the session's spend is not known yet (an opencode session's
@@ -82,6 +85,19 @@ pub enum KeeperOp {
         body: String,
         before: String,
     },
+    /// `queue_v2_add_sub` — §7: keeperd creates `<milestone>/<slug>` from the
+    /// member's fields and marks `slice` `split`, placing the sub right after
+    /// it (or at the end with `at_end`), in one commit.
+    AddSub {
+        milestone: String,
+        slice: String,
+        slug: String,
+        title: String,
+        mission: String,
+        finish_criteria: String,
+        slices: Vec<NewSliceArgs>,
+        at_end: bool,
+    },
 }
 
 impl KeeperOp {
@@ -93,6 +109,7 @@ impl KeeperOp {
             KeeperOp::FollowUps { .. } => "queue_v2_follow_ups",
             KeeperOp::Deferred { .. } => "queue_v2_deferred",
             KeeperOp::SliceInsert { .. } => "slice_insert",
+            KeeperOp::AddSub { .. } => "queue_v2_add_sub",
         }
     }
 }
@@ -174,6 +191,11 @@ pub enum NextPlan {
     /// `new_scope`'s slice, whose id keeperd assigns at insert; if the insert
     /// fails, the raised-from unit runs next instead.
     Inserted { milestone: String, fallback: NextUnit },
+    /// `growlight_add_sub_milestone`: `next` once keeperd created the sub (its
+    /// slice ids are known in advance — a new folder numbers from 001); if the
+    /// creation fails after the commit point, nothing was split and the slice
+    /// it was filed from (`fallback`) runs again.
+    SubAdded { next: Option<NextUnit>, fallback: NextUnit },
 }
 
 /// The ordered keeperd writes plus what follows them.
@@ -259,30 +281,83 @@ fn follow_ups(snapshot: &V2Snapshot, entry: &str, unit: &Unit) -> u64 {
     }
 }
 
-/// The entry's next unit once `slice` of `milestone` is done: the §4 walk over
-/// the snapshot with that one item flipped. `None` when the walk stops (a
-/// `blocked` item, a missing tree).
-fn next_after_done(snapshot: &V2Snapshot, entry: &str, milestone: &str, slice: &str) -> Option<NextUnit> {
-    let mut after = snapshot.clone();
-    if let Some(item) = after
-        .trees
-        .get_mut(milestone)
-        .and_then(|t| t.items.iter_mut().find(|i| i.kind == SliceKind::Slice && i.id == slice))
-    {
-        item.status = SliceStatus::Done;
-    }
+/// The entry's next unit over `after` (the snapshot as the commit leaves it):
+/// the §4 walk. `None` when the walk stops (a `blocked` item, a missing tree).
+fn walk_next(after: &V2Snapshot, entry: &str) -> Option<NextUnit> {
     let view = after.entries.iter().find(|e| e.id == entry)?;
-    match next_unit(&after, view) {
+    match next_unit(after, view) {
         WalkOutcome::Unit { unit, .. } => Some(next_of(entry, &unit)),
         WalkOutcome::Blocked | WalkOutcome::NoUnit => None,
     }
 }
 
+/// The snapshot with one item of `milestone`'s tree set to `status`.
+fn with_item(snapshot: &V2Snapshot, milestone: &str, kind: SliceKind, id: &str, status: SliceStatus) -> V2Snapshot {
+    let mut after = snapshot.clone();
+    if let Some(item) = after
+        .trees
+        .get_mut(milestone)
+        .and_then(|t| t.items.iter_mut().find(|i| i.kind == kind && i.id == id))
+    {
+        item.status = status;
+    }
+    after
+}
+
+/// The entry's next unit once `slice` of `milestone` is done.
+fn next_after_done(snapshot: &V2Snapshot, entry: &str, milestone: &str, slice: &str) -> Option<NextUnit> {
+    walk_next(
+        &with_item(snapshot, milestone, SliceKind::Slice, slice, SliceStatus::Done),
+        entry,
+    )
+}
+
+/// The entry's next unit once `slice` of `milestone` is `split` into a new sub
+/// `<milestone>/<slug>` placed as keeperd's `queue_v2_add_sub` places it:
+/// right after the slice, or at the end with `at_end`. The new tree's slices
+/// are `001…` (a new folder), all `queued`, inheriting the parent's chain.
+fn next_after_split(
+    snapshot: &V2Snapshot,
+    entry: &str,
+    milestone: &str,
+    slice: &str,
+    a: &AddSubMilestoneArgs,
+) -> Option<NextUnit> {
+    let mut after = with_item(snapshot, milestone, SliceKind::Slice, slice, SliceStatus::Split);
+    let tree = after.trees.get_mut(milestone)?;
+    let models = tree.models.clone();
+    let sub = ItemView {
+        kind: SliceKind::Sub,
+        id: a.slug.clone(),
+        status: SliceStatus::Queued,
+        models: None,
+        follow_ups: 0,
+    };
+    let at = if a.do_not_prioritize {
+        tree.items.len()
+    } else {
+        tree.items.iter().position(|i| i.kind == SliceKind::Slice && i.id == slice)? + 1
+    };
+    tree.items.insert(at, sub);
+    let items = (1..=a.slices.len())
+        .map(|n| ItemView {
+            kind: SliceKind::Slice,
+            id: format!("{n:03}"),
+            status: SliceStatus::Queued,
+            models: models.clone(),
+            follow_ups: 0,
+        })
+        .collect();
+    after
+        .trees
+        .insert(format!("{milestone}/{}", a.slug), TreeView { items, models });
+    walk_next(&after, entry)
+}
+
 /// §6.3 step 3, planned: the keeperd writes for a validated verb and what runs
-/// next. Pure over the snapshot the call was validated against. `None` for
-/// what the sub-milestone lifecycle (the cap slice) executes:
-/// `growlight_add_sub_milestone`, and `growlight_complete_entry` on a
-/// sub-milestone's close-out.
+/// next. Pure over the snapshot the call was validated against. `None` only
+/// for a verb on a unit its validation never passes (`complete_slice` or
+/// `add_sub_milestone` off a slice).
 pub fn plan(v: &Validated, snapshot: &V2Snapshot) -> Option<Plan> {
     let a = &v.assignment;
     let entry = entry_top(&a.entry);
@@ -369,11 +444,10 @@ pub fn plan(v: &Validated, snapshot: &V2Snapshot) -> Option<Plan> {
             }
         }
         MemberVerb::CompleteEntry(args) => {
-            // A sub-milestone's close-out completes the sub, not the entry;
-            // that lifecycle is the cap slice's (sub-milestones), so it is not
-            // executed here.
-            if matches!(&a.unit, Unit::CloseOut { milestone } if milestone.contains('/')) {
-                return None;
+            if let Unit::CloseOut { milestone } = &a.unit {
+                if milestone.contains('/') {
+                    return Some(plan_sub_close_out(v, snapshot, milestone, args, log));
+                }
             }
             let ops = match args.outcome {
                 // The log lands before `done` archives the row (the op
@@ -424,25 +498,116 @@ pub fn plan(v: &Validated, snapshot: &V2Snapshot) -> Option<Plan> {
                 alert: Some(format!("{} ({note})", a.entry)),
             }
         }
-        MemberVerb::AddSubMilestone(_) => return None,
+        MemberVerb::AddSubMilestone(args) => {
+            let Unit::Slice { milestone, slice } = &a.unit else {
+                return None; // validated: a sub-milestone is filed from a slice only
+            };
+            let identity = format!("{milestone}/{}", args.slug);
+            // §3.5 has no reason word for a split; the line records the
+            // slice's resulting status and the sub that took its work.
+            let note = format!("sub-milestone {identity}: {}", args.title);
+            Plan {
+                ops: vec![
+                    log("split", Some(&note)),
+                    KeeperOp::AddSub {
+                        milestone: milestone.clone(),
+                        slice: slice.clone(),
+                        slug: args.slug.clone(),
+                        title: args.title.clone(),
+                        mission: args.mission.clone(),
+                        finish_criteria: args.finish_criteria.clone(),
+                        slices: args.slices.clone(),
+                        at_end: args.do_not_prioritize,
+                    },
+                ],
+                continues: true,
+                next: NextPlan::SubAdded {
+                    next: next_after_split(snapshot, entry, milestone, slice, args),
+                    fallback: next_of(entry, &a.unit),
+                },
+                alert: None,
+            }
+        }
     };
 
-    // Finding 8 (§6.8): a human status change recorded on the active entry
-    // takes effect at this boundary. A verb that sets the entry's status
-    // anyway gets it applied by that op (pending wins); one that leaves the
-    // entry active applies it here, last.
-    if plan.continues {
-        if let Some(pending) = snapshot
-            .entries
-            .iter()
-            .find(|e| e.id == entry)
-            .and_then(|e| e.pending)
-            .and_then(pending_arg)
-        {
-            plan.ops.push(entry_status(pending));
-        }
-    }
+    apply_pending(&mut plan, snapshot, entry);
     Some(plan)
+}
+
+/// Finding 8 (§6.8): a human status change recorded on the active entry takes
+/// effect at this boundary. A verb that sets the entry's status anyway gets it
+/// applied by that op (pending wins); one that leaves the entry active applies
+/// it here, last.
+fn apply_pending(plan: &mut Plan, snapshot: &V2Snapshot, entry: &str) {
+    if !plan.continues {
+        return;
+    }
+    if let Some(pending) = snapshot
+        .entries
+        .iter()
+        .find(|e| e.id == entry)
+        .and_then(|e| e.pending)
+        .and_then(pending_arg)
+    {
+        plan.ops.push(KeeperOp::SetStatus {
+            entry: entry.to_string(),
+            unit: None,
+            new: pending,
+        });
+    }
+}
+
+/// `growlight_complete_entry` on a sub-milestone's close-out (§6.5 applied to
+/// a sub): it completes the SUB — its item in the parent's list goes `done`
+/// or `deferred` — and never the entry, which stays active work on the
+/// parent's next unit. `deferred` writes the tests into the sub's own
+/// `## Deferred verification`. The close-out's follow-ups count on the
+/// entry's counter (§6.5), so completing it resets that counter (§7).
+fn plan_sub_close_out(
+    v: &Validated,
+    snapshot: &V2Snapshot,
+    milestone: &str,
+    args: &CompleteEntryArgs,
+    log: impl Fn(&str, Option<&str>) -> KeeperOp,
+) -> Plan {
+    let entry = entry_top(&v.assignment.entry);
+    let (parent, sub) = milestone.rsplit_once('/').expect("a sub-milestone identity");
+    let (kind, status, arg) = match args.outcome {
+        EntryOutcome::Done => ("completed", SliceStatus::Done, DaemonStatusArg::Done),
+        EntryOutcome::Deferred => ("deferred", SliceStatus::Deferred, DaemonStatusArg::Deferred),
+    };
+    let mut ops = vec![log(kind, Some(&args.summary))];
+    if args.outcome == EntryOutcome::Deferred {
+        ops.push(KeeperOp::Deferred {
+            entry: milestone.to_string(),
+            tests: args.deferred_tests.clone().unwrap_or_default(),
+        });
+    }
+    if follow_ups(snapshot, entry, &v.assignment.unit) > 0 {
+        ops.push(KeeperOp::FollowUps {
+            entry: milestone.to_string(),
+            unit: None,
+            count: 0,
+        });
+    }
+    // Last: once the item closes, the walk moves on past the sub.
+    ops.push(KeeperOp::SetStatus {
+        entry: parent.to_string(),
+        unit: Some(sub.to_string()),
+        new: arg,
+    });
+    let after = with_item(snapshot, parent, SliceKind::Sub, sub, status);
+    let mut plan = Plan {
+        ops,
+        continues: true,
+        next: match walk_next(&after, entry) {
+            Some(next) => NextPlan::Unit(next),
+            None => NextPlan::None,
+        },
+        alert: None,
+    };
+    apply_pending(&mut plan, snapshot, entry);
+    plan
 }
 
 /// §6.3 step 3: issue the planned writes and store the baton as the entry's.
@@ -455,8 +620,13 @@ pub fn execute(v: &Validated, snapshot: &V2Snapshot, seams: &HandoffSeams) -> Re
     let mut warnings = Vec::new();
     let mut entry_landed: Option<String> = None;
     let mut inserted: Option<String> = None;
+    let mut sub_added = false;
     for (i, op) in plan.ops.iter().enumerate() {
-        match seams.keeper.apply(op) {
+        let landed = seams.keeper.apply(op);
+        if landed.is_ok() && matches!(op, KeeperOp::AddSub { .. }) {
+            sub_added = true;
+        }
+        match landed {
             Ok(KeeperOutcome::Status(status)) => {
                 if matches!(op, KeeperOp::SetStatus { unit: None, .. }) {
                     entry_landed = Some(status);
@@ -496,6 +666,13 @@ pub fn execute(v: &Validated, snapshot: &V2Snapshot, seams: &HandoffSeams) -> Re
                 },
                 None => fallback,
             }),
+            NextPlan::SubAdded { next, fallback } => {
+                if sub_added {
+                    next
+                } else {
+                    Some(fallback)
+                }
+            }
         }
     };
     Ok(Executed {
@@ -517,7 +694,8 @@ pub(crate) mod tests {
     use std::sync::Mutex;
 
     use softfig_ipc::growlightd::{
-        AddFollowUpSessionArgs, BlockArgs, CompleteEntryArgs, CompleteSliceArgs, NewSliceArgs,
+        AddFollowUpSessionArgs, AddSubMilestoneArgs, BlockArgs, CompleteEntryArgs,
+        CompleteSliceArgs, NewSliceArgs,
     };
     use softfig_ipc::queue_v2::{EntryKind, Lane};
 
@@ -982,5 +1160,237 @@ pub(crate) mod tests {
             })
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- slice 010: the sub-milestone and its close-out ----------------------
+
+    fn add_sub(do_not_prioritize: bool) -> Validated {
+        validated(
+            on_slice("001"),
+            MemberVerb::AddSubMilestone(AddSubMilestoneArgs {
+                slug: "rest".into(),
+                title: "The rest".into(),
+                mission: "finish 001".into(),
+                finish_criteria: "001's criteria hold".into(),
+                slices: vec![
+                    NewSliceArgs {
+                        slug: "a".into(),
+                        title: "A".into(),
+                        body: "do a".into(),
+                    },
+                    NewSliceArgs {
+                        slug: "b".into(),
+                        title: "B".into(),
+                        body: "do b".into(),
+                    },
+                ],
+                do_not_prioritize,
+                baton: BATON.into(),
+            }),
+            None,
+        )
+    }
+
+    fn next(entry: &str, unit: &str) -> NextUnit {
+        NextUnit {
+            entry: entry.into(),
+            unit: unit.into(),
+        }
+    }
+
+    #[test]
+    fn a_sub_milestone_logs_the_split_then_has_keeperd_file_it_and_runs_next() {
+        let snap = snapshot(vec![
+            slice("001", SliceStatus::Active, 5),
+            slice("002", SliceStatus::Queued, 0),
+        ]);
+        let p = plan(&add_sub(false), &snap).unwrap();
+        assert_eq!(
+            log_line(&p.ops),
+            "split · deepseek/deepseek-flash · member a1 · $? · sub-milestone m1/rest: The rest"
+        );
+        assert!(matches!(&p.ops[0], KeeperOp::SessionLog { entry, unit: Some(u), .. } if entry == "m1" && u == "001"));
+        assert_eq!(
+            p.ops[1],
+            KeeperOp::AddSub {
+                milestone: "m1".into(),
+                slice: "001".into(),
+                slug: "rest".into(),
+                title: "The rest".into(),
+                mission: "finish 001".into(),
+                finish_criteria: "001's criteria hold".into(),
+                slices: match &add_sub(false).verb {
+                    MemberVerb::AddSubMilestone(a) => a.slices.clone(),
+                    _ => unreachable!(),
+                },
+                at_end: false,
+            },
+        );
+        assert_eq!(p.ops.len(), 2, "the split slice's counter is moot; a sub never counts");
+        assert!(p.continues);
+        assert_eq!(
+            p.next,
+            NextPlan::SubAdded {
+                next: Some(next("m1/rest", "001")),
+                fallback: next("m1", "001"),
+            },
+            "§7 default: the sub runs next, from its first slice",
+        );
+
+        // do_not_prioritize: the sub waits at the end; 002 runs next.
+        let p = plan(&add_sub(true), &snap).unwrap();
+        assert!(matches!(&p.ops[1], KeeperOp::AddSub { at_end: true, .. }));
+        assert_eq!(
+            p.next,
+            NextPlan::SubAdded {
+                next: Some(next("m1", "002")),
+                fallback: next("m1", "001"),
+            },
+        );
+        // … unless nothing else is open, when the sub at the end is next anyway.
+        let alone = snapshot(vec![slice("001", SliceStatus::Active, 5)]);
+        assert!(matches!(
+            plan(&add_sub(true), &alone).unwrap().next,
+            NextPlan::SubAdded { next: Some(n), .. } if n == next("m1/rest", "001")
+        ));
+    }
+
+    #[test]
+    fn a_failed_sub_creation_after_the_commit_point_resumes_the_slice() {
+        let snap = snapshot(vec![slice("001", SliceStatus::Active, 5)]);
+        let (seams, dir) = seams(SpyKeeper {
+            fail_at: Some(1),
+            ..Default::default()
+        });
+        let done = execute(&add_sub(false), &snap, &seams).unwrap();
+        assert_eq!(done.next, Some(next("m1", "001")), "nothing split: the slice runs again");
+        assert!(done.warnings[0].starts_with("queue_v2_add_sub failed"), "{:?}", done.warnings);
+        assert!(done.handoff.continues);
+
+        let (seams, dir2) = seams_ok();
+        let done = execute(&add_sub(false), &snap, &seams).unwrap();
+        assert_eq!(done.next, Some(next("m1/rest", "001")));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    fn seams_ok() -> (HandoffSeams, std::path::PathBuf) {
+        seams(SpyKeeper::default())
+    }
+
+    /// m1: 001 split, the sub `rest` (its one slice done), then 002 queued.
+    fn with_finished_sub() -> V2Snapshot {
+        let mut snap = snapshot(vec![
+            slice("001", SliceStatus::Split, 5),
+            ItemView {
+                kind: SliceKind::Sub,
+                id: "rest".into(),
+                status: SliceStatus::Queued,
+                models: None,
+                follow_ups: 0,
+            },
+            slice("002", SliceStatus::Queued, 0),
+        ]);
+        snap.trees.insert(
+            "m1/rest".into(),
+            TreeView {
+                items: vec![slice("001", SliceStatus::Done, 0)],
+                models: None,
+            },
+        );
+        snap
+    }
+
+    fn close_sub(outcome: EntryOutcome) -> Validated {
+        validated(
+            Unit::CloseOut {
+                milestone: "m1/rest".into(),
+            },
+            MemberVerb::CompleteEntry(CompleteEntryArgs {
+                outcome,
+                summary: "the rest is built".into(),
+                deferred_tests: (outcome == EntryOutcome::Deferred).then(|| {
+                    vec![DeferredTestSpec {
+                        what: "run it".into(),
+                        expected: "it works".into(),
+                    }]
+                }),
+                baton: BATON.into(),
+            }),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_sub_close_out_completes_the_sub_and_the_entry_runs_on() {
+        let snap = with_finished_sub();
+        let p = plan(&close_sub(EntryOutcome::Done), &snap).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                KeeperOp::SessionLog {
+                    entry: "m1/rest".into(),
+                    unit: None,
+                    line: "completed · deepseek/deepseek-flash · member a1 · $? · the rest is built".into(),
+                },
+                // The close-out's follow-ups ride the entry's counter (2): reset.
+                KeeperOp::FollowUps {
+                    entry: "m1/rest".into(),
+                    unit: None,
+                    count: 0,
+                },
+                KeeperOp::SetStatus {
+                    entry: "m1".into(),
+                    unit: Some("rest".into()),
+                    new: DaemonStatusArg::Done,
+                },
+            ],
+            "the sub's own doc gets the line; its item in m1 closes; nothing archives",
+        );
+        assert!(p.continues, "the entry is still active work");
+        assert_eq!(p.next, NextPlan::Unit(next("m1", "002")));
+        assert!(p.alert.is_none());
+
+        let p = plan(&close_sub(EntryOutcome::Deferred), &snap).unwrap();
+        assert!(log_line(&p.ops).starts_with("deferred · "));
+        assert_eq!(
+            p.ops[1],
+            KeeperOp::Deferred {
+                entry: "m1/rest".into(),
+                tests: vec![DeferredTestSpec {
+                    what: "run it".into(),
+                    expected: "it works".into(),
+                }],
+            },
+            "the tests land in the sub's own doc",
+        );
+        assert_eq!(
+            p.ops.last(),
+            Some(&KeeperOp::SetStatus {
+                entry: "m1".into(),
+                unit: Some("rest".into()),
+                new: DaemonStatusArg::Deferred,
+            })
+        );
+        assert_eq!(p.next, NextPlan::Unit(next("m1", "002")), "a deferred sub is rolled past");
+
+        // The parent's last open item was the sub: its close-out is next.
+        let mut last = with_finished_sub();
+        last.trees.get_mut("m1").unwrap().items.pop();
+        let p = plan(&close_sub(EntryOutcome::Done), &last).unwrap();
+        assert_eq!(p.next, NextPlan::Unit(next("m1", "close-out")));
+
+        // A pending human change still lands last, at the boundary.
+        let mut pending = with_finished_sub();
+        pending.entries[0].pending = Some(EntryStatus::Paused);
+        let p = plan(&close_sub(EntryOutcome::Done), &pending).unwrap();
+        assert_eq!(
+            p.ops.last(),
+            Some(&KeeperOp::SetStatus {
+                entry: "m1".into(),
+                unit: None,
+                new: DaemonStatusArg::Paused,
+            })
+        );
     }
 }

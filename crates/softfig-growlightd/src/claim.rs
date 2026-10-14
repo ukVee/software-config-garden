@@ -38,9 +38,9 @@
 use std::path::{Path, PathBuf};
 
 use softfig_ipc::verbs::{
-    op, DaemonStatusArg, QueueV2ClaimArgs, QueueV2DeferredArgs, QueueV2FollowUpsArgs,
-    QueueV2SessionLogArgs, QueueV2SetStatusArgs, QueueV2SetStatusReply, SetItemStatusArgs,
-    SliceInsertArgs, SliceInsertReply,
+    op, DaemonStatusArg, QueueSliceSpec, QueueV2AddSubArgs, QueueV2ClaimArgs, QueueV2DeferredArgs,
+    QueueV2FollowUpsArgs, QueueV2SessionLogArgs, QueueV2SetStatusArgs, QueueV2SetStatusReply,
+    SetItemStatusArgs, SliceInsertArgs, SliceInsertReply,
 };
 use softfig_ipc::{call_reconnecting, ReconnectError, Request, Response, RetryPolicy};
 
@@ -314,6 +314,35 @@ impl V2Keeper for KeeperdV2Keeper {
                     position: Some("before".into()),
                     ref_id: Some(before.clone()),
                     dry_run: false,
+                }),
+            ),
+            KeeperOp::AddSub {
+                milestone,
+                slice,
+                slug,
+                title,
+                mission,
+                finish_criteria,
+                slices,
+                at_end,
+            } => (
+                op::QUEUE_V2_ADD_SUB,
+                serde_json::to_value(QueueV2AddSubArgs {
+                    milestone: milestone.clone(),
+                    slice: slice.clone(),
+                    slug: slug.clone(),
+                    title: title.clone(),
+                    mission: mission.clone(),
+                    finish_criteria: finish_criteria.clone(),
+                    slices: slices
+                        .iter()
+                        .map(|s| QueueSliceSpec {
+                            slug: s.slug.clone(),
+                            title: Some(s.title.clone()),
+                            body: s.body.clone(),
+                        })
+                        .collect(),
+                    at_end: *at_end,
                 }),
             ),
         };

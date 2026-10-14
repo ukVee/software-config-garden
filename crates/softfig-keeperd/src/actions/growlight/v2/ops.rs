@@ -1,7 +1,7 @@
 //! The queue v2 **daemon ops** — keeperd's write surface for growlightd's
 //! handshake (spec §6.3 step 3), milestone `queue-v2-scheduling` slice 005.
 //!
-//! Five ops over the keeperd socket, keeperd↔growlightd only (never
+//! Six ops over the keeperd socket, keeperd↔growlightd only (never
 //! agent-facing MCP verbs — growlightd calls them the way it calls the legacy
 //! `set_item_status`, `crates/softfig-growlightd/src/claim.rs`'s pattern):
 //!
@@ -15,6 +15,12 @@
 //!   `## Sessions`;
 //! - [`queue_v2_deferred`] — the §6.5/protocol §7b `## Deferred verification`
 //!   section.
+//! - [`queue_v2_add_sub`] (slice 010) — the §7 sub-milestone: its docs and
+//!   `slices.toml`, the parent slice `split`, the placement — one commit.
+//!
+//! `queue_v2_set_status` also closes a `sub` item (slice 010): a sub is never
+//! claimed (its slices are), so it closes from `queued` to `done | deferred`
+//! once its own tree has nothing open.
 //!
 //! Each op follows the human verbs' discipline ([`super::queue_verbs`]):
 //! load-validate fail-closed, mutate the in-memory models, then one
@@ -55,11 +61,13 @@
 //! `active → …` transition.
 
 use softfig_ipc::queue_v2::{
-    ArchivedEntry, EntryKind, EntryStatus, FinalStatus, QueueRefusal, SliceKind, SliceStatus,
+    sub_depth, sub_doc_violation, ArchivedEntry, EntryKind, EntryStatus, FinalStatus,
+    QueueRefusal, SliceItem, SliceKind, SliceStatus, SlicesToml, SubSliceText,
     QUEUE_ARCHIVE_FILE,
 };
 use softfig_ipc::verbs::{
-    DaemonStatusArg, QueueV2ClaimArgs, QueueV2ClaimReply, QueueV2DeferredArgs,
+    DaemonStatusArg, QueueV2AddSubArgs, QueueV2AddSubReply, QueueV2ClaimArgs, QueueV2ClaimReply,
+    QueueV2DeferredArgs,
     QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply, QueueV2SessionLogArgs,
     QueueV2SessionLogReply, QueueV2SetStatusArgs, QueueV2SetStatusReply,
 };
@@ -467,14 +475,22 @@ pub fn queue_v2_set_status(daemon: &Daemon, args: serde_json::Value) -> HandlerR
                     format!("{:?} is an entry status, not a slice status", args.new),
                 )
             })?;
-            if model.items[sidx].status != SliceStatus::Active {
-                return Err((
-                    ErrorKind::BadArgs,
-                    format!(
-                        "slice {unit:?} is {}; the daemon status write requires active",
-                        model.items[sidx].status
-                    ),
-                ));
+            match model.items[sidx].kind {
+                SliceKind::Slice => {
+                    if model.items[sidx].status != SliceStatus::Active {
+                        return Err((
+                            ErrorKind::BadArgs,
+                            format!(
+                                "slice {unit:?} is {}; the daemon status write requires active",
+                                model.items[sidx].status
+                            ),
+                        ));
+                    }
+                }
+                SliceKind::Sub => {
+                    let wt = WorkTree::new(daemon, &inner);
+                    check_sub_close(&wt, &inner, &args.entry, unit, model.items[sidx].status, new)?;
+                }
             }
             model.items[sidx].status = new;
             if new == SliceStatus::Done && model.items[sidx].kind == SliceKind::Slice {
@@ -626,6 +642,53 @@ pub fn queue_v2_set_status(daemon: &Daemon, args: serde_json::Value) -> HandlerR
             .unwrap())
         }
     }
+}
+
+/// The daemon write that closes a `sub` item (slice 010): its close-out
+/// completed (§6.5 on a sub-milestone). A sub item is never claimed — its
+/// slices are — so it sits `queued` while they run (`active` is accepted too);
+/// it closes to `done` or `deferred` only, and only once its own tree holds
+/// nothing open (every item `done`, `split` or `deferred`): the backstop for
+/// §6.5's `open_items`, so no caller can close a sub over unfinished work.
+fn check_sub_close(
+    wt: &WorkTree,
+    inner: &DaemonInner,
+    parent: &str,
+    sub: &str,
+    from: SliceStatus,
+    to: SliceStatus,
+) -> Result<(), (ErrorKind, String)> {
+    if !matches!(to, SliceStatus::Done | SliceStatus::Deferred) {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("sub-milestone {sub:?} closes to done or deferred only, not {to}"),
+        ));
+    }
+    if !matches!(from, SliceStatus::Queued | SliceStatus::Active) {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("sub-milestone {sub:?} is {from}; only an open sub closes"),
+        ));
+    }
+    let identity = format!("{parent}/{sub}");
+    let tree = match load_slices(wt, inner, &identity) {
+        Ok(Some(l)) => l.model,
+        Ok(None) => return Err(refuse(QueueRefusal::UnknownId { id: identity })),
+        Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+    };
+    let open: Vec<&str> = tree
+        .items
+        .iter()
+        .filter(|i| !matches!(i.status, SliceStatus::Done | SliceStatus::Split | SliceStatus::Deferred))
+        .map(|i| i.id.as_str())
+        .collect();
+    if !open.is_empty() {
+        return Err((
+            ErrorKind::BadArgs,
+            format!("open_items: sub-milestone {identity} still has open items: {}", open.join(", ")),
+        ));
+    }
+    Ok(())
 }
 
 // ---- queue_v2_follow_ups ----------------------------------------------------
@@ -886,6 +949,232 @@ pub fn queue_v2_deferred(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
     Ok(serde_json::to_value(QueueV2DeferredReply {
         entry: args.entry,
         path: rel,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+// ---- queue_v2_add_sub ------------------------------------------------------
+
+/// A sub-milestone's `CLAUDE.md`, written from the member's structured fields
+/// (§6.7: keeperd writes it; the member never authors the file). It declares
+/// no `> Model:`, so the sub's slices inherit the parent's chain (§6.4).
+fn sub_doc(identity: &str, parent: &str, slice: &str, title: &str, mission: &str, finish: &str) -> String {
+    format!(
+        "# backlog: {title}\n\n\
+         > Sub-milestone `{identity}`, filed from slice {slice} of `{parent}` when its work \
+         outgrew it (spec-growlight-queue §7). It runs inside its top-level entry and \
+         shares that entry's baton; its status is its item in `{parent}`'s `slices.toml`, \
+         its slices run in the order of the derived table below, and it is done when its \
+         close-out completes.\n\n\
+         ## Mission\n\n{}\n\n\
+         ## Finish criteria\n\n{}\n",
+        mission.trim_end_matches('\n'),
+        finish.trim_end_matches('\n'),
+    )
+}
+
+pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueV2AddSubArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_add_sub args: {e}")))?;
+    for (field, value) in [
+        ("milestone", &args.milestone),
+        ("slice", &args.slice),
+        ("title", &args.title),
+        ("mission", &args.mission),
+        ("finish_criteria", &args.finish_criteria),
+    ] {
+        if value.trim().is_empty() {
+            return Err((ErrorKind::BadArgs, format!("{field} must be non-empty")));
+        }
+    }
+    if conventions::validate_slug(&args.slug).is_err() {
+        return Err(refuse(QueueRefusal::BadName { name: args.slug.clone() }));
+    }
+    if args.slices.is_empty() {
+        return Err((ErrorKind::BadArgs, "a sub-milestone needs at least one slice".to_string()));
+    }
+    for spec in &args.slices {
+        if conventions::validate_slug(&spec.slug).is_err() {
+            return Err(refuse(QueueRefusal::BadName { name: spec.slug.clone() }));
+        }
+        if spec.body.trim().is_empty() {
+            return Err((
+                ErrorKind::BadArgs,
+                format!("slices: body must be non-empty for {:?}", spec.slug),
+            ));
+        }
+    }
+    let identity = format!("{}/{}", args.milestone, args.slug);
+    // §3.3: at most 2 deep below the top-level milestone.
+    sub_depth(&identity).map_err(refuse)?;
+    // §6.7's backstop: growlightd refuses these before the handshake commits,
+    // so a hit here means a caller skipped that validation.
+    let texts: Vec<SubSliceText<'_>> = args
+        .slices
+        .iter()
+        .map(|s| SubSliceText {
+            title: s.title.as_deref().unwrap_or(&s.slug),
+            body: &s.body,
+        })
+        .collect();
+    if let Some(v) = sub_doc_violation(&args.mission, &args.finish_criteria, &texts) {
+        return Err((ErrorKind::BadArgs, format!("field_not_allowed: {}", v.message())));
+    }
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let doc_rel = slices_view_host(&identity);
+    let slices_dir = format!("{}/slices", milestone_path(&identity));
+    let (mut parent, parent_version) = {
+        let wt = WorkTree::new(daemon, &inner);
+        // The sub's main doc is its dir's canary, as a milestone's is: every
+        // file under it is a first-creation write.
+        if wt.exists(&doc_rel) {
+            return Err(refuse(QueueRefusal::Exists { id: identity.clone() }));
+        }
+        match load_slices(&wt, &inner, &args.milestone) {
+            Ok(Some(l)) => (l.model, l.version),
+            Ok(None) => return Err(refuse(QueueRefusal::UnknownId { id: args.milestone.clone() })),
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+
+    // The split: an `active` slice item gives its remaining work to the sub.
+    let sidx = parent
+        .items
+        .iter()
+        .position(|i| i.id == args.slice)
+        .ok_or_else(|| refuse(QueueRefusal::UnknownId { id: args.slice.clone() }))?;
+    let item = &parent.items[sidx];
+    if item.kind != SliceKind::Slice || item.status != SliceStatus::Active {
+        return Err((
+            ErrorKind::BadArgs,
+            format!(
+                "{} {:?} is {}; only an active slice splits into a sub-milestone",
+                item.kind, args.slice, item.status
+            ),
+        ));
+    }
+    parent.items[sidx].status = SliceStatus::Split;
+    // §7 placement. The split slice was the walk's first open item, so right
+    // after it is the front of the parent's remaining items (it runs next);
+    // `do_not_prioritize` appends at the end instead.
+    let at = if args.at_end { parent.items.len() } else { sidx + 1 };
+    parent.items.insert(
+        at,
+        SliceItem {
+            kind: SliceKind::Sub,
+            id: args.slug.clone(),
+            status: SliceStatus::Queued,
+            follow_ups: None,
+        },
+    );
+    // Backstop: the slug must be a free item id in the parent's list.
+    parent.validate(&args.milestone).map_err(refuse)?;
+
+    // The sub's own list, numbered deterministically: its folder was just
+    // proven absent, so the first slice is 001 and `.seq` ends at the count.
+    let date = conventions::today_hyphen();
+    let mut slice_docs = Vec::with_capacity(args.slices.len());
+    let mut items = Vec::with_capacity(args.slices.len());
+    for (i, spec) in args.slices.iter().enumerate() {
+        let number = i as u32 + 1;
+        slice_docs.push(FileWrite {
+            rel: format!("{slices_dir}/{}", conventions::note_filename(number, &spec.slug)),
+            expected: None,
+            bytes: conventions::note_doc(spec.title.as_deref().unwrap_or(&spec.slug), &date, &spec.body)
+                .into_bytes(),
+        });
+        items.push(SliceItem {
+            kind: SliceKind::Slice,
+            id: format!("{number:03}"),
+            status: SliceStatus::Queued,
+            follow_ups: Some(0),
+        });
+    }
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let sub = SlicesToml::new(identity.clone(), items);
+    sub.validate(&identity).map_err(refuse)?;
+
+    let files = [
+        FileWrite {
+            rel: slices_file(&args.milestone),
+            expected: parent_version,
+            bytes: parent
+                .to_toml()
+                .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+                .into_bytes(),
+        },
+        FileWrite {
+            rel: slices_file(&identity),
+            expected: None,
+            bytes: sub
+                .to_toml()
+                .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+                .into_bytes(),
+        },
+    ];
+    let views = [
+        ViewWrite {
+            host: slices_view_host(&args.milestone),
+            tag: SLICES_V2_TAG,
+            body: Some(slices_view(&parent)),
+        },
+        ViewWrite {
+            host: doc_rel.clone(),
+            tag: SLICES_V2_TAG,
+            body: Some(slices_view(&sub)),
+        },
+    ];
+    // The sub's docs ride the one commit as first-creation extras (the
+    // milestone kind of `queue_add_entry` does the same), so a refusal leaves
+    // no orphan docs.
+    let mut extras = vec![
+        FileWrite {
+            rel: doc_rel.clone(),
+            expected: None,
+            bytes: sub_doc(
+                &identity,
+                &args.milestone,
+                &args.slice,
+                &args.title,
+                &args.mission,
+                &args.finish_criteria,
+            )
+            .into_bytes(),
+        },
+        FileWrite {
+            rel: format!("{slices_dir}/{}", conventions::SEQ_FILE),
+            expected: None,
+            bytes: format!("{}\n", args.slices.len()).into_bytes(),
+        },
+    ];
+    extras.extend(slice_docs);
+
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_sub_added",
+        serde_json::json!({
+            "milestone": args.milestone,
+            "slice": args.slice,
+            "sub": identity,
+            "at_end": args.at_end,
+        }),
+        &files,
+        &views,
+        &ExtraWrites {
+            writes: &extras,
+            refresh_backlinks: true,
+        },
+    )?;
+
+    Ok(serde_json::to_value(QueueV2AddSubReply {
+        milestone: identity,
+        slices: ids,
+        path: doc_rel,
         hash: hash.to_string(),
     })
     .unwrap())
@@ -1648,5 +1937,198 @@ mod tests {
         let reply = session_log(&daemon, "m/sub-a", None, "completed · reasoning · member oc · $0.00")
             .expect("sub close-out log");
         assert_eq!(reply.path, "growlight/backlog/milestones/m/subs/sub-a/CLAUDE.md");
+    }
+
+    // ---- add_sub (slice 010) ----------------------------------------------
+
+    fn add_sub(daemon: &Daemon, args: serde_json::Value) -> Result<QueueV2AddSubReply, (ErrorKind, String)> {
+        let v = queue_v2_add_sub(daemon, args)?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
+    fn sub_args(milestone: &str, slice: &str, slug: &str, at_end: bool) -> serde_json::Value {
+        serde_json::json!({
+            "milestone": milestone,
+            "slice": slice,
+            "slug": slug,
+            "title": format!("{slug} title"),
+            "mission": "finish what the slice could not",
+            "finish_criteria": "- [ ] it is done",
+            "slices": [
+                { "slug": "first", "title": "First", "body": "> Model: flash\n\nwork one" },
+                { "slug": "second", "body": "work two" },
+            ],
+            "at_end": at_end,
+        })
+    }
+
+    fn kinds(model: &SlicesToml) -> Vec<(SliceKind, String, SliceStatus)> {
+        model.items.iter().map(|i| (i.kind, i.id.clone(), i.status)).collect()
+    }
+
+    #[test]
+    fn add_sub_creates_the_sub_splits_the_slice_and_places_it_next_in_one_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_running_milestone(&daemon, "m");
+        let before = commit_count(&daemon);
+
+        let reply = add_sub(&daemon, sub_args("m", "001", "deeper", false)).expect("add_sub");
+
+        assert_eq!(commit_count(&daemon), before + 1, "one commit for the whole sub");
+        assert_eq!(reply.milestone, "m/deeper");
+        assert_eq!(reply.slices, vec!["001".to_string(), "002".to_string()]);
+        assert_eq!(reply.path, "growlight/backlog/milestones/m/subs/deeper/CLAUDE.md");
+        assert_eq!(
+            kinds(&loaded_slices(&daemon, "m")),
+            vec![
+                (SliceKind::Slice, "001".to_string(), SliceStatus::Split),
+                (SliceKind::Sub, "deeper".to_string(), SliceStatus::Queued),
+                (SliceKind::Slice, "002".to_string(), SliceStatus::Queued),
+            ],
+            "the slice splits and the sub runs next, in front of the remaining items",
+        );
+        let sub = loaded_slices(&daemon, "m/deeper");
+        assert_eq!(
+            kinds(&sub),
+            vec![
+                (SliceKind::Slice, "001".to_string(), SliceStatus::Queued),
+                (SliceKind::Slice, "002".to_string(), SliceStatus::Queued),
+            ],
+        );
+        assert!(sub.items.iter().all(|i| i.follow_ups == Some(0)));
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let doc = wt.read_to_string(&reply.path).unwrap();
+        assert!(doc.starts_with("# backlog: deeper title\n"), "{doc}");
+        assert!(doc.contains("## Mission\n\nfinish what the slice could not"), "{doc}");
+        assert!(doc.contains("## Finish criteria\n\n- [ ] it is done"), "{doc}");
+        assert_eq!(
+            softfig_ipc::model_choice::item_model_field(&doc),
+            None,
+            "the generated doc declares no model, so the sub inherits the parent's chain",
+        );
+        let region = managed::region_body(&doc, SLICES_V2_TAG).unwrap();
+        assert!(region.contains("| slice | 001 | queued |"), "{region}");
+        let parent = wt.read_to_string(&slices_view_host("m")).unwrap();
+        let region = managed::region_body(&parent, SLICES_V2_TAG).unwrap();
+        assert!(region.contains("| slice | 001 | split |") && region.contains("| sub | deeper | queued |"), "{region}");
+        let first = wt
+            .read_to_string("growlight/backlog/milestones/m/subs/deeper/slices/001-first.md")
+            .unwrap();
+        assert!(first.contains("> Model: flash") && first.contains("work one"), "{first}");
+        assert!(wt.exists("growlight/backlog/milestones/m/subs/deeper/slices/002-second.md"));
+        assert_eq!(
+            wt.read_to_string("growlight/backlog/milestones/m/subs/deeper/slices/.seq").unwrap().trim(),
+            "2",
+        );
+    }
+
+    #[test]
+    fn add_sub_with_at_end_appends_and_nests_one_more_level_only() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_running_milestone(&daemon, "m");
+        add_sub(&daemon, sub_args("m", "001", "later", true)).expect("add_sub at end");
+        assert_eq!(
+            kinds(&loaded_slices(&daemon, "m")),
+            vec![
+                (SliceKind::Slice, "001".to_string(), SliceStatus::Split),
+                (SliceKind::Slice, "002".to_string(), SliceStatus::Queued),
+                (SliceKind::Sub, "later".to_string(), SliceStatus::Queued),
+            ],
+            "do_not_prioritize: the sub waits at the end of the list",
+        );
+
+        // One level down: a running slice of m/later splits into m/later/x …
+        claim(&daemon, "m/later", Some("001")).expect("claim the sub's slice");
+        let reply = add_sub(&daemon, sub_args("m/later", "001", "x", false)).expect("2 deep");
+        assert_eq!(reply.path, "growlight/backlog/milestones/m/subs/later/subs/x/CLAUDE.md");
+        // … and that is the §3.3 bound: m/later/x can't file m/later/x/y.
+        claim(&daemon, "m/later/x", Some("001")).expect("claim 2 deep");
+        let before = commit_count(&daemon);
+        let err = add_sub(&daemon, sub_args("m/later/x", "001", "y", false)).unwrap_err();
+        assert_eq!(err.0, ErrorKind::InvalidSlug, "{err:?}");
+        assert_eq!(commit_count(&daemon), before);
+    }
+
+    #[test]
+    fn add_sub_refuses_a_slice_that_is_not_running_a_taken_slug_and_reserved_lines() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_running_milestone(&daemon, "m");
+        let before = commit_count(&daemon);
+
+        // 002 is queued, not the running slice.
+        let err = add_sub(&daemon, sub_args("m", "002", "s", false)).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        // A slug that is already an item id in the parent's list.
+        let err = add_sub(&daemon, sub_args("m", "001", "002", false)).unwrap_err();
+        assert_eq!(err.0, ErrorKind::PathAlreadyExists, "{err:?}");
+        // A bad slug.
+        let err = add_sub(&daemon, sub_args("m", "001", "Not_A_Slug", false)).unwrap_err();
+        assert_eq!(err.0, ErrorKind::InvalidSlug, "{err:?}");
+        // §6.7's backstop: a member's mission may not set the sub's model.
+        let mut args = sub_args("m", "001", "s", false);
+        args["mission"] = serde_json::json!("do it\n> Model: claude");
+        let err = add_sub(&daemon, args).unwrap_err();
+        assert!(err.0 == ErrorKind::BadArgs && err.1.starts_with("field_not_allowed: `mission`"), "{err:?}");
+        let mut args = sub_args("m", "001", "s", false);
+        args["slices"][1]["body"] = serde_json::json!("> Grants: ~/projects/x\n\nwork");
+        let err = add_sub(&daemon, args).unwrap_err();
+        assert!(err.1.starts_with("field_not_allowed: `slices[1].body`"), "{err:?}");
+        // No slices.
+        let mut args = sub_args("m", "001", "s", false);
+        args["slices"] = serde_json::json!([]);
+        assert_eq!(add_sub(&daemon, args).unwrap_err().0, ErrorKind::BadArgs);
+
+        assert_eq!(commit_count(&daemon), before, "every refusal writes nothing");
+        assert_eq!(loaded_slices(&daemon, "m").items[0].status, SliceStatus::Active);
+
+        // A sub folder already on disk, though not in the list, is refused too.
+        hand_write(garden.path(), "growlight/backlog/milestones/m/subs/orphan/CLAUDE.md", "# stray\n");
+        let err = add_sub(&daemon, sub_args("m", "001", "orphan", false)).unwrap_err();
+        assert_eq!(err.0, ErrorKind::PathAlreadyExists, "{err:?}");
+        assert_eq!(loaded_slices(&daemon, "m").items[0].status, SliceStatus::Active);
+    }
+
+    #[test]
+    fn set_status_closes_a_sub_only_once_its_tree_is_finished() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_running_milestone(&daemon, "m");
+        add_sub(&daemon, sub_args("m", "001", "s", false)).expect("add_sub");
+        claim(&daemon, "m/s", Some("001")).expect("claim");
+
+        // Open items: refused, nothing written.
+        let before = commit_count(&daemon);
+        let err = set_status(&daemon, "m", Some("s"), "done").unwrap_err();
+        assert!(err.0 == ErrorKind::BadArgs && err.1.starts_with("open_items:"), "{err:?}");
+        assert_eq!(commit_count(&daemon), before);
+
+        set_status(&daemon, "m/s", Some("001"), "done").expect("slice 001 done");
+        claim(&daemon, "m/s", Some("002")).expect("claim 002");
+        set_status(&daemon, "m/s", Some("002"), "deferred").expect("slice 002 deferred");
+
+        // A sub closes to done | deferred only.
+        let err = set_status(&daemon, "m", Some("s"), "blocked").unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+        // The sub item was never claimed: it closes from `queued`.
+        let reply = set_status(&daemon, "m", Some("s"), "done").expect("close the sub");
+        assert_eq!(reply.status, "done");
+        assert_eq!(
+            kinds(&loaded_slices(&daemon, "m")),
+            vec![
+                (SliceKind::Slice, "001".to_string(), SliceStatus::Split),
+                (SliceKind::Sub, "s".to_string(), SliceStatus::Done),
+                (SliceKind::Slice, "002".to_string(), SliceStatus::Queued),
+            ],
+        );
+        let (queue, _) = loaded_queue(&daemon);
+        assert_eq!(queue.entries[0].status, EntryStatus::Active, "the entry stays active work");
+        // Closed is closed.
+        let err = set_status(&daemon, "m", Some("s"), "deferred").unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
     }
 }

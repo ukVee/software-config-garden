@@ -1090,10 +1090,6 @@ pub const NOT_A_MEMBER_MESSAGE: &str = "this session is not a fleet member sessi
      SOFTFIG_MEMBER), so it has no growlight_* verbs — a semi-auto or human-directed session \
      hands off with its baton as before";
 
-/// [`MemberVerbReply::state`] when every §6.3 check passed but nothing was
-/// executed — today only `growlight_add_sub_milestone`, whose execution (the
-/// keeperd sub-milestone) is the cap slice's; the session keeps running.
-pub const MEMBER_VERB_VALIDATED: &str = "validated";
 /// [`MemberVerbReply::state`] when a check refused the call.
 pub const MEMBER_VERB_REFUSED: &str = "refused";
 /// [`MemberVerbReply::state`] when the handshake ran (§6.3 step 3): keeperd
@@ -1117,14 +1113,14 @@ pub struct NextUnit {
 /// [`LeaseReply::state`]) so the handshake's states join it without a
 /// wire-enum bump: [`MEMBER_VERB_OK`] (the handoff committed; `next` names
 /// what runs next for the entry, absent when the entry left the active work —
-/// completed, deferred or blocked), [`MEMBER_VERB_VALIDATED`] (every §6.3
-/// check passed, nothing executed) or [`MEMBER_VERB_REFUSED`] (`code` +
-/// `message` say why; the session keeps running).
+/// completed, deferred or blocked) or [`MEMBER_VERB_REFUSED`] (`code` +
+/// `message` say why; the session keeps running). Slice 010 retired the
+/// interim `validated` state: every verb now executes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberVerbReply {
     /// The verb this reply answers.
     pub verb: String,
-    /// `ok` | `validated` | `refused`.
+    /// `ok` | `refused`.
     pub state: String,
     /// The refusal code, present only when refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1159,20 +1155,6 @@ impl MemberVerbReply {
             message: Some(message.into()),
             entry: None,
             unit: None,
-            next: None,
-            warnings: Vec::new(),
-        }
-    }
-
-    /// `verb` passed every §6.3 check for `entry`'s `unit`.
-    pub fn validated(verb: &str, entry: impl Into<String>, unit: impl Into<String>) -> Self {
-        Self {
-            verb: verb.to_string(),
-            state: MEMBER_VERB_VALIDATED.to_string(),
-            code: None,
-            message: None,
-            entry: Some(entry.into()),
-            unit: Some(unit.into()),
             next: None,
             warnings: Vec::new(),
         }

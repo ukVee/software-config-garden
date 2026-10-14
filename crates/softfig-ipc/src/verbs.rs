@@ -318,6 +318,15 @@ pub mod op {
     /// doc's `## Deferred verification` section — replaced in place when the
     /// section exists, created otherwise. One commit, `queue_v2_deferred_set`.
     pub const QUEUE_V2_DEFERRED: &str = "queue_v2_deferred";
+    /// queue v2 daemon op, keeperd↔growlightd only: the §7 sub-milestone
+    /// (`queue-v2-scheduling` slice 010, `growlight_add_sub_milestone`'s
+    /// commit). Creates `milestones/<milestone>/subs/<slug>/` — its
+    /// `CLAUDE.md` from the structured fields, `slices/` + `.seq`, and its
+    /// `slices.toml` (every slice `queued`) — marks the `active` slice `split`,
+    /// and places the sub in the parent's `slices.toml`: right after the split
+    /// slice (the front of the remaining items, the default) or at the end
+    /// (`at_end`, `do_not_prioritize`). One commit, `queue_v2_sub_added`.
+    pub const QUEUE_V2_ADD_SUB: &str = "queue_v2_add_sub";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2613,6 +2622,46 @@ pub struct QueueV2DeferredArgs {
 pub struct QueueV2DeferredReply {
     pub entry: String,
     /// The doc the section landed in (garden-relative).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `queue_v2_add_sub({milestone, slice, slug, title, mission, finish_criteria,
+/// slices, at_end}) -> {milestone, slices, path, hash}` — the §7 sub-milestone,
+/// filed when a slice's work outgrows it. `milestone` is the identity holding
+/// the slice (a top-level id or `"<parent>/<sub>"`); the new sub's identity is
+/// `"<milestone>/<slug>"`, at most 2 deep (§3.3). Refused: a slice that is not
+/// an `active` slice item, a taken slug (in the parent's list or on disk), a
+/// sub past the depth bound, and (the §6.7 backstop) `> Model:` / `> Grants:` /
+/// `> Worktree:` lines in the member's text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2AddSubArgs {
+    /// The milestone identity holding the slice that splits.
+    pub milestone: String,
+    /// The `active` slice whose remaining work moves into the sub; it becomes
+    /// `split`.
+    pub slice: String,
+    /// The sub-milestone's slug (`[a-z0-9-]+`, 1–64): its folder and the
+    /// parent item's id.
+    pub slug: String,
+    pub title: String,
+    pub mission: String,
+    pub finish_criteria: String,
+    /// At least one; numbered `001…` in order (the sub's folder is new).
+    pub slices: Vec<QueueSliceSpec>,
+    /// `true` appends the sub at the end of the parent's list
+    /// (`do_not_prioritize`); `false` places it right after the split slice.
+    #[serde(default)]
+    pub at_end: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2AddSubReply {
+    /// The new sub-milestone's identity (`"<milestone>/<slug>"`).
+    pub milestone: String,
+    /// Its slice ids, in order.
+    pub slices: Vec<String>,
+    /// Its `CLAUDE.md` (garden-relative).
     pub path: String,
     pub hash: String,
 }

@@ -33,8 +33,13 @@
 //! urgent-before-normal, link integrity, …) are validation, not this file —
 //! they live in [`validate`], the milestone's slice 002.
 
+mod sub_doc;
 mod validate;
 
+pub use sub_doc::{
+    reserved_field, sub_doc_violation, FieldViolation, SubSliceText, SLICE_BODY_RESERVED,
+    SUB_DOC_RESERVED,
+};
 pub use validate::{sub_depth, QueueRefusal};
 
 use std::fmt;
