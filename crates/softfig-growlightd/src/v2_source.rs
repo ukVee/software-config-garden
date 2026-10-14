@@ -318,6 +318,7 @@ fn load_tree(
                     id: item.id.clone(),
                     status: item.status,
                     models,
+                    follow_ups: item.follow_ups.unwrap_or(0),
                 });
             }
             SliceKind::Sub => {
@@ -333,6 +334,7 @@ fn load_tree(
                     status: item.status,
                     // A sub's units resolve inside its own tree.
                     models: None,
+                    follow_ups: 0,
                 });
             }
         }

@@ -80,8 +80,8 @@ pub struct EntryView {
     /// First-claim time, UTC (§3.1). Carried for completeness; the pick does
     /// not order by it (stack order is `queue-v2-git`'s row).
     pub claimed: String,
-    /// Consecutive follow-ups (§7). Carried for completeness; the cap is
-    /// slice 010's row.
+    /// Consecutive follow-ups (§7) — the cap's count for a task, restack or
+    /// close-out unit ([`crate::member_verbs`]); the pick itself ignores it.
     pub follow_ups: u64,
     /// Who holds the entry. An `active` entry → the running member; a `paused`
     /// entry → the member that paused it (the step-2 resume preference), or
@@ -115,7 +115,9 @@ pub struct ItemView {
     /// unit** (slice doc → enclosing sub `CLAUDE.md`s → the milestone
     /// `CLAUDE.md`). A `sub` item carries `None`: its units resolve inside the
     /// sub's own tree.
-    pub models: Option<ModelList>,
+    pub models: Option<ModelList>,    /// Slice only: consecutive follow-ups (§7), the cap's per-slice count —
+    /// `slices.toml`'s `follow_ups` (absent = 0). A `sub` item carries 0.
+    pub follow_ups: u64,
 }
 
 /// A point-in-time view of the whole v2 list (§2, §3): every live entry in
@@ -565,6 +567,7 @@ mod tests {
             id: id.into(),
             status,
             models: None,
+            follow_ups: 0,
         }
     }
 
@@ -601,6 +604,7 @@ mod tests {
             id: "001".into(),
             status: SliceStatus::Queued,
             models,
+            follow_ups: 0,
         }]
     }
 

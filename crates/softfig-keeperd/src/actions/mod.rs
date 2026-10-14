@@ -51,7 +51,9 @@ pub use add_project::add_project;
 pub use archive::archive;
 pub use batch::batch;
 pub use growlight::{
-    add_backlog_item, add_queue, add_slice, file_report, growlight_init, growlight_set_resources,
+    add_backlog_item, add_queue, add_slice, file_report, growlight_add_follow_up_session,
+    growlight_add_sub_milestone, growlight_block, growlight_complete_entry,
+    growlight_complete_slice, growlight_init, growlight_set_resources,
     list_reports, log_baton, post_message, queue_add_entry, queue_add_project, queue_drop,
     queue_update_entry, queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups,
     queue_v2_session_log, queue_v2_set_status, read_inbox, release_lease, reorder_backlog_item,

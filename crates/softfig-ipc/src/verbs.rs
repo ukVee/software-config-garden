@@ -393,6 +393,22 @@ pub mod op {
     /// held lease, promoting the head waiter. Forwarded keeperd→growlightd like
     /// [`REQUEST_LEASE`]; a release by a non-holder comes back `denied`.
     pub const RELEASE_LEASE: &str = "release_lease";
+    /// Queue v2 member verbs (spec-growlight-queue §6.1–§6.6), agent-facing and
+    /// forwarded keeperd→growlightd like the leases: keeperd parses the
+    /// [`crate::growlightd::MemberCall`] envelope and relays growlightd's
+    /// [`crate::growlightd::MemberVerbReply`]. growlightd validates (and, with
+    /// the handshake's execution half, commits through keeperd's v2 ops).
+    pub const GROWLIGHT_ADD_FOLLOW_UP_SESSION: &str =
+        crate::growlightd::op::GROWLIGHT_ADD_FOLLOW_UP_SESSION;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_COMPLETE_SLICE: &str = crate::growlightd::op::GROWLIGHT_COMPLETE_SLICE;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_COMPLETE_ENTRY: &str = crate::growlightd::op::GROWLIGHT_COMPLETE_ENTRY;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_BLOCK: &str = crate::growlightd::op::GROWLIGHT_BLOCK;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_ADD_SUB_MILESTONE: &str =
+        crate::growlightd::op::GROWLIGHT_ADD_SUB_MILESTONE;
     /// M4 deploy (TUI Deploy tab): compute the deploy plan — a read-only diff of
     /// `config/deploy.toml` against the live filesystem. The daemon runs
     /// `softfig-deploy`'s `plan` against the unlocked garden mount so a frontend
@@ -2471,7 +2487,7 @@ pub enum DaemonStatusArg {
 /// One deferred manual test (§6.5 `deferred_tests`): what to run and the
 /// expected result, rendered into the entry doc's `## Deferred verification`
 /// section by [`super::super::verbs::op::QUEUE_V2_DEFERRED`]`queue_v2_deferred`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredTestSpec {
     /// What the human runs (the pending manual test).
     pub what: String,

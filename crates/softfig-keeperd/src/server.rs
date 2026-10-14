@@ -289,6 +289,15 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::LIST_REPORTS => crate::actions::list_reports(daemon, req.args),
         op::REQUEST_LEASE => crate::actions::request_lease(daemon, req.args),
         op::RELEASE_LEASE => crate::actions::release_lease(daemon, req.args),
+        op::GROWLIGHT_ADD_FOLLOW_UP_SESSION => {
+            crate::actions::growlight_add_follow_up_session(daemon, req.args)
+        }
+        op::GROWLIGHT_COMPLETE_SLICE => crate::actions::growlight_complete_slice(daemon, req.args),
+        op::GROWLIGHT_COMPLETE_ENTRY => crate::actions::growlight_complete_entry(daemon, req.args),
+        op::GROWLIGHT_BLOCK => crate::actions::growlight_block(daemon, req.args),
+        op::GROWLIGHT_ADD_SUB_MILESTONE => {
+            crate::actions::growlight_add_sub_milestone(daemon, req.args)
+        }
         op::RELOCK_MINT => handlers::relock_mint(daemon, req.args),
         op::RELOCK_REDEEM => handlers::relock_redeem(daemon, req.args),
         op::ARCHIVE => crate::actions::archive(daemon, req.args),

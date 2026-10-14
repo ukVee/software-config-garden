@@ -33,6 +33,7 @@ pub mod fleet;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
+pub mod member_verbs;
 pub mod notifications;
 pub mod notify_dispatch;
 pub mod opencode_backend;

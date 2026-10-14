@@ -149,6 +149,14 @@ pub struct Daemon {
     /// *outside* `inner` (like `kill_handles`) so the read never contends on the
     /// daemon lock. Read-only from here — the daemon never routes, it only looks.
     pub backends: Arc<Mutex<Option<Arc<BackendRouter>>>>,
+    /// The queue-v2 assignments the drive loop holds (queue-v2-scheduling slice
+    /// 008), mirrored here at the end of every tick so the member verbs can run
+    /// the §6.3 assignment-match check from a connection thread. The drive loop
+    /// owns the authoritative map (`&mut self`, never behind the daemon lock);
+    /// this is a read-only copy. Lives *outside* `inner` (like `kill_handles`)
+    /// so a verb's lookup never contends on the daemon lock. Empty on a legacy
+    /// or disarmed fleet — every member verb then refuses `not_your_session`.
+    pub v2_assignments: Arc<Mutex<BTreeMap<String, crate::drive_loop::V2Assignment>>>,
 }
 
 impl Daemon {
@@ -163,7 +171,27 @@ impl Daemon {
             live_scopes: Arc::new(Mutex::new(BTreeMap::new())),
             kill_handles: Arc::new(Mutex::new(BTreeMap::new())),
             backends: Arc::new(Mutex::new(None)),
+            v2_assignments: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Mirror the drive loop's v2 assignments (the drive loop calls this once
+    /// per tick, after its scheduling pass). Replaces the whole copy, so an
+    /// exited or retired member's row is gone the same tick.
+    pub fn publish_v2_assignments(
+        &self,
+        assignments: &BTreeMap<String, crate::drive_loop::V2Assignment>,
+    ) {
+        let mut mirror = self.v2_assignments.lock().unwrap();
+        if *mirror != *assignments {
+            *mirror = assignments.clone();
+        }
+    }
+
+    /// `agent`'s live v2 assignment, if it holds one — the member verbs'
+    /// assignment-match source (§6.3 step 2).
+    pub fn v2_assignment(&self, agent: &str) -> Option<crate::drive_loop::V2Assignment> {
+        self.v2_assignments.lock().unwrap().get(agent).cloned()
     }
 
     /// Register the assembled fleet's backend router, so `status` can read each

@@ -20,7 +20,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use softfig_ipc::{
     self,
-    growlightd::{ReleaseLeaseArgs, RequestLeaseArgs},
+    growlightd::{
+        AddFollowUpSessionArgs, AddSubMilestoneArgs, BlockArgs, CompleteEntryArgs,
+        CompleteSliceArgs, MemberCall, MemberVerbReply, RefusalCode, ReleaseLeaseArgs,
+        RequestLeaseArgs, MEMBER_VERB_REFUSED, NOT_A_MEMBER_MESSAGE,
+    },
     MemberIdentity,
     verbs::{
         op, AddBacklogItemArgs, AddCodeReviewArgs, AddNoteArgs, AddProjectArgs, AddQueueArgs,
@@ -740,6 +744,137 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "growlight_add_follow_up_session",
+            "description": "growlight queue v2, FLEET MEMBER SESSIONS ONLY (refused not_a_member \
+                            otherwise): end this session early and run a fresh one for the same \
+                            unit (spec §6.1). Call it LAST, after persisting garden + code. \
+                            `reason` is one of: context_full | mcp_updated | daemon_restarted | \
+                            session_fault | model_change | new_scope | preempted. new_scope needs \
+                            `new_slice` (it runs next, then this slice resumes); model_change \
+                            needs `model` (one of the unit's allowed models). Every reason but \
+                            preempted counts toward the 5-follow-up cap. The baton carries \
+                            status IN_PROGRESS. A refusal leaves this session running: read the \
+                            code and correct the call.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["reason", "baton"],
+                "properties": {
+                    "reason": { "type": "string", "description": "context_full | mcp_updated | daemon_restarted | session_fault | model_change | new_scope | preempted" },
+                    "baton": { "type": "string", "description": "the full next baton (frontmatter with status: IN_PROGRESS and item: <this entry>)" },
+                    "model": { "type": "string", "description": "optional next-session model spec (claude | reasoning | flash | provider/model, optional variant=); required for model_change; omit to keep the current model" },
+                    "variant": { "type": "string", "description": "optional reasoning level, e.g. none | low | high | max" },
+                    "new_slice": {
+                        "type": "object",
+                        "description": "required iff reason = new_scope; refused otherwise",
+                        "required": ["slug", "title", "body"],
+                        "properties": {
+                            "slug": { "type": "string" },
+                            "title": { "type": "string" },
+                            "body": { "type": "string", "description": "may declare `> Model:` only as a subset of what the slice would inherit" },
+                        },
+                    },
+                },
+            },
+        }),
+        json!({
+            "name": "growlight_complete_slice",
+            "description": "growlight queue v2, FLEET MEMBER SESSIONS ONLY: this session's slice \
+                            is done (spec §6.2). Call it LAST, after persisting garden + code. \
+                            Refused on a task, restack or close-out (task_has_no_slices) — use \
+                            growlight_complete_entry there. The baton (status IN_PROGRESS) is \
+                            for whatever runs next. A refusal leaves this session running.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["summary", "baton"],
+                "properties": {
+                    "summary": { "type": "string", "description": "one line on what the slice finished (goes to the session log)" },
+                    "baton": { "type": "string", "description": "the baton for whatever runs next (status: IN_PROGRESS)" },
+                },
+            },
+        }),
+        json!({
+            "name": "growlight_complete_entry",
+            "description": "growlight queue v2, FLEET MEMBER SESSIONS ONLY: close out this \
+                            milestone, task or restack (spec §6.5) — done (built + verified; the \
+                            loop never merges) or deferred (manual tests pending). A milestone is \
+                            refused open_items unless every slice is done, split or deferred. \
+                            Call it LAST. A refusal leaves this session running.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["outcome", "summary", "baton"],
+                "properties": {
+                    "outcome": { "type": "string", "enum": ["done", "deferred"] },
+                    "summary": { "type": "string", "description": "one line (goes to the session log)" },
+                    "deferred_tests": {
+                        "type": "array",
+                        "description": "required iff outcome = deferred: each pending manual test",
+                        "items": {
+                            "type": "object",
+                            "required": ["what", "expected"],
+                            "properties": {
+                                "what": { "type": "string", "description": "what to run" },
+                                "expected": { "type": "string", "description": "the expected result" },
+                            },
+                        },
+                    },
+                    "baton": { "type": "string", "description": "a short terminal baton: status ITEM_COMPLETE (done) or ITEM_DEFERRED (deferred)" },
+                },
+            },
+        }),
+        json!({
+            "name": "growlight_block",
+            "description": "growlight queue v2, FLEET MEMBER SESSIONS ONLY: park this entry \
+                            (spec §6.6). kind = human for a decision only the human can make \
+                            (protocol step 4/3b), stuck for no progress or a capped unit with \
+                            nowhere to split (step 6). The unit keeps its follow-up count; the \
+                            human unblocks and the baton resumes. Call it LAST. A refusal leaves \
+                            this session running.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["kind", "reason", "baton"],
+                "properties": {
+                    "kind": { "type": "string", "enum": ["human", "stuck"] },
+                    "reason": { "type": "string", "description": "what blocks (goes to the session log and to @human)" },
+                    "baton": { "type": "string", "description": "the baton to resume from once unblocked (status BLOCKED_ON_HUMAN for human, STUCK for stuck)" },
+                },
+            },
+        }),
+        json!({
+            "name": "growlight_add_sub_milestone",
+            "description": "growlight queue v2, FLEET MEMBER SESSIONS ONLY: file this slice's \
+                            remaining work as a sub-milestone (spec §7) — the answer to \
+                            cap_reached on a milestone slice. The current slice becomes split; \
+                            the sub runs next (front of the parent's list) unless \
+                            do_not_prioritize. At 2 levels deep it is refused depth_limit: end \
+                            with growlight_block kind = stuck. Call it LAST. A refusal leaves \
+                            this session running.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["slug", "title", "mission", "finish_criteria", "slices", "baton"],
+                "properties": {
+                    "slug": { "type": "string" },
+                    "title": { "type": "string" },
+                    "mission": { "type": "string" },
+                    "finish_criteria": { "type": "string" },
+                    "slices": {
+                        "type": "array",
+                        "description": "at least one; each sized to one session",
+                        "items": {
+                            "type": "object",
+                            "required": ["slug", "title", "body"],
+                            "properties": {
+                                "slug": { "type": "string" },
+                                "title": { "type": "string" },
+                                "body": { "type": "string", "description": "may declare `> Model:` only as a subset of what the slice would inherit" },
+                            },
+                        },
+                    },
+                    "do_not_prioritize": { "type": "boolean", "description": "true appends the sub at the END of the parent's list instead of running it next (only if the parent's next slices don't depend on it)" },
+                    "baton": { "type": "string", "description": "the baton for whatever runs next (status: IN_PROGRESS)" },
+                },
+            },
+        }),
+        json!({
             "name": "replace_file",
             "description": "BREAK-GLASS: overwrite a garden file with verbatim bytes — no \
                             convention stamping, so you hand-write the ENTIRE file (frontmatter, \
@@ -909,6 +1044,87 @@ fn tool_defs() -> Vec<Value> {
             },
         }),
     ]
+}
+
+/// Where a member verb goes (spec-growlight-queue §6): refused here, before any
+/// socket, or forwarded with the caller's identity in the envelope.
+#[derive(Debug)]
+enum MemberRoute {
+    /// The caller is not a member session: refused `not_a_member` locally —
+    /// identical to growlightd's own refusal text.
+    Refused(MemberVerbReply),
+    /// The op + the [`MemberCall`] envelope: `member` from the launch env, the
+    /// model's arguments (shape-checked) beside it.
+    Forward(&'static str, Value),
+}
+
+/// Route one of the five member verbs, or `None` for any other tool. The
+/// identity comes from `caller` — the startup-read `SOFTFIG_MEMBER` — and
+/// never from the arguments: the typed args refuse any extra key, so a model
+/// cannot name a member. Pure (no socket), so it's unit-testable.
+fn route_member_verb(
+    caller: &MemberIdentity,
+    name: &str,
+    args: Value,
+) -> Result<Option<MemberRoute>> {
+    fn wrap<A: serde::de::DeserializeOwned + Serialize>(
+        member: &str,
+        args: Value,
+    ) -> Result<Value> {
+        let args: A = serde_json::from_value(args)?;
+        Ok(serde_json::to_value(MemberCall {
+            member: Some(member.to_string()),
+            args,
+        })?)
+    }
+    let Some(&op_name) = softfig_ipc::growlightd::op::MEMBER_VERBS
+        .iter()
+        .find(|&&v| v == name)
+    else {
+        return Ok(None);
+    };
+    let Some(member) = caller.member() else {
+        return Ok(Some(MemberRoute::Refused(MemberVerbReply::refused(
+            op_name,
+            RefusalCode::NotAMember,
+            NOT_A_MEMBER_MESSAGE,
+        ))));
+    };
+    let envelope = match op_name {
+        op::GROWLIGHT_ADD_FOLLOW_UP_SESSION => wrap::<AddFollowUpSessionArgs>(member, args)?,
+        op::GROWLIGHT_COMPLETE_SLICE => wrap::<CompleteSliceArgs>(member, args)?,
+        op::GROWLIGHT_COMPLETE_ENTRY => wrap::<CompleteEntryArgs>(member, args)?,
+        op::GROWLIGHT_BLOCK => wrap::<BlockArgs>(member, args)?,
+        op::GROWLIGHT_ADD_SUB_MILESTONE => wrap::<AddSubMilestoneArgs>(member, args)?,
+        other => anyhow::bail!("unrouted member verb {other:?}"),
+    };
+    Ok(Some(MemberRoute::Forward(op_name, envelope)))
+}
+
+/// Render a member verb's reply. A refusal says so loudly and that the session
+/// keeps running (§6.3), so the agent corrects the call instead of exiting.
+fn summarize_member_verb(data: &Value) -> String {
+    let reply: MemberVerbReply = match serde_json::from_value(data.clone()) {
+        Ok(reply) => reply,
+        Err(e) => return format!("member verb: undecodable reply ({e}): {data}"),
+    };
+    let verb = &reply.verb;
+    if reply.state == MEMBER_VERB_REFUSED {
+        let code = reply.code.map(|c| c.as_str()).unwrap_or("?");
+        let message = reply.message.as_deref().unwrap_or("");
+        return format!(
+            "{verb}: REFUSED ({code}) — {message}. This session keeps running: correct the \
+             call, or end with another verb."
+        );
+    }
+    let entry = reply.entry.as_deref().unwrap_or("?");
+    let unit = reply.unit.as_deref().unwrap_or("?");
+    format!(
+        "{verb}: {} for {entry} / {unit} — every §6.3 check passed. The handshake's \
+         execution half (commit, baton, roll) is not built yet: nothing was written and this \
+         session keeps running.",
+        reply.state
+    )
 }
 
 /// Map an MCP tool name + arguments onto the IPC op + validated args.
@@ -1183,6 +1399,9 @@ fn summarize(name: &str, data: &Value) -> String {
         }
         return format!("read_versions {path}: {version}{flag}\n{}", sec_lines.join("\n"));
     }
+    if softfig_ipc::growlightd::op::MEMBER_VERBS.contains(&name) {
+        return summarize_member_verb(data);
+    }
     if name == "request_lease" || name == "release_lease" {
         let g = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or("?");
         let key = g("key");
@@ -1307,7 +1526,15 @@ fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-    let (op_name, ipc_args) = resolve_tool(name, args)?;
+    let (op_name, ipc_args) = match route_member_verb(caller, name, args.clone())? {
+        Some(MemberRoute::Refused(reply)) => {
+            return Ok(json!({
+                "content": [{ "type": "text", "text": summarize_member_verb(&serde_json::to_value(reply)?) }],
+            }))
+        }
+        Some(MemberRoute::Forward(op_name, envelope)) => (op_name, envelope),
+        None => resolve_tool(name, args)?,
+    };
 
     // softfig-mcp holds no persistent keeperd connection — it connects per
     // request. A verb issued during a keeperd restart window (daemon
@@ -1334,9 +1561,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_thirty_eight() {
+    fn tools_list_has_forty_three() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 38);
+        assert_eq!(defs.len(), 43);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -1374,6 +1601,11 @@ mod tests {
             "batch",
             "request_lease",
             "release_lease",
+            "growlight_add_follow_up_session",
+            "growlight_complete_slice",
+            "growlight_complete_entry",
+            "growlight_block",
+            "growlight_add_sub_milestone",
             "file_report",
             "update_report",
             "list_reports",
@@ -1389,7 +1621,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         );
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 38);
+        assert_eq!(tools.len(), 43);
     }
 
     /// A `tools/call` for a tool that doesn't exist: dispatch refuses it before
@@ -1403,10 +1635,83 @@ mod tests {
         resp["error"]["message"].as_str().unwrap().to_string()
     }
 
+    /// A member verb from a non-member session is refused `not_a_member` HERE,
+    /// before any socket (so it works with growlightd down), as an ok reply the
+    /// agent reads — the session isn't errored out. One test per verb name.
+    #[test]
+    fn a_non_member_is_refused_every_member_verb_before_any_socket() {
+        for verb in softfig_ipc::growlightd::op::MEMBER_VERBS {
+            let line = json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": verb, "arguments": {} },
+            })
+            .to_string();
+            let resp = handle_line(&MemberIdentity::NotAMember, &line);
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{resp}"));
+            assert!(
+                text.starts_with(&format!("{verb}: REFUSED (not_a_member)")),
+                "{verb}: {text}"
+            );
+            assert!(text.contains("keeps running"), "{text}");
+        }
+    }
+
+    /// A member's call is forwarded under the verb's op with the identity from
+    /// the launch env in the envelope — never from the arguments: an argument
+    /// named `member` is refused at parse, not honoured.
+    #[test]
+    fn a_member_verb_forwards_the_launch_identity_beside_the_arguments() {
+        let caller = MemberIdentity::Member("oc".into());
+        let route = route_member_verb(
+            &caller,
+            "growlight_block",
+            json!({ "kind": "stuck", "reason": "r", "baton": "b" }),
+        )
+        .unwrap();
+        match route {
+            Some(MemberRoute::Forward(op_name, envelope)) => {
+                assert_eq!(op_name, op::GROWLIGHT_BLOCK);
+                assert_eq!(
+                    envelope,
+                    json!({ "member": "oc", "args": { "kind": "stuck", "reason": "r", "baton": "b" } })
+                );
+            }
+            other => panic!("expected a forward, got {other:?}"),
+        }
+        let forged = route_member_verb(
+            &caller,
+            "growlight_complete_slice",
+            json!({ "summary": "s", "baton": "b", "member": "someone-else" }),
+        );
+        assert!(forged.is_err(), "a `member` argument must be refused: {forged:?}");
+        // Not a member verb: no route, the garden verbs' dispatch handles it.
+        assert!(route_member_verb(&caller, "log_decision", json!({})).unwrap().is_none());
+    }
+
+    #[test]
+    fn member_verb_replies_render_refusal_and_validation() {
+        let refused = serde_json::to_value(MemberVerbReply::refused(
+            "growlight_add_follow_up_session",
+            RefusalCode::CapReached,
+            "slice 003 of m has had 5 consecutive follow-ups, the cap",
+        ))
+        .unwrap();
+        let text = summarize("growlight_add_follow_up_session", &refused);
+        assert!(
+            text.starts_with("growlight_add_follow_up_session: REFUSED (cap_reached) — slice 003"),
+            "{text}"
+        );
+        let validated =
+            serde_json::to_value(MemberVerbReply::validated("growlight_complete_slice", "m", "003"))
+                .unwrap();
+        let text = summarize("growlight_complete_slice", &validated);
+        assert!(text.starts_with("growlight_complete_slice: validated for m / 003"), "{text}");
+    }
+
     #[test]
     fn a_member_or_a_human_reaches_dispatch_unchanged() {
-        // The identity is carried, not yet acted on (the member verbs + their
-        // gate are slice 008's): both reach the same dispatch as before.
+        // Outside the member verbs, the identity changes nothing: both reach the
+        // same dispatch as before.
         for caller in [MemberIdentity::NotAMember, MemberIdentity::Member("a".into())] {
             let msg = call_unknown_tool(&caller);
             assert!(msg.contains("unknown tool \"no_such_tool\""), "{caller:?}: {msg}");
@@ -1420,7 +1725,7 @@ mod tests {
         assert!(msg.starts_with("softfig-mcp refuses every verb: SOFTFIG_MEMBER="), "{msg}");
         // Listing the tools stays harmless.
         let resp = handle_line(&caller, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 38);
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 43);
     }
 
     #[test]

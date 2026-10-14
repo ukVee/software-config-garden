@@ -133,6 +133,37 @@ pub mod op {
     /// under the kill-safety discipline; already in flight → queued; targeting
     /// the requester itself → denied (use `force_stop`).
     pub const REQUEST_RESTART: &str = "request_restart";
+
+    // --- Member verbs (spec-growlight-queue §6.1–§6.6). Agent-facing, reached
+    // MCP → keeperd → growlightd like the leases. Each one's args are a
+    // [`MemberCall`] whose `member` softfig-mcp fills from `SOFTFIG_MEMBER`,
+    // never from a tool argument; the reply is a [`MemberVerbReply`]. A
+    // refusal leaves the calling session running (§6.3).
+
+    /// `growlight_add_follow_up_session(`[`MemberCall`]`<`[`AddFollowUpSessionArgs`]`>)`
+    /// — end the session early with a §5 roll reason (§6.1).
+    pub const GROWLIGHT_ADD_FOLLOW_UP_SESSION: &str = "growlight_add_follow_up_session";
+    /// `growlight_complete_slice(`[`MemberCall`]`<`[`CompleteSliceArgs`]`>)` —
+    /// the current slice is done (§6.2).
+    pub const GROWLIGHT_COMPLETE_SLICE: &str = "growlight_complete_slice";
+    /// `growlight_complete_entry(`[`MemberCall`]`<`[`CompleteEntryArgs`]`>)` —
+    /// close out a milestone, task or restack, `done` or `deferred` (§6.5).
+    pub const GROWLIGHT_COMPLETE_ENTRY: &str = "growlight_complete_entry";
+    /// `growlight_block(`[`MemberCall`]`<`[`BlockArgs`]`>)` — park the entry on
+    /// a human decision or a stuck end (§6.6).
+    pub const GROWLIGHT_BLOCK: &str = "growlight_block";
+    /// `growlight_add_sub_milestone(`[`MemberCall`]`<`[`AddSubMilestoneArgs`]`>)`
+    /// — file the slice's remaining work as a sub-milestone (§7).
+    pub const GROWLIGHT_ADD_SUB_MILESTONE: &str = "growlight_add_sub_milestone";
+
+    /// The five member verbs, in spec order.
+    pub const MEMBER_VERBS: [&str; 5] = [
+        GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+        GROWLIGHT_COMPLETE_SLICE,
+        GROWLIGHT_COMPLETE_ENTRY,
+        GROWLIGHT_BLOCK,
+        GROWLIGHT_ADD_SUB_MILESTONE,
+    ];
 }
 
 /// Reply to `status`: the orchestrator's own state, the garden root it derived
@@ -805,9 +836,367 @@ pub struct RestartReply {
     pub reason: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Member verbs (spec-growlight-queue §5–§7). The args are what a member's model
+// supplies; [`MemberCall`] wraps them with the identity softfig-mcp read from
+// its launch env. `deny_unknown_fields` on every args type: a typo'd or
+// smuggled key is refused at parse rather than dropped.
+// ---------------------------------------------------------------------------
+
+/// The envelope every member verb travels in: the caller's identity beside the
+/// model-supplied arguments, never inside them. `member` is filled by
+/// softfig-mcp from `SOFTFIG_MEMBER` ([`crate::MemberIdentity`]); `None` = the
+/// caller is not a member session, which growlightd refuses `not_a_member`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberCall<A> {
+    /// The calling member's roster id, from the MCP server's launch env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// The verb's own arguments, as the model supplied them.
+    pub args: A,
+}
+
+/// A new slice a member files: `new_slice` on a `new_scope` follow-up (§6.1)
+/// and each of a sub-milestone's slices (§7). The body follows §6.7: it may
+/// declare `> Model:` only as a subset of what the slice would inherit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewSliceArgs {
+    /// `[a-z0-9-]+`; the slice's filename address (`NNN-<slug>.md`).
+    pub slug: String,
+    /// The slice heading title.
+    pub title: String,
+    /// The slice's plan/spec markdown body.
+    pub body: String,
+}
+
+/// `growlight_add_follow_up_session` (§6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddFollowUpSessionArgs {
+    /// One of the §5 roll reasons ([`RollReason`]). A string on the wire so an
+    /// unknown value reaches growlightd and is refused `unknown_reason`, not
+    /// lost to a parse error.
+    pub reason: String,
+    /// The full next baton.
+    pub baton: String,
+    /// The next session's model spec (`parse_model_spec` grammar); omitted =
+    /// keep the current model. Required for `model_change`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The next session's reasoning level (e.g. `none | low | high | max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    /// Required iff `reason = new_scope`; refused otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_slice: Option<NewSliceArgs>,
+}
+
+/// `growlight_complete_slice` (§6.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteSliceArgs {
+    /// One line on what the slice finished (the session log).
+    pub summary: String,
+    /// The baton for whatever runs next.
+    pub baton: String,
+}
+
+/// `growlight_complete_entry`'s outcome (§6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryOutcome {
+    /// Built and verified: the row moves to the archive.
+    Done,
+    /// Awaits the human's manual verification (`deferred_tests`).
+    Deferred,
+}
+
+/// `growlight_complete_entry` (§6.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteEntryArgs {
+    pub outcome: EntryOutcome,
+    /// One line (the session log).
+    pub summary: String,
+    /// Required iff `outcome = deferred`: each pending manual test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_tests: Option<Vec<crate::verbs::DeferredTestSpec>>,
+    /// A short terminal baton (`ITEM_COMPLETE` / `ITEM_DEFERRED`).
+    pub baton: String,
+}
+
+/// `growlight_block`'s kind (§6.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockKind {
+    /// Protocol step 4/3b's `BLOCKED_ON_HUMAN`.
+    Human,
+    /// Protocol step 6's `STUCK`, and the end of a cap with nowhere to split.
+    Stuck,
+}
+
+/// `growlight_block` (§6.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockArgs {
+    pub kind: BlockKind,
+    /// What blocks (the session log and @human on the bus).
+    pub reason: String,
+    /// The baton to resume from once unblocked.
+    pub baton: String,
+}
+
+/// `growlight_add_sub_milestone` (§7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddSubMilestoneArgs {
+    pub slug: String,
+    pub title: String,
+    pub mission: String,
+    pub finish_criteria: String,
+    /// At least one.
+    pub slices: Vec<NewSliceArgs>,
+    /// `true` appends the sub at the END of the parent's list instead of the
+    /// front.
+    #[serde(default)]
+    pub do_not_prioritize: bool,
+    /// The baton for whatever runs next.
+    pub baton: String,
+}
+
+/// The §5 roll reasons — a closed list. Anything else is `unknown_reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollReason {
+    ContextFull,
+    McpUpdated,
+    DaemonRestarted,
+    SessionFault,
+    ModelChange,
+    NewScope,
+    Preempted,
+}
+
+impl RollReason {
+    /// Every reason, in the §5 table's order.
+    pub const ALL: [RollReason; 7] = [
+        RollReason::ContextFull,
+        RollReason::McpUpdated,
+        RollReason::DaemonRestarted,
+        RollReason::SessionFault,
+        RollReason::ModelChange,
+        RollReason::NewScope,
+        RollReason::Preempted,
+    ];
+
+    /// The wire name (`context_full`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RollReason::ContextFull => "context_full",
+            RollReason::McpUpdated => "mcp_updated",
+            RollReason::DaemonRestarted => "daemon_restarted",
+            RollReason::SessionFault => "session_fault",
+            RollReason::ModelChange => "model_change",
+            RollReason::NewScope => "new_scope",
+            RollReason::Preempted => "preempted",
+        }
+    }
+
+    /// Parse a wire name exactly; `None` is `unknown_reason`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// Whether the roll adds 1 to the unit's follow-ups (§5, §7): every reason
+    /// but `preempted`.
+    pub fn counts_toward_cap(self) -> bool {
+        self != RollReason::Preempted
+    }
+}
+
+impl std::fmt::Display for RollReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The §6.3 refusal codes — a closed list. A refusal leaves the calling session
+/// running so the agent can correct itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalCode {
+    UnknownReason,
+    NotAMember,
+    NotYourSession,
+    CapReached,
+    DepthLimit,
+    ModelNotAllowed,
+    BadBaton,
+    MissingNewSlice,
+    NewSliceNotAllowed,
+    TaskHasNoSlices,
+    OpenItems,
+    FieldNotAllowed,
+}
+
+impl RefusalCode {
+    /// Every code, in §6.3's listing order.
+    pub const ALL: [RefusalCode; 12] = [
+        RefusalCode::UnknownReason,
+        RefusalCode::NotAMember,
+        RefusalCode::NotYourSession,
+        RefusalCode::CapReached,
+        RefusalCode::DepthLimit,
+        RefusalCode::ModelNotAllowed,
+        RefusalCode::BadBaton,
+        RefusalCode::MissingNewSlice,
+        RefusalCode::NewSliceNotAllowed,
+        RefusalCode::TaskHasNoSlices,
+        RefusalCode::OpenItems,
+        RefusalCode::FieldNotAllowed,
+    ];
+
+    /// The wire name (`cap_reached`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusalCode::UnknownReason => "unknown_reason",
+            RefusalCode::NotAMember => "not_a_member",
+            RefusalCode::NotYourSession => "not_your_session",
+            RefusalCode::CapReached => "cap_reached",
+            RefusalCode::DepthLimit => "depth_limit",
+            RefusalCode::ModelNotAllowed => "model_not_allowed",
+            RefusalCode::BadBaton => "bad_baton",
+            RefusalCode::MissingNewSlice => "missing_new_slice",
+            RefusalCode::NewSliceNotAllowed => "new_slice_not_allowed",
+            RefusalCode::TaskHasNoSlices => "task_has_no_slices",
+            RefusalCode::OpenItems => "open_items",
+            RefusalCode::FieldNotAllowed => "field_not_allowed",
+        }
+    }
+}
+
+impl std::fmt::Display for RefusalCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `not_a_member` refusal text, shared by softfig-mcp (which refuses a
+/// non-member before any socket) and growlightd (which refuses an envelope
+/// with no `member`), so both say the same thing.
+pub const NOT_A_MEMBER_MESSAGE: &str = "this session is not a fleet member session (no \
+     SOFTFIG_MEMBER), so it has no growlight_* verbs — a semi-auto or human-directed session \
+     hands off with its baton as before";
+
+/// [`MemberVerbReply::state`] when every §6.3 check passed.
+pub const MEMBER_VERB_VALIDATED: &str = "validated";
+/// [`MemberVerbReply::state`] when a check refused the call.
+pub const MEMBER_VERB_REFUSED: &str = "refused";
+
+/// Reply to a member verb. `state` is a documented string (like
+/// [`LeaseReply::state`]) so the handshake's execution states can join it
+/// without a wire-enum bump: [`MEMBER_VERB_VALIDATED`] (every §6.3 check
+/// passed; `entry`/`unit` name what was validated) or [`MEMBER_VERB_REFUSED`]
+/// (`code` + `message` say why; the session keeps running).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberVerbReply {
+    /// The verb this reply answers.
+    pub verb: String,
+    /// `validated` | `refused`.
+    pub state: String,
+    /// The refusal code, present only when refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<RefusalCode>,
+    /// What to correct, present only when refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The caller's entry (milestone identity), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// The caller's unit — a slice id, `close-out`, or the entry itself
+    /// (`entry`) — when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+impl MemberVerbReply {
+    /// A refusal of `verb` with `code`.
+    pub fn refused(verb: &str, code: RefusalCode, message: impl Into<String>) -> Self {
+        Self {
+            verb: verb.to_string(),
+            state: MEMBER_VERB_REFUSED.to_string(),
+            code: Some(code),
+            message: Some(message.into()),
+            entry: None,
+            unit: None,
+        }
+    }
+
+    /// `verb` passed every §6.3 check for `entry`'s `unit`.
+    pub fn validated(verb: &str, entry: impl Into<String>, unit: impl Into<String>) -> Self {
+        Self {
+            verb: verb.to_string(),
+            state: MEMBER_VERB_VALIDATED.to_string(),
+            code: None,
+            message: None,
+            entry: Some(entry.into()),
+            unit: Some(unit.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The closed lists' wire names are serde's names (no drift between the
+    /// `as_str` the messages print and the JSON a client decodes), and a
+    /// reason parses back exactly — anything else is `unknown_reason`.
+    #[test]
+    fn member_verb_vocabularies_round_trip_their_wire_names() {
+        for r in RollReason::ALL {
+            assert_eq!(serde_json::to_value(r).unwrap(), r.as_str());
+            assert_eq!(RollReason::parse(r.as_str()), Some(r));
+            assert_eq!(r.counts_toward_cap(), r != RollReason::Preempted);
+        }
+        for bad in ["", "Context_Full", "context-full", "rate_limited", "crash"] {
+            assert_eq!(RollReason::parse(bad), None, "{bad:?}");
+        }
+        for c in RefusalCode::ALL {
+            assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+            assert_eq!(c.to_string(), c.as_str());
+        }
+        assert_eq!(op::MEMBER_VERBS.len(), 5);
+    }
+
+    /// The identity rides beside the model's arguments, and an unknown key in
+    /// either level is refused at parse — a smuggled `member` inside `args`
+    /// can't masquerade as the envelope's.
+    #[test]
+    fn a_member_call_keeps_identity_out_of_the_arguments() {
+        let call: MemberCall<CompleteSliceArgs> = serde_json::from_value(serde_json::json!({
+            "member": "oc",
+            "args": { "summary": "s", "baton": "b" },
+        }))
+        .unwrap();
+        assert_eq!(call.member.as_deref(), Some("oc"));
+        assert!(serde_json::from_value::<MemberCall<CompleteSliceArgs>>(serde_json::json!({
+            "args": { "summary": "s", "baton": "b", "member": "forged" },
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<MemberCall<CompleteSliceArgs>>(serde_json::json!({
+            "member": "oc", "extra": 1, "args": { "summary": "s", "baton": "b" },
+        }))
+        .is_err());
+        // An absent member is the non-member call growlightd refuses.
+        let call: MemberCall<CompleteSliceArgs> = serde_json::from_value(serde_json::json!({
+            "args": { "summary": "s", "baton": "b" },
+        }))
+        .unwrap();
+        assert_eq!(call.member, None);
+    }
 
     #[test]
     fn agent_delta_round_trips_tagged() {

@@ -26,6 +26,7 @@ pub(crate) mod chat;
 mod holders;
 mod init;
 mod leases;
+mod member_verbs;
 mod paths;
 mod queue;
 mod queues;
@@ -37,6 +38,10 @@ mod v2;
 pub use holders::{ClaimGate, HolderStore};
 pub use init::growlight_init;
 pub use leases::{release_lease, request_lease};
+pub use member_verbs::{
+    growlight_add_follow_up_session, growlight_add_sub_milestone, growlight_block,
+    growlight_complete_entry, growlight_complete_slice,
+};
 pub use queue_verbs::{
     queue_add_entry, queue_add_project, queue_drop, queue_update_entry, slice_insert, slice_update,
 };

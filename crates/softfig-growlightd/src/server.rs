@@ -15,9 +15,9 @@ use std::path::Path;
 
 use softfig_ipc::growlightd::{
     op, AgentSpendSummary, AgentSummary, BatonArgs, BatonReply, FleetStatusReply, ForceStopArgs,
-    InjectMessageArgs, InjectReply, PausedReply, ReleaseLeaseArgs, RequestLeaseArgs,
-    RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs, SetResourcesArgs,
-    SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
+    InjectMessageArgs, InjectReply, MemberCall, MemberVerbReply, PausedReply, RefusalCode,
+    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply,
+    SetPolicyArgs, SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
 };
 use softfig_ipc::{ErrorKind, Request, Response};
 
@@ -27,6 +27,7 @@ use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::drive_loop::AgentHealthSource;
 use crate::fleet::{FleetMemberConfig, MemberBackend};
+use crate::member_verbs::{self, MemberVerb, Refusal, VerbError};
 use crate::opencode_backend::ModelSelection;
 use crate::resume::ResumeOutcome;
 use crate::state::State;
@@ -156,6 +157,13 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
         op::RELEASE_LEASE => write_one_shot(&mut stream, release_lease(&daemon, &req)),
         op::REQUEST_RESTART => write_one_shot(&mut stream, request_restart(&daemon, &req)),
+        // Member verbs (spec-growlight-queue §6.1–§6.6) — one-shot. A refusal
+        // is an ok reply with `state: refused`; it never touches the session.
+        op::GROWLIGHT_ADD_FOLLOW_UP_SESSION
+        | op::GROWLIGHT_COMPLETE_SLICE
+        | op::GROWLIGHT_COMPLETE_ENTRY
+        | op::GROWLIGHT_BLOCK
+        | op::GROWLIGHT_ADD_SUB_MILESTONE => write_one_shot(&mut stream, member_verb(&daemon, &req)),
         // ack-before-teardown: flush the ack, THEN flip to Stopping, so the
         // client is guaranteed its reply before the accept loop winds down
         // (keeperd incident 20260622).
@@ -760,6 +768,87 @@ fn request_restart(daemon: &Daemon, req: &Request) -> Response {
 
 /// Encode a typed reply as a one-shot `Response::ok`, mapping a serialization
 /// failure to an `Internal` error (`what` names the verb for the message).
+/// A queue-v2 member verb (spec-growlight-queue §6.3 step 2 — validation, in
+/// the spec's order): the identity from the envelope, the caller's live v2
+/// assignment (the drive loop's mirror), then [`member_verbs::validate`] over a
+/// fresh read of the v2 list. Every refusal is an ok [`MemberVerbReply`] with
+/// `state: refused` and leaves the calling session untouched — nothing here
+/// signals, kills or rolls it. A pass replies `validated` with the entry and
+/// unit; executing the handshake (commit, store the baton, terminate after
+/// grace, pick) is not built yet.
+///
+/// The v2 list is read through the mount without the daemon lock (the drive
+/// loop's own read path), so a slow read never blocks another verb.
+pub(crate) fn member_verb(daemon: &Daemon, req: &Request) -> Response {
+    let (member, verb) = match decode_member_verb(req) {
+        Ok(decoded) => decoded,
+        Err(resp) => return resp,
+    };
+    let name = verb.name();
+    let refused = |r: Refusal| ok_reply(&MemberVerbReply::refused(name, r.code, r.message), name);
+    let member = match member_verbs::identity(member.as_deref()) {
+        Ok(member) => member.to_string(),
+        Err(r) => return refused(r),
+    };
+    let Some(assignment) = daemon.v2_assignment(&member) else {
+        return refused(member_verbs::no_assignment(&member));
+    };
+    let snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return refused(Refusal {
+                code: RefusalCode::NotYourSession,
+                message: "there is no queue-v2 list (growlight/backlog/queue.toml), so no \
+                          session holds a v2 entry"
+                    .into(),
+            })
+        }
+        Err(e) => {
+            return Response::err(
+                ErrorKind::Io,
+                format!("{name}: the queue-v2 list can't be read, so the call can't be validated: {e}"),
+            )
+        }
+    };
+    match member_verbs::validate(&member, &assignment, &snapshot, verb) {
+        Ok(v) => ok_reply(
+            &MemberVerbReply::validated(
+                name,
+                v.assignment.entry.clone(),
+                member_verbs::unit_label(&v.assignment.unit),
+            ),
+            name,
+        ),
+        Err(VerbError::Refused(r)) => refused(r),
+        Err(VerbError::BadArgs(m)) => Response::err(ErrorKind::BadArgs, format!("{name}: {m}")),
+    }
+}
+
+/// Decode a member verb's [`MemberCall`] envelope by op: the identity it
+/// carries and the typed verb.
+fn decode_member_verb(
+    req: &Request,
+) -> std::result::Result<(Option<String>, MemberVerb), Response> {
+    fn take<A: serde::de::DeserializeOwned>(
+        req: &Request,
+        wrap: fn(A) -> MemberVerb,
+    ) -> std::result::Result<(Option<String>, MemberVerb), Response> {
+        let call: MemberCall<A> = parse_args(req)?;
+        Ok((call.member, wrap(call.args)))
+    }
+    match req.op.as_str() {
+        op::GROWLIGHT_ADD_FOLLOW_UP_SESSION => take(req, MemberVerb::AddFollowUpSession),
+        op::GROWLIGHT_COMPLETE_SLICE => take(req, MemberVerb::CompleteSlice),
+        op::GROWLIGHT_COMPLETE_ENTRY => take(req, MemberVerb::CompleteEntry),
+        op::GROWLIGHT_BLOCK => take(req, MemberVerb::Block),
+        op::GROWLIGHT_ADD_SUB_MILESTONE => take(req, MemberVerb::AddSubMilestone),
+        other => Err(Response::err(
+            ErrorKind::BadArgs,
+            format!("{other:?} is not a member verb"),
+        )),
+    }
+}
+
 fn ok_reply<T: serde::Serialize>(reply: &T, what: &str) -> Response {
     match serde_json::to_value(reply) {
         Ok(v) => Response::ok(v),

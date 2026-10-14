@@ -2163,6 +2163,11 @@ impl DriveLoop {
         }
         }
 
+        // Mirror the v2 assignments for the member verbs' assignment-match check
+        // (queue-v2-scheduling slice 008): every insert/remove above happened this
+        // tick, so the copy is current before any spawned session can call a verb.
+        self.daemon.publish_v2_assignments(&self.v2_assignments);
+
         // 4. Route this tick's events through the single owned dispatcher (spec
         //    §9). The report is still RETURNED for the caller (and tests) to
         //    inspect — dispatch is the live side-effect on top of it.
@@ -6052,6 +6057,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                         id: slice_id.into(),
                         status: SliceStatus::Queued,
                         models,
+                        follow_ups: 0,
                     }],
                     models: None,
                 },
@@ -6383,5 +6389,137 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             vec!["m1".to_string()],
             "the entry is parked via the keeperd set_status op",
         );
+    }
+
+    // ---- queue v2 member verbs (slice 008) ----
+
+    /// SLICE 008 — the member verbs validate against the LIVE assignment the
+    /// drive loop mirrors to the daemon, over a fresh read of the v2 list; a
+    /// non-member is refused; and a refusal leaves the session running — the
+    /// fake backend's member is neither killed, re-rolled nor re-spawned, and
+    /// keeps its assignment. (A pass is validation only: the handshake's
+    /// execution half is not built, so it too leaves the session alone.)
+    #[test]
+    fn v2_member_verbs_validate_against_the_live_assignment_and_a_refusal_leaves_the_session_running() {
+        use softfig_ipc::growlightd::{op as gop, MemberVerbReply, RefusalCode, MEMBER_VERB_REFUSED};
+        use softfig_ipc::queue_v2::{
+            slices_file, Entry, Project, QueueToml, SliceItem, SlicesToml, QUEUE_FILE,
+        };
+        use softfig_ipc::{Request, Response};
+
+        // The garden as keeperd's claim left it: m1 active, its slice 001 active.
+        let root = std::env::temp_dir().join(format!("v2-member-verbs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, content: String| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(
+            QUEUE_FILE,
+            QueueToml::new(
+                vec![Project {
+                    name: "softfig".into(),
+                    repo: "/garden".into(),
+                    main: "main".into(),
+                }],
+                vec![Entry {
+                    id: "m1".into(),
+                    kind: EntryKind::Milestone,
+                    title: "m1".into(),
+                    project: "softfig".into(),
+                    lane: Lane::Normal,
+                    status: EntryStatus::Active,
+                    after: vec![],
+                    added: "2026-10-14T00:00:00Z".into(),
+                    branch: "feat/m1".into(),
+                    parent: String::new(),
+                    base: String::new(),
+                    claimed: "2026-10-14T00:01:00Z".into(),
+                    follow_ups: 0,
+                    pending_status: None,
+                }],
+            )
+            .to_toml()
+            .unwrap(),
+        );
+        write(
+            &slices_file("m1"),
+            SlicesToml::new(
+                "m1".into(),
+                vec![SliceItem {
+                    kind: SliceKind::Slice,
+                    id: "001".into(),
+                    status: SliceStatus::Active,
+                    follow_ups: Some(0),
+                }],
+            )
+            .to_toml()
+            .unwrap(),
+        );
+
+        let entries_dir = root.join("entries");
+        let (mut loop_, d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        d.inner.lock().unwrap().config.garden_root = root.clone();
+
+        assert!(d.v2_assignment("a1").is_none(), "nothing assigned before the first tick");
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "a1 is spawned on m1/001: {r:?}");
+        assert_eq!(
+            d.v2_assignment("a1").as_ref(),
+            r.v2_started.first(),
+            "the tick mirrors its assignment for the verbs",
+        );
+
+        let call = |member: Option<&str>, verb: &str, args: serde_json::Value| -> MemberVerbReply {
+            let mut envelope = serde_json::json!({ "args": args });
+            if let Some(member) = member {
+                envelope["member"] = member.into();
+            }
+            match crate::server::member_verb(&d, &Request::new(verb, envelope)) {
+                Response::Ok { data, .. } => serde_json::from_value(data).unwrap(),
+                Response::Err { error, .. } => panic!("{verb}: transport error {error}"),
+            }
+        };
+        let baton = "---\nstatus: IN_PROGRESS\nitem: m1\n---\n# NEXT ACTION\nnext\n";
+
+        // A non-member, and a member holding no assignment, are refused.
+        let reply = call(None, gop::GROWLIGHT_COMPLETE_SLICE, serde_json::json!({ "summary": "s", "baton": baton }));
+        assert_eq!(reply.code, Some(RefusalCode::NotAMember));
+        let reply = call(Some("a9"), gop::GROWLIGHT_COMPLETE_SLICE, serde_json::json!({ "summary": "s", "baton": baton }));
+        assert_eq!(reply.code, Some(RefusalCode::NotYourSession));
+
+        // a1's own call, refused on its reason …
+        let reply = call(
+            Some("a1"),
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({ "reason": "out_of_coffee", "baton": baton }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_REFUSED);
+        assert_eq!(reply.code, Some(RefusalCode::UnknownReason));
+
+        // … and the session keeps running: the next tick neither kills, rolls,
+        // nor re-spawns a1, and its assignment stands.
+        let r = loop_.tick(1);
+        assert!(r.v2_started.is_empty(), "no new spawn: {r:?}");
+        assert!(r.exit_dispositions.is_empty() && r.rerolls.is_empty() && r.retired.is_empty(), "{r:?}");
+        assert_eq!(backend.spawned_specs().len(), 1, "still the one spawn");
+        assert_eq!(backend.kill_count(), 0, "nothing killed");
+        assert!(d.v2_assignment("a1").is_some(), "a1 still holds m1/001");
+
+        // A well-formed call validates against the live assignment.
+        let reply = call(Some("a1"), gop::GROWLIGHT_COMPLETE_SLICE, serde_json::json!({ "summary": "s", "baton": baton }));
+        assert_eq!(
+            reply,
+            MemberVerbReply::validated(gop::GROWLIGHT_COMPLETE_SLICE, "m1", "001"),
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
