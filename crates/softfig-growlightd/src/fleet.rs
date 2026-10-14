@@ -358,7 +358,15 @@ pub struct FleetConfig {
     /// source on (slice 006). Parsed and stored here; an unknown value never
     /// reaches this struct — it is refused at parse, fail-closed.
     pub queue: QueueMode,
+    /// `roll_grace_secs` — how long a v2 member may linger after its handshake
+    /// before growlightd terminates the session (§6.3 step 4: on exit or after
+    /// the grace, whichever comes first). Absent ⇒ [`DEFAULT_ROLL_GRACE_SECS`].
+    pub roll_grace_secs: u64,
 }
+
+/// §6.3 step 4's default grace between a member's handshake and growlightd
+/// terminating its session.
+pub const DEFAULT_ROLL_GRACE_SECS: u64 = 20;
 
 impl FleetConfig {
     /// The fail-closed default: gate off, no members, default bin/prompt.
@@ -373,6 +381,7 @@ impl FleetConfig {
             build_caps: BuildCaps::default(),
             max_iterations: None,
             queue: QueueMode::Legacy,
+            roll_grace_secs: DEFAULT_ROLL_GRACE_SECS,
         }
     }
 
@@ -398,6 +407,8 @@ impl FleetConfig {
             /// value is a TOML parse error (fail-closed at the loader).
             #[serde(default)]
             queue: QueueMode,
+            /// §6.3 step 4's grace. Absent ⇒ the default.
+            roll_grace_secs: Option<u64>,
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
@@ -443,6 +454,7 @@ impl FleetConfig {
             build_caps: doc.build_caps,
             max_iterations: doc.max_iterations,
             queue: doc.queue,
+            roll_grace_secs: doc.roll_grace_secs.unwrap_or(DEFAULT_ROLL_GRACE_SECS),
         })
     }
 }
@@ -542,10 +554,7 @@ pub fn assemble_fleet(
     let agents_dir = runtime_agents_dir();
     // The garden's directory name — a cosmetic `loop:` tag in the seed baton,
     // matching the single-agent baton's frontmatter.
-    let garden_name = garden_root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| PILLAR.to_string());
+    let garden_name = garden_tag(&garden_root);
 
     // One per-member baton store over the SAME runtime `agents/` namespace the
     // pre-approval generators write each agent's config into (and the boot hook
@@ -620,6 +629,16 @@ pub fn assemble_fleet(
             parker: Box::new(KeeperdV2ItemParker::new(keeperd_socket.to_path_buf())),
         })
     })
+}
+
+/// The garden's directory name — the cosmetic `loop:` tag seeded batons carry,
+/// matching the single-agent baton's frontmatter. Shared by the fleet assembly
+/// and the handshake's entry-baton store (`main`), so the two never tag apart.
+pub fn garden_tag(garden_root: &Path) -> String {
+    garden_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| PILLAR.to_string())
 }
 
 /// Build each member's configured backend and route the roster to it (slice 005).
@@ -1081,6 +1100,7 @@ agent = "reviewer"
         // the mode the live garden runs on today.
         let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\n").unwrap();
         assert_eq!(cfg.queue, QueueMode::Legacy, "the key omitted ⇒ legacy");
+        assert_eq!(cfg.roll_grace_secs, DEFAULT_ROLL_GRACE_SECS, "the grace omitted ⇒ 20 s");
         assert_eq!(FleetConfig::disabled().queue, QueueMode::Legacy);
 
         // `queue = "v2"` parses — growlightd schedules from the v2 files (slice 006
@@ -1088,6 +1108,8 @@ agent = "reviewer"
         let v2 = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"v2\"\n")
             .unwrap();
         assert_eq!(v2.queue, QueueMode::V2);
+        let graced = FleetConfig::from_growlight_toml("roll_grace_secs = 5\n").unwrap();
+        assert_eq!(graced.roll_grace_secs, 5, "an explicit grace is kept");
 
         // `queue = "legacy"` is explicit-but-equivalent.
         let legacy =

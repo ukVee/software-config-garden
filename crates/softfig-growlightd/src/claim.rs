@@ -37,10 +37,15 @@
 
 use std::path::{Path, PathBuf};
 
-use softfig_ipc::verbs::{op, DaemonStatusArg, QueueV2ClaimArgs, QueueV2SetStatusArgs, SetItemStatusArgs};
+use softfig_ipc::verbs::{
+    op, DaemonStatusArg, QueueV2ClaimArgs, QueueV2DeferredArgs, QueueV2FollowUpsArgs,
+    QueueV2SessionLogArgs, QueueV2SetStatusArgs, QueueV2SetStatusReply, SetItemStatusArgs,
+    SliceInsertArgs, SliceInsertReply,
+};
 use softfig_ipc::{call_reconnecting, ReconnectError, Request, Response, RetryPolicy};
 
 use crate::drive_loop::{ItemParker, PartClaimer, V2Claimer, V2ItemParker};
+use crate::member_handoff::{KeeperOp, KeeperOutcome, V2Keeper};
 
 /// The status a claim writes. keeperd enforces single-active scoped to the
 /// queue's region, so this marks exactly one part `active` per queue.
@@ -215,17 +220,126 @@ impl KeeperdV2ItemParker {
     }
 }
 
-impl V2ItemParker for KeeperdV2ItemParker {
-    fn park_entry_v2(&self, entry: &str) -> Result<(), String> {
+impl KeeperdV2ItemParker {
+    /// One entry-level `queue_v2_set_status(entry, new)` round-trip.
+    fn set_entry(&self, what: &str, entry: &str, new: DaemonStatusArg) -> Result<(), String> {
         let args = serde_json::to_value(QueueV2SetStatusArgs {
             entry: entry.to_string(),
             unit: None,
-            new: DaemonStatusArg::Blocked,
+            new,
         })
         .map_err(|e| format!("encode queue_v2_set_status args: {e}"))?;
         let req = Request::new(op::QUEUE_V2_SET_STATUS, args);
         let result = call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default());
-        classify_status_write("v2 block", &self.keeperd_socket, result)
+        classify_status_write(what, &self.keeperd_socket, result)
+    }
+}
+
+impl V2ItemParker for KeeperdV2ItemParker {
+    fn park_entry_v2(&self, entry: &str) -> Result<(), String> {
+        self.set_entry("v2 block", entry, DaemonStatusArg::Blocked)
+    }
+
+    fn pause_entry_v2(&self, entry: &str) -> Result<(), String> {
+        self.set_entry("v2 pause", entry, DaemonStatusArg::Paused)
+    }
+}
+
+/// The live [`V2Keeper`] (queue-v2-scheduling slice 009): the handshake's
+/// commit over the keeperd socket — slice 005's daemon ops plus the human
+/// `slice_insert` verb for `new_scope`'s slice. growlightd calls them as
+/// keeperd's client, so the slice insert carries no member identity and §6.7's
+/// member gating does not apply to it (the member's slice body was already
+/// held to the subset rule at validation).
+#[derive(Debug, Clone)]
+pub struct KeeperdV2Keeper {
+    keeperd_socket: PathBuf,
+}
+
+impl KeeperdV2Keeper {
+    /// Bind the keeper to keeperd's listen socket.
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self { keeperd_socket }
+    }
+}
+
+impl V2Keeper for KeeperdV2Keeper {
+    fn apply(&self, op_: &KeeperOp) -> Result<KeeperOutcome, String> {
+        let encode = |e: serde_json::Error| format!("encode {} args: {e}", op_.name());
+        let (name, args) = match op_ {
+            KeeperOp::SessionLog { entry, unit, line } => (
+                op::QUEUE_V2_SESSION_LOG,
+                serde_json::to_value(QueueV2SessionLogArgs {
+                    entry: entry.clone(),
+                    unit: unit.clone(),
+                    line: line.clone(),
+                }),
+            ),
+            KeeperOp::SetStatus { entry, unit, new } => (
+                op::QUEUE_V2_SET_STATUS,
+                serde_json::to_value(QueueV2SetStatusArgs {
+                    entry: entry.clone(),
+                    unit: unit.clone(),
+                    new: *new,
+                }),
+            ),
+            KeeperOp::FollowUps { entry, unit, count } => (
+                op::QUEUE_V2_FOLLOW_UPS,
+                serde_json::to_value(QueueV2FollowUpsArgs {
+                    entry: entry.clone(),
+                    unit: unit.clone(),
+                    count: *count,
+                }),
+            ),
+            KeeperOp::Deferred { entry, tests } => (
+                op::QUEUE_V2_DEFERRED,
+                serde_json::to_value(QueueV2DeferredArgs {
+                    entry: entry.clone(),
+                    tests: tests.clone(),
+                }),
+            ),
+            KeeperOp::SliceInsert {
+                milestone,
+                slug,
+                title,
+                body,
+                before,
+            } => (
+                op::SLICE_INSERT,
+                serde_json::to_value(SliceInsertArgs {
+                    milestone: milestone.clone(),
+                    slug: slug.clone(),
+                    title: Some(title.clone()),
+                    body: body.clone(),
+                    position: Some("before".into()),
+                    ref_id: Some(before.clone()),
+                    dry_run: false,
+                }),
+            ),
+        };
+        let req = Request::new(name, args.map_err(encode)?);
+        match call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default()) {
+            Ok(Response::Ok { data, .. }) => Ok(match op_ {
+                KeeperOp::SetStatus { .. } => KeeperOutcome::Status(
+                    serde_json::from_value::<QueueV2SetStatusReply>(data)
+                        .map_err(|e| format!("decode {name} reply: {e}"))?
+                        .status,
+                ),
+                KeeperOp::SliceInsert { .. } => KeeperOutcome::Inserted(
+                    serde_json::from_value::<SliceInsertReply>(data)
+                        .map_err(|e| format!("decode {name} reply: {e}"))?
+                        .id,
+                ),
+                _ => KeeperOutcome::Done,
+            }),
+            Ok(Response::Err { kind, error, .. }) => {
+                Err(format!("keeperd refused {name} ({kind:?}): {error}"))
+            }
+            Err(e) => Err(format!(
+                "{name} to keeperd at {} failed: {e}",
+                self.keeperd_socket.display()
+            )),
+        }
     }
 }
 

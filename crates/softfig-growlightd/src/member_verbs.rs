@@ -23,8 +23,8 @@
 //! **A refusal leaves the session running** (§6.3): nothing here, nor in the
 //! server on a refusal, touches the session — the agent reads the refusal text
 //! and corrects itself. A pass returns the [`Validated`] action; executing it
-//! (commit, store the baton, terminate after grace, pick) is the handshake's
-//! execution half, built separately.
+//! (commit, store the baton) is [`crate::member_handoff`], and terminating the
+//! session after the grace and picking is the drive loop's.
 //!
 //! ## Decisions recorded in the slice doc
 //!
@@ -731,6 +731,7 @@ mod tests {
             after: vec![],
             claimed: "2026-10-14T00:00Z".into(),
             follow_ups: 0,
+            pending: None,
             holder: None,
             models: None,
         }

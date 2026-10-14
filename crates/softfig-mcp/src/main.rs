@@ -23,7 +23,7 @@ use softfig_ipc::{
     growlightd::{
         AddFollowUpSessionArgs, AddSubMilestoneArgs, BlockArgs, CompleteEntryArgs,
         CompleteSliceArgs, MemberCall, MemberVerbReply, RefusalCode, ReleaseLeaseArgs,
-        RequestLeaseArgs, MEMBER_VERB_REFUSED, NOT_A_MEMBER_MESSAGE,
+        RequestLeaseArgs, MEMBER_VERB_OK, MEMBER_VERB_REFUSED, NOT_A_MEMBER_MESSAGE,
     },
     MemberIdentity,
     verbs::{
@@ -1119,10 +1119,25 @@ fn summarize_member_verb(data: &Value) -> String {
     }
     let entry = reply.entry.as_deref().unwrap_or("?");
     let unit = reply.unit.as_deref().unwrap_or("?");
+    if reply.state == MEMBER_VERB_OK {
+        // §6.3 steps 3–4: committed; the agent's part is to stop.
+        let next = match &reply.next {
+            Some(next) => format!("next for this entry: {} / {}", next.entry, next.unit),
+            None => "the entry has left active work".to_string(),
+        };
+        let mut out = format!(
+            "{verb}: handed off {entry} / {unit} — committed, and your baton is stored as the \
+             entry's ({next}). This session is over: end your turn now; growlightd ends the \
+             session and picks this member's next work."
+        );
+        for w in &reply.warnings {
+            out.push_str(&format!("\nwarning: {w}"));
+        }
+        return out;
+    }
     format!(
-        "{verb}: {} for {entry} / {unit} — every §6.3 check passed. The handshake's \
-         execution half (commit, baton, roll) is not built yet: nothing was written and this \
-         session keeps running.",
+        "{verb}: {} for {entry} / {unit} — every §6.3 check passed, but this verb's execution \
+         is not built yet: nothing was written and this session keeps running.",
         reply.state
     )
 }
@@ -1706,6 +1721,23 @@ mod tests {
                 .unwrap();
         let text = summarize("growlight_complete_slice", &validated);
         assert!(text.starts_with("growlight_complete_slice: validated for m / 003"), "{text}");
+        // The handoff (slice 009): committed, what runs next, stop now.
+        let ok = serde_json::to_value(MemberVerbReply::ok(
+            "growlight_complete_slice",
+            "m",
+            "003",
+            Some(softfig_ipc::growlightd::NextUnit {
+                entry: "m".into(),
+                unit: "004".into(),
+            }),
+            vec!["queue_v2_follow_ups failed".into()],
+        ))
+        .unwrap();
+        let text = summarize("growlight_complete_slice", &ok);
+        assert!(text.starts_with("growlight_complete_slice: handed off m / 003"), "{text}");
+        assert!(text.contains("next for this entry: m / 004"), "{text}");
+        assert!(text.contains("end your turn now"), "{text}");
+        assert!(text.ends_with("warning: queue_v2_follow_ups failed"), "{text}");
     }
 
     #[test]

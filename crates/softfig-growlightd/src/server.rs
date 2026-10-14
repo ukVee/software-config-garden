@@ -810,17 +810,60 @@ pub(crate) fn member_verb(daemon: &Daemon, req: &Request) -> Response {
             )
         }
     };
-    match member_verbs::validate(&member, &assignment, &snapshot, verb) {
-        Ok(v) => ok_reply(
-            &MemberVerbReply::validated(
+    let v = match member_verbs::validate(&member, &assignment, &snapshot, verb) {
+        Ok(v) => v,
+        Err(VerbError::Refused(r)) => return refused(r),
+        Err(VerbError::BadArgs(m)) => {
+            return Response::err(ErrorKind::BadArgs, format!("{name}: {m}"))
+        }
+    };
+    let unit = member_verbs::unit_label(&v.assignment.unit);
+    // The sub-milestone's execution (keeperd creating the sub, `split`,
+    // placement) is the cap slice's; until then a valid call is reported as
+    // validated and executes nothing, so the session keeps running.
+    if matches!(v.verb, member_verbs::MemberVerb::AddSubMilestone(_)) {
+        return ok_reply(&MemberVerbReply::validated(name, v.assignment.entry.clone(), unit), name);
+    }
+    let Some(seams) = daemon.v2_handoff_seams() else {
+        return Response::err(
+            ErrorKind::Internal,
+            format!(
+                "{name}: growlightd has no handshake seams installed, so it can't commit a \
+                 handoff — nothing was written and this session keeps running"
+            ),
+        );
+    };
+    // §6.3 step 3. Take the assignment out of the mirror first, so a second
+    // verb from the same session can't validate against work this one moves.
+    if !daemon.begin_v2_handoff(&member, &assignment) {
+        return refused(Refusal {
+            code: RefusalCode::NotYourSession,
+            message: format!(
+                "this session's handoff is already under way or done — member {member} \
+                 no longer holds {} / {unit}",
+                assignment.entry
+            ),
+        });
+    }
+    match crate::member_handoff::execute(&v, &snapshot, &seams) {
+        Ok(done) => {
+            for w in &done.warnings {
+                eprintln!("growlightd: {name} for {member} on {}: {w}", v.assignment.entry);
+            }
+            let reply = MemberVerbReply::ok(
                 name,
                 v.assignment.entry.clone(),
-                member_verbs::unit_label(&v.assignment.unit),
-            ),
-            name,
-        ),
-        Err(VerbError::Refused(r)) => refused(r),
-        Err(VerbError::BadArgs(m)) => Response::err(ErrorKind::BadArgs, format!("{name}: {m}")),
+                unit,
+                done.next,
+                done.warnings,
+            );
+            daemon.commit_v2_handoff(&member, done.handoff);
+            ok_reply(&reply, name)
+        }
+        Err(e) => {
+            daemon.abort_v2_handoff(&member, assignment);
+            Response::err(ErrorKind::Io, format!("{name}: {e}"))
+        }
     }
 }
 

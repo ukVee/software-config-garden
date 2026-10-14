@@ -834,22 +834,25 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 });
                 archived = true;
             }
-            // Finding 8: other status changes on an `active` entry are
-            // applied immediately here. The spec's "takes effect at the next
-            // handshake" deferral needs the handshake itself, which
-            // queue-v2-scheduling builds; the running session is never
-            // killed either way.
-            QueueStatusArg::Queued => {
+            // Finding 8 (§6.8): a status change on an `active` entry takes
+            // effect at its session's next handshake, never mid-session. The
+            // row keeps `active` (the repo rule and the scheduler keep
+            // working) and records the change as `pending_status`; the view
+            // annotates it, and the handshake's `queue_v2_set_status` applies
+            // it at the boundary. Any other entry changes now.
+            QueueStatusArg::Queued | QueueStatusArg::Blocked | QueueStatusArg::Deferred => {
+                let new = match status {
+                    QueueStatusArg::Queued => EntryStatus::Queued, // also unblocks and un-defers
+                    QueueStatusArg::Blocked => EntryStatus::Blocked,
+                    _ => EntryStatus::Deferred,
+                };
                 let idx = idx_of(&queue, &args.id);
-                queue.entries[idx].status = EntryStatus::Queued; // also unblocks and un-defers
-            }
-            QueueStatusArg::Blocked => {
-                let idx = idx_of(&queue, &args.id);
-                queue.entries[idx].status = EntryStatus::Blocked;
-            }
-            QueueStatusArg::Deferred => {
-                let idx = idx_of(&queue, &args.id);
-                queue.entries[idx].status = EntryStatus::Deferred;
+                let row = &mut queue.entries[idx];
+                if row.status == EntryStatus::Active {
+                    row.pending_status = Some(new);
+                } else {
+                    row.status = new;
+                }
             }
         }
     }
@@ -2619,6 +2622,34 @@ mod tests {
             qs.queue.model.entries.iter().all(|e| e.status == EntryStatus::Queued),
             "queued unblocks and un-defers"
         );
+    }
+
+    /// Finding 8 (§6.8, queue-v2-scheduling slice 009): a human status change
+    /// on an ACTIVE entry is recorded as `pending_status` and the row stays
+    /// `active` — the running session is never interrupted; its next handshake
+    /// applies it. A later change overwrites the pending one, and the view
+    /// shows it.
+    #[test]
+    fn update_entry_on_an_active_entry_records_a_pending_status() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut running = entry("r");
+        running.status = EntryStatus::Active;
+        running.claimed = "2026-10-14T00:00:00Z".into();
+        seed_queue(&daemon, vec![project()], vec![running], None);
+
+        let reply = update_entry(&daemon, serde_json::json!({ "id": "r", "status": "blocked" }))
+            .expect("recorded");
+        assert!(reply.view.contains("active (pending: blocked)"), "{}", reply.view);
+        update_entry(&daemon, serde_json::json!({ "id": "r", "status": "deferred" }))
+            .expect("overwritten");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let r = &qs.queue.model.entries[0];
+        assert_eq!(r.status, EntryStatus::Active, "the running entry keeps active");
+        assert_eq!(r.pending_status, Some(EntryStatus::Deferred), "the latest change is pending");
     }
 
     // ---- slice 006: slice_insert, slice_update, queue_drop -------------

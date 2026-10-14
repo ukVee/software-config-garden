@@ -50,8 +50,8 @@ pub struct Member {
     /// The backend the member runs on (§6.4 backend match; grants §9 remote).
     pub backend: Backend,
     /// The member's pinned **project** (§2: a pin names a project, not a
-    /// queue). `None` = unpinned: steps 1/3 have no filter to apply and the
-    /// member goes straight to step 2 then the fallback.
+    /// queue). `None` = unpinned: steps 1/3 scan with no project filter, so
+    /// the urgent lane still comes first (§9) and the fallback adds nothing.
     pub pin: Option<String>,
 }
 
@@ -83,6 +83,10 @@ pub struct EntryView {
     /// Consecutive follow-ups (§7) — the cap's count for a task, restack or
     /// close-out unit ([`crate::member_verbs`]); the pick itself ignores it.
     pub follow_ups: u64,
+    /// A human status change recorded on this `active` entry and not yet
+    /// applied (finding 8, §6.8): the handshake applies it at the boundary.
+    /// The pick ignores it — the entry is `active` until then.
+    pub pending: Option<EntryStatus>,
     /// Who holds the entry. An `active` entry → the running member; a `paused`
     /// entry → the member that paused it (the step-2 resume preference), or
     /// `None` for a backend-mismatch pause (§6.3 step 5). Runtime state, not
@@ -427,23 +431,20 @@ fn scan_lane(
 ///    project;
 /// 4. else steps 1 and 3 again with no pin filter (the fallback).
 ///
-/// An unpinned member skips steps 1/3 (there is no pinned project to filter
-/// by) and lands on step 2 then the fallback. `None` when nothing is workable
-/// for this member anywhere.
+/// An unpinned member runs steps 1/3 with no project filter: the urgent lane
+/// still precedes its own resume, so urgent work takes every member at its
+/// next handshake (§9), pinned or not; step 4 then has nothing left to add.
+/// `None` when nothing is workable for this member anywhere.
 pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
     let mut reasons: Vec<Option<SkipReason>> = vec![None; snapshot.entries.len()];
-    let mut picked: Option<(usize, Unit, Option<ModelList>)> = None;
-
-    // 1. Urgent lane, pinned project.
-    if member.pin.is_some() {
-        picked = scan_lane(
-            snapshot,
-            member,
-            Lane::Urgent,
-            member.pin.as_deref(),
-            &mut reasons,
-        );
-    }
+    // 1. Urgent lane, pinned project (every project for an unpinned member).
+    let mut picked: Option<(usize, Unit, Option<ModelList>)> = scan_lane(
+        snapshot,
+        member,
+        Lane::Urgent,
+        member.pin.as_deref(),
+        &mut reasons,
+    );
 
     // 2. Resume the member's own last active|paused entry.
     if picked.is_none() {
@@ -488,8 +489,8 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
         }
     }
 
-    // 3. Normal lane, pinned project.
-    if picked.is_none() && member.pin.is_some() {
+    // 3. Normal lane, pinned project (every project for an unpinned member).
+    if picked.is_none() {
         picked = scan_lane(
             snapshot,
             member,
@@ -499,11 +500,12 @@ pub fn pick_v2(snapshot: &V2Snapshot, member: &Member) -> PickOutcome {
         );
     }
 
-    // 4. Fallback: repeat 1 and 3 with no pin filter.
-    if picked.is_none() {
+    // 4. Fallback: repeat 1 and 3 with no pin filter (an unpinned member's
+    // steps 1/3 already had none).
+    if picked.is_none() && member.pin.is_some() {
         picked = scan_lane(snapshot, member, Lane::Urgent, None, &mut reasons);
     }
-    if picked.is_none() {
+    if picked.is_none() && member.pin.is_some() {
         picked = scan_lane(snapshot, member, Lane::Normal, None, &mut reasons);
     }
 
@@ -549,6 +551,7 @@ mod tests {
             after: vec![],
             claimed: String::new(),
             follow_ups: 0,
+            pending: None,
             holder: None,
             models: None,
         }
@@ -1442,6 +1445,27 @@ mod tests {
                 .map(|p| p.entry.as_str()),
             Some("u")
         );
+    }
+
+    /// §9 (queue-v2-scheduling slice 009): an unpinned member's step 1 scans
+    /// the urgent lane too, so an eligible urgent entry wins over resuming its
+    /// own active entry — preemption at the handshake holds for every member,
+    /// not only pinned ones.
+    #[test]
+    fn an_unpinned_member_takes_urgent_work_before_resuming_its_own() {
+        let mut own = entry("own");
+        own.status = EntryStatus::Active;
+        own.holder = Some("m".into());
+        let mut urgent = entry("u");
+        urgent.lane = Lane::Urgent;
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![urgent.clone(), own.clone()],
+        );
+        snapshot.trees.insert("own".into(), tree(declared(None)));
+        snapshot.trees.insert("u".into(), tree(declared(None)));
+        let outcome = pick_v2(&snapshot, &member("m"));
+        assert_eq!(outcome.picked.as_ref().map(|p| p.entry.as_str()), Some("u"));
     }
 
     #[test]

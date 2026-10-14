@@ -260,6 +260,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
             after: entry.after.clone(),
             claimed: entry.claimed.clone(),
             follow_ups: entry.follow_ups,
+            pending: entry.pending_status,
             // Runtime state, not TOML — the drive loop overlays it (slice
             // 006; slice 002's contract).
             holder: None,

@@ -1090,21 +1090,41 @@ pub const NOT_A_MEMBER_MESSAGE: &str = "this session is not a fleet member sessi
      SOFTFIG_MEMBER), so it has no growlight_* verbs — a semi-auto or human-directed session \
      hands off with its baton as before";
 
-/// [`MemberVerbReply::state`] when every §6.3 check passed.
+/// [`MemberVerbReply::state`] when every §6.3 check passed but nothing was
+/// executed — today only `growlight_add_sub_milestone`, whose execution (the
+/// keeperd sub-milestone) is the cap slice's; the session keeps running.
 pub const MEMBER_VERB_VALIDATED: &str = "validated";
 /// [`MemberVerbReply::state`] when a check refused the call.
 pub const MEMBER_VERB_REFUSED: &str = "refused";
+/// [`MemberVerbReply::state`] when the handshake ran (§6.3 step 3): keeperd
+/// committed the state change, the baton is stored as the entry's, and the
+/// session ends — the agent ends its turn, and growlightd terminates it on
+/// exit or after `roll_grace_secs`.
+pub const MEMBER_VERB_OK: &str = "ok";
+
+/// What runs next for the handed-off entry (§6.3 step 3's `next`): the unit's
+/// milestone identity (`"<parent>/<sub>"` for a sub-milestone's slice, else
+/// the entry id) and the unit (a slice id, `close-out`, or `entry`). The
+/// member that runs it is pick's choice (step 5), so this names the work, not
+/// the worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextUnit {
+    pub entry: String,
+    pub unit: String,
+}
 
 /// Reply to a member verb. `state` is a documented string (like
-/// [`LeaseReply::state`]) so the handshake's execution states can join it
-/// without a wire-enum bump: [`MEMBER_VERB_VALIDATED`] (every §6.3 check
-/// passed; `entry`/`unit` name what was validated) or [`MEMBER_VERB_REFUSED`]
-/// (`code` + `message` say why; the session keeps running).
+/// [`LeaseReply::state`]) so the handshake's states join it without a
+/// wire-enum bump: [`MEMBER_VERB_OK`] (the handoff committed; `next` names
+/// what runs next for the entry, absent when the entry left the active work —
+/// completed, deferred or blocked), [`MEMBER_VERB_VALIDATED`] (every §6.3
+/// check passed, nothing executed) or [`MEMBER_VERB_REFUSED`] (`code` +
+/// `message` say why; the session keeps running).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberVerbReply {
     /// The verb this reply answers.
     pub verb: String,
-    /// `validated` | `refused`.
+    /// `ok` | `validated` | `refused`.
     pub state: String,
     /// The refusal code, present only when refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1119,6 +1139,14 @@ pub struct MemberVerbReply {
     /// (`entry`) — when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// `ok` only: what runs next for the entry; absent when the entry is no
+    /// longer active work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<NextUnit>,
+    /// `ok` only: bookkeeping writes that failed after the handoff committed
+    /// (the handoff stands; growlightd's journal carries the same lines).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl MemberVerbReply {
@@ -1131,6 +1159,8 @@ impl MemberVerbReply {
             message: Some(message.into()),
             entry: None,
             unit: None,
+            next: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -1143,6 +1173,30 @@ impl MemberVerbReply {
             message: None,
             entry: Some(entry.into()),
             unit: Some(unit.into()),
+            next: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// `verb` handed off `entry`'s `unit` (§6.3 step 3): `next` is what runs
+    /// next for the entry, `warnings` any bookkeeping write that failed after
+    /// the commit.
+    pub fn ok(
+        verb: &str,
+        entry: impl Into<String>,
+        unit: impl Into<String>,
+        next: Option<NextUnit>,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            verb: verb.to_string(),
+            state: MEMBER_VERB_OK.to_string(),
+            code: None,
+            message: None,
+            entry: Some(entry.into()),
+            unit: Some(unit.into()),
+            next,
+            warnings,
         }
     }
 }

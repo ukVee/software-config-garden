@@ -742,6 +742,12 @@ pub trait V2Claimer: Send + Sync + fmt::Debug {
 pub trait V2ItemParker: Send + Sync + fmt::Debug {
     /// Park `entry` (entry-level `active → blocked`, no unit).
     fn park_entry_v2(&self, entry: &str) -> Result<(), String>;
+    /// Pause `entry` (entry-level `active → paused`) — §6.3 step 5: a member
+    /// that handed off moves on to other work (urgent work, or a backend
+    /// mismatch on the entry's next unit), and the entry keeps its repo slot
+    /// and counters until a member resumes it (queue-v2-scheduling slice 009).
+    /// A pending human change on the entry lands instead (finding 8).
+    fn pause_entry_v2(&self, entry: &str) -> Result<(), String>;
 }
 
 /// The seam the loop writes a member's baton through at a v2 spawn (§3.6 "At
@@ -835,6 +841,23 @@ pub struct V2Assignment {
     pub resolved_model: ModelChoice,
 }
 
+/// A v2 session the loop ended after its member-verb handoff (§6.3 step 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2SessionEnd {
+    /// The member whose session ended.
+    pub agent: String,
+    /// The entry and unit it handed off.
+    pub entry: String,
+    pub unit: Unit,
+    /// The verb that ended it.
+    pub verb: &'static str,
+    /// `true` when the grace ran out and the loop killed the session; `false`
+    /// when it exited on its own.
+    pub killed: bool,
+    /// `growlight_block`'s `@human` alert text, dispatched with the tick.
+    pub alert: Option<String>,
+}
+
 /// A start the admission governor did not admit this tick — queued (cap) or
 /// refused (budget/rate). Carries the [`StartOutcome`] so the caller can log /
 /// alert the reason.
@@ -895,6 +918,12 @@ pub struct TickReport {
     /// Entries item-parked this tick under queue v2 (a member exited on a
     /// human-block and its entry was marked `blocked` via `queue_v2_set_status`).
     pub v2_parked: Vec<V2Assignment>,
+    /// Sessions ended this tick after a committed member-verb handoff (§6.3
+    /// step 4, slice 009).
+    pub v2_handoffs: Vec<V2SessionEnd>,
+    /// Entries paused this tick at a handshake (§6.3 step 5): `(member, entry)`
+    /// — the member moved on to other work, or idles.
+    pub v2_paused: Vec<(String, String)>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
     /// Fresh starts SKIPPED in step 3 before admission — no workable part, or the
@@ -1106,6 +1135,27 @@ pub struct DriveLoop {
     /// contract — `pick_v2`'s `Held` skip needs it) and (b) know which entry to
     /// park when the member exits on a human-block.
     v2_assignments: std::collections::BTreeMap<String, V2Assignment>,
+    /// Handoffs this loop has seen and not yet ended (queue-v2-scheduling slice
+    /// 009): member → the tick it was first seen, the start of §6.3 step 4's
+    /// `roll_grace_secs` on the loop's own injected clock.
+    v2_handoff_seen: std::collections::BTreeMap<String, i64>,
+    /// Entries a member handed off and still holds until its next pick (§6.3
+    /// step 5): member → entry. The entry stays `active`, overlaid as held by
+    /// this member, so no one else takes it before the member's pick decides:
+    /// resume it, or move on and pause it.
+    v2_rolled: std::collections::BTreeMap<String, String>,
+    /// Paused entries → the member that paused them, the §2 step-2 resume
+    /// preference overlaid as the entry's `holder`.
+    v2_paused_by: std::collections::BTreeMap<String, String>,
+    /// Pauses whose keeperd write failed, retried every tick: entry → the
+    /// pausing member. The entry stays held by that member meanwhile, so the
+    /// failure can't strand it as an `active` entry nobody may take.
+    v2_to_pause: std::collections::BTreeMap<String, String>,
+    /// Accepted model changes (§6.4): the next session of `(entry, unit)` runs
+    /// on this model, overlaid as the unit's allowed list until that unit is
+    /// spawned again — so the backend match routes it to a member that can
+    /// run it, and the spawn resolves to it.
+    v2_model_overrides: Vec<(String, Unit, ModelChoice)>,
     /// When the pre-spawn connectivity gate first held THIS outage (its first offline
     /// tick's `now`), or `None` while online/paused (network-failsafe slice 003).
     /// Drives the sustained-offline alert threshold — a blip clears it before
@@ -1215,6 +1265,11 @@ impl DriveLoop {
             assignments: std::collections::BTreeMap::new(),
             v2: None,
             v2_assignments: std::collections::BTreeMap::new(),
+            v2_handoff_seen: std::collections::BTreeMap::new(),
+            v2_rolled: std::collections::BTreeMap::new(),
+            v2_paused_by: std::collections::BTreeMap::new(),
+            v2_to_pause: std::collections::BTreeMap::new(),
+            v2_model_overrides: Vec::new(),
             offline_since: None,
             offline_alerted: false,
             rate_limit_hold_until: None,
@@ -1446,6 +1501,17 @@ impl DriveLoop {
             let drained = self.daemon.drain_inject_lane(agent);
             if !drained.is_empty() {
                 report.injected.push((agent.clone(), drained));
+            }
+
+            // c0. A v2 session that handed off through a member verb (§6.3 steps
+            //    4–5, slice 009): the server already committed it, so its exit is
+            //    not classified off a baton — the loop ends the session (on exit,
+            //    or after the grace) and step 3 picks for the member.
+            if v2_mode {
+                if let Some(handoff) = self.daemon.v2_handoff(agent) {
+                    self.end_handed_off_session(agent, handoff, now, &mut report);
+                    continue;
+                }
             }
 
             // c. Health-driven lifecycle. No observation (never spawned, or already
@@ -1776,6 +1842,10 @@ impl DriveLoop {
                         }
                     }
                 }
+                // The handshake's overlays (slice 009). Retry a pause that failed
+                // earlier first, so the entry it lands on reads as what it is.
+                self.retry_v2_pauses();
+                self.overlay_v2_handoffs(snapshot);
 
                 // The per-member `pick_v2` input, built from the configured fleet:
                 // backend + roster default from the member's row; the pin carried
@@ -1837,10 +1907,15 @@ impl DriveLoop {
                         let agent = &member.spec.agent;
                         // A stopping/stopped agent is never (re-)started; a registered
                         // one re-rolls via step 2, it is not re-`start`ed.
-                        if self.retiring.contains(agent)
-                            || self.stopped.contains(agent)
-                            || self.supervisor.is_registered(agent)
-                        {
+                        if self.retiring.contains(agent) || self.stopped.contains(agent) {
+                            // A stopping member never re-picks, so an entry it
+                            // handed off and still holds goes to `paused` now.
+                            if let Some(rolled) = self.v2_rolled.remove(agent) {
+                                self.pause_v2_entry(&rolled, agent, &mut report);
+                            }
+                            continue;
+                        }
+                        if self.supervisor.is_registered(agent) {
                             continue;
                         }
                         let Some(v2_member) = v2_members.get(agent.as_str()) else {
@@ -1849,7 +1924,20 @@ impl DriveLoop {
                             // pick with a fabricated member.
                             continue;
                         };
-                        let Some(pick) = pick_v2(snapshot, v2_member).picked else {
+                        let picked = pick_v2(snapshot, v2_member).picked;
+                        // §6.3 step 5 / §9: a member that handed off and is not
+                        // resuming its entry — urgent work won the pick, or the
+                        // entry's next unit needs a model this member's backend
+                        // can't run — leaves it `paused`, keeping its repo slot and
+                        // its slice's counter, for any member to resume.
+                        if let Some(rolled) = self.v2_rolled.remove(agent) {
+                            if picked.as_ref().map(|p| &p.entry) != Some(&rolled) {
+                                self.pause_v2_entry(&rolled, agent, &mut report);
+                            } else {
+                                self.v2_rolled.insert(agent.clone(), rolled);
+                            }
+                        }
+                        let Some(pick) = picked else {
                             // Nothing workable for this member right now — the v2
                             // twin of the legacy held-fresh narration.
                             report.held_fresh.push(HeldFresh {
@@ -1891,13 +1979,16 @@ impl DriveLoop {
                         };
                         // The entry id the per-entry store keys on: the TOP-LEVEL
                         // entry (a `"parent/sub"` identity shares its top-level
-                        // entry's baton, §3.6). The claim op takes the full
-                        // identity; the unit arg is the slice id, omitted for a
-                        // task, restack or close-out.
+                        // entry's baton, §3.6). The claim op takes the unit's
+                        // milestone identity (`"parent/sub"` for a sub-milestone's
+                        // slice — `pick.entry` is always the top-level row, slice
+                        // 005's addressing) and the slice id, omitted for a task,
+                        // restack or close-out.
                         let entry_top = pick.entry.split('/').next().unwrap_or(&pick.entry);
-                        let unit_arg = match &pick.unit {
-                            Unit::Slice { slice, .. } => Some(slice.clone()),
-                            Unit::CloseOut { .. } | Unit::Entry => None,
+                        let (claim_entry, unit_arg) = match &pick.unit {
+                            Unit::Slice { milestone, slice } => (milestone.clone(), Some(slice.clone())),
+                            Unit::CloseOut { milestone } => (milestone.clone(), None),
+                            Unit::Entry => (pick.entry.clone(), None),
                         };
                         // Borrow the v2 seams as locals so the claim closure below
                         // captures disjoint fields while `start_claiming` takes
@@ -1917,12 +2008,19 @@ impl DriveLoop {
                                 // before the keeperd write and never orphans an
                                 // `active` entry.
                                 copy_entry_baton(entries, &**member_writer, entry_top, agent)?;
-                                v2_claimer.claim_v2(&pick.entry, unit_arg.as_deref())
+                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref())
                             },
                         );
                         match outcome {
                             StartOutcome::Started => {
                                 spoken_for.insert(pick.entry.clone());
+                                // The handshake's bookkeeping for this entry is
+                                // spent: it is held by a running member again,
+                                // and a model change reached its session.
+                                self.v2_rolled.remove(agent);
+                                self.v2_paused_by.remove(&pick.entry);
+                                self.v2_model_overrides
+                                    .retain(|(e, u, _)| !(e == &pick.entry && u == &pick.unit));
                                 let assignment = V2Assignment {
                                     agent: agent.clone(),
                                     entry: pick.entry.clone(),
@@ -2211,6 +2309,19 @@ impl DriveLoop {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: part.clone() }, now);
         }
+        // The v2 twins (slice 009): `growlight_block`'s reason reaches @human
+        // (§6.6), and an entry parked on a human-block exit alerts like a
+        // parked legacy head.
+        for end in &report.v2_handoffs {
+            if let Some(alert) = &end.alert {
+                self.dispatcher
+                    .notify(&NotifyEvent::BlockedOnHuman { item: alert.clone() }, now);
+            }
+        }
+        for a in &report.v2_parked {
+            self.dispatcher
+                .notify(&NotifyEvent::BlockedOnHuman { item: a.entry.clone() }, now);
+        }
         // The §9 near-exhaustion alert carries the LIVE fleet-aggregate 5h reserve %
         // (task 031), not the constant rung — so a genuinely-pinned or stale value is
         // diagnosable straight from the log/bus (the old alert always rendered "97%",
@@ -2269,6 +2380,176 @@ impl DriveLoop {
         self.v2_assignments.remove(agent);
         self.stopped.insert(agent.to_string());
         report.retired.push(agent.to_string());
+    }
+
+    /// §6.3 step 4 for a member whose verb committed a handoff (slice 009):
+    /// end the session when its process exits or once `roll_grace_secs` have
+    /// passed since the loop first saw the handoff, whichever comes first. The
+    /// member is then released like an item boundary — slot freed, its budget
+    /// reading and assignment dropped — and step 3 picks for it this tick
+    /// (step 5). An entry that is still active work stays held by this member
+    /// until that pick; a boundary stop (or a reached bounded run) instead
+    /// retires the member and pauses the entry at once, since it will never
+    /// pick.
+    fn end_handed_off_session(
+        &mut self,
+        agent: &str,
+        handoff: crate::member_handoff::V2Handoff,
+        now: i64,
+        report: &mut TickReport,
+    ) {
+        let seen = *self.v2_handoff_seen.entry(agent.to_string()).or_insert(now);
+        let alive = matches!(self.health.health(agent), Some(AgentHealth::Alive { .. }));
+        let grace = i64::try_from(self.daemon.roll_grace_secs()).unwrap_or(i64::MAX);
+        if alive && now.saturating_sub(seen) < grace {
+            return; // the agent is ending its turn; give it the grace
+        }
+        self.daemon.take_v2_handoff(agent);
+        self.v2_handoff_seen.remove(agent);
+        // Deregister; a session still alive past the grace is killed (outside
+        // any daemon lock, the AgentChild contract).
+        let killed = match self.supervisor.retire(agent) {
+            Some(child) if alive => {
+                child.kill();
+                true
+            }
+            _ => false,
+        };
+        self.aggregator.forget(agent);
+        self.reconnecting.remove(agent);
+        self.v2_assignments.remove(agent);
+        let entry = handoff.entry_top().to_string();
+        if let Some(model) = &handoff.next_model {
+            // The same unit's next session runs on the requested model (§6.4).
+            let unit = handoff.assignment.unit.clone();
+            self.v2_model_overrides
+                .retain(|(e, u, _)| !(e == &entry && u == &unit));
+            self.v2_model_overrides.push((entry.clone(), unit, model.clone()));
+        }
+        report.v2_handoffs.push(V2SessionEnd {
+            agent: agent.to_string(),
+            entry: handoff.assignment.entry.clone(),
+            unit: handoff.assignment.unit.clone(),
+            verb: handoff.verb,
+            killed,
+            alert: handoff.alert.clone(),
+        });
+        // A handoff is a completed work chunk, like a clean boundary.
+        let stops = self.retiring.remove(agent) || self.record_iteration();
+        if handoff.continues {
+            if stops {
+                self.pause_v2_entry(&entry, agent, report);
+            } else {
+                self.v2_rolled.insert(agent.to_string(), entry);
+            }
+        }
+        if stops {
+            self.retire(agent, report);
+        }
+    }
+
+    /// Pause `entry` for `agent` (§6.3 step 5) through keeperd. A failed write
+    /// is retried every tick, the entry staying held by `agent` meanwhile.
+    fn pause_v2_entry(&mut self, entry: &str, agent: &str, report: &mut TickReport) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        match seams.parker.pause_entry_v2(entry) {
+            Ok(()) => {
+                self.v2_to_pause.remove(entry);
+                self.v2_paused_by.insert(entry.to_string(), agent.to_string());
+                report.v2_paused.push((agent.to_string(), entry.to_string()));
+            }
+            Err(_) => {
+                self.v2_to_pause.insert(entry.to_string(), agent.to_string());
+            }
+        }
+    }
+
+    /// Re-issue every pause whose keeperd write failed on an earlier tick.
+    fn retry_v2_pauses(&mut self) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        let landed: Vec<(String, String)> = self
+            .v2_to_pause
+            .iter()
+            .filter(|(entry, _)| seams.parker.pause_entry_v2(entry).is_ok())
+            .map(|(entry, agent)| (entry.clone(), agent.clone()))
+            .collect();
+        for (entry, agent) in landed {
+            self.v2_to_pause.remove(&entry);
+            self.v2_paused_by.insert(entry, agent);
+        }
+    }
+
+    /// The handshake's runtime state over this tick's snapshot (slice 009):
+    /// an entry a member handed off and still holds — or whose pause has not
+    /// landed yet — reads as held by that member; a paused entry carries its
+    /// pauser (the step-2 resume preference, slice 002's `holder` contract);
+    /// and an accepted model change becomes its unit's allowed list.
+    fn overlay_v2_handoffs(&mut self, snapshot: &mut scheduler_v2::V2Snapshot) {
+        let hold = |snapshot: &mut scheduler_v2::V2Snapshot, entry: &str, agent: &str, status| {
+            if let Some(e) = snapshot
+                .entries
+                .iter_mut()
+                .find(|e| e.id == entry && e.status == status)
+            {
+                e.holder = Some(agent.to_string());
+            }
+        };
+        for (agent, entry) in &self.v2_rolled {
+            hold(snapshot, entry, agent, EntryStatus::Active);
+        }
+        for (entry, agent) in &self.v2_to_pause {
+            hold(snapshot, entry, agent, EntryStatus::Active);
+        }
+        // A pauser is only a preference while the entry is still paused.
+        self.v2_paused_by.retain(|entry, _| {
+            snapshot
+                .entries
+                .iter()
+                .any(|e| &e.id == entry && e.status == EntryStatus::Paused)
+        });
+        for (entry, agent) in &self.v2_paused_by {
+            hold(snapshot, entry, agent, EntryStatus::Paused);
+        }
+        for (entry, unit, choice) in &self.v2_model_overrides {
+            overlay_unit_model(snapshot, entry, unit, choice);
+        }
+    }
+}
+
+/// Make `choice` the only allowed model of `entry`'s `unit` in the snapshot —
+/// an accepted `model_change` (§6.4), so `pick_v2`'s backend match and the
+/// spawn's resolution both follow it.
+fn overlay_unit_model(
+    snapshot: &mut scheduler_v2::V2Snapshot,
+    entry: &str,
+    unit: &Unit,
+    choice: &ModelChoice,
+) {
+    let list = Some(softfig_ipc::model_choice::ModelList::single(choice.clone()));
+    match unit {
+        Unit::Slice { milestone, slice } => {
+            if let Some(item) = snapshot.trees.get_mut(milestone).and_then(|t| {
+                t.items
+                    .iter_mut()
+                    .find(|i| i.kind == softfig_ipc::queue_v2::SliceKind::Slice && &i.id == slice)
+            }) {
+                item.models = list;
+            }
+        }
+        Unit::CloseOut { milestone } => {
+            if let Some(tree) = snapshot.trees.get_mut(milestone) {
+                tree.models = list;
+            }
+        }
+        Unit::Entry => {
+            if let Some(e) = snapshot.entries.iter_mut().find(|e| e.id == entry) {
+                e.models = list;
+            }
+        }
     }
 }
 
@@ -2338,7 +2619,7 @@ fn v2_unit_label(unit: &Unit) -> String {
 
 /// The journal label for a resolved model (slice 006): `claude` for a claude
 /// member, the `provider/model[#variant]` ref for an opencode one.
-fn model_ref_label(choice: &ModelChoice) -> String {
+pub(crate) fn model_ref_label(choice: &ModelChoice) -> String {
     match choice.backend {
         softfig_ipc::model_choice::Backend::Claude => "claude".to_string(),
         softfig_ipc::model_choice::Backend::Opencode => choice.opencode_model_ref(),
@@ -2526,6 +2807,21 @@ impl TickLogger {
                 "fleet: {} blocked on human — entry-parked v2 {}",
                 a.agent, a.entry
             ));
+        }
+        for end in &r.v2_handoffs {
+            // The handshake's voice (slice 009): which verb handed off which
+            // unit, and whether the session exited or outlived its grace.
+            out.push(format!(
+                "fleet: {} handed off v2 {} · {} via {} (session {})",
+                end.agent,
+                end.entry,
+                v2_unit_label(&end.unit),
+                end.verb,
+                if end.killed { "killed after the grace" } else { "exited" },
+            ));
+        }
+        for (agent, entry) in &r.v2_paused {
+            out.push(format!("fleet: {agent} moved on — v2 {entry} paused for any member to resume"));
         }
         // Transient network exits (network-failsafe slice 002): a latched member
         // whose re-roll is gated by the connectivity hold is re-classified
@@ -6000,10 +6296,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         }
     }
 
-    /// A recording [`V2ItemParker`] — the entry-park the Blocked arm issues.
+    /// A recording [`V2ItemParker`] — the entry-park the Blocked arm issues,
+    /// and the handshake's pause (slice 009), scriptable to fail.
     #[derive(Debug, Default)]
     struct FakeV2Parker {
         parked: Mutex<Vec<String>>,
+        paused: Mutex<Vec<String>>,
+        fail_pause: AtomicBool,
     }
 
     impl V2ItemParker for FakeV2Parker {
@@ -6011,11 +6310,21 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             self.parked.lock().unwrap().push(entry.to_string());
             Ok(())
         }
+        fn pause_entry_v2(&self, entry: &str) -> Result<(), String> {
+            if self.fail_pause.load(Ordering::SeqCst) {
+                return Err("keeperd unreachable".into());
+            }
+            self.paused.lock().unwrap().push(entry.to_string());
+            Ok(())
+        }
     }
 
     impl V2ItemParker for Arc<FakeV2Parker> {
         fn park_entry_v2(&self, entry: &str) -> Result<(), String> {
             (**self).park_entry_v2(entry)
+        }
+        fn pause_entry_v2(&self, entry: &str) -> Result<(), String> {
+            (**self).pause_entry_v2(entry)
         }
     }
 
@@ -6046,6 +6355,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 after: vec![],
                 claimed: "2026-10-14T00:00Z".into(),
                 follow_ups: 0,
+                pending: None,
                 holder: None,
                 models: None,
             }],
@@ -6514,12 +6824,509 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(backend.kill_count(), 0, "nothing killed");
         assert!(d.v2_assignment("a1").is_some(), "a1 still holds m1/001");
 
-        // A well-formed call validates against the live assignment.
-        let reply = call(Some("a1"), gop::GROWLIGHT_COMPLETE_SLICE, serde_json::json!({ "summary": "s", "baton": baton }));
+        // A well-formed call validates against the live assignment; with no
+        // handshake seams installed it can't commit, so it errors and the
+        // session keeps its assignment (slice 009's fail-closed path).
+        let envelope = serde_json::json!({ "member": "a1", "args": { "summary": "s", "baton": baton } });
+        match crate::server::member_verb(&d, &Request::new(gop::GROWLIGHT_COMPLETE_SLICE, envelope)) {
+            Response::Err { error, .. } => assert!(error.contains("no handshake seams"), "{error}"),
+            Response::Ok { data, .. } => panic!("committed without seams: {data}"),
+        }
+        assert!(d.v2_assignment("a1").is_some(), "a1 still holds m1/001");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- queue v2 handshake execution (slice 009) ----
+    //
+    // The fake-backend tests the slice's acceptance names. The loop and the
+    // server read the SAME temp garden through the real v2 source, keeperd is
+    // a recording spy, and the test plays keeperd's commit by rewriting the
+    // files the spy's ops would have changed.
+
+    use crate::member_handoff::tests::SpyKeeper;
+    use crate::member_handoff::{HandoffSeams, KeeperOp};
+    use softfig_ipc::growlightd::{op as gop, MemberVerbReply, NextUnit, RefusalCode, MEMBER_VERB_OK};
+    use softfig_ipc::queue_v2::{slices_file, Entry, Project, QueueToml, SliceItem, SlicesToml, QUEUE_FILE};
+    use softfig_ipc::verbs::DaemonStatusArg;
+
+    /// A throwaway garden the v2 source reads.
+    struct TestGarden {
+        root: PathBuf,
+    }
+
+    impl TestGarden {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "v2-handshake-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+        fn write(&self, rel: &str, content: &str) {
+            let path = self.root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        /// `queue.toml` with these rows, all in project `softfig`.
+        fn queue(&self, entries: Vec<Entry>) {
+            let project = Project {
+                name: "softfig".into(),
+                repo: "/garden".into(),
+                main: "main".into(),
+            };
+            self.write(QUEUE_FILE, &QueueToml::new(vec![project], entries).to_toml().unwrap());
+        }
+        /// `m`'s `slices.toml`: `(id, status, follow_ups)` in order.
+        fn slices(&self, m: &str, items: &[(&str, SliceStatus, u64)]) {
+            let items = items
+                .iter()
+                .map(|(id, status, follow_ups)| SliceItem {
+                    kind: SliceKind::Slice,
+                    id: (*id).into(),
+                    status: *status,
+                    follow_ups: Some(*follow_ups),
+                })
+                .collect();
+            self.write(&slices_file(m), &SlicesToml::new(m.into(), items).to_toml().unwrap());
+        }
+    }
+
+    impl Drop for TestGarden {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn row(id: &str, kind: EntryKind, lane: Lane, status: EntryStatus) -> Entry {
+        Entry {
+            id: id.into(),
+            kind,
+            title: id.into(),
+            project: "softfig".into(),
+            lane,
+            status,
+            after: vec![],
+            added: "2026-10-14T00:00:00Z".into(),
+            branch: format!("feat/{id}"),
+            parent: String::new(),
+            base: String::new(),
+            claimed: if status == EntryStatus::Queued {
+                String::new()
+            } else {
+                "2026-10-14T00:01:00Z".into()
+            },
+            follow_ups: 0,
+            pending_status: None,
+        }
+    }
+
+    fn milestone_row(id: &str, status: EntryStatus) -> Entry {
+        row(id, EntryKind::Milestone, Lane::Normal, status)
+    }
+
+    /// A v2 loop over the garden's real v2 source, with the server-side
+    /// handshake seams installed over a spy keeper; both sides share one
+    /// entry-baton store.
+    #[allow(clippy::type_complexity)]
+    fn make_handshake(
+        fleet: Vec<FleetMember>,
+        garden: &TestGarden,
+    ) -> (
+        DriveLoop,
+        Daemon,
+        Arc<FakeFleet>,
+        Arc<FakeV2Claimer>,
+        Arc<FakeV2Parker>,
+        Arc<SpyKeeper>,
+    ) {
+        let (drive, d, backend, _legacy_claimer, _legacy_parker, _queues, _probe) =
+            make_full(fleet, vec![], Policy::default());
+        let mut cfg = FleetConfig::disabled();
+        cfg.queue = QueueMode::V2;
+        d.set_fleet_config(cfg);
+        d.inner.lock().unwrap().config.garden_root = garden.root.clone();
+        let entries = garden.root.join("entries");
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let drive = drive.with_v2(V2Seams {
+            source: Box::new(crate::v2_source::V2Source::new(garden.root.clone())),
+            entries: FsEntryBatonStore::new(entries.clone(), "garden"),
+            member_writer: Box::new(Arc::clone(&backend)),
+            claimer: Box::new(Arc::clone(&claimer)),
+            parker: Box::new(Arc::clone(&parker)),
+        });
+        let keeper = Arc::new(SpyKeeper::default());
+        let mut d = d;
+        d.v2_handoff = Some(Arc::new(HandoffSeams {
+            keeper: Box::new(Arc::clone(&keeper)),
+            entries: FsEntryBatonStore::new(entries, "garden"),
+        }));
+        (drive, d, backend, claimer, parker, keeper)
+    }
+
+    /// Call a member verb as `member` through the server's handler.
+    fn verb_call(d: &Daemon, member: &str, verb: &str, args: serde_json::Value) -> MemberVerbReply {
+        let envelope = serde_json::json!({ "member": member, "args": args });
+        match crate::server::member_verb(d, &softfig_ipc::Request::new(verb, envelope)) {
+            softfig_ipc::Response::Ok { data, .. } => serde_json::from_value(data).unwrap(),
+            softfig_ipc::Response::Err { error, .. } => panic!("{verb}: transport error {error}"),
+        }
+    }
+
+    fn handoff_baton(item: &str, status: &str, next: &str) -> String {
+        format!("---\nstatus: {status}\nitem: {item}\n---\n# NEXT ACTION\n{next}\n")
+    }
+
+    /// SLICE 009 — complete_slice end to end: the server commits (the session
+    /// log, then the slice `done`), stores the baton as the entry's and replies
+    /// `ok` with the next unit; a repeat call is refused (the session no longer
+    /// holds the work); the loop lets the live session finish its turn inside
+    /// the grace, kills it once the grace runs out, and step 3 re-picks the
+    /// member onto the entry's next slice with the stored baton copied in.
+    #[test]
+    fn v2_complete_slice_commits_stores_the_baton_and_rolls_after_the_grace() {
+        let garden = TestGarden::new("complete-slice");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0), ("002", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "a1 starts on m1/001: {r:?}");
+        // keeperd's claim, as the files show it.
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0), ("002", SliceStatus::Queued, 0)]);
+
+        let baton = handoff_baton("m1", "IN_PROGRESS", "start slice 002");
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_SLICE,
+            serde_json::json!({ "summary": "built 001", "baton": baton }),
+        );
         assert_eq!(
             reply,
-            MemberVerbReply::validated(gop::GROWLIGHT_COMPLETE_SLICE, "m1", "001"),
+            MemberVerbReply::ok(
+                gop::GROWLIGHT_COMPLETE_SLICE,
+                "m1",
+                "001",
+                Some(NextUnit { entry: "m1".into(), unit: "002".into() }),
+                vec![],
+            ),
         );
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            *keeper.ops.lock().unwrap(),
+            vec![
+                KeeperOp::SessionLog {
+                    entry: "m1".into(),
+                    unit: Some("001".into()),
+                    line: "completed · deepseek/deepseek-flash · member a1 · $? · built 001".into(),
+                },
+                KeeperOp::SetStatus {
+                    entry: "m1".into(),
+                    unit: Some("001".into()),
+                    new: DaemonStatusArg::Done,
+                },
+            ],
+            "the commit: the session log first, then the slice done",
+        );
+        assert_eq!(
+            std::fs::read_to_string(garden.root.join("entries/m1/baton.md")).unwrap(),
+            baton,
+            "the verb's baton is the entry's now",
+        );
+        let again = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_SLICE,
+            serde_json::json!({ "summary": "again", "baton": baton }),
+        );
+        assert_eq!(again.code, Some(RefusalCode::NotYourSession), "{again:?}");
+        // keeperd's commit, as the files show it.
+        garden.slices("m1", &[("001", SliceStatus::Done, 0), ("002", SliceStatus::Queued, 0)]);
+
+        // The agent is still ending its turn: inside the grace, nothing happens.
+        backend.set_health("a1", AgentHealth::Alive { last_active: 1 });
+        let r = loop_.tick(1);
+        assert!(r.v2_handoffs.is_empty() && r.v2_started.is_empty(), "{r:?}");
+        assert_eq!(backend.kill_count(), 0);
+        assert!(d.v2_assignment("a1").is_none(), "the handed-off session is not re-mirrored");
+
+        // The grace runs out: the session is killed and a1 re-picked onto m1/002.
+        let r = loop_.tick(1 + crate::fleet::DEFAULT_ROLL_GRACE_SECS as i64);
+        assert_eq!(backend.kill_count(), 1, "the lingering session is terminated");
+        assert_eq!(r.v2_handoffs.len(), 1, "{r:?}");
+        assert!(r.v2_handoffs[0].killed);
+        assert!(r.v2_paused.is_empty(), "a1 resumed its own entry: nothing paused");
+        assert!(parker.paused.lock().unwrap().is_empty());
+        assert_eq!(
+            r.v2_started
+                .iter()
+                .map(|a| (a.agent.as_str(), a.entry.as_str(), v2_unit_label(&a.unit)))
+                .collect::<Vec<_>>(),
+            vec![("a1", "m1", "slice 002".to_string())],
+        );
+        assert_eq!(
+            claimer.claims.lock().unwrap().last(),
+            Some(&("m1".to_string(), Some("002".to_string())))
+        );
+        assert_eq!(
+            backend.member_writes().last(),
+            Some(&("a1".to_string(), baton.clone())),
+            "the stored baton is copied into the member's path at the re-spawn",
+        );
+        assert_eq!(d.v2_assignment("a1").map(|a| a.unit), Some(Unit::Slice {
+            milestone: "m1".into(),
+            slice: "002".into(),
+        }));
+    }
+
+    /// SLICE 009 — follow-ups count across successive handshakes (§7): each
+    /// counted follow-up writes the unit's count + 1 from the committed state,
+    /// the member resumes the same slice after its session exits, and the
+    /// second handshake counts on from the first.
+    #[test]
+    fn v2_follow_ups_count_across_successive_handshakes() {
+        let garden = TestGarden::new("follow-ups");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, _parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+
+        for (round, now) in [(1u64, 1i64), (2, 2)] {
+            garden.slices("m1", &[("001", SliceStatus::Active, round - 1)]);
+            let reply = verb_call(
+                &d,
+                "a1",
+                gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+                serde_json::json!({
+                    "reason": "context_full",
+                    "baton": handoff_baton("m1", "IN_PROGRESS", "keep going"),
+                }),
+            );
+            assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+            assert_eq!(reply.next, Some(NextUnit { entry: "m1".into(), unit: "001".into() }));
+            assert_eq!(
+                keeper.ops.lock().unwrap().last(),
+                Some(&KeeperOp::FollowUps {
+                    entry: "m1".into(),
+                    unit: Some("001".into()),
+                    count: round,
+                }),
+                "handshake {round} counts {round}",
+            );
+            // The session exits on its own; a1 resumes the same slice.
+            backend.set_health("a1", AgentHealth::Exited { code: 0 });
+            let r = loop_.tick(now);
+            assert_eq!(r.v2_handoffs.len(), 1, "{r:?}");
+            assert!(!r.v2_handoffs[0].killed, "an exited session is not killed");
+            assert_eq!(r.v2_started.len(), 1, "a1 resumes m1/001: {r:?}");
+            assert!(r.crashes.is_empty() && r.rerolls.is_empty(), "{r:?}");
+            backend.set_health("a1", AgentHealth::Alive { last_active: now });
+        }
+        assert_eq!(backend.kill_count(), 0);
+        assert_eq!(
+            claimer.claims.lock().unwrap().as_slice(),
+            vec![("m1".to_string(), Some("001".to_string())); 3].as_slice(),
+            "the first claim, then two idempotent re-claims of the same slice",
+        );
+    }
+
+    /// SLICE 009 — preemption at the handshake (§9): an urgent entry queued
+    /// while a1 works takes a1 at its next verb, and the entry it rolled from
+    /// becomes `paused` (its repo slot and counter kept) rather than staying
+    /// `active` with nobody running it.
+    #[test]
+    fn v2_urgent_work_preempts_at_the_handshake_and_pauses_the_rolled_entry() {
+        let garden = TestGarden::new("preempt");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        // m1 is claimed; an urgent task arrives meanwhile (urgent rows lead the file).
+        garden.queue(vec![
+            row("070", EntryKind::Task, Lane::Urgent, EntryStatus::Queued),
+            milestone_row("m1", EntryStatus::Active),
+        ]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "resume 001"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+
+        assert_eq!(*parker.paused.lock().unwrap(), vec!["m1".to_string()], "the rolled entry pauses");
+        assert_eq!(r.v2_paused, vec![("a1".to_string(), "m1".to_string())]);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.entry.as_str(), &a.unit)).collect::<Vec<_>>(),
+            vec![("070", &Unit::Entry)],
+            "the urgent task runs",
+        );
+        assert_eq!(claimer.claims.lock().unwrap().last(), Some(&("070".to_string(), None)));
+    }
+
+    /// SLICE 009 — a pause whose keeperd write fails is retried every tick,
+    /// and until it lands the entry stays held by the member that moved on, so
+    /// it never sits `active` with nobody allowed to take it.
+    #[test]
+    fn v2_a_failed_pause_is_retried_and_the_entry_stays_held_meanwhile() {
+        let garden = TestGarden::new("pause-retry");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, _claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1"), opencode_member("a2")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![
+            row("070", EntryKind::Task, Lane::Urgent, EntryStatus::Queued),
+            milestone_row("m1", EntryStatus::Active),
+        ]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "resume"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK);
+        parker.fail_pause.store(true, Ordering::SeqCst);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert!(r.v2_paused.is_empty(), "the pause did not land: {r:?}");
+        let starts: Vec<(&str, &str)> =
+            r.v2_started.iter().map(|a| (a.agent.as_str(), a.entry.as_str())).collect();
+        assert_eq!(starts, vec![("a1", "070")], "a1 takes the urgent task; a2 can't take m1");
+
+        let r = loop_.tick(2);
+        assert!(r.v2_started.is_empty(), "m1 is still held for the pending pause: {r:?}");
+        parker.fail_pause.store(false, Ordering::SeqCst);
+        loop_.tick(3);
+        assert_eq!(*parker.paused.lock().unwrap(), vec!["m1".to_string()], "the retry lands");
+        // keeperd's pause, as the files show it: any member may resume it now.
+        garden.queue(vec![
+            row("070", EntryKind::Task, Lane::Urgent, EntryStatus::Active),
+            milestone_row("m1", EntryStatus::Paused),
+        ]);
+        let r = loop_.tick(4);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.agent.as_str(), a.entry.as_str())).collect::<Vec<_>>(),
+            vec![("a2", "m1")],
+        );
+    }
+
+    /// SLICE 009 — the paused-on-backend-mismatch path (§6.3 step 5, §6.4): a
+    /// `model_change` to a model the opencode member can't run leaves the entry
+    /// `paused` and the member idle; the next tick a free claude member takes
+    /// it, on the requested model.
+    #[test]
+    fn v2_a_model_change_to_another_backend_pauses_the_entry_for_a_member_of_that_backend() {
+        let garden = TestGarden::new("mismatch");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        garden.write(
+            "growlight/backlog/milestones/m1/slices/001-work.md",
+            "# 001-work\n\n> Model: flash, claude\n\nwork\n",
+        );
+        let claude_member = FleetMember::unpinned(spec("b1"));
+        let (mut loop_, d, backend, _claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1"), claude_member], &garden);
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.v2_started.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "a1 (first in the roster) runs the slice on flash; b1 waits",
+        );
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "model_change",
+                "model": "claude",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "finish on claude"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(*parker.paused.lock().unwrap(), vec!["m1".to_string()], "paused on the mismatch");
+        assert!(r.v2_started.is_empty(), "a1 can't run claude and nothing else is open: {r:?}");
+        assert!(
+            r.held_fresh.iter().any(|h| h.agent == "a1"),
+            "a1 idles: {:?}",
+            r.held_fresh
+        );
+
+        // keeperd's pause, as the files show it: the claude member takes it.
+        garden.queue(vec![milestone_row("m1", EntryStatus::Paused)]);
+        let r = loop_.tick(2);
+        assert_eq!(
+            r.v2_started
+                .iter()
+                .map(|a| (a.agent.as_str(), a.resolved_model.clone()))
+                .collect::<Vec<_>>(),
+            vec![("b1", ModelChoice::claude())],
+            "a free member of the requested backend resumes it",
+        );
+    }
+
+    /// SLICE 009 — `growlight_block` (§6.6): the entry blocks, the reason
+    /// reaches the human as an alert, and the member is released with nothing
+    /// held or paused.
+    #[test]
+    fn v2_block_blocks_the_entry_alerts_and_releases_the_member() {
+        let garden = TestGarden::new("block");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, _claimer, parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_BLOCK,
+            serde_json::json!({
+                "kind": "human",
+                "reason": "which license?",
+                "baton": handoff_baton("m1", "BLOCKED_ON_HUMAN", "ask"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK);
+        assert_eq!(reply.next, None, "a blocked entry leaves active work");
+        assert_eq!(
+            keeper.ops.lock().unwrap().last(),
+            Some(&KeeperOp::SetStatus {
+                entry: "m1".into(),
+                unit: None,
+                new: DaemonStatusArg::Blocked,
+            })
+        );
+        garden.queue(vec![milestone_row("m1", EntryStatus::Blocked)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(r.v2_handoffs[0].alert.as_deref(), Some("m1 (human: which license?)"));
+        assert!(r.v2_started.is_empty() && r.v2_paused.is_empty(), "{r:?}");
+        assert!(parker.paused.lock().unwrap().is_empty());
     }
 }

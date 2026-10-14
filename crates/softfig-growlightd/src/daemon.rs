@@ -149,14 +149,41 @@ pub struct Daemon {
     /// *outside* `inner` (like `kill_handles`) so the read never contends on the
     /// daemon lock. Read-only from here — the daemon never routes, it only looks.
     pub backends: Arc<Mutex<Option<Arc<BackendRouter>>>>,
-    /// The queue-v2 assignments the drive loop holds (queue-v2-scheduling slice
-    /// 008), mirrored here at the end of every tick so the member verbs can run
-    /// the §6.3 assignment-match check from a connection thread. The drive loop
-    /// owns the authoritative map (`&mut self`, never behind the daemon lock);
-    /// this is a read-only copy. Lives *outside* `inner` (like `kill_handles`)
-    /// so a verb's lookup never contends on the daemon lock. Empty on a legacy
-    /// or disarmed fleet — every member verb then refuses `not_your_session`.
-    pub v2_assignments: Arc<Mutex<BTreeMap<String, crate::drive_loop::V2Assignment>>>,
+    /// The queue-v2 member-verb mirror (queue-v2-scheduling slices 008–009):
+    /// the drive loop's assignments, copied here at the end of every tick so
+    /// the member verbs can run the §6.3 assignment-match check from a
+    /// connection thread, plus the handoffs the verbs committed that the loop
+    /// has not yet ended. The drive loop owns the authoritative assignments
+    /// (`&mut self`, never behind the daemon lock). Lives *outside* `inner`
+    /// (like `kill_handles`) so a verb never contends on the daemon lock.
+    /// Empty on a legacy or disarmed fleet — every member verb then refuses
+    /// `not_your_session`.
+    pub v2_mirror: Arc<Mutex<V2Mirror>>,
+    /// The handshake's server-side seams (queue-v2-scheduling slice 009):
+    /// keeperd's v2 write ops and the per-entry baton store. `None` until
+    /// `main` installs them; a verb that validates without them errors and
+    /// leaves the session running.
+    pub v2_handoff: Option<Arc<crate::member_handoff::HandoffSeams>>,
+}
+
+/// One member's handoff as the mirror tracks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffState {
+    /// A verb is executing for this member: its assignment is out of the
+    /// mirror, so a second verb is refused while the first commits.
+    InFlight,
+    /// Committed; the drive loop ends the session and picks (§6.3 steps 4–5).
+    Committed(Box<crate::member_handoff::V2Handoff>),
+}
+
+/// The v2 member-verb mirror: see [`Daemon::v2_mirror`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct V2Mirror {
+    /// Each running member's v2 assignment, as of the loop's last tick, minus
+    /// the members with a handoff.
+    pub assignments: BTreeMap<String, crate::drive_loop::V2Assignment>,
+    /// Handoffs not yet ended by the loop, by member.
+    pub handoffs: BTreeMap<String, HandoffState>,
 }
 
 impl Daemon {
@@ -171,27 +198,108 @@ impl Daemon {
             live_scopes: Arc::new(Mutex::new(BTreeMap::new())),
             kill_handles: Arc::new(Mutex::new(BTreeMap::new())),
             backends: Arc::new(Mutex::new(None)),
-            v2_assignments: Arc::new(Mutex::new(BTreeMap::new())),
+            v2_mirror: Arc::new(Mutex::new(V2Mirror::default())),
+            v2_handoff: None,
         }
+    }
+
+    /// Install the handshake's server-side seams (builder-style, slice 009).
+    /// `main` binds keeperd's live v2 ops and the runtime entry-baton store; a
+    /// test installs a spy keeper.
+    pub fn with_v2_handoff(mut self, seams: crate::member_handoff::HandoffSeams) -> Self {
+        self.v2_handoff = Some(Arc::new(seams));
+        self
+    }
+
+    /// The handshake seams, if installed.
+    pub fn v2_handoff_seams(&self) -> Option<Arc<crate::member_handoff::HandoffSeams>> {
+        self.v2_handoff.clone()
     }
 
     /// Mirror the drive loop's v2 assignments (the drive loop calls this once
     /// per tick, after its scheduling pass). Replaces the whole copy, so an
-    /// exited or retired member's row is gone the same tick.
+    /// exited or retired member's row is gone the same tick — except a member
+    /// with a handoff, whose session is already handed off: the loop may still
+    /// hold its assignment until it ends the session, and re-publishing it
+    /// would let a second verb validate against work the first one moved.
     pub fn publish_v2_assignments(
         &self,
         assignments: &BTreeMap<String, crate::drive_loop::V2Assignment>,
     ) {
-        let mut mirror = self.v2_assignments.lock().unwrap();
-        if *mirror != *assignments {
-            *mirror = assignments.clone();
+        let mut mirror = self.v2_mirror.lock().unwrap();
+        let live: BTreeMap<String, crate::drive_loop::V2Assignment> = assignments
+            .iter()
+            .filter(|(agent, _)| !mirror.handoffs.contains_key(*agent))
+            .map(|(agent, a)| (agent.clone(), a.clone()))
+            .collect();
+        if mirror.assignments != live {
+            mirror.assignments = live;
         }
     }
 
     /// `agent`'s live v2 assignment, if it holds one — the member verbs'
     /// assignment-match source (§6.3 step 2).
     pub fn v2_assignment(&self, agent: &str) -> Option<crate::drive_loop::V2Assignment> {
-        self.v2_assignments.lock().unwrap().get(agent).cloned()
+        self.v2_mirror.lock().unwrap().assignments.get(agent).cloned()
+    }
+
+    /// Start `agent`'s handoff (§6.3 step 3): atomically take its assignment
+    /// out of the mirror, provided it is still exactly the one the call was
+    /// validated against and no other handoff is under way. `false` means the
+    /// session no longer holds that work — a concurrent or repeated verb.
+    pub fn begin_v2_handoff(&self, agent: &str, expected: &crate::drive_loop::V2Assignment) -> bool {
+        let mut mirror = self.v2_mirror.lock().unwrap();
+        if mirror.handoffs.contains_key(agent) || mirror.assignments.get(agent) != Some(expected) {
+            return false;
+        }
+        mirror.assignments.remove(agent);
+        mirror.handoffs.insert(agent.to_string(), HandoffState::InFlight);
+        true
+    }
+
+    /// Undo [`begin_v2_handoff`](Self::begin_v2_handoff) after a commit that
+    /// never landed: the session keeps its assignment and keeps running.
+    pub fn abort_v2_handoff(&self, agent: &str, assignment: crate::drive_loop::V2Assignment) {
+        let mut mirror = self.v2_mirror.lock().unwrap();
+        if mirror.handoffs.get(agent) == Some(&HandoffState::InFlight) {
+            mirror.handoffs.remove(agent);
+            mirror.assignments.insert(agent.to_string(), assignment);
+        }
+    }
+
+    /// Record `agent`'s committed handoff for the drive loop.
+    pub fn commit_v2_handoff(&self, agent: &str, handoff: crate::member_handoff::V2Handoff) {
+        self.v2_mirror
+            .lock()
+            .unwrap()
+            .handoffs
+            .insert(agent.to_string(), HandoffState::Committed(Box::new(handoff)));
+    }
+
+    /// `agent`'s committed handoff, if any (an in-flight one is not yet the
+    /// loop's to act on).
+    pub fn v2_handoff(&self, agent: &str) -> Option<crate::member_handoff::V2Handoff> {
+        match self.v2_mirror.lock().unwrap().handoffs.get(agent) {
+            Some(HandoffState::Committed(handoff)) => Some((**handoff).clone()),
+            _ => None,
+        }
+    }
+
+    /// Clear `agent`'s committed handoff once the loop ended its session.
+    pub fn take_v2_handoff(&self, agent: &str) -> Option<crate::member_handoff::V2Handoff> {
+        let mut mirror = self.v2_mirror.lock().unwrap();
+        match mirror.handoffs.get(agent) {
+            Some(HandoffState::Committed(_)) => match mirror.handoffs.remove(agent) {
+                Some(HandoffState::Committed(handoff)) => Some(*handoff),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The roll grace (§6.3 step 4) from the loaded fleet config.
+    pub fn roll_grace_secs(&self) -> u64 {
+        self.inner.lock().unwrap().fleet.roll_grace_secs
     }
 
     /// Register the assembled fleet's backend router, so `status` can read each
