@@ -3654,7 +3654,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-cli"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3678,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-deploy"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -3688,7 +3688,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-fuse"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "fuser",
  "libc",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-growlight-gui"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "iced",
  "serde_json",
@@ -3712,7 +3712,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-growlightd"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3729,7 +3729,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-growlightd-client"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "serde_json",
  "softfig-ipc",
@@ -3738,7 +3738,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-ipc"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -3751,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-keeperd"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3785,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-mcp"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-net"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -3816,7 +3816,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-onboard"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "include_dir",
  "serde",
@@ -3830,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-store"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "blake3",
  "hex",
@@ -3844,7 +3844,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-tui"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3856,7 +3856,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-vault"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "argon2",
  "base64",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "softfig-vcs"
-version = "0.1.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "blake3",
  "ed25519-dalek",

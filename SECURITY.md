@@ -1,11 +1,11 @@
 # Security policy
 
-> **Not audited, pre-1.0 — a design in progress.** soft-fig has not had an
+> **Not audited — an early alpha.** soft-fig has not had an
 > independent security review. The cryptography is designed carefully and
 > tested, but "carefully designed by one maintainer" is not "audited". Do not
 > use it for anything you cannot afford to lose.
 
-soft-fig is a single-maintainer, pre-1.0 project. It keeps a machine's garden
+soft-fig is a single-maintainer project in early alpha. It keeps a machine's garden
 (configuration, decisions, history), encrypts secrets at rest, syncs a
 ciphertext replica to other devices, and can deploy files into live dotfiles. A
 defect in any of those paths can expose data or the integrity of the machine, so
@@ -31,8 +31,9 @@ theory with a clear reasoning trail is still worth sending.
 
 **Latest release only.**
 
-soft-fig is pre-1.0 and has no releases yet; every install today is built from
-source at a commit. Once releases exist, fixes land on the latest one.
+The current release is **1.0.0-alpha.1**, a source release: every install is
+built from source at a tag or commit, so include the commit you built in a
+report. Fixes land on the latest release.
 
 - No backports to older versions.
 - No security branches or long-term-support lines.
@@ -130,4 +131,4 @@ is a full compromise of the box.
 ## What this project does not claim
 
 No "military-grade" or "unbreakable" cryptography, no audit, no certification
-and no security guarantee. Single maintainer, pre-1.0, best effort.
+and no security guarantee. Single maintainer, alpha, best effort.

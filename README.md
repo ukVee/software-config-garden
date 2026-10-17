@@ -29,8 +29,10 @@ reference, plus a codebase tour. This README is just the front door.
 
 ## Status
 
-Single-author work in progress, not a released tool. Built and self-hosting on
-`main`:
+**1.0.0-alpha.1 — the first public alpha.** Built and used daily on one device
+by one author: expect rough edges, and read [SECURITY.md](SECURITY.md) before
+trusting it with anything you can't afford to lose (the cryptography has not
+been independently audited). What ships:
 
 - **Engine** — the Vault (encryption at rest + selective secrets), the
   content-addressed ciphertext VCS, the per-device daemon, the FUSE
@@ -41,23 +43,26 @@ Single-author work in progress, not a released tool. Built and self-hosting on
 - **First run** — `softfig onboard`, a wizard that scaffolds a fresh garden
   and writes a *born-in-FUSE* genesis commit (no plaintext ever touches the
   garden root).
-- **Deploy spine (M4a)** — `softfig deploy` materializes a declarative
+- **Recovery as a declared policy** — `vault status`, escrow export/verify,
+  guarded recovery-door add/drop, and Argon2 cost `rewrap`.
+- **Deploy** — `softfig deploy` materializes a declarative
   `config/deploy.toml` source→target table (symlink-to-cache or stamped copy).
-- **Cross-device sync (M5a/M5b)** — device pairing, a trust matrix, and
-  read-only peer mirroring (replica push over a LAN, relayable off-LAN).
-  Single owner per garden — no multi-master merging.
+- **Cross-device sync** — device pairing over a SAS-confirmed Noise channel,
+  zero-knowledge replica backup to your own devices (LAN, relayable off-LAN),
+  and shared subtrees between paired devices. Young and lightly tested across
+  devices.
 - **Growlight** — an autonomous work loop (a curated *baton* carried across
-  Claude sessions), driven single-agent or as a supervised `growlightd` fleet.
+  agent sessions), run interactively with `softfig growlight start` or
+  unattended by the supervised `growlightd` fleet.
 
-In development (on the `feat/m5c-union-mount` branch, not `main`): **M5c**
-shared-subtrees / union-mount. Not started: **M4b/M4c** template rendering
-(MiniJinja + profile-scoped vars + render-time secrets), a general desktop
-**GUI** with TUI parity, and **M7** AUR packaging. Full, dated detail:
+Not built yet: template rendering (profile-scoped vars + render-time secrets),
+a general desktop GUI, prebuilt packages (AUR, `.deb`, …) and a
+`softfig upgrade` command. Linux + systemd + FUSE only. Full, dated detail:
 [the docs status page](https://ukvee.github.io/software-config-docs/internals/status/).
 
 ## Quickstart
 
-There's no package yet (AUR is M7), so build from source. This produces **one
+There are no prebuilt packages yet, so build from source. This produces **one
 standalone garden that documents the machine it runs on** — cloning this repo
 to a new device moves the *program* (the schema), never another device's
 *content*. The full runbook is in the
@@ -66,8 +71,10 @@ and [first-garden tutorial](https://ukvee.github.io/software-config-docs/start/f
 the short path:
 
 **Prerequisites:** a Rust toolchain (workspace targets Rust ≥ 1.88, edition
-2024), `fuse3` (Arch: `sudo pacman -S fuse3`), and `~/.local/bin` on your
-`PATH`.
+2024); `protoc` and fuse3 with its development headers (Arch:
+`sudo pacman -S protobuf fuse3`; Debian/Ubuntu:
+`sudo apt install protobuf-compiler libfuse3-dev fuse3`); and `~/.local/bin` on
+your `PATH`.
 
 ```bash
 # 1. Clone
@@ -76,7 +83,7 @@ cd ~/projects/software-config_garden
 
 # 2. Build + install the binaries. The helper builds --release, installs them,
 #    checks for fuse3, then prompts before enabling the systemd user unit and
-#    registering the MCP server in ~/.claude.json.
+#    registering the MCP server with Claude Code (user scope).
 ./scripts/onboard-device.sh
 
 # 3. Scaffold the garden. Interactive: prompts for a passphrase, prints a

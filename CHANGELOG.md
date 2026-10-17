@@ -3,16 +3,17 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project intends to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-once it has releases.
-
-**soft-fig has never been released.** The workspace version is an unreleased
-placeholder, so this file has exactly one section, `[Unreleased]`, with no dated
-version headings. Entries are grouped by what a user of the tool can observe, and
-each points at the decision record or crate that owns it, rather than at every
-internal change.
+and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Entries are grouped by what a user of the tool can observe, and each points at the
+decision record or crate that owns it, rather than at every internal change.
 
 ## [Unreleased]
+
+## [1.0.0-alpha.1] - 2026-10-17
+
+The first public alpha: everything that exists so far, released as source. Built
+and used daily on one device; expect rough edges. Linux + systemd + FUSE only, and
+install is build-from-source (no prebuilt packages yet).
 
 ### Added
 
@@ -118,6 +119,9 @@ internal change.
 - **The agent surface is typed** — garden content is data, never instructions, and
   the write verbs are narrow and convention-stamping with vault operations
   withheld from the model entirely (`decision-garden-read-channel-read-only-tools`).
-- **Pre-1.0 and unaudited** — see `SECURITY.md`. No third party has reviewed this
+- **Alpha and unaudited** — see `SECURITY.md`. No third party has reviewed this
   cryptography, and the project is maintained by one person on a best-effort
   basis.
+
+[Unreleased]: https://github.com/ukVee/software-config-garden/compare/v1.0.0-alpha.1...HEAD
+[1.0.0-alpha.1]: https://github.com/ukVee/software-config-garden/releases/tag/v1.0.0-alpha.1
