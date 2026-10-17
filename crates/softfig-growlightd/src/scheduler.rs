@@ -360,7 +360,9 @@ pub fn held(snapshot: &Snapshot) -> Vec<(String, String, ClaimHold)> {
         .iter()
         .flat_map(|q| {
             q.parts.iter().filter_map(move |p| match (&p.status, &p.hold) {
-                (PartStatus::Queued, Some(hold)) => Some((q.name.clone(), p.id.clone(), hold.clone())),
+                (PartStatus::Queued, Some(hold)) => {
+                    Some((q.name.clone(), p.id.clone(), hold.clone()))
+                }
                 _ => None,
             })
         })

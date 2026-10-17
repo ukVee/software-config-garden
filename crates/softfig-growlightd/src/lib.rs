@@ -67,8 +67,8 @@ pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
     spawn_drive_loop, AgentHealthSource, AgentStderrSource, Assignment, BatonRead, BatonSeeder,
     BatonStatusSource, BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus,
-    DeferredQueues, DriveLoop, FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource,
-    RateMeter, RateSource, TickReport, DRIVE_POLL_MS,
+    DeferredQueues, DriveLoop, FleetMember, HeldPart, HeldStart, PartClaimer, PermissiveRate,
+    QueueSource, RateMeter, RateSource, TickReport, DRIVE_POLL_MS,
 };
 pub use fleet::{
     assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig, MemberBackend,
