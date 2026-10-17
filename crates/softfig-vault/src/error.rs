@@ -62,6 +62,9 @@ pub enum VaultError {
     #[error("peer wrappings of K are managed by the trust-matrix ledger, not by this verb")]
     PeerWrappingUnsupported,
 
+    #[error("refusing to change doors without a usable recovery declaration: {0}")]
+    NoUsableDeclaration(String),
+
     #[error("invalid Argon2 parameters {0}")]
     InvalidArgon2Params(String),
 

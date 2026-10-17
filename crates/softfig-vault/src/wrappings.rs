@@ -36,7 +36,9 @@ use crate::escrow::{self, VerificationRecord};
 use crate::kek::{self, WrappingParams};
 use crate::params::{aad, Argon2Params};
 use crate::recovery::RecoveryPhrase;
-use crate::recovery_policy::{self, RecoveryPath, RecoveryPolicy, RecoveryStatus, Wrappings};
+use crate::recovery_policy::{
+    self, DeclaredPolicy, RecoveryPath, RecoveryPolicy, RecoveryStatus, Wrappings,
+};
 use crate::session::VaultSession;
 use crate::storage::{self, VaultPaths};
 
@@ -130,6 +132,12 @@ pub fn plan_drop(
         return Err(VaultError::PeerWrappingUnsupported);
     }
 
+    // A door change brings the declaration along with it, so there has to be
+    // one, and it has to be readable. Checked here (before any prompt) and
+    // again in `drop_wrapping` (before the unlink): an undeclared or corrupt
+    // recovery.toml is refused, never silently written over.
+    let _ = policy_to_edit(paths)?;
+
     let wrappings = Wrappings::read(paths);
     if !wrappings.contains(target) {
         return Err(VaultError::WrappingAbsent(target));
@@ -182,14 +190,41 @@ pub fn plan_drop(
     })
 }
 
+/// The declared policy these verbs will bring along with the door change.
+///
+/// `drop_wrapping` and `add_phrase` both re-write `recovery.toml` after the
+/// door moves, so both need a declaration that is actually there and actually
+/// parseable. An undeclared vault is refused with a pointer to `recovery
+/// declare`, and an unreadable one is refused rather than overwritten: a
+/// declaration is a human act, and the design rule slice 001 recorded is that
+/// nothing writes one on the user's behalf.
+fn policy_to_edit(paths: &VaultPaths) -> Result<RecoveryPolicy> {
+    match recovery_policy::load_declared_policy(paths) {
+        DeclaredPolicy::Declared(policy) => Ok(policy),
+        DeclaredPolicy::Undeclared => Err(VaultError::NoUsableDeclaration(
+            "no recovery.toml exists — declare the vault's recovery shape with \
+             'vault recovery declare' first, so changing a door never writes a \
+             declaration on your behalf"
+                .to_string(),
+        )),
+        DeclaredPolicy::Unreadable(reason) => Err(VaultError::NoUsableDeclaration(format!(
+            "recovery.toml exists but cannot be read ({reason}); fix or remove it before \
+             changing doors — a declaration this build could not read must not be \
+             silently replaced"
+        ))),
+    }
+}
+
 /// Remove a wrapping and bring the declared policy along with it.
 ///
 /// Re-evaluates every guard itself: a caller that skipped [`plan_drop`], or
 /// whose plan went stale while a human read the confirmation prompt, must not
 /// be able to reach the filesystem with a stale answer.
 ///
-/// **Order is a safety property.** All guards, then the unlink, then the
-/// declaration. A crash in the window leaves the policy promising a door that
+/// **Order is a safety property.** All guards — including the declaration
+/// read, which refuses an undeclared or unreadable `recovery.toml` while the
+/// door is still in place — then the unlink, then the declaration. A crash in
+/// the window leaves the policy promising a door that
 /// is gone — which slice 001 reports as a `Promised` divergence, loudly. The
 /// other order would leave a live, undeclared door instead: also divergent,
 /// but an unaccounted way into the garden is the worse of the two states.
@@ -201,9 +236,12 @@ pub fn drop_wrapping(
     let paths = &session.paths;
     let plan = plan_drop(paths, target, authenticated_through)?;
 
+    // Read before the unlink: a vault whose declaration cannot be edited
+    // refuses with every door still where it was, not after removing one.
+    let mut policy = policy_to_edit(paths)?;
+
     std::fs::remove_file(paths.root.join(plan.location))?;
 
-    let mut policy = RecoveryStatus::read(paths).effective();
     policy.remove(target);
     recovery_policy::store_declared_policy(paths, &policy)?;
     Ok(plan)
@@ -227,6 +265,11 @@ pub fn drop_wrapping(
 pub fn add_phrase(session: &VaultSession) -> Result<RecoveryPhrase> {
     let paths = &session.paths;
     check_can_add(paths, RecoveryPath::Phrase)?;
+    // The declaration this change will bring along is read before anything
+    // moves: on an undeclared or unreadable vault the whole operation
+    // refuses (see [`policy_to_edit`]) instead of writing a declaration the
+    // user never made.
+    let mut policy = policy_to_edit(paths)?;
     let params = storage::load_params(paths)?;
     let target = new_door_params(paths, &params.argon2);
 
@@ -242,7 +285,6 @@ pub fn add_phrase(session: &VaultSession) -> Result<RecoveryPhrase> {
     // `Undeclared` divergence. Nothing is lost and the gap is visible.
     write_wrapping(&paths.kek_recovery(), &wrapped)?;
 
-    let mut policy = RecoveryStatus::read(paths).effective();
     policy.insert(RecoveryPath::Phrase);
     recovery_policy::store_declared_policy(paths, &policy)?;
     Ok(phrase)

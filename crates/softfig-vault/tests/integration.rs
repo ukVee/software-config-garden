@@ -1529,6 +1529,60 @@ fn dropping_a_door_that_is_not_there_is_not_a_silent_success() {
 }
 
 #[test]
+fn a_door_change_on_an_undeclared_vault_is_refused_without_writing_a_declaration() {
+    // A vault from before the declaration existed: no recovery.toml. A door
+    // change that silently wrote one would be the tool inventing the user's
+    // recovery shape — the exact silence the declaration exists to break.
+    let (tmp, vault) = passphrase_only_vault();
+    fs::remove_file(vault.paths().recovery_policy()).expect("de-declare");
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    match wrappings::add_phrase(&session) {
+        Err(VaultError::NoUsableDeclaration(msg)) => {
+            assert!(msg.contains("declare"), "say how to declare: {msg}");
+        }
+        other => panic!("expected NoUsableDeclaration, got {other:?}"),
+    }
+    assert!(!vault.paths().kek_recovery().exists(), "no door may be minted");
+    assert!(
+        !vault.paths().recovery_policy().exists(),
+        "nothing may write a declaration on the user's behalf"
+    );
+
+    match wrappings::drop_wrapping(&session, RecoveryPath::Passphrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoUsableDeclaration(_)) => {}
+        other => panic!("expected NoUsableDeclaration, got {other:?}"),
+    }
+    assert!(vault.paths().kek_self().exists(), "no door may be removed");
+    drop(tmp);
+}
+
+#[test]
+fn a_door_change_refuses_to_overwrite_an_unreadable_declaration() {
+    // A corrupt recovery.toml is surfaced, not silently replaced — the file
+    // is the user's words, and a door change must not paper over them.
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let broken = b"this is not toml {{{";
+    fs::write(vault.paths().recovery_policy(), broken).unwrap();
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoUsableDeclaration(msg)) => {
+            assert!(msg.contains("cannot be read"), "{msg}");
+        }
+        other => panic!("expected NoUsableDeclaration, got {other:?}"),
+    }
+    assert!(vault.paths().kek_recovery().exists(), "the door must not move");
+    assert_eq!(
+        fs::read(vault.paths().recovery_policy()).unwrap(),
+        broken,
+        "the unreadable declaration must survive verbatim"
+    );
+    drop(tmp);
+}
+
+#[test]
 fn the_round_trip_makes_passphrase_only_a_reversible_choice() {
     let (tmp, vault) = passphrase_only_vault();
     assert_eq!(wrappings::shape_now(vault.paths()).0.to_string(), "passphrase-only");
