@@ -168,7 +168,7 @@ pub fn apply(
     let kek = kek::unwrap_kek_under_passphrase(passphrase, &wrapped, &fallback, aad::KEK_SELF)?;
 
     let secret = new_passphrase.unwrap_or(passphrase);
-    let rewrapped = kek::wrap_kek_under_passphrase(secret, &kek, &plan.target, aad::KEK_SELF);
+    let rewrapped = kek::wrap_kek_under_passphrase(secret, &kek, &plan.target, aad::KEK_SELF)?;
 
     // Prove the new wrapping opens BEFORE it replaces the one that does.
     //

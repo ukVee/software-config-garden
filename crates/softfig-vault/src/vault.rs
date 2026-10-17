@@ -77,7 +77,7 @@ impl Vault {
 
         // Self-path passphrase wrapping.
         let wrapped_self =
-            kek::wrap_kek_under_passphrase(passphrase, &kek, &params.argon2, aad::KEK_SELF);
+            kek::wrap_kek_under_passphrase(passphrase, &kek, &params.argon2, aad::KEK_SELF)?;
         wrappings::write_wrapping(&paths.kek_self(), &wrapped_self)?;
 
         // Recovery passphrase wrapping.
@@ -87,7 +87,7 @@ impl Vault {
             &kek,
             &params.argon2,
             aad::KEK_RECOVERY,
-        );
+        )?;
         wrappings::write_wrapping(&paths.kek_recovery(), &wrapped_recovery)?;
 
         // First master generation + identity.
@@ -230,7 +230,8 @@ impl Vault {
         )?;
 
         let target = wrappings::new_door_params(&self.paths, &params.argon2);
-        let new_self = kek::wrap_kek_under_passphrase(new_passphrase, &kek, &target, aad::KEK_SELF);
+        let new_self =
+            kek::wrap_kek_under_passphrase(new_passphrase, &kek, &target, aad::KEK_SELF)?;
 
         let proof =
             kek::unwrap_kek_under_passphrase(new_passphrase, &new_self, &target, aad::KEK_SELF)?;

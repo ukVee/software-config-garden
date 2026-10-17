@@ -236,7 +236,7 @@ pub fn add_phrase(session: &VaultSession) -> Result<RecoveryPhrase> {
         &session.kek,
         &target,
         aad::KEK_RECOVERY,
-    );
+    )?;
     // Door first, declaration second: a crash in the window leaves a working
     // door that the policy does not name, which slice 001 reports as an
     // `Undeclared` divergence. Nothing is lost and the gap is visible.

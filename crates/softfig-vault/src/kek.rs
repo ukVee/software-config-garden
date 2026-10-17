@@ -11,6 +11,7 @@ use zeroize::{Zeroizing, ZeroizeOnDrop};
 
 use crate::error::{Result, VaultError};
 use crate::params::{Argon2Params, AEAD_NONCE_LEN, AEAD_TAG_LEN, KEK_SALT_LEN, KEY_LEN};
+use crate::rewrap::MAX_CALIBRATED_M_COST;
 
 /// Key-encryption-key. Owned by an unlocked session; zeroed on drop.
 #[derive(Debug, ZeroizeOnDrop)]
@@ -51,19 +52,42 @@ fn aead_open(
         .map_err(|_| VaultError::AuthFailed)
 }
 
+/// Validate and cap Argon2 costs before any derivation runs.
+///
+/// A v2 header — and, for that matter, the `params.toml` a v1 blob reads its
+/// fallback from — is untrusted input: [`Argon2Params::to_argon2`] panics on
+/// costs Argon2 rejects, and an absurd `m_cost` turns the derivation into a
+/// multi-GiB allocation whose failure aborts the process via `expect`. This is
+/// the read-side counterpart of `rewrap::plan`'s operator-input `check`, and
+/// the cap is the same one production calibration already refuses to cross
+/// ([`MAX_CALIBRATED_M_COST`]).
+fn validated_costs(params: &Argon2Params) -> Result<()> {
+    params.check().map_err(|e| {
+        VaultError::InvalidArgon2Params(format!("in a kek wrapping ({params}): {e}"))
+    })?;
+    if params.m_cost > MAX_CALIBRATED_M_COST {
+        return Err(VaultError::InvalidArgon2Params(format!(
+            "in a kek wrapping ({params}): m_cost exceeds the {MAX_CALIBRATED_M_COST} KiB cap \
+             this build will derive under"
+        )));
+    }
+    Ok(())
+}
+
 /// Stretches a passphrase to a 32-byte AEAD key via Argon2id with the given salt.
 fn derive_from_passphrase(
     passphrase: &[u8],
     salt: &[u8; KEK_SALT_LEN],
     params: &Argon2Params,
-) -> Zeroizing<[u8; KEY_LEN]> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    validated_costs(params)?;
     use argon2::{Algorithm, Argon2, Version};
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.to_argon2());
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     argon
         .hash_password_into(passphrase, salt, out.as_mut())
-        .expect("argon2 hash_password_into is infallible for valid params");
-    out
+        .map_err(|e| VaultError::InvalidArgon2Params(format!("deriving a kek key failed: {e}")))?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,19 +224,23 @@ pub fn wrapping_params(wrapped: &[u8], fallback: &Argon2Params) -> WrappingParam
 /// skew embedding exists to prevent. The v1 branch of
 /// [`unwrap_kek_under_passphrase`] is a *reader* concession to blobs already on
 /// disk, not a live format.
+///
+/// The costs are validated and capped before deriving (the same guard the
+/// unwrap path applies to a blob's embedded costs), so a caller passing costs
+/// this build refuses to derive under gets an error, never a panic.
 pub fn wrap_kek_under_passphrase(
     passphrase: &[u8],
     kek: &Kek,
     params: &Argon2Params,
     aad: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let header = encode_v2_header(params);
     let mut salt = [0u8; KEK_SALT_LEN];
     rand::thread_rng().fill_bytes(&mut salt);
     let mut nonce = [0u8; AEAD_NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    let derived = derive_from_passphrase(passphrase, &salt, params);
+    let derived = derive_from_passphrase(passphrase, &salt, params)?;
     let ct = aead_seal(&derived, &nonce, &v2_aad(aad, &header), kek.expose());
 
     let mut out = Vec::with_capacity(V2_HEADER_LEN + KEK_SALT_LEN + AEAD_NONCE_LEN + ct.len());
@@ -220,7 +248,7 @@ pub fn wrap_kek_under_passphrase(
     out.extend_from_slice(&salt);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
-    out
+    Ok(out)
 }
 
 /// Unwrap K from either format.
@@ -230,6 +258,11 @@ pub fn wrap_kek_under_passphrase(
 /// which is precisely the right fallback, so the dispatch needed no call-site
 /// changes — including `escrow::prove_openable`, which passes the bundle's own
 /// `params.toml` member and thereby prefers the embedded costs automatically.
+///
+/// Whichever source wins, the costs are validated and capped before any
+/// derivation: a blob (or a `params.toml`) carrying costs Argon2 rejects, or an
+/// `m_cost` past [`MAX_CALIBRATED_M_COST`], yields an error — this path never
+/// panics or aborts on the bytes it is handed.
 pub fn unwrap_kek_under_passphrase(
     passphrase: &[u8],
     wrapped: &[u8],
@@ -253,7 +286,7 @@ pub fn unwrap_kek_under_passphrase(
         .unwrap();
     let ct = &body[KEK_SALT_LEN + AEAD_NONCE_LEN..];
 
-    let derived = derive_from_passphrase(passphrase, &salt, &params);
+    let derived = derive_from_passphrase(passphrase, &salt, &params)?;
     let pt = aead_open(&derived, &nonce, &aad_bytes, ct)?;
     if pt.len() != KEY_LEN {
         return Err(VaultError::Malformed("kek plaintext wrong length"));
@@ -282,7 +315,8 @@ pub(crate) fn wrap_kek_under_passphrase_v1(
     let mut nonce = [0u8; AEAD_NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    let derived = derive_from_passphrase(passphrase, &salt, params);
+    let derived =
+        derive_from_passphrase(passphrase, &salt, params).expect("test params are validated");
     let ct = aead_seal(&derived, &nonce, aad, kek.expose());
 
     let mut out = Vec::with_capacity(KEK_SALT_LEN + AEAD_NONCE_LEN + ct.len());
@@ -389,7 +423,7 @@ mod tests {
     #[test]
     fn a_v2_wrapping_opens_under_its_own_costs_and_ignores_the_fallback() {
         let kek = Kek::generate();
-        let blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF);
+        let blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF).expect("wrap");
         // The fallback is wrong on purpose: if it were consulted the derivation
         // would produce a different key and this would fail. Passing means the
         // costs really do travel inside the blob — which is the whole slice.
@@ -433,7 +467,7 @@ mod tests {
         let mut salt = [7u8; KEK_SALT_LEN];
         salt[..4].copy_from_slice(KEK_V2_MAGIC);
         let nonce = [3u8; AEAD_NONCE_LEN];
-        let derived = derive_from_passphrase(b"pw", &salt, &params);
+        let derived = derive_from_passphrase(b"pw", &salt, &params).expect("validated params");
         let ct = aead_seal(&derived, &nonce, aad::KEK_SELF, kek.expose());
 
         let mut blob = Vec::new();
@@ -450,7 +484,7 @@ mod tests {
     #[test]
     fn editing_the_embedded_costs_is_an_authentication_failure() {
         let kek = Kek::generate();
-        let mut blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF);
+        let mut blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF).expect("wrap");
         // Rewrite m_cost in the header to the same value the derivation would
         // have used anyway if the header were not authenticated...
         blob[5..9].copy_from_slice(&16u32.to_be_bytes());
@@ -463,7 +497,7 @@ mod tests {
     #[test]
     fn an_unknown_wrapping_version_is_refused_rather_than_read_as_v1() {
         let kek = Kek::generate();
-        let mut blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF);
+        let mut blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF).expect("wrap");
         blob[4] = 9;
         // A blob from a newer soft-fig must say so, not masquerade as a bad
         // passphrase and send someone re-typing a passphrase that was right.
@@ -476,7 +510,7 @@ mod tests {
     #[test]
     fn the_wrong_passphrase_fails_in_both_formats() {
         let kek = Kek::generate();
-        let v2 = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF);
+        let v2 = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF).expect("wrap");
         let v1 = v1_blob(b"pw", &kek, &fast());
         for blob in [v2, v1] {
             assert!(matches!(
@@ -491,7 +525,7 @@ mod tests {
         // The AAD extension must not have cost the domain separation the
         // constant provided.
         let kek = Kek::generate();
-        let blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF);
+        let blob = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF).expect("wrap");
         assert!(matches!(
             unwrap_kek_under_passphrase(b"pw", &blob, &fast(), aad::KEK_RECOVERY),
             Err(VaultError::AuthFailed)
@@ -501,7 +535,7 @@ mod tests {
     #[test]
     fn wrapping_params_reports_the_source_of_the_costs() {
         let kek = Kek::generate();
-        let v2 = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF);
+        let v2 = wrap_kek_under_passphrase(b"pw", &kek, &fast(), aad::KEK_SELF).expect("wrap");
         let read = wrapping_params(&v2, &other());
         assert!(read.embedded);
         assert_eq!(read.params, fast());
@@ -510,5 +544,61 @@ mod tests {
         let read = wrapping_params(&v1, &other());
         assert!(!read.embedded);
         assert_eq!(read.params, other(), "a v1 blob reports the fallback");
+    }
+
+    /// A hand-crafted v2 blob: valid magic and version, so the reader
+    /// dispatches to v2 and takes the header's word for the costs. `t_cost = 0`
+    /// is exactly what `to_argon2` panics on — the read path must return an
+    /// error instead, and never even start the derivation.
+    #[test]
+    fn a_v2_blob_carrying_argon2_rejected_costs_is_refused_not_a_panic() {
+        let mut blob = vec![0u8; V2_HEADER_LEN + V2_MIN_BODY_LEN];
+        blob[..4].copy_from_slice(KEK_V2_MAGIC);
+        blob[4] = KEK_WRAPPING_V2;
+        // m_cost 8 and p_cost 1 are legal together; t_cost 0 is what Argon2
+        // rejects.
+        blob[5..9].copy_from_slice(&8u32.to_be_bytes());
+        blob[9..13].copy_from_slice(&0u32.to_be_bytes());
+        blob[13..17].copy_from_slice(&1u32.to_be_bytes());
+
+        assert!(matches!(
+            unwrap_kek_under_passphrase(b"pw", &blob, &fast(), aad::KEK_SELF),
+            Err(VaultError::InvalidArgon2Params(_))
+        ));
+    }
+
+    /// An absurd `m_cost` used to reach Argon2's allocation as a process abort
+    /// via the old `.expect`; it must be refused at the cap before any memory
+    /// is asked for.
+    #[test]
+    fn a_v2_blob_carrying_an_absurd_m_cost_is_refused_at_the_cap() {
+        let mut blob = vec![0u8; V2_HEADER_LEN + V2_MIN_BODY_LEN];
+        blob[..4].copy_from_slice(KEK_V2_MAGIC);
+        blob[4] = KEK_WRAPPING_V2;
+        blob[5..9].copy_from_slice(&u32::MAX.to_be_bytes());
+        blob[9..13].copy_from_slice(&1u32.to_be_bytes());
+        blob[13..17].copy_from_slice(&1u32.to_be_bytes());
+
+        assert!(matches!(
+            unwrap_kek_under_passphrase(b"pw", &blob, &fast(), aad::KEK_SELF),
+            Err(VaultError::InvalidArgon2Params(_))
+        ));
+    }
+
+    /// The v1 fallback is validated too: a `params.toml` with rejected costs
+    /// must fail the same way, since it is equally untrusted bytes on disk.
+    #[test]
+    fn a_v1_blob_under_rejected_fallback_costs_is_refused_not_a_panic() {
+        let kek = Kek::generate();
+        let blob = v1_blob(b"pw", &kek, &fast());
+        let rejected = Argon2Params {
+            m_cost: 8,
+            t_cost: 0,
+            p_cost: 1,
+        };
+        assert!(matches!(
+            unwrap_kek_under_passphrase(b"pw", &blob, &rejected, aad::KEK_SELF),
+            Err(VaultError::InvalidArgon2Params(_))
+        ));
     }
 }
