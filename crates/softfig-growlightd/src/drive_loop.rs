@@ -1836,30 +1836,21 @@ impl DriveLoop {
                 }
             };
             if let Some(snapshot) = snapshot.as_mut() {
-                // Overlay the runtime holders (slice 003's contract for 006): an
-                // `active` entry's `holder` is the member whose recorded v2
-                // assignment names it — and that member is still registered (owns
-                // the slot; a released member's entry reads `None` again, so it is
-                // re-pickable). This is what arms `pick_v2`'s `Held` skip against a
-                // second member grabbing a running entry.
-                for (agent, assignment) in &self.v2_assignments {
-                    if self.supervisor.is_registered(agent) {
-                        if let Some(entry) = snapshot
-                            .entries
-                            .iter_mut()
-                            .find(|e| e.id == assignment.entry)
-                        {
-                            entry.holder = Some(agent.clone());
-                        }
-                    }
-                }
                 // §2's blocked walk: alert once per stopped entry, whatever the
                 // gates below decide about spawning.
                 self.note_v2_blocked_walks(snapshot, &mut report);
-                // The handshake's overlays (slice 009). Retry a pause that failed
-                // earlier first, so the entry it lands on reads as what it is.
+                // The runtime overlay (slices 003/006/009): who holds which entry,
+                // and the accepted model changes. Retry a pause that failed earlier
+                // first, so the entry it lands on reads as what it is; a pauser is
+                // only a preference while its entry is still paused.
                 self.retry_v2_pauses();
-                self.overlay_v2_handoffs(snapshot);
+                self.v2_paused_by.retain(|entry, _| {
+                    snapshot
+                        .entries
+                        .iter()
+                        .any(|e| &e.id == entry && e.status == EntryStatus::Paused)
+                });
+                apply_v2_overlay(snapshot, &self.v2_overlay());
 
                 // The per-member `pick_v2` input, built from the configured fleet:
                 // backend + roster default from the member's row; the pin carried
@@ -2279,6 +2270,8 @@ impl DriveLoop {
         // (queue-v2-scheduling slice 008): every insert/remove above happened this
         // tick, so the copy is current before any spawned session can call a verb.
         self.daemon.publish_v2_assignments(&self.v2_assignments);
+        // …and the runtime overlay, for `queue pick` (slice 012).
+        self.daemon.publish_v2_overlay(self.v2_overlay());
 
         // 4. Route this tick's events through the single owned dispatcher (spec
         //    §9). The report is still RETURNED for the caller (and tests) to
@@ -2535,40 +2528,88 @@ impl DriveLoop {
         self.v2_walk_blocked = stopped;
     }
 
-    /// The handshake's runtime state over this tick's snapshot (slice 009):
-    /// an entry a member handed off and still holds — or whose pause has not
-    /// landed yet — reads as held by that member; a paused entry carries its
-    /// pauser (the step-2 resume preference, slice 002's `holder` contract);
-    /// and an accepted model change becomes its unit's allowed list.
-    fn overlay_v2_handoffs(&mut self, snapshot: &mut scheduler_v2::V2Snapshot) {
-        let hold = |snapshot: &mut scheduler_v2::V2Snapshot, entry: &str, agent: &str, status| {
-            if let Some(e) = snapshot
-                .entries
-                .iter_mut()
-                .find(|e| e.id == entry && e.status == status)
-            {
-                e.holder = Some(agent.to_string());
-            }
+    /// The loop's runtime state over a v2 snapshot, as data (slices 003, 006,
+    /// 009), in the order it applies:
+    /// - a registered member's assignment holds its entry (slice 003's contract:
+    ///   `pick_v2`'s `Held` skip). A released member's entry reads `None` again,
+    ///   so it is re-pickable;
+    /// - an entry a member handed off and still holds until its next pick, or
+    ///   whose pause has not landed yet, reads `active` held by that member;
+    /// - a paused entry carries its pauser (slice 002's step-2 resume
+    ///   preference);
+    /// - an accepted model change becomes its unit's allowed list.
+    ///
+    /// Published to the daemon each tick, so `queue pick` applies the same
+    /// overlay to its own read (slice 012).
+    fn v2_overlay(&self) -> V2Overlay {
+        let hold = |entry: &str, agent: &str, status| V2Hold {
+            entry: entry.to_string(),
+            agent: agent.to_string(),
+            status,
         };
-        for (agent, entry) in &self.v2_rolled {
-            hold(snapshot, entry, agent, EntryStatus::Active);
-        }
-        for (entry, agent) in &self.v2_to_pause {
-            hold(snapshot, entry, agent, EntryStatus::Active);
-        }
-        // A pauser is only a preference while the entry is still paused.
-        self.v2_paused_by.retain(|entry, _| {
-            snapshot
-                .entries
+        let mut holds: Vec<V2Hold> = self
+            .v2_assignments
+            .iter()
+            .filter(|(agent, _)| self.supervisor.is_registered(agent))
+            .map(|(agent, a)| hold(&a.entry, agent, None))
+            .collect();
+        holds.extend(
+            self.v2_rolled
                 .iter()
-                .any(|e| &e.id == entry && e.status == EntryStatus::Paused)
-        });
-        for (entry, agent) in &self.v2_paused_by {
-            hold(snapshot, entry, agent, EntryStatus::Paused);
+                .map(|(agent, entry)| hold(entry, agent, Some(EntryStatus::Active))),
+        );
+        holds.extend(
+            self.v2_to_pause
+                .iter()
+                .map(|(entry, agent)| hold(entry, agent, Some(EntryStatus::Active))),
+        );
+        holds.extend(
+            self.v2_paused_by
+                .iter()
+                .map(|(entry, agent)| hold(entry, agent, Some(EntryStatus::Paused))),
+        );
+        V2Overlay {
+            holds,
+            model_overrides: self.v2_model_overrides.clone(),
         }
-        for (entry, unit, choice) in &self.v2_model_overrides {
-            overlay_unit_model(snapshot, entry, unit, choice);
+    }
+}
+
+/// One runtime hold over a v2 snapshot: `agent` holds `entry` while the entry
+/// reads `status` (`None`: whatever it reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2Hold {
+    pub entry: String,
+    pub agent: String,
+    pub status: Option<EntryStatus>,
+}
+
+/// The drive loop's runtime state over a v2 snapshot: the holds `pick_v2`
+/// reads as `holder`, and the accepted model changes (§6.4) as
+/// `(entry, unit, model)`. Built by the loop each tick and applied by
+/// [`apply_v2_overlay`] — to the loop's own snapshot, and to `queue pick`'s
+/// through the daemon's copy, so the two picks read the same runtime state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct V2Overlay {
+    pub holds: Vec<V2Hold>,
+    pub model_overrides: Vec<(String, Unit, ModelChoice)>,
+}
+
+/// Apply `overlay` to `snapshot`: each hold, in order, sets its entry's
+/// `holder` (a later hold on the same entry wins), then each accepted model
+/// change becomes its unit's only allowed model.
+pub fn apply_v2_overlay(snapshot: &mut scheduler_v2::V2Snapshot, overlay: &V2Overlay) {
+    for hold in &overlay.holds {
+        if let Some(e) = snapshot
+            .entries
+            .iter_mut()
+            .find(|e| e.id == hold.entry && hold.status.is_none_or(|s| e.status == s))
+        {
+            e.holder = Some(hold.agent.clone());
         }
+    }
+    for (entry, unit, choice) in &overlay.model_overrides {
+        overlay_unit_model(snapshot, entry, unit, choice);
     }
 }
 

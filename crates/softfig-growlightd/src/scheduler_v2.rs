@@ -192,6 +192,42 @@ pub enum SkipReason {
     NotPinned,
 }
 
+impl SkipReason {
+    /// The stable slug `queue pick` prints and its reply carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipReason::NotEligible => "not_eligible",
+            SkipReason::AfterNotDone => "after_not_done",
+            SkipReason::RepoHeld => "repo_held",
+            SkipReason::Held => "held",
+            SkipReason::Remote => "remote",
+            SkipReason::NoUnit => "no_unit",
+            SkipReason::BlockedWalk => "blocked_walk",
+            SkipReason::BackendMismatch => "backend_mismatch",
+            SkipReason::NotPinned => "not_pinned",
+        }
+    }
+
+    /// What the reason means, for a reader of `queue pick`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            SkipReason::NotEligible => "its status is not queued, active or paused (§2)",
+            SkipReason::AfterNotDone => "an `after` link is not archived done yet (§2)",
+            SkipReason::RepoHeld => {
+                "another normal-lane entry on its repo is active or paused (§2 repo rule)"
+            }
+            SkipReason::Held => "it is active and another running member holds it (§2)",
+            SkipReason::Remote => "a remote project, which an opencode member never takes",
+            SkipReason::NoUnit => "no next unit: its slice list is missing (§4, fail closed)",
+            SkipReason::BlockedWalk => "its walk stops at a blocked item, which needs a human (§2)",
+            SkipReason::BackendMismatch => {
+                "its next unit declares no model this member's backend runs (§6.4)"
+            }
+            SkipReason::NotPinned => "outside the member's pinned project (§2 steps 1 and 3)",
+        }
+    }
+}
+
 /// The assignment the pick produced: the entry, its next unit, and the unit's
 /// declared allowed model list. The drive loop (slice 006) resolves the
 /// concrete model — `declared`'s first backend-runnable entry, or the member

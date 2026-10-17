@@ -15,10 +15,13 @@ use std::path::Path;
 
 use softfig_ipc::growlightd::{
     op, AgentSpendSummary, AgentSummary, BatonArgs, BatonReply, FleetStatusReply, ForceStopArgs,
-    InjectMessageArgs, InjectReply, MemberCall, MemberVerbReply, PausedReply, RefusalCode,
-    ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply,
-    SetPolicyArgs, SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
+    InjectMessageArgs, InjectReply, MemberCall, MemberVerbReply, PausedReply, QueuePickArgs,
+    QueuePickAssignment, QueuePickReply, QueuePickSkip, RefusalCode, ReleaseLeaseArgs,
+    RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs,
+    SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
+    BACKEND_CLAUDE, BACKEND_OPENCODE,
 };
+use softfig_ipc::model_choice::{Backend, ModelList};
 use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
 use softfig_ipc::{ErrorKind, Request, Response};
 
@@ -30,6 +33,7 @@ use crate::drive_loop::AgentHealthSource;
 use crate::fleet::{FleetMemberConfig, MemberBackend};
 use crate::member_slices;
 use crate::member_verbs::{self, MemberVerb, Refusal, VerbError};
+use crate::scheduler_v2::{self, Member, Unit};
 use crate::opencode_backend::ModelSelection;
 use crate::resume::ResumeOutcome;
 use crate::state::State;
@@ -154,6 +158,9 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         op::SET_POLICY => write_one_shot(&mut stream, set_policy(&daemon, &req)),
         op::SET_RESOURCES => write_one_shot(&mut stream, set_resources(&daemon, &req)),
         op::RESUME_ITEM => write_one_shot(&mut stream, resume_item(&daemon, &req)),
+        // Read-only queue-v2 surface (spec-growlight-queue §6.9): what `pick_v2`
+        // assigns a member now, and why each skipped entry was skipped.
+        op::QUEUE_PICK => write_one_shot(&mut stream, queue_pick(&daemon, &req)),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
@@ -935,6 +942,153 @@ pub(crate) fn member_slice_verb(daemon: &Daemon, req: &Request) -> Response {
         Ok(req) => seams.keeper.relay(&req),
         Err(e) => Response::err(ErrorKind::Internal, format!("encode the slice verb: {e}")),
     }
+}
+
+/// `queue pick` (spec-growlight-queue §6.9): **read-only**. Runs the same
+/// [`scheduler_v2::pick_v2`] the drive loop runs — over a fresh read of the v2
+/// list with the loop's published runtime overlay applied — and returns the
+/// assignment plus every skipped entry with its reason.
+///
+/// growlightd answers it because `pick_v2` and the v2 source live here
+/// (milestone finding 6), not in the CLI. Two reads matter:
+/// - the **roster** is cloned under one brief lock: a named member's pin and
+///   backend come from it, and an unnamed member is unpinned on the default
+///   backend;
+/// - the **list** is read through the mount *without* the daemon lock — the
+///   same path the member verbs take, so a slow read never blocks another verb.
+///
+/// A named member that is not on the roster is a `BadArgs` refusal, not an
+/// empty pick: guessing a pin would answer a different question than the one
+/// asked.
+pub(crate) fn queue_pick(daemon: &Daemon, req: &Request) -> Response {
+    let args = match parse_args::<QueuePickArgs>(req) {
+        Ok(args) => args,
+        Err(resp) => return resp,
+    };
+    let members = {
+        let inner = daemon.inner.lock().unwrap();
+        inner.fleet.members.clone()
+    };
+    let member = match resolve_pick_member(&members, args.member.as_deref()) {
+        Ok(member) => member,
+        Err(message) => {
+            return Response::err(ErrorKind::BadArgs, format!("queue_pick: {message}"))
+        }
+    };
+    let base = QueuePickReply {
+        // §3.4: a garden with no v2 file shows nothing, and does so as a reply —
+        // not an error — exactly like `queue show`.
+        list: false,
+        member: args.member.clone(),
+        pin: member.pin.clone(),
+        backend: backend_label(&member.backend).to_string(),
+        picked: None,
+        skips: Vec::new(),
+    };
+    let mut snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return ok_reply(&base, "queue_pick"),
+        Err(e) => {
+            return Response::err(
+                ErrorKind::Io,
+                format!("queue_pick: the queue-v2 list can't be read: {e}"),
+            )
+        }
+    };
+    // The runtime holders and accepted model changes, as of the loop's last tick
+    // — the same overlay the loop's own pick sees (slice 012).
+    crate::drive_loop::apply_v2_overlay(&mut snapshot, &daemon.v2_overlay());
+    let outcome = scheduler_v2::pick_v2(&snapshot, &member);
+    let reply = QueuePickReply {
+        list: true,
+        picked: outcome.picked.map(|p| QueuePickAssignment {
+            entry: p.entry,
+            unit: pick_unit_label(&p.unit),
+            declared: p.declared.as_ref().map(declared_label),
+        }),
+        skips: outcome
+            .skips
+            .into_iter()
+            .map(|s| QueuePickSkip {
+                entry: s.entry,
+                reason: s.reason.as_str().to_string(),
+                detail: s.reason.describe().to_string(),
+            })
+            .collect(),
+        ..base
+    };
+    ok_reply(&reply, "queue_pick")
+}
+
+/// The member a pick runs for: a roster row (its id, backend and pin), or an
+/// unnamed unpinned member on the default backend.
+///
+/// The unnamed member's id is the empty string, which no roster agent can be
+/// (ids are non-empty), so it never matches a live holder: another member's
+/// `active` entry reads as held, which is the truth for *this* member.
+fn resolve_pick_member(
+    members: &[FleetMemberConfig],
+    requested: Option<&str>,
+) -> std::result::Result<Member, String> {
+    let Some(id) = requested else {
+        return Ok(Member {
+            id: String::new(),
+            backend: Backend::Claude,
+            pin: None,
+        });
+    };
+    let Some(row) = members.iter().find(|m| m.agent == id) else {
+        let roster = if members.is_empty() {
+            "the roster is empty".to_string()
+        } else {
+            format!(
+                "the roster is: {}",
+                members
+                    .iter()
+                    .map(|m| m.agent.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Err(format!("no fleet member {id:?} on the roster — {roster}"));
+    };
+    Ok(Member {
+        id: row.agent.clone(),
+        backend: row.backend.ipc_backend(),
+        pin: row.pin.clone(),
+    })
+}
+
+/// The wire/CLI label for a member's backend.
+fn backend_label(backend: &Backend) -> &'static str {
+    match backend {
+        Backend::Claude => BACKEND_CLAUDE,
+        Backend::Opencode => BACKEND_OPENCODE,
+    }
+}
+
+/// A picked unit, for a reader: `slice 002 of m1` (a sub-milestone's slice names
+/// `m1/sub`), `the close-out of m1`, or `the entry itself` for a task/restack.
+fn pick_unit_label(unit: &Unit) -> String {
+    match unit {
+        Unit::Slice { milestone, slice } => format!("slice {slice} of {milestone}"),
+        Unit::CloseOut { milestone } => format!("the close-out of {milestone}"),
+        Unit::Entry => "the entry itself".to_string(),
+    }
+}
+
+/// A unit's declared `> Model:` list, comma-separated, as `queue pick` prints
+/// it: `claude`, `provider/model`, or `provider/model variant=<v>`.
+fn declared_label(list: &ModelList) -> String {
+    list.entries()
+        .iter()
+        .map(|choice| match (&choice.model, &choice.variant) {
+            (None, _) => BACKEND_CLAUDE.to_string(),
+            (Some(model), Some(variant)) => format!("{model} variant={variant}"),
+            (Some(model), None) => model.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The human slice verb a member's relayed call carries.

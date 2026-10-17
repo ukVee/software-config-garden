@@ -2275,6 +2275,20 @@ pub enum QueueSub {
     /// (merge-base / restack flags) are queue-v2-git's (finding 3).
     Show,
 
+    /// Read-only: what `pick_v2` assigns a member now, and why every skipped
+    /// entry was skipped (§6.9). This form is **growlightd's** verb (the pick
+    /// lives there, not in keeperd), so it takes its own socket flag.
+    Pick {
+        /// A roster member id. Omitted: an unpinned member on the default
+        /// backend.
+        #[arg(long)]
+        member: Option<String>,
+        /// growlightd's socket. Defaults to
+        /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+        #[arg(long, value_name = "SOCKET")]
+        growlightd_socket: Option<PathBuf>,
+    },
+
     /// Append a `[[project]]` row — `queue project add`.
     Project {
         #[command(subcommand)]
@@ -2545,6 +2559,10 @@ fn client_queue(args: QueueArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
     match args.cmd.unwrap_or(QueueSub::Show) {
         QueueSub::Show => queue_show(&socket),
+        QueueSub::Pick {
+            member,
+            growlightd_socket,
+        } => queue_pick(&growlight_socket(growlightd_socket), member.as_deref()),
         QueueSub::Project { cmd } => match cmd {
             QueueProjectSub::Add(a) => queue_project_add(&socket, a),
         },
@@ -2646,10 +2664,7 @@ fn queue_show(socket: &Path) -> Result<()> {
         // §3.4: the view renders only when the TOML file exists. A missing
         // file is the expected fresh-garden state, not an error.
         Err(ClientError::Daemon { kind: ErrorKind::NotFound, .. }) => {
-            println!(
-                "no {QUEUE_FILE} — the v2 queue is empty (§3.4: the view renders only \
-                 when the file exists)"
-            );
+            println!("{}", queue_empty_line());
             Ok(())
         }
         Ok(None) => Err(anyhow!(
@@ -2659,6 +2674,71 @@ fn queue_show(socket: &Path) -> Result<()> {
         Err(ClientError::Daemon { message, .. }) => Err(anyhow!("{message}")),
         Err(e) => Err(anyhow!("{e}")),
     }
+}
+
+/// The §3.4 nothing-to-show line: shared by `queue show` and `queue pick` so the
+/// two can never drift into saying different things about the same absent file.
+fn queue_empty_line() -> String {
+    format!(
+        "no {QUEUE_FILE} — the v2 queue is empty (§3.4: the view renders only when the file exists)"
+    )
+}
+
+/// `queue pick` (§6.9): a read-only **growlightd** call (the pick and the v2
+/// source live there). No `--member`: an unpinned member on the default
+/// backend. The reply carries the assignment and every skip reason; nothing is
+/// written.
+fn queue_pick(socket: &Path, member: Option<&str>) -> Result<()> {
+    let args = growlightd::QueuePickArgs {
+        member: member.map(str::to_string),
+    };
+    let reply: growlightd::QueuePickReply =
+        growlight_call(socket, growlightd::op::QUEUE_PICK, serde_json::to_value(args)?)?;
+    print!("{}", render_queue_pick(&reply));
+    Ok(())
+}
+
+/// The `queue pick` rendering: who the pick ran for, the assignment (or its
+/// absence), and one line per skipped entry with its stable reason slug and a
+/// sentence explaining it.
+fn render_queue_pick(reply: &growlightd::QueuePickReply) -> String {
+    if !reply.list {
+        return format!("{}\n", queue_empty_line());
+    }
+    let mut out = String::from("queue pick\n");
+    let member = match &reply.member {
+        Some(id) => format!("member {id}"),
+        None => "an unpinned member".to_string(),
+    };
+    let pin = match &reply.pin {
+        Some(pin) => format!(", pin {pin}"),
+        None => ", no pin".to_string(),
+    };
+    out.push_str(&format!("{member} (backend {}{pin})\n", reply.backend));
+
+    match &reply.picked {
+        Some(picked) => {
+            out.push_str(&format!("picked: {} / {}\n", picked.entry, picked.unit));
+            match &picked.declared {
+                Some(models) => out.push_str(&format!("model: {models}\n")),
+                None => out.push_str("model: undeclared — the member default (§6.4)\n"),
+            }
+        }
+        None => out.push_str("picked: nothing workable for this member\n"),
+    }
+
+    if reply.skips.is_empty() {
+        out.push_str("skipped: none\n");
+    } else {
+        out.push_str(&format!("skipped: {}\n", reply.skips.len()));
+        for skip in &reply.skips {
+            out.push_str(&format!(
+                "  - {}: {} — {}\n",
+                skip.entry, skip.reason, skip.detail
+            ));
+        }
+    }
+    out
 }
 
 const SHOW_HEADER: &str =
@@ -4863,6 +4943,46 @@ mod tests {
         assert!(value_or_file("@").is_err(), "bare @ has no path");
         assert!(value_or_file("@/nonexistent/x").is_err(), "missing file errors");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queue_pick_renders_the_assignment_and_every_skip_reason() {
+        let reply = growlightd::QueuePickReply {
+            list: true,
+            member: Some("c".into()),
+            pin: Some("default".into()),
+            backend: "claude".into(),
+            picked: Some(growlightd::QueuePickAssignment {
+                entry: "m".into(),
+                unit: "slice 002 of m".into(),
+                declared: Some("reasoning, flash".into()),
+            }),
+            skips: vec![growlightd::QueuePickSkip {
+                entry: "n".into(),
+                reason: "blocked_walk".into(),
+                detail: "its walk stops at a blocked item, which needs a human (§2)".into(),
+            }],
+        };
+        let out = render_queue_pick(&reply);
+        assert!(out.contains("member c (backend claude, pin default)"), "{out}");
+        assert!(out.contains("picked: m / slice 002 of m"), "{out}");
+        assert!(out.contains("model: reasoning, flash"), "{out}");
+        assert!(out.contains("skipped: 1"), "{out}");
+        assert!(out.contains("  - n: blocked_walk — its walk stops"), "{out}");
+    }
+
+    #[test]
+    fn queue_pick_absent_list_prints_the_same_line_as_queue_show() {
+        let reply = growlightd::QueuePickReply {
+            list: false,
+            member: None,
+            pin: None,
+            backend: "claude".into(),
+            picked: None,
+            skips: vec![],
+        };
+        assert_eq!(render_queue_pick(&reply), format!("{}\n", queue_empty_line()));
+        assert!(queue_empty_line().contains("the v2 queue is empty (§3.4"));
     }
 
     #[test]

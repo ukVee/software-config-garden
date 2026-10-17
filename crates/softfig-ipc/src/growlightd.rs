@@ -169,6 +169,16 @@ pub mod op {
     /// — `move` only.
     pub const MEMBER_SLICE_UPDATE: &str = "member_slice_update";
 
+    /// `queue_pick(`[`QueuePickArgs`]`) -> `[`QueuePickReply`]. Read-only
+    /// (spec-growlight-queue §6.9 `queue pick`): what `pick_v2` assigns a
+    /// member now over the live v2 list, and why each skipped entry was
+    /// skipped. growlightd answers it because `pick_v2` and the v2 source live
+    /// there (queue-v2-scheduling finding 6). No `member` → an unpinned member
+    /// on the roster's default backend (claude); a roster member → its pin,
+    /// backend and resume preference. The drive loop's runtime holders are
+    /// overlaid as its own pick sees them. No v2 list → `list: false`.
+    pub const QUEUE_PICK: &str = "queue_pick";
+
     /// The five member verbs, in spec order.
     pub const MEMBER_VERBS: [&str; 5] = [
         GROWLIGHT_ADD_FOLLOW_UP_SESSION,
@@ -1124,6 +1134,63 @@ pub const MEMBER_VERB_OK: &str = "ok";
 pub struct NextUnit {
     pub entry: String,
     pub unit: String,
+}
+
+/// Args for [`op::QUEUE_PICK`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuePickArgs {
+    /// A roster member's id. `None` picks for an unpinned member on the
+    /// roster's default backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+}
+
+/// Reply to [`op::QUEUE_PICK`]: who the pick ran for, the assignment, and every
+/// skipped entry with its reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuePickReply {
+    /// `false`: the garden has no v2 list (`queue.toml` is absent), so there is
+    /// nothing to show (§3.4) and `picked`/`skips` are empty.
+    pub list: bool,
+    /// The roster member the pick ran for; `None` = an unpinned member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// The member's pinned project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// The member's backend: `claude` | `opencode`.
+    pub backend: String,
+    /// The assignment; `None` when nothing is workable for this member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picked: Option<QueuePickAssignment>,
+    /// Every entry examined and not picked, in list (file) order.
+    #[serde(default)]
+    pub skips: Vec<QueuePickSkip>,
+}
+
+/// The entry and unit `pick_v2` assigns (§2, §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuePickAssignment {
+    /// The top-level entry id.
+    pub entry: String,
+    /// The unit, for a reader: `slice 002 of m1` (a sub-milestone's slice
+    /// names `m1/sub`), `the close-out of m1`, or `the entry itself` for a
+    /// task or restack.
+    pub unit: String,
+    /// The unit's chain-resolved `> Model:` list, comma-separated; `None` =
+    /// undeclared, so the member default runs it (§6.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared: Option<String>,
+}
+
+/// One skipped entry and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuePickSkip {
+    pub entry: String,
+    /// The reason's stable slug (`repo_held`, `held`, `blocked_walk`, …).
+    pub reason: String,
+    /// What the reason means, for a reader.
+    pub detail: String,
 }
 
 /// Reply to a member verb. `state` is a documented string (like

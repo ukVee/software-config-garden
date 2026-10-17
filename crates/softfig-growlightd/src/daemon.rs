@@ -184,6 +184,10 @@ pub struct V2Mirror {
     pub assignments: BTreeMap<String, crate::drive_loop::V2Assignment>,
     /// Handoffs not yet ended by the loop, by member.
     pub handoffs: BTreeMap<String, HandoffState>,
+    /// The loop's runtime overlay as of its last tick (who holds which entry,
+    /// the accepted model changes) — what `queue pick` applies to its own read
+    /// of the v2 list (slice 012).
+    pub overlay: crate::drive_loop::V2Overlay,
 }
 
 impl Daemon {
@@ -235,6 +239,21 @@ impl Daemon {
         if mirror.assignments != live {
             mirror.assignments = live;
         }
+    }
+
+    /// Mirror the drive loop's runtime overlay (slice 012): published every
+    /// tick, read by `queue pick` so its pick sees the loop's holders.
+    pub fn publish_v2_overlay(&self, overlay: crate::drive_loop::V2Overlay) {
+        let mut mirror = self.v2_mirror.lock().unwrap();
+        if mirror.overlay != overlay {
+            mirror.overlay = overlay;
+        }
+    }
+
+    /// The drive loop's runtime overlay as of its last tick — empty before the
+    /// first tick and on a legacy loop.
+    pub fn v2_overlay(&self) -> crate::drive_loop::V2Overlay {
+        self.v2_mirror.lock().unwrap().overlay.clone()
     }
 
     /// `agent`'s live v2 assignment, if it holds one — the member verbs'
