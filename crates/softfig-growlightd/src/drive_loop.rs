@@ -1871,7 +1871,9 @@ impl DriveLoop {
     /// the single near-exhaustion rung ([`UsageAggregator::fleet_alert_at`]) fires
     /// the one usage alert. The dispatcher's per-event dedup/cooldown makes a
     /// sustained condition — a still-blocked head, a still-hot pool — announce at
-    /// most once per window, even though `tick` surfaces it every cycle.
+    /// most once per window, even though `tick` surfaces it every cycle; a
+    /// `BlockedOnHuman` block follows the reminder ladder (task 071: 30 min →
+    /// 2 h → 8 h → daily) and an un-blocked-then-re-blocked item pages fresh.
     fn dispatch(&mut self, report: &TickReport, now: i64) {
         for crash in &report.crashes {
             self.dispatcher.notify(crash, now);
@@ -1896,6 +1898,13 @@ impl DriveLoop {
                     .notify(&NotifyEvent::agent_crashed(agent.clone()), now);
             }
         }
+        // Reconcile the blocked-item identities FIRST (task 071): an item that
+        // left this tick's parked set (un-blocked, done, re-queued) is forgotten,
+        // so a later re-block pages immediately instead of being swallowed by a
+        // still-running reminder backoff. Items still in the set keep their
+        // identity, so the ladder keeps stepping.
+        let parked_items: Vec<&str> = report.parked.iter().map(|(_, part)| part.as_str()).collect();
+        self.dispatcher.reconcile_blocked(&parked_items);
         for (_queue, part) in &report.parked {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: part.clone() }, now);
@@ -5096,6 +5105,55 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(lines.len(), 2, "exactly two distinct audit lines");
         assert!(lines.iter().any(|l| l.contains("blocked on a human")));
         assert!(lines.iter().any(|l| l.contains("crashed")));
+    }
+
+    /// TASK 071 — the tick-level un-block/re-block flow: a standing block pages
+    /// once, then its reminders are suppressed; when the item LEAVES the parked
+    /// set and later re-blocks, it pages AGAIN immediately (the dispatcher's
+    /// reconcile forgot it) — the standing block never re-pages while it stands,
+    /// and a fresh block is never swallowed.
+    #[test]
+    fn an_unblocked_then_reblocked_item_pages_again() {
+        let (mut loop_, _d, _backend, _claimer, _queues, probe) = make_claiming(
+            vec![member("a1", "mine")],
+            vec![q("mine", &[("p1", "blocked"), ("p2", "queued")])],
+            Policy::default(),
+        );
+
+        // Tick 0: the blocked head pages once (a1 pivots onto p2, which goes
+        // `active` in keeperd, so the later snapshots keep it that way).
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.parked, vec![("mine".into(), "p1".into())]);
+        let blocked_lines = |probe: &Probe| {
+            probe
+                .log_lines()
+                .iter()
+                .filter(|l| l.contains("blocked on a human"))
+                .count()
+        };
+        assert_eq!(blocked_lines(&probe), 1, "the standing block pages once");
+
+        // Still blocked next tick → suppressed (the ladder holds the reminder).
+        let r1 = loop_.tick(60);
+        assert_eq!(r1.parked, vec![("mine".into(), "p1".into())]);
+        assert_eq!(blocked_lines(&probe), 1, "a standing block never re-pages");
+
+        // The block clears — the human answered, keeperd's snapshot moves on.
+        _queues.set(vec![q("mine", &[("p1", "queued"), ("p2", "active")])]);
+        let r2 = loop_.tick(120);
+        assert!(r2.parked.is_empty(), "nothing parked once the block cleared");
+        assert_eq!(blocked_lines(&probe), 1, "an un-block pages nobody");
+
+        // Re-blocked later: pages again, immediately — the reconcile forgot p1.
+        _queues.set(vec![q("mine", &[("p1", "blocked"), ("p2", "active")])]);
+        let r3 = loop_.tick(180);
+        assert_eq!(r3.parked, vec![("mine".into(), "p1".into())]);
+        assert_eq!(
+            blocked_lines(&probe),
+            2,
+            "an un-blocked then re-blocked item pages again: {:?}",
+            probe.log_lines(),
+        );
     }
 
     // ---- slice 003: part-claim closes the double-assignment window ----------

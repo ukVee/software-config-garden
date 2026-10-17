@@ -36,14 +36,52 @@
 //!   iteration. Past the cooldown the same identity fires again (a reminder).
 //!   Distinct identities — the usage alert, a different blocked item, a different
 //!   crashed agent — are independent and never suppress each other.
+//!
+//! ## Per-class cooldowns (task 071)
+//!
+//! One flat cooldown was wrong for [`BlockedOnHuman`](NotifyEvent::BlockedOnHuman):
+//! a block lasts until the human acts — often hours or days — so the old 30-min
+//! cadence re-paged every half hour for the SAME standing block (~70 pages in one
+//! night on 2026-10-16/17), training the human to ignore the alert that matters.
+//! The rule is now per-class:
+//!
+//! - **`BlockedOnHuman` reminders back off** — the first page for a newly blocked
+//!   item stays immediate; each further reminder of the same standing block waits
+//!   `30 min → 2 h → 8 h → daily` ([`BLOCKED_REMINDER_LADDER_SECS`]), so after the
+//!   first hour the human hears at most one page per 2 h per item. A *change of
+//!   reason is a new identity*: an item is parked once and stands until the human
+//!   acts (a spin-guard park and a member-declared block cannot succeed one
+//!   another without an un-block between them), and an un-blocked-then-re-blocked
+//!   item pages again immediately — the drive loop reconciles the parked set each
+//!   tick ([`reconcile_blocked`](NotifyPolicy::reconcile_blocked)): an identity
+//!   that left the set is forgotten, so the re-block (whatever its new reason) is
+//!   a fresh fire, not a swallowed reminder.
+//! - **Every other class keeps the flat cadence** ([`DEFAULT_COOLDOWN_SECS`]):
+//!   usage, crash, network — their conditions rise and clear on the loop's own
+//!   timescale, so the old "one page per window, then a reminder" semantics is
+//!   exactly right for them and is unchanged.
+//!
+//! The ladder keys off how many times the identity has fired, so the state is
+//! per-identity and survives an arbitrary gap (a block seen again a week later is
+//! still "the same standing block", not a fresh page).
 
 use std::collections::HashMap;
 
-/// Default per-event cooldown: after an event fires, the *same identity* is
-/// suppressed for at least this long. Generous (30 min) because the loop's
-/// natural cadence is whole sessions — one ping per identity per window, not
-/// per iteration. The test seam ([`NotifyPolicy::with_cooldown`]) overrides it.
+/// Default per-event cooldown for every class EXCEPT the backoff ladder
+/// ([`BlockedOnHuman`](NotifyEvent::BlockedOnHuman)): after an event fires, the
+/// *same identity* is suppressed for at least this long. Generous (30 min)
+/// because the loop's natural cadence is whole sessions — one ping per identity
+/// per window, not per iteration. The test seam ([`NotifyPolicy::with_cooldown`])
+/// overrides it.
 const DEFAULT_COOLDOWN_SECS: i64 = 1800;
+
+/// The `BlockedOnHuman` reminder ladder (task 071): the cooldown before the
+/// *next* reminder of the same standing block, by how many times its identity
+/// has fired — 30 min after the first page, then 2 h, then 8 h, then one per
+/// day. The first page itself is always immediate (a fresh identity has no
+/// stamp). After the first hour this bounds a standing block to at most one
+/// page per 2 h.
+const BLOCKED_REMINDER_LADDER_SECS: [i64; 4] = [1800, 7200, 28_800, 86_400];
 
 /// A delivery channel. Modeled as a small enum now; the concrete transports
 /// (the GUI subscribe stream, the audit log, the phone over Bluetooth) are
@@ -297,7 +335,19 @@ impl NotifyEvent {
     }
 }
 
-/// The notification policy engine: a pure router with per-event cooldown dedup.
+/// One identity's fire history — when it last fired and how many times. The
+/// [`BlockedOnHuman`](NotifyEvent::BlockedOnHuman) ladder keys its escalating
+/// cooldown off `times` (task 071); every other class ignores the count and
+/// keeps the flat cadence.
+#[derive(Debug, Clone, Copy)]
+struct FireStamp {
+    /// Unix-seconds of the last (fresh) fire.
+    at: i64,
+    /// How many times this identity has fired in total.
+    times: u32,
+}
+
+/// The notification policy engine: a pure router with per-class cooldown dedup.
 /// Holds only the last-fired stamp per event identity; no clock, no I/O, no
 /// socket. The daemon wires it thin (slice 002): on each orchestrator event it
 /// calls [`decide`](Self::decide) with the current time and fans the returned
@@ -305,7 +355,7 @@ impl NotifyEvent {
 #[derive(Debug)]
 pub struct NotifyPolicy {
     cooldown_secs: i64,
-    last_fired: HashMap<String, i64>,
+    last_fired: HashMap<String, FireStamp>,
 }
 
 impl Default for NotifyPolicy {
@@ -320,7 +370,9 @@ impl NotifyPolicy {
     }
 
     /// Construct with an explicit cooldown (the test seam — production uses
-    /// [`new`](Self::new)).
+    /// [`new`](Self::new)). Sets the flat per-window cadence for every class
+    /// except the [`BlockedOnHuman`](NotifyEvent::BlockedOnHuman) ladder, which
+    /// is a policy constant.
     pub fn with_cooldown(cooldown_secs: i64) -> Self {
         Self {
             cooldown_secs,
@@ -328,19 +380,56 @@ impl NotifyPolicy {
         }
     }
 
+    /// The cooldown gating the NEXT reminder of this identity, given it has
+    /// already fired `times` times: the `BlockedOnHuman` ladder (30 min → 2 h →
+    /// 8 h → daily, task 071), or the flat per-window cadence for every other
+    /// class.
+    fn cooldown_for(&self, event: &NotifyEvent, times: u32) -> i64 {
+        match event {
+            NotifyEvent::BlockedOnHuman { .. } => {
+                BLOCKED_REMINDER_LADDER_SECS[(times.saturating_sub(1).min(3)) as usize]
+            }
+            _ => self.cooldown_secs,
+        }
+    }
+
     /// Decide which channels `event` fires to at `now` (Unix seconds). Returns
     /// the routed channel set on a fresh fire, or an **empty** set when the same
-    /// event identity fired within the cooldown (suppressed). A fresh fire
-    /// records `now` as the event's last-fired stamp.
+    /// event identity fired within its cooldown (suppressed). A fresh fire
+    /// records `now` as the event's last-fired stamp and bumps its fire count —
+    /// which is what the `BlockedOnHuman` reminder ladder steps on.
     pub fn decide(&mut self, event: &NotifyEvent, now: i64) -> Vec<Channel> {
         let key = event.dedup_key();
-        if let Some(&last) = self.last_fired.get(&key) {
-            if now - last < self.cooldown_secs {
+        if let Some(&FireStamp { at, times }) = self.last_fired.get(&key) {
+            if now - at < self.cooldown_for(event, times) {
                 return Vec::new();
             }
         }
-        self.last_fired.insert(key, now);
+        let times = self.last_fired.get(&key).map_or(1, |s| s.times.saturating_add(1));
+        self.last_fired.insert(key, FireStamp { at: now, times });
         event.channels()
+    }
+
+    /// Forget every `BlockedOnHuman` identity not in `currently_blocked` (task
+    /// 071). The drive loop calls this each tick with the parked (blocked-head)
+    /// set: an item that left the set — un-blocked, done, re-queued — is
+    /// forgotten, so a LATER re-block pages immediately as a fresh fire instead
+    /// of being swallowed by a still-running backoff window. Identities still in
+    /// the set are untouched (their ladder keeps stepping). Every other event
+    /// class is never touched.
+    pub fn reconcile_blocked(&mut self, currently_blocked: &[&str]) {
+        let stale: Vec<String> = self
+            .last_fired
+            .keys()
+            .filter(|key| {
+                key.strip_prefix("blocked:")
+                    .is_some_and(|item| !currently_blocked.contains(&item))
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.last_fired.remove(&key);
+        }
     }
 }
 
@@ -650,5 +739,141 @@ mod tests {
             s.contains("re-arm") || s.contains("unlock"),
             "names the recovery lever: {s}",
         );
+    }
+
+    // ---- task 071: the BlockedOnHuman reminder ladder -----------------------
+
+    /// A newly blocked item pages ONCE, immediately; reminders for the SAME
+    /// standing block then back off 30 min → 2 h → 8 h → daily — and past the
+    /// first hour that is at most one page per 2 h (the upper bound the fix was
+    /// asked to hold). All on the injected clock — no sleeps, no wall time.
+    #[test]
+    fn a_standing_block_backs_off_30m_2h_8h_then_daily() {
+        let mut p = NotifyPolicy::new();
+        let e = blocked("004");
+
+        // First page: immediate.
+        assert_eq!(p.decide(&e, 0), vec![Channel::Gui, Channel::Log, Channel::Phone]);
+        // Inside the first (30-min) rung: suppressed — every tick, however often.
+        assert!(p.decide(&e, 1).is_empty());
+        assert!(p.decide(&e, 1_799).is_empty());
+
+        // 30 min → the first reminder fires.
+        assert_eq!(
+            p.decide(&e, 1_800),
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+            "the first reminder waits 30 min",
+        );
+        // Then the NEXT rung is 2 h: a tick an hour later is still suppressed.
+        assert!(p.decide(&e, 3_600).is_empty(), "still inside the 2h rung");
+
+        // 2 h after the reminder → the second reminder fires.
+        assert_eq!(
+            p.decide(&e, 9_000), // 1800 + 7200
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+            "the second reminder waits 2 h",
+        );
+        // 8 h rung.
+        assert!(p.decide(&e, 10_000).is_empty());
+        assert_eq!(
+            p.decide(&e, 37_800), // 9000 + 28800
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+            "the third reminder waits 8 h",
+        );
+        // Daily from here on: a tick 6 h later is suppressed, the next page
+        // waits a full day.
+        assert!(p.decide(&e, 40_000).is_empty());
+        assert_eq!(
+            p.decide(&e, 37_800 + 86_400),
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+            "past the 8h rung a standing block pages at most daily",
+        );
+
+        // The upper bound the fix was asked to hold: after the first hour of a
+        // standing block, at most one page per 2 h. Drive a policy from t=0 (the
+        // ladder steps on block age); between age 1h and 1h+2h the only page is
+        // the 2h30m reminder (the 30m one landed before the first hour).
+        let mut p2 = NotifyPolicy::new();
+        for now in (0..3_600).step_by(60) {
+            let _ = p2.decide(&e, now);
+        }
+        let mut pages_after_first_hour = 0;
+        for now in (3_600..(3_600 + 7_200)).step_by(60) {
+            if !p2.decide(&e, now).is_empty() {
+                pages_after_first_hour += 1;
+            }
+        }
+        assert_eq!(pages_after_first_hour, 1, "≤ 1 page per 2 h after the first hour");
+    }
+
+    /// A SECOND distinct blocked item still pages immediately — identities are
+    /// independent, so one standing block's ladder never suppresses another.
+    #[test]
+    fn a_second_distinct_blocked_item_pages_immediately() {
+        let mut p = NotifyPolicy::new();
+        // 004 blocks and pages; 005 blocks a second later — fresh identity.
+        assert!(!p.decide(&blocked("004"), 0).is_empty());
+        assert_eq!(
+            p.decide(&blocked("005"), 1),
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+            "a different blocked item is its own identity — immediate page",
+        );
+        // 004 is deep inside its first rung, 005's page left it untouched.
+        assert!(p.decide(&blocked("004"), 2).is_empty());
+    }
+
+    /// Un-blocking and re-blocking an item pages again: the drive loop
+    /// reconciles the parked set each tick, and an identity that left it is
+    /// forgotten — so the re-block is a FRESH fire, not a reminder swallowed by
+    /// the still-running ladder.
+    #[test]
+    fn unblocking_and_reblocking_pages_again() {
+        let mut p = NotifyPolicy::new();
+        assert!(!p.decide(&blocked("004"), 0).is_empty());
+
+        // The block cleared (the item left the parked set): reconcile forgets it.
+        p.reconcile_blocked(&["other"]);
+        // Re-blocked minutes later — nowhere near any ladder rung — pages fresh.
+        assert_eq!(
+            p.decide(&blocked("004"), 60),
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+            "a re-block after an un-block pages immediately",
+        );
+        // And the ladder restarts from rung one.
+        assert!(p.decide(&blocked("004"), 61).is_empty());
+        assert_eq!(
+            p.decide(&blocked("004"), 60 + 1_800),
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+        );
+
+        // Reconcile leaves still-blocked identities (and every other class) alone.
+        let mut p2 = NotifyPolicy::new();
+        assert!(!p2.decide(&blocked("004"), 0).is_empty());
+        assert!(!p2.decide(&NotifyEvent::agent_crashed("tab"), 1).is_empty());
+        p2.reconcile_blocked(&["004"]);
+        assert!(p2.decide(&blocked("004"), 10).is_empty(), "still blocked — the ladder stands");
+        assert!(
+            p2.decide(&NotifyEvent::agent_crashed("tab"), 2).is_empty(),
+            "a crash identity is never touched by the blocked reconcile",
+        );
+    }
+
+    /// Other event classes (usage, crash) keep their current cadence — the flat
+    /// per-window cooldown, no ladder: a still-hot budget re-announces every
+    /// cooldown window, exactly as before task 071.
+    #[test]
+    fn other_classes_keep_the_flat_cadence() {
+        let mut p = NotifyPolicy::with_cooldown(1_000);
+        let usage = NotifyEvent::Usage { pct: 97 };
+        assert!(!p.decide(&usage, 0).is_empty());
+        assert!(p.decide(&usage, 999).is_empty());
+        assert!(!p.decide(&usage, 1_000).is_empty(), "the usage reminder fires each window");
+        assert!(!p.decide(&usage, 2_000).is_empty(), "…and the NEXT window too — no ladder");
+
+        let crash = NotifyEvent::agent_crashed("tab");
+        assert!(!p.decide(&crash, 0).is_empty());
+        assert!(p.decide(&crash, 500).is_empty());
+        assert!(!p.decide(&crash, 1_000).is_empty());
+        assert!(!p.decide(&crash, 2_000).is_empty(), "a re-crashing agent keeps its 1/window cadence");
     }
 }

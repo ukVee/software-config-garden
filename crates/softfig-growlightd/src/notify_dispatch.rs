@@ -368,6 +368,15 @@ impl NotifyDispatcher {
         }
         channels
     }
+
+    /// Reconcile the blocked-item identities against the CURRENT parked set
+    /// (task 071): every `BlockedOnHuman` identity that left the set is
+    /// forgotten, so an item un-blocked and later re-blocked pages immediately
+    /// instead of being swallowed by a still-running reminder backoff. The drive
+    /// loop calls this each tick, before it raises the parked-head alerts.
+    pub fn reconcile_blocked(&mut self, currently_blocked: &[&str]) {
+        self.policy.reconcile_blocked(currently_blocked);
+    }
 }
 
 impl Default for NotifyDispatcher {
@@ -551,6 +560,46 @@ mod tests {
         assert!(sub.try_recv().is_err(), "no GUI event on a suppressed fire");
         assert_eq!(spy.lines().len(), 1, "no extra log line");
         assert_eq!(bus.bodies().len(), 1, "no extra bus post");
+    }
+
+    /// TASK 071 — the dispatcher's blocked reconcile: an item that left the
+    /// parked set is forgotten, so a re-block delivers again immediately (a
+    /// fresh fire through the real delivery path), while a still-blocked item's
+    /// reminder backoff keeps suppressing.
+    #[test]
+    fn reconcile_blocked_lets_a_reblock_deliver_immediately() {
+        let hub = EventHub::new();
+        let sub = hub.subscribe();
+        let spy = SpyLog::new();
+
+        // A SHORT flat cooldown would mask nothing for a blocked event (its
+        // ladder rung 1 is 30 min), so a re-block inside that window is only
+        // possible via reconcile — the point of this test.
+        let mut d = NotifyDispatcher::with_policy(NotifyPolicy::with_cooldown(100));
+        d.register(Box::new(GuiNotifier::new(hub)));
+        d.register(Box::new(LogNotifier::new(Arc::clone(&spy))));
+
+        // First block: delivers (3 channels, phone included).
+        let chans = d.notify(&blocked("004"), 0);
+        assert_eq!(chans, vec![Channel::Gui, Channel::Log, Channel::Phone]);
+        let _ = sub.try_recv().unwrap();
+        assert_eq!(spy.lines().len(), 1);
+
+        // Still blocked next tick → the ladder suppresses the reminder.
+        d.reconcile_blocked(&["004"]);
+        assert!(d.notify(&blocked("004"), 60).is_empty());
+        assert_eq!(spy.lines().len(), 1);
+
+        // The block clears → reconcile forgets it → a re-block delivers fresh.
+        d.reconcile_blocked(&[]);
+        let chans = d.notify(&blocked("004"), 120);
+        assert_eq!(
+            chans,
+            vec![Channel::Gui, Channel::Log, Channel::Phone],
+            "the re-blocked item pages again, immediately",
+        );
+        let _ = sub.try_recv().unwrap();
+        assert_eq!(spy.lines().len(), 2, "exactly two audit lines across block + re-block");
     }
 
     /// Deregistration changes who receives: drop the log channel and only the GUI
