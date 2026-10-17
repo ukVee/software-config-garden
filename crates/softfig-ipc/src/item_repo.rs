@@ -23,6 +23,14 @@
 //! *content* — enough to tell "this session moved the repo" from "this session
 //! didn't", nothing more. Ignored paths (`target/`) never reach it, by
 //! construction of `git status`.
+//!
+//! Every phase is bounded so a probe can fail but never stall its caller (the
+//! growlightd drive loop runs it on its one thread): each `git` child is killed
+//! after [`GIT_TIMEOUT`], and the in-process hashing phase runs on its own
+//! thread under [`HASH_TIMEOUT`] — a metadata or read syscall on a hung mount
+//! abandons that thread and fails the probe. Non-regular files are never
+//! opened at all ([`hash_content`]): `open(2)` on a FIFO blocks until a writer
+//! appears.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -30,6 +38,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -42,6 +51,14 @@ const CONTENT_CAP: u64 = 4 * 1024 * 1024;
 /// How long one `git` call may run before it is killed. A probe runs once per
 /// member session, off the hot path, but it must never wedge the supervisor.
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the in-process hashing phase (metadata + content reads over the
+/// dirty list) may take before the probe fails. The `git` children have their
+/// own [`GIT_TIMEOUT`]; this one bounds the caller-side work that follows them,
+/// which runs on a dedicated thread — a read on a hung mount cannot be
+/// interrupted, so on timeout that thread is abandoned and the probe fails
+/// instead of stalling the drive loop that calls [`probe`].
+const HASH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The value of the doc's first `> Worktree:` blockquote line outside fenced
 /// code, trimmed; `None` when there is none or it is empty.
@@ -132,52 +149,93 @@ pub fn probe(repo: &Path) -> Result<RepoState, String> {
     if !status.success() {
         return Err(format!("git status in {}: {status}", repo.display()));
     }
-    let mut hasher = DefaultHasher::new();
-    let mut dirty = 0;
-    let mut newest_dirty_mtime = None;
-    let mut fields = out.split(|&b| b == 0).filter(|f| !f.is_empty());
-    while let Some(entry) = fields.next() {
-        if entry.len() < 4 || entry[2] != b' ' {
-            return Err(format!("git status in {}: unparsable entry", repo.display()));
-        }
-        let (xy, path) = (&entry[..2], &entry[3..]);
-        // A rename or copy carries its source path as one more field; it names
-        // the old location, so it is hashed but never read.
-        if xy.iter().any(|&c| c == b'R' || c == b'C') {
-            fields.next().hash(&mut hasher);
-        }
-        dirty += 1;
-        xy.hash(&mut hasher);
-        path.hash(&mut hasher);
-        let full = repo.join(String::from_utf8_lossy(path).as_ref());
-        match fs::symlink_metadata(&full) {
-            Ok(meta) => {
-                if let Ok(mtime) = meta.modified() {
-                    newest_dirty_mtime = newest_dirty_mtime.max(Some(mtime));
-                }
-                hash_content(&full, &meta, &mut hasher);
-            }
-            Err(_) => b"\0missing".hash(&mut hasher),
-        }
-    }
+    let (dirty, newest_dirty_mtime, fingerprint) = hash_dirty_entries(repo, &out)?;
     let (status, out) = git(repo, &["rev-parse", "--verify", "-q", "HEAD"])?;
     let head = match status.code() {
         Some(0) => Some(String::from_utf8_lossy(&out).trim().to_string()),
         Some(1) => None,
         _ => return Err(format!("git rev-parse HEAD in {}: {status}", repo.display())),
     };
-    Ok(RepoState { head, dirty, newest_dirty_mtime, fingerprint: hasher.finish() })
+    Ok(RepoState { head, dirty, newest_dirty_mtime, fingerprint })
 }
 
-/// Hash a dirty path's content: a symlink's target, else the file's length plus
-/// its first [`CONTENT_CAP`] bytes. A path that can't be read (a directory, a
-/// permission error) hashes a marker instead.
+/// Hash `git status -z` output into `(dirty, newest_dirty_mtime, fingerprint)`.
+///
+/// The whole phase runs on a worker thread the caller joins under
+/// [`HASH_TIMEOUT`]: a single hung metadata or read syscall (a dead NFS mount)
+/// can't be interrupted, so on timeout the worker is abandoned and the probe
+/// fails — the drive-loop thread that calls [`probe`] is never stalled. A
+/// per-entry deadline check inside the worker ends the phase early (as an
+/// error) when a merely slow tree would otherwise burn the full budget.
+fn hash_dirty_entries(
+    repo: &Path,
+    out: &[u8],
+) -> Result<(usize, Option<SystemTime>, u64), String> {
+    let out = out.to_vec();
+    let repo = repo.to_path_buf();
+    let label = repo.display().to_string();
+    let (tx, rx) = mpsc::channel();
+    let inner_label = label.clone();
+    thread::spawn(move || {
+        let deadline = Instant::now() + HASH_TIMEOUT;
+        let mut hasher = DefaultHasher::new();
+        let mut dirty = 0;
+        let mut newest_dirty_mtime = None;
+        let mut fields = out.split(|&b| b == 0).filter(|f| !f.is_empty());
+        while let Some(entry) = fields.next() {
+            if Instant::now() >= deadline {
+                let _ = tx.send(Err(format!("hash phase in {inner_label}: timed out")));
+                return;
+            }
+            if entry.len() < 4 || entry[2] != b' ' {
+                let _ = tx.send(Err(format!("git status in {inner_label}: unparsable entry")));
+                return;
+            }
+            let (xy, path) = (&entry[..2], &entry[3..]);
+            // A rename or copy carries its source path as one more field; it names
+            // the old location, so it is hashed but never read.
+            if xy.iter().any(|&c| c == b'R' || c == b'C') {
+                fields.next().hash(&mut hasher);
+            }
+            dirty += 1;
+            xy.hash(&mut hasher);
+            path.hash(&mut hasher);
+            let full = repo.join(String::from_utf8_lossy(path).as_ref());
+            match fs::symlink_metadata(&full) {
+                Ok(meta) => {
+                    if let Ok(mtime) = meta.modified() {
+                        newest_dirty_mtime = newest_dirty_mtime.max(Some(mtime));
+                    }
+                    hash_content(&full, &meta, &mut hasher);
+                }
+                Err(_) => b"\0missing".hash(&mut hasher),
+            }
+        }
+        let _ = tx.send(Ok((dirty, newest_dirty_mtime, hasher.finish())));
+    });
+    match rx.recv_timeout(HASH_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("hash phase in {label}: timed out")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!("hash phase in {label}: panicked")),
+    }
+}
+
+/// Hash a dirty path's content: a symlink's target, else a regular file's
+/// length plus its first [`CONTENT_CAP`] bytes. A path that can't be read (a
+/// permission error) hashes a marker instead. Anything else — a FIFO, socket,
+/// device, or directory — contributes nothing: opening it could block the
+/// caller forever (open(2) on a FIFO waits for a writer), and its existence
+/// already counts through git's own status entry.
 fn hash_content(full: &Path, meta: &fs::Metadata, hasher: &mut DefaultHasher) {
-    if meta.file_type().is_symlink() {
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
         match fs::read_link(full) {
             Ok(target) => target.hash(hasher),
             Err(_) => b"\0unreadable".hash(hasher),
         }
+        return;
+    }
+    if !file_type.is_file() {
         return;
     }
     let mut buf = Vec::new();
@@ -273,17 +331,7 @@ mod tests {
     }
 
     fn sh_git(repo: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("run git")
-            .success();
-        assert!(ok, "git {args:?}");
+        git_with_stdin(repo, args, Stdio::null());
     }
 
     #[test]
@@ -352,5 +400,106 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(probe(dir.path()).is_err());
         assert!(probe(&dir.path().join("absent")).is_err());
+    }
+
+    /// A tracked FIFO in the dirty tree must never be opened: open(2) on a FIFO
+    /// blocks until a writer appears, so the old probe would hang forever right
+    /// here — the exact hang report 029 is about. The FIFO is tracked without
+    /// opening it (`git add` on a FIFO would block too; modern git omits
+    /// untracked special files from `status`, so only the tracked form reaches
+    /// the probe). The probe completes, counts the FIFO as dirt, and hashes
+    /// nothing for it.
+    #[cfg(unix)]
+    #[test]
+    fn probe_skips_a_tracked_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        sh_git(repo, &["init", "-q"]);
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "-m", "base"]);
+
+        // Write the empty blob into the odb and insert the index entry by hand:
+        // cacheinfo never touches the worktree file.
+        let fifo = repo.join("pipe");
+        mkfifo(&fifo);
+        git_with_stdin(repo, &["hash-object", "-w", "--stdin"], Stdio::null());
+        sh_git(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644,e69de29bb2d1d6434b8b29ae775ad8c2e48c5391,pipe",
+            ],
+        );
+        sh_git(repo, &["commit", "-q", "-m", "track the fifo"]);
+
+        let state = probe(repo).expect("a fifo in the dirty tree is not an error");
+        assert_eq!(state.dirty, 1, "the fifo still counts as dirt");
+        // Its (unreadable) content is not part of the fingerprint: bumping the
+        // fifo's mtime moves the mtime and nothing else.
+        touch(&fifo);
+        let again = probe(repo).expect("a second probe is not an error");
+        assert_eq!(again.fingerprint, state.fingerprint, "a fifo contributes no hash");
+    }
+
+    /// The unit behind the probe test: `hash_content` contributes nothing for a
+    /// non-regular file — the hasher is untouched, byte for byte. With the old
+    /// code this test would block forever inside `File::open` on the FIFO.
+    #[cfg(unix)]
+    #[test]
+    fn hash_content_contributes_nothing_for_a_fifo_or_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        mkfifo(&fifo);
+        let sock = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let empty = DefaultHasher::new().finish();
+        for path in [&fifo, &sock] {
+            let meta = fs::symlink_metadata(path).unwrap();
+            let mut hasher = DefaultHasher::new();
+            hash_content(path, &meta, &mut hasher);
+            assert_eq!(hasher.finish(), empty, "{} contributes no hash", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let ok = Command::new("mkfifo")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run mkfifo")
+            .success();
+        assert!(ok, "mkfifo {}", path.display());
+    }
+
+    #[cfg(unix)]
+    fn touch(path: &Path) {
+        let ok = Command::new("touch")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run touch")
+            .success();
+        assert!(ok, "touch {}", path.display());
+    }
+
+    fn git_with_stdin(repo: &Path, args: &[&str], stdin: Stdio) {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdin(stdin)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?}");
     }
 }
