@@ -40,10 +40,11 @@
 
 use std::path::PathBuf;
 
+use softfig_ipc::item_repo::{probe, resolve_repo, worktree_field, RepoState};
 use softfig_ipc::verbs::{op, ListTreeArgs, ListTreeReply, ReadFileArgs, ReadFileReply};
 use softfig_ipc::{call_reconnecting, ErrorKind, Request, Response, RetryPolicy};
 
-use crate::drive_loop::QueueSource;
+use crate::drive_loop::{QueueSource, RepoProbe};
 use crate::scheduler::{ClaimHold, PartView, QueueView, Snapshot};
 
 /// The garden-relative backlog doc that hosts every queue's managed region.
@@ -158,15 +159,30 @@ fn parse_item_rows(body: &str) -> Vec<PartView> {
     parts
 }
 
-/// Parse the queue registry region's queue names, in row order. Mirrors
-/// keeperd's `queues::parse`: 2-cell data rows (`queue | repo`) with a non-empty
-/// name, header/separator skipped. Returns just the names — the repo binding is
-/// keeperd's concern, not the scheduler's.
+/// Parse the queue registry region's queue names, in row order — the order the
+/// scheduler walks the named queues in.
 fn registry_names(doc: &str) -> Vec<String> {
+    registry_rows(doc).into_iter().map(|(name, _)| name).collect()
+}
+
+/// The registry's `repo` cell for `queue`, raw (task 069): the spin guard's
+/// second repo source after the item doc's `> Worktree:`.
+/// [`resolve_repo`](softfig_ipc::item_repo::resolve_repo) decides whether it is a
+/// path this machine can probe — a remote `host:/path` cell is returned as-is
+/// here and resolves to no repo there. `None` for an unregistered queue (the
+/// default queue never has a row).
+pub(crate) fn registry_repo(doc: &str, queue: &str) -> Option<String> {
+    registry_rows(doc).into_iter().find(|(name, _)| name == queue).map(|(_, repo)| repo)
+}
+
+/// The queue registry region's `(queue, repo)` rows, in row order. Mirrors
+/// keeperd's `queues::parse`: 2-cell data rows (`queue | repo`) with a non-empty
+/// name, header/separator skipped.
+fn registry_rows(doc: &str) -> Vec<(String, String)> {
     let Some(body) = region_body(doc, "queues") else {
         return Vec::new(); // no named queues registered
     };
-    let mut names = Vec::new();
+    let mut rows = Vec::new();
     for line in body.lines() {
         let line = line.trim();
         if !line.starts_with('|') {
@@ -185,9 +201,9 @@ fn registry_names(doc: &str) -> Vec<String> {
         if cells[0].is_empty() {
             continue;
         }
-        names.push(cells[0].clone());
+        rows.push((cells[0].clone(), cells[1].clone()));
     }
-    names
+    rows
 }
 
 /// A markdown table separator row (`|---|---|`): every cell non-empty and made
@@ -406,6 +422,65 @@ impl QueueSource for KeeperdQueueSource {
             Ok(doc) => doc.as_deref().and_then(fleet_marker),
             Err(e) => Some(ClaimHold::Unreadable(e)),
         }
+    }
+}
+
+/// The live [`RepoProbe`] (task 069): which repo a part's work lands in, read
+/// through the same two keeperd docs the queue source reads — the item doc's
+/// `> Worktree:` first, then the queue registry's `repo` cell — and how far it has
+/// moved, through [`probe`]. Called once per member session, on the spin guard's
+/// lazy read, so the keeperd reads and the `git` calls never run per tick.
+#[derive(Debug)]
+pub struct KeeperdRepoProbe {
+    backlog: Box<dyn BacklogReader>,
+    docs: Box<dyn ItemDocReader>,
+    /// What a leading `~` expands against (`$HOME`, read once at assembly).
+    home: Option<PathBuf>,
+}
+
+impl KeeperdRepoProbe {
+    /// Bind the probe to keeperd's listen socket (the queue source's path) and
+    /// the daemon's `$HOME`.
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self {
+            backlog: Box::new(KeeperdBacklogReader { keeperd_socket: keeperd_socket.clone() }),
+            docs: Box::new(KeeperdItemDocReader { keeperd_socket }),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+}
+
+impl RepoProbe for KeeperdRepoProbe {
+    /// Every failure is "no repo signal" (the NEXT-ACTION-only guard), never an
+    /// error: a doc keeperd can't serve and a repo `git` can't read are journaled,
+    /// and the guard decides on NEXT ACTION alone.
+    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
+        // An unreadable doc might name a worktree the registry would contradict,
+        // so it is no signal rather than a registry guess.
+        let doc = self
+            .docs
+            .read_item_doc(part)
+            .inspect_err(|e| {
+                eprintln!("growlightd: repo probe: item doc for {queue}/{part} unreadable: {e}");
+            })
+            .ok()?;
+        let worktree = doc.as_deref().and_then(worktree_field);
+        // The registry is only read when the doc names no worktree: a present
+        // `> Worktree:` wins even when it doesn't resolve.
+        let registry = match worktree {
+            Some(_) => None,
+            None => match self.backlog.read_backlog() {
+                Ok(backlog) => registry_repo(&backlog, queue),
+                Err(e) => {
+                    eprintln!("growlightd: repo probe: backlog unreadable for {queue}/{part}: {e}");
+                    None
+                }
+            },
+        };
+        let repo = resolve_repo(worktree, registry.as_deref(), self.home.as_deref())?;
+        probe(&repo)
+            .inspect_err(|e| eprintln!("growlightd: repo probe: {queue}/{part}: {e}"))
+            .ok()
     }
 }
 
@@ -691,5 +766,109 @@ mod tests {
         assert_eq!(src.snapshot(), Snapshot::default());
         // Tick 2: keeperd is back -> the real snapshot pulls through.
         assert_eq!(src.snapshot(), parse_snapshot(&doc));
+    }
+
+    // ---- task 069: the repo a part lands in --------------------------------
+
+    /// The registry shapes the live backlog carries: a local path (psy) and a
+    /// remote one with a note (roadeye). The cell comes back raw.
+    #[test]
+    fn registry_repo_returns_the_raw_repo_cell_of_a_registered_queue() {
+        let registry = "| queue | repo |\n|-------|------|\n\
+                        | psy | /home/ukv/projects/psy-website |\n\
+                        | roadeye | otg-travel:/srv/roadeye (REMOTE — not on this device) |";
+        let doc = format!(
+            "{}\n\n{}\n",
+            region("queues", registry),
+            region("queue", &item_table(&[("d1", "queued")])),
+        );
+        assert_eq!(registry_repo(&doc, "psy").as_deref(), Some("/home/ukv/projects/psy-website"));
+        assert_eq!(
+            registry_repo(&doc, "roadeye").as_deref(),
+            Some("otg-travel:/srv/roadeye (REMOTE — not on this device)"),
+            "raw — resolve_repo is what turns a remote cell into no repo",
+        );
+        assert_eq!(registry_repo(&doc, "default"), None, "the default queue has no row");
+        assert_eq!(registry_repo(&doc, "nope"), None);
+        assert_eq!(registry_repo("# no registry here\n", "psy"), None);
+        assert_eq!(registry_names(&doc), vec!["psy", "roadeye"], "the queue order is unchanged");
+    }
+
+    /// A backlog reader the probe must not touch.
+    #[derive(Debug)]
+    struct UnreadBacklog;
+    impl BacklogReader for UnreadBacklog {
+        fn read_backlog(&self) -> Result<String, String> {
+            panic!("the registry must not be read here")
+        }
+    }
+
+    fn repo_probe(
+        backlog: Box<dyn BacklogReader>,
+        docs: Result<Option<String>, String>,
+    ) -> KeeperdRepoProbe {
+        KeeperdRepoProbe { backlog, docs: Box::new(FixtureDocs(docs)), home: Some("/home/t".into()) }
+    }
+
+    /// A git repo with one committed file and `dirty` untracked ones.
+    fn git_repo(dirty: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        for i in 0..dirty {
+            std::fs::write(dir.path().join(format!("wip{i}.txt")), "wip\n").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn the_item_docs_worktree_comes_first_and_skips_the_registry() {
+        let repo = git_repo(2);
+        let doc = format!("# 069\n> Worktree: `{}`\n", repo.path().display());
+        let state = repo_probe(Box::new(UnreadBacklog), Ok(Some(doc))).repo_state("psy", "069");
+        assert_eq!(state.map(|s| s.dirty), Some(2));
+
+        // A worktree this machine can't probe is no signal — not a registry guess.
+        let remote = repo_probe(Box::new(UnreadBacklog), Ok(Some("> Worktree: host:/x\n".into())));
+        assert_eq!(remote.repo_state("psy", "069"), None);
+    }
+
+    #[test]
+    fn the_registry_repo_is_probed_when_the_doc_names_no_worktree() {
+        let repo = git_repo(1);
+        let registry = format!("| queue | repo |\n|---|---|\n| psy | {} |", repo.path().display());
+        let backlog = Box::new(FakeReader { doc: region("queues", &registry) });
+        let probe = repo_probe(backlog, Ok(Some("# booking\n> Model: claude\n".into())));
+        assert_eq!(probe.repo_state("psy", "booking").map(|s| s.dirty), Some(1));
+        // The default queue has no registry row: no repo until its doc names one.
+        assert_eq!(probe.repo_state("default", "booking"), None);
+    }
+
+    #[test]
+    fn an_unreadable_source_or_repo_is_no_signal() {
+        // The item doc failed: whether it names a worktree is unknown.
+        let locked = repo_probe(Box::new(UnreadBacklog), Err("Locked".into()));
+        assert_eq!(locked.repo_state("psy", "x"), None);
+        // The backlog failed.
+        assert_eq!(repo_probe(Box::new(ErrReader), Ok(None)).repo_state("psy", "x"), None);
+        // The path resolves but is no git repo.
+        let not_git = tempfile::tempdir().unwrap();
+        let doc = format!("> Worktree: {}\n", not_git.path().display());
+        assert_eq!(repo_probe(Box::new(UnreadBacklog), Ok(Some(doc))).repo_state("psy", "x"), None);
     }
 }

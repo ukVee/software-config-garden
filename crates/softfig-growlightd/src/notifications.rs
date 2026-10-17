@@ -48,11 +48,13 @@
 //! - **`BlockedOnHuman` reminders back off** — the first page for a newly blocked
 //!   item stays immediate; each further reminder of the same standing block waits
 //!   `30 min → 2 h → 8 h → daily` ([`BLOCKED_REMINDER_LADDER_SECS`]), so after the
-//!   first hour the human hears at most one page per 2 h per item. A *change of
-//!   reason is a new identity*: an item is parked once and stands until the human
-//!   acts (a spin-guard park and a member-declared block cannot succeed one
-//!   another without an un-block between them), and an un-blocked-then-re-blocked
-//!   item pages again immediately — the drive loop reconciles the parked set each
+//!   first hour the human hears at most one page per 2 h per item. A spin-guard
+//!   park ([`SpinGuardParked`](NotifyEvent::SpinGuardParked), task 069) rides the
+//!   same ladder under its own `stuck:` identity. A *change of reason is a new
+//!   identity*: an item is parked once and stands until the human acts (a
+//!   spin-guard park and a member-declared block cannot succeed one another
+//!   without an un-block between them), and an un-blocked-then-re-blocked item
+//!   pages again immediately — the drive loop reconciles the parked set each
 //!   tick ([`reconcile_blocked`](NotifyPolicy::reconcile_blocked)): an identity
 //!   that left the set is forgotten, so the re-block (whatever its new reason) is
 //!   a fresh fire, not a swallowed reminder.
@@ -120,6 +122,20 @@ pub enum NotifyEvent {
     BlockedOnHuman {
         /// The parked backlog item's id.
         item: String,
+    },
+    /// The spin guard parked an item (task 069): its member ended session after
+    /// session on the same NEXT ACTION with no repo movement to show for it. Not
+    /// a human decision — the member never asked one — but it stalls the item
+    /// all the same, so it pages on the same reminder ladder under its own
+    /// identity.
+    SpinGuardParked {
+        /// The parked backlog item's id.
+        item: String,
+        /// How many sessions the streak ran before the guard tripped.
+        sessions: u32,
+        /// How many dirty paths the item's repo had at the last read; `None` when
+        /// the item has no repo this machine can probe.
+        dirty: Option<usize>,
     },
     /// A work-stream drained — the named queue (or the whole backlog) has no
     /// workable part left.
@@ -242,6 +258,7 @@ impl NotifyEvent {
         match self {
             Self::Usage { .. }
             | Self::BlockedOnHuman { .. }
+            | Self::SpinGuardParked { .. }
             | Self::QueueEmpty { .. }
             | Self::AgentCrashed { .. }
             | Self::NetworkOffline { .. }
@@ -272,6 +289,7 @@ impl NotifyEvent {
         match self {
             Self::Usage { .. } => "usage".to_string(),
             Self::BlockedOnHuman { item } => format!("blocked:{item}"),
+            Self::SpinGuardParked { item, .. } => format!("stuck:{item}"),
             Self::QueueEmpty { queue } => format!("queue-empty:{queue}"),
             Self::SliceComplete { part } => format!("slice-complete:{part}"),
             Self::AgentCrashed { agent, .. } => format!("agent-crashed:{agent}"),
@@ -293,6 +311,21 @@ impl NotifyEvent {
             Self::Usage { pct } => format!("5h budget at {pct}%"),
             Self::BlockedOnHuman { item } => {
                 format!("`{item}` is blocked on a human decision")
+            }
+            Self::SpinGuardParked {
+                item,
+                sessions,
+                dirty,
+            } => {
+                let repo = match dirty {
+                    None => "repo unknown".to_string(),
+                    Some(0) => "repo clean".to_string(),
+                    Some(1) => "repo dirty: 1 file".to_string(),
+                    Some(k) => format!("repo dirty: {k} files"),
+                };
+                format!(
+                    "`{item}` stuck (spin guard): {sessions} sessions ended with no new handoff — {repo}"
+                )
             }
             Self::QueueEmpty { queue } => format!("queue `{queue}` is empty — no workable part"),
             Self::SliceComplete { part } => format!("slice `{part}` complete"),
@@ -386,7 +419,7 @@ impl NotifyPolicy {
     /// class.
     fn cooldown_for(&self, event: &NotifyEvent, times: u32) -> i64 {
         match event {
-            NotifyEvent::BlockedOnHuman { .. } => {
+            NotifyEvent::BlockedOnHuman { .. } | NotifyEvent::SpinGuardParked { .. } => {
                 BLOCKED_REMINDER_LADDER_SECS[(times.saturating_sub(1).min(3)) as usize]
             }
             _ => self.cooldown_secs,
@@ -410,19 +443,20 @@ impl NotifyPolicy {
         event.channels()
     }
 
-    /// Forget every `BlockedOnHuman` identity not in `currently_blocked` (task
-    /// 071). The drive loop calls this each tick with the parked (blocked-head)
-    /// set: an item that left the set — un-blocked, done, re-queued — is
-    /// forgotten, so a LATER re-block pages immediately as a fresh fire instead
-    /// of being swallowed by a still-running backoff window. Identities still in
-    /// the set are untouched (their ladder keeps stepping). Every other event
-    /// class is never touched.
+    /// Forget every parked-item identity — `BlockedOnHuman` or `SpinGuardParked`
+    /// — not in `currently_blocked` (tasks 071, 069). The drive loop calls this
+    /// each tick with the parked (blocked-head) set: an item that left the set —
+    /// un-blocked, done, re-queued — is forgotten, so a LATER re-block pages
+    /// immediately as a fresh fire instead of being swallowed by a still-running
+    /// backoff window. Identities still in the set are untouched (their ladder
+    /// keeps stepping). Every other event class is never touched.
     pub fn reconcile_blocked(&mut self, currently_blocked: &[&str]) {
         let stale: Vec<String> = self
             .last_fired
             .keys()
             .filter(|key| {
                 key.strip_prefix("blocked:")
+                    .or_else(|| key.strip_prefix("stuck:"))
                     .is_some_and(|item| !currently_blocked.contains(&item))
             })
             .cloned()
@@ -440,6 +474,14 @@ mod tests {
     fn blocked(item: &str) -> NotifyEvent {
         NotifyEvent::BlockedOnHuman {
             item: item.to_string(),
+        }
+    }
+
+    fn stuck(item: &str, dirty: Option<usize>) -> NotifyEvent {
+        NotifyEvent::SpinGuardParked {
+            item: item.to_string(),
+            sessions: 2,
+            dirty,
         }
     }
 
@@ -515,10 +557,12 @@ mod tests {
     /// GUI/Log only (no phone).
     #[test]
     fn human_attention_set_routes_to_phone_others_do_not() {
-        // Human-attention: budget near the rail, blocked, drained, crashed.
+        // Human-attention: budget near the rail, blocked, spin-parked, drained,
+        // crashed.
         for e in [
             NotifyEvent::Usage { pct: 97 },
             blocked("004"),
+            stuck("004", Some(3)),
             NotifyEvent::QueueEmpty {
                 queue: "all".to_string(),
             },
@@ -875,5 +919,63 @@ mod tests {
         assert!(p.decide(&crash, 500).is_empty());
         assert!(!p.decide(&crash, 1_000).is_empty());
         assert!(!p.decide(&crash, 2_000).is_empty(), "a re-crashing agent keeps its 1/window cadence");
+    }
+
+    // ---- task 069: a spin-guard park is not a human decision ---------------
+
+    /// A spin park says what happened — the guard, the session count, how dirty
+    /// the repo was — and never "blocked on a human decision". A member-declared
+    /// block reads exactly as before.
+    #[test]
+    fn a_spin_park_reads_as_stuck_never_as_a_human_decision() {
+        assert_eq!(
+            stuck("069", Some(3)).summary(),
+            "`069` stuck (spin guard): 2 sessions ended with no new handoff — repo dirty: 3 files",
+        );
+        assert_eq!(
+            stuck("069", Some(1)).summary(),
+            "`069` stuck (spin guard): 2 sessions ended with no new handoff — repo dirty: 1 file",
+        );
+        assert_eq!(
+            stuck("069", Some(0)).summary(),
+            "`069` stuck (spin guard): 2 sessions ended with no new handoff — repo clean",
+        );
+        assert_eq!(
+            stuck("069", None).summary(),
+            "`069` stuck (spin guard): 2 sessions ended with no new handoff — repo unknown",
+        );
+        for dirty in [None, Some(0), Some(4)] {
+            assert!(!stuck("069", dirty).summary().contains("human decision"));
+        }
+        assert_eq!(blocked("069").summary(), "`069` is blocked on a human decision");
+    }
+
+    /// `blocked:` and `stuck:` are separate identities: one never suppresses the
+    /// other, the spin park climbs the same reminder ladder, and the parked-set
+    /// reconcile forgets both once the item leaves.
+    #[test]
+    fn blocked_and_stuck_identities_are_independent() {
+        assert_eq!(stuck("069", Some(3)).dedup_key(), "stuck:069");
+        assert_eq!(stuck("069", None).dedup_key(), "stuck:069", "the counts are not identity");
+        assert_ne!(stuck("069", None).dedup_key(), blocked("069").dedup_key());
+
+        let page = vec![Channel::Gui, Channel::Log, Channel::Phone];
+        let mut p = NotifyPolicy::new();
+        assert_eq!(p.decide(&blocked("069"), 0), page);
+        assert_eq!(p.decide(&stuck("069", Some(3)), 0), page, "a blocked page doesn't swallow it");
+        assert!(p.decide(&stuck("069", Some(4)), 1).is_empty(), "the same standing spin park");
+
+        // The ladder, not the flat cadence: 30 min, then 2 h.
+        assert_eq!(p.decide(&stuck("069", Some(3)), 1_800), page);
+        assert!(p.decide(&stuck("069", Some(3)), 3_600).is_empty(), "inside the 2h rung");
+        assert_eq!(p.decide(&stuck("069", Some(3)), 9_000), page);
+
+        // Still parked: the reconcile leaves it. Gone: forgotten, so a re-park
+        // pages at once.
+        p.reconcile_blocked(&["069"]);
+        assert!(p.decide(&stuck("069", Some(3)), 9_001).is_empty());
+        p.reconcile_blocked(&[]);
+        assert_eq!(p.decide(&stuck("069", Some(3)), 9_002), page);
+        assert_eq!(p.decide(&blocked("069"), 9_002), page);
     }
 }

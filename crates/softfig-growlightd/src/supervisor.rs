@@ -117,7 +117,7 @@ const DEFAULT_HANG_SECS: i64 = 600;
 /// unchanged across 2+ iterations → STUCK"): the first repeat arms the streak, the
 /// second trips it, so a stuck member burns at most one extra session before it is
 /// parked with a reason rather than spinning until a budget rail trips.
-const STALL_LIMIT: u32 = 2;
+pub(crate) const STALL_LIMIT: u32 = 2;
 /// Spin guard, repo half (task 069): how many continue-exits on an unchanged
 /// `# NEXT ACTION` the guard excuses because the item's repo moved (a new `HEAD`
 /// or a new dirty-tree fingerprint) during that NEXT ACTION's run. NEXT ACTION

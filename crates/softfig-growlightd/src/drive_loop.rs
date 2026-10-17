@@ -56,6 +56,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use softfig_ipc::item_repo::RepoState;
+
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
 use crate::claude_backend::ClaudeBackend;
@@ -70,7 +72,7 @@ use crate::scheduler::{
 use crate::state::State;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
-    Supervisor,
+    Supervisor, STALL_LIMIT,
 };
 use crate::usage::{UsageAggregator, UsageSample, WindowResets};
 
@@ -579,6 +581,29 @@ impl QueueSource for DeferredQueues {
     }
 }
 
+/// The seam the spin guard reads a part's repo through (task 069): a session can
+/// do real work and exit without a handoff, so "the repo moved" is progress too.
+/// Read lazily — only on a continue clean exit that carries a NEXT ACTION, once
+/// per session — and fed to [`Supervisor::poll_with_progress`]. The production
+/// impl is [`crate::queue_source::KeeperdRepoProbe`]; a test scripts the reads.
+pub trait RepoProbe: Send + Sync + fmt::Debug {
+    /// The current [`RepoState`] of the repo `part` of `queue` lands in, or `None`
+    /// when it has none this machine can probe (or the read failed) — the guard
+    /// then decides on NEXT ACTION alone.
+    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState>;
+}
+
+/// The default [`RepoProbe`]: no repo signal, so the spin guard is the
+/// NEXT-ACTION-only guard it was before task 069.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoRepoProbe;
+
+impl RepoProbe for NoRepoProbe {
+    fn repo_state(&self, _queue: &str, _part: &str) -> Option<RepoState> {
+        None
+    }
+}
+
 /// The seam the loop reads per-agent [`AgentHealth`] through, to feed
 /// [`Supervisor::poll`]. Implemented over the live [`ClaudeBackend`] (slice 001),
 /// which tracks a heartbeat-or-exit cell per agent; a test scripts the health.
@@ -984,6 +1009,9 @@ pub struct DriveLoop {
     /// How a picked part is claimed (`active`) before its agent spawns — the
     /// write that closes the fallback double-assignment window cross-tick.
     claimer: Box<dyn PartClaimer>,
+    /// Where the spin guard reads a part's repo from (task 069). [`NoRepoProbe`]
+    /// unless [`with_repo_probe`](Self::with_repo_probe) sets one.
+    repo_probe: Box<dyn RepoProbe>,
     /// How a member's current part is item-parked (`blocked`) when it exits on a
     /// human-block (`BLOCKED_ON_HUMAN` / `STUCK`) — the write that records the
     /// block on the ITEM so the freed member pivots past it (the sibling of
@@ -1039,6 +1067,12 @@ pub struct DriveLoop {
     /// without re-reading its doc each tick, and dropped [`HOLD_RECHECK_SECS`]
     /// later so the next pick reads it again.
     holds: std::collections::BTreeMap<(String, String), (ClaimHold, i64)>,
+    /// Parts the spin guard parked (task 069), each with the sessions the streak
+    /// ran and the dirty-path count the last repo read saw: [`dispatch`](Self::dispatch)
+    /// pages these as [`NotifyEvent::SpinGuardParked`], not as a human decision.
+    /// Dropped when the part leaves the parked set. In memory only, so after a
+    /// growlightd restart a standing spin park pages as `BlockedOnHuman`.
+    spin_parks: std::collections::BTreeMap<(String, String), (u32, Option<usize>)>,
     /// Holds already journaled, each with its latest reason: a part's skip is
     /// narrated once, not on every re-read, and this is the list `growlight status`
     /// shows. A part leaves it when a read finds it claimable again or the queue
@@ -1142,6 +1176,7 @@ impl DriveLoop {
             seeder,
             queues,
             claimer,
+            repo_probe: Box::new(NoRepoProbe),
             parker,
             samples,
             rate,
@@ -1154,6 +1189,7 @@ impl DriveLoop {
             reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
             holds: std::collections::BTreeMap::new(),
+            spin_parks: std::collections::BTreeMap::new(),
             announced_holds: std::collections::BTreeMap::new(),
             offline_since: None,
             offline_alerted: false,
@@ -1177,6 +1213,16 @@ impl DriveLoop {
     #[must_use]
     pub fn with_max_iterations(mut self, max: Option<u64>) -> Self {
         self.max_iterations = max;
+        self
+    }
+
+    /// Set where the spin guard reads a part's repo from (task 069). A builder for
+    /// the same reason as [`with_max_iterations`](Self::with_max_iterations): the
+    /// default [`NoRepoProbe`] keeps every existing loop on the NEXT-ACTION-only
+    /// guard, and only the live assembly and the repo tests opt in.
+    #[must_use]
+    pub fn with_repo_probe(mut self, probe: Box<dyn RepoProbe>) -> Self {
+        self.repo_probe = probe;
         self
     }
 
@@ -1406,6 +1452,12 @@ impl DriveLoop {
                 // `usage_limit_reached` the stderr ring can't see). A matching
                 // non-zero exit is a rate-limit DEATH → no `AgentCrashed`, no
                 // backoff; the timed hold below gates the re-roll until `resets_at`.
+                //
+                // Repo progress (task 069): the spin guard reads the part's repo
+                // through `repo_probe` — lazily, so `git` runs only on a continue
+                // clean exit with a NEXT ACTION. The read is kept in `repo_read` so
+                // a spin park can say how dirty the tree was.
+                let mut repo_read: Option<RepoState> = None;
                 let outcome = {
                     let stderr = &self.stderr;
                     let stream_errs = &self.stream_errs;
@@ -1435,7 +1487,14 @@ impl DriveLoop {
                                     .stream_error(agent)
                                     .is_some_and(|e| e.is_rate_limit()))
                     };
-                    self.supervisor.poll_with_exits(
+                    let repo_probe = &self.repo_probe;
+                    let assignment = self.assignments.get(agent);
+                    let repo_state = || {
+                        repo_read = assignment
+                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part));
+                        repo_read.clone()
+                    };
+                    self.supervisor.poll_with_progress(
                         agent,
                         health,
                         baton_status.as_deref(),
@@ -1443,6 +1502,7 @@ impl DriveLoop {
                         now,
                         network_exit,
                         rate_limit_exit,
+                        repo_state,
                     )
                 };
                 // Record the classification for `status` (task 070) — BEFORE the
@@ -1586,7 +1646,7 @@ impl DriveLoop {
                             report.completed.push(agent.clone());
                         }
                     }
-                    PollOutcome::Blocked { .. } => {
+                    PollOutcome::Blocked { spin_guard, .. } => {
                         // STUCK / BLOCKED_ON_HUMAN: the member is RELEASED to idle
                         // (already gone from the supervisor, slot freed — like an
                         // item-boundary release), NOT sticky-parked on its slot. Its
@@ -1607,6 +1667,16 @@ impl DriveLoop {
                                 // already released and the local item-park below still
                                 // pivots + alerts this tick; the keeperd write is
                                 // re-attempted when the member next resolves to it.
+                            }
+                            // A spin park pages as itself, not as a human decision
+                            // (task 069); a member-declared block replaces any
+                            // stale spin record for the part.
+                            let key = (queue.clone(), part.clone());
+                            if spin_guard {
+                                let dirty = repo_read.as_ref().map(|r| r.dirty);
+                                self.spin_parks.insert(key, (STALL_LIMIT, dirty));
+                            } else {
+                                self.spin_parks.remove(&key);
                             }
                             to_block.push((queue.clone(), part.clone()));
                             report.blocked.push(Assignment {
@@ -2028,9 +2098,19 @@ impl DriveLoop {
         // identity, so the ladder keeps stepping.
         let parked_items: Vec<&str> = report.parked.iter().map(|(_, part)| part.as_str()).collect();
         self.dispatcher.reconcile_blocked(&parked_items);
-        for (_queue, part) in &report.parked {
-            self.dispatcher
-                .notify(&NotifyEvent::BlockedOnHuman { item: part.clone() }, now);
+        // A part the spin guard parked pages as a spin park (task 069) — its own
+        // identity and text — for as long as it stays parked.
+        self.spin_parks.retain(|key, _| report.parked.contains(key));
+        for (queue, part) in &report.parked {
+            let event = match self.spin_parks.get(&(queue.clone(), part.clone())) {
+                Some(&(sessions, dirty)) => NotifyEvent::SpinGuardParked {
+                    item: part.clone(),
+                    sessions,
+                    dirty,
+                },
+                None => NotifyEvent::BlockedOnHuman { item: part.clone() },
+            };
+            self.dispatcher.notify(&event, now);
         }
         // The §9 near-exhaustion alert carries the LIVE fleet-aggregate 5h reserve %
         // (task 031), not the constant rung — so a genuinely-pinned or stale value is
@@ -2144,9 +2224,10 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
         PollOutcome::Retired => "retired (queue drained)",
         PollOutcome::Completed => "completed (item boundary)",
         // The supervisor's spin guard synthesized this block (NEXT ACTION unchanged
-        // across `STALL_LIMIT` re-rolls, task 038) — name it distinctly so a spin
-        // never reads as a member-declared human block in the journal.
-        PollOutcome::Blocked { spin_guard: true, .. } => "stuck (spin guard — NEXT ACTION unchanged)",
+        // across `STALL_LIMIT` re-rolls with no repo movement to excuse them, tasks
+        // 038 + 069) — name it distinctly so a spin never reads as a member-declared
+        // human block in the journal.
+        PollOutcome::Blocked { spin_guard: true, .. } => "stuck (spin guard — no progress)",
         PollOutcome::Blocked { .. } => "blocked on human",
         PollOutcome::ParkedRateLimited => "held (rate-limited)",
         // Task 070: a rate-limit DEATH reads as the hold it is — never "crashed".
@@ -4222,6 +4303,133 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(
             classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
             QueueState::Blocked("p1".into()),
+        );
+    }
+
+    /// A scripted [`RepoProbe`] (task 069): every read answers the current state
+    /// and is recorded with the `(queue, part)` it asked for.
+    #[derive(Debug, Default)]
+    struct ScriptedRepo(Mutex<Option<RepoState>>, Mutex<Vec<(String, String)>>);
+    impl ScriptedRepo {
+        fn set(&self, head: &str, dirty: usize, fingerprint: u64) {
+            *self.0.lock().unwrap() = Some(RepoState {
+                head: Some(head.into()),
+                dirty,
+                newest_dirty_mtime: None,
+                fingerprint,
+            });
+        }
+        fn reads(&self) -> Vec<(String, String)> {
+            self.1.lock().unwrap().clone()
+        }
+    }
+    impl RepoProbe for Arc<ScriptedRepo> {
+        fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
+            self.1.lock().unwrap().push((queue.into(), part.into()));
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn alert_lines(probe: &Probe) -> Vec<String> {
+        probe.log_lines().into_iter().filter(|l| l.starts_with("growlightd alert:")).collect()
+    }
+
+    /// TASK 069 — the psy `booking` replay (2026-10-16 18:59): a member hands off
+    /// a NEXT ACTION, then works a whole session and ends it without a handoff.
+    /// The tree is dirty with that session's work, so it re-rolls — the old guard
+    /// parked it here as "blocked on a human decision". A session after that which
+    /// moves nothing is a spin, and pages as one: its own text, with the dirty
+    /// count, never a human decision.
+    #[test]
+    fn a_session_that_worked_without_a_handoff_is_not_parked() {
+        let (loop_, _d, backend, _claimer, parker, _queues, probe) = make_full(
+            vec![member("a1", "psy")],
+            vec![q("psy", &[("booking", "queued")])],
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+
+        loop_.tick(0); // a1 starts on psy/booking
+        assert!(repo.reads().is_empty(), "a start reads no repo");
+
+        // Session 1 hands off X on a clean tree.
+        repo.set("h1", 0, 0);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "wire the booking form");
+        let r1 = loop_.tick(1);
+        assert!(r1.blocked.is_empty());
+        assert_eq!(repo.reads(), vec![("psy".into(), "booking".into())], "one read, for its part");
+
+        // Session 2 works and ends with no handoff: same NEXT ACTION, 5 files dirty.
+        repo.set("h1", 5, 42);
+        let r2 = loop_.tick(2);
+        assert!(r2.blocked.is_empty(), "the repo moved — progress, not a spin");
+        assert!(parker.parks().is_empty(), "booking is not parked");
+        assert_eq!(probe.gui_alerts(), 0, "nothing pages");
+        assert_eq!(backend.spawn_count(), 3, "a1 re-rolled onto booking");
+
+        // Session 3 moves nothing: now it is a spin.
+        let r3 = loop_.tick(3);
+        assert_eq!(
+            r3.blocked,
+            vec![Assignment { agent: "a1".into(), queue: "psy".into(), part: "booking".into() }],
+        );
+        assert_eq!(probe.gui_alerts(), 1, "the spin park pages once");
+        assert_eq!(
+            alert_lines(&probe),
+            vec![
+                "growlightd alert: `booking` stuck (spin guard): 2 sessions ended with no new \
+                 handoff — repo dirty: 5 files"
+                    .to_string()
+            ],
+        );
+        assert_eq!(repo.reads().len(), 3, "one repo read per session exit, none per tick");
+
+        // While it stands, the tick-by-tick parked set never re-pages it.
+        loop_.tick(4);
+        assert_eq!(probe.gui_alerts(), 0);
+    }
+
+    /// TASK 069 — a spin park's record lasts only while the part stays parked:
+    /// once the human un-blocks it, a later member-declared `BLOCKED_ON_HUMAN` on
+    /// the same part reads as the human decision it is.
+    #[test]
+    fn a_member_declared_block_after_a_spin_park_reads_as_a_human_decision() {
+        let (mut loop_, _d, backend, _claimer, _parker, queues, probe) = make_full(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "same");
+        loop_.tick(1);
+        loop_.tick(2); // no repo signal (NoRepoProbe): the plain streak trips
+        assert_eq!(
+            alert_lines(&probe),
+            vec![
+                "growlightd alert: `p1` stuck (spin guard): 2 sessions ended with no new \
+                 handoff — repo unknown"
+                    .to_string()
+            ],
+        );
+
+        // The human re-queues p1; a1 re-claims it and declares a real block.
+        queues.set(vec![q("qa", &[("p1", "queued")])]);
+        loop_.tick(3);
+        assert!(loop_.spin_parks.is_empty(), "the record left with the park");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        loop_.tick(4);
+        let lines = alert_lines(&probe);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("growlightd alert: `p1` is blocked on a human decision"),
+            "{lines:?}",
         );
     }
 
