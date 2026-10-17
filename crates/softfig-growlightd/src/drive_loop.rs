@@ -1039,9 +1039,11 @@ pub struct DriveLoop {
     /// without re-reading its doc each tick, and dropped [`HOLD_RECHECK_SECS`]
     /// later so the next pick reads it again.
     holds: std::collections::BTreeMap<(String, String), (ClaimHold, i64)>,
-    /// Holds already journaled — a part's skip is narrated once, not on every
-    /// re-read; it is re-armed when a read finds the part claimable again.
-    announced_holds: BTreeSet<(String, String)>,
+    /// Holds already journaled, each with its latest reason: a part's skip is
+    /// narrated once, not on every re-read, and this is the list `growlight status`
+    /// shows. A part leaves it when a read finds it claimable again or the queue
+    /// stops showing it `queued`.
+    announced_holds: std::collections::BTreeMap<(String, String), ClaimHold>,
     /// When the pre-spawn connectivity gate first held THIS outage (its first offline
     /// tick's `now`), or `None` while online/paused (network-failsafe slice 003).
     /// Drives the sustained-offline alert threshold — a blip clears it before
@@ -1152,7 +1154,7 @@ impl DriveLoop {
             reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
             holds: std::collections::BTreeMap::new(),
-            announced_holds: BTreeSet::new(),
+            announced_holds: std::collections::BTreeMap::new(),
             offline_since: None,
             offline_alerted: false,
             rate_limit_hold_until: None,
@@ -1863,7 +1865,7 @@ impl DriveLoop {
                         self.announced_holds.remove(&key);
                         break Some((queue, part));
                     };
-                    if self.announced_holds.insert(key.clone()) {
+                    if self.announced_holds.insert(key.clone(), hold.clone()).is_none() {
                         report.skipped_for_human.push(HeldPart {
                             queue: queue.clone(),
                             part: part.clone(),
@@ -1955,6 +1957,28 @@ impl DriveLoop {
                 }
             }
         }
+
+        // Publish the held parts to `growlight status` (task 068): every journaled
+        // hold whose part is still `queued`. An expired hold stays listed until a
+        // read frees it, so the list does not flicker while every member is busy.
+        // An empty snapshot is a failed read, which proves nothing either way.
+        if !snapshot.queues.is_empty() {
+            self.announced_holds.retain(|(queue, part), _| {
+                snapshot.queue(queue).is_some_and(|q| {
+                    q.parts.iter().any(|p| p.id == *part && p.status == PartStatus::Queued)
+                })
+            });
+        }
+        self.daemon.record_held_parts(
+            self.announced_holds
+                .iter()
+                .map(|((queue, part), hold)| softfig_ipc::growlightd::HeldPartSummary {
+                    queue: queue.clone(),
+                    part: part.clone(),
+                    reason: hold.reason(),
+                })
+                .collect(),
+        );
 
         // 4. Route this tick's events through the single owned dispatcher (spec
         //    §9). The report is still RETURNED for the caller (and tests) to
@@ -5687,6 +5711,37 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
         assert!(r.skipped_for_human.is_empty());
         assert_eq!(queues.marker_reads(), 0);
+    }
+
+    /// TASK 068 — `growlight status` lists what the fleet left for the human. The
+    /// list holds steady while every member is busy (an expired hold nobody has
+    /// re-read is still a hold), and a part leaves it once its queue stops showing
+    /// it `queued`.
+    #[test]
+    fn status_lists_a_held_part_until_it_leaves_the_queue() {
+        let (mut loop_, d, _backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("c", "default")],
+            vec![q("default", &[("h1", "queued"), ("w", "queued")])],
+            Policy::default(),
+        );
+        queues.mark_human_only("h1");
+        let held = |d: &Daemon| d.inner.lock().unwrap().held_parts.clone();
+        let listed = vec![softfig_ipc::growlightd::HeldPartSummary {
+            queue: "default".into(),
+            part: "h1".into(),
+            reason: "human-only (> Fleet: no)".into(),
+        }];
+
+        assert_eq!(loop_.tick(0).started.len(), 1, "c skips h1 and claims w");
+        assert_eq!(held(&d), listed);
+        let reads = queues.marker_reads();
+        loop_.tick(HOLD_RECHECK_SECS + 1);
+        assert_eq!(queues.marker_reads(), reads, "c is busy on w, so nobody re-reads h1");
+        assert_eq!(held(&d), listed, "and the expired hold stays listed");
+
+        queues.set(vec![q("default", &[("h1", "done"), ("w", "active")])]);
+        loop_.tick(HOLD_RECHECK_SECS + 2);
+        assert!(held(&d).is_empty(), "a part no longer queued leaves the list");
     }
 
     /// A claim failure is fail-closed: admission cleared but the part could not be

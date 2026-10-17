@@ -59,6 +59,10 @@ pub struct DaemonInner {
     /// rate-limit death (and a transient reconnect). Read in `status`'s snapshot;
     /// empty until the loop's first poll.
     pub member_lifecycles: BTreeMap<String, crate::supervisor::MemberLifecycle>,
+    /// The parts the drive loop is leaving for the human (task 068), as of its
+    /// last tick — what `status` lists under `held`. Empty until the loop's first
+    /// tick, and always empty for a disarmed fleet (no loop runs).
+    pub held_parts: Vec<softfig_ipc::growlightd::HeldPartSummary>,
     // The live `claude -p` child *kill* handles do NOT live here under the daemon
     // lock — they are in [`Daemon::kill_handles`], a registry the backend shares
     // by `Arc` and fills on every spawn, so the hard-kill path never has to take
@@ -75,6 +79,7 @@ impl DaemonInner {
             leases: LeaseTable::new(),
             fleet: crate::fleet::FleetConfig::disabled(),
             member_lifecycles: BTreeMap::new(),
+            held_parts: Vec::new(),
         }
     }
 }
@@ -409,6 +414,13 @@ impl Daemon {
             .member_lifecycles
             .get(agent)
             .copied()
+    }
+
+    /// Replace the held-parts list `status` reports (task 068). The drive loop
+    /// calls this once per tick with the holds it has journaled, still `queued`.
+    /// A brief lock write, like [`record_member_lifecycle`](Self::record_member_lifecycle).
+    pub fn record_held_parts(&self, held: Vec<softfig_ipc::growlightd::HeldPartSummary>) {
+        self.inner.lock().unwrap().held_parts = held;
     }
 
     /// `request_lease` (spec §4c): arbitrate a lease over the shared resource

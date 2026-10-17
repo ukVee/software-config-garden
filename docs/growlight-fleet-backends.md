@@ -222,6 +222,17 @@ reserve gauge and looked broken. Two consequences of the fix are worth knowing:
 - `agents` now lists **idle** members too, so a client counting running agents must
   filter on the row's `running` flag rather than counting rows.
 
+A third list, **`held`**, names the `queued` items an armed fleet is leaving for the
+human (task 068): each one whose item doc carries a `> Fleet:` line with any value but
+`yes`, with the skip reason the journal gave. A held item is not blocked, so it pages no
+one, and this list is where it shows. Removing the line frees the item; a hold is
+trusted for 60 seconds, then the next member to reach the item reads its doc again.
+
+```
+held:
+  default/hover-view-sticky        human-only (> Fleet: no)
+```
+
 ### Spend accounting is session-scoped, and it is not a cap
 
 - **In memory only.** The counters live in the backend's cells and are lost on a
@@ -262,7 +273,8 @@ Three differences worth knowing when reading logs:
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent
 row carries id/status/ctx only. `growlight status` and the TUI do. Surfacing it there is
-its own change.
+its own change. Neither the GUI nor the TUI lists `held` items yet; only `growlight
+status` does.
 
 A headless opencode member cannot write to a **code repo**. The permission floor reaches
 only the loop's own state, so an ungranted repo yields a refusal a headless session cannot

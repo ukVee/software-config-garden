@@ -226,7 +226,7 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
 fn status(daemon: &Daemon) -> Response {
     let router = daemon.backend_router();
     // Everything the daemon lock owns, taken in one brief hold.
-    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles) = {
+    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles, held) = {
         let inner = daemon.inner.lock().unwrap();
         (
             inner.state.label().to_string(),
@@ -236,6 +236,7 @@ fn status(daemon: &Daemon) -> Response {
             inner.fleet.enabled,
             inner.fleet.members.clone(),
             inner.member_lifecycles.clone(),
+            inner.held_parts.clone(),
         )
     };
     let roster = members
@@ -267,6 +268,7 @@ fn status(daemon: &Daemon) -> Response {
         // The genuinely-running scope units (slice 006) — independent leaf lock,
         // like build_caps above; never reconstructed CLI-side.
         live_scopes: daemon.live_scope_units(),
+        held,
     };
     ok_reply(&reply, "status")
 }
@@ -963,6 +965,25 @@ mod tests {
         assert!(!reply.fleet_enabled);
         assert!(reply.agents.is_empty(), "a disarmed fleet has no live rows");
         assert_eq!(reply.roster.len(), 4, "the configured roster still reports");
+    }
+
+    #[test]
+    fn status_lists_the_parts_the_loop_left_for_the_human() {
+        // Task 068: a hold leaves the item `queued` and pages no one, so `status` is
+        // where it shows: whatever the drive loop last recorded, reason included.
+        let daemon = test_daemon_with(SpyPersister::new(false));
+        assert!(status_reply(&daemon).held.is_empty(), "nothing held before a tick");
+
+        let held = vec![softfig_ipc::growlightd::HeldPartSummary {
+            queue: "default".into(),
+            part: "hover-view-sticky".into(),
+            reason: "human-only (> Fleet: no)".into(),
+        }];
+        daemon.record_held_parts(held.clone());
+        assert_eq!(status_reply(&daemon).held, held);
+
+        daemon.record_held_parts(Vec::new());
+        assert!(status_reply(&daemon).held.is_empty(), "a freed part leaves the list");
     }
 
     #[test]
