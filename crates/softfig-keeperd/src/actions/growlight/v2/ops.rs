@@ -262,8 +262,7 @@ fn slice_status_of(new: DaemonStatusArg) -> Option<SliceStatus> {
 /// The §3.5 timestamp prefix: `YYYY-MM-DDTHH:MMZ` (the spec's example form —
 /// minute precision), stamped by keeperd.
 fn session_ts() -> String {
-    let ts = conventions::now_rfc3339();
-    format!("{}Z", &ts[..16])
+    conventions::now_rfc3339_minute()
 }
 
 // ---- queue_v2_claim ------------------------------------------------------
@@ -2165,5 +2164,23 @@ mod tests {
         // Closed is closed.
         let err = set_status(&daemon, "m", Some("s"), "deferred").unwrap_err();
         assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
+    }
+
+    /// Pins the §3.5 session-log stamp's shape: exactly
+    /// `YYYY-MM-DDTHH:MMZ` (17 bytes), so a change to any date-time
+    /// formatting fails here instead of mangling a session-log line.
+    #[test]
+    fn session_ts_shape_is_minute_precision_rfc3339() {
+        let ts = session_ts();
+        assert_eq!(ts.len(), 17, "minute-precision RFC3339 must be 17 bytes, got {ts:?}");
+        for (i, c) in ts.bytes().enumerate() {
+            match i {
+                4 | 7 => assert_eq!(c, b'-', "`-` separator at byte {i} in {ts:?}"),
+                10 => assert_eq!(c, b'T', "`T` at byte 10 in {ts:?}"),
+                13 => assert_eq!(c, b':', "`:` at byte 13 in {ts:?}"),
+                16 => assert_eq!(c, b'Z', "`Z` at byte 16 in {ts:?}"),
+                _ => assert!(c.is_ascii_digit(), "digit at byte {i} in {ts:?}"),
+            }
+        }
     }
 }

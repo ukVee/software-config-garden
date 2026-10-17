@@ -418,6 +418,22 @@ pub fn now_rfc3339() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+/// The current UTC wall-clock as an RFC 3339 timestamp at **minute**
+/// precision (`YYYY-MM-DDTHH:MMZ`) — the §3.5 session-log prefix form.
+/// Built directly from the civil date-time rather than by slicing
+/// [`now_rfc3339`]'s string, so a future change to that format can never
+/// truncate mid-character.
+pub fn now_rfc3339_minute() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let sod = secs.rem_euclid(86_400);
+    let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}Z")
+}
+
 /// The current Unix wall-clock in whole seconds. Feeds the thrash detector's
 /// window math; the detector itself takes an injected `now` so its tests never
 /// touch the real clock (this is only called on the live edit path).
