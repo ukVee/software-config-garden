@@ -446,6 +446,20 @@ fn recovery_add(garden: PathBuf, path: &str) -> Result<()> {
     // already exists is a passphrase typed at a prompt nobody read.
     wrappings::check_can_add(vault.paths(), target)?;
 
+    // Announce the cost the new door will carry, before anything is typed. A
+    // door inherits the vault's current strength, and on a rehardened vault
+    // that is a real unlock latency on whatever machine this phrase is
+    // eventually typed into — a fact to state at minting time, not one to
+    // discover on the worst day.
+    if let Ok(current) = wrappings::self_wrapping_params(vault.paths()) {
+        println!(
+            "The new door will derive at {} — the cost {} uses today.",
+            current.params,
+            storage::KEK_SELF_FILE
+        );
+        println!();
+    }
+
     let pass = prompt_passphrase("Passphrase: ")?;
     let session = vault.unlock(pass.as_bytes())?;
     let phrase = wrappings::add_wrapping(&session, target)?;
@@ -1015,8 +1029,7 @@ fn rewrap(garden: PathBuf, args: RewrapArgs) -> Result<()> {
     }
     let paths = vault.paths();
 
-    let fallback = softfig_vault::storage::load_params(paths)?.argon2;
-    let current = softfig_vault::kek::wrapping_params(&std::fs::read(paths.kek_self())?, &fallback);
+    let current = wrappings::self_wrapping_params(paths)?;
 
     // Unspecified costs inherit from the vault rather than from a constant: a
     // vault someone deliberately set to t=6 must not be quietly returned to the
@@ -1172,6 +1185,30 @@ fn rotate_key(garden: PathBuf) -> Result<()> {
 
 fn recover(garden: PathBuf) -> Result<()> {
     let vault = Vault::at(&garden);
+
+    // `recover` rewrites the same file `rewrap` does, so it owes the same
+    // announcement: the cost the replacement will carry, and the two things
+    // replacing `k.self` breaks. Printed before the phrase and the new
+    // passphrase are typed, because that is when the operator can still stop.
+    match wrappings::self_wrapping_params(vault.paths()) {
+        Ok(current) => println!(
+            "The replacement {} will derive at {} — the cost it uses today.",
+            storage::KEK_SELF_FILE, current.params
+        ),
+        Err(_) => println!(
+            "{} cannot be read, so the replacement will derive at the {} cost.",
+            storage::KEK_SELF_FILE,
+            softfig_vault::storage::PARAMS_FILE
+        ),
+    }
+    println!(
+        "Replacing it invalidates every outstanding relock blob, and turns a current"
+    );
+    println!(
+        "escrow proof into a historical one — `recovery drop` refuses to act on a"
+    );
+    println!("stale proof, so re-export and re-verify afterwards.");
+    println!();
     println!("Enter your 12-word recovery phrase (single line, words separated by spaces):");
     let phrase_input = read_line()?;
     let phrase = RecoveryPhrase::parse(&phrase_input)?;
@@ -1182,6 +1219,8 @@ fn recover(garden: PathBuf) -> Result<()> {
     }
     vault.recover(&phrase, new_pass1.as_bytes())?;
     println!("Recovery successful. Self-path passphrase has been replaced.");
+    println!();
+    print_kdf_status(vault.paths());
     Ok(())
 }
 

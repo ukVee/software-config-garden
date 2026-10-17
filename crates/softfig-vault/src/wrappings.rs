@@ -29,18 +29,71 @@
 //! verb in this codebase can prove. That is the guard working, not a gap in
 //! it.
 
+use std::path::Path;
+
 use crate::error::{Result, VaultError};
 use crate::escrow::{self, VerificationRecord};
-use crate::kek;
-use crate::params::aad;
+use crate::kek::{self, WrappingParams};
+use crate::params::{aad, Argon2Params};
 use crate::recovery::RecoveryPhrase;
 use crate::recovery_policy::{self, RecoveryPath, RecoveryPolicy, RecoveryStatus, Wrappings};
 use crate::session::VaultSession;
 use crate::storage::{self, VaultPaths};
 
-/// Key material mode. `init` predates this and uses a bare `fs::write`; a door
-/// created now gets the atomic publish and the private mode both.
+/// Key material mode. Every wrapping of `K` reaches disk through
+/// [`write_wrapping`], so this is the mode of every door in the vault —
+/// including the two `init` writes, which used a bare `fs::write`, and so the
+/// process umask, until the same publish path was applied to them.
 pub(crate) const WRAPPING_MODE: u32 = 0o600;
+
+/// The one way a wrapping of `K` is published: crash-atomic, and private from
+/// its first byte on disk.
+///
+/// One writer for the same reason [`crate::kek::wrap_kek_under_passphrase`] is
+/// one writer. A door written a second way is a door with a second set of
+/// properties, and the properties here — never torn, never even briefly
+/// group-readable — are the ones that matter on the day the vault is all that
+/// is left.
+pub(crate) fn write_wrapping(path: &Path, bytes: &[u8]) -> Result<()> {
+    storage::atomic_write_mode(path, bytes, WRAPPING_MODE)
+}
+
+/// The parameters `k.self` opens under today, and whether it carries them.
+///
+/// Reads two files and opens nothing, so it stays usable on a locked vault.
+/// `Err` when either is unreadable, which is the right posture for a *reader*
+/// — `vault status` and `rewrap`'s plan report an absent `k.self` rather than
+/// substituting a default for it.
+pub fn self_wrapping_params(paths: &VaultPaths) -> Result<WrappingParams> {
+    let fallback = storage::load_params(paths)?.argon2;
+    Ok(kek::wrapping_params(
+        &std::fs::read(paths.kek_self())?,
+        &fallback,
+    ))
+}
+
+/// The parameters a **new** door should be minted under: the ones `k.self`
+/// opens under today, falling back to `params.toml` when it does not carry its
+/// own.
+///
+/// A vault is only as strong as its weakest door, so a door created now
+/// inherits the vault's *current* posture rather than its birth posture. Since
+/// a rewrap deliberately leaves `params.toml` at the birth cost (see
+/// [`crate::rewrap`] for why it must), taking the cost from the file instead of
+/// from the door would mean every [`crate::Vault::recover`] silently undid the
+/// last rehardening, and every re-added phrase door was the weakest thing in
+/// the vault — the exact inverse of the argument this milestone makes about
+/// which door is worth worrying about.
+///
+/// Degrades instead of failing, deliberately: `recover` is the repair path for
+/// a `k.self` that is missing or torn, so *needing* to read `k.self` in order
+/// to replace it would strand the one case the verb exists for.
+pub(crate) fn new_door_params(paths: &VaultPaths, fallback: &Argon2Params) -> Argon2Params {
+    match std::fs::read(paths.kek_self()) {
+        Ok(bytes) => kek::wrapping_params(&bytes, fallback).params,
+        Err(_) => *fallback,
+    }
+}
 
 /// What a removal would do, and what licenses it.
 ///
@@ -165,22 +218,29 @@ pub fn drop_wrapping(
 /// Refuses when a phrase wrapping already exists. Replacing a door is `drop`
 /// then `add`, said out loud, so a live door is never silently swapped out
 /// from under whoever wrote the old phrase down.
+///
+/// The new door is minted at [`new_door_params`] — the strength `k.self` has
+/// now, not the strength the vault was born with. A phrase door added after a
+/// rewrap is the one most likely to be added at the wrong cost, because the
+/// milestone's own advice is to drop the phrase door and reharden: re-adding
+/// one afterwards must not quietly reopen the vault at the old cost.
 pub fn add_phrase(session: &VaultSession) -> Result<RecoveryPhrase> {
     let paths = &session.paths;
     check_can_add(paths, RecoveryPath::Phrase)?;
     let params = storage::load_params(paths)?;
+    let target = new_door_params(paths, &params.argon2);
 
     let phrase = RecoveryPhrase::generate();
     let wrapped = kek::wrap_kek_under_passphrase(
         &phrase.as_passphrase_bytes(),
         &session.kek,
-        &params.argon2,
+        &target,
         aad::KEK_RECOVERY,
     );
     // Door first, declaration second: a crash in the window leaves a working
     // door that the policy does not name, which slice 001 reports as an
     // `Undeclared` divergence. Nothing is lost and the gap is visible.
-    storage::atomic_write_mode(&paths.kek_recovery(), &wrapped, WRAPPING_MODE)?;
+    write_wrapping(&paths.kek_recovery(), &wrapped)?;
 
     let mut policy = RecoveryStatus::read(paths).effective();
     policy.insert(RecoveryPath::Phrase);

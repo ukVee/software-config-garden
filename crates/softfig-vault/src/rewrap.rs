@@ -21,7 +21,7 @@
 //! introduced to delete, reached by a different road.
 //!
 //! With one write there is no ordering to get wrong, and
-//! [`crate::storage::atomic_write_mode`] makes that write crash-atomic. A crash
+//! [`crate::wrappings::write_wrapping`] makes that write crash-atomic. A crash
 //! leaves the old `k.self` or the new one, never a torn one.
 //!
 //! # Two consequences that must be announced, not discovered
@@ -40,7 +40,7 @@ use crate::kek::{self, WrappingParams};
 use crate::params::{aad, Argon2Params, OWASP_BASELINE};
 use crate::recovery_policy::{RecoveryPath, Wrappings};
 use crate::storage::{self, VaultPaths};
-use crate::wrappings::WRAPPING_MODE;
+use crate::wrappings;
 
 /// The most memory `calibrate` will ask for: 1 GiB. Past this the unlock
 /// latency and the resident-memory spike stop being a good trade on the class
@@ -91,8 +91,7 @@ pub fn plan(paths: &VaultPaths, target: Argon2Params, allow_downgrade: bool) -> 
         .check()
         .map_err(|e| VaultError::InvalidArgon2Params(format!("{target}: {e}")))?;
 
-    let fallback = storage::load_params(paths)?.argon2;
-    let current = kek::wrapping_params(&std::fs::read(paths.kek_self())?, &fallback);
+    let current = wrappings::self_wrapping_params(paths)?;
 
     // Two bounds, each checked the same way: never below the published
     // baseline, and never below what this vault already has. The second is the
@@ -190,7 +189,7 @@ pub fn apply(
     // One file, one atomic publish. The declared policy is untouched: a rewrap
     // changes the secret and the cost behind a door, it does not add or remove
     // one — the same reasoning `Vault::recover` records.
-    storage::atomic_write_mode(&paths.kek_self(), &rewrapped, WRAPPING_MODE)?;
+    wrappings::write_wrapping(&paths.kek_self(), &rewrapped)?;
     Ok(())
 }
 

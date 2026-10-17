@@ -14,6 +14,7 @@ use crate::recovery_policy::{self, RecoveryPath, RecoveryPolicy};
 use crate::session::VaultSession;
 use crate::storage::{self, VaultPaths};
 use crate::transport::{self, TransportKey};
+use crate::wrappings;
 
 #[derive(Debug, Clone)]
 pub struct Vault {
@@ -77,7 +78,7 @@ impl Vault {
         // Self-path passphrase wrapping.
         let wrapped_self =
             kek::wrap_kek_under_passphrase(passphrase, &kek, &params.argon2, aad::KEK_SELF);
-        fs::write(paths.kek_self(), wrapped_self)?;
+        wrappings::write_wrapping(&paths.kek_self(), &wrapped_self)?;
 
         // Recovery passphrase wrapping.
         let recovery = RecoveryPhrase::generate();
@@ -87,7 +88,7 @@ impl Vault {
             &params.argon2,
             aad::KEK_RECOVERY,
         );
-        fs::write(paths.kek_recovery(), wrapped_recovery)?;
+        wrappings::write_wrapping(&paths.kek_recovery(), &wrapped_recovery)?;
 
         // First master generation + identity.
         let m1 = MasterKey::generate(1);
@@ -197,6 +198,27 @@ impl Vault {
 
     /// Recover from a forgotten passphrase: unlock with the recovery phrase,
     /// then re-wrap K under a new passphrase. Old `k.self` is replaced.
+    ///
+    /// # The cost the new door gets
+    ///
+    /// [`crate::wrappings::new_door_params`]: whatever `k.self` opens under
+    /// now, not whatever `params.toml` says. Deriving from the file would make
+    /// this verb a way to silently undo a [`crate::rewrap`] — the floor
+    /// `rewrap` refuses to cross, crossed by a different door — and there is
+    /// no `--allow-downgrade` here to consent to it with. When `k.self` cannot
+    /// be read at all, which is the state this verb repairs, the fallback is
+    /// `params.toml` and recovery still runs. Recovery is the last door: it
+    /// warns, it does not refuse.
+    ///
+    /// # Publishing
+    ///
+    /// The same standard [`crate::rewrap::apply`] holds itself to, and for a
+    /// stronger reason — `rewrap` replaces a door its caller can already open,
+    /// while this one replaces a door whose secret is by premise lost. The new
+    /// bytes are proven to reproduce `K` in memory before they replace bytes
+    /// that already do, and the publish is crash-atomic, so an interrupted
+    /// recovery leaves the old `k.self` intact rather than a torn one that no
+    /// passphrase and no phrase can open.
     pub fn recover(&self, phrase: &RecoveryPhrase, new_passphrase: &[u8]) -> Result<()> {
         let params = storage::load_params(&self.paths)?;
         let wrapped_recovery = fs::read(self.paths.kek_recovery())?;
@@ -207,9 +229,18 @@ impl Vault {
             aad::KEK_RECOVERY,
         )?;
 
-        let new_self =
-            kek::wrap_kek_under_passphrase(new_passphrase, &kek, &params.argon2, aad::KEK_SELF);
-        fs::write(self.paths.kek_self(), new_self)?;
+        let target = wrappings::new_door_params(&self.paths, &params.argon2);
+        let new_self = kek::wrap_kek_under_passphrase(new_passphrase, &kek, &target, aad::KEK_SELF);
+
+        let proof =
+            kek::unwrap_kek_under_passphrase(new_passphrase, &new_self, &target, aad::KEK_SELF)?;
+        if proof.expose() != kek.expose() {
+            return Err(VaultError::Malformed(
+                "the new k.self did not reproduce K — refusing to publish it",
+            ));
+        }
+
+        wrappings::write_wrapping(&self.paths.kek_self(), &new_self)?;
         // The declared policy is deliberately untouched: recovery replaces the
         // secret behind the self-path door, it does not add or remove a door.
         Ok(())
