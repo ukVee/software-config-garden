@@ -758,8 +758,10 @@ fn tool_defs() -> Vec<Value> {
                             `reason` is one of: context_full | mcp_updated | daemon_restarted | \
                             session_fault | model_change | new_scope | preempted. new_scope needs \
                             `new_slice` (it runs next, then this slice resumes); model_change \
-                            needs `model` (one of the unit's allowed models). Every reason but \
-                            preempted counts toward the 5-follow-up cap. The baton carries \
+                            needs `model` (one of the unit's allowed models). preempted is only \
+                            for a session growlightd told that urgent work is waiting; every \
+                            reason counts toward the 5-follow-up cap except a preempted that \
+                            growlightd asked for. The baton carries \
                             status IN_PROGRESS. A refusal leaves this session running: read the \
                             code and correct the call.",
             "inputSchema": {

@@ -41,7 +41,12 @@
 //!   it hands on `IN_PROGRESS`.
 //! - `model_change` without `model` has no code of its own in §6.3; it is
 //!   refused `model_not_allowed` (the request names no allowed model).
-//! - A `preempted` follow-up never counts, so it is never capped.
+//! - A `preempted` follow-up is exempt from the cap only when growlightd told
+//!   the member to yield (§9's `urgent_waiting`, the `told_to_yield` input).
+//!   That message is not in this build, so the server passes `false` and a
+//!   `preempted` roll counts like any other (review R2: otherwise it is a
+//!   self-declared, unlimited cap bypass). [`Validated::counted`] carries the
+//!   one verdict to the handoff's counter.
 //! - `depth_limit` is checked here with the rest of the cap step (§7's code in
 //!   §6.3's list); building the sub-milestone is [`crate::member_handoff`]'s.
 //! - Slice 010: §6.7's `field_not_allowed` for a sub-milestone's text is
@@ -160,6 +165,10 @@ pub struct Validated {
     /// `add_follow_up_session` only: the next session's model when the call
     /// changes it (model or variant); `None` keeps the current one.
     pub next_model: Option<ModelChoice>,
+    /// `add_follow_up_session` only: whether the roll adds one to its unit's
+    /// follow-ups (§5, §7). Decided once, by the cap check, so the counter the
+    /// handoff writes can't disagree with the cap that was enforced.
+    pub counted: bool,
 }
 
 /// §6.3 step 2, first check: the caller's identity. `None` (softfig-mcp found
@@ -197,11 +206,16 @@ pub fn unit_label(unit: &Unit) -> String {
 /// The rest of §6.3 step 2, in order — assignment match, reason, cap, model
 /// rule, member write limits, baton — for a caller whose identity and live
 /// assignment are already established. Pure over the snapshot.
+///
+/// `told_to_yield`: growlightd told this member that urgent work is waiting
+/// (§9's `urgent_waiting`), the one case a `preempted` roll is exempt from
+/// the cap (§5).
 pub fn validate(
     member: &str,
     assignment: &V2Assignment,
     snapshot: &V2Snapshot,
     verb: MemberVerb,
+    told_to_yield: bool,
 ) -> Result<Validated, VerbError> {
     check_shape(&verb)?;
     let ctx = assignment_match(assignment, snapshot)?;
@@ -210,7 +224,8 @@ pub fn validate(
     // under it).
     let reason = check_reason(&verb, &ctx)?;
     // The cap (§7), then where a sub-milestone would go.
-    check_cap(&verb, reason, &ctx)?;
+    let counted = reason.is_some_and(|r| r.counts_toward_cap(told_to_yield));
+    check_cap(&verb, counted, &ctx)?;
     check_sub_placement(&verb, &ctx)?;
     // The model rule (§6.4).
     let next_model = match &verb {
@@ -230,6 +245,7 @@ pub fn validate(
         verb,
         reason,
         next_model,
+        counted,
     })
 }
 
@@ -541,12 +557,12 @@ fn describe_unit(ctx: &Ctx<'_>) -> String {
 }
 
 /// The cap step (§7): the 6th consecutive counted follow-up is refused, and a
-/// sub-milestone can't nest past 2 deep.
-fn check_cap(verb: &MemberVerb, reason: Option<RollReason>, ctx: &Ctx<'_>) -> Result<(), VerbError> {
+/// sub-milestone can't nest past 2 deep. `counted`: the roll adds one to the
+/// unit's follow-ups.
+fn check_cap(verb: &MemberVerb, counted: bool, ctx: &Ctx<'_>) -> Result<(), VerbError> {
     match verb {
         MemberVerb::AddFollowUpSession(_) => {
-            let counts = reason.is_some_and(RollReason::counts_toward_cap);
-            if counts && ctx.follow_ups >= FOLLOW_UP_CAP {
+            if counted && ctx.follow_ups >= FOLLOW_UP_CAP {
                 let next = if matches!(ctx.unit, Unit::Slice { .. }) {
                     "file this slice's remaining work as a sub-milestone \
                      (growlight_add_sub_milestone)"
@@ -970,7 +986,7 @@ mod tests {
     }
 
     fn run(a: &V2Assignment, s: &V2Snapshot, verb: MemberVerb) -> Result<Validated, VerbError> {
-        validate(MEMBER, a, s, verb)
+        validate(MEMBER, a, s, verb, false)
     }
 
     #[track_caller]
@@ -1104,7 +1120,7 @@ mod tests {
     // ---- the cap step ----
 
     #[test]
-    fn the_sixth_counted_follow_up_is_refused_and_preempted_never_is() {
+    fn the_sixth_counted_follow_up_is_refused() {
         let mut s = snapshot();
         let a = on_slice("m", "002");
         s.trees.get_mut("m").unwrap().items[1].follow_ups = 4;
@@ -1116,8 +1132,6 @@ mod tests {
             RefusalCode::CapReached,
         );
         assert!(msg.contains("growlight_add_sub_milestone"), "a slice files a sub: {msg}");
-        // `preempted` doesn't count, so it is never capped.
-        run(&a, &s, MemberVerb::AddFollowUpSession(follow_up("preempted"))).unwrap();
         // The cap's remedy itself isn't capped.
         run(&a, &s, add_sub("rest", &["b"])).unwrap();
 
@@ -1135,6 +1149,27 @@ mod tests {
             run(&on_close_out("m"), &s, MemberVerb::AddFollowUpSession(follow_up("context_full"))),
             RefusalCode::CapReached,
         );
+    }
+
+    /// Review R2: `preempted` is exempt from the cap only when growlightd told
+    /// the member to yield (§5, §9). A self-declared one counts — it is
+    /// capped at the 6th and the handoff's counter takes it — so a member at
+    /// the cap can't roll on it forever instead of splitting or blocking.
+    #[test]
+    fn preempted_is_cap_exempt_only_when_growlightd_told_the_member_to_yield() {
+        let mut s = snapshot();
+        let a = on_slice("m", "002");
+        s.trees.get_mut("m").unwrap().items[1].follow_ups = FOLLOW_UP_CAP;
+        let preempted = || MemberVerb::AddFollowUpSession(follow_up("preempted"));
+
+        let msg = refused(run(&a, &s, preempted()), RefusalCode::CapReached);
+        assert!(msg.contains("growlight_add_sub_milestone"), "{msg}");
+        let told = validate(MEMBER, &a, &s, preempted(), true).expect("a requested yield");
+        assert!(!told.counted, "a requested preemption adds nothing to the counter");
+
+        s.trees.get_mut("m").unwrap().items[1].follow_ups = 0;
+        let unrequested = run(&a, &s, preempted()).expect("below the cap");
+        assert!(unrequested.counted, "an unrequested preemption is counted");
     }
 
     #[test]

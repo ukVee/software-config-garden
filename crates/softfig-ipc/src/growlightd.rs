@@ -1023,9 +1023,13 @@ impl RollReason {
     }
 
     /// Whether the roll adds 1 to the unit's follow-ups (§5, §7): every reason
-    /// but `preempted`.
-    pub fn counts_toward_cap(self) -> bool {
-        self != RollReason::Preempted
+    /// but `preempted`, and `preempted` too unless growlightd told this member
+    /// that urgent work is waiting (§9's `urgent_waiting`) — `told_to_yield`.
+    /// §5 exempts the reason because growlightd asked for the roll; a
+    /// `preempted` nobody asked for is the member's own claim, and exempting
+    /// it would make the cap optional (queue-v2-scheduling review R2).
+    pub fn counts_toward_cap(self, told_to_yield: bool) -> bool {
+        self != RollReason::Preempted || !told_to_yield
     }
 }
 
@@ -1208,7 +1212,8 @@ mod tests {
         for r in RollReason::ALL {
             assert_eq!(serde_json::to_value(r).unwrap(), r.as_str());
             assert_eq!(RollReason::parse(r.as_str()), Some(r));
-            assert_eq!(r.counts_toward_cap(), r != RollReason::Preempted);
+            assert_eq!(r.counts_toward_cap(true), r != RollReason::Preempted);
+            assert!(r.counts_toward_cap(false), "an unrequested {r} always counts");
         }
         for bad in ["", "Context_Full", "context-full", "rate_limited", "crash"] {
             assert_eq!(RollReason::parse(bad), None, "{bad:?}");

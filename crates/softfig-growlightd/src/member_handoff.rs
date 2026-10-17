@@ -408,9 +408,9 @@ pub fn plan(v: &Validated, snapshot: &V2Snapshot) -> Option<Plan> {
                     fallback: current,
                 };
             }
-            if reason.counts_toward_cap() {
-                // §7: every reason but `preempted` adds one, on the unit it
-                // was raised from.
+            if v.counted {
+                // §7: a counted roll adds one, on the unit it was raised from
+                // (validation decided which rolls count — review R2).
                 ops.push(KeeperOp::FollowUps {
                     entry: uentry.clone(),
                     unit: uunit.clone(),
@@ -824,6 +824,8 @@ pub(crate) mod tests {
             member: "a1".into(),
             assignment: assignment(unit),
             verb,
+            // As validation decides it with no yield requested (review R2).
+            counted: reason.is_some_and(|r| r.counts_toward_cap(false)),
             reason,
             next_model: None,
         }
@@ -898,11 +900,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// The counter follows validation's verdict (review R2): a preemption
+    /// growlightd requested only logs; an unrequested one counts.
     #[test]
-    fn a_preempted_follow_up_only_logs() {
+    fn a_preempted_follow_up_counts_unless_growlightd_requested_it() {
         let snap = snapshot(vec![slice("002", SliceStatus::Active, 3)]);
+        let mut requested = follow_up(RollReason::Preempted, None);
+        requested.counted = false;
+        let p = plan(&requested, &snap).unwrap();
+        assert_eq!(p.ops.len(), 1, "§5/§7: a requested yield only logs: {:?}", p.ops);
+
         let p = plan(&follow_up(RollReason::Preempted, None), &snap).unwrap();
-        assert_eq!(p.ops.len(), 1, "§5/§7: preempted never counts: {:?}", p.ops);
+        assert_eq!(
+            p.ops.last(),
+            Some(&KeeperOp::FollowUps {
+                entry: "m1".into(),
+                unit: Some("002".into()),
+                count: 4,
+            }),
+            "an unrequested preemption counts: {:?}",
+            p.ops,
+        );
     }
 
     #[test]

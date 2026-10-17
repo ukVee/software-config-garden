@@ -814,7 +814,12 @@ pub(crate) fn member_verb(daemon: &Daemon, req: &Request) -> Response {
             )
         }
     };
-    let v = match member_verbs::validate(&member, &assignment, &snapshot, verb) {
+    // §9's `urgent_waiting` is not in this build (it rides the bus overhaul),
+    // so growlightd has told no member to yield: a `preempted` roll counts
+    // toward the cap like any other (review R2). When the message lands, this
+    // reads the drive loop's record of whom it told, consumed at the handshake.
+    let told_to_yield = false;
+    let v = match member_verbs::validate(&member, &assignment, &snapshot, verb, told_to_yield) {
         Ok(v) => v,
         Err(VerbError::Refused(r)) => return refused(r),
         Err(VerbError::BadArgs(m)) => {
