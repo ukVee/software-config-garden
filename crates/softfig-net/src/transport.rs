@@ -279,13 +279,12 @@ fn recv_bytes_inner<R: Read>(
             }
             expected = Some(len);
         }
-        if let Some(len) = expected {
-            if acc.len() >= 4 + len {
+        if let Some(len) = expected
+            && acc.len() >= 4 + len {
                 acc.drain(..4);
                 acc.truncate(len);
                 return Ok(acc);
             }
-        }
     }
 }
 

@@ -520,11 +520,10 @@ impl DirtySetAccumulator {
         // Slice 1 (M5b-hardening): an auto-commit advanced a tip — wake the
         // replica push loop so backups fire event-driven, not on the ~20s
         // reconcile poll. No-op when net is down / nothing granted.
-        if committed {
-            if let Some(net) = inner.net.as_ref() {
+        if committed
+            && let Some(net) = inner.net.as_ref() {
                 net.signal_commit();
             }
-        }
     }
 
     /// Re-file `events` into the dirty buffer after a failed commit **and** arm

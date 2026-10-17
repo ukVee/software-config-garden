@@ -117,11 +117,10 @@ impl ReconnectPolicy {
     /// or `None` once the budget is exhausted (the driver then gives up).
     /// Exponential: `initial * 2^(attempt-1)`, capped at `max_backoff`.
     pub fn backoff_for(&self, attempt: u32) -> Option<Duration> {
-        if let Some(max) = self.max_consecutive {
-            if attempt > max {
+        if let Some(max) = self.max_consecutive
+            && attempt > max {
                 return None;
             }
-        }
         let shift = attempt.saturating_sub(1).min(31);
         let scaled = self
             .initial_backoff

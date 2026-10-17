@@ -421,11 +421,10 @@ pub fn eligible(
     // backend).
     match next_unit(snapshot, entry) {
         WalkOutcome::Unit { unit, models } => {
-            if let Some(list) = &models {
-                if !list.backend_can_run(member.backend) {
+            if let Some(list) = &models
+                && !list.backend_can_run(member.backend) {
                     return Err(SkipReason::BackendMismatch);
                 }
-            }
             Ok((unit, models))
         }
         WalkOutcome::Blocked { .. } => Err(SkipReason::BlockedWalk),
@@ -464,12 +463,11 @@ fn scan_lane(
         if entry.lane != lane {
             continue;
         }
-        if let Some(pin) = pin {
-            if entry.project != pin {
+        if let Some(pin) = pin
+            && entry.project != pin {
                 record(reasons, index, SkipReason::NotPinned);
                 continue;
             }
-        }
         match eligible(snapshot, member, entry) {
             Ok((unit, models)) => return Some((index, unit, models)),
             Err(reason) => record(reasons, index, reason),

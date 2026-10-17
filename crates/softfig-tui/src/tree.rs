@@ -516,11 +516,10 @@ impl BacklogTree {
     /// verification` section lights up as awaiting-smoke. No-op if the milestone
     /// or slice isn't loaded.
     pub fn refine_slice_status(&mut self, milestone: &str, num: &str, body: &str) {
-        if let Some(children) = self.slices.get_mut(milestone) {
-            if let Some(child) = children.iter_mut().find(|c| c.num == num) {
+        if let Some(children) = self.slices.get_mut(milestone)
+            && let Some(child) = children.iter_mut().find(|c| c.num == num) {
                 child.status = derive_slice_status(child.reviewed.as_deref(), Some(body));
             }
-        }
     }
 
     /// Set the slice the live runtime baton is actively working (`(milestone_id,
@@ -562,8 +561,8 @@ impl BacklogTree {
                 path: None,
                 slice_num: None,
             });
-            if expanded {
-                if let Some(children) = self.slices.get(&item.id) {
+            if expanded
+                && let Some(children) = self.slices.get(&item.id) {
                     for s in children {
                         // Clamp the stored file-derived status to the parent
                         // milestone's authoritative queue status (task 045): a
@@ -592,7 +591,6 @@ impl BacklogTree {
                         });
                     }
                 }
-            }
         }
         for ctx in &self.loop_context {
             out.push(BacklogVisibleRow {

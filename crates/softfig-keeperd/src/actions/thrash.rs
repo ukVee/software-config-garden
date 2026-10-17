@@ -126,11 +126,10 @@ impl ThrashDetector {
 
         // Dedup: one nudge per cooldown per target. The flag persists; only the
         // nudge is rate-limited.
-        if let Some(&last) = self.last_trip.get(&target) {
-            if now - last < self.cooldown_secs {
+        if let Some(&last) = self.last_trip.get(&target)
+            && now - last < self.cooldown_secs {
                 return None;
             }
-        }
         self.last_trip.insert(target.clone(), now);
         self.lease_flagged.insert(target);
 

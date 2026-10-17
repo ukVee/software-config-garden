@@ -86,15 +86,14 @@ pub fn check_update(
     }
     let assignment = held_entry(member, assignment, "slice_update")?;
     within_entry(member, assignment, "slice_update", &args.milestone)?;
-    if let Unit::Slice { milestone, slice } = &assignment.unit {
-        if *milestone == args.milestone && *slice == args.id {
+    if let Unit::Slice { milestone, slice } = &assignment.unit
+        && *milestone == args.milestone && *slice == args.id {
             return Err(format!(
                 "member_not_allowed: slice {} in {milestone} is the slice member {member} is \
                  working, and a member may not move its own active slice ({RULE})",
                 args.id
             ));
         }
-    }
     Ok(())
 }
 

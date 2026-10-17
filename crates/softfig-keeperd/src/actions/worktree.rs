@@ -152,15 +152,14 @@ impl<'a> WorkTree<'a> {
             return Ok(());
         };
         self.guard_member_model_removal(from)?;
-        if is_backlog_rel(to) || spans_backlog(to) {
-            if let Some((doc, text)) = self.first_model_doc(from) {
+        if (is_backlog_rel(to) || spans_backlog(to))
+            && let Some((doc, text)) = self.first_model_doc(from) {
                 let landing = match doc.strip_prefix(from) {
                     Some(rest) => format!("{to}{rest}"),
                     None => to.to_string(),
                 };
                 return Err(refusal(&member, &landing, None, Some(&text)));
             }
-        }
         self.guard_member_model_removal(to)
     }
 
@@ -253,8 +252,8 @@ impl<'a> WorkTree<'a> {
     /// nothing staged. Disk mode has no shared chains (`add` refuses in direct
     /// mode), so only the FUSE arm can trip.
     fn refuse_unkeyed_shared(&self, rel: &str) -> ActionResult {
-        if let WorkTree::Fuse { mount } = self {
-            if let Some(share) = mount.unkeyed_shared_owner(rel) {
+        if let WorkTree::Fuse { mount } = self
+            && let Some(share) = mount.unkeyed_shared_owner(rel) {
                 return Err((
                     ErrorKind::SharedChainUnkeyed,
                     format!(
@@ -264,7 +263,6 @@ impl<'a> WorkTree<'a> {
                     ),
                 ));
             }
-        }
         Ok(())
     }
 

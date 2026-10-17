@@ -143,8 +143,8 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
 pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: QueueAddEntryArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_add_entry args: {e}")))?;
-    if let Some(member) = crate::caller::member() {
-        if let Some(field) = member_model_field(&args) {
+    if let Some(member) = crate::caller::member()
+        && let Some(field) = member_model_field(&args) {
             return Err((
                 ErrorKind::BadArgs,
                 format!(
@@ -155,7 +155,6 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
                 ),
             ));
         }
-    }
     match args.kind {
         EntryKind::Milestone => add_milestone(daemon, args),
         EntryKind::Task => add_task(daemon, args),
@@ -795,8 +794,8 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     // at the normal lane's front (§6.8). `parent`/`base`/`claimed` stay — the
     // row moves, and its own `lane` field must move with it (position and
     // field always agree).
-    if let Some(new_lane) = args.lane {
-        if queue.entries[idx_of(&queue, &args.id)].lane != new_lane {
+    if let Some(new_lane) = args.lane
+        && queue.entries[idx_of(&queue, &args.id)].lane != new_lane {
             let mut e = queue.entries.remove(idx_of(&queue, &args.id));
             e.lane = new_lane;
             let at = match new_lane {
@@ -806,7 +805,6 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
             .map_err(refuse)?;
             queue.entries.insert(at, e);
         }
-    }
 
     // 2. move: within the lane. Refused `started` once the entry is claimed
     // (the stack order is the claim order, §8); a ref in the other lane is

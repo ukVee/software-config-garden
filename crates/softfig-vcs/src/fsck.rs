@@ -103,13 +103,12 @@ pub fn run(db: &Db, objects: &ObjectStore) -> Result<FsckReport> {
             report.problems.push(format!("commit {}: {e}", c.hash));
         }
 
-        if let Some(p) = c.parent {
-            if !commit_hashes.contains(&p) {
+        if let Some(p) = c.parent
+            && !commit_hashes.contains(&p) {
                 report
                     .problems
                     .push(format!("commit {}: parent {} missing", c.hash, p));
             }
-        }
         if !db.tree_exists(&c.root_tree)? {
             report.problems.push(format!(
                 "commit {}: root_tree {} missing",

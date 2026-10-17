@@ -319,11 +319,10 @@ fn walk_tree(root: &Path, dir: &Path, visit: &mut impl FnMut(&str)) {
                 continue;
             }
             walk_tree(root, &path, visit);
-        } else if ft.is_file() {
-            if let Some(rel) = rel_of(root, &path) {
+        } else if ft.is_file()
+            && let Some(rel) = rel_of(root, &path) {
                 visit(&rel);
             }
-        }
     }
 }
 

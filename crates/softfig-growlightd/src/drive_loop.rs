@@ -1617,11 +1617,10 @@ impl DriveLoop {
         // that pass extends the hold from the stdout stream error's `resets_at`, and
         // the elapsed-clear must run against the extended value or a freshly-pinned
         // hold would be wiped the same tick it was set.)
-        if let Some(until) = self.rate_limit_hold_until {
-            if now >= until {
+        if let Some(until) = self.rate_limit_hold_until
+            && now >= until {
                 self.rate_limit_hold_until = None;
             }
-        }
         let budget = self.aggregator.aggregate_or_fresh_at(now);
         let rate = self.rate.rate(now);
 
@@ -1653,12 +1652,11 @@ impl DriveLoop {
             //    4–5, slice 009): the server already committed it, so its exit is
             //    not classified off a baton — the loop ends the session (on exit,
             //    or after the grace) and step 3 picks for the member.
-            if v2_mode {
-                if let Some(handoff) = self.daemon.v2_handoff(agent) {
+            if v2_mode
+                && let Some(handoff) = self.daemon.v2_handoff(agent) {
                     self.end_handed_off_session(agent, handoff, now, &mut report);
                     continue;
                 }
-            }
 
             // c. Health-driven lifecycle. No observation (never spawned, or already
             //    retired) → nothing to poll. On an EXIT, read the agent's terminal

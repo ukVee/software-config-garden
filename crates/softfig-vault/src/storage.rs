@@ -237,11 +237,10 @@ pub fn list_master_ids(paths: &VaultPaths) -> Result<Vec<u32>> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(stem) = name.strip_suffix(".key") {
-            if let Ok(id) = stem.parse::<u32>() {
+        if let Some(stem) = name.strip_suffix(".key")
+            && let Ok(id) = stem.parse::<u32>() {
                 ids.push(id);
             }
-        }
     }
     ids.sort_unstable();
     Ok(ids)
@@ -259,11 +258,10 @@ pub fn list_peer_kek_ids(paths: &VaultPaths) -> Vec<String> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(stem) = name.strip_suffix(".key") {
-            if !stem.is_empty() {
+        if let Some(stem) = name.strip_suffix(".key")
+            && !stem.is_empty() {
                 ids.push(stem.to_string());
             }
-        }
     }
     ids.sort_unstable();
     ids

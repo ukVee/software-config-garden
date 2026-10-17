@@ -241,14 +241,13 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
     // request; the write limits read it from this scope, for this request only.
     // A stamp that can't name a member is refused — a garbled member must not
     // be served as a human, the same fail-closed rule softfig-mcp applies.
-    if let Some(member) = req.member.as_deref() {
-        if !softfig_ipc::is_safe_member_id(member) {
+    if let Some(member) = req.member.as_deref()
+        && !softfig_ipc::is_safe_member_id(member) {
             return Response::err(
                 ErrorKind::BadArgs,
                 format!("request member {member:?} is not a safe member id"),
             );
         }
-    }
     let _caller = crate::caller::enter(req.member.clone());
 
     let result = match req.op.as_str() {

@@ -1021,14 +1021,13 @@ fn mcp_json(mcp_bin: &Path) -> String {
 /// `softfig-mcp` (PATH lookup by Claude Code's stdio launcher) when the exe
 /// path can't be resolved or the sibling is missing.
 fn softfig_mcp_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             let sibling = dir.join("softfig-mcp");
             if sibling.is_file() {
                 return sibling;
             }
         }
-    }
     PathBuf::from("softfig-mcp")
 }
 

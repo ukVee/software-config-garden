@@ -229,11 +229,10 @@ pub fn build_local_device(session: &VaultSession, device_name: String) -> LocalD
 /// hostname, else a constant fallback. Read from `/proc/sys/kernel/hostname`
 /// (Linux live hostname) so no `unsafe` `gethostname` is needed.
 pub fn device_name(config: &KeeperConfig) -> String {
-    if let Some(name) = &config.net.device_name {
-        if !name.trim().is_empty() {
+    if let Some(name) = &config.net.device_name
+        && !name.trim().is_empty() {
             return name.clone();
         }
-    }
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_string())
@@ -1285,15 +1284,14 @@ fn handle_turn_revoke(
         return;
     }
     let mut inner = daemon.inner.lock().unwrap();
-    if let Some(turn) = inner.write_turns.get_mut(&chain) {
-        if turn.apply_revoke(&revoked, rv.epoch) {
+    if let Some(turn) = inner.write_turns.get_mut(&chain)
+        && turn.apply_revoke(&revoked, rv.epoch) {
             eprintln!(
                 "keeperd: net: turn for {chain} revoked (holder {} epoch {})",
                 hex::encode(revoked),
                 rv.epoch
             );
         }
-    }
 }
 
 // --- M5e write-turn coordination (outbound driver + expiry poll) ------------
@@ -2266,11 +2264,10 @@ fn reject_chain_push(
     if let Some(line) = line {
         eprintln!("{line}");
     }
-    if let Some(frame) = frame {
-        if let Err(e) = session.send_frame(&frame) {
+    if let Some(frame) = frame
+        && let Err(e) = session.send_frame(&frame) {
             eprintln!("keeperd: net: shared-chain {chain}: could not send the rejection: {e}");
         }
-    }
 }
 
 /// S-member pushed a committed edit for us to adopt. The choreography mirrors
@@ -2931,11 +2928,10 @@ fn reconcile_replicas(daemon: &Daemon, local: &LocalDevice) {
             // revoke left behind so `replica status` shows no ghost hosts. One
             // small write in `state_dir` (where the ledger already lives), only
             // on the revoke-all edge.
-            if health.retain_granted(&ledger.push_to) {
-                if let Err(e) = health.save(&state_dir) {
+            if health.retain_granted(&ledger.push_to)
+                && let Err(e) = health.save(&state_dir) {
                     eprintln!("keeperd: net: replica health save failed: {e}");
                 }
-            }
             return;
         }
         let announce = match replica::build_announce(repo, session) {

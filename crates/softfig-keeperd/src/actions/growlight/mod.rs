@@ -588,8 +588,8 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             // `active` within a given queue at a time. Scoping it to the resolved
             // region is exactly what lets the fleet run one active part per queue
             // concurrently; a default-only garden keeps the old global behaviour.
-            if args.status == "active" {
-                if let Some(other) = rows
+            if args.status == "active"
+                && let Some(other) = rows
                     .iter()
                     .enumerate()
                     .find(|(i, r)| *i != idx && r.status == "active")
@@ -602,7 +602,6 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
                         ),
                     ));
                 }
-            }
             rows[idx].status = args.status.clone();
 
             let new = managed::upsert(&content, &tag, &queue::render(&rows));

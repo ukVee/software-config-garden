@@ -433,11 +433,10 @@ impl NotifyPolicy {
     /// which is what the `BlockedOnHuman` reminder ladder steps on.
     pub fn decide(&mut self, event: &NotifyEvent, now: i64) -> Vec<Channel> {
         let key = event.dedup_key();
-        if let Some(&FireStamp { at, times }) = self.last_fired.get(&key) {
-            if now - at < self.cooldown_for(event, times) {
+        if let Some(&FireStamp { at, times }) = self.last_fired.get(&key)
+            && now - at < self.cooldown_for(event, times) {
                 return Vec::new();
             }
-        }
         let times = self.last_fired.get(&key).map_or(1, |s| s.times.saturating_add(1));
         self.last_fired.insert(key, FireStamp { at: now, times });
         event.channels()

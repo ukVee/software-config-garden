@@ -186,11 +186,10 @@ impl Snapshot {
     /// surfaced by the next [`QueueSource::snapshot`](crate::drive_loop::QueueSource::snapshot).
     /// A no-op when the queue or part is absent.
     pub fn mark_claimed(&mut self, queue: &str, part: &str) {
-        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue) {
-            if let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
+        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue)
+            && let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
                 p.status = PartStatus::Active;
             }
-        }
     }
 
     /// Stamp `part` in `queue` as [`PartStatus::Blocked`] — the intra-tick
@@ -206,11 +205,10 @@ impl Snapshot {
     /// the read/write split [`mark_claimed`] uses for claims. A no-op when the queue
     /// or part is absent.
     pub fn mark_blocked(&mut self, queue: &str, part: &str) {
-        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue) {
-            if let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
+        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue)
+            && let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
                 p.status = PartStatus::Blocked;
             }
-        }
     }
 
     /// Put a [`ClaimHold`] on a `queued` `part` in `queue` — the intra-tick mark
@@ -218,13 +216,11 @@ impl Snapshot {
     /// [`pick`] in the SAME tick rolls past it too. A no-op when the queue or part
     /// is absent, or the part is not `queued` (an `active` part is never held).
     pub fn mark_held(&mut self, queue: &str, part: &str, hold: ClaimHold) {
-        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue) {
-            if let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
-                if p.status == PartStatus::Queued {
+        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue)
+            && let Some(p) = q.parts.iter_mut().find(|p| p.id == part)
+                && p.status == PartStatus::Queued {
                     p.hold = Some(hold);
                 }
-            }
-        }
     }
 }
 
@@ -302,8 +298,8 @@ pub fn pick_for(
     reserved: &BTreeSet<String>,
 ) -> Option<(String, String)> {
     // 1. Pinned queue first — prefer the agent's own work-stream.
-    if let Some(pin) = pin {
-        if let Some(q) = snapshot.queue(pin) {
+    if let Some(pin) = pin
+        && let Some(q) = snapshot.queue(pin) {
             match classify_queue(q) {
                 // Resume own in-progress part, or start own next part.
                 QueueState::Active(id) | QueueState::Ready(id) => {
@@ -315,7 +311,6 @@ pub fn pick_for(
                 QueueState::Blocked(_) | QueueState::Empty => {}
             }
         }
-    }
 
     // 2. Fallback — first OTHER queue with an unclaimed (`queued`) head that no
     //    other member has reserved.

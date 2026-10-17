@@ -839,14 +839,13 @@ fn home_dir() -> PathBuf {
 /// stale PATH copy), falling back to a bare `softfig-mcp` (PATH lookup by Claude
 /// Code's stdio launcher). Mirrors the single-agent `growlight start` resolver.
 fn softfig_mcp_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             let sibling = dir.join("softfig-mcp");
             if sibling.is_file() {
                 return sibling;
             }
         }
-    }
     PathBuf::from("softfig-mcp")
 }
 

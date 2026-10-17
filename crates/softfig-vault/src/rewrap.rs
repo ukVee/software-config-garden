@@ -130,15 +130,14 @@ pub fn plan(paths: &VaultPaths, target: Argon2Params, allow_downgrade: bool) -> 
 fn legacy_doors(paths: &VaultPaths) -> Vec<RecoveryPath> {
     let wrappings = Wrappings::read(paths);
     let mut out = Vec::new();
-    if wrappings.contains(RecoveryPath::Phrase) {
-        if let Ok(bytes) = std::fs::read(paths.kek_recovery()) {
+    if wrappings.contains(RecoveryPath::Phrase)
+        && let Ok(bytes) = std::fs::read(paths.kek_recovery()) {
             // `params.toml` is the fallback either way; only `embedded` is
             // being asked about here, so the fallback value is irrelevant.
             if !kek::wrapping_params(&bytes, &OWASP_BASELINE).embedded {
                 out.push(RecoveryPath::Phrase);
             }
         }
-    }
     out
 }
 

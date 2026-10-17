@@ -286,11 +286,10 @@ pub(crate) fn commit_now_with(
     // ~20s reconcile tick. No-op when net is down or nothing is granted.
     // Task 028: a same-tree no-op advanced nothing and has nothing for a peer to
     // pull, so it must not wake the loop either.
-    if outcome.committed {
-        if let Some(net) = inner.net.as_ref() {
+    if outcome.committed
+        && let Some(net) = inner.net.as_ref() {
             net.signal_commit();
         }
-    }
     Ok(outcome)
 }
 
@@ -318,11 +317,10 @@ pub(crate) fn commit_snapshot_to_now(
     // A genesis on a shared ref never advances the device tip, so the device-only
     // replica push loop no-ops; wake it anyway for parity with `commit_now` —
     // but only when the ref actually moved (task 028).
-    if outcome.committed {
-        if let Some(net) = inner.net.as_ref() {
+    if outcome.committed
+        && let Some(net) = inner.net.as_ref() {
             net.signal_commit();
         }
-    }
     Ok(outcome.hash)
 }
 

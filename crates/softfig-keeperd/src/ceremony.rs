@@ -992,11 +992,10 @@ fn tree_has_foreign_shared_key(
                 let cipher = repo.objects().get(&e.target).map_err(|err| {
                     (ErrorKind::Internal, format!("read blob for re-encrypt scan: {err}"))
                 })?;
-                if let Ok(kid) = softfig_vault::shared::read_key_id(&cipher) {
-                    if kid != live_key_id {
+                if let Ok(kid) = softfig_vault::shared::read_key_id(&cipher)
+                    && kid != live_key_id {
                         return Ok(true);
                     }
-                }
             }
             TreeEntryKind::Tree => {
                 if tree_has_foreign_shared_key(repo, &e.target, live_key_id)? {

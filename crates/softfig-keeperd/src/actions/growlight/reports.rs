@@ -229,11 +229,10 @@ pub mod tags {
     /// Add `tag`, replacing the current value of a single-valued namespace
     /// (`type`, `severity`, `status`, `by`).
     pub fn put(tags: &mut Vec<String>, tag: String) {
-        if let Some(n) = ns(&tag) {
-            if ["type", "severity", "status", "by"].contains(&n) {
+        if let Some(n) = ns(&tag)
+            && ["type", "severity", "status", "by"].contains(&n) {
                 tags.retain(|t| ns(t) != Some(n));
             }
-        }
         if !tags.contains(&tag) {
             tags.push(tag);
         }

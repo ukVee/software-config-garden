@@ -273,11 +273,10 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     if args.entry.trim().is_empty() {
         return Err((ErrorKind::BadArgs, "entry must be non-empty".to_string()));
     }
-    if let Some(u) = args.unit.as_deref() {
-        if u.trim().is_empty() {
+    if let Some(u) = args.unit.as_deref()
+        && u.trim().is_empty() {
             return Err((ErrorKind::BadArgs, "unit must be non-empty".to_string()));
         }
-    }
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
@@ -443,11 +442,10 @@ pub fn queue_v2_set_status(daemon: &Daemon, args: serde_json::Value) -> HandlerR
     if args.entry.trim().is_empty() {
         return Err((ErrorKind::BadArgs, "entry must be non-empty".to_string()));
     }
-    if let Some(u) = args.unit.as_deref() {
-        if u.trim().is_empty() {
+    if let Some(u) = args.unit.as_deref()
+        && u.trim().is_empty() {
             return Err((ErrorKind::BadArgs, "unit must be non-empty".to_string()));
         }
-    }
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
@@ -714,11 +712,10 @@ pub fn queue_v2_follow_ups(daemon: &Daemon, args: serde_json::Value) -> HandlerR
     if args.entry.trim().is_empty() {
         return Err((ErrorKind::BadArgs, "entry must be non-empty".to_string()));
     }
-    if let Some(u) = args.unit.as_deref() {
-        if u.trim().is_empty() {
+    if let Some(u) = args.unit.as_deref()
+        && u.trim().is_empty() {
             return Err((ErrorKind::BadArgs, "unit must be non-empty".to_string()));
         }
-    }
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;

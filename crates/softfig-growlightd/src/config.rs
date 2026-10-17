@@ -251,22 +251,20 @@ impl BuildCaps {
                 ));
             }
         }
-        if let Some(weight) = args.cpu_weight {
-            if !(CPU_WEIGHT_MIN..=CPU_WEIGHT_MAX).contains(&weight) {
+        if let Some(weight) = args.cpu_weight
+            && !(CPU_WEIGHT_MIN..=CPU_WEIGHT_MAX).contains(&weight) {
                 return Err(format!(
                     "cpu_weight must be {CPU_WEIGHT_MIN}..={CPU_WEIGHT_MAX}, got {weight}"
                 ));
             }
-        }
-        if let Some(high) = &args.memory_high {
-            if !is_valid_memory_high(high) {
+        if let Some(high) = &args.memory_high
+            && !is_valid_memory_high(high) {
                 return Err(format!(
                     "memory_high {high:?} is not a valid systemd MemoryHigh value \
                      (want bytes, a 1024-base suffix like 3G/512M, a percentage like 70%, \
                      or infinity)"
                 ));
             }
-        }
         let mut merged = self.clone();
         if let Some(jobs) = args.build_jobs {
             merged.cargo_build_jobs = Some(jobs);

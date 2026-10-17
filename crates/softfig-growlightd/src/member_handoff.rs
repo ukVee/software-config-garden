@@ -450,11 +450,10 @@ pub fn plan(v: &Validated, snapshot: &V2Snapshot) -> Option<Plan> {
             }
         }
         MemberVerb::CompleteEntry(args) => {
-            if let Unit::CloseOut { milestone } = &a.unit {
-                if milestone.contains('/') {
+            if let Unit::CloseOut { milestone } = &a.unit
+                && milestone.contains('/') {
                     return Some(plan_sub_close_out(v, snapshot, milestone, args, log));
                 }
-            }
             let ops = match args.outcome {
                 // The log lands before `done` archives the row (the op
                 // addresses live rows only).

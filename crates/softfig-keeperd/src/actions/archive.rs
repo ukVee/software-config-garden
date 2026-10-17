@@ -59,8 +59,8 @@ pub fn archive(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // Slice 4: if the archived path was a numbered note, its folder's index
         // table just lost a row — refresh it in the parent CLAUDE.md (best-effort,
         // folded into this commit).
-        if conventions::parse_note_number(&basename).is_some() {
-            if let Some(parent) = Path::new(&src_rel).parent().and_then(|p| p.to_str()) {
+        if conventions::parse_note_number(&basename).is_some()
+            && let Some(parent) = Path::new(&src_rel).parent().and_then(|p| p.to_str()) {
                 if conventions::is_accretive_dir(parent) {
                     super::index::refresh_folder_index(&wt, &inner, parent);
                 }
@@ -68,7 +68,6 @@ pub fn archive(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
                     super::growlight::reports::refresh_index(&wt, &inner);
                 }
             }
-        }
         // Slice 5: repoint inbound `[[…]]` references at the archived location so
         // they don't dangle, then recompute the backlink graph (any doc can be a
         // backlink target, so this runs for every archive, not just notes).

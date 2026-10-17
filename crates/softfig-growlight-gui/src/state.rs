@@ -340,8 +340,8 @@ impl App {
     /// confirmed line. Only a `from == "human"` message can reconcile, so an
     /// agent posting an identical body never clears the human's pending line.
     pub fn reconcile_or_push_chat(&mut self, from: String, to: String, kind: String, body: String) {
-        if from == HUMAN_FROM {
-            if let Some(line) = self
+        if from == HUMAN_FROM
+            && let Some(line) = self
                 .chat
                 .iter_mut()
                 .find(|l| l.pending && l.same_message(&from, &to, &kind, &body))
@@ -349,7 +349,6 @@ impl App {
                 line.pending = false;
                 return;
             }
-        }
         self.push_chat(ChatLine::confirmed(from, to, kind, body));
     }
 }

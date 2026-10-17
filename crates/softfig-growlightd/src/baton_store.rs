@@ -105,11 +105,10 @@ impl BatonSeeder for FsBatonStore {
         // generic template would throw that context away on every daemon bounce
         // (the task-032 phantom stops made bounces a live concern). A baton for a
         // DIFFERENT item (or none, or unparseable) seeds fresh as before.
-        if let Ok(existing) = fs::read_to_string(&path) {
-            if parse_baton(&existing).item.as_deref() == Some(part) {
+        if let Ok(existing) = fs::read_to_string(&path)
+            && parse_baton(&existing).item.as_deref() == Some(part) {
                 return Ok(());
             }
-        }
         // The agent dir is created by the pre-approval generator on spawn, but the
         // seed is written BEFORE that spawn (so the SessionStart hook finds a
         // baton), so create it here too — idempotent with `generate`'s create.
@@ -181,8 +180,8 @@ impl BatonStatusSource for FsBatonStore {    fn status(&self, agent: &str) -> Ba
         // 042; the eMMC/log-churn fix). The real fix (the member writes its own path
         // deterministically) is task 035; this keeps the fleet self-sustaining until
         // that lands.
-        if let Some(legacy_path) = self.legacy_baton_path() {
-            if let Ok(legacy_raw) = fs::read_to_string(&legacy_path) {
+        if let Some(legacy_path) = self.legacy_baton_path()
+            && let Ok(legacy_raw) = fs::read_to_string(&legacy_path) {
                 let legacy = parse_baton(&legacy_raw);
                 // Hardening (a): the seed `item:` to cross-check against (absent when
                 // the per-member file is missing/unparseable → the guard is
@@ -215,7 +214,6 @@ impl BatonStatusSource for FsBatonStore {    fn status(&self, agent: &str) -> Ba
                     };
                 }
             }
-        }
 
         // A missing/unreadable baton is the clean-exit fallback (None → re-roll),
         // identical to the deferred source slice 001 shipped against. Parse ONCE and

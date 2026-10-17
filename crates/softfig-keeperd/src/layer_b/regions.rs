@@ -260,11 +260,10 @@ fn scan_regions(
             return Err(RegionParseError::MissingClosingTag(open.id.clone()));
         }
         // No nested open tag inside this region's body.
-        if let Some(inner) = next_open_tag(content, open.body_start) {
-            if inner.open_start < close.start {
+        if let Some(inner) = next_open_tag(content, open.body_start)
+            && inner.open_start < close.start {
                 return Err(RegionParseError::Nested(inner.id));
             }
-        }
         let body_range = open.body_start..close.start;
         let kind = classify_body(&content[body_range.clone()], session, path, &open.id);
         spans.push(RegionSpan {
@@ -305,15 +304,14 @@ fn next_open_tag(content: &[u8], from: usize) -> Option<OpenTag> {
                 {
                     let id_bytes = &content[id_start..id_start + end_quote_rel];
                     let after_quote = id_start + end_quote_rel + 1;
-                    if content.get(after_quote) == Some(&b'>') {
-                        if let Ok(id) = std::str::from_utf8(id_bytes) {
+                    if content.get(after_quote) == Some(&b'>')
+                        && let Ok(id) = std::str::from_utf8(id_bytes) {
                             return Some(OpenTag {
                                 open_start: i,
                                 body_start: after_quote + 1,
                                 id: id.to_string(),
                             });
                         }
-                    }
                 }
             }
         }

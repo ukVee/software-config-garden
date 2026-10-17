@@ -1393,12 +1393,11 @@ impl App {
             // Discovery is best-effort surfacing; an error just leaves the
             // pick-list as-is (no status nag).
             Tag::DiscoverList => {
-                if let Ok(v) = reply.result {
-                    if let Ok(r) = serde_json::from_value::<DiscoverListReply>(v) {
+                if let Ok(v) = reply.result
+                    && let Ok(r) = serde_json::from_value::<DiscoverListReply>(v) {
                         self.discovered = r.devices;
                         self.rebuild_peer_rows();
                     }
-                }
             }
             Tag::PairBegin => match reply.result {
                 Ok(v) => {
@@ -1829,13 +1828,12 @@ impl App {
             // A mount root never written to yet has no listing — an error there
             // just contributes no sidecars, so only the Ok path does work.
             Tag::CoordinationSidecarList => {
-                if let Ok(v) = reply.result {
-                    if let Ok(r) = serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
+                if let Ok(v) = reply.result
+                    && let Ok(r) = serde_json::from_value::<softfig_ipc::ListTreeReply>(v) {
                         self.coordination_sidecars
                             .extend(r.entries.into_iter().filter(is_conflict_sidecar));
                         self.rebuild_coordination_rows();
                     }
-                }
             }
             Tag::CoordinationSidecar => match reply.result {
                 Ok(v) => {
@@ -2245,8 +2243,8 @@ impl App {
                 }
             }
             Hit::EditorBody => {
-                if !activate {
-                    if let Some(ed) = self.editor.as_mut() {
+                if !activate
+                    && let Some(ed) = self.editor.as_mut() {
                         let scroll = ed.scroll;
                         let line = scroll as usize;
                         self.drag = Some(DragAnchor {
@@ -2255,7 +2253,6 @@ impl App {
                             target: DragTarget::Editor { line, col: 0, x0: 0 },
                         });
                     }
-                }
             }
             Hit::EditorView(bionic) => {
                 if let Some(ed) = self.editor.as_mut() {
@@ -2729,20 +2726,18 @@ impl App {
     fn collapse_selected(&mut self, ipc: &mut IpcClient) {
         match self.view {
             View::Browse => {
-                if let Some(row) = self.tree.selected_row() {
-                    if row.is_dir && self.tree.is_expanded(&row.path) {
+                if let Some(row) = self.tree.selected_row()
+                    && row.is_dir && self.tree.is_expanded(&row.path) {
                         self.tree.collapse(&row.path);
                         self.tree.clamp_selection();
                     }
-                }
             }
             View::Growlight => {
-                if let Some(row) = self.growlight_tree.selected_row() {
-                    if row.expandable && self.growlight_tree.is_expanded(&row.item_id) {
+                if let Some(row) = self.growlight_tree.selected_row()
+                    && row.expandable && self.growlight_tree.is_expanded(&row.item_id) {
                         self.growlight_tree.collapse(&row.item_id);
                         self.growlight_tree.clamp_selection();
                     }
-                }
                 self.refresh_growlight_selection(ipc);
             }
             _ => {}
@@ -2970,12 +2965,10 @@ impl App {
             .editor
             .as_ref()
             .map(|e| e.mode == EditorMode::Bionic)
-        {
-            if self.prefs.editor_bionic != bionic {
+            && self.prefs.editor_bionic != bionic {
                 self.prefs.editor_bionic = bionic;
                 self.save_prefs();
             }
-        }
         if save {
             self.editor_save(ipc, false);
         }

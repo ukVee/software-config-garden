@@ -480,11 +480,10 @@ fn is_rate_limit_error(ev: &Value) -> bool {
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase)
     };
-    if let Some(e) = field("error").or_else(|| field("apiError")) {
-        if e == "usage_limit_reached" || e == "rate_limit" {
+    if let Some(e) = field("error").or_else(|| field("apiError"))
+        && (e == "usage_limit_reached" || e == "rate_limit") {
             return true;
         }
-    }
     ev.get("apiErrorStatus").and_then(Value::as_i64) == Some(429)
 }
 

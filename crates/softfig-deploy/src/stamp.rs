@@ -51,15 +51,14 @@ pub fn compose_copy(target: &Path, source: &[u8], source_rel: &str) -> (Vec<u8>,
     let stamp = format!("{leader} {MANAGED_MARKER} (source: config/source/{source_rel})\n");
 
     // Keep a shebang on line 1: insert the stamp after the first newline.
-    if source.starts_with(b"#!") {
-        if let Some(nl) = source.iter().position(|&b| b == b'\n') {
+    if source.starts_with(b"#!")
+        && let Some(nl) = source.iter().position(|&b| b == b'\n') {
             let mut out = Vec::with_capacity(source.len() + stamp.len());
             out.extend_from_slice(&source[..=nl]);
             out.extend_from_slice(stamp.as_bytes());
             out.extend_from_slice(&source[nl + 1..]);
             return (out, true);
         }
-    }
 
     let mut out = Vec::with_capacity(source.len() + stamp.len());
     out.extend_from_slice(stamp.as_bytes());

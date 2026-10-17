@@ -355,11 +355,10 @@ fn health_label(
     health: Option<AgentHealth>,
     lifecycle: Option<&crate::supervisor::MemberLifecycle>,
 ) -> String {
-    if let Some(l) = lifecycle {
-        if let Some(label) = l.status_label(health) {
+    if let Some(l) = lifecycle
+        && let Some(label) = l.status_label(health) {
             return label;
         }
-    }
     match health {
         None => "idle".to_string(),
         Some(AgentHealth::Alive { .. }) => "running".to_string(),
@@ -396,14 +395,13 @@ fn baton(req: &Request) -> Response {
     // that isn't a bare name (a `/`, `\`, or `.`/`..` traversal). A well-behaved
     // client only ever sends a roster id; this keeps a malformed request from
     // reading an arbitrary file rather than soft-failing to empty.
-    if let Some(id) = args.agent.as_deref() {
-        if !is_simple_agent_id(id) {
+    if let Some(id) = args.agent.as_deref()
+        && !is_simple_agent_id(id) {
             return Response::err(
                 ErrorKind::BadArgs,
                 format!("agent id {id:?} must be a bare name (no path separators)"),
             );
         }
-    }
     let dir = crate::fleet::runtime_growlight_dir();
     ok_reply(&read_runtime_baton(&dir, args.agent.as_deref()), "baton")
 }
@@ -628,14 +626,13 @@ fn set_resources(daemon: &Daemon, req: &Request) -> Response {
     // discipline): the running fleet has already taken the new caps, so a persist
     // failure must NOT fail the verb — we log it and carry on. A `None` hook (a
     // test, or no keeperd socket) skips the persist entirely.
-    if let Some(persister) = daemon.persister.as_ref() {
-        if let Err(e) = persister.persist(&new) {
+    if let Some(persister) = daemon.persister.as_ref()
+        && let Err(e) = persister.persist(&new) {
             eprintln!(
                 "growlightd set_resources: persist to config/growlight.toml failed \
                  (live adjust kept): {e}"
             );
         }
-    }
 
     ok_reply(
         &SetResourcesReply {

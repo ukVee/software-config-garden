@@ -2583,14 +2583,13 @@ pub fn shared_subtree_remove(daemon: &Daemon, args: serde_json::Value) -> Handle
         // commit above already landed, so a sidecar write failure is logged
         // loudly rather than failing an op that did remove the member.
         let mut local = load_local_toggles(&state_dir);
-        if local.enable(&id) {
-            if let Err((_, e)) = save_local_toggles(&state_dir, &local) {
+        if local.enable(&id)
+            && let Err((_, e)) = save_local_toggles(&state_dir, &local) {
                 eprintln!(
                     "keeperd: shared_subtree_remove {id}: could not purge the local toggle \
                      sidecar ({e}); a future re-add of this id would start disabled here"
                 );
             }
-        }
         refresh_mount_registry(&inner, &state_dir);
     }
 

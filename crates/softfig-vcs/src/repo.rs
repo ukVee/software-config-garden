@@ -469,11 +469,10 @@ impl Repo {
         )?;
         // A no-op advanced nothing, so the FUSE view is already correct and its
         // overlay must keep every staged entry (see `CommitOutcome`).
-        if outcome.committed {
-            if let Some(cb) = &self.tip_changed {
+        if outcome.committed
+            && let Some(cb) = &self.tip_changed {
                 cb(ref_name, &outcome.hash, overlay_generation);
             }
-        }
         Ok(outcome)
     }
 
@@ -527,11 +526,10 @@ impl Repo {
         let now = unix_seconds();
         let outcome =
             write_reauthor_tx(&mut self.db, session, ref_name, parent, root_tree, intent, now)?;
-        if outcome.committed {
-            if let Some(cb) = &self.tip_changed {
+        if outcome.committed
+            && let Some(cb) = &self.tip_changed {
                 cb(ref_name, &outcome.hash, None);
             }
-        }
         Ok(outcome)
     }
 

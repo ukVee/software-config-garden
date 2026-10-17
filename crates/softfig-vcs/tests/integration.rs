@@ -188,11 +188,10 @@ fn fsck_detects_corrupted_object() {
     let mut victim = None;
     for fanout in fs::read_dir(&objects).unwrap() {
         let fanout = fanout.unwrap();
-        if fanout.file_type().unwrap().is_dir() {
-            if let Some(inner) = fs::read_dir(fanout.path()).unwrap().next() {
+        if fanout.file_type().unwrap().is_dir()
+            && let Some(inner) = fs::read_dir(fanout.path()).unwrap().next() {
                 victim = Some(inner.unwrap().path());
             }
-        }
         if victim.is_some() {
             break;
         }

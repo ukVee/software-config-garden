@@ -121,11 +121,10 @@ pub fn migrate_config(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     // Re-seed the volatile endpoint sidecar from the legacy ring (never
     // committed) so a migrated, already-paired garden keeps its peers reachable
     // across the next restart without waiting on a fresh mDNS sighting.
-    if let Some(ring) = peers_legacy_ring {
-        if let Err(e) = EndpointCache::capture(&ring).save(&endpoint_cache_path(&state_dir)) {
+    if let Some(ring) = peers_legacy_ring
+        && let Err(e) = EndpointCache::capture(&ring).save(&endpoint_cache_path(&state_dir)) {
             eprintln!("keeperd: migrate config: endpoint sidecar seed: {e}");
         }
-    }
 
     reply(migrated, skipped, true, Some(hash.to_string()))
 }

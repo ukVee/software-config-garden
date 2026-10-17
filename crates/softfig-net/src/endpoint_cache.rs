@@ -90,11 +90,10 @@ impl EndpointCache {
     /// skipped.
     pub fn apply(&self, ring: &mut Ring) {
         for (fp, eps) in &self.endpoints {
-            if let Ok(bytes) = hex::decode(fp) {
-                if let Ok(device_id) = <[u8; KEY_LEN]>::try_from(bytes.as_slice()) {
+            if let Ok(bytes) = hex::decode(fp)
+                && let Ok(device_id) = <[u8; KEY_LEN]>::try_from(bytes.as_slice()) {
                     ring.merge_endpoints(&device_id, eps);
                 }
-            }
         }
     }
 

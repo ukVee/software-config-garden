@@ -256,11 +256,10 @@ fn print_subtree(s: &SharedSubtreeInfo) {
     // Placement is per-device; the sharer's recommendation is only a hint. Show
     // it solely when this device chose a different path (the divergent-placement
     // case the milestone makes first-class).
-    if let Some(rec) = s.recommended_path.as_deref() {
-        if rec != s.mount_path {
+    if let Some(rec) = s.recommended_path.as_deref()
+        && rec != s.mount_path {
             println!("      (sharer recommended {rec})");
         }
-    }
 }
 
 /// Render a pending share-offer row (M5f slice 006). Read-only surface — accept

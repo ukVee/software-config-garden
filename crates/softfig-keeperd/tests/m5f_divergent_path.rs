@@ -77,12 +77,11 @@ fn fast_params() -> VaultParams {
 fn wait_for_socket(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if path.exists() {
-            if let Ok(stream) = UnixStream::connect(path) {
+        if path.exists()
+            && let Ok(stream) = UnixStream::connect(path) {
                 drop(stream);
                 return;
             }
-        }
         thread::sleep(Duration::from_millis(20));
     }
     panic!("socket {} did not appear", path.display());

@@ -255,11 +255,10 @@ impl UsageAggregator {
     /// new read it is. This is the age-preserving half of the window-staleness
     /// bound; [`aggregate_at`](Self::aggregate_at) is the expiry half.
     pub fn observe(&mut self, mut sample: UsageSample) {
-        if let Some(prev) = self.latest.get(&sample.agent) {
-            if prev.budget == sample.budget && prev.resets_at == sample.resets_at {
+        if let Some(prev) = self.latest.get(&sample.agent)
+            && prev.budget == sample.budget && prev.resets_at == sample.resets_at {
                 sample.read_at = prev.read_at;
             }
-        }
         self.latest.insert(sample.agent.clone(), sample);
     }
 

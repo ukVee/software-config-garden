@@ -246,13 +246,11 @@ fn cycle(args: CycleArgs) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.timeout);
     loop {
         std::thread::sleep(Duration::from_millis(200));
-        if let Ok(Some(v)) = try_daemon_call(&socket, op::STATUS, json!({})) {
-            if let Ok(s) = serde_json::from_value::<StatusReply>(v) {
-                if s.state == "locked" {
+        if let Ok(Some(v)) = try_daemon_call(&socket, op::STATUS, json!({}))
+            && let Ok(s) = serde_json::from_value::<StatusReply>(v)
+                && s.state == "locked" {
                     break;
                 }
-            }
-        }
         if Instant::now() >= deadline {
             bail!(
                 "daemon did not come back Locked within {}s. Is the \
@@ -374,14 +372,13 @@ fn call_simple(
 fn which_keeperd() -> Result<PathBuf> {
     // Prefer a sibling binary in the same directory as the running CLI
     // (cargo target dir or installed prefix). Fall back to PATH.
-    if let Ok(self_path) = std::env::current_exe() {
-        if let Some(dir) = self_path.parent() {
+    if let Ok(self_path) = std::env::current_exe()
+        && let Some(dir) = self_path.parent() {
             let cand = dir.join("softfig-keeperd");
             if cand.exists() {
                 return Ok(cand);
             }
         }
-    }
     Ok(PathBuf::from("softfig-keeperd"))
 }
 

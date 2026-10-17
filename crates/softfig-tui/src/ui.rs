@@ -1181,14 +1181,13 @@ fn render_shares_detail(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::raw(format!("  ref:      {}", info.ref_name)));
             // Placement is per-device (M5f). Surface the sharer's advisory
             // recommendation only when this device chose a different path.
-            if let Some(rec) = info.recommended_path.as_deref() {
-                if rec != info.mount_path {
+            if let Some(rec) = info.recommended_path.as_deref()
+                && rec != info.mount_path {
                     lines.push(Line::styled(
                         format!("  placed here; sharer recommended {rec}"),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
-            }
             lines.push(Line::raw(format!(
                 "  local:    {}",
                 if info.enabled {

@@ -400,8 +400,8 @@ impl WriteTurn {
     /// can never be pushed back. A non-holder heartbeat is ignored.
     pub fn renew(&mut self, device_id: &[u8; 32], now: i64) -> bool {
         let ceiling = self.cfg.max_lease;
-        if let Some(h) = self.holder.as_mut() {
-            if &h.device_id == device_id {
+        if let Some(h) = self.holder.as_mut()
+            && &h.device_id == device_id {
                 let hard = h.granted_at.saturating_add(ceiling);
                 if now >= hard {
                     return false; // at/over the ceiling — cannot extend past it
@@ -410,7 +410,6 @@ impl WriteTurn {
                 h.revoke_deadline = want.min(hard);
                 return true;
             }
-        }
         false
     }
 
@@ -482,18 +481,17 @@ impl WriteTurn {
     pub fn poll(&mut self, now: i64) -> Vec<LeaseEvent> {
         let mut events = Vec::new();
 
-        if let Some(h) = self.holder {
-            if now >= h.revoke_deadline {
+        if let Some(h) = self.holder
+            && now >= h.revoke_deadline {
                 self.holder = None;
                 events.push(LeaseEvent::Revoked {
                     device_id: h.device_id,
                     epoch: h.epoch,
                 });
             }
-        }
 
-        if self.holder.is_none() {
-            if let Some(winner) = self.next_in_line() {
+        if self.holder.is_none()
+            && let Some(winner) = self.next_in_line() {
                 self.waiters.retain(|w| w.device_id != winner);
                 let epoch = self.epoch;
                 self.epoch = self.epoch.wrapping_add(1);
@@ -508,7 +506,6 @@ impl WriteTurn {
                     epoch,
                 });
             }
-        }
 
         events
     }

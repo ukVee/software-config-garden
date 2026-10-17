@@ -334,11 +334,10 @@ fn dfs_cycle(
     }
     state[idx] = 1;
     for link in &entries[idx].after {
-        if let Some(&next) = live.get(link.as_str()) {
-            if let Some(cycle) = dfs_cycle(next, entries, live, state) {
+        if let Some(&next) = live.get(link.as_str())
+            && let Some(cycle) = dfs_cycle(next, entries, live, state) {
                 return Some(cycle);
             }
-        }
     }
     state[idx] = 2;
     None

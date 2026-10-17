@@ -407,12 +407,11 @@ mod nav {
             if in_fence {
                 continue;
             }
-            if let Some((level, text)) = atx(line) {
-                if text == heading {
+            if let Some((level, text)) = atx(line)
+                && text == heading {
                     start = Some((i, level));
                     break;
                 }
-            }
         }
         let (hline, hlevel) = start?;
         let mut in_fence = false;
@@ -426,12 +425,11 @@ mod nav {
             if in_fence {
                 continue;
             }
-            if let Some((level, _)) = atx(line) {
-                if level <= hlevel {
+            if let Some((level, _)) = atx(line)
+                && level <= hlevel {
                     end = i;
                     break;
                 }
-            }
         }
         Some((hline, end))
     }

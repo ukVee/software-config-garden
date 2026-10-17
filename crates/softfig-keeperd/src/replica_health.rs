@@ -293,11 +293,10 @@ impl PushHealth {
 
         // Steady state in the same class: nothing to say, and usually nothing to
         // write either.
-        if let (Some(i), Some((prev_state, _))) = (idx, prev) {
-            if prev_state == to {
+        if let (Some(i), Some((prev_state, _))) = (idx, prev)
+            && prev_state == to {
                 return self.record_same_class(i, outcome, now);
             }
-        }
 
         let ok_age_secs = idx.and_then(|i| self.hosts[i].ok_age_secs(now));
         let last_ok = match outcome {

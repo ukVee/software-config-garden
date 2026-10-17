@@ -249,8 +249,8 @@ pub(crate) fn cas_check_section(
     heading: &str,
     expected: &Option<String>,
 ) -> Result<(), (ErrorKind, String)> {
-    if let (Some(want), Some(cur)) = (expected, edit::section_version(content, heading)) {
-        if &cur != want {
+    if let (Some(want), Some(cur)) = (expected, edit::section_version(content, heading))
+        && &cur != want {
             return Err((
                 ErrorKind::Conflict,
                 format!(
@@ -258,7 +258,6 @@ pub(crate) fn cas_check_section(
                 ),
             ));
         }
-    }
     Ok(())
 }
 

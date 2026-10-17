@@ -203,14 +203,13 @@ pub struct WrappingParams {
 ///
 /// Reads the header only. Opens nothing, so it stays usable on a locked vault.
 pub fn wrapping_params(wrapped: &[u8], fallback: &Argon2Params) -> WrappingParams {
-    if is_v2(wrapped) {
-        if let Ok(params) = decode_v2_header(wrapped) {
+    if is_v2(wrapped)
+        && let Ok(params) = decode_v2_header(wrapped) {
             return WrappingParams {
                 params,
                 embedded: true,
             };
         }
-    }
     WrappingParams {
         params: *fallback,
         embedded: false,

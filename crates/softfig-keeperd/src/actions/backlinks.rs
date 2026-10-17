@@ -62,11 +62,10 @@ pub fn refresh_all(wt: &WorkTree, inner: &DaemonInner) {
             current_hosts.insert(rel.clone());
         }
         for token in refs::parse_refs(&content) {
-            if let Some(target) = refs::resolve_ref(rel, &token, &exists) {
-                if !is_excluded(&target) {
+            if let Some(target) = refs::resolve_ref(rel, &token, &exists)
+                && !is_excluded(&target) {
                     graph.entry(target).or_default().insert(rel.clone());
                 }
-            }
         }
         contents.insert(rel.clone(), content);
     }
@@ -209,8 +208,8 @@ pub mod refs {
         let mut out = Vec::new();
         let mut i = 0;
         while i + 1 < bytes.len() {
-            if bytes[i] == b'[' && bytes[i + 1] == b'[' && mask[i] && mask[i + 1] {
-                if let Some(close) = find_close(bytes, &mask, i + 2) {
+            if bytes[i] == b'[' && bytes[i + 1] == b'[' && mask[i] && mask[i + 1]
+                && let Some(close) = find_close(bytes, &mask, i + 2) {
                     if let Ok(inner) = std::str::from_utf8(&bytes[i + 2..close]) {
                         let token = inner.trim();
                         if valid_token(token) {
@@ -220,7 +219,6 @@ pub mod refs {
                     i = close + 2;
                     continue;
                 }
-            }
             i += 1;
         }
         out
@@ -315,8 +313,8 @@ pub mod refs {
         let mut i = 0usize;
         let mut changed = false;
         while i + 1 < bytes.len() {
-            if bytes[i] == b'[' && bytes[i + 1] == b'[' && mask[i] && mask[i + 1] {
-                if let Some(close) = find_close(bytes, &mask, i + 2) {
+            if bytes[i] == b'[' && bytes[i + 1] == b'[' && mask[i] && mask[i + 1]
+                && let Some(close) = find_close(bytes, &mask, i + 2) {
                     if let Ok(inner) = std::str::from_utf8(&bytes[i + 2..close]) {
                         let token = inner.trim();
                         if valid_token(token)
@@ -333,7 +331,6 @@ pub mod refs {
                     i = close + 2;
                     continue;
                 }
-            }
             i += 1;
         }
         if !changed {

@@ -943,11 +943,10 @@ impl Supervisor {
         let backoff = self.backoff;
         let sup = self.agents.get_mut(agent).expect("agent exists (checked in poll)");
         let was_hung = matches!(health, AgentHealth::Alive { .. });
-        if let Some(child) = sup.child.take() {
-            if was_hung {
+        if let Some(child) = sup.child.take()
+            && was_hung {
                 child.kill();
             }
-        }
         sup.consecutive_failures = sup.consecutive_failures.saturating_add(1);
         sup.not_before = now.saturating_add(backoff.delay(sup.consecutive_failures));
         PollOutcome::Crashed {
@@ -975,11 +974,10 @@ impl Supervisor {
             .get_mut(agent)
             .expect("agent exists (checked in poll)");
         let was_hung = matches!(health, AgentHealth::Alive { .. });
-        if let Some(child) = sup.child.take() {
-            if was_hung {
+        if let Some(child) = sup.child.take()
+            && was_hung {
                 child.kill();
             }
-        }
         // Transient: the failure streak is left untouched (a network blip is not a
         // failure, so it neither counts nor resets a real streak), and the member is
         // immediately re-rollable — no punitive backoff. The connectivity gate paces
