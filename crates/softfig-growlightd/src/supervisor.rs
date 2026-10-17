@@ -90,6 +90,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use softfig_ipc::baton::{classify_status, BatonDisposition};
+use softfig_ipc::item_repo::RepoState;
 
 use crate::admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
@@ -116,7 +117,15 @@ const DEFAULT_HANG_SECS: i64 = 600;
 /// unchanged across 2+ iterations → STUCK"): the first repeat arms the streak, the
 /// second trips it, so a stuck member burns at most one extra session before it is
 /// parked with a reason rather than spinning until a budget rail trips.
-const STALL_LIMIT: u32 = 2;
+pub(crate) const STALL_LIMIT: u32 = 2;
+/// Spin guard, repo half (task 069): how many continue-exits on an unchanged
+/// `# NEXT ACTION` the guard excuses because the item's repo moved (a new `HEAD`
+/// or a new dirty-tree fingerprint) during that NEXT ACTION's run. NEXT ACTION
+/// alone parked a member that WAS working — one session that ended without a
+/// handoff was enough. The cap keeps the budget protection against a member that
+/// churns its tree forever and never hands off: past it, the repo stops counting
+/// and the plain streak decides.
+const REPO_EXCUSE_LIMIT: u32 = 3;
 
 /// The per-agent spec a backend spawns from: the agent's bus id (work-stream
 /// name) plus the paths to its pre-approval `loop.json` and `mcp.json` (§15 —
@@ -550,6 +559,15 @@ struct Supervised {
     /// the previous one — the no-progress streak. At [`STALL_LIMIT`] the spin guard
     /// releases the member as `STUCK` instead of re-rolling it (task 038).
     unchanged_streak: u32,
+    /// The repo progress keys ([`RepoState::progress_key`]) seen at the
+    /// continue-exits of the current NEXT ACTION run (task 069). A key not in here
+    /// is progress; one already in here is not, which catches an A/B oscillation.
+    /// Reset with the streak; at most [`REPO_EXCUSE_LIMIT`] + 1 entries, since only
+    /// an excused exit pushes past the first.
+    seen_repo: Vec<(Option<String>, u64)>,
+    /// Continue-exits the repo signal excused during the current NEXT ACTION run,
+    /// capped at [`REPO_EXCUSE_LIMIT`].
+    repo_excused: u32,
 }
 
 /// The fleet supervisor: owns the spawn seam, the admission governor, and the
@@ -719,6 +737,8 @@ impl Supervisor {
                                 not_before: now,
                                 last_next_action: None,
                                 unchanged_streak: 0,
+                                seen_repo: Vec::new(),
+                                repo_excused: 0,
                             },
                         );
                         StartOutcome::Started
@@ -813,6 +833,43 @@ impl Supervisor {
         network_exit: F,
         rate_limit_exit: G,
     ) -> PollOutcome {
+        self.poll_with_progress(
+            agent,
+            health,
+            baton_status,
+            next_action,
+            now,
+            network_exit,
+            rate_limit_exit,
+            // The pre-task-069 behaviour: no repo signal, NEXT ACTION alone decides.
+            || None,
+        )
+    }
+
+    /// Like [`poll_with_exits`](Self::poll_with_exits), but with a `repo_state`
+    /// read of the item's repo (task 069) — evaluated ONLY inside the spin guard,
+    /// on a continue clean exit that carries a NEXT ACTION (once per session, never
+    /// on a latched re-observation), so the `git` it runs costs nothing per tick.
+    /// When the NEXT ACTION repeats but the repo moved since any exit of that
+    /// NEXT ACTION's run, the member is progressing and re-rolls instead of
+    /// parking, up to [`REPO_EXCUSE_LIMIT`] times. `None` — no repo for the item,
+    /// or a probe that failed — is exactly the NEXT-ACTION-only guard.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_with_progress<
+        F: FnOnce() -> bool,
+        G: FnOnce() -> bool,
+        H: FnOnce() -> Option<RepoState>,
+    >(
+        &mut self,
+        agent: &str,
+        health: AgentHealth,
+        baton_status: Option<&str>,
+        next_action: Option<&str>,
+        now: i64,
+        network_exit: F,
+        rate_limit_exit: G,
+        repo_state: H,
+    ) -> PollOutcome {
         let hang_secs = self.hang_secs;
         if !self.agents.contains_key(agent) {
             return PollOutcome::Unknown;
@@ -835,7 +892,7 @@ impl Supervisor {
                     // spin streak counts real consecutive sessions only.
                     PollOutcome::Down
                 } else {
-                    self.on_clean_exit(agent, baton_status, next_action, now)
+                    self.on_clean_exit(agent, baton_status, next_action, now, repo_state)
                 }
             }
             Verdict::Crashed => {
@@ -953,6 +1010,8 @@ impl Supervisor {
         sup.not_before = now;
         sup.last_next_action = None;
         sup.unchanged_streak = 0;
+        sup.seen_repo.clear();
+        sup.repo_excused = 0;
         PollOutcome::RateLimitDeath
     }
 
@@ -979,12 +1038,13 @@ impl Supervisor {
     /// A released/retired member is gone (its slot freed); a rate-limited one is
     /// down-but-registered (re-rolled when its window recovers). All stop the
     /// blind re-roll, which is what kept `claude -p` spinning.
-    fn on_clean_exit(
+    fn on_clean_exit<H: FnOnce() -> Option<RepoState>>(
         &mut self,
         agent: &str,
         baton_status: Option<&str>,
         next_action: Option<&str>,
         now: i64,
+        repo_state: H,
     ) -> PollOutcome {
         // No baton signal → the historical clean-exit re-roll, but still through the
         // spin guard: a member that never rewrites its baton keeps the seed's constant
@@ -993,10 +1053,10 @@ impl Supervisor {
         // baton leaves `next_action` `None`, which never proves a repeat, so the guard
         // stays inert there — the exact historical re-roll.
         let Some(status) = baton_status else {
-            return self.roll_or_spin(agent, next_action, now);
+            return self.roll_or_spin(agent, next_action, now, repo_state);
         };
         match classify_status(Some(status)) {
-            BatonDisposition::Continue => self.roll_or_spin(agent, next_action, now),
+            BatonDisposition::Continue => self.roll_or_spin(agent, next_action, now, repo_state),
             BatonDisposition::ItemBoundary => {
                 // Item boundary: the member already wrote `set_item_status <part>
                 // done|deferred`, so its part is finished. Release its slot — drop
@@ -1026,6 +1086,8 @@ impl Supervisor {
                     sup.child = None;
                     sup.last_next_action = None;
                     sup.unchanged_streak = 0;
+                    sup.seen_repo.clear();
+                    sup.repo_excused = 0;
                 }
                 PollOutcome::ParkedRateLimited
             }
@@ -1066,7 +1128,24 @@ impl Supervisor {
     /// item-parks its part `blocked` and alerts the human on the item — the block is
     /// tagged `spin_guard` so the journal names WHY it parked instead of reading as a
     /// member-declared human block. Not a re-roll, so no more budget is burned.
-    fn roll_or_spin(&mut self, agent: &str, next_action: Option<&str>, now: i64) -> PollOutcome {
+    ///
+    /// NEXT ACTION is not the only progress signal (task 069): a session can do
+    /// real work and exit without a handoff. So a repeat whose `repo_state` key
+    /// was not seen at any exit of this NEXT ACTION's run is progress — the streak
+    /// stays at 1 — up to [`REPO_EXCUSE_LIMIT`] times. "Not seen in this run",
+    /// not "differs from the last exit", so a tree flipping between two states
+    /// still trips. `repo_state` is only read when there is a NEXT ACTION to
+    /// compare; without one the guard is inert anyway.
+    fn roll_or_spin<H: FnOnce() -> Option<RepoState>>(
+        &mut self,
+        agent: &str,
+        next_action: Option<&str>,
+        now: i64,
+        repo_state: H,
+    ) -> PollOutcome {
+        let key = next_action
+            .and_then(|_| repo_state())
+            .map(|state| state.progress_key());
         let streak = {
             let sup = self
                 .agents
@@ -1076,11 +1155,21 @@ impl Supervisor {
                 (sup.last_next_action.as_deref(), next_action),
                 (Some(prev), Some(cur)) if prev == cur
             );
-            sup.unchanged_streak = if same {
-                sup.unchanged_streak.saturating_add(1)
+            if !same {
+                sup.unchanged_streak = 1;
+                sup.seen_repo = key.into_iter().collect();
+                sup.repo_excused = 0;
+            } else if let Some(key) =
+                key.filter(|k| !sup.seen_repo.contains(k) && sup.repo_excused < REPO_EXCUSE_LIMIT)
+            {
+                // Same NEXT ACTION, but the repo moved: the session worked and
+                // didn't hand off. Re-roll as if the action had changed.
+                sup.unchanged_streak = 1;
+                sup.seen_repo.push(key);
+                sup.repo_excused += 1;
             } else {
-                1
-            };
+                sup.unchanged_streak = sup.unchanged_streak.saturating_add(1);
+            }
             sup.last_next_action = next_action.map(str::to_string);
             sup.unchanged_streak
         };
@@ -2446,6 +2535,227 @@ mod tests {
             s.is_registered("a1"),
             "a no-signal member keeps re-rolling, never spin-tripped"
         );
+    }
+
+    /// A repo read whose progress key is `(head, fingerprint)`.
+    fn repo(head: &str, fingerprint: u64) -> Option<RepoState> {
+        Some(RepoState {
+            head: Some(head.into()),
+            dirty: 1,
+            newest_dirty_mtime: None,
+            fingerprint,
+        })
+    }
+
+    /// One continue clean-exit of `a1` on `next_action` with the repo reading
+    /// `state`, followed by the tick that re-rolls it when it rolled.
+    fn continue_exit(
+        s: &mut Supervisor,
+        next_action: &str,
+        state: Option<RepoState>,
+        now: i64,
+    ) -> PollOutcome {
+        let out = s.poll_with_progress(
+            "a1",
+            AgentHealth::Exited { code: 0 },
+            Some("IN_PROGRESS"),
+            Some(next_action),
+            now,
+            || false,
+            || false,
+            || state,
+        );
+        s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+        out
+    }
+
+    fn spin_trip() -> PollOutcome {
+        PollOutcome::Blocked {
+            status: "STUCK (spin guard): NEXT ACTION unchanged across 2 consecutive re-rolls"
+                .into(),
+            spin_guard: true,
+        }
+    }
+
+    /// Task 069: a session that worked but exited without a handoff leaves the
+    /// NEXT ACTION unchanged and the repo moved. That is progress — re-roll, no
+    /// park — whether the move is a new dirty tree or a commit.
+    #[test]
+    fn spin_guard_re_rolls_when_the_repo_moved_under_an_unchanged_next_action() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 0), 10), PollOutcome::Rolling);
+        assert_eq!(
+            continue_exit(&mut s, "build it", repo("h1", 7), 20),
+            PollOutcome::Rolling,
+            "the dirty tree moved"
+        );
+        assert_eq!(
+            continue_exit(&mut s, "build it", repo("h2", 7), 30),
+            PollOutcome::Rolling,
+            "HEAD moved"
+        );
+        assert!(s.is_registered("a1"));
+        assert_eq!(backend.spawn_count(), 4, "every session re-rolled");
+    }
+
+    /// Task 069: the repo signal does not soften the guard for a member that
+    /// truly made no progress — same NEXT ACTION, same repo trips at STALL_LIMIT
+    /// with the exact task-038 block.
+    #[test]
+    fn spin_guard_trips_when_neither_next_action_nor_the_repo_moved() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 3), 10), PollOutcome::Rolling);
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 3), 20), spin_trip());
+        assert!(!s.is_registered("a1"));
+    }
+
+    /// Task 069: "moved" means a key not seen during this NEXT ACTION's run, not
+    /// "differs from the last exit" — a tree flipping between two states is not
+    /// progress.
+    #[test]
+    fn spin_guard_trips_on_a_repo_oscillating_between_two_states() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 1), 10), PollOutcome::Rolling);
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 2), 20), PollOutcome::Rolling);
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 1), 30), spin_trip());
+    }
+
+    /// Task 069: a member that churns its tree forever without a handoff is still
+    /// a budget burn. The repo excuses REPO_EXCUSE_LIMIT exits per NEXT ACTION,
+    /// then the plain streak decides; a changed NEXT ACTION restores the excuses.
+    #[test]
+    fn spin_guard_caps_the_repo_excuses_per_next_action() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 0), 10), PollOutcome::Rolling);
+        for i in 1..=REPO_EXCUSE_LIMIT {
+            let now = 10 + i64::from(i) * 10;
+            assert_eq!(
+                continue_exit(&mut s, "build it", repo("h1", u64::from(i)), now),
+                PollOutcome::Rolling,
+                "excuse {i}"
+            );
+        }
+        // A handoff resets the run, so the excuses are available again.
+        assert_eq!(continue_exit(&mut s, "test it", repo("h1", 50), 100), PollOutcome::Rolling);
+        for i in 1..=REPO_EXCUSE_LIMIT {
+            let now = 100 + i64::from(i) * 10;
+            assert_eq!(
+                continue_exit(&mut s, "test it", repo("h1", 50 + u64::from(i)), now),
+                PollOutcome::Rolling,
+                "excuse {i} after the handoff"
+            );
+        }
+        assert_eq!(
+            continue_exit(&mut s, "test it", repo("h1", 99), 200),
+            spin_trip(),
+            "the repo moved again, but the excuses are spent"
+        );
+    }
+
+    /// Task 069: a changed NEXT ACTION resets the streak with or without a repo
+    /// signal, exactly as in task 038 — an unchanged repo across a handoff is not
+    /// a stall.
+    #[test]
+    fn a_changed_next_action_still_resets_with_an_unchanged_repo() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        for (i, action) in ["read it", "plan it", "build it"].into_iter().enumerate() {
+            let now = (i as i64 + 1) * 10;
+            assert_eq!(continue_exit(&mut s, action, repo("h1", 5), now), PollOutcome::Rolling);
+        }
+        assert!(s.is_registered("a1"));
+    }
+
+    /// Task 069: a rate-limit park starts a fresh NEXT ACTION run, the repo half
+    /// included — the excuses spent before the pause are available after it.
+    #[test]
+    fn a_rate_limit_park_restores_the_repo_excuses() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        for i in 0..=REPO_EXCUSE_LIMIT {
+            let now = i64::from(i) * 10;
+            assert_eq!(
+                continue_exit(&mut s, "build it", repo("h1", u64::from(i)), now),
+                PollOutcome::Rolling
+            );
+        }
+        assert_eq!(
+            s.poll_with_network(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("HALTED_RATE_LIMIT"),
+                None,
+                100,
+                || false,
+            ),
+            PollOutcome::ParkedRateLimited
+        );
+        s.tick(fresh_budget(), fresh_rate(), 100, &any_work);
+        assert_eq!(continue_exit(&mut s, "build it", repo("h1", 0), 110), PollOutcome::Rolling);
+        assert_eq!(
+            continue_exit(&mut s, "build it", repo("h1", 1), 120),
+            PollOutcome::Rolling,
+            "a key seen before the park is new again, and the excuse budget is back"
+        );
+    }
+
+    /// Task 069: with no repo for the item (`None`), the guard is exactly the
+    /// task-038 NEXT-ACTION-only guard — and the repo read is lazy: it never runs
+    /// without a NEXT ACTION to compare, nor on a latched re-observation.
+    #[test]
+    fn spin_guard_without_a_repo_is_the_next_action_guard() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        let never = || -> Option<RepoState> { panic!("the repo must not be read here") };
+
+        assert_eq!(
+            s.poll_with_progress(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                None,
+                5,
+                || false,
+                || false,
+                never,
+            ),
+            PollOutcome::Rolling,
+            "no NEXT ACTION, no read"
+        );
+        assert_eq!(
+            s.poll_with_progress(
+                "a1",
+                AgentHealth::Exited { code: 0 },
+                Some("IN_PROGRESS"),
+                None,
+                6,
+                || false,
+                || false,
+                never,
+            ),
+            PollOutcome::Down,
+            "a latched re-observation reads nothing"
+        );
+        s.tick(fresh_budget(), fresh_rate(), 6, &any_work);
+        assert_eq!(continue_exit(&mut s, "build it", None, 10), PollOutcome::Rolling);
+        assert_eq!(continue_exit(&mut s, "build it", None, 20), spin_trip());
     }
 
     /// THE FLEET-MEMBER-MODEL FIX (slice 001): a member that exits cleanly on an

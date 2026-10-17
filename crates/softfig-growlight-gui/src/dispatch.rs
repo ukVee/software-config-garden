@@ -285,6 +285,7 @@ mod tests {
             roster: Vec::new(),
             agents: vec![AgentSummary::new("loop-1", "running", true)],
             live_scopes: Vec::new(),
+            held: Vec::new(),
         };
 
         /// A transport that answers the one `status` round-trip with a canned

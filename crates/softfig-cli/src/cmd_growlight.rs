@@ -1812,6 +1812,17 @@ fn print_fleet_status(r: &FleetStatusReply) {
             println!("  {:<16} {:<12} {}", a.id, a.status, agent_accounting(a));
         }
     }
+    // The parts the fleet is leaving for the human (task 068), with the skip reason
+    // the journal gave. Each stays `queued` and pages no one, so this is where a
+    // hold shows; dropping the item's `> Fleet:` line frees it.
+    if r.held.is_empty() {
+        println!("held          (none)");
+    } else {
+        println!("held:");
+        for h in &r.held {
+            println!("  {:<32} {}", format!("{}/{}", h.queue, h.part), h.reason);
+        }
+    }
 }
 
 /// The accounting half of an `agents:` row: which backend serves the member and —
@@ -3344,6 +3355,7 @@ mod tests {
             roster: Vec::new(),
             agents: Vec::new(),
             live_scopes: live,
+            held: Vec::new(),
         };
 
         // Running scopes: the exact gen-suffixed unit names, verbatim.

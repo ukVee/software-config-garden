@@ -388,6 +388,7 @@ mod tests {
                 AgentSummary::new("b", "idle", false),
             ],
             live_scopes: Vec::new(),
+            held: Vec::new(),
         };
         app.apply_status(reply);
 

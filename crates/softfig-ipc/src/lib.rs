@@ -11,6 +11,7 @@
 pub mod baton;
 pub mod client;
 pub mod growlightd;
+pub mod item_repo;
 pub mod member;
 pub mod model_choice;
 pub mod opencode;

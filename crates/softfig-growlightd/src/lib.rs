@@ -72,8 +72,8 @@ pub use daemon::{Daemon, DaemonHandle, GrowlightdError};
 pub use drive_loop::{
     spawn_drive_loop, AgentHealthSource, AgentStderrSource, Assignment, BatonRead, BatonSeeder,
     BatonStatusSource, BudgetSampleSource, DeferredBatonSeeder, DeferredBatonStatus,
-    DeferredQueues, DriveLoop, FleetMember, HeldStart, PartClaimer, PermissiveRate, QueueSource,
-    RateMeter, RateSource, TickReport, DRIVE_POLL_MS,
+    DeferredQueues, DriveLoop, FleetMember, HeldPart, HeldStart, NoRepoProbe, PartClaimer,
+    PermissiveRate, QueueSource, RateMeter, RateSource, RepoProbe, TickReport, DRIVE_POLL_MS,
 };
 pub use fleet::{
     assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig, MemberBackend,
@@ -91,11 +91,14 @@ pub use opencode_backend::{AgentSpend, ModelSelection, OpencodeBackend, Opencode
 pub use opencode_preapproval::OpencodePreApproval;
 pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
-pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_QUEUE_NAME};
+pub use queue_source::{
+    parse_snapshot, KeeperdQueueSource, KeeperdRepoProbe, BACKLOG_DOC, DEFAULT_QUEUE_NAME,
+};
 pub use reconcile::{reconcile_on_boot, ReconcileReport};
 pub use resume::{ItemResumer, KeeperdItemResumer, ResumeOutcome};
 pub use scheduler::{
-    classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
+    classify_queue, held, parked, pick, pick_for, ClaimHold, PartStatus, PartView, QueueState,
+    QueueView, Snapshot,
 };
 pub use state::State;
 pub use supervisor::{

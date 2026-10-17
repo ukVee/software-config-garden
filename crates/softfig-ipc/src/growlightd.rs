@@ -244,6 +244,13 @@ pub struct FleetStatusReply {
     /// (`#[serde(default)]`) for wire back-compat.
     #[serde(default)]
     pub live_scopes: Vec<String>,
+    /// The `queued` parts the fleet is leaving for the human (task 068): each item
+    /// whose doc carries a `> Fleet:` marker other than `yes`, with the skip reason
+    /// the drive loop journaled. A hold parks nothing and pages no one, so this list
+    /// is where it shows. Empty while the fleet is disarmed. Additive
+    /// (`#[serde(default)]`) for wire back-compat.
+    #[serde(default)]
+    pub held: Vec<HeldPartSummary>,
 }
 
 /// One configured roster member echoed in [`FleetStatusReply::roster`] — the
@@ -255,6 +262,18 @@ pub struct FleetMemberSummary {
     /// The queue this member is pinned to, or `None` for a fallback-only member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
+}
+
+/// One part in [`FleetStatusReply::held`]: the fleet skipped it at claim time and
+/// left it `queued` for the human (task 068).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldPartSummary {
+    /// The queue the part sits in.
+    pub queue: String,
+    /// The part's queue id (milestone slug or task NNN).
+    pub part: String,
+    /// The one-line skip reason, e.g. `human-only (> Fleet: no)`.
+    pub reason: String,
 }
 
 /// Per-agent line in [`FleetStatusReply::agents`] — one row per ARMED roster
@@ -1641,6 +1660,7 @@ mod tests {
         assert!(!reply.fleet_enabled, "missing fleet_enabled decodes as off");
         assert!(reply.roster.is_empty(), "missing roster decodes as empty");
         assert!(reply.agents.is_empty());
+        assert!(reply.held.is_empty(), "missing held decodes as empty");
         assert_eq!(
             reply.build_caps,
             BuildCapsSummary::default(),
@@ -1676,6 +1696,11 @@ mod tests {
                 ),
             ],
             live_scopes: vec!["growlight-agent-builder-1.scope".into()],
+            held: vec![HeldPartSummary {
+                queue: "default".into(),
+                part: "hover-view-sticky".into(),
+                reason: "human-only (> Fleet: no)".into(),
+            }],
         };
         let back: FleetStatusReply =
             serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
@@ -1686,6 +1711,7 @@ mod tests {
         assert_eq!(back.roster[1].pin, None);
         assert_eq!(back.live_scopes, vec!["growlight-agent-builder-1.scope".to_string()]);
         assert_eq!(back.agents, reply.agents, "the live rows round-trip whole");
+        assert_eq!(back.held, reply.held, "the held parts round-trip whole");
     }
 
     #[test]

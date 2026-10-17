@@ -56,6 +56,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use softfig_ipc::item_repo::RepoState;
+
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
 use crate::baton_store::FsEntryBatonStore;
@@ -66,12 +68,14 @@ use crate::fleet::QueueMode;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
 use crate::opencode_backend::{ModelSelection, OpencodeBackend};
-use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
+use crate::scheduler::{
+    classify_queue, parked, pick, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
+};
 use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
 use crate::state::State;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
-    Supervisor,
+    Supervisor, STALL_LIMIT,
 };
 use crate::usage::{UsageAggregator, UsageSample, WindowResets};
 use crate::v2_source::V2Load;
@@ -100,7 +104,23 @@ pub const OFFLINE_ALERT_THRESHOLD_SECS: i64 = 180;
 pub trait QueueSource: Send + Sync + fmt::Debug {
     /// The current view of every queue the fleet can draw from, in fallback order.
     fn snapshot(&self) -> Snapshot;
+
+    /// Why the fleet must not claim `part` of `queue`, read FRESH at claim time
+    /// from the item's own doc (task 068): its `> Fleet:` marker, or a fail-closed
+    /// hold when the doc could not be read. `None` lets the claim go ahead. The
+    /// queue table carries no marker, so the snapshot can't; step 3 asks this just
+    /// before every fresh claim. Defaults to `None` — a source with no item docs
+    /// has no markers.
+    fn claim_hold(&self, _queue: &str, _part: &str) -> Option<ClaimHold> {
+        None
+    }
 }
+
+/// How long a claim hold found by the claim-time marker read is trusted before
+/// the doc is read again (task 068). Within it a held part is skipped without a
+/// keeperd read every ~1s tick; past it the next pick re-reads, so removing a
+/// `> Fleet: no` line frees the item within a minute.
+pub const HOLD_RECHECK_SECS: i64 = 60;
 
 /// The seam the loop **claims** a picked part through before spawning its agent
 /// — the WRITE counterpart to [`QueueSource`]'s read. Marking the part `active`
@@ -567,6 +587,29 @@ impl QueueSource for DeferredQueues {
     }
 }
 
+/// The seam the spin guard reads a part's repo through (task 069): a session can
+/// do real work and exit without a handoff, so "the repo moved" is progress too.
+/// Read lazily — only on a continue clean exit that carries a NEXT ACTION, once
+/// per session — and fed to [`Supervisor::poll_with_progress`]. The production
+/// impl is [`crate::queue_source::KeeperdRepoProbe`]; a test scripts the reads.
+pub trait RepoProbe: Send + Sync + fmt::Debug {
+    /// The current [`RepoState`] of the repo `part` of `queue` lands in, or `None`
+    /// when it has none this machine can probe (or the read failed) — the guard
+    /// then decides on NEXT ACTION alone.
+    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState>;
+}
+
+/// The default [`RepoProbe`]: no repo signal, so the spin guard is the
+/// NEXT-ACTION-only guard it was before task 069.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoRepoProbe;
+
+impl RepoProbe for NoRepoProbe {
+    fn repo_state(&self, _queue: &str, _part: &str) -> Option<RepoState> {
+        None
+    }
+}
+
 /// The seam the loop reads per-agent [`AgentHealth`] through, to feed
 /// [`Supervisor::poll`]. Implemented over the live [`ClaudeBackend`] (slice 001),
 /// which tracks a heartbeat-or-exit cell per agent; a test scripts the health.
@@ -934,6 +977,15 @@ pub struct ExitDisposition {
     pub misrouted: Option<(String, String)>,
 }
 
+/// A part the fleet left for the human (task 068): which, and why — the
+/// [`ClaimHold::reason`] the claim-time marker read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldPart {
+    pub queue: String,
+    pub part: String,
+    pub reason: String,
+}
+
 /// Everything one [`DriveLoop::tick`] did, for the caller (the live thread, or a
 /// test) to inspect and — in slice 003 — route through the single notification
 /// dispatcher.
@@ -966,6 +1018,10 @@ pub struct TickReport {
     /// hold so a held fleet member names itself in the journal instead of stalling
     /// silently; edge-deduped by the [`TickLogger`] like any other hold.
     pub held_fresh: Vec<HeldFresh>,
+    /// Parts the claim-time marker read newly found held for the human this tick
+    /// (task 068) — journaled once per hold, never alerted: the part stays
+    /// `queued`, and a member moves on to the next part instead.
+    pub skipped_for_human: Vec<HeldPart>,
     /// Re-roll outcomes from [`Supervisor::tick`] (rerolled / held / failed).
     pub rerolls: Vec<RerollOutcome>,
     /// Crash alerts surfaced by [`Supervisor::poll`] (slice 003 dispatches these).
@@ -1115,6 +1171,9 @@ pub struct DriveLoop {
     /// How a picked part is claimed (`active`) before its agent spawns — the
     /// write that closes the fallback double-assignment window cross-tick.
     claimer: Box<dyn PartClaimer>,
+    /// Where the spin guard reads a part's repo from (task 069). [`NoRepoProbe`]
+    /// unless [`with_repo_probe`](Self::with_repo_probe) sets one.
+    repo_probe: Box<dyn RepoProbe>,
     /// How a member's current part is item-parked (`blocked`) when it exits on a
     /// human-block (`BLOCKED_ON_HUMAN` / `STUCK`) — the write that records the
     /// block on the ITEM so the freed member pivots past it (the sibling of
@@ -1203,6 +1262,22 @@ pub struct DriveLoop {
     /// spawned again — so the backend match routes it to a member that can
     /// run it, and the spawn resolves to it.
     v2_model_overrides: Vec<(String, Unit, ModelChoice)>,
+    /// Claim holds the claim-time marker read found (task 068), each with the tick
+    /// it was read: re-applied to every snapshot so a held part is rolled past
+    /// without re-reading its doc each tick, and dropped [`HOLD_RECHECK_SECS`]
+    /// later so the next pick reads it again.
+    holds: std::collections::BTreeMap<(String, String), (ClaimHold, i64)>,
+    /// Parts the spin guard parked (task 069), each with the sessions the streak
+    /// ran and the dirty-path count the last repo read saw: [`dispatch`](Self::dispatch)
+    /// pages these as [`NotifyEvent::SpinGuardParked`], not as a human decision.
+    /// Dropped when the part leaves the parked set. In memory only, so after a
+    /// growlightd restart a standing spin park pages as `BlockedOnHuman`.
+    spin_parks: std::collections::BTreeMap<(String, String), (u32, Option<usize>)>,
+    /// Holds already journaled, each with its latest reason: a part's skip is
+    /// narrated once, not on every re-read, and this is the list `growlight status`
+    /// shows. A part leaves it when a read finds it claimable again or the queue
+    /// stops showing it `queued`.
+    announced_holds: std::collections::BTreeMap<(String, String), ClaimHold>,
     /// When the pre-spawn connectivity gate first held THIS outage (its first offline
     /// tick's `now`), or `None` while online/paused (network-failsafe slice 003).
     /// Drives the sustained-offline alert threshold — a blip clears it before
@@ -1301,6 +1376,7 @@ impl DriveLoop {
             seeder,
             queues,
             claimer,
+            repo_probe: Box::new(NoRepoProbe),
             parker,
             samples,
             rate,
@@ -1320,6 +1396,9 @@ impl DriveLoop {
             v2_paused_by: std::collections::BTreeMap::new(),
             v2_to_pause: std::collections::BTreeMap::new(),
             v2_model_overrides: Vec::new(),
+            holds: std::collections::BTreeMap::new(),
+            spin_parks: std::collections::BTreeMap::new(),
+            announced_holds: std::collections::BTreeMap::new(),
             offline_since: None,
             offline_alerted: false,
             rate_limit_hold_until: None,
@@ -1357,6 +1436,16 @@ impl DriveLoop {
         self
     }
 
+    /// Set where the spin guard reads a part's repo from (task 069). A builder for
+    /// the same reason as [`with_max_iterations`](Self::with_max_iterations): the
+    /// default [`NoRepoProbe`] keeps every existing loop on the NEXT-ACTION-only
+    /// guard, and only the live assembly and the repo tests opt in.
+    #[must_use]
+    pub fn with_repo_probe(mut self, probe: Box<dyn RepoProbe>) -> Self {
+        self.repo_probe = probe;
+        self
+    }
+
     /// Count one completed member work-chunk against the bounded-run limit (task 040)
     /// and report whether the fleet is now spent. Called once per member at each clean
     /// `Rolling`/`Completed` handoff boundary. Returns `true` — the caller retires that
@@ -1387,6 +1476,14 @@ impl DriveLoop {
     /// of everything it did.
     pub fn tick(&mut self, now: i64) -> TickReport {
         let mut report = TickReport::default();
+        // Which queue each member was draining as this tick began — read by the
+        // fallback reservation (task 068) so a member released by step 1 still
+        // holds its pinned queue for its own step-3 pick this same tick.
+        let draining_at_start: BTreeSet<(String, String)> = self
+            .assignments
+            .iter()
+            .map(|(agent, (queue, _))| (agent.clone(), queue.clone()))
+            .collect();
         let paused = self.daemon.is_paused();
         report.paused = paused;
 
@@ -1594,6 +1691,12 @@ impl DriveLoop {
                 // `usage_limit_reached` the stderr ring can't see). A matching
                 // non-zero exit is a rate-limit DEATH → no `AgentCrashed`, no
                 // backoff; the timed hold below gates the re-roll until `resets_at`.
+                //
+                // Repo progress (task 069): the spin guard reads the part's repo
+                // through `repo_probe` — lazily, so `git` runs only on a continue
+                // clean exit with a NEXT ACTION. The read is kept in `repo_read` so
+                // a spin park can say how dirty the tree was.
+                let mut repo_read: Option<RepoState> = None;
                 let outcome = {
                     let stderr = &self.stderr;
                     let stream_errs = &self.stream_errs;
@@ -1623,7 +1726,14 @@ impl DriveLoop {
                                     .stream_error(agent)
                                     .is_some_and(|e| e.is_rate_limit()))
                     };
-                    self.supervisor.poll_with_exits(
+                    let repo_probe = &self.repo_probe;
+                    let assignment = self.assignments.get(agent);
+                    let repo_state = || {
+                        repo_read = assignment
+                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part));
+                        repo_read.clone()
+                    };
+                    self.supervisor.poll_with_progress(
                         agent,
                         health,
                         baton_status.as_deref(),
@@ -1631,6 +1741,7 @@ impl DriveLoop {
                         now,
                         network_exit,
                         rate_limit_exit,
+                        repo_state,
                     )
                 };
                 // Record the classification for `status` (task 070) — BEFORE the
@@ -1788,7 +1899,7 @@ impl DriveLoop {
                             report.completed.push(agent.clone());
                         }
                     }
-                    PollOutcome::Blocked { .. } => {
+                    PollOutcome::Blocked { spin_guard, .. } => {
                         // STUCK / BLOCKED_ON_HUMAN: the member is RELEASED to idle
                         // (already gone from the supervisor, slot freed — like an
                         // item-boundary release), NOT sticky-parked on its slot. Its
@@ -1827,6 +1938,16 @@ impl DriveLoop {
                                 // already released and the local item-park below still
                                 // pivots + alerts this tick; the keeperd write is
                                 // re-attempted when the member next resolves to it.
+                            }
+                            // A spin park pages as itself, not as a human decision
+                            // (task 069); a member-declared block replaces any
+                            // stale spin record for the part.
+                            let key = (queue.clone(), part.clone());
+                            if spin_guard {
+                                let dirty = repo_read.as_ref().map(|r| r.dirty);
+                                self.spin_parks.insert(key, (STALL_LIMIT, dirty));
+                            } else {
+                                self.spin_parks.remove(&key);
                             }
                             to_block.push((queue.clone(), part.clone()));
                             report.blocked.push(Assignment {
@@ -2179,6 +2300,12 @@ impl DriveLoop {
         for (queue, part) in &to_block {
             snapshot.mark_blocked(queue, part);
         }
+        // Re-apply the claim holds still trusted (task 068) before anything picks or
+        // classifies; a stale one is dropped so step 3 reads its marker again.
+        self.holds.retain(|_, (_, read_at)| now - *read_at < HOLD_RECHECK_SECS);
+        for ((queue, part), (hold, _)) in &self.holds {
+            snapshot.mark_held(queue, part, hold.clone());
+        }
         report.parked = parked(&snapshot);
 
         // 2. Re-roll due agents ([`Intent::Roll`]). `pause` is the admission gate
@@ -2215,6 +2342,8 @@ impl DriveLoop {
                 .collect();
             let snap = &snapshot;
             let assignments = &self.assignments;
+            let draining = draining_queues(&draining_at_start, &self.assignments);
+            let (retiring, stopped) = (&self.retiring, &self.stopped);
             let workable = |agent: &str| -> bool {
                 // A down member's OWN in-progress part is workable — for itself.
                 // Its claim marked the part `active`, and `pick`'s fallback
@@ -2232,7 +2361,11 @@ impl DriveLoop {
                         matches!(classify_queue(q), QueueState::Active(head) if head == *part)
                     })
                 });
-                resumes_own || pins.get(agent).is_some_and(|pin| pick(snap, *pin).is_some())
+                resumes_own
+                    || pins.get(agent).is_some_and(|pin| {
+                        let reserved = reserved_queues(&fleet, retiring, stopped, &draining, agent);
+                        pick_for(snap, *pin, &reserved).is_some()
+                    })
             };
             report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
             // A member that re-rolled has consumed its pending-reconnect latch (slice
@@ -2290,7 +2423,45 @@ impl DriveLoop {
                 {
                     continue;
                 }
-                let Some((queue, part)) = pick(&snapshot, member.pin.as_deref()) else {
+                // Fallback leaves a queue to the member pinned to it while that
+                // member is live on it or just exiting it (task 068).
+                let draining = draining_queues(&draining_at_start, &self.assignments);
+                let reserved =
+                    reserved_queues(&fleet, &self.retiring, &self.stopped, &draining, agent);
+                // The claim-time marker read (task 068): before a fresh claim, read
+                // the part's own doc. A held part is marked on the working snapshot
+                // (so no later member re-reads it this tick) and the member picks
+                // again, past it — each pass holds one more part, so this ends.
+                // A resume of an `active` part is not a fresh claim and is never
+                // held: the marker does not park work already in flight.
+                let picked = loop {
+                    let Some((queue, part)) =
+                        pick_for(&snapshot, member.pin.as_deref(), &reserved)
+                    else {
+                        break None;
+                    };
+                    let key = (queue.clone(), part.clone());
+                    let fresh = snapshot.queue(&queue).is_some_and(|q| {
+                        q.parts.iter().any(|p| p.id == part && p.status == PartStatus::Queued)
+                    });
+                    if !fresh || spoken_for.contains(&key) {
+                        break Some((queue, part));
+                    }
+                    let Some(hold) = self.queues.claim_hold(&queue, &part) else {
+                        self.announced_holds.remove(&key);
+                        break Some((queue, part));
+                    };
+                    if self.announced_holds.insert(key.clone(), hold.clone()).is_none() {
+                        report.skipped_for_human.push(HeldPart {
+                            queue: queue.clone(),
+                            part: part.clone(),
+                            reason: hold.reason(),
+                        });
+                    }
+                    snapshot.mark_held(&queue, &part, hold.clone());
+                    self.holds.insert(key, (hold, now));
+                };
+                let Some((queue, part)) = picked else {
                     // Nothing workable for this agent's pin right now. Before task 042
                     // this `continue` was SILENT, so a held fleet-of-one (e.g. a
                     // completed member whose next queued head has not yet surfaced)
@@ -2372,6 +2543,28 @@ impl DriveLoop {
                 }
             }
         }
+
+        // Publish the held parts to `growlight status` (task 068): every journaled
+        // hold whose part is still `queued`. An expired hold stays listed until a
+        // read frees it, so the list does not flicker while every member is busy.
+        // An empty snapshot is a failed read, which proves nothing either way.
+        if !snapshot.queues.is_empty() {
+            self.announced_holds.retain(|(queue, part), _| {
+                snapshot.queue(queue).is_some_and(|q| {
+                    q.parts.iter().any(|p| p.id == *part && p.status == PartStatus::Queued)
+                })
+            });
+        }
+        self.daemon.record_held_parts(
+            self.announced_holds
+                .iter()
+                .map(|((queue, part), hold)| softfig_ipc::growlightd::HeldPartSummary {
+                    queue: queue.clone(),
+                    part: part.clone(),
+                    reason: hold.reason(),
+                })
+                .collect(),
+        );
         }
 
         // Mirror the v2 assignments for the member verbs' assignment-match check
@@ -2429,9 +2622,19 @@ impl DriveLoop {
         // identity, so the ladder keeps stepping.
         let parked_items: Vec<&str> = report.parked.iter().map(|(_, part)| part.as_str()).collect();
         self.dispatcher.reconcile_blocked(&parked_items);
-        for (_queue, part) in &report.parked {
-            self.dispatcher
-                .notify(&NotifyEvent::BlockedOnHuman { item: part.clone() }, now);
+        // A part the spin guard parked pages as a spin park (task 069) — its own
+        // identity and text — for as long as it stays parked.
+        self.spin_parks.retain(|key, _| report.parked.contains(key));
+        for (queue, part) in &report.parked {
+            let event = match self.spin_parks.get(&(queue.clone(), part.clone())) {
+                Some(&(sessions, dirty)) => NotifyEvent::SpinGuardParked {
+                    item: part.clone(),
+                    sessions,
+                    dirty,
+                },
+                None => NotifyEvent::BlockedOnHuman { item: part.clone() },
+            };
+            self.dispatcher.notify(&event, now);
         }
         // The v2 twins (slice 009): `growlight_block`'s reason reaches @human
         // (§6.6), and an entry parked on a human-block exit alerts like a
@@ -2839,6 +3042,47 @@ pub(crate) fn model_ref_label(choice: &ModelChoice) -> String {
 /// The one-word disposition label for an exit poll's [`PollOutcome`] — the
 /// health-pass journal line (task 042). Exhaustive so a new outcome variant forces
 /// a label choice rather than silently reading as an unclassified exit.
+/// `(agent, queue)` for every member draining a queue this tick: holding a part
+/// there now, or holding one when the tick began (released by step 1 since). The
+/// union is what lets a member that is just exiting keep its queue (task 068).
+fn draining_queues(
+    at_start: &BTreeSet<(String, String)>,
+    assignments: &std::collections::BTreeMap<String, (String, String)>,
+) -> BTreeSet<(String, String)> {
+    let mut draining = at_start.clone();
+    draining.extend(assignments.iter().map(|(agent, (queue, _))| (agent.clone(), queue.clone())));
+    draining
+}
+
+/// The queues `agent`'s fallback must leave alone (task 068): each queue pinned by
+/// ANOTHER member that is live on it or just exiting it (it is in `draining` for
+/// that queue) and is not stopping or stopped. Such a member takes its queue's
+/// next part itself as soon as it is free.
+///
+/// This is the 2026-10-16 17:34 sequence: `psy`'s pinned member set `psy-events`
+/// `deferred`, so `psy-booking` read `queued` for the ~30s before the member
+/// exited, and a drained member's fallback took it in that window. A pinned member
+/// busy on ANOTHER queue's part reserves nothing (it cannot take its own queue's
+/// next part until it is done there), and neither does one that has not started
+/// yet — fleet order still decides a race between two free members, as before.
+fn reserved_queues(
+    fleet: &[FleetMember],
+    retiring: &BTreeSet<String>,
+    stopped: &BTreeSet<String>,
+    draining: &BTreeSet<(String, String)>,
+    agent: &str,
+) -> BTreeSet<String> {
+    fleet
+        .iter()
+        .filter(|m| m.spec.agent != agent)
+        .filter(|m| !retiring.contains(&m.spec.agent) && !stopped.contains(&m.spec.agent))
+        .filter_map(|m| {
+            let pin = m.pin.clone()?;
+            draining.contains(&(m.spec.agent.clone(), pin.clone())).then_some(pin)
+        })
+        .collect()
+}
+
 fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
     match outcome {
         PollOutcome::Crashed { .. } => "crashed",
@@ -2848,9 +3092,10 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
         PollOutcome::Retired => "retired (queue drained)",
         PollOutcome::Completed => "completed (item boundary)",
         // The supervisor's spin guard synthesized this block (NEXT ACTION unchanged
-        // across `STALL_LIMIT` re-rolls, task 038) — name it distinctly so a spin
-        // never reads as a member-declared human block in the journal.
-        PollOutcome::Blocked { spin_guard: true, .. } => "stuck (spin guard — NEXT ACTION unchanged)",
+        // across `STALL_LIMIT` re-rolls with no repo movement to excuse them, tasks
+        // 038 + 069) — name it distinctly so a spin never reads as a member-declared
+        // human block in the journal.
+        PollOutcome::Blocked { spin_guard: true, .. } => "stuck (spin guard — no progress)",
         PollOutcome::Blocked { .. } => "blocked on human",
         PollOutcome::ParkedRateLimited => "held (rate-limited)",
         // Task 070: a rate-limit DEATH reads as the hold it is — never "crashed".
@@ -2980,6 +3225,13 @@ impl TickLogger {
         // held fleet-of-one narrates once on entry, mirroring the re-roll `HeldNoWork`.
         for hf in &r.held_fresh {
             held_now.insert((hf.agent.clone(), hf.reason));
+        }
+        // Human-only skips (task 068): the loop already narrates each hold once.
+        for h in &r.skipped_for_human {
+            out.push(format!(
+                "fleet: skipping {}/{} — {}; left queued for the human",
+                h.queue, h.part, h.reason
+            ));
         }
         for (agent, kind) in held_now.difference(&self.held) {
             out.push(format!("fleet: holding {agent} ({kind})"));
@@ -3474,10 +3726,22 @@ mod tests {
 
     /// A fixed (mutable) queue snapshot source.
     #[derive(Debug)]
-    struct FixedQueues(Mutex<Snapshot>);
+    struct FixedQueues(Mutex<Snapshot>, Mutex<BTreeMap<String, ClaimHold>>, Mutex<usize>);
     impl FixedQueues {
         fn new(qs: Vec<QueueView>) -> Arc<Self> {
-            Arc::new(Self(Mutex::new(Snapshot::new(qs))))
+            Arc::new(Self(Mutex::new(Snapshot::new(qs)), Mutex::default(), Mutex::default()))
+        }
+        /// Give a part's item doc a `> Fleet: no` line (task 068).
+        fn mark_human_only(&self, part: &str) {
+            self.1.lock().unwrap().insert(part.into(), ClaimHold::HumanOnly("no".into()));
+        }
+        /// Remove a part's `> Fleet:` line — the owner authorizes the fleet on it.
+        fn clear_marker(&self, part: &str) {
+            self.1.lock().unwrap().remove(part);
+        }
+        /// How many claim-time marker reads the loop has made.
+        fn marker_reads(&self) -> usize {
+            *self.2.lock().unwrap()
         }
         /// Mark a part `blocked` in the shared snapshot — models keeperd's
         /// committed item-park write, so the NEXT `snapshot()` shows it blocked (the
@@ -3501,6 +3765,10 @@ mod tests {
     impl QueueSource for Arc<FixedQueues> {
         fn snapshot(&self) -> Snapshot {
             self.0.lock().unwrap().clone()
+        }
+        fn claim_hold(&self, _queue: &str, part: &str) -> Option<ClaimHold> {
+            *self.2.lock().unwrap() += 1;
+            self.1.lock().unwrap().get(part).cloned()
         }
     }
 
@@ -4968,6 +5236,133 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// A scripted [`RepoProbe`] (task 069): every read answers the current state
+    /// and is recorded with the `(queue, part)` it asked for.
+    #[derive(Debug, Default)]
+    struct ScriptedRepo(Mutex<Option<RepoState>>, Mutex<Vec<(String, String)>>);
+    impl ScriptedRepo {
+        fn set(&self, head: &str, dirty: usize, fingerprint: u64) {
+            *self.0.lock().unwrap() = Some(RepoState {
+                head: Some(head.into()),
+                dirty,
+                newest_dirty_mtime: None,
+                fingerprint,
+            });
+        }
+        fn reads(&self) -> Vec<(String, String)> {
+            self.1.lock().unwrap().clone()
+        }
+    }
+    impl RepoProbe for Arc<ScriptedRepo> {
+        fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
+            self.1.lock().unwrap().push((queue.into(), part.into()));
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn alert_lines(probe: &Probe) -> Vec<String> {
+        probe.log_lines().into_iter().filter(|l| l.starts_with("growlightd alert:")).collect()
+    }
+
+    /// TASK 069 — the psy `booking` replay (2026-10-16 18:59): a member hands off
+    /// a NEXT ACTION, then works a whole session and ends it without a handoff.
+    /// The tree is dirty with that session's work, so it re-rolls — the old guard
+    /// parked it here as "blocked on a human decision". A session after that which
+    /// moves nothing is a spin, and pages as one: its own text, with the dirty
+    /// count, never a human decision.
+    #[test]
+    fn a_session_that_worked_without_a_handoff_is_not_parked() {
+        let (loop_, _d, backend, _claimer, parker, _queues, probe) = make_full(
+            vec![member("a1", "psy")],
+            vec![q("psy", &[("booking", "queued")])],
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+
+        loop_.tick(0); // a1 starts on psy/booking
+        assert!(repo.reads().is_empty(), "a start reads no repo");
+
+        // Session 1 hands off X on a clean tree.
+        repo.set("h1", 0, 0);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "wire the booking form");
+        let r1 = loop_.tick(1);
+        assert!(r1.blocked.is_empty());
+        assert_eq!(repo.reads(), vec![("psy".into(), "booking".into())], "one read, for its part");
+
+        // Session 2 works and ends with no handoff: same NEXT ACTION, 5 files dirty.
+        repo.set("h1", 5, 42);
+        let r2 = loop_.tick(2);
+        assert!(r2.blocked.is_empty(), "the repo moved — progress, not a spin");
+        assert!(parker.parks().is_empty(), "booking is not parked");
+        assert_eq!(probe.gui_alerts(), 0, "nothing pages");
+        assert_eq!(backend.spawn_count(), 3, "a1 re-rolled onto booking");
+
+        // Session 3 moves nothing: now it is a spin.
+        let r3 = loop_.tick(3);
+        assert_eq!(
+            r3.blocked,
+            vec![Assignment { agent: "a1".into(), queue: "psy".into(), part: "booking".into() }],
+        );
+        assert_eq!(probe.gui_alerts(), 1, "the spin park pages once");
+        assert_eq!(
+            alert_lines(&probe),
+            vec![
+                "growlightd alert: `booking` stuck (spin guard): 2 sessions ended with no new \
+                 handoff — repo dirty: 5 files"
+                    .to_string()
+            ],
+        );
+        assert_eq!(repo.reads().len(), 3, "one repo read per session exit, none per tick");
+
+        // While it stands, the tick-by-tick parked set never re-pages it.
+        loop_.tick(4);
+        assert_eq!(probe.gui_alerts(), 0);
+    }
+
+    /// TASK 069 — a spin park's record lasts only while the part stays parked:
+    /// once the human un-blocks it, a later member-declared `BLOCKED_ON_HUMAN` on
+    /// the same part reads as the human decision it is.
+    #[test]
+    fn a_member_declared_block_after_a_spin_park_reads_as_a_human_decision() {
+        let (mut loop_, _d, backend, _claimer, _parker, queues, probe) = make_full(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "IN_PROGRESS");
+        backend.set_baton_next_action("a1", "same");
+        loop_.tick(1);
+        loop_.tick(2); // no repo signal (NoRepoProbe): the plain streak trips
+        assert_eq!(
+            alert_lines(&probe),
+            vec![
+                "growlightd alert: `p1` stuck (spin guard): 2 sessions ended with no new \
+                 handoff — repo unknown"
+                    .to_string()
+            ],
+        );
+
+        // The human re-queues p1; a1 re-claims it and declares a real block.
+        queues.set(vec![q("qa", &[("p1", "queued")])]);
+        loop_.tick(3);
+        assert!(loop_.spin_parks.is_empty(), "the record left with the park");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        loop_.tick(4);
+        let lines = alert_lines(&probe);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("growlightd alert: `p1` is blocked on a human decision"),
+            "{lines:?}",
+        );
+    }
+
     /// TASK 047 (integration): a continue-status member whose re-roll is admission-
     /// HELD is re-observed with the SAME latched clean exit every tick — that stays a
     /// HOLD (part workable, no §9 alert), never a spin-guard mislabel-park. Pre-fix,
@@ -5419,6 +5814,27 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// EXIT narrates its observed baton status + disposition once — so a held
     /// fleet-of-one and a stale/misrouted baton are both visible in the journal
     /// where a silent stall used to be.
+    #[test]
+    fn tick_logger_narrates_a_human_only_skip() {
+        let mut logger = TickLogger::default();
+        let skipped = TickReport {
+            skipped_for_human: vec![HeldPart {
+                queue: "hoverview".into(),
+                part: "hover-view-sticky".into(),
+                reason: "human-only (> Fleet: no)".into(),
+            }],
+            ..TickReport::default()
+        };
+        assert_eq!(
+            logger.lines(&skipped),
+            vec![
+                "fleet: skipping hoverview/hover-view-sticky — human-only (> Fleet: no); \
+                 left queued for the human"
+                    .to_string(),
+            ],
+        );
+    }
+
     #[test]
     fn tick_logger_narrates_held_fresh_and_exit_dispositions() {
         let mut logger = TickLogger::default();
@@ -6242,6 +6658,228 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "qb/p claimed exactly once across both ticks — b never re-claimed a's part",
         );
         assert!(!loop_.supervisor.is_registered("b"), "b never spawned, so it is not registered");
+    }
+
+    /// TASK 068 repro — the 2026-10-16 17:34 sequence. `b` (pinned `psy`) set its
+    /// part `deferred` and was still exiting when `a` (pinned `fid`, drained) ran
+    /// its fallback: `psy-booking` read `queued`, `a` claimed it, and `b` came back
+    /// to "part already claimed". `psy` is reserved for `b` while `b` is live on it
+    /// and on the tick it exits, so `b` takes its own queue's next part.
+    #[test]
+    fn a_fallback_member_does_not_take_a_queue_whose_pinned_member_is_exiting() {
+        let (mut loop_, _d, backend, claimer, queues, _probe) = make_claiming(
+            vec![member("a", "fid"), member("b", "psy")],
+            vec![
+                q("fid", &[("f1", "queued")]),
+                q("psy", &[("psy-events", "queued"), ("psy-booking", "queued")]),
+            ],
+            Policy::default(),
+        );
+        loop_.tick(0); // a on fid/f1, b on psy/psy-events
+        assert_eq!(backend.spawns(), vec!["a", "b"]);
+
+        // a finished fid and exited; b deferred psy-events but is still running.
+        queues.set(vec![
+            q("fid", &[("f1", "done")]),
+            q("psy", &[("psy-events", "deferred"), ("psy-booking", "queued")]),
+        ]);
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        backend.set_health("b", AgentHealth::Alive { last_active: 1 });
+
+        let r1 = loop_.tick(1);
+        assert!(
+            r1.started.is_empty(),
+            "the drained member must leave psy to its live pinned member, got {:?}",
+            r1.started,
+        );
+
+        // b exits. On this very tick a is scheduled first, and psy is still b's.
+        backend.set_health("b", AgentHealth::Exited { code: 0 });
+        backend.set_baton("b", "ITEM_DEFERRED");
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            r2.started,
+            vec![Assignment { agent: "b".into(), queue: "psy".into(), part: "psy-booking".into() }],
+            "the pinned member takes its own queue's next part",
+        );
+        assert_eq!(
+            claimer.claims(),
+            vec![
+                ("fid".into(), "f1".into()),
+                ("psy".into(), "psy-events".into()),
+                ("psy".into(), "psy-booking".into()),
+            ],
+            "psy-booking is claimed once, by b",
+        );
+    }
+
+    /// The reservation lapses once the pinned member is busy elsewhere: a member
+    /// draining ANOTHER queue cannot take its own queue's next part, so a free
+    /// member's fallback still may (task 068 leaves that case as it was).
+    #[test]
+    fn a_pinned_member_busy_on_another_queue_reserves_nothing() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("b", "psy"), member("a", "fid")],
+            vec![q("psy", &[]), q("other", &[("o1", "queued")]), q("fid", &[("f1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0); // b falls back to other/o1; a on fid/f1
+        assert_eq!(backend.spawns(), vec!["b", "a"]);
+
+        // New psy work arrives while b is still on other/o1; a finishes fid.
+        queues.set(vec![
+            q("psy", &[("p1", "queued")]),
+            q("other", &[("o1", "active")]),
+            q("fid", &[("f1", "done")]),
+        ]);
+        backend.set_health("b", AgentHealth::Alive { last_active: 1 });
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a".into(), queue: "psy".into(), part: "p1".into() }],
+        );
+    }
+
+    /// TASK 068 — a pinned member never claims a human-only part. The marker is
+    /// read at claim time; the part is skipped (journaled once, left `queued`, no
+    /// park, no alert) and the member takes the part behind it.
+    #[test]
+    fn a_pinned_member_skips_a_human_only_part_for_the_next_one() {
+        let (mut loop_, _d, backend, claimer, queues, probe) = make_claiming(
+            vec![member("c", "default")],
+            vec![q("default", &[("queue-v2-scheduling", "queued"), ("068", "queued")])],
+            Policy::default(),
+        );
+        queues.mark_human_only("queue-v2-scheduling");
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "c".into(), queue: "default".into(), part: "068".into() }],
+        );
+        assert_eq!(
+            r.skipped_for_human,
+            vec![HeldPart {
+                queue: "default".into(),
+                part: "queue-v2-scheduling".into(),
+                reason: "human-only (> Fleet: no)".into(),
+            }],
+        );
+        assert_eq!(claimer.claims(), vec![("default".into(), "068".into())]);
+        assert_eq!(backend.spawns(), vec!["c"]);
+        assert!(r.parked.is_empty(), "a human-only item is not a block");
+        assert_eq!(probe.gui_alerts(), 0, "and pages no one");
+    }
+
+    /// TASK 068 repro — the 2026-10-16 sequence: a drained member's fallback walked
+    /// into three human-only items in ten minutes, parking and paging each. Now it
+    /// claims none of them, and a held part is not re-read or re-journaled on every
+    /// tick while its hold is trusted.
+    #[test]
+    fn a_fallback_member_never_claims_a_human_only_part() {
+        let human_only = ["queue-v2-scheduling", "roadeye-m1-spec-lock", "hover-view-sticky"];
+        let (mut loop_, _d, backend, claimer, queues, probe) = make_claiming(
+            vec![member("a", "fid")],
+            vec![
+                q("fid", &[("fid-pam", "done")]),
+                q("default", &[(human_only[0], "queued")]),
+                q("roadeye", &[(human_only[1], "queued")]),
+                q("hoverview", &[(human_only[2], "queued")]),
+            ],
+            Policy::default(),
+        );
+        for part in human_only {
+            queues.mark_human_only(part);
+        }
+        let r0 = loop_.tick(0);
+        assert!(r0.started.is_empty(), "nothing claimable, got {:?}", r0.started);
+        let skipped: Vec<&str> = r0.skipped_for_human.iter().map(|h| h.part.as_str()).collect();
+        assert_eq!(skipped, human_only);
+        assert_eq!(backend.spawn_count(), 0);
+        assert!(claimer.claims().is_empty(), "no human-only item was claimed");
+        assert!(r0.parked.is_empty());
+        assert_eq!(probe.gui_alerts(), 0);
+
+        let reads = queues.marker_reads();
+        let r1 = loop_.tick(1);
+        assert!(r1.started.is_empty() && r1.skipped_for_human.is_empty());
+        assert_eq!(queues.marker_reads(), reads, "a trusted hold is not re-read each tick");
+    }
+
+    /// TASK 068 — the marker is per-item and removable: once the owner drops the
+    /// line, the item is claimed at the next re-read.
+    #[test]
+    fn an_item_that_loses_the_marker_is_claimed_at_the_next_recheck() {
+        let (mut loop_, _d, _backend, claimer, queues, _probe) = make_claiming(
+            vec![FleetMember::unpinned(spec("a"))],
+            vec![q("default", &[("h1", "queued")])],
+            Policy::default(),
+        );
+        queues.mark_human_only("h1");
+        assert!(loop_.tick(0).started.is_empty());
+        queues.clear_marker("h1");
+        assert!(
+            loop_.tick(HOLD_RECHECK_SECS - 1).started.is_empty(),
+            "the hold is trusted until the recheck",
+        );
+        let r = loop_.tick(HOLD_RECHECK_SECS);
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a".into(), queue: "default".into(), part: "h1".into() }],
+        );
+        assert_eq!(claimer.claims(), vec![("default".into(), "h1".into())]);
+    }
+
+    /// TASK 068 — the marker never parks work in flight: resuming an `active` part
+    /// is not a fresh claim, so its doc is not read for a marker at all.
+    #[test]
+    fn the_marker_never_holds_a_part_already_active() {
+        let (mut loop_, _d, _backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("c", "default")],
+            vec![q("default", &[("x", "active")])],
+            Policy::default(),
+        );
+        queues.mark_human_only("x");
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "c".into(), queue: "default".into(), part: "x".into() }],
+        );
+        assert!(r.skipped_for_human.is_empty());
+        assert_eq!(queues.marker_reads(), 0);
+    }
+
+    /// TASK 068 — `growlight status` lists what the fleet left for the human. The
+    /// list holds steady while every member is busy (an expired hold nobody has
+    /// re-read is still a hold), and a part leaves it once its queue stops showing
+    /// it `queued`.
+    #[test]
+    fn status_lists_a_held_part_until_it_leaves_the_queue() {
+        let (mut loop_, d, _backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("c", "default")],
+            vec![q("default", &[("h1", "queued"), ("w", "queued")])],
+            Policy::default(),
+        );
+        queues.mark_human_only("h1");
+        let held = |d: &Daemon| d.inner.lock().unwrap().held_parts.clone();
+        let listed = vec![softfig_ipc::growlightd::HeldPartSummary {
+            queue: "default".into(),
+            part: "h1".into(),
+            reason: "human-only (> Fleet: no)".into(),
+        }];
+
+        assert_eq!(loop_.tick(0).started.len(), 1, "c skips h1 and claims w");
+        assert_eq!(held(&d), listed);
+        let reads = queues.marker_reads();
+        loop_.tick(HOLD_RECHECK_SECS + 1);
+        assert_eq!(queues.marker_reads(), reads, "c is busy on w, so nobody re-reads h1");
+        assert_eq!(held(&d), listed, "and the expired hold stays listed");
+
+        queues.set(vec![q("default", &[("h1", "done"), ("w", "active")])]);
+        loop_.tick(HOLD_RECHECK_SECS + 2);
+        assert!(held(&d).is_empty(), "a part no longer queued leaves the list");
     }
 
     /// A claim failure is fail-closed: admission cleared but the part could not be

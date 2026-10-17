@@ -244,6 +244,17 @@ reserve gauge and looked broken. Two consequences of the fix are worth knowing:
 - `agents` now lists **idle** members too, so a client counting running agents must
   filter on the row's `running` flag rather than counting rows.
 
+A third list, **`held`**, names the `queued` items an armed fleet is leaving for the
+human (task 068): each one whose item doc carries a `> Fleet:` line with any value but
+`yes`, with the skip reason the journal gave. A held item is not blocked, so it pages no
+one, and this list is where it shows. Removing the line frees the item; a hold is
+trusted for 60 seconds, then the next member to reach the item reads its doc again.
+
+```
+held:
+  default/hover-view-sticky        human-only (> Fleet: no)
+```
+
 ### Spend accounting is session-scoped, and it is not a cap
 
 - **In memory only.** The counters live in the backend's cells and are lost on a
@@ -280,15 +291,52 @@ Three differences worth knowing when reading logs:
   `AgentCrashed` alert carries them. A network error reported this way also counts toward
   the transient-network classification, the same as one on stderr.
 
+## When a member stops progressing: the spin guard
+
+A member that exits cleanly on a continue status is re-rolled. The spin guard stops one
+that keeps re-rolling without getting anywhere, before it burns the shared budget. Two
+things count as progress:
+
+- a changed `# NEXT ACTION` in the member's baton;
+- the item's repo moving, meaning a new `HEAD` or a changed dirty tree (task 069). A
+  session can do real work and still exit without a handoff, and before this, one such
+  session was enough to park the item.
+
+The repo is taken from the item doc's `> Worktree:` line, else from the queue registry's
+`repo` column, else there is none. A value this device can't probe gives no repo signal:
+a remote `host:/path`, a relative path, or a doc keeperd couldn't serve. The guard then
+decides on NEXT ACTION alone, as it did before. A default-queue item only gets the repo
+signal once its doc carries `> Worktree:`, since the default queue has no registry row.
+The repo is read once per session exit, with `git --no-optional-locks`, never once per
+tick.
+
+The repo excuses at most three repeats of one NEXT ACTION, and only a repo state not
+already seen during that NEXT ACTION's run. A tree that churns forever, or flips between
+two states, still trips. On a trip (two exits on the same NEXT ACTION with nothing to
+excuse them) the member is released and its item parked `blocked`, the same as for a
+member-written `STUCK`. The page names the guard instead of asking for a decision:
+
+```
+`069` stuck (spin guard): 2 sessions ended with no new handoff — repo dirty: 3 files
+```
+
+The tail reads `repo clean` or `repo unknown` when that is the case. A member-declared
+`BLOCKED_ON_HUMAN` still pages as `` `X` is blocked on a human decision ``. Both kinds
+use the same reminder ladder (30 min → 2 h → 8 h → daily) under separate identities, and
+both are forgotten once the item leaves the parked set. The spin record is kept in
+memory only, so after a growlightd restart a spin park that is still standing pages as a
+human block.
+
 ## Known gaps
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent
 row carries id/status/ctx only. `growlight status` and the TUI do. Surfacing it there is
-its own change.
+its own change. Neither the GUI nor the TUI lists `held` items yet; only `growlight
+status` does.
 
 A headless opencode member cannot write to a **code repo**. The permission floor reaches
 only the loop's own state, so an ungranted repo yields a refusal a headless session cannot
-answer. growlightd does not model repos at all today (the queue→repo binding is dropped
-when the registry is parsed), so there is nothing to grant from. Until the folder grants
+answer. growlightd resolves an item's repo only to see whether it moved (the spin guard
+above), and nothing grants a member write access to that repo. Until the folder grants
 land (step 2 of `decision-opencode-v2-fleet-safety-order`, appended after rule 8), an
 opencode member is limited to garden work through the softfig-mcp verbs.

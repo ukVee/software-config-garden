@@ -68,7 +68,7 @@ use crate::opencode_backend::ModelSelection;
 use crate::opencode_ledger::OpencodeDb;
 use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::{agent_paths, PreApproval};
-use crate::queue_source::KeeperdQueueSource;
+use crate::queue_source::{KeeperdQueueSource, KeeperdRepoProbe};
 use crate::supervisor::{AgentSpec, Supervisor};
 use crate::usage_file::UsageCapture;
 use crate::v2_source::V2Source;
@@ -614,7 +614,10 @@ pub fn assemble_fleet(
     // Bounded-run knob (task 040): honor `config/growlight.toml`'s `max_iterations`
     // (`None` = unbounded, the default). Read once here at arm time — a bounded run's
     // bound must not move mid-run.
-    .with_max_iterations(fleet.max_iterations))
+    .with_max_iterations(fleet.max_iterations)
+    // Repo progress (task 069): the spin guard reads each part's repo through the
+    // same keeperd docs the queue source pulls.
+    .with_repo_probe(Box::new(KeeperdRepoProbe::new(keeperd_socket.to_path_buf()))))
     .map(|drive| {
         // The queue-v2 scheduling seams (queue-v2-scheduling slice 006): installed
         // whatever the mode — the tick consults them ONLY when `queue = "v2"`, so a

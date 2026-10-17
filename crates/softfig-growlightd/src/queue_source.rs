@@ -40,19 +40,63 @@
 
 use std::path::PathBuf;
 
-use softfig_ipc::verbs::{op, ReadFileArgs, ReadFileReply};
-use softfig_ipc::{call_reconnecting, Request, Response, RetryPolicy};
+use softfig_ipc::item_repo::{probe, resolve_repo, worktree_field, RepoState};
+use softfig_ipc::verbs::{op, ListTreeArgs, ListTreeReply, ReadFileArgs, ReadFileReply};
+use softfig_ipc::{call_reconnecting, ErrorKind, Request, Response, RetryPolicy};
 
-use crate::drive_loop::QueueSource;
-use crate::scheduler::{PartView, QueueView, Snapshot};
+use crate::drive_loop::{QueueSource, RepoProbe};
+use crate::scheduler::{ClaimHold, PartView, QueueView, Snapshot};
 
 /// The garden-relative backlog doc that hosts every queue's managed region.
 pub const BACKLOG_DOC: &str = "growlight/backlog/CLAUDE.md";
+
+/// Where a milestone's doc lives: `<MILESTONES_DIR>/<id>/CLAUDE.md`.
+const MILESTONES_DIR: &str = "growlight/backlog/milestones";
+/// Where a task's doc lives: `<TASKS_DIR>/<id>-<slug>.md` (task ids are its number).
+const TASKS_DIR: &str = "growlight/backlog/tasks";
 
 /// The scheduler name of the implicit default queue. Matches keeperd's
 /// `DEFAULT_QUEUE` / `add_backlog_item`'s implicit queue, so a fleet member
 /// pinned to `"default"` resolves to this queue in [`pick`](crate::scheduler::pick).
 pub const DEFAULT_QUEUE_NAME: &str = "default";
+
+// ---------------------------------------------------------------------------
+// Pure parse: an item doc's `> Fleet:` marker -> ClaimHold (task 068).
+// ---------------------------------------------------------------------------
+
+/// The claim hold an item doc declares, if any: a `> Fleet: <value>` blockquote
+/// line marks the item human-only unless the value is `yes`, so the fleet never
+/// claims it. No line means no hold — the item schedules exactly as before.
+///
+/// Read the way `> Model:` is (`item_model_field`): the first blockquote line
+/// whose key is `fleet`, case-insensitive, anywhere in the doc. Lines inside a
+/// fenced code block don't count, so a doc that shows the marker as an example
+/// does not mark itself. Any value other than `yes` holds — a typo fails closed.
+pub fn fleet_marker(doc: &str) -> Option<ClaimHold> {
+    let mut fenced = false;
+    for line in doc.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix('>') else {
+            continue;
+        };
+        let Some((key, value)) = rest.trim().split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("fleet") {
+            let value = value.trim();
+            return (!value.eq_ignore_ascii_case("yes"))
+                .then(|| ClaimHold::HumanOnly(value.to_string()));
+        }
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Pure parse: backlog doc markdown -> Snapshot.
@@ -115,15 +159,30 @@ fn parse_item_rows(body: &str) -> Vec<PartView> {
     parts
 }
 
-/// Parse the queue registry region's queue names, in row order. Mirrors
-/// keeperd's `queues::parse`: 2-cell data rows (`queue | repo`) with a non-empty
-/// name, header/separator skipped. Returns just the names — the repo binding is
-/// keeperd's concern, not the scheduler's.
+/// Parse the queue registry region's queue names, in row order — the order the
+/// scheduler walks the named queues in.
 fn registry_names(doc: &str) -> Vec<String> {
+    registry_rows(doc).into_iter().map(|(name, _)| name).collect()
+}
+
+/// The registry's `repo` cell for `queue`, raw (task 069): the spin guard's
+/// second repo source after the item doc's `> Worktree:`.
+/// [`resolve_repo`](softfig_ipc::item_repo::resolve_repo) decides whether it is a
+/// path this machine can probe — a remote `host:/path` cell is returned as-is
+/// here and resolves to no repo there. `None` for an unregistered queue (the
+/// default queue never has a row).
+pub(crate) fn registry_repo(doc: &str, queue: &str) -> Option<String> {
+    registry_rows(doc).into_iter().find(|(name, _)| name == queue).map(|(_, repo)| repo)
+}
+
+/// The queue registry region's `(queue, repo)` rows, in row order. Mirrors
+/// keeperd's `queues::parse`: 2-cell data rows (`queue | repo`) with a non-empty
+/// name, header/separator skipped.
+fn registry_rows(doc: &str) -> Vec<(String, String)> {
     let Some(body) = region_body(doc, "queues") else {
         return Vec::new(); // no named queues registered
     };
-    let mut names = Vec::new();
+    let mut rows = Vec::new();
     for line in body.lines() {
         let line = line.trim();
         if !line.starts_with('|') {
@@ -142,9 +201,9 @@ fn registry_names(doc: &str) -> Vec<String> {
         if cells[0].is_empty() {
             continue;
         }
-        names.push(cells[0].clone());
+        rows.push((cells[0].clone(), cells[1].clone()));
     }
-    names
+    rows
 }
 
 /// A markdown table separator row (`|---|---|`): every cell non-empty and made
@@ -259,6 +318,66 @@ impl BacklogReader for KeeperdBacklogReader {
     }
 }
 
+/// The seam the claim-time marker read pulls an item's doc through (task 068).
+/// Production reads keeperd's `read_file` (and `list_tree`, to find a task's
+/// `<id>-<slug>.md`); tests inject fixture docs or a scripted error.
+pub(crate) trait ItemDocReader: Send + Sync + std::fmt::Debug {
+    /// The item's doc, `Ok(None)` when it has none (no doc, no marker), or an
+    /// error string when keeperd could not answer.
+    fn read_item_doc(&self, id: &str) -> Result<Option<String>, String>;
+}
+
+/// Production [`ItemDocReader`]: an all-digit id is a task (`tasks/<id>-*.md`,
+/// found by listing the tasks dir), anything else a milestone
+/// (`milestones/<id>/CLAUDE.md`) — the two shapes `add_backlog_item` mints.
+#[derive(Debug, Clone)]
+pub(crate) struct KeeperdItemDocReader {
+    keeperd_socket: PathBuf,
+}
+
+impl KeeperdItemDocReader {
+    /// One keeperd round-trip; `Ok(None)` for a `NotFound` refusal.
+    fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        verb: &str,
+        args: impl serde::Serialize,
+    ) -> Result<Option<T>, String> {
+        let args = serde_json::to_value(args).map_err(|e| format!("encode {verb} args: {e}"))?;
+        let req = Request::new(verb, args);
+        match call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default()) {
+            Ok(Response::Ok { data, .. }) => serde_json::from_value(data)
+                .map(Some)
+                .map_err(|e| format!("decode {verb} reply: {e}")),
+            Ok(Response::Err { kind: ErrorKind::NotFound, .. }) => Ok(None),
+            Ok(Response::Err { kind, error, .. }) => Err(format!("keeperd {kind:?}: {error}")),
+            Err(e) => Err(format!("keeperd unreachable at {}: {e}", self.keeperd_socket.display())),
+        }
+    }
+
+    fn read(&self, path: String) -> Result<Option<String>, String> {
+        let reply: Option<ReadFileReply> = self.call(op::READ_FILE, ReadFileArgs { path })?;
+        Ok(reply.map(|r| r.content))
+    }
+}
+
+impl ItemDocReader for KeeperdItemDocReader {
+    fn read_item_doc(&self, id: &str) -> Result<Option<String>, String> {
+        if !id.chars().all(|c| c.is_ascii_digit()) {
+            return self.read(format!("{MILESTONES_DIR}/{id}/CLAUDE.md"));
+        }
+        let listing: Option<ListTreeReply> =
+            self.call(op::LIST_TREE, ListTreeArgs { path: Some(TASKS_DIR.to_string()) })?;
+        let prefix = format!("{id}-");
+        let doc = listing.into_iter().flat_map(|l| l.entries).find(|e| {
+            !e.is_dir && e.name.starts_with(&prefix) && e.name.ends_with(".md")
+        });
+        match doc {
+            Some(entry) => self.read(entry.path),
+            None => Ok(None),
+        }
+    }
+}
+
 /// The live [`QueueSource`]: pull the backlog doc from keeperd each tick and
 /// [`parse_snapshot`] it into the multi-queue view the scheduler picks from.
 /// Replaces [`crate::drive_loop::DeferredQueues`] in the live assembly
@@ -267,6 +386,7 @@ impl BacklogReader for KeeperdBacklogReader {
 #[derive(Debug)]
 pub struct KeeperdQueueSource {
     reader: Box<dyn BacklogReader>,
+    docs: Box<dyn ItemDocReader>,
 }
 
 impl KeeperdQueueSource {
@@ -274,7 +394,8 @@ impl KeeperdQueueSource {
     /// the [`crate::bus::KeeperdBusSource`] tailer reads).
     pub fn new(keeperd_socket: PathBuf) -> Self {
         Self {
-            reader: Box::new(KeeperdBacklogReader { keeperd_socket }),
+            reader: Box::new(KeeperdBacklogReader { keeperd_socket: keeperd_socket.clone() }),
+            docs: Box::new(KeeperdItemDocReader { keeperd_socket }),
         }
     }
 }
@@ -291,6 +412,75 @@ impl QueueSource for KeeperdQueueSource {
                 Snapshot::default()
             }
         }
+    }
+
+    /// Read the part's item doc fresh and parse its `> Fleet:` marker (task 068).
+    /// A doc keeperd could not serve holds the part fail-closed
+    /// ([`ClaimHold::Unreadable`]); a part with no doc has no marker.
+    fn claim_hold(&self, _queue: &str, part: &str) -> Option<ClaimHold> {
+        match self.docs.read_item_doc(part) {
+            Ok(doc) => doc.as_deref().and_then(fleet_marker),
+            Err(e) => Some(ClaimHold::Unreadable(e)),
+        }
+    }
+}
+
+/// The live [`RepoProbe`] (task 069): which repo a part's work lands in, read
+/// through the same two keeperd docs the queue source reads — the item doc's
+/// `> Worktree:` first, then the queue registry's `repo` cell — and how far it has
+/// moved, through [`probe`]. Called once per member session, on the spin guard's
+/// lazy read, so the keeperd reads and the `git` calls never run per tick.
+#[derive(Debug)]
+pub struct KeeperdRepoProbe {
+    backlog: Box<dyn BacklogReader>,
+    docs: Box<dyn ItemDocReader>,
+    /// What a leading `~` expands against (`$HOME`, read once at assembly).
+    home: Option<PathBuf>,
+}
+
+impl KeeperdRepoProbe {
+    /// Bind the probe to keeperd's listen socket (the queue source's path) and
+    /// the daemon's `$HOME`.
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self {
+            backlog: Box::new(KeeperdBacklogReader { keeperd_socket: keeperd_socket.clone() }),
+            docs: Box::new(KeeperdItemDocReader { keeperd_socket }),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+}
+
+impl RepoProbe for KeeperdRepoProbe {
+    /// Every failure is "no repo signal" (the NEXT-ACTION-only guard), never an
+    /// error: a doc keeperd can't serve and a repo `git` can't read are journaled,
+    /// and the guard decides on NEXT ACTION alone.
+    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
+        // An unreadable doc might name a worktree the registry would contradict,
+        // so it is no signal rather than a registry guess.
+        let doc = self
+            .docs
+            .read_item_doc(part)
+            .inspect_err(|e| {
+                eprintln!("growlightd: repo probe: item doc for {queue}/{part} unreadable: {e}");
+            })
+            .ok()?;
+        let worktree = doc.as_deref().and_then(worktree_field);
+        // The registry is only read when the doc names no worktree: a present
+        // `> Worktree:` wins even when it doesn't resolve.
+        let registry = match worktree {
+            Some(_) => None,
+            None => match self.backlog.read_backlog() {
+                Ok(backlog) => registry_repo(&backlog, queue),
+                Err(e) => {
+                    eprintln!("growlightd: repo probe: backlog unreadable for {queue}/{part}: {e}");
+                    None
+                }
+            },
+        };
+        let repo = resolve_repo(worktree, registry.as_deref(), self.home.as_deref())?;
+        probe(&repo)
+            .inspect_err(|e| eprintln!("growlightd: repo probe: {queue}/{part}: {e}"))
+            .ok()
     }
 }
 
@@ -492,7 +682,62 @@ mod tests {
     }
 
     fn source(reader: Box<dyn BacklogReader>) -> KeeperdQueueSource {
-        KeeperdQueueSource { reader }
+        KeeperdQueueSource { reader, docs: Box::new(FixtureDocs(Ok(None))) }
+    }
+
+    /// Every item doc read answers the same scripted result.
+    #[derive(Debug)]
+    struct FixtureDocs(Result<Option<String>, String>);
+    impl ItemDocReader for FixtureDocs {
+        fn read_item_doc(&self, _id: &str) -> Result<Option<String>, String> {
+            self.0.clone()
+        }
+    }
+
+    fn with_docs(docs: Result<Option<String>, String>) -> KeeperdQueueSource {
+        KeeperdQueueSource { reader: Box::new(ErrReader), docs: Box::new(FixtureDocs(docs)) }
+    }
+
+    #[test]
+    fn fleet_marker_holds_any_value_but_yes() {
+        let doc = "# hover-view-sticky\n\n> Last reviewed: 2026-10-17\n> Fleet: no\n\n## Mission\n";
+        assert_eq!(fleet_marker(doc), Some(ClaimHold::HumanOnly("no".into())));
+        assert_eq!(fleet_marker("> fleet: No"), Some(ClaimHold::HumanOnly("No".into())));
+        // A typo fails closed rather than quietly letting the fleet in.
+        assert_eq!(fleet_marker("> Fleet: nope"), Some(ClaimHold::HumanOnly("nope".into())));
+        assert_eq!(fleet_marker("> Fleet: yes"), None, "an explicit yes is claimable");
+    }
+
+    #[test]
+    fn fleet_marker_is_absent_without_a_blockquote_line() {
+        assert_eq!(fleet_marker("# t\n\n> Model: claude\n\nFleet: no in prose\n"), None);
+        assert_eq!(fleet_marker("Mark it with `> Fleet: no`.\n"), None, "inline code is prose");
+        // A fenced example does not mark the doc that shows it.
+        assert_eq!(fleet_marker("```\n> Fleet: no\n```\n"), None);
+        assert_eq!(
+            fleet_marker("```\n> Fleet: no\n```\n> Fleet: no\n"),
+            Some(ClaimHold::HumanOnly("no".into())),
+            "a real line after the fence still counts",
+        );
+    }
+
+    #[test]
+    fn claim_hold_reads_the_marker_from_the_item_doc() {
+        let marked = with_docs(Ok(Some("# x\n> Fleet: no\n".into())));
+        assert_eq!(marked.claim_hold("default", "x"), Some(ClaimHold::HumanOnly("no".into())));
+        let unmarked = with_docs(Ok(Some("# x\n> Model: claude\n".into())));
+        assert_eq!(unmarked.claim_hold("default", "x"), None);
+        let no_doc = with_docs(Ok(None));
+        assert_eq!(no_doc.claim_hold("default", "x"), None, "no doc, no marker: as before");
+    }
+
+    #[test]
+    fn an_unreadable_item_doc_holds_fail_closed() {
+        let src = with_docs(Err("keeperd Locked: vault is locked".into()));
+        assert_eq!(
+            src.claim_hold("default", "x"),
+            Some(ClaimHold::Unreadable("keeperd Locked: vault is locked".into())),
+        );
     }
 
     #[test]
@@ -521,5 +766,109 @@ mod tests {
         assert_eq!(src.snapshot(), Snapshot::default());
         // Tick 2: keeperd is back -> the real snapshot pulls through.
         assert_eq!(src.snapshot(), parse_snapshot(&doc));
+    }
+
+    // ---- task 069: the repo a part lands in --------------------------------
+
+    /// The registry shapes the live backlog carries: a local path (psy) and a
+    /// remote one with a note (roadeye). The cell comes back raw.
+    #[test]
+    fn registry_repo_returns_the_raw_repo_cell_of_a_registered_queue() {
+        let registry = "| queue | repo |\n|-------|------|\n\
+                        | psy | /home/ukv/projects/psy-website |\n\
+                        | roadeye | otg-travel:/srv/roadeye (REMOTE — not on this device) |";
+        let doc = format!(
+            "{}\n\n{}\n",
+            region("queues", registry),
+            region("queue", &item_table(&[("d1", "queued")])),
+        );
+        assert_eq!(registry_repo(&doc, "psy").as_deref(), Some("/home/ukv/projects/psy-website"));
+        assert_eq!(
+            registry_repo(&doc, "roadeye").as_deref(),
+            Some("otg-travel:/srv/roadeye (REMOTE — not on this device)"),
+            "raw — resolve_repo is what turns a remote cell into no repo",
+        );
+        assert_eq!(registry_repo(&doc, "default"), None, "the default queue has no row");
+        assert_eq!(registry_repo(&doc, "nope"), None);
+        assert_eq!(registry_repo("# no registry here\n", "psy"), None);
+        assert_eq!(registry_names(&doc), vec!["psy", "roadeye"], "the queue order is unchanged");
+    }
+
+    /// A backlog reader the probe must not touch.
+    #[derive(Debug)]
+    struct UnreadBacklog;
+    impl BacklogReader for UnreadBacklog {
+        fn read_backlog(&self) -> Result<String, String> {
+            panic!("the registry must not be read here")
+        }
+    }
+
+    fn repo_probe(
+        backlog: Box<dyn BacklogReader>,
+        docs: Result<Option<String>, String>,
+    ) -> KeeperdRepoProbe {
+        KeeperdRepoProbe { backlog, docs: Box::new(FixtureDocs(docs)), home: Some("/home/t".into()) }
+    }
+
+    /// A git repo with one committed file and `dirty` untracked ones.
+    fn git_repo(dirty: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        for i in 0..dirty {
+            std::fs::write(dir.path().join(format!("wip{i}.txt")), "wip\n").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn the_item_docs_worktree_comes_first_and_skips_the_registry() {
+        let repo = git_repo(2);
+        let doc = format!("# 069\n> Worktree: `{}`\n", repo.path().display());
+        let state = repo_probe(Box::new(UnreadBacklog), Ok(Some(doc))).repo_state("psy", "069");
+        assert_eq!(state.map(|s| s.dirty), Some(2));
+
+        // A worktree this machine can't probe is no signal — not a registry guess.
+        let remote = repo_probe(Box::new(UnreadBacklog), Ok(Some("> Worktree: host:/x\n".into())));
+        assert_eq!(remote.repo_state("psy", "069"), None);
+    }
+
+    #[test]
+    fn the_registry_repo_is_probed_when_the_doc_names_no_worktree() {
+        let repo = git_repo(1);
+        let registry = format!("| queue | repo |\n|---|---|\n| psy | {} |", repo.path().display());
+        let backlog = Box::new(FakeReader { doc: region("queues", &registry) });
+        let probe = repo_probe(backlog, Ok(Some("# booking\n> Model: claude\n".into())));
+        assert_eq!(probe.repo_state("psy", "booking").map(|s| s.dirty), Some(1));
+        // The default queue has no registry row: no repo until its doc names one.
+        assert_eq!(probe.repo_state("default", "booking"), None);
+    }
+
+    #[test]
+    fn an_unreadable_source_or_repo_is_no_signal() {
+        // The item doc failed: whether it names a worktree is unknown.
+        let locked = repo_probe(Box::new(UnreadBacklog), Err("Locked".into()));
+        assert_eq!(locked.repo_state("psy", "x"), None);
+        // The backlog failed.
+        assert_eq!(repo_probe(Box::new(ErrReader), Ok(None)).repo_state("psy", "x"), None);
+        // The path resolves but is no git repo.
+        let not_git = tempfile::tempdir().unwrap();
+        let doc = format!("> Worktree: {}\n", not_git.path().display());
+        assert_eq!(repo_probe(Box::new(UnreadBacklog), Ok(Some(doc))).repo_state("psy", "x"), None);
     }
 }
