@@ -12,7 +12,7 @@ correct short path.
 
 ## Prerequisites
 
-- Rust toolchain (the workspace targets Rust ≥ 1.85, edition 2024).
+- Rust toolchain (the workspace targets Rust ≥ 1.88, edition 2024).
 - `fuse3` (Arch: `sudo pacman -S fuse3`). The daemon serves the decrypted
   garden through a FUSE mount at the garden root; the on-disk `.softfig/`
   state stays encrypted under `~/.local/share/softfig/<name>/`.

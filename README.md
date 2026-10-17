@@ -65,7 +65,7 @@ to a new device moves the *program* (the schema), never another device's
 and [first-garden tutorial](https://ukvee.github.io/software-config-docs/start/first-garden/);
 the short path:
 
-**Prerequisites:** a Rust toolchain (workspace targets Rust ≥ 1.85, edition
+**Prerequisites:** a Rust toolchain (workspace targets Rust ≥ 1.88, edition
 2024), `fuse3` (Arch: `sudo pacman -S fuse3`), and `~/.local/bin` on your
 `PATH`.
 
