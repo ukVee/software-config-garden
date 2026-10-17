@@ -1622,6 +1622,32 @@ fn rewrapping_under_heavier_parameters_still_opens_with_the_same_passphrase() {
 }
 
 #[test]
+fn a_door_added_after_a_rewrap_inherits_the_current_heavier_costs() {
+    // The inheritance wiring, pinned end to end: `new_door_params` reads
+    // k.self's *embedded* costs, so a phrase door minted after a rewrap must
+    // carry the current heavier strength — not the birth costs `params.toml`
+    // still holds, which a rewrap deliberately leaves alone.
+    let (tmp, vault) = passphrase_only_vault();
+    rewrap_to(&vault, heavier(), None);
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let phrase = wrappings::add_phrase(&session).expect("add");
+    drop(session);
+
+    let bytes = fs::read(vault.paths().kek_recovery()).unwrap();
+    let read = softfig_vault::kek::wrapping_params(&bytes, &fast_params().argon2);
+    assert!(read.embedded, "a new door is written in the self-describing format");
+    assert_eq!(read.params, heavier(), "the new door inherits the current strength");
+
+    // And the door really opens under those costs.
+    vault
+        .unlock_with_recovery(&phrase)
+        .expect("the inherited door opens");
+    assert_policy_matches_disk(&vault);
+    drop(tmp);
+}
+
+#[test]
 fn rewrapping_with_a_new_passphrase_opens_with_the_new_one_and_not_the_old() {
     let (_tmp, vault) = fresh_vault();
     rewrap_to(&vault, heavier(), Some(NEW_PASSPHRASE));
