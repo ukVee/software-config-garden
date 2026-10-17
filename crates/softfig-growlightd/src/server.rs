@@ -226,7 +226,7 @@ fn stream_subscription(daemon: &Daemon, mut stream: UnixStream) -> Result<()> {
 fn status(daemon: &Daemon) -> Response {
     let router = daemon.backend_router();
     // Everything the daemon lock owns, taken in one brief hold.
-    let (state, garden_root, policy, paused, fleet_enabled, members) = {
+    let (state, garden_root, policy, paused, fleet_enabled, members, lifecycles) = {
         let inner = daemon.inner.lock().unwrap();
         (
             inner.state.label().to_string(),
@@ -235,6 +235,7 @@ fn status(daemon: &Daemon) -> Response {
             inner.control.paused,
             inner.fleet.enabled,
             inner.fleet.members.clone(),
+            inner.member_lifecycles.clone(),
         )
     };
     let roster = members
@@ -247,7 +248,10 @@ fn status(daemon: &Daemon) -> Response {
     // One row per member of an armed fleet. `None` (disarmed) ⇒ no rows at all,
     // rather than a roster echo with invented liveness.
     let agents = match &router {
-        Some(router) => members.iter().map(|m| agent_summary(m, router)).collect(),
+        Some(router) => members
+            .iter()
+            .map(|m| agent_summary(m, router, lifecycles.get(&m.agent)))
+            .collect(),
         None => Vec::new(),
     };
     let reply = FleetStatusReply {
@@ -274,11 +278,19 @@ fn status(daemon: &Daemon) -> Response {
 /// they are what the operator declared, and they are known even before the member
 /// first spawns. Only health and spend are live readings. Both views are built
 /// from the same `fleet.members`, so they cannot name different backends.
-fn agent_summary(m: &FleetMemberConfig, router: &Arc<BackendRouter>) -> AgentSummary {
+///
+/// `lifecycle` is the drive loop's recorded classification (task 070) — the label
+/// `status` trusts over the raw health cell, which LATCHES the last exit until a
+/// re-spawn and would read a rate-limit death as `crashed (1)`.
+fn agent_summary(
+    m: &FleetMemberConfig,
+    router: &Arc<BackendRouter>,
+    lifecycle: Option<&crate::supervisor::MemberLifecycle>,
+) -> AgentSummary {
     let health = AgentHealthSource::health(router, &m.agent);
     let row = AgentSummary::new(
         &m.agent,
-        health_label(health),
+        health_label(health, lifecycle),
         matches!(health, Some(AgentHealth::Alive { .. })),
     );
     match &m.backend {
@@ -303,16 +315,28 @@ fn agent_summary(m: &FleetMemberConfig, router: &Arc<BackendRouter>) -> AgentSum
     }
 }
 
-/// The display label for an observed [`AgentHealth`]. Pure, so it is unit-proven
-/// directly.
+/// The display label for an observed [`AgentHealth`] + the drive loop's recorded
+/// [`MemberLifecycle`] (task 070). Pure, so it is unit-proven directly.
 ///
-/// `None` is `"idle"` — an armed member the backend has never spawned (or has
-/// forgotten), which is genuinely idle rather than missing. Note what is NOT here:
-/// `"hung"`. Classifying a stale `last_active` as hung needs the hang window and
-/// the current instant, which are the drive loop's (it owns the clock and acts on
-/// the verdict); `status` reports what it can see without re-deriving a judgement
-/// it would make with different inputs.
-fn health_label(health: Option<AgentHealth>) -> String {
+/// The lifecycle OVERRIDES the health-derived label where the raw cell would
+/// mislead: the health cell latches the last exit until a re-spawn, so a member
+/// killed by the quota wall (or a transient network death) would read `crashed
+/// (n)` for its whole hold — the record says what the supervisor actually
+/// classified. `None` is `"idle"` — an armed member the backend has never
+/// spawned (or has forgotten), which is genuinely idle rather than missing. Note
+/// what is NOT here: `"hung"`. Classifying a stale `last_active` as hung needs
+/// the hang window and the current instant, which are the drive loop's (it owns
+/// the clock and acts on the verdict); `status` reports what it can see without
+/// re-deriving a judgement it would make with different inputs.
+fn health_label(
+    health: Option<AgentHealth>,
+    lifecycle: Option<&crate::supervisor::MemberLifecycle>,
+) -> String {
+    if let Some(l) = lifecycle {
+        if let Some(label) = l.status_label(health) {
+            return label;
+        }
+    }
     match health {
         None => "idle".to_string(),
         Some(AgentHealth::Alive { .. }) => "running".to_string(),
@@ -943,21 +967,51 @@ mod tests {
 
     #[test]
     fn health_label_reports_what_it_observed_and_never_guesses_hung() {
+        use crate::supervisor::MemberLifecycle;
         // `None` is "idle" (an armed member the backend has not spawned), a clean
         // exit is the normal baton-boundary roll rather than a fault, and a non-zero
         // exit names its code so the operator can match it to the stderr tail.
-        assert_eq!(health_label(None), "idle");
-        assert_eq!(health_label(Some(AgentHealth::Alive { last_active: 7 })), "running");
-        assert_eq!(health_label(Some(AgentHealth::Exited { code: 0 })), "exited");
-        assert_eq!(health_label(Some(AgentHealth::Exited { code: 1 })), "crashed (1)");
+        assert_eq!(health_label(None, None), "idle");
+        assert_eq!(
+            health_label(Some(AgentHealth::Alive { last_active: 7 }), None),
+            "running"
+        );
+        assert_eq!(health_label(Some(AgentHealth::Exited { code: 0 }), None), "exited");
+        assert_eq!(health_label(Some(AgentHealth::Exited { code: 1 }), None), "crashed (1)");
         // Deliberately absent: "hung". Classifying a stale `last_active` needs the
         // hang window and the current instant, which are the drive loop's — a
         // second, differently-fed judgement here could disagree with the one the
         // fleet actually acts on.
         assert_eq!(
-            health_label(Some(AgentHealth::Alive { last_active: 0 })),
+            health_label(Some(AgentHealth::Alive { last_active: 0 }), None),
             "running",
             "status reports liveness, it does not re-derive the hang verdict",
+        );
+        // A recorded lifecycle (task 070) OVERRIDES the latched exit where the raw
+        // cell would mislead: the health cell latches `Exited{code: 1}` for the
+        // whole of a rate-limit hold, so the record is what keeps `status` honest.
+        assert_eq!(
+            health_label(
+                Some(AgentHealth::Exited { code: 1 }),
+                Some(&MemberLifecycle::RateLimitedHeld),
+            ),
+            "held (rate-limited)",
+            "a rate-limit death never reads `crashed (n)` in status",
+        );
+        assert_eq!(
+            health_label(
+                Some(AgentHealth::Exited { code: 1 }),
+                Some(&MemberLifecycle::Reconnecting),
+            ),
+            "reconnecting (transient network)",
+        );
+        // A genuinely crashed member still reads `crashed (code)`.
+        assert_eq!(
+            health_label(
+                Some(AgentHealth::Exited { code: 1 }),
+                Some(&MemberLifecycle::Crashed),
+            ),
+            "crashed (1)",
         );
     }
 

@@ -57,6 +57,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::admission::{BudgetUsage, RateState};
+use crate::agent_harness::StreamError;
 use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
@@ -66,7 +67,8 @@ use crate::opencode_backend::OpencodeBackend;
 use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
 use crate::state::State;
 use crate::supervisor::{
-    AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome, Supervisor,
+    poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
+    Supervisor,
 };
 use crate::usage::{UsageAggregator, UsageSample, WindowResets};
 
@@ -610,6 +612,34 @@ impl AgentStderrSource for Arc<OpencodeBackend> {
     }
 }
 
+/// The seam the loop reads a member's last **stdout** stream error through
+/// (task 070): the in-band API error a headless member prints on STDOUT — a 429 /
+/// `usage_limit_reached` rejection, or any errored result — which the stderr ring
+/// structurally never sees (stderr carries only the `systemd-run` banner). Read
+/// when a `poll` reaches a crash verdict (to classify a rate-limit death and to
+/// enrich the alert) and when a rate-limit exit needs its `resets_at` for the
+/// timed hold. Implemented over the live [`ClaudeBackend`]'s latched per-agent
+/// [`StreamError`] cell; a test scripts it.
+pub trait AgentStreamErrSource: Send + Sync + fmt::Debug {
+    /// The member's most recent stdout stream error, or `None` if its stream
+    /// ended without one (or the child never ran).
+    fn stream_error(&self, agent: &str) -> Option<StreamError>;
+}
+
+impl AgentStreamErrSource for Arc<ClaudeBackend> {
+    fn stream_error(&self, agent: &str) -> Option<StreamError> {
+        self.as_ref().stream_error(agent)
+    }
+}
+
+impl AgentStreamErrSource for Arc<OpencodeBackend> {
+    fn stream_error(&self, _agent: &str) -> Option<StreamError> {
+        // No latched in-band error signal on the opencode wire (yet) — the honest
+        // "nothing observed", never another member's error.
+        None
+    }
+}
+
 /// The seam the loop reads an EXITED agent's terminal baton status through, to
 /// feed [`Supervisor::poll`]'s retire-vs-park-vs-re-roll decision (the spin fix,
 /// [[decision-growlight-fleet-loop-spin]]). Slice 002 implements it over the
@@ -900,6 +930,13 @@ pub struct DriveLoop {
     /// `poll` classifies a crash, to enrich the [`NotifyEvent::AgentCrashed`] alert
     /// with the reason. The live [`ClaudeBackend`]'s in-memory ring in production.
     stderr: Box<dyn AgentStderrSource>,
+    /// Per-agent stdout stream-error probe (task 070): read when a `poll` reaches a
+    /// crash verdict — to classify a rate-limit death (a 429 / `usage_limit_reached`
+    /// in-band error the stderr ring can't see) and to enrich a genuine
+    /// [`NotifyEvent::AgentCrashed`] with the real reason instead of the bare
+    /// `systemd-run` banner. The live [`ClaudeBackend`]'s latched
+    /// [`StreamError`] cell in production.
+    stream_errs: Box<dyn AgentStreamErrSource>,
     /// Reads an exited agent's terminal baton status — the source for
     /// [`Supervisor::poll`]'s retire-vs-re-roll decision (the spin fix). Deferred
     /// in slice 001 ([`DeferredBatonStatus`], always `None`); slice 002 wires the
@@ -1041,6 +1078,7 @@ impl DriveLoop {
         supervisor: Supervisor,
         health: Box<dyn AgentHealthSource>,
         stderr: Box<dyn AgentStderrSource>,
+        stream_errs: Box<dyn AgentStreamErrSource>,
         baton: Box<dyn BatonStatusSource>,
         seeder: Box<dyn BatonSeeder>,
         queues: Box<dyn QueueSource>,
@@ -1058,6 +1096,7 @@ impl DriveLoop {
             supervisor,
             health,
             stderr,
+            stream_errs,
             baton,
             seeder,
             queues,
@@ -1249,16 +1288,15 @@ impl DriveLoop {
         // Clear an ELAPSED hold — the window has reset, so admission resumes with no
         // human bounce (the restored `--auto` timed-resume). Checked against the
         // tick's injected `now`, so the pure `tick` stays time-driven and unit-proven.
+        // (Moved AFTER the health pass, task 070: a rate-limit DEATH classified in
+        // that pass extends the hold from the stdout stream error's `resets_at`, and
+        // the elapsed-clear must run against the extended value or a freshly-pinned
+        // hold would be wiped the same tick it was set.)
         if let Some(until) = self.rate_limit_hold_until {
             if now >= until {
                 self.rate_limit_hold_until = None;
             }
         }
-        // A live hold gates every spawn this tick (steps 2 + 3), the pre-spawn HOLD
-        // twin of `offline`: no re-roll, no fresh start, no backoff, no crash count —
-        // the fleet simply waits out the window instead of crash-looping into it.
-        let rate_limited = self.rate_limit_hold_until.is_some();
-        report.waiting_for_rate_limit_reset = self.rate_limit_hold_until;
         let budget = self.aggregator.aggregate_or_fresh_at(now);
         let rate = self.rate.rate(now);
 
@@ -1301,7 +1339,7 @@ impl DriveLoop {
                 // progress signal (task 038): the supervisor trips it when this repeats
                 // unchanged across `STALL_LIMIT` continue re-rolls.
                 let baton_next_action = baton_read.next_action.clone();
-                // Network-exit classifier (slice 002): `poll_with_network` evaluates
+                // Network-exit classifier (slice 002): `poll_with_exits` evaluates
                 // it ONLY on a crash verdict (so a healthy tick reads no stderr). A
                 // non-zero EXIT whose in-memory stderr tail carries a network-error
                 // signature, OR that exited while the device is offline, is a
@@ -1309,10 +1347,20 @@ impl DriveLoop {
                 // non-network exit stays a genuine crash. `stderr` + `connectivity`
                 // are disjoint fields from `&mut supervisor`, scoped to this block so
                 // their borrows release before the `&mut self` match arms below.
+                //
+                // Rate-limit classifier (task 070): the SAME shape — evaluated only
+                // on an un-consumed crash verdict, fed off the budget cell's
+                // `rejected`-window reopen (a step-0 `rate_limit_event`) OR the
+                // backend's latched stdout stream error (a 429 /
+                // `usage_limit_reached` the stderr ring can't see). A matching
+                // non-zero exit is a rate-limit DEATH → no `AgentCrashed`, no
+                // backoff; the timed hold below gates the re-roll until `resets_at`.
                 let outcome = {
                     let stderr = &self.stderr;
+                    let stream_errs = &self.stream_errs;
                     let connectivity = &self.connectivity;
                     let reconnecting = &self.reconnecting;
+                    let samples = &self.samples;
                     let network_exit = || {
                         matches!(health, AgentHealth::Exited { .. })
                             // Latch: a down member is re-observed with the SAME stale
@@ -1329,15 +1377,28 @@ impl DriveLoop {
                                     connectivity.online(),
                                 ))
                     };
-                    self.supervisor.poll_with_network(
+                    let rate_limit_exit = || {
+                        matches!(health, AgentHealth::Exited { .. })
+                            && (samples.rate_limit_reopen(agent).is_some()
+                                || stream_errs
+                                    .stream_error(agent)
+                                    .is_some_and(|e| e.is_rate_limit()))
+                    };
+                    self.supervisor.poll_with_exits(
                         agent,
                         health,
                         baton_status.as_deref(),
                         baton_next_action.as_deref(),
                         now,
                         network_exit,
+                        rate_limit_exit,
                     )
                 };
+                // Record the classification for `status` (task 070) — BEFORE the
+                // arms mutate lifecycle below, so the record says how THIS poll
+                // read. `Down`/`Unknown` record nothing: they must not overwrite a
+                // latched classification (the raw health cell latches the exit).
+                let lifecycle = poll_outcome_lifecycle(&outcome);
                 // Health-pass diagnostic (task 042): record what baton status this
                 // EXIT was classified against and the disposition it drove, so a
                 // stale/misrouted baton is visible in the journal (before this, a
@@ -1369,13 +1430,26 @@ impl DriveLoop {
                 }
                 match outcome {
                     PollOutcome::Crashed { event, .. } => {
-                        // Enrich the alert with the crashed agent's stderr tail
-                        // (crash-diagnostics slice 001): the supervisor built the
-                        // event without a reason (it has no backend); we read the
-                        // in-memory ring off the backend here, before the event is
-                        // dispatched, so the human sees *why* it crashed. Read once,
-                        // only on a crash — a healthy tick never touches stderr.
-                        let event = event.with_stderr_tail(self.stderr.stderr_tail(agent));
+                        // Enrich the alert with the crashed agent's stdout stream
+                        // error + stderr tail (crash-diagnostics slice 001, task
+                        // 070): the supervisor built the event without a reason (it
+                        // has no backend); we read the in-memory ring AND the latched
+                        // in-band stream error off the backend here, before the event
+                        // is dispatched, so the human sees *why* it crashed. The
+                        // stdout error leads (headless members die on STDOUT errors
+                        // the stderr ring never sees — stderr carries only the
+                        // systemd-run banner, which is filtered out so the alert
+                        // never renders the bare banner). Read once, only on a crash
+                        // — a healthy tick never touches either ring.
+                        let event = event
+                            .with_stdout_error(
+                                self.stream_errs
+                                    .stream_error(agent)
+                                    .map(|e| e.text),
+                            )
+                            .with_stderr_tail(filter_systemd_banner(
+                                &self.stderr.stderr_tail(agent),
+                            ));
                         report.crashes.push(event);
                         // Drop the crashed agent's last budget reading (symmetric with
                         // the Retired/Completed/Blocked arms): a crash leaves a dead
@@ -1494,8 +1568,10 @@ impl DriveLoop {
                             self.retire(agent, &mut report);
                         }
                     }
-                    PollOutcome::ParkedRateLimited => {
-                        // HALTED_RATE_LIMIT: the member is down-but-registered and
+                    PollOutcome::ParkedRateLimited | PollOutcome::RateLimitDeath => {
+                        // HALTED_RATE_LIMIT (clean park) or a rate-limit DEATH (task
+                        // 070: a non-zero exit the classifier attributed to the quota
+                        // wall): either way the member is down-but-registered and
                         // re-rolled by `Supervisor::tick` once its window resets; no
                         // alert. FORGET its budget sample now — symmetric with the
                         // crash/retire/complete/block arms (task 031's rule: a boundary
@@ -1508,6 +1584,23 @@ impl DriveLoop {
                         // pinned sample — otherwise it would re-roll the instant its
                         // forgotten sample let admission read fresh and spin into the
                         // still-exhausted window. A boundary stop retires it instead.
+                        //
+                        // Task 070: when the death's signal rode the STDOUT stream
+                        // error (a 429 / `usage_limit_reached` result line) rather
+                        // than a `rate_limit_event`, step 0's budget-cell fold saw
+                        // nothing — extend the hold from the stream error's concrete
+                        // `resets_at` HERE, so the re-roll gate below holds the
+                        // member this same tick. The boundary is always concrete (the
+                        // backend pins the fail-safe when the wire gave none), so the
+                        // hold reliably elapses.
+                        let reopen = self.samples.rate_limit_reopen(agent).or_else(|| {
+                            self.stream_errs.stream_error(agent).and_then(|e| e.resets_at)
+                        });
+                        if let Some(reopen) = reopen {
+                            self.rate_limit_hold_until = Some(
+                                self.rate_limit_hold_until.map_or(reopen, |h| h.max(reopen)),
+                            );
+                        }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         } else {
@@ -1527,8 +1620,23 @@ impl DriveLoop {
                     }
                     PollOutcome::Healthy | PollOutcome::Unknown => {}
                 }
+                // Push the classification to `status` (task 070) — after the arms,
+                // so a boundary-stop retire and the record agree. `None` (a `Down`
+                // re-observation / an `Unknown`) leaves the latched record alone.
+                if let Some(lifecycle) = lifecycle {
+                    self.daemon.record_member_lifecycle(agent, lifecycle);
+                }
             }
         }
+
+        // A live hold gates every spawn this tick (steps 2 + 3), the pre-spawn HOLD
+        // twin of `offline`: no re-roll, no fresh start, no backoff, no crash count —
+        // the fleet simply waits out the window instead of crash-looping into it.
+        // Computed AFTER the health pass (task 070) so a rate-limit death classified
+        // there — whose signal rode the stdout stream, not a step-0 `rate_limit_event`
+        // — gates the re-roll the SAME tick it is recognized.
+        let rate_limited = self.rate_limit_hold_until.is_some();
+        report.waiting_for_rate_limit_reset = self.rate_limit_hold_until;
 
         // Read this tick's queue snapshot ONCE, before the re-roll: BOTH the
         // re-roll's queue-gate (step 2) and the fresh-start claim (step 3) consult
@@ -1868,9 +1976,25 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
         PollOutcome::Blocked { spin_guard: true, .. } => "stuck (spin guard — NEXT ACTION unchanged)",
         PollOutcome::Blocked { .. } => "blocked on human",
         PollOutcome::ParkedRateLimited => "held (rate-limited)",
+        // Task 070: a rate-limit DEATH reads as the hold it is — never "crashed".
+        PollOutcome::RateLimitDeath => "held (rate-limited)",
         PollOutcome::Healthy => "healthy",
         PollOutcome::Unknown => "unknown",
     }
+}
+
+/// Drop the `systemd-run` scope banner from a crash's stderr tail (task 070): a
+/// headless member's stderr typically holds ONLY `Running as unit:
+/// growlight-agent-<id>-<n>.scope; invocation ID: …` — the launch wrapper's line,
+/// not a reason — and the real error rode the member's STDOUT stream (which the
+/// crash alert carries separately). The banner is filtered so a crash body with
+/// nothing else reads plainly instead of showing the useless banner. Pure, so it
+/// is unit-proven directly.
+fn filter_systemd_banner(tail: &[String]) -> Vec<String> {
+    tail.iter()
+        .filter(|line| !line.starts_with("Running as unit:"))
+        .cloned()
+        .collect()
 }
 
 /// The drive loop's journal voice (task 033's diagnosability half): render one
@@ -2132,13 +2256,14 @@ fn unix_now() -> i64 {
 mod tests {
     use super::*;
     use crate::admission::{AdmissionDecision, AdmissionGovernor, RefuseReason};
+    use crate::agent_harness::{StreamError, StreamErrorKind};
     use crate::config::{GrowlightdConfig, Policy};
     use crate::control::AgentChild;
     use crate::hub::EventHub;
     use crate::notifications::NotifyPolicy;
     use crate::notify_dispatch::{GuiNotifier, LogNotifier, LogSink};
     use crate::scheduler::{classify_queue, PartView, QueueState, QueueView};
-    use crate::supervisor::{AgentBackend, Backoff, SpawnError};
+    use crate::supervisor::{AgentBackend, Backoff, MemberLifecycle, SpawnError};
     use softfig_ipc::growlightd::StopLevel;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2167,6 +2292,10 @@ mod tests {
         /// Scripted stderr tail per agent (the live loop reads it off the backend's
         /// ring to enrich a crash alert — crash-diagnostics slice 001).
         stderr: Mutex<BTreeMap<String, Vec<String>>>,
+        /// Scripted stdout stream error per agent (task 070 — what the live claude
+        /// backend latches off an in-band 429 / `usage_limit_reached` result line;
+        /// the stderr ring never sees it). Unset = the stream ended clean.
+        stream_errors: Mutex<BTreeMap<String, StreamError>>,
         budgets: Mutex<BTreeMap<String, BudgetUsage>>,
         /// Scripted rate-limit reopen instant (unix secs) per agent — what the live
         /// backend surfaces off a `rejected` window (task 037): the wire's `resetsAt`
@@ -2217,6 +2346,11 @@ mod tests {
                 agent.to_string(),
                 lines.iter().map(|s| s.to_string()).collect(),
             );
+        }
+        /// Script `agent`'s latched stdout stream error (task 070 — what the live
+        /// backend latches off an in-band 429 / errored result line).
+        fn set_stream_error(&self, agent: &str, err: StreamError) {
+            self.stream_errors.lock().unwrap().insert(agent.to_string(), err);
         }
         /// Script `agent`'s terminal baton status (read by the loop on its exit).
         fn set_baton(&self, agent: &str, status: &str) {
@@ -2309,6 +2443,11 @@ mod tests {
     impl AgentStderrSource for Arc<FakeFleet> {
         fn stderr_tail(&self, agent: &str) -> Vec<String> {
             self.stderr.lock().unwrap().get(agent).cloned().unwrap_or_default()
+        }
+    }
+    impl AgentStreamErrSource for Arc<FakeFleet> {
+        fn stream_error(&self, agent: &str) -> Option<StreamError> {
+            self.stream_errors.lock().unwrap().get(agent).cloned()
         }
     }
     impl BudgetSampleSource for Arc<FakeFleet> {
@@ -2608,6 +2747,7 @@ mod tests {
             sup,
             Box::new(Arc::clone(&backend)), // health
             Box::new(Arc::clone(&backend)), // stderr tail — scripted via set_stderr
+            Box::new(Arc::clone(&backend)), // stream errs — scripted via set_stream_error (task 070)
             Box::new(Arc::clone(&backend)), // baton status — scripted via set_baton
             Box::new(Arc::clone(&backend)), // seeder — records seeds, scriptable failure
             Box::new(Arc::clone(&queues)),
@@ -3427,6 +3567,217 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"], "a1 was re-spawned");
+    }
+
+    /// TASK 070 — the reported incident shape, end to end at the tick level: a
+    /// member killed by the 5h quota wall (non-zero exit coinciding with a
+    /// `rejected` window) is a RATE-LIMIT DEATH, not a crash — no `AgentCrashed`
+    /// page, journaled as the rate-limit hold, and held (no re-spawn) until the
+    /// window's `resets_at`, when the timed hold clears and it re-rolls with no
+    /// backoff.
+    #[test]
+    fn a_rate_limit_death_does_not_page_and_is_held_until_resets_at() {
+        let (mut loop_, d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        // Fresh start.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // The member dies on the quota wall: exit 1, and the budget cell latches a
+        // `rejected` window reopening at 1000 (the step-0 `rate_limit_event` shape,
+        // task 037).
+        backend.set_budget_reset("a1", 1000);
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        let r = loop_.tick(10);
+        assert!(r.crashes.is_empty(), "a rate-limit death raises NO AgentCrashed");
+        assert_eq!(probe.gui_alerts(), 0, "nothing pages the human");
+        assert!(
+            probe.log_lines().iter().all(|l| !l.contains("crashed")),
+            "no audit line reads `crashed`: {:?}",
+            probe.log_lines(),
+        );
+        assert_eq!(
+            r.waiting_for_rate_limit_reset,
+            Some(1000),
+            "the member is held until the window's resets_at",
+        );
+        assert!(
+            r.exit_dispositions
+                .iter()
+                .any(|ed| ed.agent == "a1" && ed.disposition == "held (rate-limited)"),
+            "the exit journals as rate-limited, not crashed: {:?}",
+            r.exit_dispositions,
+        );
+        assert_eq!(
+            d.member_lifecycle("a1"),
+            Some(MemberLifecycle::RateLimitedHeld),
+            "`status` records the hold, not `crashed (1)`",
+        );
+
+        // The hold gates every re-roll until the boundary.
+        let r2 = loop_.tick(999);
+        assert_eq!(
+            r2.waiting_for_rate_limit_reset,
+            Some(1000),
+            "still held inside the window",
+        );
+        assert_eq!(backend.spawn_count(), 1, "no re-spawn into the exhausted window");
+
+        // At the boundary the hold clears and the member re-rolls — no backoff
+        // (a rate-limit death never bumped the crash streak).
+        let r3 = loop_.tick(1000);
+        assert!(
+            r3.rerolls
+                .iter()
+                .any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "a1")),
+            "the member re-rolls at resets_at: {:?}",
+            r3.rerolls,
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a1"]);
+    }
+
+    /// TASK 070 — the in-band variant: the member dies on a 429 /
+    /// `usage_limit_reached` STDOUT stream error (no `rate_limit_event` rode this
+    /// run, so step 0's budget fold saw nothing). The health pass classifies the
+    /// death and extends the timed hold to the stream error's concrete `resets_at`
+    /// the SAME tick — still no page, still held to the boundary, then re-rolled.
+    #[test]
+    fn a_429_stream_error_death_is_held_until_the_streams_resets_at() {
+        let (mut loop_, d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        backend.set_stream_error(
+            "a1",
+            StreamError {
+                kind: StreamErrorKind::RateLimit,
+                text: "You've hit your session limit · resets 4:40pm".to_string(),
+                resets_at: Some(2000),
+            },
+        );
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        let r = loop_.tick(10);
+        assert!(r.crashes.is_empty(), "a 429 death raises NO AgentCrashed");
+        assert_eq!(probe.gui_alerts(), 0);
+        assert_eq!(
+            r.waiting_for_rate_limit_reset,
+            Some(2000),
+            "the hold extends to the stream error's resets_at this same tick",
+        );
+        assert_eq!(
+            d.member_lifecycle("a1"),
+            Some(MemberLifecycle::RateLimitedHeld),
+        );
+
+        // Held until the stream's boundary, then re-rolled.
+        assert_eq!(loop_.tick(1999).waiting_for_rate_limit_reset, Some(2000));
+        assert_eq!(backend.spawn_count(), 1, "no re-spawn while the hold stands");
+        assert!(
+            loop_.tick(2000).rerolls.iter().any(|o| matches!(o, RerollOutcome::Rerolled { agent } if agent == "a1")),
+        );
+        assert_eq!(backend.spawns(), vec!["a1", "a1"]);
+    }
+
+    /// TASK 070 — a GENUINE crash (no rate-limit signal) still pages, and its body
+    /// carries the member's last STDOUT stream error when there is one — the
+    /// in-band reason stderr-only enrichment is blind to — and never the bare
+    /// `systemd-run` banner (which is all the stderr ring held).
+    #[test]
+    fn a_genuine_crash_carries_the_stdout_error_and_never_the_bare_banner() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_stderr(
+            "a1",
+            &["Running as unit: growlight-agent-a1-0.scope; invocation ID: deadbeef"],
+        );
+        backend.set_stream_error(
+            "a1",
+            StreamError {
+                kind: StreamErrorKind::Other,
+                text: "API error: Connection reset".to_string(),
+                resets_at: None,
+            },
+        );
+        let r = loop_.tick(10);
+        assert_eq!(r.crashes.len(), 1, "a genuine crash still pages");
+        match &r.crashes[0] {
+            NotifyEvent::AgentCrashed {
+                agent,
+                stderr_tail,
+                stdout_error,
+            } => {
+                assert_eq!(agent, "a1");
+                assert_eq!(
+                    stdout_error.as_deref(),
+                    Some("API error: Connection reset"),
+                    "the alert carries the last stdout stream error",
+                );
+                assert!(
+                    stderr_tail.is_empty(),
+                    "the systemd-run banner is filtered, never carried: {stderr_tail:?}",
+                );
+            }
+            other => panic!("expected AgentCrashed, got {other:?}"),
+        }
+
+        // Dispatched: exactly one alert, body = the real reason, never the banner.
+        assert_eq!(probe.gui_alerts(), 1);
+        let lines = probe.log_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("API error: Connection reset"),
+            "the body names the stdout reason: {:?}",
+            lines,
+        );
+        assert!(
+            !lines[0].contains("Running as unit"),
+            "the alert never renders the bare systemd-run banner: {:?}",
+            lines,
+        );
+    }
+
+    /// TASK 070 — with ONLY the `systemd-run` banner on stderr and no stdout
+    /// stream error, a genuine crash reads plainly (`agent \`a1\` crashed`): the
+    /// banner is never the reason.
+    #[test]
+    fn a_crash_with_only_the_banner_reads_plain() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_stderr(
+            "a1",
+            &["Running as unit: growlight-agent-a1-0.scope; invocation ID: deadbeef"],
+        );
+        let r = loop_.tick(10);
+        assert_eq!(
+            r.crashes,
+            vec![NotifyEvent::agent_crashed("a1")],
+            "the banner is filtered out entirely, leaving the plain crash",
+        );
+        assert_eq!(
+            probe.log_lines(),
+            vec!["growlightd alert: agent `a1` crashed".to_string()],
+        );
     }
 
     /// TASK 044 — the 2026-07-11 incident shape, end to end at the tick level: a

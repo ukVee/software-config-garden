@@ -520,6 +520,7 @@ pub fn assemble_fleet(
         supervisor,
         Box::new(Arc::clone(&router)), // health  — the member's own backend (slice 001; routed by slice 005)
         Box::new(Arc::clone(&router)), // stderr — live in-memory ring (crash-diagnostics slice 001)
+        Box::new(Arc::clone(&router)), // stream_errs — latched in-band stdout error (task 070; routed by slice 005)
         Box::new(baton_store.clone()), // baton  — live per-member read-back (fleet-loop-spin slice 002)
         Box::new(baton_store), // seeder — fresh-start baton seed (fleet-loop-spin slice 002)
         Box::new(KeeperdQueueSource::new(keeperd_socket.to_path_buf())), // queues — live (slice 002)

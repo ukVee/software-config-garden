@@ -53,7 +53,8 @@ use softfig_ipc::usage::RateWindow;
 
 use crate::admission::BudgetUsage;
 use crate::agent_harness::{
-    AgentRateState, BackendFlavor, Harness, LineObserver, TOOL_RENDER_MAX_CHARS, truncate_chars,
+    AgentRateState, AgentStreamErrState, BackendFlavor, Harness, LineObserver, StreamError,
+    StreamErrorKind, TOOL_RENDER_MAX_CHARS, truncate_chars,
 };
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
@@ -469,6 +470,120 @@ fn rate_limit_window_for_line(line: &str) -> Option<(BudgetWindow, u8, RateWindo
     })
 }
 
+/// Whether a `result`-line error field is a **rate-limit** rejection (task 070):
+/// `usage_limit_reached` / `rate_limit` / an `apiErrorStatus` of 429 — the in-band
+/// signatures of the quota wall, distinct from any other provider error.
+fn is_rate_limit_error(ev: &Value) -> bool {
+    let field = |name: &str| {
+        ev.get(name)
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+    };
+    if let Some(e) = field("error").or_else(|| field("apiError")) {
+        if e == "usage_limit_reached" || e == "rate_limit" {
+            return true;
+        }
+    }
+    ev.get("apiErrorStatus").and_then(Value::as_i64) == Some(429)
+}
+
+/// The `resetsAt` a rate-limit `result` line carried, if any — the top-level
+/// field, else the LATER of the `rate_limits` windows' (the transcript shape the
+/// 2026-10-16 death carried). `None` when the wire gave no boundary.
+fn resets_at_from_result(ev: &Value) -> Option<i64> {
+    let top = ev.get("resetsAt").and_then(Value::as_i64);
+    let in_rates = ev
+        .get("rate_limits")
+        .and_then(Value::as_object)
+        .and_then(|rl| {
+            ["five_hour", "seven_day"]
+                .iter()
+                .filter_map(|w| {
+                    rl.get(*w)
+                        .and_then(|w| w.get("resetsAt").or_else(|| w.get("resets_at")))
+                        .and_then(Value::as_i64)
+                })
+                .max()
+        });
+    match (top, in_rates) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).max(b.unwrap_or(0))),
+    }
+}
+
+/// TASK 070 — latch the in-band **stdout** stream error a `claude -p` child
+/// prints when the API refuses it, or when its session errors out mid-stream.
+/// A 429 / `usage_limit_reached` rejection arrives on STDOUT (an errored `result`
+/// line, or an assistant text carrying the human "You've hit your session limit"
+/// message) — the stderr ring structurally never sees it (stderr carries only the
+/// `systemd-run` banner). The drive loop reads the latch to classify a crash-exit
+/// that coincides with it as a **rate-limit death** (no `AgentCrashed` page, held
+/// to `resets_at`) and to enrich a genuine crash alert with the real reason.
+///
+/// A rate-limit error always carries a CONCRETE `resets_at`: the wire's when it
+/// gave one, else a pinned `at + RATE_LIMIT_FALLBACK_HOLD_SECS` fail-safe — the
+/// [`WindowTrip`] policy (task 037 fix ①), so a member killed by the quota wall is
+/// held to a real future instant rather than re-rolled blind. Pure — a fixture
+/// drives it, no real spawn.
+fn stream_error_for_line(line: &str, at: i64) -> Option<StreamError> {
+    let ev = serde_json::from_str::<Value>(line).ok()?;
+    let type_ = ev.get("type").and_then(Value::as_str);
+
+    // The terminal errored result: `is_error: true` with an error object — the
+    // structured form. `isApiErrorMessage` on a message object is the transcript
+    // twin; honor both.
+    if type_ == Some("result") && ev.get("is_error").and_then(Value::as_bool) == Some(true) {
+        let rate = is_rate_limit_error(&ev);
+        let text = ev
+            .get("result")
+            .and_then(Value::as_str)
+            .or_else(|| ev.get("error").and_then(Value::as_str))
+            .unwrap_or(if rate { "rate limit" } else { "unknown error" });
+        let resets_at = if rate {
+            Some(resets_at_from_result(&ev).unwrap_or(at + RATE_LIMIT_FALLBACK_HOLD_SECS))
+        } else {
+            None
+        };
+        return Some(StreamError {
+            kind: if rate { StreamErrorKind::RateLimit } else { StreamErrorKind::Other },
+            text: text.to_string(),
+            resets_at,
+        });
+    }
+
+    // The in-band human message form: an assistant turn whose text carries the
+    // quota wall's own wording (the 2026-10-16 death: "You've hit your session
+    // limit · resets 4:40pm (America/New_York)"). Matched on the marker phrases
+    // the API itself prints, so an agent merely *discussing* rate limits never
+    // trips it. No machine-readable boundary rides this form, so the fail-safe
+    // reopen is pinned.
+    if type_ == Some("assistant") {
+        let text = ev
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => b.get("text").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lowered = text.to_ascii_lowercase();
+        let hit = lowered.contains("you've hit your session limit")
+            || lowered.contains("you've hit your usage limit")
+            || lowered.contains("api error: 429");
+        if hit {
+            return Some(StreamError {
+                kind: StreamErrorKind::RateLimit,
+                text,
+                resets_at: Some(at + RATE_LIMIT_FALLBACK_HOLD_SECS),
+            });
+        }
+    }
+    None
+}
+
 /// Opportunistic account-wide 5h/7d reserve from a `rate_limits` object on a
 /// `result` line, reading each window's `status` (primary) + `used_percentage`
 /// through [`window_pct`]. `None` when the result carries no such object — the
@@ -505,10 +620,12 @@ fn reserve_from_result(ev: &Value) -> Option<(BudgetUsage, [bool; 2])> {
 /// Publishes each content block as an [`Event::AgentDelta`] on `hub`, folds each
 /// `rate_limit_event` line's account-wide reserve status into `budget` (the
 /// reliable headless §7 source) and tees the raw reading to the runtime
-/// `usage.json` (task 048), and records the terminal `result` line's context
-/// gauge (+ its opportunistic `rate_limits` reserve) and token cost into `rate`.
-/// Pure over its cells: a test drives it through [`pump`] with a scripted fixture
-/// + fake clock, no real spawn.
+/// `usage.json` (task 048), records the terminal `result` line's context
+/// gauge (+ its opportunistic `rate_limits` reserve) and token cost into `rate`,
+/// and latches the last in-band stream error into `stream_err` (task 070). Pure
+/// over its cells: a test drives it through [`pump`] with a scripted fixture +
+/// fake clock, no real spawn.
+#[allow(clippy::too_many_arguments)]
 fn observe_claude_line(
     line: &str,
     at: i64,
@@ -517,6 +634,7 @@ fn observe_claude_line(
     budget: &AgentBudgetState,
     rate: &AgentRateState,
     usage: &UsageCapture,
+    stream_err: &AgentStreamErrState,
 ) {
     // A `rate_limit_event` reports this agent's reading of the shared
     // account-wide 5h/7d reserve as a coarse per-window status — the reliable
@@ -566,6 +684,13 @@ fn observe_claude_line(
     if let Some(tokens) = result_usage_tokens(line) {
         rate.record(at, tokens);
     }
+    // TASK 070 — latch the last in-band STDOUT stream error (a 429 /
+    // `usage_limit_reached` rejection, or any errored result): the signal the
+    // drive loop classifies a coinciding crash-exit as a rate-limit death with,
+    // and the reason a genuine crash alert carries (stderr alone is blind to it).
+    if let Some(err) = stream_error_for_line(line, at) {
+        stream_err.record(err);
+    }
 }
 
 /// The owned [`LineObserver`] a live spawn's reader thread holds — the cells this
@@ -577,6 +702,10 @@ struct ClaudeSpawnObserver {
     budget: Arc<AgentBudgetState>,
     rate: Arc<AgentRateState>,
     usage: Arc<UsageCapture>,
+    /// This spawn's latched stdout stream-error cell (task 070) — replaced on
+    /// every re-roll like `budget`, so the drive loop reads the CURRENT
+    /// generation's last in-band error.
+    stream_err: Arc<AgentStreamErrState>,
 }
 
 impl LineObserver for ClaudeSpawnObserver {
@@ -589,6 +718,7 @@ impl LineObserver for ClaudeSpawnObserver {
             &self.budget,
             &self.rate,
             &self.usage,
+            &self.stream_err,
         );
     }
 
@@ -608,6 +738,7 @@ struct ClaudeBorrowedObserver<'a> {
     budget: &'a AgentBudgetState,
     rate: &'a AgentRateState,
     usage: &'a UsageCapture,
+    stream_err: &'a AgentStreamErrState,
 }
 
 #[cfg(test)]
@@ -621,6 +752,7 @@ impl LineObserver for ClaudeBorrowedObserver<'_> {
             self.budget,
             self.rate,
             self.usage,
+            self.stream_err,
         );
     }
 
@@ -642,6 +774,7 @@ fn pump<R: BufRead>(
     budget: &AgentBudgetState,
     rate: &AgentRateState,
     usage: &UsageCapture,
+    stream_err: &AgentStreamErrState,
     now: &dyn Fn() -> i64,
 ) {
     crate::agent_harness::pump(
@@ -653,6 +786,7 @@ fn pump<R: BufRead>(
             budget,
             rate,
             usage,
+            stream_err,
         },
         now,
     );
@@ -698,6 +832,12 @@ struct ClaudeFlavor {
     /// via [`budget`](ClaudeBackend::budget). Re-spawn replaces the cell — the same
     /// lifecycle the harness gives its own health/rate/stderr cells.
     budgets: Mutex<BTreeMap<String, Arc<AgentBudgetState>>>,
+    /// Per-agent stdout stream-error cells (task 070), keyed by agent id; the
+    /// drive loop reads the latch via [`stream_error`](ClaudeBackend::stream_error)
+    /// to classify a rate-limit death and enrich a genuine crash alert. Re-spawn
+    /// replaces the cell — the same lifecycle as `budgets` (the error that matters
+    /// is the CURRENT generation's).
+    stream_errs: Mutex<BTreeMap<String, Arc<AgentStreamErrState>>>,
     /// The headless tee from this backend's `rate_limit_event` readings to the
     /// runtime `usage.json` (task 048). One capture per claude backend — the file
     /// describes the one account-wide pool every member reads, so the freshest
@@ -743,6 +883,18 @@ impl ClaudeFlavor {
             .unwrap()
             .get(agent)
             .and_then(|s| s.rate_limit_reopen())
+    }
+
+    /// `agent`'s latched stdout stream error (task 070), or `None` if its stream
+    /// ended without one — the in-band 429 / `usage_limit_reached` / API error the
+    /// stderr ring is blind to. Read by the drive loop to classify a rate-limit
+    /// death and enrich a crash alert.
+    fn stream_error(&self, agent: &str) -> Option<StreamError> {
+        self.stream_errs
+            .lock()
+            .unwrap()
+            .get(agent)
+            .and_then(|s| s.observe())
     }
 
     /// This flavor's headless usage capture, or a disabled one when the fleet
@@ -800,12 +952,20 @@ impl BackendFlavor for ClaudeFlavor {
             .lock()
             .unwrap()
             .insert(agent.to_string(), Arc::clone(&budget));
+        // Fresh stdout stream-error cell too (task 070): a re-roll's exit must be
+        // classified off ITS OWN stream, never a prior generation's latched 429.
+        let stream_err = Arc::new(AgentStreamErrState::default());
+        self.stream_errs
+            .lock()
+            .unwrap()
+            .insert(agent.to_string(), Arc::clone(&stream_err));
         Box::new(ClaudeSpawnObserver {
             agent: agent.to_string(),
             hub: self.hub.clone(),
             budget,
             rate,
             usage: self.usage_capture(),
+            stream_err,
         })
     }
 }
@@ -847,6 +1007,7 @@ impl ClaudeBackend {
             hub,
             preapproval,
             budgets: Mutex::new(BTreeMap::new()),
+            stream_errs: Mutex::new(BTreeMap::new()),
             usage_capture: OnceLock::new(),
         });
         Self {
@@ -931,6 +1092,18 @@ impl ClaudeBackend {
     /// file, carries the diagnostic forward.
     pub fn stderr_tail(&self, agent: &str) -> Vec<String> {
         self.harness.stderr_tail(agent)
+    }
+
+    /// `agent`'s most recent **stdout** stream error (task 070), or `None` if its
+    /// stream ended clean or it was never spawned. The in-band half of crash
+    /// diagnosis: a headless member's fatal API error (a 429 / `usage_limit_reached`
+    /// rejection, or any errored `result`) arrives on STDOUT, which the stderr ring
+    /// never sees. The drive loop reads it to classify a crash-exit that coincides
+    /// with it as a rate-limit death — no `AgentCrashed`, held to `resets_at` — and
+    /// to put the *real* reason on a genuine crash alert in place of the bare
+    /// `systemd-run` banner. Replaced on every re-roll, like the health/stderr cells.
+    pub fn stream_error(&self, agent: &str) -> Option<StreamError> {
+        self.flavor.stream_error(agent)
     }
 
     /// The argv this backend would exec for `agent` after the `systemd-run … --`
@@ -1038,12 +1211,13 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
 
         // A fake clock that ticks 10, 20, 30, … once per line read.
         let clock = AtomicI64::new(0);
         let now = || clock.fetch_add(10, Ordering::SeqCst) + 10;
 
-        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
 
         // The four content deltas reach the hub in block order, tagged by kind.
         let expect = [
@@ -1085,9 +1259,10 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
         let now = || 100; // init line stamped at t=100, then nothing more
 
-        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
 
         // No exit recorded → still Alive, but pinned at the stale init stamp.
         assert_eq!(state.observe(), AgentHealth::Alive { last_active: 100 });
@@ -1261,6 +1436,7 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
         let now = || 100;
 
         // A headless run: the 5h window goes to `rejected` (pool exhausted) while
@@ -1275,7 +1451,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
 
         // The non-"allowed" 5h status folded to a saturated 100; the allowed 7d to 0.
         let reserve = budget.observe().expect("a reserve was folded from the events");
@@ -1322,6 +1498,7 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
         let now = || 100;
 
         let stream = concat!(
@@ -1330,7 +1507,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"warning","resetsAt":1782900000}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
 
         assert_eq!(
             budget.window_resets(),
@@ -1351,7 +1528,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"allowed"}}"#,
             "\n",
         );
-        pump(Cursor::new(no_boundary), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(no_boundary), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
         assert_eq!(
             budget.window_resets(),
             WindowResets::new(None, Some(1782900000)),
@@ -1372,6 +1549,7 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::new(path.clone());
+        let stream_err = AgentStreamErrState::default();
         let now = || 1_782_360_000;
 
         let stream = concat!(
@@ -1384,7 +1562,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "a", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(stream), "a", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
 
         let written = UsageSnapshot::load(&path)
             .unwrap()
@@ -1419,12 +1597,13 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
         let now = || 100;
         let stream = concat!(
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected"}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
         // The pct still saturates (throttles the aggregate)...
         assert_eq!(budget.observe(), Some(BudgetUsage::new(100, 0)));
         // ...and the reopen is the bounded fail-safe off the line's clock (100), not
@@ -1447,12 +1626,13 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
         let now = || 100;
         let stream = concat!(
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"warning","resetsAt":1782367800}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
         assert_eq!(
             budget.observe(),
             Some(BudgetUsage::new(100, 0)),
@@ -1476,6 +1656,7 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
         let now = || 0;
 
         let stream = concat!(
@@ -1484,7 +1665,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
 
         // Both windows allowed → a fresh (0,0) reserve: no alert, admission admits.
         let reserve = budget.observe().expect("an allowed reading still records (0,0)");
@@ -1535,6 +1716,7 @@ mod tests {
         let budget = AgentBudgetState::default();
         let rate_meter = AgentRateState::default();
         let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
         let now = || 1000; // every line stamped inside one minute
 
         // A headless turn whose terminal result reports 90k tokens of usage.
@@ -1544,7 +1726,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":80000,"output_tokens":10000},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
 
         // The meter observed 90k tokens / 1 request in the trailing minute.
         let (tpm_used, rpm_used) = rate_meter.window(1000);
@@ -1764,5 +1946,105 @@ mod tests {
             ],
             "the claude invocation is byte-identical across the harness extraction",
         );
+    }
+
+    /// TASK 070 — the in-band stream-error detector: a 429 / `usage_limit_reached` /
+    /// `rate_limit` errored result reads as a rate-limit signal carrying a CONCRETE
+    /// reopen (the wire's `resetsAt`, else the pinned fail-safe); an unrelated
+    /// errored result reads as `Other` (still a crash reason); clean/irrelevant
+    /// lines latch nothing.
+    #[test]
+    fn stream_error_for_line_detects_the_rate_limit_signatures() {
+        // The 2026-10-16 transcript shape: apiErrorStatus 429 + apiError
+        // `usage_limit_reached`, with the wire's resetsAt.
+        let rejected = stream_error_for_line(
+            r#"{"type":"result","is_error":true,"result":"You've hit your session limit · resets 4:40pm (America/New_York)","error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"apiError":"usage_limit_reached","rateLimitType":"five_hour","resetsAt":1792183200}"#,
+            100,
+        )
+        .expect("a 429 result latches a stream error");
+        assert_eq!(rejected.kind, StreamErrorKind::RateLimit);
+        assert!(rejected.is_rate_limit());
+        assert_eq!(rejected.resets_at, Some(1792183200));
+        assert!(rejected.text.contains("session limit"), "the text rides along: {}", rejected.text);
+
+        // `usage_limit_reached` on the `error` field alone, no boundary → the pinned
+        // fail-safe reopen (task 037 fix ① policy), never a blind re-roll.
+        let no_reset = stream_error_for_line(
+            r#"{"type":"result","is_error":true,"result":"usage limit reached","error":"usage_limit_reached"}"#,
+            500,
+        )
+        .expect("an usage_limit_reached result latches");
+        assert_eq!(no_reset.kind, StreamErrorKind::RateLimit);
+        assert_eq!(no_reset.resets_at, Some(500 + RATE_LIMIT_FALLBACK_HOLD_SECS));
+
+        // The assistant-text form: the API's own wording, marker-matched so an agent
+        // merely discussing limits never trips it.
+        let text = stream_error_for_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 4:40pm"}]}}"#,
+            900,
+        )
+        .expect("the in-band human message latches");
+        assert_eq!(text.kind, StreamErrorKind::RateLimit);
+        assert_eq!(text.resets_at, Some(900 + RATE_LIMIT_FALLBACK_HOLD_SECS));
+        assert!(
+            stream_error_for_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I must respect the rate limits while testing"}]}}"#,
+                10,
+            )
+            .is_none(),
+            "a member TALKING about rate limits is not a rate-limit signal",
+        );
+
+        // An unrelated errored result (a permission failure) is `Other` — a crash
+        // reason, not a rate-limit signal.
+        let other = stream_error_for_line(
+            r#"{"type":"result","is_error":true,"result":"permission denied","error":"EPERM"}"#,
+            20,
+        )
+        .expect("any errored result latches");
+        assert_eq!(other.kind, StreamErrorKind::Other);
+        assert!(!other.is_rate_limit());
+        assert_eq!(other.resets_at, None, "a non-rate-limit error holds nothing");
+
+        // Clean lines latch nothing.
+        assert!(
+            stream_error_for_line(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+                30,
+            )
+            .is_none()
+        );
+        assert!(stream_error_for_line("not json", 30).is_none());
+    }
+
+    /// TASK 070 — the real fold latches the stream error off the same lines the
+    /// reader thread folds, so the drive loop's classification/enrichment reads
+    /// what the member actually printed (no parallel detection path to drift).
+    #[test]
+    fn pump_latches_the_last_stream_error_through_the_real_fold() {
+        let hub = EventHub::new();
+        let state = AgentHealthState::new(0);
+        let budget = AgentBudgetState::default();
+        let rate_meter = AgentRateState::default();
+        let usage_cap = UsageCapture::disabled();
+        let stream_err = AgentStreamErrState::default();
+        let now = || 100;
+
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"result","is_error":true,"result":"first failure","error":"EPERM"}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected","resetsAt":1782367800}}"#,
+            "\n",
+            r#"{"type":"result","is_error":true,"result":"You've hit your session limit","error":"rate_limit","apiErrorStatus":429,"resetsAt":1782367800}"#,
+            "\n",
+        );
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+
+        // Last-write-wins: the terminal 429 is what the session died on.
+        let latched = stream_err.observe().expect("the stream error is latched");
+        assert_eq!(latched.kind, StreamErrorKind::RateLimit);
+        assert_eq!(latched.resets_at, Some(1782367800));
     }
 }

@@ -259,6 +259,78 @@ pub(crate) fn drain_stderr<R: BufRead>(reader: R, buf: &AgentStderrState) {
     }
 }
 
+/// What kind of error a member's stdout stream ended with (task 070) — the
+/// provider-neutral shape of the *in-band* failure a headless member prints on
+/// STDOUT, which the stderr ring never sees (stderr carries only the
+/// `systemd-run` banner). The wire-specific detection is the flavor's
+/// ([`crate::claude_backend::stream_error_for_line`]); this is the latched value
+/// the drive loop classifies and enriches with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamErrorKind {
+    /// An API rate-limit rejection — a 429 / `usage_limit_reached` / `rate_limit`
+    /// error. A member dying on one is a rate-limit death, not a crash (task 070).
+    RateLimit,
+    /// Any other in-band stream error (a permission failure, a provider error) —
+    /// still the crash *reason*, but not a rate-limit signal.
+    Other,
+}
+
+/// One latched stdout stream error: its kind, the human-readable text, and —
+    /// for a [`StreamErrorKind::RateLimit`] error — the concrete reopen instant
+    /// (unix secs) the drive loop's timed hold should wait until: the wire's
+    /// `resetsAt` when it gave one, else a pinned fail-safe the backend derives
+    /// at record time (the [`WindowTrip`](crate::claude_backend) policy, task 037
+    /// fix ①). Always concrete for a rate-limit error, so a member killed by the
+    /// quota wall is held to a REAL future instant, never re-rolled blind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamError {
+    /// Which class of failure this was.
+    pub kind: StreamErrorKind,
+    /// The last error's text (char-truncated), for the alert body.
+    pub text: String,
+    /// When a rate-limit error's window may be re-probed (`None` for an
+    /// [`StreamErrorKind::Other`] error — nothing to hold for).
+    pub resets_at: Option<i64>,
+}
+
+impl StreamError {
+    /// Whether this is a rate-limit signal (task 070's classifier).
+    pub fn is_rate_limit(&self) -> bool {
+        self.kind == StreamErrorKind::RateLimit
+    }
+}
+
+/// Shared per-agent latch of the member's most recent **stdout** stream error
+/// (task 070) — the in-band API failure a headless member prints on STDOUT, which
+/// the stderr ring is structurally blind to. The flavor's line fold records it
+/// (the SAME `Arc` is replaced on every re-roll, mirroring the health/stderr
+/// cells); the drive loop reads it through [`crate::drive_loop::AgentStreamErrSource`]
+/// to classify a crash-exit that coincides with a 429 / `usage_limit_reached`
+/// error as a rate-limit death, and to enrich a genuine `AgentCrashed` alert with
+/// the *real* reason instead of the bare `systemd-run` banner. Sibling to
+/// [`AgentHealthState`] / [`AgentStderrState`]: one more decoupled observation of
+/// a live agent.
+#[derive(Debug, Default)]
+pub struct AgentStreamErrState {
+    inner: Mutex<Option<StreamError>>,
+}
+
+impl AgentStreamErrState {
+    /// Record the latest stream error (last-write-wins — the error that matters
+    /// is the one the session *died* on). Char-truncates the text so a giant
+    /// provider payload can't balloon the latched cell.
+    pub(crate) fn record(&self, err: StreamError) {
+        let mut err = err;
+        err.text = truncate_chars(&err.text, STDERR_LINE_MAX_CHARS);
+        *self.inner.lock().unwrap() = Some(err);
+    }
+
+    /// The most recent stream error, or `None` if the stream ended clean.
+    pub fn observe(&self) -> Option<StreamError> {
+        self.inner.lock().unwrap().clone()
+    }
+}
+
 /// One backend's per-spawn fold over its child's stdout lines — the ONLY
 /// wire-format-aware step in the reader thread. The harness has already stamped
 /// the line's arrival (`at`) and bumped the heartbeat; the observer turns the line
@@ -976,6 +1048,35 @@ impl AgentBackend for Harness {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// TASK 070 — the stdout stream-error latch records last-write-wins and
+    /// char-truncates: the drive loop classifies/enriches off the error the
+    /// session *died* on, and a giant provider payload never balloons the cell.
+    #[test]
+    fn stream_error_latch_keeps_the_last_error_and_truncates() {
+        let cell = AgentStreamErrState::default();
+        assert_eq!(cell.observe(), None, "an empty stream latches no error");
+
+        cell.record(StreamError {
+            kind: StreamErrorKind::Other,
+            text: "first error".to_string(),
+            resets_at: None,
+        });
+        cell.record(StreamError {
+            kind: StreamErrorKind::RateLimit,
+            text: "é".repeat(STDERR_LINE_MAX_CHARS + 100),
+            resets_at: Some(1792183200),
+        });
+        let last = cell.observe().expect("the last error is latched");
+        assert_eq!(last.kind, StreamErrorKind::RateLimit);
+        assert!(last.is_rate_limit());
+        assert_eq!(last.resets_at, Some(1792183200));
+        assert!(
+            last.text.chars().count() <= STDERR_LINE_MAX_CHARS + 1,
+            "the text is char-truncated, never ballooning",
+        );
+        assert!(last.text.ends_with('…'), "truncation is visible: {}", last.text);
+    }
 
     #[test]
     fn drain_stderr_rings_the_tail_and_drops_the_oldest() {

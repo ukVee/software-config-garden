@@ -52,6 +52,13 @@ pub struct DaemonInner {
     /// Defaults to [`FleetConfig::disabled`](crate::fleet::FleetConfig::disabled)
     /// until `main` sets it via [`Daemon::set_fleet_config`].
     pub fleet: crate::fleet::FleetConfig,
+    /// Per-member last poll lifecycle, recorded by the drive loop each tick
+    /// (task 070) — the classification `status` renders. The health cell alone
+    /// latches the raw exit (`crashed (1)`) for a member that died on the quota
+    /// wall; this record is what keeps `growlight status` honest about a
+    /// rate-limit death (and a transient reconnect). Read in `status`'s snapshot;
+    /// empty until the loop's first poll.
+    pub member_lifecycles: BTreeMap<String, crate::supervisor::MemberLifecycle>,
     // The live `claude -p` child *kill* handles do NOT live here under the daemon
     // lock — they are in [`Daemon::kill_handles`], a registry the backend shares
     // by `Arc` and fills on every spawn, so the hard-kill path never has to take
@@ -67,6 +74,7 @@ impl DaemonInner {
             control: Control::default(),
             leases: LeaseTable::new(),
             fleet: crate::fleet::FleetConfig::disabled(),
+            member_lifecycles: BTreeMap::new(),
         }
     }
 }
@@ -374,6 +382,33 @@ impl Daemon {
     /// Whether the fleet admission gate is engaged (`pause`/`resume`).
     pub fn is_paused(&self) -> bool {
         self.inner.lock().unwrap().control.paused
+    }
+
+    /// Record `agent`'s latest poll lifecycle (task 070) — the drive loop calls
+    /// this after each health-pass classification, and `status` renders it in
+    /// place of a verdict re-derived from the raw (latched) health cell. A brief
+    /// lock write, never held across a poll.
+    pub fn record_member_lifecycle(
+        &self,
+        agent: &str,
+        lifecycle: crate::supervisor::MemberLifecycle,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .member_lifecycles
+            .insert(agent.to_string(), lifecycle);
+    }
+
+    /// `agent`'s last recorded poll lifecycle (task 070), or `None` if the loop
+    /// has not classified it yet (a fresh/unpolled member).
+    pub fn member_lifecycle(&self, agent: &str) -> Option<crate::supervisor::MemberLifecycle> {
+        self.inner
+            .lock()
+            .unwrap()
+            .member_lifecycles
+            .get(agent)
+            .copied()
     }
 
     /// `request_lease` (spec §4c): arbitrate a lease over the shared resource

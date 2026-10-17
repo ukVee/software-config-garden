@@ -34,10 +34,10 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use crate::admission::BudgetUsage;
-use crate::agent_harness::sum_rate_windows;
+use crate::agent_harness::{StreamError, sum_rate_windows};
 use crate::claude_backend::ClaudeBackend;
 use crate::control::AgentChild;
-use crate::drive_loop::{AgentHealthSource, AgentStderrSource, BudgetSampleSource, RateMeter};
+use crate::drive_loop::{AgentHealthSource, AgentStderrSource, AgentStreamErrSource, BudgetSampleSource, RateMeter};
 use crate::usage::WindowResets;
 use crate::opencode_backend::{AgentSpend, OpencodeBackend};
 use crate::preapproval::AgentPaths;
@@ -97,6 +97,17 @@ impl BackendHandle {
         match self {
             Self::Claude(b) => b.stderr_tail(agent),
             Self::Opencode(b) => b.stderr_tail(agent),
+        }
+    }
+
+    /// `agent`'s most recent **stdout** stream error on this backend, or `None`
+    /// (task 070). Claude latches the in-band API error its wire format carries;
+    /// opencode emits no such latched signal, so it answers `None` — the honest
+    /// "nothing observed", never another member's error.
+    fn stream_error(&self, agent: &str) -> Option<StreamError> {
+        match self {
+            Self::Claude(b) => b.stream_error(agent),
+            Self::Opencode(_) => None,
         }
     }
 
@@ -278,6 +289,12 @@ impl AgentStderrSource for Arc<BackendRouter> {
     }
 }
 
+impl AgentStreamErrSource for Arc<BackendRouter> {
+    fn stream_error(&self, agent: &str) -> Option<StreamError> {
+        self.backend_for(agent).and_then(|b| b.stream_error(agent))
+    }
+}
+
 impl BudgetSampleSource for Arc<BackendRouter> {
     fn budget(&self, agent: &str) -> Option<BudgetUsage> {
         self.backend_for(agent).and_then(|b| b.budget(agent))
@@ -324,6 +341,7 @@ mod tests {
         // budget into the admission aggregate.
         assert_eq!(AgentHealthSource::health(&router, "ghost"), None);
         assert!(AgentStderrSource::stderr_tail(&router, "ghost").is_empty());
+        assert_eq!(AgentStreamErrSource::stream_error(&router, "ghost"), None);
         assert_eq!(BudgetSampleSource::budget(&router, "ghost"), None);
         assert_eq!(BudgetSampleSource::rate_limit_reopen(&router, "ghost"), None);
         assert_eq!(

@@ -48,6 +48,14 @@
 //!   for the caller to route. Repeated crashes grow the delay until it caps —
 //!   a wedged agent (e.g. a missing allow-rule that re-errors every spawn) backs
 //!   off instead of hot-looping.
+//! - **A rate-limit death is not a crash** (task 070). A non-zero exit that
+//!   coincides with a `rejected` 5h/7d window or a `usage_limit_reached` / 429 /
+//!   `rate_limit` error in the member's stdout stream classifies as a
+//!   [`PollOutcome::RateLimitDeath`]: brought down-but-registered with NO
+//!   `AgentCrashed` alert, NO streak bump, NO backoff — the caller's timed
+//!   rate-limit hold gates the re-roll until the window's `resets_at`. A
+//!   transient network death ([`PollOutcome::Reconnecting`]) keeps its own
+//!   non-punitive path (network-failsafe slice 002).
 //! - **A clean exit reads the agent's baton, then decides.** Exit code 0 is a
 //!   session that ended on its own baton boundary; the supervisor reads that
 //!   baton's terminal status (the shared [`softfig_ipc::baton`] vocabulary) and
@@ -320,6 +328,20 @@ pub enum PollOutcome {
     /// halt the budget governor resumes; the rate gate itself, not a flag, holds it
     /// until its window resets.
     ParkedRateLimited,
+    /// A **rate-limit death** (task 070): a NON-ZERO exit the classifier attributed
+    /// to the quota wall — it coincides with a `rejected` 5h/7d window or with a
+    /// `usage_limit_reached` / 429 / `rate_limit` error in the member's stdout
+    /// stream — rather than a genuine crash. The non-zero twin of
+    /// [`ParkedRateLimited`](Self::ParkedRateLimited): the member is brought down
+    /// (its dead child dropped) but kept in the fleet, the failure streak is NOT
+    /// bumped, NO punitive backoff is scheduled (`not_before = now`), and NO
+    /// `AgentCrashed` alert fires. The drive loop's timed rate-limit hold — the
+    /// step-0 `rate_limit_hold_until` gate, extended to the stream error's
+    /// `resets_at` when the signal rode the stdout stream rather than a
+    /// `rate_limit_event` — holds the re-roll until the window resets, exactly
+    /// like the clean-exit park. The spin-guard streak resets (a budget pause is
+    /// not a stall, task 038), mirroring the clean park.
+    RateLimitDeath,
     /// Exited cleanly on a `STUCK` / `BLOCKED_ON_HUMAN` / unrecognized baton — the
     /// member can't progress on its current part without a human, so it is
     /// **released to idle** (dropped from the fleet, slot freed — exactly like an
@@ -383,6 +405,70 @@ pub enum PollOutcome {
     Down,
     /// The agent was never started (unknown id) — ignored.
     Unknown,
+}
+
+/// The human-facing lifecycle label the drive loop records to the daemon after
+/// each poll (task 070) — `growlight status` renders it instead of re-deriving a
+/// verdict from the raw health cell. The health cell LATCHES the last exit until
+/// a re-spawn, so a member that died on the quota wall would read `crashed (1)`
+/// forever without this: the classification lives here, in the supervisor that
+/// decided it, and the record is the single source `status` trusts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberLifecycle {
+    /// Alive with a recent heartbeat (a [`PollOutcome::Healthy`] observation).
+    Running,
+    /// Ended cleanly (continue roll, item boundary, retire, or a human-block
+    /// release) — the health cell's `Exited{code: 0}` reads "exited".
+    ExitedClean,
+    /// Down between sessions (inside a crash backoff / a held re-roll).
+    Down,
+    /// Crashed (errored exit or hung) — `status` shows `crashed (code)`.
+    Crashed,
+    /// A transient network death (soft reconnect, not a crash).
+    Reconnecting,
+    /// Rate-limited — a clean `HALTED_RATE_LIMIT` park OR a rate-limit death
+    /// (task 070): `status` shows the hold, never `crashed (n)`.
+    RateLimitedHeld,
+}
+
+impl MemberLifecycle {
+    /// The `status` label this lifecycle forces when it overrides the raw
+    /// health-cell reading — `None` means "fall back to the health-derived
+    /// label". A rate-limit hold and a reconnect override (the latched exit
+    /// would misread as `crashed (n)`); the rest let health speak (a crashed
+    /// member's `Exited{code}` is exactly right).
+    pub fn status_label(&self, health: Option<AgentHealth>) -> Option<String> {
+        match self {
+            Self::RateLimitedHeld => Some("held (rate-limited)".to_string()),
+            Self::Reconnecting => Some("reconnecting (transient network)".to_string()),
+            Self::Crashed => Some(match health {
+                Some(AgentHealth::Exited { code }) => format!("crashed ({code})"),
+                _ => "crashed".to_string(),
+            }),
+            Self::Running | Self::ExitedClean | Self::Down => None,
+        }
+    }
+}
+
+/// Map a [`PollOutcome`] to the [`MemberLifecycle`] the drive loop records for
+/// `status` (task 070). `None` for re-observations the record must NOT
+/// overwrite: a `Down` is an exit already consumed (its classification is still
+/// latched in the record), and an `Unknown` is an agent that was never
+/// registered. Pure, so the mapping is unit-proven.
+pub fn poll_outcome_lifecycle(outcome: &PollOutcome) -> Option<MemberLifecycle> {
+    match outcome {
+        PollOutcome::Healthy => Some(MemberLifecycle::Running),
+        PollOutcome::Rolling
+        | PollOutcome::Retired
+        | PollOutcome::Completed
+        | PollOutcome::Blocked { .. } => Some(MemberLifecycle::ExitedClean),
+        PollOutcome::ParkedRateLimited | PollOutcome::RateLimitDeath => {
+            Some(MemberLifecycle::RateLimitedHeld)
+        }
+        PollOutcome::Crashed { .. } => Some(MemberLifecycle::Crashed),
+        PollOutcome::Reconnecting => Some(MemberLifecycle::Reconnecting),
+        PollOutcome::Down | PollOutcome::Unknown => None,
+    }
 }
 
 /// The outcome of attempting one re-roll during a [`Supervisor::tick`].
@@ -671,6 +757,42 @@ impl Supervisor {
         now: i64,
         network_exit: F,
     ) -> PollOutcome {
+        self.poll_with_exits(
+            agent,
+            health,
+            baton_status,
+            next_action,
+            now,
+            network_exit,
+            // The pre-task-070 behaviour: every non-network exit is a genuine crash.
+            || false,
+        )
+    }
+
+    /// Like [`poll_with_network`](Self::poll_with_network), but with a
+    /// `rate_limit_exit` predicate too — evaluated ONLY on a crash verdict of a
+    /// non-zero exit whose child is still un-consumed (so a healthy tick pays
+    /// nothing, and a re-observed latched exit stays the inert `Down`). It decides
+    /// whether the exit is a **rate-limit death** (task 070): the quota wall killed
+    /// the member — the exit coincides with a `rejected` 5h/7d window or with a
+    /// `usage_limit_reached` / 429 / `rate_limit` error in its stdout stream — so
+    /// the member is brought down-but-registered with NO streak bump, NO backoff,
+    /// and NO `AgentCrashed` alert ([`PollOutcome::RateLimitDeath`]). The drive loop
+    /// builds it from the budget cell's `rate_limit_reopen` + the backend's latched
+    /// [`StreamError`](crate::agent_harness::StreamError) (the stderr ring can't see
+    /// the in-band 429); the timed rate-limit hold gates the re-roll until the
+    /// window's `resets_at`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_with_exits<F: FnOnce() -> bool, G: FnOnce() -> bool>(
+        &mut self,
+        agent: &str,
+        health: AgentHealth,
+        baton_status: Option<&str>,
+        next_action: Option<&str>,
+        now: i64,
+        network_exit: F,
+        rate_limit_exit: G,
+    ) -> PollOutcome {
         let hang_secs = self.hang_secs;
         if !self.agents.contains_key(agent) {
             return PollOutcome::Unknown;
@@ -716,7 +838,18 @@ impl Supervisor {
                     // the backoff; `tick` re-rolls when it elapses. Covers the
                     // errored-exit re-observation AND the killed-hung child
                     // whose stale `Alive` lingers until the reaper flips it.
+                    // (A rate-limit death is consumed the same way — its first
+                    // observation took the child; re-observations are `Down`,
+                    // and the timed rate-limit hold, not a re-classification,
+                    // gates the re-roll until `resets_at`.)
                     PollOutcome::Down
+                } else if rate_limit_exit() {
+                    // The quota wall, not a bug (task 070): the exit coincides
+                    // with a `rejected` window / a 429 in the member's stdout
+                    // stream. Brought down-but-registered — no alert, no
+                    // streak, no backoff; the drive loop's rate-limit hold
+                    // gates the re-roll until the window resets.
+                    self.on_rate_limit_exit(agent, health, now)
                 } else {
                     self.on_crash(agent, health, now)
                 }
@@ -776,6 +909,31 @@ impl Supervisor {
         // the actual re-spawn while offline.
         sup.not_before = now;
         PollOutcome::Reconnecting
+    }
+
+    /// Handle a **rate-limit death** (task 070): a non-zero exit the classifier
+    /// attributed to the quota wall — a `rejected` 5h/7d window or a
+    /// `usage_limit_reached` / 429 / `rate_limit` error in the member's stdout
+    /// stream — not a genuine crash. The child already exited, so its handle is
+    /// just dropped; the member stays down-but-registered (re-rolled once the
+    /// drive loop's timed rate-limit hold elapses at the window's `resets_at`),
+    /// with NO failure-streak bump, NO punitive backoff (`not_before = now`), and
+    /// NO alert. The spin-guard streak resets exactly like the clean
+    /// `HALTED_RATE_LIMIT` park (a budget pause is not a no-progress stall,
+    /// task 038); the crash streak is left untouched (a rate-limit death is not a
+    /// failure, but neither is it a clean session to reset one).
+    fn on_rate_limit_exit(&mut self, agent: &str, _health: AgentHealth, now: i64) -> PollOutcome {
+        let sup = self
+            .agents
+            .get_mut(agent)
+            .expect("agent exists (checked in poll)");
+        // The child EXITED (the predicate only ever fires on an `Exited` health) —
+        // drop the handle; nothing to kill.
+        let _ = sup.child.take();
+        sup.not_before = now;
+        sup.last_next_action = None;
+        sup.unchanged_streak = 0;
+        PollOutcome::RateLimitDeath
     }
 
     /// Decide what a clean (code-0) exit means by reading the agent's terminal
@@ -1353,6 +1511,151 @@ mod tests {
                 vec![RerollOutcome::Rerolled { agent: "a1".into() }]
             );
         }
+    }
+
+    /// TASK 070 — a non-zero exit the rate-limit classifier attributes to the
+    /// quota wall (a `rejected` window / a 429 in the stdout stream) is a
+    /// **rate-limit death**, not a crash: brought down-but-registered with NO
+    /// `AgentCrashed` alert, NO failure-streak bump, NO backoff — the drive loop's
+    /// timed rate-limit hold (not a punitive delay) gates the re-roll until the
+    /// window's `resets_at`. Re-observations of the same latched exit stay inert
+    /// (`Down`), like a consumed crash.
+    #[test]
+    fn poll_with_exits_classifies_a_rate_limit_death_without_backoff_or_event() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend)); // base 2, cap 8
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        // A non-zero exit WITH the rate-limit signal → a rate-limit death: no
+        // event, no streak, immediately re-rollable.
+        let out = s.poll_with_exits(
+            "a1",
+            AgentHealth::Exited { code: 1 },
+            None,
+            None,
+            0,
+            || false,
+            || true,
+        );
+        assert_eq!(out, PollOutcome::RateLimitDeath);
+        assert_eq!(s.failures("a1"), 0, "a rate-limit death never bumps the crash streak");
+        assert!(!s.is_running("a1"), "the dead child was dropped");
+        assert_eq!(backend.kill_count(), 0, "an exited child is not killed again");
+
+        // The member is immediately re-rollable (no backoff): `not_before = now`.
+        // The drive loop's timed rate-limit hold — not the supervisor — paces the
+        // actual re-roll until `resets_at`.
+        assert_eq!(
+            s.tick(fresh_budget(), fresh_rate(), 1, &any_work),
+            vec![RerollOutcome::Rerolled { agent: "a1".into() }]
+        );
+
+        // Re-observations of the same latched exit are inert `Down` (task 044's
+        // consumed-exit guard), never a re-run of the classification.
+        let backend2 = FakeBackend::new();
+        let mut s2 = sup(Arc::clone(&backend2));
+        s2.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert_eq!(
+            s2.poll_with_exits("a1", AgentHealth::Exited { code: 1 }, None, None, 0, || false, || true),
+            PollOutcome::RateLimitDeath
+        );
+        assert_eq!(
+            s2.poll_with_exits("a1", AgentHealth::Exited { code: 1 }, None, None, 1, || false, || true),
+            PollOutcome::Down,
+            "the consumed rate-limit death re-observes inert",
+        );
+    }
+
+    /// TASK 070 — without the rate-limit signal the crash path is bit-for-bit
+    /// unchanged (`poll_with_exits` with a false predicate is the historical
+    /// classification), and the network classifier keeps precedence (slice 002's
+    /// contract: evaluated before the consumed-exit guard).
+    #[test]
+    fn poll_with_exits_keeps_the_genuine_crash_and_network_paths_unchanged() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        // No rate signal → a genuine crash, exactly as before.
+        let out = s.poll_with_exits(
+            "a1",
+            AgentHealth::Exited { code: 1 },
+            None,
+            None,
+            0,
+            || false,
+            || false,
+        );
+        assert_eq!(
+            out,
+            PollOutcome::Crashed {
+                event: NotifyEvent::agent_crashed("a1"),
+                failures: 1,
+                not_before: 2,
+            }
+        );
+
+        // Both signals → the network classifier wins (it is evaluated first; a
+        // rate-limit death's stderr never matches a network signature anyway).
+        let backend2 = FakeBackend::new();
+        let mut s2 = sup(Arc::clone(&backend2));
+        s2.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+        assert_eq!(
+            s2.poll_with_exits("a1", AgentHealth::Exited { code: 1 }, None, None, 0, || true, || true),
+            PollOutcome::Reconnecting
+        );
+    }
+
+    /// TASK 070 — the `status` lifecycle mapping: a rate-limit death and a clean
+    /// rate park record the SAME `RateLimitedHeld` override (the label that keeps
+    /// `status` from latching `crashed (n)`), a reconnect records `Reconnecting`,
+    /// and the inert re-observations record nothing (they must not overwrite the
+    /// latched classification).
+    #[test]
+    fn poll_outcome_lifecycle_records_the_status_overrides() {
+        assert_eq!(
+            poll_outcome_lifecycle(&PollOutcome::RateLimitDeath),
+            Some(MemberLifecycle::RateLimitedHeld)
+        );
+        assert_eq!(
+            poll_outcome_lifecycle(&PollOutcome::ParkedRateLimited),
+            Some(MemberLifecycle::RateLimitedHeld)
+        );
+        assert_eq!(
+            poll_outcome_lifecycle(&PollOutcome::Reconnecting),
+            Some(MemberLifecycle::Reconnecting)
+        );
+        assert_eq!(
+            poll_outcome_lifecycle(&PollOutcome::Crashed {
+                event: NotifyEvent::agent_crashed("a1"),
+                failures: 1,
+                not_before: 2,
+            }),
+            Some(MemberLifecycle::Crashed)
+        );
+        assert_eq!(
+            poll_outcome_lifecycle(&PollOutcome::Healthy),
+            Some(MemberLifecycle::Running)
+        );
+        assert_eq!(poll_outcome_lifecycle(&PollOutcome::Down), None);
+        assert_eq!(poll_outcome_lifecycle(&PollOutcome::Unknown), None);
+
+        // The override labels: a rate-limit death never renders `crashed (1)`,
+        // whatever the latched health cell says.
+        assert_eq!(
+            MemberLifecycle::RateLimitedHeld.status_label(Some(AgentHealth::Exited { code: 1 })),
+            Some("held (rate-limited)".to_string())
+        );
+        assert_eq!(
+            MemberLifecycle::Reconnecting.status_label(Some(AgentHealth::Exited { code: 1 })),
+            Some("reconnecting (transient network)".to_string())
+        );
+        assert_eq!(
+            MemberLifecycle::Crashed.status_label(Some(AgentHealth::Exited { code: 1 })),
+            Some("crashed (1)".to_string())
+        );
+        // Non-overriding lifecycles fall back to the health-derived label.
+        assert_eq!(MemberLifecycle::Running.status_label(Some(AgentHealth::Alive { last_active: 0 })), None);
     }
 
     /// A clean exit (code 0) re-rolls immediately with no alert and clears the

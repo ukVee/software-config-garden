@@ -106,6 +106,14 @@ pub enum NotifyEvent {
         /// keys on the agent alone, so a re-crash with different stderr still dedups
         /// per cooldown window.
         stderr_tail: Vec<String>,
+        /// The crashed agent's last **stdout** stream error, when its stream ended
+        /// on one (task 070): the in-band API error a headless member prints on
+        /// STDOUT — a permission failure, a provider error, anything the stderr
+        /// ring is blind to (stderr carries only the `systemd-run` banner). Rendered
+        /// FIRST in the summary, so the alert names the real reason; the banner
+        /// lines are filtered out of `stderr_tail` by the drive loop, never carried.
+        /// NOT part of the dedup identity.
+        stdout_error: Option<String>,
     },
     /// The thrash detector tripped on a contended target (§4d rung 1).
     ThrashDetected {
@@ -155,13 +163,15 @@ pub enum NotifyEvent {
 impl NotifyEvent {
     /// An [`AgentCrashed`](Self::AgentCrashed) with no stderr tail yet. The
     /// supervisor builds it this way (it has no backend to read stderr from); the
-    /// drive loop enriches it via [`with_stderr_tail`](Self::with_stderr_tail)
-    /// before dispatch. Also the right shape for a *spawn* failure — the child never
-    /// ran, so there is no stderr to carry.
+    /// drive loop enriches it via [`with_stderr_tail`](Self::with_stderr_tail) /
+    /// [`with_stdout_error`](Self::with_stdout_error) before dispatch. Also the
+    /// right shape for a *spawn* failure — the child never ran, so there is no
+    /// stderr to carry.
     pub fn agent_crashed(agent: impl Into<String>) -> Self {
         Self::AgentCrashed {
             agent: agent.into(),
             stderr_tail: Vec::new(),
+            stdout_error: None,
         }
     }
 
@@ -171,6 +181,18 @@ impl NotifyEvent {
     pub fn with_stderr_tail(mut self, tail: Vec<String>) -> Self {
         if let Self::AgentCrashed { stderr_tail, .. } = &mut self {
             *stderr_tail = tail;
+        }
+        self
+    }
+
+    /// Attach a crashed agent's last stdout stream error (task 070), returning the
+    /// enriched event: the in-band API error a headless member printed on STDOUT —
+    /// the reason stderr-only enrichment can't see (stderr carries only the
+    /// `systemd-run` banner). A no-op on any non-[`AgentCrashed`](Self::AgentCrashed)
+    /// event.
+    pub fn with_stdout_error(mut self, error: Option<String>) -> Self {
+        if let Self::AgentCrashed { stdout_error, .. } = &mut self {
+            *stdout_error = error;
         }
         self
     }
@@ -236,14 +258,26 @@ impl NotifyEvent {
             }
             Self::QueueEmpty { queue } => format!("queue `{queue}` is empty — no workable part"),
             Self::SliceComplete { part } => format!("slice `{part}` complete"),
-            Self::AgentCrashed { agent, stderr_tail } => {
-                if stderr_tail.is_empty() {
+            Self::AgentCrashed {
+                agent,
+                stderr_tail,
+                stdout_error,
+            } => {
+                // The stdout stream error (task 070) leads — it is the in-band
+                // reason the member died on; the stderr lines (banner-filtered by
+                // the drive loop) follow. Neither present → the plain crash line.
+                let mut lines: Vec<&str> = Vec::new();
+                if let Some(err) = stdout_error {
+                    lines.push(err.as_str());
+                }
+                lines.extend(stderr_tail.iter().map(String::as_str));
+                if lines.is_empty() {
                     format!("agent `{agent}` crashed")
                 } else {
-                    // The tail rides the one-line alert body so `growlight watch`
-                    // and the log show the crash *reason*; lines joined with a
-                    // visible separator (the ring already bounds it).
-                    format!("agent `{agent}` crashed: {}", stderr_tail.join(" ⏎ "))
+                    // The reasons ride the one-line alert body so `growlight watch`
+                    // and the log show the crash *why*; lines joined with a visible
+                    // separator (the ring already bounds it).
+                    format!("agent `{agent}` crashed: {}", lines.join(" ⏎ "))
                 }
             }
             Self::ThrashDetected { target } => format!("thrash detected on {target}"),
@@ -547,6 +581,46 @@ mod tests {
         // `with_stderr_tail` is a no-op on a non-crash event.
         assert_eq!(
             NotifyEvent::Usage { pct: 97 }.with_stderr_tail(vec!["x".to_string()]),
+            NotifyEvent::Usage { pct: 97 }
+        );
+    }
+
+    /// TASK 070 — the crash body leads with the member's last **stdout** stream
+    /// error when there is one (the in-band reason stderr-only enrichment is blind
+    /// to), the stderr lines follow, and neither present reads the plain crash
+    /// line. Enrichment never changes the dedup identity.
+    #[test]
+    fn agent_crashed_summary_leads_with_the_stdout_error() {
+        // A 429 death that slipped through as a genuine crash (the classifier
+        // missed it) still names its real reason from the stream, not the banner.
+        let with_stream = NotifyEvent::agent_crashed("a")
+            .with_stdout_error(Some(
+                "You've hit your session limit · resets 4:40pm".to_string(),
+            ))
+            .with_stderr_tail(vec!["stack line".to_string()]);
+        assert_eq!(
+            with_stream.summary(),
+            "agent `a` crashed: You've hit your session limit · resets 4:40pm ⏎ stack line"
+        );
+        assert_eq!(
+            with_stream.dedup_key(),
+            NotifyEvent::agent_crashed("a").dedup_key(),
+            "the stdout error is not part of the identity"
+        );
+
+        // No stdout error, no stderr → the plain line.
+        assert_eq!(
+            NotifyEvent::agent_crashed("a")
+                .with_stdout_error(None)
+                .with_stderr_tail(Vec::new())
+                .summary(),
+            "agent `a` crashed"
+        );
+
+        // `with_stdout_error` is a no-op on a non-crash event.
+        assert_eq!(
+            NotifyEvent::Usage { pct: 97 }
+                .with_stdout_error(Some("x".to_string())),
             NotifyEvent::Usage { pct: 97 }
         );
     }
