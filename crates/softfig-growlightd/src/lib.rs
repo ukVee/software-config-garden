@@ -90,7 +90,8 @@ pub use queue_source::{parse_snapshot, KeeperdQueueSource, BACKLOG_DOC, DEFAULT_
 pub use reconcile::{reconcile_on_boot, ReconcileReport};
 pub use resume::{ItemResumer, KeeperdItemResumer, ResumeOutcome};
 pub use scheduler::{
-    classify_queue, parked, pick, PartStatus, PartView, QueueState, QueueView, Snapshot,
+    classify_queue, held, parked, pick, pick_for, ClaimHold, PartStatus, PartView, QueueState,
+    QueueView, Snapshot,
 };
 pub use state::State;
 pub use supervisor::{

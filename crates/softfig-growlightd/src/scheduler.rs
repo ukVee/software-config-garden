@@ -34,6 +34,17 @@
 //!   *per queue* (slice 001), a queue an agent is already draining shows an
 //!   `active` head and is skipped by every other agent's fallback — so free agents
 //!   flow to distinct unclaimed queues instead of piling onto one.
+//! - **Human-only items are never claimed** (task 068). A `queued` part carrying a
+//!   [`ClaimHold`] — its item doc declares `> Fleet: no` — is rolled past like a
+//!   `deferred` one, by the pinned pick and by fallback alike. It stays `queued`
+//!   (it is the human's, not blocked), so nothing parks and nothing pages; the
+//!   loop lists it via [`held`] so the skip is journaled and shown in `status`.
+//! - **A pinned queue is its pinned member's first** (task 068). Fallback skips a
+//!   queue another member still [`reserved`](pick_for) — pinned to it and free to
+//!   take its next part, or still draining it — so a drained member cannot take
+//!   the next part out from under the member whose work-stream it is.
+
+use std::collections::BTreeSet;
 
 /// A backlog item's status, as the scheduler classifies it. Mirrors the status
 /// vocabulary keeperd writes into the queue tables (`queued`/`active`/`done`/
@@ -73,23 +84,57 @@ impl PartStatus {
     }
 }
 
-/// One assignable part — a row in a queue. The scheduler needs only the id (what
-/// it returns) and the status (how it classifies); title/type are carried by the
-/// item docs, not here.
+/// Why the fleet must not claim a `queued` part (task 068). Read from the item's
+/// own doc, not its status: the part stays `queued` — it is waiting for the human,
+/// not blocked — so a hold parks nothing and pages no one; [`classify_queue`]
+/// just rolls past it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimHold {
+    /// The item doc declares `> Fleet: <value>` with any value but `yes` — the
+    /// declared value is carried for the journal. Removing the line (or writing
+    /// `yes`) makes the item claimable again.
+    HumanOnly(String),
+    /// The item doc could not be read, so the marker is unknown — fail-closed
+    /// for this pass rather than risk claiming human-only work. Carries the error.
+    Unreadable(String),
+}
+
+impl ClaimHold {
+    /// The one-line skip reason the journal and `growlight status` show.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::HumanOnly(value) => format!("human-only (> Fleet: {value})"),
+            Self::Unreadable(error) => format!("fleet marker unreadable: {error}"),
+        }
+    }
+}
+
+/// One assignable part — a row in a queue. The scheduler needs the id (what it
+/// returns), the status (how it classifies), and any [`ClaimHold`] the item doc
+/// declares; title/type are carried by the item docs, not here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartView {
     pub id: String,
     pub status: PartStatus,
+    /// Set on a part the fleet must not claim. Only a `queued` part is ever held:
+    /// an `active` part is someone's work already, and is never parked by it.
+    pub hold: Option<ClaimHold>,
 }
 
 impl PartView {
     /// Convenience constructor from a raw `(id, status-string)` pair, the shape a
-    /// keeperd queue row reduces to.
+    /// keeperd queue row reduces to. No hold — the queue table does not carry one.
     pub fn new(id: impl Into<String>, status: &str) -> Self {
         Self {
             id: id.into(),
             status: PartStatus::parse(status),
+            hold: None,
         }
+    }
+
+    /// Whether the fleet may start this part: `queued` with no hold.
+    fn claimable(&self) -> bool {
+        self.status == PartStatus::Queued && self.hold.is_none()
     }
 }
 
@@ -167,6 +212,20 @@ impl Snapshot {
             }
         }
     }
+
+    /// Put a [`ClaimHold`] on a `queued` `part` in `queue` — the intra-tick mark
+    /// for a hold found by the claim-time marker re-read, so a later member's
+    /// [`pick`] in the SAME tick rolls past it too. A no-op when the queue or part
+    /// is absent, or the part is not `queued` (an `active` part is never held).
+    pub fn mark_held(&mut self, queue: &str, part: &str, hold: ClaimHold) {
+        if let Some(q) = self.queues.iter_mut().find(|q| q.name == queue) {
+            if let Some(p) = q.parts.iter_mut().find(|p| p.id == part) {
+                if p.status == PartStatus::Queued {
+                    p.hold = Some(hold);
+                }
+            }
+        }
+    }
 }
 
 /// A queue's drainable state, reduced to its head workable part. Produced by
@@ -191,12 +250,16 @@ pub enum QueueState {
 /// Reduce a queue to its head workable part by scanning rows in order. The first
 /// `active`/`queued`/`blocked` row decides the state; `done`/`deferred`/`other`
 /// rows are rolled past (so a `blocked` row is head-of-line — it cannot be jumped
-/// by a later `queued` row, honoring intra-queue ordering deps).
+/// by a later `queued` row, honoring intra-queue ordering deps). A held `queued`
+/// row ([`ClaimHold`]) is rolled past too: it is the human's work, waiting on
+/// them like a `deferred` one, so it neither parks the queue nor gets claimed.
 pub fn classify_queue(queue: &QueueView) -> QueueState {
     for part in &queue.parts {
         match part.status {
             PartStatus::Active => return QueueState::Active(part.id.clone()),
-            PartStatus::Queued => return QueueState::Ready(part.id.clone()),
+            PartStatus::Queued if part.claimable() => return QueueState::Ready(part.id.clone()),
+            // Held for the human — rolled past, never claimed (task 068).
+            PartStatus::Queued => {}
             PartStatus::Blocked => return QueueState::Blocked(part.id.clone()),
             // Rolled past: finished, parked-for-human, or unrecognized.
             PartStatus::Deferred | PartStatus::Done | PartStatus::Other => {}
@@ -220,6 +283,24 @@ pub fn classify_queue(queue: &QueueView) -> QueueState {
 /// a queue and its head turns `active`, every other agent's fallback flows past it
 /// to a different unclaimed queue.
 pub fn pick(snapshot: &Snapshot, pin: Option<&str>) -> Option<(String, String)> {
+    pick_for(snapshot, pin, &BTreeSet::new())
+}
+
+/// [`pick`] with the queues **`reserved`** for other members left out of the
+/// fallback (task 068). The drive loop reserves a queue for the member pinned to
+/// it while that member can take its next part — free to start one, or still
+/// draining that queue (its part just went terminal and it is on its way out).
+/// Without this a drained member's fallback took `psy/psy-booking` while `psy`'s
+/// own pinned member was still exiting from `psy-events` (2026-10-16 17:34),
+/// and the pinned member came back to find its queue's next part gone.
+///
+/// Only the fallback reads `reserved`: an agent's own pinned queue is never
+/// reserved against it, even when another member shares the pin.
+pub fn pick_for(
+    snapshot: &Snapshot,
+    pin: Option<&str>,
+    reserved: &BTreeSet<String>,
+) -> Option<(String, String)> {
     // 1. Pinned queue first — prefer the agent's own work-stream.
     if let Some(pin) = pin {
         if let Some(q) = snapshot.queue(pin) {
@@ -236,10 +317,14 @@ pub fn pick(snapshot: &Snapshot, pin: Option<&str>) -> Option<(String, String)> 
         }
     }
 
-    // 2. Fallback — first OTHER queue with an unclaimed (`queued`) head.
+    // 2. Fallback — first OTHER queue with an unclaimed (`queued`) head that no
+    //    other member has reserved.
     for q in &snapshot.queues {
         if Some(q.name.as_str()) == pin {
             continue; // already considered as the pinned queue
+        }
+        if reserved.contains(&q.name) {
+            continue; // its pinned member can take it — not ours to drain
         }
         if let QueueState::Ready(id) = classify_queue(q) {
             return Some((q.name.clone(), id));
@@ -261,6 +346,23 @@ pub fn parked(snapshot: &Snapshot) -> Vec<(String, String)> {
         .filter_map(|q| match classify_queue(q) {
             QueueState::Blocked(id) => Some((q.name.clone(), id)),
             _ => None,
+        })
+        .collect()
+}
+
+/// Every held `queued` part across the snapshot, as `(queue, part, hold)` in
+/// snapshot order — what the fleet is leaving for the human (task 068). The drive
+/// loop journals a change in this set and `growlight status` lists it, so a skip
+/// is always visible; it is not an alert (a hold is not a block).
+pub fn held(snapshot: &Snapshot) -> Vec<(String, String, ClaimHold)> {
+    snapshot
+        .queues
+        .iter()
+        .flat_map(|q| {
+            q.parts.iter().filter_map(move |p| match (&p.status, &p.hold) {
+                (PartStatus::Queued, Some(hold)) => Some((q.name.clone(), p.id.clone(), hold.clone())),
+                _ => None,
+            })
         })
         .collect()
 }
@@ -507,6 +609,113 @@ mod tests {
             QueueState::Ready("p1".into()),
             "a mark against a missing queue/part changes nothing",
         );
+    }
+
+    /// A `queued` part whose item doc declares `> Fleet: no`.
+    fn human_only(id: &str) -> PartView {
+        PartView { hold: Some(ClaimHold::HumanOnly("no".into())), ..PartView::new(id, "queued") }
+    }
+
+    #[test]
+    fn a_pinned_member_rolls_past_a_human_only_head_to_the_next_part() {
+        // The pinned queue's head is the human's; the member takes the part behind
+        // it instead of claiming it — and nothing parks (a hold is not a block).
+        let snap = Snapshot::new(vec![QueueView::new(
+            "mine",
+            vec![human_only("h1"), PartView::new("p2", "queued")],
+        )]);
+        assert_eq!(pick_pinned(&snap, "mine"), Some(("mine".into(), "p2".into())));
+        assert!(parked(&snap).is_empty(), "a human-only item never parks its queue");
+    }
+
+    #[test]
+    fn a_fallback_member_never_claims_a_human_only_part() {
+        // The 2026-10-16 sequence: a drained member's fallback walked into
+        // human-only items. Every other queue holds only human-only work, so there
+        // is nothing to take — not the human's item.
+        let snap = Snapshot::new(vec![
+            q("mine", &[("p1", "done")]),
+            QueueView::new("default", vec![human_only("queue-v2-scheduling")]),
+            QueueView::new("hoverview", vec![human_only("hover-view-sticky")]),
+        ]);
+        assert_eq!(pick_pinned(&snap, "mine"), None);
+        assert_eq!(pick(&snap, None), None, "an unpinned member is held off it too");
+        assert!(parked(&snap).is_empty());
+    }
+
+    #[test]
+    fn an_item_that_loses_the_marker_becomes_claimable() {
+        let held_snap = Snapshot::new(vec![QueueView::new("default", vec![human_only("h1")])]);
+        assert_eq!(pick(&held_snap, None), None);
+        // The owner removes the `> Fleet: no` line: the next snapshot carries no
+        // hold, and the very same row schedules exactly as an unmarked one.
+        let cleared = Snapshot::new(vec![q("default", &[("h1", "queued")])]);
+        assert_eq!(pick(&cleared, None), Some(("default".into(), "h1".into())));
+    }
+
+    #[test]
+    fn held_lists_every_held_queued_part_with_its_reason() {
+        let unreadable = PartView {
+            hold: Some(ClaimHold::Unreadable("keeperd down".into())),
+            ..PartView::new("u1", "queued")
+        };
+        let snap = Snapshot::new(vec![
+            QueueView::new("a", vec![PartView::new("a1", "queued"), human_only("a2")]),
+            QueueView::new("b", vec![unreadable]),
+        ]);
+        let listed = held(&snap);
+        assert_eq!(listed.len(), 2);
+        assert_eq!((listed[0].0.as_str(), listed[0].1.as_str()), ("a", "a2"));
+        assert_eq!(listed[0].2.reason(), "human-only (> Fleet: no)");
+        assert_eq!(listed[1].2.reason(), "fleet marker unreadable: keeperd down");
+    }
+
+    #[test]
+    fn mark_held_holds_a_queued_part_but_never_an_active_one() {
+        let mut snap = Snapshot::new(vec![
+            q("qa", &[("p1", "queued")]),
+            q("qb", &[("p2", "active")]),
+        ]);
+        snap.mark_held("qa", "p1", ClaimHold::HumanOnly("no".into()));
+        assert_eq!(classify_queue(snap.queue("qa").unwrap()), QueueState::Empty);
+        // A member is already on p2: the marker never parks work in flight.
+        snap.mark_held("qb", "p2", ClaimHold::HumanOnly("no".into()));
+        assert_eq!(classify_queue(snap.queue("qb").unwrap()), QueueState::Active("p2".into()));
+        assert!(held(&snap).iter().all(|(_, part, _)| part != "p2"));
+    }
+
+    #[test]
+    fn fallback_leaves_a_reserved_queue_to_its_pinned_member() {
+        // The 2026-10-16 17:34 sequence, reduced: `psy`'s head turned `queued` the
+        // moment its pinned member's part went terminal, while that member was still
+        // exiting. The drained `fid` member's fallback must not take it.
+        let snap = Snapshot::new(vec![
+            q("fid", &[("f1", "done")]),
+            q("psy", &[("psy-events", "deferred"), ("psy-booking", "queued")]),
+        ]);
+        let reserved: BTreeSet<String> = ["psy".to_string()].into();
+        assert_eq!(pick_for(&snap, Some("fid"), &reserved), None);
+        // Unreserved (its pinned member is stopped), fallback takes it as before.
+        assert_eq!(
+            pick_for(&snap, Some("fid"), &BTreeSet::new()),
+            Some(("psy".into(), "psy-booking".into())),
+        );
+        // The pinned member itself is never kept off its own queue.
+        assert_eq!(
+            pick_for(&snap, Some("psy"), &reserved),
+            Some(("psy".into(), "psy-booking".into())),
+        );
+    }
+
+    #[test]
+    fn fallback_flows_past_a_reserved_queue_to_a_free_one() {
+        let snap = Snapshot::new(vec![
+            q("mine", &[]),
+            q("taken", &[("t1", "queued")]),
+            q("free", &[("f1", "queued")]),
+        ]);
+        let reserved: BTreeSet<String> = ["taken".to_string()].into();
+        assert_eq!(pick_for(&snap, Some("mine"), &reserved), Some(("free".into(), "f1".into())));
     }
 
     #[test]
