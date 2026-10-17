@@ -269,6 +269,42 @@ Three differences worth knowing when reading logs:
   `AgentCrashed` alert carries them. A network error reported this way also counts toward
   the transient-network classification, the same as one on stderr.
 
+## When a member stops progressing: the spin guard
+
+A member that exits cleanly on a continue status is re-rolled. The spin guard stops one
+that keeps re-rolling without getting anywhere, before it burns the shared budget. Two
+things count as progress:
+
+- a changed `# NEXT ACTION` in the member's baton;
+- the item's repo moving, meaning a new `HEAD` or a changed dirty tree (task 069). A
+  session can do real work and still exit without a handoff, and before this, one such
+  session was enough to park the item.
+
+The repo is taken from the item doc's `> Worktree:` line, else from the queue registry's
+`repo` column, else there is none. A value this device can't probe gives no repo signal:
+a remote `host:/path`, a relative path, or a doc keeperd couldn't serve. The guard then
+decides on NEXT ACTION alone, as it did before. A default-queue item only gets the repo
+signal once its doc carries `> Worktree:`, since the default queue has no registry row.
+The repo is read once per session exit, with `git --no-optional-locks`, never once per
+tick.
+
+The repo excuses at most three repeats of one NEXT ACTION, and only a repo state not
+already seen during that NEXT ACTION's run. A tree that churns forever, or flips between
+two states, still trips. On a trip (two exits on the same NEXT ACTION with nothing to
+excuse them) the member is released and its item parked `blocked`, the same as for a
+member-written `STUCK`. The page names the guard instead of asking for a decision:
+
+```
+`069` stuck (spin guard): 2 sessions ended with no new handoff — repo dirty: 3 files
+```
+
+The tail reads `repo clean` or `repo unknown` when that is the case. A member-declared
+`BLOCKED_ON_HUMAN` still pages as `` `X` is blocked on a human decision ``. Both kinds
+use the same reminder ladder (30 min → 2 h → 8 h → daily) under separate identities, and
+both are forgotten once the item leaves the parked set. The spin record is kept in
+memory only, so after a growlightd restart a spin park that is still standing pages as a
+human block.
+
 ## Known gaps
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent
@@ -278,7 +314,7 @@ status` does.
 
 A headless opencode member cannot write to a **code repo**. The permission floor reaches
 only the loop's own state, so an ungranted repo yields a refusal a headless session cannot
-answer. growlightd does not model repos at all today (the queue→repo binding is dropped
-when the registry is parsed), so there is nothing to grant from. Until the folder grants
+answer. growlightd resolves an item's repo only to see whether it moved (the spin guard
+above), and nothing grants a member write access to that repo. Until the folder grants
 land (step 2 of `decision-opencode-v2-fleet-safety-order`, appended after rule 8), an
 opencode member is limited to garden work through the softfig-mcp verbs.
