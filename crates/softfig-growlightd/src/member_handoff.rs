@@ -293,7 +293,7 @@ fn walk_next(after: &V2Snapshot, entry: &str) -> Option<NextUnit> {
     let view = after.entries.iter().find(|e| e.id == entry)?;
     match next_unit(after, view) {
         WalkOutcome::Unit { unit, .. } => Some(next_of(entry, &unit)),
-        WalkOutcome::Blocked | WalkOutcome::NoUnit => None,
+        WalkOutcome::Blocked { .. } | WalkOutcome::NoUnit => None,
     }
 }
 

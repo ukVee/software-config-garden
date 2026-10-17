@@ -232,7 +232,9 @@ pub enum WalkOutcome {
         models: Option<ModelList>,
     },
     /// The walk stopped at a `blocked` item: the entry has no next slice.
-    Blocked,
+    /// `at` is that item's address, `<milestone>:<id>` (a sub-milestone's
+    /// slice reads `<parent>/<sub>:<id>`) — what the §2 alert names.
+    Blocked { at: String },
     /// No unit at all — a missing tree (fail closed; a close-out is never
     /// guessed over unseen work).
     NoUnit,
@@ -284,7 +286,11 @@ fn walk_tree(snapshot: &V2Snapshot, milestone: &str) -> WalkOutcome {
                         models: item.models.clone(),
                     };
                 }
-                SliceStatus::Blocked => return WalkOutcome::Blocked,
+                SliceStatus::Blocked => {
+                    return WalkOutcome::Blocked {
+                        at: format!("{milestone}:{}", item.id),
+                    }
+                }
                 // Rolled past (§2).
                 SliceStatus::Done | SliceStatus::Split | SliceStatus::Deferred => {}
             },
@@ -296,7 +302,11 @@ fn walk_tree(snapshot: &V2Snapshot, milestone: &str) -> WalkOutcome {
                     // the whole entry.
                     return walk_tree(snapshot, &format!("{milestone}/{}", item.id));
                 }
-                SliceStatus::Blocked => return WalkOutcome::Blocked,
+                SliceStatus::Blocked => {
+                    return WalkOutcome::Blocked {
+                        at: format!("{milestone}:{}", item.id),
+                    }
+                }
                 // `split` is a slice-only state in meaning (§3.3); treat a
                 // split sub as done, defensively.
                 SliceStatus::Done | SliceStatus::Split | SliceStatus::Deferred => {}
@@ -382,7 +392,7 @@ pub fn eligible(
             }
             Ok((unit, models))
         }
-        WalkOutcome::Blocked => Err(SkipReason::BlockedWalk),
+        WalkOutcome::Blocked { .. } => Err(SkipReason::BlockedWalk),
         WalkOutcome::NoUnit => Err(SkipReason::NoUnit),
     }
 }
@@ -1050,7 +1060,10 @@ mod tests {
             vec![e.clone()],
         );
         snapshot.trees.insert("e".into(), tree(items));
-        assert_eq!(next_unit(&snapshot, &e), WalkOutcome::Blocked);
+        assert_eq!(
+            next_unit(&snapshot, &e),
+            WalkOutcome::Blocked { at: "e:002".into() }
+        );
         assert_eq!(
             eligible(&snapshot, &member("m"), &e),
             Err(SkipReason::BlockedWalk)
@@ -1124,7 +1137,10 @@ mod tests {
         );
         snapshot.trees.insert("m".into(), tree(parent_items));
         snapshot.trees.insert("m/s".into(), tree(sub_items));
-        assert_eq!(next_unit(&snapshot, &e), WalkOutcome::Blocked);
+        assert_eq!(
+            next_unit(&snapshot, &e),
+            WalkOutcome::Blocked { at: "m/s:002".into() }
+        );
     }
 
     #[test]
@@ -1139,7 +1155,10 @@ mod tests {
             vec![e.clone()],
         );
         snapshot.trees.insert("m".into(), tree(parent_items));
-        assert_eq!(next_unit(&snapshot, &e), WalkOutcome::Blocked);
+        assert_eq!(
+            next_unit(&snapshot, &e),
+            WalkOutcome::Blocked { at: "m:s".into() }
+        );
     }
 
     #[test]

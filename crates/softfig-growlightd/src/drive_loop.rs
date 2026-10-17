@@ -66,7 +66,7 @@ use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
 use crate::opencode_backend::{ModelSelection, OpencodeBackend};
 use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
-use crate::scheduler_v2::{self, pick_v2, Pick, Unit};
+use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
 use crate::state::State;
 use crate::supervisor::{
     AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome, Supervisor,
@@ -924,6 +924,11 @@ pub struct TickReport {
     /// Entries paused this tick at a handshake (§6.3 step 5): `(member, entry)`
     /// — the member moved on to other work, or idles.
     pub v2_paused: Vec<(String, String)>,
+    /// Items that newly stopped an entry's §4 walk this tick — the blocked
+    /// item's address (`<milestone>:<id>`). §2: the entry is ineligible and
+    /// growlightd alerts once, so an item lands here on the tick its block is
+    /// first seen, not every tick it persists.
+    pub v2_walk_blocked: Vec<String>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
     /// Fresh starts SKIPPED in step 3 before admission — no workable part, or the
@@ -1147,6 +1152,11 @@ pub struct DriveLoop {
     /// Paused entries → the member that paused them, the §2 step-2 resume
     /// preference overlaid as the entry's `holder`.
     v2_paused_by: std::collections::BTreeMap<String, String>,
+    /// Entries whose §4 walk stops at a `blocked` item, already alerted (§2
+    /// "growlightd alerts once"): entry → the blocked item's address. In memory
+    /// like the v2 source's alert memory. An entry leaves when its walk moves
+    /// on, so a later block is a new incident and alerts again.
+    v2_walk_blocked: std::collections::BTreeMap<String, String>,
     /// Pauses whose keeperd write failed, retried every tick: entry → the
     /// pausing member. The entry stays held by that member meanwhile, so the
     /// failure can't strand it as an `active` entry nobody may take.
@@ -1265,6 +1275,7 @@ impl DriveLoop {
             assignments: std::collections::BTreeMap::new(),
             v2: None,
             v2_assignments: std::collections::BTreeMap::new(),
+            v2_walk_blocked: std::collections::BTreeMap::new(),
             v2_handoff_seen: std::collections::BTreeMap::new(),
             v2_rolled: std::collections::BTreeMap::new(),
             v2_paused_by: std::collections::BTreeMap::new(),
@@ -1842,6 +1853,9 @@ impl DriveLoop {
                         }
                     }
                 }
+                // §2's blocked walk: alert once per stopped entry, whatever the
+                // gates below decide about spawning.
+                self.note_v2_blocked_walks(snapshot, &mut report);
                 // The handshake's overlays (slice 009). Retry a pause that failed
                 // earlier first, so the entry it lands on reads as what it is.
                 self.retry_v2_pauses();
@@ -2322,6 +2336,11 @@ impl DriveLoop {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: a.entry.clone() }, now);
         }
+        // §2: a walk stopped at a human-`blocked` item (review R3).
+        for at in &report.v2_walk_blocked {
+            self.dispatcher
+                .notify(&NotifyEvent::BlockedOnHuman { item: at.clone() }, now);
+        }
         // The §9 near-exhaustion alert carries the LIVE fleet-aggregate 5h reserve %
         // (task 031), not the constant rung — so a genuinely-pinned or stale value is
         // diagnosable straight from the log/bus (the old alert always rendered "97%",
@@ -2481,6 +2500,39 @@ impl DriveLoop {
             self.v2_to_pause.remove(&entry);
             self.v2_paused_by.insert(entry, agent);
         }
+    }
+
+    /// §2: an entry whose walk stops at a `blocked` item has no next slice, so
+    /// it is ineligible and growlightd alerts once (review R3 — the skip used
+    /// to land only in `pick_v2`'s skips, so the milestone stalled silently).
+    /// Only an entry the pick would otherwise walk counts (`queued`, `active`,
+    /// `paused`); a block not seen last tick, or one that moved to another
+    /// item, lands on the report for the dispatcher.
+    fn note_v2_blocked_walks(
+        &mut self,
+        snapshot: &scheduler_v2::V2Snapshot,
+        report: &mut TickReport,
+    ) {
+        let stopped: std::collections::BTreeMap<String, String> = snapshot
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    EntryStatus::Queued | EntryStatus::Active | EntryStatus::Paused
+                )
+            })
+            .filter_map(|e| match next_unit(snapshot, e) {
+                WalkOutcome::Blocked { at } => Some((e.id.clone(), at)),
+                _ => None,
+            })
+            .collect();
+        for (entry, at) in &stopped {
+            if self.v2_walk_blocked.get(entry) != Some(at) {
+                report.v2_walk_blocked.push(at.clone());
+            }
+        }
+        self.v2_walk_blocked = stopped;
     }
 
     /// The handshake's runtime state over this tick's snapshot (slice 009):
@@ -6683,6 +6735,48 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             *claimer.claims.lock().unwrap(),
             vec![("m1".to_string(), Some("001".to_string()))],
             "the re-claim names the entry's active unit",
+        );
+    }
+
+    /// Review R3 — §2: a walk stopped at a human-`blocked` slice makes the entry
+    /// ineligible, and growlightd alerts ONCE. The block lands on the report on
+    /// the tick it is first seen and stays quiet while it persists; once the
+    /// walk moves on, the next block is a new incident and alerts again.
+    #[test]
+    fn v2_mode_a_blocked_walk_alerts_once_per_incident() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-walk-blocked-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let blocked = || {
+            let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+            snapshot.trees.get_mut("m1").unwrap().items[0].status = SliceStatus::Blocked;
+            snapshot
+        };
+        let source = FakeV2Source::with(blocked());
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let first = loop_.tick(0);
+        assert_eq!(first.v2_walk_blocked, vec!["m1:001".to_string()], "alerted on first sight");
+        assert!(first.v2_started.is_empty(), "the stopped entry is ineligible");
+        assert!(loop_.tick(1).v2_walk_blocked.is_empty(), "a persisting block stays quiet");
+
+        // The human unblocks the slice: the walk moves on, the memory clears.
+        source.set(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        assert!(loop_.tick(2).v2_walk_blocked.is_empty());
+        source.set(blocked());
+        assert_eq!(
+            loop_.tick(3).v2_walk_blocked,
+            vec!["m1:001".to_string()],
+            "a new block is a new incident",
         );
     }
 
