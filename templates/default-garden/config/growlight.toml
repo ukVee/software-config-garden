@@ -26,6 +26,13 @@ fleet_enabled = false
 # growlight verbs operate on the v2 files whatever this says.)
 # queue = "legacy"
 
+# The v2 handshake's grace (spec-growlight-queue §6.3 step 4): how many seconds
+# a member may linger after growlightd asks it to roll into a fresh session
+# before its session is terminated — on the member's exit, or after the grace,
+# whichever comes first, so a member that ignores the handshake can never keep
+# running. Only read under `queue = "v2"`. Omit the key for the default.
+# roll_grace_secs = 20
+
 # Bounded-run knob for controlled debugging — the growlightd equivalent of the
 # retired `--auto --max-iterations`. Stops the fleet CLEANLY after this many
 # completed member work-chunks (clean continue / item-boundary handoffs), then

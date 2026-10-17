@@ -17,6 +17,11 @@ fleet_enabled = true
 # Unknown values are refused at arm time. The migration session flips it.
 # queue = "legacy"
 
+# The v2 handshake's grace: seconds a member may linger after growlightd asks
+# it to roll before its session is terminated (spec-growlight-queue §6.3 step 4).
+# Omit for the default. Only read when `queue = "v2"`.
+# roll_grace_secs = 20
+
 # The binaries each backend shells. Both are resolved on PATH when omitted.
 # claude_bin   = "claude"
 # opencode_bin = "opencode"
@@ -37,6 +42,14 @@ exactly as it did — there is no migration.
 `queue` defaults to `legacy`, so scheduling is unchanged until the v2 migration flips
 it (spec-growlight-queue §11). An unknown value is a parse error — growlightd logs it
 and stays disarmed, never silently meaning legacy.
+
+`roll_grace_secs` (default 20) is the v2 handshake's grace window (spec-growlight-queue
+§6.3 step 4). When growlightd asks a member to roll into a fresh session — context full,
+model change, preemption — it lets the member finish the verb it is on, then terminates
+its session when it exits **or** after the grace, whichever comes first. The grace is
+the hard bound, not a polite request: a member that ignores the handshake and keeps
+running is stopped at `roll_grace_secs` rather than left occupying the assignment.
+It is only read when `queue = "v2"`; a legacy fleet ignores it.
 
 `model` / `variant` ride **argv** (`--model provider/model[#variant]`), not the generated
 config. opencode 2.x `run` ignores `agent.<id>.model` entirely, and argv is the one model
