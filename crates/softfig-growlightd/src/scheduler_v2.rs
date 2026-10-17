@@ -87,10 +87,12 @@ pub struct EntryView {
     /// applied (finding 8, §6.8): the handshake applies it at the boundary.
     /// The pick ignores it — the entry is `active` until then.
     pub pending: Option<EntryStatus>,
-    /// Who holds the entry. An `active` entry → the running member; a `paused`
-    /// entry → the member that paused it (the step-2 resume preference), or
-    /// `None` for a backend-mismatch pause (§6.3 step 5). Runtime state, not
-    /// TOML — growlightd knows both at the moment they happen.
+    /// Who holds the entry. An `active` entry → the running member, or `None`
+    /// when no running member holds it (an orphan any member resumes); a
+    /// `paused` entry → the member that paused it (the step-2 resume
+    /// preference), or `None` for a backend-mismatch pause (§6.3 step 5).
+    /// Runtime state, not TOML — growlightd knows both at the moment they
+    /// happen.
     pub holder: Option<String>,
     /// The chain-resolved `> Model:` declaration for a **task/restack unit**
     /// (whose chain is just its doc). A milestone carries `None` here — its
@@ -348,8 +350,17 @@ pub fn eligible(
     }
     // 4. The holder rule: an `active` entry is held by exactly one running
     // member, and no other member takes it (§2). A `paused` entry has no
-    // holder — anyone may resume it.
-    if entry.status == EntryStatus::Active && entry.holder.as_deref() != Some(member.id.as_str())
+    // holder — anyone may resume it. `holder` is runtime state the drive loop
+    // overlays from its live members, so an `active` entry reading `None` has
+    // no running member at all — the boot reaper killed its session on a
+    // growlightd restart, or its spawn failed after the claim landed. That is
+    // an orphan, not a hold: any member resumes it, exactly as a paused entry.
+    // Refusing it would strand it `active` forever, holding its repo with it.
+    if entry.status == EntryStatus::Active
+        && entry
+            .holder
+            .as_deref()
+            .is_some_and(|holder| holder != member.id)
     {
         return Err(SkipReason::Held);
     }
@@ -847,6 +858,48 @@ mod tests {
             Err(SkipReason::Held)
         );
         assert!(eligible(&snapshot, &member("alice"), &e).is_ok());
+    }
+
+    /// Review R1: `holder` is runtime state, so after a growlightd restart (or a
+    /// spawn that failed after its claim) an `active` entry reads `None`. No
+    /// running member holds it, so any member resumes it — it must not read
+    /// `Held` to everyone, which would strand it and its repo for good.
+    #[test]
+    fn an_active_entry_with_no_running_holder_is_resumable_by_any_member() {
+        let mut e = entry("e");
+        e.status = EntryStatus::Active;
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![e.clone()],
+        );
+        snapshot.trees.insert("e".into(), tree(declared(None)));
+        assert!(eligible(&snapshot, &member("alice"), &e).is_ok());
+        assert!(eligible(&snapshot, &member("bob"), &e).is_ok());
+    }
+
+    /// Review R1, through the pick: the orphaned `active` entry still holds its
+    /// repo against the next normal-lane entry, and the pick hands the member
+    /// the orphan itself rather than nothing.
+    #[test]
+    fn the_pick_resumes_an_orphaned_active_entry_ahead_of_its_repo_peers() {
+        let mut orphan = entry("orphan");
+        orphan.status = EntryStatus::Active;
+        let next = entry("next");
+        let mut snapshot = snap(
+            vec![project("softfig", "~/projects/softfig")],
+            vec![next.clone(), orphan.clone()],
+        );
+        snapshot.trees.insert("orphan".into(), tree(declared(None)));
+        snapshot.trees.insert("next".into(), tree(declared(None)));
+        let outcome = pick_v2(&snapshot, &member("bob"));
+        assert_eq!(outcome.picked.map(|p| p.entry), Some("orphan".to_string()));
+        assert_eq!(
+            outcome.skips,
+            vec![Skip {
+                entry: "next".into(),
+                reason: SkipReason::RepoHeld,
+            }],
+        );
     }
 
     #[test]

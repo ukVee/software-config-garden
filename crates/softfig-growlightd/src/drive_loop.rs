@@ -6647,6 +6647,45 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
+    /// Review R1 — a growlightd restart: the new loop has no v2 assignments, the
+    /// boot reaper killed every member scope, and the committed state still
+    /// reads the entry `active` with its slice `active`. No running member holds
+    /// it, so the first free member resumes it (keeperd's re-claim of an active
+    /// unit is idempotent). It used to read `Held` to every member forever,
+    /// stranding the entry and its repo.
+    #[test]
+    fn v2_mode_after_a_restart_an_orphaned_active_entry_is_resumed() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-orphan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let mut snapshot = v2_milestone("m1", EntryStatus::Active, "001", None);
+        snapshot.trees.get_mut("m1").unwrap().items[0].status = SliceStatus::Active;
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(snapshot),
+            entries_dir,
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let report = loop_.tick(0);
+        assert_eq!(
+            report.v2_started.iter().map(|a| (a.agent.as_str(), a.entry.as_str())).collect::<Vec<_>>(),
+            vec![("a1", "m1")],
+            "the orphan is resumed, not held: {:?}",
+            report.held_fresh,
+        );
+        assert_eq!(
+            *claimer.claims.lock().unwrap(),
+            vec![("m1".to_string(), Some("001".to_string()))],
+            "the re-claim names the entry's active unit",
+        );
+    }
+
     /// SLICE 006 — a v2 member exiting on a human-block parks its ENTRY (the v2
     /// `queue_v2_set_status(entry, blocked)`), recorded on the report for the
     /// journal — the v2 twin of the legacy item-park.
