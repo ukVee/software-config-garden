@@ -297,8 +297,9 @@ pub mod op {
     /// the row to the archive, the §6.5 close-out), slice `active → done |
     /// split | blocked | deferred | queued` (`done` resets `follow_ups` to 0).
     /// A pending human status change on the entry (its `pending_status`
-    /// field) wins over the requested status, is cleared here, and the reply
-    /// reports what actually landed. One commit, `queue_v2_status_set`.
+    /// field) wins over the requested status — except a requested `done` or
+    /// `blocked`, which drop it — is cleared here, and the reply reports what
+    /// actually landed. One commit, `queue_v2_status_set`.
     pub const QUEUE_V2_SET_STATUS: &str = "queue_v2_set_status";
     /// queue v2 daemon op, keeperd↔growlightd only: write the §7 follow_ups
     /// counter as an absolute value (growlightd owns the increment-on-follow-up
@@ -2537,7 +2538,9 @@ pub struct QueueV2ClaimReply {
 /// §6.5 close-out). Slice level (`unit` given): `active → done | split |
 /// blocked | deferred | queued` (`done` resets the slice's `follow_ups` to 0,
 /// §3.3). A recorded `pending_status` on the entry wins over `new`, is
-/// cleared, and is reported as the reply's `status` (finding 8's boundary).
+/// cleared, and is reported as the reply's `status` (finding 8's boundary) —
+/// except under a `new` of `done` or `blocked` (the member's own stop, review
+/// R4), which lands and drops the pending change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2SetStatusArgs {
     pub entry: String,

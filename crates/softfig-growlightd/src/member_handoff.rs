@@ -542,7 +542,8 @@ pub fn plan(v: &Validated, snapshot: &V2Snapshot) -> Option<Plan> {
 
 /// Finding 8 (§6.8): a human status change recorded on the active entry takes
 /// effect at this boundary. A verb that sets the entry's status anyway gets it
-/// applied by that op (pending wins); one that leaves the entry active applies
+/// applied by that op (pending wins, unless the verb blocks — review R4); one
+/// that leaves the entry active applies
 /// it here, last.
 fn apply_pending(plan: &mut Plan, snapshot: &V2Snapshot, entry: &str) {
     if !plan.continues {

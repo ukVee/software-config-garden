@@ -53,10 +53,12 @@
 //! and the scheduler keep working. At the boundary, growlightd's handshake
 //! calls [`queue_v2_set_status`] and the op applies the **pending** status
 //! instead of the requested one — the pending value wins over
-//! `paused`/`blocked`/`deferred`/`queued`, is cleared in the same commit,
-//! and the reply's `status` reports what actually landed. One exception: a
-//! `done` close-out archives the row and the pending request dies with it
-//! (the work is finished; parking it is moot). `pending_status` is not a
+//! `paused`/`deferred`/`queued`, is cleared in the same commit, and the
+//! reply's `status` reports what actually landed. Two exceptions, where the
+//! pending request dies instead: a `done` close-out archives the row (the
+//! work is finished; parking it is moot), and a requested `blocked` lands
+//! (the member's own stop on a question only the human can answer, which is
+//! newer than the pending change — review R4). `pending_status` is not a
 //! §3.1 invariant — it parses, and the boundary ops act on it only at the
 //! `active → …` transition.
 
@@ -585,10 +587,24 @@ pub fn queue_v2_set_status(daemon: &Daemon, args: serde_json::Value) -> HandlerR
                 }
                 other => {
                     // Finding 8: a pending human change wins over the
-                    // requested status and is cleared here.
+                    // requested status and is cleared here — except over
+                    // `blocked`. growlightd asks for `blocked` only for the
+                    // member's own stop (`growlight_block`, or an exit on a
+                    // BLOCKED_ON_HUMAN baton): the session hit a question only
+                    // the human can answer, and its alert is on the way. The
+                    // pending change predates that question, and applying it
+                    // could undo the stop (a `queued` makes the entry eligible
+                    // again, to hit the same question). So the block lands and
+                    // the pending change is dropped; the human answering the
+                    // alert sets the status directly on the now-inactive
+                    // entry (review R4).
                     let new = entry_status_of(other).expect("done/split handled above");
-                    let pending_was = queue.entries[eidx].pending_status.is_some();
-                    let applied = queue.entries[eidx].pending_status.take().unwrap_or(new);
+                    let pending = queue.entries[eidx].pending_status.take();
+                    let pending_was = pending.is_some();
+                    let applied = match pending {
+                        Some(_) if new == EntryStatus::Blocked => new,
+                        pending => pending.unwrap_or(new),
+                    };
                     let changed = queue.entries[eidx].status != applied || pending_was;
                     queue.entries[eidx].status = applied;
                     effective = applied.to_string();
@@ -1559,6 +1575,25 @@ mod tests {
         let (queue, _) = loaded_queue(&daemon);
         assert_eq!(queue.entries[0].status, EntryStatus::Blocked);
         assert_eq!(queue.entries[0].pending_status, None, "pending cleared in the same commit");
+    }
+
+    /// Review R4: a member's own `blocked` (its stop on a question for the
+    /// human) lands over a pending human change, which is dropped — a pending
+    /// `queued` would otherwise make the entry eligible to hit the same
+    /// question again.
+    #[test]
+    fn set_status_blocked_wins_over_a_pending_change() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut e = entry("m", Lane::Normal, EntryStatus::Active);
+        e.pending_status = Some(EntryStatus::Queued);
+        seed_queue_rows(&daemon, vec![e]);
+
+        let reply = set_status(&daemon, "m", None, "blocked").expect("boundary write");
+        assert_eq!(reply.status, "blocked", "the member's block lands");
+        let (queue, _) = loaded_queue(&daemon);
+        assert_eq!(queue.entries[0].status, EntryStatus::Blocked);
+        assert_eq!(queue.entries[0].pending_status, None, "the pending change is dropped");
     }
 
     #[test]
