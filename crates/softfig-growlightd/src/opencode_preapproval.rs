@@ -59,7 +59,10 @@
 //!   that fails closed on a bad id. See [`crate::opencode_backend::ModelSelection`].
 //! - `mcp.servers.softfig-mcp` — the explicit project-scoped attach, resolved
 //!   exactly as the claude `mcp.json` is, so the garden verbs exist regardless of
-//!   the user's global `~/.config/opencode` registration.
+//!   the user's global `~/.config/opencode` registration. Its `environment`
+//!   carries `SOFTFIG_MEMBER=<agent>`, the member identity softfig-mcp reads at
+//!   startup (spec-growlight-queue §6, [`softfig_ipc::member`]); `environment` is
+//!   opencode 2.x's native `Mcp.LocalConfig` key for the server's env.
 //!
 //! ## Known gap — no code repo is writable yet
 //!
@@ -280,6 +283,7 @@ fn opencode_json(cfg: &AgentInputs<'_>) -> Result<String, GenError> {
                 "softfig-mcp": {
                     "type": "local",
                     "command": [ cfg.mcp_bin.display().to_string() ],
+                    "environment": { softfig_ipc::MEMBER_ENV: cfg.agent_name },
                 }
             }
         },
@@ -522,6 +526,32 @@ mod tests {
         let mcp = &v["mcp"]["servers"]["softfig-mcp"];
         assert_eq!(mcp["command"][0], "/usr/bin/softfig-mcp");
         assert_eq!(mcp["type"], "local");
+    }
+
+    #[test]
+    fn the_mcp_block_carries_exactly_this_members_identity_and_nothing_else_changes() {
+        // The whole `mcp` block, pinned: one server, its two existing keys, and
+        // an `environment` holding the member id under the shared key — once.
+        for agent in ["a", "b"] {
+            let (v, _paths, _tmp) = generated(agent);
+            assert_eq!(
+                v["mcp"],
+                serde_json::json!({
+                    "servers": {
+                        "softfig-mcp": {
+                            "type": "local",
+                            "command": ["/usr/bin/softfig-mcp"],
+                            "environment": { "SOFTFIG_MEMBER": agent }
+                        }
+                    }
+                }),
+                "{agent}",
+            );
+            // The rest of the config keeps its shape: the same top-level keys.
+            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["$schema", "agents", "mcp", "permissions"], "{agent}");
+        }
     }
 
     #[test]

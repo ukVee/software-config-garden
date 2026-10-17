@@ -78,6 +78,14 @@ fn lane<'a>(out: &mut String, rows: impl Iterator<Item = &'a Entry>) {
         } else {
             queue::escape(&e.branch)
         };
+        // A pending human status change (finding 8, scheduling slice 005) is
+        // visible in the view: the row stays `active` until the boundary
+        // applies it, and the annotation tells the human the change is
+        // recorded, not lost.
+        let status = match &e.pending_status {
+            Some(p) => format!("{} (pending: {})", e.status, p),
+            None => e.status.to_string(),
+        };
         out.push_str(&format!(
             "\n| {} | {} | {} | {} | {} | {} | {} | {} |",
             i + 1,
@@ -85,7 +93,7 @@ fn lane<'a>(out: &mut String, rows: impl Iterator<Item = &'a Entry>) {
             queue::escape(&e.kind.to_string()),
             queue::escape(&e.title),
             queue::escape(&e.project),
-            queue::escape(&e.status.to_string()),
+            queue::escape(&status),
             after,
             branch,
         ));
@@ -141,6 +149,7 @@ mod tests {
             base: String::new(),
             claimed: String::new(),
             follow_ups: 0,
+            pending_status: None,
         }
     }
 
@@ -201,6 +210,26 @@ mod tests {
         let body = queue_view(&q);
         assert!(body.contains("a\\|b"), "{body}");
         assert!(body.contains("title with \\| pipe"), "{body}");
+    }
+
+    #[test]
+    fn queue_view_annotates_a_pending_human_status_change() {
+        // Finding 8 (scheduling slice 005): the row stays `active` until the
+        // handshake applies the human's change; the annotation makes the
+        // deferral visible.
+        let mut e = entry("a", Lane::Normal, &[]);
+        e.status = EntryStatus::Active;
+        e.pending_status = Some(EntryStatus::Blocked);
+        let q = QueueToml::new(vec![], vec![e]);
+        let body = queue_view(&q);
+        assert!(body.contains("| active (pending: blocked) |"), "{body}");
+
+        // No pending → the plain status cell, no annotation.
+        let mut plain = entry("b", Lane::Normal, &[]);
+        plain.status = EntryStatus::Active;
+        let body = queue_view(&QueueToml::new(vec![], vec![plain]));
+        assert!(body.contains("| active |"), "{body}");
+        assert!(!body.contains("(pending:"), "{body}");
     }
 
     #[test]

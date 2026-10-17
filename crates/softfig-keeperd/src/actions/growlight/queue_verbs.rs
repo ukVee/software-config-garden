@@ -143,11 +143,54 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
 pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: QueueAddEntryArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_add_entry args: {e}")))?;
+    if let Some(member) = crate::caller::member() {
+        if let Some(field) = member_model_field(&args) {
+            return Err((
+                ErrorKind::BadArgs,
+                format!(
+                    "field_not_allowed: `{field}` carries a `> Model:` line, and fleet member \
+                     {member} may not set a unit's model in the docs queue_add_entry writes \
+                     (spec-growlight-queue §6.7) — a new entry declares no model, so its slices \
+                     may declare none"
+                ),
+            ));
+        }
+    }
     match args.kind {
         EntryKind::Milestone => add_milestone(daemon, args),
         EntryKind::Task => add_task(daemon, args),
         EntryKind::Restack => add_restack(daemon, args),
     }
+}
+
+/// §6.7 for a member's `queue_add_entry`: the first text field carrying a
+/// `> Model:` line, by name. keeperd renders the entry's docs from these
+/// fields through the structured writer, outside the worktree's member guard,
+/// so the guard runs here on the member's own text — and not on keeperd's
+/// generated `001-plan` slice, whose `> Model:` line is the daemon's.
+/// `queue_add_entry` is not one of §6.7's slice-body exceptions, so a slice
+/// body may declare nothing either (the new milestone declares nothing to
+/// take a subset of).
+fn member_model_field(args: &QueueAddEntryArgs) -> Option<String> {
+    use softfig_ipc::queue_v2::reserved_field;
+    let declares = |text: Option<&str>| text.is_some_and(|t| reserved_field(t, &["model"]).is_some());
+    let entry_fields = [
+        ("title", args.title.as_deref()),
+        ("mission", args.mission.as_deref()),
+        ("finish_criteria", args.finish_criteria.as_deref()),
+    ];
+    if let Some((field, _)) = entry_fields.iter().find(|(_, text)| declares(*text)) {
+        return Some(field.to_string());
+    }
+    args.slices.iter().enumerate().find_map(|(i, s)| {
+        if declares(s.title.as_deref()) {
+            Some(format!("slices[{i}].title"))
+        } else if declares(Some(&s.body)) {
+            Some(format!("slices[{i}].body"))
+        } else {
+            None
+        }
+    })
 }
 
 /// A required non-empty `Option` arg (the wire structs keep the per-kind
@@ -291,6 +334,7 @@ fn add_milestone(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         base: String::new(),
         claimed: String::new(),
         follow_ups: 0,
+        pending_status: None,
     };
     let idx = place_entry(&queue.entries, lane, &position).map_err(refuse)?;
     queue.entries.insert(idx, entry);
@@ -454,6 +498,7 @@ fn add_task(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         base: String::new(),
         claimed: String::new(),
         follow_ups: 0,
+        pending_status: None,
     };
     let doc_content = task_doc_v2(&id, &title, &mission, &finish);
     let idx = place_entry(&queue.entries, lane, &position).map_err(refuse)?;
@@ -579,6 +624,7 @@ fn restack_core(
         base: String::new(),
         claimed: String::new(),
         follow_ups: 0,
+        pending_status: None,
     };
     // §6.8/§8: urgent lane, appended at the urgent lane's back.
     let idx = place_entry(&queue.entries, Lane::Urgent, &V2Position::Back).map_err(refuse)?;
@@ -831,22 +877,25 @@ pub fn queue_update_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
                 });
                 archived = true;
             }
-            // Finding 8: other status changes on an `active` entry are
-            // applied immediately here. The spec's "takes effect at the next
-            // handshake" deferral needs the handshake itself, which
-            // queue-v2-scheduling builds; the running session is never
-            // killed either way.
-            QueueStatusArg::Queued => {
+            // Finding 8 (§6.8): a status change on an `active` entry takes
+            // effect at its session's next handshake, never mid-session. The
+            // row keeps `active` (the repo rule and the scheduler keep
+            // working) and records the change as `pending_status`; the view
+            // annotates it, and the handshake's `queue_v2_set_status` applies
+            // it at the boundary. Any other entry changes now.
+            QueueStatusArg::Queued | QueueStatusArg::Blocked | QueueStatusArg::Deferred => {
+                let new = match status {
+                    QueueStatusArg::Queued => EntryStatus::Queued, // also unblocks and un-defers
+                    QueueStatusArg::Blocked => EntryStatus::Blocked,
+                    _ => EntryStatus::Deferred,
+                };
                 let idx = idx_of(&queue, &args.id);
-                queue.entries[idx].status = EntryStatus::Queued; // also unblocks and un-defers
-            }
-            QueueStatusArg::Blocked => {
-                let idx = idx_of(&queue, &args.id);
-                queue.entries[idx].status = EntryStatus::Blocked;
-            }
-            QueueStatusArg::Deferred => {
-                let idx = idx_of(&queue, &args.id);
-                queue.entries[idx].status = EntryStatus::Deferred;
+                let row = &mut queue.entries[idx];
+                if row.status == EntryStatus::Active {
+                    row.pending_status = Some(new);
+                } else {
+                    row.status = new;
+                }
             }
         }
     }
@@ -1652,6 +1701,7 @@ mod tests {
             base: String::new(),
             claimed: String::new(),
             follow_ups: 0,
+            pending_status: None,
         }
     }
 
@@ -1817,6 +1867,52 @@ mod tests {
         let backlog = wt.read_to_string(&queue_view_host()).unwrap();
         let body = managed::region_body(&backlog, QUEUE_V2_TAG).expect("queue view");
         assert!(body.contains("m1"), "{body}");
+    }
+
+    /// §6.7 for a member's found work: its text fields may carry no
+    /// `> Model:` line (refused `field_not_allowed`, nothing committed), but an
+    /// unplanned milestone still gets keeperd's own `001-plan` slice with the
+    /// daemon's `> Model:` line. A human's identical call is unrestricted.
+    #[test]
+    fn a_members_add_entry_may_not_declare_a_model_but_still_gets_the_plan_slice() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        let before = commit_count(&daemon);
+        let declaring = [
+            ("mission", milestone_args("m1", "softfig", serde_json::json!({ "mission": "x\n> Model: claude" }))),
+            ("finish_criteria", milestone_args("m1", "softfig", serde_json::json!({ "finish_criteria": "> model: flash" }))),
+            ("slices[1].body", milestone_args("m1", "softfig", serde_json::json!({ "slices": [
+                { "slug": "a", "title": "A", "body": "plain" },
+                { "slug": "b", "title": "B", "body": "> Model: flash\n\nwork" },
+            ] }))),
+        ];
+        {
+            let _member = crate::caller::enter(Some("c".into()));
+            for (field, args) in &declaring {
+                let err = add_entry(&daemon, args.clone()).unwrap_err();
+                assert_eq!(err.0, ErrorKind::BadArgs);
+                assert!(
+                    err.1.starts_with("field_not_allowed:") && err.1.contains(&format!("`{field}`")),
+                    "{field}: {err:?}"
+                );
+            }
+            assert_eq!(commit_count(&daemon), before, "a refusal commits nothing");
+            add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({})))
+                .expect("a member's plain found work lands");
+        }
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(&daemon, &inner);
+            let plan = wt
+                .read_to_string("growlight/backlog/milestones/m1/slices/001-plan.md")
+                .expect("generated plan slice");
+            assert!(plan.contains("> Model: reasoning"), "keeperd's own line, {plan}");
+        }
+        let (_, human) = &declaring[2];
+        let mut human = human.clone();
+        human["slug"] = serde_json::json!("m2");
+        add_entry(&daemon, human).expect("a human may declare a slice model");
     }
 
     #[test]
@@ -2615,6 +2711,34 @@ mod tests {
             qs.queue.model.entries.iter().all(|e| e.status == EntryStatus::Queued),
             "queued unblocks and un-defers"
         );
+    }
+
+    /// Finding 8 (§6.8, queue-v2-scheduling slice 009): a human status change
+    /// on an ACTIVE entry is recorded as `pending_status` and the row stays
+    /// `active` — the running session is never interrupted; its next handshake
+    /// applies it. A later change overwrites the pending one, and the view
+    /// shows it.
+    #[test]
+    fn update_entry_on_an_active_entry_records_a_pending_status() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut running = entry("r");
+        running.status = EntryStatus::Active;
+        running.claimed = "2026-10-14T00:00:00Z".into();
+        seed_queue(&daemon, vec![project()], vec![running], None);
+
+        let reply = update_entry(&daemon, serde_json::json!({ "id": "r", "status": "blocked" }))
+            .expect("recorded");
+        assert!(reply.view.contains("active (pending: blocked)"), "{}", reply.view);
+        update_entry(&daemon, serde_json::json!({ "id": "r", "status": "deferred" }))
+            .expect("overwritten");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let r = &qs.queue.model.entries[0];
+        assert_eq!(r.status, EntryStatus::Active, "the running entry keeps active");
+        assert_eq!(r.pending_status, Some(EntryStatus::Deferred), "the latest change is pending");
     }
 
     // ---- slice 006: slice_insert, slice_update, queue_drop -------------

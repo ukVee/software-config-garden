@@ -26,7 +26,8 @@ pub(crate) mod chat;
 mod holders;
 mod init;
 mod leases;
-mod paths;
+mod member_verbs;
+pub(crate) mod paths;
 mod queue;
 mod queues;
 mod queue_verbs;
@@ -37,11 +38,23 @@ mod v2;
 pub use holders::{ClaimGate, HolderStore};
 pub use init::growlight_init;
 pub use leases::{release_lease, request_lease};
+pub use member_verbs::{
+    growlight_add_follow_up_session, growlight_add_sub_milestone, growlight_block,
+    growlight_complete_entry, growlight_complete_slice, member_slice_insert, member_slice_update,
+};
+/// The unlocked Disk-mode test daemon, for the action tests outside this
+/// module (the worktree's §6.7 guard).
+#[cfg(test)]
+pub(crate) use v2::write::tests::unlocked;
 pub use queue_verbs::{
     queue_add_entry, queue_add_project, queue_drop, queue_update_entry, slice_insert, slice_update,
 };
 pub use reports::{file_report, list_reports, update_report};
 pub use set_resources::growlight_set_resources;
+pub use v2::{
+    queue_v2_add_sub, queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups, queue_v2_session_log,
+    queue_v2_set_status,
+};
 
 use softfig_vcs::Intent;
 use softfig_ipc::verbs::{

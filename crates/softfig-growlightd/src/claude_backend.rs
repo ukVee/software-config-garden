@@ -917,10 +917,18 @@ impl BackendFlavor for ClaudeFlavor {
         })
     }
 
-    fn command_argv(&self, _agent: &str, paths: &AgentPaths) -> Vec<OsString> {
+    fn command_argv(
+        &self,
+        _agent: &str,
+        paths: &AgentPaths,
+        _model: Option<&crate::opencode_backend::ModelSelection>,
+    ) -> Vec<OsString> {
         // claude names nothing per-member on its own command line — the member's
         // identity reaches it through the generated `--settings` (whose
-        // SessionStart hook cats THIS agent's baton), not through argv.
+        // SessionStart hook cats THIS agent's baton), not through argv. The
+        // per-spawn model override is deliberately ignored: claude's model and
+        // effort are the harness's own, not settable from this launch path
+        // (§6.4 — a `claude` assignment simply runs claude).
         claude_command_argv(
             &self.bin,
             &self.prompt,
@@ -1111,8 +1119,14 @@ impl ClaudeBackend {
     /// invocation, wrapper excluded. The routing seam (slice 005) asserts a
     /// claude-backed member through it; the wrapper half is pinned separately by
     /// `the_claude_argv_is_byte_identical_to_the_pre_harness_invocation`.
-    pub fn command_argv(&self, agent: &str, paths: &AgentPaths) -> Vec<OsString> {
-        self.harness.command_argv(agent, paths)
+    /// `model` is the per-spawn override (slice 006), which claude ignores.
+    pub fn command_argv(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+        model: Option<&crate::opencode_backend::ModelSelection>,
+    ) -> Vec<OsString> {
+        self.harness.command_argv(agent, paths, model)
     }
 }
 

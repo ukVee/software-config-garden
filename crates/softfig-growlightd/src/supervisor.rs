@@ -130,10 +130,18 @@ pub struct AgentSpec {
     pub loop_settings: PathBuf,
     /// Per-agent `mcp.json` — the softfig-mcp attach config.
     pub mcp_config: PathBuf,
+    /// The per-spawn model override (queue-v2-scheduling slice 006): the
+    /// assignment's resolved `> Model:` choice for an opencode member, carried
+    /// on argv `--model` for THIS spawn. `None` = the backend's roster default
+    /// (every legacy spawn). A claude member's assignment resolves to `None` —
+    /// claude carries its whole config on argv and its model is the harness's
+    /// own, not settable from this launch path.
+    pub model: Option<crate::opencode_backend::ModelSelection>,
 }
 
 impl AgentSpec {
-    /// Construct a spec for `agent` from its pre-approval file paths.
+    /// Construct a spec for `agent` from its pre-approval file paths. No model
+    /// override — the legacy shape, and the only shape the legacy path builds.
     pub fn new(
         agent: impl Into<String>,
         loop_settings: impl Into<PathBuf>,
@@ -143,7 +151,19 @@ impl AgentSpec {
             agent: agent.into(),
             loop_settings: loop_settings.into(),
             mcp_config: mcp_config.into(),
+            model: None,
         }
+    }
+
+    /// Pin this spawn's opencode `--model` argv value (slice 006): the unit's
+    /// resolved model, overriding the backend's roster default for THIS spawn.
+    #[must_use]
+    pub fn with_model(
+        mut self,
+        model: crate::opencode_backend::ModelSelection,
+    ) -> Self {
+        self.model = Some(model);
+        self
     }
 }
 

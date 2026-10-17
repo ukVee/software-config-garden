@@ -9,6 +9,10 @@ use signal_hook::iterator::SignalsInfo;
 
 use std::sync::Arc;
 
+use softfig_growlightd::baton_store::{runtime_entries_dir, FsEntryBatonStore};
+use softfig_growlightd::claim::KeeperdV2Keeper;
+use softfig_growlightd::fleet::garden_tag;
+use softfig_growlightd::member_handoff::HandoffSeams;
 use softfig_growlightd::{
     garden_root_via_keeperd, load_fleet_config, reconcile_on_boot, spawn_bus_tailer, spawn_fleet,
     BusEmit, Daemon, GrowlightdConfig, KeeperdBusEmit, KeeperdBusSource, KeeperdItemResumer,
@@ -66,9 +70,17 @@ fn main() -> Result<()> {
     // persist hook (a live `set_resources` writes the new default back into
     // `config/growlight.toml` via keeperd's commit path) — both bound to the same
     // keeperd socket the queue source / claimer / parker use.
+    // The queue-v2 handshake's server-side seams (queue-v2-scheduling slice
+    // 009): keeperd's v2 write ops + the runtime per-entry baton store, the same
+    // one the drive loop copies from at spawn. Inert under the legacy queue —
+    // no member ever holds a v2 assignment there, so no verb reaches them.
     let daemon = Daemon::new(config)
         .with_item_resumer(Arc::new(KeeperdItemResumer::new(keeperd_socket.clone())))
-        .with_resource_persister(Arc::new(KeeperdResourcePersister::new(keeperd_socket.clone())));
+        .with_resource_persister(Arc::new(KeeperdResourcePersister::new(keeperd_socket.clone())))
+        .with_v2_handoff(HandoffSeams {
+            keeper: Box::new(KeeperdV2Keeper::new(keeperd_socket.clone())),
+            entries: FsEntryBatonStore::new(runtime_entries_dir(), garden_tag(&garden_root)),
+        });
     let handle = daemon.start()?;
 
     eprintln!(

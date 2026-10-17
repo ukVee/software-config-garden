@@ -12,6 +12,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod actions;
+pub mod caller;
 pub mod ceremony;
 pub mod chain_health;
 pub mod classify;

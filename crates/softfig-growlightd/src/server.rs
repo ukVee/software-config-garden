@@ -15,10 +15,14 @@ use std::path::Path;
 
 use softfig_ipc::growlightd::{
     op, AgentSpendSummary, AgentSummary, BatonArgs, BatonReply, FleetStatusReply, ForceStopArgs,
-    InjectMessageArgs, InjectReply, PausedReply, ReleaseLeaseArgs, RequestLeaseArgs,
-    RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs, SetResourcesArgs,
-    SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
+    InjectMessageArgs, InjectReply, MemberCall, MemberVerbReply, PausedReply, QueuePickArgs,
+    QueuePickAssignment, QueuePickReply, QueuePickSkip, RefusalCode, ReleaseLeaseArgs,
+    RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs,
+    SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
+    BACKEND_CLAUDE, BACKEND_OPENCODE,
 };
+use softfig_ipc::model_choice::{Backend, ModelList};
+use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
 use softfig_ipc::{ErrorKind, Request, Response};
 
 use crate::agent_harness::apply_set_property;
@@ -27,6 +31,9 @@ use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::drive_loop::AgentHealthSource;
 use crate::fleet::{FleetMemberConfig, MemberBackend};
+use crate::member_slices;
+use crate::member_verbs::{self, MemberVerb, Refusal, VerbError};
+use crate::scheduler_v2::{self, Member, Unit};
 use crate::opencode_backend::ModelSelection;
 use crate::resume::ResumeOutcome;
 use crate::state::State;
@@ -151,11 +158,25 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         op::SET_POLICY => write_one_shot(&mut stream, set_policy(&daemon, &req)),
         op::SET_RESOURCES => write_one_shot(&mut stream, set_resources(&daemon, &req)),
         op::RESUME_ITEM => write_one_shot(&mut stream, resume_item(&daemon, &req)),
+        // Read-only queue-v2 surface (spec-growlight-queue §6.9): what `pick_v2`
+        // assigns a member now, and why each skipped entry was skipped.
+        op::QUEUE_PICK => write_one_shot(&mut stream, queue_pick(&daemon, &req)),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
         op::RELEASE_LEASE => write_one_shot(&mut stream, release_lease(&daemon, &req)),
         op::REQUEST_RESTART => write_one_shot(&mut stream, request_restart(&daemon, &req)),
+        // Member verbs (spec-growlight-queue §6.1–§6.6) — one-shot. A refusal
+        // is an ok reply with `state: refused`; it never touches the session.
+        op::GROWLIGHT_ADD_FOLLOW_UP_SESSION
+        | op::GROWLIGHT_COMPLETE_SLICE
+        | op::GROWLIGHT_COMPLETE_ENTRY
+        | op::GROWLIGHT_BLOCK
+        | op::GROWLIGHT_ADD_SUB_MILESTONE => write_one_shot(&mut stream, member_verb(&daemon, &req)),
+        // A member's §6.8 slice verbs (§6.7), relayed by keeperd — one-shot.
+        op::MEMBER_SLICE_INSERT | op::MEMBER_SLICE_UPDATE => {
+            write_one_shot(&mut stream, member_slice_verb(&daemon, &req))
+        }
         // ack-before-teardown: flush the ack, THEN flip to Stopping, so the
         // client is guaranteed its reply before the accept loop winds down
         // (keeperd incident 20260622).
@@ -782,6 +803,349 @@ fn request_restart(daemon: &Daemon, req: &Request) -> Response {
     )
 }
 
+/// A queue-v2 member verb (spec-growlight-queue §6.3): the identity from the
+/// envelope, the caller's live v2 assignment (the drive loop's mirror), then
+/// [`member_verbs::validate`] over a fresh read of the v2 list. Every refusal
+/// is an ok [`MemberVerbReply`] with `state: refused` and leaves the calling
+/// session untouched — nothing here signals, kills or rolls it. A pass runs
+/// step 3 ([`crate::member_handoff::execute`]: keeperd commits, the baton is
+/// stored as the entry's) and replies `ok` with what runs next; the drive loop
+/// then ends the session after the grace and picks (steps 4–5).
+///
+/// The v2 list is read through the mount without the daemon lock (the drive
+/// loop's own read path), so a slow read never blocks another verb.
+pub(crate) fn member_verb(daemon: &Daemon, req: &Request) -> Response {
+    let (member, verb) = match decode_member_verb(req) {
+        Ok(decoded) => decoded,
+        Err(resp) => return resp,
+    };
+    let name = verb.name();
+    let refused = |r: Refusal| ok_reply(&MemberVerbReply::refused(name, r.code, r.message), name);
+    let member = match member_verbs::identity(member.as_deref()) {
+        Ok(member) => member.to_string(),
+        Err(r) => return refused(r),
+    };
+    let Some(assignment) = daemon.v2_assignment(&member) else {
+        return refused(member_verbs::no_assignment(&member));
+    };
+    let snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return refused(Refusal {
+                code: RefusalCode::NotYourSession,
+                message: "there is no queue-v2 list (growlight/backlog/queue.toml), so no \
+                          session holds a v2 entry"
+                    .into(),
+            })
+        }
+        Err(e) => {
+            return Response::err(
+                ErrorKind::Io,
+                format!("{name}: the queue-v2 list can't be read, so the call can't be validated: {e}"),
+            )
+        }
+    };
+    // §9's `urgent_waiting` is not in this build (it rides the bus overhaul),
+    // so growlightd has told no member to yield: a `preempted` roll counts
+    // toward the cap like any other (review R2). When the message lands, this
+    // reads the drive loop's record of whom it told, consumed at the handshake.
+    let told_to_yield = false;
+    let v = match member_verbs::validate(&member, &assignment, &snapshot, verb, told_to_yield) {
+        Ok(v) => v,
+        Err(VerbError::Refused(r)) => return refused(r),
+        Err(VerbError::BadArgs(m)) => {
+            return Response::err(ErrorKind::BadArgs, format!("{name}: {m}"))
+        }
+    };
+    let unit = member_verbs::unit_label(&v.assignment.unit);
+    let Some(seams) = daemon.v2_handoff_seams() else {
+        return Response::err(
+            ErrorKind::Internal,
+            format!(
+                "{name}: growlightd has no handshake seams installed, so it can't commit a \
+                 handoff — nothing was written and this session keeps running"
+            ),
+        );
+    };
+    // §6.3 step 3. Take the assignment out of the mirror first, so a second
+    // verb from the same session can't validate against work this one moves.
+    if !daemon.begin_v2_handoff(&member, &assignment) {
+        return refused(Refusal {
+            code: RefusalCode::NotYourSession,
+            message: format!(
+                "this session's handoff is already under way or done — member {member} \
+                 no longer holds {} / {unit}",
+                assignment.entry
+            ),
+        });
+    }
+    match crate::member_handoff::execute(&v, &snapshot, &seams) {
+        Ok(done) => {
+            for w in &done.warnings {
+                eprintln!("growlightd: {name} for {member} on {}: {w}", v.assignment.entry);
+            }
+            let reply = MemberVerbReply::ok(
+                name,
+                v.assignment.entry.clone(),
+                unit,
+                done.next,
+                done.warnings,
+            );
+            daemon.commit_v2_handoff(&member, done.handoff);
+            ok_reply(&reply, name)
+        }
+        Err(e) => {
+            daemon.abort_v2_handoff(&member, assignment);
+            Response::err(ErrorKind::Io, format!("{name}: {e}"))
+        }
+    }
+}
+
+/// A member's `slice_insert` / `slice_update`, relayed by keeperd (§6.7):
+/// the identity, the member's live assignment and — for an insert's subset
+/// rule — a fresh read of the v2 list, then [`member_slices`]'s checks. A pass
+/// issues the plain human verb to keeperd as growlightd's own client and
+/// relays keeperd's response verbatim; a refusal is a wire error led by its
+/// code, like any §6.8 refusal. Nothing here touches the calling session.
+pub(crate) fn member_slice_verb(daemon: &Daemon, req: &Request) -> Response {
+    let refused = |message: String| Response::err(ErrorKind::BadArgs, message);
+    let (member, human) = match req.op.as_str() {
+        op::MEMBER_SLICE_INSERT => match parse_args::<MemberCall<SliceInsertArgs>>(req) {
+            Ok(call) => (call.member, HumanSliceVerb::Insert(call.args)),
+            Err(resp) => return resp,
+        },
+        _ => match parse_args::<MemberCall<SliceUpdateArgs>>(req) {
+            Ok(call) => (call.member, HumanSliceVerb::Update(call.args)),
+            Err(resp) => return resp,
+        },
+    };
+    let member = match member_verbs::identity(member.as_deref()) {
+        Ok(member) => member.to_string(),
+        Err(r) => return refused(format!("{}: {}", r.code.as_str(), r.message)),
+    };
+    let assignment = daemon.v2_assignment(&member);
+    let checked = match &human {
+        HumanSliceVerb::Insert(args) => {
+            let snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+                Ok(snapshot) => snapshot.unwrap_or_default(),
+                Err(e) => {
+                    return Response::err(
+                        ErrorKind::Io,
+                        format!(
+                            "slice_insert: the queue-v2 list can't be read, so the call can't be \
+                             validated: {e}"
+                        ),
+                    )
+                }
+            };
+            member_slices::check_insert(&member, assignment.as_ref(), &snapshot, args)
+        }
+        HumanSliceVerb::Update(args) => {
+            member_slices::check_update(&member, assignment.as_ref(), args)
+        }
+    };
+    if let Err(message) = checked {
+        return refused(message);
+    }
+    let Some(seams) = daemon.v2_handoff_seams() else {
+        return Response::err(
+            ErrorKind::Internal,
+            "growlightd has no keeperd seam installed, so it can't issue the slice verb — \
+             nothing was written",
+        );
+    };
+    let relayed = match &human {
+        HumanSliceVerb::Insert(args) => {
+            serde_json::to_value(args).map(|a| Request::new(softfig_ipc::op::SLICE_INSERT, a))
+        }
+        HumanSliceVerb::Update(args) => {
+            serde_json::to_value(args).map(|a| Request::new(softfig_ipc::op::SLICE_UPDATE, a))
+        }
+    };
+    match relayed {
+        Ok(req) => seams.keeper.relay(&req),
+        Err(e) => Response::err(ErrorKind::Internal, format!("encode the slice verb: {e}")),
+    }
+}
+
+/// `queue pick` (spec-growlight-queue §6.9): **read-only**. Runs the same
+/// [`scheduler_v2::pick_v2`] the drive loop runs — over a fresh read of the v2
+/// list with the loop's published runtime overlay applied — and returns the
+/// assignment plus every skipped entry with its reason.
+///
+/// growlightd answers it because `pick_v2` and the v2 source live here
+/// (milestone finding 6), not in the CLI. Two reads matter:
+/// - the **roster** is cloned under one brief lock: a named member's pin and
+///   backend come from it, and an unnamed member is unpinned on the default
+///   backend;
+/// - the **list** is read through the mount *without* the daemon lock — the
+///   same path the member verbs take, so a slow read never blocks another verb.
+///
+/// A named member that is not on the roster is a `BadArgs` refusal, not an
+/// empty pick: guessing a pin would answer a different question than the one
+/// asked.
+pub(crate) fn queue_pick(daemon: &Daemon, req: &Request) -> Response {
+    let args = match parse_args::<QueuePickArgs>(req) {
+        Ok(args) => args,
+        Err(resp) => return resp,
+    };
+    let members = {
+        let inner = daemon.inner.lock().unwrap();
+        inner.fleet.members.clone()
+    };
+    let member = match resolve_pick_member(&members, args.member.as_deref()) {
+        Ok(member) => member,
+        Err(message) => {
+            return Response::err(ErrorKind::BadArgs, format!("queue_pick: {message}"))
+        }
+    };
+    let base = QueuePickReply {
+        // §3.4: a garden with no v2 file shows nothing, and does so as a reply —
+        // not an error — exactly like `queue show`.
+        list: false,
+        member: args.member.clone(),
+        pin: member.pin.clone(),
+        backend: backend_label(&member.backend).to_string(),
+        picked: None,
+        skips: Vec::new(),
+    };
+    let mut snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return ok_reply(&base, "queue_pick"),
+        Err(e) => {
+            return Response::err(
+                ErrorKind::Io,
+                format!("queue_pick: the queue-v2 list can't be read: {e}"),
+            )
+        }
+    };
+    // The runtime holders and accepted model changes, as of the loop's last tick
+    // — the same overlay the loop's own pick sees (slice 012).
+    crate::drive_loop::apply_v2_overlay(&mut snapshot, &daemon.v2_overlay());
+    let outcome = scheduler_v2::pick_v2(&snapshot, &member);
+    let reply = QueuePickReply {
+        list: true,
+        picked: outcome.picked.map(|p| QueuePickAssignment {
+            entry: p.entry,
+            unit: pick_unit_label(&p.unit),
+            declared: p.declared.as_ref().map(declared_label),
+        }),
+        skips: outcome
+            .skips
+            .into_iter()
+            .map(|s| QueuePickSkip {
+                entry: s.entry,
+                reason: s.reason.as_str().to_string(),
+                detail: s.reason.describe().to_string(),
+            })
+            .collect(),
+        ..base
+    };
+    ok_reply(&reply, "queue_pick")
+}
+
+/// The member a pick runs for: a roster row (its id, backend and pin), or an
+/// unnamed unpinned member on the default backend.
+///
+/// The unnamed member's id is the empty string, which no roster agent can be
+/// (ids are non-empty), so it never matches a live holder: another member's
+/// `active` entry reads as held, which is the truth for *this* member.
+fn resolve_pick_member(
+    members: &[FleetMemberConfig],
+    requested: Option<&str>,
+) -> std::result::Result<Member, String> {
+    let Some(id) = requested else {
+        return Ok(Member {
+            id: String::new(),
+            backend: Backend::Claude,
+            pin: None,
+        });
+    };
+    let Some(row) = members.iter().find(|m| m.agent == id) else {
+        let roster = if members.is_empty() {
+            "the roster is empty".to_string()
+        } else {
+            format!(
+                "the roster is: {}",
+                members
+                    .iter()
+                    .map(|m| m.agent.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Err(format!("no fleet member {id:?} on the roster — {roster}"));
+    };
+    Ok(Member {
+        id: row.agent.clone(),
+        backend: row.backend.ipc_backend(),
+        pin: row.pin.clone(),
+    })
+}
+
+/// The wire/CLI label for a member's backend.
+fn backend_label(backend: &Backend) -> &'static str {
+    match backend {
+        Backend::Claude => BACKEND_CLAUDE,
+        Backend::Opencode => BACKEND_OPENCODE,
+    }
+}
+
+/// A picked unit, for a reader: `slice 002 of m1` (a sub-milestone's slice names
+/// `m1/sub`), `the close-out of m1`, or `the entry itself` for a task/restack.
+fn pick_unit_label(unit: &Unit) -> String {
+    match unit {
+        Unit::Slice { milestone, slice } => format!("slice {slice} of {milestone}"),
+        Unit::CloseOut { milestone } => format!("the close-out of {milestone}"),
+        Unit::Entry => "the entry itself".to_string(),
+    }
+}
+
+/// A unit's declared `> Model:` list, comma-separated, as `queue pick` prints
+/// it: `claude`, `provider/model`, or `provider/model variant=<v>`.
+fn declared_label(list: &ModelList) -> String {
+    list.entries()
+        .iter()
+        .map(|choice| match (&choice.model, &choice.variant) {
+            (None, _) => BACKEND_CLAUDE.to_string(),
+            (Some(model), Some(variant)) => format!("{model} variant={variant}"),
+            (Some(model), None) => model.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The human slice verb a member's relayed call carries.
+enum HumanSliceVerb {
+    Insert(SliceInsertArgs),
+    Update(SliceUpdateArgs),
+}
+
+/// Decode a member verb's [`MemberCall`] envelope by op: the identity it
+/// carries and the typed verb.
+fn decode_member_verb(
+    req: &Request,
+) -> std::result::Result<(Option<String>, MemberVerb), Response> {
+    fn take<A: serde::de::DeserializeOwned>(
+        req: &Request,
+        wrap: fn(A) -> MemberVerb,
+    ) -> std::result::Result<(Option<String>, MemberVerb), Response> {
+        let call: MemberCall<A> = parse_args(req)?;
+        Ok((call.member, wrap(call.args)))
+    }
+    match req.op.as_str() {
+        op::GROWLIGHT_ADD_FOLLOW_UP_SESSION => take(req, MemberVerb::AddFollowUpSession),
+        op::GROWLIGHT_COMPLETE_SLICE => take(req, MemberVerb::CompleteSlice),
+        op::GROWLIGHT_COMPLETE_ENTRY => take(req, MemberVerb::CompleteEntry),
+        op::GROWLIGHT_BLOCK => take(req, MemberVerb::Block),
+        op::GROWLIGHT_ADD_SUB_MILESTONE => take(req, MemberVerb::AddSubMilestone),
+        other => Err(Response::err(
+            ErrorKind::BadArgs,
+            format!("{other:?} is not a member verb"),
+        )),
+    }
+}
+
 /// Encode a typed reply as a one-shot `Response::ok`, mapping a serialization
 /// failure to an `Internal` error (`what` names the verb for the message).
 fn ok_reply<T: serde::Serialize>(reply: &T, what: &str) -> Response {
@@ -835,6 +1199,69 @@ mod tests {
     fn test_daemon_with(persister: Arc<SpyPersister>) -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
             .with_resource_persister(persister)
+    }
+
+    /// A member's relayed slice verb (§6.7): identity, then the member's own
+    /// entry, then keeperd as growlightd's own client — the relayed request
+    /// is the plain human verb with no member on it, and keeperd's reply comes
+    /// back verbatim. A refusal is a wire error led by its code and relays
+    /// nothing.
+    #[test]
+    fn a_members_slice_verb_is_checked_then_relayed_to_keeperd_as_a_human_verb() {
+        use crate::member_handoff::{tests::SpyKeeper, HandoffSeams};
+        use crate::scheduler_v2::Unit;
+        let garden = tempfile::tempdir().unwrap();
+        let spy = Arc::new(SpyKeeper::default());
+        let daemon = Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), garden.path().into()))
+            .with_v2_handoff(HandoffSeams {
+                keeper: Box::new(spy.clone()),
+                entries: crate::baton_store::FsEntryBatonStore::new(garden.path().join("e"), "g"),
+            });
+        let assignment = crate::drive_loop::V2Assignment {
+            agent: "c".into(),
+            entry: "m1".into(),
+            unit: Unit::Slice { milestone: "m1".into(), slice: "001".into() },
+            resolved_model: softfig_ipc::model_choice::ModelChoice::claude(),
+        };
+        daemon.publish_v2_assignments(&std::iter::once(("c".to_string(), assignment)).collect());
+
+        let call = |member: Option<&str>, op_: &str, args: serde_json::Value| {
+            let mut envelope = serde_json::json!({ "args": args });
+            if let Some(member) = member {
+                envelope["member"] = member.into();
+            }
+            member_slice_verb(&daemon, &Request::new(op_, envelope))
+        };
+        let refusal = |resp: Response| match resp {
+            Response::Err { kind, error, .. } => {
+                assert_eq!(kind, ErrorKind::BadArgs, "{error}");
+                error
+            }
+            Response::Ok { data, .. } => panic!("expected a refusal, got {data}"),
+        };
+        let insert = |milestone: &str| serde_json::json!({ "milestone": milestone, "slug": "found", "body": "work" });
+        let mv = |id: &str| serde_json::json!({ "milestone": "m1", "id": id, "move": { "to": "front" } });
+
+        let e = refusal(call(None, op::MEMBER_SLICE_INSERT, insert("m1")));
+        assert!(e.starts_with("not_a_member:"), "{e}");
+        let e = refusal(call(Some("z"), op::MEMBER_SLICE_INSERT, insert("m1")));
+        assert!(e.starts_with("member_not_allowed:") && e.contains("holds no v2 entry"), "{e}");
+        let e = refusal(call(Some("c"), op::MEMBER_SLICE_INSERT, insert("m2")));
+        assert!(e.starts_with("member_not_allowed:") && e.contains("outside"), "{e}");
+        let e = refusal(call(Some("c"), op::MEMBER_SLICE_UPDATE, mv("001")));
+        assert!(e.contains("own active slice"), "{e}");
+        assert!(spy.relayed.lock().unwrap().is_empty(), "a refusal relays nothing");
+
+        for (op_, args, human) in [
+            (op::MEMBER_SLICE_INSERT, insert("m1/sub"), softfig_ipc::op::SLICE_INSERT),
+            (op::MEMBER_SLICE_UPDATE, mv("002"), softfig_ipc::op::SLICE_UPDATE),
+        ] {
+            let resp = call(Some("c"), op_, args.clone());
+            assert!(matches!(&resp, Response::Ok { data, .. } if data["relayed"] == human), "{resp:?}");
+            let relayed = spy.relayed.lock().unwrap().pop().expect("relayed");
+            assert_eq!((relayed.op.as_str(), relayed.member.as_deref()), (human, None));
+            assert_eq!(relayed.args["milestone"], args["milestone"], "the human verb's own args");
+        }
     }
 
     /// A claude + opencode roster, the shape slice 006's status surface has to make

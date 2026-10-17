@@ -10,6 +10,15 @@ pub struct Request {
     pub op: String,
     #[serde(default = "Value::default")]
     pub args: Value,
+    /// The fleet member a member session's softfig-mcp is serving, read from
+    /// its launch env (`SOFTFIG_MEMBER`, spec-growlight-queue §6.7) — never
+    /// from a tool argument. keeperd holds a request that carries one to the
+    /// member write limits; absent (every other client, growlightd's own calls
+    /// included) means a human-directed or daemon request, served as before.
+    /// Optional and skipped when absent, so the wire stays what older peers
+    /// send and accept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
 }
 
 impl Request {
@@ -18,7 +27,14 @@ impl Request {
             v: crate::PROTOCOL_VERSION,
             op: op.into(),
             args,
+            member: None,
         }
+    }
+
+    /// Stamp the calling member (`None` leaves the request a non-member one).
+    pub fn with_member(mut self, member: Option<&str>) -> Self {
+        self.member = member.map(str::to_string);
+        self
     }
 }
 
@@ -246,5 +262,22 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// A request with no member is the wire it always was (no `member` key, so
+    /// an older keeperd reads it unchanged), and an older client's request —
+    /// no key at all — decodes as a non-member one.
+    #[test]
+    fn the_member_field_is_optional_on_the_wire() {
+        let plain = Request::new("status", serde_json::json!({}));
+        let s = serde_json::to_string(&plain).unwrap();
+        assert!(!s.contains("member"), "{s}");
+        let back: Request = serde_json::from_str(r#"{"v":1,"op":"status","args":{}}"#).unwrap();
+        assert_eq!(back.member, None);
+
+        let stamped = Request::new("patch_file", serde_json::json!({})).with_member(Some("c"));
+        let back: Request = serde_json::from_str(&serde_json::to_string(&stamped).unwrap()).unwrap();
+        assert_eq!(back.member.as_deref(), Some("c"));
+        assert_eq!(Request::new("x", serde_json::json!({})).with_member(None).member, None);
     }
 }

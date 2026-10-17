@@ -58,19 +58,25 @@ use std::time::Duration;
 
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
+use crate::baton_store::FsEntryBatonStore;
 use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
+use crate::fleet::QueueMode;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
-use crate::opencode_backend::OpencodeBackend;
+use crate::opencode_backend::{ModelSelection, OpencodeBackend};
 use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
+use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
 use crate::state::State;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
     Supervisor,
 };
 use crate::usage::{UsageAggregator, UsageSample, WindowResets};
+use crate::v2_source::V2Load;
+use softfig_ipc::model_choice::{member_default, ModelChoice};
+use softfig_ipc::queue_v2::EntryStatus;
 
 /// How often the live drive loop ticks: schedule, observe health, honor control,
 /// re-roll. Agents run for minutes per session, so a ~1s cadence is ample — this
@@ -727,6 +733,65 @@ impl BatonSeeder for DeferredBatonSeeder {
     }
 }
 
+// ---- queue v2 scheduling seams (queue-v2-scheduling slice 006) ----
+//
+// The v2 siblings of the legacy seams above, held in [`V2Seams`] and consulted
+// ONLY when the §11 switch reads `queue = "v2"` — so the legacy path (every
+// seam above, byte-identical) never sees them and a legacy loop's construction
+// is untouched. A loop whose daemon reads `v2` but has NO seams installed (a
+// test that forgot `with_v2`) schedules nothing from v2: fail-closed.
+
+/// The seam the loop reads the v2 list through (spec §3): the live impl is
+/// [`crate::v2_source::V2Source`] (`load` per tick, alert-once memory inside);
+/// a test scripts [`V2Load::Snapshot`] / [`V2Load::Absent`].
+pub trait V2QueueSource: Send + Sync + fmt::Debug {
+    /// One tick's v2 read: a validated snapshot ready for
+    /// [`pick_v2`](crate::scheduler_v2::pick_v2), `Absent` (no `queue.toml` —
+    /// schedule nothing), or `Failed` (invalid — schedule nothing; the source
+    /// already alerted).
+    fn load(&mut self) -> V2Load;
+}
+
+/// The seam the loop claims a picked v2 unit through (spec §6.3 step 3's claim
+/// at assignment, slice 005's op): keeperd's `queue_v2_claim({entry, unit?})`.
+/// `Ok(())` means the unit is now this member's (the op's idempotent
+/// re-claim counts); `Err` aborts the spawn fail-closed, exactly like the
+/// legacy [`PartClaimer`]. The live impl is
+/// [`crate::claim::KeeperdV2Claimer`] over the keeperd socket.
+pub trait V2Claimer: Send + Sync + fmt::Debug {
+    /// Claim `entry` (the milestone identity — `"parent/sub"` for subs) and its
+    /// `unit` slice id (`None` for a task, restack, or close-out).
+    fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String>;
+}
+
+/// The seam the loop item-parks a v2 ENTRY through when its member exits on a
+/// human-block (`BLOCKED_ON_HUMAN` / `STUCK`): keeperd's
+/// `queue_v2_set_status(entry, blocked)` — the v2 sibling of [`ItemParker`].
+/// Fail-soft in the drive loop (the member is already released), exactly like
+/// the legacy park. The live impl is [`crate::claim::KeeperdV2ItemParker`].
+pub trait V2ItemParker: Send + Sync + fmt::Debug {
+    /// Park `entry` (entry-level `active → blocked`, no unit).
+    fn park_entry_v2(&self, entry: &str) -> Result<(), String>;
+    /// Pause `entry` (entry-level `active → paused`) — §6.3 step 5: a member
+    /// that handed off moves on to other work (urgent work, or a backend
+    /// mismatch on the entry's next unit), and the entry keeps its repo slot
+    /// and counters until a member resumes it (queue-v2-scheduling slice 009).
+    /// A pending human change on the entry lands instead (finding 8).
+    fn pause_entry_v2(&self, entry: &str) -> Result<(), String>;
+}
+
+/// The seam the loop writes a member's baton through at a v2 spawn (§3.6 "At
+/// spawn, growlightd copies the entry's baton into the member's baton path").
+/// Distinct from [`BatonSeeder`]: that one templates a fresh seed keyed to
+/// `(queue, part)`; this one carries the per-entry baton's EXACT contents (a
+/// paused entry's curated state handed to its possibly different resuming
+/// member). The live impl is [`crate::baton_store::FsBatonStore`] over the same
+/// runtime `agents/` namespace the legacy seeder uses.
+pub trait MemberBatonWriter: Send + Sync + fmt::Debug {
+    /// Write `baton` verbatim to `agent`'s member baton path.
+    fn write(&self, agent: &str, baton: &str) -> Result<(), String>;
+}
+
 /// One configured fleet member: the agent's spawn [`AgentSpec`] plus the
 /// work-stream it is **pinned** to (pinned-with-fallback, spec §6). An unpinned
 /// member (`pin: None`) goes straight to fallback.
@@ -736,20 +801,39 @@ pub struct FleetMember {
     pub spec: AgentSpec,
     /// The agent's pinned queue name, or `None` for an unpinned agent.
     pub pin: Option<String>,
+    /// Which backend this member runs on (opencode-fleet-backend slice 005),
+    /// carried so v2 scheduling (queue-v2-scheduling slice 006) can build the
+    /// per-member [`crate::scheduler_v2::Member`] (backend match + the member
+    /// default) without re-deriving it from the router. Defaults to
+    /// [`crate::fleet::MemberBackend::Claude`] on the legacy constructors.
+    pub backend: crate::fleet::MemberBackend,
 }
 
 impl FleetMember {
-    /// A member pinned to `pin`'s work-stream.
+    /// A member pinned to `pin`'s work-stream, on the claude backend (the legacy
+    /// default — use [`with_backend`](Self::with_backend) to override).
     pub fn pinned(spec: AgentSpec, pin: impl Into<String>) -> Self {
         Self {
             spec,
             pin: Some(pin.into()),
+            backend: crate::fleet::MemberBackend::Claude,
         }
     }
 
-    /// An unpinned member (fallback-only).
+    /// An unpinned member (fallback-only), on the claude backend.
     pub fn unpinned(spec: AgentSpec) -> Self {
-        Self { spec, pin: None }
+        Self {
+            spec,
+            pin: None,
+            backend: crate::fleet::MemberBackend::Claude,
+        }
+    }
+
+    /// Set the member's backend (the roster's `[[fleet]]` row).
+    #[must_use]
+    pub fn with_backend(mut self, backend: crate::fleet::MemberBackend) -> Self {
+        self.backend = backend;
+        self
     }
 }
 
@@ -763,6 +847,45 @@ pub struct Assignment {
     pub queue: String,
     /// The part (item id) at that queue's head.
     pub part: String,
+}
+
+/// A queue-v2 scheduler assignment (queue-v2-scheduling slice 006): which agent
+/// was started on which `(entry, unit)` with which resolved model — spec §12's
+/// "assignment carries entry + unit + resolved model". Sits BESIDE the legacy
+/// [`Assignment`]: the legacy type and every legacy path that produces it stay
+/// byte-identical; the v2 scheduling pass records this instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2Assignment {
+    /// The agent that was started.
+    pub agent: String,
+    /// The milestone identity the pick returned (`"<parent>/<sub>"` for a
+    /// sub-milestone) — the `entry` addressing of slice 005's ops.
+    pub entry: String,
+    /// The unit the pick walked to: a slice id, the close-out, or the
+    /// task/restack itself.
+    pub unit: Unit,
+    /// The concrete launch choice for this spawn: the unit's declared list's
+    /// first backend-runnable entry, or the member default when nothing was
+    /// declared (§6.4). A claude member's choice is always `claude` (its model
+    /// is the harness's own, not settable from this path).
+    pub resolved_model: ModelChoice,
+}
+
+/// A v2 session the loop ended after its member-verb handoff (§6.3 step 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2SessionEnd {
+    /// The member whose session ended.
+    pub agent: String,
+    /// The entry and unit it handed off.
+    pub entry: String,
+    pub unit: Unit,
+    /// The verb that ended it.
+    pub verb: &'static str,
+    /// `true` when the grace ran out and the loop killed the session; `false`
+    /// when it exited on its own.
+    pub killed: bool,
+    /// `growlight_block`'s `@human` alert text, dispatched with the tick.
+    pub alert: Option<String>,
 }
 
 /// A start the admission governor did not admit this tick — queued (cap) or
@@ -818,6 +941,24 @@ pub struct ExitDisposition {
 pub struct TickReport {
     /// Agents started this tick, with their scheduler assignment.
     pub started: Vec<Assignment>,
+    /// Agents started this tick under queue v2, with their `(entry, unit)`
+    /// assignment and the resolved model the spawn carried (slice 006). Empty on
+    /// every legacy tick.
+    pub v2_started: Vec<V2Assignment>,
+    /// Entries item-parked this tick under queue v2 (a member exited on a
+    /// human-block and its entry was marked `blocked` via `queue_v2_set_status`).
+    pub v2_parked: Vec<V2Assignment>,
+    /// Sessions ended this tick after a committed member-verb handoff (§6.3
+    /// step 4, slice 009).
+    pub v2_handoffs: Vec<V2SessionEnd>,
+    /// Entries paused this tick at a handshake (§6.3 step 5): `(member, entry)`
+    /// — the member moved on to other work, or idles.
+    pub v2_paused: Vec<(String, String)>,
+    /// Items that newly stopped an entry's §4 walk this tick — the blocked
+    /// item's address (`<milestone>:<id>`). §2: the entry is ineligible and
+    /// growlightd alerts once, so an item lands here on the tick its block is
+    /// first seen, not every tick it persists.
+    pub v2_walk_blocked: Vec<String>,
     /// Starts held by admission (cap queue / budget-rate refuse / spawn failure).
     pub held_starts: Vec<HeldStart>,
     /// Fresh starts SKIPPED in step 3 before admission — no workable part, or the
@@ -908,6 +1049,27 @@ pub struct TickReport {
     /// edge-logged by the [`TickLogger`] on the tripping tick. `false` on every tick of
     /// an unbounded (`max_iterations` absent) run — the default.
     pub bounded_run_stopped: bool,
+}
+
+/// The queue-v2 scheduling seams (slice 006) — the v2 siblings of the legacy
+/// seams, bundled so [`DriveLoop::with_v2`] installs them in one step and a
+/// legacy loop's [`DriveLoop::new`] construction stays untouched. Consulted
+/// ONLY when the daemon reads `queue = "v2"` (§11).
+#[derive(Debug)]
+pub struct V2Seams {
+    /// The live v2 queue source (holds the alert-once memory across ticks).
+    pub source: Box<dyn V2QueueSource>,
+    /// The per-entry baton store (spec §3.6) over the runtime `entries/`
+    /// namespace — read at spawn, seeded from the template when never claimed.
+    pub entries: FsEntryBatonStore,
+    /// Writes the member's baton at spawn — the §3.6 copy target
+    /// (`agents/<id>/baton.md`).
+    pub member_writer: Box<dyn MemberBatonWriter>,
+    /// The v2 claim (`queue_v2_claim`) over the keeperd socket.
+    pub claimer: Box<dyn V2Claimer>,
+    /// The v2 item-park (`queue_v2_set_status(entry, blocked)`) over the keeperd
+    /// socket.
+    pub parker: Box<dyn V2ItemParker>,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -1003,6 +1165,44 @@ pub struct DriveLoop {
     /// owns lifecycle (it knows the agent, not its part); the loop owns the
     /// assignment (it did the claim), so the part lookup lives here.
     assignments: std::collections::BTreeMap<String, (String, String)>,
+    /// The v2 scheduling seams (slice 006) — the v2 source, the per-entry baton
+    /// store, the member-baton writer, and the v2 claimer/parker. `None` = a
+    /// legacy loop (nothing to consult); a loop whose daemon reads
+    /// `queue = "v2"` but was built without seams schedules nothing (fail-closed).
+    v2: Option<V2Seams>,
+    /// Each running member's current v2 `(entry, unit)` assignment — the v2 twin
+    /// of `assignments`, recorded on the member's v2 fresh start and carried
+    /// across re-rolls (a re-roll re-spawns on the same spec, model included).
+    /// Read to (a) overlay `holder` on the per-tick snapshot (slice 003's
+    /// contract — `pick_v2`'s `Held` skip needs it) and (b) know which entry to
+    /// park when the member exits on a human-block.
+    v2_assignments: std::collections::BTreeMap<String, V2Assignment>,
+    /// Handoffs this loop has seen and not yet ended (queue-v2-scheduling slice
+    /// 009): member → the tick it was first seen, the start of §6.3 step 4's
+    /// `roll_grace_secs` on the loop's own injected clock.
+    v2_handoff_seen: std::collections::BTreeMap<String, i64>,
+    /// Entries a member handed off and still holds until its next pick (§6.3
+    /// step 5): member → entry. The entry stays `active`, overlaid as held by
+    /// this member, so no one else takes it before the member's pick decides:
+    /// resume it, or move on and pause it.
+    v2_rolled: std::collections::BTreeMap<String, String>,
+    /// Paused entries → the member that paused them, the §2 step-2 resume
+    /// preference overlaid as the entry's `holder`.
+    v2_paused_by: std::collections::BTreeMap<String, String>,
+    /// Entries whose §4 walk stops at a `blocked` item, already alerted (§2
+    /// "growlightd alerts once"): entry → the blocked item's address. In memory
+    /// like the v2 source's alert memory. An entry leaves when its walk moves
+    /// on, so a later block is a new incident and alerts again.
+    v2_walk_blocked: std::collections::BTreeMap<String, String>,
+    /// Pauses whose keeperd write failed, retried every tick: entry → the
+    /// pausing member. The entry stays held by that member meanwhile, so the
+    /// failure can't strand it as an `active` entry nobody may take.
+    v2_to_pause: std::collections::BTreeMap<String, String>,
+    /// Accepted model changes (§6.4): the next session of `(entry, unit)` runs
+    /// on this model, overlaid as the unit's allowed list until that unit is
+    /// spawned again — so the backend match routes it to a member that can
+    /// run it, and the spawn resolves to it.
+    v2_model_overrides: Vec<(String, Unit, ModelChoice)>,
     /// When the pre-spawn connectivity gate first held THIS outage (its first offline
     /// tick's `now`), or `None` while online/paused (network-failsafe slice 003).
     /// Drives the sustained-offline alert threshold — a blip clears it before
@@ -1112,6 +1312,14 @@ impl DriveLoop {
             stopped: BTreeSet::new(),
             reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
+            v2: None,
+            v2_assignments: std::collections::BTreeMap::new(),
+            v2_walk_blocked: std::collections::BTreeMap::new(),
+            v2_handoff_seen: std::collections::BTreeMap::new(),
+            v2_rolled: std::collections::BTreeMap::new(),
+            v2_paused_by: std::collections::BTreeMap::new(),
+            v2_to_pause: std::collections::BTreeMap::new(),
+            v2_model_overrides: Vec::new(),
             offline_since: None,
             offline_alerted: false,
             rate_limit_hold_until: None,
@@ -1134,6 +1342,18 @@ impl DriveLoop {
     #[must_use]
     pub fn with_max_iterations(mut self, max: Option<u64>) -> Self {
         self.max_iterations = max;
+        self
+    }
+
+    /// Install the queue-v2 scheduling seams (slice 006). A builder like
+    /// [`with_max_iterations`](Self::with_max_iterations), so the 15-arg
+    /// [`new`](Self::new) — and every legacy test that builds a loop through it —
+    /// is unchanged; only the live [`assemble_fleet`](crate::fleet::assemble_fleet)
+    /// and the v2 tests opt in. With seams absent, a daemon that reads
+    /// `queue = "v2"` schedules nothing from v2 (fail-closed).
+    #[must_use]
+    pub fn with_v2(mut self, seams: V2Seams) -> Self {
+        self.v2 = Some(seams);
         self
     }
 
@@ -1169,6 +1389,14 @@ impl DriveLoop {
         let mut report = TickReport::default();
         let paused = self.daemon.is_paused();
         report.paused = paused;
+
+        // The §11 queue switch (queue-v2-scheduling slice 006): which queue model
+        // this tick schedules from. Read from the daemon each tick like `policy`
+        // (below) — the boot-set `config/growlight.toml` `queue` key. Under `v2`,
+        // the health pass's assignment-touching arms and steps 2 + 3 run the v2
+        // variants; under `legacy` (the default) every path below is byte-identical
+        // to the pre-switch loop.
+        let v2_mode = self.daemon.queue_mode() == QueueMode::V2;
 
         // Connectivity gate (network-failsafe slice 001). Probe the link BEFORE any
         // spawn: a headless `claude -p` launched offline errors out on its first API
@@ -1322,6 +1550,17 @@ impl DriveLoop {
             let drained = self.daemon.drain_inject_lane(agent);
             if !drained.is_empty() {
                 report.injected.push((agent.clone(), drained));
+            }
+
+            // c0. A v2 session that handed off through a member verb (§6.3 steps
+            //    4–5, slice 009): the server already committed it, so its exit is
+            //    not classified off a baton — the loop ends the session (on exit,
+            //    or after the grace) and step 3 picks for the member.
+            if v2_mode {
+                if let Some(handoff) = self.daemon.v2_handoff(agent) {
+                    self.end_handed_off_session(agent, handoff, now, &mut report);
+                    continue;
+                }
             }
 
             // c. Health-driven lifecycle. No observation (never spawned, or already
@@ -1503,7 +1742,13 @@ impl DriveLoop {
                         // human also asked it to stop, it stops for good; otherwise
                         // it stays eligible to RE-START when new queued work appears
                         // (not in `stopped`), and the daemon idles in between.
-                        self.assignments.remove(agent);
+                        if v2_mode {
+                            // The v2 assignment dies with the member (a re-pick walks
+                            // the tree fresh); the legacy map is never populated.
+                            self.v2_assignments.remove(agent);
+                        } else {
+                            self.assignments.remove(agent);
+                        }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         } else {
@@ -1521,7 +1766,15 @@ impl DriveLoop {
                         // pending boundary stop instead retires it for good (it must
                         // not re-pick). Drop the finished assignment; step 3 records
                         // the next one if it re-picks.
-                        self.assignments.remove(agent);
+                        if v2_mode {
+                            // v2: drop the (entry, unit) assignment; the entry's
+                            // status transition (done/paused/…) is the §6.3 handshake's
+                            // row (slice 009), so the pick re-walks the tree as the
+                            // files describe it.
+                            self.v2_assignments.remove(agent);
+                        } else {
+                            self.assignments.remove(agent);
+                        }
                         // A human boundary stop OR a reached bounded-run limit (task 040)
                         // retires the member — an item boundary is a completed iteration
                         // too, so at the bound it retires instead of letting step 3
@@ -1550,7 +1803,25 @@ impl DriveLoop {
                         // the pinned member next cycles back to it. The slot is never
                         // stuck — that is the whole fix.
                         self.aggregator.forget(agent);
-                        if let Some((queue, part)) = self.assignments.remove(agent) {
+                        if v2_mode {
+                            // The v2 twin: park the ENTRY via `queue_v2_set_status(entry,
+                            // blocked)` (fail-soft — the member is already released and
+                            // `pick_v2` skips `blocked` entries, so a failed write just
+                            // means a re-pick attempt next tick, which the single-active
+                            // tree rule refuses rather than double-runs).
+                            if let Some(assignment) = self.v2_assignments.remove(agent) {
+                                if let Err(_e) = self
+                                    .v2
+                                    .as_ref()
+                                    .expect("v2 seams installed when the daemon reads v2")
+                                    .parker
+                                    .park_entry_v2(&assignment.entry)
+                                {
+                                    // Fail-soft, see the arm comment.
+                                }
+                                report.v2_parked.push(assignment);
+                            }
+                        } else if let Some((queue, part)) = self.assignments.remove(agent) {
                             if let Err(_e) = self.parker.park_item(&queue, &part) {
                                 // Fail-soft (see the arm comment): the member is
                                 // already released and the local item-park below still
@@ -1638,6 +1909,263 @@ impl DriveLoop {
         let rate_limited = self.rate_limit_hold_until.is_some();
         report.waiting_for_rate_limit_reset = self.rate_limit_hold_until;
 
+        // ---- queue v2 scheduling (slice 006): steps 2 + 3 on the v2 source ----
+        //
+        // Under `queue = "v2"` the legacy snapshot read, step 2 (re-roll) and step 3
+        // (fresh start) below are REPLACED by the v2 variants — the v2 source (003)
+        // + `pick_v2` (002) + the keeperd claim op (005), the per-unit model, and
+        // the §3.6 entry-baton copy. The shared gates (`paused` / `offline` /
+        // `rate_limited` / `superseded` / `bound_reached`) apply to both modes.
+        // `Absent`/`Failed` (or seams never installed) schedule nothing from v2:
+        // fail-closed, exactly as the source's contract states.
+        //
+        // Bounded-run stop (task 040): once the iteration limit was reached (latched in
+        // the health pass above, when a member's clean boundary hit `max_iterations`),
+        // HOLD every spawn — no re-roll (step 2), no fresh start (step 3) — the
+        // pre-spawn twin of `superseded`, and equally TERMINAL (only a daemon restart
+        // clears it, re-arming a fresh bounded batch). The member(s) that hit the bound
+        // already retired above; this stops the fleet from starting anything new, so the
+        // fleet stops after EXACTLY the configured count. Read AFTER the health pass
+        // (the latch may have just been set) — unlike `superseded`, which is known up
+        // front. Hoisted above the mode split (from its pre-switch position after the
+        // legacy parked computation) so both modes share the one gate; reading it here
+        // is the same pure field read the legacy path always did.
+        let bound_reached = self.iteration_bound_reached;
+        report.bounded_run_stopped = bound_reached;
+
+        if v2_mode {
+            let mut snapshot = match self.v2.as_mut().map(|seams| seams.source.load()) {
+                Some(V2Load::Snapshot(snapshot)) => Some(snapshot),
+                Some(V2Load::Absent) | Some(V2Load::Failed { .. }) | None => {
+                    // Schedule nothing this tick (the source alerted already, once).
+                    // Health/control (step 1) still ran — exits and boundary stops
+                    // are observed; only the v2 spawns are held.
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot.as_mut() {
+                // §2's blocked walk: alert once per stopped entry, whatever the
+                // gates below decide about spawning.
+                self.note_v2_blocked_walks(snapshot, &mut report);
+                // The runtime overlay (slices 003/006/009): who holds which entry,
+                // and the accepted model changes. Retry a pause that failed earlier
+                // first, so the entry it lands on reads as what it is; a pauser is
+                // only a preference while its entry is still paused.
+                self.retry_v2_pauses();
+                self.v2_paused_by.retain(|entry, _| {
+                    snapshot
+                        .entries
+                        .iter()
+                        .any(|e| &e.id == entry && e.status == EntryStatus::Paused)
+                });
+                apply_v2_overlay(snapshot, &self.v2_overlay());
+
+                // The per-member `pick_v2` input, built from the configured fleet:
+                // backend + roster default from the member's row; the pin carried
+                // through as-is (under v2 a pin names a project, §2 — the live
+                // config stays legacy-pinned until the migration, so a v2 pin
+                // rarely matches and the member simply falls back).
+                let v2_members: std::collections::BTreeMap<&str, scheduler_v2::Member> = fleet
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.spec.agent.as_str(),
+                            scheduler_v2::Member {
+                                id: member.spec.agent.clone(),
+                                backend: member.backend.ipc_backend(),
+                                pin: member.pin.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+
+                // Step 2 analog — the re-roll, with the same shared gates. The
+                // workable gate is the v2 twin of the legacy closure: a down
+                // member's own entry still standing `active` in the fresh snapshot
+                // is workable (resume own work — `pick_v2` alone would skip it as
+                // held), as is anything `pick_v2` would hand it.
+                if !paused && !offline && !rate_limited && !superseded && !bound_reached {
+                    let assignments = &self.v2_assignments;
+                    let workable = |agent: &str| -> bool {
+                        let resumes_own = assignments.get(agent).is_some_and(|a| {
+                            snapshot.entries.iter().any(|e| {
+                                e.id == a.entry && e.status == EntryStatus::Active
+                            })
+                        });
+                        resumes_own
+                            || v2_members
+                                .get(agent)
+                                .is_some_and(|m| pick_v2(snapshot, m).picked.is_some())
+                    };
+                    report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
+                    for outcome in &report.rerolls {
+                        if let RerollOutcome::Rerolled { agent } = outcome {
+                            self.reconnecting.remove(agent);
+                        }
+                    }
+                }
+
+                // Step 3 analog — schedule + claim + admit + spawn over the
+                // snapshot, with the same shared gates. The claim (the keeperd op)
+                // and the §3.6 baton copy sit between admission and the spawn,
+                // exactly where the legacy seed + claim sit: a failed claim or
+                // copy aborts the start fail-closed before any child exists.
+                if !paused && !offline && !rate_limited && !superseded && !bound_reached {
+                    // Entries already spoken for — every live member's recorded
+                    // assignment (cross-tick), extended per-tick below — so the
+                    // SAME entry is never assigned twice.
+                    let mut spoken_for: std::collections::BTreeSet<String> =
+                        self.v2_assignments.values().map(|a| a.entry.clone()).collect();
+                    for member in &fleet {
+                        let agent = &member.spec.agent;
+                        // A stopping/stopped agent is never (re-)started; a registered
+                        // one re-rolls via step 2, it is not re-`start`ed.
+                        if self.retiring.contains(agent) || self.stopped.contains(agent) {
+                            // A stopping member never re-picks, so an entry it
+                            // handed off and still holds goes to `paused` now.
+                            if let Some(rolled) = self.v2_rolled.remove(agent) {
+                                self.pause_v2_entry(&rolled, agent, &mut report);
+                            }
+                            continue;
+                        }
+                        if self.supervisor.is_registered(agent) {
+                            continue;
+                        }
+                        let Some(v2_member) = v2_members.get(agent.as_str()) else {
+                            // Not in the configured fleet map — cannot happen (both
+                            // are built from `fleet`), but fail-closed rather than
+                            // pick with a fabricated member.
+                            continue;
+                        };
+                        let picked = pick_v2(snapshot, v2_member).picked;
+                        // §6.3 step 5 / §9: a member that handed off and is not
+                        // resuming its entry — urgent work won the pick, or the
+                        // entry's next unit needs a model this member's backend
+                        // can't run — leaves it `paused`, keeping its repo slot and
+                        // its slice's counter, for any member to resume.
+                        if let Some(rolled) = self.v2_rolled.remove(agent) {
+                            if picked.as_ref().map(|p| &p.entry) != Some(&rolled) {
+                                self.pause_v2_entry(&rolled, agent, &mut report);
+                            } else {
+                                self.v2_rolled.insert(agent.clone(), rolled);
+                            }
+                        }
+                        let Some(pick) = picked else {
+                            // Nothing workable for this member right now — the v2
+                            // twin of the legacy held-fresh narration.
+                            report.held_fresh.push(HeldFresh {
+                                agent: agent.clone(),
+                                reason: "no workable unit",
+                            });
+                            continue;
+                        };
+                        // An entry already spoken for — held by a live member
+                        // (cross-tick) or claimed earlier this tick — is taken;
+                        // never double-assign it (the v2 twin of the legacy guard).
+                        if spoken_for.contains(&pick.entry) {
+                            report.held_fresh.push(HeldFresh {
+                                agent: agent.clone(),
+                                reason: "entry already claimed",
+                            });
+                            continue;
+                        }
+                        // Resolve the concrete model (§6.4): the unit's declared
+                        // list's first entry this member's backend runs, or the
+                        // member default when nothing was declared. `pick_v2` only
+                        // yields units whose declared list the backend can run
+                        // (`BackendMismatch` skips otherwise), so the `and_then`
+                        // falling through to the default is the undeclared case.
+                        let resolved = resolve_v2_model(&pick, member);
+                        // The spawn spec: an opencode member carries the override on
+                        // argv `--model`; a claude member's spec carries `None`
+                        // (claude's model is the harness's own).
+                        let spec = match &resolved {
+                            ModelChoice {
+                                backend: softfig_ipc::model_choice::Backend::Opencode,
+                                model: Some(model),
+                                variant,
+                            } => member.spec.clone().with_model(ModelSelection {
+                                model: model.clone(),
+                                variant: variant.clone(),
+                            }),
+                            _ => member.spec.clone(),
+                        };
+                        // The entry id the per-entry store keys on: the TOP-LEVEL
+                        // entry (a `"parent/sub"` identity shares its top-level
+                        // entry's baton, §3.6). The claim op takes the unit's
+                        // milestone identity (`"parent/sub"` for a sub-milestone's
+                        // slice — `pick.entry` is always the top-level row, slice
+                        // 005's addressing) and the slice id, omitted for a task,
+                        // restack or close-out.
+                        let entry_top = pick.entry.split('/').next().unwrap_or(&pick.entry);
+                        let (claim_entry, unit_arg) = match &pick.unit {
+                            Unit::Slice { milestone, slice } => (milestone.clone(), Some(slice.clone())),
+                            Unit::CloseOut { milestone } => (milestone.clone(), None),
+                            Unit::Entry => (pick.entry.clone(), None),
+                        };
+                        // Borrow the v2 seams as locals so the claim closure below
+                        // captures disjoint fields while `start_claiming` takes
+                        // `&mut self.supervisor` (the legacy seed/claim pattern).
+                        let v2_seams = self.v2.as_ref().expect("v2 seams installed");
+                        let entries = &v2_seams.entries;
+                        let member_writer = &v2_seams.member_writer;
+                        let v2_claimer = &v2_seams.claimer;
+                        let outcome = self.supervisor.start_claiming(
+                            spec,
+                            budget,
+                            rate,
+                            now,
+                            || {
+                                // Baton FIRST, then the claim — the legacy order
+                                // (seed before claim), so a baton failure aborts
+                                // before the keeperd write and never orphans an
+                                // `active` entry.
+                                copy_entry_baton(entries, &**member_writer, entry_top, agent)?;
+                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref())
+                            },
+                        );
+                        match outcome {
+                            StartOutcome::Started => {
+                                spoken_for.insert(pick.entry.clone());
+                                // The handshake's bookkeeping for this entry is
+                                // spent: it is held by a running member again,
+                                // and a model change reached its session.
+                                self.v2_rolled.remove(agent);
+                                self.v2_paused_by.remove(&pick.entry);
+                                self.v2_model_overrides
+                                    .retain(|(e, u, _)| !(e == &pick.entry && u == &pick.unit));
+                                let assignment = V2Assignment {
+                                    agent: agent.clone(),
+                                    entry: pick.entry.clone(),
+                                    unit: pick.unit.clone(),
+                                    resolved_model: resolved,
+                                };
+                                self.v2_assignments.insert(agent.clone(), assignment.clone());
+                                report.v2_started.push(assignment);
+                            }
+                            // The claim landed even though the spawn failed — keep
+                            // the entry excluded this tick so no peer grabs what
+                            // keeperd now shows `active`; the agent retries next
+                            // tick via a re-pick of its (now `active`) entry.
+                            outcome @ StartOutcome::SpawnFailed { .. } => {
+                                spoken_for.insert(pick.entry.clone());
+                                report.held_starts.push(HeldStart {
+                                    agent: agent.clone(),
+                                    outcome,
+                                });
+                            }
+                            // Queued / Refused (no claim attempted) or ClaimFailed
+                            // (claim refused, fail-closed): nothing claimed, nothing
+                            // excluded.
+                            outcome => report.held_starts.push(HeldStart {
+                                agent: agent.clone(),
+                                outcome,
+                            }),
+                        }
+                    }
+                }
+            }
+        } else {
         // Read this tick's queue snapshot ONCE, before the re-roll: BOTH the
         // re-roll's queue-gate (step 2) and the fresh-start claim (step 3) consult
         // it, so they share one consistent view. Step 3 mutates a working copy
@@ -1652,18 +2180,6 @@ impl DriveLoop {
             snapshot.mark_blocked(queue, part);
         }
         report.parked = parked(&snapshot);
-
-        // Bounded-run stop (task 040): once the iteration limit was reached (latched in
-        // the health pass above, when a member's clean boundary hit `max_iterations`),
-        // HOLD every spawn — no re-roll (step 2), no fresh start (step 3) — the
-        // pre-spawn twin of `superseded`, and equally TERMINAL (only a daemon restart
-        // clears it, re-arming a fresh bounded batch). The member(s) that hit the bound
-        // already retired above; this stops the fleet from starting anything new, so the
-        // fleet stops after EXACTLY the configured count. Read AFTER the health pass
-        // (the latch may have just been set) — unlike `superseded`, which is known up
-        // front.
-        let bound_reached = self.iteration_bound_reached;
-        report.bounded_run_stopped = bound_reached;
 
         // 2. Re-roll due agents ([`Intent::Roll`]). `pause` is the admission gate
         //    (spec §8): a paused fleet attempts no rolls (and no starts, below).
@@ -1856,6 +2372,14 @@ impl DriveLoop {
                 }
             }
         }
+        }
+
+        // Mirror the v2 assignments for the member verbs' assignment-match check
+        // (queue-v2-scheduling slice 008): every insert/remove above happened this
+        // tick, so the copy is current before any spawned session can call a verb.
+        self.daemon.publish_v2_assignments(&self.v2_assignments);
+        // …and the runtime overlay, for `queue pick` (slice 012).
+        self.daemon.publish_v2_overlay(self.v2_overlay());
 
         // 4. Route this tick's events through the single owned dispatcher (spec
         //    §9). The report is still RETURNED for the caller (and tests) to
@@ -1908,6 +2432,24 @@ impl DriveLoop {
         for (_queue, part) in &report.parked {
             self.dispatcher
                 .notify(&NotifyEvent::BlockedOnHuman { item: part.clone() }, now);
+        }
+        // The v2 twins (slice 009): `growlight_block`'s reason reaches @human
+        // (§6.6), and an entry parked on a human-block exit alerts like a
+        // parked legacy head.
+        for end in &report.v2_handoffs {
+            if let Some(alert) = &end.alert {
+                self.dispatcher
+                    .notify(&NotifyEvent::BlockedOnHuman { item: alert.clone() }, now);
+            }
+        }
+        for a in &report.v2_parked {
+            self.dispatcher
+                .notify(&NotifyEvent::BlockedOnHuman { item: a.entry.clone() }, now);
+        }
+        // §2: a walk stopped at a human-`blocked` item (review R3).
+        for at in &report.v2_walk_blocked {
+            self.dispatcher
+                .notify(&NotifyEvent::BlockedOnHuman { item: at.clone() }, now);
         }
         // The §9 near-exhaustion alert carries the LIVE fleet-aggregate 5h reserve %
         // (task 031), not the constant rung — so a genuinely-pinned or stale value is
@@ -1963,8 +2505,334 @@ impl DriveLoop {
         // and its assignment so a stale part is never item-parked later.
         self.aggregator.forget(agent);
         self.assignments.remove(agent);
+        // The v2 twin (slice 006) — a no-op on a legacy loop's always-empty map.
+        self.v2_assignments.remove(agent);
         self.stopped.insert(agent.to_string());
         report.retired.push(agent.to_string());
+    }
+
+    /// §6.3 step 4 for a member whose verb committed a handoff (slice 009):
+    /// end the session when its process exits or once `roll_grace_secs` have
+    /// passed since the loop first saw the handoff, whichever comes first. The
+    /// member is then released like an item boundary — slot freed, its budget
+    /// reading and assignment dropped — and step 3 picks for it this tick
+    /// (step 5). An entry that is still active work stays held by this member
+    /// until that pick; a boundary stop (or a reached bounded run) instead
+    /// retires the member and pauses the entry at once, since it will never
+    /// pick.
+    fn end_handed_off_session(
+        &mut self,
+        agent: &str,
+        handoff: crate::member_handoff::V2Handoff,
+        now: i64,
+        report: &mut TickReport,
+    ) {
+        let seen = *self.v2_handoff_seen.entry(agent.to_string()).or_insert(now);
+        let alive = matches!(self.health.health(agent), Some(AgentHealth::Alive { .. }));
+        let grace = i64::try_from(self.daemon.roll_grace_secs()).unwrap_or(i64::MAX);
+        if alive && now.saturating_sub(seen) < grace {
+            return; // the agent is ending its turn; give it the grace
+        }
+        self.daemon.take_v2_handoff(agent);
+        self.v2_handoff_seen.remove(agent);
+        // Deregister; a session still alive past the grace is killed (outside
+        // any daemon lock, the AgentChild contract).
+        let killed = match self.supervisor.retire(agent) {
+            Some(child) if alive => {
+                child.kill();
+                true
+            }
+            _ => false,
+        };
+        self.aggregator.forget(agent);
+        self.reconnecting.remove(agent);
+        self.v2_assignments.remove(agent);
+        let entry = handoff.entry_top().to_string();
+        if let Some(model) = &handoff.next_model {
+            // The same unit's next session runs on the requested model (§6.4).
+            let unit = handoff.assignment.unit.clone();
+            self.v2_model_overrides
+                .retain(|(e, u, _)| !(e == &entry && u == &unit));
+            self.v2_model_overrides.push((entry.clone(), unit, model.clone()));
+        }
+        report.v2_handoffs.push(V2SessionEnd {
+            agent: agent.to_string(),
+            entry: handoff.assignment.entry.clone(),
+            unit: handoff.assignment.unit.clone(),
+            verb: handoff.verb,
+            killed,
+            alert: handoff.alert.clone(),
+        });
+        // A handoff is a completed work chunk, like a clean boundary.
+        let stops = self.retiring.remove(agent) || self.record_iteration();
+        if handoff.continues {
+            if stops {
+                self.pause_v2_entry(&entry, agent, report);
+            } else {
+                self.v2_rolled.insert(agent.to_string(), entry);
+            }
+        }
+        if stops {
+            self.retire(agent, report);
+        }
+    }
+
+    /// Pause `entry` for `agent` (§6.3 step 5) through keeperd. A failed write
+    /// is retried every tick, the entry staying held by `agent` meanwhile.
+    fn pause_v2_entry(&mut self, entry: &str, agent: &str, report: &mut TickReport) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        match seams.parker.pause_entry_v2(entry) {
+            Ok(()) => {
+                self.v2_to_pause.remove(entry);
+                self.v2_paused_by.insert(entry.to_string(), agent.to_string());
+                report.v2_paused.push((agent.to_string(), entry.to_string()));
+            }
+            Err(_) => {
+                self.v2_to_pause.insert(entry.to_string(), agent.to_string());
+            }
+        }
+    }
+
+    /// Re-issue every pause whose keeperd write failed on an earlier tick.
+    fn retry_v2_pauses(&mut self) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        let landed: Vec<(String, String)> = self
+            .v2_to_pause
+            .iter()
+            .filter(|(entry, _)| seams.parker.pause_entry_v2(entry).is_ok())
+            .map(|(entry, agent)| (entry.clone(), agent.clone()))
+            .collect();
+        for (entry, agent) in landed {
+            self.v2_to_pause.remove(&entry);
+            self.v2_paused_by.insert(entry, agent);
+        }
+    }
+
+    /// §2: an entry whose walk stops at a `blocked` item has no next slice, so
+    /// it is ineligible and growlightd alerts once (review R3 — the skip used
+    /// to land only in `pick_v2`'s skips, so the milestone stalled silently).
+    /// Only an entry the pick would otherwise walk counts (`queued`, `active`,
+    /// `paused`); a block not seen last tick, or one that moved to another
+    /// item, lands on the report for the dispatcher.
+    fn note_v2_blocked_walks(
+        &mut self,
+        snapshot: &scheduler_v2::V2Snapshot,
+        report: &mut TickReport,
+    ) {
+        let stopped: std::collections::BTreeMap<String, String> = snapshot
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    EntryStatus::Queued | EntryStatus::Active | EntryStatus::Paused
+                )
+            })
+            .filter_map(|e| match next_unit(snapshot, e) {
+                WalkOutcome::Blocked { at } => Some((e.id.clone(), at)),
+                _ => None,
+            })
+            .collect();
+        for (entry, at) in &stopped {
+            if self.v2_walk_blocked.get(entry) != Some(at) {
+                report.v2_walk_blocked.push(at.clone());
+            }
+        }
+        self.v2_walk_blocked = stopped;
+    }
+
+    /// The loop's runtime state over a v2 snapshot, as data (slices 003, 006,
+    /// 009), in the order it applies:
+    /// - a registered member's assignment holds its entry (slice 003's contract:
+    ///   `pick_v2`'s `Held` skip). A released member's entry reads `None` again,
+    ///   so it is re-pickable;
+    /// - an entry a member handed off and still holds until its next pick, or
+    ///   whose pause has not landed yet, reads `active` held by that member;
+    /// - a paused entry carries its pauser (slice 002's step-2 resume
+    ///   preference);
+    /// - an accepted model change becomes its unit's allowed list.
+    ///
+    /// Published to the daemon each tick, so `queue pick` applies the same
+    /// overlay to its own read (slice 012).
+    fn v2_overlay(&self) -> V2Overlay {
+        let hold = |entry: &str, agent: &str, status| V2Hold {
+            entry: entry.to_string(),
+            agent: agent.to_string(),
+            status,
+        };
+        let mut holds: Vec<V2Hold> = self
+            .v2_assignments
+            .iter()
+            .filter(|(agent, _)| self.supervisor.is_registered(agent))
+            .map(|(agent, a)| hold(&a.entry, agent, None))
+            .collect();
+        holds.extend(
+            self.v2_rolled
+                .iter()
+                .map(|(agent, entry)| hold(entry, agent, Some(EntryStatus::Active))),
+        );
+        holds.extend(
+            self.v2_to_pause
+                .iter()
+                .map(|(entry, agent)| hold(entry, agent, Some(EntryStatus::Active))),
+        );
+        holds.extend(
+            self.v2_paused_by
+                .iter()
+                .map(|(entry, agent)| hold(entry, agent, Some(EntryStatus::Paused))),
+        );
+        V2Overlay {
+            holds,
+            model_overrides: self.v2_model_overrides.clone(),
+        }
+    }
+}
+
+/// One runtime hold over a v2 snapshot: `agent` holds `entry` while the entry
+/// reads `status` (`None`: whatever it reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2Hold {
+    pub entry: String,
+    pub agent: String,
+    pub status: Option<EntryStatus>,
+}
+
+/// The drive loop's runtime state over a v2 snapshot: the holds `pick_v2`
+/// reads as `holder`, and the accepted model changes (§6.4) as
+/// `(entry, unit, model)`. Built by the loop each tick and applied by
+/// [`apply_v2_overlay`] — to the loop's own snapshot, and to `queue pick`'s
+/// through the daemon's copy, so the two picks read the same runtime state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct V2Overlay {
+    pub holds: Vec<V2Hold>,
+    pub model_overrides: Vec<(String, Unit, ModelChoice)>,
+}
+
+/// Apply `overlay` to `snapshot`: each hold, in order, sets its entry's
+/// `holder` (a later hold on the same entry wins), then each accepted model
+/// change becomes its unit's only allowed model.
+pub fn apply_v2_overlay(snapshot: &mut scheduler_v2::V2Snapshot, overlay: &V2Overlay) {
+    for hold in &overlay.holds {
+        if let Some(e) = snapshot
+            .entries
+            .iter_mut()
+            .find(|e| e.id == hold.entry && hold.status.is_none_or(|s| e.status == s))
+        {
+            e.holder = Some(hold.agent.clone());
+        }
+    }
+    for (entry, unit, choice) in &overlay.model_overrides {
+        overlay_unit_model(snapshot, entry, unit, choice);
+    }
+}
+
+/// Make `choice` the only allowed model of `entry`'s `unit` in the snapshot —
+/// an accepted `model_change` (§6.4), so `pick_v2`'s backend match and the
+/// spawn's resolution both follow it.
+fn overlay_unit_model(
+    snapshot: &mut scheduler_v2::V2Snapshot,
+    entry: &str,
+    unit: &Unit,
+    choice: &ModelChoice,
+) {
+    let list = Some(softfig_ipc::model_choice::ModelList::single(choice.clone()));
+    match unit {
+        Unit::Slice { milestone, slice } => {
+            if let Some(item) = snapshot.trees.get_mut(milestone).and_then(|t| {
+                t.items
+                    .iter_mut()
+                    .find(|i| i.kind == softfig_ipc::queue_v2::SliceKind::Slice && &i.id == slice)
+            }) {
+                item.models = list;
+            }
+        }
+        Unit::CloseOut { milestone } => {
+            if let Some(tree) = snapshot.trees.get_mut(milestone) {
+                tree.models = list;
+            }
+        }
+        Unit::Entry => {
+            if let Some(e) = snapshot.entries.iter_mut().find(|e| e.id == entry) {
+                e.models = list;
+            }
+        }
+    }
+}
+
+/// Resolve the concrete launch choice for a picked v2 unit (§6.4): the unit's
+/// declared list's first entry the member's backend can run, or the member
+/// default when nothing was declared (the roster's model + variant for an
+/// opencode member, `claude` for a claude member). Pure — proven directly.
+///
+/// `pick_v2` only yields units whose declared list the member's backend can run
+/// (an un-runnable list skips with `BackendMismatch`), so a `Some` declared list
+/// always resolves; the member default is the `None` (undeclared) case and the
+/// defensive fallback if a list ever disagrees.
+fn resolve_v2_model(pick: &Pick, member: &FleetMember) -> ModelChoice {
+    let backend = member.backend.ipc_backend();
+    pick.declared
+        .as_ref()
+        .and_then(|list| list.first_for_backend(backend))
+        .cloned()
+        .unwrap_or_else(|| {
+            member_default(
+                backend,
+                member.backend.roster_model(),
+                member.backend.roster_variant(),
+            )
+            .first()
+            .clone()
+        })
+}
+
+/// The §3.6 spawn copy: write the entry's baton — seeding it from the template
+/// first when the entry was never claimed — into the member's baton path. The
+/// entry id is the TOP-LEVEL id (a `"parent/sub"` identity shares its top-level
+/// entry's baton). Fail-closed: any read/seed/write error aborts the spawn
+/// before the claim (the legacy seed-before-claim order), so a member never
+/// boots stateless and a claim never lands behind a failed baton.
+///
+/// The §8 base line (branch/base) is seeded as the literal `<branch>`/`<base>`
+/// tokens: computing the concrete stack-top values is `queue-v2-git`'s row
+/// (§13), so this milestone records the tokens, exactly as the store documents.
+fn copy_entry_baton(
+    entries: &FsEntryBatonStore,
+    member_writer: &dyn MemberBatonWriter,
+    entry_top: &str,
+    agent: &str,
+) -> Result<(), String> {
+    let baton = match entries.read(entry_top) {
+        Some(baton) => baton,
+        None => {
+            entries.seed(entry_top, None, None)?;
+            entries
+                .read(entry_top)
+                .ok_or_else(|| format!("entry baton for {entry_top} unreadable after seed"))?
+        }
+    };
+    member_writer.write(agent, &baton)
+}
+
+/// The journal label for a v2 unit (slice 006) — the `unit` half of a
+/// `started … on v2 <entry> · <unit>` line.
+fn v2_unit_label(unit: &Unit) -> String {
+    match unit {
+        Unit::Slice { slice, .. } => format!("slice {slice}"),
+        Unit::CloseOut { .. } => "close-out".to_string(),
+        Unit::Entry => "the entry".to_string(),
+    }
+}
+
+/// The journal label for a resolved model (slice 006): `claude` for a claude
+/// member, the `provider/model[#variant]` ref for an opencode one.
+pub(crate) fn model_ref_label(choice: &ModelChoice) -> String {
+    match choice.backend {
+        softfig_ipc::model_choice::Backend::Claude => "claude".to_string(),
+        softfig_ipc::model_choice::Backend::Opencode => choice.opencode_model_ref(),
     }
 }
 
@@ -2066,6 +2934,17 @@ impl TickLogger {
         for a in &r.started {
             out.push(format!("fleet: started {} on {}/{}", a.agent, a.queue, a.part));
         }
+        for a in &r.v2_started {
+            // The v2 journal voice (slice 006): name the entry, unit and resolved
+            // model so a v2 assignment is diagnosable like a legacy one.
+            out.push(format!(
+                "fleet: started {} on v2 {} · {} ({})",
+                a.agent,
+                a.entry,
+                v2_unit_label(&a.unit),
+                model_ref_label(&a.resolved_model),
+            ));
+        }
         let mut held_now: BTreeSet<(String, &'static str)> = BTreeSet::new();
         for roll in &r.rerolls {
             match roll {
@@ -2148,6 +3027,27 @@ impl TickLogger {
                 "fleet: {} blocked on human — item-parked {}/{}",
                 a.agent, a.queue, a.part
             ));
+        }
+        for a in &r.v2_parked {
+            out.push(format!(
+                "fleet: {} blocked on human — entry-parked v2 {}",
+                a.agent, a.entry
+            ));
+        }
+        for end in &r.v2_handoffs {
+            // The handshake's voice (slice 009): which verb handed off which
+            // unit, and whether the session exited or outlived its grace.
+            out.push(format!(
+                "fleet: {} handed off v2 {} · {} via {} (session {})",
+                end.agent,
+                end.entry,
+                v2_unit_label(&end.unit),
+                end.verb,
+                if end.killed { "killed after the grace" } else { "exited" },
+            ));
+        }
+        for (agent, entry) in &r.v2_paused {
+            out.push(format!("fleet: {agent} moved on — v2 {entry} paused for any member to resume"));
         }
         // Transient network exits (network-failsafe slice 002): a latched member
         // whose re-roll is gated by the connectivity hold is re-classified
@@ -2296,6 +3196,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeFleet {
         spawns: Mutex<Vec<String>>,
+        /// Every spawned [`AgentSpec`] (slice 006 — a test asserts the model the
+        /// spawn carried; the legacy `spawns` records ids only).
+        spawned_specs: Mutex<Vec<AgentSpec>>,
         kills: Arc<AtomicUsize>,
         health: Mutex<BTreeMap<String, AgentHealth>>,
         /// Scripted stderr tail per agent (the live loop reads it off the backend's
@@ -2323,6 +3226,12 @@ mod tests {
         /// seed the loop writes on a FRESH start. A test asserts a fresh start
         /// seeds and a re-roll does not (carry-across-iterations).
         seeds: Mutex<Vec<(String, String, String)>>,
+        /// Recorded v2 member-baton writes `(agent, contents)` — the §3.6 copy the
+        /// v2 fresh start performs (slice 006); the legacy loop never touches this.
+        member_writes: Mutex<Vec<(String, String)>>,
+        /// When set, every v2 member-baton write fails (the fail-closed copy path —
+        /// a member that can't be given its entry baton is not spawned).
+        fail_member_write: AtomicBool,
         /// When set, every `spawn` fails (models a fail-closed pre-approval
         /// generation failure, slice 004 — `ClaudeBackend::spawn` returns
         /// `SpawnError` before exec).
@@ -2423,6 +3332,12 @@ mod tests {
         fn spawns(&self) -> Vec<String> {
             self.spawns.lock().unwrap().clone()
         }
+        fn spawned_specs(&self) -> Vec<AgentSpec> {
+            self.spawned_specs.lock().unwrap().clone()
+        }
+        fn member_writes(&self) -> Vec<(String, String)> {
+            self.member_writes.lock().unwrap().clone()
+        }
         fn spawn_count(&self) -> usize {
             self.spawns.lock().unwrap().len()
         }
@@ -2433,6 +3348,7 @@ mod tests {
     impl AgentBackend for Arc<FakeFleet> {
         fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
+            self.spawned_specs.lock().unwrap().push(spec.clone());
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(SpawnError(format!(
                     "pre-approval generation failed for agent {}",
@@ -2442,6 +3358,20 @@ mod tests {
             Ok(Box::new(FakeChild {
                 kills: Arc::clone(&self.kills),
             }))
+        }
+    }
+    /// The v2 member-baton writer (slice 006): record the copy the loop performs
+    /// at a v2 spawn, scriptable to fail like the legacy seeder.
+    impl MemberBatonWriter for Arc<FakeFleet> {
+        fn write(&self, agent: &str, baton: &str) -> Result<(), String> {
+            if self.fail_member_write.load(Ordering::SeqCst) {
+                return Err("member write refused".into());
+            }
+            self.member_writes
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), baton.to_string()));
+            Ok(())
         }
     }
     impl AgentHealthSource for Arc<FakeFleet> {
@@ -5783,5 +6713,1340 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             ),
             "the exit disposition is narrated with the observed baton status: {lines:?}",
         );
+    }
+
+    // ---- queue v2 scheduling (slice 006) ----
+    //
+    // The fake-v2-source drive-loop tests the slice's acceptance names: the
+    // assignment carries the resolved model, the §3.6 baton copy happens at
+    // spawn, the claim op is issued — and the legacy path stays untouched.
+
+    use softfig_ipc::model_choice::{parse_declaration, Backend as IpcBackend, Declaration};
+    use softfig_ipc::queue_v2::{EntryKind, EntryStatus, Lane, SliceKind, SliceStatus};
+
+    use crate::fleet::FleetConfig;
+    use crate::scheduler_v2::{EntryView, ItemView, ProjectView, TreeView, V2Snapshot};
+
+    /// The scripted v2 source (the slice's "fake-v2-source"): returns the stored
+    /// snapshot every `load`, or `Absent` — a `Failed` is the real source's
+    /// alert-once row, already unit-proven in `v2_source`. `Clone` so a test
+    /// keeps a handle to swap the snapshot between ticks (the holder-overlay
+    /// test's committed-state flip).
+    #[derive(Debug, Clone, Default)]
+    struct FakeV2Source {
+        cell: Arc<Mutex<Option<V2Snapshot>>>,
+        absent: Arc<AtomicBool>,
+    }
+
+    impl FakeV2Source {
+        fn with(snapshot: V2Snapshot) -> Self {
+            Self {
+                cell: Arc::new(Mutex::new(Some(snapshot))),
+                absent: Arc::new(AtomicBool::new(false)),
+            }
+        }
+        fn absent() -> Self {
+            Self {
+                cell: Arc::new(Mutex::new(None)),
+                absent: Arc::new(AtomicBool::new(true)),
+            }
+        }
+        /// Replace the scripted snapshot (the next `load`s read it) — the test's
+        /// stand-in for the committed state a claim produces.
+        fn set(&self, snapshot: V2Snapshot) {
+            *self.cell.lock().unwrap() = Some(snapshot);
+            self.absent.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl V2QueueSource for FakeV2Source {
+        fn load(&mut self) -> V2Load {
+            if self.absent.load(Ordering::SeqCst) {
+                V2Load::Absent
+            } else {
+                V2Load::Snapshot(self.cell.lock().unwrap().clone().expect("scripted"))
+            }
+        }
+    }
+
+    /// A recording [`V2Claimer`] — scriptable to refuse, the fail-closed path.
+    #[derive(Debug, Default)]
+    struct FakeV2Claimer {
+        claims: Mutex<Vec<(String, Option<String>)>>,
+        fail: AtomicBool,
+    }
+
+    impl V2Claimer for FakeV2Claimer {
+        fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
+            self.claims
+                .lock()
+                .unwrap()
+                .push((entry.to_string(), unit.map(str::to_string)));
+            if self.fail.load(Ordering::SeqCst) {
+                Err("claim refused".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The `Arc` shape the loop's `Box<dyn V2Claimer>` holds (same pattern as
+    /// `FakeFleet`).
+    impl V2Claimer for Arc<FakeV2Claimer> {
+        fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
+            (**self).claim_v2(entry, unit)
+        }
+    }
+
+    /// A recording [`V2ItemParker`] — the entry-park the Blocked arm issues,
+    /// and the handshake's pause (slice 009), scriptable to fail.
+    #[derive(Debug, Default)]
+    struct FakeV2Parker {
+        parked: Mutex<Vec<String>>,
+        paused: Mutex<Vec<String>>,
+        fail_pause: AtomicBool,
+    }
+
+    impl V2ItemParker for FakeV2Parker {
+        fn park_entry_v2(&self, entry: &str) -> Result<(), String> {
+            self.parked.lock().unwrap().push(entry.to_string());
+            Ok(())
+        }
+        fn pause_entry_v2(&self, entry: &str) -> Result<(), String> {
+            if self.fail_pause.load(Ordering::SeqCst) {
+                return Err("keeperd unreachable".into());
+            }
+            self.paused.lock().unwrap().push(entry.to_string());
+            Ok(())
+        }
+    }
+
+    impl V2ItemParker for Arc<FakeV2Parker> {
+        fn park_entry_v2(&self, entry: &str) -> Result<(), String> {
+            (**self).park_entry_v2(entry)
+        }
+        fn pause_entry_v2(&self, entry: &str) -> Result<(), String> {
+            (**self).pause_entry_v2(entry)
+        }
+    }
+
+    /// A v2 snapshot with one milestone entry and one queued slice, whose
+    /// declared `> Model:` list is `decl` (parsed) — the smallest list
+    /// `pick_v2` walks to a slice unit.
+    fn v2_milestone(
+        entry_id: &str,
+        status: EntryStatus,
+        slice_id: &str,
+        decl: Option<&str>,
+    ) -> V2Snapshot {
+        let models = decl.map(|d| match parse_declaration(d).unwrap() {
+            Declaration::List(list) => list,
+            Declaration::Auto => panic!("no auto in a test declaration"),
+        });
+        V2Snapshot {
+            projects: vec![ProjectView {
+                name: "softfig".into(),
+                repo: "/garden".into(),
+            }],
+            entries: vec![EntryView {
+                id: entry_id.into(),
+                kind: EntryKind::Milestone,
+                project: "softfig".into(),
+                lane: Lane::Normal,
+                status,
+                after: vec![],
+                claimed: "2026-10-14T00:00Z".into(),
+                follow_ups: 0,
+                pending: None,
+                holder: None,
+                models: None,
+            }],
+            trees: [(
+                entry_id.to_string(),
+                TreeView {
+                    items: vec![ItemView {
+                        kind: SliceKind::Slice,
+                        id: slice_id.into(),
+                        status: SliceStatus::Queued,
+                        models,
+                        follow_ups: 0,
+                    }],
+                    models: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            done_ids: BTreeSet::new(),
+        }
+    }
+
+    /// A v2 drive loop over the scripted source + the fakes, with the daemon's
+    /// §11 switch set to `v2`. The legacy seams come from [`make_full`] and are
+    /// simply never consulted; the per-entry store lives under `entries_dir`.
+    #[allow(clippy::type_complexity)]
+    fn make_v2(
+        fleet: Vec<FleetMember>,
+        source: FakeV2Source,
+        entries_dir: PathBuf,
+        claimer: Arc<FakeV2Claimer>,
+        parker: Arc<FakeV2Parker>,
+        policy: Policy,
+    ) -> (
+        DriveLoop,
+        Daemon,
+        Arc<FakeFleet>,
+        Probe,
+    ) {
+        let (drive, d, backend, _legacy_claimer, _legacy_parker, _queues, probe) =
+            make_full(fleet, vec![], policy);
+        let mut cfg = FleetConfig::disabled();
+        cfg.queue = QueueMode::V2;
+        d.set_fleet_config(cfg);
+        let drive = drive.with_v2(V2Seams {
+            source: Box::new(source),
+            entries: FsEntryBatonStore::new(entries_dir, "garden"),
+            member_writer: Box::new(Arc::clone(&backend)),
+            claimer: Box::new(claimer),
+            parker: Box::new(parker),
+        });
+        (drive, d, backend, probe)
+    }
+
+    /// An opencode member on the flash roster default, unpinned.
+    fn opencode_member(id: &str) -> FleetMember {
+        FleetMember::unpinned(spec(id)).with_backend(crate::fleet::MemberBackend::Opencode(
+            ModelSelection::model("deepseek/deepseek-flash"),
+        ))
+    }
+
+    /// SLICE 006 — the v2 fresh start: `pick_v2` walks to the slice, the claim op
+    /// is issued with the `(entry, unit)`, the never-claimed entry's baton is
+    /// seeded from the template and copied verbatim into the member's path, and
+    /// the spawn carries the unit's resolved `> Model:` — the slice's declaration
+    /// (reasoning), NOT the member's roster default (flash).
+    #[test]
+    fn v2_mode_picks_claims_copies_the_baton_and_spawns_with_the_resolved_model() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone(
+                "m1",
+                EntryStatus::Queued,
+                "001",
+                Some("reasoning"),
+            )),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.v2_started,
+            vec![V2Assignment {
+                agent: "a1".into(),
+                entry: "m1".into(),
+                unit: Unit::Slice {
+                    milestone: "m1".into(),
+                    slice: "001".into(),
+                },
+                resolved_model: ModelChoice::opencode(softfig_ipc::model_choice::DEEPSEEK_REASONING),
+            }],
+            "the assignment names the entry, the walked unit, and the resolved model",
+        );
+        assert!(r.started.is_empty(), "no legacy assignment on a v2 tick");
+        // The claim op was issued with the (entry, unit) the pick produced.
+        assert_eq!(
+            *claimer.claims.lock().unwrap(),
+            vec![("m1".to_string(), Some("001".to_string()))],
+            "the keeperd claim op is issued before the spawn",
+        );
+        // The spawn carried the RESOLVED model, not the roster default.
+        let specs = backend.spawned_specs();
+        assert_eq!(specs.len(), 1, "exactly one spawn: {specs:?}");
+        assert_eq!(
+            specs[0].model,
+            Some(ModelSelection::model(softfig_ipc::model_choice::DEEPSEEK_REASONING)),
+            "the unit's declared reasoning model overrides the flash roster default",
+        );
+        // The §3.6 copy: the never-claimed entry was seeded from the template
+        // (with the literal §8 base-line tokens — the concrete values are
+        // queue-v2-git's row) and the SAME contents written to the member path.
+        let seeded = std::fs::read_to_string(entries_dir.join("m1").join("baton.md"))
+            .expect("the entry baton was seeded");
+        assert!(
+            seeded.contains("item: m1"),
+            "the seed is the entry's baton: {seeded}"
+        );
+        assert!(
+            seeded.contains("<branch>") && seeded.contains("<base>"),
+            "the §8 base-line tokens ride the seed until queue-v2-git computes them: {seeded}"
+        );
+        let writes = backend.member_writes();
+        assert_eq!(writes.len(), 1, "one member write: {writes:?}");
+        assert_eq!(writes[0].0, "a1", "copied into the member's own path");
+        assert_eq!(
+            writes[0].1, seeded,
+            "the member's baton is a verbatim copy of the entry baton",
+        );
+    }
+
+    /// SLICE 006 — a claude member runs claude: the resolved choice is `claude`
+    /// whatever the declared list's opencode entries, and the spawn carries no
+    /// model override (claude's model is the harness's own).
+    #[test]
+    fn v2_mode_a_claude_member_runs_claude() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-claude-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![FleetMember::unpinned(spec("c1"))], // claude backend, the legacy default
+            FakeV2Source::with(v2_milestone(
+                "m1",
+                EntryStatus::Queued,
+                "001",
+                Some("claude, reasoning"),
+            )),
+            entries_dir,
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "the claude member is assigned: {r:?}");
+        let assignment = &r.v2_started[0];
+        assert_eq!(
+            assignment.resolved_model.backend,
+            IpcBackend::Claude,
+            "the first backend-runnable entry is claude",
+        );
+        let specs = backend.spawned_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].model, None,
+            "a claude member carries no model override (claude's model is the harness's own)",
+        );
+    }
+
+    /// SLICE 006 — a claim failure aborts the spawn fail-closed: nothing spawned,
+    /// no assignment recorded, the start held for the next tick.
+    #[test]
+    fn v2_mode_a_failed_claim_aborts_the_spawn() {
+        let claimer = Arc::new(FakeV2Claimer::default());
+        claimer.fail.store(true, Ordering::SeqCst);
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            std::env::temp_dir().join(format!("v2-entries-fail-{}", std::process::id())),
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let r = loop_.tick(0);
+        assert!(r.v2_started.is_empty(), "no assignment on a refused claim");
+        assert_eq!(backend.spawn_count(), 0, "no spawn on a refused claim");
+        assert_eq!(r.held_starts.len(), 1, "the start is held, not dropped");
+        assert!(
+            matches!(r.held_starts[0].outcome, StartOutcome::ClaimFailed { .. }),
+            "held as a claim failure: {:?}",
+            r.held_starts[0].outcome,
+        );
+    }
+
+    /// SLICE 006 — an `Absent` v2 source (no `queue.toml`) schedules nothing,
+    /// and a v2-mode daemon whose loop was never given seams schedules nothing
+    /// either — both fail-closed, never a legacy fallback.
+    #[test]
+    fn v2_mode_an_absent_source_schedules_nothing() {
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::absent(),
+            std::env::temp_dir().join(format!("v2-entries-absent-{}", std::process::id())),
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let r = loop_.tick(0);
+        assert!(r.v2_started.is_empty(), "nothing scheduled with no v2 state");
+        assert_eq!(backend.spawn_count(), 0, "no spawn with no v2 state");
+
+        // Seams never installed (a v2-mode daemon, a legacy-built loop): the same
+        // fail-closed silence — no panic, no legacy fallback.
+        let (mut loop2, _d2, backend2, _probe2) = {
+            let (drive, d, b, _c, _q, probe) = make_claiming(
+                vec![opencode_member("a1")],
+                vec![],
+                Policy::default(),
+            );
+            (drive, d, b, probe)
+        };
+        let mut cfg = FleetConfig::disabled();
+        cfg.queue = QueueMode::V2;
+        _d2.set_fleet_config(cfg);
+        let r2 = loop2.tick(0);
+        assert!(r2.v2_started.is_empty(), "no seams ⇒ nothing scheduled from v2");
+        assert_eq!(backend2.spawn_count(), 0, "never a legacy fallback under v2");
+    }
+
+    /// SLICE 006 — the holder overlay: an `active` entry whose member is still
+    /// registered reads as HELD to every other member (slice 003's contract for
+    /// 006), so a second member's pick skips it instead of double-claiming.
+    #[test]
+    fn v2_mode_an_entry_held_by_a_registered_member_is_not_repicked() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-holder-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        // The source starts with the entry `queued`; after a1's claim the test
+        // flips it to `active` (the committed state) and the overlay must make a2
+        // skip it.
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1"), opencode_member("a2")],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let first = loop_.tick(0);
+        assert_eq!(first.v2_started.len(), 1, "a1 starts on the queued entry");
+        // The committed state after a1's claim: the entry is `active`.
+        source.set(v2_milestone("m1", EntryStatus::Active, "001", None));
+        let second = loop_.tick(1);
+        assert!(
+            second.v2_started.is_empty(),
+            "a2 must not re-pick a1's active entry: {:?}",
+            second.v2_started,
+        );
+        assert!(
+            second
+                .held_fresh
+                .iter()
+                .any(|h| h.agent == "a2" && h.reason == "no workable unit"),
+            "a2 is held, naming itself: {:?}",
+            second.held_fresh,
+        );
+    }
+
+    /// Review R1 — a growlightd restart: the new loop has no v2 assignments, the
+    /// boot reaper killed every member scope, and the committed state still
+    /// reads the entry `active` with its slice `active`. No running member holds
+    /// it, so the first free member resumes it (keeperd's re-claim of an active
+    /// unit is idempotent). It used to read `Held` to every member forever,
+    /// stranding the entry and its repo.
+    #[test]
+    fn v2_mode_after_a_restart_an_orphaned_active_entry_is_resumed() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-orphan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let mut snapshot = v2_milestone("m1", EntryStatus::Active, "001", None);
+        snapshot.trees.get_mut("m1").unwrap().items[0].status = SliceStatus::Active;
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(snapshot),
+            entries_dir,
+            Arc::clone(&claimer),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let report = loop_.tick(0);
+        assert_eq!(
+            report.v2_started.iter().map(|a| (a.agent.as_str(), a.entry.as_str())).collect::<Vec<_>>(),
+            vec![("a1", "m1")],
+            "the orphan is resumed, not held: {:?}",
+            report.held_fresh,
+        );
+        assert_eq!(
+            *claimer.claims.lock().unwrap(),
+            vec![("m1".to_string(), Some("001".to_string()))],
+            "the re-claim names the entry's active unit",
+        );
+    }
+
+    /// Review R3 — §2: a walk stopped at a human-`blocked` slice makes the entry
+    /// ineligible, and growlightd alerts ONCE. The block lands on the report on
+    /// the tick it is first seen and stays quiet while it persists; once the
+    /// walk moves on, the next block is a new incident and alerts again.
+    #[test]
+    fn v2_mode_a_blocked_walk_alerts_once_per_incident() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-walk-blocked-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let blocked = || {
+            let mut snapshot = v2_milestone("m1", EntryStatus::Queued, "001", None);
+            snapshot.trees.get_mut("m1").unwrap().items[0].status = SliceStatus::Blocked;
+            snapshot
+        };
+        let source = FakeV2Source::with(blocked());
+        let (mut loop_, _d, _backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+
+        let first = loop_.tick(0);
+        assert_eq!(first.v2_walk_blocked, vec!["m1:001".to_string()], "alerted on first sight");
+        assert!(first.v2_started.is_empty(), "the stopped entry is ineligible");
+        assert!(loop_.tick(1).v2_walk_blocked.is_empty(), "a persisting block stays quiet");
+
+        // The human unblocks the slice: the walk moves on, the memory clears.
+        source.set(v2_milestone("m1", EntryStatus::Queued, "001", None));
+        assert!(loop_.tick(2).v2_walk_blocked.is_empty());
+        source.set(blocked());
+        assert_eq!(
+            loop_.tick(3).v2_walk_blocked,
+            vec!["m1:001".to_string()],
+            "a new block is a new incident",
+        );
+    }
+
+    /// SLICE 006 — a v2 member exiting on a human-block parks its ENTRY (the v2
+    /// `queue_v2_set_status(entry, blocked)`), recorded on the report for the
+    /// journal — the v2 twin of the legacy item-park.
+    #[test]
+    fn v2_mode_a_human_block_exit_parks_the_entry() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-blocked-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            source.clone(),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+
+        let first = loop_.tick(0);
+        assert_eq!(first.v2_started.len(), 1, "a1 starts");
+        // The member exits on a human-block: terminal status on its baton. The
+        // committed state models keeperd's park write: the entry reads `blocked`.
+        backend.set_baton("a1", "BLOCKED_ON_HUMAN");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        source.set(v2_milestone("m1", EntryStatus::Blocked, "001", None));
+        let second = loop_.tick(1);
+        assert_eq!(
+            second.v2_parked,
+            vec![V2Assignment {
+                agent: "a1".into(),
+                entry: "m1".into(),
+                unit: Unit::Slice {
+                    milestone: "m1".into(),
+                    slice: "001".into(),
+                },
+                resolved_model: ModelChoice::opencode(softfig_ipc::model_choice::DEEPSEEK_FLASH),
+            }],
+            "the released member's assignment is recorded as parked",
+        );
+        assert_eq!(
+            *parker.parked.lock().unwrap(),
+            vec!["m1".to_string()],
+            "the entry is parked via the keeperd set_status op",
+        );
+    }
+
+    // ---- queue v2 member verbs (slice 008) ----
+
+    /// SLICE 008 — the member verbs validate against the LIVE assignment the
+    /// drive loop mirrors to the daemon, over a fresh read of the v2 list; a
+    /// non-member is refused; and a refusal leaves the session running — the
+    /// fake backend's member is neither killed, re-rolled nor re-spawned, and
+    /// keeps its assignment. (A pass is validation only: the handshake's
+    /// execution half is not built, so it too leaves the session alone.)
+    #[test]
+    fn v2_member_verbs_validate_against_the_live_assignment_and_a_refusal_leaves_the_session_running() {
+        use softfig_ipc::growlightd::{op as gop, MemberVerbReply, RefusalCode, MEMBER_VERB_REFUSED};
+        use softfig_ipc::queue_v2::{
+            slices_file, Entry, Project, QueueToml, SliceItem, SlicesToml, QUEUE_FILE,
+        };
+        use softfig_ipc::{Request, Response};
+
+        // The garden as keeperd's claim left it: m1 active, its slice 001 active.
+        let root = std::env::temp_dir().join(format!("v2-member-verbs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, content: String| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(
+            QUEUE_FILE,
+            QueueToml::new(
+                vec![Project {
+                    name: "softfig".into(),
+                    repo: "/garden".into(),
+                    main: "main".into(),
+                }],
+                vec![Entry {
+                    id: "m1".into(),
+                    kind: EntryKind::Milestone,
+                    title: "m1".into(),
+                    project: "softfig".into(),
+                    lane: Lane::Normal,
+                    status: EntryStatus::Active,
+                    after: vec![],
+                    added: "2026-10-14T00:00:00Z".into(),
+                    branch: "feat/m1".into(),
+                    parent: String::new(),
+                    base: String::new(),
+                    claimed: "2026-10-14T00:01:00Z".into(),
+                    follow_ups: 0,
+                    pending_status: None,
+                }],
+            )
+            .to_toml()
+            .unwrap(),
+        );
+        write(
+            &slices_file("m1"),
+            SlicesToml::new(
+                "m1".into(),
+                vec![SliceItem {
+                    kind: SliceKind::Slice,
+                    id: "001".into(),
+                    status: SliceStatus::Active,
+                    follow_ups: Some(0),
+                }],
+            )
+            .to_toml()
+            .unwrap(),
+        );
+
+        let entries_dir = root.join("entries");
+        let (mut loop_, d, backend, _probe) = make_v2(
+            vec![opencode_member("a1")],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        d.inner.lock().unwrap().config.garden_root = root.clone();
+
+        assert!(d.v2_assignment("a1").is_none(), "nothing assigned before the first tick");
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "a1 is spawned on m1/001: {r:?}");
+        assert_eq!(
+            d.v2_assignment("a1").as_ref(),
+            r.v2_started.first(),
+            "the tick mirrors its assignment for the verbs",
+        );
+
+        let call = |member: Option<&str>, verb: &str, args: serde_json::Value| -> MemberVerbReply {
+            let mut envelope = serde_json::json!({ "args": args });
+            if let Some(member) = member {
+                envelope["member"] = member.into();
+            }
+            match crate::server::member_verb(&d, &Request::new(verb, envelope)) {
+                Response::Ok { data, .. } => serde_json::from_value(data).unwrap(),
+                Response::Err { error, .. } => panic!("{verb}: transport error {error}"),
+            }
+        };
+        let baton = "---\nstatus: IN_PROGRESS\nitem: m1\n---\n# NEXT ACTION\nnext\n";
+
+        // A non-member, and a member holding no assignment, are refused.
+        let reply = call(None, gop::GROWLIGHT_COMPLETE_SLICE, serde_json::json!({ "summary": "s", "baton": baton }));
+        assert_eq!(reply.code, Some(RefusalCode::NotAMember));
+        let reply = call(Some("a9"), gop::GROWLIGHT_COMPLETE_SLICE, serde_json::json!({ "summary": "s", "baton": baton }));
+        assert_eq!(reply.code, Some(RefusalCode::NotYourSession));
+
+        // a1's own call, refused on its reason …
+        let reply = call(
+            Some("a1"),
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({ "reason": "out_of_coffee", "baton": baton }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_REFUSED);
+        assert_eq!(reply.code, Some(RefusalCode::UnknownReason));
+
+        // … and the session keeps running: the next tick neither kills, rolls,
+        // nor re-spawns a1, and its assignment stands.
+        let r = loop_.tick(1);
+        assert!(r.v2_started.is_empty(), "no new spawn: {r:?}");
+        assert!(r.exit_dispositions.is_empty() && r.rerolls.is_empty() && r.retired.is_empty(), "{r:?}");
+        assert_eq!(backend.spawned_specs().len(), 1, "still the one spawn");
+        assert_eq!(backend.kill_count(), 0, "nothing killed");
+        assert!(d.v2_assignment("a1").is_some(), "a1 still holds m1/001");
+
+        // A well-formed call validates against the live assignment; with no
+        // handshake seams installed it can't commit, so it errors and the
+        // session keeps its assignment (slice 009's fail-closed path).
+        let envelope = serde_json::json!({ "member": "a1", "args": { "summary": "s", "baton": baton } });
+        match crate::server::member_verb(&d, &Request::new(gop::GROWLIGHT_COMPLETE_SLICE, envelope)) {
+            Response::Err { error, .. } => assert!(error.contains("no handshake seams"), "{error}"),
+            Response::Ok { data, .. } => panic!("committed without seams: {data}"),
+        }
+        assert!(d.v2_assignment("a1").is_some(), "a1 still holds m1/001");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- queue v2 handshake execution (slice 009) ----
+    //
+    // The fake-backend tests the slice's acceptance names. The loop and the
+    // server read the SAME temp garden through the real v2 source, keeperd is
+    // a recording spy, and the test plays keeperd's commit by rewriting the
+    // files the spy's ops would have changed.
+
+    use crate::member_handoff::tests::SpyKeeper;
+    use crate::member_handoff::{HandoffSeams, KeeperOp};
+    use softfig_ipc::growlightd::{op as gop, MemberVerbReply, NextUnit, RefusalCode, MEMBER_VERB_OK};
+    use softfig_ipc::queue_v2::{slices_file, Entry, Project, QueueToml, SliceItem, SlicesToml, QUEUE_FILE};
+    use softfig_ipc::verbs::DaemonStatusArg;
+
+    /// A throwaway garden the v2 source reads.
+    struct TestGarden {
+        root: PathBuf,
+    }
+
+    impl TestGarden {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "v2-handshake-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+        fn write(&self, rel: &str, content: &str) {
+            let path = self.root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        /// `queue.toml` with these rows, all in project `softfig`.
+        fn queue(&self, entries: Vec<Entry>) {
+            let project = Project {
+                name: "softfig".into(),
+                repo: "/garden".into(),
+                main: "main".into(),
+            };
+            self.write(QUEUE_FILE, &QueueToml::new(vec![project], entries).to_toml().unwrap());
+        }
+        /// `m`'s `slices.toml`: `(id, status, follow_ups)` in order.
+        fn slices(&self, m: &str, items: &[(&str, SliceStatus, u64)]) {
+            let items = items
+                .iter()
+                .map(|(id, status, follow_ups)| SliceItem {
+                    kind: SliceKind::Slice,
+                    id: (*id).into(),
+                    status: *status,
+                    follow_ups: Some(*follow_ups),
+                })
+                .collect();
+            self.write(&slices_file(m), &SlicesToml::new(m.into(), items).to_toml().unwrap());
+        }
+        /// `m`'s `slices.toml` with slices and sub-milestones mixed:
+        /// `(kind, id, status, follow_ups)`, a sub's count ignored.
+        fn tree(&self, m: &str, items: &[(SliceKind, &str, SliceStatus, u64)]) {
+            let items = items
+                .iter()
+                .map(|(kind, id, status, follow_ups)| SliceItem {
+                    kind: *kind,
+                    id: (*id).into(),
+                    status: *status,
+                    follow_ups: (*kind == SliceKind::Slice).then_some(*follow_ups),
+                })
+                .collect();
+            self.write(&slices_file(m), &SlicesToml::new(m.into(), items).to_toml().unwrap());
+        }
+    }
+
+    impl Drop for TestGarden {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn row(id: &str, kind: EntryKind, lane: Lane, status: EntryStatus) -> Entry {
+        Entry {
+            id: id.into(),
+            kind,
+            title: id.into(),
+            project: "softfig".into(),
+            lane,
+            status,
+            after: vec![],
+            added: "2026-10-14T00:00:00Z".into(),
+            branch: format!("feat/{id}"),
+            parent: String::new(),
+            base: String::new(),
+            claimed: if status == EntryStatus::Queued {
+                String::new()
+            } else {
+                "2026-10-14T00:01:00Z".into()
+            },
+            follow_ups: 0,
+            pending_status: None,
+        }
+    }
+
+    fn milestone_row(id: &str, status: EntryStatus) -> Entry {
+        row(id, EntryKind::Milestone, Lane::Normal, status)
+    }
+
+    /// A v2 loop over the garden's real v2 source, with the server-side
+    /// handshake seams installed over a spy keeper; both sides share one
+    /// entry-baton store.
+    #[allow(clippy::type_complexity)]
+    fn make_handshake(
+        fleet: Vec<FleetMember>,
+        garden: &TestGarden,
+    ) -> (
+        DriveLoop,
+        Daemon,
+        Arc<FakeFleet>,
+        Arc<FakeV2Claimer>,
+        Arc<FakeV2Parker>,
+        Arc<SpyKeeper>,
+    ) {
+        let (drive, d, backend, _legacy_claimer, _legacy_parker, _queues, _probe) =
+            make_full(fleet, vec![], Policy::default());
+        let mut cfg = FleetConfig::disabled();
+        cfg.queue = QueueMode::V2;
+        d.set_fleet_config(cfg);
+        d.inner.lock().unwrap().config.garden_root = garden.root.clone();
+        let entries = garden.root.join("entries");
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let drive = drive.with_v2(V2Seams {
+            source: Box::new(crate::v2_source::V2Source::new(garden.root.clone())),
+            entries: FsEntryBatonStore::new(entries.clone(), "garden"),
+            member_writer: Box::new(Arc::clone(&backend)),
+            claimer: Box::new(Arc::clone(&claimer)),
+            parker: Box::new(Arc::clone(&parker)),
+        });
+        let keeper = Arc::new(SpyKeeper::default());
+        let mut d = d;
+        d.v2_handoff = Some(Arc::new(HandoffSeams {
+            keeper: Box::new(Arc::clone(&keeper)),
+            entries: FsEntryBatonStore::new(entries, "garden"),
+        }));
+        (drive, d, backend, claimer, parker, keeper)
+    }
+
+    /// Call a member verb as `member` through the server's handler.
+    fn verb_call(d: &Daemon, member: &str, verb: &str, args: serde_json::Value) -> MemberVerbReply {
+        let envelope = serde_json::json!({ "member": member, "args": args });
+        match crate::server::member_verb(d, &softfig_ipc::Request::new(verb, envelope)) {
+            softfig_ipc::Response::Ok { data, .. } => serde_json::from_value(data).unwrap(),
+            softfig_ipc::Response::Err { error, .. } => panic!("{verb}: transport error {error}"),
+        }
+    }
+
+    fn handoff_baton(item: &str, status: &str, next: &str) -> String {
+        format!("---\nstatus: {status}\nitem: {item}\n---\n# NEXT ACTION\n{next}\n")
+    }
+
+    /// SLICE 009 — complete_slice end to end: the server commits (the session
+    /// log, then the slice `done`), stores the baton as the entry's and replies
+    /// `ok` with the next unit; a repeat call is refused (the session no longer
+    /// holds the work); the loop lets the live session finish its turn inside
+    /// the grace, kills it once the grace runs out, and step 3 re-picks the
+    /// member onto the entry's next slice with the stored baton copied in.
+    #[test]
+    fn v2_complete_slice_commits_stores_the_baton_and_rolls_after_the_grace() {
+        let garden = TestGarden::new("complete-slice");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0), ("002", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "a1 starts on m1/001: {r:?}");
+        // keeperd's claim, as the files show it.
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0), ("002", SliceStatus::Queued, 0)]);
+
+        let baton = handoff_baton("m1", "IN_PROGRESS", "start slice 002");
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_SLICE,
+            serde_json::json!({ "summary": "built 001", "baton": baton }),
+        );
+        assert_eq!(
+            reply,
+            MemberVerbReply::ok(
+                gop::GROWLIGHT_COMPLETE_SLICE,
+                "m1",
+                "001",
+                Some(NextUnit { entry: "m1".into(), unit: "002".into() }),
+                vec![],
+            ),
+        );
+        assert_eq!(
+            *keeper.ops.lock().unwrap(),
+            vec![
+                KeeperOp::SessionLog {
+                    entry: "m1".into(),
+                    unit: Some("001".into()),
+                    line: "completed · deepseek/deepseek-flash · member a1 · $? · built 001".into(),
+                },
+                KeeperOp::SetStatus {
+                    entry: "m1".into(),
+                    unit: Some("001".into()),
+                    new: DaemonStatusArg::Done,
+                },
+            ],
+            "the commit: the session log first, then the slice done",
+        );
+        assert_eq!(
+            std::fs::read_to_string(garden.root.join("entries/m1/baton.md")).unwrap(),
+            baton,
+            "the verb's baton is the entry's now",
+        );
+        let again = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_SLICE,
+            serde_json::json!({ "summary": "again", "baton": baton }),
+        );
+        assert_eq!(again.code, Some(RefusalCode::NotYourSession), "{again:?}");
+        // keeperd's commit, as the files show it.
+        garden.slices("m1", &[("001", SliceStatus::Done, 0), ("002", SliceStatus::Queued, 0)]);
+
+        // The agent is still ending its turn: inside the grace, nothing happens.
+        backend.set_health("a1", AgentHealth::Alive { last_active: 1 });
+        let r = loop_.tick(1);
+        assert!(r.v2_handoffs.is_empty() && r.v2_started.is_empty(), "{r:?}");
+        assert_eq!(backend.kill_count(), 0);
+        assert!(d.v2_assignment("a1").is_none(), "the handed-off session is not re-mirrored");
+
+        // The grace runs out: the session is killed and a1 re-picked onto m1/002.
+        let r = loop_.tick(1 + crate::fleet::DEFAULT_ROLL_GRACE_SECS as i64);
+        assert_eq!(backend.kill_count(), 1, "the lingering session is terminated");
+        assert_eq!(r.v2_handoffs.len(), 1, "{r:?}");
+        assert!(r.v2_handoffs[0].killed);
+        assert!(r.v2_paused.is_empty(), "a1 resumed its own entry: nothing paused");
+        assert!(parker.paused.lock().unwrap().is_empty());
+        assert_eq!(
+            r.v2_started
+                .iter()
+                .map(|a| (a.agent.as_str(), a.entry.as_str(), v2_unit_label(&a.unit)))
+                .collect::<Vec<_>>(),
+            vec![("a1", "m1", "slice 002".to_string())],
+        );
+        assert_eq!(
+            claimer.claims.lock().unwrap().last(),
+            Some(&("m1".to_string(), Some("002".to_string())))
+        );
+        assert_eq!(
+            backend.member_writes().last(),
+            Some(&("a1".to_string(), baton.clone())),
+            "the stored baton is copied into the member's path at the re-spawn",
+        );
+        assert_eq!(d.v2_assignment("a1").map(|a| a.unit), Some(Unit::Slice {
+            milestone: "m1".into(),
+            slice: "002".into(),
+        }));
+    }
+
+    /// SLICE 009 — follow-ups count across successive handshakes (§7): each
+    /// counted follow-up writes the unit's count + 1 from the committed state,
+    /// the member resumes the same slice after its session exits, and the
+    /// second handshake counts on from the first.
+    #[test]
+    fn v2_follow_ups_count_across_successive_handshakes() {
+        let garden = TestGarden::new("follow-ups");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, _parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+
+        for (round, now) in [(1u64, 1i64), (2, 2)] {
+            garden.slices("m1", &[("001", SliceStatus::Active, round - 1)]);
+            let reply = verb_call(
+                &d,
+                "a1",
+                gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+                serde_json::json!({
+                    "reason": "context_full",
+                    "baton": handoff_baton("m1", "IN_PROGRESS", "keep going"),
+                }),
+            );
+            assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+            assert_eq!(reply.next, Some(NextUnit { entry: "m1".into(), unit: "001".into() }));
+            assert_eq!(
+                keeper.ops.lock().unwrap().last(),
+                Some(&KeeperOp::FollowUps {
+                    entry: "m1".into(),
+                    unit: Some("001".into()),
+                    count: round,
+                }),
+                "handshake {round} counts {round}",
+            );
+            // The session exits on its own; a1 resumes the same slice.
+            backend.set_health("a1", AgentHealth::Exited { code: 0 });
+            let r = loop_.tick(now);
+            assert_eq!(r.v2_handoffs.len(), 1, "{r:?}");
+            assert!(!r.v2_handoffs[0].killed, "an exited session is not killed");
+            assert_eq!(r.v2_started.len(), 1, "a1 resumes m1/001: {r:?}");
+            assert!(r.crashes.is_empty() && r.rerolls.is_empty(), "{r:?}");
+            backend.set_health("a1", AgentHealth::Alive { last_active: now });
+        }
+        assert_eq!(backend.kill_count(), 0);
+        assert_eq!(
+            claimer.claims.lock().unwrap().as_slice(),
+            vec![("m1".to_string(), Some("001".to_string())); 3].as_slice(),
+            "the first claim, then two idempotent re-claims of the same slice",
+        );
+    }
+
+    /// SLICE 009 — preemption at the handshake (§9): an urgent entry queued
+    /// while a1 works takes a1 at its next verb, and the entry it rolled from
+    /// becomes `paused` (its repo slot and counter kept) rather than staying
+    /// `active` with nobody running it.
+    #[test]
+    fn v2_urgent_work_preempts_at_the_handshake_and_pauses_the_rolled_entry() {
+        let garden = TestGarden::new("preempt");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        // m1 is claimed; an urgent task arrives meanwhile (urgent rows lead the file).
+        garden.queue(vec![
+            row("070", EntryKind::Task, Lane::Urgent, EntryStatus::Queued),
+            milestone_row("m1", EntryStatus::Active),
+        ]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "resume 001"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+
+        assert_eq!(*parker.paused.lock().unwrap(), vec!["m1".to_string()], "the rolled entry pauses");
+        assert_eq!(r.v2_paused, vec![("a1".to_string(), "m1".to_string())]);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.entry.as_str(), &a.unit)).collect::<Vec<_>>(),
+            vec![("070", &Unit::Entry)],
+            "the urgent task runs",
+        );
+        assert_eq!(claimer.claims.lock().unwrap().last(), Some(&("070".to_string(), None)));
+    }
+
+    /// SLICE 009 — a pause whose keeperd write fails is retried every tick,
+    /// and until it lands the entry stays held by the member that moved on, so
+    /// it never sits `active` with nobody allowed to take it.
+    #[test]
+    fn v2_a_failed_pause_is_retried_and_the_entry_stays_held_meanwhile() {
+        let garden = TestGarden::new("pause-retry");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, _claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1"), opencode_member("a2")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![
+            row("070", EntryKind::Task, Lane::Urgent, EntryStatus::Queued),
+            milestone_row("m1", EntryStatus::Active),
+        ]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "resume"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK);
+        parker.fail_pause.store(true, Ordering::SeqCst);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert!(r.v2_paused.is_empty(), "the pause did not land: {r:?}");
+        let starts: Vec<(&str, &str)> =
+            r.v2_started.iter().map(|a| (a.agent.as_str(), a.entry.as_str())).collect();
+        assert_eq!(starts, vec![("a1", "070")], "a1 takes the urgent task; a2 can't take m1");
+
+        let r = loop_.tick(2);
+        assert!(r.v2_started.is_empty(), "m1 is still held for the pending pause: {r:?}");
+        parker.fail_pause.store(false, Ordering::SeqCst);
+        loop_.tick(3);
+        assert_eq!(*parker.paused.lock().unwrap(), vec!["m1".to_string()], "the retry lands");
+        // keeperd's pause, as the files show it: any member may resume it now.
+        garden.queue(vec![
+            row("070", EntryKind::Task, Lane::Urgent, EntryStatus::Active),
+            milestone_row("m1", EntryStatus::Paused),
+        ]);
+        let r = loop_.tick(4);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.agent.as_str(), a.entry.as_str())).collect::<Vec<_>>(),
+            vec![("a2", "m1")],
+        );
+    }
+
+    /// SLICE 009 — the paused-on-backend-mismatch path (§6.3 step 5, §6.4): a
+    /// `model_change` to a model the opencode member can't run leaves the entry
+    /// `paused` and the member idle; the next tick a free claude member takes
+    /// it, on the requested model.
+    #[test]
+    fn v2_a_model_change_to_another_backend_pauses_the_entry_for_a_member_of_that_backend() {
+        let garden = TestGarden::new("mismatch");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        garden.write(
+            "growlight/backlog/milestones/m1/slices/001-work.md",
+            "# 001-work\n\n> Model: flash, claude\n\nwork\n",
+        );
+        let claude_member = FleetMember::unpinned(spec("b1"));
+        let (mut loop_, d, backend, _claimer, parker, _keeper) =
+            make_handshake(vec![opencode_member("a1"), claude_member], &garden);
+        let r = loop_.tick(0);
+        assert_eq!(
+            r.v2_started.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "a1 (first in the roster) runs the slice on flash; b1 waits",
+        );
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "model_change",
+                "model": "claude",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "finish on claude"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(*parker.paused.lock().unwrap(), vec!["m1".to_string()], "paused on the mismatch");
+        assert!(r.v2_started.is_empty(), "a1 can't run claude and nothing else is open: {r:?}");
+        assert!(
+            r.held_fresh.iter().any(|h| h.agent == "a1"),
+            "a1 idles: {:?}",
+            r.held_fresh
+        );
+
+        // keeperd's pause, as the files show it: the claude member takes it.
+        garden.queue(vec![milestone_row("m1", EntryStatus::Paused)]);
+        let r = loop_.tick(2);
+        assert_eq!(
+            r.v2_started
+                .iter()
+                .map(|a| (a.agent.as_str(), a.resolved_model.clone()))
+                .collect::<Vec<_>>(),
+            vec![("b1", ModelChoice::claude())],
+            "a free member of the requested backend resumes it",
+        );
+    }
+
+    /// SLICE 009 — `growlight_block` (§6.6): the entry blocks, the reason
+    /// reaches the human as an alert, and the member is released with nothing
+    /// held or paused.
+    #[test]
+    fn v2_block_blocks_the_entry_alerts_and_releases_the_member() {
+        let garden = TestGarden::new("block");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, _claimer, parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        garden.slices("m1", &[("001", SliceStatus::Active, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_BLOCK,
+            serde_json::json!({
+                "kind": "human",
+                "reason": "which license?",
+                "baton": handoff_baton("m1", "BLOCKED_ON_HUMAN", "ask"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK);
+        assert_eq!(reply.next, None, "a blocked entry leaves active work");
+        assert_eq!(
+            keeper.ops.lock().unwrap().last(),
+            Some(&KeeperOp::SetStatus {
+                entry: "m1".into(),
+                unit: None,
+                new: DaemonStatusArg::Blocked,
+            })
+        );
+        garden.queue(vec![milestone_row("m1", EntryStatus::Blocked)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(r.v2_handoffs[0].alert.as_deref(), Some("m1 (human: which license?)"));
+        assert!(r.v2_started.is_empty() && r.v2_paused.is_empty(), "{r:?}");
+        assert!(parker.paused.lock().unwrap().is_empty());
+    }
+
+    /// SLICE 010 — the cap's full path on a milestone slice (§7), end to end:
+    /// the 6th follow-up is refused `cap_reached` with the session left up;
+    /// the agent files the rest as a sub-milestone, which keeperd places in
+    /// front of the parent's remaining items with the slice `split`; the
+    /// member re-picks into the sub's first slice, runs it and its close-out,
+    /// and the sub's close-out completes the SUB (never the entry), so the
+    /// member rolls on into the parent's next slice.
+    #[test]
+    fn v2_a_capped_slice_files_a_sub_milestone_that_runs_next_then_closes_into_its_parent() {
+        use SliceKind::{Slice as S, Sub};
+        let garden = TestGarden::new("sub-milestone");
+        garden.queue(vec![milestone_row("m1", EntryStatus::Queued)]);
+        garden.slices("m1", &[("001", SliceStatus::Queued, 0), ("002", SliceStatus::Queued, 0)]);
+        let (mut loop_, d, backend, claimer, parker, keeper) =
+            make_handshake(vec![opencode_member("a1")], &garden);
+        loop_.tick(0);
+        garden.queue(vec![milestone_row("m1", EntryStatus::Active)]);
+        // Slice 001 has spent the cap.
+        garden.slices("m1", &[("001", SliceStatus::Active, 5), ("002", SliceStatus::Queued, 0)]);
+
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_FOLLOW_UP_SESSION,
+            serde_json::json!({
+                "reason": "context_full",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "again"),
+            }),
+        );
+        assert_eq!(reply.code, Some(RefusalCode::CapReached), "{reply:?}");
+        assert!(reply.message.unwrap().contains("growlight_add_sub_milestone"));
+        assert!(keeper.ops.lock().unwrap().is_empty(), "a refusal writes nothing");
+        assert!(d.v2_assignment("a1").is_some(), "and the session keeps its work");
+
+        let baton = handoff_baton("m1", "IN_PROGRESS", "start the sub");
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_ADD_SUB_MILESTONE,
+            serde_json::json!({
+                "slug": "rest",
+                "title": "The rest of 001",
+                "mission": "finish the parser",
+                "finish_criteria": "- [ ] it parses",
+                "slices": [{ "slug": "finish", "title": "Finish", "body": "the remaining work" }],
+                "baton": baton,
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        assert_eq!(reply.next, Some(NextUnit { entry: "m1/rest".into(), unit: "001".into() }));
+        let ops = keeper.ops.lock().unwrap().clone();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(
+            matches!(&ops[0], KeeperOp::SessionLog { entry, unit: Some(u), line }
+                if entry == "m1" && u == "001" && line.starts_with("split · ")),
+            "{ops:?}"
+        );
+        assert!(
+            matches!(&ops[1], KeeperOp::AddSub { milestone, slice, slug, at_end: false, .. }
+                if milestone == "m1" && slice == "001" && slug == "rest"),
+            "{ops:?}"
+        );
+        // keeperd's commit, as the files show it.
+        garden.tree("m1", &[(S, "001", SliceStatus::Split, 5), (Sub, "rest", SliceStatus::Queued, 0), (S, "002", SliceStatus::Queued, 0)]);
+        garden.slices("m1/rest", &[("001", SliceStatus::Queued, 0)]);
+
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.entry.as_str(), &a.unit)).collect::<Vec<_>>(),
+            vec![("m1", &Unit::Slice { milestone: "m1/rest".into(), slice: "001".into() })],
+            "the sub runs next",
+        );
+        assert_eq!(claimer.claims.lock().unwrap().last(), Some(&("m1/rest".to_string(), Some("001".to_string()))));
+        assert_eq!(backend.member_writes().last(), Some(&("a1".to_string(), baton)), "the sub shares the entry's baton");
+
+        // The sub's slice completes: its close-out is next.
+        garden.slices("m1/rest", &[("001", SliceStatus::Active, 0)]);
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_SLICE,
+            serde_json::json!({ "summary": "finished", "baton": handoff_baton("m1", "IN_PROGRESS", "close the sub") }),
+        );
+        assert_eq!(reply.next, Some(NextUnit { entry: "m1/rest".into(), unit: "close-out".into() }));
+        garden.slices("m1/rest", &[("001", SliceStatus::Done, 0)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(2);
+        assert_eq!(r.v2_started[0].unit, Unit::CloseOut { milestone: "m1/rest".into() });
+
+        // The sub's close-out completes the sub; the entry runs on.
+        keeper.ops.lock().unwrap().clear();
+        let reply = verb_call(
+            &d,
+            "a1",
+            gop::GROWLIGHT_COMPLETE_ENTRY,
+            serde_json::json!({
+                "outcome": "done",
+                "summary": "the parser is done",
+                "baton": handoff_baton("m1", "IN_PROGRESS", "start 002"),
+            }),
+        );
+        assert_eq!(reply.state, MEMBER_VERB_OK, "{reply:?}");
+        assert_eq!(reply.next, Some(NextUnit { entry: "m1".into(), unit: "002".into() }));
+        assert_eq!(
+            keeper.ops.lock().unwrap().last(),
+            Some(&KeeperOp::SetStatus {
+                entry: "m1".into(),
+                unit: Some("rest".into()),
+                new: DaemonStatusArg::Done,
+            }),
+            "the sub's item closes; nothing archives the entry",
+        );
+        garden.tree("m1", &[(S, "001", SliceStatus::Split, 5), (Sub, "rest", SliceStatus::Done, 0), (S, "002", SliceStatus::Queued, 0)]);
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        let r = loop_.tick(3);
+        assert_eq!(
+            r.v2_started.iter().map(|a| (a.entry.as_str(), &a.unit)).collect::<Vec<_>>(),
+            vec![("m1", &Unit::Slice { milestone: "m1".into(), slice: "002".into() })],
+        );
+        assert!(parker.paused.lock().unwrap().is_empty(), "the member never left its entry");
     }
 }

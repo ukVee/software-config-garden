@@ -286,6 +286,48 @@ pub mod op {
     /// project (§8). One commit, `queue_v2_updated`. `--dry-run` computes +
     /// renders, writes nothing.
     pub const QUEUE_DROP: &str = "queue_drop";
+    /// queue v2 daemon op, keeperd↔growlightd only (never an agent-facing MCP
+    /// verb): claim the assignment — entry `queued | paused → active` plus
+    /// the unit slice `queued → active`, idempotent on re-claim. One commit,
+    /// `queue_v2_claimed`, both derived views re-rendered.
+    pub const QUEUE_V2_CLAIM: &str = "queue_v2_claim";
+    /// queue v2 daemon op, keeperd↔growlightd only: the daemon-owned status
+    /// transitions (§6.8, built by `queue-v2-scheduling` slice 005) — entry
+    /// `active → paused | blocked | deferred | queued | done` (`done` moves
+    /// the row to the archive, the §6.5 close-out), slice `active → done |
+    /// split | blocked | deferred | queued` (`done` resets `follow_ups` to 0).
+    /// A pending human status change on the entry (its `pending_status`
+    /// field) wins over the requested status — except a requested `done` or
+    /// `blocked`, which drop it — is cleared here, and the reply reports what
+    /// actually landed. One commit, `queue_v2_status_set`.
+    pub const QUEUE_V2_SET_STATUS: &str = "queue_v2_set_status";
+    /// queue v2 daemon op, keeperd↔growlightd only: write the §7 follow_ups
+    /// counter as an absolute value (growlightd owns the increment-on-follow-up
+    /// / reset-on-done arithmetic and passes the result) — the entry's own
+    /// counter when `unit` is omitted, a slice item's otherwise. One commit,
+    /// `queue_v2_follow_ups_set`.
+    pub const QUEUE_V2_FOLLOW_UPS: &str = "queue_v2_follow_ups";
+    /// queue v2 daemon op, keeperd↔growlightd only: append the §3.5 session
+    /// line to the unit doc's `## Sessions` section — keeperd stamps the
+    /// `- <utc> · ` prefix and appends the caller's `<reason> · <model> ·
+    /// member <id> · $cost` tail. The doc is the slice doc (`unit` given),
+    /// the milestone `CLAUDE.md` (close-out), or the task/restack doc. One
+    /// commit, `queue_v2_session_logged`.
+    pub const QUEUE_V2_SESSION_LOG: &str = "queue_v2_session_log";
+    /// queue v2 daemon op, keeperd↔growlightd only: write the close-out's
+    /// deferred tests (§6.5 `deferred_tests`, protocol §7b) into the entry
+    /// doc's `## Deferred verification` section — replaced in place when the
+    /// section exists, created otherwise. One commit, `queue_v2_deferred_set`.
+    pub const QUEUE_V2_DEFERRED: &str = "queue_v2_deferred";
+    /// queue v2 daemon op, keeperd↔growlightd only: the §7 sub-milestone
+    /// (`queue-v2-scheduling` slice 010, `growlight_add_sub_milestone`'s
+    /// commit). Creates `milestones/<milestone>/subs/<slug>/` — its
+    /// `CLAUDE.md` from the structured fields, `slices/` + `.seq`, and its
+    /// `slices.toml` (every slice `queued`) — marks the `active` slice `split`,
+    /// and places the sub in the parent's `slices.toml`: right after the split
+    /// slice (the front of the remaining items, the default) or at the end
+    /// (`at_end`, `do_not_prioritize`). One commit, `queue_v2_sub_added`.
+    pub const QUEUE_V2_ADD_SUB: &str = "queue_v2_add_sub";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -361,6 +403,22 @@ pub mod op {
     /// held lease, promoting the head waiter. Forwarded keeperd→growlightd like
     /// [`REQUEST_LEASE`]; a release by a non-holder comes back `denied`.
     pub const RELEASE_LEASE: &str = "release_lease";
+    /// Queue v2 member verbs (spec-growlight-queue §6.1–§6.6), agent-facing and
+    /// forwarded keeperd→growlightd like the leases: keeperd parses the
+    /// [`crate::growlightd::MemberCall`] envelope and relays growlightd's
+    /// [`crate::growlightd::MemberVerbReply`]. growlightd validates (and, with
+    /// the handshake's execution half, commits through keeperd's v2 ops).
+    pub const GROWLIGHT_ADD_FOLLOW_UP_SESSION: &str =
+        crate::growlightd::op::GROWLIGHT_ADD_FOLLOW_UP_SESSION;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_COMPLETE_SLICE: &str = crate::growlightd::op::GROWLIGHT_COMPLETE_SLICE;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_COMPLETE_ENTRY: &str = crate::growlightd::op::GROWLIGHT_COMPLETE_ENTRY;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_BLOCK: &str = crate::growlightd::op::GROWLIGHT_BLOCK;
+    /// See [`GROWLIGHT_ADD_FOLLOW_UP_SESSION`].
+    pub const GROWLIGHT_ADD_SUB_MILESTONE: &str =
+        crate::growlightd::op::GROWLIGHT_ADD_SUB_MILESTONE;
     /// M4 deploy (TUI Deploy tab): compute the deploy plan — a read-only diff of
     /// `config/deploy.toml` against the live filesystem. The daemon runs
     /// `softfig-deploy`'s `plan` against the unlocked garden mount so a frontend
@@ -2411,6 +2469,203 @@ pub struct QueueDropReply {
     /// §6.9 CLI prints.
     pub view: String,
     /// Commit hash; on a dry run the untouched tip.
+    pub hash: String,
+}
+
+// ---- queue v2 daemon ops (keeperd↔growlightd, slice 005) --------------
+//
+// The handshake's commit path: growlightd's §6.3 step 3 calls these over
+// keeperd's socket (the `set_item_status` client pattern). They are not
+// agent-facing MCP verbs and have no `dry_run`.
+
+/// The `queue_v2_set_status` target status (`new`). One closed vocabulary for
+/// both levels; keeperd validates per level: entry takes `paused | blocked |
+/// deferred | queued | done`, a slice takes `done | split | blocked |
+/// deferred | queued` — an out-of-level value is a `BadArgs` refusal, not a
+/// serde shape error (the same reasoning as [`QueueStatusArg`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonStatusArg {
+    Paused,
+    Blocked,
+    Deferred,
+    Queued,
+    Done,
+    Split,
+}
+
+/// One deferred manual test (§6.5 `deferred_tests`): what to run and the
+/// expected result, rendered into the entry doc's `## Deferred verification`
+/// section by [`super::super::verbs::op::QUEUE_V2_DEFERRED`]`queue_v2_deferred`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredTestSpec {
+    /// What the human runs (the pending manual test).
+    pub what: String,
+    /// The expected result, so the pass/fail judgement is pre-written.
+    pub expected: String,
+}
+
+/// `queue_v2_claim({entry, unit?}) -> {entry, unit, hash}` — the daemon claim
+/// (spec §6.3 step 3's claim at assignment, `queue-v2-scheduling` slice 005).
+/// Entry `queued | paused → active`; `unit` (a slice id) `queued → active`.
+/// `unit` is omitted for a task/restack or a milestone close-out. A re-claim
+/// of an already-active unit is an idempotent no-op; a different already-active
+/// slice of the same entry is refused `started`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ClaimArgs {
+    /// The live entry id (a milestone identity, a task's NNN, or a restack's
+    /// NNN).
+    pub entry: String,
+    /// The unit slice's id within the entry's `slices.toml`; omitted for a
+    /// task, restack or close-out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ClaimReply {
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Commit hash; on an idempotent re-claim the untouched tip.
+    pub hash: String,
+}
+
+/// `queue_v2_set_status({entry, unit?, new}) -> {entry, unit, status, hash}` —
+/// the daemon-owned status transitions (§6.8; the handshake's status write).
+/// Entry level (`unit` omitted): `active → paused | blocked | deferred |
+/// queued | done`, where `done` archives the row (`final_status = done`, the
+/// §6.5 close-out). Slice level (`unit` given): `active → done | split |
+/// blocked | deferred | queued` (`done` resets the slice's `follow_ups` to 0,
+/// §3.3). A recorded `pending_status` on the entry wins over `new`, is
+/// cleared, and is reported as the reply's `status` (finding 8's boundary) —
+/// except under a `new` of `done` or `blocked` (the member's own stop, review
+/// R4), which lands and drops the pending change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2SetStatusArgs {
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    pub new: DaemonStatusArg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2SetStatusReply {
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// The status that actually landed (a pending human change overrides
+    /// `new`; `done` means the row was archived).
+    pub status: String,
+    /// Commit hash; on a no-op write the untouched tip.
+    pub hash: String,
+}
+
+/// `queue_v2_follow_ups({entry, unit?, count}) -> {entry, unit, hash}` — the
+/// §7 bookkeeping. `count` is absolute: growlightd owns the
+/// increment-on-accepted-follow-up / reset-on-done arithmetic and passes the
+/// result. `unit` omitted writes the entry's own counter (task, restack,
+/// close-out); `unit` given writes the slice item's (`slices.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2FollowUpsArgs {
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2FollowUpsReply {
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Commit hash; on a no-op write (the same count) the untouched tip.
+    pub hash: String,
+}
+
+/// `queue_v2_session_log({entry, unit?, line}) -> {entry, unit, path, hash}` —
+/// the §3.5 session log. keeperd stamps the `- <utc> · ` prefix and appends
+/// `line` (the `<reason> · <model ref> · member <id> · $cost` tail) to the
+/// unit doc's `## Sessions` section: the slice doc for `unit`, the milestone
+/// `CLAUDE.md` for a close-out, the task/restack doc otherwise. The section
+/// is created when absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2SessionLogArgs {
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// The roll line's tail (reason · model ref · member id · cost) — the
+    /// part after keeperd's stamped timestamp.
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2SessionLogReply {
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// The doc the line landed in (garden-relative).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `queue_v2_deferred({entry, tests}) -> {entry, path, hash}` — the §6.5 /
+/// protocol §7b deferred-verification write. Renders each test into the entry
+/// doc's `## Deferred verification` section (`milestone` → its `CLAUDE.md`,
+/// `task`/`restack` → its tasks doc), replacing the section in place when it
+/// exists, creating it otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2DeferredArgs {
+    pub entry: String,
+    /// At least one pending manual test.
+    pub tests: Vec<DeferredTestSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2DeferredReply {
+    pub entry: String,
+    /// The doc the section landed in (garden-relative).
+    pub path: String,
+    pub hash: String,
+}
+
+/// `queue_v2_add_sub({milestone, slice, slug, title, mission, finish_criteria,
+/// slices, at_end}) -> {milestone, slices, path, hash}` — the §7 sub-milestone,
+/// filed when a slice's work outgrows it. `milestone` is the identity holding
+/// the slice (a top-level id or `"<parent>/<sub>"`); the new sub's identity is
+/// `"<milestone>/<slug>"`, at most 2 deep (§3.3). Refused: a slice that is not
+/// an `active` slice item, a taken slug (in the parent's list or on disk), a
+/// sub past the depth bound, and (the §6.7 backstop) `> Model:` / `> Grants:` /
+/// `> Worktree:` lines in the member's text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2AddSubArgs {
+    /// The milestone identity holding the slice that splits.
+    pub milestone: String,
+    /// The `active` slice whose remaining work moves into the sub; it becomes
+    /// `split`.
+    pub slice: String,
+    /// The sub-milestone's slug (`[a-z0-9-]+`, 1–64): its folder and the
+    /// parent item's id.
+    pub slug: String,
+    pub title: String,
+    pub mission: String,
+    pub finish_criteria: String,
+    /// At least one; numbered `001…` in order (the sub's folder is new).
+    pub slices: Vec<QueueSliceSpec>,
+    /// `true` appends the sub at the end of the parent's list
+    /// (`do_not_prioritize`); `false` places it right after the split slice.
+    #[serde(default)]
+    pub at_end: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2AddSubReply {
+    /// The new sub-milestone's identity (`"<milestone>/<slug>"`).
+    pub milestone: String,
+    /// Its slice ids, in order.
+    pub slices: Vec<String>,
+    /// Its `CLAUDE.md` (garden-relative).
+    pub path: String,
     pub hash: String,
 }
 

@@ -33,6 +33,9 @@ pub mod fleet;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
+pub mod member_handoff;
+pub mod member_slices;
+pub mod member_verbs;
 pub mod notifications;
 pub mod notify_dispatch;
 pub mod opencode_backend;
@@ -45,12 +48,14 @@ pub mod queue_source;
 pub mod reconcile;
 pub mod resume;
 pub mod scheduler;
+pub mod scheduler_v2;
 pub mod server;
 pub mod state;
 pub mod supervisor;
 pub mod thrash_bridge;
 pub mod usage;
 pub mod usage_file;
+pub mod v2_source;
 
 pub use admission::{
     AdmissionDecision, AdmissionGovernor, BudgetUsage, Intent, RateState, RefuseReason,
@@ -72,7 +77,7 @@ pub use drive_loop::{
 };
 pub use fleet::{
     assemble_fleet, load_fleet_config, spawn_fleet, FleetConfig, FleetMemberConfig, MemberBackend,
-    DEFAULT_CLAUDE_BIN, DEFAULT_OPENCODE_BIN, DEFAULT_PROMPT,
+    QueueMode, DEFAULT_CLAUDE_BIN, DEFAULT_OPENCODE_BIN, DEFAULT_PROMPT,
 };
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
@@ -101,3 +106,4 @@ pub use thrash_bridge::{parse_target, KeeperThrashClear, TargetClear};
 pub use usage::{
     usage_alert_reached, UsageAggregator, UsageSample, WindowResets, USAGE_ALERT_PCT,
 };
+pub use v2_source::{assemble, V2Load, V2Source, V2SourceError};

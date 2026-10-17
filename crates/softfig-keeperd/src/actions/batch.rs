@@ -205,11 +205,14 @@ pub fn batch(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // under an unkeyed shared subtree) are validation too: checked here,
         // a refused target fails the batch with nothing staged instead of
         // after the ops before it already landed in the overlay.
+        // So is §6.7's member `> Model:` guard, over the exact bytes the op
+        // will stage.
         if let Some(s) = staged.last() {
             let wt = WorkTree::new(daemon, &inner);
-            wt.check_write(staged_target(&s.mutation)).map_err(|(kind, msg)| {
-                (kind, format!("batch op[{i}] ({}) failed: {msg}", op.op))
-            })?;
+            wt.check_write_bytes(staged_target(&s.mutation), staged_bytes(&s.mutation))
+                .map_err(|(kind, msg)| {
+                    (kind, format!("batch op[{i}] ({}) failed: {msg}", op.op))
+                })?;
         }
     }
 
@@ -301,6 +304,15 @@ fn staged_target(m: &Mutation) -> &str {
     match m {
         Mutation::Write { rel, .. } => rel,
         Mutation::AddNote { note_rel, .. } | Mutation::ReviseNote { note_rel, .. } => note_rel,
+    }
+}
+
+/// The bytes a staged mutation writes at its [`staged_target`].
+fn staged_bytes(m: &Mutation) -> &[u8] {
+    match m {
+        Mutation::Write { content, .. }
+        | Mutation::AddNote { content, .. }
+        | Mutation::ReviseNote { content, .. } => content.as_bytes(),
     }
 }
 

@@ -206,9 +206,90 @@ fn extract_section(baton: &str, heading: &str) -> Option<String> {
     }
 }
 
+/// Why a handoff baton fails the queue-v2 §6.3 head check — the member verbs'
+/// `bad_baton` refusal. The message names what to fix, because the refused
+/// session keeps running and corrects itself from it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BatonHeadError {
+    /// No `---` … `---` frontmatter at the top.
+    #[error("the baton has no `---` frontmatter head")]
+    NoHead,
+    /// The head carries no `status:`.
+    #[error("the baton head has no `status:`")]
+    MissingStatus,
+    /// `status:` is outside [`STATUS_VOCABULARY`].
+    #[error("the baton head's `status: {0}` is not a baton status")]
+    UnknownStatus(String),
+    /// A vocabulary status, but not the one this handoff carries.
+    #[error("this handoff's baton carries `status: {expected}`, not `{found}`")]
+    WrongStatus { found: String, expected: String },
+    /// The head carries no `item:`.
+    #[error("the baton head has no `item:`")]
+    MissingItem,
+}
+
+/// The §6.3 head check every member verb runs on the baton it carries: a
+/// closed frontmatter head with `item:` and a `status:` from
+/// [`STATUS_VOCABULARY`] that is one of `expected` (the statuses this handoff
+/// may write). The shared validation spec §12 places beside [`parse_baton`],
+/// so a verb and any later reader agree on what a well-formed head is.
+pub fn validate_head(baton: &str, expected: &[&str]) -> Result<BatonView, BatonHeadError> {
+    let mut lines = baton.lines();
+    let opened = lines.next().map(str::trim) == Some("---");
+    if !opened || !lines.any(|l| l.trim() == "---") {
+        return Err(BatonHeadError::NoHead);
+    }
+    let view = parse_baton(baton);
+    let status = view.status.clone().ok_or(BatonHeadError::MissingStatus)?;
+    if !STATUS_VOCABULARY.contains(&status.as_str()) {
+        return Err(BatonHeadError::UnknownStatus(status));
+    }
+    if !expected.contains(&status.as_str()) {
+        return Err(BatonHeadError::WrongStatus {
+            found: status,
+            expected: expected.join("` or `"),
+        });
+    }
+    if view.item.is_none() {
+        return Err(BatonHeadError::MissingItem);
+    }
+    Ok(view)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_head_requires_a_closed_head_a_known_expected_status_and_an_item() {
+        let ok = "---\nstatus: IN_PROGRESS\nitem: m1\n---\n# NEXT ACTION\nx\n";
+        let v = validate_head(ok, &["IN_PROGRESS"]).unwrap();
+        assert_eq!(v.item.as_deref(), Some("m1"));
+
+        let expect = &["IN_PROGRESS"];
+        assert_eq!(validate_head("status: IN_PROGRESS\nitem: m\n", expect), Err(BatonHeadError::NoHead));
+        assert_eq!(
+            validate_head("---\nstatus: IN_PROGRESS\nitem: m\n", expect),
+            Err(BatonHeadError::NoHead),
+            "an unclosed head is no head",
+        );
+        assert_eq!(validate_head("---\nitem: m\n---\n", expect), Err(BatonHeadError::MissingStatus));
+        assert_eq!(
+            validate_head("---\nstatus: DONE\nitem: m\n---\n", expect),
+            Err(BatonHeadError::UnknownStatus("DONE".into())),
+        );
+        assert_eq!(
+            validate_head("---\nstatus: ITEM_COMPLETE\nitem: m\n---\n", expect),
+            Err(BatonHeadError::WrongStatus {
+                found: "ITEM_COMPLETE".into(),
+                expected: "IN_PROGRESS".into(),
+            }),
+        );
+        assert_eq!(
+            validate_head("---\nstatus: IN_PROGRESS\nitem: null\n---\n", expect),
+            Err(BatonHeadError::MissingItem),
+        );
+    }
 
     #[test]
     fn parse_baton_reads_frontmatter_and_the_next_action_section() {

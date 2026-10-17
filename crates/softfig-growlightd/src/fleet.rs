@@ -53,14 +53,14 @@ use softfig_ipc as ipc;
 
 use crate::admission::AdmissionGovernor;
 use crate::backend_router::{BackendHandle, BackendRouter};
-use crate::baton_store::FsBatonStore;
+use crate::baton_store::{runtime_entries_dir, FsBatonStore, FsEntryBatonStore};
 use crate::config::BuildCaps;
-use crate::claim::{KeeperdItemParker, KeeperdPartClaimer};
+use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2Claimer, KeeperdV2ItemParker};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
     spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RateMeter, RouteConnectivity,
-    SystemExeProbe, DRIVE_POLL_MS,
+    SystemExeProbe, V2Seams, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
@@ -71,6 +71,7 @@ use crate::preapproval::{agent_paths, PreApproval};
 use crate::queue_source::KeeperdQueueSource;
 use crate::supervisor::{AgentSpec, Supervisor};
 use crate::usage_file::UsageCapture;
+use crate::v2_source::V2Source;
 
 /// The `claude` binary the backend shells when the config omits `claude_bin`.
 pub const DEFAULT_CLAUDE_BIN: &str = "claude";
@@ -114,6 +115,35 @@ pub enum MemberBackend {
     /// opencode member with none is refused at parse (see
     /// [`FleetMemberDoc::validate`]), never left to opencode's own default.
     Opencode(ModelSelection),
+}
+
+impl MemberBackend {
+    /// The [`softfig_ipc::model_choice::Backend`] this member runs on — the
+    /// §6.4 backend-match input v2 scheduling (slice 006) needs to build the
+    /// per-member [`crate::scheduler_v2::Member`].
+    pub fn ipc_backend(&self) -> softfig_ipc::model_choice::Backend {
+        match self {
+            MemberBackend::Claude => softfig_ipc::model_choice::Backend::Claude,
+            MemberBackend::Opencode(_) => softfig_ipc::model_choice::Backend::Opencode,
+        }
+    }
+
+    /// The roster's `model` — the opencode member's default for undeclared work
+    /// (§6.4). `None` for a claude member.
+    pub fn roster_model(&self) -> Option<&str> {
+        match self {
+            MemberBackend::Claude => None,
+            MemberBackend::Opencode(sel) => Some(&sel.model),
+        }
+    }
+
+    /// The roster's `variant` (opencode-only).
+    pub fn roster_variant(&self) -> Option<&str> {
+        match self {
+            MemberBackend::Claude => None,
+            MemberBackend::Opencode(sel) => sel.variant.as_deref(),
+        }
+    }
 }
 
 /// One configured fleet member, **validated** — what [`FleetConfig`] carries and
@@ -257,11 +287,38 @@ impl FleetMemberConfig {
     fn to_member(&self, agents_dir: &Path) -> FleetMember {
         let paths = agent_paths(agents_dir, &self.agent);
         let spec = AgentSpec::new(&self.agent, paths.loop_settings, paths.mcp_config);
-        match &self.pin {
+        let member = match &self.pin {
             Some(pin) => FleetMember::pinned(spec, pin.clone()),
             None => FleetMember::unpinned(spec),
-        }
+        };
+        member.with_backend(self.backend.clone())
     }
+}
+
+/// Which queue model growlightd schedules from — the §11 switch
+/// (`config/growlight.toml` `queue = "legacy" | "v2"`, default `legacy`).
+///
+/// The key parses as a serde snake_case enum, so an **unknown value is a TOML
+/// parse error**: [`FleetConfig::from_growlight_toml`] returns `Err` and the
+/// loader fails closed to a disabled fleet — that IS the arm-time refusal §11
+/// requires. The `Doc` deliberately has no `deny_unknown_fields` (recorded as a
+/// planning finding): an unknown VALUE is caught here, by the enum parse, so a
+/// typo'd switch can never silently mean legacy.
+///
+/// Under `legacy` (the default) growlightd behaves exactly as today. Under
+/// `v2` it schedules from the v2 files via the [`V2Source`](crate::v2_source)
+/// — wired in slice 006, so this slice only parses and stores the mode; it
+/// changes no scheduling. The v2 growlight verbs operate on the v2 files
+/// whatever this says (§11). The dedicated migration session flips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueMode {
+    /// Today's backlog tables + named queues — unchanged behavior.
+    #[default]
+    Legacy,
+    /// Schedule from the v2 files (`queue.toml` / `queue-archive.toml` /
+    /// per-milestone `slices.toml`).
+    V2,
 }
 
 /// The parsed `config/growlight.toml` fleet config: the off-by-default `enabled`
@@ -295,7 +352,21 @@ pub struct FleetConfig {
     /// [`DriveLoop`] at [`assemble_fleet`]; a `0` is rejected at parse (fail-closed to a
     /// disabled fleet) since it would stop before any work runs.
     pub max_iterations: Option<u64>,
+    /// `queue` — the §11 switch: which queue model growlightd schedules from.
+    /// [`QueueMode::Legacy`] (the default, and every pre-v2 config's meaning)
+    /// keeps today's behavior byte-identical; [`QueueMode::V2`] turns the v2
+    /// source on (slice 006). Parsed and stored here; an unknown value never
+    /// reaches this struct — it is refused at parse, fail-closed.
+    pub queue: QueueMode,
+    /// `roll_grace_secs` — how long a v2 member may linger after its handshake
+    /// before growlightd terminates the session (§6.3 step 4: on exit or after
+    /// the grace, whichever comes first). Absent ⇒ [`DEFAULT_ROLL_GRACE_SECS`].
+    pub roll_grace_secs: u64,
 }
+
+/// §6.3 step 4's default grace between a member's handshake and growlightd
+/// terminating its session.
+pub const DEFAULT_ROLL_GRACE_SECS: u64 = 20;
 
 impl FleetConfig {
     /// The fail-closed default: gate off, no members, default bin/prompt.
@@ -309,6 +380,8 @@ impl FleetConfig {
             members: Vec::new(),
             build_caps: BuildCaps::default(),
             max_iterations: None,
+            queue: QueueMode::Legacy,
+            roll_grace_secs: DEFAULT_ROLL_GRACE_SECS,
         }
     }
 
@@ -330,6 +403,12 @@ impl FleetConfig {
             build_caps: BuildCaps,
             /// The bounded-run knob (task 040). Absent ⇒ `None` ⇒ unbounded.
             max_iterations: Option<u64>,
+            /// The §11 queue switch. Absent ⇒ [`QueueMode::Legacy`]; an unknown
+            /// value is a TOML parse error (fail-closed at the loader).
+            #[serde(default)]
+            queue: QueueMode,
+            /// §6.3 step 4's grace. Absent ⇒ the default.
+            roll_grace_secs: Option<u64>,
         }
         let doc: Doc =
             toml::from_str(s).map_err(|e| format!("parse {}: {e}", ipc::GROWLIGHT_CONFIG_FILE))?;
@@ -374,6 +453,8 @@ impl FleetConfig {
             members,
             build_caps: doc.build_caps,
             max_iterations: doc.max_iterations,
+            queue: doc.queue,
+            roll_grace_secs: doc.roll_grace_secs.unwrap_or(DEFAULT_ROLL_GRACE_SECS),
         })
     }
 }
@@ -473,10 +554,7 @@ pub fn assemble_fleet(
     let agents_dir = runtime_agents_dir();
     // The garden's directory name — a cosmetic `loop:` tag in the seed baton,
     // matching the single-agent baton's frontmatter.
-    let garden_name = garden_root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| PILLAR.to_string());
+    let garden_name = garden_tag(&garden_root);
 
     // One per-member baton store over the SAME runtime `agents/` namespace the
     // pre-approval generators write each agent's config into (and the boot hook
@@ -485,7 +563,7 @@ pub fn assemble_fleet(
     // `BatonStatusSource` slice 001 reads on exit — one store cloned into both
     // boxes, so the file the seeder writes and the file the reader parses can never
     // drift. `FsBatonStore` is a cheap `Clone` (two paths + a name), so no `Arc`.
-    let baton_store = FsBatonStore::new(agents_dir.clone(), garden_name);
+    let baton_store = FsBatonStore::new(agents_dir.clone(), garden_name.clone());
 
     // Each member's own backend, behind ONE router (slice 005). The `DriveLoop::new`
     // contract is unchanged — it still receives a single backend-shaped thing cloned
@@ -537,6 +615,31 @@ pub fn assemble_fleet(
     // (`None` = unbounded, the default). Read once here at arm time — a bounded run's
     // bound must not move mid-run.
     .with_max_iterations(fleet.max_iterations))
+    .map(|drive| {
+        // The queue-v2 scheduling seams (queue-v2-scheduling slice 006): installed
+        // whatever the mode — the tick consults them ONLY when `queue = "v2"`, so a
+        // legacy fleet carries them inert. Built over the SAME runtime `agents/`
+        // store (the member writer is the §3.6 copy target the SessionStart hook
+        // reads) and the SAME keeperd socket the legacy claimer rides.
+        let baton_writer = FsBatonStore::new(agents_dir.clone(), garden_name.clone());
+        drive.with_v2(V2Seams {
+            source: Box::new(V2Source::new(garden_root.clone())),
+            entries: FsEntryBatonStore::new(runtime_entries_dir(), garden_name),
+            member_writer: Box::new(baton_writer),
+            claimer: Box::new(KeeperdV2Claimer::new(keeperd_socket.to_path_buf())),
+            parker: Box::new(KeeperdV2ItemParker::new(keeperd_socket.to_path_buf())),
+        })
+    })
+}
+
+/// The garden's directory name — the cosmetic `loop:` tag seeded batons carry,
+/// matching the single-agent baton's frontmatter. Shared by the fleet assembly
+/// and the handshake's entry-baton store (`main`), so the two never tag apart.
+pub fn garden_tag(garden_root: &Path) -> String {
+    garden_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| PILLAR.to_string())
 }
 
 /// Build each member's configured backend and route the roster to it (slice 005).
@@ -989,6 +1092,54 @@ agent = "reviewer"
         assert!(
             err.contains("max_iterations"),
             "the error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn queue_switch_defaults_to_legacy_and_parses_v2() {
+        // Absent ⇒ legacy: the default, what every pre-v2 config already means, and
+        // the mode the live garden runs on today.
+        let cfg = FleetConfig::from_growlight_toml("fleet_enabled = true\n").unwrap();
+        assert_eq!(cfg.queue, QueueMode::Legacy, "the key omitted ⇒ legacy");
+        assert_eq!(cfg.roll_grace_secs, DEFAULT_ROLL_GRACE_SECS, "the grace omitted ⇒ 20 s");
+        assert_eq!(FleetConfig::disabled().queue, QueueMode::Legacy);
+
+        // `queue = "v2"` parses — growlightd schedules from the v2 files (slice 006
+        // consumes it; this slice only parses and stores the mode).
+        let v2 = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"v2\"\n")
+            .unwrap();
+        assert_eq!(v2.queue, QueueMode::V2);
+        let graced = FleetConfig::from_growlight_toml("roll_grace_secs = 5\n").unwrap();
+        assert_eq!(graced.roll_grace_secs, 5, "an explicit grace is kept");
+
+        // `queue = "legacy"` is explicit-but-equivalent.
+        let legacy =
+            FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"legacy\"\n")
+                .unwrap();
+        assert_eq!(legacy.queue, QueueMode::Legacy);
+    }
+
+    #[test]
+    fn queue_switch_unknown_value_is_refused_fail_closed() {
+        // An unknown VALUE is a serde enum parse error → Err → the loader turns it
+        // into a disabled fleet. This is the arm-time refusal §11 wants: the `Doc`
+        // deliberately has no `deny_unknown_fields` (planning finding 5), so the
+        // enum parse is what keeps a typo'd switch from silently meaning legacy.
+        let err = FleetConfig::from_growlight_toml("fleet_enabled = true\nqueue = \"bogus\"\n")
+            .unwrap_err();
+        assert!(
+            err.contains("bogus"),
+            "the refusal names the offending value: {err}"
+        );
+
+        // Through the loader: the parse error is surfaced to the arming human (the
+        // `eprintln!` in `load_fleet_config`) and the fleet stays OFF.
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "fleet_enabled = true\nqueue = \"bogus\"\n");
+        assert_eq!(
+            load_fleet_config(dir.path()),
+            FleetConfig::disabled(),
+            "an unknown queue value fails closed to a disabled fleet",
         );
     }
 

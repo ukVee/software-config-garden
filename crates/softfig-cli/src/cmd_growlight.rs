@@ -44,8 +44,9 @@ use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
     AgentBackend, Backend, ClaudeBackend, Clock, DEEPSEEK_FLASH, DEEPSEEK_REASONING, ExeIdentity,
     ExeProbe, InteractiveLaunch, IterationOutcome, IterationRequest, ModelChoice, ModelSpec,
-    OpencodeConfigInputs, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, item_model_field,
-    opencode_config, opencode_context, opencode_interactive_args, parse_model_spec,
+    OpencodeConfigInputs, RateWindow, SystemClock, SystemExeProbe, UsageSnapshot, agent_bin,
+    interactive_command, item_doc_candidates, opencode_config, opencode_context,
+    opencode_interactive_args, parse_model_spec, resolve_item_models,
 };
 use crate::opencode_catalog;
 
@@ -244,7 +245,7 @@ pub struct StartArgs {
     /// `opencode` runs the same human-driven loop on opencode — interactive-first,
     /// so headless `--auto` opencode is not yet implemented (deferred to slice
     /// 004). Omitting it on a TTY brings up the picker instead.
-    #[arg(long, value_enum)]
+    #[arg(long, value_parser = parse_backend_arg)]
     pub backend: Option<Backend>,
     /// Shorthand for `--backend opencode`.
     #[arg(long, conflicts_with = "backend")]
@@ -556,7 +557,7 @@ fn start(args: StartArgs) -> Result<()> {
                 choice.opencode_model_ref()
             );
             let checked = opencode_catalog::verify_model(
-                backend.agent_bin(),
+                agent_bin(backend),
                 &staged,
                 &garden_root,
                 choice.opencode_model(),
@@ -661,7 +662,7 @@ fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
              {} {}",
             choice.opencode_model_ref(),
             launch.opencode_config.display(),
-            choice.backend.agent_bin(),
+            agent_bin(choice.backend),
             opencode_interactive_args().join(" "),
         ),
     }
@@ -698,6 +699,14 @@ fn resolve_model_choice(
         ModelSpec::Fixed(choice) => choice,
         ModelSpec::Auto => declared_model(garden_root, baton_path),
     })
+}
+
+/// The `--backend` value parser. `Backend` moved to `softfig-ipc` (queue v2
+/// §6.4) and no longer derives clap's `ValueEnum`, so this maps the word with
+/// the same spelling the flag always accepted.
+fn parse_backend_arg(s: &str) -> Result<Backend, String> {
+    s.parse()
+        .map_err(|_| format!("expected `claude` or `opencode`, got `{s}`"))
 }
 
 /// The spec the command line asked for, if any. `--opencode` is shorthand for
@@ -780,72 +789,35 @@ fn declared_model(garden_root: &Path, baton_path: &Path) -> ModelChoice {
         return default();
     };
 
-    for doc_path in item_doc_candidates(garden_root, item, view.slice.as_deref()) {
-        let Ok(doc) = fs::read_to_string(&doc_path) else {
-            continue;
-        };
-        let Some(field) = item_model_field(&doc) else {
-            continue;
-        };
-        let label = doc_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| item.to_string());
-        match parse_model_spec(field) {
-            // A doc declaring `auto` would be circular — treat it as no
-            // declaration and keep looking up the chain.
-            Ok(ModelSpec::Auto) => continue,
-            Ok(ModelSpec::Fixed(choice)) => {
-                println!("growlight decides: {field} (declared by {label})");
-                return choice;
-            }
-            Err(e) => {
-                println!("growlight decides: {DEFAULT_OPENCODE_MODEL} — ignoring {label}: {e}");
-                return default();
-            }
-        }
-    }
-
-    println!("growlight decides: {DEFAULT_OPENCODE_MODEL} (no `> Model:` declared by {item})");
-    default()
-}
-
-/// Where an active item's `> Model:` declaration may live, nearest-first: the
-/// active slice's own doc, then the milestone doc that owns it. A standalone task
-/// has just the one doc.
-///
-/// Filenames carry a slug we don't know (`005-backend-model-picker.md`), so each
-/// is found by its numeric prefix rather than reconstructed.
-fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) -> Vec<PathBuf> {
-    let backlog = garden_root.join(PILLAR).join("backlog");
-    let milestone = backlog.join("milestones").join(item);
-    if milestone.is_dir() {
-        let mut candidates = Vec::new();
-        // Baton slices are written `6` or `006`; the files are always zero-padded.
-        if let Some(slice) = slice {
-            let padded = format!("{:0>3}", slice.trim());
-            if let Some(doc) = find_by_number(&milestone.join("slices"), &padded) {
-                candidates.push(doc);
-            }
-        }
-        candidates.push(milestone.join("CLAUDE.md"));
-        return candidates;
-    }
-    find_by_number(&backlog.join("tasks"), item)
+    let docs = item_doc_candidates(garden_root, item, view.slice.as_deref())
         .into_iter()
-        .collect()
-}
-
-/// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`.
-fn find_by_number(dir: &Path, number: &str) -> Option<PathBuf> {
-    let prefix = format!("{number}-");
-    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".md"))
-            .then_some(path)
-    })
+        .map(|doc_path| {
+            let label = doc_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| item.to_string());
+            let content = fs::read_to_string(&doc_path).ok();
+            (label, content)
+        });
+    match resolve_item_models(docs) {
+        Ok(Some(resolved)) => {
+            println!(
+                "growlight decides: {} (declared by {})",
+                resolved.field, resolved.origin
+            );
+            // §6.4 legacy trap: a comma list resolves to its first entry here
+            // (single-entry lines behave exactly as before).
+            resolved.list.first().clone()
+        }
+        Ok(None) => {
+            println!("growlight decides: {DEFAULT_OPENCODE_MODEL} (no `> Model:` declared by {item})");
+            default()
+        }
+        Err(e) => {
+            println!("growlight decides: {DEFAULT_OPENCODE_MODEL} — ignoring: {e}");
+            default()
+        }
+    }
 }
 
 // ---- headless orchestrator (full-auto, slices 001-002) -----------------
@@ -1400,8 +1372,8 @@ fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> 
     // `opencode` it wires `OPENCODE_CONFIG` + the runtime cwd + the first-turn
     // kick (slice 003).
     let backend = choice.backend;
-    let mut cmd = backend.interactive_command(launch)?;
-    let bin = backend.agent_bin();
+    let mut cmd = interactive_command(backend, launch)?;
+    let bin = agent_bin(backend);
     match backend {
         Backend::Claude => println!("\nlaunching {bin} --name {AGENT_NAME} …\n"),
         // Name the model: with four ways to pick one, the human should never have
@@ -2303,6 +2275,20 @@ pub enum QueueSub {
     /// (merge-base / restack flags) are queue-v2-git's (finding 3).
     Show,
 
+    /// Read-only: what `pick_v2` assigns a member now, and why every skipped
+    /// entry was skipped (§6.9). This form is **growlightd's** verb (the pick
+    /// lives there, not in keeperd), so it takes its own socket flag.
+    Pick {
+        /// A roster member id. Omitted: an unpinned member on the default
+        /// backend.
+        #[arg(long)]
+        member: Option<String>,
+        /// growlightd's socket. Defaults to
+        /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+        #[arg(long, value_name = "SOCKET")]
+        growlightd_socket: Option<PathBuf>,
+    },
+
     /// Append a `[[project]]` row — `queue project add`.
     Project {
         #[command(subcommand)]
@@ -2573,6 +2559,10 @@ fn client_queue(args: QueueArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
     match args.cmd.unwrap_or(QueueSub::Show) {
         QueueSub::Show => queue_show(&socket),
+        QueueSub::Pick {
+            member,
+            growlightd_socket,
+        } => queue_pick(&growlight_socket(growlightd_socket), member.as_deref()),
         QueueSub::Project { cmd } => match cmd {
             QueueProjectSub::Add(a) => queue_project_add(&socket, a),
         },
@@ -2674,10 +2664,7 @@ fn queue_show(socket: &Path) -> Result<()> {
         // §3.4: the view renders only when the TOML file exists. A missing
         // file is the expected fresh-garden state, not an error.
         Err(ClientError::Daemon { kind: ErrorKind::NotFound, .. }) => {
-            println!(
-                "no {QUEUE_FILE} — the v2 queue is empty (§3.4: the view renders only \
-                 when the file exists)"
-            );
+            println!("{}", queue_empty_line());
             Ok(())
         }
         Ok(None) => Err(anyhow!(
@@ -2687,6 +2674,71 @@ fn queue_show(socket: &Path) -> Result<()> {
         Err(ClientError::Daemon { message, .. }) => Err(anyhow!("{message}")),
         Err(e) => Err(anyhow!("{e}")),
     }
+}
+
+/// The §3.4 nothing-to-show line: shared by `queue show` and `queue pick` so the
+/// two can never drift into saying different things about the same absent file.
+fn queue_empty_line() -> String {
+    format!(
+        "no {QUEUE_FILE} — the v2 queue is empty (§3.4: the view renders only when the file exists)"
+    )
+}
+
+/// `queue pick` (§6.9): a read-only **growlightd** call (the pick and the v2
+/// source live there). No `--member`: an unpinned member on the default
+/// backend. The reply carries the assignment and every skip reason; nothing is
+/// written.
+fn queue_pick(socket: &Path, member: Option<&str>) -> Result<()> {
+    let args = growlightd::QueuePickArgs {
+        member: member.map(str::to_string),
+    };
+    let reply: growlightd::QueuePickReply =
+        growlight_call(socket, growlightd::op::QUEUE_PICK, serde_json::to_value(args)?)?;
+    print!("{}", render_queue_pick(&reply));
+    Ok(())
+}
+
+/// The `queue pick` rendering: who the pick ran for, the assignment (or its
+/// absence), and one line per skipped entry with its stable reason slug and a
+/// sentence explaining it.
+fn render_queue_pick(reply: &growlightd::QueuePickReply) -> String {
+    if !reply.list {
+        return format!("{}\n", queue_empty_line());
+    }
+    let mut out = String::from("queue pick\n");
+    let member = match &reply.member {
+        Some(id) => format!("member {id}"),
+        None => "an unpinned member".to_string(),
+    };
+    let pin = match &reply.pin {
+        Some(pin) => format!(", pin {pin}"),
+        None => ", no pin".to_string(),
+    };
+    out.push_str(&format!("{member} (backend {}{pin})\n", reply.backend));
+
+    match &reply.picked {
+        Some(picked) => {
+            out.push_str(&format!("picked: {} / {}\n", picked.entry, picked.unit));
+            match &picked.declared {
+                Some(models) => out.push_str(&format!("model: {models}\n")),
+                None => out.push_str("model: undeclared — the member default (§6.4)\n"),
+            }
+        }
+        None => out.push_str("picked: nothing workable for this member\n"),
+    }
+
+    if reply.skips.is_empty() {
+        out.push_str("skipped: none\n");
+    } else {
+        out.push_str(&format!("skipped: {}\n", reply.skips.len()));
+        for skip in &reply.skips {
+            out.push_str(&format!(
+                "  - {}: {} — {}\n",
+                skip.entry, skip.reason, skip.detail
+            ));
+        }
+    }
+    out
 }
 
 const SHOW_HEADER: &str =
@@ -4388,9 +4440,7 @@ mod tests {
             ModelChoice::opencode(DEEPSEEK_FLASH),
         ] {
             let hint = no_launch_hint(&choice, &launch);
-            let cwd = choice
-                .backend
-                .interactive_command(&launch)
+            let cwd = interactive_command(choice.backend, &launch)
                 .unwrap()
                 .get_current_dir()
                 .map(Path::to_path_buf)
@@ -4413,8 +4463,7 @@ mod tests {
         // pasted command attaches to the shared service, which ignores
         // OPENCODE_CONFIG (slice 001 finding 1). The hint's argv is the launch's
         // argv minus the trailing `--prompt <kick>`, which the human types instead.
-        let spawned: Vec<String> = Backend::Opencode
-            .interactive_command(&launch)
+        let spawned: Vec<String> = interactive_command(Backend::Opencode, &launch)
             .unwrap()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -4505,6 +4554,38 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    #[test]
+    fn growlight_decides_takes_a_comma_lists_first_entry() {
+        // §6.4 legacy trap: semi-auto's "let growlight decide" runs the first
+        // entry of a comma list (single-entry lines behave as before), and a
+        // malformed list still never fails the launch.
+        let root = declaring_garden("list");
+        let slices = root
+            .join(PILLAR)
+            .join("backlog")
+            .join("milestones")
+            .join("m-x")
+            .join("slices");
+        fs::write(
+            slices.join("007-list.md"),
+            "# List\n\n> Model: reasoning, claude\n",
+        )
+        .unwrap();
+
+        // The list's first entry wins: reasoning (opencode v4-pro).
+        let on_007 = declared_model(&root, &baton_at(&root, "m-x", "007"));
+        assert_eq!(on_007, ModelChoice::opencode(DEEPSEEK_REASONING));
+
+        // A malformed comma list is reported and defaulted, never a launch error.
+        fs::write(slices.join("008-bad.md"), "# Bad\n\n> Model: reasoning,\n").unwrap();
+        assert_eq!(
+            declared_model(&root, &baton_at(&root, "m-x", "008")),
+            ModelChoice::opencode(DEFAULT_OPENCODE_MODEL)
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     fn baton_at(root: &Path, item: &str, slice: &str) -> PathBuf {
@@ -4865,6 +4946,46 @@ mod tests {
     }
 
     #[test]
+    fn queue_pick_renders_the_assignment_and_every_skip_reason() {
+        let reply = growlightd::QueuePickReply {
+            list: true,
+            member: Some("c".into()),
+            pin: Some("default".into()),
+            backend: "claude".into(),
+            picked: Some(growlightd::QueuePickAssignment {
+                entry: "m".into(),
+                unit: "slice 002 of m".into(),
+                declared: Some("reasoning, flash".into()),
+            }),
+            skips: vec![growlightd::QueuePickSkip {
+                entry: "n".into(),
+                reason: "blocked_walk".into(),
+                detail: "its walk stops at a blocked item, which needs a human (§2)".into(),
+            }],
+        };
+        let out = render_queue_pick(&reply);
+        assert!(out.contains("member c (backend claude, pin default)"), "{out}");
+        assert!(out.contains("picked: m / slice 002 of m"), "{out}");
+        assert!(out.contains("model: reasoning, flash"), "{out}");
+        assert!(out.contains("skipped: 1"), "{out}");
+        assert!(out.contains("  - n: blocked_walk — its walk stops"), "{out}");
+    }
+
+    #[test]
+    fn queue_pick_absent_list_prints_the_same_line_as_queue_show() {
+        let reply = growlightd::QueuePickReply {
+            list: false,
+            member: None,
+            pin: None,
+            backend: "claude".into(),
+            picked: None,
+            skips: vec![],
+        };
+        assert_eq!(render_queue_pick(&reply), format!("{}\n", queue_empty_line()));
+        assert!(queue_empty_line().contains("the v2 queue is empty (§3.4"));
+    }
+
+    #[test]
     fn queue_show_renders_both_lanes_and_the_stack_columns_verbatim() {
         use softfig_ipc::queue_v2::{EntryStatus, Lane, Project};
         let e = |id: &str, lane: Lane, branch: &str, base: &str| Entry {
@@ -4881,6 +5002,7 @@ mod tests {
             base: base.into(),
             claimed: String::new(),
             follow_ups: 0,
+            pending_status: None,
         };
         let mut linked = e("normal-a", Lane::Normal, "feat/normal-a", "");
         linked.after = vec!["u1".into()];
