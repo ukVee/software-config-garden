@@ -106,4 +106,7 @@ in the docs is the way into the crates.
 
 ## License
 
-[MPL-2.0](https://www.mozilla.org/en-US/MPL/2.0/).
+AGPL-3.0-or-later — strong copyleft: any modified version must be offered
+under the same terms, including when it is run as a network service (the
+§13 "Remote Network Interaction" clause). See [LICENSE](LICENSE) for the
+full text.
