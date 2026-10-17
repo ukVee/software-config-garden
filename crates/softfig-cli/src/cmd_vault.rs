@@ -19,6 +19,8 @@ use softfig_vault::{
     discover_garden, DeclaredPolicy, RecoveryPhrase, RecoveryPolicy, Vault, VaultError,
 };
 
+use zeroize::Zeroizing;
+
 use crate::cmd_daemon::try_daemon_call;
 
 #[derive(Subcommand, Debug)]
@@ -352,7 +354,7 @@ fn init(garden: PathBuf) -> Result<()> {
     println!("Initializing vault at {}/.softfig/vault/", garden.display());
     let pass1 = prompt_passphrase("Choose a passphrase: ")?;
     let pass2 = prompt_passphrase("Confirm passphrase: ")?;
-    if pass1 != pass2 {
+    if pass1.as_str() != pass2.as_str() {
         return Err(anyhow!("passphrases do not match"));
     }
 
@@ -1126,7 +1128,7 @@ fn rewrap(garden: PathBuf, args: RewrapArgs) -> Result<()> {
     let new_secret = if args.new_passphrase {
         let p1 = prompt_passphrase("New passphrase: ")?;
         let p2 = prompt_passphrase("Confirm new passphrase: ")?;
-        if p1 != p2 {
+        if p1.as_str() != p2.as_str() {
             return Err(anyhow!("passphrases do not match — nothing was changed"));
         }
         Some(p1)
@@ -1214,7 +1216,7 @@ fn recover(garden: PathBuf) -> Result<()> {
     let phrase = RecoveryPhrase::parse(&phrase_input)?;
     let new_pass1 = prompt_passphrase("New passphrase: ")?;
     let new_pass2 = prompt_passphrase("Confirm new passphrase: ")?;
-    if new_pass1 != new_pass2 {
+    if new_pass1.as_str() != new_pass2.as_str() {
         return Err(anyhow!("passphrases do not match"));
     }
     vault.recover(&phrase, new_pass1.as_bytes())?;
@@ -1224,8 +1226,12 @@ fn recover(garden: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn prompt_passphrase(prompt: &str) -> Result<String> {
-    rpassword::prompt_password(prompt).context("could not read passphrase from tty")
+/// Prompt for a passphrase. The secret is held in a [`Zeroizing`] buffer, so
+/// it leaves the heap deterministically the moment the caller drops it — a
+/// prompted passphrase is key material and must not linger in freed pages.
+fn prompt_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
+    let secret = rpassword::prompt_password(prompt).context("could not read passphrase from tty")?;
+    Ok(Zeroizing::new(secret))
 }
 
 fn read_line() -> Result<String> {
