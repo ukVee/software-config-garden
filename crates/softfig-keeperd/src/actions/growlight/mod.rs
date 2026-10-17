@@ -27,7 +27,7 @@ mod holders;
 mod init;
 mod leases;
 mod member_verbs;
-mod paths;
+pub(crate) mod paths;
 mod queue;
 mod queues;
 mod queue_verbs;
@@ -40,8 +40,12 @@ pub use init::growlight_init;
 pub use leases::{release_lease, request_lease};
 pub use member_verbs::{
     growlight_add_follow_up_session, growlight_add_sub_milestone, growlight_block,
-    growlight_complete_entry, growlight_complete_slice,
+    growlight_complete_entry, growlight_complete_slice, member_slice_insert, member_slice_update,
 };
+/// The unlocked Disk-mode test daemon, for the action tests outside this
+/// module (the worktree's §6.7 guard).
+#[cfg(test)]
+pub(crate) use v2::write::tests::unlocked;
 pub use queue_verbs::{
     queue_add_entry, queue_add_project, queue_drop, queue_update_entry, slice_insert, slice_update,
 };

@@ -126,11 +126,15 @@ pub fn apply(
         // host that is itself an extra gets the region upserted on top of its
         // staged doc, and before the backlink refresh so the new docs' refs
         // resolve.
+        // Structured writes: every byte here is keeperd's own rendering of a
+        // verb's typed fields (`write_structured`, outside §6.7's member
+        // `> Model:` guard — the one member-callable verb that reaches here,
+        // `queue_add_entry`, holds the member's text fields to §6.7 itself).
         for f in files {
-            wt.write(&f.rel, &f.bytes)?;
+            wt.write_structured(&f.rel, &f.bytes)?;
         }
         for f in extras.writes {
-            wt.write(&f.rel, &f.bytes)?;
+            wt.write_structured(&f.rel, &f.bytes)?;
         }
         for (v, host) in views.iter().zip(hosts) {
             let Some(content) = host else {
@@ -142,7 +146,7 @@ pub fn apply(
             };
             if new != content {
                 wt.check_write(&v.host)?;
-                wt.write(&v.host, new.as_bytes())?;
+                wt.write_structured(&v.host, new.as_bytes())?;
             }
         }
         if extras.refresh_backlinks {

@@ -156,6 +156,19 @@ pub mod op {
     /// — file the slice's remaining work as a sub-milestone (§7).
     pub const GROWLIGHT_ADD_SUB_MILESTONE: &str = "growlight_add_sub_milestone";
 
+    // A member's two §6.8 slice verbs (spec-growlight-queue §6.7), relayed
+    // keeperd→growlightd like the member verbs: keeperd forwards a
+    // member-stamped `slice_insert` / `slice_update` here as a [`MemberCall`]
+    // around the human verb's own args, growlightd holds it to the member's own
+    // current entry (and a slice body to the subset rule), then issues the
+    // human verb to keeperd itself and relays keeperd's reply verbatim.
+
+    /// `member_slice_insert(`[`MemberCall`]`<`[`SliceInsertArgs`](crate::verbs::SliceInsertArgs)`>)`.
+    pub const MEMBER_SLICE_INSERT: &str = "member_slice_insert";
+    /// `member_slice_update(`[`MemberCall`]`<`[`SliceUpdateArgs`](crate::verbs::SliceUpdateArgs)`>)`
+    /// — `move` only.
+    pub const MEMBER_SLICE_UPDATE: &str = "member_slice_update";
+
     /// The five member verbs, in spec order.
     pub const MEMBER_VERBS: [&str; 5] = [
         GROWLIGHT_ADD_FOLLOW_UP_SESSION,

@@ -237,6 +237,20 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         );
     }
 
+    // §6.7: a member session's softfig-mcp stamps its identity on every
+    // request; the write limits read it from this scope, for this request only.
+    // A stamp that can't name a member is refused — a garbled member must not
+    // be served as a human, the same fail-closed rule softfig-mcp applies.
+    if let Some(member) = req.member.as_deref() {
+        if !softfig_ipc::is_safe_member_id(member) {
+            return Response::err(
+                ErrorKind::BadArgs,
+                format!("request member {member:?} is not a safe member id"),
+            );
+        }
+    }
+    let _caller = crate::caller::enter(req.member.clone());
+
     let result = match req.op.as_str() {
         op::STATUS => handlers::status(daemon, req.args),
         op::UNLOCK => handlers::unlock(daemon, req.args),
@@ -271,8 +285,17 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::QUEUE_ADD_PROJECT => crate::actions::queue_add_project(daemon, req.args),
         op::QUEUE_ADD_ENTRY => crate::actions::queue_add_entry(daemon, req.args),
         op::QUEUE_UPDATE_ENTRY => crate::actions::queue_update_entry(daemon, req.args),
-        op::SLICE_INSERT => crate::actions::slice_insert(daemon, req.args),
-        op::SLICE_UPDATE => crate::actions::slice_update(daemon, req.args),
+        // A member's slice verbs are held to its own current entry, which only
+        // growlightd knows: relayed there, and growlightd issues the human verb
+        // back to keeperd once it passes (§6.7).
+        op::SLICE_INSERT => match req.member.as_deref() {
+            Some(member) => crate::actions::member_slice_insert(daemon, member, req.args),
+            None => crate::actions::slice_insert(daemon, req.args),
+        },
+        op::SLICE_UPDATE => match req.member.as_deref() {
+            Some(member) => crate::actions::member_slice_update(daemon, member, req.args),
+            None => crate::actions::slice_update(daemon, req.args),
+        },
         op::QUEUE_DROP => crate::actions::queue_drop(daemon, req.args),
         op::QUEUE_V2_CLAIM => crate::actions::queue_v2_claim(daemon, req.args),
         op::QUEUE_V2_SET_STATUS => crate::actions::queue_v2_set_status(daemon, req.args),
@@ -369,4 +392,97 @@ pub fn err_to_response(e: KeeperError) -> (ErrorKind, String) {
         KeeperError::AlreadyStopping | KeeperError::Other(_) => ErrorKind::Internal,
     };
     (kind, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    use crate::actions::WorkTree;
+    use softfig_ipc::growlightd::MemberCall;
+    use softfig_ipc::verbs::SliceInsertArgs;
+
+    fn unlocked() -> (tempfile::TempDir, Daemon) {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = crate::actions::growlight_test_daemon(garden.path());
+        (garden, daemon)
+    }
+
+    fn err_of(resp: Response) -> (ErrorKind, String) {
+        match resp {
+            Response::Err { kind, error, .. } => (kind, error),
+            Response::Ok { data, .. } => panic!("expected a refusal, got {data}"),
+        }
+    }
+
+    /// A stamp that can't name a member is refused before any verb runs — a
+    /// garbled member is never served as a human.
+    #[test]
+    fn a_garbled_member_stamp_is_refused() {
+        let (_g, daemon) = unlocked();
+        let req = Request::new(softfig_ipc::op::STATUS, serde_json::json!({})).with_member(Some("../x"));
+        let (kind, msg) = err_of(dispatch(&daemon, req));
+        assert_eq!(kind, ErrorKind::BadArgs);
+        assert!(msg.contains("not a safe member id"), "{msg}");
+    }
+
+    /// The stamp reaches the write: a member's `replace_file` that adds a
+    /// `> Model:` line under the backlog is refused `field_not_allowed`; the
+    /// same request without the stamp lands. The scope ends with the request.
+    #[test]
+    fn the_member_stamp_holds_a_raw_write_to_the_model_guard() {
+        let (_g, daemon) = unlocked();
+        let args = serde_json::json!({
+            "path": "growlight/backlog/milestones/m/slices/001-a.md",
+            "content": "# a\n\n> Model: claude\n",
+        });
+        let member = Request::new(softfig_ipc::op::REPLACE_FILE, args.clone()).with_member(Some("c"));
+        let (_, msg) = err_of(dispatch(&daemon, member));
+        assert!(msg.starts_with("field_not_allowed:") && msg.contains("member c"), "{msg}");
+        assert_eq!(crate::caller::member(), None, "the scope ended with the request");
+        let human = dispatch(&daemon, Request::new(softfig_ipc::op::REPLACE_FILE, args));
+        assert!(matches!(human, Response::Ok { .. }), "{human:?}");
+    }
+
+    /// A member's `slice_insert` is relayed to growlightd as a member call
+    /// around the human verb's args (growlightd holds it to the member's own
+    /// entry); a human's is served by keeperd as before, never relayed.
+    #[test]
+    fn a_members_slice_insert_is_relayed_to_growlightd() {
+        let (_g, daemon) = unlocked();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("growlightd.sock");
+        daemon.inner.lock().unwrap().config.growlightd_socket = Some(socket.clone());
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let reply = Response::ok(serde_json::json!({ "relayed": true }));
+            let mut bytes = serde_json::to_vec(&reply).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+            serde_json::from_str::<Request>(line.trim_end()).unwrap()
+        });
+        let args = serde_json::json!({ "milestone": "m", "slug": "found", "body": "work" });
+        let req = Request::new(softfig_ipc::op::SLICE_INSERT, args.clone()).with_member(Some("c"));
+        let resp = dispatch(&daemon, req);
+        assert!(matches!(&resp, Response::Ok { data, .. } if data["relayed"] == true), "{resp:?}");
+        let relayed = server.join().unwrap();
+        assert_eq!(relayed.op, softfig_ipc::growlightd::op::MEMBER_SLICE_INSERT);
+        assert_eq!(relayed.member, None, "growlightd reads the identity from the envelope");
+        let call: MemberCall<SliceInsertArgs> = serde_json::from_value(relayed.args).unwrap();
+        assert_eq!(call.member.as_deref(), Some("c"));
+        assert_eq!((call.args.milestone.as_str(), call.args.slug.as_str()), ("m", "found"));
+
+        // The human path never dials growlightd: the listener is gone, and
+        // keeperd answers from its own v2 state (here: no queue at all).
+        let human = dispatch(&daemon, Request::new(softfig_ipc::op::SLICE_INSERT, args));
+        let (_, msg) = err_of(human);
+        assert!(!msg.contains("growlightd"), "{msg}");
+        let inner = daemon.inner.lock().unwrap();
+        assert!(!WorkTree::new(&daemon, &inner).exists("growlight/backlog/milestones/m/slices"));
+    }
 }

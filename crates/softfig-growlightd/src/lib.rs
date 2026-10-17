@@ -34,6 +34,7 @@ pub mod handshake;
 pub mod hub;
 pub mod leases;
 pub mod member_handoff;
+pub mod member_slices;
 pub mod member_verbs;
 pub mod notifications;
 pub mod notify_dispatch;

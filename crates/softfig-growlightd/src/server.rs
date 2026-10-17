@@ -19,6 +19,7 @@ use softfig_ipc::growlightd::{
     ReleaseLeaseArgs, RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply,
     SetPolicyArgs, SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
 };
+use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
 use softfig_ipc::{ErrorKind, Request, Response};
 
 use crate::agent_harness::apply_set_property;
@@ -27,6 +28,7 @@ use crate::config::Policy;
 use crate::daemon::{Daemon, DaemonHandle, Result};
 use crate::drive_loop::AgentHealthSource;
 use crate::fleet::{FleetMemberConfig, MemberBackend};
+use crate::member_slices;
 use crate::member_verbs::{self, MemberVerb, Refusal, VerbError};
 use crate::opencode_backend::ModelSelection;
 use crate::resume::ResumeOutcome;
@@ -164,6 +166,10 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         | op::GROWLIGHT_COMPLETE_ENTRY
         | op::GROWLIGHT_BLOCK
         | op::GROWLIGHT_ADD_SUB_MILESTONE => write_one_shot(&mut stream, member_verb(&daemon, &req)),
+        // A member's §6.8 slice verbs (§6.7), relayed by keeperd — one-shot.
+        op::MEMBER_SLICE_INSERT | op::MEMBER_SLICE_UPDATE => {
+            write_one_shot(&mut stream, member_slice_verb(&daemon, &req))
+        }
         // ack-before-teardown: flush the ack, THEN flip to Stopping, so the
         // client is guaranteed its reply before the accept loop winds down
         // (keeperd incident 20260622).
@@ -859,6 +865,79 @@ pub(crate) fn member_verb(daemon: &Daemon, req: &Request) -> Response {
     }
 }
 
+/// A member's `slice_insert` / `slice_update`, relayed by keeperd (§6.7):
+/// the identity, the member's live assignment and — for an insert's subset
+/// rule — a fresh read of the v2 list, then [`member_slices`]'s checks. A pass
+/// issues the plain human verb to keeperd as growlightd's own client and
+/// relays keeperd's response verbatim; a refusal is a wire error led by its
+/// code, like any §6.8 refusal. Nothing here touches the calling session.
+pub(crate) fn member_slice_verb(daemon: &Daemon, req: &Request) -> Response {
+    let refused = |message: String| Response::err(ErrorKind::BadArgs, message);
+    let (member, human) = match req.op.as_str() {
+        op::MEMBER_SLICE_INSERT => match parse_args::<MemberCall<SliceInsertArgs>>(req) {
+            Ok(call) => (call.member, HumanSliceVerb::Insert(call.args)),
+            Err(resp) => return resp,
+        },
+        _ => match parse_args::<MemberCall<SliceUpdateArgs>>(req) {
+            Ok(call) => (call.member, HumanSliceVerb::Update(call.args)),
+            Err(resp) => return resp,
+        },
+    };
+    let member = match member_verbs::identity(member.as_deref()) {
+        Ok(member) => member.to_string(),
+        Err(r) => return refused(format!("{}: {}", r.code.as_str(), r.message)),
+    };
+    let assignment = daemon.v2_assignment(&member);
+    let checked = match &human {
+        HumanSliceVerb::Insert(args) => {
+            let snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+                Ok(snapshot) => snapshot.unwrap_or_default(),
+                Err(e) => {
+                    return Response::err(
+                        ErrorKind::Io,
+                        format!(
+                            "slice_insert: the queue-v2 list can't be read, so the call can't be \
+                             validated: {e}"
+                        ),
+                    )
+                }
+            };
+            member_slices::check_insert(&member, assignment.as_ref(), &snapshot, args)
+        }
+        HumanSliceVerb::Update(args) => {
+            member_slices::check_update(&member, assignment.as_ref(), args)
+        }
+    };
+    if let Err(message) = checked {
+        return refused(message);
+    }
+    let Some(seams) = daemon.v2_handoff_seams() else {
+        return Response::err(
+            ErrorKind::Internal,
+            "growlightd has no keeperd seam installed, so it can't issue the slice verb — \
+             nothing was written",
+        );
+    };
+    let relayed = match &human {
+        HumanSliceVerb::Insert(args) => {
+            serde_json::to_value(args).map(|a| Request::new(softfig_ipc::op::SLICE_INSERT, a))
+        }
+        HumanSliceVerb::Update(args) => {
+            serde_json::to_value(args).map(|a| Request::new(softfig_ipc::op::SLICE_UPDATE, a))
+        }
+    };
+    match relayed {
+        Ok(req) => seams.keeper.relay(&req),
+        Err(e) => Response::err(ErrorKind::Internal, format!("encode the slice verb: {e}")),
+    }
+}
+
+/// The human slice verb a member's relayed call carries.
+enum HumanSliceVerb {
+    Insert(SliceInsertArgs),
+    Update(SliceUpdateArgs),
+}
+
 /// Decode a member verb's [`MemberCall`] envelope by op: the identity it
 /// carries and the typed verb.
 fn decode_member_verb(
@@ -937,6 +1016,69 @@ mod tests {
     fn test_daemon_with(persister: Arc<SpyPersister>) -> Daemon {
         Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), "/garden".into()))
             .with_resource_persister(persister)
+    }
+
+    /// A member's relayed slice verb (§6.7): identity, then the member's own
+    /// entry, then keeperd as growlightd's own client — the relayed request
+    /// is the plain human verb with no member on it, and keeperd's reply comes
+    /// back verbatim. A refusal is a wire error led by its code and relays
+    /// nothing.
+    #[test]
+    fn a_members_slice_verb_is_checked_then_relayed_to_keeperd_as_a_human_verb() {
+        use crate::member_handoff::{tests::SpyKeeper, HandoffSeams};
+        use crate::scheduler_v2::Unit;
+        let garden = tempfile::tempdir().unwrap();
+        let spy = Arc::new(SpyKeeper::default());
+        let daemon = Daemon::new(GrowlightdConfig::new("/run/g.sock".into(), garden.path().into()))
+            .with_v2_handoff(HandoffSeams {
+                keeper: Box::new(spy.clone()),
+                entries: crate::baton_store::FsEntryBatonStore::new(garden.path().join("e"), "g"),
+            });
+        let assignment = crate::drive_loop::V2Assignment {
+            agent: "c".into(),
+            entry: "m1".into(),
+            unit: Unit::Slice { milestone: "m1".into(), slice: "001".into() },
+            resolved_model: softfig_ipc::model_choice::ModelChoice::claude(),
+        };
+        daemon.publish_v2_assignments(&std::iter::once(("c".to_string(), assignment)).collect());
+
+        let call = |member: Option<&str>, op_: &str, args: serde_json::Value| {
+            let mut envelope = serde_json::json!({ "args": args });
+            if let Some(member) = member {
+                envelope["member"] = member.into();
+            }
+            member_slice_verb(&daemon, &Request::new(op_, envelope))
+        };
+        let refusal = |resp: Response| match resp {
+            Response::Err { kind, error, .. } => {
+                assert_eq!(kind, ErrorKind::BadArgs, "{error}");
+                error
+            }
+            Response::Ok { data, .. } => panic!("expected a refusal, got {data}"),
+        };
+        let insert = |milestone: &str| serde_json::json!({ "milestone": milestone, "slug": "found", "body": "work" });
+        let mv = |id: &str| serde_json::json!({ "milestone": "m1", "id": id, "move": { "to": "front" } });
+
+        let e = refusal(call(None, op::MEMBER_SLICE_INSERT, insert("m1")));
+        assert!(e.starts_with("not_a_member:"), "{e}");
+        let e = refusal(call(Some("z"), op::MEMBER_SLICE_INSERT, insert("m1")));
+        assert!(e.starts_with("member_not_allowed:") && e.contains("holds no v2 entry"), "{e}");
+        let e = refusal(call(Some("c"), op::MEMBER_SLICE_INSERT, insert("m2")));
+        assert!(e.starts_with("member_not_allowed:") && e.contains("outside"), "{e}");
+        let e = refusal(call(Some("c"), op::MEMBER_SLICE_UPDATE, mv("001")));
+        assert!(e.contains("own active slice"), "{e}");
+        assert!(spy.relayed.lock().unwrap().is_empty(), "a refusal relays nothing");
+
+        for (op_, args, human) in [
+            (op::MEMBER_SLICE_INSERT, insert("m1/sub"), softfig_ipc::op::SLICE_INSERT),
+            (op::MEMBER_SLICE_UPDATE, mv("002"), softfig_ipc::op::SLICE_UPDATE),
+        ] {
+            let resp = call(Some("c"), op_, args.clone());
+            assert!(matches!(&resp, Response::Ok { data, .. } if data["relayed"] == human), "{resp:?}");
+            let relayed = spy.relayed.lock().unwrap().pop().expect("relayed");
+            assert_eq!((relayed.op.as_str(), relayed.member.as_deref()), (human, None));
+            assert_eq!(relayed.args["milestone"], args["milestone"], "the human verb's own args");
+        }
     }
 
     /// A claude + opencode roster, the shape slice 006's status surface has to make

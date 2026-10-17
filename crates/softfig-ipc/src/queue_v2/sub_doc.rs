@@ -37,6 +37,17 @@ pub fn reserved_field(text: &str, keys: &[&'static str]) -> Option<&'static str>
     })
 }
 
+/// Every `> Model:` metadata line in `text`, in order, trimmed — each line
+/// [`reserved_field`] would report as `model`. §6.7's guard on a member's
+/// write under `growlight/backlog/` compares these before and after: any
+/// difference adds, removes or changes a `> Model:` line.
+pub fn model_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| reserved_field(line, &["model"]).is_some())
+        .map(str::trim)
+        .collect()
+}
+
 /// One slice of a member's sub-milestone, as the rule reads it.
 #[derive(Debug, Clone, Copy)]
 pub struct SubSliceText<'a> {
@@ -124,6 +135,13 @@ mod tests {
         assert_eq!(reserved_field("Model: flash (prose)", &SUB_DOC_RESERVED), None, "prose is not metadata");
         assert_eq!(reserved_field("> Last reviewed: 2026-10-14", &SUB_DOC_RESERVED), None);
         assert_eq!(reserved_field("> Model: flash", &SLICE_BODY_RESERVED), None);
+    }
+
+    #[test]
+    fn model_lines_are_every_model_metadata_line_in_order() {
+        let doc = "# t\n\n> Model: flash\nprose Model: x\n  >  model : claude \n> Grants: ~/x\n";
+        assert_eq!(model_lines(doc), vec!["> Model: flash", ">  model : claude"]);
+        assert!(model_lines("# no metadata\n").is_empty());
     }
 
     #[test]

@@ -127,8 +127,8 @@ pub struct ItemView {
 /// A point-in-time view of the whole v2 list (§2, §3): every live entry in
 /// file order, the live milestones' slice trees, and the archive's `done` ids
 /// for `after` resolution. Assembled and validated by the v2 source (slice
-/// 003); the pick never reads a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 003); the pick never reads a file. `Default` is the empty list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct V2Snapshot {
     pub projects: Vec<ProjectView>,
     /// Live entries in **file order** (urgent lane first per the §3.1 writer

@@ -423,9 +423,9 @@ fn tool_defs() -> Vec<Value> {
             "name": "queue_add_project",
             "description": "growlight queue v2: append a [[project]] row to queue.toml (name, repo, \
                             merge branch). On a fresh garden this creates the first v2 file, so the \
-                            softfig:queue-v2 view renders from then on. A HUMAN verb today — member \
-                            gating (§6.7) lands with queue-v2-scheduling; agents call it only under \
-                            the human's direction. Refusal codes surface as-is from keeperd.",
+                            softfig:queue-v2 view renders from then on. A HUMAN verb: a fleet member \
+                            is refused member_not_allowed (§6.7). Refusal codes surface as-is from \
+                            keeperd.",
             "inputSchema": {
                 "type": "object",
                 "required": ["name", "repo"],
@@ -444,8 +444,11 @@ fn tool_defs() -> Vec<Value> {
                             plus the generated 001-plan slice when no slices are given); task kind \
                             writes tasks/NNN-<slug>.md (branch fix/<NNN>); restack kind writes a \
                             generated doc into the urgent lane (project only — every other arg is \
-                            refused BadArgs). A HUMAN verb today — member gating (§6.7) lands with \
-                            queue-v2-scheduling. Refusal codes surface as-is from keeperd.",
+                            refused BadArgs). A fleet member may call it for found work only \
+                            (§6.7): a milestone or task in the normal lane, appended at the back, \
+                            `after` allowed, and no `> Model:` line in any text (field_not_allowed); \
+                            urgent work goes to @human. Anything else is member_not_allowed. Refusal \
+                            codes surface as-is from keeperd.",
             "inputSchema": {
                 "type": "object",
                 "required": ["kind", "project"],
@@ -471,9 +474,9 @@ fn tool_defs() -> Vec<Value> {
                             lane → move → after → status — patch-style, pass only the fields you \
                             change. status takes the human statuses queued | blocked | deferred | \
                             done (done archives the row; refused running on an active entry); \
-                            active/paused/split are daemon-owned and refused. A HUMAN verb today — \
-                            member gating (§6.7) lands with queue-v2-scheduling. Refusal codes \
-                            surface as-is from keeperd.",
+                            active/paused/split are daemon-owned and refused. A HUMAN verb: a fleet \
+                            member is refused member_not_allowed (§6.7). Refusal codes surface as-is \
+                            from keeperd.",
             "inputSchema": {
                 "type": "object",
                 "required": ["id"],
@@ -492,9 +495,9 @@ fn tool_defs() -> Vec<Value> {
             "description": "growlight queue v2: drop a live entry — its row moves to queue-archive.toml \
                             as dropped with the reason. Refused linked_from while a live entry's after \
                             names it, running for an active entry; if a stacked branch was cut from \
-                            it, one restack is enqueued per child project. A HUMAN verb today — \
-                            member gating (§6.7) lands with queue-v2-scheduling. Refusal codes \
-                            surface as-is from keeperd.",
+                            it, one restack is enqueued per child project. A HUMAN verb: a fleet \
+                            member is refused member_not_allowed (§6.7). Refusal codes surface as-is \
+                            from keeperd.",
             "inputSchema": {
                 "type": "object",
                 "required": ["id", "reason"],
@@ -510,9 +513,12 @@ fn tool_defs() -> Vec<Value> {
             "description": "growlight queue v2: append a numbered slice under a milestone — writes \
                             slices/NNN-<slug>.md (NNN from the milestone's slices/.seq) and inserts \
                             the queued item into its slices.toml at the given position in file order. \
-                            milestone is a top-level id or <parent>/<sub> (≤ 2 deep). A HUMAN verb \
-                            today — member gating (§6.7) lands with queue-v2-scheduling. Refusal \
-                            codes surface as-is from keeperd.",
+                            milestone is a top-level id or <parent>/<sub> (≤ 2 deep). A fleet \
+                            member may insert only within its own current entry (its milestone and \
+                            subs; member_not_allowed otherwise), and a body's `> Model:` line may \
+                            declare only a subset of what the new slice inherits (model_not_allowed; \
+                            nothing inherited means declare nothing) (§6.7). Refusal codes surface \
+                            as-is from keeperd.",
             "inputSchema": {
                 "type": "object",
                 "required": ["milestone", "slug", "body"],
@@ -533,9 +539,10 @@ fn tool_defs() -> Vec<Value> {
                             move → status — patch-style, pass only the fields you change. move is \
                             refused started for active/done/split items (the slice order is the run \
                             order); status takes queued | blocked | deferred | done (done resets \
-                            follow_ups; active/split are daemon-owned and refused). A HUMAN verb \
-                            today — member gating (§6.7) lands with queue-v2-scheduling. Refusal \
-                            codes surface as-is from keeperd.",
+                            follow_ups; active/split are daemon-owned and refused). A fleet member \
+                            may only `move`, within its own current entry, and never its own active \
+                            slice (member_not_allowed, §6.7). Refusal codes surface as-is from \
+                            keeperd.",
             "inputSchema": {
                 "type": "object",
                 "required": ["milestone", "id"],
@@ -1106,6 +1113,66 @@ fn route_member_verb(
     Ok(Some(MemberRoute::Forward(op_name, envelope)))
 }
 
+/// §6.7's member gating of the §6.8 human verbs, before any socket: `Some`
+/// is the `member_not_allowed` refusal for a fleet member calling a human
+/// verb, or a verb argument, reserved to humans. A member may call
+/// `queue_add_entry` for found work — normal lane, appended at the back,
+/// `after` allowed — and `slice_insert` / `slice_update` with `move` only;
+/// growlightd then holds those slice verbs to the member's own current entry
+/// (keeperd relays them there). Every other §6.8 verb is refused here, and
+/// every non-§6.8 tool passes (keeperd holds its writes to the `> Model:`
+/// guard). Human and semi-auto callers are unrestricted. Arguments that
+/// don't parse pass through to [`resolve_tool`]'s shape error. Pure.
+fn gate_member_human_verb(caller: &MemberIdentity, name: &str, args: &Value) -> Option<String> {
+    caller.member()?;
+    let refused = |verb: &str, why: &str| {
+        format!(
+            "{} — {why} (spec-growlight-queue §6.7). This session keeps running.",
+            softfig_ipc::queue_v2::QueueRefusal::MemberNotAllowed { verb: verb.to_string() }
+        )
+    };
+    match name {
+        "queue_add_project" | "queue_update_entry" | "queue_drop" => Some(refused(
+            name,
+            "a fleet member may add found work with queue_add_entry, and move slices in its own \
+             entry; shaping the queue is the human's",
+        )),
+        "queue_add_entry" => {
+            let a: QueueAddEntryArgs = serde_json::from_value(args.clone()).ok()?;
+            let urgent = "urgent work goes to the human instead: post_message to @human";
+            if a.kind == softfig_ipc::queue_v2::EntryKind::Restack {
+                Some(refused(
+                    "queue_add_entry kind=restack",
+                    &format!("a restack is always urgent, and {urgent}"),
+                ))
+            } else if a.lane == Some(softfig_ipc::queue_v2::Lane::Urgent) {
+                Some(refused(
+                    "queue_add_entry lane=urgent",
+                    &format!("a member's found work joins the normal lane, and {urgent}"),
+                ))
+            } else if a.position.as_deref().is_some_and(|p| p != "back") || a.ref_id.is_some() {
+                Some(refused(
+                    "queue_add_entry position",
+                    "a member's found work is appended at the back of the normal lane (`after` \
+                     links are allowed)",
+                ))
+            } else {
+                None
+            }
+        }
+        "slice_update" => {
+            let a: SliceUpdateArgs = serde_json::from_value(args.clone()).ok()?;
+            a.status.is_some().then(|| {
+                refused(
+                    "slice_update status",
+                    "a fleet member's slice_update may only `move` a slice in its own entry",
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Render a member verb's reply. A refusal says so loudly and that the session
 /// keeps running (§6.3), so the agent corrects the call instead of exiting.
 fn summarize_member_verb(data: &Value) -> String {
@@ -1555,7 +1622,12 @@ fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
             }))
         }
         Some(MemberRoute::Forward(op_name, envelope)) => (op_name, envelope),
-        None => resolve_tool(name, args)?,
+        None => {
+            if let Some(refusal) = gate_member_human_verb(caller, name, &args) {
+                anyhow::bail!("{refusal}");
+            }
+            resolve_tool(name, args)?
+        }
     };
 
     // softfig-mcp holds no persistent keeperd connection — it connects per
@@ -1565,8 +1637,11 @@ fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
     // transient restart with bounded backoff, retrying ONLY pre-send failures
     // (connect/write — provably not applied) and surfacing a post-send drop
     // distinctly so a committing verb is never blindly double-applied.
+    // A member session's every request carries its identity, so keeperd holds
+    // its writes to §6.7 (the `> Model:` guard) and relays its slice verbs to
+    // growlightd; a human's carries none and is served as before.
     let socket = softfig_ipc::runtime_socket_path();
-    let req = Request::new(op_name, ipc_args);
+    let req = Request::new(op_name, ipc_args).with_member(caller.member());
     let resp = softfig_ipc::call_reconnecting(&socket, &req, softfig_ipc::RetryPolicy::default())?;
     match resp {
         Response::Ok { data, .. } => Ok(json!({
@@ -1708,6 +1783,65 @@ mod tests {
         assert!(forged.is_err(), "a `member` argument must be refused: {forged:?}");
         // Not a member verb: no route, the garden verbs' dispatch handles it.
         assert!(route_member_verb(&caller, "log_decision", json!({})).unwrap().is_none());
+    }
+
+    /// §6.7's reach over the six §6.8 human verbs: a member may add found work
+    /// (normal lane, at the back, `after` links allowed), insert a slice, and
+    /// move one; every other §6.8 verb, and every reserved argument, is
+    /// `member_not_allowed`. A human is unrestricted, and a non-§6.8 tool
+    /// passes the gate for both (keeperd holds its writes to the Model guard).
+    #[test]
+    fn a_members_reach_over_the_human_verbs() {
+        let member = MemberIdentity::Member("c".into());
+        let human = MemberIdentity::NotAMember;
+        let entry = |extra: Value| {
+            let mut a = json!({
+                "kind": "milestone", "slug": "found", "title": "Found", "mission": "m",
+                "finish_criteria": "f", "project": "softfig",
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                a[k] = v.clone();
+            }
+            a
+        };
+        let allowed = [
+            ("queue_add_entry", entry(json!({}))),
+            ("queue_add_entry", entry(json!({ "lane": "normal", "position": "back", "after": ["x"] }))),
+            ("queue_add_entry", json!({ "kind": "task", "slug": "t", "title": "T", "mission": "m", "finish_criteria": "f", "project": "softfig" })),
+            ("slice_insert", json!({ "milestone": "m", "slug": "s", "body": "b", "position": "front" })),
+            ("slice_update", json!({ "milestone": "m", "id": "002", "move": { "to": "front" } })),
+            ("patch_file", json!({ "path": "growlight/backlog/x.md", "old": "a", "new": "b" })),
+        ];
+        for (verb, args) in &allowed {
+            assert_eq!(gate_member_human_verb(&member, verb, args), None, "{verb} {args}");
+        }
+        let refused = [
+            ("queue_add_project", json!({ "name": "p", "repo": "~/p" })),
+            ("queue_update_entry", json!({ "id": "m", "lane": "urgent" })),
+            ("queue_drop", json!({ "id": "m", "reason": "r" })),
+            ("queue_add_entry", entry(json!({ "lane": "urgent" }))),
+            ("queue_add_entry", entry(json!({ "position": "front" }))),
+            ("queue_add_entry", entry(json!({ "position": "after", "ref": "x" }))),
+            ("queue_add_entry", json!({ "kind": "restack", "project": "softfig" })),
+            ("slice_update", json!({ "milestone": "m", "id": "002", "status": "done" })),
+        ];
+        for (verb, args) in &refused {
+            let refusal = gate_member_human_verb(&member, verb, args)
+                .unwrap_or_else(|| panic!("{verb} {args} should be refused"));
+            assert!(refusal.starts_with("member_not_allowed:"), "{refusal}");
+            assert!(refusal.contains("keeps running"), "{refusal}");
+            assert_eq!(gate_member_human_verb(&human, verb, args), None, "a human may: {verb}");
+            resolve_tool(verb, args.clone()).expect("the refused call is well-formed");
+        }
+
+        // Through tools/call, the refusal lands before any socket is opened.
+        let resp = handle_line(
+            &member,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"queue_drop","arguments":{"id":"m","reason":"r"}}}"#,
+        );
+        assert_eq!(resp["error"]["code"], -32000, "{resp}");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("member_not_allowed: 'queue_drop'"), "{msg}");
     }
 
     #[test]

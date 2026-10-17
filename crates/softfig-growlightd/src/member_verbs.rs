@@ -719,40 +719,43 @@ fn check_slice_bodies(verb: &MemberVerb, ctx: &Ctx<'_>) -> Result<(), VerbError>
         return Ok(());
     }
     let (milestone, tree) = ctx.tree.expect("only a slice unit files slices");
-    let inherited = tree.models.as_ref();
     for slice in bodies {
-        let Some(field) = item_model_field(&slice.body) else {
-            continue;
-        };
-        let declared = match parse_declaration(field) {
-            // `auto` is circular on an item doc and resolves as no declaration.
-            Ok(Declaration::Auto) => continue,
-            Ok(Declaration::List(list)) => list,
-            Err(e) => {
-                return refuse(
-                    RefusalCode::ModelNotAllowed,
-                    format!("slice {}'s `> Model: {field}` does not parse: {e:#}", slice.slug),
-                )
-            }
-        };
-        if validate_declared_subset(inherited, &declared).is_err() {
-            let why = match inherited {
-                None => format!(
-                    "{milestone} declares no `> Model:`, so a new slice in it may declare none"
-                ),
-                Some(list) => format!(
-                    "a new slice in {milestone} may declare only a subset of its inherited \
-                     list ({})",
-                    list.entries().iter().map(render).collect::<Vec<_>>().join(", ")
-                ),
-            };
-            return refuse(
-                RefusalCode::ModelNotAllowed,
-                format!("slice {}'s `> Model: {field}` is refused: {why}", slice.slug),
-            );
+        if let Some(why) = body_model_refusal(&slice.slug, &slice.body, milestone, tree.models.as_ref())
+        {
+            return refuse(RefusalCode::ModelNotAllowed, why);
         }
     }
     Ok(())
+}
+
+/// §6.7's subset rule on one new slice body filed into `milestone`, whose
+/// tree resolves to `inherited` (`None` = nothing declared): `Some(why)` when
+/// the body's `> Model:` line doesn't parse or declares more than a subset of
+/// it. One rule for every path a member files a slice body down — the member
+/// verbs' `new_slice` and sub slices, and a member's `slice_insert`
+/// ([`crate::member_slices`]).
+pub(crate) fn body_model_refusal(
+    slug: &str,
+    body: &str,
+    milestone: &str,
+    inherited: Option<&ModelList>,
+) -> Option<String> {
+    let field = item_model_field(body)?;
+    let declared = match parse_declaration(field) {
+        // `auto` is circular on an item doc and resolves as no declaration.
+        Ok(Declaration::Auto) => return None,
+        Ok(Declaration::List(list)) => list,
+        Err(e) => return Some(format!("slice {slug}'s `> Model: {field}` does not parse: {e:#}")),
+    };
+    validate_declared_subset(inherited, &declared).err()?;
+    let why = match inherited {
+        None => format!("{milestone} declares no `> Model:`, so a new slice in it may declare none"),
+        Some(list) => format!(
+            "a new slice in {milestone} may declare only a subset of its inherited list ({})",
+            list.entries().iter().map(render).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    Some(format!("slice {slug}'s `> Model: {field}` is refused: {why}"))
 }
 
 /// The baton step: the head parses with its required fields, its status is the

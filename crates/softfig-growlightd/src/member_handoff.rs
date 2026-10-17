@@ -132,6 +132,12 @@ pub enum KeeperOutcome {
 pub trait V2Keeper: Send + Sync + fmt::Debug {
     /// Issue one op. `Err` carries keeperd's refusal or the transport failure.
     fn apply(&self, op: &KeeperOp) -> Result<KeeperOutcome, String>;
+
+    /// Issue a human verb to keeperd as growlightd's own client — no member
+    /// on the request — and return keeperd's response verbatim, refusal
+    /// included: a member's §6.7-checked `slice_insert` / `slice_update`
+    /// ([`crate::member_slices`]), whose reply the member reads as keeperd's.
+    fn relay(&self, req: &softfig_ipc::Request) -> softfig_ipc::Response;
 }
 
 /// The server-side handshake seams, installed on the daemon at boot
@@ -708,6 +714,8 @@ pub(crate) mod tests {
         pub fail_at: Option<usize>,
         /// What an entry-level `set_status` reports landed (a pending override).
         pub entry_status: Option<String>,
+        /// Every human verb relayed to keeperd ([`V2Keeper::relay`]).
+        pub relayed: Mutex<Vec<softfig_ipc::Request>>,
     }
 
     impl V2Keeper for SpyKeeper {
@@ -731,6 +739,12 @@ pub(crate) mod tests {
                 _ => KeeperOutcome::Done,
             })
         }
+
+        /// Records the relayed request; answers as keeperd would on a pass.
+        fn relay(&self, req: &softfig_ipc::Request) -> softfig_ipc::Response {
+            self.relayed.lock().unwrap().push(req.clone());
+            softfig_ipc::Response::ok(serde_json::json!({ "relayed": req.op }))
+        }
     }
 
     /// The `Arc` shape, so a test keeps a handle on the ops the seam's box
@@ -738,6 +752,10 @@ pub(crate) mod tests {
     impl V2Keeper for std::sync::Arc<SpyKeeper> {
         fn apply(&self, op: &KeeperOp) -> Result<KeeperOutcome, String> {
             (**self).apply(op)
+        }
+
+        fn relay(&self, req: &softfig_ipc::Request) -> softfig_ipc::Response {
+            (**self).relay(req)
         }
     }
 

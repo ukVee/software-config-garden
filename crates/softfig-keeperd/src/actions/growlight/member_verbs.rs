@@ -8,15 +8,24 @@
 //! and relays growlightd's [`MemberVerbReply`](softfig_ipc::growlightd::MemberVerbReply)
 //! verbatim. The identity in `member` was set by softfig-mcp from its launch
 //! env; keeperd neither fills nor trusts-and-rewrites it.
+//!
+//! A member's `slice_insert` / `slice_update` take the same road (§6.7,
+//! queue-v2-scheduling slice 011): the request arrives as the human verb with
+//! the member stamped on the envelope ([`Request::member`]), and keeperd wraps
+//! the args in a [`MemberCall`] and relays them to growlightd, which holds the
+//! call to the member's own current entry. A pass comes back as growlightd
+//! issuing the plain human verb to keeperd as its own client (no member), and
+//! growlightd's reply — keeperd's, relayed — comes back here verbatim.
 
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use softfig_ipc::growlightd::{
-    AddFollowUpSessionArgs, AddSubMilestoneArgs, BlockArgs, CompleteEntryArgs, CompleteSliceArgs,
-    MemberCall,
+    self, AddFollowUpSessionArgs, AddSubMilestoneArgs, BlockArgs, CompleteEntryArgs,
+    CompleteSliceArgs, MemberCall,
 };
+use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
 use softfig_ipc::{op, ErrorKind, Request};
 
 use super::leases::forward_to_growlightd;
@@ -68,6 +77,45 @@ pub fn growlight_block(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
 /// `growlight_add_sub_milestone` (§7).
 pub fn growlight_add_sub_milestone(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     forward::<AddSubMilestoneArgs>(daemon, op::GROWLIGHT_ADD_SUB_MILESTONE, args)
+}
+
+/// Wrap a member's human-verb args in a [`MemberCall`] for growlightd: the
+/// args are shape-checked here (`BadArgs` without a hop), the identity is the
+/// request's stamp.
+fn member_envelope<A: DeserializeOwned + Serialize>(
+    verb: &'static str,
+    member: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, (ErrorKind, String)> {
+    let args: A = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("{verb} args: {e}")))?;
+    Ok(serde_json::to_value(MemberCall {
+        member: Some(member.to_string()),
+        args,
+    })
+    .unwrap())
+}
+
+/// A member's `slice_insert` (§6.7), relayed to growlightd.
+pub fn member_slice_insert(
+    daemon: &Daemon,
+    member: &str,
+    args: serde_json::Value,
+) -> HandlerResult {
+    let call = member_envelope::<SliceInsertArgs>(op::SLICE_INSERT, member, args)?;
+    let req = Request::new(growlightd::op::MEMBER_SLICE_INSERT, call);
+    forward_to_growlightd(&daemon.growlightd_socket(), &req)
+}
+
+/// A member's `slice_update` (§6.7, `move` only), relayed to growlightd.
+pub fn member_slice_update(
+    daemon: &Daemon,
+    member: &str,
+    args: serde_json::Value,
+) -> HandlerResult {
+    let call = member_envelope::<SliceUpdateArgs>(op::SLICE_UPDATE, member, args)?;
+    let req = Request::new(growlightd::op::MEMBER_SLICE_UPDATE, call);
+    forward_to_growlightd(&daemon.growlightd_socket(), &req)
 }
 
 #[cfg(test)]

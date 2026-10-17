@@ -75,6 +75,9 @@ pub fn write_numbered<T: Tree>(
             format!("{note_rel}: already exists"),
         ));
     }
+    // Refuse the doc before the `.seq` bump stages, so a refused doc burns no
+    // number and strands no half-write.
+    wt.check_write_bytes(note_rel, content.as_bytes())?;
     let seq_rel = format!("{dir_rel}/{}", conventions::SEQ_FILE);
     wt.write(&seq_rel, format!("{number}\n").as_bytes())?;
     wt.write(note_rel, content.as_bytes())?;

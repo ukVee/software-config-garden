@@ -143,11 +143,54 @@ pub fn queue_add_project(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
 pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: QueueAddEntryArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_add_entry args: {e}")))?;
+    if let Some(member) = crate::caller::member() {
+        if let Some(field) = member_model_field(&args) {
+            return Err((
+                ErrorKind::BadArgs,
+                format!(
+                    "field_not_allowed: `{field}` carries a `> Model:` line, and fleet member \
+                     {member} may not set a unit's model in the docs queue_add_entry writes \
+                     (spec-growlight-queue §6.7) — a new entry declares no model, so its slices \
+                     may declare none"
+                ),
+            ));
+        }
+    }
     match args.kind {
         EntryKind::Milestone => add_milestone(daemon, args),
         EntryKind::Task => add_task(daemon, args),
         EntryKind::Restack => add_restack(daemon, args),
     }
+}
+
+/// §6.7 for a member's `queue_add_entry`: the first text field carrying a
+/// `> Model:` line, by name. keeperd renders the entry's docs from these
+/// fields through the structured writer, outside the worktree's member guard,
+/// so the guard runs here on the member's own text — and not on keeperd's
+/// generated `001-plan` slice, whose `> Model:` line is the daemon's.
+/// `queue_add_entry` is not one of §6.7's slice-body exceptions, so a slice
+/// body may declare nothing either (the new milestone declares nothing to
+/// take a subset of).
+fn member_model_field(args: &QueueAddEntryArgs) -> Option<String> {
+    use softfig_ipc::queue_v2::reserved_field;
+    let declares = |text: Option<&str>| text.is_some_and(|t| reserved_field(t, &["model"]).is_some());
+    let entry_fields = [
+        ("title", args.title.as_deref()),
+        ("mission", args.mission.as_deref()),
+        ("finish_criteria", args.finish_criteria.as_deref()),
+    ];
+    if let Some((field, _)) = entry_fields.iter().find(|(_, text)| declares(*text)) {
+        return Some(field.to_string());
+    }
+    args.slices.iter().enumerate().find_map(|(i, s)| {
+        if declares(s.title.as_deref()) {
+            Some(format!("slices[{i}].title"))
+        } else if declares(Some(&s.body)) {
+            Some(format!("slices[{i}].body"))
+        } else {
+            None
+        }
+    })
 }
 
 /// A required non-empty `Option` arg (the wire structs keep the per-kind
@@ -1824,6 +1867,52 @@ mod tests {
         let backlog = wt.read_to_string(&queue_view_host()).unwrap();
         let body = managed::region_body(&backlog, QUEUE_V2_TAG).expect("queue view");
         assert!(body.contains("m1"), "{body}");
+    }
+
+    /// §6.7 for a member's found work: its text fields may carry no
+    /// `> Model:` line (refused `field_not_allowed`, nothing committed), but an
+    /// unplanned milestone still gets keeperd's own `001-plan` slice with the
+    /// daemon's `> Model:` line. A human's identical call is unrestricted.
+    #[test]
+    fn a_members_add_entry_may_not_declare_a_model_but_still_gets_the_plan_slice() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        let before = commit_count(&daemon);
+        let declaring = [
+            ("mission", milestone_args("m1", "softfig", serde_json::json!({ "mission": "x\n> Model: claude" }))),
+            ("finish_criteria", milestone_args("m1", "softfig", serde_json::json!({ "finish_criteria": "> model: flash" }))),
+            ("slices[1].body", milestone_args("m1", "softfig", serde_json::json!({ "slices": [
+                { "slug": "a", "title": "A", "body": "plain" },
+                { "slug": "b", "title": "B", "body": "> Model: flash\n\nwork" },
+            ] }))),
+        ];
+        {
+            let _member = crate::caller::enter(Some("c".into()));
+            for (field, args) in &declaring {
+                let err = add_entry(&daemon, args.clone()).unwrap_err();
+                assert_eq!(err.0, ErrorKind::BadArgs);
+                assert!(
+                    err.1.starts_with("field_not_allowed:") && err.1.contains(&format!("`{field}`")),
+                    "{field}: {err:?}"
+                );
+            }
+            assert_eq!(commit_count(&daemon), before, "a refusal commits nothing");
+            add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({})))
+                .expect("a member's plain found work lands");
+        }
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(&daemon, &inner);
+            let plan = wt
+                .read_to_string("growlight/backlog/milestones/m1/slices/001-plan.md")
+                .expect("generated plan slice");
+            assert!(plan.contains("> Model: reasoning"), "keeperd's own line, {plan}");
+        }
+        let (_, human) = &declaring[2];
+        let mut human = human.clone();
+        human["slug"] = serde_json::json!("m2");
+        add_entry(&daemon, human).expect("a human may declare a slice model");
     }
 
     #[test]

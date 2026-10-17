@@ -370,6 +370,16 @@ impl V2Keeper for KeeperdV2Keeper {
             )),
         }
     }
+
+    fn relay(&self, req: &Request) -> Response {
+        match call_reconnecting(&self.keeperd_socket, req, RetryPolicy::default()) {
+            Ok(resp) => resp,
+            Err(e) => Response::err(
+                softfig_ipc::ErrorKind::Io,
+                format!("{} to keeperd at {} failed: {e}", req.op, self.keeperd_socket.display()),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
