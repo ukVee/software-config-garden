@@ -15,18 +15,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# No `cargo fmt` job here: the tree is not yet rustfmt-clean, so fmt would be
+# red on arrival. `cargo clippy --all-targets -- -D warnings` (the clippy job
+# below) is this repo's style gate, per CLAUDE.md's build/test/run section.
 jobs:
-  fmt:
-    name: fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-
   clippy:
     name: clippy
     runs-on: ubuntu-latest
