@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# No `cargo fmt` job here: the tree is not yet rustfmt-clean, so fmt would be
+# red on arrival. `cargo clippy --all-targets -- -D warnings` (the clippy job
+# below) is this repo's style gate, per CLAUDE.md's build/test/run section.
+jobs:
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps (protoc + libfuse3)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps (protoc + libfuse3)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+      - run: cargo test --workspace --no-fail-fast
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps (protoc + libfuse3)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+      - run: cargo build --workspace --release
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps (protoc + libfuse3)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+      - run: cargo check --workspace --all-targets

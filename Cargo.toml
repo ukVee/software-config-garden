@@ -21,8 +21,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-license = "MPL-2.0"
+rust-version = "1.88"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/ukVee/software-config-garden"
 
 [workspace.dependencies]
