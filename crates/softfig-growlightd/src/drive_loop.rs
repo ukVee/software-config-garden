@@ -64,7 +64,7 @@ use crate::daemon::Daemon;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
 use crate::opencode_backend::OpencodeBackend;
-use crate::scheduler::{classify_queue, parked, pick, QueueState, Snapshot};
+use crate::scheduler::{classify_queue, parked, pick_for, QueueState, Snapshot};
 use crate::state::State;
 use crate::supervisor::{
     poll_outcome_lifecycle, AgentHealth, AgentSpec, PollOutcome, RerollOutcome, StartOutcome,
@@ -1167,6 +1167,14 @@ impl DriveLoop {
     /// of everything it did.
     pub fn tick(&mut self, now: i64) -> TickReport {
         let mut report = TickReport::default();
+        // Which queue each member was draining as this tick began — read by the
+        // fallback reservation (task 068) so a member released by step 1 still
+        // holds its pinned queue for its own step-3 pick this same tick.
+        let draining_at_start: BTreeSet<(String, String)> = self
+            .assignments
+            .iter()
+            .map(|(agent, (queue, _))| (agent.clone(), queue.clone()))
+            .collect();
         let paused = self.daemon.is_paused();
         report.paused = paused;
 
@@ -1699,6 +1707,8 @@ impl DriveLoop {
                 .collect();
             let snap = &snapshot;
             let assignments = &self.assignments;
+            let draining = draining_queues(&draining_at_start, &self.assignments);
+            let (retiring, stopped) = (&self.retiring, &self.stopped);
             let workable = |agent: &str| -> bool {
                 // A down member's OWN in-progress part is workable — for itself.
                 // Its claim marked the part `active`, and `pick`'s fallback
@@ -1716,7 +1726,11 @@ impl DriveLoop {
                         matches!(classify_queue(q), QueueState::Active(head) if head == *part)
                     })
                 });
-                resumes_own || pins.get(agent).is_some_and(|pin| pick(snap, *pin).is_some())
+                resumes_own
+                    || pins.get(agent).is_some_and(|pin| {
+                        let reserved = reserved_queues(&fleet, retiring, stopped, &draining, agent);
+                        pick_for(snap, *pin, &reserved).is_some()
+                    })
             };
             report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
             // A member that re-rolled has consumed its pending-reconnect latch (slice
@@ -1774,7 +1788,12 @@ impl DriveLoop {
                 {
                     continue;
                 }
-                let Some((queue, part)) = pick(&snapshot, member.pin.as_deref()) else {
+                // Fallback leaves a queue to the member pinned to it while that
+                // member is live on it or just exiting it (task 068).
+                let draining = draining_queues(&draining_at_start, &self.assignments);
+                let reserved = reserved_queues(&fleet, &self.retiring, &self.stopped, &draining, agent);
+                let Some((queue, part)) = pick_for(&snapshot, member.pin.as_deref(), &reserved)
+                else {
                     // Nothing workable for this agent's pin right now. Before task 042
                     // this `continue` was SILENT, so a held fleet-of-one (e.g. a
                     // completed member whose next queued head has not yet surfaced)
@@ -1971,6 +1990,44 @@ impl DriveLoop {
 /// The one-word disposition label for an exit poll's [`PollOutcome`] — the
 /// health-pass journal line (task 042). Exhaustive so a new outcome variant forces
 /// a label choice rather than silently reading as an unclassified exit.
+/// `(agent, queue)` for every member draining a queue this tick: holding a part
+/// there now, or holding one when the tick began (released by step 1 since). The
+/// union is what lets a member that is just exiting keep its queue (task 068).
+fn draining_queues(
+    at_start: &BTreeSet<(String, String)>,
+    assignments: &std::collections::BTreeMap<String, (String, String)>,
+) -> BTreeSet<(String, String)> {
+    let mut draining = at_start.clone();
+    draining.extend(assignments.iter().map(|(agent, (queue, _))| (agent.clone(), queue.clone())));
+    draining
+}
+
+/// The queues `agent`'s fallback must leave alone (task 068): each queue pinned by
+/// ANOTHER member that is live on it or just exiting it (it is in `draining` for
+/// that queue) and is not stopping or stopped. Such a member takes its queue's
+/// next part itself as soon as it is free.
+///
+/// This is the 2026-10-16 17:34 sequence: `psy`'s pinned member set `psy-events`
+/// `deferred`, so `psy-booking` read `queued` for the ~30s before the member
+/// exited, and a drained member's fallback took it in that window. A pinned member
+/// busy on ANOTHER queue's part reserves nothing (it cannot take its own queue's
+/// next part until it is done there), and neither does one that has not started
+/// yet — fleet order still decides a race between two free members, as before.
+fn reserved_queues(
+    fleet: &[FleetMember],
+    retiring: &BTreeSet<String>,
+    stopped: &BTreeSet<String>,
+    draining: &BTreeSet<(String, String)>,
+    agent: &str,
+) -> BTreeSet<String> {
+    fleet
+        .iter()
+        .filter(|m| m.spec.agent != agent)
+        .filter(|m| !retiring.contains(&m.spec.agent) && !stopped.contains(&m.spec.agent))
+        .filter_map(|m| m.pin.clone().filter(|pin| draining.contains(&(m.spec.agent.clone(), pin.clone()))))
+        .collect()
+}
+
 fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
     match outcome {
         PollOutcome::Crashed { .. } => "crashed",
@@ -5312,6 +5369,89 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             "qb/p claimed exactly once across both ticks — b never re-claimed a's part",
         );
         assert!(!loop_.supervisor.is_registered("b"), "b never spawned, so it is not registered");
+    }
+
+    /// TASK 068 repro — the 2026-10-16 17:34 sequence. `b` (pinned `psy`) set its
+    /// part `deferred` and was still exiting when `a` (pinned `fid`, drained) ran
+    /// its fallback: `psy-booking` read `queued`, `a` claimed it, and `b` came back
+    /// to "part already claimed". `psy` is reserved for `b` while `b` is live on it
+    /// and on the tick it exits, so `b` takes its own queue's next part.
+    #[test]
+    fn a_fallback_member_does_not_take_a_queue_whose_pinned_member_is_exiting() {
+        let (mut loop_, _d, backend, claimer, queues, _probe) = make_claiming(
+            vec![member("a", "fid"), member("b", "psy")],
+            vec![
+                q("fid", &[("f1", "queued")]),
+                q("psy", &[("psy-events", "queued"), ("psy-booking", "queued")]),
+            ],
+            Policy::default(),
+        );
+        loop_.tick(0); // a on fid/f1, b on psy/psy-events
+        assert_eq!(backend.spawns(), vec!["a", "b"]);
+
+        // a finished fid and exited; b deferred psy-events but is still running.
+        queues.set(vec![
+            q("fid", &[("f1", "done")]),
+            q("psy", &[("psy-events", "deferred"), ("psy-booking", "queued")]),
+        ]);
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        backend.set_health("b", AgentHealth::Alive { last_active: 1 });
+
+        let r1 = loop_.tick(1);
+        assert!(
+            r1.started.is_empty(),
+            "the drained member must leave psy to its live pinned member, got {:?}",
+            r1.started,
+        );
+
+        // b exits. On this very tick a is scheduled first, and psy is still b's.
+        backend.set_health("b", AgentHealth::Exited { code: 0 });
+        backend.set_baton("b", "ITEM_DEFERRED");
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            r2.started,
+            vec![Assignment { agent: "b".into(), queue: "psy".into(), part: "psy-booking".into() }],
+            "the pinned member takes its own queue's next part",
+        );
+        assert_eq!(
+            claimer.claims(),
+            vec![
+                ("fid".into(), "f1".into()),
+                ("psy".into(), "psy-events".into()),
+                ("psy".into(), "psy-booking".into()),
+            ],
+            "psy-booking is claimed once, by b",
+        );
+    }
+
+    /// The reservation lapses once the pinned member is busy elsewhere: a member
+    /// draining ANOTHER queue cannot take its own queue's next part, so a free
+    /// member's fallback still may (task 068 leaves that case as it was).
+    #[test]
+    fn a_pinned_member_busy_on_another_queue_reserves_nothing() {
+        let (mut loop_, _d, backend, _claimer, queues, _probe) = make_claiming(
+            vec![member("b", "psy"), member("a", "fid")],
+            vec![q("psy", &[]), q("other", &[("o1", "queued")]), q("fid", &[("f1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0); // b falls back to other/o1; a on fid/f1
+        assert_eq!(backend.spawns(), vec!["b", "a"]);
+
+        // New psy work arrives while b is still on other/o1; a finishes fid.
+        queues.set(vec![
+            q("psy", &[("p1", "queued")]),
+            q("other", &[("o1", "active")]),
+            q("fid", &[("f1", "done")]),
+        ]);
+        backend.set_health("b", AgentHealth::Alive { last_active: 1 });
+        backend.set_health("a", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a", "ITEM_COMPLETE");
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.started,
+            vec![Assignment { agent: "a".into(), queue: "psy".into(), part: "p1".into() }],
+        );
     }
 
     /// A claim failure is fail-closed: admission cleared but the part could not be
