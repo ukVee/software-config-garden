@@ -69,7 +69,7 @@ use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
 use crate::opencode_backend::{ModelSelection, OpencodeBackend};
 use crate::scheduler::{
-    classify_queue, parked, pick, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
+    classify_queue, parked, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
 };
 use crate::scheduler_v2::{self, next_unit, pick_v2, Pick, Unit, WalkOutcome};
 use crate::state::State;
