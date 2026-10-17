@@ -2,7 +2,10 @@
 //! calls into IPC requests against a running `softfig-keeperd`.
 //!
 //! Spawned per Claude Code session. Exposes the typed garden-write verbs
-//! plus the `replace_file` break-glass escape hatch.
+//! (including the surgical `patch_file` / section / `batch` forms), the
+//! read verbs (`read_inbox`, `read_versions`, `file_provenance`,
+//! `list_reports`), the growlight fleet-member verbs routed to growlightd,
+//! and the `replace_file` break-glass escape hatch. No vault verbs.
 //!
 //! MCP wire shape (subset of JSON-RPC 2.0): one request per stdin line,
 //! one response per stdout line. We implement the minimum the Claude
@@ -331,8 +334,8 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "add_project",
             "description": "Scaffold projects/<name>/ with the four reserved-name stubs \
-                            (CLAUDE.md, instructions.md, notes.md, refs.md) in one \
-                            project_added commit.",
+                            (CLAUDE.md, instructions.md, an empty notes/ folder, refs.md) \
+                            in one project_added commit.",
             "inputSchema": {
                 "type": "object",
                 "required": ["name"],

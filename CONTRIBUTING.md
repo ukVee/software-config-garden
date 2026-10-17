@@ -20,13 +20,15 @@ accepted under the terms in `CLA.md`.
 - **Security reports do not go in issues.** See `SECURITY.md`.
 - **Small, focused fixes are welcome without ceremony** — a typo, a broken link, a
   one-line bug fix.
-- The project is pre-1.0 and single-maintainer. Review is best effort, not a
-  service.
+- The project is an early alpha and single-maintainer. Review is best effort,
+  not a service.
 
 ## Building
 
-Rust 1.85 or newer is required (`rust-version` in `Cargo.toml`). `protoc` is
-needed at build time because `softfig-net` compiles protobuf definitions.
+Rust 1.88 or newer is required (`rust-version` in `Cargo.toml`). Two system
+packages are needed at build time: `protoc` (`softfig-net` compiles protobuf
+definitions) and the libfuse3 development headers (`softfig-fuse`) — e.g.
+`protobuf-compiler libfuse3-dev` on Debian/Ubuntu, `protobuf fuse3` on Arch.
 
 ```sh
 cargo build --workspace
@@ -34,15 +36,18 @@ cargo build --workspace
 
 ## The local gate
 
-Run these four before opening a pull request. CI runs the same set, and a PR
+Run these three before opening a pull request. CI runs the same set, and a PR
 that fails any of them will not be merged.
 
 ```sh
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
 ```
+
+The tree is not yet rustfmt-clean, so `cargo fmt --check` is not part of the
+gate. Run `rustfmt` on the files you touch, but don't reformat files you didn't
+otherwise change (see *No unrelated formatting sweeps* below).
 
 If you touched crypto, sync, or anything with a filesystem side effect, say in
 the PR what you ran beyond the gate — a test that proves the failure path is
@@ -73,7 +78,7 @@ auto-merge, and no delegated maintainership yet. Expect comments, and expect a
 review that asks for the reason behind a change rather than its mechanics.
 
 A PR is merged when it is correct, tested, documented where it changes user-
-visible behaviour, and the four gate commands pass.
+visible behaviour, and the three gate commands pass.
 
 ## Contributor License Agreement
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=soft-fig per-device keeper daemon
-Documentation=https://github.com/ukv/software-config_garden
+Documentation=https://github.com/ukVee/software-config-garden
 # The daemon talks to a vault on disk; nothing graphical, so don't gate
 # on the desktop session. Mirrors sliver-dock.service's headless shape.
 After=default.target

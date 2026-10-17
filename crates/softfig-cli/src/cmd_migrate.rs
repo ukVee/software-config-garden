@@ -1,6 +1,9 @@
-//! `softfig migrate {prepare, finalize}` + no-arg status.
+//! `softfig migrate {prepare, finalize, split, config, reindex}` + no-arg
+//! status.
 //!
-//! The slice scope locks a non-destructive three-phase flow:
+//! `prepare`/`finalize` move a garden that predates the FUSE layout (its
+//! `.softfig/` still inside the garden root) to a relocated state root, in a
+//! non-destructive three-step flow:
 //!
 //! * **prepare** — copies `.softfig/` to `~/.local/share/softfig/<repo_id>/`,
 //!   writes `keeper.toml` with the new `state_root`. No deletion. Refuses
@@ -9,7 +12,7 @@
 //! * **start** — `softfig daemon start` picks up the new `keeper.toml`
 //!   and mounts FUSE. No CLI verb here; the daemon's existing start
 //!   path is sufficient.
-//! * **finalize** — IPC verb to the running M2a daemon. Daemon
+//! * **finalize** — IPC verb to the running FUSE-mode daemon. Daemon
 //!   orchestrates unmount → delete plaintext → delete old `.softfig/`
 //!   → remount.
 //!
@@ -38,12 +41,13 @@ const KEEPER_TOML: &str = "keeper.toml";
 
 #[derive(Subcommand, Debug)]
 pub enum MigrateCmd {
-    /// Phase 1: copy `.softfig/` to the XDG state dir and write
-    /// `keeper.toml`. No deletion. Refuses if a daemon is reachable.
+    /// Step 1 of moving a pre-FUSE garden: copy `.softfig/` to the XDG state
+    /// dir and write `keeper.toml`. No deletion. Refuses if a daemon is
+    /// reachable.
     Prepare(PrepareArgs),
-    /// Phase 3: ask the running M2a daemon to delete the orphan
-    /// plaintext working tree and the legacy `.softfig/` (best-effort)
-    /// and remount FUSE.
+    /// Step 3 (after `softfig daemon start`): ask the running FUSE-mode daemon
+    /// to delete the orphan plaintext working tree and the legacy `.softfig/`
+    /// (best-effort) and remount FUSE.
     Finalize(FinalizeArgs),
     /// One-time small-files split: rewrite every `notes.md` /
     /// `troubleshooting.md` monolith into its sibling numbered-note folder

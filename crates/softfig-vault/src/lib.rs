@@ -1,10 +1,25 @@
-//! Single-device Vault for soft-fig.
+//! The soft-fig Vault: key custody and encryption at rest.
 //!
-//! Layer A only: encrypted-at-rest blob storage, identity-key signing for
-//! the future VCS layer. Multi-device features (trust matrix, peer unlock,
-//! panic counter), Layer B selective secrets, FUSE, and TPM mode are not
-//! in this slice — see `meta/spec-vault.md` in the soft-fig garden for the
-//! full target.
+//! - **Layer A** — whole-garden encrypted-at-rest blob storage: convergent
+//!   blob encryption under master-key generations `M` (`blob`, `master`),
+//!   which are wrapped under the key-encryption key `K` (`kek`); `K` is
+//!   wrapped once per door — passphrase, optional recovery phrase (`storage`,
+//!   `wrappings`).
+//! - **Device keys** — the Ed25519 identity key that signs VCS commits
+//!   (`identity`) and the X25519 Noise static key for peer channels
+//!   (`transport`).
+//! - **Layer B** — per-path and inline-region selective secrets under HKDF
+//!   subkeys (`layer_b`).
+//! - **Recovery** — the recovery phrase, the declared recovery policy, escrow
+//!   export/verify, and Argon2 cost rewrap (`recovery`, `recovery_policy`,
+//!   `escrow`, `rewrap`).
+//! - **Sessions** — the in-memory unlocked state and the relock token
+//!   (`session`, `relock`).
+//! - **Shared subtrees** — blob crypto under the collaborative key `S`
+//!   (`shared`).
+//!
+//! Not built: peer unlock, the panic counter, TPM mode. See
+//! `meta/spec-vault.md` in the soft-fig garden for the full target.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]

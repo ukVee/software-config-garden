@@ -1,14 +1,16 @@
 //! soft-fig FUSE plaintext-view of the encrypted Layer A working tree.
 //!
 //! Mounts a userspace filesystem at `garden_root` (the user-visible
-//! mount point) backed by:
+//! mount point). The view is a **union**: the device's own chain plus each
+//! enabled shared-subtree chain mounted at its subtree path, and a write is
+//! routed to the chain that owns its path. Backed by:
 //!
 //! * `softfig-store::ObjectStore` for ciphertext blob lookup,
 //! * `softfig-vault::VaultSession` for blob decryption,
 //! * `softfig-store::Db` (read-only secondary connection) for the
 //!   current tip's tree rows,
 //! * an in-memory write overlay buffering changes until the daemon's
-//!   M1d `DirtySetAccumulator` flushes them into a commit.
+//!   `DirtySetAccumulator` flushes them into a commit.
 //!
 //! The mount handle owns a `fuser::BackgroundSession`; dropping the
 //! handle unmounts the FS. The daemon binds the lifecycle to its state
@@ -20,7 +22,7 @@
 //! handle exposes [`MountHandle::on_tip_changed`] for the
 //! `commit_workdir` callback registered by the daemon, and
 //! [`MountHandle::push_callbacks`] so the daemon can wire dirty events
-//! straight into its M1d `DirtySetAccumulator`.
+//! straight into its `DirtySetAccumulator`.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]

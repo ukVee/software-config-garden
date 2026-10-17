@@ -1,6 +1,6 @@
 [Unit]
 Description=soft-fig multi-agent orchestrator daemon (growlight fleet)
-Documentation=https://github.com/ukv/software-config_garden
+Documentation=https://github.com/ukVee/software-config-garden
 # Ordering only: growlightd derives the garden root from keeperd's read-only
 # `status` handshake, so keeperd should come up first. Deliberately NOT
 # `Requires=`/`BindsTo=` — those would tie growlightd's life to "keeperd

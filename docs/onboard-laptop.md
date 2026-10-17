@@ -1,27 +1,30 @@
 # Onboarding soft-fig on a new device
 
-This is the manual runbook for bringing soft-fig up on a second machine
-(the laptop). It produces **one standalone, single-device garden** that
-documents *that* machine — it does **not** copy the tablet's garden
-content. Cloning moves the *program* (the schema), never a garden's
-*instance* (the knowledge). Cross-device **sync** is a later milestone
-(M5); for now the laptop garden stands alone.
+This is the manual runbook for bringing soft-fig up on a new machine. It
+produces **one standalone garden** that documents *that* machine — it does
+**not** copy another device's garden content. Cloning moves the *program*
+(the schema), never a garden's *instance* (the knowledge). Linking gardens
+across your devices (`softfig pair`, replica backup, shared subtrees) is a
+separate step after this one.
 
-AUR packaging (M7) will automate all of the below. Until then, this is the
-correct short path.
+There are no prebuilt packages yet; building from source is the install path.
 
 ## Prerequisites
 
 - Rust toolchain (the workspace targets Rust ≥ 1.88, edition 2024).
-- `fuse3` (Arch: `sudo pacman -S fuse3`). The daemon serves the decrypted
-  garden through a FUSE mount at the garden root; the on-disk `.softfig/`
-  state stays encrypted under `~/.local/share/softfig/<name>/`.
+- Build-time system packages: `protoc` (`softfig-net` compiles protobuf
+  definitions) and the libfuse3 development headers — Arch:
+  `sudo pacman -S protobuf fuse3`; Debian/Ubuntu:
+  `sudo apt install protobuf-compiler libfuse3-dev fuse3`.
+- `fuse3` at runtime. The daemon serves the decrypted garden through a FUSE
+  mount at the garden root; the on-disk `.softfig/` state stays encrypted
+  under `~/.local/share/softfig/<name>/`.
 - `~/.local/bin` on your `PATH`.
 
 ## 1. Clone the program
 
 ```bash
-git clone <repo-url> ~/projects/software-config_garden
+git clone https://github.com/ukVee/software-config-garden ~/projects/software-config_garden
 cd ~/projects/software-config_garden
 ```
 
@@ -34,9 +37,11 @@ Either run the helper script:
 ```
 
 …which builds `--release`, installs `softfig`, `softfig-keeperd`,
-`softfig-mcp`, and `softfig-tui` into `~/.local/bin`, checks for `fuse3`,
-then **prompts** before enabling the systemd user unit and before
-registering the MCP server in `~/.claude.json`.
+`softfig-mcp`, `softfig-tui`, and `softfig-growlightd` into `~/.local/bin`,
+checks for `fuse3`, then **prompts** before enabling the `softfig-keeperd`
+systemd user unit and before registering the MCP server with Claude Code
+(user scope, so every Claude session sees it — including one opened from the
+garden).
 
 Or do it by hand:
 
@@ -46,7 +51,13 @@ install -m0755 target/release/softfig         ~/.local/bin/
 install -m0755 target/release/softfig-keeperd  ~/.local/bin/
 install -m0755 target/release/softfig-mcp      ~/.local/bin/
 install -m0755 target/release/softfig-tui      ~/.local/bin/
+install -m0755 target/release/softfig-growlightd ~/.local/bin/
+claude mcp add --scope user softfig-mcp ~/.local/bin/softfig-mcp
 ```
+
+The growlight fleet unit (`packaging/systemd/softfig-growlightd.service`) is
+not installed by the script; copy it into `~/.config/systemd/user/` if you
+plan to run the fleet (see `packaging/systemd/README.md`).
 
 ## 3. Scaffold the garden
 
@@ -74,7 +85,9 @@ What it does (born-in-FUSE — no plaintext ever lands at the garden root):
    substitutes `{{machine}}` / `{{date}}` placeholders.
 4. Writes the genesis `init` commit, encrypting the skeleton into
    `state_root/.softfig/`, then discards the plaintext staging.
-5. Writes the `keeper.toml` state-root pointer the daemon discovers.
+5. Writes the `keeper.toml` state-root pointer the daemon discovers (at
+   `<garden_root>/.softfig/keeper.toml` and alongside the state), and
+   scaffolds the in-garden `config/` (`keeper.toml`, `growlight.toml`).
 
 ## 4. Start the daemon + unlock
 
@@ -100,19 +113,19 @@ the mount; saves are committed by the watcher.
 > **Smoke check (do this on the real machine — FUSE can't mount in a dev
 > sandbox):** after unlock, `ls ~/soft-fig_garden` should show `CLAUDE.md`,
 > `meta/`, the concept-dir stubs, etc. Unmounting (stop the daemon) makes
-> the garden root show only the `keeper.toml` pointer again — the plaintext
-> only ever exists through the mount.
+> the garden root show only the hidden `.softfig/keeper.toml` pointer again
+> (`ls -a`) — the plaintext only ever exists through the mount.
 
 ## 5. Fill the garden
 
 Open a Claude session at `~/soft-fig_garden`. The stamped routing
 `CLAUDE.md` carries a "how to behave on a fresh garden" note: Claude reads
 the skeleton, then helps survey the machine (installed packages, enabled
-services, hardware, the device's bombadil profile) and fill the concept
+services, hardware, your dotfile setup) and fill the concept
 stubs. The `snapshots/` refresh-script pattern (e.g. `refresh-pacman.sh`)
 is the model for capturing mutating state.
 
-## 6. (optional) Drive the garden from the terminal (M3b TUI)
+## 6. (optional) Drive the garden from the terminal (TUI)
 
 `softfig-tui` is a ratatui frontend over the running daemon — handy on a
 headless box over SSH, or just for a tactile view. It talks to the same
@@ -217,7 +230,7 @@ The daemon mounts via the setuid-root `fusermount3` helper, which is broken by:
   `fusermount3` runs unprivileged and the `mount(2)` syscall returns EPERM.
 - `ProtectSystem=` / `PrivateTmp=` and other namespacing options — give the
   unit its own mount namespace, so even a successful mount stays invisible
-  to your shell (`ls ~/soft-fig_garden` shows only `keeper.toml`).
+  to your shell (`ls -a ~/soft-fig_garden` shows only `.softfig/`).
 
 The shipped `packaging/systemd/softfig-keeperd.service` carries none of
 these. If you hit the error, you're likely running an **older copy of the
@@ -261,14 +274,13 @@ unmounts explicitly on every clean path and reclaims a crashed daemon's stale
 mount on the next mount, so dropping `AutoUnmount` costs nothing. If you see
 the line above, you're on a pre-fix build — rebuild and reinstall the binaries.
 
-## What's deferred
+## What's not here yet
 
-- **Templating + secret-aware deploy** (M4b/M4c) — the static deploy spine
-  (`softfig deploy`, M4a) has landed, but onboarding still does dumb one-shot
-  `{{name}}` substitution, not the MiniJinja templating engine (M4b) or
-  render-time Vault secrets/posthooks (M4c). A freshly onboarded laptop garden
-  has no `config/` tree to deploy yet — that arrives at the dogfood ceremony.
-- **Cross-device sync / pairing** (M5) — "clone" here is plain git; the
-  laptop garden is standalone.
-- **AUR packaging + post-install automation** (M7) — this runbook is the
-  manual stand-in.
+- **Templating + secret-aware deploy** — the static deploy step
+  (`softfig deploy`) has landed, but onboarding still does one-shot
+  `{{name}}` substitution, not a templating engine or render-time vault
+  secrets/posthooks. A fresh garden has a `config/` dir but no `deploy.toml`;
+  add one when you want to deploy dotfiles.
+- **Prebuilt packages + post-install automation** — this runbook and
+  `scripts/onboard-device.sh` are the install path until a release pipeline
+  ships.

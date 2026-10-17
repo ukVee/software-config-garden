@@ -20,16 +20,14 @@
 //!   ([`softfig_growlightd_client`]) and hand each frame to the runtime as a
 //!   [`Message`]. This is the exact body the iced `Subscription` runs.
 //!
-//! ## What's deferred (§7b live render binding)
+//! ## The live render binding (`gui` feature)
 //!
-//! The literal `iced` dependency, the `Subscription`/`view()`/window, and the
-//! on-device visual check are the **live render binding** — deferred to the human
-//! per the milestone's pure-core discipline ("the live binding defers to its
-//! natural phase behind a default-absent seam"; tests prove the view-model, not
-//! pixels). Adding iced is a heavy, unverifiable-in-headless step and is flagged
-//! for the merge. When it lands, the iced app is thin: hold an [`App`], call
-//! [`update`] from a `Subscription` fed by [`drive_messages`], and render the
-//! [`render`] projections.
+//! The `iced` window — `Subscription`, `view()`, event loop — lives in
+//! `runtime`, behind the off-by-default `gui` feature, and the `growlight-gui`
+//! binary requires it. It stays thin: hold an [`App`], call [`update`] from a
+//! `Subscription` fed by [`drive_messages`], and render the [`render`]
+//! projections. Tests prove the view-model, not pixels; the default workspace
+//! build never compiles iced.
 
 pub mod command;
 pub mod dispatch;

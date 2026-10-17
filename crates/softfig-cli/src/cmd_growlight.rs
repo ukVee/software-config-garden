@@ -87,7 +87,7 @@ pub enum GrowlightCmd {
 
     /// Show the orchestrator daemon's fleet status — a one-shot query to
     /// growlightd's own IPC socket: state, garden root, policy, the admission
-    /// gate (`paused`), and the (phase-1 empty) agent list.
+    /// gate (`paused`), and one row per live agent.
     Status(ClientArgs),
 
     /// Tail growlightd's live event stream (the `subscribe` verb): agent
@@ -134,10 +134,10 @@ pub enum GrowlightCmd {
     /// The queue v2 human surface (§6.9): `queue show` and the mutating forms —
     /// `project add`, `add`, `move`, `lane`, `after`, `status`, `drop`. Each is
     /// a thin client over the matching §6.8 keeperd verb, with `--dry-run`
-    /// (compute + validate + render the would-be list, write nothing). These
-    /// verbs touch only the v2 files; the live loop still runs on the legacy
-    /// queue (§11). `queue pick` lands with queue-v2-scheduling (it needs
-    /// `pick_v2`).
+    /// (compute + validate + render the would-be list, write nothing), plus the
+    /// read-only `queue pick`. These verbs touch only the v2 files; the fleet
+    /// schedules from them only under `queue = "v2"` in `config/growlight.toml`
+    /// (default `legacy`, §11).
     Queue(QueueArgs),
 
     /// The queue v2 slice surface (§6.9): `insert`, `move` and `status` inside a
@@ -1693,9 +1693,10 @@ fn delta_kind_label(kind: AgentDeltaKind) -> &'static str {
 /// The queue v2 human surface (§6.9): `show` and the mutating forms — `project
 /// add`, `add`, `move`, `lane`, `after`, `status`, `drop`. Each mutating form
 /// is a thin client over the matching §6.8 keeperd verb, with `--dry-run`
-/// (compute + validate + render the would-be list, write nothing). `queue pick`
-/// lands with queue-v2-scheduling (it needs `pick_v2`). The verbs touch only
-/// the v2 files; the live loop still runs on the legacy queue (§11).
+/// (compute + validate + render the would-be list, write nothing), plus the
+/// read-only `pick` (growlightd's `pick_v2`). The verbs touch only the v2
+/// files; the fleet schedules from them only under `queue = "v2"` in
+/// `config/growlight.toml` (default `legacy`, §11).
 #[derive(Args, Debug)]
 pub struct QueueArgs {
     /// keeperd socket. Defaults to `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.

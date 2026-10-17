@@ -3,8 +3,8 @@
 # onboard-device.sh — take a freshly-cloned soft-fig repo to a working,
 # encrypted, FUSE-mounted garden on a new device.
 #
-# Posture (M-onboard locked pick #6 / the install-reach open-question lean):
-#   * AUTOMATIC, no prompt: release build + install the four binaries to
+# Posture:
+#   * AUTOMATIC, no prompt: release build + install the five binaries to
 #     ~/.local/bin, and check that fuse3 is present.
 #   * PROMPTED, reversible, user-consented: enabling the systemd --user
 #     unit and registering the MCP server in ~/.claude.json.
@@ -79,15 +79,15 @@ fi
 # ---- 5. MCP registration (prompted) --------------------------------------
 if command -v claude >/dev/null 2>&1; then
   if ask "Register softfig-mcp with Claude Code (writes ~/.claude.json)?"; then
-    claude mcp add softfig-mcp "${BIN_DIR}/softfig-mcp"
+    claude mcp add --scope user softfig-mcp "${BIN_DIR}/softfig-mcp"
     info "Registered softfig-mcp."
   else
     info "Skipped MCP registration. Register later with:"
-    echo "    claude mcp add softfig-mcp \"${BIN_DIR}/softfig-mcp\""
+    echo "    claude mcp add --scope user softfig-mcp \"${BIN_DIR}/softfig-mcp\""
   fi
 else
   warn "'claude' CLI not found — skipping MCP registration."
-  echo "    Register later with: claude mcp add softfig-mcp \"${BIN_DIR}/softfig-mcp\""
+  echo "    Register later with: claude mcp add --scope user softfig-mcp \"${BIN_DIR}/softfig-mcp\""
 fi
 
 cat <<EOF
