@@ -48,21 +48,81 @@ pub struct Argon2Params {
     pub p_cost: u32,
 }
 
+/// OWASP 2023 second recommendation: m=64 MiB, t=3, p=4. This is both the
+/// default for a fresh vault and the **absolute floor** `vault rewrap` refuses
+/// to go below without `--allow-downgrade` — one constant so the two can never
+/// drift apart.
+pub const OWASP_BASELINE: Argon2Params = Argon2Params {
+    m_cost: 65536,
+    t_cost: 3,
+    p_cost: 4,
+};
+
 impl Default for Argon2Params {
-    /// OWASP 2023 second recommendation: m=64 MiB, t=3, p=4.
     fn default() -> Self {
-        Self {
-            m_cost: 65536,
-            t_cost: 3,
-            p_cost: 4,
-        }
+        OWASP_BASELINE
     }
 }
 
 impl Argon2Params {
+    /// Panics on invalid costs. Callers taking operator input must
+    /// [`Self::check`] first; the internal callers pass validated values.
     pub fn to_argon2(self) -> argon2::Params {
         argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, Some(KEY_LEN))
             .expect("argon2 params validated by softfig defaults")
+    }
+
+    /// Validity as Argon2 itself defines it. [`Self::to_argon2`] panics on
+    /// invalid costs, and `vault rewrap` accepts numbers from an operator, so
+    /// this has to run before the panic can.
+    pub fn check(self) -> std::result::Result<(), String> {
+        argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, Some(KEY_LEN))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Memory-time area — the quantity Argon2's security argument is actually
+    /// about. Widened to `u64` because `m_cost * t_cost` overflows `u32` at
+    /// entirely reachable costs (64 MiB and t=3 is already 196608, and a
+    /// gigabyte at t=8 is 2^23).
+    pub fn area(self) -> u64 {
+        u64::from(self.m_cost) * u64::from(self.t_cost)
+    }
+
+    /// Is `self` at least as strong as `other`?
+    ///
+    /// Two comparisons rather than one, because Argon2 cost is not totally
+    /// ordered. The area may not shrink, **and** `m_cost` alone may not shrink:
+    /// memory hardness is what makes GPU and ASIC attack expensive, so it must
+    /// not be traded away for iterations that a parallel attacker buys cheaply.
+    /// `p_cost` is deliberately excluded — it partitions the same `m x t` work
+    /// across lanes rather than changing its total.
+    pub fn at_least_as_strong_as(self, other: Self) -> bool {
+        self.area() >= other.area() && self.m_cost >= other.m_cost
+    }
+}
+
+impl std::fmt::Display for Argon2Params {
+    /// `m=64 MiB t=3 p=4` — the form `vault status` and `vault rewrap` print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "m={} t={} p={}",
+            format_kib(self.m_cost),
+            self.t_cost,
+            self.p_cost
+        )
+    }
+}
+
+/// Render a KiB count the way an operator thinks about memory. Exact powers of
+/// two get a MiB/GiB label; anything else stays in KiB rather than rounding a
+/// security parameter into a lie.
+fn format_kib(kib: u32) -> String {
+    match kib {
+        k if k >= 1024 * 1024 && k % (1024 * 1024) == 0 => format!("{} GiB", k / (1024 * 1024)),
+        k if k >= 1024 && k % 1024 == 0 => format!("{} MiB", k / 1024),
+        k => format!("{k} KiB"),
     }
 }
 

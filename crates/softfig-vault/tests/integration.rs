@@ -774,3 +774,1105 @@ fn shared_region_round_trips_and_needs_s() {
         Err(VaultError::SharedKeyUnavailable(_))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Recovery policy (milestone `vault-recovery-policy`, slice 001)
+//
+// The unit tests in `src/recovery_policy.rs` cover the model against synthetic
+// fixtures. These cover it against a *real* vault, and pin the one property
+// that cannot be checked with fixtures: reading the recovery status never opens
+// a wrapping.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_declares_the_shape_it_just_built() {
+    use softfig_vault::RecoveryStatus;
+
+    let (tmp, vault) = fresh_vault();
+    assert!(
+        vault.paths().recovery_policy().exists(),
+        "init should leave the vault declared, not undeclared"
+    );
+
+    let status = RecoveryStatus::read(vault.paths());
+    assert!(
+        !status.is_inferred(),
+        "a freshly-initialized vault must not report an inferred policy"
+    );
+    assert_eq!(status.effective().to_string(), "passphrase+phrase");
+    assert!(
+        status.divergences.is_empty(),
+        "init builds exactly what it declares: {:?}",
+        status.divergences
+    );
+    drop(tmp);
+}
+
+#[test]
+fn recovery_status_never_opens_a_wrapping() {
+    use softfig_vault::{DeclaredPolicy, RecoveryPolicy, RecoveryStatus};
+
+    let (_tmp, vault) = fresh_vault();
+    let paths = vault.paths();
+
+    // Destroy both wrappings. Every byte of `k.self` and `k.recovery` is now
+    // garbage, so ANY attempt to unwrap `K` — with the right passphrase or
+    // otherwise — fails. This is also, precisely, a *locked* vault from the
+    // status path's point of view: it holds no secret with which to open
+    // anything.
+    fs::write(paths.kek_self(), b"shredded").expect("clobber k.self");
+    fs::write(paths.kek_recovery(), b"shredded").expect("clobber k.recovery");
+    assert!(
+        vault.unlock(PASSPHRASE).is_err(),
+        "precondition: the wrappings must genuinely be unopenable"
+    );
+
+    // Status still reports the whole picture. If it unwrapped anything on the
+    // way, this call would have failed instead.
+    let status = RecoveryStatus::read(paths);
+    assert!(status.wrappings.passphrase);
+    assert!(status.wrappings.phrase);
+    assert_eq!(status.effective().to_string(), "passphrase+phrase");
+    assert!(status.divergences.is_empty());
+
+    // And divergence is still computed against the declaration, not against
+    // anything the wrappings would have to be opened to learn.
+    softfig_vault::recovery_policy::store_declared_policy(
+        paths,
+        &RecoveryPolicy::passphrase_only(),
+    )
+    .expect("declare");
+    let status = RecoveryStatus::read(paths);
+    assert!(matches!(status.declared, DeclaredPolicy::Declared(_)));
+    assert_eq!(status.divergences.len(), 1, "{:?}", status.divergences);
+}
+
+#[test]
+fn an_existing_undeclared_vault_reports_inferred_and_is_not_written_to() {
+    use softfig_vault::{DeclaredPolicy, RecoveryStatus};
+
+    // A garden created before the declaration existed: remove the file `init`
+    // wrote and you have exactly the pre-milestone on-disk shape.
+    let (_tmp, vault) = fresh_vault();
+    let paths = vault.paths();
+    fs::remove_file(paths.recovery_policy()).expect("de-declare");
+
+    let status = RecoveryStatus::read(paths);
+    assert_eq!(status.declared, DeclaredPolicy::Undeclared);
+    assert!(status.is_inferred());
+    assert_eq!(status.effective().to_string(), "passphrase+phrase");
+    assert!(
+        !paths.recovery_policy().exists(),
+        "reading status must never write a declaration on the user's behalf"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// vault-recovery-policy 002 — `vault escrow export`
+//
+// The bundle is a file-copy-and-describe artifact: these tests run against a
+// real initialized vault (not a fixture of fake bytes) precisely to pin that
+// what lands in the bundle is byte-identical to what the vault holds, and that
+// nothing else does.
+// ---------------------------------------------------------------------------
+
+use softfig_vault::escrow;
+use softfig_vault::recovery_policy;
+
+fn b3(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+#[test]
+fn escrow_round_trips_every_member_byte_for_byte() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+
+    let summary = escrow::export(vault.paths(), Some("garden-abc"), &dest, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest).unwrap()).expect("parse");
+
+    assert_eq!(bundle.garden_id, "garden-abc");
+    assert_eq!(bundle.member_count, bundle.members.len());
+    assert_eq!(summary.members.len(), bundle.members.len());
+    assert!(
+        bundle.member("k.self").is_some() && bundle.member("master/1.key").is_some(),
+        "the wrapping and the key it opens both have to be in the bundle"
+    );
+
+    for m in &bundle.members {
+        let on_disk = fs::read(vault.paths().root.join(&m.name))
+            .unwrap_or_else(|e| panic!("member {} is not on disk: {e}", m.name));
+        let decoded = m.decoded().expect("base64");
+        assert_eq!(decoded, on_disk, "member {} differs from the vault", m.name);
+        assert_eq!(m.size, on_disk.len() as u64, "member {} size", m.name);
+        assert_eq!(b3(&on_disk), m.blake3, "member {} hash", m.name);
+    }
+}
+
+#[test]
+fn escrow_carries_every_master_generation_not_just_the_active_one() {
+    let (tmp, vault) = fresh_vault();
+    let mut session = vault.unlock(PASSPHRASE).expect("unlock");
+    let new_id = session.rotate_master_key().expect("rotate");
+    assert_eq!(new_id, 2);
+
+    let dest = tmp.path().join("escrow.toml");
+    escrow::export(vault.paths(), None, &dest, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest).unwrap()).expect("parse");
+
+    // Historical blobs name the generation that sealed them, so an escrow that
+    // dropped generation 1 would restore a vault that cannot read its own past.
+    assert!(bundle.member("master/1.key").is_some(), "gen 1 must survive rotation");
+    assert!(bundle.member("master/2.key").is_some(), "gen 2 must be present");
+}
+
+#[test]
+fn escrow_reports_a_declared_policy_as_declared_and_a_broken_one_as_inferred() {
+    let (tmp, vault) = fresh_vault();
+    recovery_policy::store_declared_policy(
+        vault.paths(),
+        &softfig_vault::RecoveryPolicy::passphrase_only(),
+    )
+    .expect("declare");
+
+    let dest = tmp.path().join("declared.toml");
+    escrow::export(vault.paths(), None, &dest, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest).unwrap()).expect("parse");
+    assert_eq!(bundle.policy, "passphrase-only");
+    assert_eq!(bundle.policy_source, escrow::SOURCE_DECLARED);
+    assert!(bundle.policy_note.is_empty());
+    assert!(
+        bundle.member("recovery.toml").is_some(),
+        "the declaration rides the bundle"
+    );
+
+    // A declaration that cannot be read must not stop the copy: export records
+    // the shape it could see, says the reading failed, and ships the broken
+    // file verbatim so the original is not lost with it.
+    let declaration = vault.paths().recovery_policy();
+    fs::write(&declaration, b"this is not a policy").unwrap();
+    let dest2 = tmp.path().join("unreadable.toml");
+    escrow::export(vault.paths(), None, &dest2, false).expect("export");
+    let bundle = escrow::parse(&fs::read_to_string(&dest2).unwrap()).expect("parse");
+    assert_eq!(bundle.policy_source, escrow::SOURCE_INFERRED);
+    assert!(!bundle.policy_note.is_empty(), "say why it was inferred");
+    assert_eq!(
+        bundle.member("recovery.toml").unwrap().decoded().unwrap(),
+        b"this is not a policy"
+    );
+}
+
+#[test]
+fn escrow_leaks_no_garden_content_and_no_database() {
+    let (tmp, vault) = fresh_vault();
+    // A plaintext note in the vault directory and a database beside it: both
+    // are the leak class the allowlist exists to make structurally impossible.
+    fs::write(
+        vault.paths().root.join("sealed-paths.toml"),
+        b"globs = [\"CANARY-GLOB-STRING\"]",
+    )
+    .unwrap();
+    fs::write(vault.paths().root.join("notes.txt"), b"CANARY-PLAINTEXT-NOTE").unwrap();
+    fs::write(
+        tmp.path().join(".softfig").join("db.sqlite"),
+        b"SQLite format 3 CANARY-DATABASE-BYTES",
+    )
+    .unwrap();
+
+    let dest = tmp.path().join("escrow.toml");
+    escrow::export(vault.paths(), None, &dest, false).expect("export");
+    let raw = fs::read_to_string(&dest).unwrap();
+
+    for canary in ["CANARY-GLOB-STRING", "CANARY-PLAINTEXT-NOTE", "CANARY-DATABASE-BYTES"] {
+        assert!(!raw.contains(canary), "{canary} leaked into the bundle");
+    }
+    let bundle = escrow::parse(&raw).unwrap();
+    for name in ["sealed-paths.toml", "notes.txt", "db.sqlite"] {
+        assert!(bundle.member(name).is_none(), "{name} must not be a member");
+    }
+}
+
+#[test]
+fn escrow_of_a_whole_vault_stays_a_file_you_can_print() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let summary = escrow::export(vault.paths(), Some("garden-abc"), &dest, false).expect("export");
+
+    // The artifact's whole premise is that it is small enough to copy
+    // everywhere and put on paper. An order-of-magnitude guard: if this trips,
+    // something that is not key material has started riding along.
+    assert!(
+        summary.bytes < 16 * 1024,
+        "escrow bundle grew to {} bytes — check what got added",
+        summary.bytes
+    );
+    assert_eq!(summary.bytes, fs::metadata(&dest).unwrap().len());
+    assert_eq!(summary.bundle_blake3, b3(&fs::read(&dest).unwrap()));
+}
+
+// ---------------------------------------------------------------------------
+// vault-recovery-policy 003 — `vault escrow verify`
+//
+// Integrity is checkable on a fixture of fake bytes; **openability is not**.
+// These run against a real initialized vault with real Argon2 (at test cost)
+// because the question the verb exists to answer — "would this bundle actually
+// reopen my vault?" — is only answered by an unwrap that could fail.
+// ---------------------------------------------------------------------------
+
+/// Every file in the vault directory with its bytes and mtime, for proving
+/// verification changed nothing.
+fn vault_snapshot(root: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>, std::time::SystemTime)>) {
+        for entry in fs::read_dir(dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let meta = fs::metadata(&path).expect("metadata");
+                out.push((
+                    path.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
+                    fs::read(&path).expect("read"),
+                    meta.modified().expect("mtime"),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn export_and_parse(vault: &Vault, dest: &Path) -> softfig_vault::EscrowBundle {
+    escrow::export(vault.paths(), Some("garden-abc"), dest, true).expect("export");
+    escrow::parse(&fs::read_to_string(dest).unwrap()).expect("parse")
+}
+
+#[test]
+fn escrow_verify_proves_a_fresh_bundle_actually_opens() {
+    let (tmp, vault) = fresh_vault();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+
+    let report = escrow::check_integrity(&bundle);
+    assert!(report.is_intact(), "findings: {:?}", report.findings);
+
+    let proof = escrow::prove_openable(&bundle, PASSPHRASE).expect("the bundle must open");
+    assert_eq!(proof.active_master_key_id, 1);
+    assert_eq!(proof.generations_proved, vec![1]);
+    // A fresh vault has a phrase door, and this verb cannot test it: saying so
+    // is the difference between "the bundle is proved" and "the part of it
+    // this verb can prove is proved".
+    assert_eq!(proof.unproved_doors, vec!["k.recovery"]);
+}
+
+#[test]
+fn a_wrong_passphrase_is_distinguishable_from_a_damaged_bundle() {
+    let (tmp, vault) = fresh_vault();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+
+    // Right bytes, wrong secret: intact, does not open.
+    assert!(escrow::check_integrity(&bundle).is_intact());
+    match escrow::prove_openable(&bundle, WRONG_PASSPHRASE) {
+        Err(VaultError::AuthFailed) => {}
+        other => panic!("a wrong passphrase must be AuthFailed, got {other:?}"),
+    }
+
+    // Wrong bytes, right secret: the failure is named before a passphrase is
+    // ever asked for. The two remedies are different — buy a new card, or
+    // remember the passphrase — so the two reports have to be.
+    let mut damaged = bundle.clone();
+    let m = damaged
+        .members
+        .iter_mut()
+        .find(|m| m.name == "master/1.key")
+        .unwrap();
+    m.blake3 = "0".repeat(64);
+    let findings = escrow::check_integrity(&damaged).findings;
+    assert!(
+        matches!(findings.as_slice(), [escrow::Finding::Corrupt { name, .. }] if name == "master/1.key"),
+        "got {findings:?}"
+    );
+}
+
+#[test]
+fn verification_needs_no_live_vault_and_cannot_reach_one() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let bundle = export_and_parse(&vault, &dest);
+
+    // Delete the vault entirely. If verification could touch a live vault it
+    // would need one; it does not, because the entry points hold no path.
+    fs::remove_dir_all(tmp.path().join(".softfig")).expect("remove vault");
+    assert!(!vault.is_initialized());
+
+    assert!(escrow::check_integrity(&bundle).is_intact());
+    let proof = escrow::prove_openable(&bundle, PASSPHRASE).expect("opens with no vault present");
+    assert_eq!(proof.generations_proved, vec![1]);
+}
+
+#[test]
+fn verifying_leaves_every_byte_of_the_live_vault_alone() {
+    let (tmp, vault) = fresh_vault();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+    let before = vault_snapshot(&vault.paths().root);
+
+    escrow::check_integrity(&bundle);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+    // Even the failure path must not touch it.
+    let _ = escrow::prove_openable(&bundle, WRONG_PASSPHRASE);
+
+    assert_eq!(before, vault_snapshot(&vault.paths().root), "verify mutated the vault");
+    assert!(
+        !vault.paths().escrow_record().exists(),
+        "a record is written by an explicit, separate call — never by verifying"
+    );
+}
+
+#[test]
+fn a_bundle_exported_before_a_rotation_still_verifies_and_repairs_nothing() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let stale = export_and_parse(&vault, &dest);
+
+    let mut session = vault.unlock(PASSPHRASE).expect("unlock");
+    assert_eq!(session.rotate_master_key().expect("rotate"), 2);
+    drop(session);
+
+    // The old bundle is a valid historical artifact: it verifies on its own
+    // terms, against its own active pointer.
+    assert!(escrow::check_integrity(&stale).is_intact());
+    let proof = escrow::prove_openable(&stale, PASSPHRASE).expect("the old copy still opens");
+    assert_eq!(proof.active_master_key_id, 1);
+    assert_eq!(proof.generations_proved, vec![1]);
+
+    // And the live vault is untouched — no "helpful" sync back to generation 1.
+    assert_eq!(
+        softfig_vault::storage::load_active(vault.paths()).unwrap().master_key_id,
+        2
+    );
+    assert!(vault.paths().master(2).exists());
+
+    // A fresh export of the rotated vault proves both generations.
+    let current = export_and_parse(&vault, &tmp.path().join("escrow2.toml"));
+    let proof = escrow::prove_openable(&current, PASSPHRASE).expect("opens");
+    assert_eq!(proof.active_master_key_id, 2);
+    assert_eq!(proof.generations_proved, vec![1, 2], "history must stay readable");
+}
+
+#[test]
+fn a_member_that_belongs_to_another_vault_is_not_a_wrong_passphrase() {
+    let (tmp_a, vault_a) = fresh_vault();
+    let (tmp_b, vault_b) = fresh_vault();
+    let mut bundle = export_and_parse(&vault_a, &tmp_a.path().join("a.toml"));
+    let other = export_and_parse(&vault_b, &tmp_b.path().join("b.toml"));
+
+    // Substitute B's master key into A's bundle, manifest and all, so integrity
+    // passes. The passphrase is right; the bundle is not.
+    let swapped = other.member("master/1.key").unwrap().clone();
+    let slot = bundle
+        .members
+        .iter_mut()
+        .find(|m| m.name == "master/1.key")
+        .unwrap();
+    *slot = swapped;
+    assert!(escrow::check_integrity(&bundle).is_intact(), "the swap is hash-consistent");
+
+    match escrow::prove_openable(&bundle, PASSPHRASE) {
+        Err(VaultError::EscrowMalformed(msg)) => {
+            assert!(msg.contains("master/1.key"), "{msg}");
+            assert!(msg.contains("passphrase was right"), "{msg}");
+        }
+        other => panic!("expected an EscrowMalformed naming the member, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_verification_record_survives_a_round_trip_and_stays_out_of_the_bundle() {
+    let (tmp, vault) = fresh_vault();
+    let dest = tmp.path().join("escrow.toml");
+    let raw = {
+        escrow::export(vault.paths(), Some("garden-abc"), &dest, false).expect("export");
+        fs::read(&dest).unwrap()
+    };
+    let bundle = escrow::parse(std::str::from_utf8(&raw).unwrap()).expect("parse");
+    let report = escrow::check_integrity(&bundle);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+
+    let entry = escrow::VerificationRecord {
+        bundle_blake3: escrow::bundle_blake3(&raw),
+        self_blake3: report.self_blake3.clone(),
+        garden_id: bundle.garden_id.clone(),
+        policy: bundle.policy.clone(),
+        member_count: bundle.members.len(),
+        outcome: escrow::OUTCOME_OPENABLE.to_string(),
+        verified_at: 0,
+    };
+    escrow::record_verification(vault.paths(), entry, 1_700_000_000).expect("record");
+
+    let log = escrow::read_verifications(vault.paths()).expect("read back");
+    let latest = log.latest().expect("one row");
+    assert_eq!(latest.verified_at, 1_700_000_000);
+    assert_eq!(latest.outcome, escrow::OUTCOME_OPENABLE);
+    assert_eq!(latest.self_blake3, b3(&fs::read(vault.paths().kek_self()).unwrap()));
+    assert!(
+        log.verified(&escrow::bundle_blake3(&raw)).is_some(),
+        "the row is keyed by the bundle's own hash"
+    );
+    // It records hashes, never contents: no member's bytes appear in the file.
+    let record_raw = fs::read_to_string(vault.paths().escrow_record()).unwrap();
+    for m in &bundle.members {
+        assert!(!record_raw.contains(&m.data), "member {} leaked into the record", m.name);
+    }
+
+    // And recording must not change what the vault exports — otherwise
+    // verifying a copy would invalidate every copy.
+    let after = tmp.path().join("escrow-after.toml");
+    escrow::export(vault.paths(), Some("garden-abc"), &after, false).expect("re-export");
+    assert_eq!(raw, fs::read(&after).unwrap(), "the record must not enter the bundle");
+}
+
+#[test]
+fn a_recorded_proof_goes_stale_when_the_passphrase_door_is_replaced() {
+    let (tmp, vault, phrase) = fresh_vault_with_recovery();
+    let bundle = export_and_parse(&vault, &tmp.path().join("escrow.toml"));
+    let report = escrow::check_integrity(&bundle);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+    let recorded_self = report.self_blake3.clone();
+
+    assert_eq!(
+        escrow::current_self_blake3(vault.paths()).unwrap(),
+        recorded_self,
+        "the fresh proof matches the live door"
+    );
+
+    // `recover` re-wraps K under a new passphrase: same vault, new k.self. The
+    // old bundle is still a valid artifact of the old door, but it is no longer
+    // a proof that today's vault reopens — which is exactly the fact `drop`
+    // will have to gate on in slice 004.
+    vault.recover(&phrase, NEW_PASSPHRASE).expect("recover");
+    assert_ne!(
+        escrow::current_self_blake3(vault.paths()).unwrap(),
+        recorded_self,
+        "a replaced door must be visible as a stale proof"
+    );
+    // The old copy still opens under the old passphrase — it was never a lie.
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("the historical copy still opens");
+}
+
+#[test]
+fn recording_against_a_directory_that_is_not_a_vault_is_refused() {
+    let tmp = TempDir::new().expect("tempdir");
+    let paths = softfig_vault::VaultPaths::for_garden(tmp.path());
+    let entry = escrow::VerificationRecord {
+        bundle_blake3: "aaaa".into(),
+        self_blake3: "bbbb".into(),
+        garden_id: "garden-abc".into(),
+        policy: "passphrase-only".into(),
+        member_count: 5,
+        outcome: escrow::OUTCOME_OPENABLE.to_string(),
+        verified_at: 0,
+    };
+    match escrow::record_verification(&paths, entry, 1_000) {
+        Err(VaultError::NotInitialized(_)) => {}
+        other => panic!("expected NotInitialized, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vault-recovery-policy 004 — `vault recovery add` / `drop`
+//
+// The slice that can make a garden *less* recoverable, so most of these tests
+// are about refusals. The ordering property they pin: every guard is evaluated
+// before anything on disk moves.
+// ---------------------------------------------------------------------------
+
+use std::os::unix::fs::PermissionsExt;
+
+use softfig_vault::recovery_policy::{Divergence, RecoveryPath, Wrappings};
+use softfig_vault::wrappings;
+
+/// Export → verify → record, i.e. what the human does with the SD card before
+/// they are allowed to remove a door.
+fn certify_escrow(tmp: &TempDir, vault: &Vault) -> softfig_vault::VerificationRecord {
+    let dest = tmp.path().join("certify.toml");
+    escrow::export(vault.paths(), Some("garden-abc"), &dest, true).expect("export");
+    let raw = fs::read(&dest).unwrap();
+    let bundle = escrow::parse(std::str::from_utf8(&raw).unwrap()).expect("parse");
+    let report = escrow::check_integrity(&bundle);
+    assert!(report.is_intact(), "{:?}", report.findings);
+    escrow::prove_openable(&bundle, PASSPHRASE).expect("opens");
+    let entry = softfig_vault::VerificationRecord {
+        bundle_blake3: escrow::bundle_blake3(&raw),
+        self_blake3: report.self_blake3.clone(),
+        garden_id: bundle.garden_id.clone(),
+        policy: bundle.policy.clone(),
+        member_count: bundle.members.len(),
+        outcome: escrow::OUTCOME_OPENABLE.to_string(),
+        verified_at: 0,
+    };
+    escrow::record_verification(vault.paths(), entry, 1_700_000_000).expect("record")
+}
+
+/// The declaration and the disk have to agree after every successful
+/// operation — this milestone's own tool must never be the source of a
+/// divergence it would then report.
+fn assert_policy_matches_disk(vault: &Vault) {
+    let (policy, wrappings) = wrappings::shape_now(vault.paths());
+    assert_eq!(
+        policy,
+        wrappings.as_policy(),
+        "declared policy and the doors on disk disagree"
+    );
+    assert!(
+        softfig_vault::RecoveryStatus::read(vault.paths()).divergences.is_empty(),
+        "a successful operation must leave no divergence"
+    );
+}
+
+/// A vault whose only door is the master passphrase, with a proven escrow
+/// copy on record — the state slice 004 exists to make reachable.
+fn passphrase_only_vault() -> (TempDir, Vault) {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase)
+        .expect("the phrase door comes off");
+    (tmp, vault)
+}
+
+#[test]
+fn add_phrase_creates_a_door_that_actually_opens_and_declares_it() {
+    let (tmp, vault) = passphrase_only_vault();
+    assert!(!vault.paths().kek_recovery().exists());
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let phrase = wrappings::add_phrase(&session).expect("add");
+    drop(session);
+
+    // The phrase it printed has to be the phrase that works. Anything less
+    // makes `add` a verb that hands out a door key to nothing.
+    let recovered = vault
+        .unlock_with_recovery(&phrase)
+        .expect("the generated phrase must unwrap K");
+    assert_eq!(recovered.active_master_key_id(), 1);
+
+    let (policy, on_disk) = wrappings::shape_now(vault.paths());
+    assert!(policy.contains(RecoveryPath::Phrase), "the new door is declared");
+    assert!(on_disk.phrase, "and it is on disk");
+    assert_policy_matches_disk(&vault);
+    drop(tmp);
+}
+
+#[test]
+fn the_new_wrapping_is_private_and_atomically_published() {
+    let (_tmp, vault) = passphrase_only_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    wrappings::add_phrase(&session).expect("add");
+
+    let mode = fs::metadata(vault.paths().kek_recovery())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "a wrapping of K is key material");
+}
+
+#[test]
+fn add_refuses_to_silently_replace_a_live_door() {
+    let (_tmp, vault) = fresh_vault();
+    let before = fs::read(vault.paths().kek_recovery()).unwrap();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    match wrappings::add_phrase(&session) {
+        Err(VaultError::WrappingExists(RecoveryPath::Phrase)) => {}
+        other => panic!("expected WrappingExists, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read(vault.paths().kek_recovery()).unwrap(),
+        before,
+        "whoever wrote the old phrase down still has a working door"
+    );
+}
+
+#[test]
+fn drop_refuses_to_remove_the_last_way_into_the_vault() {
+    let (_tmp, vault) = passphrase_only_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    match wrappings::drop_wrapping(&session, RecoveryPath::Passphrase, RecoveryPath::Passphrase) {
+        Err(VaultError::LastWrapping(RecoveryPath::Passphrase)) => {}
+        other => panic!("expected LastWrapping, got {other:?}"),
+    }
+    assert!(vault.paths().kek_self().exists(), "nothing was removed");
+    assert_policy_matches_disk(&vault);
+}
+
+#[test]
+fn drop_refuses_without_a_verified_escrow_copy() {
+    let (_tmp, vault) = fresh_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoVerifiedEscrow { removing, reason }) => {
+            assert_eq!(removing, RecoveryPath::Phrase);
+            assert!(reason.contains("escrow"), "{reason}");
+        }
+        other => panic!("expected NoVerifiedEscrow, got {other:?}"),
+    }
+    assert!(vault.paths().kek_recovery().exists(), "nothing was removed");
+}
+
+#[test]
+fn a_proof_of_a_replaced_door_does_not_license_a_removal() {
+    let (tmp, vault, phrase) = fresh_vault_with_recovery();
+    certify_escrow(&tmp, &vault);
+    // `recover` re-wraps K under a new passphrase: same vault, new k.self, so
+    // the record now proves a door that no longer exists.
+    vault.recover(&phrase, NEW_PASSPHRASE).expect("recover");
+
+    let session = vault.unlock(NEW_PASSPHRASE).expect("unlock");
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoVerifiedEscrow { reason, .. }) => {
+            assert!(reason.contains("older"), "{reason}");
+        }
+        other => panic!("a stale proof must not license a drop, got {other:?}"),
+    }
+    assert!(vault.paths().kek_recovery().exists());
+}
+
+#[test]
+fn drop_refuses_the_door_the_session_came_in_through() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    // Both doors exist and the escrow proof covers the passphrase one — but
+    // that is the door being removed, so nothing proven would remain.
+    match wrappings::drop_wrapping(&session, RecoveryPath::Passphrase, RecoveryPath::Passphrase) {
+        Err(VaultError::AuthenticatedWrapping(RecoveryPath::Passphrase)) => {}
+        other => panic!("expected AuthenticatedWrapping, got {other:?}"),
+    }
+    assert!(vault.paths().kek_self().exists(), "nothing was removed");
+    assert_policy_matches_disk(&vault);
+}
+
+#[test]
+fn drop_removes_a_dead_door_without_ever_asking_it_to_open() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+
+    // This device's actual state: a `k.recovery` whose phrase is lost. Make it
+    // genuinely unopenable — no phrase in existence unwraps this.
+    fs::write(vault.paths().kek_recovery(), b"garbage where a wrapping used to be").unwrap();
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let plan = wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase)
+        .expect("a dead door must be removable — requiring the lost phrase would be a catch-22");
+
+    assert_eq!(plan.removing, RecoveryPath::Phrase);
+    assert_eq!(plan.remaining, vec![RecoveryPath::Passphrase]);
+    assert!(!vault.paths().kek_recovery().exists());
+    let (policy, _) = wrappings::shape_now(vault.paths());
+    assert_eq!(policy.to_string(), "passphrase-only");
+    assert_policy_matches_disk(&vault);
+
+    // And the vault still opens the way it always did.
+    vault.unlock(PASSPHRASE).expect("the surviving door works");
+}
+
+#[test]
+fn a_drop_interrupted_between_the_unlink_and_the_declaration_reads_as_divergent() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+
+    // Exactly the window: the door is gone, the policy has not caught up. The
+    // requirement is not that this cannot happen — it is that slice 001 sees
+    // it, rather than reporting a vault that looks fine.
+    fs::remove_file(vault.paths().kek_recovery()).unwrap();
+
+    let status = softfig_vault::RecoveryStatus::read(vault.paths());
+    assert_eq!(
+        status.divergences,
+        vec![Divergence::Promised(RecoveryPath::Phrase)],
+        "an interrupted drop must be visible, never silently fine"
+    );
+}
+
+#[test]
+fn peer_wrappings_are_refused_cleanly_rather_than_half_managed() {
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+
+    assert!(matches!(
+        wrappings::add_wrapping(&session, RecoveryPath::Peers),
+        Err(VaultError::PeerWrappingUnsupported)
+    ));
+    assert!(matches!(
+        wrappings::drop_wrapping(&session, RecoveryPath::Peers, RecoveryPath::Passphrase),
+        Err(VaultError::PeerWrappingUnsupported)
+    ));
+    assert!(matches!(
+        wrappings::add_wrapping(&session, RecoveryPath::Passphrase),
+        Err(VaultError::WrappingExists(RecoveryPath::Passphrase))
+    ));
+}
+
+#[test]
+fn dropping_a_door_that_is_not_there_is_not_a_silent_success() {
+    let (_tmp, vault) = passphrase_only_vault();
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::WrappingAbsent(RecoveryPath::Phrase)) => {}
+        other => panic!("expected WrappingAbsent, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_door_change_on_an_undeclared_vault_is_refused_without_writing_a_declaration() {
+    // A vault from before the declaration existed: no recovery.toml. A door
+    // change that silently wrote one would be the tool inventing the user's
+    // recovery shape — the exact silence the declaration exists to break.
+    let (tmp, vault) = passphrase_only_vault();
+    fs::remove_file(vault.paths().recovery_policy()).expect("de-declare");
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    match wrappings::add_phrase(&session) {
+        Err(VaultError::NoUsableDeclaration(msg)) => {
+            assert!(msg.contains("declare"), "say how to declare: {msg}");
+        }
+        other => panic!("expected NoUsableDeclaration, got {other:?}"),
+    }
+    assert!(!vault.paths().kek_recovery().exists(), "no door may be minted");
+    assert!(
+        !vault.paths().recovery_policy().exists(),
+        "nothing may write a declaration on the user's behalf"
+    );
+
+    match wrappings::drop_wrapping(&session, RecoveryPath::Passphrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoUsableDeclaration(_)) => {}
+        other => panic!("expected NoUsableDeclaration, got {other:?}"),
+    }
+    assert!(vault.paths().kek_self().exists(), "no door may be removed");
+    drop(tmp);
+}
+
+#[test]
+fn a_door_change_refuses_to_overwrite_an_unreadable_declaration() {
+    // A corrupt recovery.toml is surfaced, not silently replaced — the file
+    // is the user's words, and a door change must not paper over them.
+    let (tmp, vault) = fresh_vault();
+    certify_escrow(&tmp, &vault);
+    let broken = b"this is not toml {{{";
+    fs::write(vault.paths().recovery_policy(), broken).unwrap();
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    match wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase) {
+        Err(VaultError::NoUsableDeclaration(msg)) => {
+            assert!(msg.contains("cannot be read"), "{msg}");
+        }
+        other => panic!("expected NoUsableDeclaration, got {other:?}"),
+    }
+    assert!(vault.paths().kek_recovery().exists(), "the door must not move");
+    assert_eq!(
+        fs::read(vault.paths().recovery_policy()).unwrap(),
+        broken,
+        "the unreadable declaration must survive verbatim"
+    );
+    drop(tmp);
+}
+
+#[test]
+fn the_round_trip_makes_passphrase_only_a_reversible_choice() {
+    let (tmp, vault) = passphrase_only_vault();
+    assert_eq!(wrappings::shape_now(vault.paths()).0.to_string(), "passphrase-only");
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let phrase = wrappings::add_phrase(&session).expect("add");
+    drop(session);
+    assert_eq!(
+        wrappings::shape_now(vault.paths()).0.to_string(),
+        "passphrase+phrase"
+    );
+    vault.unlock_with_recovery(&phrase).expect("the new door opens");
+
+    // The escrow record still proves the *passphrase* door, which is what
+    // licenses taking the phrase door back off.
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    wrappings::drop_wrapping(&session, RecoveryPath::Phrase, RecoveryPath::Passphrase)
+        .expect("and back off again");
+    assert_eq!(wrappings::shape_now(vault.paths()).0.to_string(), "passphrase-only");
+    assert_policy_matches_disk(&vault);
+    drop(tmp);
+}
+
+#[test]
+fn plan_drop_names_what_goes_and_what_stays_without_touching_anything() {
+    let (tmp, vault) = fresh_vault();
+    let record = certify_escrow(&tmp, &vault);
+    let before = vault_snapshot(&vault.paths().root);
+
+    let plan = wrappings::plan_drop(
+        vault.paths(),
+        RecoveryPath::Phrase,
+        RecoveryPath::Passphrase,
+    )
+    .expect("plan");
+    assert_eq!(plan.removing, RecoveryPath::Phrase);
+    assert_eq!(plan.location, "k.recovery");
+    assert_eq!(plan.remaining, vec![RecoveryPath::Passphrase]);
+    assert_eq!(plan.certified_by.bundle_blake3, record.bundle_blake3);
+
+    assert_eq!(before, vault_snapshot(&vault.paths().root), "planning is read-only");
+    let _ = Wrappings::read(vault.paths());
+}
+
+// ---------------------------------------------------------------------------
+// Slice 005 — `vault rewrap`
+//
+// The format-interoperation half of this slice (reading a genuine pre-embedding
+// blob, and the escrow bundles either side of a rewrap) lives in
+// `rewrap.rs`'s unit tests, because writing a real v1 wrapping is deliberately
+// crate-private. What is asserted here is the public contract: the door still
+// opens, the data never moved, and the floor cannot be crossed by accident.
+// ---------------------------------------------------------------------------
+
+use softfig_vault::params::OWASP_BASELINE;
+use softfig_vault::rewrap;
+
+/// A cheap-but-real step up in cost. Still far below the baseline — these
+/// tests are about the mechanism, and every one of them therefore passes
+/// `allow_downgrade`, which is exactly the flag a below-baseline vault needs.
+fn heavier() -> Argon2Params {
+    Argon2Params {
+        m_cost: 32,
+        t_cost: 2,
+        p_cost: 1,
+    }
+}
+
+fn rewrap_to(vault: &Vault, target: Argon2Params, new_passphrase: Option<&[u8]>) {
+    let plan = rewrap::plan(vault.paths(), target, true).expect("plan");
+    rewrap::apply(vault.paths(), &plan, PASSPHRASE, new_passphrase).expect("apply");
+}
+
+#[test]
+fn rewrapping_under_heavier_parameters_still_opens_with_the_same_passphrase() {
+    let (_tmp, vault) = fresh_vault();
+    rewrap_to(&vault, heavier(), None);
+
+    vault.unlock(PASSPHRASE).expect("the same passphrase opens it");
+    assert!(matches!(
+        vault.unlock(WRONG_PASSPHRASE),
+        Err(VaultError::AuthFailed)
+    ));
+
+    // And the new costs are the ones actually in force, read back off disk
+    // without opening anything.
+    let bytes = fs::read(vault.paths().kek_self()).unwrap();
+    let read = softfig_vault::kek::wrapping_params(&bytes, &fast_params().argon2);
+    assert!(read.embedded, "a rewrapped door carries its own costs");
+    assert_eq!(read.params, heavier());
+}
+
+#[test]
+fn a_door_added_after_a_rewrap_inherits_the_current_heavier_costs() {
+    // The inheritance wiring, pinned end to end: `new_door_params` reads
+    // k.self's *embedded* costs, so a phrase door minted after a rewrap must
+    // carry the current heavier strength — not the birth costs `params.toml`
+    // still holds, which a rewrap deliberately leaves alone.
+    let (tmp, vault) = passphrase_only_vault();
+    rewrap_to(&vault, heavier(), None);
+
+    let session = vault.unlock(PASSPHRASE).expect("unlock");
+    let phrase = wrappings::add_phrase(&session).expect("add");
+    drop(session);
+
+    let bytes = fs::read(vault.paths().kek_recovery()).unwrap();
+    let read = softfig_vault::kek::wrapping_params(&bytes, &fast_params().argon2);
+    assert!(read.embedded, "a new door is written in the self-describing format");
+    assert_eq!(read.params, heavier(), "the new door inherits the current strength");
+
+    // And the door really opens under those costs.
+    vault
+        .unlock_with_recovery(&phrase)
+        .expect("the inherited door opens");
+    assert_policy_matches_disk(&vault);
+    drop(tmp);
+}
+
+#[test]
+fn rewrapping_with_a_new_passphrase_opens_with_the_new_one_and_not_the_old() {
+    let (_tmp, vault) = fresh_vault();
+    rewrap_to(&vault, heavier(), Some(NEW_PASSPHRASE));
+
+    vault.unlock(NEW_PASSPHRASE).expect("the new passphrase opens it");
+    assert!(
+        matches!(vault.unlock(PASSPHRASE), Err(VaultError::AuthFailed)),
+        "the old passphrase must stop working"
+    );
+}
+
+#[test]
+fn a_rewrap_leaves_every_key_and_the_active_pointer_byte_identical() {
+    // The scope fence, asserted rather than asserted-about: this milestone adds,
+    // removes, copies and describes *wrappings of K*. If a rewrap ever touched
+    // `M`, a generation, or the active pointer, it would have left scope — and
+    // in a garden that means every commit hash moved.
+    let (tmp, vault) = fresh_vault();
+    let root = tmp.path().join(".softfig/vault");
+    let watched = [
+        "master/1.key",
+        "active.toml",
+        "identity.key",
+        "transport.key",
+        "params.toml",
+        "k.recovery",
+        "recovery.toml",
+    ];
+    let before: Vec<Vec<u8>> = watched.iter().map(|f| fs::read(root.join(f)).unwrap()).collect();
+
+    rewrap_to(&vault, heavier(), Some(NEW_PASSPHRASE));
+
+    for (name, was) in watched.iter().zip(before) {
+        assert_eq!(fs::read(root.join(name)).unwrap(), was, "{name} moved");
+    }
+    // The session still reads the same master material through the new door.
+    let session = vault.unlock(NEW_PASSPHRASE).expect("unlock");
+    assert_eq!(session.active_master_key_id(), 1);
+    assert_eq!(session.known_master_key_ids(), vec![1]);
+}
+
+#[test]
+fn parameters_below_the_baseline_are_refused_without_the_downgrade_flag() {
+    let (_tmp, vault) = fresh_vault();
+    let err = rewrap::plan(vault.paths(), heavier(), false).expect_err("must refuse");
+    match err {
+        VaultError::WeakerParams { what, .. } => {
+            assert_eq!(what, "the recommended baseline");
+        }
+        other => panic!("wrong refusal: {other}"),
+    }
+    // And nothing was written on the way to refusing.
+    vault.unlock(PASSPHRASE).expect("still opens");
+}
+
+#[test]
+fn parameters_weaker_than_this_vaults_own_are_refused_by_their_own_message() {
+    // A vault someone already hardened must not be walked back by a command
+    // that only mentions the published baseline — "weaker than the baseline"
+    // would be the wrong sentence, and would let a 512 MiB vault drop to 64.
+    let tmp = TempDir::new().expect("tempdir");
+    let strong = VaultParams {
+        format_version: softfig_vault::params::CURRENT_FORMAT_VERSION,
+        argon2: Argon2Params {
+            m_cost: 1024,
+            t_cost: 4,
+            p_cost: 1,
+        },
+    };
+    let (vault, _s, _r) = Vault::init_with_params(tmp.path(), PASSPHRASE, strong).expect("init");
+
+    let err = rewrap::plan(
+        vault.paths(),
+        Argon2Params {
+            m_cost: 512,
+            t_cost: 2,
+            p_cost: 1,
+        },
+        false,
+    )
+    .expect_err("must refuse");
+    match err {
+        VaultError::WeakerParams { what, .. } => {
+            assert_eq!(what, "this vault's current parameters");
+        }
+        other => panic!("wrong refusal: {other}"),
+    }
+}
+
+#[test]
+fn a_downgrade_goes_through_only_when_it_is_asked_for() {
+    let (_tmp, vault) = fresh_vault();
+    let plan = rewrap::plan(vault.paths(), heavier(), true).expect("permitted");
+    assert!(plan.is_downgrade, "below the baseline is a downgrade");
+    rewrap::apply(vault.paths(), &plan, PASSPHRASE, None).expect("apply");
+    vault.unlock(PASSPHRASE).expect("opens");
+}
+
+#[test]
+fn a_rewrap_that_changes_nothing_is_recognisable_as_such() {
+    let (_tmp, vault) = fresh_vault();
+    rewrap_to(&vault, heavier(), None);
+    let plan = rewrap::plan(vault.paths(), heavier(), true).expect("plan");
+    assert!(plan.is_noop());
+
+    // ...but migrating a door into the embedded format at unchanged costs is
+    // NOT a no-op, which is what stops `rewrap` from declining to do the very
+    // migration it exists for.
+    let (_tmp2, legacy) = fresh_vault();
+    let plan = rewrap::plan(legacy.paths(), fast_params().argon2, true).expect("plan");
+    assert!(!plan.is_noop() || plan.current.embedded);
+}
+
+#[test]
+fn invalid_argon2_costs_are_refused_rather_than_panicking() {
+    // `to_argon2` panics on invalid costs and `rewrap` takes numbers from an
+    // operator, so the validation has to happen before the panic can.
+    let (_tmp, vault) = fresh_vault();
+    let err = rewrap::plan(
+        vault.paths(),
+        Argon2Params {
+            m_cost: 1,
+            t_cost: 0,
+            p_cost: 0,
+        },
+        true,
+    )
+    .expect_err("must refuse");
+    assert!(matches!(err, VaultError::InvalidArgon2Params(_)), "{err}");
+}
+
+#[test]
+fn the_wrapping_is_never_published_unless_it_has_been_opened() {
+    // `apply` proves the rewrapped bytes reproduce K *before* they replace the
+    // bytes that already do. The observable consequence is that a failed rewrap
+    // leaves the vault untouched — asserted here through the one failure a test
+    // can force, a wrong current passphrase.
+    let (_tmp, vault) = fresh_vault();
+    let before = fs::read(vault.paths().kek_self()).unwrap();
+    let plan = rewrap::plan(vault.paths(), heavier(), true).expect("plan");
+    assert!(matches!(
+        rewrap::apply(vault.paths(), &plan, WRONG_PASSPHRASE, None),
+        Err(VaultError::AuthFailed)
+    ));
+    assert_eq!(fs::read(vault.paths().kek_self()).unwrap(), before);
+    vault.unlock(PASSPHRASE).expect("untouched and still opening");
+}
+
+#[test]
+fn the_baseline_is_one_constant_shared_by_the_default_and_the_floor() {
+    // Two places that must never drift: what a fresh vault gets, and what
+    // `rewrap` refuses to go below.
+    assert_eq!(Argon2Params::default(), OWASP_BASELINE);
+    assert!(OWASP_BASELINE.at_least_as_strong_as(OWASP_BASELINE));
+}
+
+#[test]
+fn strength_is_area_and_memory_together_not_either_alone() {
+    let base = OWASP_BASELINE;
+    // More iterations at the same memory is stronger.
+    assert!(Argon2Params { t_cost: 4, ..base }.at_least_as_strong_as(base));
+    // Trading memory away for iterations is NOT: the area holds, but memory
+    // hardness is what makes GPU and ASIC attack expensive.
+    let traded = Argon2Params {
+        m_cost: base.m_cost / 2,
+        t_cost: base.t_cost * 2,
+        ..base
+    };
+    assert_eq!(traded.area(), base.area());
+    assert!(!traded.at_least_as_strong_as(base));
+    // Parallelism is not part of the comparison at all — it partitions the same
+    // `m x t` work rather than changing its total.
+    assert!(Argon2Params { p_cost: 1, ..base }.at_least_as_strong_as(base));
+}

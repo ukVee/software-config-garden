@@ -11,26 +11,39 @@
 
 pub mod blob;
 pub mod error;
+pub mod escrow;
 pub mod identity;
 pub mod kek;
 pub mod layer_b;
 pub mod master;
 pub mod params;
 pub mod recovery;
+pub mod recovery_policy;
 pub mod relock;
+pub mod rewrap;
 pub mod session;
 pub mod shared;
 pub mod storage;
 pub mod transport;
+pub mod wrappings;
 mod vault;
 
 pub use error::{Result, VaultError};
+pub use escrow::{
+    EscrowBundle, EscrowLog, ExportSummary, Finding, IntegrityReport, Member, OpenProof,
+    VerificationRecord, ESCROW_FORMAT_VERSION,
+};
 pub use layer_b::{is_layer_b, LayerBKey};
 pub use shared::{is_shared, is_shared_blob, is_shared_layer_b};
 pub use recovery::RecoveryPhrase;
+pub use recovery_policy::{
+    DeclaredPolicy, Divergence, RecoveryPath, RecoveryPolicy, RecoveryStatus, Wrappings,
+};
 pub use relock::{RelockBlob, RelockToken, RELOCK_TTL_SECS};
+pub use rewrap::{Calibration, RewrapPlan};
 pub use session::VaultSession;
 pub use storage::{discover_garden, VaultPaths};
+pub use wrappings::DropPlan;
 pub use vault::Vault;
 
 /// 32 bytes of OS-sourced cryptographically secure randomness. The vault is
