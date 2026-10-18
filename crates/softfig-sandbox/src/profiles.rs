@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use crate::{Bind, Network, Policy, SeccompDeny, TmpfsMount};
+use crate::{Bind, Network, Policy, ProxyConfig, SeccompDeny, TmpfsMount, EGRESS_SOCKET};
 
 /// The job context a profile derives from. All paths are *host* paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +89,11 @@ fn base(ctx: &JobContext) -> Policy {
     policy.env.insert("PATH".into(), "/usr/bin:/usr/sbin".into());
     policy.env.insert("HOME".into(), "/home/job".into());
     policy.env.insert("LANG".into(), "C.UTF-8".into());
+    // `rustup` proxies cargo/rustc on the reference laptop (Arch: /usr/bin/cargo
+    // is a symlink to rustup), so it must find its home — the toolchain bind —
+    // or it refuses to run. The channel is pinned per profile (a rust-toolchain
+    // file in the tree or RUSTUP_TOOLCHAIN), not here.
+    policy.env.insert("RUSTUP_HOME".into(), "/opt/toolchain".into());
 
     policy
 }
@@ -112,12 +117,35 @@ pub fn profile_materialize(ctx: &JobContext, mirror: PathBuf) -> Policy {
 
 /// Fetch: only the manifests + lockfile, against the allowlisted egress proxy.
 /// No repo-authored code runs, so there is deliberately **no `/src`** (spec §7.2).
-pub fn profile_fetch(ctx: &JobContext, proxy: PathBuf) -> Policy {
+///
+/// `skeleton` is the extracted dependency shape (manifests + lockfile + empty
+/// stubs, no `build.rs`/`.cargo/config.toml`/source — see `softfig-source`),
+/// bound read-only at `/skeleton` and set as the cwd.
+pub fn profile_fetch(ctx: &JobContext, skeleton: PathBuf, proxy: ProxyConfig) -> Policy {
     let mut p = base(ctx);
+    let listen = proxy.listen.clone();
+    let socket = proxy.socket.clone();
     p.network = Network::Proxy(proxy);
-    // The cargo-home registry is the only writable non-scratch path.
+    // The cargo-home registry is the only writable non-scratch path, and rw
+    // **only** in this step (the slice-005 cargo-home probe: `cargo fetch` fills
+    // registry/{cache,index,src} and writes the root `.global-cache`/`.package-cache`,
+    // while `cargo build --offline` needs the whole home read-only).
     p.rw_binds.push(Bind::rw(&ctx.cargo_home, "/opt/cargo-home"));
     p.env.insert("CARGO_HOME".into(), "/opt/cargo-home".into());
+    p.ro_binds.push(Bind::ro(skeleton, "/skeleton"));
+    p.chdir = Some("/skeleton".into());
+
+    // The proxy socket is bind-mounted rw: `connect()` to a Unix socket needs
+    // write permission on the socket file (it is a socket, not a regular file,
+    // so rw here does not let the job modify runnerd's proxy).
+    p.rw_binds.push(Bind::rw(socket, EGRESS_SOCKET));
+
+    // Point cargo's HTTP(S) at the in-namespace forwarder (lowercase + uppercase,
+    // for cargo/libcurl and git). The CONNECT allowlist decision stays in runnerd.
+    let url = format!("http://{listen}");
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        p.env.insert(key.into(), url.clone());
+    }
     p
 }
 
@@ -131,6 +159,23 @@ pub fn profile_run(ctx: &JobContext) -> Policy {
     p.env.insert("CARGO_HOME".into(), "/opt/cargo-home".into());
     p.env.insert("CARGO_TARGET_DIR".into(), "/cache/target".into());
     p.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    p
+}
+
+/// Run with `network = "egress"`: the offline [`profile_run`] view, but routed
+/// through the same allowlisted proxy as fetch, and with `CARGO_NET_OFFLINE`
+/// cleared so the run step may actually reach it (spec §7.2 "opting in to
+/// network at run time"). Declared in the requester's config and recorded in
+/// the attestation.
+pub fn profile_run_egress(ctx: &JobContext, proxy: ProxyConfig) -> Policy {
+    let mut p = profile_run(ctx);
+    let listen = proxy.listen.clone();
+    p.network = Network::Proxy(proxy);
+    p.env.remove("CARGO_NET_OFFLINE");
+    let url = format!("http://{listen}");
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        p.env.insert(key.into(), url.clone());
+    }
     p
 }
 
@@ -171,13 +216,35 @@ mod tests {
         assert!(p.ro_binds.iter().any(|b| b.dest.as_path() == Path::new("/opt/toolchain")));
     }
 
+    fn proxy() -> ProxyConfig {
+        ProxyConfig {
+            socket: "/run/egress.sock".into(),
+            forwarder: "/softfig-sandbox-forward".into(),
+            listen: "127.0.0.1:3128".into(),
+        }
+    }
+
     #[test]
     fn fetch_profile_has_no_src_and_uses_the_proxy() {
-        let p = profile_fetch(&ctx(), "/run/egress.sock".into());
-        assert_eq!(p.network, Network::Proxy("/run/egress.sock".into()));
+        let p = profile_fetch(&ctx(), "/skeleton".into(), proxy());
+        assert_eq!(p.network, Network::Proxy(proxy()));
         assert!(!p.rw_binds.iter().any(|b| b.dest.as_path() == Path::new("/src")));
         assert!(!p.ro_binds.iter().any(|b| b.dest.as_path() == Path::new("/src")));
         assert!(p.rw_binds.iter().any(|b| b.dest.as_path() == Path::new("/opt/cargo-home")));
+        // The skeleton is the fetch step's only input: read-only and the cwd.
+        assert!(p.ro_binds.iter().any(|b| b.dest.as_path() == Path::new("/skeleton")));
+        assert_eq!(p.chdir.as_deref(), Some(Path::new("/skeleton")));
+        assert_eq!(p.env.get("http_proxy").map(String::as_str), Some("http://127.0.0.1:3128"));
+    }
+
+    #[test]
+    fn run_egress_clears_offline_and_uses_the_proxy() {
+        let p = profile_run_egress(&ctx(), proxy());
+        assert_eq!(p.network, Network::Proxy(proxy()));
+        assert!(!p.env.contains_key("CARGO_NET_OFFLINE"));
+        assert_eq!(p.env.get("http_proxy").map(String::as_str), Some("http://127.0.0.1:3128"));
+        // Still the full run view.
+        assert!(p.rw_binds.iter().any(|b| b.dest.as_path() == Path::new("/src")));
     }
 
     #[test]

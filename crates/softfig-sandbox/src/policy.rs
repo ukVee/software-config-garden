@@ -65,10 +65,31 @@ pub enum Network {
     /// No network: `--unshare-all` gives a fresh netns with only loopback.
     #[default]
     None,
-    /// Allowlisted egress through a proxy socket (spec §7.2, slice 005). The
-    /// socket is handed to the in-namespace forwarder, not to bwrap, so it does
-    /// not change the rendered argv.
-    Proxy(PathBuf),
+    /// Allowlisted egress through the runner's CONNECT proxy (spec §7.2, slice
+    /// 005). The proxy is a Unix socket bind-mounted into the sandbox; an
+    /// in-namespace forwarder (spawned by the init shim) listens on loopback and
+    /// pumps to it. None of this changes the rendered argv — the socket is handed
+    /// to the forwarder, not to bwrap.
+    Proxy(ProxyConfig),
+}
+
+/// Where the runner's CONNECT proxy Unix socket is bind-mounted **in the
+/// sandbox** (a fixed path, like `/opt/cargo-home` and `/opt/toolchain`). The
+/// forwarder connects here; cargo's `http_proxy` points at the forwarder.
+pub const EGRESS_SOCKET: &str = "/softfig-egress.sock";
+
+/// The allowlisted-egress configuration for [`Network::Proxy`] (spec §7.2).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// The **host** path of the runner's CONNECT proxy Unix socket; the
+    /// fetch/egress profile bind-mounts it at [`EGRESS_SOCKET`].
+    pub socket: PathBuf,
+    /// The in-namespace forwarder binary path **in the sandbox** (bind-mounted
+    /// like the init shim); the shim spawns it when the policy uses a proxy.
+    pub forwarder: PathBuf,
+    /// The loopback TCP address the forwarder listens on. A fresh netns makes a
+    /// fixed port safe, so this is conventionally `127.0.0.1:3128`.
+    pub listen: String,
 }
 
 /// Syscalls to deny beyond the base profile. Consumed by the init shim's seccomp
@@ -116,6 +137,9 @@ pub struct Policy {
     pub proc: bool,
     /// Mount a fresh devtmpfs at `/dev` (null/zero/random/urandom).
     pub dev: bool,
+    /// `--chdir DIR`: the working directory the command starts in (e.g. the
+    /// fetch step's skeleton root). `None` inherits bwrap's cwd.
+    pub chdir: Option<PathBuf>,
 }
 
 impl Policy {
@@ -188,6 +212,12 @@ impl Policy {
             argv.push("--setenv".into());
             argv.push(k.clone());
             argv.push(v.clone());
+        }
+
+        // Working directory (e.g. the fetch step's skeleton root).
+        if let Some(dir) = &self.chdir {
+            argv.push("--chdir".into());
+            argv.push(dir.to_string_lossy().into_owned());
         }
 
         argv
@@ -292,6 +322,17 @@ mod tests {
             rest,
             &["--setenv", "HOME", "/home/job", "--setenv", "LANG", "C.UTF-8"]
         );
+    }
+
+    #[test]
+    fn render_emits_chdir_when_set() {
+        let mut p = Policy::default();
+        assert!(!p.render().contains(&"--chdir".to_string()));
+
+        p.chdir = Some(PathBuf::from("/skeleton"));
+        let argv = p.render();
+        let pos = argv.iter().position(|s| s == "--chdir").expect("--chdir present");
+        assert_eq!(argv[pos + 1], "/skeleton");
     }
 
     #[test]

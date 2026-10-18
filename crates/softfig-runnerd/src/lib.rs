@@ -24,6 +24,7 @@ pub mod cert;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod fetch;
 pub mod keys;
 pub mod proxy;
 pub mod state;
@@ -37,6 +38,7 @@ pub use admin::{
 pub use cert::{StoredCert, StoredRevocation};
 pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
+pub use fetch::{toolchain_add_command, toolchain_missing};
 pub use keys::RunnerKeys;
 pub use proxy::{host_allowed, EgressProxy};
 pub use state::{StateRoot, DEFAULT_STATE_ROOT};

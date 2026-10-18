@@ -23,7 +23,7 @@ use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
     ABI,
 };
-use softfig_sandbox::{build_seccomp_filter, Policy};
+use softfig_sandbox::{build_seccomp_filter, Network, Policy, EGRESS_SOCKET};
 
 /// The Landlock ABI this shim targets. `V5` covers every access right the
 /// runner needs (through `IoctlDev`, added in ABI 5 / kernel 6.7) without
@@ -38,6 +38,20 @@ fn main() -> Result<()> {
     let (policy_json, cmd) = parse_args(args)?;
     let policy: Policy =
         serde_json::from_str(&policy_json).context("failed to parse --policy JSON")?;
+
+    // The egress forwarder is *our* trusted helper, so it is spawned before
+    // Landlock and seccomp confine this process (which then execs the job
+    // command). It lives as a plain child across the exec and dies with the
+    // sandbox's teardown when the command exits.
+    if let Network::Proxy(cfg) = &policy.network {
+        // The forwarder connects to the proxy socket at its in-sandbox mount
+        // point (the host `cfg.socket` is bind-mounted there by the profile).
+        Command::new(&cfg.forwarder)
+            .arg(EGRESS_SOCKET)
+            .arg(&cfg.listen)
+            .spawn()
+            .context("failed to spawn the egress forwarder")?;
+    }
 
     apply_landlock(&policy)?;
 

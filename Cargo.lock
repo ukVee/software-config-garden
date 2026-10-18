@@ -3900,6 +3900,9 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
+ "softfig-source",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]

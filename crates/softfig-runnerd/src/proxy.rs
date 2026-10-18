@@ -23,6 +23,8 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::thread;
 
 use crate::error::{Error, Result};
@@ -45,48 +47,117 @@ pub fn host_allowed(host: &str, port: u16, allowlist: &[String]) -> bool {
     })
 }
 
-/// A CONNECT proxy with an allowlist. Listens on a TCP address; `run` serves
-/// each connection on its own thread (matching `softfig-net`'s concurrency
-/// model).
+/// A bidirectional byte stream the proxy can tunnel. Abstracted over
+/// [`TcpStream`] (the testable listener) and [`UnixStream`] (the production
+/// listener) so one `serve_conn` serves both.
+pub(crate) trait Duplex: Read + Write + Send + 'static {
+    fn try_clone(&self) -> std::io::Result<Self>
+    where
+        Self: Sized;
+    fn shutdown_write(&self) -> std::io::Result<()>;
+}
+
+impl Duplex for TcpStream {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        TcpStream::try_clone(self)
+    }
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
+}
+
+impl Duplex for UnixStream {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
+}
+
+/// Which kind of listener the proxy is bound to.
+enum Listener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+/// A client connection, tagged with its listener kind.
+pub enum Conn {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+/// A CONNECT proxy with an allowlist. Binds either a TCP address (testable) or
+/// a Unix socket (production — bind-mounted into the fetch sandbox); `run`
+/// serves each connection on its own thread (matching `softfig-net`'s
+/// concurrency model).
 pub struct EgressProxy {
-    listener: TcpListener,
+    listener: Listener,
     allowlist: Vec<String>,
 }
 
 impl EgressProxy {
-    /// Bind the proxy on `addr` with the given allowlist.
+    /// Bind the proxy on a TCP `addr` with the given allowlist (for tests).
     pub fn bind(addr: &str, allowlist: Vec<String>) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .map_err(|e| Error::Protocol(format!("egress proxy bind {addr}: {e}")))?;
-        Ok(Self { listener, allowlist })
+        Ok(Self { listener: Listener::Tcp(listener), allowlist })
     }
 
-    /// The bound address (for tests and the fetch harness's `http_proxy` env).
+    /// Bind the proxy on a Unix socket at `path` (production — the fetch
+    /// harness bind-mounts the socket into the sandbox). The parent directory
+    /// must exist; a stale socket is not unlinked (the caller owns the path).
+    pub fn bind_unix(path: &Path, allowlist: Vec<String>) -> Result<Self> {
+        let listener = UnixListener::bind(path)
+            .map_err(|e| Error::Protocol(format!("egress proxy bind unix {}: {e}", path.display())))?;
+        Ok(Self { listener: Listener::Unix(listener), allowlist })
+    }
+
+    /// The bound TCP address (for tests and the fetch harness's `http_proxy` env).
     pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
-        Ok(self.listener.local_addr()?)
+        match &self.listener {
+            Listener::Tcp(l) => Ok(l.local_addr()?),
+            Listener::Unix(_) => Err(Error::Protocol("a unix-socket proxy has no TCP address".into())),
+        }
     }
 
-    /// The underlying listener, so a test can bound an accept.
+    /// The underlying TCP listener, so a test can bound an accept.
     pub fn listener(&self) -> &TcpListener {
-        &self.listener
+        match &self.listener {
+            Listener::Tcp(l) => l,
+            Listener::Unix(_) => panic!("listener() is TCP-only; use accept() for the unix listener"),
+        }
+    }
+
+    /// Accept one client connection on either listener kind.
+    pub fn accept(&self) -> std::io::Result<Conn> {
+        match &self.listener {
+            Listener::Tcp(l) => l.accept().map(|(s, _)| Conn::Tcp(s)),
+            Listener::Unix(l) => l.accept().map(|(s, _)| Conn::Unix(s)),
+        }
     }
 
     /// Serve connections until the listener errors.
     pub fn run(self: std::sync::Arc<Self>) -> Result<()> {
-        for conn in self.listener.incoming() {
-            let conn = conn?;
+        loop {
+            let conn = match self.accept() {
+                Ok(c) => c,
+                Err(e) => return Err(Error::Io(e)),
+            };
             let me = std::sync::Arc::clone(&self);
             thread::spawn(move || {
-                let _ = me.serve_conn(conn);
+                let _ = match conn {
+                    Conn::Tcp(s) => me.serve_conn(s),
+                    Conn::Unix(s) => me.serve_conn(s),
+                };
             });
         }
-        Ok(())
     }
 
     /// Serve one client connection: read the CONNECT request, refuse a
     /// non-allowlisted host with `403`, otherwise establish the tunnel and pump
-    /// bytes bidirectionally.
-    pub fn serve_conn(&self, mut stream: TcpStream) -> Result<()> {
+    /// bytes bidirectionally. Crate-internal: the public entry is [`Self::run`].
+    pub(crate) fn serve_conn<S: Duplex>(&self, mut stream: S) -> Result<()> {
         let (host, port) = read_connect_target(&mut stream)?;
         if !host_allowed(&host, port, &self.allowlist) {
             let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
@@ -108,7 +179,7 @@ impl EgressProxy {
 
 /// Read and parse the CONNECT request head (`CONNECT host:port HTTP/1.1` +
 /// headers through the blank line). Returns the target `(host, port)`.
-fn read_connect_target(stream: &mut TcpStream) -> Result<(String, u16)> {
+fn read_connect_target<R: Read>(stream: &mut R) -> Result<(String, u16)> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while buf.len() < 64 * 1024 {
@@ -151,7 +222,7 @@ fn split_host_port(target: &str) -> Result<(String, u16)> {
 }
 
 /// Bidirectionally pump bytes between two streams until either side closes.
-fn pump(mut a: TcpStream, mut b: TcpStream) {
+fn pump<A: Duplex, B: Duplex>(mut a: A, mut b: B) {
     let mut a_read = match a.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -162,11 +233,11 @@ fn pump(mut a: TcpStream, mut b: TcpStream) {
     };
     let a_to_b = thread::spawn(move || {
         let _ = std::io::copy(&mut a, &mut b_read);
-        let _ = b_read.shutdown(Shutdown::Write);
+        let _ = b_read.shutdown_write();
     });
     let b_to_a = thread::spawn(move || {
         let _ = std::io::copy(&mut b, &mut a_read);
-        let _ = a_read.shutdown(Shutdown::Write);
+        let _ = a_read.shutdown_write();
     });
     let _ = a_to_b.join();
     let _ = b_to_a.join();
@@ -262,5 +333,27 @@ mod tests {
 
         echo_thread.join().unwrap();
         serve.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn unix_socket_refuses_a_non_allowlisted_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress.sock");
+        let proxy = EgressProxy::bind_unix(&path, vec!["index.crates.io".into()]).unwrap();
+        let proxy = std::sync::Arc::new(proxy);
+        let me = std::sync::Arc::clone(&proxy);
+        let serve = thread::spawn(move || match me.accept().unwrap() {
+            Conn::Unix(s) => me.serve_conn(s),
+            Conn::Tcp(_) => panic!("expected a unix conn"),
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp);
+        serve.join().unwrap().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403"), "resp = {resp:?}");
     }
 }

@@ -17,3 +17,8 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Slice 005: the fetch-harness integration test extracts a skeleton
+# (softfig-source) and fetches it through the sandbox proxy stack.
+softfig-source = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }

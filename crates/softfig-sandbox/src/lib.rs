@@ -26,9 +26,9 @@ mod policy;
 mod profiles;
 mod seccomp;
 
-pub use policy::{Bind, BindMode, FsRule, Network, Policy, SeccompDeny, TmpfsMount};
+pub use policy::{Bind, BindMode, FsRule, Network, Policy, ProxyConfig, SeccompDeny, TmpfsMount, EGRESS_SOCKET};
 pub use profiles::{
     profile_collect, profile_fetch, profile_ingest, profile_materialize, profile_run,
-    JobContext,
+    profile_run_egress, JobContext,
 };
 pub use seccomp::build_seccomp_filter;
