@@ -17,10 +17,11 @@ use std::process::Command;
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
+use softfig_net::proto::{frame, Frame, JobAttach, JobCancel, JobLog};
 use softfig_net::runner_cert::RunnerCert;
 use softfig_net::{
     offer_signing_bytes, run_job_collecting, static_attestation_message, testing, CachedRunner,
-    JobOutcome, JobRejectReason, LocalDevice, RunnerCache,
+    JobOutcome, JobRejectReason, JobState, LocalDevice, RunnerCache,
 };
 use softfig_source::{create_bundle, repo_key, root_commits, snapshot_repo, SubmodulePolicy};
 use softfig_runnerd::cert::StoredCert;
@@ -880,3 +881,264 @@ fn loopback_job_streams_logs_and_returns_verified_attestation() {
     assert!(!tampered.verify(&cert.runner_attest_pubkey));
 }
 
+
+
+/// Copy the sandbox helper binaries into `dir`, beside the staged runnerd, so
+/// the transient unit's `--run-job` payload (which resolves them via
+/// `next_to_runnerd`) can reach them when it runs a bwrap step.
+fn stage_sandbox_bins(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bins = sandbox_bins();
+    for (src, name) in [
+        (bins.init, "softfig-sandbox-init"),
+        (bins.forwarder, "softfig-sandbox-forward"),
+        (bins.collect, "softfig-sandbox-collect"),
+    ] {
+        let dst = dir.join(name);
+        std::fs::copy(&src, &dst).unwrap();
+        let mut perms = std::fs::metadata(&dst).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dst, perms).unwrap();
+    }
+}
+
+/// The slice-006 chunk-4 "done when": a loopback job is cancelled mid-run and
+/// leaves no stray pid in its cgroup. A no-manifest tree with a long `sleep`
+/// runs inside a `systemd-run --user` unit; a second connection sends
+/// `JobCancel`, which stops the unit. Skips loudly when systemd-run/bwrap are
+/// unavailable.
+#[test]
+fn loopback_job_can_be_cancelled_mid_run() {
+    if systemd_skip() {
+        return;
+    }
+    if sandbox_skip() {
+        return;
+    }
+
+    let req = Requester::new(60, 61);
+    let shm_root = std::path::PathBuf::from("/dev/shm").join(format!(
+        "softfig-wire-cancel-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&shm_root).unwrap();
+    let fx =
+        RunnerFixture::new_transient_unit(shm_root.clone(), [0x60; 16], NOW + 90 * 24 * 60 * 60);
+    // Stage the sandbox helpers beside the staged runnerd so the payload can run
+    // the (bwrap) run step.
+    stage_sandbox_bins(&shm_root);
+    fx.grant(&req);
+    fx.serve_one(); // the job connection
+    fx.serve_one(); // the cancel connection
+
+    let snap = SnapshotFixture::new([60u8; 32]);
+    let mut offer = snap.offer();
+    offer.cmd = vec!["sh".into(), "-c".into(), "sleep 30".into()];
+    offer.signature = req.sign_offer(&offer);
+    let job_id = offer.job_id.clone();
+
+    let (mut job_session, _cert) = connect(&req, &fx, None, &[]);
+    let offer2 = offer.clone();
+    let job_handle = std::thread::spawn(move || {
+        run_job_collecting(&mut job_session, &offer2, |haves| snap.make_bundle(haves))
+    });
+
+    // Wait for the transient unit to be running before cancelling.
+    let unit = format!("softfig-runner-{}", hex::encode(&job_id));
+    let mut saw_active = false;
+    for _ in 0..150 {
+        let out = Command::new("systemctl")
+            .args(["--user", "show", &unit, "--property=ActiveState"])
+            .output();
+        if let Ok(o) = out {
+            let t = String::from_utf8_lossy(&o.stdout).to_string();
+            if t.contains("ActiveState=active") {
+                saw_active = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(saw_active, "the job's transient unit should be active before cancel");
+
+    // Cancel over a second connection.
+    let (mut cancel_session, _c) = connect(&req, &fx, None, &[]);
+    match cancel_session.recv_frame().unwrap().kind {
+        Some(frame::Kind::RunnerCaps(_)) => {}
+        other => panic!("expected RunnerCaps, got {other:?}"),
+    }
+    cancel_session
+        .send_frame(&Frame::job_cancel(JobCancel { job_id: job_id.clone() }))
+        .unwrap();
+    let ev = match cancel_session.recv_frame().unwrap().kind {
+        Some(frame::Kind::JobEvent(e)) => e,
+        other => panic!("expected JobEvent, got {other:?}"),
+    };
+    assert_eq!(ev.state, JobState::Cancelled as u32, "cancel must report cancelled");
+
+    // The job thread's run returns the (cancelled) result.
+    let (_caps, outcome, _logs, _events) = job_handle.join().unwrap().unwrap();
+    let result = match outcome {
+        JobOutcome::Accepted(r) => r,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    assert_eq!(
+        result.exit_code,
+        softfig_runnerd::CANCELLED_EXIT,
+        "a cancelled job reports the cancelled exit code"
+    );
+
+    // No stray pids: the unit is gone and its cgroup is empty.
+    let out = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &unit,
+            "--property=ActiveState",
+            "--property=TasksCurrent",
+        ])
+        .output()
+        .unwrap();
+    let t = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        t.contains("ActiveState=inactive") || t.contains("ActiveState=failed"),
+        "the unit must be stopped after cancel: {t}"
+    );
+    // No stray pids: the cgroup is empty (TasksCurrent=0) or already torn down
+    // (property not set) — never a positive count.
+    assert!(
+        t.contains("TasksCurrent=0") || t.contains("TasksCurrent=[not set]"),
+        "no stray pids may remain in the cgroup after cancel: {t}"
+    );
+
+    let _ = std::fs::remove_dir_all(&shm_root);
+}
+
+/// The slice-006 chunk-4 "done when": a finished job can be re-attached from a
+/// `from_seq`, replaying exactly the retained tail (seq >= from_seq) and the
+/// stored result. Direct mode (in-process executor) keeps the job in the table.
+#[test]
+fn loopback_job_can_be_reattached_from_a_seq() {
+    if sandbox_skip() {
+        return;
+    }
+
+    let req = Requester::new(52, 53);
+    let fx = RunnerFixture::new([0x52; 16], NOW + 90 * 24 * 60 * 60);
+    fx.grant(&req);
+
+    // Connection 1: run the job and collect its logs.
+    fx.serve_one();
+    let (mut session, _cert) = connect(&req, &fx, None, &[]);
+    let snap = SnapshotFixture::new([52u8; 32]);
+    let mut offer = snap.offer();
+    offer.cmd = vec![
+        "sh".into(),
+        "-c".into(),
+        "echo AAA; sleep 0.3; echo BBB; sleep 0.3; echo CCC".into(),
+    ];
+    offer.signature = req.sign_offer(&offer);
+    let (_caps, outcome, logs, _events) =
+        run_job_collecting(&mut session, &offer, |haves| snap.make_bundle(haves)).unwrap();
+    let result = match outcome {
+        JobOutcome::Accepted(r) => r,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    assert_eq!(result.exit_code, 0, "the echo job must exit 0");
+    drop(session);
+
+    let stdout_seqs: Vec<u64> = logs.iter().filter(|l| l.stream == 0).map(|l| l.seq).collect();
+    assert!(
+        stdout_seqs.len() >= 2,
+        "expected multiple stdout chunks, got seqs {stdout_seqs:?}"
+    );
+
+    // Connection 2: attach from seq 1.
+    fx.serve_one();
+    let (mut session2, _cert2) = connect(&req, &fx, None, &[]);
+    match session2.recv_frame().unwrap().kind {
+        Some(frame::Kind::RunnerCaps(_)) => {}
+        other => panic!("expected RunnerCaps, got {other:?}"),
+    }
+    session2
+        .send_frame(&Frame::job_attach(JobAttach { job_id: offer.job_id.clone(), from_seq: 1 }))
+        .unwrap();
+    let mut replayed: Vec<JobLog> = Vec::new();
+    let result2 = loop {
+        match session2.recv_frame().unwrap().kind {
+            Some(frame::Kind::JobLog(l)) => replayed.push(l),
+            Some(frame::Kind::JobResult(r)) => break r,
+            other => panic!("expected JobLog/JobResult, got {other:?}"),
+        }
+    };
+    assert_eq!(result2.job_id, offer.job_id);
+    assert_eq!(
+        result2.attestation, result.attestation,
+        "attach must re-deliver the same signed attestation"
+    );
+
+    // Replayed chunks all carry seq >= 1, and their bytes match the original tail.
+    assert!(replayed.iter().all(|l| l.seq >= 1), "from_seq=1 must not replay seq 0");
+    let replayed_stdout: String = replayed
+        .iter()
+        .filter(|l| l.stream == 0)
+        .flat_map(|l| l.bytes.iter().copied())
+        .map(char::from)
+        .collect();
+    let original_tail: String = logs
+        .iter()
+        .filter(|l| l.stream == 0 && l.seq >= 1)
+        .flat_map(|l| l.bytes.iter().copied())
+        .map(char::from)
+        .collect();
+    assert_eq!(replayed_stdout, original_tail, "attach replays exactly the seq>=1 tail");
+    assert!(
+        replayed_stdout.contains("BBB") && replayed_stdout.contains("CCC"),
+        "the replayed tail carries the later chunks: {replayed_stdout:?}"
+    );
+}
+
+/// The slice-006 chunk-4 "done when": every job leaves a `jobs.ndjson` row whose
+/// `attestation_hash` matches the returned attestation's digest (spec §6 step 9).
+#[test]
+fn loopback_job_leaves_a_jobs_ndjson_row() {
+    if sandbox_skip() {
+        return;
+    }
+
+    let req = Requester::new(54, 55);
+    let fx = RunnerFixture::new([0x54; 16], NOW + 90 * 24 * 60 * 60);
+    fx.grant(&req);
+    fx.serve_one();
+
+    let (mut session, _cert) = connect(&req, &fx, None, &[]);
+    let snap = SnapshotFixture::new([54u8; 32]);
+    let mut offer = snap.offer();
+    offer.cmd = vec!["sh".into(), "-c".into(), "echo NDJSON_TEST".into()];
+    offer.signature = req.sign_offer(&offer);
+    let (_caps, outcome, _logs, _events) =
+        run_job_collecting(&mut session, &offer, |haves| snap.make_bundle(haves)).unwrap();
+    let result = match outcome {
+        JobOutcome::Accepted(r) => r,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    let signed = softfig_runnerd::SignedAttestation::from_bytes(&result.attestation).unwrap();
+    let expected_hash = hex::encode(signed.attestation.hash().unwrap());
+
+    let text = std::fs::read_to_string(fx.root.log_dir().join("jobs.ndjson")).unwrap();
+    let mut found = None;
+    for line in text.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["job_id"] == serde_json::Value::String(hex::encode(&offer.job_id)) {
+            found = Some(v);
+        }
+    }
+    let row = found.expect("the job must leave a jobs.ndjson row");
+    assert_eq!(
+        row["attestation_hash"], expected_hash,
+        "attestation_hash must match the returned attestation"
+    );
+    assert_eq!(row["where_route"], "lan");
+    assert_eq!(row["cache_mode"], "shared");
+    assert_eq!(row["exit"]["code"], 0);
+}

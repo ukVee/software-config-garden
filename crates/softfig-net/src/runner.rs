@@ -91,6 +91,22 @@ impl JobRejectReason {
     }
 }
 
+/// The job lifecycle states (spec remote-runner §6). The discriminant is the
+/// `JobEvent.state` wire value. `Lost` is the terminal state for a job the
+/// runner no longer holds (expired past the TTL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobState {
+    Queued = 0,
+    Ingesting = 1,
+    Fetching = 2,
+    Running = 3,
+    Collecting = 4,
+    Done = 5,
+    Failed = 6,
+    Cancelled = 7,
+    Lost = 8,
+}
+
 // --- Certificate conversion + verification --------------------------------
 
 /// Decode a fixed-size byte field, mapping a wrong length to a protocol error.

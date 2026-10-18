@@ -27,6 +27,7 @@ pub mod daemon;
 pub mod error;
 pub mod executor;
 pub mod fetch;
+pub mod jobs;
 pub mod keys;
 pub mod log;
 pub mod proxy;
@@ -48,12 +49,14 @@ pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
 pub use executor::{parse_duration, parse_size, Artifact, RunOutcome, SandboxBinaries};
 pub use fetch::{toolchain_add_command, toolchain_missing};
+pub use jobs::{append_ndjson, Job, JobRecord, JobTable};
 pub use keys::RunnerKeys;
-pub use log::{DEFAULT_LOG_RING_BYTES, JobLogs, LogChunk, LogSink};
+pub use log::{read_framed_chunks, write_framed_chunk, DEFAULT_LOG_RING_BYTES, JobLogs, LogChunk, LogSink};
 pub use proxy::{host_allowed, EgressProxy};
 pub use state::{StateRoot, DEFAULT_STATE_ROOT};
 pub use systemd::{
-    battery_reject, on_battery, run_unit, Caps, CapsHit, EnvSpec, JobReport, JobSpec,
-    Manager, UnitResult, OOM_EXIT, POWER_SUPPLY_PATH, TIMEOUT_EXIT,
+    battery_reject, on_battery, run_unit, stop_unit, unit_name, Caps, CapsHit, EnvSpec,
+    JobReport, JobSpec, Manager, UnitResult, CANCELLED_EXIT, OOM_EXIT, POWER_SUPPLY_PATH,
+    TIMEOUT_EXIT,
 };
 pub use wire::WireServer;

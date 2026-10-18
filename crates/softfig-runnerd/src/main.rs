@@ -192,7 +192,16 @@ fn run_job_mode(spec_path: &Path, result_path: &Path) -> Result<u8, String> {
         ..Default::default()
     };
 
-    let report = match softfig_runnerd::executor::execute(&spec.ctx, &serve, &offer, &bins, None) {
+    // The run step's output is streamed, framed, to `run.log` beside the result,
+    // so the runner can stream it back after the unit completes (unit-mode log
+    // capture). Create it up front so an empty job still leaves a (empty) file.
+    let log_path = result_path.with_file_name("run.log");
+    let log_file =
+        std::fs::File::create(&log_path).map_err(|e| format!("create log file: {e}"))?;
+    let logs = softfig_runnerd::JobLogs::new();
+    let sink = logs.sink().with_file(log_file);
+
+    let report = match softfig_runnerd::executor::execute(&spec.ctx, &serve, &offer, &bins, Some(&sink)) {
         Ok(outcome) => softfig_runnerd::JobReport::ok(outcome),
         Err(softfig_runnerd::Error::ToolchainMissing(cmd)) => {
             softfig_runnerd::JobReport::err(format!("toolchain-missing: {cmd}"))

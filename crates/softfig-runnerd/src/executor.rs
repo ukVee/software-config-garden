@@ -251,6 +251,10 @@ fn run_step(
     if offer.cmd.is_empty() {
         return Ok((0, None, None));
     }
+    // The egress run step must bind-mount the in-namespace forwarder, or the
+    // proxy the profile points at never launches (report #060 — the chunk-1
+    // copy hard-coded `false`).
+    let with_forwarder = offer.network == "egress";
     let mut policy = match (&offer.network, proxy) {
         (n, Some(cfg)) if n == "egress" => profile_run_egress(ctx, cfg),
         _ => profile_run(ctx),
@@ -265,9 +269,9 @@ fn run_step(
     let sandbox_policy = hex::encode(*blake3::hash(&serde_jcs::to_vec(&policy)?).as_bytes());
 
     let (code, signal) = match log {
-        Some(sink) => run_streaming(&policy, &offer.cmd, bins, false, sink)?,
+        Some(sink) => run_streaming(&policy, &offer.cmd, bins, with_forwarder, sink)?,
         None => {
-            let out = run_sandboxed(&policy, &offer.cmd, bins, false, false)?;
+            let out = run_sandboxed(&policy, &offer.cmd, bins, with_forwarder, false)?;
             (exit_code(&out), out.status.signal())
         }
     };

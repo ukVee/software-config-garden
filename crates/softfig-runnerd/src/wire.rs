@@ -17,10 +17,16 @@
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use softfig_net::proto::{frame, Frame, JobAccept, JobLog, JobReject, JobResult, RunnerCaps, RunnerHandshake, SourceHave};
+use softfig_net::proto::{
+    frame, Frame, JobAccept, JobAttach, JobCancel, JobEvent, JobLog, JobReject, JobResult,
+    RunnerCaps, RunnerHandshake, SourceHave,
+};
+use softfig_net::JobState;
 use softfig_sandbox::JobContext;
 use softfig_source::SourceBackend;
 
@@ -31,13 +37,17 @@ use crate::cert::StoredCert;
 use crate::config::{AcceptConfig, ServeConfig};
 use crate::error::{Error, Result};
 use crate::executor::{self, SandboxBinaries};
+use crate::jobs::{append_ndjson, Job, JobRecord, JobTable};
 use crate::keys::RunnerKeys;
-use crate::log::{JobLogs, LogSink};
+use crate::log::{read_framed_chunks, JobLogs, LogSink};
 use crate::state::StateRoot;
 use crate::systemd::{
-    battery_reject, on_battery, run_unit, Caps, CapsHit, EnvSpec, JobReport, JobSpec, Manager,
-    UnitResult, POWER_SUPPLY_PATH,
+    battery_reject, on_battery, run_unit, stop_unit, unit_name, Caps, CapsHit, EnvSpec, JobReport,
+    JobSpec, Manager, UnitResult, POWER_SUPPLY_PATH,
 };
+
+/// The default hold for a finished job's result + log tail (spec §6 TTL).
+const DEFAULT_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// The runner's job listener. Owns its `TcpListener` and the long-lived
 /// transport static; the certificate and the `accept.toml` / `serve.toml`
@@ -60,6 +70,10 @@ pub struct WireServer {
     /// (`--run-job`). Production uses `current_exe`; tests point it at the
     /// built binary.
     runnerd_bin: PathBuf,
+    /// The job table (attach/cancel/TTL, spec §6).
+    jobs: JobTable,
+    /// How long a finished job's result + log tail are held (spec §6 TTL).
+    ttl_secs: i64,
 }
 
 impl WireServer {
@@ -96,6 +110,8 @@ impl WireServer {
             manager: Manager::Direct,
             power_supply_path: PathBuf::from(POWER_SUPPLY_PATH),
             runnerd_bin: std::env::current_exe().unwrap_or_else(|_| "softfig-runnerd".into()),
+            jobs: JobTable::new(),
+            ttl_secs: DEFAULT_TTL_SECS,
         })
     }
 
@@ -112,6 +128,11 @@ impl WireServer {
     /// Point the transient-unit payload at a specific runnerd binary (tests).
     pub fn set_runnerd_bin(&mut self, bin: PathBuf) {
         self.runnerd_bin = bin;
+    }
+
+    /// Point the TTL at a short window (tests). Default 24 h (spec §6).
+    pub fn set_ttl_secs(&mut self, secs: i64) {
+        self.ttl_secs = secs;
     }
 
     /// The bound address (useful for tests and for the mDNS announce).
@@ -162,42 +183,48 @@ impl WireServer {
         let accept = AcceptConfig::load(&self.root.accept_toml())?;
         let serve = ServeConfig::load(&self.root.serve_toml())?;
 
-        // Advertise capabilities (public), then read the offer.
-        session.send_frame(&Frame::runner_caps(self.runner_caps(&serve)))?;
-        let offer = match session.recv_frame()?.kind {
-            Some(frame::Kind::JobOffer(o)) => o,
-            _ => return Err(Error::Protocol("expected JobOffer".into())),
-        };
+        // Sweep jobs whose TTL elapsed before serving this connection.
+        self.sweep_expired();
 
-        match self.authorize(&offer, &device_id, session.peer_static(), &accept, &serve) {
-            None => {
-                // Power state (spec §6 step 1): refuse on battery when the
-                // `[serve]` table says refuse, before any source transfer.
-                let on_batt = on_battery(&self.power_supply_path)?;
-                if let Some(reason) = battery_reject(&serve, on_batt) {
-                    session.send_frame(&Frame::job_reject(JobReject {
-                        job_id: offer.job_id.clone(),
-                        reason: reason.to_u32(),
-                    }))?;
-                    return Ok(());
+        // Advertise capabilities (public), then read the first frame: an offer
+        // (a new job) or an attach/cancel for an existing one (spec §6).
+        session.send_frame(&Frame::runner_caps(self.runner_caps(&serve)))?;
+        let first = session.recv_frame()?;
+        match first.kind {
+            Some(frame::Kind::JobOffer(offer)) => {
+                match self.authorize(&offer, &device_id, session.peer_static(), &accept, &serve) {
+                    None => {
+                        // Power state (spec §6 step 1): refuse on battery when the
+                        // `[serve]` table says refuse, before any source transfer.
+                        let on_batt = on_battery(&self.power_supply_path)?;
+                        if let Some(reason) = battery_reject(&serve, on_batt) {
+                            session.send_frame(&Frame::job_reject(JobReject {
+                                job_id: offer.job_id.clone(),
+                                reason: reason.to_u32(),
+                            }))?;
+                            return Ok(());
+                        }
+                        session.send_frame(&Frame::job_accept(JobAccept {
+                            job_id: offer.job_id.clone(),
+                            queue_pos: 0,
+                        }))?;
+                        self.serve_source(session, &offer, &serve, on_batt, device_id, &cert)?;
+                    }
+                    Some(reason) => {
+                        session.send_frame(&Frame::job_reject(JobReject {
+                            job_id: offer.job_id,
+                            reason: reason.to_u32(),
+                        }))?;
+                    }
                 }
-                session.send_frame(&Frame::job_accept(JobAccept {
-                    job_id: offer.job_id.clone(),
-                    queue_pos: 0,
-                }))?;
-                // Slice 004: the source step — negotiate have/want, read the
-                // bundle, ingest + verify (rejecting `source-mismatch`), and
-                // materialize. Slice 006 then runs the real fetch → run →
-                // collect sequence (in the transient unit) and returns the
-                // real result.
-                self.serve_source(session, &offer, &serve, on_batt, device_id, &cert)?;
             }
-            Some(reason) => {
-                session.send_frame(&Frame::job_reject(JobReject {
-                    job_id: offer.job_id,
-                    reason: reason.to_u32(),
-                }))?;
+            Some(frame::Kind::JobAttach(attach)) => {
+                self.serve_attach(session, attach, &device_id, &accept, &serve)?;
             }
+            Some(frame::Kind::JobCancel(cancel)) => {
+                self.serve_cancel(session, cancel, &device_id, &accept, &serve)?;
+            }
+            _ => return Err(Error::Protocol("expected JobOffer, JobAttach or JobCancel".into())),
         }
         Ok(())
     }
@@ -223,12 +250,10 @@ impl WireServer {
         Ok(device_id)
     }
 
-    /// Decide accept vs reject for an offer. The order of checks is the closed
-    /// reason list: disabled first, then the allowlist (identity + static), then
-    /// the offer signature against the granted identity.
-    fn authorize(
+    /// The allowlist + enabled check shared by offer/attach/cancel (spec §6).
+    /// `None` means the requester is granted and the runner is enabled.
+    fn granted(
         &self,
-        offer: &softfig_net::proto::JobOffer,
         device_id: &[u8; 32],
         peer_static: &[u8; 32],
         accept: &AcceptConfig,
@@ -244,10 +269,26 @@ impl WireServer {
         else {
             return Some(softfig_net::JobRejectReason::NotGranted);
         };
-        // The handshake static must be the one `grant` recorded for this
-        // identity, and the offer must be signed by that identity.
+        // The handshake static must be the one `grant` recorded for this identity.
         if hex::decode(&granted.transport_pubkey).ok().as_deref() != Some(peer_static) {
             return Some(softfig_net::JobRejectReason::NotGranted);
+        }
+        None
+    }
+
+    /// Decide accept vs reject for an offer. The order of checks is the closed
+    /// reason list: disabled first, then the allowlist (identity + static), then
+    /// the offer signature against the granted identity.
+    fn authorize(
+        &self,
+        offer: &softfig_net::proto::JobOffer,
+        device_id: &[u8; 32],
+        peer_static: &[u8; 32],
+        accept: &AcceptConfig,
+        serve: &ServeConfig,
+    ) -> Option<softfig_net::JobRejectReason> {
+        if let Some(reason) = self.granted(device_id, peer_static, accept, serve) {
+            return Some(reason);
         }
         if !softfig_net::verify_offer_sig(offer, device_id, &offer.signature) {
             return Some(softfig_net::JobRejectReason::NotGranted);
@@ -377,52 +418,104 @@ impl WireServer {
         // Split the Noise session: the source transfer is done, and from here the
         // runner only sends (live logs, then the result). The drain thread owns
         // the write half and streams `JobLog` frames as the run produces them;
-        // it hands the writer back once the log channel closes.
+        // it hands the writer back once the job is done.
         let (reader, writer) = session
             .split()
             .map_err(|e| Error::Protocol(format!("session split: {e}")))?;
         drop(reader);
 
-        let (mut logs, rx) = JobLogs::new();
-        let job_id = offer.job_id.clone();
+        // The shared log collector, registered in the job table before the run so
+        // attach/cancel can find the job while it is still running (spec §6).
+        let logs = JobLogs::new();
+        let job = Arc::new(Job {
+            job_id: offer.job_id.clone(),
+            requester_device,
+            unit: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            logs: logs.clone(),
+            started_at: now_unix(),
+            finished_at: Mutex::new(None),
+            result: Mutex::new(None),
+        });
+        self.jobs.insert(job.clone());
+
+        let done = Arc::new(AtomicBool::new(false));
+        let drain_done = Arc::clone(&done);
+        let drain_job_id = offer.job_id.clone();
+        let rx = logs.subscribe();
         let drain = std::thread::spawn(move || {
             let mut w = writer;
-            for chunk in rx {
-                if w.send_frame(&Frame::job_log(JobLog {
-                    job_id: job_id.clone(),
-                    seq: chunk.seq,
-                    stream: chunk.stream as u32,
-                    bytes: chunk.bytes,
-                }))
-                .is_err()
-                {
-                    // The requester disconnected mid-run; stop streaming (the
-                    // job runs to completion regardless — detach is chunk 4).
-                    break;
+            loop {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(chunk) => {
+                        let f = Frame::job_log(JobLog {
+                            job_id: drain_job_id.clone(),
+                            seq: chunk.seq,
+                            stream: chunk.stream as u32,
+                            bytes: chunk.bytes,
+                        });
+                        if w.send_frame(&f).is_err() {
+                            // The requester disconnected mid-run; stop streaming
+                            // (the job runs to completion regardless — detach).
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if drain_done.load(Ordering::SeqCst) {
+                            // Drain any queued chunks before handing back the writer.
+                            while let Ok(chunk) = rx.try_recv() {
+                                let f = Frame::job_log(JobLog {
+                                    job_id: drain_job_id.clone(),
+                                    seq: chunk.seq,
+                                    stream: chunk.stream as u32,
+                                    bytes: chunk.bytes,
+                                });
+                                if w.send_frame(&f).is_err() {
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
             w
         });
 
         // Direct mode streams the run step's output live into the sink; the
-        // transient-unit path buffers (unit log capture + attach/cancel land in
-        // chunk 4).
-        let log = match self.manager {
-            Manager::Direct => Some(logs.sink()),
-            Manager::System | Manager::User => None,
-        };
+        // transient-unit path runs in the unit and reads the payload's framed log
+        // file back after the unit completes (unit-mode log capture).
         let started_at = now_unix();
-        let run = self.run_job(&ctx, serve, offer, on_battery, &job_dir, log.as_ref());
+        let unit = if matches!(self.manager, Manager::System | Manager::User) {
+            let name = unit_name(&offer.job_id);
+            *job.unit.lock().unwrap() = Some(name.clone());
+            Some(name)
+        } else {
+            None
+        };
+        let run = match self.manager {
+            Manager::Direct => {
+                self.run_job(&ctx, serve, offer, on_battery, &job_dir, Some(&logs.sink()), None, &job)
+            }
+            Manager::System | Manager::User => {
+                let r = self.run_job(&ctx, serve, offer, on_battery, &job_dir, None, unit.as_deref(), &job);
+                // Stream the payload's framed log file back into the shared sink.
+                let _ = stream_unit_log(&job_dir, &logs);
+                r
+            }
+        };
         let finished_at = now_unix();
 
-        // Every producer clone is dropped when run_job returns; drop our sink
-        // clone and then close the master sender so the drain thread's channel
-        // closes and it hands back the writer.
-        drop(log);
-        logs.close();
+        // Mark the job done and join the drain before sending the result.
+        *job.finished_at.lock().unwrap() = Some(finished_at);
+        done.store(true, Ordering::SeqCst);
         let writer = match drain.join() {
             Ok(w) => w,
-            Err(_) => return Err(Error::Protocol("log drain thread panicked".into())),
+            Err(_) => {
+                self.jobs.remove(&offer.job_id);
+                return Err(Error::Protocol("log drain thread panicked".into()));
+            }
         };
 
         match run {
@@ -434,7 +527,7 @@ impl WireServer {
                         hit.as_str()
                     );
                 }
-                let attestation = build_attestation(
+                let mut attestation = build_attestation(
                     offer,
                     &source_id,
                     &repo_key,
@@ -446,14 +539,50 @@ impl WireServer {
                     started_at,
                     finished_at,
                 )?;
+                // A cancelled job (unit stopped mid-run) records `cancelled`.
+                let cancelled =
+                    job.is_cancelled() && !matches!(self.manager, Manager::Direct);
+                if cancelled {
+                    attestation.exit = ExitInfo::reason("cancelled");
+                }
+                let exit_code =
+                    if cancelled { crate::systemd::CANCELLED_EXIT } else { outcome.exit_code };
+
+                // The durable run-log row (spec §6 step 9). `attestation_hash` is
+                // the bare canonical digest, distinct from the signing message.
+                let mut env_names: Vec<String> = offer.env.iter().map(|e| e.name.clone()).collect();
+                env_names.sort_unstable();
+                let record = JobRecord {
+                    job_id: attestation.job_id.clone(),
+                    requester_device: attestation.requester_device.clone(),
+                    repo_key: attestation.repo_key.clone(),
+                    source_id: source_id.hex(),
+                    snapshot_commit: hex::encode(&offer.snapshot_commit),
+                    profile: attestation.profile.clone(),
+                    cmd: attestation.cmd.clone(),
+                    env_names,
+                    toolchain: attestation.toolchain.clone(),
+                    caps_hit: caps_hit.map(|h| h.as_str().to_string()),
+                    cache_mode: offer.cache.clone(),
+                    started_at: attestation.started_at,
+                    finished_at: attestation.finished_at,
+                    exit: attestation.exit.clone(),
+                    log_blake3: attestation.log_blake3.clone(),
+                    attestation_hash: hex::encode(attestation.hash()?),
+                    where_route: "lan".to_string(),
+                };
+                append_ndjson(&self.root, &record)?;
+
                 let signature = attestation.sign(&self.attest_signing)?;
                 let signed = SignedAttestation { attestation, signature: hex::encode(signature) };
-                let mut w = writer;
-                w.send_frame(&Frame::job_result(JobResult {
+                let result = JobResult {
                     job_id: offer.job_id.clone(),
-                    exit_code: outcome.exit_code,
+                    exit_code,
                     attestation: signed.to_bytes()?,
-                }))?;
+                };
+                *job.result.lock().unwrap() = Some(result.clone());
+                let mut w = writer;
+                w.send_frame(&Frame::job_result(result))?;
             }
             Err(Error::ToolchainMissing(add_cmd)) => {
                 // The `JobReject` frame has no message field, so the exact
@@ -462,23 +591,29 @@ impl WireServer {
                     "softfig-runnerd: job {} rejected (toolchain-missing): {add_cmd}",
                     hex::encode(&offer.job_id)
                 );
+                self.jobs.remove(&offer.job_id);
                 let mut w = writer;
                 w.send_frame(&Frame::job_reject(JobReject {
                     job_id: offer.job_id.clone(),
                     reason: softfig_net::JobRejectReason::ToolchainMissing.to_u32(),
                 }))?;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.jobs.remove(&offer.job_id);
+                return Err(e);
+            }
         }
 
         // Best-effort cleanup of the per-job scratch (the shared target cache
-        // stays; a fresh cache dies with the job, spec §6 step 8).
+        // stays; a fresh cache dies with the job, spec §6 step 8). The job's
+        // result + log tail stay in the table for the TTL.
         let _ = std::fs::remove_dir_all(&job_dir);
         Ok(())
     }
 
     /// Run a job's fetch → run → collect: in-process (the `Direct` test seam)
     /// or inside the transient unit (production + loopback).
+    #[allow(clippy::too_many_arguments)]
     fn run_job(
         &self,
         ctx: &JobContext,
@@ -487,19 +622,28 @@ impl WireServer {
         on_battery: bool,
         job_dir: &std::path::Path,
         log: Option<&LogSink>,
+        unit: Option<&str>,
+        job: &Job,
     ) -> Result<(executor::RunOutcome, Option<CapsHit>)> {
         match self.manager {
             Manager::Direct => {
                 executor::execute(ctx, serve, offer, &self.sandbox_bins, log).map(|o| (o, None))
             }
-            Manager::System | Manager::User => {
-                self.run_in_unit(ctx, serve, offer, on_battery, job_dir)
-            }
+            Manager::System | Manager::User => self.run_in_unit(
+                ctx,
+                serve,
+                offer,
+                on_battery,
+                job_dir,
+                unit.expect("the unit name is set in unit mode"),
+                job,
+            ),
         }
     }
 
     /// Run the executor inside a `systemd-run` transient unit: serialize the
     /// job spec, re-invoke runnerd with `--run-job`, and read its report.
+    #[allow(clippy::too_many_arguments)]
     fn run_in_unit(
         &self,
         ctx: &JobContext,
@@ -507,7 +651,17 @@ impl WireServer {
         offer: &softfig_net::proto::JobOffer,
         on_battery: bool,
         job_dir: &std::path::Path,
+        unit: &str,
+        job: &Job,
     ) -> Result<(executor::RunOutcome, Option<CapsHit>)> {
+        // A job cancelled before the unit launched never starts.
+        if job.is_cancelled() {
+            return Ok((
+                executor::RunOutcome { exit_code: crate::systemd::CANCELLED_EXIT, ..Default::default() },
+                None,
+            ));
+        }
+
         let spec = JobSpec {
             ctx: ctx.clone(),
             egress: serve.egress.clone(),
@@ -526,7 +680,6 @@ impl WireServer {
         std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
 
         let caps = Caps::resolve(serve, on_battery)?;
-        let unit = format!("softfig-runner-{}", hex::encode(&offer.job_id));
         let payload = vec![
             self.runnerd_bin.display().to_string(),
             "--run-job".to_string(),
@@ -535,11 +688,19 @@ impl WireServer {
         ];
         let (unit_result, _code) = run_unit(
             self.manager,
-            &unit,
+            unit,
             &caps,
             &payload,
             &[self.root.root().to_path_buf()],
         )?;
+
+        // A cancelled job (its unit was stopped) has no result file.
+        if job.is_cancelled() {
+            return Ok((
+                executor::RunOutcome { exit_code: crate::systemd::CANCELLED_EXIT, ..Default::default() },
+                None,
+            ));
+        }
 
         // A cap kill leaves no result file: map it to a sentinel exit + CapsHit.
         let caps_hit = match unit_result {
@@ -563,6 +724,148 @@ impl WireServer {
             .ok_or_else(|| Error::Protocol("job payload returned neither outcome nor error".into()))?;
         Ok((outcome, None))
     }
+
+    /// Serve a `JobAttach` (spec §6): resume a detached job's log from `from_seq`
+    /// and deliver its result. Authorized to the submitting requester only.
+    fn serve_attach(
+        &self,
+        mut session: softfig_net::NoiseSession<TcpStream>,
+        attach: JobAttach,
+        device_id: &[u8; 32],
+        accept: &AcceptConfig,
+        serve: &ServeConfig,
+    ) -> Result<()> {
+        if let Some(reason) = self.granted(device_id, session.peer_static(), accept, serve) {
+            session.send_frame(&Frame::job_reject(JobReject {
+                job_id: attach.job_id.clone(),
+                reason: reason.to_u32(),
+            }))?;
+            return Ok(());
+        }
+        let Some(job) = self.jobs.get(&attach.job_id) else {
+            session.send_frame(&Frame::job_event(JobEvent {
+                job_id: attach.job_id.clone(),
+                state: JobState::Lost as u32,
+                detail: "no such job".into(),
+            }))?;
+            return Ok(());
+        };
+        if job.requester_device != *device_id {
+            session.send_frame(&Frame::job_reject(JobReject {
+                job_id: attach.job_id.clone(),
+                reason: softfig_net::JobRejectReason::NotGranted.to_u32(),
+            }))?;
+            return Ok(());
+        }
+
+        // Replay the retained ring from `from_seq`, then follow live until the
+        // result is set (the job completed and stored it).
+        let (rx, replay) = job.logs.subscribe_and_replay(attach.from_seq);
+        for chunk in replay {
+            if session
+                .send_frame(&Frame::job_log(JobLog {
+                    job_id: attach.job_id.clone(),
+                    seq: chunk.seq,
+                    stream: chunk.stream as u32,
+                    bytes: chunk.bytes,
+                }))
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        loop {
+            if let Some(result) = job.result.lock().unwrap().clone() {
+                session.send_frame(&Frame::job_result(result))?;
+                return Ok(());
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => {
+                    if session
+                        .send_frame(&Frame::job_log(JobLog {
+                            job_id: attach.job_id.clone(),
+                            seq: chunk.seq,
+                            stream: chunk.stream as u32,
+                            bytes: chunk.bytes,
+                        }))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => continue,
+            }
+        }
+    }
+
+    /// Serve a `JobCancel` (spec §6): mark the job cancelled and stop its
+    /// transient unit (killing the whole cgroup).
+    fn serve_cancel(
+        &self,
+        mut session: softfig_net::NoiseSession<TcpStream>,
+        cancel: JobCancel,
+        device_id: &[u8; 32],
+        accept: &AcceptConfig,
+        serve: &ServeConfig,
+    ) -> Result<()> {
+        if let Some(reason) = self.granted(device_id, session.peer_static(), accept, serve) {
+            session.send_frame(&Frame::job_reject(JobReject {
+                job_id: cancel.job_id.clone(),
+                reason: reason.to_u32(),
+            }))?;
+            return Ok(());
+        }
+        let Some(job) = self.jobs.get(&cancel.job_id) else {
+            session.send_frame(&Frame::job_event(JobEvent {
+                job_id: cancel.job_id.clone(),
+                state: JobState::Lost as u32,
+                detail: "no such job".into(),
+            }))?;
+            return Ok(());
+        };
+        if job.requester_device != *device_id {
+            session.send_frame(&Frame::job_reject(JobReject {
+                job_id: cancel.job_id.clone(),
+                reason: softfig_net::JobRejectReason::NotGranted.to_u32(),
+            }))?;
+            return Ok(());
+        }
+        job.cancelled.store(true, Ordering::SeqCst);
+        if let Some(unit) = job.unit.lock().unwrap().as_ref() {
+            stop_unit(self.manager, unit);
+        }
+        session.send_frame(&Frame::job_event(JobEvent {
+            job_id: cancel.job_id.clone(),
+            state: JobState::Cancelled as u32,
+            detail: String::new(),
+        }))?;
+        Ok(())
+    }
+
+    /// Remove jobs whose TTL elapsed, plus their scratch dirs.
+    fn sweep_expired(&self) {
+        let expired = self.jobs.sweep(self.ttl_secs);
+        for id in expired {
+            let _ = std::fs::remove_dir_all(self.root.jobs_dir().join(hex::encode(id)));
+        }
+    }
+}
+
+/// Read the transient unit's framed log file (`job_dir/run.log`) and stream its
+/// chunks into `logs` (unit-mode log capture). Best-effort: a missing or empty
+/// file (no run step, or a cap-killed payload) is not an error.
+fn stream_unit_log(job_dir: &std::path::Path, logs: &JobLogs) -> Result<()> {
+    let path = job_dir.join("run.log");
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+    let sink = logs.sink();
+    for (stream, bytes) in read_framed_chunks(&mut f)? {
+        sink.push(stream, &bytes);
+    }
+    Ok(())
 }
 
 /// Build the in-handshake [`RunnerHandshake`] from the stored certificate

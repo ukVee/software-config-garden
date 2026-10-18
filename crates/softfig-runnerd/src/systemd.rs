@@ -28,6 +28,11 @@ use crate::executor::{parse_duration, parse_size, RunOutcome};
 /// through sysfs").
 pub const POWER_SUPPLY_PATH: &str = "/sys/class/power_supply";
 
+/// The transient unit name for a job (spec §6): `softfig-runner-<jobhex>`.
+pub fn unit_name(job_id: &[u8]) -> String {
+    format!("softfig-runner-{}", hex::encode(job_id))
+}
+
 /// Which systemd manager a transient unit runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Manager {
@@ -155,6 +160,9 @@ pub const TIMEOUT_EXIT: i32 = 124;
 /// The `JobResult.exit_code` sentinel for a job killed by the memory cap
 /// (128 + SIGKILL).
 pub const OOM_EXIT: i32 = 137;
+/// `JobResult.exit_code` for a cancelled job (128 + SIGTERM). The attestation
+/// records the richer `exit.reason = "cancelled"`; this is the wire exit code.
+pub const CANCELLED_EXIT: i32 = 143;
 
 /// Which resource cap killed a job (spec §6 step 9's `caps_hit`; folded into
 /// the attestation in chunk 3).
@@ -261,6 +269,27 @@ pub fn run_unit(
     };
 
     Ok((result, code))
+}
+
+/// Stop a job's transient unit (`systemctl stop`), killing its whole cgroup
+/// (spec §6 `JobCancel`). Best-effort: a stop on an already-finished unit is a
+/// no-op, and the `Direct` test seam has no unit to stop.
+pub fn stop_unit(manager: Manager, unit: &str) {
+    if matches!(manager, Manager::Direct) {
+        return;
+    }
+    let mut cmd = Command::new("systemctl");
+    match manager {
+        Manager::System => {
+            cmd.arg("--system");
+        }
+        Manager::User => {
+            cmd.arg("--user");
+        }
+        Manager::Direct => unreachable!("guarded above"),
+    }
+    cmd.arg("stop").arg(unit);
+    let _ = cmd.output();
 }
 
 // --- Payload/report types (the `--run-job` mode) -------------------------

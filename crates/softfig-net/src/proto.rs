@@ -313,6 +313,21 @@ impl Frame {
             kind: Some(frame::Kind::SourceChunk(chunk)),
         }
     }
+
+    /// A `JobCancel` frame (requester -> runner): cancel a job (spec §6).
+    pub fn job_cancel(cancel: JobCancel) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobCancel(cancel)),
+        }
+    }
+
+    /// A `JobAttach` frame (requester -> runner): attach to a detached job
+    /// (spec §6), resuming the log from `from_seq`.
+    pub fn job_attach(attach: JobAttach) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobAttach(attach)),
+        }
+    }
 }
 
 impl HelloPayload {
