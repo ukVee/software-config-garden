@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use softfig_install::detect::{package_owned, package_owned_message, Distro};
 use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
+use softfig_install::source;
 use softfig_ipc::compat::INSTALLED_SET;
 use softfig_ipc::{runtime_socket_path, verbs::op, StatusReply};
 
@@ -73,9 +74,10 @@ pub fn run(args: UninstallArgs) -> Result<()> {
     };
 
     let plan = removal_plan(&prefix);
+    let recorded = source::recorded_source(&prefix);
     let store_paths = discover_garden(&socket).map(|g| resolve_store_paths(&g));
 
-    print_plan(&plan, store_paths.as_ref());
+    print_plan(&plan, store_paths.as_ref(), recorded.as_deref());
     if args.dry_run {
         println!("dry run: nothing removed.");
         return Ok(());
@@ -103,6 +105,12 @@ pub fn run(args: UninstallArgs) -> Result<()> {
     remove_binaries(&plan)?;
     remove_units()?;
     remove_mcp()?;
+
+    // The install records its `--source` checkout in the prefix; remove that
+    // record with the program (best-effort — the program is already gone).
+    if let Err(e) = source::remove_source_record(&prefix) {
+        println!("note: could not remove the recorded source: {e}");
+    }
 
     // Offer 2 — the data, only on --yes-remove-data, and only after the first
     // removal is done. The summary names every path that would be removed. The
@@ -173,7 +181,7 @@ pub struct RemovalPlan {
     pub has_mcp: bool,
 }
 
-fn print_plan(plan: &RemovalPlan, store: Option<&StorePaths>) {
+fn print_plan(plan: &RemovalPlan, store: Option<&StorePaths>, recorded: Option<&Path>) {
     println!("soft-fig uninstall — will remove:");
     if plan.binaries.is_empty() {
         println!("  binaries      (none found in this directory)");
@@ -193,6 +201,10 @@ fn print_plan(plan: &RemovalPlan, store: Option<&StorePaths>) {
         "  MCP           {}",
         if plan.has_mcp { "softfig-mcp registration (deregister)" } else { "(claude CLI not found)" }
     );
+    match recorded {
+        Some(src) => println!("  source        {} (recorded at install; removed with the program)", src.display()),
+        None => println!("  source        (none recorded)"),
+    }
     match store {
         Some(sp) => {
             println!("  data          NOT removed unless you pass --yes-remove-data:");

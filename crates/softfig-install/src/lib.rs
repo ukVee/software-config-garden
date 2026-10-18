@@ -70,9 +70,11 @@
 pub mod detect;
 pub mod gate;
 pub mod prompt;
+pub mod source;
 pub mod stage;
 pub mod swap;
 pub mod unit;
 
+pub use source::Source;
 pub use stage::{stage_and_swap, StageOutcome};
 pub use swap::{swap_binaries, Result, SwapError};

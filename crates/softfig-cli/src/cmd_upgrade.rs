@@ -2,15 +2,20 @@
 //! `meta/spec-install.md` workstream C). One command encapsulates the
 //! hand-done dance:
 //!
-//! 1. fetch new source (`git pull` for a source checkout);
-//! 2. `cargo build --release --locked`;
-//! 3. the support-window pre-check (refuse from older than the previous
-//!    minor — `meta/spec-release.md` → "Support window");
-//! 4. stage + atomic install of the reconciled set (slice 003's swap);
-//! 5. safely cycle the daemon (the `daemon cycle` relock-token path);
-//! 6. run pending migrations (`migrate` status → `migrate finalize` if
+//! 1. resolve a real source — an explicit `--source` checkout, an explicit
+//!    `--repo`/`--ref` clone, the source recorded at install, or the baked
+//!    repo + tag (never the current dir);
+//! 2. fetch it (`git pull --ff-only` for a checkout; a tagged clone is already
+//!    at the tag);
+//! 3. pre-check the support window against the source's *declared* version,
+//!    before the build (refuse from older than the previous minor —
+//!    `meta/spec-release.md` → "Support window");
+//! 4. `cargo build --release --locked`;
+//! 5. stage + atomic install of the reconciled set (slice 003's swap);
+//! 6. safely cycle the daemon (the `daemon cycle` relock-token path);
+//! 7. run pending migrations (`migrate` status → `migrate finalize` if
 //!    prepared);
-//! 7. confirm the running daemon now reports the new version (slice 002's
+//! 8. confirm the running daemon now reports the new version (slice 002's
 //!    handshake, checked against the *built* version — this process is the
 //!    pre-upgrade binary, so `binary_version()` is the old one).
 //!
@@ -25,6 +30,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use semver::Version;
 use softfig_install::detect::{package_owned, package_owned_message, Distro, Supervisor};
+use softfig_install::source;
 use softfig_install::stage::{rollback, stage_and_swap, StageOutcome, PREVIOUS_SET_DIR};
 use softfig_ipc::compat::SetReport;
 use softfig_ipc::{
@@ -36,9 +42,15 @@ use crate::cmd_daemon::{cycle, stop_daemon, try_daemon_call, CycleArgs, CYCLE_RE
 
 #[derive(Args, Debug)]
 pub struct UpgradeArgs {
-    /// Build an existing source checkout at this path (default: the current dir).
+    /// Build an existing source checkout at this path.
     #[arg(long)]
     pub source: Option<PathBuf>,
+    /// Clone this repo URL instead of building an existing checkout.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// The tag/ref to check out when cloning with `--repo`.
+    #[arg(long)]
+    pub r#ref: Option<String>,
     /// Install the binaries here (default: the directory this `softfig` runs from).
     #[arg(long)]
     pub prefix: Option<PathBuf>,
@@ -84,7 +96,16 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
         return Ok(());
     }
 
-    let source = args.source.clone().unwrap_or_else(|| PathBuf::from("."));
+    // M8: resolve a *real* source — the explicit `--source` checkout, an
+    // explicit `--repo`/`--ref` clone, the source recorded at install, or the
+    // baked repo + tag. Never silently build the current dir.
+    let recorded = source::recorded_source(&prefix);
+    let source = source::resolve(
+        args.source.as_deref(),
+        args.repo.as_deref(),
+        args.r#ref.as_deref(),
+        recorded.as_deref(),
+    )?;
     let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
 
     // Refuse a package-owned prefix before pulling/building/swapping: the
@@ -103,17 +124,27 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     let daemon = daemon_state(&socket);
     let cycle_ok = can_cycle(supervisor, &daemon);
 
-    // 1. Fetch new source.
-    pull(&source, args.no_pull)?;
+    // 1. Fetch the source: a checkout gets `git pull --ff-only`; a fresh
+    //    clone of a pinned tag is already at the tag, so there is nothing to
+    //    pull.
+    if source.is_checkout() {
+        pull(source.path(), args.no_pull)?;
+    }
 
-    // 2. Build the program from source (the same build the release workflow
+    // 2. Pre-check the support window against the source's *declared* version,
+    //    BEFORE the build (M8) — an out-of-window upgrade is refused without
+    //    paying for a full `cargo build`.
+    let declared = declared_version(source.path())?;
+    check_support_window(&prefix, &declared)?;
+
+    // 3. Build the program from source (the same build the release workflow
     //    runs — `--locked` against the committed Cargo.lock).
-    build_program(&source)?;
+    build_program(source.path())?;
 
     // The freshly-built version is the upgrade target. Read it out of the
     // built set (this process is still the old binary, so `binary_version()`
     // is the origin, not the destination).
-    let target_dir = source.join("target/release");
+    let target_dir = source.path().join("target/release");
     let target = SetReport::scan(&target_dir)
         .consistent_version()
         .map(str::to_string)
@@ -122,21 +153,17 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
              `cargo build --release` produce the installed set?",
         )?;
 
-    // 3. Support-window pre-check: refuse from older than the previous minor,
-    //    before anything is swapped.
-    check_support_window(&prefix, &target)?;
-
     if args.dry_run {
         println!(
-            "dry run: pulled + built {target} + support-window check passed; \
-             stopping before the swap."
+            "dry run: support-window check passed + built {target}; stopping \
+             before the swap."
         );
         return Ok(());
     }
 
     // 4. Stage + atomically install the reconciled set (idempotent by
     //    identity; --force re-swaps even an identical identity).
-    match stage_and_swap(&source, &prefix, args.force)? {
+    match stage_and_swap(source.path(), &prefix, args.force)? {
         StageOutcome::Noop { version, .. } => {
             println!("already at {version} in {} — nothing to swap", prefix.display());
         }
@@ -307,6 +334,40 @@ fn check_support_window(prefix: &Path, target: &str) -> Result<()> {
              untouched."
         )
     }
+}
+
+/// The source checkout's declared workspace version, read from its `Cargo.toml`
+/// *before* the build (M8). The support-window check needs the target version
+/// to refuse an out-of-window upgrade, and it must do so before paying for a
+/// full `cargo build`. The build itself stays authoritative — the freshly
+/// built set is re-scanned after the build for the swap identity.
+fn declared_version(source: &Path) -> Result<String> {
+    let manifest = source.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("reading {}", manifest.display()))?;
+    let doc: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing {}", manifest.display()))?;
+    // Every crate here inherits `version.workspace = true`, so the workspace
+    // `version` is what the build will produce.
+    if let Some(v) = doc
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+    {
+        return Ok(v.to_string());
+    }
+    if let Some(v) = doc
+        .get("package")
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+    {
+        return Ok(v.to_string());
+    }
+    bail!(
+        "no version declared in {} — cannot pre-check the support window",
+        manifest.display()
+    )
 }
 
 /// The keeperd's state, read ONCE before the swap so the upgrade can decide
@@ -648,5 +709,32 @@ mod tests {
             no_cycle_reason(Supervisor::SystemdUser, &state(true, false, false)),
             "relock is disabled (`[growlight] allow_relock` not set)"
         );
+    }
+
+    // ---- M8: the pre-build support-window check reads the declared version ----
+
+    #[test]
+    fn declared_version_reads_the_workspace_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\n[workspace.package]\nversion = \"1.0.0-alpha.1\"\n",
+        )
+        .unwrap();
+        assert_eq!(declared_version(dir.path()).unwrap(), "1.0.0-alpha.1");
+    }
+
+    #[test]
+    fn declared_version_falls_back_to_the_package_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nversion = \"0.1.0\"\n").unwrap();
+        assert_eq!(declared_version(dir.path()).unwrap(), "0.1.0");
+    }
+
+    #[test]
+    fn a_versionless_manifest_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert!(declared_version(dir.path()).is_err());
     }
 }

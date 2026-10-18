@@ -18,6 +18,7 @@ use clap::Parser;
 use softfig_install::detect::{package_owned, package_owned_message, which, Distro, Supervisor};
 use softfig_install::gate::{self, Gate};
 use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
+use softfig_install::source::{self, Source};
 use softfig_install::stage::{stage_and_swap, StageOutcome};
 use softfig_install::unit;
 use softfig_ipc::compat::SetReport;
@@ -25,7 +26,7 @@ use softfig_ipc::compat::SetReport;
 #[derive(Parser, Debug)]
 #[command(name = "softfig-install", version, about = "soft-fig: the guided install front door")]
 struct Cli {
-    /// Build an existing source checkout at this path (default: the current dir).
+    /// Build an existing source checkout at this path.
     #[arg(long)]
     source: Option<PathBuf>,
     /// Clone this repo URL instead of building an existing checkout.
@@ -101,21 +102,28 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
         return Ok(());
     }
 
-    // 4. Resolve the source directory (clone, or an existing checkout).
-    let (source, _keep) = resolve_source(&cli)?;
+    // 4. Resolve a real source: an explicit --source checkout, an explicit
+    //    --repo/--ref clone, or the baked repo + tag — never the current dir.
+    let source = resolve_source(&cli)?;
 
     // 5. Build the program from source.
-    build_program(&source)?;
+    build_program(source.path())?;
 
     // 6. Stage + atomically install the reconciled set (idempotent).
-    install_set(&source, &prefix)?;
+    install_set(source.path(), &prefix)?;
+
+    // Record an explicit --source checkout at install, so a later
+    // `softfig upgrade` / `softfig uninstall` can name the real source.
+    if source.is_checkout() {
+        source::record_source(&prefix, source.path())?;
+    }
 
     // 7. Non-fatal environment checks (fuse3, PATH).
     check_fuse(&distro);
     check_path(&prefix);
 
     // 8. Consented, reversible integration steps.
-    offer_unit(consent, &source, &supervisor, &prefix, &garden);
+    offer_unit(consent, source.path(), &supervisor, &prefix, &garden);
     offer_mcp(consent, &prefix);
 
     // 9. Hand off to `softfig onboard`.
@@ -137,34 +145,15 @@ fn default_garden() -> PathBuf {
     home().join("soft-fig_garden")
 }
 
-/// Resolve where the program source lives: a `--repo` clone (into a temp dir
-/// the caller keeps alive), or an existing `--source` checkout (default `.`).
-fn resolve_source(cli: &Cli) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
-    if let Some(repo) = &cli.repo {
-        let r#ref = cli
-            .r#ref
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--repo requires --ref <tag> (the tagged source to build)"))?;
-        println!("cloning {repo} at {ref}…");
-        let dir = tempfile::Builder::new()
-            .prefix("softfig-src-")
-            .tempdir()
-            .context("creating a temp dir for the clone")?;
-        let status = std::process::Command::new("git")
-            .args(["clone", "--depth", "1", "--branch", r#ref, repo])
-            .arg(dir.path())
-            .status()
-            .context("running git clone")?;
-        if !status.success() {
-            anyhow::bail!("git clone failed (exit {status})");
-        }
-        return Ok((dir.path().to_path_buf(), Some(dir)));
-    }
-    let source = cli
-        .source
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."));
-    Ok((source, None))
+/// Resolve a real source: an explicit `--source` checkout, an explicit
+/// `--repo`/`--ref` clone, or the baked repo + tag — never the current dir.
+fn resolve_source(cli: &Cli) -> Result<Source> {
+    source::resolve(
+        cli.source.as_deref(),
+        cli.repo.as_deref(),
+        cli.r#ref.as_deref(),
+        None,
+    )
 }
 
 /// `cargo build --release --locked` in the source root — the same build the
