@@ -60,8 +60,37 @@ pub struct BatteryCaps {
     pub time_max: String,
 }
 
+impl Default for ServeConfig {
+    /// A fresh, disabled runner: `enabled = false` until the owner runs
+    /// `softfig runner apply` (which pushes the garden's `[serve]` table) or
+    /// `softfig runner enable`. The caps are the spec §5.2 defaults, inert
+    /// while disabled. This exists so a freshly-installed state root has a
+    /// valid (refusing) `serve.toml` before the first `apply`.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_jobs: 1,
+            cpu_weight: 20,
+            nice: 10,
+            io_class: "idle".into(),
+            memory_max: "8G".into(),
+            tasks_max: 4096,
+            time_max: "60m".into(),
+            scratch_max: "20G".into(),
+            cache_max: "60G".into(),
+            on_battery: "allow".into(),
+            on_battery_caps: None,
+            toolchains: Vec::new(),
+            egress: Vec::new(),
+        }
+    }
+}
+
 impl ServeConfig {
     pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
         Ok(toml::from_str(&fs::read_to_string(path)?)?)
     }
 

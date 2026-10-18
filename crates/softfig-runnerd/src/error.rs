@@ -17,6 +17,9 @@ pub enum Error {
     #[error("config serialize error: {0}")]
     ConfigSerialize(#[from] toml::ser::Error),
 
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("admin protocol error: {0}")]
     Protocol(String),
 }

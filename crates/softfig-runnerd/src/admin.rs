@@ -13,12 +13,12 @@ use std::mem;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// One admin request. `verb` names the operation; `args` is the verb's payload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminRequest {
     pub verb: String,
     #[serde(default)]
@@ -158,6 +158,147 @@ where
         writer.flush()?;
     }
     Ok(())
+}
+
+// --- typed verb payloads --------------------------------------------------
+//
+// The admin protocol is JSON-Lines (`AdminRequest`/`AdminResponse`); these
+// structs type the verbs the CLI drives. They are plain serde shapes — the
+// server side re-uses them directly (main.rs), the CLI constructs them.
+
+/// `grant` payload: a requester the CLI read from the ring (keeperd
+/// `pair_list`) and hands to runnerd to add to `accept.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantArgs {
+    /// Requester Ed25519 identity (lowercase hex).
+    pub device_id: String,
+    /// Requester X25519 transport static (lowercase hex).
+    pub transport_pubkey: String,
+    /// Display name (not trusted for anything).
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantReply {
+    /// False when the peer was already granted (an idempotent refresh).
+    pub granted: bool,
+}
+
+/// `revoke` payload: remove a requester from `accept.toml` and purge its
+/// mirrors/caches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeArgs {
+    pub device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeReply {
+    pub revoked: bool,
+}
+
+/// `apply` payload: the full `[serve]` table, pushed by the CLI from the
+/// garden's `config/runner.toml` (spec §5.2). runnerd writes it to `serve.toml`
+/// verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyArgs {
+    pub serve: crate::config::ServeConfig,
+}
+
+/// `store-cert` payload: the signed certificate written by `softfig runner
+/// enable`/`renew` (the CLI got it back from keeperd's `runner_sign_cert`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreCertArgs {
+    pub cert: crate::cert::StoredCert,
+}
+
+/// `revoke-cert` payload: the device identity's signed revocation, held locally
+/// until slice 003 distributes it to the ring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeCertArgs {
+    pub device_id: String,
+    pub serial: String,
+    pub signature: String,
+}
+
+// --- client ---------------------------------------------------------------
+
+/// Low-level one-shot admin round-trip: connect, write `req` as a JSON line,
+/// read one response line. `Ok(None)` means the server closed without a reply
+/// (a foreign uid is refused before a byte is read, or the socket is gone).
+pub fn call(socket: &Path, req: &AdminRequest) -> io::Result<Option<AdminResponse>> {
+    let mut stream = UnixStream::connect(socket)?;
+    let mut bytes =
+        serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes)?;
+    stream.flush()?;
+    let mut line = String::new();
+    let n = BufReader::new(stream).read_line(&mut line)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let resp = serde_json::from_str(line.trim_end_matches('\n'))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(resp))
+}
+
+/// A typed client for the runnerd admin socket. The CLI constructs one with the
+/// socket path (default `/var/lib/softfig-runner/admin.sock`) and calls the
+/// verb helpers; it runs as the owner uid (a different uid from
+/// `softfig-runner`), so the server's `SO_PEERCRED` gate is what admits it.
+pub struct AdminClient {
+    socket: PathBuf,
+}
+
+impl AdminClient {
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        Self {
+            socket: socket.into(),
+        }
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// One request/response round-trip. A served response is returned (its
+    /// `ok` may be false); a connection that closes without replying (foreign
+    /// uid, or no runnerd) is a [`crate::error::Error::Protocol`].
+    pub fn request(
+        &self,
+        verb: &str,
+        args: serde_json::Value,
+    ) -> crate::error::Result<AdminResponse> {
+        let req = AdminRequest {
+            verb: verb.to_string(),
+            args,
+        };
+        match call(&self.socket, &req)? {
+            Some(resp) => Ok(resp),
+            None => Err(crate::error::Error::Protocol(
+                "runnerd closed the admin socket without replying (are you the owner uid?)".into(),
+            )),
+        }
+    }
+
+    /// `verb` with a payload struct, returning the parsed `data` on `ok`.
+    pub fn call_typed<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        verb: &str,
+        args: T,
+    ) -> crate::error::Result<R> {
+        let resp = self.request(verb, serde_json::to_value(args)?)?;
+        if !resp.ok {
+            return Err(crate::error::Error::Protocol(format!(
+                "{verb} failed: {}",
+                resp.error.as_deref().unwrap_or("unknown error")
+            )));
+        }
+        let data = resp
+            .data
+            .ok_or_else(|| crate::error::Error::Protocol(format!("{verb} returned no data")))?;
+        Ok(serde_json::from_value(data)?)
+    }
 }
 
 #[cfg(test)]

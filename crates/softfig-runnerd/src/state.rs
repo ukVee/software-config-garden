@@ -54,6 +54,23 @@ impl StateRoot {
         self.root.join("log")
     }
 
+    /// The signed revocation record (`revocation.toml`), written by
+    /// `revoke-cert` and held locally until slice 003 distributes it.
+    pub fn revocation_toml(&self) -> PathBuf {
+        self.root.join("revocation.toml")
+    }
+
+    /// `repos/` — one bare mirror per repo key (slice 004). Purged by
+    /// `revoke`/`purge`.
+    pub fn repos_dir(&self) -> PathBuf {
+        self.root.join("repos")
+    }
+
+    /// `cache/` — per-(repo key, toolchain) target caches (slice 006).
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
     /// Create the state-root layout with the runner's ownership modes (root and
     /// `keys/` 0700; `log/` 0700). Idempotent.
     pub fn ensure_dirs(&self) -> Result<()> {

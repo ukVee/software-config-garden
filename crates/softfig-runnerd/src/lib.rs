@@ -20,12 +20,19 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod cert;
 pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod keys;
 pub mod state;
 
-pub use admin::{require_owner_uid, serve_connection, AdminRequest, AdminResponse, AdminSocket};
+pub use admin::{
+    call as admin_call, require_owner_uid, serve_connection, AdminClient, AdminRequest,
+    AdminResponse, AdminSocket, ApplyArgs, GrantArgs, GrantReply, RevokeArgs, RevokeCertArgs,
+    RevokeReply, StoreCertArgs,
+};
+pub use cert::{StoredCert, StoredRevocation};
 pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
 pub use keys::RunnerKeys;
