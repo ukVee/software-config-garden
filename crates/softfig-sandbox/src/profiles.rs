@@ -24,8 +24,9 @@ pub struct JobContext {
     pub cargo_home: PathBuf,
     /// A minimal `/etc` (ld cache, ssl certs, a stub `passwd`).
     pub etc: PathBuf,
-    /// Scratch tmpfs size string ("2G").
-    pub scratch_size: String,
+    /// Scratch tmpfs size in **bytes** (bwrap's `--size` is a byte count; the
+    /// config layer converts human-readable sizes like "2G" into bytes).
+    pub scratch_size: u64,
 }
 
 /// The seccomp deny list from spec §7.1 layer 5 (applied by the init shim, not
@@ -67,13 +68,22 @@ fn base(ctx: &JobContext) -> Policy {
     };
 
     // Read-only system view (spec §7.1): `/usr`, a minimal `/etc`, the toolchain.
+    // On a merged-/usr system (Arch, the reference laptop) `/bin`, `/lib`,
+    // `/lib64` and `/sbin` are symlinks into `/usr`, and a dynamically-linked
+    // binary's ELF interpreter (`/lib64/ld-linux-*.so.2`) lives behind those
+    // symlinks — they must be present in the namespace or exec fails with
+    // ENOENT even though `/usr` is bound.
     policy.ro_binds.push(Bind::ro("/usr", "/usr"));
+    policy.ro_binds.push(Bind::ro("/bin", "/bin"));
+    policy.ro_binds.push(Bind::ro("/lib", "/lib"));
+    policy.ro_binds.push(Bind::ro("/lib64", "/lib64"));
+    policy.ro_binds.push(Bind::ro("/sbin", "/sbin"));
     policy.ro_binds.push(Bind::ro(&ctx.etc, "/etc"));
     policy.ro_binds.push(Bind::ro(&ctx.toolchain, "/opt/toolchain"));
 
     // Scratch tmpfs.
-    policy.tmpfs.push(TmpfsMount::sized("/tmp", ctx.scratch_size.clone()));
-    policy.tmpfs.push(TmpfsMount::sized("/home/job", ctx.scratch_size.clone()));
+    policy.tmpfs.push(TmpfsMount::sized("/tmp", ctx.scratch_size));
+    policy.tmpfs.push(TmpfsMount::sized("/home/job", ctx.scratch_size));
 
     // Cleared environment, then the explicit set (spec §7.1).
     policy.env.insert("PATH".into(), "/usr/bin:/usr/sbin".into());
@@ -147,7 +157,7 @@ mod tests {
             toolchain: "/var/lib/softfig-runner/toolchains/rust".into(),
             cargo_home: "/var/lib/softfig-runner/cargo".into(),
             etc: "/var/lib/softfig-runner/etc".into(),
-            scratch_size: "2G".into(),
+            scratch_size: 2 * 1024 * 1024 * 1024,
         }
     }
 

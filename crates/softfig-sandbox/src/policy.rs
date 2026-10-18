@@ -42,8 +42,9 @@ impl Bind {
 pub struct TmpfsMount {
     /// In-sandbox mount point.
     pub path: PathBuf,
-    /// Optional size limit, a bwrap `--size` string ("512M", "2G"); `None` = unbounded.
-    pub size: Option<String>,
+    /// Optional size limit in **bytes** (bwrap's `--size` takes a byte count,
+    /// not a human-readable string); `None` = unbounded.
+    pub size: Option<u64>,
 }
 
 impl TmpfsMount {
@@ -52,9 +53,9 @@ impl TmpfsMount {
         Self { path: path.into(), size: None }
     }
 
-    /// A size-capped tmpfs.
-    pub fn sized(path: impl Into<PathBuf>, size: impl Into<String>) -> Self {
-        Self { path: path.into(), size: Some(size.into()) }
+    /// A size-capped tmpfs, in bytes.
+    pub fn sized(path: impl Into<PathBuf>, bytes: u64) -> Self {
+        Self { path: path.into(), size: Some(bytes) }
     }
 }
 
@@ -173,9 +174,9 @@ impl Policy {
         let mut tmpfs: Vec<&TmpfsMount> = self.tmpfs.iter().collect();
         tmpfs.sort_unstable();
         for t in tmpfs {
-            if let Some(size) = &t.size {
+            if let Some(size) = t.size {
                 argv.push("--size".into());
-                argv.push(size.clone());
+                argv.push(size.to_string());
             }
             argv.push("--tmpfs".into());
             argv.push(t.path.to_string_lossy().into_owned());
@@ -268,11 +269,11 @@ mod tests {
     #[test]
     fn render_emits_size_before_its_tmpfs() {
         let mut p = Policy { die_with_parent: true, ..Policy::default() };
-        p.tmpfs.push(TmpfsMount::sized("/tmp", "2G"));
+        p.tmpfs.push(TmpfsMount::sized("/tmp", 2_147_483_648));
 
         let argv = p.render();
         let size = argv.iter().position(|s| s == "--size").expect("--size present");
-        assert_eq!(argv[size + 1], "2G");
+        assert_eq!(argv[size + 1], "2147483648");
         assert_eq!(argv[size + 2], "--tmpfs");
         assert_eq!(argv[size + 3], "/tmp");
     }
@@ -298,7 +299,7 @@ mod tests {
         let mut p = Policy { proc: true, dev: true, ..Policy::default() };
         p.ro_binds.push(Bind::ro("/usr", "/usr"));
         p.rw_binds.push(Bind::rw("/host/src", "/src"));
-        p.tmpfs.push(TmpfsMount::sized("/tmp", "2G"));
+        p.tmpfs.push(TmpfsMount::sized("/tmp", 2_147_483_648));
 
         let rules = p.fs_rules();
 
