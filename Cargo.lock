@@ -3700,6 +3700,7 @@ dependencies = [
  "base64",
  "blake3",
  "clap",
+ "ed25519-dalek",
  "hex",
  "hostname",
  "rpassword",
@@ -3718,7 +3719,9 @@ dependencies = [
  "softfig-store",
  "softfig-vault",
  "softfig-vcs",
+ "tempfile",
  "toml",
+ "x25519-dalek",
  "zeroize",
 ]
 

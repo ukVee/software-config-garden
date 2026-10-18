@@ -45,3 +45,11 @@ softfig-growlightd.workspace = true
 # as the binary sends them — the same fixture shape keeperd's own e2e suite
 # uses. Dev-only — the CLI's command code talks to keeperd over IPC only.
 softfig-keeperd.workspace = true
+# slice 007 chunk 5: the binary-spawn `softfig run` e2e test seeds the keeperd
+# ring with a forged runner peer (its cert signer's identity) and grants the
+# keeperd's transport static into the runner's accept.toml, so it needs the
+# two key types directly (derive the peer's public static from the keeperd
+# `runner_local_device` transport_secret; sign the forged ring attestation).
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+tempfile.workspace = true
