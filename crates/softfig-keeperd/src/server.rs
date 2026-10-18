@@ -342,6 +342,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::DISCOVER_LIST => handlers::discover_list(daemon, req.args),
         op::RUNNER_SIGN_CERT => handlers::runner_sign_cert(daemon, req.args),
         op::RUNNER_SIGN_REVOKE => handlers::runner_sign_revoke(daemon, req.args),
+        op::RUNNER_SIGN_OFFER => handlers::runner_sign_offer(daemon, req.args),
+        op::RUNNER_LOCAL_DEVICE => handlers::runner_local_device(daemon, req.args),
         op::REPLICA_GRANT => handlers::replica_grant(daemon, req.args),
         op::REPLICA_REVOKE => handlers::replica_revoke(daemon, req.args),
         op::REPLICA_STATUS => handlers::replica_status(daemon, req.args),
@@ -589,5 +591,98 @@ mod tests {
         let (kind, msg) = err_of(resp);
         assert_eq!(kind, ErrorKind::BadArgs);
         assert!(msg.contains("after issued_at"), "{msg}");
+    }
+
+    /// `runner_sign_offer` signs an offer whose signature verifies via
+    /// `softfig_net::verify_offer_sig`, and `runner_local_device` returns this
+    /// device's transport material with a self-attestation that checks out
+    /// (spec §3.3, §6 step 1) — the slice-007 remote-execution requester core.
+    #[test]
+    fn runner_sign_offer_and_local_device_round_trip() {
+        use softfig_ipc::verbs::{RunnerLocalDeviceReply, RunnerSignOfferReply};
+        use softfig_net::proto::{EnvEntry, JobOffer};
+
+        let (_g, daemon) = unlocked();
+
+        // A correctly-shaped offer: 16-byte job_id, 32-byte repo_key, a typed
+        // source id (tag 1 + 20-byte sha1 root), and a 20-byte snapshot commit.
+        let job_id = "01".repeat(16);
+        let repo_key = "02".repeat(32);
+        let source_id = format!("01{}", "03".repeat(20));
+        let snapshot_commit = "04".repeat(20);
+
+        let offer_resp = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_SIGN_OFFER,
+                serde_json::json!({
+                    "job_id": job_id,
+                    "repo_key": repo_key,
+                    "source_id": source_id,
+                    "snapshot_commit": snapshot_commit,
+                    "profile": "gate",
+                    "cmd": ["cargo", "test"],
+                    "env": [{"name": "B", "value": "2"}, {"name": "A", "value": "1"}],
+                    "toolchain": "rust",
+                    "network": "none",
+                    "cache": "shared",
+                    "artifacts": ["target/release/softfig"],
+                    "requested_at": 1_800_000_000i64,
+                }),
+            ),
+        );
+        let data = match offer_resp {
+            Response::Ok { data, .. } => data,
+            other => panic!("runner_sign_offer failed: {other:?}"),
+        };
+        let reply: RunnerSignOfferReply = serde_json::from_value(data).unwrap();
+
+        let device_id: [u8; 32] = hex::decode(&reply.device_id).unwrap().try_into().unwrap();
+        let sig = hex::decode(&reply.signature).unwrap();
+
+        let offer = JobOffer {
+            job_id: hex::decode(&job_id).unwrap(),
+            repo_key: hex::decode(&repo_key).unwrap(),
+            source_id: hex::decode(&source_id).unwrap(),
+            snapshot_commit: hex::decode(&snapshot_commit).unwrap(),
+            profile: "gate".into(),
+            cmd: vec!["cargo".into(), "test".into()],
+            env: vec![
+                EnvEntry { name: "B".into(), value: "2".into() },
+                EnvEntry { name: "A".into(), value: "1".into() },
+            ],
+            toolchain: "rust".into(),
+            network: "none".into(),
+            cache: "shared".into(),
+            artifacts: vec!["target/release/softfig".into()],
+            requested_at: 1_800_000_000,
+            signature: Vec::new(),
+        };
+        assert!(
+            softfig_net::verify_offer_sig(&offer, &device_id, &sig),
+            "offer signature must verify under the daemon identity"
+        );
+
+        // `runner_local_device` returns the same identity + a verifiable
+        // self-attestation over the transport static.
+        let ld_resp = dispatch(
+            &daemon,
+            Request::new(softfig_ipc::op::RUNNER_LOCAL_DEVICE, serde_json::json!({})),
+        );
+        let ld_data = match ld_resp {
+            Response::Ok { data, .. } => data,
+            other => panic!("runner_local_device failed: {other:?}"),
+        };
+        let ld: RunnerLocalDeviceReply = serde_json::from_value(ld_data).unwrap();
+        assert_eq!(ld.device_id, reply.device_id, "identity must be consistent");
+        let transport_pubkey: [u8; 32] = {
+            let secret: [u8; 32] = hex::decode(&ld.transport_secret).unwrap().try_into().unwrap();
+            x25519_dalek::x25519(secret, x25519_dalek::X25519_BASEPOINT_BYTES)
+        };
+        let attestation: [u8; 64] = hex::decode(&ld.static_attestation).unwrap().try_into().unwrap();
+        assert!(
+            softfig_net::verify_static_attestation(&device_id, &transport_pubkey, &attestation),
+            "the returned self-attestation must verify"
+        );
     }
 }

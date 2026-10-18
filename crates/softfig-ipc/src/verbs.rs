@@ -164,6 +164,15 @@ pub mod op {
     /// serial with the device identity key, so a stolen runner key cannot
     /// revoke itself.
     pub const RUNNER_SIGN_REVOKE: &str = "runner_sign_revoke";
+    /// remote-runner (spec §6 step 1): sign a `JobOffer`'s canonical bytes with
+    /// the device identity key, so a runner can verify *who* offered. The
+    /// identity secret never leaves the vault.
+    pub const RUNNER_SIGN_OFFER: &str = "runner_sign_offer";
+    /// remote-runner (spec §3.3): hand `softfig run` this device's own transport
+    /// material (X25519 static + self-attestation) so the CLI can open the
+    /// Noise connection to a runner. Only the transport static is exposed; the
+    /// Ed25519 identity *signing* secret stays in the vault.
+    pub const RUNNER_LOCAL_DEVICE: &str = "runner_local_device";
     /// M5b: grant a ring member permission to host this device's chain backup —
     /// add it to the owner-side `push_to` allow-list. The owner then pushes its
     /// signed ciphertext chain to that host (which must also have opted in via
@@ -1563,6 +1572,71 @@ pub struct RunnerSignRevokeReply {
     pub device_id: String,
     /// The identity key's signature over the revocation message (hex, 128 chars).
     pub signature: String,
+}
+
+/// One named env binding in a signed offer (`JobOffer.env`). `softfig-ipc`
+/// cannot depend on softfig-net's protobuf, so this mirrors the two-string
+/// `EnvEntry` shape for the `runner_sign_offer` args.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerOfferEnv {
+    pub name: String,
+    pub value: String,
+}
+
+/// `runner_sign_offer({job_id, repo_key, source_id, snapshot_commit, profile,
+/// cmd, env, toolchain, network, cache, artifacts, requested_at}) ->
+/// {device_id, signature}`. keeperd rebuilds the offer, derives its canonical
+/// signing bytes (`offer_signing_bytes`), and signs them with the device
+/// identity key — the secret never leaves the vault. Byte fields are lowercase
+/// hex (`job_id` 32 chars, `repo_key` 64, `source_id` a format tag + root,
+/// `snapshot_commit` 40 or 64).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerSignOfferArgs {
+    /// Random 128-bit job id (lowercase hex).
+    pub job_id: String,
+    /// BLAKE3 repo key (lowercase hex).
+    pub repo_key: String,
+    /// Typed source id (format tag + root, lowercase hex).
+    pub source_id: String,
+    /// Snapshot commit id (lowercase hex).
+    pub snapshot_commit: String,
+    pub profile: String,
+    pub cmd: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<RunnerOfferEnv>,
+    pub toolchain: String,
+    pub network: String,
+    pub cache: String,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    /// Unix seconds.
+    pub requested_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerSignOfferReply {
+    /// This device's identity key (lowercase hex).
+    pub device_id: String,
+    /// The identity key's signature over the offer bytes (hex, 128 chars).
+    pub signature: String,
+}
+
+/// `runner_local_device({}) -> {device_id, device_name, transport_secret,
+/// static_attestation}`. The requester's own transport material for the
+/// one-connection-per-job Noise session to a runner (spec §3.3). The X25519
+/// transport static is handed to the owner-run CLI process (the same trust
+/// boundary as the owner, who can unlock the vault directly); the Ed25519
+/// identity signing secret stays in keeperd.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerLocalDeviceReply {
+    /// This device's Ed25519 identity key (lowercase hex).
+    pub device_id: String,
+    /// Human-readable device name.
+    pub device_name: String,
+    /// The X25519 transport secret (lowercase hex, 64 chars).
+    pub transport_secret: String,
+    /// The self-attestation signature over the transport static (hex, 128 chars).
+    pub static_attestation: String,
 }
 
 // ---- M5b: replication (zero-knowledge device-chain backup) ------------

@@ -1536,6 +1536,82 @@ pub fn runner_sign_revoke(daemon: &Daemon, args: serde_json::Value) -> HandlerRe
     .unwrap())
 }
 
+/// `runner_sign_offer`: sign a job offer's canonical bytes with this device's
+/// identity key (secret never leaves the vault). The CLI builds the offer and
+/// hands over its signing-relevant fields; keeperd rebuilds it, derives the
+/// canonical bytes ([`softfig_net::offer_signing_bytes`]), and signs — the
+/// verifier ([`softfig_net::verify_offer_sig`]) re-derives the same bytes from
+/// the received fields, so a reordered `env` still verifies.
+pub fn runner_sign_offer(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    use softfig_ipc::verbs::{RunnerSignOfferArgs, RunnerSignOfferReply};
+    use softfig_net::proto::{EnvEntry, JobOffer};
+
+    let args: RunnerSignOfferArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("runner_sign_offer args: {e}")))?;
+
+    let decode = |s: &str, field: &'static str| -> std::result::Result<Vec<u8>, (ErrorKind, String)> {
+        hex::decode(s.trim()).map_err(|_| (ErrorKind::BadArgs, format!("{field} is not valid hex")))
+    };
+
+    let offer = JobOffer {
+        job_id: decode(&args.job_id, "job_id")?,
+        repo_key: decode(&args.repo_key, "repo_key")?,
+        source_id: decode(&args.source_id, "source_id")?,
+        snapshot_commit: decode(&args.snapshot_commit, "snapshot_commit")?,
+        profile: args.profile,
+        cmd: args.cmd,
+        env: args
+            .env
+            .into_iter()
+            .map(|e| EnvEntry {
+                name: e.name,
+                value: e.value,
+            })
+            .collect(),
+        toolchain: args.toolchain,
+        network: args.network,
+        cache: args.cache,
+        artifacts: args.artifacts,
+        requested_at: args.requested_at,
+        signature: Vec::new(),
+    };
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let session = inner.session.as_ref().expect("unlocked").clone();
+    let device_id = session.identity_pubkey().to_bytes();
+
+    let signature = session.sign(&softfig_net::offer_signing_bytes(&offer)).to_bytes();
+
+    Ok(serde_json::to_value(RunnerSignOfferReply {
+        device_id: hex::encode(device_id),
+        signature: hex::encode(signature),
+    })
+    .unwrap())
+}
+
+/// `runner_local_device`: hand the requester its own transport material (X25519
+/// static + self-attestation + identity + name) for the one-connection-per-job
+/// Noise session to a runner (spec §3.3). Only the transport static is
+/// exposed; the Ed25519 identity signing secret stays in the vault.
+pub fn runner_local_device(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    use softfig_ipc::verbs::RunnerLocalDeviceReply;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let session = inner.session.as_ref().expect("unlocked").clone();
+    let name = crate::net::device_name(&inner.config);
+    let local = crate::net::build_local_device(&session, name);
+
+    Ok(serde_json::to_value(RunnerLocalDeviceReply {
+        device_id: hex::encode(local.device_id),
+        device_name: local.device_name,
+        transport_secret: hex::encode(local.transport_secret),
+        static_attestation: hex::encode(local.static_attestation),
+    })
+    .unwrap())
+}
+
 // ---- M5b: replication (zero-knowledge device-chain backup) ------------
 
 pub fn replica_grant(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {

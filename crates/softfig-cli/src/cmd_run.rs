@@ -5,26 +5,33 @@
 //! job's own code on success, **254** for runner-side failures (with the
 //! reason printed), and local fallback only on the §9 triggers.
 //!
-//! This chunk wires config load + resolve + local fallback + exit codes. The
-//! remote execution path (snapshot → signed offer → `connect_runner` →
-//! `run_job`) and the keeperd `runner_sign_offer` verb land in the next
-//! slice-007 chunk, along with the keeperd job table that backs
-//! `ls`/`show`/`logs`/`attach`/`cancel`.
+//! Chunk 1 wired config load + resolve + local fallback + exit codes. Chunk 2
+//! lands the remote execution path: snapshot → `runner_sign_offer` keeperd
+//! verb → `connect_runner`/`run_job` (via `softfig_net::run_remote`). Runner
+//! discovery (mDNS `_softfig-runner._tcp` + relay) is a later chunk / slice-008
+//! manual smoke — today a peer's endpoint comes from its ring entry and
+//! `--on host:port` dials a runner directly (the loopback/test form).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     runtime_socket_path,
-    verbs::{op, ReadFileArgs, ReadFileReply},
+    verbs::{
+        op, PairListReply, ReadFileArgs, ReadFileReply, RunnerLocalDeviceReply, RunnerOfferEnv,
+        RunnerSignOfferArgs, RunnerSignOfferReply,
+    },
     Request,
 };
+use softfig_net::proto::{EnvEntry, JobOffer};
 use softfig_net::{
-    fallback_action, outcome_exit_code, Fallback, FallbackAction, ResolvedRun, RunFailure,
-    RunnerConfig,
+    fallback_action, is_fallback_trigger, outcome_exit_code, run_remote, Fallback,
+    FallbackAction, JobOutcome, LocalDevice, ResolvedRun, RunFailure, RunnerCache, RunnerConfig,
 };
+use softfig_source::{create_bundle, repo_key, root_commits, snapshot_repo, SubmodulePolicy};
 
 /// The per-call `--fallback` override (mirrors `[use] fallback`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -64,7 +71,7 @@ pub enum RunCmd {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Run on this runner peer (ring name or device-id fingerprint).
+    /// Run on this runner: `host:port` (direct) or a peer name/fingerprint.
     #[arg(long)]
     on: Option<String>,
     /// Use this named profile from the matched `[[project]]`.
@@ -168,6 +175,26 @@ fn load_config(socket: &Path) -> Result<RunnerConfig> {
     RunnerConfig::parse(&read.content).map_err(|e| anyhow!("config/runner.toml: {e}"))
 }
 
+/// The failure modes `attempt_runner` reports: a §9 fallback-driving
+/// [`RunFailure`], or a requester-side error that aborts without fallback
+/// (snapshot, sign, or config — never a "runner unavailable" event).
+enum AttemptFailure {
+    Runner(RunFailure),
+    Fatal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for AttemptFailure {
+    fn from(e: anyhow::Error) -> Self {
+        AttemptFailure::Fatal(e)
+    }
+}
+
+impl From<RunFailure> for AttemptFailure {
+    fn from(f: RunFailure) -> Self {
+        AttemptFailure::Runner(f)
+    }
+}
+
 fn run_job(args: RunArgs) -> Result<()> {
     if args.detach {
         return Err(anyhow!(
@@ -192,45 +219,253 @@ fn run_job(args: RunArgs) -> Result<()> {
 
     let cli_fallback = args.fallback.map(Fallback::from);
 
-    match attempt_runner(&resolved, args.on.as_deref()) {
-        Ok(outcome) => {
-            // A real runner result — exit with the job's own code (or 254 on a
-            // reject). `attempt_runner` returns a reject as `Ok(Rejected(..))`,
-            // so `outcome_exit_code` yields 254 here, not a fallback.
-            std::process::exit(outcome_exit_code(&outcome));
+    match attempt_runner(&socket, &cwd, &resolved, &config.use_.peers, args.on.as_deref()) {
+        Ok(outcome) => std::process::exit(outcome_exit_code(&outcome)),
+        Err(AttemptFailure::Fatal(e)) => Err(e),
+        Err(AttemptFailure::Runner(failure)) => {
+            match fallback_action(config.use_.fallback, cli_fallback, &failure) {
+                Some(FallbackAction::RunLocal) => run_local(&resolved, &failure),
+                Some(FallbackAction::Wait) => wait_and_retry(
+                    &socket,
+                    &cwd,
+                    &resolved,
+                    &config.use_.peers,
+                    args.on.as_deref(),
+                    &config.use_.wait_timeout,
+                    &failure,
+                ),
+                Some(FallbackAction::Fail) => {
+                    eprintln!("runner: {}", failure.reason());
+                    std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+                }
+                None => {
+                    eprintln!("runner: {}", failure.reason());
+                    std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+                }
+            }
         }
-        Err(failure) => match fallback_action(config.use_.fallback, cli_fallback, &failure) {
-            Some(FallbackAction::RunLocal) => run_local(&resolved, &failure),
-            Some(FallbackAction::Wait) => {
-                // `wait` retries until `wait_timeout`; the retry loop lands
-                // with the remote execution path (next chunk). For now it is
-                // indistinguishable from `fail` here — see the slice doc.
-                eprintln!("runner: {}", failure.reason());
-                eprintln!("fallback = wait is pending the remote execution path");
-                std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
-            }
-            Some(FallbackAction::Fail) => {
-                eprintln!("runner: {}", failure.reason());
-                std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
-            }
-            None => {
-                // Not a fallback trigger — a permanent runner-side failure.
-                eprintln!("runner: {}", failure.reason());
-                std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
-            }
-        },
     }
 }
 
-/// Attempt the remote runner path. This chunk returns `NoRunner` until the
-/// remote execution (snapshot → signed offer → `connect_runner` → `run_job`)
-/// lands in the next slice-007 chunk; the decision function is already the
-/// tested [`fallback_action`]/[`outcome_exit_code`].
-fn attempt_runner(_resolved: &ResolvedRun, _on: Option<&str>) -> std::result::Result<softfig_net::JobOutcome, RunFailure> {
-    // TODO(slice-007 chunk 2): snapshot the repo, build the offer, sign it via
-    // the keeperd `runner_sign_offer` verb, discover the runner endpoint
-    // (mDNS `_softfig-runner._tcp` — manual smoke), connect, and `run_job`.
-    Err(RunFailure::NoRunner)
+/// The remote execution path (spec §3.3, §4, §6, §9): snapshot the repo, build
+/// the offer, sign it via keeperd, resolve the runner, then
+/// [`run_remote`]. Returns the job outcome, or a fallback-driving failure.
+fn attempt_runner(
+    socket: &Path,
+    cwd: &Path,
+    resolved: &ResolvedRun,
+    peers: &[String],
+    on: Option<&str>,
+) -> std::result::Result<JobOutcome, AttemptFailure> {
+    // This device's transport material (the identity signing secret never
+    // leaves the vault; only the X25519 static is handed to this process).
+    let local = local_device(socket)?;
+
+    // Snapshot the worktree (immutable tree + synthetic commit), leaving refs,
+    // index and worktree byte-identical (spec §4.2).
+    let submodules = match resolved.submodules {
+        softfig_net::Submodules::Refuse => SubmodulePolicy::Refuse,
+        softfig_net::Submodules::Ignore => SubmodulePolicy::Ignore,
+    };
+    let snapshot = snapshot_repo(cwd, submodules).map_err(|e| anyhow!("snapshot: {e}"))?;
+    let roots = root_commits(cwd).map_err(|e| anyhow!("root commits: {e}"))?;
+    let repo_key = repo_key(&local.device_id, &roots);
+
+    let mut offer = build_offer(&snapshot, &repo_key, resolved);
+    offer.signature = sign_offer(socket, &offer)?;
+
+    let (endpoint, ring_identity) = resolve_runner(socket, on, peers)?;
+
+    // Volatile cache: certificates are re-learnable via XX, so a lost cache
+    // costs one extra handshake. Persistence to `<garden>/.softfig/runners.toml`
+    // lands with the keeperd job table (a later chunk).
+    let mut cache = RunnerCache::default();
+
+    let source_id = snapshot.source_id;
+    let commit = snapshot.commit;
+    let repo = cwd.to_path_buf();
+    let now = unix_now();
+    let outcome = run_remote(
+        &local,
+        &ring_identity,
+        &endpoint,
+        &mut cache,
+        &offer,
+        move |haves: &[Vec<u8>]| {
+            create_bundle(&repo, &source_id, &commit, haves).map_err(|e| e.to_string())
+        },
+        now,
+    )
+    .map_err(AttemptFailure::Runner)?;
+
+    Ok(outcome)
+}
+
+/// Build the unsigned [`JobOffer`] from a snapshot + resolved run (spec §6 step
+/// 1). The signature is filled by keeperd's `runner_sign_offer` afterwards.
+fn build_offer(snapshot: &softfig_source::Snapshot, repo_key: &[u8; 32], resolved: &ResolvedRun) -> JobOffer {
+    JobOffer {
+        job_id: random_job_id(),
+        repo_key: repo_key.to_vec(),
+        source_id: snapshot.source_id.encode(),
+        snapshot_commit: snapshot.commit.clone(),
+        profile: resolved.profile.clone(),
+        cmd: resolved.cmd.clone(),
+        env: resolved
+            .env
+            .iter()
+            .map(|(name, value)| EnvEntry {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        toolchain: resolved.toolchain.clone(),
+        network: resolved.network.clone(),
+        cache: resolved.cache.clone(),
+        artifacts: resolved.artifacts.clone(),
+        requested_at: unix_now(),
+        signature: Vec::new(),
+    }
+}
+
+/// This device's transport material, read back from keeperd.
+fn local_device(socket: &Path) -> Result<LocalDevice> {
+    let reply: RunnerLocalDeviceReply = serde_json::from_value(daemon_call(
+        socket,
+        op::RUNNER_LOCAL_DEVICE,
+        serde_json::json!({}),
+    )?)?;
+    Ok(LocalDevice {
+        transport_secret: fixed_bytes::<32>(&reply.transport_secret, "transport_secret")?,
+        device_id: fixed_bytes::<32>(&reply.device_id, "device_id")?,
+        device_name: reply.device_name,
+        static_attestation: fixed_bytes::<64>(&reply.static_attestation, "static_attestation")?,
+    })
+}
+
+/// Sign the offer's canonical bytes via keeperd (the identity secret never
+/// leaves the vault); the reply signature (hex) becomes `offer.signature`.
+fn sign_offer(socket: &Path, offer: &JobOffer) -> Result<Vec<u8>> {
+    let reply: RunnerSignOfferReply = serde_json::from_value(daemon_call(
+        socket,
+        op::RUNNER_SIGN_OFFER,
+        serde_json::to_value(RunnerSignOfferArgs {
+            job_id: hex::encode(&offer.job_id),
+            repo_key: hex::encode(&offer.repo_key),
+            source_id: hex::encode(&offer.source_id),
+            snapshot_commit: hex::encode(&offer.snapshot_commit),
+            profile: offer.profile.clone(),
+            cmd: offer.cmd.clone(),
+            env: offer
+                .env
+                .iter()
+                .map(|e| RunnerOfferEnv {
+                    name: e.name.clone(),
+                    value: e.value.clone(),
+                })
+                .collect(),
+            toolchain: offer.toolchain.clone(),
+            network: offer.network.clone(),
+            cache: offer.cache.clone(),
+            artifacts: offer.artifacts.clone(),
+            requested_at: offer.requested_at,
+        })?,
+    )?)?;
+    let sig = hex::decode(&reply.signature).map_err(|e| anyhow!("runner_sign_offer: bad hex: {e}"))?;
+    if sig.len() != 64 {
+        return Err(anyhow!("runner_sign_offer: signature wrong length"));
+    }
+    Ok(sig)
+}
+
+/// Resolve the runner endpoint + the owner identity (for cert verification).
+/// `on` may be a literal `host:port` (direct dial) or a peer name/fingerprint;
+/// otherwise the first `[use] peers` entry names the peer. Runner mDNS browse
+/// (`_softfig-runner._tcp`) and the relay are a later chunk / slice-008 manual
+/// smoke — a peer's endpoint today comes from its ring entry (filled by
+/// discovery), and `--on host:port` dials a runner directly.
+fn resolve_runner(
+    socket: &Path,
+    on: Option<&str>,
+    peers: &[String],
+) -> std::result::Result<(String, [u8; 32]), RunFailure> {
+    // Direct dial: `--on host:port`.
+    if let Some(hostport) = on
+        && looks_like_hostport(hostport)
+    {
+        let ring = first_peer_identity(socket, peers)?;
+        return Ok((hostport.to_string(), ring));
+    }
+    // A peer by name/fingerprint (from `--on`, else the first `[use] peers`).
+    let query = on.map(str::to_string).or_else(|| peers.first().cloned());
+    let query = query.ok_or(RunFailure::NoRunner)?;
+    let peer = resolve_peer(socket, &query).map_err(|_| RunFailure::NoRunner)?;
+    let device_id = fixed_bytes::<32>(&peer.fingerprint, "peer fingerprint")
+        .map_err(|_| RunFailure::NoRunner)?;
+    let endpoint = peer.endpoints.first().cloned().ok_or(RunFailure::NoRunner)?;
+    Ok((endpoint, device_id))
+}
+
+/// The identity of the first `[use] peers` entry (the runner owner, whose
+/// identity signed the runner certificate).
+fn first_peer_identity(socket: &Path, peers: &[String]) -> std::result::Result<[u8; 32], RunFailure> {
+    let query = peers.first().ok_or(RunFailure::NoRunner)?;
+    let peer = resolve_peer(socket, query).map_err(|_| RunFailure::NoRunner)?;
+    fixed_bytes::<32>(&peer.fingerprint, "peer fingerprint").map_err(|_| RunFailure::NoRunner)
+}
+
+/// Resolve a peer name/fingerprint to its ring entry (via keeperd `pair_list`).
+fn resolve_peer(socket: &Path, query: &str) -> Result<softfig_ipc::verbs::PairPeer> {
+    let reply: PairListReply = serde_json::from_value(daemon_call(
+        socket,
+        op::PAIR_LIST,
+        serde_json::json!({}),
+    )?)?;
+    let q = query.to_lowercase();
+    reply
+        .peers
+        .into_iter()
+        .find(|p| p.name == query || p.fingerprint == q || p.fingerprint.starts_with(&q))
+        .ok_or_else(|| anyhow!("no ring peer matches {query:?} — pair it first"))
+}
+
+/// Retry the remote path until `wait_timeout` elapses (`fallback = wait`, spec
+/// §9). A non-trigger failure is permanent and stops the retry immediately.
+/// Never returns.
+fn wait_and_retry(
+    socket: &Path,
+    cwd: &Path,
+    resolved: &ResolvedRun,
+    peers: &[String],
+    on: Option<&str>,
+    wait_timeout: &str,
+    first: &RunFailure,
+) -> ! {
+    eprintln!("runner: {}", first.reason());
+    let wait_secs = softfig_net::parse_runner_duration(wait_timeout).unwrap_or(1200);
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    let mut last = first.clone();
+    loop {
+        if Instant::now() >= deadline {
+            eprintln!("runner: gave up after wait_timeout (last: {})", last.reason());
+            std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        match attempt_runner(socket, cwd, resolved, peers, on) {
+            Ok(outcome) => std::process::exit(outcome_exit_code(&outcome)),
+            Err(AttemptFailure::Fatal(e)) => {
+                eprintln!("runner: {e:#}");
+                std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+            }
+            Err(AttemptFailure::Runner(f)) => {
+                last = f.clone();
+                if !is_fallback_trigger(&f) {
+                    eprintln!("runner: {}", f.reason());
+                    std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+                }
+            }
+        }
+    }
 }
 
 /// Run the resolved command locally in the repo (spec §9 local fallback): not
@@ -248,4 +483,54 @@ fn run_local(resolved: &ResolvedRun, reason: &RunFailure) -> ! {
             std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
         });
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// A random 128-bit job id (spec §6 step 1), from `/dev/urandom`.
+fn random_job_id() -> Vec<u8> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_ok()
+    {
+        return b.to_vec();
+    }
+    // Fallback: still unique per invocation (time + pid).
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut m = [0u8; 16];
+    m[..8].copy_from_slice(&now.to_be_bytes());
+    m[8..12].copy_from_slice(&std::process::id().to_be_bytes());
+    m.to_vec()
+}
+
+/// Decode a lowercase-hex string into a fixed-size byte array.
+fn fixed_bytes<const N: usize>(hex_s: &str, what: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(hex_s.trim()).map_err(|e| anyhow!("{what}: bad hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("{what}: wrong length (want {N} bytes)"))
+}
+
+/// Whether `s` looks like a direct `host:port` dial (an IPv4/IPv6 literal or a
+/// bare hostname followed by a numeric port).
+fn looks_like_hostport(s: &str) -> bool {
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => return false,
+    };
+    if host.contains('/') || host.contains(' ') {
+        return false;
+    }
+    port.parse::<u16>().is_ok()
+}
+
+/// Current unix time in seconds.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

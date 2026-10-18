@@ -20,8 +20,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use softfig_net::proto::{frame, Frame, JobAttach, JobCancel, JobLog};
 use softfig_net::runner_cert::RunnerCert;
 use softfig_net::{
-    offer_signing_bytes, run_job_collecting, static_attestation_message, testing, CachedRunner,
-    JobOutcome, JobRejectReason, JobState, LocalDevice, RunnerCache,
+    offer_signing_bytes, run_job_collecting, run_remote, static_attestation_message, testing,
+    CachedRunner, JobOutcome, JobRejectReason, JobState, LocalDevice, RunFailure, RunnerCache,
 };
 use softfig_source::{create_bundle, repo_key, root_commits, snapshot_repo, SubmodulePolicy};
 use softfig_runnerd::cert::StoredCert;
@@ -502,6 +502,115 @@ fn happy_path_offer_accept_result() {
     // Chunk 3: the result carries a signed, verifiable attestation.
     let signed = softfig_runnerd::SignedAttestation::from_bytes(&result.attestation).unwrap();
     assert!(signed.verify(&cert.runner_attest_pubkey));
+}
+
+#[test]
+fn run_remote_happy_path_returns_the_job_code() {
+    let req = Requester::new(21, 22);
+    let fx = RunnerFixture::new([0x21; 16], NOW + 90 * 24 * 60 * 60);
+    fx.grant(&req);
+    fx.serve_one();
+
+    let snap = SnapshotFixture::new([21u8; 32]);
+    let mut offer = snap.offer();
+    offer.signature = req.sign_offer(&offer);
+
+    let mut cache = RunnerCache::default();
+    let outcome = run_remote(
+        &req.local(),
+        &fx.ring_identity(),
+        &fx.addr(),
+        &mut cache,
+        &offer,
+        |haves| snap.make_bundle(haves),
+        NOW,
+    )
+    .unwrap();
+    let result = match outcome {
+        JobOutcome::Accepted(r) => r,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.job_id, offer.job_id);
+}
+
+#[test]
+fn run_remote_maps_a_reject_to_a_run_failure() {
+    let req = Requester::new(31, 32);
+    let fx = RunnerFixture::new([0x31; 16], NOW + 90 * 24 * 60 * 60);
+    // No grant: the runner refuses with `not-granted` before any bundle.
+    fx.serve_one();
+
+    let snap = SnapshotFixture::new([31u8; 32]);
+    let mut offer = snap.offer();
+    offer.signature = req.sign_offer(&offer);
+
+    let mut cache = RunnerCache::default();
+    let err = run_remote(
+        &req.local(),
+        &fx.ring_identity(),
+        &fx.addr(),
+        &mut cache,
+        &offer,
+        |_haves| no_bundle(_haves),
+        NOW,
+    )
+    .unwrap_err();
+    assert_eq!(err, RunFailure::Rejected(JobRejectReason::NotGranted));
+}
+
+#[test]
+fn run_remote_maps_a_cert_failure_to_invalid_cert() {
+    let req = Requester::new(41, 42);
+    let fx = RunnerFixture::new([0x41; 16], NOW + 90 * 24 * 60 * 60);
+    fx.grant(&req);
+    fx.serve_one();
+
+    let snap = SnapshotFixture::new([41u8; 32]);
+    let mut offer = snap.offer();
+    offer.signature = req.sign_offer(&offer);
+
+    // A ring identity that is NOT the signer of the certificate: the cert
+    // signature fails to verify, so `run_remote` reports `InvalidCert`.
+    let wrong_ring: [u8; 32] = [0xEE; 32];
+    let mut cache = RunnerCache::default();
+    let err = run_remote(
+        &req.local(),
+        &wrong_ring,
+        &fx.addr(),
+        &mut cache,
+        &offer,
+        |_haves| no_bundle(_haves),
+        NOW,
+    )
+    .unwrap_err();
+    assert_eq!(err, RunFailure::InvalidCert);
+}
+
+#[test]
+fn run_remote_maps_an_unreachable_runner_to_no_runner() {
+    let req = Requester::new(51, 52);
+    let snap = SnapshotFixture::new([51u8; 32]);
+    let mut offer = snap.offer();
+    offer.signature = req.sign_offer(&offer);
+
+    // Dial a port nobody is listening on: connection refused -> NoRunner.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+
+    let mut cache = RunnerCache::default();
+    let err = run_remote(
+        &req.local(),
+        &[0u8; 32],
+        &addr,
+        &mut cache,
+        &offer,
+        |_haves| no_bundle(_haves),
+        NOW,
+    )
+    .unwrap_err();
+    assert_eq!(err, RunFailure::NoRunner);
 }
 
 #[test]

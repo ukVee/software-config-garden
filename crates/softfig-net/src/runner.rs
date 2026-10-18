@@ -27,6 +27,7 @@ use crate::attest::{KEY_LEN, SIG_LEN};
 use crate::error::{NetError, Result};
 use crate::pairing::LocalDevice;
 use crate::proto::{self, frame, Frame, JobEvent, JobLog, JobOffer, JobResult, RunnerCaps, RunnerCertRevoke, SourceChunk};
+use crate::run_plan::RunFailure;
 use crate::runner_cert::{self, RUNNER_SERIAL_LEN};
 use crate::transport::{runner_ik_initiator, runner_xx_initiator, RunnerSession};
 
@@ -507,6 +508,67 @@ where
             Ok((caps, JobOutcome::Rejected(reason), logs, events))
         }
         _ => Err(NetError::Protocol("expected JobAccept or JobReject")),
+    }
+}
+
+/// Run one job against a runner at `endpoint` (spec §9): dial, verify the
+/// certificate against `ring_identity` + the cached revocation list, then
+/// [`run_job`] with the caller's bundle closure. Maps transport/cert failures
+/// onto [`RunFailure`] so the CLI's fallback/exit-code decision is a pure
+/// function of the result, and caches a freshly-verified certificate back into
+/// `cache` for the next `IK` reconnect. The offer must already carry its
+/// identity signature (keeperd signs it — the requester holds no secret).
+pub fn run_remote<E, F>(
+    local: &LocalDevice,
+    ring_identity: &[u8; KEY_LEN],
+    endpoint: &str,
+    cache: &mut RunnerCache,
+    offer: &JobOffer,
+    make_bundle: F,
+    now: i64,
+) -> std::result::Result<JobOutcome, RunFailure>
+where
+    F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
+    E: std::fmt::Display,
+{
+    // Revoked-cache fast path: refuse before dialing when the cached cert's
+    // serial is already revoked.
+    let cached_key = hex::encode(ring_identity);
+    if let Some(c) = cache.get(&cached_key)
+        && cache.is_serial_revoked(&c.cert.serial)
+    {
+        return Err(RunFailure::RevokedCert);
+    }
+
+    let stream = std::net::TcpStream::connect(endpoint)
+        .map_err(|_| RunFailure::NoRunner)?;
+
+    let cached = cache.get(&cached_key);
+    let revoked = cache.revoked_serial_bytes();
+    let (mut session, cert) = connect_runner(stream, local, ring_identity, cached, &revoked, now)
+        .map_err(|e| match e {
+            NetError::RunnerCert(_) => RunFailure::InvalidCert,
+            _ => RunFailure::NoRunner,
+        })?;
+
+    // Cache the verified certificate (keyed by the owner identity == the
+    // cert's device_id) for the next IK reconnect.
+    cache.put(
+        &cached_key,
+        CachedRunner {
+            cert: cert.clone(),
+            signature: hex::encode(session.signature()),
+        },
+    );
+
+    let (_caps, outcome) = run_job(&mut session, offer, make_bundle).map_err(|e| match e {
+        NetError::RunnerCert(_) => RunFailure::InvalidCert,
+        _ => RunFailure::NoRunner,
+    })?;
+
+    match outcome {
+        JobOutcome::Rejected(reason) => Err(RunFailure::Rejected(reason)),
+        accepted => Ok(accepted),
     }
 }
 
