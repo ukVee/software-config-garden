@@ -156,6 +156,14 @@ pub mod op {
     /// discovery cache so the CLI/TUI can pair by name without typing a
     /// fingerprint.
     pub const DISCOVER_LIST: &str = "discover_list";
+    /// remote-runner (spec): sign a runner certificate with the device identity
+    /// key. The certificate binds a runner's X25519 transport static + Ed25519
+    /// attest key to this device; the secret never leaves the vault.
+    pub const RUNNER_SIGN_CERT: &str = "runner_sign_cert";
+    /// remote-runner (spec §3.1): sign a runner-certificate *revocation* over a
+    /// serial with the device identity key, so a stolen runner key cannot
+    /// revoke itself.
+    pub const RUNNER_SIGN_REVOKE: &str = "runner_sign_revoke";
     /// M5b: grant a ring member permission to host this device's chain backup —
     /// add it to the owner-side `push_to` allow-list. The owner then pushes its
     /// signed ciphertext chain to that host (which must also have opted in via
@@ -1491,7 +1499,74 @@ pub struct DiscoveredDevice {
     pub last_seen_secs: u64,
 }
 
+// ---- remote runner (delegated identity, spec §3.1) ---------------------
+//
+// The runner certificate's *wire* form. This duplicates the hex-string serde
+// shape of `softfig-net::runner_cert::RunnerCert` (softfig-ipc deliberately
+// does not depend on softfig-net — it would drag in snow/prost/mdns-sd for a
+// six-field struct). The two must stay byte-compatible: a `RunnerCertWire`
+// serializes to the same TOML/JSON a `RunnerCert` does, so the CLI can store
+// it verbatim as `cert.toml`. Field names are the serde contract.
+
+/// One delegated runner certificate in hex-string wire form. `device_id`,
+/// `runner_transport_pubkey`, `runner_attest_pubkey` are 32-byte keys as
+/// lowercase hex; `serial` is the 16-byte serial as lowercase hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerCertWire {
+    pub device_id: String,
+    pub runner_transport_pubkey: String,
+    pub runner_attest_pubkey: String,
+    pub serial: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+}
+
+/// `runner_sign_cert({runner_transport_pubkey, runner_attest_pubkey,
+/// issued_at, expires_at}) -> {cert, signature}`. keeperd generates a fresh
+/// 128-bit serial, fills in `device_id` from its own identity, and signs the
+/// certificate's canonical bytes. The caller supplies the runner's two public
+/// keys and the validity window; the identity secret stays in the vault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerSignCertArgs {
+    /// The runner's X25519 transport static (lowercase hex, 64 chars).
+    pub runner_transport_pubkey: String,
+    /// The runner's Ed25519 attest pubkey (lowercase hex, 64 chars).
+    pub runner_attest_pubkey: String,
+    /// Issue time, Unix seconds.
+    pub issued_at: i64,
+    /// Expiry time, Unix seconds (exclusive).
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerSignCertReply {
+    /// The complete certificate (with `device_id` + generated `serial`), ready
+    /// to store verbatim as `cert.toml`.
+    pub cert: RunnerCertWire,
+    /// The device identity's signature over the canonical bytes (hex, 128 chars).
+    pub signature: String,
+}
+
+/// `runner_sign_revoke({serial}) -> {device_id, signature}`. The device
+/// identity signs a revocation record over the serial (domain
+/// `softfig/runner/revocation/v1`); the caller holds it locally until slice
+/// 003's `RunnerCertRevoke` wire frame distributes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerSignRevokeArgs {
+    /// The 16-byte certificate serial to revoke (lowercase hex, 32 chars).
+    pub serial: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerSignRevokeReply {
+    /// This device's identity key (lowercase hex).
+    pub device_id: String,
+    /// The identity key's signature over the revocation message (hex, 128 chars).
+    pub signature: String,
+}
+
 // ---- M5b: replication (zero-knowledge device-chain backup) ------------
+
 
 /// `replica_grant({fingerprint}) -> {fingerprint, granted}`. Add a ring member
 /// (by device-id fingerprint, full or unique prefix) to the owner's `push_to`

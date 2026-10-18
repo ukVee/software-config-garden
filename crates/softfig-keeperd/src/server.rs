@@ -340,6 +340,8 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::PAIR_LIST => handlers::pair_list(daemon, req.args),
         op::PAIR_REMOVE => handlers::pair_remove(daemon, req.args),
         op::DISCOVER_LIST => handlers::discover_list(daemon, req.args),
+        op::RUNNER_SIGN_CERT => handlers::runner_sign_cert(daemon, req.args),
+        op::RUNNER_SIGN_REVOKE => handlers::runner_sign_revoke(daemon, req.args),
         op::REPLICA_GRANT => handlers::replica_grant(daemon, req.args),
         op::REPLICA_REVOKE => handlers::replica_revoke(daemon, req.args),
         op::REPLICA_STATUS => handlers::replica_status(daemon, req.args),
@@ -483,5 +485,109 @@ mod tests {
         assert!(!msg.contains("growlightd"), "{msg}");
         let inner = daemon.inner.lock().unwrap();
         assert!(!WorkTree::new(&daemon, &inner).exists("growlight/backlog/milestones/m/slices"));
+    }
+
+    /// `runner_sign_cert` signs a cert whose signature verifies against the
+    /// daemon's real identity, and `runner_sign_revoke` signs a revocation the
+    /// runner_cert module can check — the slice-002 delegated-identity core.
+    #[test]
+    fn runner_sign_cert_and_revoke_round_trip() {
+        use softfig_ipc::verbs::{RunnerSignCertReply, RunnerSignRevokeReply};
+
+        let (_g, daemon) = unlocked();
+        let now = 1_800_000_000i64;
+
+        // Arbitrary (but correctly-shaped) runner public keys; keeperd signs
+        // whatever bytes they produce, so no real keypair is needed.
+        let transport = "ab".repeat(32);
+        let attest = "cd".repeat(32);
+
+        let cert_resp = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_SIGN_CERT,
+                serde_json::json!({
+                    "runner_transport_pubkey": transport,
+                    "runner_attest_pubkey": attest,
+                    "issued_at": now,
+                    "expires_at": now + 90 * 24 * 60 * 60,
+                }),
+            ),
+        );
+        let cert_data = match cert_resp {
+            Response::Ok { data, .. } => data,
+            other => panic!("runner_sign_cert failed: {other:?}"),
+        };
+        let reply: RunnerSignCertReply = serde_json::from_value(cert_data).unwrap();
+        assert_eq!(reply.cert.runner_transport_pubkey, transport);
+        assert_eq!(reply.cert.runner_attest_pubkey, attest);
+        assert_eq!(reply.cert.issued_at, now);
+
+        // The signature verifies under the daemon's identity, over the wire cert.
+        let device_id: [u8; 32] = hex::decode(&reply.cert.device_id).unwrap().try_into().unwrap();
+        let serial: [u8; 16] = hex::decode(&reply.cert.serial).unwrap().try_into().unwrap();
+        let cert = softfig_net::runner_cert::RunnerCert {
+            device_id,
+            runner_transport_pubkey: hex::decode(&reply.cert.runner_transport_pubkey)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            runner_attest_pubkey: hex::decode(&reply.cert.runner_attest_pubkey)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            serial,
+            issued_at: reply.cert.issued_at,
+            expires_at: reply.cert.expires_at,
+        };
+        let sig: [u8; 64] = hex::decode(&reply.signature).unwrap().try_into().unwrap();
+        assert!(
+            softfig_net::runner_cert::verify(&cert, &sig, &device_id, now, &[]),
+            "certificate signature must verify against the daemon identity"
+        );
+
+        // Revocation: the identity signs the serial; the message checks out.
+        let revoke_resp = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_SIGN_REVOKE,
+                serde_json::json!({ "serial": reply.cert.serial }),
+            ),
+        );
+        let revoke_data = match revoke_resp {
+            Response::Ok { data, .. } => data,
+            other => panic!("runner_sign_revoke failed: {other:?}"),
+        };
+        let revoke: RunnerSignRevokeReply = serde_json::from_value(revoke_data).unwrap();
+        assert_eq!(revoke.device_id, reply.cert.device_id);
+        let rev_sig: [u8; 64] = hex::decode(&revoke.signature).unwrap().try_into().unwrap();
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let vk = VerifyingKey::from_bytes(&device_id).unwrap();
+        vk.verify(
+            &softfig_net::runner_cert::revocation_message(&device_id, &serial),
+            &Signature::from_bytes(&rev_sig),
+        )
+        .unwrap();
+    }
+
+    /// A non-positive certificate window is refused, not signed.
+    #[test]
+    fn runner_sign_cert_refuses_bad_window() {
+        let (_g, daemon) = unlocked();
+        let resp = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_SIGN_CERT,
+                serde_json::json!({
+                    "runner_transport_pubkey": "ab".repeat(32),
+                    "runner_attest_pubkey": "cd".repeat(32),
+                    "issued_at": 10,
+                    "expires_at": 5,
+                }),
+            ),
+        );
+        let (kind, msg) = err_of(resp);
+        assert_eq!(kind, ErrorKind::BadArgs);
+        assert!(msg.contains("after issued_at"), "{msg}");
     }
 }

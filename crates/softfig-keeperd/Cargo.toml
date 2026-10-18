@@ -51,6 +51,9 @@ base64.workspace = true
 # it is sealed under the vault (softfig-net stays zeroize-free by design).
 zeroize.workspace = true
 
+# remote-runner: generate a fresh runner-certificate serial in `runner_sign_cert`.
+rand.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 # M5a-4 pairing test: forge a second device (Ed25519 id + X25519 static +

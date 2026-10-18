@@ -1426,6 +1426,116 @@ pub fn discover_list(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult
     Ok(serde_json::to_value(DiscoverListReply { devices }).unwrap())
 }
 
+// ---- remote runner (delegated identity, spec §3.1) ---------------------
+
+/// Decode a lowercase-hex string into a fixed-size byte array, naming the
+/// field in the refusal so a CLI user sees which value was malformed.
+fn decode_hex_array<const N: usize>(
+    s: &str,
+    field: &'static str,
+) -> std::result::Result<[u8; N], (ErrorKind, String)> {
+    let bytes = hex::decode(s.trim())
+        .map_err(|_| (ErrorKind::BadArgs, format!("{field} is not valid hex")))?;
+    bytes.try_into().map_err(|_| {
+        (
+            ErrorKind::BadArgs,
+            format!("{field} has wrong length (want {N} bytes)"),
+        )
+    })
+}
+
+/// `runner_sign_cert`: sign a runner certificate with this device's identity
+/// key. Generates the serial, fills `device_id` from the vault-held identity,
+/// and signs the canonical bytes — the secret never leaves the vault. The
+/// caller (the CLI) supplies the runner's two public keys (read back from
+/// runnerd's admin socket on `enable`) and the validity window.
+pub fn runner_sign_cert(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    use softfig_ipc::verbs::{
+        RunnerCertWire, RunnerSignCertArgs, RunnerSignCertReply,
+    };
+    use softfig_net::runner_cert::{self, RUNNER_SERIAL_LEN};
+
+    let args: RunnerSignCertArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("runner_sign_cert args: {e}")))?;
+
+    let runner_transport_pubkey = decode_hex_array::<32>(
+        &args.runner_transport_pubkey,
+        "runner_transport_pubkey",
+    )?;
+    let runner_attest_pubkey =
+        decode_hex_array::<32>(&args.runner_attest_pubkey, "runner_attest_pubkey")?;
+
+    // A non-positive window is a caller bug, never something to sign.
+    if args.expires_at <= args.issued_at {
+        return Err((
+            ErrorKind::BadArgs,
+            format!(
+                "expires_at ({}) must be after issued_at ({})",
+                args.expires_at, args.issued_at
+            ),
+        ));
+    }
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let session = inner.session.as_ref().expect("unlocked").clone();
+    let device_id = session.identity_pubkey().to_bytes();
+
+    // Fresh random serial — the unit of revocation.
+    let mut serial = [0u8; RUNNER_SERIAL_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut serial);
+
+    let cert = runner_cert::RunnerCert {
+        device_id,
+        runner_transport_pubkey,
+        runner_attest_pubkey,
+        serial,
+        issued_at: args.issued_at,
+        expires_at: args.expires_at,
+    };
+    let signature = session.sign(&runner_cert::signing_message(&cert)).to_bytes();
+
+    Ok(serde_json::to_value(RunnerSignCertReply {
+        cert: RunnerCertWire {
+            device_id: hex::encode(device_id),
+            runner_transport_pubkey: hex::encode(runner_transport_pubkey),
+            runner_attest_pubkey: hex::encode(runner_attest_pubkey),
+            serial: hex::encode(serial),
+            issued_at: cert.issued_at,
+            expires_at: cert.expires_at,
+        },
+        signature: hex::encode(signature),
+    })
+    .unwrap())
+}
+
+/// `runner_sign_revoke`: sign a runner-certificate revocation over a serial
+/// with the device identity key. The record is held locally until slice 003's
+/// `RunnerCertRevoke` wire frame distributes it to the ring.
+pub fn runner_sign_revoke(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    use softfig_ipc::verbs::{RunnerSignRevokeArgs, RunnerSignRevokeReply};
+    use softfig_net::runner_cert::{self, RUNNER_SERIAL_LEN};
+
+    let args: RunnerSignRevokeArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("runner_sign_revoke args: {e}")))?;
+    let serial = decode_hex_array::<RUNNER_SERIAL_LEN>(&args.serial, "serial")?;
+
+    let inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+    let session = inner.session.as_ref().expect("unlocked").clone();
+    let device_id = session.identity_pubkey().to_bytes();
+
+    let signature = session
+        .sign(&runner_cert::revocation_message(&device_id, &serial))
+        .to_bytes();
+
+    Ok(serde_json::to_value(RunnerSignRevokeReply {
+        device_id: hex::encode(device_id),
+        signature: hex::encode(signature),
+    })
+    .unwrap())
+}
+
 // ---- M5b: replication (zero-knowledge device-chain backup) ------------
 
 pub fn replica_grant(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
