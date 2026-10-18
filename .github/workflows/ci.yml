@@ -59,6 +59,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo build --workspace --release
 
+  # The rescue artifact must build without the FUSE stack (meta/spec-release.md
+  # → "What CI must prove"): this job deliberately installs no protoc and no
+  # libfuse3-dev, so a stray FUSE link or protoc dependency in the rescue crate
+  # fails here. The readelf check then proves the built binary needs no libfuse.
+  rescue:
+    name: rescue (no-FUSE, minimal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the rescue artifact (no system deps)
+        run: cargo build -p softfig-rescue --release --locked
+      - name: Prove the rescue binary needs no libfuse3
+        run: |
+          set -euo pipefail
+          if readelf -d target/release/softfig-rescue 2>/dev/null | grep -qi 'libfuse'; then
+            echo "softfig-rescue needs libfuse — the rescue profile must not require FUSE" >&2
+            exit 1
+          fi
+          echo "rescue binary needs no libfuse"
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest

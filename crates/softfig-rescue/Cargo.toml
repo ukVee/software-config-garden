@@ -1,0 +1,17 @@
+[package]
+name = "softfig-rescue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig rescue artifact — the recovery-wedge binary (no FUSE, no daemon, no network): writes the carry-file and declares the packs seam."
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -27,10 +27,9 @@ jobs:
   # Tier 1 x86_64-unknown-linux-gnu is built and tested (by CI's test gate on
   # main, the commit a tag must point at); tier 2 aarch64-unknown-linux-gnu is
   # built, untested on hardware, and labeled as such in the artifact name. The
-  # helper (static musl ×2, slice 005) and the rescue artifact (static musl ×2,
-  # slice 006) do not exist yet; their slots are named here (meta/spec-release.md
-  # → "Artifacts" → "Target matrix") so they drop in without restructuring the
-  # matrix.
+  # rescue artifact (static musl ×2, slice 006) builds in its own job below. The
+  # helper slot (static musl ×2, slice 005) is still unowned — report 050, the
+  # owner's pre-tag step.
   program:
     name: program (${{ matrix.target }})
     strategy:
@@ -74,6 +73,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # --- Rescue artifact: static musl, no FUSE, no daemon (slice 006) ---------
+  # tier 1 x86_64-unknown-linux-musl + tier 2 aarch64-unknown-linux-musl, both
+  # static and minimal (meta/spec-release.md → "Artifacts" → "Target matrix").
+  # Built with NO system deps on purpose: the rescue binary must not link
+  # libfuse3 or anything else a live-USB/chroot lacks, so a stray FUSE
+  # dependency in the rescue crate fails this build (no libfuse3-dev is
+  # installed here).
+  rescue:
+    name: rescue (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the rescue artifact (static musl, no system deps)
+        run: cargo build -p softfig-rescue --release --locked --target ${{ matrix.target }}
+      - name: Prove the rescue binary needs no libfuse3
+        run: |
+          set -euo pipefail
+          if readelf -d "target/${{ matrix.target }}/release/softfig-rescue" 2>/dev/null | grep -qi 'libfuse'; then
+            echo "softfig-rescue needs libfuse — the rescue profile must not require FUSE" >&2
+            exit 1
+          fi
+          echo "rescue binary needs no libfuse"
+      - name: Stage the rescue artifact
+        run: |
+          set -euo pipefail
+          stage="softfig-rescue-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          cp "target/${{ matrix.target }}/release/softfig-rescue" "dist/${stage}/softfig-rescue"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rescue-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   # --- Privileged: attest provenance + publish ------------------------------
   # Mints the sigstore build-provenance attestation for every artifact and
   # uploads the release. Runs only through the `release` Environment (required
@@ -81,7 +127,7 @@ jobs:
   # token: the workflow default is contents: read; this job alone gains
   # id-token + attestations + contents write.
   publish:
-    needs: program
+    needs: [program, rescue]
     runs-on: ubuntu-latest
     permissions:
       contents: write

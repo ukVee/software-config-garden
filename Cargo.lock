@@ -3844,6 +3844,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-rescue"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "clap",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "softfig-store"
 version = "1.0.0-alpha.1"
 dependencies = [
