@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
 
 # No `cargo fmt` job here: the tree is not yet rustfmt-clean, so fmt would be
-# red on arrival. `cargo clippy --all-targets -- -D warnings` (the clippy job
+# red on arrival. `cargo clippy --all-targets --locked -- -D warnings` (the clippy job
 # below) is this repo's style gate, per CLAUDE.md's build/test/run section.
 #
 # Every action is pinned to a full commit SHA, never a floating tag — a mutable
@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: test
@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo test --workspace --no-fail-fast
+      - run: cargo test --workspace --no-fail-fast --locked
 
   build:
     name: build
@@ -57,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo build --workspace --release
+      - run: cargo build --workspace --release --locked
 
   # The rescue artifact must build without the FUSE stack (meta/spec-release.md
   # → "What CI must prove"): this job deliberately installs no protoc and no
@@ -92,7 +92,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --locked
 
   deny:
     name: deny (advisories + licenses + bans)
