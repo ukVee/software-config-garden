@@ -110,9 +110,8 @@ jobs:
   # Tier 1 x86_64-unknown-linux-gnu is built and tested (by CI's test gate on
   # main, the commit a tag must point at); tier 2 aarch64-unknown-linux-gnu is
   # built, untested on hardware, and labeled as such in the artifact name. The
-  # rescue artifact (static musl ×2, slice 006) builds in its own job below. The
-  # helper slot (static musl ×2, slice 005) is still unowned — report 050, the
-  # owner's pre-tag step.
+  # rescue artifact (static musl ×2, slice 006) and the helper (softfig-install,
+  # static musl ×2, slice 005) build in their own jobs below (report 050).
   program:
     name: program (${{ matrix.target }})
     needs: [gate]
@@ -264,6 +263,78 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # --- Helper artifact: the softfig-install front door, static musl (slice 005)
+  # tier 1 x86_64-unknown-linux-musl + tier 2 aarch64-unknown-linux-musl, both
+  # static (meta/spec-release.md → "Target matrix" → helper). The downloaded
+  # front door must run on a cold box with no toolchain, so like the rescue job
+  # it builds with NO system deps and NO C cross-compiler: the softfig-install
+  # crate is pure Rust (clap/toml/rustix/semver/tempfile/softfig-ipc), so a stray
+  # C/openssl/ring/git2 dependency fails this build instead of silently shipping
+  # a helper that needs a linker (report 050).
+  helper:
+    name: helper (${{ matrix.target }})
+    needs: [gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
+      - name: Build the helper artifact (static musl, no system deps)
+        run: cargo build -p softfig-install --release --locked --target ${{ matrix.target }}
+      - name: Prove the helper binary is statically linked
+        run: |
+          set -euo pipefail
+          if readelf -d "target/${{ matrix.target }}/release/softfig-install" 2>/dev/null | grep -qi 'NEEDED'; then
+            echo "softfig-install has dynamic NEEDED entries — the helper must be statically linked" >&2
+            exit 1
+          fi
+          echo "helper binary is statically linked"
+      - name: Compute the release version (validated tag without the leading v)
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "$TAG_NAME" | grep -Eq '^v[0-9A-Za-z._-]+$' || {
+            echo "tag name does not match ^v[0-9A-Za-z._-]+$" >&2
+            exit 1
+          }
+          echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Stage the helper artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="softfig-install-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${stage}"
+          cp "target/${TARGET}/release/softfig-install" "dist/${stage}/softfig-install"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: helper-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   # --- Privileged: attest provenance + publish ------------------------------
   # Mints the sigstore build-provenance attestation for every artifact and
   # uploads the release. Runs only through the `release` Environment (required
@@ -275,7 +346,7 @@ jobs:
   # checksum + attestation steps have succeeded.
   publish:
     name: publish (Environment-gated)
-    needs: [gate, program, rescue]
+    needs: [gate, program, rescue, helper]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
