@@ -1702,6 +1702,17 @@ pub struct RunnerJobRecordArgs {
     /// The job's log ring bytes (base64), appended to the per-job ring.
     #[serde(default)]
     pub log_base64: String,
+    /// The runner's dial endpoint (`host:port`), stored so `attach`/`cancel`
+    /// can re-dial without re-resolving (spec §6).
+    #[serde(default)]
+    pub endpoint: String,
+    /// The runner owner's identity (device id, lowercase hex), for re-verifying
+    /// the certificate on `attach`/`cancel`.
+    #[serde(default)]
+    pub runner_identity: String,
+    /// `cancel` marks the row `cancelled` (a terminal state).
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 /// One job's summary row, for `runner_job_ls`.
@@ -1747,6 +1758,14 @@ pub struct RunnerJobShowReply {
     #[serde(rename = "where")]
     pub where_: String,
     pub state: String,
+    /// The runner's dial endpoint (`host:port`), stored at start for
+    /// `attach`/`cancel` re-dial.
+    #[serde(default)]
+    pub endpoint: String,
+    /// The runner owner's identity (device id, lowercase hex), for re-verifying
+    /// the certificate on `attach`/`cancel`.
+    #[serde(default)]
+    pub runner_identity: String,
     /// The log ring's current byte count (the bytes themselves come via
     /// `runner_job_log`).
     pub log_bytes: usize,

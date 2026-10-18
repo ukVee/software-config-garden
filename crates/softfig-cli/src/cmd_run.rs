@@ -23,15 +23,16 @@ use softfig_ipc::{
     verbs::{
         op, PairListReply, ReadFileArgs, ReadFileReply, RunnerJobLogReply, RunnerJobLsReply,
         RunnerJobRecordArgs, RunnerJobShowReply, RunnerLocalDeviceReply, RunnerOfferEnv,
-        RunnerSignOfferArgs, RunnerSignOfferReply,
+        RunnerSignOfferArgs, RunnerSignOfferReply, StatusReply,
     },
     Request,
 };
 use softfig_net::proto::{EnvEntry, JobLog, JobOffer};
 use softfig_net::{
-    fallback_action, is_fallback_trigger, outcome_exit_code, run_remote_collecting,
-    strip_control_sequences, Fallback, FallbackAction, JobOutcome, LocalDevice, ResolvedRun,
-    RunFailure, RunnerCache, RunnerConfig,
+    fallback_action, is_fallback_trigger, outcome_exit_code, run_remote_attach, run_remote_cancel,
+    run_remote_collecting, run_remote_start, runner_cache_path, strip_control_sequences,
+    CancelOutcome, Fallback, FallbackAction, JobOutcome, LocalDevice, ResolvedRun, RunFailure,
+    RunnerCache, RunnerConfig,
 };
 use softfig_source::{create_bundle, repo_key, root_commits, snapshot_repo, SubmodulePolicy};
 
@@ -131,9 +132,8 @@ pub fn run(cmd: RunCmd) -> Result<()> {
         RunCmd::Ls => job_ls(),
         RunCmd::Show(args) => job_show(&args),
         RunCmd::Logs(args) => job_log(&args),
-        RunCmd::Attach(_) | RunCmd::Cancel(_) => Err(anyhow!(
-            "attach/cancel needs the detached-job runner session — a later slice-007 chunk"
-        )),
+        RunCmd::Attach(args) => job_attach(&args),
+        RunCmd::Cancel(args) => job_cancel(&args),
         RunCmd::Fetch(_) => Err(anyhow!(
             "artifact fetch is parked on report #057 (the artifact glob base)"
         )),
@@ -197,11 +197,6 @@ impl From<RunFailure> for AttemptFailure {
 }
 
 fn run_job(args: RunArgs) -> Result<()> {
-    if args.detach {
-        return Err(anyhow!(
-            "--detach needs the keeperd job table — a later slice-007 chunk"
-        ));
-    }
     if !args.fetch.is_empty() {
         return Err(anyhow!(
             "--fetch is parked on report #057 (the artifact glob base)"
@@ -217,6 +212,23 @@ fn run_job(args: RunArgs) -> Result<()> {
         Some(args.cmd.clone())
     };
     let resolved = config.resolve(&cwd, args.profile.as_deref(), ad_hoc)?;
+
+    // Detached (spec §6): start on the runner, record a `running` row, print the
+    // job id, and exit 0 — no local fallback (a detached job is remote by
+    // definition, so a runner-side failure exits 254).
+    if args.detach {
+        match detach_job(&socket, &cwd, &resolved, &config.use_.peers, args.on.as_deref()) {
+            Ok(job_id) => {
+                println!("{job_id}");
+                return Ok(());
+            }
+            Err(AttemptFailure::Fatal(e)) => return Err(e),
+            Err(AttemptFailure::Runner(f)) => {
+                eprintln!("runner: {}", f.reason());
+                std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+            }
+        }
+    }
 
     let cli_fallback = args.fallback.map(Fallback::from);
 
@@ -277,10 +289,9 @@ fn attempt_runner(
 
     let (endpoint, ring_identity) = resolve_runner(socket, on, peers)?;
 
-    // Volatile cache: certificates are re-learnable via XX, so a lost cache
-    // costs one extra handshake. Persistence to `<garden>/.softfig/runners.toml`
-    // lands with the keeperd job table (a later chunk).
-    let mut cache = RunnerCache::default();
+    // Load the cert sidecar so `--detach`/`attach`/`cancel` share one cache; a
+    // missing/corrupt cache is empty (certs are re-learnable via XX).
+    let (mut cache, cache_path) = load_runner_cache(socket)?;
 
     let source_id = snapshot.source_id;
     let commit = snapshot.commit;
@@ -299,27 +310,27 @@ fn attempt_runner(
         now,
     )
     .map_err(AttemptFailure::Runner)?;
+    let _ = cache.save(&cache_path);
 
     // Record the completed job into keeperd's bounded in-memory table (spec §6,
     // §8), which backs `softfig run ls|show|logs`. Best-effort: a recording
     // failure never changes the job's own exit code.
-    record_job(socket, &local, &offer, &outcome, &logs, started_at);
+    record_job(
+        socket,
+        &local,
+        &offer,
+        &outcome,
+        &logs,
+        started_at,
+        (endpoint.as_str(), &ring_identity),
+    );
 
     Ok(outcome)
 }
 
-/// Record a completed remote job into keeperd's bounded in-memory table (spec
-/// §6, §8). The log frames are interleaved in arrival order (like a terminal);
-/// the attestation hash is the BLAKE3 of the signed attestation bytes. Never
-/// fails the run — a recording problem is a warning, not a different exit code.
-fn record_job(
-    socket: &Path,
-    local: &LocalDevice,
-    offer: &JobOffer,
-    outcome: &JobOutcome,
-    logs: &[JobLog],
-    started_at: i64,
-) {
+/// The terminal row fields for an outcome + log frames: exit code, attestation
+/// hash (BLAKE3 of the signed attestation), and the ordered log bytes as base64.
+fn outcome_row(outcome: &JobOutcome, logs: &[JobLog]) -> (Option<i32>, Option<String>, String) {
     use base64::Engine as _;
 
     let (exit, attestation_hash) = match outcome {
@@ -341,6 +352,28 @@ fn record_job(
         buf.extend_from_slice(&l.bytes);
     }
 
+    (
+        exit,
+        attestation_hash,
+        base64::engine::general_purpose::STANDARD.encode(&buf),
+    )
+}
+
+/// Record a completed remote job into keeperd's bounded in-memory table (spec
+/// §6, §8). The log frames are interleaved in arrival order (like a terminal);
+/// the attestation hash is the BLAKE3 of the signed attestation bytes. Never
+/// fails the run — a recording problem is a warning, not a different exit code.
+fn record_job(
+    socket: &Path,
+    local: &LocalDevice,
+    offer: &JobOffer,
+    outcome: &JobOutcome,
+    logs: &[JobLog],
+    started_at: i64,
+    target: (&str, &[u8; 32]),
+) {
+    let (exit, attestation_hash, log_base64) = outcome_row(outcome, logs);
+
     let mut env_names: Vec<String> = offer.env.iter().map(|e| e.name.clone()).collect();
     env_names.sort();
 
@@ -360,11 +393,122 @@ fn record_job(
         exit,
         attestation_hash,
         finished_at: Some(unix_now()),
-        log_base64: base64::engine::general_purpose::STANDARD.encode(&buf),
+        log_base64,
+        endpoint: target.0.to_string(),
+        runner_identity: hex::encode(target.1),
+        cancelled: false,
     };
 
     if let Err(e) = daemon_call(socket, op::RUNNER_JOB_RECORD, serde_json::to_value(args).unwrap()) {
         eprintln!("warning: could not record job in the keeperd table: {e:#}");
+    }
+}
+
+/// Record a `running` row (the start of a detached job, spec §6): no exit, no
+/// finish, an empty log ring. Reads as state `running` until a terminal record
+/// lands via `attach`/`cancel`.
+fn record_start(
+    socket: &Path,
+    local: &LocalDevice,
+    offer: &JobOffer,
+    endpoint: &str,
+    runner_identity: &[u8; 32],
+    started_at: i64,
+) {
+    let mut env_names: Vec<String> = offer.env.iter().map(|e| e.name.clone()).collect();
+    env_names.sort();
+
+    let args = RunnerJobRecordArgs {
+        job_id: hex::encode(&offer.job_id),
+        requester_device: local.device_name.clone(),
+        repo_key: hex::encode(&offer.repo_key),
+        source_id: hex::encode(&offer.source_id),
+        snapshot_commit: hex::encode(&offer.snapshot_commit),
+        profile: offer.profile.clone(),
+        cmd: offer.cmd.clone(),
+        env_names,
+        toolchain: offer.toolchain.clone(),
+        cache: offer.cache.clone(),
+        where_: "remote".to_string(),
+        started_at,
+        exit: None,
+        attestation_hash: None,
+        finished_at: None,
+        log_base64: String::new(),
+        endpoint: endpoint.to_string(),
+        runner_identity: hex::encode(runner_identity),
+        cancelled: false,
+    };
+
+    if let Err(e) = daemon_call(socket, op::RUNNER_JOB_RECORD, serde_json::to_value(args).unwrap()) {
+        eprintln!("warning: could not record the running job in the keeperd table: {e:#}");
+    }
+}
+
+/// Record the terminal outcome of an `attach` (spec §6): upserts the existing
+/// row, appending the resumed log and setting exit/attestation/finish.
+fn record_attach_terminal(
+    socket: &Path,
+    job_id: &str,
+    outcome: &JobOutcome,
+    logs: &[JobLog],
+    started_at: i64,
+) {
+    let (exit, attestation_hash, log_base64) = outcome_row(outcome, logs);
+    let args = RunnerJobRecordArgs {
+        job_id: job_id.to_string(),
+        requester_device: String::new(),
+        repo_key: String::new(),
+        source_id: String::new(),
+        snapshot_commit: String::new(),
+        profile: String::new(),
+        cmd: Vec::new(),
+        env_names: Vec::new(),
+        toolchain: String::new(),
+        cache: String::new(),
+        where_: String::new(),
+        started_at,
+        exit,
+        attestation_hash,
+        finished_at: Some(unix_now()),
+        log_base64,
+        endpoint: String::new(),
+        runner_identity: String::new(),
+        cancelled: false,
+    };
+
+    if let Err(e) = daemon_call(socket, op::RUNNER_JOB_RECORD, serde_json::to_value(args).unwrap()) {
+        eprintln!("warning: could not record the attached job in the keeperd table: {e:#}");
+    }
+}
+
+/// Mark a row `cancelled` (spec §6): upserts the existing row with `cancelled`
+/// and a finished time; no exit code or log.
+fn record_cancel(socket: &Path, job_id: &str, started_at: i64) {
+    let args = RunnerJobRecordArgs {
+        job_id: job_id.to_string(),
+        requester_device: String::new(),
+        repo_key: String::new(),
+        source_id: String::new(),
+        snapshot_commit: String::new(),
+        profile: String::new(),
+        cmd: Vec::new(),
+        env_names: Vec::new(),
+        toolchain: String::new(),
+        cache: String::new(),
+        where_: String::new(),
+        started_at,
+        exit: None,
+        attestation_hash: None,
+        finished_at: Some(unix_now()),
+        log_base64: String::new(),
+        endpoint: String::new(),
+        runner_identity: String::new(),
+        cancelled: true,
+    };
+
+    if let Err(e) = daemon_call(socket, op::RUNNER_JOB_RECORD, serde_json::to_value(args).unwrap()) {
+        eprintln!("warning: could not record the cancelled job in the keeperd table: {e:#}");
     }
 }
 
@@ -456,6 +600,171 @@ fn job_log(args: &LogsArgs) -> Result<()> {
         eprintln!("note: `-f` (live follow) needs the detached-job session — a later slice-007 chunk");
     }
     Ok(())
+}
+
+/// The garden root (state root), read from keeperd's `status` — locates the
+/// never-committed `.softfig/runners.toml` cert sidecar (spec §3.1).
+fn garden_root(socket: &Path) -> Result<PathBuf> {
+    let reply: StatusReply = serde_json::from_value(daemon_call(
+        socket,
+        op::STATUS,
+        serde_json::Value::Null,
+    )?)?;
+    Ok(PathBuf::from(reply.garden_root))
+}
+
+/// Load (or empty) the runner cert cache from `<garden>/.softfig/runners.toml`
+/// (spec §3.1). A missing or corrupt cache is empty — certs are re-learnable
+/// via an `XX` handshake.
+fn load_runner_cache(socket: &Path) -> Result<(RunnerCache, PathBuf)> {
+    let root = garden_root(socket)?;
+    let path = runner_cache_path(&root);
+    let cache = RunnerCache::load(&path).unwrap_or_default();
+    Ok((cache, path))
+}
+
+/// The `--detach` path (spec §6): snapshot, sign, resolve, then start the job on
+/// the runner and return its id — WITHOUT waiting for logs or the result. The
+/// runner runs to completion independently. No local fallback: a detached job is
+/// remote by definition, so a runner-side failure exits 254.
+fn detach_job(
+    socket: &Path,
+    cwd: &Path,
+    resolved: &ResolvedRun,
+    peers: &[String],
+    on: Option<&str>,
+) -> std::result::Result<String, AttemptFailure> {
+    let local = local_device(socket)?;
+    let submodules = match resolved.submodules {
+        softfig_net::Submodules::Refuse => SubmodulePolicy::Refuse,
+        softfig_net::Submodules::Ignore => SubmodulePolicy::Ignore,
+    };
+    let snapshot = snapshot_repo(cwd, submodules).map_err(|e| anyhow!("snapshot: {e}"))?;
+    let roots = root_commits(cwd).map_err(|e| anyhow!("root commits: {e}"))?;
+    let repo_key = repo_key(&local.device_id, &roots);
+    let mut offer = build_offer(&snapshot, &repo_key, resolved);
+    offer.signature = sign_offer(socket, &offer)?;
+    let (endpoint, ring_identity) = resolve_runner(socket, on, peers)?;
+
+    let (mut cache, cache_path) = load_runner_cache(socket)?;
+    let source_id = snapshot.source_id;
+    let commit = snapshot.commit;
+    let repo = cwd.to_path_buf();
+    let now = unix_now();
+    run_remote_start(
+        &local,
+        &ring_identity,
+        &endpoint,
+        &mut cache,
+        &offer,
+        move |haves: &[Vec<u8>]| {
+            create_bundle(&repo, &source_id, &commit, haves).map_err(|e| e.to_string())
+        },
+        now,
+    )
+    .map_err(AttemptFailure::Runner)?;
+    let _ = cache.save(&cache_path);
+
+    record_start(socket, &local, &offer, &endpoint, &ring_identity, now);
+    Ok(hex::encode(&offer.job_id))
+}
+
+/// `softfig run attach <job>` (spec §6): re-dial the runner (IK via the cached
+/// static) and resume a detached job — replay the retained log tail, record the
+/// terminal row, and exit with the job's own exit code.
+fn job_attach(args: &JobArgs) -> Result<()> {
+    use std::io::Write as _;
+
+    let socket = daemon_socket(&None);
+    let row: RunnerJobShowReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::RUNNER_JOB_SHOW,
+        serde_json::json!({ "job_id": args.job }),
+    )?)?;
+    if row.endpoint.is_empty() || row.runner_identity.is_empty() {
+        return Err(anyhow!(
+            "job {:?} has no recorded runner — was it started with `--detach`?",
+            args.job
+        ));
+    }
+    let local = local_device(&socket)?;
+    let ring_identity = fixed_bytes::<32>(&row.runner_identity, "runner_identity")?;
+    let job_id = hex::decode(&row.job_id).map_err(|e| anyhow!("job_id: {e}"))?;
+    let (mut cache, cache_path) = load_runner_cache(&socket)?;
+
+    let (outcome, logs, _events) = run_remote_attach(
+        &local,
+        &ring_identity,
+        &row.endpoint,
+        &mut cache,
+        &job_id,
+        0,
+        unix_now(),
+    )
+    .map_err(|f| anyhow!("attach: {}", f.reason()))?;
+    let _ = cache.save(&cache_path);
+
+    // Replay the resumed log tail (sanitized; logs are untrusted bytes).
+    let mut ordered: Vec<&JobLog> = logs.iter().collect();
+    ordered.sort_by_key(|l| l.seq);
+    let mut stdout = std::io::stdout().lock();
+    for l in ordered {
+        let bytes = strip_control_sequences(&l.bytes);
+        stdout.write_all(&bytes)?;
+    }
+    stdout.flush()?;
+
+    record_attach_terminal(&socket, &row.job_id, &outcome, &logs, row.started_at);
+
+    let code = outcome_exit_code(&outcome);
+    eprintln!("job {} exit {code}", row.job_id);
+    std::process::exit(code);
+}
+
+/// `softfig run cancel <job>` (spec §6): re-dial and send `JobCancel`; the
+/// runner marks the job cancelled and stops its unit. Records a `cancelled` row.
+fn job_cancel(args: &JobArgs) -> Result<()> {
+    let socket = daemon_socket(&None);
+    let row: RunnerJobShowReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::RUNNER_JOB_SHOW,
+        serde_json::json!({ "job_id": args.job }),
+    )?)?;
+    if row.endpoint.is_empty() || row.runner_identity.is_empty() {
+        return Err(anyhow!(
+            "job {:?} has no recorded runner — was it started with `--detach`?",
+            args.job
+        ));
+    }
+    let local = local_device(&socket)?;
+    let ring_identity = fixed_bytes::<32>(&row.runner_identity, "runner_identity")?;
+    let job_id = hex::decode(&row.job_id).map_err(|e| anyhow!("job_id: {e}"))?;
+    let (mut cache, cache_path) = load_runner_cache(&socket)?;
+
+    match run_remote_cancel(&local, &ring_identity, &row.endpoint, &mut cache, &job_id, unix_now())
+    {
+        Ok(CancelOutcome::Cancelled) => {
+            let _ = cache.save(&cache_path);
+            record_cancel(&socket, &row.job_id, row.started_at);
+            println!("cancelled {}", row.job_id);
+            Ok(())
+        }
+        Ok(CancelOutcome::Lost) => {
+            eprintln!(
+                "job {} is no longer held by the runner (expired past the TTL)",
+                row.job_id
+            );
+            std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+        }
+        Ok(CancelOutcome::Rejected(reason)) => {
+            eprintln!("runner: {}", reason.as_str());
+            std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+        }
+        Err(f) => {
+            eprintln!("runner: {}", f.reason());
+            std::process::exit(softfig_net::RUNNER_FAILURE_EXIT);
+        }
+    }
 }
 
 /// Build the unsigned [`JobOffer`] from a snapshot + resolved run (spec §6 step

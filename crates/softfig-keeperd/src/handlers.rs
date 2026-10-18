@@ -1651,6 +1651,9 @@ pub fn runner_job_record(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
         if let Some(t) = args.finished_at {
             existing.finished_at = Some(t);
         }
+        if args.cancelled {
+            existing.cancelled = true;
+        }
     } else {
         let mut log = crate::runner_jobs::JobLogRing::new(crate::runner_jobs::LOG_RING_CAP);
         log.append(&log_bytes);
@@ -1670,6 +1673,9 @@ pub fn runner_job_record(daemon: &Daemon, args: serde_json::Value) -> HandlerRes
             finished_at: args.finished_at,
             exit: args.exit,
             attestation_hash: args.attestation_hash,
+            endpoint: args.endpoint,
+            runner_identity: args.runner_identity,
+            cancelled: args.cancelled,
             log,
         });
     }

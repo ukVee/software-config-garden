@@ -86,6 +86,9 @@ pub struct RunnerJob {
     pub toolchain: String,
     pub cache: String,
     pub where_: String,
+    pub endpoint: String,
+    pub runner_identity: String,
+    pub cancelled: bool,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub exit: Option<i32>,
@@ -97,6 +100,9 @@ impl RunnerJob {
     /// The lifecycle state: `running` until a terminal row lands, then
     /// `done`/`failed` from the exit code.
     pub fn state(&self) -> &'static str {
+        if self.cancelled {
+            return "cancelled";
+        }
         match self.exit {
             None => STATE_RUNNING,
             Some(0) => "done",
@@ -135,6 +141,8 @@ impl RunnerJob {
             attestation_hash: self.attestation_hash.clone(),
             where_: self.where_.clone(),
             state: self.state().to_string(),
+            endpoint: self.endpoint.clone(),
+            runner_identity: self.runner_identity.clone(),
             log_bytes: self.log.len(),
         }
     }
@@ -222,6 +230,9 @@ mod tests {
             toolchain: "rust".to_string(),
             cache: "shared".to_string(),
             where_: "remote".to_string(),
+            endpoint: String::new(),
+            runner_identity: String::new(),
+            cancelled: false,
             started_at: 1,
             finished_at: None,
             exit: None,
@@ -274,5 +285,15 @@ mod tests {
         assert_eq!(j.state(), "done");
         j.exit = Some(3);
         assert_eq!(j.state(), "failed");
+    }
+
+    #[test]
+    fn state_reports_cancelled_over_any_exit() {
+        let mut j = job("a");
+        j.cancelled = true;
+        assert_eq!(j.state(), "cancelled");
+        // `cancelled` is terminal and wins over a (stale) exit code.
+        j.exit = Some(0);
+        assert_eq!(j.state(), "cancelled");
     }
 }

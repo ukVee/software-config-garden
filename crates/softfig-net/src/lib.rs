@@ -95,8 +95,9 @@ pub use ring::{ring_path, Ring, RingEntry};
 pub use runner_cert::{signing_message as runner_cert_signing_message, verify as verify_runner_cert, RunnerCert, RUNNER_CERT_DOMAIN, RUNNER_DEFAULT_LIFETIME_SECS, RUNNER_SERIAL_LEN};
 pub use runner::{
     connect_runner, offer_signing_bytes, run_job, run_job_collecting, run_remote,
-    run_remote_collecting, runner_cache_path, verify_offer_sig, verify_runner_cert_revoke,
-    verify_runner_handshake, CachedRunner, JobOutcome, JobRejectReason, JobState, RunnerCache,
+    run_remote_attach, run_remote_cancel, run_remote_collecting, run_remote_start,
+    runner_cache_path, verify_offer_sig, verify_runner_cert_revoke, verify_runner_handshake,
+    CancelOutcome, CachedRunner, JobOutcome, JobRejectReason, JobState, RunnerCache,
     RUNNER_CACHE_FILE,
 };
 pub use run_config::{

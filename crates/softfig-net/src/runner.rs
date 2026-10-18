@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::attest::{KEY_LEN, SIG_LEN};
 use crate::error::{NetError, Result};
 use crate::pairing::LocalDevice;
-use crate::proto::{self, frame, Frame, JobEvent, JobLog, JobOffer, JobResult, RunnerCaps, RunnerCertRevoke, SourceChunk};
+use crate::proto::{self, frame, Frame, JobAttach, JobCancel, JobEvent, JobLog, JobOffer, JobResult, RunnerCaps, RunnerCertRevoke, SourceChunk};
 use crate::run_plan::RunFailure;
 use crate::runner_cert::{self, RUNNER_SERIAL_LEN};
 use crate::transport::{runner_ik_initiator, runner_xx_initiator, RunnerSession};
@@ -449,6 +449,56 @@ where
     run_job_inner(session, offer, make_bundle)
 }
 
+/// The offer/source-transfer phase outcome (spec §4.3, §6 step 1): the runner
+/// accepted and received the full bundle, or it rejected the offer. `RunnerCaps`
+/// is read first and returned on both paths so the caller can surface it.
+enum TransferOutcome {
+    Accepted,
+    Rejected(JobRejectReason),
+}
+
+/// Send the signed [`JobOffer`], read the [`RunnerCaps`]/[`JobAccept`]/
+/// [`JobReject`], and — on accept — stream the have/want bundle (produced by
+/// `make_bundle`) as [`SourceChunk`]s. Returns after the source transfer, or on
+/// an immediate reject (before `SourceHave`). Shared by the collecting, start
+/// and attach paths.
+fn transfer_source<S, F, E>(
+    session: &mut RunnerSession<S>,
+    offer: &JobOffer,
+    make_bundle: F,
+) -> Result<(RunnerCaps, TransferOutcome)>
+where
+    S: Read + Write,
+    F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
+    E: std::fmt::Display,
+{
+    let caps = match session.recv_frame()?.kind {
+        Some(frame::Kind::RunnerCaps(c)) => c,
+        _ => return Err(NetError::Protocol("expected RunnerCaps after handshake")),
+    };
+    session.send_frame(&Frame::job_offer(offer.clone()))?;
+    match session.recv_frame()?.kind {
+        Some(frame::Kind::JobAccept(_)) => {
+            let haves = match session.recv_frame()?.kind {
+                Some(frame::Kind::SourceHave(h)) => h,
+                _ => return Err(NetError::Protocol("expected SourceHave after JobAccept")),
+            };
+            let mut have_list: Vec<Vec<u8>> = Vec::new();
+            have_list.extend(haves.tips);
+            have_list.extend(haves.recent_commits);
+            let bundle = make_bundle(&have_list).map_err(|e| NetError::Source(e.to_string()))?;
+            stream_chunks(session, &offer.job_id, &bundle)?;
+            Ok((caps, TransferOutcome::Accepted))
+        }
+        Some(frame::Kind::JobReject(r)) => {
+            let reason = JobRejectReason::from_u32(r.reason)
+                .ok_or(NetError::Protocol("runner sent an unknown reject reason"))?;
+            Ok((caps, TransferOutcome::Rejected(reason)))
+        }
+        _ => Err(NetError::Protocol("expected JobAccept or JobReject")),
+    }
+}
+
 /// Drive one job, reading the interleaved [`JobLog`]/[`JobEvent`] frames the
 /// runner streams ahead of the terminal [`JobResult`]/[`JobReject`] (spec §6).
 fn run_job_inner<S, F, E>(
@@ -461,24 +511,12 @@ where
     F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
     E: std::fmt::Display,
 {
-    let caps = match session.recv_frame()?.kind {
-        Some(frame::Kind::RunnerCaps(c)) => c,
-        _ => return Err(NetError::Protocol("expected RunnerCaps after handshake")),
-    };
-    session.send_frame(&Frame::job_offer(offer.clone()))?;
+    let (caps, transfer) = transfer_source(session, offer, make_bundle)?;
     let mut logs = Vec::new();
     let mut events = Vec::new();
-    match session.recv_frame()?.kind {
-        Some(frame::Kind::JobAccept(_)) => {
-            let haves = match session.recv_frame()?.kind {
-                Some(frame::Kind::SourceHave(h)) => h,
-                _ => return Err(NetError::Protocol("expected SourceHave after JobAccept")),
-            };
-            let mut have_list: Vec<Vec<u8>> = Vec::new();
-            have_list.extend(haves.tips);
-            have_list.extend(haves.recent_commits);
-            let bundle = make_bundle(&have_list).map_err(|e| NetError::Source(e.to_string()))?;
-            stream_chunks(session, &offer.job_id, &bundle)?;
+    match transfer {
+        TransferOutcome::Rejected(reason) => Ok((caps, JobOutcome::Rejected(reason), logs, events)),
+        TransferOutcome::Accepted => {
             // The runner streams JobLog/JobEvent frames before the terminal
             // JobResult/JobReject; consume them in arrival order.
             loop {
@@ -502,12 +540,6 @@ where
                 }
             }
         }
-        Some(frame::Kind::JobReject(r)) => {
-            let reason = JobRejectReason::from_u32(r.reason)
-                .ok_or(NetError::Protocol("runner sent an unknown reject reason"))?;
-            Ok((caps, JobOutcome::Rejected(reason), logs, events))
-        }
-        _ => Err(NetError::Protocol("expected JobAccept or JobReject")),
     }
 }
 
@@ -535,6 +567,50 @@ where
         .map(|(outcome, _logs, _events)| outcome)
 }
 
+/// Dial the runner, run the Noise handshake (XX on first contact, IK when the
+/// cached static is known), verify the certificate, and cache the verified cert
+/// back into `cache` for the next `IK` reconnect. The revoked-cache fast path
+/// refuses before dialing. Shared by the collect/start/attach/cancel paths.
+fn dial_and_verify(
+    local: &LocalDevice,
+    ring_identity: &[u8; KEY_LEN],
+    endpoint: &str,
+    cache: &mut RunnerCache,
+    now: i64,
+) -> std::result::Result<(RunnerSession<std::net::TcpStream>, runner_cert::RunnerCert), RunFailure>
+{
+    // Revoked-cache fast path: refuse before dialing when the cached cert's
+    // serial is already revoked.
+    let cached_key = hex::encode(ring_identity);
+    if let Some(c) = cache.get(&cached_key)
+        && cache.is_serial_revoked(&c.cert.serial)
+    {
+        return Err(RunFailure::RevokedCert);
+    }
+
+    let stream = std::net::TcpStream::connect(endpoint)
+        .map_err(|_| RunFailure::NoRunner)?;
+
+    let cached = cache.get(&cached_key);
+    let revoked = cache.revoked_serial_bytes();
+    let (session, cert) = connect_runner(stream, local, ring_identity, cached, &revoked, now)
+        .map_err(|e| match e {
+            NetError::RunnerCert(_) => RunFailure::InvalidCert,
+            _ => RunFailure::NoRunner,
+        })?;
+
+    // Cache the verified certificate (keyed by the owner identity == the
+    // cert's device_id) for the next IK reconnect.
+    cache.put(
+        &cached_key,
+        CachedRunner {
+            cert: cert.clone(),
+            signature: hex::encode(session.signature()),
+        },
+    );
+    Ok((session, cert))
+}
+
 /// [`run_remote`], but also returns the live `JobLog`/`JobEvent` frames the
 /// runner streamed before the terminal result. The requester-side job table
 /// (slice 007) records these into keeperd's bounded in-memory log ring.
@@ -551,35 +627,7 @@ where
     F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
     E: std::fmt::Display,
 {
-    // Revoked-cache fast path: refuse before dialing when the cached cert's
-    // serial is already revoked.
-    let cached_key = hex::encode(ring_identity);
-    if let Some(c) = cache.get(&cached_key)
-        && cache.is_serial_revoked(&c.cert.serial)
-    {
-        return Err(RunFailure::RevokedCert);
-    }
-
-    let stream = std::net::TcpStream::connect(endpoint)
-        .map_err(|_| RunFailure::NoRunner)?;
-
-    let cached = cache.get(&cached_key);
-    let revoked = cache.revoked_serial_bytes();
-    let (mut session, cert) = connect_runner(stream, local, ring_identity, cached, &revoked, now)
-        .map_err(|e| match e {
-            NetError::RunnerCert(_) => RunFailure::InvalidCert,
-            _ => RunFailure::NoRunner,
-        })?;
-
-    // Cache the verified certificate (keyed by the owner identity == the
-    // cert's device_id) for the next IK reconnect.
-    cache.put(
-        &cached_key,
-        CachedRunner {
-            cert: cert.clone(),
-            signature: hex::encode(session.signature()),
-        },
-    );
+    let (mut session, _cert) = dial_and_verify(local, ring_identity, endpoint, cache, now)?;
 
     let (_caps, outcome, logs, events) =
         run_job_collecting(&mut session, offer, make_bundle).map_err(|e| match e {
@@ -590,6 +638,114 @@ where
     match outcome {
         JobOutcome::Rejected(reason) => Err(RunFailure::Rejected(reason)),
         accepted => Ok((accepted, logs, events)),
+    }
+}
+
+/// Start a job and return once the runner has accepted the offer and received
+/// the full source bundle — WITHOUT reading the streamed logs or the result
+/// (spec §6 Detach). The caller records a `running` row and exits; the runner
+/// runs the job to completion regardless of the requester's disconnect, and the
+/// result is held for the TTL for a later [`run_remote_attach`]/cancel.
+pub fn run_remote_start<E, F>(
+    local: &LocalDevice,
+    ring_identity: &[u8; KEY_LEN],
+    endpoint: &str,
+    cache: &mut RunnerCache,
+    offer: &JobOffer,
+    make_bundle: F,
+    now: i64,
+) -> std::result::Result<(), RunFailure>
+where
+    F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
+    E: std::fmt::Display,
+{
+    let (mut session, _cert) = dial_and_verify(local, ring_identity, endpoint, cache, now)?;
+    let (_caps, transfer) =
+        transfer_source(&mut session, offer, make_bundle).map_err(|e| match e {
+            NetError::RunnerCert(_) => RunFailure::InvalidCert,
+            _ => RunFailure::NoRunner,
+        })?;
+    match transfer {
+        TransferOutcome::Accepted => Ok(()),
+        TransferOutcome::Rejected(reason) => Err(RunFailure::Rejected(reason)),
+    }
+    // (the session is dropped here — the runner runs on, detached)
+}
+
+/// Re-attach to a detached job (spec §6): re-dial (IK via the cached static),
+/// send `JobAttach{job_id, from_seq}`, and read the replayed + live `JobLog`/
+/// `JobEvent` frames through the terminal `JobResult`/`JobReject`.
+pub fn run_remote_attach(
+    local: &LocalDevice,
+    ring_identity: &[u8; KEY_LEN],
+    endpoint: &str,
+    cache: &mut RunnerCache,
+    job_id: &[u8],
+    from_seq: u64,
+    now: i64,
+) -> std::result::Result<(JobOutcome, Vec<JobLog>, Vec<JobEvent>), RunFailure> {
+    let (mut session, _cert) = dial_and_verify(local, ring_identity, endpoint, cache, now)?;
+    session
+        .send_frame(&Frame::job_attach(JobAttach {
+            job_id: job_id.to_vec(),
+            from_seq,
+        }))
+        .map_err(|_| RunFailure::NoRunner)?;
+
+    let mut logs = Vec::new();
+    let mut events = Vec::new();
+    let outcome = loop {
+        match session.recv_frame().map_err(|_| RunFailure::NoRunner)?.kind {
+            Some(frame::Kind::JobResult(r)) => break JobOutcome::Accepted(r),
+            Some(frame::Kind::JobReject(r)) => {
+                let reason = JobRejectReason::from_u32(r.reason).ok_or(RunFailure::NoRunner)?;
+                break JobOutcome::Rejected(reason);
+            }
+            Some(frame::Kind::JobLog(l)) => logs.push(l),
+            Some(frame::Kind::JobEvent(e)) => events.push(e),
+            _ => return Err(RunFailure::NoRunner),
+        }
+    };
+    Ok((outcome, logs, events))
+}
+
+/// The outcome of a [`run_remote_cancel`] (spec §6): `cancelled` (the runner
+/// marked the job and stopped its unit), `lost` (the runner no longer holds the
+/// job — expired past the TTL), or `rejected` (not-granted/disabled/…).
+pub enum CancelOutcome {
+    Cancelled,
+    Lost,
+    Rejected(JobRejectReason),
+}
+
+/// Cancel a running job (spec §6): re-dial, send `JobCancel{job_id}`, and read
+/// the runner's terminal `JobEvent`/`JobReject`.
+pub fn run_remote_cancel(
+    local: &LocalDevice,
+    ring_identity: &[u8; KEY_LEN],
+    endpoint: &str,
+    cache: &mut RunnerCache,
+    job_id: &[u8],
+    now: i64,
+) -> std::result::Result<CancelOutcome, RunFailure> {
+    let (mut session, _cert) = dial_and_verify(local, ring_identity, endpoint, cache, now)?;
+    session
+        .send_frame(&Frame::job_cancel(JobCancel {
+            job_id: job_id.to_vec(),
+        }))
+        .map_err(|_| RunFailure::NoRunner)?;
+
+    match session.recv_frame().map_err(|_| RunFailure::NoRunner)?.kind {
+        Some(frame::Kind::JobEvent(e)) if e.state == JobState::Cancelled as u32 => {
+            Ok(CancelOutcome::Cancelled)
+        }
+        Some(frame::Kind::JobEvent(e)) if e.state == JobState::Lost as u32 => {
+            Ok(CancelOutcome::Lost)
+        }
+        Some(frame::Kind::JobReject(r)) => Ok(CancelOutcome::Rejected(
+            JobRejectReason::from_u32(r.reason).ok_or(RunFailure::NoRunner)?,
+        )),
+        _ => Err(RunFailure::NoRunner),
     }
 }
 
