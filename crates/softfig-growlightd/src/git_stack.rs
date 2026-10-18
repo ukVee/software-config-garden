@@ -36,7 +36,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use softfig_ipc::queue_v2::Lane;
+use softfig_ipc::queue_v2::{Lane, RestackBranch};
 
 /// How long one read-only `git` call may run before it is killed. The stack is
 /// computed at claim time, on the drive loop's one thread, so it must never
@@ -314,6 +314,98 @@ pub fn claim_base(
     Ok(ClaimBase { parent, base })
 }
 
+/// One live entry reduced to what restack detection reads: the §8 first-claim
+/// fields ([`StackEntry`]) plus the recorded `parent` and `base`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestackEntry {
+    pub id: String,
+    pub branch: String,
+    pub lane: Lane,
+    pub claimed: String,
+    /// The recorded `parent` — the entry whose branch this was cut from;
+    /// `""` = `main` (§8).
+    pub parent: String,
+    /// The recorded `base` — the commit cut from (local) / the parent branch
+    /// name (remote). `""` = never claimed.
+    pub base: String,
+}
+
+/// Detect a §8 restack: `main` moved under the open stack (an urgent fix
+/// merged, or a lower branch amended in review). Walks the stack candidates in
+/// claim order (read-only, via [`stack_candidates`]) and returns the ordered
+/// stack — each branch with its recorded `parent`/`base` and the resolved
+/// `--onto` target — when any branch's recorded `base` is no longer an
+/// ancestor of its parent's tip (or `main`). `None` when the stack is healthy
+/// (no false positive), empty, or remote (a remote repo never auto-enqueues,
+/// §8 — growlightd can't see `main` move there). `git` is never written to.
+pub fn detect_restack(
+    repo: &Repo,
+    main: &str,
+    entries: &[RestackEntry],
+    git: &Git,
+) -> Result<Option<Vec<RestackBranch>>, GitError> {
+    if matches!(repo, Repo::Remote) {
+        return Ok(None);
+    }
+    let stack_input: Vec<StackEntry> = entries
+        .iter()
+        .map(|e| StackEntry {
+            id: e.id.clone(),
+            branch: e.branch.clone(),
+            lane: e.lane,
+            claimed: e.claimed.clone(),
+        })
+        .collect();
+    let stack = stack_candidates(repo, main, &stack_input, git)?;
+    if stack.candidates.is_empty() {
+        return Ok(None);
+    }
+    // id → branch (to resolve a parent entry's branch), and branch → the
+    // recorded (parent, base) pair.
+    let branch_of: std::collections::HashMap<&str, &str> = entries
+        .iter()
+        .filter(|e| !e.branch.is_empty())
+        .map(|e| (e.id.as_str(), e.branch.as_str()))
+        .collect();
+    let recorded: std::collections::HashMap<&str, (&str, &str)> = entries
+        .iter()
+        .filter(|e| !e.branch.is_empty())
+        .map(|e| (e.branch.as_str(), (e.parent.as_str(), e.base.as_str())))
+        .collect();
+
+    let mut stale = false;
+    let mut out = Vec::with_capacity(stack.candidates.len());
+    for c in &stack.candidates {
+        let Some(&(parent, base)) = recorded.get(c.branch.as_str()) else {
+            continue; // a candidate with no recorded branch data — skip it
+        };
+        // The `--onto` target: the parent's branch, or `main` for a
+        // main-rooted branch. A missing parent entry falls back to `main`
+        // (defensive — a live parent is the §8 invariant).
+        let onto = if parent.is_empty() {
+            main.to_string()
+        } else {
+            branch_of.get(parent).copied().unwrap_or(main).to_string()
+        };
+        // Stale when the recorded base is no longer an ancestor of the parent's
+        // tip (or `main`). An empty base (never recorded) can't be judged.
+        if !base.is_empty() && !git.is_ancestor(base, &onto)? {
+            stale = true;
+        }
+        out.push(RestackBranch {
+            branch: c.branch.clone(),
+            parent: parent.to_string(),
+            base: base.to_string(),
+            onto,
+        });
+    }
+    if stale {
+        Ok(Some(out))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +640,134 @@ mod tests {
         // A rev that does not resolve is an error, not a panic or a false.
         assert!(git.rev_parse("no-such-branch").is_err());
         assert!(git.is_ancestor("no-such", "main").is_err());
+    }
+
+    // ---- restack detection (queue-v2-git slice 003) ----------------------
+
+    /// A branch off `from` with one commit on it; returns to `main` and gives
+    /// the branch's tip (so a stack can be cut branch-off-branch).
+    fn open_branch_from(repo: &Path, name: &str, from: &str) -> String {
+        sh_git(repo, &["checkout", "-q", from]);
+        sh_git(repo, &["checkout", "-q", "-b", name]);
+        let file = format!("{}.txt", name.replace('/', "_"));
+        fs::write(repo.join(&file), format!("{name}\n")).unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "-m", name]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+        rev_parse_sh(repo, name)
+    }
+
+    /// Rewrite `main`'s tip so the recorded base commit is abandoned (an
+    /// amend — the new tip is no longer a descendant of the old one).
+    fn amend_main(repo: &Path) -> String {
+        sh_git(repo, &["checkout", "-q", "main"]);
+        fs::write(repo.join("a.txt"), "amended\n").unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "--amend", "-m", "main rewritten"]);
+        rev_parse_sh(repo, "main")
+    }
+
+    fn restack_entry(id: &str, branch: &str, parent: &str, base: &str, claimed: &str) -> RestackEntry {
+        RestackEntry {
+            id: id.into(),
+            branch: branch.into(),
+            lane: Lane::Normal,
+            claimed: claimed.into(),
+            parent: parent.into(),
+            base: base.into(),
+        }
+    }
+
+    #[test]
+    fn detect_restack_fires_when_main_moves_under_a_two_branch_stack() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let one_tip = open_branch_from(repo, "feat/one", "main");
+        let two_tip = open_branch_from(repo, "feat/two", "feat/one");
+        // main is rewritten AFTER the stack was cut: feat/one's recorded base
+        // (the old main tip) is no longer an ancestor of main.
+        let _new_main = amend_main(repo);
+
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
+            restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
+        ];
+
+        let git = Git::new(repo.to_path_buf());
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git)
+            .unwrap()
+            .expect("a restack is needed");
+        // The whole stack, in claim order, with each branch's parent/base/onto.
+        assert_eq!(need.len(), 2, "{need:?}");
+        assert_eq!(need[0].branch, "feat/one");
+        assert_eq!(need[0].parent, "");
+        assert_eq!(need[0].base, main_commit, "cut from the old main tip");
+        assert_eq!(need[0].onto, "main");
+        assert_eq!(need[1].branch, "feat/two");
+        assert_eq!(need[1].parent, "one");
+        assert_eq!(need[1].base, one_tip, "cut from feat/one's tip");
+        assert_eq!(need[1].onto, "feat/one");
+        // The two tips are untouched by the read-only detection.
+        assert_eq!(rev_parse_sh(repo, "feat/one"), one_tip);
+        assert_eq!(rev_parse_sh(repo, "feat/two"), two_tip);
+    }
+
+    #[test]
+    fn detect_restack_is_silent_when_main_is_unchanged() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        let one_tip = open_branch_from(repo, "feat/one", "main");
+        let _two_tip = open_branch_from(repo, "feat/two", "feat/one");
+
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &rev_parse_sh(repo, "main"), "2026-10-01T00:00:00Z"),
+            restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
+        ];
+
+        let git = Git::new(repo.to_path_buf());
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap();
+        assert!(need.is_none(), "no false positive when main is unchanged: {need:?}");
+    }
+
+    #[test]
+    fn detect_restack_never_auto_enqueues_a_remote_repo() {
+        // A remote repo runs no git — point the handle at a non-repo; if the
+        // detection ever touched it, these calls would fail. They must not.
+        let git = Git::new("/nonexistent/not-a-repo");
+        let entries = vec![
+            restack_entry("one", "feat/one", "", "deadbeef", "2026-10-01T00:00:00Z"),
+        ];
+        let need = detect_restack(&Repo::Remote, "main", &entries, &git).unwrap();
+        assert!(need.is_none(), "a remote repo never auto-enqueues");
+    }
+
+    #[test]
+    fn detect_restack_fires_when_a_lower_branch_is_rewritten() {
+        let (dir, _main) = seeded_repo();
+        let repo = dir.path();
+        open_branch_from(repo, "feat/one", "main");
+        let two_tip = open_branch_from(repo, "feat/two", "feat/one");
+        // Amend feat/one (the lower branch): feat/two's recorded base (feat/one's
+        // old tip) is no longer an ancestor of feat/one's new tip.
+        sh_git(repo, &["checkout", "-q", "feat/one"]);
+        fs::write(repo.join("feat_one.txt"), "rewritten\n").unwrap();
+        sh_git(repo, &["add", "."]);
+        sh_git(repo, &["commit", "-q", "--amend", "-m", "one rewritten"]);
+        sh_git(repo, &["checkout", "-q", "main"]);
+
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &rev_parse_sh(repo, "main"), "2026-10-01T00:00:00Z"),
+            restack_entry("two", "feat/two", "one", &two_tip, "2026-10-02T00:00:00Z"),
+        ];
+
+        let git = Git::new(repo.to_path_buf());
+        let need = detect_restack(&Repo::Local(repo.to_path_buf()), "main", &entries, &git)
+            .unwrap()
+            .expect("a restack is needed");
+        assert_eq!(need.len(), 2, "{need:?}");
+        assert_eq!(need[0].branch, "feat/one");
+        assert_eq!(need[1].branch, "feat/two");
+        assert_eq!(need[1].base, two_tip, "feat/two's recorded base is feat/one's old tip");
+        assert_eq!(need[1].onto, "feat/one");
     }
 }

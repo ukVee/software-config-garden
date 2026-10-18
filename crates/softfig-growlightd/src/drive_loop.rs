@@ -65,6 +65,7 @@ use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
 use crate::first_claim::{self, FirstClaim};
+use crate::git_stack::{self, Git, Repo};
 use crate::fleet::QueueMode;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
@@ -81,7 +82,7 @@ use crate::supervisor::{
 use crate::usage::{UsageAggregator, UsageSample, WindowResets};
 use crate::v2_source::V2Load;
 use softfig_ipc::model_choice::{member_default, ModelChoice};
-use softfig_ipc::queue_v2::EntryStatus;
+use softfig_ipc::queue_v2::{EntryStatus, RestackBranch};
 
 /// How often the live drive loop ticks: schedule, observe health, honor control,
 /// re-roll. Agents run for minutes per session, so a ~1s cadence is ample — this
@@ -832,6 +833,20 @@ pub trait V2ItemParker: Send + Sync + fmt::Debug {
     fn pause_entry_v2(&self, entry: &str) -> Result<(), String>;
 }
 
+/// The seam the loop enqueues an auto-detected §8 restack through (queue-v2-git
+/// slice 003): keeperd's `queue_v2_enqueue_restack({project, stack})` — growlightd
+/// detected a stale stack (read-only git) and keeperd enqueues ONE urgent restack
+/// row for the project (idempotent per project) + generates the full doc. Fail-soft
+/// in the drive loop: a failed enqueue is logged, never wedges a claim or handoff.
+/// The live impl is [`crate::claim::KeeperdV2RestackEnqueuer`] over the keeperd
+/// socket.
+pub trait V2RestackEnqueuer: Send + Sync + fmt::Debug {
+    /// Enqueue a restack for `project` with the ordered `stack` growlightd
+    /// resolved. Returns the new entry id (`None` on the idempotent no-op), or
+    /// `Err(reason)`.
+    fn enqueue_restack(&self, project: &str, stack: &[RestackBranch]) -> Result<Option<String>, String>;
+}
+
 /// The seam the loop writes a member's baton through at a v2 spawn (§3.6 "At
 /// spawn, growlightd copies the entry's baton into the member's baton path").
 /// Distinct from [`BatonSeeder`]: that one templates a fresh seed keyed to
@@ -1135,6 +1150,10 @@ pub struct V2Seams {
     /// The v2 item-park (`queue_v2_set_status(entry, blocked)`) over the keeperd
     /// socket.
     pub parker: Box<dyn V2ItemParker>,
+    /// The v2 auto-restack enqueue (`queue_v2_enqueue_restack`) over the keeperd
+    /// socket — §8 restack detection (queue-v2-git slice 003) at daemon start,
+    /// claim and handshake.
+    pub restacker: Box<dyn V2RestackEnqueuer>,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -1238,6 +1257,14 @@ pub struct DriveLoop {
     /// legacy loop (nothing to consult); a loop whose daemon reads
     /// `queue = "v2"` but was built without seams schedules nothing (fail-closed).
     v2: Option<V2Seams>,
+    /// Whether the §8 restack scan has run once at boot (queue-v2-git slice 003).
+    /// Set on the first v2 tick after the snapshot loads; a daemon restart
+    /// re-runs it (the spec's "at daemon start").
+    restack_boot_done: bool,
+    /// Top-level entry ids that handed off this tick (queue-v2-git slice 003):
+    /// the handshake runs in step 1, before the snapshot loads, so its §8
+    /// restack scan is deferred here and drained once the snapshot is read.
+    v2_handoff_scans: std::collections::BTreeSet<String>,
     /// Each running member's current v2 `(entry, unit)` assignment — the v2 twin
     /// of `assignments`, recorded on the member's v2 fresh start and carried
     /// across re-rolls (a re-roll re-spawns on the same spec, model included).
@@ -1398,6 +1425,8 @@ impl DriveLoop {
             reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
             v2: None,
+            restack_boot_done: false,
+            v2_handoff_scans: std::collections::BTreeSet::new(),
             v2_assignments: std::collections::BTreeMap::new(),
             v2_walk_blocked: std::collections::BTreeMap::new(),
             v2_handoff_seen: std::collections::BTreeMap::new(),
@@ -2088,6 +2117,25 @@ impl DriveLoop {
                 });
                 apply_v2_overlay(snapshot, &self.v2_overlay());
 
+                // §8 restack detection (queue-v2-git slice 003): once at daemon
+                // start, and once per handoff this tick (deferred from step 1,
+                // which runs before the snapshot loads).
+                if !self.restack_boot_done {
+                    self.scan_restacks(snapshot, None);
+                    self.restack_boot_done = true;
+                }
+                let handoff_scans = std::mem::take(&mut self.v2_handoff_scans);
+                for entry_id in &handoff_scans {
+                    if let Some(p) = snapshot
+                        .entries
+                        .iter()
+                        .find(|e| e.id == *entry_id)
+                        .map(|e| e.project.clone())
+                    {
+                        self.scan_restacks(snapshot, Some(&p));
+                    }
+                }
+
                 // The per-member `pick_v2` input, built from the configured fleet:
                 // backend + roster default from the member's row; the pin carried
                 // through as-is (under v2 a pin names a project, §2 — the live
@@ -2307,6 +2355,17 @@ impl DriveLoop {
                                 };
                                 self.v2_assignments.insert(agent.clone(), assignment.clone());
                                 report.v2_started.push(assignment);
+
+                                // §8 restack detection at claim (queue-v2-git
+                                // slice 003): check the claimed entry's repo.
+                                if let Some(p) = snapshot
+                                    .entries
+                                    .iter()
+                                    .find(|e| e.id == entry_top)
+                                    .map(|e| e.project.as_str())
+                                {
+                                    self.scan_restacks(snapshot, Some(p));
+                                }
                             }
                             // The claim landed even though the spawn failed — keep
                             // the entry excluded this tick so no peer grabs what
@@ -2758,6 +2817,55 @@ impl DriveLoop {
         report.retired.push(agent.to_string());
     }
 
+    /// §8 restack detection (queue-v2-git slice 003): scan the snapshot's LOCAL
+    /// repos (read-only git) for a stack whose `main` moved under an open
+    /// branch, and enqueue one restack per affected repo through the restacker
+    /// seam. `project: None` scans every local project (daemon start);
+    /// `Some(p)` scans just `p` (a claim or handshake in that repo). Fail-soft:
+    /// a detection or enqueue error is skipped — the next scan re-detects it,
+    /// and a restack row already enqueued is an idempotent no-op in keeperd.
+    fn scan_restacks(&self, snapshot: &scheduler_v2::V2Snapshot, project: Option<&str>) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        for proj in &snapshot.projects {
+            if let Some(want) = project
+                && proj.name != want
+            {
+                continue;
+            }
+            let repo = Repo::classify(&proj.repo, home.as_deref());
+            let repo_path = match &repo {
+                Repo::Local(path) => path.clone(),
+                Repo::Remote => continue, // a remote repo never auto-enqueues (§8)
+            };
+            let entries: Vec<git_stack::RestackEntry> = snapshot
+                .entries
+                .iter()
+                .filter(|e| e.project == proj.name)
+                .map(|e| git_stack::RestackEntry {
+                    id: e.id.clone(),
+                    branch: e.branch.clone(),
+                    lane: e.lane,
+                    claimed: e.claimed.clone(),
+                    parent: e.parent.clone(),
+                    base: e.base.clone(),
+                })
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let git = Git::new(repo_path);
+            let stack = match git_stack::detect_restack(&repo, &proj.main, &entries, &git) {
+                Ok(Some(stack)) => stack,
+                Ok(None) => continue,
+                Err(_) => continue, // fail-soft: re-detected on the next scan
+            };
+            let _ = seams.restacker.enqueue_restack(&proj.name, &stack);
+        }
+    }
+
     /// §6.3 step 4 for a member whose verb committed a handoff (slice 009):
     /// end the session when its process exits or once `roll_grace_secs` have
     /// passed since the loop first saw the handoff, whichever comes first. The
@@ -2795,6 +2903,9 @@ impl DriveLoop {
         self.reconnecting.remove(agent);
         self.v2_assignments.remove(agent);
         let entry = handoff.entry_top().to_string();
+        // §8 restack detection at handshake (queue-v2-git slice 003): deferred
+        // until the snapshot loads (step 3), then drained by the tick.
+        self.v2_handoff_scans.insert(entry.clone());
         if let Some(model) = &handoff.next_model {
             // The same unit's next session runs on the requested model (§6.4).
             let unit = handoff.assignment.unit.clone();
@@ -7526,6 +7637,37 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         }
     }
 
+    /// A recording [`V2RestackEnqueuer`] — the §8 restack enqueue (slice 003),
+    /// recording each `(project, stack)` for assertions.
+    #[derive(Debug, Default)]
+    struct FakeV2RestackEnqueuer {
+        enqueued: Mutex<Vec<(String, usize)>>,
+    }
+
+    impl V2RestackEnqueuer for FakeV2RestackEnqueuer {
+        fn enqueue_restack(
+            &self,
+            project: &str,
+            stack: &[RestackBranch],
+        ) -> Result<Option<String>, String> {
+            self.enqueued
+                .lock()
+                .unwrap()
+                .push((project.to_string(), stack.len()));
+            Ok(Some("001".into()))
+        }
+    }
+
+    impl V2RestackEnqueuer for Arc<FakeV2RestackEnqueuer> {
+        fn enqueue_restack(
+            &self,
+            project: &str,
+            stack: &[RestackBranch],
+        ) -> Result<Option<String>, String> {
+            (**self).enqueue_restack(project, stack)
+        }
+    }
+
     /// A v2 snapshot with one milestone entry and one queued slice, whose
     /// declared `> Model:` list is `decl` (parsed) — the smallest list
     /// `pick_v2` walks to a slice unit.
@@ -7554,6 +7696,8 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 after: vec![],
                 branch: String::new(),
                 claimed: "2026-10-14T00:00Z".into(),
+                parent: String::new(),
+                base: String::new(),
                 follow_ups: 0,
                 pending: None,
                 holder: None,
@@ -7606,6 +7750,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             member_writer: Box::new(Arc::clone(&backend)),
             claimer: Box::new(claimer),
             parker: Box::new(parker),
+            restacker: Box::new(FakeV2RestackEnqueuer::default()),
         });
         (drive, d, backend, probe)
     }
@@ -8281,6 +8426,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             member_writer: Box::new(Arc::clone(&backend)),
             claimer: Box::new(Arc::clone(&claimer)),
             parker: Box::new(Arc::clone(&parker)),
+            restacker: Box::new(FakeV2RestackEnqueuer::default()),
         });
         let keeper = Arc::new(SpyKeeper::default());
         let mut d = d;

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::queue_v2::{EntryKind, Lane, SliceStatus};
+use crate::queue_v2::{EntryKind, Lane, RestackBranch, SliceStatus};
 
 pub mod op {
     pub const STATUS: &str = "status";
@@ -328,6 +328,14 @@ pub mod op {
     /// slice (the front of the remaining items, the default) or at the end
     /// (`at_end`, `do_not_prioritize`). One commit, `queue_v2_sub_added`.
     pub const QUEUE_V2_ADD_SUB: &str = "queue_v2_add_sub";
+    /// queue v2 daemon op, keeperd↔growlightd only (never an agent-facing MCP
+    /// verb): enqueue ONE urgent `restack` entry for a repo whose stack moved
+    /// under an open branch (§8, `queue-v2-git` slice 003). Idempotent per
+    /// project — a live restack row already present is returned untouched (the
+    /// reply's `id`/`path` are `None`). The full restack doc is generated from
+    /// `stack` (growlightd resolved it read-only with git). One commit,
+    /// `queue_v2_updated`.
+    pub const QUEUE_V2_ENQUEUE_RESTACK: &str = "queue_v2_enqueue_restack";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2681,6 +2689,35 @@ pub struct QueueV2AddSubReply {
     pub slices: Vec<String>,
     /// Its `CLAUDE.md` (garden-relative).
     pub path: String,
+    pub hash: String,
+}
+
+/// `queue_v2_enqueue_restack({project, stack}) -> {id?, path?, hash}` — the §8
+/// auto-restack enqueue (`queue-v2-git` slice 003), keeperd↔growlightd only.
+/// growlightd detected a stale stack (read-only git) and passes the ordered
+/// stack; keeperd enqueues ONE urgent restack row for `project` and generates
+/// the full restack doc from `stack`. Idempotent per project: if a live restack
+/// row for `project` already exists, `id`/`path` are `None` and nothing is
+/// written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2EnqueueRestackArgs {
+    /// The project whose repo needs a restack.
+    pub project: String,
+    /// The ordered stack (claim order) growlightd resolved with git — each
+    /// branch, its recorded `parent`/`base`, and the resolved `--onto` target.
+    pub stack: Vec<RestackBranch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2EnqueueRestackReply {
+    /// The new restack entry's id (`NNN`); `None` when a live restack row for
+    /// `project` already existed (idempotent no-op).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The new restack doc (garden-relative); `None` on the idempotent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The commit hash, or the untouched tip on the idempotent no-op.
     pub hash: String,
 }
 

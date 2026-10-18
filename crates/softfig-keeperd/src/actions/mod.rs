@@ -56,8 +56,9 @@ pub use growlight::{
     growlight_complete_slice, growlight_init, growlight_set_resources,
     list_reports, log_baton, member_slice_insert, member_slice_update, post_message,
     queue_add_entry, queue_add_project, queue_drop,
-    queue_update_entry, queue_v2_add_sub, queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups,
-    queue_v2_session_log, queue_v2_set_status, read_inbox, release_lease, reorder_backlog_item,
+    queue_update_entry, queue_v2_add_sub, queue_v2_claim, queue_v2_deferred,
+    queue_v2_enqueue_restack, queue_v2_follow_ups, queue_v2_session_log, queue_v2_set_status,
+    read_inbox, release_lease, reorder_backlog_item,
     request_lease, set_item_status, slice_insert, slice_update, tail_bus, update_report,
     HolderStore,
 };

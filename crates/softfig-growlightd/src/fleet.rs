@@ -55,7 +55,7 @@ use crate::admission::AdmissionGovernor;
 use crate::backend_router::{BackendHandle, BackendRouter};
 use crate::baton_store::{runtime_entries_dir, FsBatonStore, FsEntryBatonStore};
 use crate::config::BuildCaps;
-use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2Claimer, KeeperdV2ItemParker};
+use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2Claimer, KeeperdV2ItemParker, KeeperdV2RestackEnqueuer};
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
@@ -631,6 +631,7 @@ pub fn assemble_fleet(
             member_writer: Box::new(baton_writer),
             claimer: Box::new(KeeperdV2Claimer::new(keeperd_socket.to_path_buf())),
             parker: Box::new(KeeperdV2ItemParker::new(keeperd_socket.to_path_buf())),
+            restacker: Box::new(KeeperdV2RestackEnqueuer::new(keeperd_socket.to_path_buf())),
         })
     })
 }

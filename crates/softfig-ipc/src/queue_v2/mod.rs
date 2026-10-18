@@ -207,6 +207,25 @@ pub struct Entry {
     pub pending_status: Option<EntryStatus>,
 }
 
+/// One branch in a restack's ordered stack (§8): what to rebase, and onto what.
+/// growlightd resolves `onto` (keeperd runs no git); the restack doc
+/// (`tasks/NNN-restack-<project>.md`) renders one step per branch from these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestackBranch {
+    /// The branch to rebase (`feat/<id>` / `fix/<id>`).
+    pub branch: String,
+    /// The recorded `parent` — the entry this branch was cut from; `""` =
+    /// `main` (§8).
+    pub parent: String,
+    /// The recorded `base` — the commit cut from (local) / the parent branch
+    /// name (remote).
+    pub base: String,
+    /// The `--onto` target: the parent's branch, or `main` for a main-rooted
+    /// branch. growlightd resolves it from the parent entry's branch.
+    pub onto: String,
+}
+
 /// The archive's outcome (§3.2): `done` satisfies `after` links, `dropped`
 /// satisfies none (a `dropped` entry never satisfies a link — §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

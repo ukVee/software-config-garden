@@ -261,6 +261,8 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
             after: entry.after.clone(),
             branch: entry.branch.clone(),
             claimed: entry.claimed.clone(),
+            parent: entry.parent.clone(),
+            base: entry.base.clone(),
             follow_ups: entry.follow_ups,
             pending: entry.pending_status,
             // Runtime state, not TOML — the drive loop overlays it (slice

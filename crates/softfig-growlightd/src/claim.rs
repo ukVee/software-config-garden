@@ -39,12 +39,14 @@ use std::path::{Path, PathBuf};
 
 use softfig_ipc::verbs::{
     op, DaemonStatusArg, QueueSliceSpec, QueueV2AddSubArgs, QueueV2ClaimArgs, QueueV2DeferredArgs,
-    QueueV2FollowUpsArgs, QueueV2SessionLogArgs, QueueV2SetStatusArgs, QueueV2SetStatusReply,
-    SetItemStatusArgs, SliceInsertArgs, SliceInsertReply,
+    QueueV2EnqueueRestackArgs, QueueV2EnqueueRestackReply, QueueV2FollowUpsArgs,
+    QueueV2SessionLogArgs, QueueV2SetStatusArgs, QueueV2SetStatusReply, SetItemStatusArgs,
+    SliceInsertArgs, SliceInsertReply,
 };
+use softfig_ipc::queue_v2::RestackBranch;
 use softfig_ipc::{call_reconnecting, ReconnectError, Request, Response, RetryPolicy};
 
-use crate::drive_loop::{ItemParker, PartClaimer, V2Claimer, V2ItemParker};
+use crate::drive_loop::{ItemParker, PartClaimer, V2Claimer, V2ItemParker, V2RestackEnqueuer};
 use crate::first_claim::FirstClaim;
 use crate::member_handoff::{KeeperOp, KeeperOutcome, V2Keeper};
 
@@ -253,6 +255,55 @@ impl V2ItemParker for KeeperdV2ItemParker {
 
     fn pause_entry_v2(&self, entry: &str) -> Result<(), String> {
         self.set_entry("v2 pause", entry, DaemonStatusArg::Paused)
+    }
+}
+
+/// The live [`V2RestackEnqueuer`] (queue-v2-git slice 003): growlightd detected a
+/// stale stack (read-only git) and issues keeperd's `queue_v2_enqueue_restack` —
+/// the WRITE that enqueues ONE urgent restack row for the project (idempotent per
+/// project) and generates the full restack doc. Same socket, same
+/// [`call_reconnecting`] ride-out, same fail-closed `classify_status_write`
+/// mapping as the v2 claimer.
+#[derive(Debug, Clone)]
+pub struct KeeperdV2RestackEnqueuer {
+    keeperd_socket: PathBuf,
+}
+
+impl KeeperdV2RestackEnqueuer {
+    /// Bind the restacker to keeperd's listen socket.
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self { keeperd_socket }
+    }
+}
+
+impl V2RestackEnqueuer for KeeperdV2RestackEnqueuer {
+    fn enqueue_restack(&self, project: &str, stack: &[RestackBranch]) -> Result<Option<String>, String> {
+        let args = serde_json::to_value(QueueV2EnqueueRestackArgs {
+            project: project.to_string(),
+            stack: stack.to_vec(),
+        })
+        .map_err(|e| format!("encode queue_v2_enqueue_restack args: {e}"))?;
+        let req = Request::new(op::QUEUE_V2_ENQUEUE_RESTACK, args);
+        let result = call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default());
+        // Same fail-closed mapping as the v2 claimer: only a `Response::Ok`
+        // enqueued (or hit the idempotent no-op); a refusal or a transport
+        // failure is `Err`.
+        let data = match result {
+            Ok(resp) => resp.into_result().map_err(|(kind, error)| {
+                format!("keeperd refused v2 restack enqueue ({kind:?}): {error}")
+            })?,
+            Err(e) => {
+                return Err(format!(
+                    "v2 restack enqueue to keeperd at {} failed: {e}",
+                    self.keeperd_socket.display()
+                ))
+            }
+        };
+        // The op replies `{id?, path?, hash}`; `id` is `None` on the idempotent
+        // no-op (a live restack row already exists).
+        let reply: QueueV2EnqueueRestackReply = serde_json::from_value(data)
+            .map_err(|e| format!("decode queue_v2_enqueue_restack reply: {e}"))?;
+        Ok(reply.id)
     }
 }
 

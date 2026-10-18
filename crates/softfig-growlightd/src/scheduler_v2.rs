@@ -87,6 +87,14 @@ pub struct EntryView {
     /// First-claim time, UTC (§3.1). Carried for completeness; the pick does
     /// not order by it (stack order is `queue-v2-git`'s row).
     pub claimed: String,
+    /// The recorded `parent` — the entry whose branch this was cut from;
+    /// `""` = `main` (§8). Carried so restack detection (`queue-v2-git` slice
+    /// 003) can compare each branch's recorded base against its parent's tip.
+    pub parent: String,
+    /// The recorded `base` — the commit cut from (local) / the parent branch
+    /// name (remote) (§8). `""` = never claimed. Carried for restack
+    /// detection.
+    pub base: String,
     /// Consecutive follow-ups (§7) — the cap's count for a task, restack or
     /// close-out unit ([`crate::member_verbs`]); the pick itself ignores it.
     pub follow_ups: u64,
@@ -614,6 +622,8 @@ mod tests {
             after: vec![],
             branch: String::new(),
             claimed: String::new(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
             holder: None,

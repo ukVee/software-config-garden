@@ -165,6 +165,8 @@ mod tests {
             after: vec![],
             branch: branch.into(),
             claimed: claimed.into(),
+            parent: String::new(),
+            base: String::new(),
             follow_ups: 0,
             pending: None,
             holder: None,

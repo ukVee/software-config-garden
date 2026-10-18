@@ -25,13 +25,14 @@ use std::collections::HashSet;
 
 use softfig_ipc::queue_v2::{
     sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
-    QueueArchiveToml, QueueRefusal, QueueToml, SliceItem, SliceKind, SliceStatus, SlicesToml,
-    QUEUE_ARCHIVE_FILE,
+    QueueArchiveToml, QueueRefusal, QueueToml, RestackBranch, SliceItem, SliceKind, SliceStatus,
+    SlicesToml, QUEUE_ARCHIVE_FILE,
 };
 use softfig_ipc::verbs::{
     QueueAddEntryArgs, QueueAddEntryReply, QueueAddProjectArgs, QueueAddProjectReply,
     QueueDropArgs, QueueDropReply, QueueStatusArg, QueueUpdateEntryArgs, QueueUpdateEntryReply,
-    SliceInsertArgs, SliceInsertReply, SliceUpdateArgs, SliceUpdateReply,
+    QueueV2EnqueueRestackArgs, QueueV2EnqueueRestackReply, SliceInsertArgs, SliceInsertReply,
+    SliceUpdateArgs, SliceUpdateReply,
 };
 use softfig_ipc::ErrorKind;
 
@@ -584,19 +585,22 @@ struct RestackStaged {
     content: String,
 }
 
-/// The restack-creation core (§8), shared by `add_restack` (slice 005) and
-/// `queue_drop`'s drop→restack path (slice 006): build the urgent no-branch
-/// row for `project` and insert it at the urgent lane's back, numbered `n`
-/// (the caller numbers, so one verb enqueuing several restacks hands out
-/// distinct numbers before any `.seq` write lands). The doc itself is staged
-/// by the caller (so a dry run can compute the row without writing anything).
-/// The caller proves the project exists before calling — its entry rows
-/// validated on load.
+/// The restack-creation core (§8), shared by `add_restack` (slice 005),
+/// `queue_drop`'s drop→restack path (slice 006), and the daemon's auto-enqueue
+/// (`queue_v2_enqueue_restack`, slice 003): build the urgent no-branch row for
+/// `project` and insert it at the urgent lane's back, numbered `n` (the caller
+/// numbers, so one verb enqueuing several restacks hands out distinct numbers
+/// before any `.seq` write lands). The doc itself is staged by the caller (so a
+/// dry run can compute the row without writing anything), rendered from `stack`
+/// (the §8 full template when non-empty; the caller passes the git-resolved
+/// stack, or `&[]` when it has none). The caller proves the project exists
+/// before calling — its entry rows validated on load.
 fn restack_core(
     wt: &WorkTree,
     queue: &mut QueueToml,
     project: &str,
     number: u32,
+    stack: &[RestackBranch],
 ) -> Result<RestackStaged, (ErrorKind, String)> {
     let tasks_dir = paths::tasks_dir();
     let slug = format!("restack-{project}");
@@ -631,7 +635,7 @@ fn restack_core(
     Ok(RestackStaged {
         id,
         number,
-        content: restack_doc(project, &conventions::today_hyphen()),
+        content: restack_doc(project, &conventions::today_hyphen(), stack),
         rel,
     })
 }
@@ -676,7 +680,7 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
     let restack = {
         let wt = WorkTree::new(daemon, &inner);
         let number = numbering::next_number(&wt, &paths::tasks_dir());
-        restack_core(&wt, &mut queue, &args.project, number)?
+        restack_core(&wt, &mut queue, &args.project, number, &[])?
     };
     queue.validate(&archive).map_err(refuse)?;
 
@@ -746,6 +750,109 @@ fn add_restack(daemon: &Daemon, args: QueueAddEntryArgs) -> HandlerResult {
         id: restack.id,
         path: restack.rel,
         view,
+        hash: hash.to_string(),
+    })
+    .unwrap())
+}
+
+/// `queue_v2_enqueue_restack` (queue-v2-git slice 003): keeperd↔growlightd only —
+/// the daemon detected a stale stack (§8, read-only git) and enqueues ONE urgent
+/// restack row for `project`, rendering the full restack doc from `stack` (each
+/// branch's `parent`/`base` and the resolved `--onto`, the steps, the gate).
+/// Idempotent per project: a live restack row already present is returned
+/// untouched (`id`/`path` `None`, no commit). One commit, `queue_v2_updated`; the
+/// restack doc + its `.seq` bump ride it as extras.
+pub fn queue_v2_enqueue_restack(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueV2EnqueueRestackArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_enqueue_restack args: {e}")))?;
+    if args.project.trim().is_empty() {
+        return Err((ErrorKind::BadArgs, "project must be non-empty".to_string()));
+    }
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (mut queue, queue_version, archive) = {
+        let wt = WorkTree::new(daemon, &inner);
+        load_for_add(&wt, &inner, &args.project, &[])?
+    };
+
+    // Idempotent per project: a live restack row for `project` already present
+    // → nothing new (the reply carries no id/path, just the current tip).
+    let already = queue
+        .entries
+        .iter()
+        .any(|e| e.kind == EntryKind::Restack && e.project == args.project);
+    if already {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(QueueV2EnqueueRestackReply {
+            id: None,
+            path: None,
+            hash,
+        })
+        .unwrap());
+    }
+
+    let restack = {
+        let wt = WorkTree::new(daemon, &inner);
+        let number = numbering::next_number(&wt, &paths::tasks_dir());
+        restack_core(&wt, &mut queue, &args.project, number, &args.stack)?
+    };
+    queue.validate(&archive).map_err(refuse)?;
+
+    let files = [FileWrite {
+        rel: QUEUE_FILE.to_string(),
+        expected: queue_version,
+        bytes: queue
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+            .into_bytes(),
+    }];
+    let view = queue_view(&queue);
+
+    // The restack doc + its `.seq` bump ride `apply`'s one commit as extras
+    // (the same envelope as `add_restack`).
+    let seq_expected = {
+        let wt = WorkTree::new(daemon, &inner);
+        numbering::seq_version(&wt, &paths::tasks_dir())
+    };
+    let extras = [
+        FileWrite {
+            rel: restack.rel.clone(),
+            expected: None,
+            bytes: restack.content.clone().into_bytes(),
+        },
+        FileWrite {
+            rel: format!("{}/{}", paths::tasks_dir(), conventions::SEQ_FILE),
+            expected: seq_expected,
+            bytes: format!("{}\n", restack.number).into_bytes(),
+        },
+    ];
+
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_updated",
+        serde_json::json!({
+            "verb": "queue_v2_enqueue_restack",
+            "id": restack.id,
+            "project": args.project,
+        }),
+        &files,
+        &[ViewWrite {
+            host: queue_view_host(),
+            tag: QUEUE_V2_TAG,
+            body: Some(view.clone()),
+        }],
+        &ExtraWrites {
+            writes: &extras,
+            refresh_backlinks: true,
+        },
+    )?;
+
+    Ok(serde_json::to_value(QueueV2EnqueueRestackReply {
+        id: Some(restack.id),
+        path: Some(restack.rel),
         hash: hash.to_string(),
     })
     .unwrap())
@@ -1330,7 +1437,7 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         let wt = WorkTree::new(daemon, &inner);
         (numbering::next_number(&wt, &paths::tasks_dir())..)
             .zip(child_projects.iter())
-            .map(|(number, p)| restack_core(&wt, &mut queue, p, number))
+            .map(|(number, p)| restack_core(&wt, &mut queue, p, number, &[]))
             .collect::<Result<_, _>>()?
     };
 
@@ -1644,19 +1751,58 @@ fn task_doc_v2(id: &str, title: &str, mission: &str, finish: &str) -> String {
     )
 }
 
-/// The minimal restack doc this milestone writes: §8's full template — the
-/// stack in order with each branch's `parent` and `base`, the steps, the gate
-/// command — is `queue-v2-git`'s (the milestone finish criteria say so).
-/// Until then the doc is a placeholder carrying the one pointer that matters.
-fn restack_doc(project: &str, date_hyphen: &str) -> String {
-    format!(
+/// The §8 restack doc (queue-v2-git slice 003): with a resolved `stack`, the
+/// full template — the stack in order (each branch's `parent` and `base`), the
+/// steps (rebase each unmerged branch in stack order with `git rebase --onto`),
+/// and the gate command. With an empty `stack` (a human/drop-enqueued restack
+/// carries no git resolution) the doc is a placeholder naming `queue show` as
+/// the way to re-derive it.
+fn restack_doc(project: &str, date_hyphen: &str, stack: &[RestackBranch]) -> String {
+    if stack.is_empty() {
+        return format!(
+            "# Restack {project}\n\n\
+             > Last reviewed: {date_hyphen}\n\n\
+             > Generated restack entry for project `{project}` (queue v2 §8). Lane, \
+             status and branch live in `queue.toml` (the derived `softfig:queue-v2` \
+             table in `../CLAUDE.md`). No stack was recorded at enqueue — re-derive \
+             it from `softfig growlight queue show` before rebasing.\n"
+        );
+    }
+    let mut doc = format!(
         "# Restack {project}\n\n\
          > Last reviewed: {date_hyphen}\n\n\
-         > Generated restack entry for project `{project}` (queue v2 §8). Lane, \
-         status and branch live in `queue.toml` (the derived `softfig:queue-v2` \
-         table in `../CLAUDE.md`). The full doc — the stack in order, the steps, \
-         the gate command — is generated by `queue-v2-git`.\n"
-    )
+         > Generated restack entry for project `{project}` (queue v2 §8): `main` \
+         moved under an open stack, so each unmerged branch must be rebased in \
+         stack order. Lane, status and branch live in `queue.toml` (the derived \
+         `softfig:queue-v2` table in `../CLAUDE.md`).\n\n\
+         ## Stack\n\n"
+    );
+    for b in stack {
+        let parent = if b.parent.is_empty() { "main" } else { &b.parent };
+        doc.push_str(&format!(
+            "- `{}` — parent: `{parent}`, base: `{}`\n",
+            b.branch, b.base
+        ));
+    }
+    doc.push_str(
+        "\n## Steps\n\n\
+         Rebase each branch in stack order (bottom first), resolving conflicts and \
+         re-running the gate per branch:\n\n",
+    );
+    for b in stack {
+        doc.push_str(&format!(
+            "- `git rebase --onto {} {} {}`\n",
+            b.onto, b.base, b.branch
+        ));
+    }
+    doc.push_str(
+        "\n## Gate\n\n\
+         After each rebase, re-run the repo's gate before `growlight_complete_entry`:\n\n\
+         ```\n\
+         cargo test --workspace\n\
+         ```\n",
+    );
+    doc
 }
 
 #[cfg(test)]
@@ -2377,8 +2523,8 @@ mod tests {
             .expect("restack doc");
         assert!(doc.starts_with("# Restack softfig\n"), "{doc}");
         assert!(
-            doc.contains("queue-v2-git"),
-            "the full template's owner is named, {doc}"
+            doc.contains("No stack was recorded at enqueue"),
+            "the placeholder names the re-derivation path, {doc}"
         );
 
         let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
@@ -2429,6 +2575,117 @@ mod tests {
         let err = add_entry(&daemon, restack_args("ghost", serde_json::json!({}))).unwrap_err();
         assert!(err.1.starts_with("unknown_project:"), "{err:?}");
         assert_eq!(commit_count(&daemon), before, "refusals mint no commit");
+    }
+
+    // ---- slice 003: queue_v2_enqueue_restack (the auto-detection path) ----
+
+    fn rb(branch: &str, parent: &str, base: &str, onto: &str) -> RestackBranch {
+        RestackBranch {
+            branch: branch.into(),
+            parent: parent.into(),
+            base: base.into(),
+            onto: onto.into(),
+        }
+    }
+
+    fn enqueue_restack(
+        daemon: &Daemon,
+        project: &str,
+        stack: Vec<RestackBranch>,
+    ) -> Result<QueueV2EnqueueRestackReply, (ErrorKind, String)> {
+        queue_v2_enqueue_restack(
+            daemon,
+            serde_json::json!({ "project": project, "stack": stack }),
+        )
+        .map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn enqueue_restack_writes_one_urgent_row_and_the_full_doc() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        add_entry(&daemon, milestone_args("m1", "softfig", serde_json::json!({}))).unwrap();
+        let before = commit_count(&daemon);
+
+        let stack = vec![
+            rb("feat/one", "", "abc123", "main"),
+            rb("feat/two", "one", "def456", "feat/one"),
+        ];
+        let reply = enqueue_restack(&daemon, "softfig", stack).expect("enqueue");
+        assert_eq!(commit_count(&daemon), before + 1, "exactly one commit per enqueue");
+        assert_eq!(reply.id.as_deref(), Some("001"));
+        assert!(reply.path.as_deref().unwrap().ends_with("tasks/001-restack-softfig.md"));
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+
+        // One urgent, branchless row, ahead of the normal milestone.
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["001", "m1"], "the urgent restack precedes the normal milestone");
+        let r = &qs.queue.model.entries[0];
+        assert_eq!(r.kind, EntryKind::Restack);
+        assert_eq!(r.lane, Lane::Urgent);
+        assert_eq!(r.branch, "", "a restack has no branch of its own");
+        assert_eq!(r.project, "softfig");
+
+        // The full §8 template: stack, steps, gate.
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        assert!(doc.starts_with("# Restack softfig
+"), "{doc}");
+        assert!(doc.contains("## Stack"), "{doc}");
+        assert!(doc.contains("- `feat/one` — parent: `main`, base: `abc123`"), "{doc}");
+        assert!(doc.contains("- `feat/two` — parent: `one`, base: `def456`"), "{doc}");
+        assert!(doc.contains("## Steps"), "{doc}");
+        assert!(doc.contains("- `git rebase --onto main abc123 feat/one`"), "{doc}");
+        assert!(doc.contains("- `git rebase --onto feat/one def456 feat/two`"), "{doc}");
+        assert!(doc.contains("## Gate"), "{doc}");
+        assert!(doc.contains("cargo test --workspace"), "{doc}");
+        assert_eq!(wt.read_to_string("growlight/backlog/tasks/.seq").unwrap(), "1
+");
+        drop(inner);
+    }
+
+    #[test]
+    fn enqueue_restack_is_idempotent_per_project() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+
+        let stack = vec![rb("feat/one", "", "abc123", "main")];
+        let first = enqueue_restack(&daemon, "softfig", stack.clone()).expect("first");
+        assert_eq!(first.id.as_deref(), Some("001"));
+        let after_first = commit_count(&daemon);
+
+        // A second detection of the same stale stack is a no-op — the live
+        // restack row already exists, so no second entry and no commit.
+        let second = enqueue_restack(&daemon, "softfig", stack).expect("second");
+        assert_eq!(second.id, None, "idempotent: no new entry");
+        assert_eq!(second.path, None);
+        assert_eq!(commit_count(&daemon), after_first, "no commit on the no-op");
+
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let qs = load_queue_state(&wt, &inner).unwrap().unwrap();
+        assert_eq!(qs.queue.model.entries.len(), 1, "still exactly one restack row");
+        assert!(!wt.exists("growlight/backlog/tasks/002-restack-softfig.md"));
+        drop(inner);
+    }
+
+    #[test]
+    fn enqueue_restack_refuses_an_unknown_project() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        add_project(&daemon, "softfig", "~/p");
+        let before = commit_count(&daemon);
+
+        let err = enqueue_restack(&daemon, "ghost", vec![rb("feat/one", "", "abc123", "main")])
+            .unwrap_err();
+        assert!(err.1.starts_with("unknown_project:"), "{err:?}");
+        assert_eq!(commit_count(&daemon), before, "a refusal mints no commit");
     }
 
     #[test]

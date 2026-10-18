@@ -787,6 +787,8 @@ pub(crate) mod tests {
                 after: vec![],
                 branch: String::new(),
                 claimed: "2026-10-14T00:00Z".into(),
+                parent: String::new(),
+                base: String::new(),
                 follow_ups: 2,
                 pending: None,
                 holder: None,
