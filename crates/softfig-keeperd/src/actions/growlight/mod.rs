@@ -105,6 +105,23 @@ fn non_empty(field: &str, value: &str) -> Result<(), (ErrorKind, String)> {
     }
 }
 
+/// Report 036: a fleet member's reach over the legacy growlight verbs. A
+/// member may `log_baton` and `set_item_status` on its OWN held item to
+/// `done` | `deferred` | `blocked` (protocol-fleet.md's handoff steps); every
+/// other legacy queue-table write is the human's or growlightd's. Refused
+/// here `member_not_allowed`, before any tree change.
+fn refuse_member_legacy(member: &str, verb: &str, why: &str) -> (ErrorKind, String) {
+    (
+        ErrorKind::BadArgs,
+        format!(
+            "member_not_allowed: '{verb}' is not a member's call — {why}. Fleet member \
+             {member} may only log_baton and set its own held item to done/deferred/blocked \
+             (protocol-fleet.md); file_report it or post_message to @human instead. \
+             (spec-growlight-queue §6.7)"
+        ),
+    )
+}
+
 // ---- log_baton ---------------------------------------------------------
 
 pub fn log_baton(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
@@ -297,6 +314,14 @@ pub fn add_backlog_item(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     non_empty("mission", &args.mission)?;
     non_empty("finish_criteria", &args.finish_criteria)?;
 
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "add_backlog_item",
+            "shaping the backlog is the human's",
+        ));
+    }
+
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
     let date = conventions::today_hyphen();
@@ -390,6 +415,14 @@ pub fn add_slice(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     conventions::validate_slug(&args.milestone)?;
     conventions::validate_slug(&args.slug)?;
     non_empty("body", &args.body)?;
+
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "add_slice",
+            "adding a slice is the human's",
+        ));
+    }
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
@@ -508,6 +541,24 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
     non_empty("id", &args.id)?;
     paths::validate_status(&args.status)?;
 
+    // Report 036: a member may only move its OWN item to a handoff status —
+    // never claim (`active`) or resume (`queued`), which are growlightd's and
+    // the human's. The own-item check below runs once the queue region resolves.
+    let member = crate::caller::member();
+    if let Some(member) = member.as_deref()
+        && !matches!(args.status.as_str(), "done" | "deferred" | "blocked")
+    {
+        return Err(refuse_member_legacy(
+            member,
+            "set_item_status",
+            &format!(
+                "a status change to {:?} is growlightd's (an `active` claim) or the human's \
+                 (a `queued` resume); a member may only set done, deferred or blocked",
+                args.status
+            ),
+        ));
+    }
+
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;
 
@@ -547,6 +598,39 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             .ok_or((ErrorKind::NotFound, format!("no backlog item with id {:?}", args.id)))?;
 
         let key: holders::PartKey = (tag.clone(), args.id.clone());
+
+        // Report 036: a member's `set_item_status` reaches only the item it
+        // holds. The holder map is rebuilt empty on every daemon start, so an
+        // unrecorded holder (a post-`daemon cycle` window) fails closed — the
+        // member cannot set the status, and the human runs the change.
+        if let Some(member) = member.as_deref() {
+            match inner.holders.holder_of(&key) {
+                Some(h) if h == member => {}
+                Some(other) => {
+                    return Err((
+                        ErrorKind::BadArgs,
+                        format!(
+                            "member_not_allowed: item {:?} is held by agent {other:?}, not \
+                             member {member:?} — a member sets only its own held item's status \
+                             (protocol-fleet.md). (spec-growlight-queue §6.7)",
+                            args.id
+                        ),
+                    ))
+                }
+                None => {
+                    return Err((
+                        ErrorKind::BadArgs,
+                        format!(
+                            "member_not_allowed: no holder is recorded for item {:?} (a daemon \
+                             cycle rebuilds the holder map empty), so member {member:?} cannot \
+                             set its status — the human runs this change. (spec-growlight-queue \
+                             §6.7)",
+                            args.id
+                        ),
+                    ))
+                }
+            }
+        }
 
         // Holder-identity CAS (milestone #40): only the write TO `active` is
         // gated. A claim of a part already `active` under a *different* holder is
@@ -657,6 +741,14 @@ pub fn reorder_backlog_item(daemon: &Daemon, args: serde_json::Value) -> Handler
         .map_err(|e| (ErrorKind::BadArgs, format!("reorder_backlog_item args: {e}")))?;
     non_empty("id", &args.id)?;
     let position = paths::parse_position(&args.position, args.ref_id.as_deref())?;
+
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "reorder_backlog_item",
+            "reordering the queue is the human's",
+        ));
+    }
 
     let mut inner = daemon.inner.lock().unwrap();
     require_unlocked(&inner)?;

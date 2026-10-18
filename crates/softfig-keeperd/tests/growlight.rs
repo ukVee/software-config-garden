@@ -610,6 +610,167 @@ fn leaving_active_drops_the_holder() {
     ));
 }
 
+// ---- set_item_status: member write guards (report 036) ----------------
+
+/// Unwrap an `Err` response's message, panicking if it was `Ok`.
+fn err_msg(resp: &Response) -> String {
+    match resp {
+        Response::Err { error, .. } => error.clone(),
+        Response::Ok { data, .. } => panic!("expected Err, got Ok: {data}"),
+    }
+}
+
+/// Report 036: a member's reach over the legacy growlight verbs is exactly
+/// `log_baton` and `set_item_status` on its OWN held item to a handoff status
+/// (`done` | `deferred` | `blocked`). A claim (`active`), a resume (`queued`),
+/// another item's status, and every shaping verb (`add_backlog_item`,
+/// `add_slice`, `reorder_backlog_item`) are refused `member_not_allowed`; the
+/// human is unrestricted.
+#[test]
+fn a_member_is_held_to_log_baton_and_its_own_items_handoff_status() {
+    let fx = Fixture::start();
+    fx.add_milestone("done", "Done");
+    fx.add_milestone("deferred", "Deferred");
+    fx.add_milestone("blocked", "Blocked");
+    fx.add_task("unmount", "Unmount"); // id 001
+
+    let member = |op_name: &str, args: serde_json::Value| {
+        send(
+            &fx.socket,
+            &Request::new(op_name, args).with_member(Some("m-a")),
+        )
+    };
+
+    // log_baton is a member verb (protocol-fleet.md step 5b).
+    assert!(matches!(
+        member(
+            op::LOG_BATON,
+            serde_json::json!({ "item": "done", "iteration": 1, "summary": "handed off" })
+        ),
+        Response::Ok { .. }
+    ));
+
+    // A claim (`active`) and a resume (`queued`) are refused, even on the
+    // member's own item — those are growlightd's / the human's.
+    for status in ["active", "queued"] {
+        let resp = member(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "done", "status": status }),
+        );
+        assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{status}");
+    }
+
+    // Each own held item may go to exactly the handoff statuses.
+    for (id, status) in [("done", "done"), ("deferred", "deferred"), ("blocked", "blocked")] {
+        // growlightd records the holder on the claim; the member then hands off.
+        assert!(matches!(
+            fx.call(
+                op::SET_ITEM_STATUS,
+                serde_json::json!({ "id": id, "status": "active", "holder": "m-a" })
+            ),
+            Response::Ok { .. }
+        ));
+        let resp = member(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": id, "status": status }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{id} {status}: {resp:?}");
+    }
+
+    // Another agent's held item is refused (the member holds only its own).
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "001", "status": "active", "holder": "m-b" })
+        ),
+        Response::Ok { .. }
+    ));
+    let resp = member(
+        op::SET_ITEM_STATUS,
+        serde_json::json!({ "id": "001", "status": "done" }),
+    );
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "another item");
+
+    // The shaping verbs are refused outright.
+    for (verb, args) in [
+        (
+            op::ADD_BACKLOG_ITEM,
+            serde_json::json!({
+                "item_type": "task", "slug": "x", "title": "X",
+                "mission": "m", "finish_criteria": "f"
+            }),
+        ),
+        (
+            op::ADD_SLICE,
+            serde_json::json!({ "milestone": "done", "slug": "s", "body": "b" }),
+        ),
+        (
+            op::REORDER_BACKLOG_ITEM,
+            serde_json::json!({ "id": "001", "position": "top" }),
+        ),
+    ] {
+        let resp = member(verb, args);
+        assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{verb}");
+    }
+
+    // The human's calls are unchanged.
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "001", "status": "done" })
+        ),
+        Response::Ok { .. }
+    ));
+    assert!(matches!(
+        fx.call(
+            op::ADD_BACKLOG_ITEM,
+            serde_json::json!({
+                "item_type": "task", "slug": "human", "title": "H",
+                "mission": "m", "finish_criteria": "f"
+            })
+        ),
+        Response::Ok { .. }
+    ));
+}
+
+/// Report 036's unknown-holder decision, fail-closed: a part `active` with no
+/// recorded holder (a part left active without a holdered claim, or one whose
+/// holder map was rebuilt empty by a `daemon cycle`) is refused for a member —
+/// the human runs that status change. The member still has `log_baton` and
+/// `post_message` to hand off around it.
+#[test]
+fn a_member_set_item_status_fails_closed_on_an_unknown_holder() {
+    let mut fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    // Active WITHOUT a holder: the holder map has no entry — the same state a
+    // cycled daemon starts in for a part left active.
+    assert!(matches!(
+        fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "active" })),
+        Response::Ok { .. }
+    ));
+
+    let socket = fx.socket.clone();
+    let member_done = move || {
+        send(
+            &socket,
+            &Request::new(
+                op::SET_ITEM_STATUS,
+                serde_json::json!({ "id": "m5b", "status": "done" }),
+            )
+            .with_member(Some("m-a")),
+        )
+    };
+    let resp = member_done();
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
+
+    // The same refusal holds across a real daemon cycle: the active row
+    // survives (persisted), the holder map does not (in-memory).
+    fx.restart();
+    assert!(fx.backlog().contains("| 1 | m5b | milestone | Backup | active |"));
+    let resp = member_done();
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
+}
+
 // ---- reorder_backlog_item ---------------------------------------------
 
 #[test]
