@@ -27,6 +27,7 @@
 //! `softfig-vault`.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
 
 use crate::attest::{KEY_LEN, SIG_LEN};
 
@@ -132,6 +133,172 @@ pub fn verify(
     verifying_key
         .verify(&signing_message(cert), &signature)
         .is_ok()
+}
+
+
+// --- serde: hex-string wire form -------------------------------------------
+//
+// `RunnerCert` travels as `cert.toml` (stored by runnerd) and over the admin
+// socket / keeperd IPC. On the wire the three 32-byte keys and the 16-byte
+// serial are lowercase hex strings and the two timestamps are Unix seconds —
+// the same shape a TOML/JSON config file holds. The canonical *signing* bytes
+// ([`signing_message`]) are untouched: serde is a transport/storage concern
+// only, so a certificate round-tripped through TOML signs and verifies exactly
+// as one built in memory.
+
+impl Serialize for RunnerCert {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("RunnerCert", 6)?;
+        st.serialize_field("device_id", &hex::encode(self.device_id))?;
+        st.serialize_field(
+            "runner_transport_pubkey",
+            &hex::encode(self.runner_transport_pubkey),
+        )?;
+        st.serialize_field("runner_attest_pubkey", &hex::encode(self.runner_attest_pubkey))?;
+        st.serialize_field("serial", &hex::encode(self.serial))?;
+        st.serialize_field("issued_at", &self.issued_at)?;
+        st.serialize_field("expires_at", &self.expires_at)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RunnerCert {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            device_id: String,
+            runner_transport_pubkey: String,
+            runner_attest_pubkey: String,
+            serial: String,
+            issued_at: i64,
+            expires_at: i64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(RunnerCert {
+            device_id: decode_hex::<KEY_LEN>(&raw.device_id, "device_id")
+                .map_err(serde::de::Error::custom)?,
+            runner_transport_pubkey: decode_hex::<KEY_LEN>(
+                &raw.runner_transport_pubkey,
+                "runner_transport_pubkey",
+            )
+            .map_err(serde::de::Error::custom)?,
+            runner_attest_pubkey: decode_hex::<KEY_LEN>(
+                &raw.runner_attest_pubkey,
+                "runner_attest_pubkey",
+            )
+            .map_err(serde::de::Error::custom)?,
+            serial: decode_hex::<RUNNER_SERIAL_LEN>(&raw.serial, "serial")
+                .map_err(serde::de::Error::custom)?,
+            issued_at: raw.issued_at,
+            expires_at: raw.expires_at,
+        })
+    }
+}
+
+/// Decode a lowercase-hex string into a fixed-size byte array. The error is a
+/// plain `String` so a serde `Deserialize` impl can attach a field name via
+/// `Error::custom`, and a hand-rolled parser can surface it directly.
+fn decode_hex<const N: usize>(s: &str, field: &str) -> Result<[u8; N], String> {
+    let bytes = hex::decode(s.trim()).map_err(|_| format!("{field} is not valid hex"))?;
+    let arr: [u8; N] = bytes
+        .try_into()
+        .map_err(|_| format!("{field} has wrong length (want {N} bytes)"))?;
+    Ok(arr)
+}
+
+/// Domain-separation prefix for the runner-certificate *revocation* record.
+/// Signed by the device **identity** key (not the runner attest key), so a
+/// revocation cannot be forged by a stolen runner key (spec §3.1). Versioned,
+/// and distinct from the certificate domain and every other identity-key
+/// context.
+pub const RUNNER_REVOKE_DOMAIN: &[u8] = b"softfig/runner/revocation/v1";
+
+/// The exact bytes a device identity signs to revoke a runner-certificate
+/// serial. The full `RunnerCertRevoke` wire frame lands in slice 003; this
+/// message is its signing payload, defined here so slice 002's `revoke-cert`
+/// already produces a forward-compatible signed record.
+pub fn revocation_message(
+    device_id: &[u8; KEY_LEN],
+    serial: &[u8; RUNNER_SERIAL_LEN],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(RUNNER_REVOKE_DOMAIN.len() + KEY_LEN + RUNNER_SERIAL_LEN);
+    msg.extend_from_slice(RUNNER_REVOKE_DOMAIN);
+    msg.extend_from_slice(device_id);
+    msg.extend_from_slice(serial);
+    msg
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn id(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn xpub(seed: u8) -> [u8; KEY_LEN] {
+        x25519_dalek::x25519([seed; 32], x25519_dalek::X25519_BASEPOINT_BYTES)
+    }
+
+    fn cert(seed: u8) -> RunnerCert {
+        let i = id(seed);
+        RunnerCert {
+            device_id: i.verifying_key().to_bytes(),
+            runner_transport_pubkey: xpub(seed),
+            runner_attest_pubkey: id(seed.wrapping_add(50)).verifying_key().to_bytes(),
+            serial: [seed; RUNNER_SERIAL_LEN],
+            issued_at: 1_800_000_000,
+            expires_at: 1_800_000_000 + RUNNER_DEFAULT_LIFETIME_SECS,
+        }
+    }
+
+    #[test]
+    fn round_trips_through_toml_preserving_signing_bytes() {
+        let c = cert(1);
+        let toml = toml::to_string(&c).unwrap();
+        let back: RunnerCert = toml::from_str(&toml).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(back.signing_message(), c.signing_message());
+    }
+
+    #[test]
+    fn serializes_keys_and_serial_as_hex() {
+        let c = cert(2);
+        let toml = toml::to_string(&c).unwrap();
+        let dev = hex::encode(c.device_id);
+        assert!(toml.contains(&format!("device_id = \"{dev}\"")));
+        assert!(toml.contains(&format!("serial = \"{}\"", hex::encode(c.serial))));
+        // Never a byte-array form.
+        assert!(!toml.contains("[0, 0"));
+    }
+
+    #[test]
+    fn rejects_bad_hex_and_wrong_length() {
+        let c = cert(3);
+        let good = toml::to_string(&c).unwrap();
+        // Invalid hex in the serial.
+        let bad_hex = good.replace(&format!("\"{}\"", hex::encode(c.serial)), "\"zz\"");
+        assert!(toml::from_str::<RunnerCert>(&bad_hex).is_err());
+        // Wrong-length device_id.
+        let bad_len = good.replace(&format!("\"{}\"", hex::encode(c.device_id)), "\"abcd\"");
+        assert!(toml::from_str::<RunnerCert>(&bad_len).is_err());
+    }
+
+    #[test]
+    fn revocation_message_is_domain_separated() {
+        let i = id(4);
+        let dev = i.verifying_key().to_bytes();
+        let serial = [7u8; RUNNER_SERIAL_LEN];
+        let m = revocation_message(&dev, &serial);
+        assert!(m.starts_with(RUNNER_REVOKE_DOMAIN));
+        // Distinct from a certificate signing message over the same keys.
+        let c = cert(5);
+        assert_ne!(m, signing_message(&c));
+        // And from the transport-attestation message.
+        assert_ne!(m, crate::attest::static_attestation_message(&dev));
+    }
 }
 
 #[cfg(test)]
