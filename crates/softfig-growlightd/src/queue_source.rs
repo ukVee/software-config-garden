@@ -450,13 +450,13 @@ impl KeeperdRepoProbe {
     }
 }
 
-impl RepoProbe for KeeperdRepoProbe {
-    /// Every failure is "no repo signal" (the NEXT-ACTION-only guard), never an
-    /// error: a doc keeperd can't serve and a repo `git` can't read are journaled,
-    /// and the guard decides on NEXT ACTION alone.
-    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
-        // An unreadable doc might name a worktree the registry would contradict,
-        // so it is no signal rather than a registry guess.
+impl KeeperdRepoProbe {
+    /// Resolve the local repo path for `(queue, part)` — the doc's `> Worktree:`
+    /// first, then the queue registry's `repo` cell — journaling an unreadable doc
+    /// or backlog rather than guessing. `None` = no repo signal (never an error);
+    /// an unreadable doc might name a worktree the registry would contradict, so
+    /// it is no signal rather than a registry guess.
+    fn resolve(&self, queue: &str, part: &str) -> Option<PathBuf> {
         let doc = self
             .docs
             .read_item_doc(part)
@@ -477,10 +477,26 @@ impl RepoProbe for KeeperdRepoProbe {
                 }
             },
         };
-        let repo = resolve_repo(worktree, registry.as_deref(), self.home.as_deref())?;
+        resolve_repo(worktree, registry.as_deref(), self.home.as_deref())
+    }
+}
+
+impl RepoProbe for KeeperdRepoProbe {
+    /// Every failure is "no repo signal" (the NEXT-ACTION-only guard), never an
+    /// error: a doc keeperd can't serve and a repo `git` can't read are journaled,
+    /// and the guard decides on NEXT ACTION alone.
+    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
+        let repo = self.resolve(queue, part)?;
         probe(&repo)
             .inspect_err(|e| eprintln!("growlightd: repo probe: {queue}/{part}: {e}"))
             .ok()
+    }
+
+    /// The boot guard (task 064) names the repo in its journal line, so the path
+    /// is surfaced alongside the state — the same resolution [`Self::repo_state`]
+    /// uses, without the `git` probe.
+    fn repo_path(&self, queue: &str, part: &str) -> Option<PathBuf> {
+        self.resolve(queue, part)
     }
 }
 

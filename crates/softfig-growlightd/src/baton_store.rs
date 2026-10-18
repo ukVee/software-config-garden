@@ -119,6 +119,31 @@ impl BatonSeeder for FsBatonStore {
         let body = seed_baton(&self.garden_name, agent, queue, part, &path);
         fs::write(&path, body).map_err(|e| format!("write baton {}: {e}", path.display()))
     }
+
+    fn warn_dirty_tree(
+        &self,
+        agent: &str,
+        repo: &Path,
+        dirty: usize,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let path = self.baton_path(agent);
+        let section = format!(
+            "\n# ⚠️ PRE-EXISTING DIRTY TREE\n\n\
+             The repo `{}` had {dirty} uncommitted path(s) when you were spawned,\n\
+             newer than this baton's last handoff — a prior session likely worked and was\n\
+             cut off before committing. Review `git status` there before starting new\n\
+             work. This guard is read-only: it reverted, staged and committed nothing.\n",
+            repo.display()
+        );
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("open baton {} for warn: {e}", path.display()))?;
+        file.write_all(section.as_bytes())
+            .map_err(|e| format!("append warning to baton {}: {e}", path.display()))
+    }
 }
 
 /// The v2 member-baton copy (queue-v2-scheduling slice 006): write an entry
