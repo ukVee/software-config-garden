@@ -2505,12 +2505,19 @@ pub struct DeferredTestSpec {
     pub expected: String,
 }
 
-/// `queue_v2_claim({entry, unit?}) -> {entry, unit, hash}` — the daemon claim
-/// (spec §6.3 step 3's claim at assignment, `queue-v2-scheduling` slice 005).
-/// Entry `queued | paused → active`; `unit` (a slice id) `queued → active`.
-/// `unit` is omitted for a task/restack or a milestone close-out. A re-claim
-/// of an already-active unit is an idempotent no-op; a different already-active
-/// slice of the same entry is refused `started`.
+/// `queue_v2_claim({entry, unit?, parent?, base?}) -> {entry, unit, hash}` —
+/// the daemon claim (spec §6.3 step 3's claim at assignment,
+/// `queue-v2-scheduling` slice 005). Entry `queued | paused → active`; `unit`
+/// (a slice id) `queued → active`. `unit` is omitted for a task/restack or a
+/// milestone close-out. A re-claim of an already-active unit is an idempotent
+/// no-op; a different already-active slice of the same entry is refused
+/// `started`.
+///
+/// `parent`/`base` are the §8 first-claim recording (`queue-v2-git` slice 002):
+/// growlightd computes them from the stack and passes them only on a first
+/// claim (a never-claimed entry). keeperd records them — and stamps `claimed`
+/// itself — only when the entry's `claimed` is still empty, so a resume or a
+/// re-claim never overwrites an already-recorded base.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueV2ClaimArgs {
     /// The live entry id (a milestone identity, a task's NNN, or a restack's
@@ -2520,6 +2527,14 @@ pub struct QueueV2ClaimArgs {
     /// task, restack or close-out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// §8 `parent` — the entry whose branch this was cut from (`""` = `main`).
+    /// First claim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// §8 `base` — the commit cut from (local) or the parent branch name
+    /// (remote). First claim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

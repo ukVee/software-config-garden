@@ -776,6 +776,7 @@ pub(crate) mod tests {
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/garden".into(),
+                main: "main".into(),
             }],
             entries: vec![EntryView {
                 id: "m1".into(),
@@ -784,6 +785,7 @@ pub(crate) mod tests {
                 lane: Lane::Normal,
                 status: EntryStatus::Active,
                 after: vec![],
+                branch: String::new(),
                 claimed: "2026-10-14T00:00Z".into(),
                 follow_ups: 2,
                 pending: None,

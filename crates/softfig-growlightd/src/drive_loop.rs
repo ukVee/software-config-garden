@@ -64,6 +64,7 @@ use crate::baton_store::FsEntryBatonStore;
 use crate::claude_backend::ClaudeBackend;
 use crate::config::RateLimits;
 use crate::daemon::Daemon;
+use crate::first_claim::{self, FirstClaim};
 use crate::fleet::QueueMode;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
@@ -796,15 +797,23 @@ pub trait V2QueueSource: Send + Sync + fmt::Debug {
 }
 
 /// The seam the loop claims a picked v2 unit through (spec §6.3 step 3's claim
-/// at assignment, slice 005's op): keeperd's `queue_v2_claim({entry, unit?})`.
-/// `Ok(())` means the unit is now this member's (the op's idempotent
-/// re-claim counts); `Err` aborts the spawn fail-closed, exactly like the
-/// legacy [`PartClaimer`]. The live impl is
+/// at assignment, slice 005's op): keeperd's
+/// `queue_v2_claim({entry, unit?, parent?, base?})`. `Ok(())` means the unit is
+/// now this member's (the op's idempotent re-claim counts); `Err` aborts the
+/// spawn fail-closed, exactly like the legacy [`PartClaimer`]. The live impl is
 /// [`crate::claim::KeeperdV2Claimer`] over the keeperd socket.
 pub trait V2Claimer: Send + Sync + fmt::Debug {
     /// Claim `entry` (the milestone identity — `"parent/sub"` for subs) and its
-    /// `unit` slice id (`None` for a task, restack, or close-out).
-    fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String>;
+    /// `unit` slice id (`None` for a task, restack, or close-out). `first` is
+    /// the §8 first-claim recording (queue-v2-git slice 002), present only on a
+    /// never-claimed entry — a resume or re-claim passes `None` and the op
+    /// leaves any recorded base untouched.
+    fn claim_v2(
+        &self,
+        entry: &str,
+        unit: Option<&str>,
+        first: Option<&FirstClaim>,
+    ) -> Result<(), String>;
 }
 
 /// The seam the loop item-parks a v2 ENTRY through when its member exits on a
@@ -2239,8 +2248,45 @@ impl DriveLoop {
                                 // (seed before claim), so a baton failure aborts
                                 // before the keeperd write and never orphans an
                                 // `active` entry.
-                                copy_entry_baton(entries, &**member_writer, entry_top, agent)?;
-                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref())
+                                //
+                                // First claim (§8, queue-v2-git slice 002): a
+                                // never-claimed entry gets its `parent`/`base`
+                                // computed from the stack here, its baton seeded
+                                // with the concrete `create <branch> from <base>`
+                                // line, and those values passed to the claim op.
+                                // A resume or re-claim (`claimed` already set)
+                                // computes nothing and passes `None`, so an
+                                // already-recorded base is never overwritten. A
+                                // git failure here fails the claim closed — no
+                                // spawn, retried next tick.
+                                let first = match snapshot
+                                    .entries
+                                    .iter()
+                                    .find(|e| e.id == entry_top)
+                                {
+                                    Some(ev) if ev.claimed.is_empty() => {
+                                        let home =
+                                            std::env::var_os("HOME").map(std::path::PathBuf::from);
+                                        first_claim::first_claim(snapshot, ev, home.as_deref())
+                                            .map_err(|e| e.to_string())?
+                                    }
+                                    _ => None,
+                                };
+                                let (branch, base) = match &first {
+                                    Some(fc) => {
+                                        (Some(fc.branch.as_str()), Some(fc.base.as_str()))
+                                    }
+                                    None => (None, None),
+                                };
+                                copy_entry_baton(
+                                    entries,
+                                    &**member_writer,
+                                    entry_top,
+                                    agent,
+                                    branch,
+                                    base,
+                                )?;
+                                v2_claimer.claim_v2(&claim_entry, unit_arg.as_deref(), first.as_ref())
                             },
                         );
                         match outcome {
@@ -2997,19 +3043,23 @@ fn resolve_v2_model(pick: &Pick, member: &FleetMember) -> ModelChoice {
 /// before the claim (the legacy seed-before-claim order), so a member never
 /// boots stateless and a claim never lands behind a failed baton.
 ///
-/// The §8 base line (branch/base) is seeded as the literal `<branch>`/`<base>`
-/// tokens: computing the concrete stack-top values is `queue-v2-git`'s row
-/// (§13), so this milestone records the tokens, exactly as the store documents.
+/// The §8 base line (queue-v2-git slice 002): a first claim passes the CONCRETE
+/// `branch`/`base` (computed by [`crate::first_claim`]) so the seeded baton
+/// reads `create <branch> from <base>`. A resume or a branchless entry (a
+/// restack) passes `None` and the seed renders the literal `<branch>`/`<base>`
+/// tokens, exactly as the store documents.
 fn copy_entry_baton(
     entries: &FsEntryBatonStore,
     member_writer: &dyn MemberBatonWriter,
     entry_top: &str,
     agent: &str,
+    branch: Option<&str>,
+    base: Option<&str>,
 ) -> Result<(), String> {
     let baton = match entries.read(entry_top) {
         Some(baton) => baton,
         None => {
-            entries.seed(entry_top, None, None)?;
+            entries.seed(entry_top, branch, base)?;
             entries
                 .read(entry_top)
                 .ok_or_else(|| format!("entry baton for {entry_top} unreadable after seed"))?
@@ -7413,7 +7463,12 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     }
 
     impl V2Claimer for FakeV2Claimer {
-        fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
+        fn claim_v2(
+            &self,
+            entry: &str,
+            unit: Option<&str>,
+            _first: Option<&FirstClaim>,
+        ) -> Result<(), String> {
             self.claims
                 .lock()
                 .unwrap()
@@ -7429,8 +7484,13 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// The `Arc` shape the loop's `Box<dyn V2Claimer>` holds (same pattern as
     /// `FakeFleet`).
     impl V2Claimer for Arc<FakeV2Claimer> {
-        fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
-            (**self).claim_v2(entry, unit)
+        fn claim_v2(
+            &self,
+            entry: &str,
+            unit: Option<&str>,
+            first: Option<&FirstClaim>,
+        ) -> Result<(), String> {
+            (**self).claim_v2(entry, unit, first)
         }
     }
 
@@ -7483,6 +7543,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/garden".into(),
+                main: "main".into(),
             }],
             entries: vec![EntryView {
                 id: entry_id.into(),
@@ -7491,6 +7552,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 lane: Lane::Normal,
                 status,
                 after: vec![],
+                branch: String::new(),
                 claimed: "2026-10-14T00:00Z".into(),
                 follow_ups: 0,
                 pending: None,
@@ -8071,6 +8133,10 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// A throwaway garden the v2 source reads.
     struct TestGarden {
         root: PathBuf,
+        /// A real git repo (at `root/repo`, one `main` commit) so the §8
+        /// first-claim stack computation (queue-v2-git slice 002) can resolve
+        /// `main` when a `Queued` entry is first claimed.
+        repo: PathBuf,
     }
 
     impl TestGarden {
@@ -8081,7 +8147,33 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             ));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
-            Self { root }
+            let repo = root.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let ok = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .expect("run git")
+                    .success();
+                assert!(ok, "git {args:?}");
+            };
+            git(&["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+            Self { root, repo }
         }
         fn write(&self, rel: &str, content: &str) {
             let path = self.root.join(rel);
@@ -8092,7 +8184,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         fn queue(&self, entries: Vec<Entry>) {
             let project = Project {
                 name: "softfig".into(),
-                repo: "/garden".into(),
+                repo: self.repo.display().to_string(),
                 main: "main".into(),
             };
             self.write(QUEUE_FILE, &QueueToml::new(vec![project], entries).to_toml().unwrap());

@@ -295,9 +295,25 @@ pub fn queue_v2_claim(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
     // resumable by any member — the slice doc's "queued → active" is the
     // first-claim case, the resume is the §2 case); `active` is an
     // idempotent re-claim; anything else is a protocol bug, refused loud.
+    //
+    // §8 first claim (queue-v2-git slice 002): a never-claimed entry records
+    // the `parent`/`base` growlightd computed from the stack, and keeperd (the
+    // writer) stamps `claimed` itself. A resume or a re-claim — `claimed`
+    // already set — leaves all three untouched, so an already-recorded base is
+    // never overwritten by a stale first-claim attempt.
+    let first_claim = queue.entries[eidx].claimed.is_empty();
     let entry_changed = match queue.entries[eidx].status {
         EntryStatus::Queued | EntryStatus::Paused => {
             queue.entries[eidx].status = EntryStatus::Active;
+            if first_claim {
+                queue.entries[eidx].claimed = conventions::now_rfc3339();
+                if let Some(parent) = args.parent.as_deref() {
+                    queue.entries[eidx].parent = parent.to_string();
+                }
+                if let Some(base) = args.base.as_deref() {
+                    queue.entries[eidx].base = base.to_string();
+                }
+            }
             true
         }
         EntryStatus::Active => false,
@@ -1306,6 +1322,22 @@ mod tests {
         Ok(serde_json::from_value(v).unwrap())
     }
 
+    /// A claim carrying the §8 first-claim `parent`/`base` (queue-v2-git slice
+    /// 002) — the shape growlightd sends for a never-claimed entry.
+    fn claim_first(
+        daemon: &Daemon,
+        entry: &str,
+        unit: Option<&str>,
+        parent: &str,
+        base: &str,
+    ) -> Result<QueueV2ClaimReply, (ErrorKind, String)> {
+        let v = queue_v2_claim(
+            daemon,
+            serde_json::json!({ "entry": entry, "unit": unit, "parent": parent, "base": base }),
+        )?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
     fn set_status(
         daemon: &Daemon,
         entry: &str,
@@ -1403,6 +1435,60 @@ mod tests {
         let slices_region = managed::region_body(&claude, SLICES_V2_TAG).unwrap();
         assert!(slices_region.contains("| slice | 001 | active |"), "{slices_region}");
         assert!(!reply.hash.is_empty());
+    }
+
+    #[test]
+    fn first_claim_records_parent_base_and_claimed_and_resume_keeps_them() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        claim_first(&daemon, "m", Some("001"), "other", "deadbeef").expect("first claim");
+
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "other", "parent recorded at first claim");
+        assert_eq!(e.base, "deadbeef", "base recorded at first claim");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed stamped by keeperd: {}",
+            e.claimed
+        );
+
+        // A resume (pause → active) without parent/base must not overwrite the
+        // recorded base.
+        set_status(&daemon, "m", None, "paused").expect("pause");
+        claim(&daemon, "m", None).expect("resume");
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "other", "parent unchanged by a resume");
+        assert_eq!(e.base, "deadbeef", "base unchanged by a resume");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed unchanged by a resume: {}",
+            e.claimed
+        );
+    }
+
+    #[test]
+    fn a_first_claim_without_parent_or_base_stamps_claimed_and_leaves_them_empty() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queued_milestone(&daemon, "m");
+
+        // A restack (or any branchless first claim) sends no parent/base —
+        // `claimed` is still stamped, parent/base stay empty.
+        claim(&daemon, "m", Some("001")).expect("first claim, no base");
+
+        let (queue, _) = loaded_queue(&daemon);
+        let e = &queue.entries[0];
+        assert_eq!(e.parent, "", "no parent without a base line");
+        assert_eq!(e.base, "", "no base without a base line");
+        assert!(
+            e.claimed.starts_with("20") && e.claimed.ends_with('Z'),
+            "claimed still stamped: {}",
+            e.claimed
+        );
     }
 
     #[test]

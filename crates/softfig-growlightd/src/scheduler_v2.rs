@@ -62,6 +62,9 @@ pub struct ProjectView {
     /// The repo path or `host:path`. The repo rule keys on this; a value
     /// containing `:` is a remote project (grants §9).
     pub repo: String,
+    /// The branch merges land on (§3.1). The stack computation (queue-v2-git
+    /// §8) reads it as the cut-from branch when the stack is empty.
+    pub main: String,
 }
 
 /// One `[[entry]]` row plus the runtime fields the pick needs (§3.1). The v2
@@ -77,6 +80,10 @@ pub struct EntryView {
     pub status: EntryStatus,
     /// Ids that must be archived `done` first (§2 links).
     pub after: Vec<String>,
+    /// The entry's branch (`feat/<id>` / `fix/<id>`; `""` for a restack) — set
+    /// at enqueue (§3.1). Carried so the first-claim stack computation
+    /// (queue-v2-git §8) sees each live entry's branch; the pick ignores it.
+    pub branch: String,
     /// First-claim time, UTC (§3.1). Carried for completeness; the pick does
     /// not order by it (stack order is `queue-v2-git`'s row).
     pub claimed: String,
@@ -593,6 +600,7 @@ mod tests {
         ProjectView {
             name: name.into(),
             repo: repo.into(),
+            main: "main".into(),
         }
     }
 
@@ -604,6 +612,7 @@ mod tests {
             lane: Lane::Normal,
             status: EntryStatus::Queued,
             after: vec![],
+            branch: String::new(),
             claimed: String::new(),
             follow_ups: 0,
             pending: None,

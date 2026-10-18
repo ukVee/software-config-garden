@@ -45,6 +45,7 @@ use softfig_ipc::verbs::{
 use softfig_ipc::{call_reconnecting, ReconnectError, Request, Response, RetryPolicy};
 
 use crate::drive_loop::{ItemParker, PartClaimer, V2Claimer, V2ItemParker};
+use crate::first_claim::FirstClaim;
 use crate::member_handoff::{KeeperOp, KeeperOutcome, V2Keeper};
 
 /// The status a claim writes. keeperd enforces single-active scoped to the
@@ -187,10 +188,20 @@ impl KeeperdV2Claimer {
 }
 
 impl V2Claimer for KeeperdV2Claimer {
-    fn claim_v2(&self, entry: &str, unit: Option<&str>) -> Result<(), String> {
+    fn claim_v2(
+        &self,
+        entry: &str,
+        unit: Option<&str>,
+        first: Option<&FirstClaim>,
+    ) -> Result<(), String> {
+        // §8 (queue-v2-git slice 002): `first` carries the parent/base only on
+        // a never-claimed entry; a resume or re-claim passes `None` and keeperd
+        // leaves any recorded base untouched.
         let args = serde_json::to_value(QueueV2ClaimArgs {
             entry: entry.to_string(),
             unit: unit.map(str::to_string),
+            parent: first.map(|f| f.parent.clone()),
+            base: first.map(|f| f.base.clone()),
         })
         .map_err(|e| format!("encode queue_v2_claim args: {e}"))?;
         let req = Request::new(op::QUEUE_V2_CLAIM, args);

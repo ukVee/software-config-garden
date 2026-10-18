@@ -232,6 +232,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
         .map(|p| ProjectView {
             name: p.name.clone(),
             repo: p.repo.clone(),
+            main: p.main.clone(),
         })
         .collect();
 
@@ -258,6 +259,7 @@ pub fn assemble(garden_root: &Path) -> Result<Option<V2Snapshot>, V2SourceError>
             lane: entry.lane,
             status: entry.status,
             after: entry.after.clone(),
+            branch: entry.branch.clone(),
             claimed: entry.claimed.clone(),
             follow_ups: entry.follow_ups,
             pending: entry.pending_status,

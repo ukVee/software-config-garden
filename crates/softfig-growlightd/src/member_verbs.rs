@@ -833,6 +833,7 @@ mod tests {
             lane: Lane::Normal,
             status,
             after: vec![],
+            branch: String::new(),
             claimed: "2026-10-14T00:00Z".into(),
             follow_ups: 0,
             pending: None,
@@ -865,6 +866,7 @@ mod tests {
             projects: vec![ProjectView {
                 name: "softfig".into(),
                 repo: "/r".into(),
+                main: "main".into(),
             }],
             entries: vec![
                 entry("m", EntryKind::Milestone, EntryStatus::Active),
