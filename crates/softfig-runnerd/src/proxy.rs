@@ -157,9 +157,17 @@ impl EgressProxy {
     /// Serve one client connection: read the CONNECT request, refuse a
     /// non-allowlisted host with `403`, otherwise establish the tunnel and pump
     /// bytes bidirectionally. Crate-internal: the public entry is [`Self::run`].
-    pub(crate) fn serve_conn<S: Duplex>(&self, mut stream: S) -> Result<()> {
+    pub(crate) fn serve_conn<S: Duplex>(&self, stream: S) -> Result<()> {
+        Self::serve_conn_with(stream, &self.allowlist)
+    }
+
+    /// Serve one client connection against an explicit allowlist. Split out of
+    /// [`Self::serve_conn`] so the executor — which owns its own listener for
+    /// the fetch step's lifetime — can serve a connection without going through
+    /// an [`EgressProxy`] instance's private listener.
+    pub(crate) fn serve_conn_with<S: Duplex>(mut stream: S, allowlist: &[String]) -> Result<()> {
         let (host, port) = read_connect_target(&mut stream)?;
-        if !host_allowed(&host, port, &self.allowlist) {
+        if !host_allowed(&host, port, allowlist) {
             let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             let _ = stream.flush();
             return Ok(());

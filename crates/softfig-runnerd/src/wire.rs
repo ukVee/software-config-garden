@@ -19,11 +19,13 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
 use softfig_net::proto::{frame, Frame, JobAccept, JobReject, JobResult, RunnerCaps, RunnerHandshake, SourceHave};
+use softfig_sandbox::JobContext;
 use softfig_source::SourceBackend;
 
 use crate::cert::StoredCert;
 use crate::config::{AcceptConfig, ServeConfig};
 use crate::error::{Error, Result};
+use crate::executor::{self, SandboxBinaries};
 use crate::keys::RunnerKeys;
 use crate::state::StateRoot;
 
@@ -35,12 +37,24 @@ pub struct WireServer {
     listener: TcpListener,
     root: StateRoot,
     transport_secret: [u8; 32],
+    sandbox_bins: SandboxBinaries,
 }
 
 impl WireServer {
-    /// Bind the job listener on `addr`, loading the runner's transport static.
-    /// Fails if the keys have not been generated (a not-yet-enabled runner).
+    /// Bind the job listener on `addr`, loading the runner's transport static
+    /// and resolving the sandbox helpers from beside the running binary. Fails
+    /// if the keys have not been generated (a not-yet-enabled runner).
     pub fn bind(root: StateRoot, addr: &str) -> Result<Self> {
+        Self::bind_with_bins(root, addr, SandboxBinaries::next_to_runnerd()?)
+    }
+
+    /// Bind with explicit sandbox helper paths. Tests use this (they cannot rely
+    /// on the install layout); production goes through [`Self::bind`].
+    pub fn bind_with_bins(
+        root: StateRoot,
+        addr: &str,
+        sandbox_bins: SandboxBinaries,
+    ) -> Result<Self> {
         let keys = RunnerKeys::load(&root.keys_dir())?;
         let listener = TcpListener::bind(addr).map_err(|e| {
             Error::Protocol(format!("could not bind the runner listener on {addr}: {e}"))
@@ -49,6 +63,7 @@ impl WireServer {
             listener,
             root,
             transport_secret: *keys.transport_secret(),
+            sandbox_bins,
         })
     }
 
@@ -115,8 +130,9 @@ impl WireServer {
                 }))?;
                 // Slice 004: the source step — negotiate have/want, read the
                 // bundle, ingest + verify (rejecting `source-mismatch`), and
-                // materialize. Real execution lands in slice 006.
-                self.serve_source(&mut session, &offer)?;
+                // materialize. Slice 006 then runs the real fetch → run →
+                // collect sequence and returns the real result.
+                self.serve_source(&mut session, &offer, &serve)?;
             }
             Some(reason) => {
                 session.send_frame(&Frame::job_reject(JobReject {
@@ -209,6 +225,7 @@ impl WireServer {
         &self,
         session: &mut softfig_net::NoiseSession<TcpStream>,
         offer: &softfig_net::proto::JobOffer,
+        serve: &ServeConfig,
     ) -> Result<()> {
         let source_id = softfig_source::SourceId::decode(&offer.source_id)
             .ok_or_else(|| Error::Protocol("malformed source id in offer".into()))?;
@@ -256,26 +273,71 @@ impl WireServer {
             return Err(Error::Protocol(format!("verify failed: {e}")));
         }
 
-        // Materialize into a scratch dir (slice 006 replaces this with the
-        // job's sandboxed `/src`); this proves the read-tree/checkout-index
-        // path end to end against the hostile-tree hardening.
-        let scratch = tempfile::tempdir()?;
+        // Materialize into the job's source dir, then run the real
+        // fetch → run → collect sequence (slice 006 chunk 1).
+        let src_dir = tempfile::tempdir()?;
         backend
             .materialize(
                 &repo_key,
                 &source_id,
                 &offer.snapshot_commit,
-                scratch.path(),
+                src_dir.path(),
                 false,
             )
             .map_err(|e| Error::Protocol(format!("materialize failed: {e}")))?;
 
-        // Stub result: the real run step + signed attestation land in slice 006.
-        session.send_frame(&Frame::job_result(JobResult {
-            job_id: offer.job_id.clone(),
-            exit_code: 0,
-            attestation: Vec::new(),
-        }))?;
+        // The target cache: shared across a repo key, or a fresh empty dir when
+        // the offer demands `cache = "fresh"` (spec §7.3).
+        let fresh_cache = (offer.cache == "fresh").then(tempfile::tempdir).transpose()?;
+        let target_cache = match &fresh_cache {
+            Some(dir) => dir.path().to_path_buf(),
+            None => {
+                let dir = self
+                    .root
+                    .cache_dir()
+                    .join(hex::encode(repo_key))
+                    .join("target");
+                std::fs::create_dir_all(&dir)?;
+                dir
+            }
+        };
+
+        let ctx = JobContext {
+            src: src_dir.path().to_path_buf(),
+            target_cache,
+            toolchain: self.root.rustup_home(),
+            cargo_home: self.root.cargo_home_dir(),
+            etc: std::path::PathBuf::from("/etc"),
+            scratch_size: executor::parse_size(&serve.scratch_max)?,
+        };
+        // bwrap binds require the source paths to exist.
+        std::fs::create_dir_all(&ctx.cargo_home)?;
+        std::fs::create_dir_all(&ctx.target_cache)?;
+
+        match executor::execute(&ctx, serve, offer, &self.sandbox_bins) {
+            Ok(outcome) => {
+                session.send_frame(&Frame::job_result(JobResult {
+                    job_id: offer.job_id.clone(),
+                    exit_code: outcome.exit_code,
+                    // The signed canonical-JSON attestation lands in chunk 2;
+                    // the collected artifact hashes fold into it there.
+                    attestation: Vec::new(),
+                }))?;
+            }
+            Err(Error::ToolchainMissing(add_cmd)) => {
+                // The `JobReject` frame has no message field, so the exact
+                // `softfig runner toolchain add <spec>` rides the runner log.
+                eprintln!(
+                    "softfig-runnerd: job {} rejected (toolchain-missing): {add_cmd}",
+                    hex::encode(&offer.job_id)
+                );
+                session.send_frame(&Frame::job_reject(JobReject {
+                    job_id: offer.job_id.clone(),
+                    reason: softfig_net::JobRejectReason::ToolchainMissing.to_u32(),
+                }))?;
+            }
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 }

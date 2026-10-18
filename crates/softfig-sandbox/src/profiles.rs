@@ -187,6 +187,9 @@ pub fn profile_collect(ctx: &JobContext) -> Policy {
     p.ro_binds.push(Bind::ro(&ctx.cargo_home, "/opt/cargo-home"));
     p.ro_binds.push(Bind::ro(&ctx.src, "/src"));
     p.ro_binds.push(Bind::ro(&ctx.target_cache, "/cache/target"));
+    // The collect helper matches the declared artifact globs relative to its
+    // working directory, so start it in the materialized tree root.
+    p.chdir = Some("/src".into());
     p
 }
 

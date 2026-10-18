@@ -3882,6 +3882,7 @@ dependencies = [
  "serde",
  "serde_json",
  "softfig-net",
+ "softfig-sandbox",
  "softfig-source",
  "tempfile",
  "thiserror 2.0.18",
@@ -3895,6 +3896,8 @@ name = "softfig-sandbox"
 version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
+ "blake3",
+ "globset",
  "landlock",
  "libc",
  "seccompiler",

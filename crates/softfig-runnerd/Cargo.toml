@@ -36,6 +36,10 @@ softfig-source.workspace = true
 # Slice 004 materializes the ingested tree into a scratch dir (the real
 # sandboxed job dir lands in slice 006).
 tempfile.workspace = true
+# Slice 006: the real executor runs the fetch/run/collect steps inside
+# softfig-sandbox profiles (bwrap + Landlock + seccomp). Vault-free, so the
+# "never links softfig-vault" constraint holds.
+softfig-sandbox.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

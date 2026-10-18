@@ -71,6 +71,19 @@ impl StateRoot {
         self.root.join("cache")
     }
 
+    /// `cargo/` — the cargo home the fetch step fills and the run step reads
+    /// read-only (spec §7.1). Shared across one requester's repos (§7.3).
+    pub fn cargo_home_dir(&self) -> PathBuf {
+        self.root.join("cargo")
+    }
+
+    /// The rustup toolchain root (`RUSTUP_HOME`), bound read-only at
+    /// `/opt/toolchain` (spec §7.1). `softfig runner toolchain add` installs
+    /// channels here. A test can symlink this path to a real rustup home.
+    pub fn rustup_home(&self) -> PathBuf {
+        self.root.join("rustup")
+    }
+
     /// Create the state-root layout with the runner's ownership modes (root and
     /// `keys/` 0700; `log/` 0700). Idempotent.
     pub fn ensure_dirs(&self) -> Result<()> {

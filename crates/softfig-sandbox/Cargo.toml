@@ -14,6 +14,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
 anyhow = { workspace = true }
+# Slice 006: the collect helper binary (`softfig-sandbox-collect`) BLAKE3s the
+# declared artifact globs inside the collect sandbox.
+blake3 = { workspace = true }
+globset = { workspace = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -21,4 +26,3 @@ serde_json = { workspace = true }
 # (softfig-source) and fetches it through the sandbox proxy stack.
 softfig-source = { workspace = true }
 tempfile = { workspace = true }
-walkdir = { workspace = true }

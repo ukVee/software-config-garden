@@ -25,6 +25,9 @@ pub enum Error {
 
     #[error("network error: {0}")]
     Net(#[from] softfig_net::NetError),
+
+    #[error("toolchain missing: run `{0}` on the runner")]
+    ToolchainMissing(String),
 }
 
 impl Error {
