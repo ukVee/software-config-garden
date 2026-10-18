@@ -78,16 +78,9 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
     println!("  distro:     {}", distro.report());
     println!("  supervisor: {}", supervisor.describe());
 
-    // 2. Toolchain gate — refuse here, before anything is built or touched.
-    let gate = Gate::probe();
-    if !gate.is_ok() {
-        println!("{}", gate::failure_message(&gate));
-        anyhow::bail!("toolchain gate failed");
-    }
-
-    // 2b. Resolve the prefix and refuse a package-owned one — the helper must
-    //     never write over `/usr/bin` (an AUR install). Refused before the
-    //     build, the swap, and any filesystem touch.
+    // 2. Resolve the prefix and refuse a package-owned one — the helper must
+    //    never write over `/usr/bin` (an AUR install). Refused before the
+    //    build, the swap, and any filesystem touch.
     let prefix = cli.prefix.clone().unwrap_or_else(default_bin_dir);
     if package_owned(&distro, &prefix) {
         anyhow::bail!("{}", package_owned_message(&prefix));
@@ -95,21 +88,30 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
     // Resolve the garden too — the unit render and the hand-off both name it.
     let garden = cli.garden.clone().unwrap_or_else(default_garden);
 
-    // 3. Dry run: detection + gate are the only side-effect-free facts; stop
-    //    before the build (which is real work) and before any filesystem touch.
+    // 3. Resolve a real source: an explicit --source checkout, an explicit
+    //    --repo/--ref clone, or the baked repo + tag — never the current dir.
+    //    Resolved *before* the gate: the gate reads the required rustc from the
+    //    source's own manifest and probes rustc with `cwd = source` (M9).
+    let source = resolve_source(&cli)?;
+
+    // 4. Toolchain gate — refuse here, before anything is built or touched.
+    let gate = Gate::probe(source.path())?;
+    if !gate.is_ok() {
+        println!("{}", gate::failure_message(&gate));
+        anyhow::bail!("toolchain gate failed");
+    }
+
+    // 5. Dry run: detection + gate passed; stop before the build (which is
+    //    real work) and before any filesystem touch.
     if cli.dry_run {
         println!("dry run: detection + toolchain gate passed; stopping before build/install.");
         return Ok(());
     }
 
-    // 4. Resolve a real source: an explicit --source checkout, an explicit
-    //    --repo/--ref clone, or the baked repo + tag — never the current dir.
-    let source = resolve_source(&cli)?;
-
-    // 5. Build the program from source.
+    // 6. Build the program from source.
     build_program(source.path())?;
 
-    // 6. Stage + atomically install the reconciled set (idempotent).
+    // 7. Stage + atomically install the reconciled set (idempotent).
     install_set(source.path(), &prefix)?;
 
     // Record an explicit --source checkout at install, so a later
@@ -118,15 +120,15 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
         source::record_source(&prefix, source.path())?;
     }
 
-    // 7. Non-fatal environment checks (fuse3, PATH).
+    // 8. Non-fatal environment checks (fuse3, PATH).
     check_fuse(&distro);
     check_path(&prefix);
 
-    // 8. Consented, reversible integration steps.
+    // 9. Consented, reversible integration steps.
     offer_unit(consent, source.path(), &supervisor, &prefix, &garden);
     offer_mcp(consent, &prefix);
 
-    // 9. Hand off to `softfig onboard`.
+    // 10. Hand off to `softfig onboard`.
     handoff(&prefix, &garden);
     Ok(())
 }
