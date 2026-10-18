@@ -17,6 +17,7 @@ members = [
     "crates/softfig-deploy",
     "crates/softfig-net",
     "crates/softfig-sandbox",
+    "crates/softfig-runnerd",
 ]
 
 [workspace.package]

@@ -1,0 +1,27 @@
+[package]
+name = "softfig-runnerd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig remote runner daemon: a system service under its own uid that runs sandboxed build/test jobs for a paired requester."
+
+[dependencies]
+# Runner keys: Ed25519 attest (signs job attestations) + X25519 transport static
+# (Noise key agreement). Deliberately NOT vault-sealed, and this crate never
+# links softfig-vault (spec §3.1 — the runner stays up while the garden is
+# locked; an escape must not reach a key that can read the garden).
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
