@@ -11,6 +11,8 @@
 //!   `rust-version`, with the `rustup` bootstrap fallback (slice 005).
 //! - [`prompt`] — the consented, reversible offer model for the integration
 //!   steps (systemd unit, MCP registration) (slice 005).
+//! - [`unit`] — the systemd unit render (template → rendered text with the
+//!   resolved prefix + garden) and the `ExecStart` executable check (M5).
 //!
 //! The front-door binary (`[[bin]] softfig-install`, `src/main.rs`) composes
 //! these. This crate is kept small on purpose: it is built as a static-musl
@@ -70,6 +72,7 @@ pub mod gate;
 pub mod prompt;
 pub mod stage;
 pub mod swap;
+pub mod unit;
 
 pub use stage::{stage_and_swap, StageOutcome};
 pub use swap::{swap_binaries, Result, SwapError};

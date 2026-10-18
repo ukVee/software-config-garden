@@ -19,6 +19,7 @@ use softfig_install::detect::{package_owned, package_owned_message, which, Distr
 use softfig_install::gate::{self, Gate};
 use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
 use softfig_install::stage::{stage_and_swap, StageOutcome};
+use softfig_install::unit;
 use softfig_ipc::compat::SetReport;
 
 #[derive(Parser, Debug)]
@@ -90,6 +91,8 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
     if package_owned(&distro, &prefix) {
         anyhow::bail!("{}", package_owned_message(&prefix));
     }
+    // Resolve the garden too — the unit render and the hand-off both name it.
+    let garden = cli.garden.clone().unwrap_or_else(default_garden);
 
     // 3. Dry run: detection + gate are the only side-effect-free facts; stop
     //    before the build (which is real work) and before any filesystem touch.
@@ -112,11 +115,11 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
     check_path(&prefix);
 
     // 8. Consented, reversible integration steps.
-    offer_unit(consent, &source, &supervisor);
+    offer_unit(consent, &source, &supervisor, &prefix, &garden);
     offer_mcp(consent, &prefix);
 
     // 9. Hand off to `softfig onboard`.
-    handoff(&prefix, cli.garden.as_deref());
+    handoff(&prefix, &garden);
     Ok(())
 }
 
@@ -225,7 +228,13 @@ fn check_path(prefix: &Path) {
 }
 
 /// The consented, reversible systemd unit install.
-fn offer_unit(consent: &mut dyn Consent, source: &Path, supervisor: &Supervisor) {
+fn offer_unit(
+    consent: &mut dyn Consent,
+    source: &Path,
+    supervisor: &Supervisor,
+    prefix: &Path,
+    garden: &Path,
+) {
     if *supervisor != Supervisor::SystemdUser {
         println!(
             "no systemd user bus — skipping the daemon unit offer \
@@ -234,8 +243,29 @@ fn offer_unit(consent: &mut dyn Consent, source: &Path, supervisor: &Supervisor)
         return;
     }
     let unit_src = source.join("packaging/systemd/softfig-keeperd.service");
-    if !unit_src.is_file() {
-        println!("unit file not found in source ({}) — skipping the unit offer.", unit_src.display());
+    let template = match std::fs::read_to_string(&unit_src) {
+        Ok(text) => text,
+        Err(_) => {
+            println!("unit file not found in source ({}) — skipping the unit offer.", unit_src.display());
+            return;
+        }
+    };
+    // Render the unit with the resolved prefix + garden — never the `%h`-based
+    // template verbatim.
+    let rendered = unit::render_unit(&template, prefix, garden);
+    // The daemon binary the rendered unit will exec: verify it exists and is
+    // executable BEFORE enabling, so a missing install is a clear skip, not a
+    // silently broken enable.
+    let Some(bin) = unit::exec_start(&rendered).map(PathBuf::from) else {
+        println!("rendered unit has no ExecStart — skipping the unit offer.");
+        return;
+    };
+    if !unit::is_executable(&bin) {
+        println!(
+            "{} is not an executable — skipping the unit offer (the daemon \
+             binary must exist at the install prefix before it can be enabled).",
+            bin.display()
+        );
         return;
     }
     let offer = Offer {
@@ -253,10 +283,12 @@ fn offer_unit(consent: &mut dyn Consent, source: &Path, supervisor: &Supervisor)
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
         .join("systemd/user");
-    if let Err(e) = install_unit(&unit_src, &unit_dir) {
+    if let Err(e) = install_unit(&rendered, &unit_dir) {
         println!("unit install failed: {e}");
         return;
     }
+    // daemon-reload AFTER the write, BEFORE enable — systemd must load the
+    // rendered unit we just wrote, not a stale cached copy.
     let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "enable", "--now", "softfig-keeperd.service"])
@@ -264,9 +296,9 @@ fn offer_unit(consent: &mut dyn Consent, source: &Path, supervisor: &Supervisor)
     println!("unit enabled (reversible: {})", offer.undo);
 }
 
-fn install_unit(src: &Path, dir: &Path) -> std::io::Result<()> {
+fn install_unit(rendered: &str, dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    std::fs::copy(src, dir.join("softfig-keeperd.service"))?;
+    std::fs::write(dir.join("softfig-keeperd.service"), rendered)?;
     Ok(())
 }
 
@@ -309,10 +341,8 @@ fn offer_mcp(consent: &mut dyn Consent, prefix: &Path) {
 /// The hand-off: print the exact `softfig onboard` / unlock steps. (`softfig
 /// onboard` is interactive — it needs a passphrase at a TTY — so the helper
 /// prints it rather than exec-ing it and stealing the passphrase prompt.)
-fn handoff(prefix: &Path, garden: Option<&Path>) {
+fn handoff(prefix: &Path, garden: &Path) {
     let softfig = prefix.join("softfig");
-    let default = default_garden();
-    let garden = garden.unwrap_or(&default);
     println!();
     println!("Done. Next:");
     println!("  1. Scaffold the garden (interactive — needs a passphrase at a TTY):");
