@@ -7,9 +7,12 @@ to the device by a certificate the device identity signs — and an `accept.toml
 allowlist of requesters written through an admin socket that only the owner uid
 may reach.
 
-> **Status (slice 002):** the identity + install skeleton ships here. Job
-> transport, sandboxing, and the wire frames land in slices 003–007, so
-> `enable`/`grant`/`status` work today but no job will run yet.
+> **Status (2026-10-18, slice 007):** the identity + install skeleton below
+> shipped in slice 002; job transport, sandboxing, the wire frames and the
+> requester surface landed in slices 003–007, so a job now runs end-to-end.
+> The requester side (how to run a job) is in
+> [`remote-runner-usage.md`](remote-runner-usage.md). The laptop install and
+> the two-device smoke remain the human's root step (slices 001/002/008).
 
 ## Install (the human's root step)
 
