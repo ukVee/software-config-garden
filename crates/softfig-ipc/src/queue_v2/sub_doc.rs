@@ -37,13 +37,14 @@ pub fn reserved_field(text: &str, keys: &[&'static str]) -> Option<&'static str>
     })
 }
 
-/// Every `> Model:` metadata line in `text`, in order, trimmed — each line
-/// [`reserved_field`] would report as `model`. §6.7's guard on a member's
-/// write under `growlight/backlog/` compares these before and after: any
-/// difference adds, removes or changes a `> Model:` line.
-pub fn model_lines(text: &str) -> Vec<&str> {
+/// Every `> <key>:` metadata line in `text`, in order, trimmed — each line
+/// [`reserved_field`] would report as one of `keys`. §6.7's guard on a member's
+/// write under `growlight/backlog/` compares these before and after for each
+/// key in [`SUB_DOC_RESERVED`]: any difference adds, removes or changes one of
+/// the reserved lines.
+pub fn reserved_lines<'a>(text: &'a str, keys: &[&'static str]) -> Vec<&'a str> {
     text.lines()
-        .filter(|line| reserved_field(line, &["model"]).is_some())
+        .filter(|line| reserved_field(line, keys).is_some())
         .map(str::trim)
         .collect()
 }
@@ -138,10 +139,11 @@ mod tests {
     }
 
     #[test]
-    fn model_lines_are_every_model_metadata_line_in_order() {
+    fn reserved_lines_are_every_matching_metadata_line_in_order() {
         let doc = "# t\n\n> Model: flash\nprose Model: x\n  >  model : claude \n> Grants: ~/x\n";
-        assert_eq!(model_lines(doc), vec!["> Model: flash", ">  model : claude"]);
-        assert!(model_lines("# no metadata\n").is_empty());
+        assert_eq!(reserved_lines(doc, &["model"]), vec!["> Model: flash", ">  model : claude"]);
+        assert_eq!(reserved_lines(doc, &["grants"]), vec!["> Grants: ~/x"]);
+        assert!(reserved_lines("# no metadata\n", &SUB_DOC_RESERVED).is_empty());
     }
 
     #[test]

@@ -96,20 +96,22 @@ impl<'a> WorkTree<'a> {
 
     /// [`check_write`](Self::check_write) plus the content check
     /// [`write`](Self::write) makes for these exact bytes: §6.7's guard on a
-    /// member's `> Model:` lines ([`member_model_refusal`]). A verb that stages
-    /// more than one file runs this over each before its first write, like
-    /// `check_write`.
+    /// member's reserved `> Model:` / `> Grants:` / `> Worktree:` lines
+    /// ([`member_reserved_refusal`]) and the `> Fleet:` hold
+    /// ([`member_fleet_refusal`]). A verb that stages more than one file runs
+    /// this over each before its first write, like `check_write`.
     pub fn check_write_bytes(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         self.check_write(rel)?;
-        self.guard_member_models(rel, Some(bytes))
+        self.guard_member_write(rel, Some(bytes))
     }
 
     /// §6.7's member guards for replacing `rel` with `new` (`None` = removing it):
-    /// the `> Model:` line is member-immutable and the `> Fleet:` line is
-    /// member-tighten-only (see [`member_model_refusal`] / [`member_fleet_refusal`]).
-    /// A no-op unless this request runs for a fleet member ([`crate::caller`])
-    /// and `rel` lies under `growlight/backlog/`.
-    fn guard_member_models(&self, rel: &str, new: Option<&[u8]>) -> ActionResult {
+    /// the three reserved metadata lines (`> Model:`, `> Grants:`, `> Worktree:`)
+    /// are member-immutable and the `> Fleet:` line is member-tighten-only (see
+    /// [`member_reserved_refusal`] / [`member_fleet_refusal`]). A no-op unless
+    /// this request runs for a fleet member ([`crate::caller`]) and `rel` lies
+    /// under `growlight/backlog/`.
+    fn guard_member_write(&self, rel: &str, new: Option<&[u8]>) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
@@ -119,7 +121,7 @@ impl<'a> WorkTree<'a> {
         let old = self.read(rel);
         let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
         let (old, new) = (text(old.as_deref()), text(new));
-        if let Some(why) = member_model_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+        if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
             return Err((ErrorKind::BadArgs, why));
         }
         if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
@@ -129,10 +131,11 @@ impl<'a> WorkTree<'a> {
     }
 
     /// The same guard for removing `rel`, which may be a whole directory:
-    /// refused for a member when it removes a `> Model:` line or loosens a
-    /// held `> Fleet:` line under `growlight/backlog/` — a doc there carrying
-    /// one, a directory holding such a doc, or an ancestor of the backlog itself.
-    fn guard_member_model_removal(&self, rel: &str) -> ActionResult {
+    /// refused for a member when it removes a reserved `> Model:` / `> Grants:`
+    /// / `> Worktree:` line or loosens a held `> Fleet:` line under
+    /// `growlight/backlog/` — a doc there carrying one, a directory holding such
+    /// a doc, or an ancestor of the backlog itself.
+    fn guard_member_removal(&self, rel: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
@@ -143,8 +146,8 @@ impl<'a> WorkTree<'a> {
         } else {
             return Ok(());
         };
-        if let Some((doc, text)) = self.first_model_doc(&scope) {
-            return Err(refusal(&member, &doc, Some(&text), None));
+        if let Some((doc, text)) = self.first_reserved_doc(&scope) {
+            return Err(reserved_refusal(&member, &doc, Some(&text), None));
         }
         if let Some((doc, text)) = self.first_fleet_doc(&scope) {
             return Err(fleet_refusal(&member, &doc, Some(&text), None));
@@ -154,23 +157,24 @@ impl<'a> WorkTree<'a> {
 
     /// The guard for a rename: moving `from` removes its lines from where they
     /// were, moving it into the backlog adds them at `to` (whatever `from`
-    /// is), and replacing an existing `to` removes the destination's. `> Model:`
-    /// is refused in both directions; `> Fleet:` only in the loosening one (a
-    /// member may move a held doc *into* the backlog — that tightens).
+    /// is), and replacing an existing `to` removes the destination's. A reserved
+    /// `> Model:` / `> Grants:` / `> Worktree:` line is refused in both
+    /// directions; `> Fleet:` only in the loosening one (a member may move a
+    /// held doc *into* the backlog — that tightens).
     fn guard_member_rename(&self, from: &str, to: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
-        self.guard_member_model_removal(from)?;
+        self.guard_member_removal(from)?;
         if (is_backlog_rel(to) || spans_backlog(to))
-            && let Some((doc, text)) = self.first_model_doc(from) {
+            && let Some((doc, text)) = self.first_reserved_doc(from) {
                 let landing = match doc.strip_prefix(from) {
                     Some(rest) => format!("{to}{rest}"),
                     None => to.to_string(),
                 };
-                return Err(refusal(&member, &landing, None, Some(&text)));
+                return Err(reserved_refusal(&member, &landing, None, Some(&text)));
             }
-        self.guard_member_model_removal(to)
+        self.guard_member_removal(to)
     }
 
     /// The first file at or under `rel` (a file or a directory) whose text
@@ -189,9 +193,11 @@ impl<'a> WorkTree<'a> {
         pred(&text).then(|| (rel.to_string(), text))
     }
 
-    /// The first file at or under `rel` carrying a `> Model:` line, with its text.
-    fn first_model_doc(&self, rel: &str) -> Option<(String, String)> {
-        self.first_doc_with(rel, |t| !softfig_ipc::queue_v2::model_lines(t).is_empty())
+    /// The first file at or under `rel` carrying a reserved `> Model:` /
+    /// `> Grants:` / `> Worktree:` line, with its text.
+    fn first_reserved_doc(&self, rel: &str) -> Option<(String, String)> {
+        use softfig_ipc::queue_v2::{reserved_field, SUB_DOC_RESERVED};
+        self.first_doc_with(rel, |t| reserved_field(t, &SUB_DOC_RESERVED).is_some())
     }
 
     /// The first file at or under `rel` carrying a held `> Fleet:` line, with
@@ -295,15 +301,16 @@ impl<'a> WorkTree<'a> {
     /// event, then write. FUSE: stage into the overlay (no kernel event).
     ///
     /// For a fleet member's request, a write under `growlight/backlog/` that
-    /// adds, removes or changes a `> Model:` line is refused here (§6.7) —
-    /// see [`check_write_bytes`](Self::check_write_bytes).
+    /// adds, removes or changes a reserved `> Model:` / `> Grants:` /
+    /// `> Worktree:` line (or loosens a `> Fleet:` hold) is refused here
+    /// (§6.7) — see [`check_write_bytes`](Self::check_write_bytes).
     pub fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         self.check_write_bytes(rel, bytes)?;
         self.stage(rel, bytes)
     }
 
-    /// [`write`](Self::write) without §6.7's member `> Model:` guard, for the
-    /// docs keeperd builds itself from a verb's typed fields — the v2 queue
+    /// [`write`](Self::write) without §6.7's member reserved-line guard, for
+    /// the docs keeperd builds itself from a verb's typed fields — the v2 queue
     /// writer ([`super::growlight::v2::apply`]), whose generated `001-plan`
     /// slice carries keeperd's own `> Model:` line, not the caller's. The verb
     /// holds a member's text fields to §6.7 before it gets here.
@@ -364,7 +371,7 @@ impl<'a> WorkTree<'a> {
     /// a blob, never adds one), so no `refuse_unkeyed_shared` guard is needed.
     pub fn remove(&self, rel: &str) -> ActionResult {
         Self::require_garden_rel(rel)?;
-        self.guard_member_model_removal(rel)?;
+        self.guard_member_removal(rel)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
                 let abs = garden_root.join(rel);
@@ -389,7 +396,7 @@ impl<'a> WorkTree<'a> {
 }
 
 /// Whether repo-relative `rel` lies under `growlight/backlog/` — the tree
-/// §6.7's `> Model:` guard covers.
+/// §6.7's reserved-line and `> Fleet:` guards cover.
 fn is_backlog_rel(rel: &str) -> bool {
     let backlog = super::growlight::paths::backlog_dir();
     rel.strip_prefix(backlog.as_str())
@@ -402,40 +409,61 @@ fn spans_backlog(rel: &str) -> bool {
     rel.is_empty() || super::growlight::paths::backlog_dir().starts_with(&format!("{rel}/"))
 }
 
-/// [`member_model_refusal`] as the worktree's error, for a change the caller
-/// already knows touches a `> Model:` line.
-fn refusal(member: &str, rel: &str, old: Option<&str>, new: Option<&str>) -> (ErrorKind, String) {
-    let why = member_model_refusal(member, rel, old, new)
-        .expect("the caller found a `> Model:` line this change touches");
+/// [`member_reserved_refusal`] as the worktree's error, for a change the caller
+/// already knows touches a reserved `> Model:` / `> Grants:` / `> Worktree:`
+/// line.
+fn reserved_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> (ErrorKind, String) {
+    let why = member_reserved_refusal(member, rel, old, new)
+        .expect("the caller found a reserved `> key:` line this change touches");
     (ErrorKind::BadArgs, why)
 }
 
-/// §6.7's member `> Model:` guard, pure: `Some(refusal)` when replacing
+/// §6.7's member reserved-line guard, pure: `Some(refusal)` when replacing
 /// `old` with `new` at `rel` (`None` = absent / removed) adds, removes or
-/// changes a `> Model:` line ([`softfig_ipc::queue_v2::model_lines`]). The
-/// refusal text leads with the wire code, `field_not_allowed`.
-pub(crate) fn member_model_refusal(
+/// changes a `> <key>:` line for any key in
+/// [`softfig_ipc::queue_v2::SUB_DOC_RESERVED`] — the `> Model:`, `> Grants:`
+/// and `> Worktree:` lines §6.7 reserves to humans. The refusal text leads with
+/// the wire code, `field_not_allowed`.
+pub(crate) fn member_reserved_refusal(
     member: &str,
     rel: &str,
     old: Option<&str>,
     new: Option<&str>,
 ) -> Option<String> {
-    use softfig_ipc::queue_v2::model_lines;
-    let before = old.map(model_lines).unwrap_or_default();
-    let after = new.map(model_lines).unwrap_or_default();
-    if before == after {
-        return None;
+    use softfig_ipc::queue_v2::{reserved_lines, SUB_DOC_RESERVED};
+    for key in SUB_DOC_RESERVED {
+        let before = old.map(|t| reserved_lines(t, &[key])).unwrap_or_default();
+        let after = new.map(|t| reserved_lines(t, &[key])).unwrap_or_default();
+        if before == after {
+            continue;
+        }
+        let key = capitalized(key);
+        let what = match (before.is_empty(), after.is_empty()) {
+            (true, _) => format!("adds a `> {key}:` line"),
+            (false, true) => format!("removes its `> {key}:` line"),
+            (false, false) => format!("changes its `> {key}:` line"),
+        };
+        return Some(format!(
+            "field_not_allowed: this write {what} in {rel}, and fleet member {member} may not \
+             add, remove or change a `> {key}:` line under growlight/backlog/ \
+             (spec-growlight-queue §6.7)."
+        ));
     }
-    let what = match (before.is_empty(), after.is_empty()) {
-        (true, _) => "adds a `> Model:` line",
-        (false, true) => "removes its `> Model:` line",
-        (false, false) => "changes its `> Model:` line",
-    };
-    Some(format!(
-        "field_not_allowed: this write {what} in {rel}, and fleet member {member} may not set a \
-         unit's model under growlight/backlog/ (spec-growlight-queue §6.7). A slice body passed to \
-         slice_insert, or a member verb's new slice, may declare a subset of what it inherits."
-    ))
+    None
+}
+
+/// `model` → `Model`, for the refusal text.
+fn capitalized(key: &str) -> String {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// [`member_fleet_refusal`] as the worktree's error, for a change the caller
@@ -541,18 +569,25 @@ mod tests {
     }
 
     #[test]
-    fn adding_removing_or_changing_a_model_line_is_refused() {
+    fn adding_removing_or_changing_a_reserved_line_is_refused() {
         let rel = "growlight/backlog/milestones/m/slices/001-a.md";
-        let add = member_model_refusal("c", rel, Some("# slice\n\nbody\n"), Some(DOC)).unwrap();
-        assert!(add.starts_with("field_not_allowed: this write adds"), "{add}");
-        let new_file = member_model_refusal("c", rel, None, Some(DOC)).unwrap();
-        assert!(new_file.contains("adds"), "{new_file}");
-        let change =
-            member_model_refusal("c", rel, Some(DOC), Some(&DOC.replace("flash", "claude"))).unwrap();
-        assert!(change.contains("changes"), "{change}");
-        let remove = member_model_refusal("c", rel, Some(DOC), Some("# slice\n")).unwrap();
-        assert!(remove.contains("removes"), "{remove}");
-        assert!(member_model_refusal("c", rel, Some(DOC), None).unwrap().contains("removes"));
+        let cases = [
+            ("Model", "# slice\n\n> Model: flash\n\nbody\n", "# slice\n\n> Model: claude\n\nbody\n"),
+            ("Grants", "# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
+            ("Worktree", "# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+        ];
+        for (key, doc, changed) in cases {
+            let add = member_reserved_refusal("c", rel, Some("# slice\n\nbody\n"), Some(doc)).unwrap();
+            assert!(add.starts_with("field_not_allowed: this write adds"), "{add}");
+            assert!(add.contains(&format!("`> {key}:`")), "{add}");
+            let new_file = member_reserved_refusal("c", rel, None, Some(doc)).unwrap();
+            assert!(new_file.contains("adds"), "{new_file}");
+            let change = member_reserved_refusal("c", rel, Some(doc), Some(changed)).unwrap();
+            assert!(change.contains("changes"), "{change}");
+            let remove = member_reserved_refusal("c", rel, Some(doc), Some("# slice\n")).unwrap();
+            assert!(remove.contains("removes"), "{remove}");
+            assert!(member_reserved_refusal("c", rel, Some(doc), None).unwrap().contains("removes"));
+        }
     }
 
     use super::super::growlight::unlocked;
@@ -561,11 +596,13 @@ mod tests {
     const SLICE: &str = "growlight/backlog/milestones/m/slices/001-a.md";
 
     /// The guard where every action writes: a member's write under the backlog
-    /// that adds, changes or removes a `> Model:` line is refused before it
-    /// lands; one that leaves them alone, one outside the backlog, a human's,
-    /// and keeperd's own structured write all pass.
+    /// that adds, changes or removes a reserved `> Model:` / `> Grants:` /
+    /// `> Worktree:` line is refused before it lands; one that leaves them
+    /// alone, one outside the backlog, a human's, and keeperd's own structured
+    /// write all pass. The `> Model:` flow is exercised here; the grants and
+    /// worktree keys get their own matrix in the next test.
     #[test]
-    fn a_members_backlog_write_may_not_touch_a_model_line() {
+    fn a_members_backlog_write_may_not_touch_a_reserved_line() {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         let inner = daemon.inner.lock().unwrap();
@@ -599,6 +636,43 @@ mod tests {
             wt.rename("projects/p/notes/001-x.md", "projects/p/notes/003-x.md")
                 .expect("a rename outside the backlog is not the guard's");
             wt.write_structured(SLICE, b"# a\n").expect("keeperd's own structured write");
+        }
+    }
+
+    /// The same worktree-level guard refuses a member's add, change and remove
+    /// of a `> Grants:` or `> Worktree:` line (report 020), across write,
+    /// `check_write_bytes`, `unlink` (remove) and rename-out. A human may set
+    /// and change either.
+    #[test]
+    fn a_members_backlog_write_may_not_touch_a_grants_or_worktree_line() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let cases = [
+            ("# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
+            ("# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+        ];
+        for (doc, changed) in cases {
+            wt.write(SLICE, b"# a\n\nbody\n").expect("reset");
+            {
+                let _member = caller::enter(Some("c".into()));
+                let err = wt.write(SLICE, doc.as_bytes()).unwrap_err();
+                assert_eq!(err.0, ErrorKind::BadArgs);
+                assert!(err.1.starts_with("field_not_allowed:"), "{err:?}");
+                assert_eq!(wt.read_to_string(SLICE).as_deref(), Some("# a\n\nbody\n"), "add refused");
+                wt.write(SLICE, b"# a\n\nmore\n").expect("a write touching no reserved line");
+            }
+            wt.write(SLICE, doc.as_bytes()).expect("a human may set the line");
+            {
+                let _member = caller::enter(Some("c".into()));
+                assert!(wt.write(SLICE, changed.as_bytes()).is_err(), "change refused");
+                assert!(wt.write(SLICE, b"# a\n").is_err(), "remove refused");
+                assert!(wt.check_write_bytes(SLICE, b"# a\n").is_err(), "pre-check agrees");
+                assert!(wt.remove(SLICE).is_err(), "unlink removes the line");
+                assert!(wt.rename(SLICE, "archive/001-a.md").is_err(), "rename-out removes it");
+                assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(doc), "untouched");
+            }
         }
     }
 
@@ -650,11 +724,33 @@ mod tests {
     }
 
     #[test]
-    fn a_write_that_leaves_the_model_lines_alone_passes() {
+    fn a_write_that_leaves_the_reserved_lines_alone_passes() {
         let rel = "growlight/backlog/milestones/m/CLAUDE.md";
-        assert_eq!(member_model_refusal("c", rel, Some(DOC), Some(&format!("{DOC}more\n"))), None);
-        assert_eq!(member_model_refusal("c", rel, None, Some("# new doc, no model\n")), None);
-        assert_eq!(member_model_refusal("c", rel, Some("prose\n"), None), None);
+        assert_eq!(member_reserved_refusal("c", rel, Some(DOC), Some(&format!("{DOC}more\n"))), None);
+        assert_eq!(member_reserved_refusal("c", rel, None, Some("# new doc, no reserved line\n")), None);
+        assert_eq!(member_reserved_refusal("c", rel, Some("prose\n"), None), None);
+        // Prose and inline-code mentions are not metadata lines: no refusal.
+        assert_eq!(member_reserved_refusal("c", rel, Some("Grants: ~/x in prose\n"), Some("ok\n")), None);
+        assert_eq!(member_reserved_refusal("c", rel, Some("`> Worktree: /tmp/x`\n"), None), None);
+    }
+
+    /// A reserved line inside a fenced code block still matches, because the
+    /// `> Model:` resolver reads fenced lines too — a guard that ignored fenced
+    /// lines would let a member hide a `> Model:` change in a fence. (Over-
+    /// guarding a fenced `> Grants:` / `> Worktree:` example is a benign false
+    /// positive, not a hole.)
+    #[test]
+    fn a_fenced_reserved_line_still_matches() {
+        let rel = "growlight/backlog/milestones/m/slices/001-a.md";
+        let fenced = "```\n> Model: flash\n```\n";
+        assert!(
+            member_reserved_refusal("c", rel, Some("# t\n"), Some(fenced)).is_some(),
+            "adding a fenced model line is still refused",
+        );
+        assert!(
+            member_reserved_refusal("c", rel, Some(fenced), Some("# t\n")).is_some(),
+            "removing a fenced model line is still refused",
+        );
     }
 
     /// The `> Fleet:` guard is tighten-only in the pure sense: a member's write
