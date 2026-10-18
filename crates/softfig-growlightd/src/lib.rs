@@ -30,6 +30,7 @@ pub mod control;
 pub mod daemon;
 pub mod drive_loop;
 pub mod fleet;
+pub mod git_stack;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
