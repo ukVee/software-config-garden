@@ -66,6 +66,20 @@ jobs:
           for bin in softfig softfig-keeperd softfig-mcp softfig-tui softfig-growlightd; do
             cp "target/release/${bin}" "dist/${stage}/${bin}"
           done
+          # Ship the units, the desktop entry and the license INSIDE the tarball
+          # so the -bin channel has nothing to fetch from a mutable tag (report
+          # 052). The source package reads the same files from the git archive.
+          cp packaging/systemd/softfig-keeperd.service    "dist/${stage}/softfig-keeperd.service"
+          cp packaging/systemd/softfig-growlightd.service "dist/${stage}/softfig-growlightd.service"
+          cp packaging/desktop/softfig-tui.desktop        "dist/${stage}/softfig-tui.desktop"
+          cp LICENSE                                      "dist/${stage}/LICENSE"
+          # Per-file checksums, generated inside the stage so they travel with
+          # the tarball (spec-release.md -> Artifacts: "one tarball plus
+          # per-file checksums").
+          (cd "dist/${stage}" && sha256sum \
+            softfig softfig-keeperd softfig-mcp softfig-tui softfig-growlightd \
+            softfig-keeperd.service softfig-growlightd.service \
+            softfig-tui.desktop LICENSE > SHA256SUMS)
           tar -C dist -czf "dist/${stage}-${{ matrix.tier }}.tar.gz" "${stage}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -135,20 +149,51 @@ jobs:
       attestations: write
     environment: release
     steps:
+      # Checkout at the tag commit so the CHANGELOG (release body) and the
+      # committed minisign public key are the ones the tag points at.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums (every artifact)
+      - name: Checksums (every tarball)
         run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Sign the checksum manifest (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # The secret is the base64 of the owner's passwordless minisign
+          # secret-key file (setup in packaging/aur/README.md). Decode to a
+          # temp file, sign SHA256SUMS, publish the committed public key beside
+          # it, then delete the key.
+          keyfile="$(mktemp)"
+          printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > "$keyfile"
+          chmod 600 "$keyfile"
+          (cd dist && minisign -S -s "$keyfile" -m SHA256SUMS -x SHA256SUMS.minisig)
+          rm -f "$keyfile"
+          cp packaging/signing/minisign.pub dist/minisign.pub
       - name: Attest build provenance (every artifact)
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             dist/*.tar.gz
             dist/SHA256SUMS
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## \[/ { if (in_section) exit; if ($0 ~ ("^## \\[" v "\\]")) in_section = 1 }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
       - name: Publish the GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/*
-          generate_release_notes: true
+          body_path: release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig
+            dist/minisign.pub

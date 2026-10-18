@@ -1,43 +1,61 @@
 # Maintainer: <owner name> <owner email>   # PROPOSED — pending the owner's H9 answer; see ../README.md
 
 pkgname=soft-fig-bin
-pkgver=1.0.0_alpha.1
+pkgver=1.0.0alpha.1
 pkgrel=1
 pkgdesc="Encrypted local-first knowledge base: FUSE garden view + growlight fleet (bin)"
 arch=('x86_64')
 url="https://github.com/ukVee/software-config-garden"
 license=('AGPL-3.0-or-later')
-depends=('fuse3' 'systemd')
+depends=('fuse3' 'systemd' 'foot')
+makedepends=('minisign')
 provides=('soft-fig')
 conflicts=('soft-fig')
 
-# `_tag` is the real git tag; `pkgver` its AUR-safe form. The release and tag
-# do not exist yet — the owner cuts the tag, runs the release workflow, and
-# fills in the real sha256s at publish time (../README.md). 'SKIP' until then.
+# `_tag` is the real git tag; `pkgver` its AUR-safe form. `1.0.0alpha.1` is
+# used over `1.0.0_alpha.1` on purpose: alpm treats `_` as a version separator,
+# so `vercmp 1.0.0_alpha.1 1.0.0` -> `1` (the alpha reads NEWER, and
+# `pacman -Syu` would refuse the eventual `1.0.0` as a downgrade), while the
+# no-separator form sorts below it: `vercmp 1.0.0alpha.1 1.0.0` -> `-1`.
 _tag="v1.0.0-alpha.1"
 _target="x86_64-unknown-linux-gnu"
 _tarball="softfig-${_tag}-${_target}-tier1.tar.gz"
 
-# The tier-1 program tarball (repackaged verbatim) + the checksum manifest it
-# ships with (SHA256SUMS), plus the systemd user units and desktop entry pinned
-# to the same tag. The units are fetched from the tag, not copied into this
-# directory, so packaging/systemd/ stays the single source of truth and the two
-# packages cannot drift apart.
+# The tier-1 program tarball (repackaged verbatim), the signed checksum manifest
+# it ships with, the manifest's minisign signature, and the public key. The
+# systemd units and the desktop entry are NOT fetched from the mutable tag
+# anymore — they are staged INSIDE the tarball by the release workflow (see
+# ../README.md), so every installed file is checksummed and the signature pins
+# the whole set. The release and tag do not exist yet — the owner cuts the tag,
+# runs the release workflow, and fills in the real sha256s at publish time
+# (../README.md). Until then the checksums are all-zero placeholders that FAIL
+# makepkg's verification instead of skipping it.
 source=(
   "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/${_tarball}"
   "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/SHA256SUMS"
-  "softfig-keeperd.service::https://raw.githubusercontent.com/ukVee/software-config-garden/${_tag}/packaging/systemd/softfig-keeperd.service"
-  "softfig-growlightd.service::https://raw.githubusercontent.com/ukVee/software-config-garden/${_tag}/packaging/systemd/softfig-growlightd.service"
-  "softfig-tui.desktop::https://raw.githubusercontent.com/ukVee/software-config-garden/${_tag}/packaging/desktop/softfig-tui.desktop"
+  "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/SHA256SUMS.minisig"
+  "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/minisign.pub"
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+sha256sums=(
+  '0000000000000000000000000000000000000000000000000000000000000000'
+  '0000000000000000000000000000000000000000000000000000000000000000'
+  '0000000000000000000000000000000000000000000000000000000000000000'
+  '0000000000000000000000000000000000000000000000000000000000000000'
+)
 
 check() {
   cd "$srcdir"
-  # Verify the tarball's sha256 against its SHA256SUMS entry before anything is
-  # installed (provenance, meta/spec-release.md → "Signing and the trust root").
-  # The manifest is `sha256sum *.tar.gz` from the release, so the tarball name
-  # is the second whitespace-separated field.
+
+  # 1) Verify the manifest's signature before trusting it. This breaks the
+  #    circular "tarball vs same-origin SHA256SUMS" check the mutable-tag fetch
+  #    used to rely on: the public key is a separate, checksum-pinned source,
+  #    so a forged manifest no longer passes.
+  minisign -V -m SHA256SUMS -x SHA256SUMS.minisig -p minisign.pub
+
+  # 2) Verify the tarball's sha256 against its SHA256SUMS entry before anything
+  #    is installed (provenance, meta/spec-release.md → "Signing and the trust
+  #    root"). The manifest is `sha256sum *.tar.gz` from the release, so the
+  #    tarball name is the second whitespace-separated field.
   local expected actual
   expected="$(awk -v f="$_tarball" '$2 == f {print $1; exit}' SHA256SUMS)"
   if [[ -z "$expected" ]]; then
@@ -62,13 +80,21 @@ package() {
     install -Dm755 "${stagedir}/${bin}" "$pkgdir/usr/bin/${bin}"
   done
 
-  # systemd USER units + desktop entry, same path-only substitution as the
-  # source package ("set paths, never patch defaults").
-  install -Dm644 softfig-keeperd.service "$pkgdir/usr/lib/systemd/user/softfig-keeperd.service"
-  install -Dm644 softfig-growlightd.service "$pkgdir/usr/lib/systemd/user/softfig-growlightd.service"
+  # --- license ---
+  install -Dm644 "${stagedir}/LICENSE" "$pkgdir/usr/share/licenses/soft-fig-bin/LICENSE"
+
+  # --- systemd USER units + desktop entry, same path-only substitution as the
+  # source package ("set paths, never patch defaults"). ---
+  install -Dm644 "${stagedir}/softfig-keeperd.service" \
+    "$pkgdir/usr/lib/systemd/user/softfig-keeperd.service"
+  install -Dm644 "${stagedir}/softfig-growlightd.service" \
+    "$pkgdir/usr/lib/systemd/user/softfig-growlightd.service"
   sed -i 's|%h/.local/bin/|/usr/bin/|g' \
     "$pkgdir/usr/lib/systemd/user/softfig-keeperd.service" \
     "$pkgdir/usr/lib/systemd/user/softfig-growlightd.service"
 
-  install -Dm644 softfig-tui.desktop "$pkgdir/usr/share/applications/softfig-tui.desktop"
+  install -Dm644 "${stagedir}/softfig-tui.desktop" \
+    "$pkgdir/usr/share/applications/softfig-tui.desktop"
+  sed -i 's| softfig-tui$| /usr/bin/softfig-tui|' \
+    "$pkgdir/usr/share/applications/softfig-tui.desktop"
 }
