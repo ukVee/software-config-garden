@@ -74,6 +74,13 @@ fn boot(socket: &Path, garden: &Path) -> softfig_keeperd::DaemonHandle {
 fn cli(socket: &Path, group: &str, args: &[&str]) -> Output {
     let sock = socket.to_str().expect("utf8 socket path");
     let mut argv: Vec<&str> = vec!["growlight", group, "--socket", sock];
+    // `queue show` layers growlightd's live stack + session annotations
+    // (queue-v2-git slice 006); this suite boots only keeperd, so point the
+    // flag at a socket that never exists — the binary then skips the
+    // annotations instead of hitting the live (older) growlightd.
+    if group == "queue" {
+        argv.extend_from_slice(&["--growlightd-socket", "/nonexistent/growlightd-absent.sock"]);
+    }
     let rest = if args.first() == Some(&group) {
         &args[1..]
     } else {

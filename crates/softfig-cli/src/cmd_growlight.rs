@@ -26,8 +26,8 @@ use softfig_ipc::{
     baton::parse_baton,
     growlightd::{
         self, AgentDeltaKind, BuildCapsSummary, Event, FleetStatusReply, ForceStopArgs,
-        PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
-        StopLevel, StopReply,
+        PausedReply, QueueShowEntry, QueueShowReply, ResumeItemArgs, ResumeItemReply,
+        SetResourcesArgs, SetResourcesReply, StopLevel, StopReply,
     },
     queue_v2::{Entry, EntryKind, Lane as QueueLane, QueueToml, SliceStatus, QUEUE_FILE},
     verbs::{
@@ -1197,6 +1197,18 @@ fn client_status(args: ClientArgs) -> Result<()> {
     let reply: FleetStatusReply =
         growlight_call(&socket, growlightd::op::STATUS, serde_json::Value::Null)?;
     print_fleet_status(&reply);
+    // The v2 queue view (§6.9): both lanes, the stack per repo, and the
+    // session log — the same annotations `queue show` layers onto its TOML.
+    let view: QueueShowReply =
+        growlight_call(&socket, growlightd::op::QUEUE_SHOW, serde_json::Value::Null)?;
+    println!();
+    if view.list {
+        println!("queue v2");
+        print!("{}", render_queue_lanes(&view));
+        print!("{}", render_annotations(&view));
+    } else {
+        println!("{}", queue_empty_line());
+    }
     Ok(())
 }
 
@@ -1702,6 +1714,11 @@ pub struct QueueArgs {
     /// keeperd socket. Defaults to `$XDG_RUNTIME_DIR/softfig-keeperd.sock`.
     #[arg(long)]
     pub socket: Option<PathBuf>,
+    /// growlightd socket, for `show`'s live git-stack + session annotations
+    /// (growlightd runs the read-only git). Defaults to
+    /// `$XDG_RUNTIME_DIR/softfig-growlightd.sock`.
+    #[arg(long, value_name = "SOCKET")]
+    pub growlightd_socket: Option<PathBuf>,
     #[command(subcommand)]
     pub cmd: Option<QueueSub>,
 }
@@ -1998,7 +2015,7 @@ pub struct SliceStatusArgs {
 fn client_queue(args: QueueArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
     match args.cmd.unwrap_or(QueueSub::Show) {
-        QueueSub::Show => queue_show(&socket),
+        QueueSub::Show => queue_show(&socket, &growlight_socket(args.growlightd_socket)),
         QueueSub::Pick {
             member,
             growlightd_socket,
@@ -2084,7 +2101,7 @@ fn placement(to: MoveTarget, ref_id: Option<String>) -> Result<(String, Option<S
     }
 }
 
-fn queue_show(socket: &Path) -> Result<()> {
+fn queue_show(socket: &Path, growlightd_socket: &Path) -> Result<()> {
     let read = try_daemon_call(
         socket,
         op::READ_FILE,
@@ -2099,6 +2116,28 @@ fn queue_show(socket: &Path) -> Result<()> {
                 anyhow!("{QUEUE_FILE} does not parse ({e}) — keeperd writes it, so this is corruption")
             })?;
             print!("{}", render_queue_show(&queue));
+            // The live git-stack + session annotations (queue-v2-git slice
+            // 006) — growlightd runs the read-only git, keeperd can't (§8).
+            // Best-effort: a stopped growlightd just skips the annotations (the
+            // TOML table above is the core render); a growlightd that rejects
+            // the call is surfaced.
+            match try_daemon_call(
+                growlightd_socket,
+                growlightd::op::QUEUE_SHOW,
+                serde_json::Value::Null,
+            ) {
+                Ok(Some(value)) => {
+                    let view: QueueShowReply = serde_json::from_value(value)?;
+                    if view.list {
+                        print!("{}", render_annotations(&view));
+                    }
+                }
+                Ok(None) => {}
+                Err(ClientError::Daemon { kind, message }) => {
+                    return Err(anyhow!("growlightd error ({kind:?}): {message}"))
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            }
             Ok(())
         }
         // §3.4: the view renders only when the TOML file exists. A missing
@@ -2242,6 +2281,92 @@ fn show_lane<'a>(out: &mut String, name: &str, rows: impl Iterator<Item = &'a En
         ));
     }
     out.push('\n');
+}
+
+/// The `growlight status` queue v2 lanes (§6.9): both lanes, one row per entry
+/// in file order — id, status, project, the `after` links, and the branch with
+/// its live open annotation (the git-stack flag). `queue show` keeps
+/// [`render_queue_show`]'s TOML table instead; this is the growlightd-side
+/// form, so it omits the TOML-only columns (kind/title/base/claimed).
+fn render_queue_lanes(view: &QueueShowReply) -> String {
+    let mut out = String::from("### Urgent\n\n");
+    lane_rows(&mut out, view.entries.iter().filter(|e| e.lane == "urgent"));
+    out.push_str("\n### Normal\n\n");
+    lane_rows(&mut out, view.entries.iter().filter(|e| e.lane == "normal"));
+    out
+}
+
+fn lane_rows<'a>(out: &mut String, rows: impl Iterator<Item = &'a QueueShowEntry>) {
+    let cell = |s: &str| {
+        if s.is_empty() {
+            "—".to_string()
+        } else {
+            s.replace('|', "\\|")
+        }
+    };
+    out.push_str("| id | status | project | after | branch |\n|---|---|---|---|---|");
+    for e in rows {
+        let after = if e.after.is_empty() {
+            String::new()
+        } else {
+            e.after.join(", ")
+        };
+        let branch = if e.open {
+            format!("{} (open)", e.branch)
+        } else {
+            e.branch.clone()
+        };
+        out.push_str(&format!(
+            "\n| {} | {} | {} | {} | {} |",
+            cell(&e.id),
+            cell(&e.status),
+            cell(&e.project),
+            cell(&after),
+            cell(&branch),
+        ));
+    }
+    out.push('\n');
+}
+
+/// The §6.9 live annotations layered onto both surfaces (queue-v2-git slice
+/// 006): the stack per repo (the git-stack candidates in claim order) and the
+/// §3.5 session log. Shared by `queue show` and `growlight status` so the two
+/// surfaces can never drift about the same stack.
+fn render_annotations(view: &QueueShowReply) -> String {
+    let mut out = String::from("\n### Stack per repo\n\n");
+    if view.projects.is_empty() {
+        out.push_str("(no projects)\n");
+    }
+    for p in &view.projects {
+        let kind = if p.local { "local" } else { "remote" };
+        out.push_str(&format!("- {} ({}, main = {}) {}\n", p.name, kind, p.main, p.repo));
+        if p.stack.is_empty() {
+            out.push_str("  (empty — the next branch cuts from main)\n");
+        } else {
+            for b in &p.stack {
+                let parent = if b.parent.is_empty() { "main".to_string() } else { b.parent.clone() };
+                out.push_str(&format!(
+                    "  - {}  parent={}  base={}  claimed={}\n",
+                    b.branch, parent, b.base, b.claimed
+                ));
+            }
+        }
+    }
+    out.push_str("\n### Sessions\n\n");
+    if view.sessions.is_empty() {
+        out.push_str("(no sessions logged)\n");
+    }
+    for s in &view.sessions {
+        let unit = match &s.unit {
+            Some(u) => format!("/{u}"),
+            None => String::new(),
+        };
+        out.push_str(&format!("{}{} ({})\n", s.entry, unit, s.path));
+        for line in &s.lines {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    out
 }
 
 fn queue_project_add(socket: &Path, args: QueueProjectAddArgs) -> Result<()> {
@@ -3756,6 +3881,93 @@ mod tests {
         assert!(piped_body.contains("p\\|1"), "{piped_body}");
     }
 
+    #[test]
+    fn queue_show_lanes_render_status_project_links_and_the_open_flag() {
+        let entries = vec![
+            QueueShowEntry {
+                id: "u1".into(),
+                kind: "milestone".into(),
+                project: "softfig".into(),
+                lane: "urgent".into(),
+                status: "active".into(),
+                after: vec!["done-x".into()],
+                branch: "feat/u1".into(),
+                base: String::new(),
+                claimed: "2026-10-11T15:04:00Z".into(),
+                open: true,
+            },
+            QueueShowEntry {
+                id: "n1".into(),
+                kind: "milestone".into(),
+                project: "softfig".into(),
+                lane: "normal".into(),
+                status: "queued".into(),
+                after: vec![],
+                branch: String::new(),
+                base: String::new(),
+                claimed: String::new(),
+                open: false,
+            },
+        ];
+        let view = QueueShowReply {
+            list: true,
+            projects: Vec::new(),
+            entries,
+            sessions: Vec::new(),
+        };
+        let body = render_queue_lanes(&view);
+        let urgent = body.find("### Urgent").expect("urgent lane");
+        let normal = body.find("### Normal").expect("normal lane");
+        assert!(urgent < normal, "urgent lane renders first: {body}");
+        // status, project and after links; the open branch carries its flag.
+        assert!(
+            body.contains("| u1 | active | softfig | done-x | feat/u1 (open) |"),
+            "{body}"
+        );
+        assert!(body.contains("| n1 | queued | softfig | — | — |"), "{body}");
+    }
+
+    #[test]
+    fn queue_show_annotations_render_stack_and_sessions() {
+        use softfig_ipc::growlightd::{QueueProjectStack, QueueShowSession, QueueStackBranch};
+        let view = QueueShowReply {
+            list: true,
+            projects: vec![QueueProjectStack {
+                name: "softfig".into(),
+                repo: "~/p".into(),
+                main: "main".into(),
+                local: true,
+                stack: vec![QueueStackBranch {
+                    entry: "one".into(),
+                    branch: "feat/one".into(),
+                    parent: String::new(),
+                    base: "abc123".into(),
+                    claimed: "2026-10-11T15:04:00Z".into(),
+                }],
+            }],
+            entries: Vec::new(),
+            sessions: vec![QueueShowSession {
+                entry: "one".into(),
+                unit: None,
+                path: "growlight/backlog/milestones/one/CLAUDE.md".into(),
+                lines: vec!["- 2026-10-11T15:40Z · completed · reasoning · member oc · $0.04".into()],
+            }],
+        };
+        let body = render_annotations(&view);
+        assert!(body.contains("### Stack per repo"), "{body}");
+        assert!(
+            body.contains("- softfig (local, main = main) ~/p"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- feat/one  parent=main  base=abc123  claimed=2026-10-11T15:04:00Z"),
+            "{body}"
+        );
+        assert!(body.contains("### Sessions"), "{body}");
+        assert!(body.contains("one (growlight/backlog/milestones/one/CLAUDE.md)"), "{body}");
+        assert!(body.contains("  - 2026-10-11T15:40Z · completed"), "{body}");
+    }
+
     // The e2e fixture: a REAL keeperd on a temp garden (no FUSE, no watcher,
     // temp socket) — the same shape keeperd's own e2e suite boots — so the
     // §6.9 forms are exercised over the wire exactly as the binary sends them,
@@ -3856,7 +4068,7 @@ mod tests {
 
         // Fresh garden: no queue.toml — `queue show` exits clean with the
         // §3.4 "renders only when the file exists" message.
-        queue_show(&socket).unwrap();
+        queue_show(&socket, &dir.join("growlightd-absent.sock")).unwrap();
 
         // project add → ok; a duplicate is refused and the wire code leads.
         queue_project_add(
@@ -4089,7 +4301,7 @@ mod tests {
         assert!(format!("{err:#}").contains("bad_name"), "{err:#}");
 
         // `queue show` still renders the surviving state end to end.
-        queue_show(&socket).unwrap();
+        queue_show(&socket, &dir.join("growlightd-absent.sock")).unwrap();
 
         handle.shutdown();
         handle.join().unwrap();

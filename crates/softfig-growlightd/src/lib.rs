@@ -47,6 +47,7 @@ pub mod peer;
 pub mod persist;
 pub mod preapproval;
 pub mod queue_source;
+pub mod queue_show;
 pub mod reconcile;
 pub mod resume;
 pub mod scheduler;

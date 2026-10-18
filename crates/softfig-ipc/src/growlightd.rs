@@ -179,6 +179,15 @@ pub mod op {
     /// overlaid as its own pick sees them. No v2 list → `list: false`.
     pub const QUEUE_PICK: &str = "queue_pick";
 
+    /// `queue_show() -> `[`QueueShowReply`]. Read-only (spec-growlight-queue
+    /// §6.9 `growlight status` / `queue show`): the live v2 list reduced to
+    /// what the human surfaces render — both lanes' entries, the per-repo
+    /// stack with its live git-stack annotations (which branches are still
+    /// open, via slice 001's stack model), and the §3.5 session log. growlightd
+    /// answers it because the stack model and the read-only git surface live
+    /// there (queue-v2-git slice 006). No v2 list -> `list: false`.
+    pub const QUEUE_SHOW: &str = "queue_show";
+
     /// The five member verbs, in spec order.
     pub const MEMBER_VERBS: [&str; 5] = [
         GROWLIGHT_ADD_FOLLOW_UP_SESSION,
@@ -1210,6 +1219,90 @@ pub struct QueuePickSkip {
     pub reason: String,
     /// What the reason means, for a reader.
     pub detail: String,
+}
+
+/// One entry in the [`QueueShowReply`] list, in file (list) order. Fields
+/// are the TOML wire names (rendered verbatim), so the surfaces never re-word
+/// a status or lane the writer owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowEntry {
+    pub id: String,
+    pub kind: String,
+    pub project: String,
+    pub lane: String,
+    pub status: String,
+    pub after: Vec<String>,
+    pub branch: String,
+    pub base: String,
+    pub claimed: String,
+    /// The live git-stack annotation: this entry's branch is an *open* stack
+    /// candidate (started and — for a local repo — not yet merged into `main`).
+    /// `false` for a never-claimed entry, a restack (no branch), or a local
+    /// branch already fast-forwarded into `main`.
+    pub open: bool,
+}
+
+/// One branch of a repo's open stack, in claim order (oldest first) — the §8
+/// "stack per repo" a human reads to spot a pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueStackBranch {
+    /// The entry that owns the branch.
+    pub entry: String,
+    pub branch: String,
+    /// The recorded `parent` (`""` = `main`).
+    pub parent: String,
+    /// The recorded `base` (the cut-from commit, local; the branch name, remote).
+    pub base: String,
+    pub claimed: String,
+}
+
+/// One project's stack, as [`QueueShowReply`] carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueProjectStack {
+    pub name: String,
+    pub repo: String,
+    pub main: String,
+    /// `true` when growlightd ran read-only git here (a local path); `false`
+    /// for a `host:path` remote, where list state stands in and every claimed
+    /// entry is a candidate (§8).
+    pub local: bool,
+    /// The still-open branches in claim order; empty when the stack is empty
+    /// (the next branch cuts from `main`).
+    pub stack: Vec<QueueStackBranch>,
+}
+
+/// One unit's §3.5 session-log lines, verbatim (`- <ts> · …`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowSession {
+    /// The top-level entry id.
+    pub entry: String,
+    /// The slice NNN, or `None` for the entry's own close-out / task / restack
+    /// doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// The garden-relative doc the lines were read from.
+    pub path: String,
+    /// The `## Sessions` lines, in the order written.
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+/// Reply to [`op::QUEUE_SHOW`]: the live v2 list and its annotations, for the
+/// `growlight status` and `queue show` surfaces (§6.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowReply {
+    /// `false`: no `queue.toml` — there is no v2 list to show (§3.4), and the
+    /// other fields are empty.
+    pub list: bool,
+    /// One row per project, each with its open stack.
+    #[serde(default)]
+    pub projects: Vec<QueueProjectStack>,
+    /// One row per entry, in file (list) order.
+    #[serde(default)]
+    pub entries: Vec<QueueShowEntry>,
+    /// The §3.5 session-log lines across the list's units.
+    #[serde(default)]
+    pub sessions: Vec<QueueShowSession>,
 }
 
 /// Reply to a member verb. `state` is a documented string (like

@@ -19,7 +19,7 @@ use softfig_ipc::growlightd::{
     QueuePickAssignment, QueuePickReply, QueuePickSkip, RefusalCode, ReleaseLeaseArgs,
     RequestLeaseArgs, RequestRestartArgs, ResumeItemArgs, ResumeItemReply, SetPolicyArgs,
     SetResourcesArgs, SetResourcesReply, StopAfterSliceArgs, StopLevel, StopReply,
-    BACKEND_CLAUDE, BACKEND_OPENCODE,
+    QueueShowReply, BACKEND_CLAUDE, BACKEND_OPENCODE,
 };
 use softfig_ipc::model_choice::{Backend, ModelList};
 use softfig_ipc::verbs::{SliceInsertArgs, SliceUpdateArgs};
@@ -161,6 +161,7 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         // Read-only queue-v2 surface (spec-growlight-queue §6.9): what `pick_v2`
         // assigns a member now, and why each skipped entry was skipped.
         op::QUEUE_PICK => write_one_shot(&mut stream, queue_pick(&daemon, &req)),
+        op::QUEUE_SHOW => write_one_shot(&mut stream, queue_show(&daemon)),
         // Coordinate family — arbitrated shared-action leases (spec §4c / §14).
         // One-shot; growlightd grants/queues/denies and (for a restart) acts.
         op::REQUEST_LEASE => write_one_shot(&mut stream, request_lease(&daemon, &req)),
@@ -1041,6 +1042,39 @@ pub(crate) fn queue_pick(daemon: &Daemon, req: &Request) -> Response {
         ..base
     };
     ok_reply(&reply, "queue_pick")
+}
+
+/// `queue_show` (§6.9): the live v2 list reduced for the `growlight status`
+/// and `queue show` surfaces — the entries (lanes, statuses, links), the
+/// per-repo stack with its live git-stack annotations, and the §3.5 session
+/// log. growlightd answers it because the stack model and the read-only git
+/// surface live here. A garden with no v2 file answers `list: false` (not an
+/// error, §3.4); a v2 file that fails to parse is surfaced as an error (the
+/// writer owns that invariant).
+fn queue_show(daemon: &Daemon) -> Response {
+    let snapshot = match crate::v2_source::assemble(&daemon.garden_root()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return ok_reply(
+                &QueueShowReply {
+                    list: false,
+                    projects: Vec::new(),
+                    entries: Vec::new(),
+                    sessions: Vec::new(),
+                },
+                "queue_show",
+            )
+        }
+        Err(e) => {
+            return Response::err(
+                ErrorKind::Io,
+                format!("queue_show: the queue-v2 list can't be read: {e}"),
+            )
+        }
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let reply = crate::queue_show::build(&snapshot, &daemon.garden_root(), home.as_deref());
+    ok_reply(&reply, "queue_show")
 }
 
 /// The member a pick runs for: a roster row (its id, backend and pin), or an
