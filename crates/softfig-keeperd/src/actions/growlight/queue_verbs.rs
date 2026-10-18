@@ -1411,17 +1411,22 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         return Err(refuse(QueueRefusal::Running { id: args.id.clone() }));
     }
 
-    // The drop→restack path (§8): live children cut from the dropped entry,
-    // one restack per distinct child project. Collected before the row leaves
-    // the list.
-    let child_projects: HashSet<String> = queue
+    // The drop→restack path (§8, queue-v2-git slice 004): live children cut
+    // from the dropped entry, one restack per distinct child project, each
+    // carrying the `--onto` rebase that moves the child off the abandoned
+    // commits (`git rebase --onto <dropped base> <dropped branch> <child>`).
+    // Collected before the row leaves the list.
+    let children: Vec<(String, String)> = queue
         .entries
         .iter()
         .filter(|e| e.parent == args.id)
-        .map(|e| e.project.clone())
+        .map(|e| (e.project.clone(), e.branch.clone()))
         .collect();
 
     let row = queue.entries.remove(idx);
+    // Capture the dropped entry's stack fields before the row is archived.
+    let dropped_branch = row.branch.clone();
+    let dropped_base = row.base.clone();
     archive.entries.push(ArchivedEntry {
         row,
         finished: conventions::now_rfc3339(),
@@ -1435,9 +1440,25 @@ pub fn queue_drop(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     // numbers even before any `.seq` write lands.
     let restacks: Vec<RestackStaged> = {
         let wt = WorkTree::new(daemon, &inner);
+        // Group the children per project (project order = first-child order,
+        // child order = the list order, which is the claim order §8).
+        let mut by_project: Vec<(String, Vec<RestackBranch>)> = Vec::new();
+        for (project, branch) in &children {
+            let rb = RestackBranch {
+                branch: branch.clone(),
+                parent: args.id.clone(),
+                base: dropped_branch.clone(),
+                onto: dropped_base.clone(),
+            };
+            if let Some((_, stack)) = by_project.iter_mut().find(|(p, _)| p == project) {
+                stack.push(rb);
+            } else {
+                by_project.push((project.clone(), vec![rb]));
+            }
+        }
         (numbering::next_number(&wt, &paths::tasks_dir())..)
-            .zip(child_projects.iter())
-            .map(|(number, p)| restack_core(&wt, &mut queue, p, number, &[]))
+            .zip(by_project.iter())
+            .map(|(number, (p, stack))| restack_core(&wt, &mut queue, p, number, stack))
             .collect::<Result<_, _>>()?
     };
 
@@ -3460,6 +3481,7 @@ mod tests {
         // claims are not file state, and no claim machinery exists yet).
         let mut a = entry("a");
         a.claimed = "2026-10-11T12:00:00Z".to_string();
+        a.base = "parent-commit".to_string();
         let mut b = entry("b");
         b.parent = "a".to_string();
         b.base = "abc123".to_string();
@@ -3500,11 +3522,17 @@ mod tests {
         assert!(!archived.finished.is_empty());
         assert!(wt.exists(QUEUE_ARCHIVE_FILE));
 
-        // The minimal restack doc landed through the shared tasks .seq.
+        // The restack doc landed through the shared tasks .seq, carrying the
+        // §8 --onto rebase (queue-v2-git slice 004): the child moves off the
+        // dropped branch onto the dropped entry's base.
         let doc = wt
             .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
             .expect("restack doc");
         assert!(doc.starts_with("# Restack softfig\n"), "{doc}");
+        assert!(
+            doc.contains("- `git rebase --onto parent-commit feat/a feat/b`"),
+            "{doc}"
+        );
         assert_eq!(wt.read_to_string("growlight/backlog/tasks/.seq").unwrap(), "1\n");
         // The dropped entry left the list view.
         assert!(!reply.view.contains("| a | milestone"), "{reply:?}");
@@ -3539,6 +3567,7 @@ mod tests {
         // repo's stack (§8).
         let mut a = entry("a");
         a.claimed = "2026-10-11T12:00:00Z".to_string();
+        a.base = "parent-commit".to_string();
         let mut b = entry("b");
         b.parent = "a".to_string();
         let mut c = entry("c");
@@ -3552,6 +3581,18 @@ mod tests {
         let ids: Vec<&str> = qs.queue.model.entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["001", "b", "c"], "exactly one restack per project");
         assert!(!wt.exists("growlight/backlog/tasks/002-restack-softfig.md"));
+        // Both children's --onto steps ride the one restack doc, in list order.
+        let doc = wt
+            .read_to_string("growlight/backlog/tasks/001-restack-softfig.md")
+            .expect("restack doc");
+        assert!(
+            doc.contains("- `git rebase --onto parent-commit feat/a feat/b`"),
+            "{doc}"
+        );
+        assert!(
+            doc.contains("- `git rebase --onto parent-commit feat/a feat/c`"),
+            "{doc}"
+        );
     }
 
     #[test]

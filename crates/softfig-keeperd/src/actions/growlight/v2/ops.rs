@@ -70,7 +70,8 @@ use softfig_ipc::queue_v2::{
 use softfig_ipc::verbs::{
     DaemonStatusArg, QueueV2AddSubArgs, QueueV2AddSubReply, QueueV2ClaimArgs, QueueV2ClaimReply,
     QueueV2DeferredArgs,
-    QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply, QueueV2SessionLogArgs,
+    QueueV2DeferredReply, QueueV2FollowUpsArgs, QueueV2FollowUpsReply,
+    QueueV2ReRecordBasesArgs, QueueV2ReRecordBasesReply, QueueV2SessionLogArgs,
     QueueV2SessionLogReply, QueueV2SetStatusArgs, QueueV2SetStatusReply,
 };
 use softfig_ipc::ErrorKind;
@@ -1208,6 +1209,78 @@ pub fn queue_v2_add_sub(daemon: &Daemon, args: serde_json::Value) -> HandlerResu
     .unwrap())
 }
 
+/// `queue_v2_re_record_bases` (queue-v2-git slice 004): keeperd↔growlightd only —
+/// growlightd recomputed each restacked branch's base read-only after the
+/// restack completed (§8, `git merge-base`) and writes them back: each named
+/// live entry's `base` is replaced. An all-no-op write (every `base` already
+/// the given value) mints no commit. One commit, `queue_v2_bases_rererecorded`;
+/// the derived view re-renders.
+pub fn queue_v2_re_record_bases(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    let args: QueueV2ReRecordBasesArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("queue_v2_re_record_bases args: {e}")))?;
+    if args.entries.is_empty() {
+        return Err((ErrorKind::BadArgs, "entries must be non-empty".to_string()));
+    }
+
+    let mut inner = daemon.inner.lock().unwrap();
+    require_unlocked(&inner)?;
+
+    let (mut queue, queue_version, archive) = {
+        let wt = WorkTree::new(daemon, &inner);
+        match load_queue_state(&wt, &inner) {
+            Ok(Some(qs)) => (qs.queue.model, qs.queue.version, qs.archive.model),
+            Ok(None) => {
+                return Err((
+                    ErrorKind::NotFound,
+                    "no queue.toml — there is no v2 state".to_string(),
+                ))
+            }
+            Err(e) => return Err((ErrorKind::Internal, e.to_string())),
+        }
+    };
+
+    let mut changed = false;
+    for rec in &args.entries {
+        let Some(e) = queue.entries.iter_mut().find(|e| e.id == rec.entry) else {
+            return Err(refuse(QueueRefusal::UnknownId { id: rec.entry.clone() }));
+        };
+        if e.base != rec.base {
+            e.base = rec.base.clone();
+            changed = true;
+        }
+    }
+    queue.validate(&archive).map_err(refuse)?;
+
+    if !changed {
+        let hash = current_tip(&inner)?;
+        return Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash }).unwrap());
+    }
+
+    let files = [FileWrite {
+        rel: QUEUE_FILE.to_string(),
+        expected: queue_version,
+        bytes: queue
+            .to_toml()
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?
+            .into_bytes(),
+    }];
+    let hash = apply(
+        daemon,
+        &mut inner,
+        "queue_v2_bases_rererecorded",
+        serde_json::json!({ "entries": args.entries.len() }),
+        &files,
+        &[ViewWrite {
+            host: queue_view_host(),
+            tag: QUEUE_V2_TAG,
+            body: Some(queue_view(&queue)),
+        }],
+        &ExtraWrites::NONE,
+    )?;
+
+    Ok(serde_json::to_value(QueueV2ReRecordBasesReply { hash: hash.to_string() }).unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2265,5 +2338,78 @@ mod tests {
                 _ => assert!(c.is_ascii_digit(), "digit at byte {i} in {ts:?}"),
             }
         }
+    }
+
+    // ---- slice 004: queue_v2_re_record_bases ----------------------------
+
+    fn re_record(
+        daemon: &Daemon,
+        entries: Vec<(&str, &str)>,
+    ) -> Result<QueueV2ReRecordBasesReply, (ErrorKind, String)> {
+        let v = queue_v2_re_record_bases(
+            daemon,
+            serde_json::json!({
+                "entries": entries
+                    .iter()
+                    .map(|(e, b)| serde_json::json!({ "entry": e, "base": b }))
+                    .collect::<Vec<_>>(),
+            }),
+        )?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn re_record_replaces_each_named_entry_base_in_one_commit() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.claimed = "2026-10-11T12:00:00Z".to_string();
+        a.base = "abc123".to_string();
+        let mut b = entry("b", Lane::Normal, EntryStatus::Queued);
+        b.claimed = "2026-10-11T12:10:00Z".to_string();
+        b.base = "def456".to_string();
+        b.parent = "a".to_string();
+        seed_queue_rows(&daemon, vec![a, b]);
+        let before = commit_count(&daemon);
+
+        let reply = re_record(&daemon, vec![("a", "111aaa"), ("b", "222bbb")]).expect("re-record");
+        assert_eq!(commit_count(&daemon), before + 1, "exactly one commit");
+        assert!(!reply.hash.is_empty());
+
+        let (queue, _) = loaded_queue(&daemon);
+        assert_eq!(queue.entries[0].base, "111aaa");
+        assert_eq!(queue.entries[1].base, "222bbb");
+        // parent/claimed/status are untouched by a re-record.
+        assert_eq!(queue.entries[1].parent, "a");
+        assert_eq!(queue.entries[0].claimed, "2026-10-11T12:00:00Z");
+        assert_eq!(queue.entries[0].status, EntryStatus::Queued);
+    }
+
+    #[test]
+    fn re_record_refuses_an_unknown_entry_and_a_noop_writes_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let mut a = entry("a", Lane::Normal, EntryStatus::Queued);
+        a.base = "abc123".to_string();
+        seed_queue_rows(&daemon, vec![a]);
+        let before = commit_count(&daemon);
+
+        // An unknown entry is refused, nothing written.
+        let err = re_record(&daemon, vec![("ghost", "x")]).unwrap_err();
+        assert_eq!(err.0, ErrorKind::NotFound, "{err:?}");
+        assert_eq!(commit_count(&daemon), before, "a refusal mints no commit");
+
+        // An all-no-op write (base already the given value) mints no commit.
+        re_record(&daemon, vec![("a", "abc123")]).expect("no-op re-record");
+        assert_eq!(commit_count(&daemon), before, "no commit for a no-op");
+    }
+
+    #[test]
+    fn re_record_refuses_an_empty_entries_list() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        seed_queue_rows(&daemon, vec![entry("a", Lane::Normal, EntryStatus::Queued)]);
+        let err = re_record(&daemon, vec![]).unwrap_err();
+        assert_eq!(err.0, ErrorKind::BadArgs, "{err:?}");
     }
 }

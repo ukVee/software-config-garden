@@ -26,8 +26,8 @@ mod views;
 pub(crate) mod write;
 
 pub use ops::{
-    queue_v2_add_sub, queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups, queue_v2_session_log,
-    queue_v2_set_status,
+    queue_v2_add_sub, queue_v2_claim, queue_v2_deferred, queue_v2_follow_ups,
+    queue_v2_re_record_bases, queue_v2_session_log, queue_v2_set_status,
 };
 pub use state::{load_queue_state, load_slices, milestone_path, slices_file, QUEUE_FILE};
 pub use views::{

@@ -108,6 +108,38 @@ impl Git {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// `git rev-parse --abbrev-ref <branch>@{upstream}`: does `branch` track
+    /// an upstream? `true` when git resolves it (exit 0), `false` when git
+    /// reports none (exit 128 — a branch with no upstream, or no such branch),
+    /// and an error on anything else (a bad repo, a timeout).
+    pub fn has_upstream(&self, branch: &str) -> Result<bool, GitError> {
+        let upstream = format!("{branch}@{{upstream}}");
+        let (status, _) = self.run(&["rev-parse", "--abbrev-ref", &upstream])?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(128) => Ok(false),
+            _ => Err(GitError::Run {
+                cmd: "rev-parse --abbrev-ref <branch>@{upstream}".into(),
+                repo: self.repo.clone(),
+                cause: status.to_string(),
+            }),
+        }
+    }
+
+    /// `git merge-base <a> <b>`: the merge base of two committishes. Fails on
+    /// an unknown rev.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
+        let (status, out) = self.run(&["merge-base", a, b])?;
+        if !status.success() {
+            return Err(GitError::Run {
+                cmd: "merge-base".into(),
+                repo: self.repo.clone(),
+                cause: status.to_string(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
     fn run(&self, args: &[&str]) -> Result<(ExitStatus, Vec<u8>), GitError> {
         let mut child = Command::new("git")
             .arg("--no-optional-locks")
@@ -404,6 +436,99 @@ pub fn detect_restack(
     } else {
         Ok(None)
     }
+}
+
+/// One restacked branch's re-recorded base (§8): the `entry` it belongs to,
+/// its `branch`, and the recomputed `base` (growlightd resolved it read-only
+/// with `git merge-base` after the restack completed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReRecordedBase {
+    pub entry: String,
+    pub branch: String,
+    pub base: String,
+}
+
+/// The result of a §8 re-record pass (queue-v2-git slice 004): either one new
+/// base per restacked branch (claim order), or a branch that tracks an
+/// upstream — which the loop never rewrites, so the restack blocks for the
+/// human instead (`growlight_block kind = human`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReRecord {
+    /// The new base per restacked branch, in claim order.
+    Bases(Vec<ReRecordedBase>),
+    /// A branch tracks an upstream: the loop must not rewrite it; block.
+    Upstream { branch: String },
+}
+
+/// Re-record the restacked branches' bases after a restack completes (§8):
+/// each branch's new `base` is `git merge-base <branch> <its parent's tip or
+/// main>`. A branch that has an upstream is never rewritten — the pass returns
+/// [`ReRecord::Upstream`] and the loop blocks for the human. A remote repo runs
+/// no git and has no commit to resolve, so its pass is empty (the human
+/// re-records by hand, §8). `git` is never written to.
+pub fn re_record_bases(
+    repo: &Repo,
+    main: &str,
+    entries: &[RestackEntry],
+    git: &Git,
+) -> Result<ReRecord, GitError> {
+    if matches!(repo, Repo::Remote) {
+        return Ok(ReRecord::Bases(Vec::new()));
+    }
+    let stack_input: Vec<StackEntry> = entries
+        .iter()
+        .map(|e| StackEntry {
+            id: e.id.clone(),
+            branch: e.branch.clone(),
+            lane: e.lane,
+            claimed: e.claimed.clone(),
+        })
+        .collect();
+    let stack = stack_candidates(repo, main, &stack_input, git)?;
+    if stack.candidates.is_empty() {
+        return Ok(ReRecord::Bases(Vec::new()));
+    }
+    // branch → its recorded entry (for the parent), and id → branch (to
+    // resolve a parent entry's branch), mirroring [`detect_restack`].
+    let recorded: std::collections::HashMap<&str, &RestackEntry> = entries
+        .iter()
+        .filter(|e| !e.branch.is_empty())
+        .map(|e| (e.branch.as_str(), e))
+        .collect();
+    let branch_of: std::collections::HashMap<&str, &str> = entries
+        .iter()
+        .filter(|e| !e.branch.is_empty())
+        .map(|e| (e.id.as_str(), e.branch.as_str()))
+        .collect();
+
+    let mut out = Vec::with_capacity(stack.candidates.len());
+    for c in &stack.candidates {
+        let Some(entry) = recorded.get(c.branch.as_str()) else {
+            continue; // a candidate with no recorded branch data — skip it
+        };
+        // The loop never rewrites a branch that tracks an upstream.
+        if git.has_upstream(&c.branch)? {
+            return Ok(ReRecord::Upstream {
+                branch: c.branch.clone(),
+            });
+        }
+        let onto = if entry.parent.is_empty() {
+            main.to_string()
+        } else {
+            branch_of
+                .get(entry.parent.as_str())
+                .copied()
+                .unwrap_or(main)
+                .to_string()
+        };
+        let base = git.merge_base(&c.branch, &onto)?;
+        out.push(ReRecordedBase {
+            entry: c.id.clone(),
+            branch: c.branch.clone(),
+            base,
+        });
+    }
+    Ok(ReRecord::Bases(out))
 }
 
 #[cfg(test)]
@@ -769,5 +894,91 @@ mod tests {
         assert_eq!(need[1].branch, "feat/two");
         assert_eq!(need[1].base, two_tip, "feat/two's recorded base is feat/one's old tip");
         assert_eq!(need[1].onto, "feat/one");
+    }
+
+    // ---- restack execution (queue-v2-git slice 004) ---------------------
+
+    /// Point `branch` at a fabricated `origin/<remote_branch>` remote-tracking
+    /// ref, so `git rev-parse <branch>@{upstream}` resolves — the minimal
+    /// upstream a branch can track in a temp repo.
+    fn track_upstream(repo: &Path, branch: &str, remote_branch: &str) {
+        let tip = rev_parse_sh(repo, "main");
+        let remote_ref = format!("refs/remotes/origin/{remote_branch}");
+        sh_git(repo, &["update-ref", &remote_ref, &tip]);
+        // Register the remote so `--set-upstream-to` maps refs/heads/<remote>
+        // to refs/remotes/origin/<remote> (a bare config `remote.origin.url`
+        // alone is not enough — git requires the remote to be a real remote).
+        sh_git(repo, &["remote", "add", "origin", "https://example.invalid/origin"]);
+        let upstream = format!("origin/{remote_branch}");
+        sh_git(repo, &["branch", "--set-upstream-to", &upstream, branch]);
+    }
+
+    #[test]
+    fn re_record_recomputes_each_branch_base_as_merge_base() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let one_tip = open_branch_from(repo, "feat/one", "main");
+        let _two_tip = open_branch_from(repo, "feat/two", "feat/one");
+
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
+            restack_entry("two", "feat/two", "one", &one_tip, "2026-10-02T00:00:00Z"),
+        ];
+
+        let git = Git::new(repo.to_path_buf());
+        let ReRecord::Bases(bases) =
+            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap()
+        else {
+            panic!("expected re-recorded bases");
+        };
+        assert_eq!(bases.len(), 2, "{bases:?}");
+        assert_eq!(bases[0].entry, "one");
+        assert_eq!(bases[0].branch, "feat/one");
+        assert_eq!(
+            bases[0].base, main_commit,
+            "feat/one's base is merge-base(feat/one, main)"
+        );
+        assert_eq!(bases[1].entry, "two");
+        assert_eq!(bases[1].branch, "feat/two");
+        assert_eq!(
+            bases[1].base, one_tip,
+            "feat/two's base is merge-base(feat/two, feat/one)"
+        );
+        // The tips are untouched by the read-only re-record.
+        assert_eq!(rev_parse_sh(repo, "feat/one"), one_tip);
+    }
+
+    #[test]
+    fn re_record_blocks_on_an_upstream_branch_and_never_rewrites() {
+        let (dir, main_commit) = seeded_repo();
+        let repo = dir.path();
+        let one_tip = open_branch_from(repo, "feat/one", "main");
+        track_upstream(repo, "feat/one", "main");
+
+        let entries = vec![
+            restack_entry("one", "feat/one", "", &main_commit, "2026-10-01T00:00:00Z"),
+        ];
+
+        let git = Git::new(repo.to_path_buf());
+        let outcome =
+            re_record_bases(&Repo::Local(repo.to_path_buf()), "main", &entries, &git).unwrap();
+        assert_eq!(
+            outcome,
+            ReRecord::Upstream {
+                branch: "feat/one".to_string()
+            },
+            "an upstream branch is never rewritten: block for the human",
+        );
+        assert_eq!(rev_parse_sh(repo, "feat/one"), one_tip, "the tip is untouched");
+    }
+
+    #[test]
+    fn re_record_is_empty_for_a_remote_repo() {
+        let git = Git::new("/nonexistent/not-a-repo");
+        let entries = vec![
+            restack_entry("one", "feat/one", "", "deadbeef", "2026-10-01T00:00:00Z"),
+        ];
+        let outcome = re_record_bases(&Repo::Remote, "main", &entries, &git).unwrap();
+        assert_eq!(outcome, ReRecord::Bases(Vec::new()), "no git against a remote repo");
     }
 }

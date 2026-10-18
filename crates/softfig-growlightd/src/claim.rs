@@ -38,15 +38,18 @@
 use std::path::{Path, PathBuf};
 
 use softfig_ipc::verbs::{
-    op, DaemonStatusArg, QueueSliceSpec, QueueV2AddSubArgs, QueueV2ClaimArgs, QueueV2DeferredArgs,
+    op, DaemonStatusArg, QueueSliceSpec, QueueV2AddSubArgs, QueueV2BaseRecord, QueueV2ClaimArgs,
+    QueueV2DeferredArgs,
     QueueV2EnqueueRestackArgs, QueueV2EnqueueRestackReply, QueueV2FollowUpsArgs,
-    QueueV2SessionLogArgs, QueueV2SetStatusArgs, QueueV2SetStatusReply, SetItemStatusArgs,
-    SliceInsertArgs, SliceInsertReply,
+    QueueV2ReRecordBasesArgs, QueueV2SessionLogArgs, QueueV2SetStatusArgs, QueueV2SetStatusReply,
+    SetItemStatusArgs, SliceInsertArgs, SliceInsertReply,
 };
 use softfig_ipc::queue_v2::RestackBranch;
 use softfig_ipc::{call_reconnecting, ReconnectError, Request, Response, RetryPolicy};
 
-use crate::drive_loop::{ItemParker, PartClaimer, V2Claimer, V2ItemParker, V2RestackEnqueuer};
+use crate::drive_loop::{
+    ItemParker, PartClaimer, V2BaseReRecorder, V2Claimer, V2ItemParker, V2RestackEnqueuer,
+};
 use crate::first_claim::FirstClaim;
 use crate::member_handoff::{KeeperOp, KeeperOutcome, V2Keeper};
 
@@ -304,6 +307,42 @@ impl V2RestackEnqueuer for KeeperdV2RestackEnqueuer {
         let reply: QueueV2EnqueueRestackReply = serde_json::from_value(data)
             .map_err(|e| format!("decode queue_v2_enqueue_restack reply: {e}"))?;
         Ok(reply.id)
+    }
+}
+
+/// The live [`V2BaseReRecorder`] (queue-v2-git slice 004): growlightd
+/// recomputed the restacked branches' bases read-only after the restack
+/// completed (§8, `git merge-base`) and issues keeperd's
+/// `queue_v2_re_record_bases` — the WRITE that replaces each named live
+/// entry's `base`. Same socket, same [`call_reconnecting`] ride-out, same
+/// fail-closed `classify_status_write` mapping as the v2 claimer.
+#[derive(Debug, Clone)]
+pub struct KeeperdV2BaseReRecorder {
+    keeperd_socket: PathBuf,
+}
+
+impl KeeperdV2BaseReRecorder {
+    /// Bind the re-recorder to keeperd's listen socket.
+    pub fn new(keeperd_socket: PathBuf) -> Self {
+        Self { keeperd_socket }
+    }
+}
+
+impl V2BaseReRecorder for KeeperdV2BaseReRecorder {
+    fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String> {
+        let args = serde_json::to_value(QueueV2ReRecordBasesArgs {
+            entries: entries
+                .iter()
+                .map(|(entry, base)| QueueV2BaseRecord {
+                    entry: entry.clone(),
+                    base: base.clone(),
+                })
+                .collect(),
+        })
+        .map_err(|e| format!("encode queue_v2_re_record_bases args: {e}"))?;
+        let req = Request::new(op::QUEUE_V2_RE_RECORD_BASES, args);
+        let result = call_reconnecting(&self.keeperd_socket, &req, RetryPolicy::default());
+        classify_status_write("v2 re-record", &self.keeperd_socket, result)
     }
 }
 

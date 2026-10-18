@@ -82,7 +82,7 @@ use crate::supervisor::{
 use crate::usage::{UsageAggregator, UsageSample, WindowResets};
 use crate::v2_source::V2Load;
 use softfig_ipc::model_choice::{member_default, ModelChoice};
-use softfig_ipc::queue_v2::{EntryStatus, RestackBranch};
+use softfig_ipc::queue_v2::{EntryKind, EntryStatus, RestackBranch};
 
 /// How often the live drive loop ticks: schedule, observe health, honor control,
 /// re-roll. Agents run for minutes per session, so a ~1s cadence is ample — this
@@ -847,6 +847,18 @@ pub trait V2RestackEnqueuer: Send + Sync + fmt::Debug {
     fn enqueue_restack(&self, project: &str, stack: &[RestackBranch]) -> Result<Option<String>, String>;
 }
 
+/// The seam the loop re-records restacked branches' bases through (§8,
+/// queue-v2-git slice 004): keeperd's
+/// `queue_v2_re_record_bases({entries: [{entry, base}]})` — growlightd
+/// recomputed each branch's base read-only with `git merge-base` after a
+/// restack completed, and keeperd writes them back. Fail-soft in the drive
+/// loop: a failed write is logged, never wedges a completion. The live impl is
+/// [`crate::claim::KeeperdV2BaseReRecorder`] over the keeperd socket.
+pub trait V2BaseReRecorder: Send + Sync + fmt::Debug {
+    /// Re-record `entries`' bases — `(entry, new base)` pairs.
+    fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String>;
+}
+
 /// The seam the loop writes a member's baton through at a v2 spawn (§3.6 "At
 /// spawn, growlightd copies the entry's baton into the member's baton path").
 /// Distinct from [`BatonSeeder`]: that one templates a fresh seed keyed to
@@ -1154,6 +1166,9 @@ pub struct V2Seams {
     /// socket — §8 restack detection (queue-v2-git slice 003) at daemon start,
     /// claim and handshake.
     pub restacker: Box<dyn V2RestackEnqueuer>,
+    /// The v2 base re-record (`queue_v2_re_record_bases`) over the keeperd
+    /// socket — §8 re-record (queue-v2-git slice 004) after a restack completes.
+    pub re_recorder: Box<dyn V2BaseReRecorder>,
 }
 
 /// The fleet drive loop: binds the scheduler, the [`Supervisor`], and the daemon
@@ -1265,6 +1280,14 @@ pub struct DriveLoop {
     /// the handshake runs in step 1, before the snapshot loads, so its §8
     /// restack scan is deferred here and drained once the snapshot is read.
     v2_handoff_scans: std::collections::BTreeSet<String>,
+    /// A restack entry's project, recorded at claim (queue-v2-git slice 004) so
+    /// its completion — which archives the row, dropping it from the snapshot —
+    /// still names the repo whose branches' bases must be re-recorded.
+    v2_restack_project: std::collections::BTreeMap<String, String>,
+    /// Projects whose restack completed this tick (queue-v2-git slice 004): the
+    /// re-record is deferred like the handoff scan — the handshake runs in step
+    /// 1, before the snapshot loads — and drained once it is read.
+    v2_re_record_scans: std::collections::BTreeSet<String>,
     /// Each running member's current v2 `(entry, unit)` assignment — the v2 twin
     /// of `assignments`, recorded on the member's v2 fresh start and carried
     /// across re-rolls (a re-roll re-spawns on the same spec, model included).
@@ -1427,6 +1450,8 @@ impl DriveLoop {
             v2: None,
             restack_boot_done: false,
             v2_handoff_scans: std::collections::BTreeSet::new(),
+            v2_restack_project: std::collections::BTreeMap::new(),
+            v2_re_record_scans: std::collections::BTreeSet::new(),
             v2_assignments: std::collections::BTreeMap::new(),
             v2_walk_blocked: std::collections::BTreeMap::new(),
             v2_handoff_seen: std::collections::BTreeMap::new(),
@@ -2135,6 +2160,12 @@ impl DriveLoop {
                         self.scan_restacks(snapshot, Some(&p));
                     }
                 }
+                // §8 re-record (queue-v2-git slice 004): restack completions
+                // deferred from step 1, drained once the snapshot loads.
+                let re_record_scans = std::mem::take(&mut self.v2_re_record_scans);
+                for project in &re_record_scans {
+                    self.re_record_restack(snapshot, project);
+                }
 
                 // The per-member `pick_v2` input, built from the configured fleet:
                 // backend + roster default from the member's row; the pin carried
@@ -2358,13 +2389,16 @@ impl DriveLoop {
 
                                 // §8 restack detection at claim (queue-v2-git
                                 // slice 003): check the claimed entry's repo.
-                                if let Some(p) = snapshot
-                                    .entries
-                                    .iter()
-                                    .find(|e| e.id == entry_top)
-                                    .map(|e| e.project.as_str())
-                                {
-                                    self.scan_restacks(snapshot, Some(p));
+                                if let Some(ev) = snapshot.entries.iter().find(|e| e.id == entry_top) {
+                                    // Record a restack entry's project now, so
+                                    // its completion (which archives the row)
+                                    // still names the repo to re-record (§8,
+                                    // queue-v2-git slice 004).
+                                    if ev.kind == EntryKind::Restack {
+                                        self.v2_restack_project
+                                            .insert(entry_top.to_string(), ev.project.clone());
+                                    }
+                                    self.scan_restacks(snapshot, Some(&ev.project));
                                 }
                             }
                             // The claim landed even though the spawn failed — keep
@@ -2866,6 +2900,62 @@ impl DriveLoop {
         }
     }
 
+    /// §8 re-record (queue-v2-git slice 004): after a restack completed,
+    /// recompute each restacked local branch's `base` read-only
+    /// (`git merge-base <branch> <its parent's tip or main>`) and write them
+    /// back through the re-recorder seam. A branch that tracks an upstream is
+    /// never rewritten — the pass returns [`git_stack::ReRecord::Upstream`]
+    /// and the loop leaves the base untouched (the restack's doc tells the
+    /// agent to end with `growlight_block kind = human`; slice 005's protocol
+    /// carries that instruction). Fail-soft: a git or write error is skipped —
+    /// the next restack detection re-flags the stale base.
+    fn re_record_restack(&self, snapshot: &scheduler_v2::V2Snapshot, project: &str) {
+        let Some(seams) = self.v2.as_ref() else {
+            return;
+        };
+        let Some(proj) = snapshot.projects.iter().find(|p| p.name == project) else {
+            return;
+        };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let repo = Repo::classify(&proj.repo, home.as_deref());
+        let repo_path = match &repo {
+            Repo::Local(path) => path.clone(),
+            Repo::Remote => return, // a remote repo has no commit to resolve (§8)
+        };
+        let entries: Vec<git_stack::RestackEntry> = snapshot
+            .entries
+            .iter()
+            .filter(|e| e.project == project)
+            .map(|e| git_stack::RestackEntry {
+                id: e.id.clone(),
+                branch: e.branch.clone(),
+                lane: e.lane,
+                claimed: e.claimed.clone(),
+                parent: e.parent.clone(),
+                base: e.base.clone(),
+            })
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let git = Git::new(repo_path);
+        let bases = match git_stack::re_record_bases(&repo, &proj.main, &entries, &git) {
+            Ok(git_stack::ReRecord::Bases(bases)) => bases,
+            // A branch tracks an upstream: the loop never rewrites it — the
+            // restack's doc instructs the agent to block for the human instead.
+            Ok(git_stack::ReRecord::Upstream { .. }) => return,
+            Err(_) => return, // fail-soft: re-detected on the next scan
+        };
+        if bases.is_empty() {
+            return;
+        }
+        let pairs: Vec<(String, String)> = bases
+            .iter()
+            .map(|b| (b.entry.clone(), b.base.clone()))
+            .collect();
+        let _ = seams.re_recorder.re_record_bases(&pairs);
+    }
+
     /// §6.3 step 4 for a member whose verb committed a handoff (slice 009):
     /// end the session when its process exits or once `roll_grace_secs` have
     /// passed since the loop first saw the handoff, whichever comes first. The
@@ -2906,6 +2996,14 @@ impl DriveLoop {
         // §8 restack detection at handshake (queue-v2-git slice 003): deferred
         // until the snapshot loads (step 3), then drained by the tick.
         self.v2_handoff_scans.insert(entry.clone());
+        // §8 re-record (queue-v2-git slice 004): a restack entry that completed
+        // is archived — its row is gone from the next snapshot — so its project
+        // was recorded at claim. Defer the re-record for that project here.
+        if handoff.verb == softfig_ipc::growlightd::op::GROWLIGHT_COMPLETE_ENTRY
+            && let Some(project) = self.v2_restack_project.remove(&entry)
+        {
+            self.v2_re_record_scans.insert(project);
+        }
         if let Some(model) = &handoff.next_model {
             // The same unit's next session runs on the requested model (§6.4).
             let unit = handoff.assignment.unit.clone();
@@ -7668,6 +7766,26 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         }
     }
 
+    /// A recording [`V2BaseReRecorder`] — the §8 re-record (slice 004),
+    /// recording each `(entry, base)` pair for assertions.
+    #[derive(Debug, Default)]
+    struct FakeV2BaseReRecorder {
+        recorded: Mutex<Vec<(String, String)>>,
+    }
+
+    impl V2BaseReRecorder for FakeV2BaseReRecorder {
+        fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String> {
+            self.recorded.lock().unwrap().extend_from_slice(entries);
+            Ok(())
+        }
+    }
+
+    impl V2BaseReRecorder for Arc<FakeV2BaseReRecorder> {
+        fn re_record_bases(&self, entries: &[(String, String)]) -> Result<(), String> {
+            (**self).re_record_bases(entries)
+        }
+    }
+
     /// A v2 snapshot with one milestone entry and one queued slice, whose
     /// declared `> Model:` list is `decl` (parsed) — the smallest list
     /// `pick_v2` walks to a slice unit.
@@ -7751,6 +7869,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             claimer: Box::new(claimer),
             parker: Box::new(parker),
             restacker: Box::new(FakeV2RestackEnqueuer::default()),
+            re_recorder: Box::new(FakeV2BaseReRecorder::default()),
         });
         (drive, d, backend, probe)
     }
@@ -8427,6 +8546,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             claimer: Box::new(Arc::clone(&claimer)),
             parker: Box::new(Arc::clone(&parker)),
             restacker: Box::new(FakeV2RestackEnqueuer::default()),
+            re_recorder: Box::new(FakeV2BaseReRecorder::default()),
         });
         let keeper = Arc::new(SpyKeeper::default());
         let mut d = d;

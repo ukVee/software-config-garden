@@ -336,6 +336,13 @@ pub mod op {
     /// `stack` (growlightd resolved it read-only with git). One commit,
     /// `queue_v2_updated`.
     pub const QUEUE_V2_ENQUEUE_RESTACK: &str = "queue_v2_enqueue_restack";
+    /// queue v2 daemon op, keeperd↔growlightd only (never an agent-facing MCP
+    /// verb): re-record the restacked branches' bases after a restack completed
+    /// (§8, `queue-v2-git` slice 004). growlightd recomputed each branch's base
+    /// read-only with `git merge-base` and passes `entries: [{entry, base}]`;
+    /// keeperd replaces each named live entry's `base`. One commit,
+    /// `queue_v2_bases_rererecorded`.
+    pub const QUEUE_V2_RE_RECORD_BASES: &str = "queue_v2_re_record_bases";
     /// growlight Phase 2: scaffold the `growlight/` pillar — write the routing
     /// docs + embedded `protocol.md`/`session-policy.md` + the backlog/baton-log
     /// skeleton, and wire the garden nav (root map + boundary row + meta docs).
@@ -2718,6 +2725,33 @@ pub struct QueueV2EnqueueRestackReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// The commit hash, or the untouched tip on the idempotent no-op.
+    pub hash: String,
+}
+
+/// One restacked branch's re-recorded base (§8, `queue-v2-git` slice 004):
+/// growlightd recomputed it read-only with `git merge-base` after the restack
+/// completed, and keeperd writes it back onto the named live entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueV2BaseRecord {
+    /// The live entry whose `base` is re-recorded.
+    pub entry: String,
+    /// The new base (a commit hash for a local repo).
+    pub base: String,
+}
+
+/// `queue_v2_re_record_bases({entries}) -> {hash}` — the §8 re-record
+/// (`queue-v2-git` slice 004), keeperd↔growlightd only. growlightd recomputed
+/// each restacked branch's base after the restack completed and passes the
+/// `(entry, base)` pairs; keeperd replaces each named live entry's `base`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ReRecordBasesArgs {
+    /// The re-recorded `(entry, base)` pairs.
+    pub entries: Vec<QueueV2BaseRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueV2ReRecordBasesReply {
+    /// The commit hash, or the untouched tip on an all-no-op write.
     pub hash: String,
 }
 
