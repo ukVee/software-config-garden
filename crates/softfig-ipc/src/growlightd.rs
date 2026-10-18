@@ -1287,6 +1287,32 @@ pub struct QueueShowSession {
     pub lines: Vec<String>,
 }
 
+/// One slice item of a milestone's `slices.toml` tree (§3.3), as the surface
+/// reply carries it — the `id` (the `NNN`, or a sub-milestone slug) + `kind` +
+/// `status` the TUI's expanded milestone renders and its `slice_update` action
+/// addresses. The slice-list half of §6.9's "expands to its slice list".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowSlice {
+    /// `slice`: the `NNN` of `slices/NNN-<slug>.md`; `sub`: the sub-milestone slug.
+    pub id: String,
+    /// The item kind, verbatim (`slice` | `sub`).
+    pub kind: String,
+    /// The item status, verbatim (`queued` | `active` | `done` | `split` |
+    /// `blocked` | `deferred`).
+    pub status: String,
+}
+
+/// One milestone's slice tree (`slices.toml` items in file order, §3.3), as
+/// [`QueueShowReply`] carries it so a surface can expand an entry to its slice
+/// list without a second read. `milestone` is a top-level id, or `"<parent>/<sub>"`
+/// for a sub-milestone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueShowTree {
+    pub milestone: String,
+    #[serde(default)]
+    pub slices: Vec<QueueShowSlice>,
+}
+
 /// Reply to [`op::QUEUE_SHOW`]: the live v2 list and its annotations, for the
 /// `growlight status` and `queue show` surfaces (§6.9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1300,9 +1326,20 @@ pub struct QueueShowReply {
     /// One row per entry, in file (list) order.
     #[serde(default)]
     pub entries: Vec<QueueShowEntry>,
+    /// The archive rows (§3.2), in the order they left the list. Each row's
+    /// `status` carries its `final_status` (`done` | `dropped`) and `lane` is
+    /// empty (archive rows have no lane); `open` is always `false`. The TUI's
+    /// collapsed archive section (§6.9) renders these.
+    #[serde(default)]
+    pub archived: Vec<QueueShowEntry>,
     /// The §3.5 session-log lines across the list's units.
     #[serde(default)]
     pub sessions: Vec<QueueShowSession>,
+    /// Each live milestone's slice tree (§3.3), in file order — the "expands to
+    /// its slice list" half of §6.9, carried so the TUI needs no second read on
+    /// expand. A sub-milestone's identity is `"<parent>/<sub>"`.
+    #[serde(default)]
+    pub trees: Vec<QueueShowTree>,
 }
 
 /// Reply to a member verb. `state` is a documented string (like

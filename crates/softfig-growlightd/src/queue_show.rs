@@ -1,8 +1,8 @@
 //! The §6.9 **human surfaces' read model** (queue-v2-git slice 006): reduce the
 //! v2 snapshot to what `growlight status` and `queue show` render — the two
-//! lanes' entries, the per-repo stack with its **live git-stack annotations**
-//! (which branches are still open, via slice 001's stack model), and the §3.5
-//! session log.
+//! lanes' entries, the archive (§3.2), the per-repo stack with its **live
+//! git-stack annotations** (which branches are still open, via slice 001's
+//! stack model), and the §3.5 session log.
 //!
 //! ## Why growlightd owns this
 //!
@@ -25,9 +25,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use softfig_ipc::growlightd::{
-    QueueProjectStack, QueueShowEntry, QueueShowReply, QueueShowSession, QueueStackBranch,
+    QueueProjectStack, QueueShowEntry, QueueShowReply, QueueShowSession, QueueShowSlice,
+    QueueShowTree, QueueStackBranch,
 };
-use softfig_ipc::queue_v2::{milestone_path, EntryKind, SliceKind};
+use softfig_ipc::queue_v2::{
+    milestone_path, EntryKind, QueueArchiveToml, SliceKind, QUEUE_ARCHIVE_FILE,
+};
 
 use crate::git_stack::{self, Git, Repo, StackEntry};
 use crate::scheduler_v2::{EntryView, V2Snapshot};
@@ -46,7 +49,9 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
         list: true,
         projects: Vec::new(),
         entries: Vec::new(),
+        archived: Vec::new(),
         sessions: Vec::new(),
+        trees: Vec::new(),
     };
 
     // The open branches per (project, branch) — the live annotation the entry
@@ -122,6 +127,48 @@ pub fn build(snapshot: &V2Snapshot, garden_root: &Path, home: Option<&Path>) -> 
 
     for entry in &snapshot.entries {
         collect_sessions(snapshot, entry, garden_root, &mut reply.sessions);
+    }
+
+    // Each live milestone's slice tree (§3.3), in file order — the §6.9 "expands
+    // to its slice list" half. A sessionless slice is still visible here (unlike
+    // the session log, which only names a slice once it has rolled), so the TUI
+    // can address any slice's `slice_update` verb by id.
+    for (identity, tree) in &snapshot.trees {
+        reply.trees.push(QueueShowTree {
+            milestone: identity.clone(),
+            slices: tree
+                .items
+                .iter()
+                .map(|item| QueueShowSlice {
+                    id: item.id.clone(),
+                    kind: item.kind.to_string(),
+                    status: item.status.to_string(),
+                })
+                .collect(),
+        });
+    }
+
+    // The archive (§3.2): every row that left the list, `done`/`dropped` in the
+    // order it left. Read here, not from the snapshot (which reduces the archive
+    // to `done_ids` for `after` resolution) — and fail-soft: a missing or
+    // unparseable archive contributes nothing, the live lanes are the core render.
+    if let Ok(text) = std::fs::read_to_string(garden_root.join(QUEUE_ARCHIVE_FILE))
+        && let Ok(archive) = QueueArchiveToml::parse(&text)
+    {
+        for a in archive.entries {
+            reply.archived.push(QueueShowEntry {
+                id: a.row.id,
+                kind: a.row.kind.to_string(),
+                project: a.row.project,
+                lane: String::new(),
+                status: a.final_status.to_string(),
+                after: a.row.after,
+                branch: a.row.branch,
+                base: a.row.base,
+                claimed: a.row.claimed,
+                open: false,
+            });
+        }
     }
 
     reply
@@ -227,7 +274,7 @@ fn find_by_number(root: &Path, dir: &str, n: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::scheduler_v2::{ItemView, ProjectView, TreeView};
-    use softfig_ipc::queue_v2::{EntryStatus, Lane};
+    use softfig_ipc::queue_v2::{ArchivedEntry, Entry, EntryStatus, FinalStatus, Lane};
     use std::collections::BTreeMap;
     use std::fs;
     use std::process::{Command, Stdio};
@@ -446,6 +493,16 @@ mod tests {
         .unwrap();
 
         let reply = build(&snapshot, root, None);
+        // The slice tree is carried too — a sessionless slice (002) is still
+        // visible in `trees`, so the TUI can address its `slice_update` by id.
+        assert_eq!(reply.trees.len(), 1, "{:?}", reply.trees);
+        assert_eq!(reply.trees[0].milestone, "m");
+        let tree_ids: Vec<&str> = reply.trees[0]
+            .slices
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(tree_ids, vec!["001", "002"]);
         // Close-out + slice 001 have lines; slice 002 has none.
         assert_eq!(reply.sessions.len(), 2, "{:?}", reply.sessions);
         let close = reply.sessions.iter().find(|s| s.unit.is_none()).unwrap();
@@ -462,5 +519,69 @@ mod tests {
         let doc = "## Sessions\n- a\n- b\n## Next\n- not a session\n";
         assert_eq!(extract_sessions(doc), vec!["- a", "- b"]);
         assert_eq!(extract_sessions("no sections\n"), Vec::<String>::new());
+    }
+
+    /// An archive row whose `final_status` and (for a drop) `reason` are set;
+    /// the flattened entry `row` is the minimum the writer would have moved.
+    fn archived(id: &str, final_status: FinalStatus, reason: Option<&str>) -> ArchivedEntry {
+        ArchivedEntry {
+            row: Entry {
+                id: id.into(),
+                kind: EntryKind::Milestone,
+                title: "archived entry".into(),
+                project: "softfig".into(),
+                lane: Lane::Normal,
+                status: EntryStatus::Queued,
+                after: vec![],
+                added: "2026-10-01T00:00:00Z".into(),
+                branch: format!("feat/{id}"),
+                parent: String::new(),
+                base: String::new(),
+                claimed: "2026-10-01T00:00:00Z".into(),
+                follow_ups: 0,
+                pending_status: None,
+            },
+            finished: "2026-10-02T00:00:00Z".into(),
+            final_status,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn archive_rows_carry_final_status_and_no_lane() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        // No live entries — the archive is orthogonal to the live lanes.
+        let snapshot = snap(root, vec![], BTreeMap::new());
+        let archive = QueueArchiveToml::new(vec![
+            archived("done-one", FinalStatus::Done, None),
+            archived("dropped-one", FinalStatus::Dropped, Some("abandoned")),
+        ]);
+        fs::create_dir_all(root.join("growlight/backlog")).unwrap();
+        fs::write(
+            root.join(QUEUE_ARCHIVE_FILE),
+            archive.to_toml().expect("serialize archive"),
+        )
+        .unwrap();
+
+        let reply = build(&snapshot, root, None);
+        assert_eq!(reply.archived.len(), 2, "archive order is exit order");
+        let done = &reply.archived[0];
+        assert_eq!(done.id, "done-one");
+        assert_eq!(done.status, "done");
+        assert!(done.lane.is_empty(), "an archive row has no lane");
+        assert!(!done.open, "an archive row is never an open branch");
+        assert_eq!(done.project, "softfig");
+        let dropped = &reply.archived[1];
+        assert_eq!(dropped.status, "dropped");
+        assert_eq!(dropped.branch, "feat/dropped-one");
+    }
+
+    #[test]
+    fn a_missing_archive_contributes_no_rows() {
+        let repo = tempfile::tempdir().unwrap();
+        let snapshot = snap(repo.path(), vec![], BTreeMap::new());
+        let reply = build(&snapshot, repo.path(), None);
+        assert!(reply.archived.is_empty(), "no archive file → empty archive");
     }
 }

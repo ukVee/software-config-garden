@@ -120,6 +120,15 @@ fn run(
             last_fleet_poll = None;
         }
 
+        // The queue-v2 two-lane snapshot (slice 007) is a heavier garden read
+        // than the status poll, so it is one-shot: fired when marked stale (tab
+        // entry / refresh / a confirmed action), then the run loop clears the
+        // mark. It rides the same growlightd channel as the fleet/baton poll.
+        if app.should_poll_queue_v2() {
+            app.poll_queue_v2(growlightd);
+            app.growlight_v2_stale = false;
+        }
+
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {

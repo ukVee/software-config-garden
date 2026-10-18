@@ -3913,7 +3913,9 @@ mod tests {
             list: true,
             projects: Vec::new(),
             entries,
+            archived: Vec::new(),
             sessions: Vec::new(),
+            trees: Vec::new(),
         };
         let body = render_queue_lanes(&view);
         let urgent = body.find("### Urgent").expect("urgent lane");
@@ -3946,12 +3948,14 @@ mod tests {
                 }],
             }],
             entries: Vec::new(),
+            archived: Vec::new(),
             sessions: vec![QueueShowSession {
                 entry: "one".into(),
                 unit: None,
                 path: "growlight/backlog/milestones/one/CLAUDE.md".into(),
                 lines: vec!["- 2026-10-11T15:40Z · completed · reasoning · member oc · $0.04".into()],
             }],
+            trees: Vec::new(),
         };
         let body = render_annotations(&view);
         assert!(body.contains("### Stack per repo"), "{body}");

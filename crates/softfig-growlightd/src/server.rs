@@ -1060,7 +1060,9 @@ fn queue_show(daemon: &Daemon) -> Response {
                     list: false,
                     projects: Vec::new(),
                     entries: Vec::new(),
+                    archived: Vec::new(),
                     sessions: Vec::new(),
+                    trees: Vec::new(),
                 },
                 "queue_show",
             )

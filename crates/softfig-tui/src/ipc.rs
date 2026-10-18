@@ -117,6 +117,19 @@ pub enum Tag {
     /// newest-first rows. An `Err` surfaces on `self.status` like the other garden
     /// reads — the page keeps working with growlightd down (keeper-sourced).
     GrowlightBus,
+    /// growlight: the queue-v2 two-lane snapshot (`queue_show`), on the SECOND
+    /// (growlightd-only) channel — the stack annotation needs growlightd's
+    /// read-only git surface. Fired once when the tab is active and the snapshot
+    /// is marked stale (entry / refresh / a confirmed action), NOT polled. `Ok`
+    /// carries a `softfig_ipc::growlightd::QueueShowReply`; an `Err` (growlightd
+    /// down) soft-fails to `None` — the legacy tree still renders (slice 007).
+    GrowlightQueueShow,
+    /// growlight: one §6.9 mutating action (`queue_update_entry` / `queue_drop` /
+    /// `slice_update`) over the keeperd `ipc` channel. The FIRST reply of a pair
+    /// is the `dry_run` preview (opened in the confirm overlay); the second, after
+    /// confirm, is the committed write (reloads the snapshot). Distinguished by
+    /// `App::growlight_v2_pending` (Some = dry-run in flight, None = committed).
+    GrowlightQueueAction,
     /// growlight: the PROTOCOL half of the injected-context node (slice 006) — a
     /// keeperd `read_file` of `growlight/protocol.md` (the SINGLE-AGENT template,
     /// through the resolver's garden arm), fired on select. `Ok` carries a
