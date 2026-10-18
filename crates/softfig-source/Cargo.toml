@@ -5,13 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "soft-fig source snapshot + have/want transfer + sandboxed ingest/materialize (spec remote-runner §4); the SourceBackend trait with git as implementation #1."
+description = "soft-fig source snapshot + have/want transfer + sandboxed ingest/materialize (spec remote-runner §4); the SourceBackend trait with git as implementation #1, plus the fetch-step skeleton (spec §7.2)."
 
 [dependencies]
 blake3 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
+# Slice 005: skeleton extraction parses Cargo.toml for `[lib]`/`[[bin]]` target
+# paths and walks the materialized tree.
+toml = { workspace = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

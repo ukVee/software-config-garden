@@ -1,4 +1,4 @@
-//! Source-transfer errors.
+//! Source-transfer and skeleton errors.
 
 use std::io;
 
@@ -22,6 +22,9 @@ pub enum Error {
 
     #[error("bundle: {0}")]
     Bundle(String),
+
+    #[error("skeleton: {0}")]
+    Skeleton(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

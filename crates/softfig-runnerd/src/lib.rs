@@ -25,6 +25,7 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod keys;
+pub mod proxy;
 pub mod state;
 pub mod wire;
 
@@ -37,5 +38,6 @@ pub use cert::{StoredCert, StoredRevocation};
 pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
 pub use keys::RunnerKeys;
+pub use proxy::{host_allowed, EgressProxy};
 pub use state::{StateRoot, DEFAULT_STATE_ROOT};
 pub use wire::WireServer;
