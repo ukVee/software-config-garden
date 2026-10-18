@@ -1,0 +1,17 @@
+pkgbase = soft-fig
+	pkgdesc = Encrypted local-first knowledge base: FUSE garden view + growlight fleet
+	pkgver = 1.0.0_alpha.1
+	pkgrel = 1
+	url = https://github.com/ukVee/software-config-garden
+	arch = x86_64
+	license = AGPL-3.0-or-later
+	makedepends = cargo
+	makedepends = protobuf
+	makedepends = fuse3
+	depends = fuse3
+	depends = systemd
+	conflicts = soft-fig-bin
+	source = https://github.com/ukVee/software-config-garden/archive/refs/tags/v1.0.0-alpha.1.tar.gz
+	sha256sums = SKIP
+
+pkgname = soft-fig

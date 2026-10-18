@@ -1,0 +1,74 @@
+# Maintainer: <owner name> <owner email>   # PROPOSED — pending the owner's H9 answer; see ../README.md
+
+pkgname=soft-fig-bin
+pkgver=1.0.0_alpha.1
+pkgrel=1
+pkgdesc="Encrypted local-first knowledge base: FUSE garden view + growlight fleet (bin)"
+arch=('x86_64')
+url="https://github.com/ukVee/software-config-garden"
+license=('AGPL-3.0-or-later')
+depends=('fuse3' 'systemd')
+provides=('soft-fig')
+conflicts=('soft-fig')
+
+# `_tag` is the real git tag; `pkgver` its AUR-safe form. The release and tag
+# do not exist yet — the owner cuts the tag, runs the release workflow, and
+# fills in the real sha256s at publish time (../README.md). 'SKIP' until then.
+_tag="v1.0.0-alpha.1"
+_target="x86_64-unknown-linux-gnu"
+_tarball="softfig-${_tag}-${_target}-tier1.tar.gz"
+
+# The tier-1 program tarball (repackaged verbatim) + the checksum manifest it
+# ships with (SHA256SUMS), plus the systemd user units and desktop entry pinned
+# to the same tag. The units are fetched from the tag, not copied into this
+# directory, so packaging/systemd/ stays the single source of truth and the two
+# packages cannot drift apart.
+source=(
+  "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/${_tarball}"
+  "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/SHA256SUMS"
+  "softfig-keeperd.service::https://raw.githubusercontent.com/ukVee/software-config-garden/${_tag}/packaging/systemd/softfig-keeperd.service"
+  "softfig-growlightd.service::https://raw.githubusercontent.com/ukVee/software-config-garden/${_tag}/packaging/systemd/softfig-growlightd.service"
+  "softfig-tui.desktop::https://raw.githubusercontent.com/ukVee/software-config-garden/${_tag}/packaging/desktop/softfig-tui.desktop"
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+check() {
+  cd "$srcdir"
+  # Verify the tarball's sha256 against its SHA256SUMS entry before anything is
+  # installed (provenance, meta/spec-release.md → "Signing and the trust root").
+  # The manifest is `sha256sum *.tar.gz` from the release, so the tarball name
+  # is the second whitespace-separated field.
+  local expected actual
+  expected="$(awk -v f="$_tarball" '$2 == f {print $1; exit}' SHA256SUMS)"
+  if [[ -z "$expected" ]]; then
+    echo "SHA256SUMS has no entry for $_tarball" >&2
+    return 1
+  fi
+  actual="$(sha256sum "$_tarball" | awk '{print $1}')"
+  if [[ "$expected" != "$actual" ]]; then
+    echo "checksum mismatch for $_tarball" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    return 1
+  fi
+}
+
+package() {
+  cd "$srcdir"
+  # The tarball's top-level dir is softfig-<tag>-<target>/ (release.yml `stage`).
+  local stagedir="softfig-${_tag}-${_target}"
+
+  for bin in softfig softfig-keeperd softfig-growlightd softfig-mcp softfig-tui; do
+    install -Dm755 "${stagedir}/${bin}" "$pkgdir/usr/bin/${bin}"
+  done
+
+  # systemd USER units + desktop entry, same path-only substitution as the
+  # source package ("set paths, never patch defaults").
+  install -Dm644 softfig-keeperd.service "$pkgdir/usr/lib/systemd/user/softfig-keeperd.service"
+  install -Dm644 softfig-growlightd.service "$pkgdir/usr/lib/systemd/user/softfig-growlightd.service"
+  sed -i 's|%h/.local/bin/|/usr/bin/|g' \
+    "$pkgdir/usr/lib/systemd/user/softfig-keeperd.service" \
+    "$pkgdir/usr/lib/systemd/user/softfig-growlightd.service"
+
+  install -Dm644 softfig-tui.desktop "$pkgdir/usr/share/applications/softfig-tui.desktop"
+}
