@@ -26,6 +26,7 @@ pub mod daemon;
 pub mod error;
 pub mod keys;
 pub mod state;
+pub mod wire;
 
 pub use admin::{
     call as admin_call, require_owner_uid, serve_connection, AdminClient, AdminRequest,
@@ -37,3 +38,4 @@ pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
 pub use keys::RunnerKeys;
 pub use state::{StateRoot, DEFAULT_STATE_ROOT};
+pub use wire::WireServer;

@@ -42,6 +42,12 @@ pub enum NetError {
     #[error("peer refused chain {}: {}", .0.chain, .0.reason)]
     ChainRejected(Box<crate::turn::ChainRejection>),
 
+    /// The runner certificate failed verification (expired, revoked, wrong
+    /// identity, bad signature, or a handshake-static mismatch) — a
+    /// local-fallback trigger (spec §3.3), never a job.
+    #[error("runner certificate: {0}")]
+    RunnerCert(String),
+
     /// M5b: a replication sink/source failure carrying a dynamic message —
     /// a storage error, a malformed wire row, or a security-relevant check the
     /// host rejected (bad commit signature, wrong author, content-address

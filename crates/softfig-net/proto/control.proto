@@ -79,6 +79,25 @@ message Frame {
     // indistinguishable from SUCCESS, let alone from a transport failure. This
     // frame makes the refusal legible and carries the machine-readable reason.
     ChainRejected chain_rejected = 209;              // receiver -> pusher: "I will not adopt this; here is why"
+    // Remote runner (spec remote-runner): 300+. One Noise connection per job,
+    // requester device key <-> runner key; the runner certificate rides the
+    // handshake payload (like HelloPayload). Signed frames follow the same
+    // discipline as turn/ceremony/offer: the driver re-derives the signed bytes
+    // from these fields (softfig-net's `runner` module), never a re-serialization.
+    RunnerCaps runner_caps = 300;                 // runner -> requester: what this runner can do
+    JobOffer job_offer = 301;                     // requester -> runner: signed offer (spec §6)
+    JobAccept job_accept = 302;                   // runner -> requester: queued
+    JobReject job_reject = 303;                   // runner -> requester: closed reason enum
+    SourceHave source_have = 304;                 // runner -> requester: known tips (have/want, slice 004)
+    SourceChunk source_chunk = 305;               // requester -> runner: bundle bytes (slice 004)
+    JobEvent job_event = 306;                     // runner -> requester: state transition
+    JobLog job_log = 307;                         // runner -> requester: live log stream
+    JobResult job_result = 308;                   // runner -> requester: exit + signed attestation
+    ArtifactRequest artifact_request = 309;       // requester -> runner: fetch an artifact
+    ArtifactChunk artifact_chunk = 310;           // runner -> requester: artifact bytes
+    JobCancel job_cancel = 311;                   // requester -> runner: cancel a job
+    JobAttach job_attach = 312;                   // requester -> runner: attach to a detached job
+    RunnerCertRevoke runner_cert_revoke = 313;    // runner device -> ring: signed by the identity key
   }
   // 10,11 stay reserved for a future control-frame pairing step (M5a-2 pairing
   // rides entirely inside the Noise XX handshake, so none was spent). 12-19 and
@@ -86,7 +105,8 @@ message Frame {
   // plane; 200-201 is the M5d shared-key ceremony; 202 is the M5d slice-008
   // recovery hand-off; 203-206 is the M5e write-turn coordination; 207 is the
   // M5e shared-chain push (slice 002); 208 is the M5f share-offer (slice 003);
-  // 209 is the task-059 push rejection; 210+ stays open for later sync slices.
+  // 209 is the task-059 push rejection; 210-299 stay open for later sync slices;
+  // 300-313 is the remote-runner block (spec remote-runner).
   reserved 3 to 19, 23 to 99, 110 to 199;
 }
 
@@ -426,4 +446,154 @@ message ChainRejected {
   uint32 reason = 2;   // ChainRejectReason discriminant (1 = not-a-member, 2 = unknown-chain, 3 = not-ready); an unknown value is read as "other", never as success
   bytes device_id = 3; // the REJECTING device's Ed25519 identity (32 bytes); must match the session peer
   bytes signature = 4; // Ed25519 (64 bytes) over chain_rejected_signing_bytes(...)
+}
+
+// --- Remote runner (spec remote-runner), block 300+ -----------------------
+//
+// A build/test job rides one Noise connection per job, requester device key
+// <-> runner key. The delegated runner certificate rides the Noise handshake
+// payload on first contact (like `HelloPayload`); the frames below are normal
+// control-plane frames. protobuf is not canonical, so signed frames carry
+// their signature over domain-separated, length-prefixed bytes re-derived from
+// the fields (softfig-net's `runner` module) — never a protobuf re-serialization.
+
+// The delegated runner certificate (spec §3.1), carried in the handshake
+// payload. Mirrors softfig-net's `runner_cert::RunnerCert`; the signing
+// device's Ed25519 signature over the canonical cert bytes rides beside it in
+// `RunnerHandshake`.
+message RunnerCert {
+  bytes device_id = 1;               // Ed25519 identity of the SIGNING device (32 bytes)
+  bytes runner_transport_pubkey = 2; // runner X25519 static (32 bytes) — must equal the handshake static
+  bytes runner_attest_pubkey = 3;    // runner Ed25519 attest key (32 bytes)
+  bytes serial = 4;                  // 16-byte random serial (the revocation unit)
+  int64 issued_at = 5;               // Unix seconds
+  int64 expires_at = 6;              // Unix seconds (exclusive)
+}
+
+// The runner's in-handshake payload: the certificate plus the device identity's
+// signature over the canonical cert bytes (`runner_cert::signing_message`). Like
+// `HelloPayload`, it is not a Frame.
+message RunnerHandshake {
+  RunnerCert cert = 1;
+  bytes signature = 2;               // Ed25519 (64 bytes) over signing_message(cert)
+}
+
+// 300: runner -> requester. Advertised right after the handshake so the
+// requester can select least-loaded (spec §5.1).
+message RunnerCaps {
+  string arch = 1;
+  string triple = 2;
+  uint32 cores = 3;
+  uint64 mem_bytes = 4;
+  repeated string toolchains = 5;
+  uint32 max_jobs = 6;               // serve.toml max_jobs
+  uint32 active_jobs = 7;            // currently running (least-loaded selection)
+  string power = 8;                  // "ac" | "battery" | "unknown"
+}
+
+// 301: requester -> runner. Signed by the requester's Ed25519 identity (field
+// 13) over `offer_signing_bytes(...)`.
+message JobOffer {
+  bytes job_id = 1;                  // random 128-bit
+  bytes repo_key = 2;                // BLAKE3 repo key (slice 004 fills it; opaque stub here)
+  bytes source_id = 3;               // typed source id (slice 004)
+  bytes snapshot_commit = 4;         // snapshot commit (slice 004)
+  string profile = 5;
+  repeated string cmd = 6;
+  repeated EnvEntry env = 7;
+  string toolchain = 8;
+  string network = 9;                // "none" | "egress"
+  string cache = 10;                 // "shared" | "fresh"
+  repeated string artifacts = 11;
+  int64 requested_at = 12;           // Unix seconds
+  bytes signature = 13;              // Ed25519 (64 bytes) over offer_signing_bytes(...)
+}
+
+// One named environment binding (deterministic: sorted by name when signed).
+message EnvEntry {
+  string name = 1;
+  string value = 2;
+}
+
+// 302: runner -> requester. `queue_pos = 0` means running now.
+message JobAccept {
+  bytes job_id = 1;
+  uint32 queue_pos = 2;
+}
+
+// 303: runner -> requester. Closed reason enum (spec §6).
+message JobReject {
+  bytes job_id = 1;
+  uint32 reason = 2;                 // JobRejectReason (softfig-net's `runner` module)
+}
+
+// 304: runner -> requester. Known tips for a repo key (have/want, slice 004).
+message SourceHave {
+  bytes repo_key = 1;
+  repeated bytes tips = 2;
+  repeated bytes recent_commits = 3;
+}
+
+// 305: requester -> runner. Bundle bytes (have/want, slice 004).
+message SourceChunk {
+  bytes job_id = 1;
+  uint64 seq = 2;
+  bool last = 3;
+  bytes payload = 4;
+}
+
+// 306: runner -> requester. State transitions (spec §6).
+message JobEvent {
+  bytes job_id = 1;
+  uint32 state = 2;                  // JobState (softfig-net's `runner` module)
+  string detail = 3;
+}
+
+// 307: runner -> requester. Live log stream (spec §6 Logs).
+message JobLog {
+  bytes job_id = 1;
+  uint64 seq = 2;
+  uint32 stream = 3;                 // 0 = stdout, 1 = stderr, 2 = system
+  bytes bytes = 4;
+}
+
+// 308: runner -> requester. Exit + signed attestation (slice 006 fills the
+// attestation; slice 003's stub sends a canned result).
+message JobResult {
+  bytes job_id = 1;
+  int32 exit_code = 2;
+  bytes attestation = 3;             // canonical-JSON attestation (empty in the stub)
+}
+
+// 309: requester -> runner. Fetch a declared artifact (slice 006).
+message ArtifactRequest {
+  bytes job_id = 1;
+  string path = 2;
+}
+
+// 310: runner -> requester. Artifact bytes (slice 006).
+message ArtifactChunk {
+  bytes job_id = 1;
+  uint64 seq = 2;
+  bool last = 3;
+  bytes payload = 4;
+}
+
+// 311: requester -> runner. Cancel a job (spec §6).
+message JobCancel {
+  bytes job_id = 1;
+}
+
+// 312: requester -> runner. Attach to a detached job (spec §6).
+message JobAttach {
+  bytes job_id = 1;
+  uint64 from_seq = 2;
+}
+
+// 313: runner device -> ring. Signed by the device IDENTITY key (not the runner
+// attest key), so a stolen runner key cannot revoke itself (spec §3.1).
+message RunnerCertRevoke {
+  bytes device_id = 1;               // the signing device's Ed25519 identity (32 bytes)
+  bytes serial = 2;                  // the revoked 16-byte serial
+  bytes signature = 3;               // Ed25519 (64 bytes) over revocation_message(...)
 }

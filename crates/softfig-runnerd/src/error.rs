@@ -22,6 +22,9 @@ pub enum Error {
 
     #[error("admin protocol error: {0}")]
     Protocol(String),
+
+    #[error("network error: {0}")]
+    Net(#[from] softfig_net::NetError),
 }
 
 impl Error {

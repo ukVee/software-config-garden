@@ -1,12 +1,13 @@
 //! The runner's stored certificate (spec §3.1): the device identity's signed
 //! certificate, plus its signature, held at `cert.toml`.
 //!
-//! runnerd does **not** link `softfig-net`, so it cannot parse the real
-//! `RunnerCert` type. It stores the certificate as the *hex-string wire form*
-//! (the exact serde shape `softfig-net::runner_cert::RunnerCert` serializes to,
-//! shared here as a plain struct) plus the identity's signature. The fields are
-//! opaque to runnerd — it only needs to report `serial`/`expires_at` (status),
-//! hand the record to a requester's handshake (slice 003), and revoke it.
+//! runnerd stores the certificate as the *hex-string wire form* (the exact
+//! serde shape `softfig-net::runner_cert::RunnerCert` serializes to, shared here
+//! as a plain struct) plus the identity's signature. This on-disk form keeps the
+//! storage self-contained; the wire module (`wire.rs`) converts it to the
+//! protobuf `RunnerHandshake` payload for the Noise handshake (slice 003). The
+//! fields are otherwise opaque to runnerd — it reports `serial`/`expires_at`
+//! (status), hands the record to a requester's handshake, and revokes it.
 //!
 //! This struct's field set MUST stay byte-compatible with
 //! `softfig-ipc::verbs::RunnerCertWire` + a `signature` field.

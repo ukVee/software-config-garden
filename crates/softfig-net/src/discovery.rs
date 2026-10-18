@@ -203,6 +203,88 @@ fn socket_endpoint(ip: IpAddr, port: u16) -> String {
     }
 }
 
+// --- Runner discovery: `_softfig-runner._tcp` (spec remote-runner §3.3) ----
+//
+// runnerd announces a distinct service type so a requester can find a runner's
+// LAN endpoint and prefer the direct connection (LAN is always preferred over
+// the relay). The TXT carries the *signing device's* id fingerprint — the
+// runner itself has no Ed25519 identity; the requester maps the fingerprint to
+// the ring peer whose identity signs the runner's certificate. As with the
+// keeper service, authentication happens in the Noise handshake + certificate
+// verification, never in mDNS, so a spoofed announcement wastes at most one
+// failed connection. **Manual smoke** — multicast does not work headless.
+
+/// The DNS-SD service type for soft-fig runners.
+pub const RUNNER_SERVICE_TYPE: &str = "_softfig-runner._tcp.local.";
+
+/// TXT key for the signing device's id fingerprint (hex of the Ed25519 identity
+/// that signed the runner certificate).
+pub const RUNNER_TXT_DEVICE: &str = "fp";
+/// TXT key for the runner protocol version.
+pub const RUNNER_TXT_VERSION: &str = "v";
+
+/// What a runner announces on the LAN.
+#[derive(Clone, Debug)]
+pub struct RunnerAdvertisement {
+    /// Ed25519 identity of the device that signed this runner's certificate —
+    /// the id the requester resolves to a ring peer.
+    pub device_id: [u8; 32],
+    /// The TCP port runnerd's job listener is bound to.
+    pub port: u16,
+}
+
+impl RunnerAdvertisement {
+    /// Lowercase-hex fingerprint of the signing device id (the TXT `fp` value).
+    pub fn fingerprint(&self) -> String {
+        hex::encode(self.device_id)
+    }
+
+    /// The TXT properties to publish.
+    pub fn txt_properties(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (RUNNER_TXT_DEVICE.to_string(), self.fingerprint()),
+            (RUNNER_TXT_VERSION.to_string(), crate::PROTOCOL_VERSION.to_string()),
+        ])
+    }
+}
+
+/// Parse a runner's TXT record into the signing device's fingerprint (64
+/// lowercase hex chars). `None` if missing or malformed — ignore it, like a
+/// malformed keeper announcement.
+pub fn parse_runner_txt(props: &HashMap<String, String>) -> Option<String> {
+    let fp = props.get(RUNNER_TXT_DEVICE)?.to_ascii_lowercase();
+    if fp.len() != 64 || hex::decode(&fp).is_err() {
+        return None;
+    }
+    Some(fp)
+}
+
+/// Announce this runner on the LAN. **Manual smoke step** (multicast).
+pub fn announce_runner(
+    daemon: &ServiceDaemon,
+    ad: &RunnerAdvertisement,
+    instance_name: &str,
+    host_name: &str,
+    addrs: &[IpAddr],
+) -> Result<String> {
+    let info = ServiceInfo::new(
+        RUNNER_SERVICE_TYPE,
+        instance_name,
+        host_name,
+        addrs,
+        ad.port,
+        ad.txt_properties(),
+    )?;
+    let fullname = info.get_fullname().to_string();
+    daemon.register(info)?;
+    Ok(fullname)
+}
+
+/// Start browsing for soft-fig runners. **Manual smoke step** (multicast).
+pub fn browse_runner(daemon: &ServiceDaemon) -> Result<Receiver<ServiceEvent>> {
+    Ok(daemon.browse(RUNNER_SERVICE_TYPE)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +407,22 @@ mod tests {
             endpoints: vec!["10.0.0.5:9100".into()],
         };
         assert!(!refresh_ring_endpoints(&mut ring, &peer));
+    }
+
+    #[test]
+    fn runner_txt_round_trips_and_rejects_malformed() {
+        let ad = RunnerAdvertisement {
+            device_id: SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes(),
+            port: 9200,
+        };
+        let parsed = parse_runner_txt(&ad.txt_properties()).expect("valid runner txt");
+        assert_eq!(parsed, ad.fingerprint());
+
+        // Missing / malformed fingerprint is ignored, not trusted.
+        assert!(parse_runner_txt(&HashMap::new()).is_none());
+        let bad = HashMap::from([(RUNNER_TXT_DEVICE.to_string(), "z".repeat(64))]);
+        assert!(parse_runner_txt(&bad).is_none());
+        let short = HashMap::from([(RUNNER_TXT_DEVICE.to_string(), "ab".to_string())]);
+        assert!(parse_runner_txt(&short).is_none());
     }
 }

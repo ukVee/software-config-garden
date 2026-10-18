@@ -22,6 +22,14 @@ toml.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 libc.workspace = true
+# Slice 003: the wire listener. runnerd links softfig-net for the Noise
+# transport + control-plane frames + the runner certificate handshake. This does
+# NOT pull in softfig-vault (softfig-net is vault-free), so the "never links
+# softfig-vault / never reads a garden" constraint still holds (spec §3.1).
+softfig-net.workspace = true
+# Runner mDNS (_softfig-runner._tcp) announce; the mdns-sd ServiceDaemon is
+# owned here and handed to softfig-net's discovery helpers.
+mdns-sd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

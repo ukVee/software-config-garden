@@ -41,13 +41,21 @@ use prost::Message;
 use snow::{HandshakeState, StatelessTransportState};
 
 use crate::error::{NetError, Result};
-use crate::proto::{Frame, HelloPayload};
+use crate::proto::{Frame, HelloPayload, RunnerHandshake};
+use crate::attest::SIG_LEN;
 
 const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 /// Length of an X25519 static key.
 const KEY_LEN: usize = 32;
+
+/// On-wire length of Noise `XX` message 1: just the initiator's ephemeral `e`
+/// (32 bytes), sent in the clear before any key is shared — so no AEAD tag.
+/// `IK` message 1 additionally carries `es, s, ss`, so it is always much longer
+/// (>= 144 bytes). The runner's single listener uses this as the XX-vs-IK
+/// discriminator (see [`runner_responder`]).
+const XX_FIRST_MSG_LEN: usize = 32;
 
 /// Length of the Noise handshake hash. BLAKE2s (our Noise hash) is 256-bit, so
 /// `get_handshake_hash()` always returns 32 bytes; the SAS is derived from it.
@@ -369,6 +377,146 @@ pub fn ik_responder<S: Read + Write>(
     finish(io, hs, peer_hello)
 }
 
+/// A session whose peer is a **runner** (spec remote-runner §3.3): the runner
+/// certificate rode the handshake payload where a `HelloPayload` would. The
+/// inner [`NoiseSession`] holds the transport state (its `peer_hello` is the
+/// default — the runner sent a certificate, not a hello); this wrapper carries
+/// the parsed certificate and its signature.
+pub struct RunnerSession<S> {
+    session: NoiseSession<S>,
+    cert: crate::proto::RunnerCert,
+    signature: [u8; SIG_LEN],
+}
+
+impl<S> RunnerSession<S> {
+    /// The runner's authenticated X25519 transport static.
+    pub fn peer_static(&self) -> &[u8; KEY_LEN] {
+        self.session.peer_static()
+    }
+
+    /// The runner certificate that rode the handshake (proto wire form).
+    pub fn cert(&self) -> &crate::proto::RunnerCert {
+        &self.cert
+    }
+
+    /// The signing device's Ed25519 signature over the certificate.
+    pub fn signature(&self) -> &[u8; SIG_LEN] {
+        &self.signature
+    }
+
+    /// The Noise handshake hash (SAS derivation, if ever needed here).
+    pub fn handshake_hash(&self) -> &[u8; HASH_LEN] {
+        self.session.handshake_hash()
+    }
+}
+
+impl<S: Read + Write> RunnerSession<S> {
+    /// Send an arbitrary-length message (see [`NoiseSession::send_bytes`]).
+    pub fn send_bytes(&mut self, msg: &[u8]) -> Result<()> {
+        self.session.send_bytes(msg)
+    }
+
+    /// Receive one message (see [`NoiseSession::recv_bytes`]).
+    pub fn recv_bytes(&mut self) -> Result<Vec<u8>> {
+        self.session.recv_bytes()
+    }
+
+    /// Send a protobuf control [`Frame`].
+    pub fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        self.session.send_frame(frame)
+    }
+
+    /// Receive a protobuf control [`Frame`].
+    pub fn recv_frame(&mut self) -> Result<Frame> {
+        self.session.recv_frame()
+    }
+}
+
+// --- Runner handshakes (spec remote-runner §3.3) --------------------------
+//
+// First contact is Noise `XX` (the initiator learns the runner's static key +
+// certificate in-band); reconnects use `IK` keyed by the cached static. The
+// runner's certificate rides the responder's handshake payload in both, where a
+// device's `HelloPayload` would. The requester still presents its own
+// `HelloPayload` (with the transport attestation), so the runner can verify it
+// against `accept.toml`.
+
+/// Run the runner `XX` handshake as the **initiator** (first contact). Sends
+/// our [`HelloPayload`]; reads the runner's [`RunnerHandshake`] payload.
+pub fn runner_xx_initiator<S: Read + Write>(
+    mut io: S,
+    local_private: &[u8; KEY_LEN],
+    hello: &HelloPayload,
+) -> Result<RunnerSession<S>> {
+    let mut hs = build_handshake(NOISE_XX, local_private, None, true)?;
+    let mut buf = vec![0u8; NOISE_MAX_MSG];
+
+    // -> e
+    let n = hs.write_message(&[], &mut buf)?;
+    write_lp(&mut io, &buf[..n])?;
+    // <- e, ee, s, es   (the runner's certificate)
+    let (cert, signature) = read_runner_handshake(&mut hs, &read_lp(&mut io)?)?;
+    // -> s, se          (our hello)
+    let n = hs.write_message(&hello.encode_to_vec(), &mut buf)?;
+    write_lp(&mut io, &buf[..n])?;
+
+    finish_runner(io, hs, cert, signature)
+}
+
+/// Run the runner `IK` handshake as the **initiator** (reconnect; we hold the
+/// runner's cached static). Sends our [`HelloPayload`]; reads the runner's
+/// [`RunnerHandshake`].
+pub fn runner_ik_initiator<S: Read + Write>(
+    mut io: S,
+    local_private: &[u8; KEY_LEN],
+    remote_static: &[u8; KEY_LEN],
+    hello: &HelloPayload,
+) -> Result<RunnerSession<S>> {
+    let mut hs = build_handshake(NOISE_IK, local_private, Some(remote_static), true)?;
+    let mut buf = vec![0u8; NOISE_MAX_MSG];
+
+    // -> e, es, s, ss   (our hello)
+    let n = hs.write_message(&hello.encode_to_vec(), &mut buf)?;
+    write_lp(&mut io, &buf[..n])?;
+    // <- e, ee, se      (the runner's certificate)
+    let (cert, signature) = read_runner_handshake(&mut hs, &read_lp(&mut io)?)?;
+
+    finish_runner(io, hs, cert, signature)
+}
+
+/// Run the runner handshake as the **responder** (the runnerd side). One
+/// listener serves both first-contact `XX` and reconnect `IK`; the pattern is
+/// chosen by peeking the first message — Noise `XX` message 1 is exactly
+/// [`XX_FIRST_MSG_LEN`] bytes (ephemeral + tag), while `IK` message 1 carries
+/// the initiator's static + payload and is always longer. Sends our
+/// [`RunnerHandshake`]; reads the requester's [`HelloPayload`] (returned inside
+/// the session's `peer_hello`).
+pub fn runner_responder<S: Read + Write>(
+    mut io: S,
+    local_private: &[u8; KEY_LEN],
+    handshake: &RunnerHandshake,
+) -> Result<NoiseSession<S>> {
+    let first = read_lp(&mut io)?;
+    let mut buf = vec![0u8; NOISE_MAX_MSG];
+
+    if first.len() == XX_FIRST_MSG_LEN {
+        // XX: message 1 is empty; then our certificate, then the peer's hello.
+        let mut hs = build_handshake(NOISE_XX, local_private, None, false)?;
+        read_handshake_hello(&mut hs, &first)?;
+        let n = hs.write_message(&handshake.encode_to_vec(), &mut buf)?;
+        write_lp(&mut io, &buf[..n])?;
+        let peer_hello = read_handshake_hello(&mut hs, &read_lp(&mut io)?)?;
+        finish(io, hs, peer_hello)
+    } else {
+        // IK: message 1 carries the initiator's hello; then our certificate.
+        let mut hs = build_handshake(NOISE_IK, local_private, None, false)?;
+        let peer_hello = read_handshake_hello(&mut hs, &first)?;
+        let n = hs.write_message(&handshake.encode_to_vec(), &mut buf)?;
+        write_lp(&mut io, &buf[..n])?;
+        finish(io, hs, peer_hello)
+    }
+}
+
 // --- Internals -------------------------------------------------------------
 
 fn build_handshake(
@@ -400,6 +548,27 @@ fn read_handshake_hello(hs: &mut HandshakeState, msg: &[u8]) -> Result<HelloPayl
     Ok(HelloPayload::decode(&payload[..n])?)
 }
 
+/// Decrypt a handshake message whose payload is the runner's
+/// [`RunnerHandshake`] (certificate + signature). Returns the cert message and
+/// the 64-byte signature, validating the signature length.
+fn read_runner_handshake(
+    hs: &mut HandshakeState,
+    msg: &[u8],
+) -> Result<(crate::proto::RunnerCert, [u8; SIG_LEN])> {
+    let mut payload = vec![0u8; msg.len()];
+    let n = hs.read_message(msg, &mut payload)?;
+    let rh = RunnerHandshake::decode(&payload[..n])?;
+    let cert = rh
+        .cert
+        .ok_or(NetError::Protocol("runner handshake missing certificate"))?;
+    let signature: [u8; SIG_LEN] = rh
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| NetError::Protocol("runner handshake signature wrong length"))?;
+    Ok((cert, signature))
+}
+
 /// Capture the peer static and the handshake hash (both before the handshake
 /// state is consumed), then transition into stateless transport mode.
 fn finish<S>(io: S, hs: HandshakeState, peer_hello: HelloPayload) -> Result<NoiseSession<S>> {
@@ -414,6 +583,33 @@ fn finish<S>(io: S, hs: HandshakeState, peer_hello: HelloPayload) -> Result<Nois
         peer_static,
         peer_hello,
         handshake_hash,
+    })
+}
+
+/// Like [`finish`], but the peer presented a runner certificate rather than a
+/// `HelloPayload`. The inner [`NoiseSession`]'s `peer_hello` is the default
+/// (unused); the certificate + signature live in the [`RunnerSession`] wrapper.
+fn finish_runner<S>(
+    io: S,
+    hs: HandshakeState,
+    cert: crate::proto::RunnerCert,
+    signature: [u8; SIG_LEN],
+) -> Result<RunnerSession<S>> {
+    let peer_static = remote_static(&hs)?;
+    let handshake_hash = handshake_hash(&hs)?;
+    let transport = hs.into_stateless_transport_mode()?;
+    Ok(RunnerSession {
+        session: NoiseSession {
+            io,
+            transport,
+            send_nonce: 0,
+            recv_nonce: 0,
+            peer_static,
+            peer_hello: HelloPayload::default(),
+            handshake_hash,
+        },
+        cert,
+        signature,
     })
 }
 
@@ -552,6 +748,66 @@ mod tests {
         );
         // The initiator then fails too (responder dropped the connection).
         assert!(client.is_err());
+    }
+
+    #[test]
+    fn runner_xx_handshake_exchanges_certificate() {
+        let sk_r = [60u8; 32];
+        let sk_i = [61u8; 32];
+        let handshake = crate::proto::RunnerHandshake {
+            cert: Some(crate::proto::RunnerCert {
+                device_id: vec![9u8; 32],
+                runner_transport_pubkey: x25519_dalek::x25519(
+                    sk_r,
+                    x25519_dalek::X25519_BASEPOINT_BYTES,
+                )
+                .to_vec(),
+                runner_attest_pubkey: vec![8u8; 32],
+                serial: vec![7u8; 16],
+                issued_at: 1,
+                expires_at: 2,
+            }),
+            signature: vec![6u8; SIG_LEN],
+        };
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let responder = thread::spawn(move || {
+            let s = runner_responder(b, &sk_r, &handshake).unwrap();
+            assert_eq!(s.peer_hello().device_name, "initiator");
+        });
+        let initiator = runner_xx_initiator(a, &sk_i, &hello("initiator")).unwrap();
+        assert_eq!(initiator.cert().device_id, vec![9u8; 32]);
+        assert_eq!(initiator.signature(), &[6u8; SIG_LEN]);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn runner_ik_reconnect_uses_the_discriminator() {
+        let sk_r = [62u8; 32];
+        let sk_i = [63u8; 32];
+        let static_r = x25519_dalek::x25519(sk_r, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let handshake = crate::proto::RunnerHandshake {
+            cert: Some(crate::proto::RunnerCert {
+                device_id: vec![9u8; 32],
+                runner_transport_pubkey: static_r.to_vec(),
+                runner_attest_pubkey: vec![8u8; 32],
+                serial: vec![7u8; 16],
+                issued_at: 1,
+                expires_at: 2,
+            }),
+            signature: vec![6u8; SIG_LEN],
+        };
+
+        // The initiator already holds the runner's static (cached), so it dials
+        // IK; the responder's single listener must pick IK by the message length.
+        let (a, b) = UnixStream::pair().unwrap();
+        let responder = thread::spawn(move || {
+            let s = runner_responder(b, &sk_r, &handshake).unwrap();
+            assert_eq!(s.peer_hello().device_name, "initiator");
+        });
+        let initiator = runner_ik_initiator(a, &sk_i, &static_r, &hello("initiator")).unwrap();
+        assert_eq!(initiator.peer_static(), &static_r);
+        responder.join().unwrap();
     }
 
     #[test]

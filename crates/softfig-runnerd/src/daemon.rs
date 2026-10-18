@@ -46,6 +46,12 @@ impl Runner {
         })
     }
 
+    /// The runner's state root (so the binary can bind the wire listener
+    /// beside the admin socket).
+    pub fn state_root(&self) -> &StateRoot {
+        &self.root
+    }
+
     /// Bind the admin socket and serve verbs until the listener errors or the
     /// process exits. The `SO_PEERCRED` gate admits only `owner_uid`.
     pub fn serve(self, admin_socket: &Path) -> Result<()> {

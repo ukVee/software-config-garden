@@ -11,10 +11,13 @@ mod generated {
 }
 
 pub use generated::{
-    frame, ChainRejected, CommitData, DeviceStateAnnounce, Frame, GetCommit, GetObject, GetTip,
-    GetTree, HelloPayload, ObjectData, Ping, Pong, RelayConnect, RelayData, ReplicaDone,
-    ReplicaGrant, ShareOffer, SharedChainPush, SharedKeyCommit, SharedKeyHandoff, SharedKeyReveal,
-    StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg, TurnRequest, TurnRevoke, TurnYield,
+    frame, ArtifactChunk, ArtifactRequest, ChainRejected, CommitData, DeviceStateAnnounce,
+    EnvEntry, Frame, GetCommit, GetObject, GetTip, GetTree, HelloPayload, JobAccept, JobAttach,
+    JobCancel, JobEvent, JobLog, JobOffer, JobReject, JobResult, ObjectData, Ping, Pong,
+    RelayConnect, RelayData, ReplicaDone, ReplicaGrant, RunnerCaps, RunnerCert, RunnerCertRevoke,
+    RunnerHandshake, ShareOffer, SharedChainPush, SharedKeyCommit, SharedKeyHandoff,
+    SharedKeyReveal, SourceChunk, SourceHave, StateAnnounce, TipAnnounce, TreeData, TreeEntryMsg,
+    TurnRequest, TurnRevoke, TurnYield,
 };
 
 /// Redacting `Debug` for the M5d recovery hand-off (slice 015 / LEAK-1). The
@@ -234,6 +237,52 @@ impl Frame {
     pub fn chain_rejected(rejected: ChainRejected) -> Self {
         Self {
             kind: Some(frame::Kind::ChainRejected(rejected)),
+        }
+    }
+}
+
+// --- Remote runner frame constructors (spec remote-runner) ---------------
+
+impl Frame {
+    /// A `RunnerCaps` frame (runner -> requester): advertise capabilities.
+    pub fn runner_caps(caps: RunnerCaps) -> Self {
+        Self {
+            kind: Some(frame::Kind::RunnerCaps(caps)),
+        }
+    }
+
+    /// A `JobOffer` frame (requester -> runner).
+    pub fn job_offer(offer: JobOffer) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobOffer(offer)),
+        }
+    }
+
+    /// A `JobAccept` frame (runner -> requester).
+    pub fn job_accept(accept: JobAccept) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobAccept(accept)),
+        }
+    }
+
+    /// A `JobReject` frame (runner -> requester).
+    pub fn job_reject(reject: JobReject) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobReject(reject)),
+        }
+    }
+
+    /// A `JobResult` frame (runner -> requester).
+    pub fn job_result(result: JobResult) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobResult(result)),
+        }
+    }
+
+    /// A `RunnerCertRevoke` frame (runner device -> ring).
+    pub fn runner_cert_revoke(revoke: RunnerCertRevoke) -> Self {
+        Self {
+            kind: Some(frame::Kind::RunnerCertRevoke(revoke)),
         }
     }
 }
