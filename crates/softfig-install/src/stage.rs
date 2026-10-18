@@ -259,6 +259,67 @@ mod tests {
         );
     }
 
+    /// The precise 077 regression: a mid-swap mix of two same-version builds
+    /// reads as one *version* but not one *identity*, so a re-run swaps —
+    /// never a no-op — and the mix converges instead of persisting.
+    #[test]
+    fn a_same_version_mixed_prefix_swaps_not_noop() {
+        let source = source_with_id("1.0.0-alpha.1", "bbb");
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        // Mid-swap: three binaries already at the new build, two still the old
+        // build — same version throughout, no marker.
+        for (i, &name) in INSTALLED_SET.iter().enumerate() {
+            let id = if i < 3 { "bbb" } else { "aaa" };
+            write_binary_id(&prefix, name, "1.0.0-alpha.1", id);
+        }
+
+        let before = SetReport::scan(&prefix);
+        // The version agrees — the pre-077 idempotency key would have called
+        // this clean and kept the mix.
+        assert_eq!(before.consistent_version(), Some("1.0.0-alpha.1"), "{before}");
+        assert_eq!(
+            before.consistent_identity(),
+            None,
+            "mixed build ids at one version must read partial: {before}"
+        );
+
+        let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
+        assert!(!outcome.is_noop(), "a mixed prefix must be repaired, not kept: {outcome:?}");
+        assert_eq!(
+            SetReport::scan(&prefix).consistent_identity(),
+            Some(("1.0.0-alpha.1", "bbb"))
+        );
+    }
+
+    /// A re-run over an interrupted same-version swap converges to a clean set:
+    /// the marker is cleared and every binary lands on the one new build.
+    #[test]
+    fn a_rerun_repairs_an_interrupted_same_version_swap() {
+        let source = source_with_id("1.0.0-alpha.1", "bbb");
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        // Mid-rename: some binaries at the new build, some at the old, and the
+        // swap-in-progress marker left behind by the crash.
+        for (i, &name) in INSTALLED_SET.iter().enumerate() {
+            let id = if i < 3 { "bbb" } else { "aaa" };
+            write_binary_id(&prefix, name, "1.0.0-alpha.1", id);
+        }
+        std::fs::write(prefix.join(SWAP_IN_PROGRESS_MARKER), b"version 1.0.0-alpha.1\n").unwrap();
+
+        let before = SetReport::scan(&prefix);
+        assert!(before.swap_in_progress);
+        assert_eq!(before.consistent_identity(), None, "a marked set reads partial: {before}");
+
+        let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
+        assert!(!outcome.is_noop(), "an interrupted swap must be repaired, not skipped: {outcome:?}");
+
+        let after = SetReport::scan(&prefix);
+        assert!(!after.swap_in_progress, "the repair must clear the marker: {after}");
+        assert_eq!(after.consistent_identity(), Some(("1.0.0-alpha.1", "bbb")));
+        assert!(!prefix.join(SWAP_IN_PROGRESS_MARKER).exists());
+    }
+
     /// A version bump records the replaced version.
     #[test]
     fn a_version_bump_records_the_replaced_version() {

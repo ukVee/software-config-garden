@@ -249,17 +249,16 @@ fn report_status(socket: &Path, set: std::io::Result<SetReport>) -> Result<()> {
             } else if set.consistent_version().is_none() {
                 problems.push(format!("partial install: {set}"));
             }
-            if handshake_ok {
-                if let Some(daemon_dir) = &daemon_exe_dir {
-                    if daemon_dir != &set.dir {
-                        problems.push(format!(
-                            "two installs at one version: the daemon runs from {} but this \
-                             `softfig` is in {}",
-                            daemon_dir.display(),
-                            set.dir.display(),
-                        ));
-                    }
-                }
+            if handshake_ok
+                && let Some(daemon_dir) = &daemon_exe_dir
+                && daemon_dir != &set.dir
+            {
+                problems.push(format!(
+                    "two installs at one version: the daemon runs from {} but this \
+                     `softfig` is in {}",
+                    daemon_dir.display(),
+                    set.dir.display(),
+                ));
             }
         }
         Err(e) => println!("installed set   (could not find this binary's directory: {e})"),
