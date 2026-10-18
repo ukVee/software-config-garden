@@ -18,16 +18,21 @@ env:
 # No `cargo fmt` job here: the tree is not yet rustfmt-clean, so fmt would be
 # red on arrival. `cargo clippy --all-targets -- -D warnings` (the clippy job
 # below) is this repo's style gate, per CLAUDE.md's build/test/run section.
+#
+# Every action is pinned to a full commit SHA, never a floating tag — a mutable
+# `@v4` can be repointed by a compromised action repo (meta/spec-install.md →
+# "CI pipeline" → "hardening"). The `# <tag>` comment names the ref the SHA was
+# taken from.
 jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -36,9 +41,9 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo test --workspace --no-fail-fast
@@ -47,9 +52,9 @@ jobs:
     name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo build --workspace --release
@@ -58,11 +63,20 @@ jobs:
     name: msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.88"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo check --workspace --all-targets
+
+  deny:
+    name: deny (advisories + licenses + bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check

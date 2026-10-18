@@ -1,0 +1,74 @@
+# cargo-deny config — the supply-chain gate (release-pipeline slice 004;
+# meta/spec-install.md → "CI pipeline" → "dependency gate", and
+# meta/spec-release.md → "What CI must prove"). The `deny` job in ci.yml runs
+# `cargo deny check` against this file on every push and PR.
+#
+# Four checks, four sections below. The project is AGPL-3.0-or-later; its
+# dependency tree (including the feature-gated `gui`/iced subtree, which is in
+# Cargo.lock even though it is not built by default) compiles into the release
+# binaries, so it is gated here too.
+
+[advisories]
+# A vulnerable, unmaintained, or yanked crate fails the gate (the default lint
+# for the advisories check). `ignore` is the reviewed-and-accepted exception
+# list: one entry per advisory, with a reason and a re-check date — never a
+# blanket mute. Every entry here is tracked as a growlight report so it is not
+# silently forgotten.
+ignore = [
+    # lru 0.12 (softfig-fuse, ratatui) and lru 0.16.4 (transitive) are both
+    # below the 0.18.2 fix for a `pop()` use-after-free; 0.12 is also below the
+    # 0.16.3 `IterMut` fix. Upgrading softfig-fuse to 0.18 and ratatui's
+    # transitive 0.12 is a dependency-hygiene slice, not this one. Re-check when
+    # that slice lands. (growlight report: security)
+    "RUSTSEC-2026-0253",
+    "RUSTSEC-2026-0002",
+    # fuser 0.14 (softfig-fuse's FUSE bindings) has an uninitialized-memory
+    # read/leak, fixed in 0.16. Upgrading the FUSE bindings is a
+    # dependency-hygiene slice. Re-check when it lands. (growlight report:
+    # security)
+    "RUSTSEC-2021-0154",
+    # `paste` is unmaintained and archived; it is a transitive dependency of
+    # ratatui 0.29, which we cannot drop. No safe upgrade exists.
+    # (growlight report: finding)
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# Permissive licenses and weak (file-level) copyleft are fine; strong copyleft
+# is not, except the project's own AGPL-3.0-or-later. Every crate we link must
+# fall in the allow list or carry a named exception.
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "OpenSSL",
+    "0BSD",
+    "CC0-1.0",
+]
+# A crate whose license expression can't be read at this confidence is treated
+# as unlicensed and fails, rather than being waved through on a guess.
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+# The workspace inherits versions via `[workspace.dependencies]` + `foo.workspace
+# = true`; cargo-deny cannot resolve workspace inheritance, so it reads those as
+# wildcards (and even reports an `unresolved-workspace-dependency` bug). The
+# wildcard check is therefore meaningless for this tree — the inherited versions
+# are pinned in the root Cargo.toml, not `*`.
+wildcards = "allow"
+# Banned crates go here (e.g. a known-bad yanked-but-still-listed crate).
+deny = []
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
