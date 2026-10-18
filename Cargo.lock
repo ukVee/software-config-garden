@@ -3741,6 +3741,9 @@ dependencies = [
 name = "softfig-install"
 version = "1.0.0-alpha.1"
 dependencies = [
+ "anyhow",
+ "clap",
+ "semver",
  "softfig-ipc",
  "tempfile",
  "thiserror 2.0.18",

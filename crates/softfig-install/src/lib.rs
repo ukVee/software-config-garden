@@ -1,17 +1,23 @@
 //! soft-fig install/upgrade helper — the consumer-side machinery from
-//! `meta/spec-install.md`, starting with the **atomic installed-set swap**
-//! (release-pipeline slice 003; round-2 decision 7, generalized from the
-//! original "four" to the reconciled five-binary set).
+//! `meta/spec-install.md`. It holds the pieces install and upgrade share:
 //!
-//! This crate is the home for the pieces install and upgrade share: the swap
-//! routine now, and (later slices) the OS/supervisor detection, the toolchain
-//! gate, and the front-door binary. It is kept small on purpose — slice 005
-//! builds it as a static-musl helper binary, so its dependency tree *is* the
-//! install trust root.
+//! - [`swap`] — the **atomic installed-set swap** (release-pipeline slice 003;
+//!   round-2 decision 7, generalized from the original "four" to the
+//!   reconciled five-binary set).
+//! - [`detect`] — OS/distro + supervisor detection (slice 005).
+//! - [`gate`] — the toolchain gate: distro `rustc` vs the workspace
+//!   `rust-version`, with the `rustup` bootstrap fallback (slice 005).
+//! - [`prompt`] — the consented, reversible offer model for the integration
+//!   steps (systemd unit, MCP registration) (slice 005).
+//!
+//! The front-door binary (`[[bin]] softfig-install`, `src/main.rs`) composes
+//! these. This crate is kept small on purpose: it is built as a static-musl
+//! helper binary, so its dependency tree *is* the install trust root
+//! (`meta/spec-install.md` → "Download integrity").
 //!
 //! # The atomic swap
 //!
-//! [`swap_binaries`] moves a staged set of binaries into the install
+//! [`swap::swap_binaries`] moves a staged set of binaries into the install
 //! directory, all-or-nothing to the limit `rename(2)` allows.
 //!
 //! ## Crash-window analysis
@@ -23,13 +29,14 @@
 //!
 //! - **Phase 1 (validate) mutates nothing.** Every member of `set` must exist
 //!   at `staged_dir/<name>` and be an executable regular file, or the swap
-//!   returns [`SwapError::StagedIncomplete`] *before the first rename*. A
-//!   half-swap can never start from an incomplete staged set.
+//!   returns [`SwapError::StagedIncomplete`](swap::SwapError::StagedIncomplete)
+//!   *before the first rename*. A half-swap can never start from an incomplete
+//!   staged set.
 //! - **Phase 2 (swap) renames each `staged_dir/<name>` over `target_dir/<name>`
 //!   in `set` order.** A crash mid-phase leaves some names at the new build and
 //!   some at the old: a partial install. `softfig_ipc::compat::SetReport::scan`
 //!   detects it (`consistent_version()` is `None`), and a re-run of the swap —
-//!   with the staged dir re-populated, which is what the upgrade path does when
+//!   with the staged dir re-populated, which is what the install path does when
 //!   it re-stages from the build output — converges, because every name is
 //!   renamed to the new build regardless of what it held before.
 //! - **Ordering.** The set is renamed in `softfig_ipc::compat::INSTALLED_SET`
@@ -45,8 +52,7 @@
 //!
 //! `rename(2)` fails with `EXDEV` across filesystems, so `staged_dir` must live
 //! on the same filesystem as `target_dir`. The helper stages in a sibling temp
-//! dir of the install directory, never `/tmp` on a tmpfs — slice 005's job,
-//! named here so the footgun is not silently forgotten.
+//! dir of the install directory, never `/tmp` on a tmpfs.
 //!
 //! ## Binary-format-agnostic
 //!
@@ -57,6 +63,9 @@
 
 #![forbid(unsafe_code)]
 
-mod swap;
+pub mod detect;
+pub mod gate;
+pub mod prompt;
+pub mod swap;
 
 pub use swap::{swap_binaries, Result, SwapError};

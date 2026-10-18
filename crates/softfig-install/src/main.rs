@@ -1,0 +1,342 @@
+//! `softfig-install` — the downloaded, prebuilt front door (round-2 decision
+//! 5, `meta/spec-install.md` workstream B). Detects OS + supervisor, gates the
+//! toolchain, builds the program from source, installs the reconciled binary
+//! set atomically, offers the consented + reversible integration steps
+//! (systemd unit, MCP registration), then hands off to `softfig onboard`.
+//!
+//! Idempotent: re-running on an installed device is a repair / no-op, not a
+//! duplicate (the growlight `init` "idempotent retrofit" is the model).
+//!
+//! Posture, mirroring `scripts/onboard-device.sh`: the build, install, fuse3
+//! and PATH checks are **automatic**; the unit install and MCP registration
+//! are **prompted, reversible, user-consented** — never silent.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use softfig_install::detect::{which, Distro, Supervisor};
+use softfig_install::gate::{self, Gate};
+use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
+use softfig_install::swap::swap_binaries;
+use softfig_ipc::compat::{SetReport, INSTALLED_SET};
+
+#[derive(Parser, Debug)]
+#[command(name = "softfig-install", version, about = "soft-fig: the guided install front door")]
+struct Cli {
+    /// Build an existing source checkout at this path (default: the current dir).
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// Clone this repo URL instead of building an existing checkout.
+    #[arg(long)]
+    repo: Option<String>,
+    /// The tag/ref to check out when cloning with `--repo`.
+    #[arg(long)]
+    r#ref: Option<String>,
+    /// Install the binaries here (default: ~/.local/bin).
+    #[arg(long)]
+    prefix: Option<PathBuf>,
+    /// The garden path handed to `softfig onboard` (default: ~/soft-fig_garden).
+    #[arg(long)]
+    garden: Option<PathBuf>,
+    /// Consent to every offered step (unit + MCP registration) without prompting.
+    #[arg(long)]
+    yes: bool,
+    /// Decline every offered step without prompting.
+    #[arg(long)]
+    no: bool,
+    /// Detect + gate + print the plan, then stop before building or touching anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let mut consent: Box<dyn Consent> = if cli.yes {
+        Box::new(Fixed(Answer::Yes))
+    } else if cli.no {
+        Box::new(Fixed(Answer::No))
+    } else {
+        Box::new(Tty)
+    };
+
+    if let Err(err) = run(cli, consent.as_mut()) {
+        // A failed toolchain gate already printed its own actionable message
+        // (the rustup command) inside `run`; everything else is a real error.
+        eprintln!("softfig-install: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
+    // 1. Detect and report.
+    let distro = Distro::detect(Path::new("/"));
+    let supervisor = Supervisor::detect();
+    println!("soft-fig install");
+    println!("  distro:     {}", distro.report());
+    println!("  supervisor: {}", supervisor.describe());
+
+    // 2. Toolchain gate — refuse here, before anything is built or touched.
+    let gate = Gate::probe();
+    if !gate.is_ok() {
+        println!("{}", gate::failure_message(&gate));
+        anyhow::bail!("toolchain gate failed");
+    }
+
+    // 3. Dry run: detection + gate are the only side-effect-free facts; stop
+    //    before the build (which is real work) and before any filesystem touch.
+    if cli.dry_run {
+        println!("dry run: detection + toolchain gate passed; stopping before build/install.");
+        return Ok(());
+    }
+
+    // 4. Resolve the source directory (clone, or an existing checkout).
+    let (source, _keep) = resolve_source(&cli)?;
+
+    // 5. Build the program from source.
+    build_program(&source)?;
+
+    // 6. Stage + atomically install the reconciled set (idempotent).
+    let prefix = cli.prefix.unwrap_or_else(default_bin_dir);
+    install_set(&source, &prefix)?;
+
+    // 7. Non-fatal environment checks (fuse3, PATH).
+    check_fuse(&distro);
+    check_path(&prefix);
+
+    // 8. Consented, reversible integration steps.
+    offer_unit(consent, &source, &supervisor);
+    offer_mcp(consent, &prefix);
+
+    // 9. Hand off to `softfig onboard`.
+    handoff(&prefix, cli.garden.as_deref());
+    Ok(())
+}
+
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_bin_dir() -> PathBuf {
+    home().join(".local/bin")
+}
+
+fn default_garden() -> PathBuf {
+    home().join("soft-fig_garden")
+}
+
+/// Resolve where the program source lives: a `--repo` clone (into a temp dir
+/// the caller keeps alive), or an existing `--source` checkout (default `.`).
+fn resolve_source(cli: &Cli) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    if let Some(repo) = &cli.repo {
+        let r#ref = cli
+            .r#ref
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--repo requires --ref <tag> (the tagged source to build)"))?;
+        println!("cloning {repo} at {ref}…");
+        let dir = tempfile::Builder::new()
+            .prefix("softfig-src-")
+            .tempdir()
+            .context("creating a temp dir for the clone")?;
+        let status = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", "--branch", r#ref, repo])
+            .arg(dir.path())
+            .status()
+            .context("running git clone")?;
+        if !status.success() {
+            anyhow::bail!("git clone failed (exit {status})");
+        }
+        return Ok((dir.path().to_path_buf(), Some(dir)));
+    }
+    let source = cli
+        .source
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    Ok((source, None))
+}
+
+/// `cargo build --release --locked` in the source root — the same build the
+/// release workflow runs (`meta/spec-release.md` → "What CI must prove").
+fn build_program(source: &Path) -> Result<()> {
+    println!("building the program from source (cargo build --release --locked)…");
+    let status = std::process::Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--locked")
+        .current_dir(source)
+        .status()
+        .context("running cargo build")?;
+    if !status.success() {
+        anyhow::bail!("cargo build failed (exit {status})");
+    }
+    Ok(())
+}
+
+/// Stage the five freshly-built binaries into a same-filesystem temp dir and
+/// atomically swap them into `prefix`. Idempotent: a prefix already carrying a
+/// consistent set at the freshly-built version is a no-op.
+fn install_set(source: &Path, prefix: &Path) -> Result<()> {
+    let target_dir = source.join("target/release");
+
+    // Idempotency short-circuit: the installed set and the built set agree on
+    // one version ⇒ nothing to do (a repair re-run converges via the swap).
+    let installed = SetReport::scan(prefix).consistent_version().map(str::to_string);
+    let built = SetReport::scan(&target_dir).consistent_version().map(str::to_string);
+    if let (Some(a), Some(b)) = (&installed, &built)
+        && a == b
+    {
+        println!("already installed: {a} in {} — nothing to do", prefix.display());
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
+    // Stage beside the prefix (same filesystem), never /tmp on a tmpfs — the
+    // crate doc's same-filesystem note.
+    let staging = tempfile::Builder::new()
+        .prefix(".softfig-stage-")
+        .tempdir_in(prefix.parent().unwrap_or(prefix))
+        .context("creating the staging dir")?;
+    for name in INSTALLED_SET {
+        let from = target_dir.join(name);
+        if !from.is_file() {
+            anyhow::bail!(
+                "built binary missing: {} — did `cargo build --release` produce the installed set?",
+                from.display()
+            );
+        }
+        std::fs::copy(&from, staging.path().join(name))
+            .with_context(|| format!("staging {}", from.display()))?;
+    }
+
+    swap_binaries(staging.path(), prefix, &INSTALLED_SET)
+        .map_err(|e| anyhow::anyhow!("atomic install failed: {e}"))?;
+    println!("installed: {}", SetReport::scan(prefix));
+    Ok(())
+}
+
+/// Non-fatal fuse3 check — the daemon mounts its plaintext view over FUSE.
+fn check_fuse(distro: &Distro) {
+    let present = which("fusermount3") || Path::new("/dev/fuse").exists();
+    if present {
+        println!("fuse3 present.");
+        return;
+    }
+    let hint = distro
+        .fuse_package_command()
+        .map(|c| format!(" — install it first ({c})"))
+        .unwrap_or_default();
+    println!("WARNING: fuse3 not found{hint} before starting the daemon.");
+}
+
+/// Non-fatal PATH check — `~/.local/bin` must be on PATH for `softfig` to work.
+fn check_path(prefix: &Path) {
+    let on_path = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|d| d == prefix)
+    });
+    if !on_path {
+        println!(
+            "NOTE: {} is not on your PATH — add it to your shell profile.",
+            prefix.display()
+        );
+    }
+}
+
+/// The consented, reversible systemd unit install.
+fn offer_unit(consent: &mut dyn Consent, source: &Path, supervisor: &Supervisor) {
+    if *supervisor != Supervisor::SystemdUser {
+        println!(
+            "no systemd user bus — skipping the daemon unit offer \
+             (start the daemon in the foreground instead)."
+        );
+        return;
+    }
+    let unit_src = source.join("packaging/systemd/softfig-keeperd.service");
+    if !unit_src.is_file() {
+        println!("unit file not found in source ({}) — skipping the unit offer.", unit_src.display());
+        return;
+    }
+    let offer = Offer {
+        id: "systemd-unit",
+        summary: "Install + enable the softfig-keeperd systemd user unit (auto-start the daemon at login)?".to_string(),
+        undo: "systemctl --user disable --now softfig-keeperd.service && \
+               rm ~/.config/systemd/user/softfig-keeperd.service"
+            .to_string(),
+    };
+    if consent.ask(&offer) != Answer::Yes {
+        println!("skipped unit install — start the daemon manually with: softfig daemon start");
+        return;
+    }
+    let unit_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"))
+        .join("systemd/user");
+    if let Err(e) = install_unit(&unit_src, &unit_dir) {
+        println!("unit install failed: {e}");
+        return;
+    }
+    let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now", "softfig-keeperd.service"])
+        .status();
+    println!("unit enabled (reversible: {})", offer.undo);
+}
+
+fn install_unit(src: &Path, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::copy(src, dir.join("softfig-keeperd.service"))?;
+    Ok(())
+}
+
+/// The consented, reversible MCP registration (writes `~/.claude.json` via the
+/// `claude` CLI — the same `claude mcp add --scope user` as onboard-device.sh).
+fn offer_mcp(consent: &mut dyn Consent, prefix: &Path) {
+    let bin = prefix.join("softfig-mcp");
+    if !which("claude") {
+        println!(
+            "'claude' CLI not found — skipping MCP registration. \
+             Register later with: claude mcp add --scope user softfig-mcp {}",
+            bin.display()
+        );
+        return;
+    }
+    let offer = Offer {
+        id: "mcp-registration",
+        summary: "Register softfig-mcp with Claude Code (writes ~/.claude.json)?".to_string(),
+        undo: "claude mcp remove --scope user softfig-mcp".to_string(),
+    };
+    if consent.ask(&offer) != Answer::Yes {
+        println!(
+            "skipped MCP registration — register later with: \
+             claude mcp add --scope user softfig-mcp {}",
+            bin.display()
+        );
+        return;
+    }
+    let status = std::process::Command::new("claude")
+        .args(["mcp", "add", "--scope", "user", "softfig-mcp"])
+        .arg(&bin)
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("registered softfig-mcp (reversible: {})", offer.undo),
+        Ok(s) => println!("MCP registration exited {s}"),
+        Err(e) => println!("MCP registration failed: {e}"),
+    }
+}
+
+/// The hand-off: print the exact `softfig onboard` / unlock steps. (`softfig
+/// onboard` is interactive — it needs a passphrase at a TTY — so the helper
+/// prints it rather than exec-ing it and stealing the passphrase prompt.)
+fn handoff(prefix: &Path, garden: Option<&Path>) {
+    let softfig = prefix.join("softfig");
+    let default = default_garden();
+    let garden = garden.unwrap_or(&default);
+    println!();
+    println!("Done. Next:");
+    println!("  1. Scaffold the garden (interactive — needs a passphrase at a TTY):");
+    println!("       {} onboard --garden-root {}", softfig.display(), garden.display());
+    println!("  2. Unlock the session once per boot:");
+    println!("       {} daemon unlock", softfig.display());
+    println!("See docs/onboard-laptop.md for the full walkthrough.");
+}
