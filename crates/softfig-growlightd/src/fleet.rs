@@ -703,7 +703,7 @@ fn build_claude_backend(
         daemon.hub.clone(),
         PreApproval::new(
             agents_dir.to_path_buf(),
-            fleet_protocol(garden_root),
+            fleet_protocol(garden_root, fleet.queue),
             garden_root.to_path_buf(),
             softfig_mcp_path(),
             claude_dir(),
@@ -770,7 +770,7 @@ fn build_opencode_backend(
         OpencodePreApproval::new(
             agents_dir.to_path_buf(),
             garden_root.to_path_buf(),
-            fleet_protocol(garden_root),
+            fleet_protocol(garden_root, fleet.queue),
             runtime_grant_root(),
             softfig_mcp_path(),
             claude_dir(),
@@ -861,6 +861,10 @@ const PILLAR: &str = "growlight";
 /// injects. growlightd only ever spawns fleet members, so this is the protocol
 /// every pre-approval it generates carries.
 const FLEET_PROTOCOL_FILE: &str = "protocol-fleet.md";
+/// The queue-v2 fleet-member protocol filename (queue-v2-git slice 005) — the
+/// legacy [`FLEET_PROTOCOL_FILE`] plus the §10 v2 changes, injected instead of it
+/// only when `queue = "v2"` (§11). The legacy file stays byte-unchanged.
+const FLEET_PROTOCOL_V2_FILE: &str = "protocol-fleet-v2.md";
 
 /// The runtime budget file inside the growlight namespace — the ONE name the
 /// headless capture writes and every reader (the loop protocol's §2b boot check,
@@ -870,10 +874,15 @@ const USAGE_FILE: &str = "usage.json";
 
 /// The garden path to the fleet-member protocol the SessionStart hook injects.
 /// Pure + named so the fleet/single-agent split is a tested choice, not an inline
-/// literal: a fleet member injects `protocol-fleet.md`, NEVER the single-agent
-/// `protocol.md`.
-fn fleet_protocol(garden_root: &Path) -> PathBuf {
-    garden_root.join(PILLAR).join(FLEET_PROTOCOL_FILE)
+/// literal: a fleet member injects `protocol-fleet.md` (or, under `queue = "v2"`,
+/// `protocol-fleet-v2.md`), NEVER the single-agent `protocol.md`. The §11 switch
+/// picks the file; the legacy file is unchanged under either mode.
+fn fleet_protocol(garden_root: &Path, queue: QueueMode) -> PathBuf {
+    let file = match queue {
+        QueueMode::V2 => FLEET_PROTOCOL_V2_FILE,
+        QueueMode::Legacy => FLEET_PROTOCOL_FILE,
+    };
+    garden_root.join(PILLAR).join(file)
 }
 
 /// Assemble (via [`assemble_fleet`]) and spawn the live drive-loop thread — iff
@@ -934,12 +943,36 @@ mod tests {
         // fleet variant (protocol-fleet.md) — never the single-agent protocol.md
         // that `softfig growlight start` injects. This is the slice-002 split that
         // closes the self-pull double-assignment race.
-        let p = fleet_protocol(Path::new("/garden"));
+        let p = fleet_protocol(Path::new("/garden"), QueueMode::Legacy);
         assert_eq!(p, Path::new("/garden/growlight/protocol-fleet.md"));
         assert_ne!(
             p.file_name().unwrap(),
             "protocol.md",
             "a fleet member must NOT inject the single-agent self-pull protocol",
+        );
+    }
+
+    #[test]
+    fn the_queue_switch_selects_the_v2_protocol() {
+        // The §11 switch: `queue = "legacy"` injects the legacy fleet file, `v2`
+        // injects protocol-fleet-v2.md (queue-v2-git slice 005). The legacy file
+        // is byte-unchanged under both modes.
+        assert_eq!(
+            fleet_protocol(Path::new("/garden"), QueueMode::Legacy),
+            Path::new("/garden/growlight/protocol-fleet.md"),
+            "legacy mode injects the legacy fleet protocol",
+        );
+        assert_eq!(
+            fleet_protocol(Path::new("/garden"), QueueMode::V2),
+            Path::new("/garden/growlight/protocol-fleet-v2.md"),
+            "v2 mode injects the v2 fleet protocol",
+        );
+        assert_ne!(
+            fleet_protocol(Path::new("/garden"), QueueMode::V2)
+                .file_name()
+                .unwrap(),
+            "protocol.md",
+            "a v2 member must NOT inject the single-agent self-pull protocol",
         );
     }
 

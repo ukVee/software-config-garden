@@ -40,6 +40,14 @@ const PROTOCOL_FLEET_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../templates/growlight/protocol-fleet.md"
 ));
+/// The queue-v2 fleet-member variant (queue-v2-git slice 005) — the legacy
+/// [`PROTOCOL_FLEET_MD`] plus the §10 v2 changes (roll verbs, the cap, planning,
+/// declared lines). growlightd injects this instead of the legacy file only when
+/// `queue = "v2"`; the legacy file is byte-unchanged.
+const PROTOCOL_FLEET_V2_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../templates/growlight/protocol-fleet-v2.md"
+));
 /// The claude-memory rules opencode sessions get by `{file:}` reference: the read
 /// half always, the write half only where memory is writable (opencode-v2-repin
 /// slice 005).
@@ -113,10 +121,11 @@ pub fn growlight_init(daemon: &Daemon, args: serde_json::Value) -> HandlerResult
         // never clobbered if the MCP verbs already seeded it). The numbered
         // folders get a `.seq` seed so their first entry counts from 001,
         // materializing the dir as a tracked entity at the same time.
-        let pillar: [(String, String); 12] = [
+        let pillar: [(String, String); 13] = [
             (paths::pillar_claude(), paths::pillar_claude_stub()),
             (paths::protocol_md(), PROTOCOL_MD.to_string()),
             (paths::protocol_fleet_md(), PROTOCOL_FLEET_MD.to_string()),
+            (paths::protocol_fleet_v2_md(), PROTOCOL_FLEET_V2_MD.to_string()),
             (paths::memory_read_md(), MEMORY_READ_MD.to_string()),
             (paths::memory_write_md(), MEMORY_WRITE_MD.to_string()),
             (paths::session_policy_md(), SESSION_POLICY_MD.to_string()),
@@ -272,7 +281,7 @@ fn current_tip(inner: &DaemonInner) -> Result<String, (ErrorKind, String)> {
 
 #[cfg(test)]
 mod template_tests {
-    use super::{PROTOCOL_FLEET_MD, PROTOCOL_MD};
+    use super::{PROTOCOL_FLEET_MD, PROTOCOL_FLEET_V2_MD, PROTOCOL_MD};
 
     /// The boundary between the shared steps (1–6) and the mode-specific
     /// continuation (step 7). The two protocols are byte-identical before this
@@ -294,6 +303,79 @@ mod template_tests {
         assert_eq!(s, f, "the shared protocol prefix must stay byte-identical");
     }
 
+    /// The boundary between the shared steps (1–3) and the v2-specific
+    /// continuation (3b) for the fleet/v2 pair (queue-v2-git slice 005). The v2
+    /// protocol is the fleet protocol plus §10's changes, so everything before
+    /// step 3b is the SAME text; only the v2 continuation differs.
+    const STEP_3B: &str = "3b. DAEMON RESTART";
+
+    #[test]
+    fn fleet_and_v2_protocols_share_steps_1_through_3() {
+        let f = PROTOCOL_FLEET_MD
+            .split_once(STEP_3B)
+            .expect("fleet protocol has a step 3b")
+            .0;
+        let v = PROTOCOL_FLEET_V2_MD
+            .split_once(STEP_3B)
+            .expect("v2 protocol has a step 3b")
+            .0;
+        // Intro + steps 1–3 are the SAME text — the v2 file is the legacy fleet
+        // protocol plus §10's changes, so a shared step edited in one file fails
+        // this until both are synced.
+        assert_eq!(f, v, "the shared fleet/v2 prefix must stay byte-identical");
+    }
+
+    #[test]
+    fn v2_protocol_keeps_step_3c_byte_identical() {
+        // Step 3c (REPORT) sits between the changed 3b and 4, so it is outside the
+        // shared-prefix guard — assert it stays byte-identical on its own.
+        fn section(doc: &str) -> &str {
+            doc.split_once("3c. REPORT.")
+                .expect("protocol has a step 3c")
+                .1
+                .split_once("4. HUMAN CHECKPOINTS.")
+                .expect("step 3c is followed by step 4")
+                .0
+        }
+        assert_eq!(
+            section(PROTOCOL_FLEET_MD),
+            section(PROTOCOL_FLEET_V2_MD),
+            "step 3c must stay byte-identical between the fleet and v2 protocols"
+        );
+    }
+
+    #[test]
+    fn v2_protocol_carries_the_section_10_changes() {
+        // Each §10 change is pinned so an edit can't silently regress the v2
+        // contract: the roll/close verbs must be named, and the legacy handoff
+        // endings it replaces must be gone.
+        let v = PROTOCOL_FLEET_V2_MD;
+        for verb in [
+            "`growlight_add_follow_up_session`",
+            "`growlight_complete_slice`",
+            "`growlight_block`",
+            "`growlight_complete_entry`",
+            "`growlight_add_sub_milestone`",
+            "`slice_insert`",
+        ] {
+            assert!(v.contains(verb), "v2 protocol must name {verb}");
+        }
+        assert!(v.contains(
+            "Never edit a `> Model:`, `> Grants:` or `> Worktree:` line"
+        ));
+        assert!(v.contains("Do NOT call `set_item_status`"));
+        // The legacy endings §10 replaces are gone from the v2 text.
+        assert!(!v.contains("log_baton"), "v2 protocol must not keep log_baton");
+        assert!(
+            !v.contains("set status STUCK"),
+            "v2 protocol must not keep the legacy STUCK ending"
+        );
+        assert!(
+            !v.contains("status BLOCKED_ON_HUMAN"),
+            "v2 protocol must not keep the legacy BLOCKED_ON_HUMAN ending"
+        );
+    }
+
     /// Task 048 leg C: §2b's budget rule must stay a `resets_at` judgement, not
     /// an age one. The prose is the only thing that makes a *member* refuse to
     /// echo a fossil's percentage into its baton head (there is no code path
@@ -303,7 +385,11 @@ mod template_tests {
     fn session_budget_step_judges_a_window_by_its_reset_boundary() {
         // §2b lives in the shared prefix, so asserting once per protocol keeps
         // both honest even if the drift guard above is ever relaxed.
-        for (name, doc) in [("single-agent", PROTOCOL_MD), ("fleet", PROTOCOL_FLEET_MD)] {
+        for (name, doc) in [
+            ("single-agent", PROTOCOL_MD),
+            ("fleet", PROTOCOL_FLEET_MD),
+            ("v2", PROTOCOL_FLEET_V2_MD),
+        ] {
             let step = doc
                 .split_once("2b. SESSION BUDGET")
                 .unwrap_or_else(|| panic!("{name} protocol has a step 2b"))
