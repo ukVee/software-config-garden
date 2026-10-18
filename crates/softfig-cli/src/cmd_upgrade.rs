@@ -737,4 +737,73 @@ mod tests {
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         assert!(declared_version(dir.path()).is_err());
     }
+
+    // ---- release-pipeline: confirm_upgraded failure paths (slice 002) ----
+
+    /// A `status` reply scripting the two fields `confirm_upgraded` reads: the
+    /// daemon's build (`axes.binary`) and its executable path (`exe`).
+    /// `binary: None` scripts a pre-stamp daemon (no `axes`), `exe: None` a
+    /// daemon that does not report its executable.
+    fn confirm_status_json(binary: Option<&str>, exe: Option<&str>) -> serde_json::Value {
+        json!({
+            "state": "unlocked",
+            "tip": null,
+            "garden_root": "/g",
+            "protocol_version": PROTOCOL_VERSION,
+            "relock_enabled": true,
+            "axes": binary.map(|b| json!({
+                "binary": b,
+                "ipc_protocol": PROTOCOL_VERSION,
+                "store_schema": 1,
+                "wire_protocol": 1,
+                "queue_v2_schema": 1,
+            })),
+            "exe": exe,
+        })
+    }
+
+    #[test]
+    fn confirm_upgraded_errors_when_the_daemon_did_not_land_on_the_new_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stale.sock");
+        let mock = spawn_status_daemon(
+            &socket,
+            confirm_status_json(Some("0.9.0"), Some("/usr/bin/softfig")),
+        );
+        let err = confirm_upgraded(&socket, "1.0.0-alpha.1").unwrap_err();
+        mock.join().unwrap();
+        assert!(err.to_string().contains("cycle again"), "got: {err}");
+    }
+
+    #[test]
+    fn confirm_upgraded_errors_when_the_exe_was_replaced_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("replaced.sock");
+        let mock = spawn_status_daemon(
+            &socket,
+            confirm_status_json(Some("1.0.0-alpha.1"), Some("/usr/bin/softfig (deleted)")),
+        );
+        let err = confirm_upgraded(&socket, "1.0.0-alpha.1").unwrap_err();
+        mock.join().unwrap();
+        assert!(err.to_string().contains("replaced on disk"), "got: {err}");
+        assert!(err.to_string().contains("cycle the daemon again"), "got: {err}");
+    }
+
+    #[test]
+    fn confirm_upgraded_accepts_a_clean_upgraded_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("clean.sock");
+        let mock = spawn_status_daemon(
+            &socket,
+            confirm_status_json(Some("1.0.0-alpha.1"), Some("/usr/bin/softfig")),
+        );
+        confirm_upgraded(&socket, "1.0.0-alpha.1").unwrap();
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn confirm_upgraded_reports_an_absent_daemon_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        confirm_upgraded(&dir.path().join("absent.sock"), "1.0.0-alpha.1").unwrap();
+    }
 }
