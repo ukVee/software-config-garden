@@ -124,7 +124,17 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
         },
     }
 
-    // 5. Warn about a live growlight loop (spec-growlight §12), then cycle the
+    // 5. Run pending migrations with the newly-installed binary, BEFORE the
+    //    daemon cycle. A schema-bumping release must apply its migration while
+    //    the old daemon is still up, not after the new daemon boots and refuses
+    //    the old store (report 055). The garden is resolved from the daemon
+    //    explicitly — this process's cwd is the source checkout, never the
+    //    garden.
+    if !args.no_migrate {
+        run_migrations(&prefix, daemon_garden_root(&socket).as_deref())?;
+    }
+
+    // 6. Warn about a live growlight loop (spec-growlight §12), then cycle the
     //    daemon if one is running.
     warn_if_growlight_live();
 
@@ -149,12 +159,6 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
         }
     } else {
         println!("daemon not running — nothing to cycle; start it with `softfig daemon start`.");
-    }
-
-    // 6. Run pending migrations via the *newly-installed* binary (it matches
-    //    the new daemon; this process would be refused as a stale client).
-    if !args.no_migrate {
-        run_migrations(&prefix);
     }
 
     // 7. Confirm the running daemon now reports the new version.
@@ -287,33 +291,51 @@ fn warn_if_growlight_live() {
     }
 }
 
-/// Run pending migrations with the newly-installed `softfig` binary: print
-/// `migrate` status, and if the garden is mid-migration (`prepared`), run
-/// `migrate finalize`. The one-time `split` / `config` / `reindex` conversions
-/// are idempotent and remain manual. Best-effort — the version confirmation
-/// below is the hard gate; the store schema check is the daemon's own boot
-/// gate (a refused schema shows up as a failed cycle above).
-fn run_migrations(prefix: &Path) {
+/// Run pending migrations with the newly-installed `softfig` binary, BEFORE the
+/// daemon cycle (report 055): print `migrate` status against the daemon's garden
+/// (resolved explicitly — never from this process's cwd, which is the source
+/// checkout), and if the garden is mid-migration (`prepared`), run
+/// `migrate finalize`. A failed migration now fails the upgrade with the remedy
+/// instead of being swallowed. The one-time `split` / `config` / `reindex`
+/// conversions are idempotent and remain manual.
+fn run_migrations(prefix: &Path, garden_root: Option<&str>) -> Result<()> {
     let softfig = prefix.join("softfig");
-    println!("checking migrations (`softfig migrate`)…");
-    let status = match run_captured(&softfig, &["migrate"]) {
-        Ok(out) => {
-            print!("{out}");
-            out
-        }
-        Err(e) => {
-            println!("migrate status failed: {e:#}");
-            return;
-        }
+
+    // No daemon ⇒ no garden to migrate: the store-schema gate runs the
+    // migration at the next daemon boot, so there is nothing to do here.
+    let Some(garden) = garden_root else {
+        println!("daemon not running — migrations will run at the next daemon boot.");
+        return Ok(());
     };
-    if status.contains("prepared (or finalized)")
-        && status.contains("run `softfig migrate finalize`")
-    {
+
+    println!("checking migrations (`softfig migrate --garden {garden}`)…");
+    let status = run_captured(&softfig, &["migrate", "--garden", garden])
+        .with_context(|| "migration check failed — fix it by hand (`softfig migrate`), then re-run `softfig upgrade`")?;
+    print!("{status}");
+    if needs_finalize(&status) {
         println!("finalizing the migration (`softfig migrate finalize`)…");
-        match run_captured(&softfig, &["migrate", "finalize"]) {
-            Ok(out) => print!("{out}"),
-            Err(e) => println!("migrate finalize failed: {e:#} — run it by hand after the daemon is up"),
-        }
+        let out = run_captured(&softfig, &["migrate", "finalize"])
+            .with_context(|| "migration failed — fix it by hand (`softfig migrate`), then re-run `softfig upgrade`")?;
+        print!("{out}");
+    }
+    Ok(())
+}
+
+/// Does a `migrate` status output name a prepared-but-not-finalized garden?
+fn needs_finalize(status: &str) -> bool {
+    status.contains("prepared (or finalized)")
+        && status.contains("run `softfig migrate finalize`")
+}
+
+/// The garden the running daemon owns, from its `status` reply. `None` when no
+/// daemon is running or the reply is unexpected.
+fn daemon_garden_root(socket: &Path) -> Option<String> {
+    match try_daemon_call(socket, op::STATUS, serde_json::Value::Null) {
+        Ok(Some(v)) => serde_json::from_value::<StatusReply>(v)
+            .ok()
+            .map(|r| r.garden_root)
+            .filter(|g| !g.is_empty()),
+        _ => None,
     }
 }
 
@@ -409,5 +431,20 @@ mod tests {
     fn a_downgrade_is_never_an_upgrade() {
         assert!(!support_window_allows(&v("1.1.0"), &v("1.0.0")));
         assert!(!support_window_allows(&v("1.0.1"), &v("1.0.0")));
+    }
+
+    #[test]
+    fn finalize_is_gated_on_both_status_markers() {
+        // A prepared-but-not-finalized garden prints both markers.
+        let prepared = "phase             prepared (or finalized)\n\
+                        next              run `softfig migrate finalize` once FUSE is mounted\n";
+        assert!(needs_finalize(prepared));
+        // A garden with a state_root but nothing left to delete prints the
+        // phase marker without the finalize instruction — not a finalize.
+        let migrated = "phase             prepared (or finalized)\n\
+                        next              fully migrated; nothing to do\n";
+        assert!(!needs_finalize(migrated));
+        // An unmigrated garden prints neither.
+        assert!(!needs_finalize("phase             unmigrated (no keeper.toml)\n"));
     }
 }
