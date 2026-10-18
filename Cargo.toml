@@ -17,6 +17,7 @@ members = [
     "crates/softfig-deploy",
     "crates/softfig-net",
     "crates/softfig-sandbox",
+    "crates/softfig-source",
     "crates/softfig-runnerd",
 ]
 
@@ -40,6 +41,7 @@ softfig-onboard = { path = "crates/softfig-onboard" }
 softfig-deploy  = { path = "crates/softfig-deploy" }
 softfig-net     = { path = "crates/softfig-net" }
 softfig-sandbox = { path = "crates/softfig-sandbox" }
+softfig-source  = { path = "crates/softfig-source" }
 softfig-runnerd = { path = "crates/softfig-runnerd" }
 
 # Crypto

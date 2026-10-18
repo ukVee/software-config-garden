@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::attest::{KEY_LEN, SIG_LEN};
 use crate::error::{NetError, Result};
 use crate::pairing::LocalDevice;
-use crate::proto::{self, frame, Frame, JobOffer, JobResult, RunnerCaps, RunnerCertRevoke};
+use crate::proto::{self, frame, Frame, JobOffer, JobResult, RunnerCaps, RunnerCertRevoke, SourceChunk};
 use crate::runner_cert::{self, RUNNER_SERIAL_LEN};
 use crate::transport::{runner_ik_initiator, runner_xx_initiator, RunnerSession};
 
@@ -393,14 +393,24 @@ pub fn connect_runner<S: Read + Write>(
     Ok((session, cert))
 }
 
-/// Run one job over an established runner session: read the runner's
-/// [`RunnerCaps`] (advertised right after the handshake), send the signed
-/// [`JobOffer`], then read the [`JobAccept`]/[`JobReject`] and — on accept — the
-/// stub [`JobResult`]. The caller signs the offer (keeperd holds the secret).
-pub fn run_job<S: Read + Write>(
+/// Run one job over an established runner session, including the source
+/// transfer (spec §4.3, §6): read the runner's [`RunnerCaps`], send the signed
+/// [`JobOffer`], read [`JobAccept`]/[`JobReject`], then — on accept — read the
+/// runner's [`SourceHave`] and stream the have/want bundle (produced by
+/// `make_bundle`) as [`SourceChunk`]s before reading the [`JobResult`] (or a
+/// [`JobReject`] carrying `source-mismatch`). The caller signs the offer
+/// (keeperd holds the secret); `make_bundle` receives the runner's tips +
+/// parents and returns the bundle bytes (`softfig_source::create_bundle`).
+pub fn run_job<S, F, E>(
     session: &mut RunnerSession<S>,
     offer: &JobOffer,
-) -> Result<(RunnerCaps, JobOutcome)> {
+    make_bundle: F,
+) -> Result<(RunnerCaps, JobOutcome)>
+where
+    S: Read + Write,
+    F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
+    E: std::fmt::Display,
+{
     let caps = match session.recv_frame()?.kind {
         Some(frame::Kind::RunnerCaps(c)) => c,
         _ => return Err(NetError::Protocol("expected RunnerCaps after handshake")),
@@ -408,11 +418,25 @@ pub fn run_job<S: Read + Write>(
     session.send_frame(&Frame::job_offer(offer.clone()))?;
     match session.recv_frame()?.kind {
         Some(frame::Kind::JobAccept(_)) => {
-            let result = match session.recv_frame()?.kind {
-                Some(frame::Kind::JobResult(r)) => r,
-                _ => return Err(NetError::Protocol("expected JobResult after JobAccept")),
+            let haves = match session.recv_frame()?.kind {
+                Some(frame::Kind::SourceHave(h)) => h,
+                _ => return Err(NetError::Protocol("expected SourceHave after JobAccept")),
             };
-            Ok((caps, JobOutcome::Accepted(result)))
+            let mut have_list: Vec<Vec<u8>> = Vec::new();
+            have_list.extend(haves.tips);
+            have_list.extend(haves.recent_commits);
+            let bundle = make_bundle(&have_list).map_err(|e| NetError::Source(e.to_string()))?;
+            stream_chunks(session, &offer.job_id, &bundle)?;
+            match session.recv_frame()?.kind {
+                Some(frame::Kind::JobResult(r)) => Ok((caps, JobOutcome::Accepted(r))),
+                Some(frame::Kind::JobReject(r)) => {
+                    let reason = JobRejectReason::from_u32(r.reason).ok_or(NetError::Protocol(
+                        "runner sent an unknown reject reason",
+                    ))?;
+                    Ok((caps, JobOutcome::Rejected(reason)))
+                }
+                _ => Err(NetError::Protocol("expected JobResult or JobReject after transfer")),
+            }
         }
         Some(frame::Kind::JobReject(r)) => {
             let reason = JobRejectReason::from_u32(r.reason)
@@ -421,6 +445,30 @@ pub fn run_job<S: Read + Write>(
         }
         _ => Err(NetError::Protocol("expected JobAccept or JobReject")),
     }
+}
+
+/// Stream `bundle` as [`SourceChunk`] frames (bounded chunks, `seq` + `last`).
+fn stream_chunks<S: Read + Write>(
+    session: &mut RunnerSession<S>,
+    job_id: &[u8],
+    bundle: &[u8],
+) -> Result<()> {
+    const CHUNK: usize = 256 * 1024;
+    let chunks: Vec<&[u8]> = if bundle.is_empty() {
+        vec![bundle]
+    } else {
+        bundle.chunks(CHUNK).collect()
+    };
+    let n = chunks.len();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        session.send_frame(&Frame::source_chunk(SourceChunk {
+            job_id: job_id.to_vec(),
+            seq: i as u64,
+            last: i == n - 1,
+            payload: chunk.to_vec(),
+        }))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -30,6 +30,12 @@ softfig-net.workspace = true
 # Runner mDNS (_softfig-runner._tcp) announce; the mdns-sd ServiceDaemon is
 # owned here and handed to softfig-net's discovery helpers.
 mdns-sd.workspace = true
+# Slice 004: the source step (git snapshot have/want bundle, ingest, verify,
+# materialize). Vault-free, so the "never links softfig-vault" constraint holds.
+softfig-source.workspace = true
+# Slice 004 materializes the ingested tree into a scratch dir (the real
+# sandboxed job dir lands in slice 006).
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

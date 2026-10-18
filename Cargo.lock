@@ -3882,6 +3882,7 @@ dependencies = [
  "serde",
  "serde_json",
  "softfig-net",
+ "softfig-source",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -3899,6 +3900,16 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "softfig-source"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "blake3",
+ "hex",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

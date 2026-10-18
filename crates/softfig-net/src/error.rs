@@ -48,6 +48,11 @@ pub enum NetError {
     #[error("runner certificate: {0}")]
     RunnerCert(String),
 
+    /// A source-transfer failure on the requester side (snapshot/bundle build
+    /// failed — e.g. a git error) carrying a dynamic message. Slice 004.
+    #[error("source: {0}")]
+    Source(String),
+
     /// M5b: a replication sink/source failure carrying a dynamic message —
     /// a storage error, a malformed wire row, or a security-relevant check the
     /// host rejected (bad commit signature, wrong author, content-address

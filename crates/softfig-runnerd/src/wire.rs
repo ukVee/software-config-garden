@@ -18,7 +18,8 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
-use softfig_net::proto::{frame, Frame, JobAccept, JobReject, JobResult, RunnerCaps, RunnerHandshake};
+use softfig_net::proto::{frame, Frame, JobAccept, JobReject, JobResult, RunnerCaps, RunnerHandshake, SourceHave};
+use softfig_source::SourceBackend;
 
 use crate::cert::StoredCert;
 use crate::config::{AcceptConfig, ServeConfig};
@@ -112,12 +113,10 @@ impl WireServer {
                     job_id: offer.job_id.clone(),
                     queue_pos: 0,
                 }))?;
-                // Stub executor: a canned result, no real execution (slice 006).
-                session.send_frame(&Frame::job_result(JobResult {
-                    job_id: offer.job_id,
-                    exit_code: 0,
-                    attestation: Vec::new(),
-                }))?;
+                // Slice 004: the source step — negotiate have/want, read the
+                // bundle, ingest + verify (rejecting `source-mismatch`), and
+                // materialize. Real execution lands in slice 006.
+                self.serve_source(&mut session, &offer)?;
             }
             Some(reason) => {
                 session.send_frame(&Frame::job_reject(JobReject {
@@ -199,6 +198,85 @@ impl WireServer {
             active_jobs: 0,
             power: "unknown".into(),
         }
+    }
+    /// Serve the source step for an accepted job (spec §4.3): advertise the
+    /// have/want tips, read the bundle chunks, ingest + verify (a tree mismatch
+    /// is a `source-mismatch` [`JobReject`]), then materialize into a scratch
+    /// dir and return the stub result. The sandbox-wrapped ingest/materialize
+    /// and the real run step land in slice 006; here the git calls run under
+    /// `softfig_source`'s hardening config (hooks off, no network, fsck on).
+    fn serve_source(
+        &self,
+        session: &mut softfig_net::NoiseSession<TcpStream>,
+        offer: &softfig_net::proto::JobOffer,
+    ) -> Result<()> {
+        let source_id = softfig_source::SourceId::decode(&offer.source_id)
+            .ok_or_else(|| Error::Protocol("malformed source id in offer".into()))?;
+        let repo_key: [u8; 32] = offer
+            .repo_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Protocol("repo_key wrong length".into()))?;
+        let backend = softfig_source::GitBackend::new(self.root.repos_dir());
+
+        let haves = backend
+            .negotiate(&repo_key)
+            .map_err(|e| Error::Protocol(format!("negotiate failed: {e}")))?;
+        session.send_frame(&Frame::source_have(SourceHave {
+            repo_key: offer.repo_key.clone(),
+            tips: haves.tips,
+            recent_commits: haves.commits,
+        }))?;
+
+        // Read the bundle chunks until the `last` flag.
+        let mut bundle = Vec::new();
+        loop {
+            match session.recv_frame()?.kind {
+                Some(frame::Kind::SourceChunk(c)) => {
+                    bundle.extend_from_slice(&c.payload);
+                    if c.last {
+                        break;
+                    }
+                }
+                _ => return Err(Error::Protocol("expected SourceChunk during transfer".into())),
+            }
+        }
+
+        backend
+            .ingest(&repo_key, &source_id, &bundle)
+            .map_err(|e| Error::Protocol(format!("ingest failed: {e}")))?;
+        if let Err(e) = backend.verify(&repo_key, &source_id, &offer.snapshot_commit) {
+            if matches!(e, softfig_source::Error::SourceMismatch(_)) {
+                session.send_frame(&Frame::job_reject(JobReject {
+                    job_id: offer.job_id.clone(),
+                    reason: softfig_net::JobRejectReason::SourceMismatch.to_u32(),
+                }))?;
+                return Ok(());
+            }
+            return Err(Error::Protocol(format!("verify failed: {e}")));
+        }
+
+        // Materialize into a scratch dir (slice 006 replaces this with the
+        // job's sandboxed `/src`); this proves the read-tree/checkout-index
+        // path end to end against the hostile-tree hardening.
+        let scratch = tempfile::tempdir()?;
+        backend
+            .materialize(
+                &repo_key,
+                &source_id,
+                &offer.snapshot_commit,
+                scratch.path(),
+                false,
+            )
+            .map_err(|e| Error::Protocol(format!("materialize failed: {e}")))?;
+
+        // Stub result: the real run step + signed attestation land in slice 006.
+        session.send_frame(&Frame::job_result(JobResult {
+            job_id: offer.job_id.clone(),
+            exit_code: 0,
+            attestation: Vec::new(),
+        }))?;
+        Ok(())
     }
 }
 

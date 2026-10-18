@@ -285,6 +285,20 @@ impl Frame {
             kind: Some(frame::Kind::RunnerCertRevoke(revoke)),
         }
     }
+
+    /// A `SourceHave` frame (runner -> requester): known tips for a repo key.
+    pub fn source_have(have: SourceHave) -> Self {
+        Self {
+            kind: Some(frame::Kind::SourceHave(have)),
+        }
+    }
+
+    /// A `SourceChunk` frame (requester -> runner): one slice of the bundle.
+    pub fn source_chunk(chunk: SourceChunk) -> Self {
+        Self {
+            kind: Some(frame::Kind::SourceChunk(chunk)),
+        }
+    }
 }
 
 impl HelloPayload {

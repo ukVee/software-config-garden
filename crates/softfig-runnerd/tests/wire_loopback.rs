@@ -18,6 +18,7 @@ use softfig_net::{
     offer_signing_bytes, static_attestation_message, testing, CachedRunner, JobOutcome,
     JobRejectReason, LocalDevice, RunnerCache,
 };
+use softfig_source::{create_bundle, repo_key, root_commits, snapshot_repo, SubmodulePolicy};
 use softfig_runnerd::cert::StoredCert;
 use softfig_runnerd::config::{AcceptConfig, AcceptedPeer, ServeConfig};
 use softfig_runnerd::keys::RunnerKeys;
@@ -187,6 +188,76 @@ fn connect(
         .unwrap()
 }
 
+/// A requester-side git repo + snapshot: the offer fields the source step fills.
+struct SnapshotFixture {
+    _repo: tempfile::TempDir,
+    repo_path: std::path::PathBuf,
+    source_id: softfig_source::SourceId,
+    commit: Vec<u8>,
+    repo_key: [u8; 32],
+}
+
+impl SnapshotFixture {
+    fn new(device_id: [u8; 32]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let g = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(ok.success(), "git {args:?} failed");
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        g(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.path().join("f.txt"), "hello\n").unwrap();
+        g(&["add", "f.txt"]);
+        g(&["commit", "-q", "-m", "c1"]);
+
+        let snap = snapshot_repo(dir.path(), SubmodulePolicy::Refuse).unwrap();
+        let roots = root_commits(dir.path()).unwrap();
+        let repo_key = repo_key(&device_id, &roots);
+        let repo_path = dir.path().to_path_buf();
+        Self {
+            _repo: dir,
+            repo_path,
+            source_id: snap.source_id,
+            commit: snap.commit,
+            repo_key,
+        }
+    }
+
+    fn offer(&self) -> softfig_net::proto::JobOffer {
+        softfig_net::proto::JobOffer {
+            job_id: vec![0x01; 16],
+            repo_key: self.repo_key.to_vec(),
+            source_id: self.source_id.encode(),
+            snapshot_commit: self.commit.clone(),
+            profile: "gate".into(),
+            cmd: vec!["cargo".into(), "test".into()],
+            env: vec![],
+            toolchain: "rust".into(),
+            network: "none".into(),
+            cache: "shared".into(),
+            artifacts: vec![],
+            requested_at: NOW,
+            signature: Vec::new(),
+        }
+    }
+
+    fn make_bundle(&self, haves: &[Vec<u8>]) -> softfig_source::Result<Vec<u8>> {
+        create_bundle(&self.repo_path, &self.source_id, &self.commit, haves)
+    }
+}
+
+/// The bundle is never requested for a job the runner rejects up front.
+fn no_bundle(_haves: &[Vec<u8>]) -> softfig_source::Result<Vec<u8>> {
+    unreachable!("the source bundle is never requested for a rejected job")
+}
+
 #[test]
 fn happy_path_offer_accept_stub_result() {
     let req = Requester::new(1, 2);
@@ -197,9 +268,11 @@ fn happy_path_offer_accept_stub_result() {
     let (mut session, cert) = connect(&req, &fx, None, &[]);
     assert_eq!(cert.device_id, fx.ring_identity());
 
-    let mut offer = job_offer();
+    let snap = SnapshotFixture::new([1u8; 32]);
+    let mut offer = snap.offer();
     offer.signature = req.sign_offer(&offer);
-    let (_caps, outcome) = softfig_net::run_job(&mut session, &offer).unwrap();
+    let (_caps, outcome) =
+        softfig_net::run_job(&mut session, &offer, |haves| snap.make_bundle(haves)).unwrap();
     let result = match outcome {
         JobOutcome::Accepted(r) => r,
         other => panic!("expected Accepted, got {other:?}"),
@@ -234,10 +307,36 @@ fn second_connection_uses_ik() {
     let (mut session2, cert2) = connect(&req, &fx, Some(&cached), &[]);
     assert_eq!(cert2, cert, "IK reconnect must re-present and re-verify the same cert");
 
-    let mut offer = job_offer();
+    let snap = SnapshotFixture::new([3u8; 32]);
+    let mut offer = snap.offer();
     offer.signature = req.sign_offer(&offer);
-    let (_caps, outcome) = softfig_net::run_job(&mut session2, &offer).unwrap();
+    let (_caps, outcome) =
+        softfig_net::run_job(&mut session2, &offer, |haves| snap.make_bundle(haves)).unwrap();
     assert!(matches!(outcome, JobOutcome::Accepted(_)));
+}
+
+#[test]
+fn source_tree_mismatch_is_rejected_over_the_wire() {
+    let req = Requester::new(13, 14);
+    let fx = RunnerFixture::new([0x10; 16], NOW + 90 * 24 * 60 * 60);
+    fx.grant(&req);
+    fx.serve_one();
+
+    let (mut session, _cert) = connect(&req, &fx, None, &[]);
+
+    let snap = SnapshotFixture::new([13u8; 32]);
+    // A wrong source id (same format, different root): the offer claims it, but
+    // the bundle ships `snap.commit` whose tree is the honest one.
+    let wrong = softfig_source::SourceId::from_git_hash(&"ff".repeat(20)).unwrap();
+    let mut offer = snap.offer();
+    offer.source_id = wrong.encode();
+    offer.signature = req.sign_offer(&offer);
+
+    let (_caps, outcome) = softfig_net::run_job(&mut session, &offer, |haves| {
+        create_bundle(&snap.repo_path, &wrong, &snap.commit, haves)
+    })
+    .unwrap();
+    assert_eq!(outcome, JobOutcome::Rejected(JobRejectReason::SourceMismatch));
 }
 
 #[test]
@@ -249,7 +348,7 @@ fn unknown_requester_is_refused() {
     let (mut session, _cert) = connect(&req, &fx, None, &[]);
     let mut offer = job_offer();
     offer.signature = req.sign_offer(&offer);
-    let (_caps, outcome) = softfig_net::run_job(&mut session, &offer).unwrap();
+    let (_caps, outcome) = softfig_net::run_job(&mut session, &offer, no_bundle).unwrap();
     assert_eq!(outcome, JobOutcome::Rejected(JobRejectReason::NotGranted));
 }
 
@@ -264,7 +363,7 @@ fn offer_signed_by_wrong_key_is_refused() {
     let mut offer = job_offer();
     let other = SigningKey::from_bytes(&[0x99; 32]);
     offer.signature = other.sign(&offer_signing_bytes(&offer)).to_bytes().to_vec();
-    let (_caps, outcome) = softfig_net::run_job(&mut session, &offer).unwrap();
+    let (_caps, outcome) = softfig_net::run_job(&mut session, &offer, no_bundle).unwrap();
     assert_eq!(outcome, JobOutcome::Rejected(JobRejectReason::NotGranted));
 }
 
