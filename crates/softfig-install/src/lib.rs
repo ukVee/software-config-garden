@@ -4,6 +4,8 @@
 //! - [`swap`] — the **atomic installed-set swap** (release-pipeline slice 003;
 //!   round-2 decision 7, generalized from the original "four" to the
 //!   reconciled five-binary set).
+//! - [`stage`] — staging the built set + the atomic swap as one routine
+//!   (release-pipeline slice 007; shared by install and `softfig upgrade`).
 //! - [`detect`] — OS/distro + supervisor detection (slice 005).
 //! - [`gate`] — the toolchain gate: distro `rustc` vs the workspace
 //!   `rust-version`, with the `rustup` bootstrap fallback (slice 005).
@@ -66,6 +68,8 @@
 pub mod detect;
 pub mod gate;
 pub mod prompt;
+pub mod stage;
 pub mod swap;
 
+pub use stage::{stage_and_swap, StageOutcome};
 pub use swap::{swap_binaries, Result, SwapError};

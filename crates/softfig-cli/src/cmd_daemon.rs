@@ -20,7 +20,7 @@ use softfig_ipc::{
 };
 
 /// How long `cycle` waits for systemd to respawn the daemon Locked.
-const CYCLE_RESTART_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CYCLE_RESTART_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonCmd {
@@ -255,7 +255,7 @@ fn unlock(args: BasicArgs) -> Result<()> {
 /// (incident 20260622). Both artifacts are single-use, deleted on a clean
 /// redeem, and tmpfs-only (wiped on reboot); the token bytes never enter this
 /// process or the model's context (the daemon reads its own token file).
-fn cycle(args: CycleArgs) -> Result<()> {
+pub(crate) fn cycle(args: CycleArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(runtime_socket_path);
 
     // 1. Arm a relock token, PERSISTED to the 0600 tmpfs path. Arming before the

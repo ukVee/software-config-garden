@@ -18,8 +18,8 @@ use clap::Parser;
 use softfig_install::detect::{which, Distro, Supervisor};
 use softfig_install::gate::{self, Gate};
 use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
-use softfig_install::swap::swap_binaries;
-use softfig_ipc::compat::{SetReport, INSTALLED_SET};
+use softfig_install::stage::{stage_and_swap, StageOutcome};
+use softfig_ipc::compat::SetReport;
 
 #[derive(Parser, Debug)]
 #[command(name = "softfig-install", version, about = "soft-fig: the guided install front door")]
@@ -175,44 +175,18 @@ fn build_program(source: &Path) -> Result<()> {
 }
 
 /// Stage the five freshly-built binaries into a same-filesystem temp dir and
-/// atomically swap them into `prefix`. Idempotent: a prefix already carrying a
-/// consistent set at the freshly-built version is a no-op.
+/// atomically swap them into `prefix` (the shared [`stage_and_swap`] routine).
+/// Idempotent: a prefix already carrying a consistent set at the
+/// freshly-built version is a no-op.
 fn install_set(source: &Path, prefix: &Path) -> Result<()> {
-    let target_dir = source.join("target/release");
-
-    // Idempotency short-circuit: the installed set and the built set agree on
-    // one version ⇒ nothing to do (a repair re-run converges via the swap).
-    let installed = SetReport::scan(prefix).consistent_version().map(str::to_string);
-    let built = SetReport::scan(&target_dir).consistent_version().map(str::to_string);
-    if let (Some(a), Some(b)) = (&installed, &built)
-        && a == b
-    {
-        println!("already installed: {a} in {} — nothing to do", prefix.display());
-        return Ok(());
-    }
-
-    std::fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
-    // Stage beside the prefix (same filesystem), never /tmp on a tmpfs — the
-    // crate doc's same-filesystem note.
-    let staging = tempfile::Builder::new()
-        .prefix(".softfig-stage-")
-        .tempdir_in(prefix.parent().unwrap_or(prefix))
-        .context("creating the staging dir")?;
-    for name in INSTALLED_SET {
-        let from = target_dir.join(name);
-        if !from.is_file() {
-            anyhow::bail!(
-                "built binary missing: {} — did `cargo build --release` produce the installed set?",
-                from.display()
-            );
+    match stage_and_swap(source, prefix)? {
+        StageOutcome::Noop { version } => {
+            println!("already installed: {version} in {} — nothing to do", prefix.display());
         }
-        std::fs::copy(&from, staging.path().join(name))
-            .with_context(|| format!("staging {}", from.display()))?;
+        StageOutcome::Swapped { .. } => {
+            println!("installed: {}", SetReport::scan(prefix));
+        }
     }
-
-    swap_binaries(staging.path(), prefix, &INSTALLED_SET)
-        .map_err(|e| anyhow::anyhow!("atomic install failed: {e}"))?;
-    println!("installed: {}", SetReport::scan(prefix));
     Ok(())
 }
 

@@ -10,6 +10,8 @@ mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
 mod cmd_shared_subtree;
+mod cmd_uninstall;
+mod cmd_upgrade;
 mod cmd_vault;
 mod growlight_backend;
 mod opencode_catalog;
@@ -83,6 +85,15 @@ enum Cmd {
     /// launches the agent in loop mode.
     #[command(subcommand)]
     Growlight(cmd_growlight::GrowlightCmd),
+
+    /// Upgrade this install onto a newer build: fetch source, build, atomic
+    /// swap, cycle the daemon, run migrations, confirm the new version.
+    Upgrade(cmd_upgrade::UpgradeArgs),
+
+    /// Remove the soft-fig program (binaries, unit, MCP). The store and garden
+    /// are never touched without a separate, explicit `--remove-data`
+    /// confirmation.
+    Uninstall(cmd_uninstall::UninstallArgs),
 }
 
 #[derive(Args, Debug)]
@@ -113,5 +124,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Replica(cmd) => cmd_replica::run(cmd),
         Cmd::SharedSubtree(cmd) => cmd_shared_subtree::run(cmd),
         Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
+        Cmd::Upgrade(args) => cmd_upgrade::run(args),
+        Cmd::Uninstall(args) => cmd_uninstall::run(args),
     }
 }
