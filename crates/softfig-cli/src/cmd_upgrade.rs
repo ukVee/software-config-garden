@@ -57,6 +57,10 @@ pub struct UpgradeArgs {
     /// Pull + build + check, then stop before the swap.
     #[arg(long)]
     pub dry_run: bool,
+    /// Re-install even when the installed set already matches the built set
+    /// (same version *and* same build id).
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub fn run(args: UpgradeArgs) -> Result<()> {
@@ -95,14 +99,29 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 4. Stage + atomically install the reconciled set (idempotent).
-    match stage_and_swap(&source, &prefix)? {
-        StageOutcome::Noop { version } => {
+    // 4. Stage + atomically install the reconciled set (idempotent by
+    //    identity; --force re-swaps even an identical identity).
+    match stage_and_swap(&source, &prefix, args.force)? {
+        StageOutcome::Noop { version, .. } => {
             println!("already at {version} in {} — nothing to swap", prefix.display());
         }
-        StageOutcome::Swapped { version } => {
-            println!("installed: {} ({version})", SetReport::scan(&prefix));
-        }
+        StageOutcome::Swapped { version, build_id, from } => match from {
+            Some((prev_version, prev_build_id)) if prev_version == version => {
+                println!(
+                    "installed: same version {version}, new build {build_id}                      (was {prev_build_id}) in {}",
+                    prefix.display()
+                );
+            }
+            Some((prev_version, _)) => {
+                println!(
+                    "installed: upgraded {prev_version} → {version} (build {build_id}) in {}",
+                    prefix.display()
+                );
+            }
+            None => {
+                println!("installed: {version} (build {build_id}) in {}", prefix.display());
+            }
+        },
     }
 
     // 5. Warn about a live growlight loop (spec-growlight §12), then cycle the

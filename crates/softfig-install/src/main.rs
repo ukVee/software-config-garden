@@ -179,8 +179,8 @@ fn build_program(source: &Path) -> Result<()> {
 /// Idempotent: a prefix already carrying a consistent set at the
 /// freshly-built version is a no-op.
 fn install_set(source: &Path, prefix: &Path) -> Result<()> {
-    match stage_and_swap(source, prefix)? {
-        StageOutcome::Noop { version } => {
+    match stage_and_swap(source, prefix, false)? {
+        StageOutcome::Noop { version, .. } => {
             println!("already installed: {version} in {} — nothing to do", prefix.display());
         }
         StageOutcome::Swapped { .. } => {
