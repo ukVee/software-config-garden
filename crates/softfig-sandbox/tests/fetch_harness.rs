@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 
-use softfig_sandbox::{profile_fetch, JobContext, ProxyConfig};
+use softfig_sandbox::{profile_fetch, profile_run, JobContext, ProxyConfig};
 use softfig_source::extract_skeleton;
 
 const SHIM: &str = env!("CARGO_BIN_EXE_softfig-sandbox-init");
@@ -202,6 +202,80 @@ fn run_fetch(ctx: &JobContext, skeleton: &Path, proxy: ProxyConfig) -> Output {
     command.arg(SHIM_MOUNT).arg("--policy").arg(&json).arg("--");
     command.args(["cargo", "fetch", "--locked"]);
     command.output().expect("failed to spawn bwrap")
+}
+
+/// Run the offline run step: `cargo build --offline` in the full materialized
+/// tree (`src` rw at `/src`), with the fetch-populated cargo home read-only.
+fn run_build(ctx: &JobContext) -> Output {
+    let policy = profile_run(ctx);
+    let mut argv = policy.render();
+    argv.push("--ro-bind".into());
+    argv.push(SHIM.to_string());
+    argv.push(SHIM_MOUNT.into());
+
+    let json = serde_json::to_string(&policy).expect("policy serializes");
+    let mut command = Command::new("bwrap");
+    command.args(&argv);
+    command.arg(SHIM_MOUNT).arg("--policy").arg(&json).arg("--");
+    command.args(["cargo", "build", "--offline"]);
+    command.output().expect("failed to spawn bwrap")
+}
+
+#[test]
+fn run_builds_offline_from_the_fetch_cache() {
+    if skip() {
+        return;
+    }
+
+    let dir = fixture();
+    let _pin_home = pin_lockfile(dir.path());
+
+    let skeleton = tempfile::tempdir().unwrap();
+    extract_skeleton(dir.path(), skeleton.path()).unwrap();
+    let cargo_home = tempfile::tempdir().unwrap();
+    let target_cache = tempfile::tempdir().unwrap();
+
+    let proxy_socket_dir = tempfile::tempdir().unwrap();
+    let proxy_socket = proxy_socket_dir.path().join("egress.sock");
+    spawn_proxy(&proxy_socket);
+
+    let ctx = JobContext {
+        src: dir.path().to_path_buf(),
+        target_cache: target_cache.path().to_path_buf(),
+        toolchain: PathBuf::from("/home/ukv/.rustup"),
+        cargo_home: cargo_home.path().to_path_buf(),
+        etc: PathBuf::from("/etc"),
+        scratch_size: 64 * 1024 * 1024,
+    };
+
+    // 1. Fetch through the proxy, filling the fresh cargo home.
+    let proxy = ProxyConfig {
+        socket: proxy_socket,
+        forwarder: PathBuf::from(FORWARDER_MOUNT),
+        listen: "127.0.0.1:3128".into(),
+    };
+    let fetch = run_fetch(&ctx, skeleton.path(), proxy);
+    assert!(
+        fetch.status.success(),
+        "fetch failed:\n{}",
+        String::from_utf8_lossy(&fetch.stderr)
+    );
+    // The marker-writing build.rs must not have run during fetch.
+    assert!(find(dir.path(), "MARKER").is_none(), "build.rs must not run during fetch");
+
+    // 2. Build offline from that cache (the run profile binds cargo_home ro).
+    let run = run_build(&ctx);
+    assert!(
+        run.status.success(),
+        "offline run build failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // This time build.rs *did* run, offline, in the run step.
+    assert!(
+        find(dir.path(), "MARKER").is_some(),
+        "build.rs must run in the offline run step"
+    );
 }
 
 #[test]

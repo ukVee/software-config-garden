@@ -155,6 +155,7 @@ pub fn profile_run(ctx: &JobContext) -> Policy {
     p.ro_binds.push(Bind::ro(&ctx.cargo_home, "/opt/cargo-home"));
     p.rw_binds.push(Bind::rw(&ctx.src, "/src"));
     p.rw_binds.push(Bind::rw(&ctx.target_cache, "/cache/target"));
+    p.chdir = Some("/src".into());
 
     p.env.insert("CARGO_HOME".into(), "/opt/cargo-home".into());
     p.env.insert("CARGO_TARGET_DIR".into(), "/cache/target".into());
