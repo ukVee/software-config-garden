@@ -91,8 +91,8 @@ enum Cmd {
     Upgrade(cmd_upgrade::UpgradeArgs),
 
     /// Remove the soft-fig program (binaries, unit, MCP). The store and garden
-    /// are never touched without a separate, explicit `--remove-data`
-    /// confirmation.
+    /// are never touched without a separate, explicit `--yes-remove-data`
+    /// consent.
     Uninstall(cmd_uninstall::UninstallArgs),
 }
 

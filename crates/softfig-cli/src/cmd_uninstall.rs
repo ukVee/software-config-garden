@@ -34,13 +34,15 @@ pub struct UninstallArgs {
     /// Override the keeperd socket path. Defaults to the runtime socket.
     #[arg(long)]
     pub socket: Option<PathBuf>,
-    /// Also remove the encrypted store + garden content (requires a second,
-    /// explicit confirmation naming each path). Without this flag, the store
-    /// and garden are never touched.
+    /// Also remove the encrypted store + garden content. This flag is itself
+    /// the explicit, named consent: the data offer is only ever made — and
+    /// only ever answered Yes — when it is set. `--yes` alone never removes
+    /// data.
     #[arg(long)]
-    pub remove_data: bool,
-    /// Consent to every prompt without asking (still never removes data
-    /// unless `--remove-data` is also given).
+    pub yes_remove_data: bool,
+    /// Consent to every prompt without asking. Never removes data: the data
+    /// offer is answered only by its own dedicated `--yes-remove-data` flag,
+    /// never by this blanket consent.
     #[arg(long)]
     pub yes: bool,
     /// Decline every prompt without asking.
@@ -102,20 +104,14 @@ pub fn run(args: UninstallArgs) -> Result<()> {
     remove_units()?;
     remove_mcp()?;
 
-    // Offer 2 — the data, only on --remove-data, and only after the first
-    // removal is done. The summary names every path that would be removed.
+    // Offer 2 — the data, only on --yes-remove-data, and only after the first
+    // removal is done. The summary names every path that would be removed. The
+    // answer comes from a dedicated consent (never the blanket `--yes`/`--no`
+    // backend): `--yes-remove-data` is itself the explicit, named consent.
     match &store_paths {
-        Some(sp) if args.remove_data => {
-            let data_offer = Offer {
-                id: "remove-data",
-                summary: data_removal_summary(sp),
-                undo: "restore from your backup".to_string(),
-            };
-            if consent.ask(&data_offer) == Answer::Yes {
-                remove_data(sp)?;
-            } else {
-                print_data_untouched(sp);
-            }
+        Some(sp) if args.yes_remove_data => {
+            let mut data_consent: Box<dyn Consent> = Box::new(Fixed(Answer::Yes));
+            offer_and_remove_data(sp, data_consent.as_mut())?;
         }
         Some(sp) => print_data_untouched(sp),
         None => println!("no garden or store found — nothing else to remove."),
@@ -199,7 +195,7 @@ fn print_plan(plan: &RemovalPlan, store: Option<&StorePaths>) {
     );
     match store {
         Some(sp) => {
-            println!("  data          NOT removed unless you pass --remove-data and confirm:");
+            println!("  data          NOT removed unless you pass --yes-remove-data:");
             println!("    garden      {}", sp.garden.display());
             match &sp.store {
                 Some(s) => println!("    store       {}", s.display()),
@@ -414,6 +410,24 @@ fn remove_data(sp: &StorePaths) -> Result<()> {
     Ok(())
 }
 
+/// Make the data offer and, on a Yes, remove the store + garden. On a decline
+/// (or any No — the safe default) the data is left untouched and its paths are
+/// printed. Returns `true` when data was removed.
+fn offer_and_remove_data(sp: &StorePaths, consent: &mut dyn Consent) -> Result<bool> {
+    let data_offer = Offer {
+        id: "remove-data",
+        summary: data_removal_summary(sp),
+        undo: "restore from your backup".to_string(),
+    };
+    if consent.ask(&data_offer) == Answer::Yes {
+        remove_data(sp)?;
+        Ok(true)
+    } else {
+        print_data_untouched(sp);
+        Ok(false)
+    }
+}
+
 /// Find the garden: first by walking up from the cwd for a `.softfig`
 /// (pre-migrate), then by asking a running daemon for its `garden_root`
 /// (post-`finalize` the garden's `.softfig` is gone, but the daemon still
@@ -436,6 +450,7 @@ fn discover_garden(socket: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use softfig_install::prompt::Scripted;
     use softfig_ipc::compat::stamp_for;
 
     /// Write a fake binary carrying the build stamp, so `is_file` is what the
@@ -564,5 +579,46 @@ mod tests {
             has_mcp: false,
         };
         assert!(remove_binaries(&plan).is_ok());
+    }
+
+    // ---- M7: `--yes` alone never deletes data ----
+
+    #[test]
+    fn a_declined_data_offer_leaves_store_and_garden_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let garden = dir.path().join("garden");
+        let store = dir.path().join("state/softfig");
+        std::fs::create_dir_all(garden.join("notes")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        let sp = StorePaths {
+            garden: garden.clone(),
+            store: Some(store.clone()),
+        };
+        // A declined offer is the safe default: nothing is removed.
+        let mut consent = Scripted(vec![Answer::No]);
+        let removed = offer_and_remove_data(&sp, &mut consent).unwrap();
+        assert!(!removed);
+        assert!(garden.is_dir(), "garden must survive a declined data offer");
+        assert!(store.is_dir(), "store must survive a declined data offer");
+    }
+
+    #[test]
+    fn a_consented_data_offer_removes_store_and_garden() {
+        let dir = tempfile::tempdir().unwrap();
+        let garden = dir.path().join("garden");
+        let store = dir.path().join("state/softfig");
+        std::fs::create_dir_all(&garden).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        let sp = StorePaths {
+            garden: garden.clone(),
+            store: Some(store.clone()),
+        };
+        let mut consent = Scripted(vec![Answer::Yes]);
+        let removed = offer_and_remove_data(&sp, &mut consent).unwrap();
+        assert!(removed);
+        assert!(!garden.exists(), "garden should be removed on consent");
+        assert!(!store.exists(), "store should be removed on consent");
     }
 }
