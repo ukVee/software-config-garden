@@ -104,9 +104,11 @@ impl<'a> WorkTree<'a> {
         self.guard_member_models(rel, Some(bytes))
     }
 
-    /// §6.7's `> Model:` guard for replacing `rel` with `new` (`None` = removing
-    /// it): a no-op unless this request runs for a fleet member
-    /// ([`crate::caller`]) and `rel` lies under `growlight/backlog/`.
+    /// §6.7's member guards for replacing `rel` with `new` (`None` = removing it):
+    /// the `> Model:` line is member-immutable and the `> Fleet:` line is
+    /// member-tighten-only (see [`member_model_refusal`] / [`member_fleet_refusal`]).
+    /// A no-op unless this request runs for a fleet member ([`crate::caller`])
+    /// and `rel` lies under `growlight/backlog/`.
     fn guard_member_models(&self, rel: &str, new: Option<&[u8]>) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
@@ -117,16 +119,19 @@ impl<'a> WorkTree<'a> {
         let old = self.read(rel);
         let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
         let (old, new) = (text(old.as_deref()), text(new));
-        match member_model_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-            Some(why) => Err((ErrorKind::BadArgs, why)),
-            None => Ok(()),
+        if let Some(why) = member_model_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+            return Err((ErrorKind::BadArgs, why));
         }
+        if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        Ok(())
     }
 
     /// The same guard for removing `rel`, which may be a whole directory:
-    /// refused for a member when it removes a `> Model:` line under
-    /// `growlight/backlog/` — a doc there carrying one, a directory holding
-    /// such a doc, or an ancestor of the backlog itself.
+    /// refused for a member when it removes a `> Model:` line or loosens a
+    /// held `> Fleet:` line under `growlight/backlog/` — a doc there carrying
+    /// one, a directory holding such a doc, or an ancestor of the backlog itself.
     fn guard_member_model_removal(&self, rel: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
@@ -138,15 +143,20 @@ impl<'a> WorkTree<'a> {
         } else {
             return Ok(());
         };
-        match self.first_model_doc(&scope) {
-            Some((doc, text)) => Err(refusal(&member, &doc, Some(&text), None)),
-            None => Ok(()),
+        if let Some((doc, text)) = self.first_model_doc(&scope) {
+            return Err(refusal(&member, &doc, Some(&text), None));
         }
+        if let Some((doc, text)) = self.first_fleet_doc(&scope) {
+            return Err(fleet_refusal(&member, &doc, Some(&text), None));
+        }
+        Ok(())
     }
 
     /// The guard for a rename: moving `from` removes its lines from where they
     /// were, moving it into the backlog adds them at `to` (whatever `from`
-    /// is), and replacing an existing `to` removes the destination's.
+    /// is), and replacing an existing `to` removes the destination's. `> Model:`
+    /// is refused in both directions; `> Fleet:` only in the loosening one (a
+    /// member may move a held doc *into* the backlog — that tightens).
     fn guard_member_rename(&self, from: &str, to: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
@@ -163,17 +173,31 @@ impl<'a> WorkTree<'a> {
         self.guard_member_model_removal(to)
     }
 
-    /// The first file at or under `rel` (a file or a directory) carrying a
-    /// `> Model:` line, with its text.
-    fn first_model_doc(&self, rel: &str) -> Option<(String, String)> {
+    /// The first file at or under `rel` (a file or a directory) whose text
+    /// satisfies `pred`, with its text.
+    fn first_doc_with(
+        &self,
+        rel: &str,
+        pred: impl Fn(&str) -> bool + Copy,
+    ) -> Option<(String, String)> {
         if self.is_dir(rel) {
-            return self
-                .read_dir(rel)
-                .into_iter()
-                .find_map(|entry| self.first_model_doc(&format!("{rel}/{}", entry.name)));
+            return self.read_dir(rel).into_iter().find_map(|entry| {
+                self.first_doc_with(&format!("{rel}/{}", entry.name), pred)
+            });
         }
         let text = String::from_utf8_lossy(&self.read(rel)?).into_owned();
-        (!softfig_ipc::queue_v2::model_lines(&text).is_empty()).then(|| (rel.to_string(), text))
+        pred(&text).then(|| (rel.to_string(), text))
+    }
+
+    /// The first file at or under `rel` carrying a `> Model:` line, with its text.
+    fn first_model_doc(&self, rel: &str) -> Option<(String, String)> {
+        self.first_doc_with(rel, |t| !softfig_ipc::queue_v2::model_lines(t).is_empty())
+    }
+
+    /// The first file at or under `rel` carrying a held `> Fleet:` line, with
+    /// its text.
+    fn first_fleet_doc(&self, rel: &str) -> Option<(String, String)> {
+        self.first_doc_with(rel, softfig_ipc::fleet::held)
     }
 
     /// Working-tree bytes for repo-relative `rel`, or `None` if absent /
@@ -414,6 +438,39 @@ pub(crate) fn member_model_refusal(
     ))
 }
 
+/// [`member_fleet_refusal`] as the worktree's error, for a change the caller
+/// already knows loosens or removes a held `> Fleet:` line.
+fn fleet_refusal(member: &str, rel: &str, old: Option<&str>, new: Option<&str>) -> (ErrorKind, String) {
+    let why = member_fleet_refusal(member, rel, old, new)
+        .expect("the caller found a held `> Fleet:` line this change loosens");
+    (ErrorKind::BadArgs, why)
+}
+
+/// The member `> Fleet:` guard, pure: `Some(refusal)` when replacing `old`
+/// with `new` at `rel` (`None` = absent / removed) loosens or removes a
+/// `> Fleet:` hold ([`softfig_ipc::fleet_marker`]): the doc goes from held (a
+/// non-`yes` value) to claimable (`yes`, or no line). Adding a line or
+/// tightening one — claimable → held — is allowed, because it fails closed.
+/// The refusal text leads with the wire code, `field_not_allowed`.
+pub(crate) fn member_fleet_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<String> {
+    let before = old.and_then(softfig_ipc::fleet_marker);
+    let after = new.and_then(softfig_ipc::fleet_marker);
+    if before.is_some() && after.is_none() {
+        Some(format!(
+            "field_not_allowed: this write loosens or removes the `> Fleet:` hold in {rel}, and \
+             fleet member {member} may only add or tighten one (growlight/backlog/CLAUDE.md \
+             'Marking an item human-only'). Only the human removes it to free the item."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Whether `rel` is a plain garden-relative path: `""` (the garden root) or
 /// only normal components (`.` allowed). `..`, an absolute path, or a Windows
 /// prefix is refused. Verb args are validated upstream by
@@ -472,6 +529,7 @@ mod tests {
     use super::*;
 
     const DOC: &str = "# slice\n\n> Model: flash\n\nbody\n";
+    const FLEET_HELD: &str = "# slice\n\n> Fleet: no\n\nbody\n";
 
     #[test]
     fn the_guard_covers_growlight_backlog_only() {
@@ -597,5 +655,128 @@ mod tests {
         assert_eq!(member_model_refusal("c", rel, Some(DOC), Some(&format!("{DOC}more\n"))), None);
         assert_eq!(member_model_refusal("c", rel, None, Some("# new doc, no model\n")), None);
         assert_eq!(member_model_refusal("c", rel, Some("prose\n"), None), None);
+    }
+
+    /// The `> Fleet:` guard is tighten-only in the pure sense: a member's write
+    /// may add a line or tighten one (claimable → held), but never remove or
+    /// loosen one (held → claimable), matching the resolver's "first line wins"
+    /// and "fenced code doesn't count" reads.
+    #[test]
+    fn the_fleet_guard_is_tighten_only() {
+        let rel = "growlight/backlog/milestones/m/CLAUDE.md";
+        // Tighten: claimable → held is allowed (fails closed).
+        assert_eq!(member_fleet_refusal("c", rel, Some("# t\n"), Some("> Fleet: no\n")), None);
+        assert_eq!(member_fleet_refusal("c", rel, Some("> Fleet: yes\n"), Some("> Fleet: no\n")), None);
+        // Loosen / remove: held → claimable is refused.
+        assert!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), Some("> Fleet: yes\n")).is_some());
+        assert!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), Some("# t\n")).is_some());
+        assert!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), None).is_some());
+        // Inserting a `yes` before the first `no` line flips the resolved marker.
+        assert!(
+            member_fleet_refusal(
+                "c",
+                rel,
+                Some("> Fleet: no\n> Fleet: yes\n"),
+                Some("> Fleet: yes\n> Fleet: no\n"),
+            )
+            .is_some()
+        );
+        // A held value changed to another non-`yes` value stays held: allowed.
+        assert_eq!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), Some("> Fleet: nope\n")), None);
+        // A non-holding line is not protected.
+        assert_eq!(member_fleet_refusal("c", rel, Some("# t\n"), Some("> Fleet: yes\n")), None);
+        assert_eq!(member_fleet_refusal("c", rel, Some("> Fleet: yes\n"), Some("# t\n")), None);
+        // A fenced example is not a marker, so removing it is allowed …
+        assert_eq!(
+            member_fleet_refusal("c", rel, Some("```\n> Fleet: no\n```\n"), Some("# t\n")),
+            None,
+        );
+        // … but a real line after the fence is held, so removing it is refused.
+        assert!(
+            member_fleet_refusal(
+                "c",
+                rel,
+                Some("```\n> Fleet: no\n```\n> Fleet: no\n"),
+                Some("```\n> Fleet: no\n```\n"),
+            )
+            .is_some()
+        );
+    }
+
+    /// The worktree-level `> Fleet:` guard: a member may add/tighten a line but
+    /// never loosen/remove it, across write, `check_write_bytes`, `unlink`
+    /// (remove), `archive` (rename out), directory/ancestor removal, and a
+    /// rename *into* the backlog (which is a tighten, so allowed). A human may
+    /// remove the line.
+    #[test]
+    fn a_members_backlog_write_may_not_loosen_or_remove_a_fleet_line() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(SLICE, b"# a\n\nbody\n").unwrap();
+        {
+            let _member = caller::enter(Some("c".into()));
+            // Add a hold: allowed (fails closed).
+            wt.write(SLICE, FLEET_HELD.as_bytes()).expect("adding a hold");
+            assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD));
+            // Loosen: refused.
+            let loosened = FLEET_HELD.replace("> Fleet: no", "> Fleet: yes");
+            let err = wt.write(SLICE, loosened.as_bytes()).unwrap_err();
+            assert_eq!(err.0, ErrorKind::BadArgs);
+            assert!(err.1.contains("loosens or removes") && err.1.contains("member c"), "{err:?}");
+            assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "nothing written");
+            // Remove: refused (and the pre-check agrees).
+            assert!(wt.write(SLICE, b"# slice\n\nbody\n").is_err(), "remove the line");
+            assert!(wt.check_write_bytes(SLICE, b"# slice\n\nbody\n").is_err(), "pre-check");
+            // unlink / archive / directory / ancestor removal all refused.
+            assert!(wt.remove(SLICE).is_err(), "unlink removes the hold");
+            assert!(wt.rename(SLICE, "archive/001-a.md").is_err(), "archive moves it out");
+            assert!(wt.remove("growlight/backlog/milestones/m").is_err(), "a dir holding one");
+            assert!(wt.remove("growlight").is_err(), "an ancestor of the backlog");
+            assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "all refused untouched");
+            // Moving a held doc INTO the backlog tightens: allowed.
+            wt.write("projects/p/notes/020-z.md", FLEET_HELD.as_bytes()).expect("seed outside");
+            wt.rename("projects/p/notes/020-z.md", "growlight/backlog/milestones/m/slices/020-z.md")
+                .expect("moving a held doc in is a tighten");
+            // Outside the backlog is not the guard's.
+            wt.write("projects/p/notes/021-x.md", FLEET_HELD.as_bytes()).expect("outside add");
+            wt.write("projects/p/notes/021-x.md", b"# a\n").expect("outside loosen is fine");
+        }
+        // A human may remove the line (this frees the item).
+        wt.write(SLICE, b"# slice\n\nbody\n").expect("the human removes it");
+    }
+
+    /// `batch` validates every op before the first write: a member's op that
+    /// loosens a `> Fleet:` line fails the batch with the ops before it unstaged.
+    #[test]
+    fn a_members_batch_that_loosens_a_fleet_line_stages_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let note = "projects/p/notes/001-x.md";
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(&daemon, &inner);
+            wt.write(note, b"# x\n\nold\n").unwrap();
+            wt.write(SLICE, FLEET_HELD.as_bytes()).unwrap();
+        }
+        let patch = |path: &str, old: &str, new: &str| {
+            serde_json::json!({ "op": "patch_file", "args": { "path": path, "old": old, "new": new } })
+        };
+        let args = serde_json::json!({ "ops": [
+            patch(note, "old", "new"),
+            patch(SLICE, "> Fleet: no", "> Fleet: yes"),
+        ] });
+        let err = {
+            let _member = caller::enter(Some("c".into()));
+            super::super::batch(&daemon, args.clone()).unwrap_err()
+        };
+        assert!(err.1.contains("op[1]") && err.1.contains("loosens or removes"), "{err:?}");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        assert_eq!(wt.read_to_string(note).as_deref(), Some("# x\n\nold\n"), "op 0 unstaged");
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "op 1 unstaged");
+        drop(inner);
+        super::super::batch(&daemon, args).expect("a human's batch lands");
     }
 }
