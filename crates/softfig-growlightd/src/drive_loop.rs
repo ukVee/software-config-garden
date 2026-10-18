@@ -702,6 +702,16 @@ pub trait BatonStatusSource: Send + Sync + fmt::Debug {
     /// written/readable — the clean-exit re-roll fallback), plus a diagnostic when
     /// the read fell back to the misrouted legacy single-agent path (task 042/035).
     fn status(&self, agent: &str) -> BatonRead;
+
+    /// The baton FILE's last-modified time — the "handoff" instant the boot-time
+    /// dirty-tree guard (task 064) compares the repo's newest dirty mtime against
+    /// to tell "the tree moved after the last handoff" from "it did not". `None`
+    /// when the path is unknown or the file is missing/unreadable. The default is
+    /// `None` so the deferred/test sources keep the guard inert; the live
+    /// [`crate::baton_store::FsBatonStore`] reads the real file.
+    fn baton_mtime(&self, _agent: &str) -> Option<std::time::SystemTime> {
+        None
+    }
 }
 
 /// The result of reading an exited member's terminal baton

@@ -140,6 +140,17 @@ impl RepoState {
     }
 }
 
+/// The boot-time dirty-tree guard's decision (task 064): does `repo` carry
+/// uncommitted work that is NEWER than the baton's last write (`baton_mtime`)?
+/// That is the signature of a session that did work and was cut off before its
+/// handoff — a dirty tree the baton does not know about. Pure over
+/// [`RepoState`], so growlightd (fleet member spawn) and the single-agent /
+/// semi-auto boot decide identically. Read-only: the caller only ever
+/// *surfaces* the answer, never reverts, stages or commits.
+pub fn dirty_newer_than(state: &RepoState, baton_mtime: SystemTime) -> bool {
+    state.dirty > 0 && state.newest_dirty_mtime.is_some_and(|m| m > baton_mtime)
+}
+
 /// Read `repo`'s [`RepoState`] through `git`. `Err` when `repo` is not a git
 /// repo, `git` can't be run, or a call outlives its timeout.
 pub fn probe(repo: &Path) -> Result<RepoState, String> {
@@ -400,6 +411,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(probe(dir.path()).is_err());
         assert!(probe(&dir.path().join("absent")).is_err());
+    }
+
+    #[test]
+    fn dirty_newer_than_flags_work_newer_than_the_baton_write() {
+        let t = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        let state = |dirty: usize, mtime: Option<SystemTime>| RepoState {
+            head: Some("abc".into()),
+            dirty,
+            newest_dirty_mtime: mtime,
+            fingerprint: 0,
+        };
+
+        // A clean tree never flags, however new.
+        assert!(!dirty_newer_than(&state(0, Some(t(2))), t(1)));
+        // Dirt with no readable mtime can't prove "newer" — no flag.
+        assert!(!dirty_newer_than(&state(1, None), t(1)));
+        // Dirt OLDER than the baton is a prior handoff's state — no flag.
+        assert!(!dirty_newer_than(&state(1, Some(t(1))), t(2)));
+        assert!(!dirty_newer_than(&state(1, Some(t(1))), t(1)), "equal is not newer");
+        // Dirt NEWER than the baton write is the cut-off-session signature.
+        assert!(dirty_newer_than(&state(1, Some(t(3))), t(2)));
+        // An unborn HEAD still flags on dirty+newer (head is not the signal).
+        let unborn = RepoState { head: None, dirty: 2, newest_dirty_mtime: Some(t(5)), fingerprint: 0 };
+        assert!(dirty_newer_than(&unborn, t(4)));
     }
 
     /// A tracked FIFO in the dirty tree must never be opened: open(2) on a FIFO

@@ -141,7 +141,12 @@ impl crate::drive_loop::MemberBatonWriter for FsBatonStore {
     }
 }
 
-impl BatonStatusSource for FsBatonStore {    fn status(&self, agent: &str) -> BatonRead {
+impl BatonStatusSource for FsBatonStore {
+    fn baton_mtime(&self, agent: &str) -> Option<std::time::SystemTime> {
+        fs::metadata(self.baton_path(agent)).and_then(|md| md.modified()).ok()
+    }
+
+    fn status(&self, agent: &str) -> BatonRead {
         let per_member_path = self.baton_path(agent);
         let per_member_raw = fs::read_to_string(&per_member_path).ok();
 
@@ -626,6 +631,18 @@ mod tests {
         let view = parse_baton(&fs::read_to_string(s.baton_path("a1")).unwrap());
         assert_eq!(view.item.as_deref(), Some("t2"), "a fresh seed reflects the new item");
         assert_eq!(view.status.as_deref(), Some("IN_PROGRESS"));
+    }
+
+    #[test]
+    fn baton_mtime_reads_the_file_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        assert_eq!(s.baton_mtime("a"), None, "no baton yet reads as no mtime");
+
+        s.seed("a", "default", "t1").expect("seeds");
+        let mtime = s.baton_mtime("a").expect("a seeded baton has an mtime");
+        let file_mtime = std::fs::metadata(s.baton_path("a")).unwrap().modified().unwrap();
+        assert_eq!(mtime, file_mtime, "the trait reads the real file mtime");
     }
 
     #[test]
