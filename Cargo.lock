@@ -3738,6 +3738,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-install"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "softfig-ipc",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "softfig-ipc"
 version = "1.0.0-alpha.1"
 dependencies = [

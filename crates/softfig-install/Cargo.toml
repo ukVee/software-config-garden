@@ -1,0 +1,15 @@
+[package]
+name = "softfig-install"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig install/upgrade helper — the atomic installed-set swap, shared by install and upgrade."
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+softfig-ipc = { workspace = true }
