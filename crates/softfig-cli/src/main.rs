@@ -9,6 +9,7 @@ mod cmd_pair;
 mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
+mod cmd_runner;
 mod cmd_shared_subtree;
 mod cmd_vault;
 mod growlight_backend;
@@ -78,6 +79,11 @@ enum Cmd {
     #[command(subcommand)]
     SharedSubtree(cmd_shared_subtree::SharedSubtreeCmd),
 
+    /// The remote runner (spec `remote-runner`): enable/grant/apply against
+    /// this device's `softfig-runnerd`, and sign its delegated certificate.
+    #[command(subcommand)]
+    Runner(cmd_runner::RunnerCmd),
+
     /// growlight — the autonomous work-loop pillar. `init` scaffolds it into
     /// an already-onboarded garden; `start` sets up the loop runtime and
     /// launches the agent in loop mode.
@@ -112,6 +118,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Unpair(args) => cmd_pair::unpair(args),
         Cmd::Replica(cmd) => cmd_replica::run(cmd),
         Cmd::SharedSubtree(cmd) => cmd_shared_subtree::run(cmd),
+        Cmd::Runner(cmd) => cmd_runner::run(cmd),
         Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
     }
 }
