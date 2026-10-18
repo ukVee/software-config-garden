@@ -1,0 +1,10 @@
+[package]
+name = "softfig-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "soft-fig sandbox engine: one Policy -> bwrap argv + Landlock + seccomp (shared with the remote runner and fleet safety-order step 4)."
+
+[dependencies]

@@ -3829,6 +3829,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-sandbox"
+version = "1.0.0-alpha.1"
+
+[[package]]
 name = "softfig-store"
 version = "1.0.0-alpha.1"
 dependencies = [
