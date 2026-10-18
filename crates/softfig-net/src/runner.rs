@@ -531,6 +531,26 @@ where
     F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
     E: std::fmt::Display,
 {
+    run_remote_collecting(local, ring_identity, endpoint, cache, offer, make_bundle, now)
+        .map(|(outcome, _logs, _events)| outcome)
+}
+
+/// [`run_remote`], but also returns the live `JobLog`/`JobEvent` frames the
+/// runner streamed before the terminal result. The requester-side job table
+/// (slice 007) records these into keeperd's bounded in-memory log ring.
+pub fn run_remote_collecting<E, F>(
+    local: &LocalDevice,
+    ring_identity: &[u8; KEY_LEN],
+    endpoint: &str,
+    cache: &mut RunnerCache,
+    offer: &JobOffer,
+    make_bundle: F,
+    now: i64,
+) -> std::result::Result<(JobOutcome, Vec<JobLog>, Vec<JobEvent>), RunFailure>
+where
+    F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
+    E: std::fmt::Display,
+{
     // Revoked-cache fast path: refuse before dialing when the cached cert's
     // serial is already revoked.
     let cached_key = hex::encode(ring_identity);
@@ -561,14 +581,15 @@ where
         },
     );
 
-    let (_caps, outcome) = run_job(&mut session, offer, make_bundle).map_err(|e| match e {
-        NetError::RunnerCert(_) => RunFailure::InvalidCert,
-        _ => RunFailure::NoRunner,
-    })?;
+    let (_caps, outcome, logs, events) =
+        run_job_collecting(&mut session, offer, make_bundle).map_err(|e| match e {
+            NetError::RunnerCert(_) => RunFailure::InvalidCert,
+            _ => RunFailure::NoRunner,
+        })?;
 
     match outcome {
         JobOutcome::Rejected(reason) => Err(RunFailure::Rejected(reason)),
-        accepted => Ok(accepted),
+        accepted => Ok((accepted, logs, events)),
     }
 }
 

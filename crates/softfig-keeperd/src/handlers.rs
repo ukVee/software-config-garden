@@ -1612,6 +1612,107 @@ pub fn runner_local_device(daemon: &Daemon, _args: serde_json::Value) -> Handler
     .unwrap())
 }
 
+/// `runner_job_record`: record (or update) one job row in the bounded in-memory
+/// job table (spec §6, §8). The CLI records a completed job after the remote
+/// run returns: it inserts a fresh row (upsert by job id) and appends the log
+/// bytes. In-memory only — no disk, and no `require_unlocked` (the table is
+/// readable/writable independent of the vault; it resets on a daemon cycle).
+pub fn runner_job_record(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    use base64::Engine as _;
+    use softfig_ipc::verbs::RunnerJobRecordArgs;
+
+    let args: RunnerJobRecordArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("runner_job_record args: {e}")))?;
+    let job_id = args.job_id.trim().to_lowercase();
+    if job_id.is_empty() || job_id.len() > 64 {
+        return Err((ErrorKind::BadArgs, "runner_job_record: bad job_id".into()));
+    }
+
+    let log_bytes = if args.log_base64.is_empty() {
+        Vec::new()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(args.log_base64.trim())
+            .map_err(|_| (ErrorKind::BadArgs, "runner_job_record: log_base64 is not valid base64".into()))?
+    };
+
+    let mut inner = daemon.inner.lock().unwrap();
+    // Upsert by job id: a re-record (retry, or the attach path later) replaces.
+    if let Some(existing) = inner.runner_jobs.find_mut(&job_id) {
+        if !log_bytes.is_empty() {
+            existing.log.append(&log_bytes);
+        }
+        if let Some(exit) = args.exit {
+            existing.exit = Some(exit);
+        }
+        if let Some(h) = args.attestation_hash {
+            existing.attestation_hash = Some(h);
+        }
+        if let Some(t) = args.finished_at {
+            existing.finished_at = Some(t);
+        }
+    } else {
+        let mut log = crate::runner_jobs::JobLogRing::new(crate::runner_jobs::LOG_RING_CAP);
+        log.append(&log_bytes);
+        inner.runner_jobs.insert(crate::runner_jobs::RunnerJob {
+            job_id: job_id.clone(),
+            requester_device: args.requester_device,
+            repo_key: args.repo_key,
+            source_id: args.source_id,
+            snapshot_commit: args.snapshot_commit,
+            profile: args.profile,
+            cmd: args.cmd,
+            env_names: args.env_names,
+            toolchain: args.toolchain,
+            cache: args.cache,
+            where_: args.where_,
+            started_at: args.started_at,
+            finished_at: args.finished_at,
+            exit: args.exit,
+            attestation_hash: args.attestation_hash,
+            log,
+        });
+    }
+    Ok(serde_json::json!({}))
+}
+
+/// `runner_job_ls`: list the bounded job table (newest first).
+pub fn runner_job_ls(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
+    let inner = daemon.inner.lock().unwrap();
+    Ok(serde_json::to_value(inner.runner_jobs.ls()).unwrap())
+}
+
+/// `runner_job_show`: the full row for one job (by id or unique prefix).
+pub fn runner_job_show(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    #[derive(serde::Deserialize)]
+    struct ShowArgs {
+        job_id: String,
+    }
+    let args: ShowArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("runner_job_show args: {e}")))?;
+    let inner = daemon.inner.lock().unwrap();
+    match inner.runner_jobs.find(&args.job_id) {
+        Some(job) => Ok(serde_json::to_value(job.to_show()).unwrap()),
+        None => Err((ErrorKind::NotFound, format!("no job matches {:?}", args.job_id))),
+    }
+}
+
+/// `runner_job_log`: one job's bounded log ring (raw bytes, base64). The caller
+/// strips terminal control sequences before rendering (spec §6 Logs).
+pub fn runner_job_log(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
+    #[derive(serde::Deserialize)]
+    struct LogArgs {
+        job_id: String,
+    }
+    let args: LogArgs = serde_json::from_value(args)
+        .map_err(|e| (ErrorKind::BadArgs, format!("runner_job_log args: {e}")))?;
+    let inner = daemon.inner.lock().unwrap();
+    match inner.runner_jobs.find(&args.job_id) {
+        Some(job) => Ok(serde_json::to_value(job.to_log()).unwrap()),
+        None => Err((ErrorKind::NotFound, format!("no job matches {:?}", args.job_id))),
+    }
+}
+
 // ---- M5b: replication (zero-knowledge device-chain backup) ------------
 
 pub fn replica_grant(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {

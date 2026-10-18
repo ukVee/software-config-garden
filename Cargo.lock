@@ -3697,6 +3697,8 @@ name = "softfig-cli"
 version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
+ "base64",
+ "blake3",
  "clap",
  "hex",
  "hostname",

@@ -344,6 +344,10 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         op::RUNNER_SIGN_REVOKE => handlers::runner_sign_revoke(daemon, req.args),
         op::RUNNER_SIGN_OFFER => handlers::runner_sign_offer(daemon, req.args),
         op::RUNNER_LOCAL_DEVICE => handlers::runner_local_device(daemon, req.args),
+        op::RUNNER_JOB_RECORD => handlers::runner_job_record(daemon, req.args),
+        op::RUNNER_JOB_LS => handlers::runner_job_ls(daemon, req.args),
+        op::RUNNER_JOB_SHOW => handlers::runner_job_show(daemon, req.args),
+        op::RUNNER_JOB_LOG => handlers::runner_job_log(daemon, req.args),
         op::REPLICA_GRANT => handlers::replica_grant(daemon, req.args),
         op::REPLICA_REVOKE => handlers::replica_revoke(daemon, req.args),
         op::REPLICA_STATUS => handlers::replica_status(daemon, req.args),
@@ -684,5 +688,111 @@ mod tests {
             softfig_net::verify_static_attestation(&device_id, &transport_pubkey, &attestation),
             "the returned self-attestation must verify"
         );
+    }
+
+    /// The bounded in-memory job table round-trips through the verbs (spec §6,
+    /// §8): record a completed job, list it, show its full row, and read its
+    /// log ring back. This is the slice-007 surface that backs `softfig run
+    /// ls|show|logs`.
+    #[test]
+    fn runner_job_table_round_trip() {
+        use base64::Engine as _;
+        use softfig_ipc::verbs::{RunnerJobLogReply, RunnerJobLsReply, RunnerJobShowReply};
+
+        let (_g, daemon) = unlocked();
+
+        let job_id = "ab".repeat(16);
+        let log = b"\x1b[32m   Compiling softfig\x1b[0m\nwarning: unused\n";
+
+        let resp = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_JOB_RECORD,
+                serde_json::json!({
+                    "job_id": job_id,
+                    "requester_device": "tablet",
+                    "repo_key": "11".repeat(32),
+                    "source_id": "0120".to_string() + &"33".repeat(20),
+                    "snapshot_commit": "44".repeat(20),
+                    "profile": "gate",
+                    "cmd": ["cargo", "test"],
+                    "env_names": ["RUST_LOG"],
+                    "toolchain": "rust",
+                    "cache": "shared",
+                    "where": "remote",
+                    "started_at": 1_800_000_000i64,
+                    "exit": 0,
+                    "attestation_hash": "55".repeat(32),
+                    "finished_at": 1_800_000_100i64,
+                    "log_base64": base64::engine::general_purpose::STANDARD.encode(log),
+                }),
+            ),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // ls — the new row is newest-first.
+        let ls_resp = dispatch(
+            &daemon,
+            Request::new(softfig_ipc::op::RUNNER_JOB_LS, serde_json::json!({})),
+        );
+        let ls_data = match ls_resp {
+            Response::Ok { data, .. } => data,
+            other => panic!("runner_job_ls failed: {other:?}"),
+        };
+        let ls: RunnerJobLsReply = serde_json::from_value(ls_data).unwrap();
+        assert_eq!(ls.jobs.len(), 1);
+        assert_eq!(ls.jobs[0].job_id, job_id);
+        assert_eq!(ls.jobs[0].exit, Some(0));
+        assert_eq!(ls.jobs[0].where_, "remote");
+        assert_eq!(ls.jobs[0].state, "done");
+
+        // show — the full row.
+        let show_resp = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_JOB_SHOW,
+                serde_json::json!({ "job_id": &job_id[..12] }),
+            ),
+        );
+        let show_data = match show_resp {
+            Response::Ok { data, .. } => data,
+            other => panic!("runner_job_show failed: {other:?}"),
+        };
+        let show: RunnerJobShowReply = serde_json::from_value(show_data).unwrap();
+        assert_eq!(show.cmd, vec!["cargo", "test"]);
+        assert_eq!(show.env_names, vec!["RUST_LOG"]);
+        let expect_hash = "55".repeat(32);
+        assert_eq!(show.attestation_hash.as_deref(), Some(expect_hash.as_str()));
+        assert_eq!(show.log_bytes, log.len());
+
+        // log — the raw ring bytes round-trip (control sequences intact; the
+        // CLI strips them at render time).
+        let log_resp = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_JOB_LOG,
+                serde_json::json!({ "job_id": job_id }),
+            ),
+        );
+        let log_data = match log_resp {
+            Response::Ok { data, .. } => data,
+            other => panic!("runner_job_log failed: {other:?}"),
+        };
+        let got: RunnerJobLogReply = serde_json::from_value(log_data).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&got.log_base64)
+            .unwrap();
+        assert_eq!(decoded.as_slice(), log.as_slice());
+
+        // show an unknown job -> NotFound.
+        let missing = dispatch(
+            &daemon,
+            Request::new(
+                softfig_ipc::op::RUNNER_JOB_SHOW,
+                serde_json::json!({ "job_id": "zz".repeat(16) }),
+            ),
+        );
+        let (kind, _) = err_of(missing);
+        assert_eq!(kind, ErrorKind::NotFound);
     }
 }

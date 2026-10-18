@@ -173,6 +173,21 @@ pub mod op {
     /// Noise connection to a runner. Only the transport static is exposed; the
     /// Ed25519 identity *signing* secret stays in the vault.
     pub const RUNNER_LOCAL_DEVICE: &str = "runner_local_device";
+    /// remote-runner (spec §6, §8): record a job row into keeperd's bounded
+    /// in-memory job table (the requester-side system of record for this
+    /// session). The CLI records a completed job (start + log + terminal) after
+    /// the remote run returns; `--detach`/`attach`/`cancel` reuse the same
+    /// table in later chunks.
+    pub const RUNNER_JOB_RECORD: &str = "runner_job_record";
+    /// remote-runner (spec §6): list the bounded in-memory job table (last N
+    /// jobs, newest first).
+    pub const RUNNER_JOB_LS: &str = "runner_job_ls";
+    /// remote-runner (spec §6): show one job row's full fields (incl. the
+    /// attestation hash), by job id prefix.
+    pub const RUNNER_JOB_SHOW: &str = "runner_job_show";
+    /// remote-runner (spec §6 Logs): read one job's bounded in-memory log ring
+    /// (raw bytes; the caller strips control sequences before rendering).
+    pub const RUNNER_JOB_LOG: &str = "runner_job_log";
     /// M5b: grant a ring member permission to host this device's chain backup —
     /// add it to the owner-side `push_to` allow-list. The owner then pushes its
     /// signed ciphertext chain to that host (which must also have opted in via
@@ -1637,6 +1652,112 @@ pub struct RunnerLocalDeviceReply {
     pub transport_secret: String,
     /// The self-attestation signature over the transport static (hex, 128 chars).
     pub static_attestation: String,
+}
+
+/// `runner_job_record({...}) -> {}`. Record (or update) one job row in
+/// keeperd's bounded in-memory job table (spec §6, §8). The CLI records a
+/// completed job after the remote run returns. Byte fields are lowercase hex;
+/// the log ring bytes are base64.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerJobRecordArgs {
+    /// Random 128-bit job id (lowercase hex).
+    pub job_id: String,
+    /// This (requester) device's human-readable name.
+    #[serde(default)]
+    pub requester_device: String,
+    /// BLAKE3 repo key (lowercase hex).
+    #[serde(default)]
+    pub repo_key: String,
+    /// Typed source id (format tag + root, lowercase hex).
+    #[serde(default)]
+    pub source_id: String,
+    /// Snapshot commit id (lowercase hex).
+    #[serde(default)]
+    pub snapshot_commit: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// The env *names* only (values never leave the runner — spec §6 row).
+    #[serde(default)]
+    pub env_names: Vec<String>,
+    #[serde(default)]
+    pub toolchain: String,
+    #[serde(default)]
+    pub cache: String,
+    /// Where the job ran: `remote` | `local`.
+    #[serde(default, rename = "where")]
+    pub where_: String,
+    /// Unix seconds the run began.
+    pub started_at: i64,
+    /// The job's own exit code (present once the job finished).
+    #[serde(default)]
+    pub exit: Option<i32>,
+    /// BLAKE3 of the signed attestation (lowercase hex); `None` for local runs.
+    #[serde(default)]
+    pub attestation_hash: Option<String>,
+    /// Unix seconds the run finished.
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+    /// The job's log ring bytes (base64), appended to the per-job ring.
+    #[serde(default)]
+    pub log_base64: String,
+}
+
+/// One job's summary row, for `runner_job_ls`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerJobSummary {
+    pub job_id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub exit: Option<i32>,
+    /// `remote` | `local`.
+    #[serde(rename = "where")]
+    pub where_: String,
+    pub profile: String,
+    pub cmd: Vec<String>,
+    /// `running` until finished, then `done`/`failed`/`cancelled`/`lost`.
+    pub state: String,
+}
+
+/// `runner_job_ls({}) -> {jobs}`. Newest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerJobLsReply {
+    #[serde(default)]
+    pub jobs: Vec<RunnerJobSummary>,
+}
+
+/// `runner_job_show({job_id}) -> {…}`. The full row for one job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerJobShowReply {
+    pub job_id: String,
+    pub requester_device: String,
+    pub repo_key: String,
+    pub source_id: String,
+    pub snapshot_commit: String,
+    pub profile: String,
+    pub cmd: Vec<String>,
+    pub env_names: Vec<String>,
+    pub toolchain: String,
+    pub cache: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub exit: Option<i32>,
+    pub attestation_hash: Option<String>,
+    #[serde(rename = "where")]
+    pub where_: String,
+    pub state: String,
+    /// The log ring's current byte count (the bytes themselves come via
+    /// `runner_job_log`).
+    pub log_bytes: usize,
+}
+
+/// `runner_job_log({job_id}) -> {job_id, log_base64}`. The raw ring bytes; the
+/// caller strips terminal control sequences before rendering (spec §6 Logs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerJobLogReply {
+    pub job_id: String,
+    pub log_base64: String,
 }
 
 // ---- M5b: replication (zero-knowledge device-chain backup) ------------

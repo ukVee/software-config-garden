@@ -21,15 +21,17 @@ use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     runtime_socket_path,
     verbs::{
-        op, PairListReply, ReadFileArgs, ReadFileReply, RunnerLocalDeviceReply, RunnerOfferEnv,
+        op, PairListReply, ReadFileArgs, ReadFileReply, RunnerJobLogReply, RunnerJobLsReply,
+        RunnerJobRecordArgs, RunnerJobShowReply, RunnerLocalDeviceReply, RunnerOfferEnv,
         RunnerSignOfferArgs, RunnerSignOfferReply,
     },
     Request,
 };
-use softfig_net::proto::{EnvEntry, JobOffer};
+use softfig_net::proto::{EnvEntry, JobLog, JobOffer};
 use softfig_net::{
-    fallback_action, is_fallback_trigger, outcome_exit_code, run_remote, Fallback,
-    FallbackAction, JobOutcome, LocalDevice, ResolvedRun, RunFailure, RunnerCache, RunnerConfig,
+    fallback_action, is_fallback_trigger, outcome_exit_code, run_remote_collecting,
+    strip_control_sequences, Fallback, FallbackAction, JobOutcome, LocalDevice, ResolvedRun,
+    RunFailure, RunnerCache, RunnerConfig,
 };
 use softfig_source::{create_bundle, repo_key, root_commits, snapshot_repo, SubmodulePolicy};
 
@@ -126,12 +128,11 @@ pub struct FetchArgs {
 pub fn run(cmd: RunCmd) -> Result<()> {
     match cmd {
         RunCmd::Run(args) => run_job(args),
-        RunCmd::Ls
-        | RunCmd::Show(_)
-        | RunCmd::Logs(_)
-        | RunCmd::Attach(_)
-        | RunCmd::Cancel(_) => Err(anyhow!(
-            "job history (ls/show/logs/attach/cancel) needs the keeperd job table — a later slice-007 chunk"
+        RunCmd::Ls => job_ls(),
+        RunCmd::Show(args) => job_show(&args),
+        RunCmd::Logs(args) => job_log(&args),
+        RunCmd::Attach(_) | RunCmd::Cancel(_) => Err(anyhow!(
+            "attach/cancel needs the detached-job runner session — a later slice-007 chunk"
         )),
         RunCmd::Fetch(_) => Err(anyhow!(
             "artifact fetch is parked on report #057 (the artifact glob base)"
@@ -285,7 +286,8 @@ fn attempt_runner(
     let commit = snapshot.commit;
     let repo = cwd.to_path_buf();
     let now = unix_now();
-    let outcome = run_remote(
+    let started_at = now;
+    let (outcome, logs, _events) = run_remote_collecting(
         &local,
         &ring_identity,
         &endpoint,
@@ -298,7 +300,162 @@ fn attempt_runner(
     )
     .map_err(AttemptFailure::Runner)?;
 
+    // Record the completed job into keeperd's bounded in-memory table (spec §6,
+    // §8), which backs `softfig run ls|show|logs`. Best-effort: a recording
+    // failure never changes the job's own exit code.
+    record_job(socket, &local, &offer, &outcome, &logs, started_at);
+
     Ok(outcome)
+}
+
+/// Record a completed remote job into keeperd's bounded in-memory table (spec
+/// §6, §8). The log frames are interleaved in arrival order (like a terminal);
+/// the attestation hash is the BLAKE3 of the signed attestation bytes. Never
+/// fails the run — a recording problem is a warning, not a different exit code.
+fn record_job(
+    socket: &Path,
+    local: &LocalDevice,
+    offer: &JobOffer,
+    outcome: &JobOutcome,
+    logs: &[JobLog],
+    started_at: i64,
+) {
+    use base64::Engine as _;
+
+    let (exit, attestation_hash) = match outcome {
+        JobOutcome::Accepted(result) => {
+            let hash = if result.attestation.is_empty() {
+                None
+            } else {
+                Some(hex::encode(blake3::hash(&result.attestation).as_bytes()))
+            };
+            (Some(result.exit_code), hash)
+        }
+        JobOutcome::Rejected(_) => (None, None),
+    };
+
+    let mut ordered: Vec<&JobLog> = logs.iter().collect();
+    ordered.sort_by_key(|l| l.seq);
+    let mut buf = Vec::new();
+    for l in ordered {
+        buf.extend_from_slice(&l.bytes);
+    }
+
+    let mut env_names: Vec<String> = offer.env.iter().map(|e| e.name.clone()).collect();
+    env_names.sort();
+
+    let args = RunnerJobRecordArgs {
+        job_id: hex::encode(&offer.job_id),
+        requester_device: local.device_name.clone(),
+        repo_key: hex::encode(&offer.repo_key),
+        source_id: hex::encode(&offer.source_id),
+        snapshot_commit: hex::encode(&offer.snapshot_commit),
+        profile: offer.profile.clone(),
+        cmd: offer.cmd.clone(),
+        env_names,
+        toolchain: offer.toolchain.clone(),
+        cache: offer.cache.clone(),
+        where_: "remote".to_string(),
+        started_at,
+        exit,
+        attestation_hash,
+        finished_at: Some(unix_now()),
+        log_base64: base64::engine::general_purpose::STANDARD.encode(&buf),
+    };
+
+    if let Err(e) = daemon_call(socket, op::RUNNER_JOB_RECORD, serde_json::to_value(args).unwrap()) {
+        eprintln!("warning: could not record job in the keeperd table: {e:#}");
+    }
+}
+
+/// `softfig run ls` — list the bounded job table (newest first).
+fn job_ls() -> Result<()> {
+    let socket = daemon_socket(&None);
+    let reply: RunnerJobLsReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::RUNNER_JOB_LS,
+        serde_json::json!({}),
+    )?)?;
+    if reply.jobs.is_empty() {
+        println!("(no jobs recorded)");
+        return Ok(());
+    }
+    for j in &reply.jobs {
+        let id = &j.job_id[..j.job_id.len().min(12)];
+        let exit = j
+            .exit
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{id}  {:<7}  {:<8}  exit {exit:>3}  {}",
+            j.where_,
+            j.state,
+            j.cmd.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// `softfig run show <job>` — the full row for one job.
+fn job_show(args: &JobArgs) -> Result<()> {
+    let socket = daemon_socket(&None);
+    let reply: RunnerJobShowReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::RUNNER_JOB_SHOW,
+        serde_json::json!({ "job_id": args.job }),
+    )?)?;
+    println!("job:         {}", reply.job_id);
+    println!("requester:   {}", reply.requester_device);
+    println!("repo_key:    {}", reply.repo_key);
+    println!("source_id:   {}", reply.source_id);
+    println!("snapshot:    {}", reply.snapshot_commit);
+    println!("profile:     {}", reply.profile);
+    println!("cmd:         {}", reply.cmd.join(" "));
+    println!("env:         {}", reply.env_names.join(", "));
+    println!("toolchain:   {}", reply.toolchain);
+    println!("cache:       {}", reply.cache);
+    println!("where:       {}", reply.where_);
+    println!("state:       {}", reply.state);
+    println!("started_at:  {}", reply.started_at);
+    if let Some(t) = reply.finished_at {
+        println!("finished_at: {t}");
+    }
+    if let Some(e) = reply.exit {
+        println!("exit:        {e}");
+    }
+    match reply.attestation_hash {
+        Some(h) if args.attestation => {
+            println!("attestation: {h} (BLAKE3 of the signed attestation)");
+        }
+        Some(_) => {} // shown only with --attestation
+        None if args.attestation => println!("attestation: (none — local run)"),
+        None => {}
+    }
+    println!("log:         {} bytes", reply.log_bytes);
+    Ok(())
+}
+
+/// `softfig run logs <job>` — the job's log ring, control sequences stripped
+/// (spec §6 Logs). Always sanitizes: logs are untrusted bytes.
+fn job_log(args: &LogsArgs) -> Result<()> {
+    use base64::Engine as _;
+    let socket = daemon_socket(&None);
+    let reply: RunnerJobLogReply = serde_json::from_value(daemon_call(
+        &socket,
+        op::RUNNER_JOB_LOG,
+        serde_json::json!({ "job_id": args.job }),
+    )?)?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(reply.log_base64.trim())
+        .map_err(|e| anyhow!("runner_job_log: bad base64: {e}"))?;
+    let bytes = strip_control_sequences(&raw);
+    let mut stdout = std::io::stdout().lock();
+    use std::io::Write as _;
+    stdout.write_all(&bytes)?;
+    if args.follow {
+        eprintln!("note: `-f` (live follow) needs the detached-job session — a later slice-007 chunk");
+    }
+    Ok(())
 }
 
 /// Build the unsigned [`JobOffer`] from a snapshot + resolved run (spec §6 step

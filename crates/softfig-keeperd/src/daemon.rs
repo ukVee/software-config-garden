@@ -177,6 +177,11 @@ pub struct DaemonInner {
     /// one is NOT persisted the way task 058's replica health is. Cleared on
     /// soft lock alongside [`Self::write_turns`].
     pub chain_health: crate::chain_health::ChainHealth,
+    /// Remote-runner (spec §6, §8): the requester-side bounded in-memory job
+    /// table — the last N jobs, each with a bounded log ring. In-memory by
+    /// design (no disk on the tablet's eMMC); a `daemon cycle` resets it. Backs
+    /// `softfig run ls|show|logs` and (later) `--detach`/`attach`/`cancel`.
+    pub runner_jobs: crate::runner_jobs::RunnerJobTable,
 }
 
 impl DaemonInner {
@@ -204,6 +209,9 @@ impl DaemonInner {
             write_turns: HashMap::new(),
             pending_turn_broadcasts: Vec::new(),
             chain_health: crate::chain_health::ChainHealth::new(),
+            runner_jobs: crate::runner_jobs::RunnerJobTable::new(
+                crate::runner_jobs::DEFAULT_MAX_JOBS,
+            ),
         }
     }
 }
