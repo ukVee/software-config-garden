@@ -623,4 +623,53 @@ mod tests {
         assert_eq!(m.daemon.as_deref(), Some("0.0.1"));
         assert_eq!(m.skew(), Skew::ClientNewer);
     }
+
+    /// Release-workflow gate (release-pipeline slice 004, slice 002's
+    /// follow-up): the release profile's thin LTO must not strip the build
+    /// stamp out of the program binaries. Run with `cargo test --release`
+    /// after `cargo build --workspace --release --locked` so the release
+    /// binaries sit in the profile dir this test binary is beside. The release
+    /// workflow sets `EXPECTED_RELEASE_VERSION` to the tag (leading `v`
+    /// stripped) so a tag that doesn't match the workspace version — or a
+    /// release build that dropped the stamp — fails the release before upload.
+    /// In a casual `cargo test` the check is best-effort: it reads whatever
+    /// binaries are beside this test and skips if there are none.
+    #[test]
+    fn release_binaries_carry_the_build_stamp() {
+        // This test binary lives at <profile>/deps/<name>; the program
+        // binaries are built beside it in <profile>/.
+        let exe = std::env::current_exe().unwrap();
+        let profile_dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
+        let expected = std::env::var("EXPECTED_RELEASE_VERSION").ok();
+
+        let first = profile_dir.join(INSTALLED_SET[0]);
+        if !first.exists() {
+            match &expected {
+                Some(_) => panic!(
+                    "release binary set missing at {} — run `cargo build \
+                     --workspace --release --locked` first",
+                    profile_dir.display()
+                ),
+                None => {
+                    eprintln!(
+                        "skipping release-stamp check: no binaries at {}",
+                        profile_dir.display()
+                    );
+                    return;
+                }
+            }
+        }
+
+        let report = SetReport::scan(&profile_dir);
+        let want = match expected.as_deref() {
+            Some(v) => v,
+            None => binary_version(),
+        };
+        assert_eq!(
+            report.consistent_version(),
+            Some(want),
+            "the release binary set is not one {want} build — thin LTO dropped \
+             or mangled the stamp: {report}"
+        );
+    }
 }

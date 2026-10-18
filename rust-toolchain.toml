@@ -1,0 +1,14 @@
+# Pinned toolchain — the reproducible-builds groundwork (meta/spec-release.md
+# → "Open questions" → "Reproducible builds", and meta/spec-install.md → "CI
+# pipeline" → "dependency gate"). Every build in this repo — local, CI, and the
+# release workflow — uses exactly this toolchain, so a release artifact is
+# reproducible against the committed Cargo.lock.
+#
+# 1.95.0 is what this device builds with and the workspace gate is green on it;
+# the CI jobs (`dtolnay/rust-toolchain`) read this file when no `toolchain:`
+# input is given. Bump it deliberately, never on a whim — a bump re-proves the
+# clippy/test/release gate against the new compiler.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,108 @@
+name: Release
+
+# The producer side of meta/spec-release.md: on a `v*` tag push, build the
+# per-artifact target matrix, verify the build stamp survived thin LTO, attest
+# provenance, and publish. The privileged publish job runs only through a
+# GitHub Environment with a required reviewer, and only on a tag push to the
+# upstream repo — this workflow has no `pull_request` trigger, so it never runs
+# on a fork PR (meta/spec-install.md → "CI pipeline" → "release gate").
+#
+# The loop never tags or pushes; the human cuts the tag. The Environment named
+# `release` (below) must be created in the repo settings with the required
+# reviewer before the first tag — without it, the publish job stays pending.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --- Build matrix: the program tarball, per target -------------------------
+  # Tier 1 x86_64-unknown-linux-gnu is built and tested (by CI's test gate on
+  # main, the commit a tag must point at); tier 2 aarch64-unknown-linux-gnu is
+  # built, untested on hardware, and labeled as such in the artifact name. The
+  # helper (static musl ×2, slice 005) and the rescue artifact (static musl ×2,
+  # slice 006) do not exist yet; their slots are named here (meta/spec-release.md
+  # → "Artifacts" → "Target matrix") so they drop in without restructuring the
+  # matrix.
+  program:
+    name: program (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            tier: tier1
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            tier: tier2
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install system deps (protoc + libfuse3)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+      - name: Build (release, locked)
+        run: cargo build --workspace --release --locked
+      - name: Compute the release version (tag without the leading v)
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Verify the release binaries carry the tag's build stamp
+        env:
+          EXPECTED_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo test --release -p softfig-ipc --lib --locked -- release_binaries_carry_the_build_stamp
+      - name: Stage the program tarball
+        run: |
+          set -euo pipefail
+          stage="softfig-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          for bin in softfig softfig-keeperd softfig-mcp softfig-tui softfig-growlightd; do
+            cp "target/release/${bin}" "dist/${stage}/${bin}"
+          done
+          tar -C dist -czf "dist/${stage}-${{ matrix.tier }}.tar.gz" "${stage}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: program-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --- Privileged: attest provenance + publish ------------------------------
+  # Mints the sigstore build-provenance attestation for every artifact and
+  # uploads the release. Runs only through the `release` Environment (required
+  # reviewer) and only on a tag push to the upstream repo. Least-privilege
+  # token: the workflow default is contents: read; this job alone gains
+  # id-token + attestations + contents write.
+  publish:
+    needs: program
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    environment: release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums (every artifact)
+        run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Attest build provenance (every artifact)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*
+          generate_release_notes: true
