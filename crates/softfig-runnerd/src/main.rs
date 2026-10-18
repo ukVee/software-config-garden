@@ -192,7 +192,7 @@ fn run_job_mode(spec_path: &Path, result_path: &Path) -> Result<u8, String> {
         ..Default::default()
     };
 
-    let report = match softfig_runnerd::executor::execute(&spec.ctx, &serve, &offer, &bins) {
+    let report = match softfig_runnerd::executor::execute(&spec.ctx, &serve, &offer, &bins, None) {
         Ok(outcome) => softfig_runnerd::JobReport::ok(outcome),
         Err(softfig_runnerd::Error::ToolchainMissing(cmd)) => {
             softfig_runnerd::JobReport::err(format!("toolchain-missing: {cmd}"))

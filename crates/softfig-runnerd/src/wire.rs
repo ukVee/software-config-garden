@@ -18,16 +18,21 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use softfig_net::proto::{frame, Frame, JobAccept, JobReject, JobResult, RunnerCaps, RunnerHandshake, SourceHave};
+use softfig_net::proto::{frame, Frame, JobAccept, JobLog, JobReject, JobResult, RunnerCaps, RunnerHandshake, SourceHave};
 use softfig_sandbox::JobContext;
 use softfig_source::SourceBackend;
 
+use crate::attestation::{
+    ArtifactEntry, EnvBinding, ExitInfo, JobAttestation, SignedAttestation, SourceRef,
+};
 use crate::cert::StoredCert;
 use crate::config::{AcceptConfig, ServeConfig};
 use crate::error::{Error, Result};
 use crate::executor::{self, SandboxBinaries};
 use crate::keys::RunnerKeys;
+use crate::log::{JobLogs, LogSink};
 use crate::state::StateRoot;
 use crate::systemd::{
     battery_reject, on_battery, run_unit, Caps, CapsHit, EnvSpec, JobReport, JobSpec, Manager,
@@ -42,6 +47,8 @@ pub struct WireServer {
     listener: TcpListener,
     root: StateRoot,
     transport_secret: [u8; 32],
+    /// The Ed25519 attest key — signs job attestations (spec §8).
+    attest_signing: ed25519_dalek::SigningKey,
     sandbox_bins: SandboxBinaries,
     /// Which systemd manager a job's transient unit runs under (spec §7.1
     /// layer 2). `System` in production; `Direct` runs the executor in-process
@@ -84,6 +91,7 @@ impl WireServer {
             listener,
             root,
             transport_secret: *keys.transport_secret(),
+            attest_signing: keys.attest_signing().clone(),
             sandbox_bins,
             manager: Manager::Direct,
             power_supply_path: PathBuf::from(POWER_SUPPLY_PATH),
@@ -182,7 +190,7 @@ impl WireServer {
                 // materialize. Slice 006 then runs the real fetch → run →
                 // collect sequence (in the transient unit) and returns the
                 // real result.
-                self.serve_source(&mut session, &offer, &serve, on_batt)?;
+                self.serve_source(session, &offer, &serve, on_batt, device_id, &cert)?;
             }
             Some(reason) => {
                 session.send_frame(&Frame::job_reject(JobReject {
@@ -273,10 +281,12 @@ impl WireServer {
     /// `softfig_source`'s hardening config (hooks off, no network, fsck on).
     fn serve_source(
         &self,
-        session: &mut softfig_net::NoiseSession<TcpStream>,
+        mut session: softfig_net::NoiseSession<TcpStream>,
         offer: &softfig_net::proto::JobOffer,
         serve: &ServeConfig,
         on_battery: bool,
+        requester_device: [u8; 32],
+        cert: &StoredCert,
     ) -> Result<()> {
         let source_id = softfig_source::SourceId::decode(&offer.source_id)
             .ok_or_else(|| Error::Protocol("malformed source id in offer".into()))?;
@@ -364,7 +374,58 @@ impl WireServer {
         std::fs::create_dir_all(&ctx.cargo_home)?;
         std::fs::create_dir_all(&ctx.target_cache)?;
 
-        match self.run_job(&ctx, serve, offer, on_battery, &job_dir) {
+        // Split the Noise session: the source transfer is done, and from here the
+        // runner only sends (live logs, then the result). The drain thread owns
+        // the write half and streams `JobLog` frames as the run produces them;
+        // it hands the writer back once the log channel closes.
+        let (reader, writer) = session
+            .split()
+            .map_err(|e| Error::Protocol(format!("session split: {e}")))?;
+        drop(reader);
+
+        let (mut logs, rx) = JobLogs::new();
+        let job_id = offer.job_id.clone();
+        let drain = std::thread::spawn(move || {
+            let mut w = writer;
+            for chunk in rx {
+                if w.send_frame(&Frame::job_log(JobLog {
+                    job_id: job_id.clone(),
+                    seq: chunk.seq,
+                    stream: chunk.stream as u32,
+                    bytes: chunk.bytes,
+                }))
+                .is_err()
+                {
+                    // The requester disconnected mid-run; stop streaming (the
+                    // job runs to completion regardless — detach is chunk 4).
+                    break;
+                }
+            }
+            w
+        });
+
+        // Direct mode streams the run step's output live into the sink; the
+        // transient-unit path buffers (unit log capture + attach/cancel land in
+        // chunk 4).
+        let log = match self.manager {
+            Manager::Direct => Some(logs.sink()),
+            Manager::System | Manager::User => None,
+        };
+        let started_at = now_unix();
+        let run = self.run_job(&ctx, serve, offer, on_battery, &job_dir, log.as_ref());
+        let finished_at = now_unix();
+
+        // Every producer clone is dropped when run_job returns; drop our sink
+        // clone and then close the master sender so the drain thread's channel
+        // closes and it hands back the writer.
+        drop(log);
+        logs.close();
+        let writer = match drain.join() {
+            Ok(w) => w,
+            Err(_) => return Err(Error::Protocol("log drain thread panicked".into())),
+        };
+
+        match run {
             Ok((outcome, caps_hit)) => {
                 if let Some(hit) = caps_hit {
                     eprintln!(
@@ -373,12 +434,25 @@ impl WireServer {
                         hit.as_str()
                     );
                 }
-                session.send_frame(&Frame::job_result(JobResult {
+                let attestation = build_attestation(
+                    offer,
+                    &source_id,
+                    &repo_key,
+                    &outcome,
+                    caps_hit,
+                    requester_device,
+                    cert,
+                    &logs,
+                    started_at,
+                    finished_at,
+                )?;
+                let signature = attestation.sign(&self.attest_signing)?;
+                let signed = SignedAttestation { attestation, signature: hex::encode(signature) };
+                let mut w = writer;
+                w.send_frame(&Frame::job_result(JobResult {
                     job_id: offer.job_id.clone(),
                     exit_code: outcome.exit_code,
-                    // The signed canonical-JSON attestation lands in chunk 3;
-                    // the collected artifact hashes + caps_hit fold into it.
-                    attestation: Vec::new(),
+                    attestation: signed.to_bytes()?,
                 }))?;
             }
             Err(Error::ToolchainMissing(add_cmd)) => {
@@ -388,7 +462,8 @@ impl WireServer {
                     "softfig-runnerd: job {} rejected (toolchain-missing): {add_cmd}",
                     hex::encode(&offer.job_id)
                 );
-                session.send_frame(&Frame::job_reject(JobReject {
+                let mut w = writer;
+                w.send_frame(&Frame::job_reject(JobReject {
                     job_id: offer.job_id.clone(),
                     reason: softfig_net::JobRejectReason::ToolchainMissing.to_u32(),
                 }))?;
@@ -411,10 +486,11 @@ impl WireServer {
         offer: &softfig_net::proto::JobOffer,
         on_battery: bool,
         job_dir: &std::path::Path,
+        log: Option<&LogSink>,
     ) -> Result<(executor::RunOutcome, Option<CapsHit>)> {
         match self.manager {
             Manager::Direct => {
-                executor::execute(ctx, serve, offer, &self.sandbox_bins).map(|o| (o, None))
+                executor::execute(ctx, serve, offer, &self.sandbox_bins, log).map(|o| (o, None))
             }
             Manager::System | Manager::User => {
                 self.run_in_unit(ctx, serve, offer, on_battery, job_dir)
@@ -472,7 +548,7 @@ impl WireServer {
             _ => None,
         };
         if let Some(hit) = caps_hit {
-            return Ok((executor::RunOutcome { exit_code: hit.exit_code(), artifacts: Vec::new() }, caps_hit));
+            return Ok((executor::RunOutcome { exit_code: hit.exit_code(), ..Default::default() }, caps_hit));
         }
 
         let report: JobReport = serde_json::from_slice(&std::fs::read(&result_path)?)?;
@@ -512,6 +588,78 @@ fn build_runner_handshake(cert: &StoredCert) -> Result<RunnerHandshake> {
 /// wrong-length value to a `Malformed` error naming the field.
 fn decode_hex(s: &str, what: &'static str) -> Result<Vec<u8>> {
     hex::decode(s.trim()).map_err(|e| Error::malformed(what, e.to_string()))
+}
+
+/// The current time in Unix seconds (the attestation's `started_at`/`finished_at`).
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Build the [`JobAttestation`] for a completed job (spec §8): the source id,
+/// the offer fields, the toolchain, the sandbox-policy fingerprint, the exit
+/// (code / signal / cap reason), the artifacts, and the log hash. The caller
+/// signs it with the runner's attest key.
+#[allow(clippy::too_many_arguments)]
+fn build_attestation(
+    offer: &softfig_net::proto::JobOffer,
+    source_id: &softfig_source::SourceId,
+    repo_key: &[u8; 32],
+    outcome: &executor::RunOutcome,
+    caps_hit: Option<CapsHit>,
+    requester_device: [u8; 32],
+    cert: &StoredCert,
+    logs: &JobLogs,
+    started_at: i64,
+    finished_at: i64,
+) -> Result<JobAttestation> {
+    let mut env: Vec<EnvBinding> = offer
+        .env
+        .iter()
+        .map(|e| EnvBinding { name: e.name.clone(), value: e.value.clone() })
+        .collect();
+    env.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+
+    let exit = match caps_hit {
+        Some(hit) => ExitInfo::reason(hit.as_str()),
+        None => match outcome.signal {
+            Some(sig) => ExitInfo::signal(sig),
+            None => ExitInfo::code(outcome.exit_code),
+        },
+    };
+
+    let artifacts = outcome
+        .artifacts
+        .iter()
+        .map(|a| ArtifactEntry { path: a.path.clone(), size: a.size, blake3: a.blake3.clone() })
+        .collect();
+
+    Ok(JobAttestation {
+        job_id: hex::encode(&offer.job_id),
+        requester_device: hex::encode(requester_device),
+        runner_device: cert.device_id.clone(),
+        runner_cert_serial: cert.serial.clone(),
+        source: SourceRef {
+            format: source_id.format.as_str().to_string(),
+            root: source_id.hex(),
+            commit: hex::encode(&offer.snapshot_commit),
+        },
+        repo_key: hex::encode(repo_key),
+        profile: offer.profile.clone(),
+        cmd: offer.cmd.clone(),
+        env,
+        network: offer.network.clone(),
+        cache: offer.cache.clone(),
+        toolchain: outcome.toolchain.clone(),
+        sandbox_policy: outcome.sandbox_policy.clone(),
+        exit,
+        started_at,
+        finished_at,
+        artifacts,
+        log_blake3: hex::encode(logs.log_blake3()),
+    })
 }
 
 #[cfg(test)]

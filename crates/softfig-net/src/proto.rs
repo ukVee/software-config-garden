@@ -279,6 +279,20 @@ impl Frame {
         }
     }
 
+    /// A `JobEvent` frame (runner -> requester): a state transition (spec §6).
+    pub fn job_event(event: JobEvent) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobEvent(event)),
+        }
+    }
+
+    /// A `JobLog` frame (runner -> requester): one live log chunk (spec §6 Logs).
+    pub fn job_log(log: JobLog) -> Self {
+        Self {
+            kind: Some(frame::Kind::JobLog(log)),
+        }
+    }
+
     /// A `RunnerCertRevoke` frame (runner device -> ring).
     pub fn runner_cert_revoke(revoke: RunnerCertRevoke) -> Self {
         Self {

@@ -20,6 +20,7 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod attestation;
 pub mod cert;
 pub mod config;
 pub mod daemon;
@@ -27,6 +28,7 @@ pub mod error;
 pub mod executor;
 pub mod fetch;
 pub mod keys;
+pub mod log;
 pub mod proxy;
 pub mod state;
 pub mod systemd;
@@ -37,12 +39,17 @@ pub use admin::{
     AdminResponse, AdminSocket, ApplyArgs, GrantArgs, GrantReply, RevokeArgs, RevokeCertArgs,
     RevokeReply, StoreCertArgs,
 };
+pub use attestation::{
+    ArtifactEntry, EnvBinding, ExitInfo, JobAttestation, SignedAttestation, SourceRef,
+    ToolchainInfo, ATTEST_DOMAIN,
+};
 pub use cert::{StoredCert, StoredRevocation};
 pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
 pub use executor::{parse_duration, parse_size, Artifact, RunOutcome, SandboxBinaries};
 pub use fetch::{toolchain_add_command, toolchain_missing};
 pub use keys::RunnerKeys;
+pub use log::{DEFAULT_LOG_RING_BYTES, JobLogs, LogChunk, LogSink};
 pub use proxy::{host_allowed, EgressProxy};
 pub use state::{StateRoot, DEFAULT_STATE_ROOT};
 pub use systemd::{

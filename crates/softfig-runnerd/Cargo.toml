@@ -40,6 +40,13 @@ tempfile.workspace = true
 # softfig-sandbox profiles (bwrap + Landlock + seccomp). Vault-free, so the
 # "never links softfig-vault" constraint holds.
 softfig-sandbox.workspace = true
+# Slice 006 chunk 3: the signed canonical-JSON attestation (reusing the VCS's
+# JCS canonicalizer, never a second one) and the per-job log ring's BLAKE3.
+serde_jcs.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The streaming loopback test cross-checks the attestation's `log_blake3`
+# against the BLAKE3 of the streamed log bytes.
+blake3.workspace = true

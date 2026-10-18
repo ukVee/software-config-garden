@@ -19,8 +19,8 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer, SigningKey};
 use softfig_net::runner_cert::RunnerCert;
 use softfig_net::{
-    offer_signing_bytes, static_attestation_message, testing, CachedRunner, JobOutcome,
-    JobRejectReason, LocalDevice, RunnerCache,
+    offer_signing_bytes, run_job_collecting, static_attestation_message, testing, CachedRunner,
+    JobOutcome, JobRejectReason, LocalDevice, RunnerCache,
 };
 use softfig_source::{create_bundle, repo_key, root_commits, snapshot_repo, SubmodulePolicy};
 use softfig_runnerd::cert::StoredCert;
@@ -498,7 +498,9 @@ fn happy_path_offer_accept_result() {
     };
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.job_id, offer.job_id);
-    assert!(result.attestation.is_empty(), "chunk 1 leaves the attestation empty");
+    // Chunk 3: the result carries a signed, verifiable attestation.
+    let signed = softfig_runnerd::SignedAttestation::from_bytes(&result.attestation).unwrap();
+    assert!(signed.verify(&cert.runner_attest_pubkey));
 }
 
 #[test]
@@ -689,7 +691,7 @@ fn loopback_job_runs_fetch_build_collect_over_the_wire() {
     fx.grant(&req);
     fx.serve_one();
 
-    let (mut session, _cert) = connect(&req, &fx, None, &[]);
+    let (mut session, cert) = connect(&req, &fx, None, &[]);
 
     let snap = CargoSnapshotFixture::new([40u8; 32]);
     let mut offer = snap.offer();
@@ -702,7 +704,8 @@ fn loopback_job_runs_fetch_build_collect_over_the_wire() {
         other => panic!("expected Accepted, got {other:?}"),
     };
     assert_eq!(result.exit_code, 0, "the offline build must succeed over the wire");
-    assert!(result.attestation.is_empty(), "chunk 1 leaves the attestation empty");
+    let signed = softfig_runnerd::SignedAttestation::from_bytes(&result.attestation).unwrap();
+    assert!(signed.verify(&cert.runner_attest_pubkey));
 }
 
 /// `true` when `systemd-run --user` can't run a unit, after a loud skip.
@@ -739,7 +742,7 @@ fn loopback_job_runs_in_a_transient_unit() {
     fx.grant(&req);
     fx.serve_one();
 
-    let (mut session, _cert) = connect(&req, &fx, None, &[]);
+    let (mut session, cert) = connect(&req, &fx, None, &[]);
 
     // A no-manifest tree + empty command: the executor runs fetch(skip) →
     // run(skip) → collect(skip) entirely inside the transient unit.
@@ -754,7 +757,8 @@ fn loopback_job_runs_in_a_transient_unit() {
         other => panic!("expected Accepted, got {other:?}"),
     };
     assert_eq!(result.exit_code, 0, "the empty job must run inside the unit and exit 0");
-    assert!(result.attestation.is_empty());
+    let signed = softfig_runnerd::SignedAttestation::from_bytes(&result.attestation).unwrap();
+    assert!(signed.verify(&cert.runner_attest_pubkey));
 
     let _ = std::fs::remove_dir_all(&shm_root);
 }
@@ -794,3 +798,85 @@ fn battery_refused_over_the_wire() {
         softfig_net::run_job(&mut session, &offer, no_bundle).unwrap();
     assert_eq!(outcome, JobOutcome::Rejected(JobRejectReason::OnBattery));
 }
+
+/// The slice-006 chunk-3 "done when": a loopback job (a no-manifest tree with a
+/// command that emits both stdout and stderr) streams its logs live as
+/// `JobLog` frames and returns a signed attestation whose signature verifies
+/// against the cached certificate's attest key, while a tampered attestation is
+/// rejected. Runs in `Direct` mode (the executor in-process), where log
+/// streaming is live. Skips loudly when the sandbox stack is unavailable.
+#[test]
+fn loopback_job_streams_logs_and_returns_verified_attestation() {
+    if sandbox_skip() {
+        return;
+    }
+
+    let req = Requester::new(50, 51);
+    let fx = RunnerFixture::new([0x50; 16], NOW + 90 * 24 * 60 * 60);
+    fx.grant(&req);
+    fx.serve_one();
+
+    let (mut session, cert) = connect(&req, &fx, None, &[]);
+
+    let snap = SnapshotFixture::new([50u8; 32]);
+    let mut offer = snap.offer();
+    // A command that emits a distinct line to each stream: proves stdout (0)
+    // and stderr (1) are both streamed, and that the run step's output — not
+    // the fetch step's — is what flows back.
+    offer.cmd = vec![
+        "sh".into(),
+        "-c".into(),
+        "echo HELLO_STDOUT; echo HELLO_STDERR >&2".into(),
+    ];
+    offer.signature = req.sign_offer(&offer);
+
+    let (_caps, outcome, logs, _events) =
+        run_job_collecting(&mut session, &offer, |haves| snap.make_bundle(haves)).unwrap();
+    let result = match outcome {
+        JobOutcome::Accepted(r) => r,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    assert_eq!(result.exit_code, 0, "the echo job must exit 0");
+
+    // Both streams arrived, in order, via JobLog frames.
+    let stdout: String = logs
+        .iter()
+        .filter(|l| l.stream == 0)
+        .flat_map(|l| l.bytes.iter().copied())
+        .map(char::from)
+        .collect();
+    let stderr: String = logs
+        .iter()
+        .filter(|l| l.stream == 1)
+        .flat_map(|l| l.bytes.iter().copied())
+        .map(char::from)
+        .collect();
+    assert!(stdout.contains("HELLO_STDOUT"), "stdout streamed: {stdout:?}");
+    assert!(stderr.contains("HELLO_STDERR"), "stderr streamed: {stderr:?}");
+
+    // The attestation verifies against the cached certificate's attest key.
+    let signed = softfig_runnerd::SignedAttestation::from_bytes(&result.attestation).unwrap();
+    assert!(signed.verify(&cert.runner_attest_pubkey));
+    // Its source/cmd/exit fields reflect what was offered and run.
+    assert_eq!(signed.attestation.job_id, hex::encode(&offer.job_id));
+    assert_eq!(signed.attestation.cmd, offer.cmd);
+    assert_eq!(signed.attestation.exit.code, Some(0));
+    // The log hash in the attestation matches the streamed bytes' BLAKE3.
+    let mut combined: Vec<u8> = Vec::new();
+    for l in &logs {
+        combined.extend_from_slice(&l.bytes);
+    }
+    assert_eq!(
+        signed.attestation.log_blake3,
+        hex::encode(*blake3::hash(&combined).as_bytes()),
+        "attestation log_blake3 must be the BLAKE3 of the streamed log"
+    );
+
+    // A tampered attestation is rejected: flip the exit code and re-verify.
+    let mut tampered = signed.clone();
+    tampered.attestation.exit = softfig_runnerd::ExitInfo::code(99);
+    let tampered_bytes = tampered.to_bytes().unwrap();
+    let tampered = softfig_runnerd::SignedAttestation::from_bytes(&tampered_bytes).unwrap();
+    assert!(!tampered.verify(&cert.runner_attest_pubkey));
+}
+

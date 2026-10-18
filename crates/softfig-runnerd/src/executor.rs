@@ -13,8 +13,10 @@
 //! Here the steps run unsandboxed-from-systemd (bwrap still confines them) and
 //! the result carries the real exit code with an empty attestation.
 
+use std::io::Read;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,9 +29,11 @@ use softfig_sandbox::{
 };
 use softfig_source::extract_skeleton;
 
+use crate::attestation::ToolchainInfo;
 use crate::config::ServeConfig;
 use crate::error::{Error, Result};
 use crate::fetch::toolchain_missing;
+use crate::log::LogSink;
 use crate::proxy::EgressProxy;
 
 /// In-sandbox mount points for the helper binaries (mirrors the install
@@ -84,12 +88,22 @@ pub struct Artifact {
     pub blake3: String,
 }
 
-/// The outcome of a job's run: the exit code plus the collected artifacts.
-/// Chunk 2 signs this into the `JobAttestation`.
+/// The outcome of a job's run: the exit code (or signal), the collected
+/// artifacts, the runner's toolchain, and the resolved run-policy fingerprint.
+/// Chunk 3 folds these into the signed `JobAttestation`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunOutcome {
     pub exit_code: i32,
+    /// `Some(signal)` when the run step was signal-killed (exit code -1).
+    pub signal: Option<i32>,
     pub artifacts: Vec<Artifact>,
+    /// The toolchain the runner used (empty for a cap-killed job, whose payload
+    /// never wrote a report).
+    #[serde(default)]
+    pub toolchain: ToolchainInfo,
+    /// Hex BLAKE3 of the resolved run policy (`None` when the offer named no
+    /// command, so no run step happened).
+    pub sandbox_policy: Option<String>,
 }
 
 /// Parse a human-readable size ("8G", "512M", "20G") into bytes (1024-based, as
@@ -154,6 +168,7 @@ pub fn execute(
     serve: &ServeConfig,
     offer: &softfig_net::proto::JobOffer,
     bins: &SandboxBinaries,
+    log: Option<&LogSink>,
 ) -> Result<RunOutcome> {
     // 1. Extract the skeleton (manifests + lockfile + toolchain file) and check
     //    the toolchain *before* any sandbox runs (spec §7.2).
@@ -163,6 +178,8 @@ pub fn execute(
     if let Some(add_cmd) = toolchain_missing(skel.toolchain.as_deref(), serve) {
         return Err(Error::ToolchainMissing(add_cmd));
     }
+    // The toolchain the run step will resolve (spec §8 `toolchain`).
+    let toolchain = toolchain_info(&ctx.toolchain, skel.toolchain.as_deref());
 
     // A live egress proxy is needed when the fetch step has manifests to
     // resolve (cargo fetch) or the run step opts into network.
@@ -176,12 +193,20 @@ pub fn execute(
         if exit != 0 {
             // A failed fetch is a failed job — a real result, not a runner-side
             // error (spec §9: only rejects trigger local fallback).
-            return Ok(RunOutcome { exit_code: exit, artifacts: Vec::new() });
+            return Ok(RunOutcome {
+                exit_code: exit,
+                signal: None,
+                artifacts: Vec::new(),
+                toolchain,
+                sandbox_policy: None,
+            });
         }
     }
 
-    // 3. Run the offered command (skip when the offer names none).
-    let exit_code = run_step(ctx, offer, proxy.as_ref().map(JobProxy::config), bins)?;
+    // 3. Run the offered command (skip when the offer names none), streaming
+    //    its stdout/stderr to `log` when present.
+    let (exit_code, signal, sandbox_policy) =
+        run_step(ctx, offer, proxy.as_ref().map(JobProxy::config), bins, log)?;
 
     // 4. Collect the declared artifacts, BLAKE3-ed inside the sandbox view.
     let artifacts = if offer.artifacts.is_empty() {
@@ -190,7 +215,7 @@ pub fn execute(
         collect_step(ctx, &offer.artifacts, bins)?
     };
 
-    Ok(RunOutcome { exit_code, artifacts })
+    Ok(RunOutcome { exit_code, signal, artifacts, toolchain, sandbox_policy })
 }
 
 /// `cargo fetch --locked` against the skeleton, through the allowlisted proxy.
@@ -214,14 +239,17 @@ fn fetch_step(
 
 /// Run the offered command in the run profile (offline, or egress when the
 /// offer opts in). The offer's `env` rides on top of the profile's environment.
+/// Returns the exit code, the signal (when signal-killed), and the hex BLAKE3
+/// of the resolved run policy (`None` when the offer named no command).
 fn run_step(
     ctx: &JobContext,
     offer: &softfig_net::proto::JobOffer,
     proxy: Option<ProxyConfig>,
     bins: &SandboxBinaries,
-) -> Result<i32> {
+    log: Option<&LogSink>,
+) -> Result<(i32, Option<i32>, Option<String>)> {
     if offer.cmd.is_empty() {
-        return Ok(0);
+        return Ok((0, None, None));
     }
     let mut policy = match (&offer.network, proxy) {
         (n, Some(cfg)) if n == "egress" => profile_run_egress(ctx, cfg),
@@ -230,8 +258,20 @@ fn run_step(
     for e in &offer.env {
         policy.env.insert(e.name.clone(), e.value.clone());
     }
-    let out = run_sandboxed(&policy, &offer.cmd, bins, false, false)?;
-    Ok(exit_code(&out))
+
+    // The resolved run policy, fingerprinted canonically (spec §8
+    // `sandbox_policy`), using the same JCS canonicalizer the attestation
+    // reuses — never a second canonicalization scheme.
+    let sandbox_policy = hex::encode(*blake3::hash(&serde_jcs::to_vec(&policy)?).as_bytes());
+
+    let (code, signal) = match log {
+        Some(sink) => run_streaming(&policy, &offer.cmd, bins, false, sink)?,
+        None => {
+            let out = run_sandboxed(&policy, &offer.cmd, bins, false, false)?;
+            (exit_code(&out), out.status.signal())
+        }
+    };
+    Ok((code, signal, Some(sandbox_policy)))
 }
 
 /// BLAKE3 the declared artifact globs inside the collect sandbox.
@@ -268,20 +308,16 @@ fn parse_artifacts(stdout: &[u8]) -> Result<Vec<Artifact>> {
     Ok(out)
 }
 
-/// Render a policy into a bwrap argv and run the command inside the sandbox.
-///
-/// The helper binaries are added as read-only binds **on the policy** (not just
-/// the bwrap argv), so the Landlock ruleset the shim derives from the *same*
-/// bind list lets the command reach them. The collect helper is the command the
-/// shim execs after Landlock is applied, so it must be Landlock-visible, not
-/// merely mount-visible.
-fn run_sandboxed(
+/// Build the bwrap [`Command`] for a policy + command: render the argv, add the
+/// helper binaries as read-only binds **on the policy** (not just the argv), so
+/// the Landlock ruleset the shim derives from the *same* bind list lets the
+/// command reach them. The command's own argv is appended by the caller.
+fn sandbox_command(
     policy: &Policy,
-    cmd: &[String],
     bins: &SandboxBinaries,
     with_forwarder: bool,
     with_collect: bool,
-) -> std::io::Result<Output> {
+) -> std::io::Result<Command> {
     let mut policy = policy.clone();
     policy.ro_binds.push(Bind::ro(&bins.init, SHIM_MOUNT));
     if with_forwarder {
@@ -296,14 +332,110 @@ fn run_sandboxed(
     let mut c = Command::new("bwrap");
     c.args(&argv);
     c.arg(SHIM_MOUNT).arg("--policy").arg(&json).arg("--");
+    Ok(c)
+}
+
+/// Render a policy into a bwrap argv and run the command inside the sandbox,
+/// buffering its output. Used by the fetch and collect steps (whose output is
+/// machine-read or short); the run step streams instead (see [`run_streaming`]).
+fn run_sandboxed(
+    policy: &Policy,
+    cmd: &[String],
+    bins: &SandboxBinaries,
+    with_forwarder: bool,
+    with_collect: bool,
+) -> std::io::Result<Output> {
+    let mut c = sandbox_command(policy, bins, with_forwarder, with_collect)?;
     c.args(cmd);
     c.output()
 }
 
+/// Run a sandboxed command with piped stdio, streaming its stdout (stream 0)
+/// and stderr (stream 1) to `log` as they arrive. Returns the exit code and, if
+/// signal-killed, the signal number. This replaces `Command::output()` buffering
+/// for the run step (spec §6 Logs).
+fn run_streaming(
+    policy: &Policy,
+    cmd: &[String],
+    bins: &SandboxBinaries,
+    with_forwarder: bool,
+    log: &LogSink,
+) -> std::io::Result<(i32, Option<i32>)> {
+    let mut c = sandbox_command(policy, bins, with_forwarder, false)?;
+    c.args(cmd);
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn()?;
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let out_sink = log.clone();
+    let err_sink = log.clone();
+    let out_thread = std::thread::spawn(move || pump(stdout, 0, &out_sink));
+    let err_thread = std::thread::spawn(move || pump(stderr, 1, &err_sink));
+
+    let status = child.wait()?;
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    Ok((status.code().unwrap_or(-1), status.signal()))
+}
+
+/// Read a byte stream to EOF, pushing each read into the log sink.
+fn pump<R: Read>(mut reader: R, stream: u8, sink: &LogSink) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => sink.push(stream, &buf[..n]),
+            Err(_) => break,
+        }
+    }
+}
+
 /// The exit code of a completed sandbox step: the process's code, or `-1` for a
-/// signal-killed command (chunk 2 records the signal in the attestation).
+/// signal-killed command (the attestation records the signal separately).
 fn exit_code(out: &Output) -> i32 {
     out.status.code().unwrap_or(-1)
+}
+
+/// The runner's toolchain, as the run step will resolve it: `rustc -vV` under
+/// the runner's rustup home, pinned to the tree's channel when one is declared.
+/// On any failure (no rustc, a missing channel), returns an empty record — a
+/// rust job could not have run anyway, and `toolchain_missing` already rejects
+/// a declared channel the runner lacks before this point.
+fn toolchain_info(toolchain_home: &Path, channel: Option<&str>) -> ToolchainInfo {
+    let mut cmd = Command::new("rustc");
+    cmd.arg("-vV").env("RUSTUP_HOME", toolchain_home);
+    if let Some(c) = channel {
+        cmd.env("RUSTUP_TOOLCHAIN", c);
+    }
+    match cmd.output() {
+        Ok(out) if out.status.success() => parse_rustc_vv(&out.stdout),
+        _ => ToolchainInfo::default(),
+    }
+}
+
+/// Parse `rustc -vV` output into a [`ToolchainInfo`]: the `rustc` line (the
+/// version, commit and date) and the `host:` line (the target triple), then
+/// infer the libc from the triple.
+fn parse_rustc_vv(stdout: &[u8]) -> ToolchainInfo {
+    let text = String::from_utf8_lossy(stdout);
+    let mut rustc = String::new();
+    let mut host = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("rustc ") {
+            rustc = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("host: ") {
+            host = rest.trim().to_string();
+        }
+    }
+    let libc = if host.contains("musl") {
+        "musl".into()
+    } else if host.contains("gnu") {
+        "gnu".into()
+    } else {
+        String::new()
+    };
+    ToolchainInfo { rustc, host_triple: host, libc }
 }
 
 /// A per-job allowlisted egress proxy on a Unix socket, served on a background
@@ -407,5 +539,20 @@ mod tests {
                 Artifact { path: "target/release/keeperd".into(), size: 7, blake3: "def456".into() },
             ]
         );
+    }
+
+    #[test]
+    fn parse_rustc_vv_extracts_version_host_and_libc() {
+        let vv = b"rustc 1.85.0 (4d91de4e4 2025-02-17)\nbinary: rustc\ncommit-hash: 4d91de4e4\ncommit-date: 2025-02-17\nhost: x86_64-unknown-linux-gnu\nrelease: 1.85.0\nLLVM version: 20.1.0\n";
+        let t = parse_rustc_vv(vv);
+        assert_eq!(t.rustc, "1.85.0 (4d91de4e4 2025-02-17)");
+        assert_eq!(t.host_triple, "x86_64-unknown-linux-gnu");
+        assert_eq!(t.libc, "gnu");
+    }
+
+    #[test]
+    fn parse_rustc_vv_infers_musl() {
+        let vv = b"rustc 1.85.0 (x)\nhost: x86_64-unknown-linux-musl\n";
+        assert_eq!(parse_rustc_vv(vv).libc, "musl");
     }
 }

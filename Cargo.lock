@@ -3874,12 +3874,14 @@ dependencies = [
 name = "softfig-runnerd"
 version = "1.0.0-alpha.1"
 dependencies = [
+ "blake3",
  "ed25519-dalek",
  "hex",
  "libc",
  "mdns-sd",
  "rand",
  "serde",
+ "serde_jcs",
  "serde_json",
  "softfig-net",
  "softfig-sandbox",

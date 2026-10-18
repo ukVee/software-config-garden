@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::attest::{KEY_LEN, SIG_LEN};
 use crate::error::{NetError, Result};
 use crate::pairing::LocalDevice;
-use crate::proto::{self, frame, Frame, JobOffer, JobResult, RunnerCaps, RunnerCertRevoke, SourceChunk};
+use crate::proto::{self, frame, Frame, JobEvent, JobLog, JobOffer, JobResult, RunnerCaps, RunnerCertRevoke, SourceChunk};
 use crate::runner_cert::{self, RUNNER_SERIAL_LEN};
 use crate::transport::{runner_ik_initiator, runner_xx_initiator, RunnerSession};
 
@@ -411,11 +411,46 @@ where
     F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
     E: std::fmt::Display,
 {
+    let (caps, outcome, _logs, _events) = run_job_inner(session, offer, make_bundle)?;
+    Ok((caps, outcome))
+}
+
+/// [`run_job`], but also returns the live `JobLog`/`JobEvent` frames the runner
+/// streamed before the result. The `JobOutcome` (accept/reject) is unchanged;
+/// this is the collector variant the log-rendering surface (slice 007) and the
+/// loopback streaming test use.
+pub fn run_job_collecting<S, F, E>(
+    session: &mut RunnerSession<S>,
+    offer: &JobOffer,
+    make_bundle: F,
+) -> Result<(RunnerCaps, JobOutcome, Vec<JobLog>, Vec<JobEvent>)>
+where
+    S: Read + Write,
+    F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
+    E: std::fmt::Display,
+{
+    run_job_inner(session, offer, make_bundle)
+}
+
+/// Drive one job, reading the interleaved [`JobLog`]/[`JobEvent`] frames the
+/// runner streams ahead of the terminal [`JobResult`]/[`JobReject`] (spec §6).
+fn run_job_inner<S, F, E>(
+    session: &mut RunnerSession<S>,
+    offer: &JobOffer,
+    make_bundle: F,
+) -> Result<(RunnerCaps, JobOutcome, Vec<JobLog>, Vec<JobEvent>)>
+where
+    S: Read + Write,
+    F: FnOnce(&[Vec<u8>]) -> std::result::Result<Vec<u8>, E>,
+    E: std::fmt::Display,
+{
     let caps = match session.recv_frame()?.kind {
         Some(frame::Kind::RunnerCaps(c)) => c,
         _ => return Err(NetError::Protocol("expected RunnerCaps after handshake")),
     };
     session.send_frame(&Frame::job_offer(offer.clone()))?;
+    let mut logs = Vec::new();
+    let mut events = Vec::new();
     match session.recv_frame()?.kind {
         Some(frame::Kind::JobAccept(_)) => {
             let haves = match session.recv_frame()?.kind {
@@ -427,21 +462,33 @@ where
             have_list.extend(haves.recent_commits);
             let bundle = make_bundle(&have_list).map_err(|e| NetError::Source(e.to_string()))?;
             stream_chunks(session, &offer.job_id, &bundle)?;
-            match session.recv_frame()?.kind {
-                Some(frame::Kind::JobResult(r)) => Ok((caps, JobOutcome::Accepted(r))),
-                Some(frame::Kind::JobReject(r)) => {
-                    let reason = JobRejectReason::from_u32(r.reason).ok_or(NetError::Protocol(
-                        "runner sent an unknown reject reason",
-                    ))?;
-                    Ok((caps, JobOutcome::Rejected(reason)))
+            // The runner streams JobLog/JobEvent frames before the terminal
+            // JobResult/JobReject; consume them in arrival order.
+            loop {
+                match session.recv_frame()?.kind {
+                    Some(frame::Kind::JobResult(r)) => {
+                        return Ok((caps, JobOutcome::Accepted(r), logs, events));
+                    }
+                    Some(frame::Kind::JobReject(r)) => {
+                        let reason = JobRejectReason::from_u32(r.reason).ok_or(
+                            NetError::Protocol("runner sent an unknown reject reason"),
+                        )?;
+                        return Ok((caps, JobOutcome::Rejected(reason), logs, events));
+                    }
+                    Some(frame::Kind::JobLog(l)) => logs.push(l),
+                    Some(frame::Kind::JobEvent(e)) => events.push(e),
+                    _ => {
+                        return Err(NetError::Protocol(
+                            "expected JobResult or JobReject after transfer",
+                        ));
+                    }
                 }
-                _ => Err(NetError::Protocol("expected JobResult or JobReject after transfer")),
             }
         }
         Some(frame::Kind::JobReject(r)) => {
             let reason = JobRejectReason::from_u32(r.reason)
                 .ok_or(NetError::Protocol("runner sent an unknown reject reason"))?;
-            Ok((caps, JobOutcome::Rejected(reason)))
+            Ok((caps, JobOutcome::Rejected(reason), logs, events))
         }
         _ => Err(NetError::Protocol("expected JobAccept or JobReject")),
     }

@@ -91,9 +91,9 @@ pub use replica::{
 pub use ring::{ring_path, Ring, RingEntry};
 pub use runner_cert::{signing_message as runner_cert_signing_message, verify as verify_runner_cert, RunnerCert, RUNNER_CERT_DOMAIN, RUNNER_DEFAULT_LIFETIME_SECS, RUNNER_SERIAL_LEN};
 pub use runner::{
-    connect_runner, offer_signing_bytes, run_job, runner_cache_path, verify_offer_sig,
-    verify_runner_cert_revoke, verify_runner_handshake, CachedRunner, JobOutcome,
-    JobRejectReason, RunnerCache, RUNNER_CACHE_FILE,
+    connect_runner, offer_signing_bytes, run_job, run_job_collecting, runner_cache_path,
+    verify_offer_sig, verify_runner_cert_revoke, verify_runner_handshake, CachedRunner,
+    JobOutcome, JobRejectReason, RunnerCache, RUNNER_CACHE_FILE,
 };
 pub use sas::Sas;
 pub use transport::{

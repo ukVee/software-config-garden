@@ -108,7 +108,7 @@ fn execute_runs_fetch_build_collect_and_returns_artifacts() {
         ..Default::default()
     };
 
-    let outcome = execute(&ctx, &serve, &offer, &sandbox_bins()).unwrap();
+    let outcome = execute(&ctx, &serve, &offer, &sandbox_bins(), None).unwrap();
     assert_eq!(outcome.exit_code, 0, "the offline build must succeed");
 
     assert_eq!(outcome.artifacts.len(), 1, "one declared artifact: Cargo.lock");
