@@ -148,8 +148,9 @@ pub enum FleetHeader {
     /// Not polled yet (before the first `status` reply after entering the tab).
     #[default]
     Unknown,
-    /// A decoded live growlightd `status` reply.
-    Live(FleetStatusReply),
+    /// A decoded live growlightd `status` reply. Boxed: the reply dwarfs the
+    /// other variants.
+    Live(Box<FleetStatusReply>),
     /// The last poll couldn't reach growlightd — render one dim line, keep the
     /// garden-only page fully functional.
     Unreachable,
@@ -1669,7 +1670,7 @@ impl App {
                 // reply degrades to the dim line rather than a splat.
                 Ok(v) => {
                     self.fleet = match serde_json::from_value::<FleetStatusReply>(v) {
-                        Ok(reply) => FleetHeader::Live(reply),
+                        Ok(reply) => FleetHeader::Live(Box::new(reply)),
                         Err(_) => FleetHeader::Unreachable,
                     };
                 }
@@ -5706,6 +5707,8 @@ mod tests {
                 relock_expires_at: None,
                 growlight_enabled,
                 shared_key_divergence: None,
+                axes: None,
+                exe: None,
             })
             .unwrap()),
         }

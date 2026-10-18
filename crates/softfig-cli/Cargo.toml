@@ -39,3 +39,6 @@ softfig-growlightd.workspace = true
 # as the binary sends them — the same fixture shape keeperd's own e2e suite
 # uses. Dev-only — the CLI's command code talks to keeperd over IPC only.
 softfig-keeperd.workspace = true
+# release-pipeline slice 002: `daemon status` tests fake an installed set in a
+# temp dir.
+tempfile.workspace = true

@@ -7,9 +7,14 @@
 //! verb + [`StatusReply`] type — the exact seam
 //! `cmd_growlight::resolve_garden_root` uses, so the two daemons can never
 //! disagree on the path.
+//!
+//! The same reply carries keeperd's build (release-pipeline slice 002), so
+//! growlightd also refuses to start against a keeperd of another build: a
+//! stale daemon, or a partial install.
 
 use std::path::{Path, PathBuf};
 
+use softfig_ipc::compat::VersionMismatch;
 use softfig_ipc::{connect, op, ClientError, Request, StatusReply};
 use thiserror::Error;
 
@@ -26,6 +31,10 @@ pub enum HandshakeError {
     /// garden to read protocol/baton/backlog for its agents.
     #[error("garden is {state} — unlock it first (`softfig daemon unlock`)")]
     NotUnlocked { state: String },
+    /// keeperd is another build than this growlightd. Checked before the lock
+    /// state, because unlocking would not make the pair work.
+    #[error("{0}")]
+    VersionMismatch(#[from] VersionMismatch),
     /// Transport/decode failure talking to keeperd.
     #[error("keeperd status query failed: {0}")]
     Ipc(#[from] ClientError),
@@ -57,6 +66,7 @@ pub fn garden_root_via_keeperd(socket: &Path) -> Result<PathBuf, HandshakeError>
         }
     };
     let reply: StatusReply = serde_json::from_value(value)?;
+    reply.version_check()?;
     if reply.state != "unlocked" {
         return Err(HandshakeError::NotUnlocked { state: reply.state });
     }
@@ -70,6 +80,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
+    use softfig_ipc::compat::{binary_version, VersionAxes};
     use softfig_ipc::{Response, PROTOCOL_VERSION};
 
     /// A one-shot mock keeperd: accept one connection, read the `status`
@@ -102,6 +113,7 @@ mod tests {
             "tip": null,
             "garden_root": garden_root,
             "protocol_version": PROTOCOL_VERSION,
+            "axes": VersionAxes::this_build(1, 1),
         })
     }
 
@@ -126,6 +138,41 @@ mod tests {
         let err = garden_root_via_keeperd(&socket).unwrap_err();
         assert!(matches!(err, HandshakeError::NotUnlocked { .. }));
         h.join().unwrap();
+    }
+
+    /// A keeperd of another build is refused with the handshake's message,
+    /// even when the garden is unlocked.
+    #[test]
+    fn refuses_a_keeperd_of_another_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let mut reply = status_reply("unlocked", "/g");
+        reply["axes"]["binary"] = "0.0.1".into();
+        let h = spawn_mock_keeperd(socket.clone(), reply);
+        let err = garden_root_via_keeperd(&socket).unwrap_err();
+        h.join().unwrap();
+        assert!(matches!(err, HandshakeError::VersionMismatch(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with(&format!(
+                "your `softfig` ({}) is newer than the running daemon (0.0.1)",
+                binary_version()
+            )),
+            "{msg}"
+        );
+    }
+
+    /// A keeperd that predates the stamp reports no axes: an older build.
+    #[test]
+    fn refuses_a_keeperd_that_predates_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("keeperd.sock");
+        let mut reply = status_reply("unlocked", "/g");
+        reply.as_object_mut().unwrap().remove("axes");
+        let h = spawn_mock_keeperd(socket.clone(), reply);
+        let err = garden_root_via_keeperd(&socket).unwrap_err();
+        h.join().unwrap();
+        assert!(err.to_string().contains("predates version stamping"), "{err}");
     }
 
     #[test]

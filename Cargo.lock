@@ -3672,6 +3672,7 @@ dependencies = [
  "softfig-store",
  "softfig-vault",
  "softfig-vcs",
+ "tempfile",
  "toml",
  "zeroize",
 ]
@@ -3742,6 +3743,8 @@ version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "libc",
+ "memchr",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

@@ -250,6 +250,15 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
         }
     let _caller = crate::caller::enter(req.member.clone());
 
+    // release-pipeline slice 002: a client of another build is refused before
+    // the verb runs. The lifecycle ops are served anyway, because the remedy
+    // (`daemon status`, `daemon cycle`, unlock) runs through them.
+    if !op::LIFECYCLE.contains(&req.op.as_str())
+        && let Err(mismatch) = softfig_ipc::compat::check_request(&req)
+    {
+        return Response::err(ErrorKind::VersionMismatch, mismatch.to_string());
+    }
+
     let result = match req.op.as_str() {
         op::STATUS => handlers::status(daemon, req.args),
         op::UNLOCK => handlers::unlock(daemon, req.args),
@@ -401,7 +410,7 @@ mod tests {
 
     use crate::actions::WorkTree;
     use softfig_ipc::growlightd::MemberCall;
-    use softfig_ipc::verbs::SliceInsertArgs;
+    use softfig_ipc::verbs::{SliceInsertArgs, StatusReply};
 
     fn unlocked() -> (tempfile::TempDir, Daemon) {
         let garden = tempfile::tempdir().unwrap();
@@ -414,6 +423,59 @@ mod tests {
             Response::Err { kind, error, .. } => (kind, error),
             Response::Ok { data, .. } => panic!("expected a refusal, got {data}"),
         }
+    }
+
+    /// release-pipeline slice 002: a request stamped by another build is
+    /// refused with the handshake's message before the verb runs; the same
+    /// request from this build, or unstamped (a script, a pre-stamp client),
+    /// is served.
+    #[test]
+    fn a_request_from_another_build_is_refused() {
+        let (_g, daemon) = unlocked();
+        let mut req = Request::new(softfig_ipc::op::LOG, serde_json::json!({}));
+        assert!(matches!(dispatch(&daemon, req.clone()), Response::Ok { .. }), "same build");
+        req.binary_version = Some("0.0.1".into());
+        let (kind, msg) = err_of(dispatch(&daemon, req.clone()));
+        assert_eq!(kind, ErrorKind::VersionMismatch);
+        assert!(
+            msg.starts_with("your `softfig` (0.0.1) is older than the running daemon"),
+            "{msg}"
+        );
+        req.binary_version = None;
+        assert!(matches!(dispatch(&daemon, req), Response::Ok { .. }), "unstamped");
+    }
+
+    /// The lifecycle ops are never refused for the build: `daemon cycle` and
+    /// `daemon status` are the handshake's own remedy.
+    #[test]
+    fn lifecycle_ops_are_served_to_another_build() {
+        let (_g, daemon) = unlocked();
+        for op in softfig_ipc::op::LIFECYCLE {
+            let mut req = Request::new(*op, serde_json::json!({}));
+            req.binary_version = Some("99.0.0".into());
+            if let Response::Err { kind, error, .. } = dispatch(&daemon, req) {
+                assert_ne!(kind, ErrorKind::VersionMismatch, "{op}: {error}");
+            }
+        }
+    }
+
+    /// `status` reports every axis, this build's version included.
+    #[test]
+    fn status_reports_every_axis() {
+        let (_g, daemon) = unlocked();
+        let resp = dispatch(&daemon, Request::new(softfig_ipc::op::STATUS, serde_json::json!({})));
+        let Response::Ok { data, .. } = resp else { panic!("{resp:?}") };
+        let reply: StatusReply = serde_json::from_value(data).unwrap();
+        let axes = reply.axes.as_ref().expect("axes");
+        assert_eq!(axes.binary, softfig_ipc::compat::binary_version());
+        assert_eq!(axes.store_schema, softfig_store::db::SCHEMA_VERSION);
+        assert_eq!(axes.wire_protocol, softfig_net::PROTOCOL_VERSION);
+        assert_eq!(axes.ipc_protocol, softfig_ipc::PROTOCOL_VERSION);
+        assert_eq!(axes.queue_v2_schema, softfig_ipc::queue_v2::SCHEMA_VERSION);
+        assert_eq!(axes.pack_format, None);
+        assert_eq!(axes.garden_convention, None);
+        assert!(reply.exe.is_some());
+        assert!(reply.version_check().is_ok());
     }
 
     /// A stamp that can't name a member is refused before any verb runs — a

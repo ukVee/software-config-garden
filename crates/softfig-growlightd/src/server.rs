@@ -140,6 +140,17 @@ fn handle_connection(daemon: Daemon, mut stream: UnixStream) -> Result<()> {
         return write_one_shot(&mut stream, Response::err(ErrorKind::BadArgs, msg));
     }
 
+    // release-pipeline slice 002: a client of another build is refused before
+    // the verb runs, except status and shutdown, which the remedy needs.
+    if !op::LIFECYCLE.contains(&req.op.as_str())
+        && let Err(mismatch) = softfig_ipc::compat::check_request(&req)
+    {
+        return write_one_shot(
+            &mut stream,
+            Response::err(ErrorKind::VersionMismatch, mismatch.to_string()),
+        );
+    }
+
     match req.op.as_str() {
         // The one streaming verb: it takes over the connection and writes
         // newline-framed `Event` objects until the client hangs up or the daemon
@@ -280,6 +291,7 @@ fn status(daemon: &Daemon) -> Response {
         state,
         garden_root,
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
+        binary_version: Some(softfig_ipc::compat::binary_version().to_string()),
         policy,
         build_caps: daemon.build_caps().summary(),
         paused,

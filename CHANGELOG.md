@@ -9,6 +9,26 @@ decision record or crate that owns it, rather than at every internal change.
 
 ## [Unreleased]
 
+### Added
+
+- **Version handshake.** `softfig daemon status` reports every compatibility axis:
+  binary, IPC protocol, store schema, wire protocol and queue-v2 schema. Pack format
+  and garden convention read `none` until they exist. It also checks that this
+  `softfig` and the running daemon are the same build, reads the build stamp out of
+  each installed binary to name a partial install, and exits non-zero if any check
+  fails. keeperd and growlightd refuse a request from a client of another build with
+  "your `softfig` is newer/older than the running daemon …". The lifecycle verbs
+  that `daemon status` and `daemon cycle` need are exempt. The TUI refuses to start,
+  and growlightd to boot, against a daemon of another build. `softfig-tui` and
+  `softfig-mcp` accept `--version`. (`softfig_ipc::compat`, release-pipeline slice 002)
+
+### Protocol
+
+- IPC requests gain an optional `binary_version` field, and errors gain a
+  `version_mismatch` kind. Both are additive and the IPC protocol stays v1: daemons
+  from 1.0.0-alpha.1 ignore the field, and only a client that sends the field can
+  draw the new kind.
+
 ## [1.0.0-alpha.1] - 2026-10-17
 
 The first public alpha: everything that exists so far, released as source. Built

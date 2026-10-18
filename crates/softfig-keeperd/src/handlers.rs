@@ -29,6 +29,7 @@ use softfig_ipc::verbs::{
     UnlockReply, VaultListSealedReply, VaultRevealArgs, VaultRevealReply,
     VaultSealArgs, VaultSealReply, VaultUnsealArgs, VaultUnsealReply,
 };
+use softfig_ipc::compat::VersionAxes;
 use softfig_ipc::ErrorKind;
 use softfig_store::{Hash, TreeEntryKind};
 use softfig_vault::{RelockToken, Vault, RELOCK_TTL_SECS};
@@ -78,6 +79,13 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
         relock_expires_at,
         growlight_enabled,
         shared_key_divergence,
+        // release-pipeline slice 002: every compatibility axis, this build's
+        // own version included, and the executable the kernel says is running.
+        axes: Some(VersionAxes::this_build(
+            softfig_store::db::SCHEMA_VERSION,
+            softfig_net::PROTOCOL_VERSION,
+        )),
+        exe: std::env::current_exe().ok().map(|p| p.display().to_string()),
     };
     Ok(serde_json::to_value(reply).unwrap())
 }

@@ -280,3 +280,29 @@ fn the_six_nine_forms_round_trip_through_the_binary() {
     handle.join().unwrap();
     fs::remove_dir_all(&dir).ok();
 }
+
+/// release-pipeline slice 002: the built `softfig` carries the build stamp,
+/// so `softfig daemon status` can read its version off disk without running it.
+#[test]
+fn the_built_binary_carries_the_build_stamp() {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_softfig"));
+    assert_eq!(
+        softfig_ipc::compat::read_stamp(bin),
+        softfig_ipc::compat::BinStamp::Stamped(softfig_ipc::compat::binary_version().to_string())
+    );
+}
+
+/// `softfig --version` reports the workspace version and exits.
+#[test]
+fn version_flag_reports_the_workspace_version() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_softfig"))
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        concat!("softfig ", env!("CARGO_PKG_VERSION"), "\n")
+    );
+}

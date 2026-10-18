@@ -536,3 +536,13 @@ fn ipc_shutdown_acks_before_process_exit() {
     assert!(!socket.exists(), "socket left behind after IPC shutdown teardown");
 }
 
+/// release-pipeline slice 002: the built `softfig-keeperd` carries the build stamp,
+/// so `softfig daemon status` can read its version off disk without running it.
+#[test]
+fn the_built_binary_carries_the_build_stamp() {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_softfig-keeperd"));
+    assert_eq!(
+        softfig_ipc::compat::read_stamp(bin),
+        softfig_ipc::compat::BinStamp::Stamped(softfig_ipc::compat::binary_version().to_string())
+    );
+}

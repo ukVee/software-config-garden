@@ -439,6 +439,14 @@ pub mod op {
     /// lock, so Require Unlocked. v1 exposes the turn HOLDER only (queue depth
     /// deferred). Device ids are hex; names are resolved frontend-side via the ring.
     pub const COORDINATION_STATUS: &str = "coordination_status";
+
+    /// release-pipeline slice 002: the ops keeperd serves whatever the
+    /// caller's build. The version handshake's own remedy runs through them:
+    /// `daemon status` to see the mismatch, and `daemon cycle` (relock mint →
+    /// shutdown → relock redeem) or unlock to bring the daemon onto the
+    /// installed build. Refusing any of them could strand the daemon locked
+    /// (incident 20260622).
+    pub const LIFECYCLE: &[&str] = &[STATUS, UNLOCK, SHUTDOWN, RELOCK_MINT, RELOCK_REDEEM];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,6 +480,18 @@ pub struct StatusReply {
     /// stderr-only. `#[serde(default)]` keeps older daemons/clients compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_key_divergence: Option<String>,
+    /// release-pipeline slice 002: every compatibility axis this daemon speaks,
+    /// its own build included. `None` means the daemon predates the report, and
+    /// [`StatusReply::version_check`] treats that as an older build.
+    /// `#[serde(default)]` keeps older daemons' replies parseable.
+    #[serde(default)]
+    pub axes: Option<crate::compat::VersionAxes>,
+    /// The daemon's executable as the kernel reports it (`/proc/self/exe`).
+    /// It ends in ` (deleted)` once the file was replaced on disk after the
+    /// daemon started: a same-version rebuild that the version check alone
+    /// can't see (the stale-inode class of tasks 007/039).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }
 
 // ---- growlight relock token -------------------------------------------

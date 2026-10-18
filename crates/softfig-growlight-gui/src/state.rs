@@ -367,6 +367,7 @@ mod tests {
             state: "running".into(),
             garden_root: "/g".into(),
             protocol_version: 1,
+            binary_version: None,
             policy: PolicySummary {
                 max_concurrent_agents: 2,
                 ctx_roll_pct: 50,

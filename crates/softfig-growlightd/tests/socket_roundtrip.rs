@@ -283,3 +283,14 @@ fn set_resources_rejects_a_hard_cap_style_value_and_leaves_the_caps_unchanged() 
     handle.shutdown();
     handle.join().unwrap();
 }
+
+/// release-pipeline slice 002: the built `softfig-growlightd` carries the build stamp,
+/// so `softfig daemon status` can read its version off disk without running it.
+#[test]
+fn the_built_binary_carries_the_build_stamp() {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_softfig-growlightd"));
+    assert_eq!(
+        softfig_ipc::compat::read_stamp(bin),
+        softfig_ipc::compat::BinStamp::Stamped(softfig_ipc::compat::binary_version().to_string())
+    );
+}

@@ -59,6 +59,11 @@ serde_jcs = "0.1"
 toml = "0.8"
 hex = "0.4"
 
+# Version handshake (softfig-ipc `compat`): ordering builds, and finding the
+# build stamp inside a binary on disk
+semver = "1"
+memchr = "2"
+
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
 

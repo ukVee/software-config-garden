@@ -27,7 +27,18 @@ use softfig_tui::ui;
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn main() -> Result<()> {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("softfig-tui {}", softfig_ipc::compat::binary_version());
+        return Ok(());
+    }
     let socket = softfig_ipc::runtime_socket_path();
+    // release-pipeline slice 002: refuse to start against a daemon of another
+    // build, before the terminal is taken over, so the message stays readable.
+    // A daemon that is absent or unreachable is not a refusal: the TUI starts
+    // and reports it as before.
+    if let Some(mismatch) = softfig_ipc::compat::daemon_mismatch(&socket) {
+        anyhow::bail!("{mismatch}");
+    }
     let mut ipc = IpcClient::spawn(socket);
     // A SECOND, independent IPC channel — growlightd's own socket — for the live
     // fleet header (its `status` poll). Kept distinct from the keeperd garden

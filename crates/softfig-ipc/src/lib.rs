@@ -10,6 +10,7 @@
 
 pub mod baton;
 pub mod client;
+pub mod compat;
 pub mod growlightd;
 pub mod item_repo;
 pub mod member;

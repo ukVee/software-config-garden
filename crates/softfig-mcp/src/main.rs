@@ -97,6 +97,10 @@ fn err(id: Value, code: i32, message: impl Into<String>) -> Value {
 }
 
 fn main() -> Result<()> {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("softfig-mcp {}", softfig_ipc::compat::binary_version());
+        return Ok(());
+    }
     let caller = MemberIdentity::from_process_env();
     let stdin = io::stdin();
     let stdout = io::stdout();
