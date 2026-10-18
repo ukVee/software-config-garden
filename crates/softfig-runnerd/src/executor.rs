@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use softfig_sandbox::{
     profile_collect, profile_fetch, profile_run, profile_run_egress, Bind, JobContext, Policy,
     ProxyConfig,
@@ -75,7 +77,7 @@ impl SandboxBinaries {
 }
 
 /// One hashed artifact from the collect step (spec §8 `artifacts`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     pub path: String,
     pub size: u64,
@@ -84,7 +86,7 @@ pub struct Artifact {
 
 /// The outcome of a job's run: the exit code plus the collected artifacts.
 /// Chunk 2 signs this into the `JobAttestation`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunOutcome {
     pub exit_code: i32,
     pub artifacts: Vec<Artifact>,
@@ -111,6 +113,34 @@ pub fn parse_size(s: &str) -> Result<u64> {
         .trim()
         .parse()
         .map_err(|_| Error::malformed("size", s.to_string()))?;
+    Ok(n * mult)
+}
+
+/// Parse a human-readable duration ("60m", "45m", "20m", "10s", "2h", "1d")
+/// into whole seconds (spec §5.2's shorthand). systemd time spans reject a bare
+/// `m` (ambiguous min vs month), so the spec's "60m" is our shorthand: `s`
+/// seconds, `m` minutes, `h` hours, `d` days. A bare number is seconds. Reused
+/// by the transient unit for `RuntimeMaxSec` (and, later, `[use] wait_timeout`).
+pub fn parse_duration(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(Error::malformed("duration", "empty"));
+    }
+    let (num, mult) = if let Some(v) = s.strip_suffix('m') {
+        (v, 60u64)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3600)
+    } else if let Some(v) = s.strip_suffix('d') {
+        (v, 86400)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| Error::malformed("duration", s.to_string()))?;
     Ok(n * mult)
 }
 
@@ -351,6 +381,19 @@ mod tests {
         assert_eq!(parse_size("4096").unwrap(), 4096);
         assert!(parse_size("").is_err());
         assert!(parse_size("bogus").is_err());
+    }
+
+    #[test]
+    fn parse_duration_handles_suffixes_and_bare_seconds() {
+        assert_eq!(parse_duration("60m").unwrap(), 3600);
+        assert_eq!(parse_duration("45m").unwrap(), 2700);
+        assert_eq!(parse_duration("20m").unwrap(), 1200);
+        assert_eq!(parse_duration("10s").unwrap(), 10);
+        assert_eq!(parse_duration("2h").unwrap(), 7200);
+        assert_eq!(parse_duration("1d").unwrap(), 86400);
+        assert_eq!(parse_duration("90").unwrap(), 90);
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("bogus").is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! one connection per job, slice 003).
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -84,6 +84,14 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // `--run-job <spec> <result>`: the transient unit's payload. Runs the
+    // executor from a serialized [`JobSpec`] and writes the [`JobReport`],
+    // exiting with the job's code (slice 006 chunk 2).
+    if std::env::args().any(|a| a == "--run-job") {
+        let argv: Vec<String> = std::env::args().collect();
+        return run_job_payload(&argv);
+    }
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -132,6 +140,73 @@ fn main() -> ExitCode {
     }
     let _ = wire_thread.join();
     ExitCode::SUCCESS
+}
+
+/// Dispatch the transient-unit payload mode (`--run-job <spec> <result>`).
+fn run_job_payload(argv: &[String]) -> ExitCode {
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--run-job" {
+            let (Some(spec), Some(result)) = (it.next(), it.next()) else {
+                eprintln!("softfig-runnerd: --run-job needs <spec> and <result>");
+                return ExitCode::from(2);
+            };
+            return match run_job_mode(Path::new(spec), Path::new(result)) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("softfig-runnerd run-job: {e}");
+                    // 254: a runner-side failure (spec §9's runner failure code).
+                    ExitCode::from(254)
+                }
+            };
+        }
+    }
+    eprintln!("softfig-runnerd: --run-job needs <spec> and <result>");
+    ExitCode::from(2)
+}
+
+/// The transient unit's payload: deserialize the spec, run the executor, write
+/// the report, and return the job's exit code (or 254 for a runner-side
+/// failure — the report's `error` field carries the reason).
+fn run_job_mode(spec_path: &Path, result_path: &Path) -> Result<u8, String> {
+    let spec: softfig_runnerd::JobSpec = {
+        let bytes = std::fs::read(spec_path).map_err(|e| format!("read spec: {e}"))?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse spec: {e}"))?
+    };
+    let bins = softfig_runnerd::SandboxBinaries::next_to_runnerd()
+        .map_err(|e| format!("resolve helper bins: {e}"))?;
+    let serve = softfig_runnerd::ServeConfig {
+        toolchains: spec.toolchains,
+        egress: spec.egress,
+        ..Default::default()
+    };
+    let offer = softfig_net::proto::JobOffer {
+        cmd: spec.cmd,
+        env: spec
+            .env
+            .into_iter()
+            .map(|e| softfig_net::proto::EnvEntry { name: e.name, value: e.value })
+            .collect(),
+        network: spec.network,
+        artifacts: spec.artifacts,
+        ..Default::default()
+    };
+
+    let report = match softfig_runnerd::executor::execute(&spec.ctx, &serve, &offer, &bins) {
+        Ok(outcome) => softfig_runnerd::JobReport::ok(outcome),
+        Err(softfig_runnerd::Error::ToolchainMissing(cmd)) => {
+            softfig_runnerd::JobReport::err(format!("toolchain-missing: {cmd}"))
+        }
+        Err(e) => softfig_runnerd::JobReport::err(e.to_string()),
+    };
+    let code = report
+        .outcome
+        .as_ref()
+        .map(|o| u8::try_from(o.exit_code).unwrap_or(254))
+        .unwrap_or(254);
+    std::fs::write(result_path, serde_json::to_vec(&report).map_err(|e| format!("encode report: {e}"))?)
+        .map_err(|e| format!("write report: {e}"))?;
+    Ok(code)
 }
 
 /// Best-effort mDNS announce of `_softfig-runner._tcp` (spec §3.3). Failure is

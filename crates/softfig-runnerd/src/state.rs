@@ -71,6 +71,15 @@ impl StateRoot {
         self.root.join("cache")
     }
 
+    /// `jobs/` — per-job scratch (the materialized tree, the transient unit's
+    /// spec/result files, a fresh cache). Lives under the state root rather
+    /// than `/tmp` because the unit's `PrivateTmp` hides `/tmp` from its
+    /// payload, and `ProtectSystem=strict` re-opens only the state root via
+    /// `ReadWritePaths` (slice 006 chunk 2).
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.root.join("jobs")
+    }
+
     /// `cargo/` — the cargo home the fetch step fills and the run step reads
     /// read-only (spec §7.1). Shared across one requester's repos (§7.3).
     pub fn cargo_home_dir(&self) -> PathBuf {

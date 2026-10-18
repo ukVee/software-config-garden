@@ -16,6 +16,7 @@
 //! `cert.toml` + `accept.toml` + `serve.toml` in its own state root.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use softfig_net::proto::{frame, Frame, JobAccept, JobReject, JobResult, RunnerCaps, RunnerHandshake, SourceHave};
@@ -28,6 +29,10 @@ use crate::error::{Error, Result};
 use crate::executor::{self, SandboxBinaries};
 use crate::keys::RunnerKeys;
 use crate::state::StateRoot;
+use crate::systemd::{
+    battery_reject, on_battery, run_unit, Caps, CapsHit, EnvSpec, JobReport, JobSpec, Manager,
+    UnitResult, POWER_SUPPLY_PATH,
+};
 
 /// The runner's job listener. Owns its `TcpListener` and the long-lived
 /// transport static; the certificate and the `accept.toml` / `serve.toml`
@@ -38,18 +43,34 @@ pub struct WireServer {
     root: StateRoot,
     transport_secret: [u8; 32],
     sandbox_bins: SandboxBinaries,
+    /// Which systemd manager a job's transient unit runs under (spec §7.1
+    /// layer 2). `System` in production; `Direct` runs the executor in-process
+    /// (tests); `User` is the loopback path.
+    manager: Manager,
+    /// The sysfs power-supply root for the `on_battery` check (spec §5.2).
+    power_supply_path: PathBuf,
+    /// The runnerd binary the transient unit re-invokes as its payload
+    /// (`--run-job`). Production uses `current_exe`; tests point it at the
+    /// built binary.
+    runnerd_bin: PathBuf,
 }
 
 impl WireServer {
     /// Bind the job listener on `addr`, loading the runner's transport static
     /// and resolving the sandbox helpers from beside the running binary. Fails
     /// if the keys have not been generated (a not-yet-enabled runner).
+    /// Production: transient units run under the **system** manager.
     pub fn bind(root: StateRoot, addr: &str) -> Result<Self> {
-        Self::bind_with_bins(root, addr, SandboxBinaries::next_to_runnerd()?)
+        let mut s = Self::bind_with_bins(root, addr, SandboxBinaries::next_to_runnerd()?)?;
+        s.manager = Manager::System;
+        Ok(s)
     }
 
     /// Bind with explicit sandbox helper paths. Tests use this (they cannot rely
-    /// on the install layout); production goes through [`Self::bind`].
+    /// on the install layout); production goes through [`Self::bind`]. Defaults
+    /// to [`Manager::Direct`] (the executor runs in-process) so the wire tests
+    /// don't need a systemd manager; the transient-unit tests switch it with
+    /// [`Self::set_manager`].
     pub fn bind_with_bins(
         root: StateRoot,
         addr: &str,
@@ -64,7 +85,25 @@ impl WireServer {
             root,
             transport_secret: *keys.transport_secret(),
             sandbox_bins,
+            manager: Manager::Direct,
+            power_supply_path: PathBuf::from(POWER_SUPPLY_PATH),
+            runnerd_bin: std::env::current_exe().unwrap_or_else(|_| "softfig-runnerd".into()),
         })
+    }
+
+    /// Switch the transient-unit manager (tests: [`Manager::User`]).
+    pub fn set_manager(&mut self, manager: Manager) {
+        self.manager = manager;
+    }
+
+    /// Point the power check at a fixture sysfs dir (tests).
+    pub fn set_power_supply_path(&mut self, path: PathBuf) {
+        self.power_supply_path = path;
+    }
+
+    /// Point the transient-unit payload at a specific runnerd binary (tests).
+    pub fn set_runnerd_bin(&mut self, bin: PathBuf) {
+        self.runnerd_bin = bin;
     }
 
     /// The bound address (useful for tests and for the mDNS announce).
@@ -124,6 +163,16 @@ impl WireServer {
 
         match self.authorize(&offer, &device_id, session.peer_static(), &accept, &serve) {
             None => {
+                // Power state (spec §6 step 1): refuse on battery when the
+                // `[serve]` table says refuse, before any source transfer.
+                let on_batt = on_battery(&self.power_supply_path)?;
+                if let Some(reason) = battery_reject(&serve, on_batt) {
+                    session.send_frame(&Frame::job_reject(JobReject {
+                        job_id: offer.job_id.clone(),
+                        reason: reason.to_u32(),
+                    }))?;
+                    return Ok(());
+                }
                 session.send_frame(&Frame::job_accept(JobAccept {
                     job_id: offer.job_id.clone(),
                     queue_pos: 0,
@@ -131,8 +180,9 @@ impl WireServer {
                 // Slice 004: the source step — negotiate have/want, read the
                 // bundle, ingest + verify (rejecting `source-mismatch`), and
                 // materialize. Slice 006 then runs the real fetch → run →
-                // collect sequence and returns the real result.
-                self.serve_source(&mut session, &offer, &serve)?;
+                // collect sequence (in the transient unit) and returns the
+                // real result.
+                self.serve_source(&mut session, &offer, &serve, on_batt)?;
             }
             Some(reason) => {
                 session.send_frame(&Frame::job_reject(JobReject {
@@ -226,6 +276,7 @@ impl WireServer {
         session: &mut softfig_net::NoiseSession<TcpStream>,
         offer: &softfig_net::proto::JobOffer,
         serve: &ServeConfig,
+        on_battery: bool,
     ) -> Result<()> {
         let source_id = softfig_source::SourceId::decode(&offer.source_id)
             .ok_or_else(|| Error::Protocol("malformed source id in offer".into()))?;
@@ -273,37 +324,36 @@ impl WireServer {
             return Err(Error::Protocol(format!("verify failed: {e}")));
         }
 
-        // Materialize into the job's source dir, then run the real
-        // fetch → run → collect sequence (slice 006 chunk 1).
-        let src_dir = tempfile::tempdir()?;
+        // Materialize into the job's scratch dir under the state root (never
+        // `/tmp`: the unit's `PrivateTmp` hides `/tmp` from its payload, and
+        // `ProtectSystem=strict` re-opens only the state root via
+        // `ReadWritePaths`). Then run the real fetch → run → collect sequence.
+        let job_dir = self.root.jobs_dir().join(hex::encode(&offer.job_id));
+        std::fs::create_dir_all(&job_dir)?;
+        let src_dir = job_dir.join("src");
         backend
             .materialize(
                 &repo_key,
                 &source_id,
                 &offer.snapshot_commit,
-                src_dir.path(),
+                &src_dir,
                 false,
             )
             .map_err(|e| Error::Protocol(format!("materialize failed: {e}")))?;
 
         // The target cache: shared across a repo key, or a fresh empty dir when
         // the offer demands `cache = "fresh"` (spec §7.3).
-        let fresh_cache = (offer.cache == "fresh").then(tempfile::tempdir).transpose()?;
-        let target_cache = match &fresh_cache {
-            Some(dir) => dir.path().to_path_buf(),
-            None => {
-                let dir = self
-                    .root
-                    .cache_dir()
-                    .join(hex::encode(repo_key))
-                    .join("target");
-                std::fs::create_dir_all(&dir)?;
-                dir
-            }
+        let target_cache = if offer.cache == "fresh" {
+            job_dir.join("fresh-cache")
+        } else {
+            self.root
+                .cache_dir()
+                .join(hex::encode(repo_key))
+                .join("target")
         };
 
         let ctx = JobContext {
-            src: src_dir.path().to_path_buf(),
+            src: src_dir,
             target_cache,
             toolchain: self.root.rustup_home(),
             cargo_home: self.root.cargo_home_dir(),
@@ -314,13 +364,20 @@ impl WireServer {
         std::fs::create_dir_all(&ctx.cargo_home)?;
         std::fs::create_dir_all(&ctx.target_cache)?;
 
-        match executor::execute(&ctx, serve, offer, &self.sandbox_bins) {
-            Ok(outcome) => {
+        match self.run_job(&ctx, serve, offer, on_battery, &job_dir) {
+            Ok((outcome, caps_hit)) => {
+                if let Some(hit) = caps_hit {
+                    eprintln!(
+                        "softfig-runnerd: job {} killed by the {} cap",
+                        hex::encode(&offer.job_id),
+                        hit.as_str()
+                    );
+                }
                 session.send_frame(&Frame::job_result(JobResult {
                     job_id: offer.job_id.clone(),
                     exit_code: outcome.exit_code,
-                    // The signed canonical-JSON attestation lands in chunk 2;
-                    // the collected artifact hashes fold into it there.
+                    // The signed canonical-JSON attestation lands in chunk 3;
+                    // the collected artifact hashes + caps_hit fold into it.
                     attestation: Vec::new(),
                 }))?;
             }
@@ -338,7 +395,97 @@ impl WireServer {
             }
             Err(e) => return Err(e),
         }
+
+        // Best-effort cleanup of the per-job scratch (the shared target cache
+        // stays; a fresh cache dies with the job, spec §6 step 8).
+        let _ = std::fs::remove_dir_all(&job_dir);
         Ok(())
+    }
+
+    /// Run a job's fetch → run → collect: in-process (the `Direct` test seam)
+    /// or inside the transient unit (production + loopback).
+    fn run_job(
+        &self,
+        ctx: &JobContext,
+        serve: &ServeConfig,
+        offer: &softfig_net::proto::JobOffer,
+        on_battery: bool,
+        job_dir: &std::path::Path,
+    ) -> Result<(executor::RunOutcome, Option<CapsHit>)> {
+        match self.manager {
+            Manager::Direct => {
+                executor::execute(ctx, serve, offer, &self.sandbox_bins).map(|o| (o, None))
+            }
+            Manager::System | Manager::User => {
+                self.run_in_unit(ctx, serve, offer, on_battery, job_dir)
+            }
+        }
+    }
+
+    /// Run the executor inside a `systemd-run` transient unit: serialize the
+    /// job spec, re-invoke runnerd with `--run-job`, and read its report.
+    fn run_in_unit(
+        &self,
+        ctx: &JobContext,
+        serve: &ServeConfig,
+        offer: &softfig_net::proto::JobOffer,
+        on_battery: bool,
+        job_dir: &std::path::Path,
+    ) -> Result<(executor::RunOutcome, Option<CapsHit>)> {
+        let spec = JobSpec {
+            ctx: ctx.clone(),
+            egress: serve.egress.clone(),
+            toolchains: serve.toolchains.clone(),
+            cmd: offer.cmd.clone(),
+            env: offer
+                .env
+                .iter()
+                .map(|e| EnvSpec { name: e.name.clone(), value: e.value.clone() })
+                .collect(),
+            network: offer.network.clone(),
+            artifacts: offer.artifacts.clone(),
+        };
+        let spec_path = job_dir.join("spec.json");
+        let result_path = job_dir.join("result.json");
+        std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
+
+        let caps = Caps::resolve(serve, on_battery)?;
+        let unit = format!("softfig-runner-{}", hex::encode(&offer.job_id));
+        let payload = vec![
+            self.runnerd_bin.display().to_string(),
+            "--run-job".to_string(),
+            spec_path.display().to_string(),
+            result_path.display().to_string(),
+        ];
+        let (unit_result, _code) = run_unit(
+            self.manager,
+            &unit,
+            &caps,
+            &payload,
+            &[self.root.root().to_path_buf()],
+        )?;
+
+        // A cap kill leaves no result file: map it to a sentinel exit + CapsHit.
+        let caps_hit = match unit_result {
+            UnitResult::TimedOut => Some(CapsHit::Time),
+            UnitResult::OomKilled => Some(CapsHit::Memory),
+            _ => None,
+        };
+        if let Some(hit) = caps_hit {
+            return Ok((executor::RunOutcome { exit_code: hit.exit_code(), artifacts: Vec::new() }, caps_hit));
+        }
+
+        let report: JobReport = serde_json::from_slice(&std::fs::read(&result_path)?)?;
+        if let Some(err) = report.error {
+            if let Some(rest) = err.strip_prefix("toolchain-missing:") {
+                return Err(Error::ToolchainMissing(rest.trim().to_string()));
+            }
+            return Err(Error::Protocol(format!("job payload failed: {err}")));
+        }
+        let outcome = report
+            .outcome
+            .ok_or_else(|| Error::Protocol("job payload returned neither outcome nor error".into()))?;
+        Ok((outcome, None))
     }
 }
 

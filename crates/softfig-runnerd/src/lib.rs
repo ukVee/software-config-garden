@@ -29,6 +29,7 @@ pub mod fetch;
 pub mod keys;
 pub mod proxy;
 pub mod state;
+pub mod systemd;
 pub mod wire;
 
 pub use admin::{
@@ -39,9 +40,13 @@ pub use admin::{
 pub use cert::{StoredCert, StoredRevocation};
 pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
-pub use executor::{parse_size, Artifact, RunOutcome, SandboxBinaries};
+pub use executor::{parse_duration, parse_size, Artifact, RunOutcome, SandboxBinaries};
 pub use fetch::{toolchain_add_command, toolchain_missing};
 pub use keys::RunnerKeys;
 pub use proxy::{host_allowed, EgressProxy};
 pub use state::{StateRoot, DEFAULT_STATE_ROOT};
+pub use systemd::{
+    battery_reject, on_battery, run_unit, Caps, CapsHit, EnvSpec, JobReport, JobSpec,
+    Manager, UnitResult, OOM_EXIT, POWER_SUPPLY_PATH, TIMEOUT_EXIT,
+};
 pub use wire::WireServer;

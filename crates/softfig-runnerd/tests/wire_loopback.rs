@@ -12,6 +12,7 @@
 //! `softfig-net`'s `discovery` module.
 
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use softfig_runnerd::config::{AcceptConfig, AcceptedPeer, ServeConfig};
 use softfig_runnerd::keys::RunnerKeys;
 use softfig_runnerd::state::StateRoot;
 use softfig_runnerd::wire::WireServer;
-use softfig_runnerd::SandboxBinaries;
+use softfig_runnerd::{Manager, SandboxBinaries};
 
 /// A fixed "now" so certificate expiry is deterministic.
 const NOW: i64 = 1_800_000_000;
@@ -77,7 +78,8 @@ impl Requester {
 /// A runner fixture: temp state root with keys, a signed certificate, an
 /// enabled `serve.toml`, and a bound `WireServer`.
 struct RunnerFixture {
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
+    _shm_root: Option<PathBuf>,
     root: StateRoot,
     server: Arc<WireServer>,
     signer: SigningKey,
@@ -88,6 +90,56 @@ impl RunnerFixture {
     fn new(serial: [u8; 16], expires_at: i64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = StateRoot::new(dir.path());
+        let (server, signer, cert) = Self::setup(
+            root.clone(),
+            serial,
+            expires_at,
+            Manager::Direct,
+            std::env::current_exe().unwrap(),
+        );
+        Self {
+            _dir: Some(dir),
+            _shm_root: None,
+            root,
+            server,
+            signer,
+            cert,
+        }
+    }
+
+    /// A runner whose jobs run in `systemd-run --user` transient units, rooted
+    /// under `/dev/shm` (not `/tmp`, which the unit's `PrivateTmp` hides from
+    /// its payload). `shm_root` must already be a fresh, writable dir; the
+    /// caller removes it.
+    fn new_transient_unit(shm_root: PathBuf, serial: [u8; 16], expires_at: i64) -> Self {
+        let root = StateRoot::new(&shm_root);
+        let staged = stage_runnerd(&shm_root);
+        let (server, signer, cert) = Self::setup(
+            root.clone(),
+            serial,
+            expires_at,
+            Manager::User,
+            staged,
+        );
+        Self {
+            _dir: None,
+            _shm_root: Some(shm_root),
+            root,
+            server,
+            signer,
+            cert,
+        }
+    }
+
+    /// Shared setup: state-root dirs, keys, a signed certificate, an enabled
+    /// `serve.toml`, and a `WireServer` bound with the given manager.
+    fn setup(
+        root: StateRoot,
+        serial: [u8; 16],
+        expires_at: i64,
+        manager: Manager,
+        runnerd_bin: PathBuf,
+    ) -> (Arc<WireServer>, SigningKey, RunnerCert) {
         root.ensure_dirs().unwrap();
         let keys = RunnerKeys::generate();
         keys.persist(&root.keys_dir()).unwrap();
@@ -129,16 +181,13 @@ impl RunnerFixture {
         };
         serve.save(&root.serve_toml()).unwrap();
 
-        let server = Arc::new(
-            WireServer::bind_with_bins(root.clone(), "127.0.0.1:0", sandbox_bins()).unwrap(),
-        );
-        Self {
-            _dir: dir,
-            root,
-            server,
-            signer,
-            cert,
+        let mut server =
+            WireServer::bind_with_bins(root.clone(), "127.0.0.1:0", sandbox_bins()).unwrap();
+        server.set_manager(manager);
+        if !matches!(manager, Manager::Direct) {
+            server.set_runnerd_bin(runnerd_bin);
         }
+        (Arc::new(server), signer, cert)
     }
 
     /// The runner device's ring identity (the cert's signing device).
@@ -170,6 +219,27 @@ impl RunnerFixture {
             let _ = s.serve_connection(stream);
         });
     }
+}
+
+/// The built `softfig-runnerd` binary, beside this test's target dir (the
+/// transient unit's `--run-job` payload).
+fn runnerd_bin() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.parent().unwrap().parent().unwrap().join("softfig-runnerd")
+}
+
+/// Stage the runnerd binary into `dir` (non-`/tmp`, so the unit's `PrivateTmp`
+/// doesn't hide it) and return the staged path.
+fn stage_runnerd(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let src = runnerd_bin();
+    assert!(src.exists(), "build softfig-runnerd first: {}", src.display());
+    let dst = dir.join("softfig-runnerd");
+    std::fs::copy(&src, &dst).unwrap();
+    let mut perms = std::fs::metadata(&dst).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&dst, perms).unwrap();
+    dst
 }
 
 /// The sandbox helper binaries live beside this test's own target dir:
@@ -633,4 +703,94 @@ fn loopback_job_runs_fetch_build_collect_over_the_wire() {
     };
     assert_eq!(result.exit_code, 0, "the offline build must succeed over the wire");
     assert!(result.attestation.is_empty(), "chunk 1 leaves the attestation empty");
+}
+
+/// `true` when `systemd-run --user` can't run a unit, after a loud skip.
+fn systemd_skip() -> bool {
+    let ok = Command::new("systemd-run")
+        .args(["--user", "--wait", "true"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("SKIPPED: systemd-run --user unavailable; cannot run the transient-unit loopback test");
+    }
+    !ok
+}
+
+/// The slice-006 chunk-2 "done when": a loopback job runs fetch → run → collect
+/// **inside a `systemd-run --user` transient unit** (the real `serve_source`
+/// path — spec §7.1 layer 2), with a no-manifest tree and an empty command so
+/// the sequence needs no bwrap/cargo/network yet still exercises the unit +
+/// spec/report round-trip. Skips loudly when systemd-run is unavailable.
+#[test]
+fn loopback_job_runs_in_a_transient_unit() {
+    if systemd_skip() {
+        return;
+    }
+
+    let req = Requester::new(42, 43);
+    let shm_root = std::path::PathBuf::from("/dev/shm").join(format!(
+        "softfig-wire-unit-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&shm_root).unwrap();
+    let fx = RunnerFixture::new_transient_unit(shm_root.clone(), [0x42; 16], NOW + 90 * 24 * 60 * 60);
+    fx.grant(&req);
+    fx.serve_one();
+
+    let (mut session, _cert) = connect(&req, &fx, None, &[]);
+
+    // A no-manifest tree + empty command: the executor runs fetch(skip) →
+    // run(skip) → collect(skip) entirely inside the transient unit.
+    let snap = SnapshotFixture::new([42u8; 32]);
+    let mut offer = snap.offer();
+    offer.signature = req.sign_offer(&offer);
+
+    let (_caps, outcome) =
+        softfig_net::run_job(&mut session, &offer, |haves| snap.make_bundle(haves)).unwrap();
+    let result = match outcome {
+        JobOutcome::Accepted(r) => r,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    assert_eq!(result.exit_code, 0, "the empty job must run inside the unit and exit 0");
+    assert!(result.attestation.is_empty());
+
+    let _ = std::fs::remove_dir_all(&shm_root);
+}
+
+/// A job is rejected with `on-battery` when the runner is on battery and
+/// `[serve] on_battery = "refuse"` (spec §6 step 1) — over the wire, before any
+/// source transfer. The power check reads the fixture's sysfs dir (Mains
+/// offline, Battery present), so this needs no real battery.
+#[test]
+fn battery_refused_over_the_wire() {
+    let req = Requester::new(44, 45);
+    let mut fx = RunnerFixture::new([0x44; 16], NOW + 90 * 24 * 60 * 60);
+
+    // A fixture power_supply tree that reports "on battery".
+    let ps = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ps.path().join("AC0")).unwrap();
+    std::fs::write(ps.path().join("AC0/type"), "Mains").unwrap();
+    std::fs::write(ps.path().join("AC0/online"), "0").unwrap();
+    std::fs::create_dir_all(ps.path().join("BAT0")).unwrap();
+    std::fs::write(ps.path().join("BAT0/type"), "Battery").unwrap();
+
+    // Refuse on battery + point the check at the fixture.
+    let mut serve = ServeConfig::load(&fx.root.serve_toml()).unwrap();
+    serve.on_battery = "refuse".into();
+    serve.save(&fx.root.serve_toml()).unwrap();
+    Arc::get_mut(&mut fx.server).unwrap().set_power_supply_path(ps.path().to_path_buf());
+
+    fx.grant(&req);
+    fx.serve_one();
+
+    let (mut session, _cert) = connect(&req, &fx, None, &[]);
+    let snap = SnapshotFixture::new([44u8; 32]);
+    let mut offer = snap.offer();
+    offer.signature = req.sign_offer(&offer);
+
+    let (_caps, outcome) =
+        softfig_net::run_job(&mut session, &offer, no_bundle).unwrap();
+    assert_eq!(outcome, JobOutcome::Rejected(JobRejectReason::OnBattery));
 }

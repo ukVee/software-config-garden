@@ -9,10 +9,12 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Bind, Network, Policy, ProxyConfig, SeccompDeny, TmpfsMount, EGRESS_SOCKET};
 
 /// The job context a profile derives from. All paths are *host* paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobContext {
     /// The materialized source tree (rw at `/src`).
     pub src: PathBuf,
