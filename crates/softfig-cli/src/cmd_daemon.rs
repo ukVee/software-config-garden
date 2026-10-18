@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use softfig_ipc::{
-    compat::{binary_version, SetReport},
+    compat::{binary_version, SetReport, SWAP_IN_PROGRESS_MARKER},
     runtime_socket_path,
     verbs::{op, RelockMintReply, StatusReply, UnlockArgs, UnlockReply},
     ClientError, ErrorKind, Request,
@@ -223,7 +223,13 @@ fn report_status(socket: &Path, set: std::io::Result<SetReport>) -> Result<()> {
     match set {
         Ok(set) => {
             println!("installed set   {set}");
-            if set.consistent_version().is_none() {
+            if set.swap_in_progress {
+                problems.push(format!(
+                    "an interrupted swap left {SWAP_IN_PROGRESS_MARKER} in {} — \
+                     re-run the install/upgrade to converge",
+                    set.dir.display()
+                ));
+            } else if set.consistent_version().is_none() {
                 problems.push(format!("partial install: {set}"));
             }
         }

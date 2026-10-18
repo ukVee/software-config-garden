@@ -131,7 +131,7 @@ pub fn stage_and_swap(source: &Path, prefix: &Path, force: bool) -> Result<Stage
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use softfig_ipc::compat::stamp_with_identity;
+    use softfig_ipc::compat::{stamp_with_identity, SWAP_IN_PROGRESS_MARKER};
 
     /// Write a fake binary carrying the build stamp for `version` and the
     /// placeholder identity `"test"`, mode `0755`.
@@ -186,6 +186,22 @@ mod tests {
         assert!(!outcome.is_noop());
         assert_eq!(outcome.from().map(|(v, b)| (v.as_str(), b.as_str())), None);
         assert_eq!(SetReport::scan(&prefix).consistent_version(), Some("1.0.1"));
+    }
+
+    /// A clean swap through the shared routine leaves no swap-in-progress
+    /// marker behind (release-pipeline slice 003).
+    #[test]
+    fn a_clean_swap_leaves_no_swap_marker() {
+        let source = source_with("1.0.1");
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+
+        let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
+        assert!(!outcome.is_noop());
+
+        let report = SetReport::scan(&prefix);
+        assert_eq!(report.consistent_version(), Some("1.0.1"));
+        assert!(!report.swap_in_progress, "a clean swap must not leave the marker");
+        assert!(!prefix.join(SWAP_IN_PROGRESS_MARKER).exists());
     }
 
     /// Idempotency criterion: a re-run over an already-upgraded prefix is a

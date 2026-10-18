@@ -297,6 +297,12 @@ pub const INSTALLED_SET: [&str; 5] = [
     "softfig-growlightd",
 ];
 
+/// The marker file a swap writes into the install directory before the first
+/// rename and removes after the last. Its presence alone means a swap was
+/// interrupted: the installed set reads PARTIAL even when the five binaries
+/// happen to read as one consistent build (the same-version rebuild case).
+pub const SWAP_IN_PROGRESS_MARKER: &str = ".softfig-swap-in-progress";
+
 /// What [`read_stamp`] found in one binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinStamp {
@@ -384,6 +390,10 @@ pub struct SetReport {
     pub dir: PathBuf,
     /// One entry per [`INSTALLED_SET`] member, in that order.
     pub bins: Vec<(&'static str, BinStamp)>,
+    /// True when [`SWAP_IN_PROGRESS_MARKER`] exists in `dir` — a swap was
+    /// interrupted mid-rename. The set reads PARTIAL whenever this is set,
+    /// even if the five binaries themselves read as one consistent build.
+    pub swap_in_progress: bool,
 }
 
 impl SetReport {
@@ -395,6 +405,7 @@ impl SetReport {
                 .iter()
                 .map(|&name| (name, read_stamp(&dir.join(name))))
                 .collect(),
+            swap_in_progress: dir.join(SWAP_IN_PROGRESS_MARKER).exists(),
         }
     }
 
@@ -411,6 +422,11 @@ impl SetReport {
     /// The one version every binary carries, or `None` for a partial install:
     /// a binary missing, unreadable or unstamped, or two versions in one set.
     pub fn consistent_version(&self) -> Option<&str> {
+        // A swap interrupted mid-rename reads as partial even when the
+        // binaries happen to agree on one version (a same-version rebuild).
+        if self.swap_in_progress {
+            return None;
+        }
         let mut versions = self.bins.iter().map(|(_, stamp)| match stamp {
             BinStamp::Stamped { version, .. } => Some(version.as_str()),
             _ => None,
@@ -425,6 +441,9 @@ impl SetReport {
     /// keys on — same version, different build id is still a different build
     /// (release-pipeline task 077).
     pub fn consistent_identity(&self) -> Option<(&str, &str)> {
+        if self.swap_in_progress {
+            return None;
+        }
         let mut ids = self.bins.iter().map(|(_, stamp)| match stamp {
             BinStamp::Stamped { version, build_id } => Some((version.as_str(), build_id.as_str())),
             _ => None,
@@ -456,11 +475,18 @@ impl fmt::Display for SetReport {
                 None => groups.push((label, vec![name])),
             }
         }
-        let groups: Vec<String> = groups
-            .iter()
-            .map(|(label, names)| format!("{} {label} ({})", names.len(), names.join(", ")))
-            .collect();
-        write!(f, "PARTIAL in {dir} — {}", groups.join(" · "))
+        let mut pieces: Vec<String> = Vec::new();
+        // The marker is the headline of a partial report: its presence means a
+        // swap was interrupted, whatever the binaries read as.
+        if self.swap_in_progress {
+            pieces.push(format!("swap in progress ({SWAP_IN_PROGRESS_MARKER} present)"));
+        }
+        pieces.extend(
+            groups
+                .iter()
+                .map(|(label, names)| format!("{} {label} ({})", names.len(), names.join(", "))),
+        );
+        write!(f, "PARTIAL in {dir} — {}", pieces.join(" · "))
     }
 }
 
@@ -682,6 +708,27 @@ mod tests {
         let report = SetReport::scan(dir.path());
         assert_eq!(report.consistent_version(), None);
         assert!(report.to_string().ends_with("1 missing (softfig-growlightd)"), "{report}");
+    }
+
+    /// A swap-in-progress marker alone makes an otherwise-consistent set read
+    /// PARTIAL: the same-version rebuild's mid-swap state, where all five
+    /// binaries agree on the version but a rename is still owed.
+    #[test]
+    fn a_swap_marker_makes_an_otherwise_consistent_set_read_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in INSTALLED_SET {
+            std::fs::write(dir.path().join(name), stamp_with_identity("1.0.0", "aaa")).unwrap();
+        }
+        let clean = SetReport::scan(dir.path());
+        assert!(!clean.swap_in_progress);
+        assert_eq!(clean.consistent_identity(), Some(("1.0.0", "aaa")));
+
+        std::fs::write(dir.path().join(SWAP_IN_PROGRESS_MARKER), "version 1.0.0\n").unwrap();
+        let marked = SetReport::scan(dir.path());
+        assert!(marked.swap_in_progress);
+        assert_eq!(marked.consistent_version(), None, "marker forces PARTIAL: {marked}");
+        assert_eq!(marked.consistent_identity(), None);
+        assert!(marked.to_string().contains("swap in progress"), "{marked}");
     }
 
     /// `INSTALLED_SET` is the code-side copy of the installed set; the

@@ -6,6 +6,8 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use softfig_ipc::compat::{SetReport, SWAP_IN_PROGRESS_MARKER};
+
 /// Everything that can go wrong swapping the installed set.
 #[derive(Debug, thiserror::Error)]
 pub enum SwapError {
@@ -70,7 +72,18 @@ fn swap_binaries_inner(
         path: target_dir.to_path_buf(),
         source,
     })?;
-    for &name in set {
+
+    // Mark the swap in progress before the first rename. The marker's presence
+    // is what makes a crash mid-swap detectable even when the binaries happen
+    // to read as one consistent build — the same-version rebuild case, where
+    // every binary carries the same version string. It records the staged
+    // identity and the names still owed, then shrinks as each rename lands.
+    let staged_identity = SetReport::scan(staged_dir)
+        .consistent_identity()
+        .map(|(version, build_id)| (version.to_string(), build_id.to_string()));
+    write_swap_marker(target_dir, staged_identity.as_ref(), set)?;
+
+    for (i, &name) in set.iter().enumerate() {
         before_rename(name)?;
         let from = staged_dir.join(name);
         let to = target_dir.join(name);
@@ -78,8 +91,44 @@ fn swap_binaries_inner(
             path: from,
             source,
         })?;
+        write_swap_marker(target_dir, staged_identity.as_ref(), &set[i + 1..])?;
     }
+
+    // Every rename landed; the marker goes, leaving a clean set behind.
+    remove_swap_marker(target_dir)?;
     Ok(())
+}
+
+/// Write the swap-in-progress marker into `target_dir`: the staged identity
+/// (so a post-crash human can see what was being installed) and the names the
+/// swap still owes. Written before the first rename and shrunk after each one.
+fn write_swap_marker(
+    target_dir: &Path,
+    staged_identity: Option<&(String, String)>,
+    remaining: &[&str],
+) -> Result<()> {
+    let mut content = String::new();
+    match staged_identity {
+        Some((version, build_id)) => {
+            content.push_str(&format!("version {version}\nbuild_id {build_id}\n"));
+        }
+        None => content.push_str("version unknown\nbuild_id unknown\n"),
+    }
+    content.push_str(&format!("remaining {}\n", remaining.join(" ")));
+    let path = target_dir.join(SWAP_IN_PROGRESS_MARKER);
+    std::fs::write(&path, content).map_err(|source| SwapError::Io { path, source })
+}
+
+/// Remove the swap-in-progress marker after the last rename. A missing marker
+/// is already the goal state (an earlier remove won the race), so that is not
+/// an error.
+fn remove_swap_marker(target_dir: &Path) -> Result<()> {
+    let path = target_dir.join(SWAP_IN_PROGRESS_MARKER);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SwapError::Io { path, source }),
+    }
 }
 
 #[cfg(test)]
@@ -132,7 +181,10 @@ mod tests {
 
         swap_binaries(staged.path(), target.path(), &INSTALLED_SET).unwrap();
 
-        assert_eq!(SetReport::scan(target.path()).consistent_version(), Some("1.0.1"));
+        let report = SetReport::scan(target.path());
+        assert_eq!(report.consistent_version(), Some("1.0.1"));
+        assert!(!report.swap_in_progress, "a clean swap must not leave the marker");
+        assert!(!target.path().join(SWAP_IN_PROGRESS_MARKER).exists());
     }
 
     #[test]
@@ -188,12 +240,17 @@ mod tests {
         // The version handshake must be able to see that.
         let report = SetReport::scan(target.path());
         assert_eq!(report.consistent_version(), None, "partial install must be detectable: {report}");
+        assert!(report.swap_in_progress, "an interrupt must leave the marker");
+        assert!(target.path().join(SWAP_IN_PROGRESS_MARKER).exists());
 
         // Re-stage (the upgrade path re-stages from the build output) and
-        // re-run: the swap converges to the new set.
+        // re-run: the swap converges to the new set and clears the marker.
         write_set(staged.path(), "1.0.1");
         swap_binaries(staged.path(), target.path(), &INSTALLED_SET).unwrap();
-        assert_eq!(SetReport::scan(target.path()).consistent_version(), Some("1.0.1"));
+        let converged = SetReport::scan(target.path());
+        assert_eq!(converged.consistent_version(), Some("1.0.1"));
+        assert!(!converged.swap_in_progress, "a re-run must clear the marker");
+        assert!(!target.path().join(SWAP_IN_PROGRESS_MARKER).exists());
     }
 
     #[test]
