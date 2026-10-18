@@ -48,6 +48,12 @@ pub enum NetError {
     #[error("runner certificate: {0}")]
     RunnerCert(String),
 
+    /// Requester-side `config/runner.toml` parsing/resolution failed (slice
+    /// 007). Carries a dynamic message so a bad config is a *clear* error, never
+    /// a silent default.
+    #[error("config: {0}")]
+    Config(String),
+
     /// A source-transfer failure on the requester side (snapshot/bundle build
     /// failed — e.g. a git error) carrying a dynamic message. Slice 004.
     #[error("source: {0}")]

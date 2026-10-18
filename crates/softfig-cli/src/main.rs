@@ -9,6 +9,7 @@ mod cmd_pair;
 mod cmd_replica;
 mod cmd_repo;
 mod cmd_reveal;
+mod cmd_run;
 mod cmd_runner;
 mod cmd_shared_subtree;
 mod cmd_vault;
@@ -84,6 +85,11 @@ enum Cmd {
     #[command(subcommand)]
     Runner(cmd_runner::RunnerCmd),
 
+    /// Run a job on a remote runner (spec `remote-runner` §9): `softfig run
+    /// [--on] [--profile] [--fallback] [-- cmd…]`, with local fallback.
+    #[command(subcommand)]
+    Run(cmd_run::RunCmd),
+
     /// growlight — the autonomous work-loop pillar. `init` scaffolds it into
     /// an already-onboarded garden; `start` sets up the loop runtime and
     /// launches the agent in loop mode.
@@ -119,6 +125,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Replica(cmd) => cmd_replica::run(cmd),
         Cmd::SharedSubtree(cmd) => cmd_shared_subtree::run(cmd),
         Cmd::Runner(cmd) => cmd_runner::run(cmd),
+        Cmd::Run(cmd) => cmd_run::run(cmd),
         Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
     }
 }

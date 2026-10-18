@@ -49,6 +49,8 @@ pub mod replica;
 pub mod ring;
 pub mod runner;
 pub mod runner_cert;
+pub mod run_config;
+pub mod run_plan;
 pub mod sas;
 // Test support (task 055): bounded accepts/reads for tests that own both ends of
 // a loopback socket. `pub` because keeperd's unit AND integration tests need it
@@ -94,6 +96,14 @@ pub use runner::{
     connect_runner, offer_signing_bytes, run_job, run_job_collecting, runner_cache_path,
     verify_offer_sig, verify_runner_cert_revoke, verify_runner_handshake, CachedRunner,
     JobOutcome, JobRejectReason, JobState, RunnerCache, RUNNER_CACHE_FILE,
+};
+pub use run_config::{
+    parse_duration as parse_runner_duration, Fallback, ProjectConfig, ProfileConfig, ResolvedRun,
+    RunnerConfig, Submodules, UseConfig,
+};
+pub use run_plan::{
+    fallback_action, is_fallback_trigger, outcome_exit_code, FallbackAction, RunFailure,
+    RUNNER_FAILURE_EXIT,
 };
 pub use sas::Sas;
 pub use transport::{

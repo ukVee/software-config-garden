@@ -3708,6 +3708,7 @@ dependencies = [
  "softfig-growlightd-client",
  "softfig-ipc",
  "softfig-keeperd",
+ "softfig-net",
  "softfig-onboard",
  "softfig-runnerd",
  "softfig-store",
