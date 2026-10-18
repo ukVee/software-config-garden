@@ -464,6 +464,15 @@ fn start(args: StartArgs) -> Result<()> {
     let baton_seeded = seed_if_absent(&baton_path, &seed_baton(garden_name, &today_iso()))?;
     let questions_seeded = seed_if_absent(&questions_path, SEED_QUESTIONS)?;
 
+    // Task 064: surface a repo left dirty AND newer than the baton's last handoff
+    // (report 001's cut-off signature) BEFORE anything is launched. The baton is
+    // seeded by now, so its mtime is the prior handoff — or the just-now seed,
+    // against which a stale tree reads as NOT newer and stays silent. Read-only
+    // and best-effort; a failed probe never blocks a launch.
+    if let Some(line) = boot_dirty_check(&garden_root, &baton_path) {
+        eprintln!("{line}");
+    }
+
     print_setup(&runtime, &loop_path, baton_seeded, questions_seeded);
 
     // The statusline budget dump is jq-based (spec §6). Without jq it degrades
@@ -571,6 +580,54 @@ fn start(args: StartArgs) -> Result<()> {
         return Ok(());
     }
     launch_agent(&choice, &launch)
+}
+
+/// Task 064 — the semi-auto/CLI half of the boot-time dirty-tree guard: at
+/// `start`, resolve the root baton's active item repo (the item doc's
+/// `> Worktree:` line — the `default` queue the semi-auto loop runs on has no
+/// `## Queues` registry row, so there is no registry fallback) and, when the
+/// repo is dirty AND newer than the baton's last handoff, return the same
+/// journal line growlightd prints before a member spawn, so the human launching
+/// the loop sees it before the agent does new work. Read-only: it only ever
+/// *surfaces* the answer, never reverts, stages or commits. Best-effort — a
+/// missing item, an unprobeable repo or a `git` failure is `None`, never a
+/// launch failure.
+fn boot_dirty_check(garden_root: &Path, baton_path: &Path) -> Option<String> {
+    let view = parse_baton(&fs::read_to_string(baton_path).ok()?);
+    let item = view.item.as_deref()?;
+    let worktree = item_doc_candidates(garden_root, item, view.slice.as_deref())
+        .into_iter()
+        .find_map(|doc| {
+            let content = fs::read_to_string(&doc).ok()?;
+            softfig_ipc::item_repo::worktree_field(&content).map(str::to_string)
+        });
+    let repo = softfig_ipc::item_repo::resolve_repo(
+        worktree.as_deref(),
+        None,
+        home_dir().ok().as_deref(),
+    )?;
+    let state = softfig_ipc::item_repo::probe(&repo).ok()?;
+    let baton_mtime = fs::metadata(baton_path).and_then(|md| md.modified()).ok()?;
+    if !softfig_ipc::item_repo::dirty_newer_than(&state, baton_mtime) {
+        return None;
+    }
+    let dirty = state.dirty;
+    Some(
+        match state
+            .newest_dirty_mtime
+            .and_then(|m| m.duration_since(baton_mtime).ok())
+        {
+            Some(newer_by) => format!(
+                "growlight: boot dirty tree: {item}: {} has {dirty} uncommitted path(s), newest ~{}s newer than the baton handoff",
+                repo.display(),
+                newer_by.as_secs(),
+            ),
+            None => format!(
+                "growlight: boot dirty tree: {item}: {} has {dirty} uncommitted path(s), newest newer than the baton handoff",
+                repo.display(),
+            ),
+        },
+    )
 }
 
 /// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
@@ -3307,6 +3364,86 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    /// Run `git -C <repo>` in the test sandbox and fail the test on a non-zero
+    /// exit (the same shell-out [`boot_dirty_check`] performs through
+    /// [`softfig_ipc::item_repo::probe`]).
+    fn run_git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Backdate a file's mtime to 2000-01-01, so a later tree edit is provably
+    /// NEWER than the baton it is compared against (the boot guard's whole test).
+    fn backdate_mtime(path: &Path) {
+        let out = std::process::Command::new("touch")
+            .arg("-d")
+            .arg("2000-01-01T00:00:00")
+            .arg(path)
+            .output()
+            .expect("run touch");
+        assert!(out.status.success(), "touch failed");
+    }
+
+    /// TASK 064 — the CLI boot dirty-tree guard surfaces an item repo left dirty
+    /// AND newer than the root baton's last handoff, and stays silent for a
+    /// clean tree / a missing item / a baton with no active item. Read-only:
+    /// nothing is reverted/staged/committed — the only observable effect is the
+    /// returned journal line.
+    #[test]
+    fn boot_dirty_check_surfaces_a_dirty_tree_newer_than_the_baton() {
+        let root = unique_tmp("boot-dirty");
+        let _ = fs::remove_dir_all(&root);
+        let tasks = root.join(PILLAR).join("backlog").join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        // A real repo: one committed base file.
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        fs::write(
+            tasks.join("200-a-task.md"),
+            format!("# Task\n\n> Worktree: {}\n", repo.display()),
+        )
+        .unwrap();
+        let baton = root.join("baton.md");
+
+        // No active item -> no signal.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: null\n---\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton).is_none());
+
+        // A baton naming the item, backdated before the tree's last edit.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: 200\n---\n").unwrap();
+        backdate_mtime(&baton);
+        // Clean tree -> no signal.
+        assert!(boot_dirty_check(&root, &baton).is_none());
+
+        // Leave one uncommitted edit, newer than the (backdated) baton.
+        fs::write(repo.join("a.txt"), "dirty\n").unwrap();
+        let line = boot_dirty_check(&root, &baton)
+            .expect("a dirty tree newer than the baton handoff surfaces");
+        assert!(line.contains("200"), "names the item: {line}");
+        assert!(
+            line.contains(&repo.display().to_string()),
+            "names the repo: {line}"
+        );
+        assert!(line.contains("1 uncommitted path"), "names the count: {line}");
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
