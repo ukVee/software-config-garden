@@ -32,7 +32,7 @@ use softfig_ipc::{
     verbs::{op, StatusReply},
 };
 
-use crate::cmd_daemon::{cycle, try_daemon_call, CycleArgs, CYCLE_RESTART_TIMEOUT_SECS};
+use crate::cmd_daemon::{cycle, stop_daemon, try_daemon_call, CycleArgs, CYCLE_RESTART_TIMEOUT_SECS};
 
 #[derive(Args, Debug)]
 pub struct UpgradeArgs {
@@ -67,6 +67,15 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     let source = args.source.clone().unwrap_or_else(|| PathBuf::from("."));
     let prefix = args.prefix.clone().unwrap_or_else(default_prefix);
     let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+
+    // 0. Preflight the daemon ONCE, before anything is swapped: is one
+    //    running, is it locked, and can it be relock-cycled? The cycle
+    //    capability must be known *before* the swap — after the swap the only
+    //    safe non-cycle move is a shutdown (the running daemon is the old
+    //    binary against a new set).
+    let supervisor = Supervisor::detect();
+    let daemon = daemon_state(&socket);
+    let cycle_ok = can_cycle(supervisor, &daemon);
 
     // 1. Fetch new source.
     pull(&source, args.no_pull)?;
@@ -131,38 +140,38 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     //    explicitly — this process's cwd is the source checkout, never the
     //    garden.
     if !args.no_migrate {
-        run_migrations(&prefix, daemon_garden_root(&socket).as_deref())?;
+        run_migrations(&prefix, daemon.garden_root.as_deref())?;
     }
 
     // 6. Warn about a live growlight loop (spec-growlight §12), then cycle the
-    //    daemon if one is running.
+    //    daemon onto the new build — or, when a cycle is impossible, stop it so
+    //    it is not left running the old binary against the new set.
     warn_if_growlight_live();
 
-    if daemon_running(&socket) {
-        match Supervisor::detect() {
-            Supervisor::SystemdUser => {
-                cycle(CycleArgs {
-                    socket: Some(socket.clone()),
-                    timeout: args.timeout,
-                })?;
-            }
-            Supervisor::None => {
-                // No supervisor to respawn the daemon: `cycle` would stop it
-                // and wait forever. Say what the human must do instead, and do
-                // not strand the daemon Locked mid-upgrade.
-                println!(
-                    "no systemd user bus detected — the daemon cannot auto-respawn.\n\
-                     stop + restart it by hand after this upgrade:\n  \
-                     softfig daemon stop\n  softfig daemon start\n  softfig daemon unlock"
-                );
-            }
-        }
+    if cycle_ok {
+        // Running, unlocked, relock-enabled, and a systemd user bus will
+        // respawn it — the clean relock cycle.
+        cycle(CycleArgs {
+            socket: Some(socket.clone()),
+            timeout: args.timeout,
+        })?;
+        // 7. Confirm the running daemon now reports the new version.
+        confirm_upgraded(&socket, &target)?;
+    } else if daemon.running {
+        // A running daemon we cannot cycle (no supervisor, locked, or relock
+        // disabled): stop it, tell the human how to bring it back, and skip the
+        // confirm — the daemon is down, so confirming would only report it
+        // absent.
+        stop_daemon(&socket)?;
+        println!(
+            "cannot cycle the daemon automatically ({}); stopped it so it does not\n\
+             keep running the pre-upgrade binary. Start + unlock it by hand:\n  \
+             softfig daemon start\n  softfig daemon unlock",
+            no_cycle_reason(supervisor, &daemon)
+        );
     } else {
-        println!("daemon not running — nothing to cycle; start it with `softfig daemon start`.");
+        println!("daemon not running — start it with `softfig daemon start`.");
     }
-
-    // 7. Confirm the running daemon now reports the new version.
-    confirm_upgraded(&socket, &target)?;
 
     println!("upgrade complete: soft-fig is now {target}.");
     Ok(())
@@ -268,12 +277,67 @@ fn check_support_window(prefix: &Path, target: &str) -> Result<()> {
     }
 }
 
-/// Is a keeperd listening at `socket`?
-fn daemon_running(socket: &Path) -> bool {
-    matches!(
-        try_daemon_call(socket, op::STATUS, serde_json::Value::Null),
-        Ok(Some(_))
-    )
+/// The keeperd's state, read ONCE before the swap so the upgrade can decide
+/// its cycle path up front (M1). `relock_enabled` is the `[growlight]
+/// allow_relock` opt-in surfaced in [`StatusReply`]; a daemon older than that
+/// field reads `false` — the fail-closed default, i.e. no cycle.
+struct DaemonState {
+    running: bool,
+    locked: bool,
+    relock_enabled: bool,
+    garden_root: Option<String>,
+}
+
+/// Read the daemon's state in one `status` call. A missing daemon (or an
+/// unparseable reply — a pre-stamp build, say) reports a fail-closed state:
+/// no cycle, no garden.
+fn daemon_state(socket: &Path) -> DaemonState {
+    match try_daemon_call(socket, op::STATUS, serde_json::Value::Null) {
+        Ok(Some(v)) => match serde_json::from_value::<StatusReply>(v) {
+            Ok(r) => DaemonState {
+                running: true,
+                locked: r.state == "locked",
+                relock_enabled: r.relock_enabled,
+                garden_root: (!r.garden_root.is_empty()).then_some(r.garden_root),
+            },
+            Err(_) => DaemonState {
+                running: true,
+                locked: false,
+                relock_enabled: false,
+                garden_root: None,
+            },
+        },
+        _ => DaemonState {
+            running: false,
+            locked: false,
+            relock_enabled: false,
+            garden_root: None,
+        },
+    }
+}
+
+/// Can the upgrade cycle the daemon onto the new build? Only when a systemd
+/// user bus will respawn it, the daemon is running and unlocked, and relock is
+/// enabled (`[growlight] allow_relock`). Every other case takes the shutdown
+/// path instead of a cycle that would bail mid-flight.
+fn can_cycle(supervisor: Supervisor, daemon: &DaemonState) -> bool {
+    supervisor == Supervisor::SystemdUser
+        && daemon.running
+        && !daemon.locked
+        && daemon.relock_enabled
+}
+
+/// Why a running daemon cannot be cycled, for the shutdown path's message. The
+/// three cases are mutually exclusive by [`can_cycle`]'s construction (a
+/// running, unlocked, relock-enabled daemon with a systemd bus cycles).
+fn no_cycle_reason(supervisor: Supervisor, daemon: &DaemonState) -> &'static str {
+    if supervisor != Supervisor::SystemdUser {
+        "no systemd user bus detected"
+    } else if daemon.locked {
+        "the daemon is locked"
+    } else {
+        "relock is disabled (`[growlight] allow_relock` not set)"
+    }
 }
 
 /// The live-loop caveat (`spec-growlight` §12): a running growlightd launches
@@ -325,18 +389,6 @@ fn run_migrations(prefix: &Path, garden_root: Option<&str>) -> Result<()> {
 fn needs_finalize(status: &str) -> bool {
     status.contains("prepared (or finalized)")
         && status.contains("run `softfig migrate finalize`")
-}
-
-/// The garden the running daemon owns, from its `status` reply. `None` when no
-/// daemon is running or the reply is unexpected.
-fn daemon_garden_root(socket: &Path) -> Option<String> {
-    match try_daemon_call(socket, op::STATUS, serde_json::Value::Null) {
-        Ok(Some(v)) => serde_json::from_value::<StatusReply>(v)
-            .ok()
-            .map(|r| r.garden_root)
-            .filter(|g| !g.is_empty()),
-        _ => None,
-    }
 }
 
 /// Run `program args…`, returning combined stdout+stderr.
@@ -404,6 +456,13 @@ fn confirm_upgraded(socket: &Path, target: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread::JoinHandle;
+
+    use serde_json::json;
+    use softfig_ipc::{Request, Response, PROTOCOL_VERSION};
+
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
     }
@@ -446,5 +505,116 @@ mod tests {
         assert!(!needs_finalize(migrated));
         // An unmigrated garden prints neither.
         assert!(!needs_finalize("phase             unmigrated (no keeper.toml)\n"));
+    }
+
+    // ---- M1: the daemon-state preflight + cycle decision ----
+
+    /// A one-connection mock keeperd answering `status` with `reply`, so
+    /// `daemon_state` can be read against a scripted daemon (locked,
+    /// relock-disabled, etc.).
+    fn spawn_status_daemon(socket: &std::path::Path, reply: serde_json::Value) -> JoinHandle<()> {
+        let listener = UnixListener::bind(socket).expect("bind mock socket");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let req: Request = serde_json::from_str(line.trim_end()).unwrap();
+            assert_eq!(req.op, op::STATUS);
+            let mut bytes = serde_json::to_vec(&Response::ok(reply)).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+        })
+    }
+
+    fn status_json(state: &str, relock_enabled: bool) -> serde_json::Value {
+        json!({
+            "state": state,
+            "tip": null,
+            "garden_root": "/g",
+            "protocol_version": PROTOCOL_VERSION,
+            "relock_enabled": relock_enabled,
+        })
+    }
+
+    fn state(running: bool, locked: bool, relock_enabled: bool) -> DaemonState {
+        DaemonState {
+            running,
+            locked,
+            relock_enabled,
+            garden_root: None,
+        }
+    }
+
+    #[test]
+    fn daemon_state_reads_running_locked_and_relock() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Unlocked + relock-enabled: a cycle candidate.
+        let socket = dir.path().join("unlocked.sock");
+        let mock = spawn_status_daemon(&socket, status_json("unlocked", true));
+        let s = daemon_state(&socket);
+        mock.join().unwrap();
+        assert!(s.running);
+        assert!(!s.locked);
+        assert!(s.relock_enabled);
+        assert_eq!(s.garden_root.as_deref(), Some("/g"));
+
+        // Locked.
+        let socket = dir.path().join("locked.sock");
+        let mock = spawn_status_daemon(&socket, status_json("locked", true));
+        let s = daemon_state(&socket);
+        mock.join().unwrap();
+        assert!(s.running);
+        assert!(s.locked);
+        assert!(s.relock_enabled);
+
+        // Relock-disabled.
+        let socket = dir.path().join("relock-off.sock");
+        let mock = spawn_status_daemon(&socket, status_json("unlocked", false));
+        let s = daemon_state(&socket);
+        mock.join().unwrap();
+        assert!(s.running);
+        assert!(!s.locked);
+        assert!(!s.relock_enabled);
+    }
+
+    #[test]
+    fn daemon_state_reports_an_absent_daemon_as_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = daemon_state(&dir.path().join("absent.sock"));
+        assert!(!s.running);
+        assert!(!s.locked);
+        assert!(!s.relock_enabled);
+        assert_eq!(s.garden_root, None);
+    }
+
+    #[test]
+    fn can_cycle_requires_supervisor_running_unlocked_and_relock() {
+        // The one combination that cycles.
+        assert!(can_cycle(Supervisor::SystemdUser, &state(true, false, true)));
+        // Supervisor::None → no respawn, shutdown path.
+        assert!(!can_cycle(Supervisor::None, &state(true, false, true)));
+        // Locked → cycle can only resume an unlocked session.
+        assert!(!can_cycle(Supervisor::SystemdUser, &state(true, true, true)));
+        // Relock disabled → the mint would bail.
+        assert!(!can_cycle(Supervisor::SystemdUser, &state(true, false, false)));
+        // Not running → nothing to cycle.
+        assert!(!can_cycle(Supervisor::SystemdUser, &state(false, false, true)));
+    }
+
+    #[test]
+    fn no_cycle_reason_names_each_failure() {
+        assert_eq!(
+            no_cycle_reason(Supervisor::None, &state(true, false, true)),
+            "no systemd user bus detected"
+        );
+        assert_eq!(
+            no_cycle_reason(Supervisor::SystemdUser, &state(true, true, true)),
+            "the daemon is locked"
+        );
+        assert_eq!(
+            no_cycle_reason(Supervisor::SystemdUser, &state(true, false, false)),
+            "relock is disabled (`[growlight] allow_relock` not set)"
+        );
     }
 }

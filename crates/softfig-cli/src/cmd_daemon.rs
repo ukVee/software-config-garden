@@ -112,7 +112,17 @@ fn start(args: StartArgs) -> Result<()> {
 
 fn stop(args: BasicArgs) -> Result<()> {
     let path = args.socket.unwrap_or_else(runtime_socket_path);
-    match send_shutdown_tolerating_close(&path)? {
+    stop_daemon(&path)
+}
+
+/// Send `shutdown` to a running daemon, tolerating a connection drop around
+/// the stop as the stop itself (incident 20260622). Prints the outcome and
+/// returns `Ok(())` whether the daemon was running or not — stopping an absent
+/// daemon is not an error. Shared by the `stop` command and `upgrade`'s
+/// non-cycle path (which stops the daemon so it is not left running the old
+/// binary against a newly-swapped set).
+pub(crate) fn stop_daemon(socket: &Path) -> Result<()> {
+    match send_shutdown_tolerating_close(socket)? {
         StopOutcome::Stopped => {
             println!("daemon: stopping");
             Ok(())

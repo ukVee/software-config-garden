@@ -5705,6 +5705,7 @@ mod tests {
                 protocol_version: softfig_ipc::PROTOCOL_VERSION,
                 relock_pending: false,
                 relock_expires_at: None,
+                relock_enabled: false,
                 growlight_enabled,
                 shared_key_divergence: None,
                 axes: None,

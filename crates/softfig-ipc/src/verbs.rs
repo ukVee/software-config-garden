@@ -465,6 +465,13 @@ pub struct StatusReply {
     /// Unix seconds at which the armed relock token expires, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relock_expires_at: Option<i64>,
+    /// Whether the daemon will mint a relock token (`[growlight] allow_relock`).
+    /// Surfaced so a client can preflight a `cycle` — `upgrade` reads it before
+    /// the swap to decide cycle-vs-shutdown instead of attempting the mint and
+    /// bailing mid-flight. `#[serde(default)]` keeps older daemons/clients
+    /// wire-compatible (an absent field ⇒ `false`, the fail-closed default).
+    #[serde(default)]
+    pub relock_enabled: bool,
     /// Daemon-owned growlight gate: the fail-closed `fleet_enabled()` value the
     /// keeperd already owns, surfaced so a client never re-derives it from
     /// file-presence and disagrees. Refreshes on every status tick.

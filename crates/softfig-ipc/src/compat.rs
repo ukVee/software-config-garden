@@ -768,6 +768,7 @@ mod tests {
                 protocol_version: crate::PROTOCOL_VERSION,
                 relock_pending: false,
                 relock_expires_at: None,
+                relock_enabled: false,
                 growlight_enabled: false,
                 shared_key_divergence: None,
                 axes: Some(VersionAxes { binary: "0.0.1".into(), ..VersionAxes::this_build(1, 1) }),

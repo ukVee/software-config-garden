@@ -44,7 +44,14 @@ pub type HandlerResult = std::result::Result<serde_json::Value, (ErrorKind, Stri
 const PROJECT: &str = "softfig-keeperd";
 
 pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
-    let (state_label, tip_hex, garden_root, relock_expires_at, shared_key_divergence) = {
+    let (
+        state_label,
+        tip_hex,
+        garden_root,
+        relock_expires_at,
+        shared_key_divergence,
+        relock_enabled,
+    ) = {
         let inner = daemon.inner.lock().unwrap();
         let tip_hex = match inner.repo.as_ref() {
             Some(repo) => repo.tip().ok().flatten().map(|h| h.to_string()),
@@ -61,6 +68,7 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
             relock_expires_at,
             // M5d slice 006: in-memory daemon field, safe under `inner`.
             inner.last_shared_key_divergence.clone(),
+            inner.config.growlight.allow_relock,
         )
     };
     // Growlight enablement — the daemon's own fail-closed `fleet_enabled()` gate,
@@ -77,6 +85,7 @@ pub fn status(daemon: &Daemon, _args: serde_json::Value) -> HandlerResult {
         protocol_version: softfig_ipc::PROTOCOL_VERSION,
         relock_pending: relock_expires_at.is_some(),
         relock_expires_at,
+        relock_enabled,
         growlight_enabled,
         shared_key_divergence,
         // release-pipeline slice 002: every compatibility axis, this build's
