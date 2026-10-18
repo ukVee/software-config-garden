@@ -3,8 +3,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// How a path is mounted into the sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BindMode {
     /// Read-only.
     Ro,
@@ -13,7 +15,7 @@ pub enum BindMode {
 }
 
 /// One bind mount in the sandbox filesystem view.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Bind {
     /// Host source path.
     pub src: PathBuf,
@@ -36,7 +38,7 @@ impl Bind {
 }
 
 /// A sized tmpfs mount (scratch, `/tmp`, `/home/job`, …).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TmpfsMount {
     /// In-sandbox mount point.
     pub path: PathBuf,
@@ -57,7 +59,7 @@ impl TmpfsMount {
 }
 
 /// The network posture of the sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Network {
     /// No network: `--unshare-all` gives a fresh netns with only loopback.
     #[default]
@@ -70,14 +72,28 @@ pub enum Network {
 
 /// Syscalls to deny beyond the base profile. Consumed by the init shim's seccomp
 /// filter, not by [`Policy::render`] — the bwrap argv stays a pure `Vec<String>`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SeccompDeny {
     /// Lowercase syscall names ("ptrace", "bpf", "keyctl", …).
     pub syscalls: Vec<String>,
 }
 
+/// One filesystem rule for the Landlock layer (spec §7.1 layer 4).
+///
+/// Derived from the *same* bind list bwrap uses, so a bwrap misconfiguration
+/// (say, an over-broad bind that bwrap happily mounts) is still blocked by
+/// Landlock. Paths are the **in-sandbox** destinations the shim sees once bwrap
+/// has set up the mount namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsRule {
+    /// In-sandbox path (a bind `dest`, a tmpfs mount point, or `/proc`//`/dev`).
+    pub path: PathBuf,
+    /// Whether the path is writable (rw bind or tmpfs) or read-only.
+    pub writable: bool,
+}
+
 /// A fully-specified sandbox policy — one per runner step (or ad hoc run).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Policy {
     /// Read-only binds.
     pub ro_binds: Vec<Bind>,
@@ -175,6 +191,37 @@ impl Policy {
 
         argv
     }
+
+    /// Derive the Landlock filesystem rules this policy implies (spec §7.1
+    /// layer 4), from the same bind list bwrap uses. The init shim turns these
+    /// into a `PathBeneath` ruleset that mirrors the mount table, so a bind
+    /// bwrap mounts but Landlock does not allow stays blocked.
+    ///
+    /// Every rule uses the **in-sandbox** path: a bind's `dest`, a tmpfs mount
+    /// point, and the `/proc`//`/dev` pseudo-filesystems bwrap mounts fresh.
+    /// The result is sorted by path for determinism.
+    pub fn fs_rules(&self) -> Vec<FsRule> {
+        let mut rules = Vec::new();
+
+        for b in &self.ro_binds {
+            rules.push(FsRule { path: b.dest.clone(), writable: false });
+        }
+        for b in &self.rw_binds {
+            rules.push(FsRule { path: b.dest.clone(), writable: true });
+        }
+        for t in &self.tmpfs {
+            rules.push(FsRule { path: t.path.clone(), writable: true });
+        }
+        if self.proc {
+            rules.push(FsRule { path: PathBuf::from("/proc"), writable: false });
+        }
+        if self.dev {
+            rules.push(FsRule { path: PathBuf::from("/dev"), writable: true });
+        }
+
+        rules.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        rules
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +291,38 @@ mod tests {
             rest,
             &["--setenv", "HOME", "/home/job", "--setenv", "LANG", "C.UTF-8"]
         );
+    }
+
+    #[test]
+    fn fs_rules_use_dest_paths_and_flag_writability() {
+        let mut p = Policy { proc: true, dev: true, ..Policy::default() };
+        p.ro_binds.push(Bind::ro("/usr", "/usr"));
+        p.rw_binds.push(Bind::rw("/host/src", "/src"));
+        p.tmpfs.push(TmpfsMount::sized("/tmp", "2G"));
+
+        let rules = p.fs_rules();
+
+        // /usr read-only, /src read-write, /tmp read-write, /proc ro, /dev rw.
+        let find = |path: &str| rules.iter().find(|r| r.path.as_path() == std::path::Path::new(path)).unwrap_or_else(|| panic!("rule {path} missing from {rules:?}"));
+        assert!(!find("/usr").writable);
+        assert!(find("/src").writable);
+        assert!(find("/tmp").writable);
+        assert!(!find("/proc").writable);
+        assert!(find("/dev").writable);
+        // The host source path must never leak into a rule.
+        assert!(rules.iter().all(|r| r.path.as_path() != std::path::Path::new("/host/src")));
+    }
+
+    #[test]
+    fn fs_rules_are_sorted_by_path() {
+        let mut p = Policy { proc: true, dev: true, ..Policy::default() };
+        p.rw_binds.push(Bind::rw("/src", "/src"));
+        p.ro_binds.push(Bind::ro("/usr", "/usr"));
+
+        let rules = p.fs_rules();
+        let paths: Vec<&std::path::Path> = rules.iter().map(|r| r.path.as_path()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "fs_rules must be deterministic");
     }
 }

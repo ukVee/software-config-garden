@@ -8,3 +8,9 @@ repository.workspace = true
 description = "soft-fig sandbox engine: one Policy -> bwrap argv + Landlock + seccomp (shared with the remote runner and fleet safety-order step 4)."
 
 [dependencies]
+landlock = "0.4.7"
+seccompiler = "0.5.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+anyhow = { workspace = true }
