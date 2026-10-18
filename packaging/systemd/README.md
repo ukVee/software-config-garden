@@ -44,7 +44,7 @@ Always redeploy **unit + binary** together:
 ```
 cargo build --release --workspace                                    # 1. rebuild
 install -m 0755 target/release/{softfig,softfig-keeperd,softfig-mcp,softfig-tui,softfig-growlightd} \
-  ~/.local/bin/                                                      #    install the binaries
+  ~/.local/bin/                                                      #    install the five binaries
 cp packaging/systemd/*.service ~/.config/systemd/user/               # 2. refresh the units
 systemctl --user daemon-reload                                       # 3. reload unit definitions
 softfig daemon cycle                                                 # 4. resume onto the new binaries
@@ -54,6 +54,10 @@ softfig daemon cycle                                                 # 4. resume
 re-prompting for the passphrase, so the new keeperd picks up the refreshed unit
 and re-arms growlightd on resume. After upgrading `softfig-mcp`, restart any
 open Claude Code session — it keeps the old MCP server process until then.
+
+Those five binaries are the installed set, the same list as `BINARIES=` in
+`scripts/onboard-device.sh`. If you opted into `growlight-gui`, it is not part
+of that set, so rebuild it on its own (see `packaging/desktop/README.md`).
 
 ## No sandboxing — on purpose
 
