@@ -47,6 +47,7 @@ pub mod proto;
 pub mod relay;
 pub mod replica;
 pub mod ring;
+pub mod runner_cert;
 pub mod sas;
 // Test support (task 055): bounded accepts/reads for tests that own both ends of
 // a loopback socket. `pub` because keeperd's unit AND integration tests need it
@@ -87,6 +88,7 @@ pub use replica::{
     ReplicaSink, ReplicaSource, ServeSummary, SubtreeSummary,
 };
 pub use ring::{ring_path, Ring, RingEntry};
+pub use runner_cert::{signing_message as runner_cert_signing_message, verify as verify_runner_cert, RunnerCert, RUNNER_CERT_DOMAIN, RUNNER_DEFAULT_LIFETIME_SECS, RUNNER_SERIAL_LEN};
 pub use sas::Sas;
 pub use transport::{
     ik_initiator, ik_responder, xx_initiator, xx_responder, NoiseReader, NoiseSession, NoiseWriter,
