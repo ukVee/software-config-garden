@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use softfig_install::detect::{which, Distro, Supervisor};
+use softfig_install::detect::{package_owned, package_owned_message, which, Distro, Supervisor};
 use softfig_install::gate::{self, Gate};
 use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
 use softfig_install::stage::{stage_and_swap, StageOutcome};
@@ -83,6 +83,14 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
         anyhow::bail!("toolchain gate failed");
     }
 
+    // 2b. Resolve the prefix and refuse a package-owned one — the helper must
+    //     never write over `/usr/bin` (an AUR install). Refused before the
+    //     build, the swap, and any filesystem touch.
+    let prefix = cli.prefix.clone().unwrap_or_else(default_bin_dir);
+    if package_owned(&distro, &prefix) {
+        anyhow::bail!("{}", package_owned_message(&prefix));
+    }
+
     // 3. Dry run: detection + gate are the only side-effect-free facts; stop
     //    before the build (which is real work) and before any filesystem touch.
     if cli.dry_run {
@@ -97,7 +105,6 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
     build_program(&source)?;
 
     // 6. Stage + atomically install the reconciled set (idempotent).
-    let prefix = cli.prefix.unwrap_or_else(default_bin_dir);
     install_set(&source, &prefix)?;
 
     // 7. Non-fatal environment checks (fuse3, PATH).

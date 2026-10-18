@@ -170,6 +170,59 @@ pub fn which(name: &str) -> bool {
     })
 }
 
+/// Is the installed set at `prefix` owned by the distro's package manager?
+///
+/// A package-owned prefix — an AUR `/usr/bin` install — must never be written
+/// or removed by the helper: those files belong to the package manager. The
+/// question is only answerable on Arch, where `pacman` can say so directly;
+/// every other distro returns `false` (the helper cannot overwrite a package
+/// manager it does not know).
+pub fn package_owned(distro: &Distro, prefix: &Path) -> bool {
+    match distro {
+        Distro::Arch => package_owned_with("pacman", prefix),
+        Distro::Debian | Distro::Ubuntu | Distro::Fedora | Distro::Other(_) | Distro::Unknown => {
+            false
+        }
+    }
+}
+
+/// The shared refusal for a package-owned prefix: point at the package manager
+/// for both update and removal, since the helper never writes over or removes
+/// files the package manager owns. Install/upgrade/uninstall all gate on it.
+pub fn package_owned_message(prefix: &Path) -> String {
+    format!(
+        "the install prefix {} is owned by the package manager (soft-fig is \
+         installed from the AUR here). The helper will not write over or remove \
+         package-managed files: update with `pacman -Syu soft-fig`, or remove with \
+         `pacman -Rns soft-fig`.",
+        prefix.display()
+    )
+}
+
+/// The `pacman` half of [`package_owned`]: ask it whether it owns any
+/// installed-set member at `prefix`. `pacman -Qo <path>` exits 0 when the
+/// package database owns the file, 1 when it does not. The first member that
+/// exists is the one asked about, so a partial install still answers correctly.
+/// A missing pacman (or a prefix with no installed-set member) is "not owned" —
+/// the helper only needs to refuse a real AUR install, and no pacman means no
+/// package manager to conflict with.
+fn package_owned_with(pacman: &str, prefix: &Path) -> bool {
+    if !which(pacman) {
+        return false;
+    }
+    for name in softfig_ipc::compat::INSTALLED_SET {
+        let candidate = prefix.join(name);
+        if candidate.is_file() {
+            let status = std::process::Command::new(pacman)
+                .args(["-Qo"])
+                .arg(&candidate)
+                .status();
+            return matches!(status, Ok(s) if s.success());
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +283,78 @@ mod tests {
         assert_eq!(Distro::Ubuntu.fuse_package_command(), Some("sudo apt-get install -y fuse3"));
         assert_eq!(Distro::Fedora.fuse_package_command(), Some("sudo dnf install -y fuse3"));
         assert_eq!(Distro::Unknown.fuse_package_command(), None);
+    }
+
+    // ---- M4: package-owned prefix detection ----
+
+    /// A fake `pacman` script that exits with `exit_code` — the test stand-in
+    /// for `pacman -Qo` (0 = owns the file, 1 = does not).
+    fn write_fake_pacman(dir: &Path, exit_code: i32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("pacman");
+        std::fs::write(&p, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn write_member(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"fake").unwrap();
+    }
+
+    #[test]
+    fn package_owned_reads_pacmans_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_member(&prefix, "softfig");
+
+        // pacman exits 0 ⇒ the file is package-owned.
+        let owned = write_fake_pacman(dir.path(), 0);
+        assert!(package_owned_with(owned.to_string_lossy().as_ref(), &prefix));
+        // pacman exits 1 ⇒ not owned.
+        let not_owned = write_fake_pacman(dir.path(), 1);
+        assert!(!package_owned_with(not_owned.to_string_lossy().as_ref(), &prefix));
+    }
+
+    #[test]
+    fn package_owned_is_false_off_arch() {
+        let dir = tempfile::tempdir().unwrap();
+        // Non-Arch distros never consult pacman, regardless of what is there.
+        assert!(!package_owned(&Distro::Debian, dir.path()));
+        assert!(!package_owned(&Distro::Ubuntu, dir.path()));
+        assert!(!package_owned(&Distro::Fedora, dir.path()));
+        assert!(!package_owned(&Distro::Other("nixos".into()), dir.path()));
+        assert!(!package_owned(&Distro::Unknown, dir.path()));
+    }
+
+    #[test]
+    fn package_owned_is_false_when_pacman_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_member(&prefix, "softfig");
+        // A program name that is certainly not on PATH.
+        assert!(!package_owned_with("softfig-no-such-pacman-anywhere", &prefix));
+    }
+
+    #[test]
+    fn package_owned_is_false_with_no_installed_set_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        // Nothing to own, even though pacman would claim it.
+        let owned = write_fake_pacman(dir.path(), 0);
+        assert!(!package_owned_with(owned.to_string_lossy().as_ref(), &prefix));
+    }
+
+    #[test]
+    fn package_owned_asks_about_the_first_member_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        // `softfig` and `softfig-keeperd` are absent; `softfig-mcp` exists.
+        write_member(&prefix, "softfig-mcp");
+        let owned = write_fake_pacman(dir.path(), 0);
+        assert!(package_owned_with(owned.to_string_lossy().as_ref(), &prefix));
     }
 }

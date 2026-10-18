@@ -24,7 +24,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use semver::Version;
-use softfig_install::detect::Supervisor;
+use softfig_install::detect::{package_owned, package_owned_message, Distro, Supervisor};
 use softfig_install::stage::{rollback, stage_and_swap, StageOutcome, PREVIOUS_SET_DIR};
 use softfig_ipc::compat::SetReport;
 use softfig_ipc::{
@@ -86,6 +86,13 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
 
     let source = args.source.clone().unwrap_or_else(|| PathBuf::from("."));
     let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+
+    // Refuse a package-owned prefix before pulling/building/swapping: the
+    // helper must never write over `/usr/bin` (an AUR install).
+    let distro = Distro::detect(Path::new("/"));
+    if package_owned(&distro, &prefix) {
+        bail!("{}", package_owned_message(&prefix));
+    }
 
     // 0. Preflight the daemon ONCE, before anything is swapped: is one
     //    running, is it locked, and can it be relock-cycled? The cycle

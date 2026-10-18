@@ -1,6 +1,6 @@
 //! `softfig uninstall` — clean removal (release-pipeline slice 007,
 //! `meta/spec-install.md` workstream D). Removes the installed-set binaries,
-//! the systemd unit, and the MCP registration — and **refuses** to touch the
+//! the systemd units, and the MCP registration — and **refuses** to touch the
 //! encrypted store or the garden content without a separate, explicit
 //! confirmation that names exactly what would be removed.
 //!
@@ -13,11 +13,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
+use softfig_install::detect::{package_owned, package_owned_message, Distro};
 use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
 use softfig_ipc::compat::INSTALLED_SET;
 use softfig_ipc::{runtime_socket_path, verbs::op, StatusReply};
 
 use crate::cmd_daemon::try_daemon_call;
+
+/// The two systemd user units an install can create — keeperd, and the
+/// growlight orchestrator keeperd manages. Both are stopped and removed by
+/// `uninstall`.
+const UNIT_NAMES: [&str; 2] = ["softfig-keeperd.service", "softfig-growlightd.service"];
 
 #[derive(Args, Debug)]
 pub struct UninstallArgs {
@@ -49,6 +55,13 @@ pub fn run(args: UninstallArgs) -> Result<()> {
     let prefix = args.prefix.clone().unwrap_or_else(default_prefix);
     let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
 
+    // Refuse a package-owned prefix before removing anything: those files
+    // belong to the package manager (an AUR install), not to us.
+    let distro = Distro::detect(Path::new("/"));
+    if package_owned(&distro, &prefix) {
+        anyhow::bail!("{}", package_owned_message(&prefix));
+    }
+
     let mut consent: Box<dyn Consent> = if args.yes {
         Box::new(Fixed(Answer::Yes))
     } else if args.no {
@@ -71,7 +84,7 @@ pub fn run(args: UninstallArgs) -> Result<()> {
         id: "remove-program",
         summary: format!(
             "Remove the soft-fig program: {} binary/ies from {}, the systemd \
-             user unit, and the MCP registration? (your store and garden will \
+             user units, and the MCP registration? (your store and garden will \
              NOT be touched)",
             plan.binaries.len(),
             prefix.display()
@@ -84,9 +97,10 @@ pub fn run(args: UninstallArgs) -> Result<()> {
     }
 
     stop_daemon(&socket);
-    remove_binaries(&plan);
-    remove_unit();
-    remove_mcp();
+    stop_units();
+    remove_binaries(&plan)?;
+    remove_units()?;
+    remove_mcp()?;
 
     // Offer 2 — the data, only on --remove-data, and only after the first
     // removal is done. The summary names every path that would be removed.
@@ -142,11 +156,11 @@ pub fn removal_plan(prefix: &Path) -> RemovalPlan {
     if gui.is_file() {
         binaries.push(gui);
     }
-    let has_unit = unit_path().map(|p| p.is_file()).unwrap_or(false);
+    let units = unit_dir().map(|d| existing_units_in(&d)).unwrap_or_default();
     let has_mcp = which_claude();
     RemovalPlan {
         binaries,
-        has_unit,
+        units,
         has_mcp,
     }
 }
@@ -156,10 +170,10 @@ pub fn removal_plan(prefix: &Path) -> RemovalPlan {
 pub struct RemovalPlan {
     /// Absolute paths of the binaries to remove (installed set + opt-in GUI).
     pub binaries: Vec<PathBuf>,
-    /// The systemd user unit exists.
-    pub has_unit: bool,
+    /// The systemd user unit files that exist (keeperd + growlightd).
+    pub units: Vec<PathBuf>,
     /// The `claude` CLI is present, so an MCP registration may exist (removal
-    /// is attempted best-effort).
+    /// is attempted only when it is).
     pub has_mcp: bool,
 }
 
@@ -172,13 +186,16 @@ fn print_plan(plan: &RemovalPlan, store: Option<&StorePaths>) {
             println!("  binary        {}", b.display());
         }
     }
-    println!(
-        "  systemd unit  {}",
-        if plan.has_unit { "softfig-keeperd.service (disable + remove)" } else { "(none)" }
-    );
+    if plan.units.is_empty() {
+        println!("  systemd unit  (none)");
+    } else {
+        for u in &plan.units {
+            println!("  systemd unit  {} (disable + remove)", u.display());
+        }
+    }
     println!(
         "  MCP           {}",
-        if plan.has_mcp { "softfig-mcp registration (best-effort)" } else { "(claude CLI not found)" }
+        if plan.has_mcp { "softfig-mcp registration (deregister)" } else { "(claude CLI not found)" }
     );
     match store {
         Some(sp) => {
@@ -201,37 +218,75 @@ fn stop_daemon(socket: &Path) {
     }
 }
 
-fn remove_binaries(plan: &RemovalPlan) {
+/// Remove the installed-set binaries, failing the uninstall if any one of
+/// them cannot be removed (a failed removal is a hard stop, not a warning).
+fn remove_binaries(plan: &RemovalPlan) -> Result<()> {
+    let mut failures = Vec::new();
     for b in &plan.binaries {
         match std::fs::remove_file(b) {
             Ok(()) => println!("removed {}", b.display()),
-            Err(e) => println!("could not remove {}: {e}", b.display()),
+            Err(e) => failures.push(format!("{}: {e}", b.display())),
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", failures.join("; "))
     }
 }
 
-fn unit_path() -> Option<PathBuf> {
+/// The systemd user unit dir (`$XDG_CONFIG_HOME/systemd/user`, or
+/// `~/.config/systemd/user`).
+fn unit_dir() -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(config.join("systemd/user/softfig-keeperd.service"))
+    Some(config.join("systemd/user"))
 }
 
-fn remove_unit() {
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "--now", "softfig-keeperd.service"])
-        .status();
-    if let Some(p) = unit_path()
-        && p.is_file()
-    {
-        match std::fs::remove_file(&p) {
-            Ok(()) => println!("removed unit {}", p.display()),
-            Err(e) => println!("could not remove {}: {e}", p.display()),
+/// The unit files that exist under `user_dir` — the seam the tests point at a
+/// temp dir. Both keeperd and growlightd are named, never one.
+fn existing_units_in(user_dir: &Path) -> Vec<PathBuf> {
+    UNIT_NAMES
+        .iter()
+        .filter_map(|name| {
+            let p = user_dir.join(name);
+            p.is_file().then_some(p)
+        })
+        .collect()
+}
+
+/// Disable + stop both systemd units (keeperd and growlightd) before their
+/// binaries are removed, so neither keeps running the soon-to-be-deleted set.
+/// Best-effort: a missing systemctl is not an error (there is nothing to stop).
+fn stop_units() {
+    for name in UNIT_NAMES {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", name])
+            .status();
+    }
+}
+
+/// Remove both systemd unit files, failing on any failed removal, then reload
+/// systemd.
+fn remove_units() -> Result<()> {
+    let mut failures = Vec::new();
+    if let Some(dir) = unit_dir() {
+        for p in existing_units_in(&dir) {
+            match std::fs::remove_file(&p) {
+                Ok(()) => println!("removed unit {}", p.display()),
+                Err(e) => failures.push(format!("{}: {e}", p.display())),
+            }
         }
     }
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", failures.join("; "))
+    }
 }
 
 fn which_claude() -> bool {
@@ -240,18 +295,20 @@ fn which_claude() -> bool {
     })
 }
 
-fn remove_mcp() {
+fn remove_mcp() -> Result<()> {
     if !which_claude() {
         println!("'claude' CLI not found — skipping MCP deregistration.");
-        return;
+        return Ok(());
     }
     let status = std::process::Command::new("claude")
         .args(["mcp", "remove", "--scope", "user", "softfig-mcp"])
-        .status();
-    match status {
-        Ok(s) if s.success() => println!("removed softfig-mcp MCP registration"),
-        Ok(s) => println!("MCP deregistration exited {s}"),
-        Err(e) => println!("MCP deregistration failed: {e}"),
+        .status()
+        .context("running `claude mcp remove`")?;
+    if status.success() {
+        println!("removed softfig-mcp MCP registration");
+        Ok(())
+    } else {
+        anyhow::bail!("MCP deregistration exited {status}");
     }
 }
 
@@ -457,5 +514,55 @@ mod tests {
         let sp = resolve_store_paths(&garden);
         assert_eq!(sp.store, None);
         assert_eq!(sp.garden, garden);
+    }
+
+    // ---- M4: both units named + failed removal is an error ----
+
+    #[test]
+    fn both_units_are_named_when_they_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("systemd/user");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("softfig-keeperd.service"), b"unit").unwrap();
+        std::fs::write(user.join("softfig-growlightd.service"), b"unit").unwrap();
+        // An unrelated unit is never named.
+        std::fs::write(user.join("other.service"), b"unit").unwrap();
+
+        let names: Vec<_> = existing_units_in(&user)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "softfig-keeperd.service".to_string(),
+                "softfig-growlightd.service".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_binary_removal_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A "binary" path that is actually a directory: remove_file fails.
+        let not_a_file = dir.path().join("softfig");
+        std::fs::create_dir_all(&not_a_file).unwrap();
+
+        let plan = RemovalPlan {
+            binaries: vec![not_a_file],
+            units: vec![],
+            has_mcp: false,
+        };
+        assert!(remove_binaries(&plan).is_err());
+    }
+
+    #[test]
+    fn no_binaries_is_not_an_error() {
+        let plan = RemovalPlan {
+            binaries: vec![],
+            units: vec![],
+            has_mcp: false,
+        };
+        assert!(remove_binaries(&plan).is_ok());
     }
 }
