@@ -36,20 +36,27 @@ use crate::client::{call, connect};
 use crate::proto::Request;
 use crate::verbs::{op, StatusReply};
 
-/// The build stamp: a marker, this build's version, then a NUL. It is one
-/// contiguous byte string in every binary that links this crate, so
-/// [`read_stamp`] can find it in a binary on disk.
+/// The build stamp: two markers back-to-back — this build's version, then this
+/// build's identity (commit SHA + dirty). They are one contiguous byte string
+/// in every binary that links this crate, so [`read_stamp`] finds both.
 ///
-/// `v1` is the layout of the stamp itself. A reader trusts only the layout it
-/// knows.
-static BUILD_STAMP: &str = concat!("\0softfig-build-stamp:v1:", env!("CARGO_PKG_VERSION"), "\0");
+/// `v1` is the layout of each marker. A reader trusts only the layout it knows.
+static BUILD_STAMP: &str = concat!(
+    "\0softfig-build-stamp:v1:", env!("CARGO_PKG_VERSION"), "\0",
+    "\0softfig-build-id:v1:", env!("SOFTFIG_BUILD_ID"), "\0",
+);
 
-/// Length of the marker in front of the version.
+/// The marker in front of the version.
 const STAMP_PREFIX_LEN: usize = "\0softfig-build-stamp:v1:".len();
+/// The marker in front of the build identity.
+const BUILD_ID_PREFIX: &str = "\0softfig-build-id:v1:";
 
 /// The longest version [`find_stamp`] accepts. Workspace versions are far
 /// shorter; the bound stops a scan from reading a whole binary as a version.
 const MAX_VERSION_LEN: usize = 64;
+/// The longest build id [`find_build_id`] accepts (a 12-hex SHA + `-dirty`,
+/// plus headroom for CI ids).
+const MAX_BUILD_ID_LEN: usize = 128;
 
 /// The stamp's bytes, read through [`std::hint::black_box`] so the optimizer
 /// can't fold callers down to a copy of just the part they use. The whole
@@ -67,8 +74,24 @@ fn stamp_bytes() -> &'static [u8] {
 /// stamp is what keeps the stamp in every binary.
 pub fn binary_version() -> &'static str {
     let stamp = stamp_bytes();
-    std::str::from_utf8(&stamp[STAMP_PREFIX_LEN..stamp.len() - 1])
-        .expect("CARGO_PKG_VERSION is UTF-8")
+    let rest = &stamp[STAMP_PREFIX_LEN..];
+    let end = rest.iter().position(|&b| b == 0).expect("version is NUL-terminated");
+    std::str::from_utf8(&rest[..end]).expect("CARGO_PKG_VERSION is UTF-8")
+}
+
+/// This build's identity: the commit (or CI build id) the version was built
+/// from. Two builds at one version still differ here — what lets the install
+/// swap name a same-version rebuild (release-pipeline task 077).
+pub fn build_id() -> &'static str {
+    let stamp = stamp_bytes();
+    let marker = BUILD_ID_PREFIX.as_bytes();
+    let at = stamp
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .expect("build-id marker present in the stamp");
+    let rest = &stamp[at + marker.len()..];
+    let end = rest.iter().position(|&b| b == 0).expect("build id is NUL-terminated");
+    std::str::from_utf8(&rest[..end]).expect("SOFTFIG_BUILD_ID is UTF-8")
 }
 
 /// The pack format version. `None`: this build has no pack runtime
@@ -277,8 +300,8 @@ pub const INSTALLED_SET: [&str; 5] = [
 /// What [`read_stamp`] found in one binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinStamp {
-    /// Carries a stamp for this version.
-    Stamped(String),
+    /// Carries a stamp for this version and build identity.
+    Stamped { version: String, build_id: String },
     /// Readable, with no stamp: a build older than the stamp.
     Unstamped,
     /// No such file.
@@ -290,8 +313,18 @@ pub enum BinStamp {
 /// The stamp a build of `version` carries. Tests use it to fake an installed
 /// binary of another build.
 pub fn stamp_for(version: &str) -> Vec<u8> {
+    stamp_with_identity(version, "test")
+}
+
+/// The stamp a build of `version` built from `build_id` carries. The default
+/// [`stamp_for`] uses a fixed placeholder id; tests that care about identity
+/// pass a real one here.
+pub fn stamp_with_identity(version: &str, build_id: &str) -> Vec<u8> {
     let mut bytes = stamp_bytes()[..STAMP_PREFIX_LEN].to_vec();
     bytes.extend_from_slice(version.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(BUILD_ID_PREFIX.as_bytes());
+    bytes.extend_from_slice(build_id.as_bytes());
     bytes.push(0);
     bytes
 }
@@ -299,7 +332,17 @@ pub fn stamp_for(version: &str) -> Vec<u8> {
 /// Read the build stamp out of a binary on disk. Never executes it.
 pub fn read_stamp(path: &Path) -> BinStamp {
     match std::fs::read(path) {
-        Ok(bytes) => find_stamp(&bytes).map_or(BinStamp::Unstamped, BinStamp::Stamped),
+        Ok(bytes) => match (find_stamp(&bytes), find_build_id(&bytes)) {
+            (Some(version), Some(build_id)) => BinStamp::Stamped { version, build_id },
+            // Version stamp but no build-id marker: a build that predates the
+            // identity. It reads as "unknown" so it never compares equal to a
+            // real build id.
+            (Some(version), None) => BinStamp::Stamped {
+                version,
+                build_id: "unknown".to_string(),
+            },
+            (None, _) => BinStamp::Unstamped,
+        },
         Err(e) if e.kind() == io::ErrorKind::NotFound => BinStamp::Missing,
         Err(e) => BinStamp::Unreadable(e.to_string()),
     }
@@ -316,6 +359,22 @@ fn find_stamp(bytes: &[u8]) -> Option<String> {
         let version = std::str::from_utf8(&rest[..end]).ok()?;
         semver::Version::parse(version).ok()?;
         Some(version.to_string())
+    })
+}
+
+/// The first well-formed build-id marker in `bytes`: the marker, a non-empty
+/// id (no NUL), then a NUL. A build that predates the identity has no such
+/// marker, and a stray copy followed by garbage is never read as an id.
+fn find_build_id(bytes: &[u8]) -> Option<String> {
+    let marker = BUILD_ID_PREFIX.as_bytes();
+    memchr::memmem::find_iter(bytes, marker).find_map(|at| {
+        let rest = &bytes[at + marker.len()..];
+        let end = rest.iter().take(MAX_BUILD_ID_LEN + 1).position(|&b| b == 0)?;
+        if end == 0 {
+            return None;
+        }
+        let id = std::str::from_utf8(&rest[..end]).ok()?;
+        Some(id.to_string())
     })
 }
 
@@ -353,11 +412,25 @@ impl SetReport {
     /// a binary missing, unreadable or unstamped, or two versions in one set.
     pub fn consistent_version(&self) -> Option<&str> {
         let mut versions = self.bins.iter().map(|(_, stamp)| match stamp {
-            BinStamp::Stamped(v) => Some(v.as_str()),
+            BinStamp::Stamped { version, .. } => Some(version.as_str()),
             _ => None,
         });
         let first = versions.next()??;
         versions.all(|v| v == Some(first)).then_some(first)
+    }
+
+    /// The one `(version, build_id)` pair every binary carries, or `None` for
+    /// a mixed set: a binary missing/unreadable/unstamped, two versions, or one
+    /// version at two identities. This is the idempotency signal `stage_and_swap`
+    /// keys on — same version, different build id is still a different build
+    /// (release-pipeline task 077).
+    pub fn consistent_identity(&self) -> Option<(&str, &str)> {
+        let mut ids = self.bins.iter().map(|(_, stamp)| match stamp {
+            BinStamp::Stamped { version, build_id } => Some((version.as_str(), build_id.as_str())),
+            _ => None,
+        });
+        let first = ids.next()??;
+        ids.all(|v| v == Some(first)).then_some(first)
     }
 }
 
@@ -373,7 +446,7 @@ impl fmt::Display for SetReport {
         let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
         for (name, stamp) in &self.bins {
             let label = match stamp {
-                BinStamp::Stamped(v) => format!("at {v}"),
+                BinStamp::Stamped { version, .. } => format!("at {version}"),
                 BinStamp::Unstamped => "unstamped, older than version stamping".to_string(),
                 BinStamp::Missing => "missing".to_string(),
                 BinStamp::Unreadable(e) => format!("unreadable ({e})"),
@@ -410,12 +483,52 @@ mod tests {
     #[test]
     fn this_test_binary_carries_its_own_stamp() {
         let exe = std::env::current_exe().unwrap();
-        assert_eq!(read_stamp(&exe), BinStamp::Stamped(binary_version().to_string()));
+        assert_eq!(
+            read_stamp(&exe),
+            BinStamp::Stamped {
+                version: binary_version().to_string(),
+                build_id: build_id().to_string()
+            }
+        );
     }
 
     #[test]
     fn find_stamp_reads_a_well_formed_stamp() {
         assert_eq!(find_stamp(&stamped("1.2.3-alpha.4")).as_deref(), Some("1.2.3-alpha.4"));
+    }
+
+    #[test]
+    fn find_build_id_reads_a_well_formed_build_id() {
+        assert_eq!(
+            find_build_id(&stamp_with_identity("1.0.0", "abc123def456")).as_deref(),
+            Some("abc123def456")
+        );
+    }
+
+    #[test]
+    fn build_id_is_present_and_not_the_version() {
+        assert!(!build_id().is_empty());
+        assert_ne!(build_id(), binary_version());
+    }
+
+    #[test]
+    fn consistent_identity_names_same_version_different_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, name) in INSTALLED_SET.iter().enumerate() {
+            let id = if i == INSTALLED_SET.len() - 1 { "bbb" } else { "aaa" };
+            std::fs::write(dir.path().join(name), stamp_with_identity("1.0.0", id)).unwrap();
+        }
+        let report = SetReport::scan(dir.path());
+        assert_eq!(report.consistent_version(), Some("1.0.0"), "version agrees: {report}");
+        assert_eq!(report.consistent_identity(), None, "identity disagrees: {report}");
+
+        // A fully-matching set reads as one identity.
+        let dir2 = tempfile::tempdir().unwrap();
+        for name in INSTALLED_SET {
+            std::fs::write(dir2.path().join(name), stamp_with_identity("1.0.0", "aaa")).unwrap();
+        }
+        let report2 = SetReport::scan(dir2.path());
+        assert_eq!(report2.consistent_identity(), Some(("1.0.0", "aaa")));
     }
 
     /// A bare marker followed by anything that isn't `<semver>\0` is not a

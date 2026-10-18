@@ -288,7 +288,10 @@ fn the_built_binary_carries_the_build_stamp() {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_softfig"));
     assert_eq!(
         softfig_ipc::compat::read_stamp(bin),
-        softfig_ipc::compat::BinStamp::Stamped(softfig_ipc::compat::binary_version().to_string())
+        softfig_ipc::compat::BinStamp::Stamped {
+            version: softfig_ipc::compat::binary_version().to_string(),
+            build_id: softfig_ipc::compat::build_id().to_string(),
+        }
     );
 }
 
