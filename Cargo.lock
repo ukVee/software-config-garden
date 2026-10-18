@@ -3745,6 +3745,7 @@ version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
+ "rustix 1.1.4",
  "semver",
  "softfig-ipc",
  "tempfile",

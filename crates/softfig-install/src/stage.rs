@@ -11,6 +11,16 @@ use softfig_ipc::compat::{SetReport, INSTALLED_SET};
 
 use crate::swap::swap_binaries;
 
+/// The directory inside the install prefix that holds the one superseded
+/// install set — the binaries the current set replaced — so
+/// `softfig upgrade --rollback` can restore them. One level deep: exactly one
+/// previous set, never a history stack (a new swap discards the prior one).
+pub const PREVIOUS_SET_DIR: &str = ".previous";
+
+/// The advisory lock file the stage+swap takes in the install prefix, so two
+/// concurrent installs/upgrades cannot interleave their swaps.
+const INSTALL_LOCK_FILE: &str = ".softfig.lock";
+
 /// What [`stage_and_swap`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageOutcome {
@@ -100,6 +110,13 @@ pub fn stage_and_swap(source: &Path, prefix: &Path, force: bool) -> Result<Stage
     }
 
     std::fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
+
+    // Serialise the whole stage+swap: an advisory `flock` on a lock file in
+    // the prefix. A concurrent `upgrade`/`install` finds it held and refuses
+    // with a non-zero exit — two swaps can never interleave (the lock is held
+    // for the life of `_lock`, released when it drops on return).
+    let _lock = acquire_install_lock(prefix)?;
+
     // Stage beside the prefix (same filesystem), never /tmp on a tmpfs — the
     // crate doc's same-filesystem note (`rename(2)` fails EXDEV across them).
     let staging = tempfile::Builder::new()
@@ -118,13 +135,143 @@ pub fn stage_and_swap(source: &Path, prefix: &Path, force: bool) -> Result<Stage
             .with_context(|| format!("staging {}", from.display()))?;
     }
 
+    // fsync each staged binary before the renames, so a crash mid-swap cannot
+    // leave a half-flushed staged file (pairs with the swap-in-progress marker
+    // the swap writes on the *target* side).
+    fsync_staged(staging.path())?;
+
+    // Keep the superseded set recoverable: move the current binaries into the
+    // one `.previous` sibling before the swap, so `--rollback` can restore
+    // them.
+    save_previous(prefix)?;
+
     swap_binaries(staging.path(), prefix, &INSTALLED_SET)
         .map_err(|e| anyhow::anyhow!("atomic install failed: {e}"))?;
+
+    // fsync the prefix directory so the renames' dirents are durable, not just
+    // the binaries' data — a crash right after the last rename can otherwise
+    // drop the new entries on some filesystems.
+    fsync_dir(prefix)?;
+
     Ok(StageOutcome::Swapped {
         version: built_version.to_string(),
         build_id: built_id.to_string(),
         from: installed_id.map(|(v, b)| (v.to_string(), b.to_string())),
     })
+}
+
+/// What [`rollback`] restored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackOutcome {
+    pub version: String,
+    pub build_id: String,
+}
+
+/// Restore the one previous install set (kept at [`PREVIOUS_SET_DIR`] inside
+/// `prefix`) over the current set, atomically. This is `softfig upgrade
+/// --rollback`: the superseded binaries come back, all or nothing, through the
+/// same shared swap routine. An absent or partial previous set is an error —
+/// there is nothing to roll back to. The restore consumes the previous set (a
+/// rollback has no previous set of its own).
+pub fn rollback(prefix: &Path) -> Result<RollbackOutcome> {
+    std::fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
+    let _lock = acquire_install_lock(prefix)?;
+
+    let previous = prefix.join(PREVIOUS_SET_DIR);
+    let report = SetReport::scan(&previous);
+    let Some((version, build_id)) = report.consistent_identity() else {
+        anyhow::bail!(
+            "no previous set to roll back to in {} — run an install or upgrade \
+             first, then roll back from the set it superseded",
+            previous.display()
+        );
+    };
+
+    swap_binaries(&previous, prefix, &INSTALLED_SET)
+        .map_err(|e| anyhow::anyhow!("rollback failed: {e}"))?;
+    fsync_dir(prefix)?;
+
+    Ok(RollbackOutcome {
+        version: version.to_string(),
+        build_id: build_id.to_string(),
+    })
+}
+
+/// Take the advisory exclusive `flock` on the install lock file in `prefix`,
+/// non-blocking: a concurrent install/upgrade holds it, so this one refuses
+/// (no interleaved swaps). The returned handle owns the lock; dropping it
+/// releases it. The lock file is created (and left behind) on purpose — a
+/// persistent file is what a second process opens and flocks against.
+fn acquire_install_lock(prefix: &Path) -> Result<std::fs::File> {
+    let path = prefix.join(INSTALL_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening the install lock {}", path.display()))?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!(
+                "another install or upgrade is already in progress (lock held on {}) — \
+                 wait for it to finish, then re-run",
+                path.display()
+            );
+        }
+        Err(e) => Err(e).with_context(|| format!("locking {}", path.display())),
+    }
+}
+
+/// Move the currently-installed binaries into the one `.previous` sibling, so
+/// the swap it precedes stays recoverable. A prior `.previous` is discarded
+/// first (one set, never a stack); a prefix with nothing installed leaves no
+/// `.previous` at all.
+fn save_previous(prefix: &Path) -> Result<()> {
+    let previous = prefix.join(PREVIOUS_SET_DIR);
+    if previous.exists() {
+        std::fs::remove_dir_all(&previous)
+            .with_context(|| format!("removing the prior previous set {}", previous.display()))?;
+    }
+    let mut moved = false;
+    for name in INSTALLED_SET {
+        let from = prefix.join(name);
+        if from.exists() {
+            if !moved {
+                std::fs::create_dir_all(&previous)
+                    .with_context(|| format!("creating {}", previous.display()))?;
+                moved = true;
+            }
+            std::fs::rename(&from, previous.join(name))
+                .with_context(|| format!("moving {} into {}", from.display(), previous.display()))?;
+        }
+    }
+    if moved {
+        fsync_dir(&previous)?;
+    }
+    Ok(())
+}
+
+/// `fsync` every staged binary (the freshly-copied set) so each is durable
+/// before the swap renames it.
+fn fsync_staged(staging: &Path) -> Result<()> {
+    for name in INSTALLED_SET {
+        let path = staging.join(name);
+        std::fs::File::open(&path)
+            .with_context(|| format!("opening {} for fsync", path.display()))?
+            .sync_all()
+            .with_context(|| format!("fsyncing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `fsync` a directory so its entries (renames) are durable. On Linux, opening
+/// a directory and calling `sync_all` fsyncs the directory inode.
+fn fsync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .with_context(|| format!("opening directory {} for fsync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("fsyncing directory {}", dir.display()))
 }
 
 #[cfg(test)]
@@ -360,5 +507,131 @@ mod tests {
             SetReport::scan(&prefix).consistent_identity(),
             Some(("1.0.1", "bbb"))
         );
+    }
+
+    // ---- M3: one previous set + rollback + lock + fsync ----
+
+    /// A second swap keeps exactly one previous set: the prior `.previous` is
+    /// discarded and replaced by the set this swap superseded (one level deep,
+    /// never a history stack).
+    #[test]
+    fn a_second_swap_keeps_exactly_one_previous_set() {
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_set_id(&prefix, "1.0.0", "aaa");
+
+        let first = source_with_id("1.0.1", "bbb");
+        stage_and_swap(first.path(), &prefix, false).unwrap();
+        assert_eq!(
+            SetReport::scan(&prefix).consistent_identity(),
+            Some(("1.0.1", "bbb"))
+        );
+        assert_eq!(
+            SetReport::scan(&prefix.join(PREVIOUS_SET_DIR)).consistent_identity(),
+            Some(("1.0.0", "aaa"))
+        );
+
+        let second = source_with_id("1.0.2", "ccc");
+        stage_and_swap(second.path(), &prefix, false).unwrap();
+        assert_eq!(
+            SetReport::scan(&prefix).consistent_identity(),
+            Some(("1.0.2", "ccc"))
+        );
+        // The prior previous set (1.0.0) is gone; the previous set is now the
+        // set the second swap superseded (1.0.1) — exactly one, no stack.
+        let prev = prefix.join(PREVIOUS_SET_DIR);
+        let report = SetReport::scan(&prev);
+        assert_eq!(report.consistent_identity(), Some(("1.0.1", "bbb")));
+        let names: Vec<_> = std::fs::read_dir(&prev)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), INSTALLED_SET.len(), "exactly the set, no stack: {names:?}");
+        for name in INSTALLED_SET {
+            assert!(names.contains(&name.to_string()), "missing {name} in {names:?}");
+        }
+    }
+
+    /// A fresh install (nothing previously installed) keeps no `.previous` —
+    /// there is no superseded set to roll back to.
+    #[test]
+    fn a_fresh_install_keeps_no_previous_set() {
+        let source = source_with("1.0.1");
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+
+        let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
+        assert!(!outcome.is_noop());
+        assert!(
+            !prefix.join(PREVIOUS_SET_DIR).exists(),
+            "a fresh install has no superseded set"
+        );
+    }
+
+    /// A held lock refuses a concurrent swap: two swaps cannot interleave.
+    /// (`flock` is per open-file-description, so two `open`s on the same lock
+    /// file in one process still conflict.)
+    #[test]
+    fn a_held_lock_refuses_a_concurrent_swap() {
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_set(&prefix, "1.0.0");
+
+        // Simulate another install/upgrade already holding the lock.
+        let lock_path = prefix.join(".softfig.lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+
+        let source = source_with("1.0.1");
+        let err = stage_and_swap(source.path(), &prefix, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("already in progress"),
+            "a held lock must refuse: {err:#}"
+        );
+        // Nothing was swapped.
+        assert_eq!(SetReport::scan(&prefix).consistent_identity(), Some(("1.0.0", "test")));
+    }
+
+    /// `rollback` restores the one previous set over the current set.
+    #[test]
+    fn rollback_restores_the_previous_set() {
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_set_id(&prefix, "1.0.0", "aaa");
+
+        let source = source_with_id("1.0.1", "bbb");
+        stage_and_swap(source.path(), &prefix, false).unwrap();
+        assert_eq!(
+            SetReport::scan(&prefix).consistent_identity(),
+            Some(("1.0.1", "bbb"))
+        );
+
+        let outcome = rollback(&prefix).unwrap();
+        assert_eq!(outcome.version, "1.0.0");
+        assert_eq!(outcome.build_id, "aaa");
+        assert_eq!(
+            SetReport::scan(&prefix).consistent_identity(),
+            Some(("1.0.0", "aaa"))
+        );
+    }
+
+    /// `rollback` errors when there is no previous set, and leaves the current
+    /// set untouched.
+    #[test]
+    fn rollback_errors_when_there_is_no_previous_set() {
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_set(&prefix, "1.0.0");
+
+        let err = rollback(&prefix).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no previous set"),
+            "an absent previous set must error: {err:#}"
+        );
+        assert_eq!(SetReport::scan(&prefix).consistent_version(), Some("1.0.0"));
     }
 }

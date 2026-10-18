@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use semver::Version;
 use softfig_install::detect::Supervisor;
-use softfig_install::stage::{stage_and_swap, StageOutcome};
+use softfig_install::stage::{rollback, stage_and_swap, StageOutcome, PREVIOUS_SET_DIR};
 use softfig_ipc::compat::SetReport;
 use softfig_ipc::{
     growlightd_runtime_socket_path, runtime_socket_path,
@@ -61,11 +61,30 @@ pub struct UpgradeArgs {
     /// (same version *and* same build id).
     #[arg(long)]
     pub force: bool,
+    /// Restore the one previous install set (kept at `<prefix>/.previous`)
+    /// over the current set, atomically. Skips pull/build/swap/cycle entirely.
+    #[arg(long)]
+    pub rollback: bool,
 }
 
 pub fn run(args: UpgradeArgs) -> Result<()> {
-    let source = args.source.clone().unwrap_or_else(|| PathBuf::from("."));
     let prefix = args.prefix.clone().unwrap_or_else(default_prefix);
+
+    // --rollback is a terminal restore: put the kept previous set back over
+    // the current set and stop, without pulling, building, or touching the
+    // daemon.
+    if args.rollback {
+        let outcome = rollback(&prefix)?;
+        println!(
+            "rolled back: {} (build {}) in {}",
+            outcome.version,
+            outcome.build_id,
+            prefix.display()
+        );
+        return Ok(());
+    }
+
+    let source = args.source.clone().unwrap_or_else(|| PathBuf::from("."));
     let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
 
     // 0. Preflight the daemon ONCE, before anything is swapped: is one
@@ -114,23 +133,29 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
         StageOutcome::Noop { version, .. } => {
             println!("already at {version} in {} — nothing to swap", prefix.display());
         }
-        StageOutcome::Swapped { version, build_id, from } => match from {
-            Some((prev_version, prev_build_id)) if prev_version == version => {
-                println!(
-                    "installed: same version {version}, new build {build_id}                      (was {prev_build_id}) in {}",
-                    prefix.display()
-                );
+        StageOutcome::Swapped { version, build_id, from } => {
+            match from {
+                Some((prev_version, prev_build_id)) if prev_version == version => {
+                    println!(
+                        "installed: same version {version}, new build {build_id}                      (was {prev_build_id}) in {}",
+                        prefix.display()
+                    );
+                }
+                Some((prev_version, _)) => {
+                    println!(
+                        "installed: upgraded {prev_version} → {version} (build {build_id}) in {}",
+                        prefix.display()
+                    );
+                }
+                None => {
+                    println!("installed: {version} (build {build_id}) in {}", prefix.display());
+                }
             }
-            Some((prev_version, _)) => {
-                println!(
-                    "installed: upgraded {prev_version} → {version} (build {build_id}) in {}",
-                    prefix.display()
-                );
-            }
-            None => {
-                println!("installed: {version} (build {build_id}) in {}", prefix.display());
-            }
-        },
+            println!(
+                "  previous set kept at {} — roll back with `softfig upgrade --rollback`",
+                prefix.join(PREVIOUS_SET_DIR).display()
+            );
+        }
     }
 
     // 5. Run pending migrations with the newly-installed binary, BEFORE the

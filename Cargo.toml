@@ -75,6 +75,7 @@ walkdir = "2"
 hostname = "0.4"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+rustix = { version = "1", features = ["fs"] }
 
 # M-onboard — embedded default-garden skeleton template
 include_dir = "0.7"
