@@ -1,0 +1,62 @@
+# softfig-runnerd — the remote-runner daemon (spec `remote-runner` §3).
+#
+# A SYSTEM unit (unlike the keeperd/growlightd *user* units in this dir): the
+# runner runs as its own dedicated system user `softfig-runner`, so an escape
+# from a job sandbox lands in an account that cannot read the owner's home, the
+# garden, ssh keys, or the browser profile. It must serve while nobody is
+# logged in, so it is not gated on a login session.
+#
+# NOTE — PROVISIONAL HARDENING. The exact directive set is still provisional:
+# slice 001's laptop probe (spec §15 "systemd directive set") is pending. The
+# directives below are the candidate set from spec §7.1; settle them against
+# the probe's OK/BROKEN table before relying on this unit in production.
+# `NoNewPrivileges=`/`PrivateUsers=` are expected to report BROKEN *for bwrap*,
+# but bwrap runs in the per-job TRANSIENT unit (slice 006), never in this
+# long-running service — so they are safe here and their probe result does not
+# bind this unit. The probe is authoritative for the transient unit, not this.
+
+[Unit]
+Description=soft-fig remote runner daemon
+Documentation=https://github.com/ukVee/software-config-garden
+After=network.target
+
+[Service]
+Type=simple
+User=softfig-runner
+# Adjust 1000 to the laptop owner's uid (the uid allowed on the admin socket).
+# `id -u <owner>` on the laptop. The admin socket gates on this uid (SO_PEERCRED).
+ExecStart=/usr/local/bin/softfig-runnerd --owner-uid 1000
+Restart=on-failure
+RestartSec=3
+
+# --- hardening (PROVISIONAL — see header note) -----------------------------
+# runnerd is a socket server + key holder. It opens a unix socket and writes
+# only under /var/lib/softfig-runner. It never execs bwrap itself, so the
+# namespace-affecting knobs below cannot break the job sandbox.
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Its only writable tree: the state root (keys, serve.toml, accept.toml, cert).
+ReadWritePaths=/var/lib/softfig-runner
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# Admin socket only today; slice 003 (wire frames + mDNS) adds AF_INET/AF_INET6.
+RestrictAddressFamilies=AF_UNIX
+
+# Headless daemon — errors only.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

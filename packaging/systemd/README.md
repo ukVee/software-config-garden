@@ -70,3 +70,12 @@ keeperd projects a FUSE mount into your login session via the setuid-root
 
 Don't add them back without `MountFlags=shared` and without
 `NoNewPrivileges`. See `docs/onboard-laptop.md` (Troubleshooting).
+
+
+## softfig-runnerd.service — a SYSTEM unit (not a user unit)
+
+The remote-runner daemon (`softfig-runnerd`) is a **system** unit under its own
+`softfig-runner` system user, unlike the two user units above. It installs to
+`/etc/systemd/system/` with `sysusers.d` + `tmpfiles.d` fragments. The full
+install + rollback commands live in `docs/remote-runner.md`. Its hardening is
+**provisional** until slice 001's laptop probe settles spec §15's directive set.
