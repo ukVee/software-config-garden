@@ -42,6 +42,11 @@ use softfig_ipc::{
     },
     Request, Response,
 };
+use std::path::PathBuf;
+use softfig_run::{
+    attestation_hash, cancel_job, exit_code, load_config, log_tail, read_job_log, run_remote_job,
+    AttemptFailure, CancelOutcome,
+};
 
 const PROTOCOL: &str = "2024-11-05";
 
@@ -1060,6 +1065,55 @@ fn tool_defs() -> Vec<Value> {
                 },
             },
         }),
+        json!({
+            "name": "run_job",
+            "description": "Run one job on a remote runner (spec remote-runner §9): snapshot the \
+                            repo, sign the offer through keeperd, transfer the source, and run the \
+                            command. Synchronous to completion. Returns the job id, state, exit \
+                            code, where it ran, the last 60 log lines, and the BLAKE3 attestation \
+                            hash (absent for a run with no attestation). No local fallback: a \
+                            runner-side failure is an error naming the reason. `repo` is an \
+                            absolute path to the repo to snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["repo"],
+                "properties": {
+                    "repo": { "type": "string", "description": "absolute path of the repo to run" },
+                    "profile": { "type": "string", "description": "named [[project]] profile; defaults to the matched project's default" },
+                    "cmd": { "type": "array", "items": { "type": "string" }, "description": "ad-hoc command (instead of a profile); the `softfig run -- <cmd…>` form" },
+                    "wait_secs": { "type": "integer", "description": "accepted for the §9 shape; the run is synchronous this build (bounded by the runner's time_max + connect_timeout)" },
+                },
+            },
+        }),
+        json!({
+            "name": "job_log",
+            "description": "Read a job's stored log ring (spec remote-runner §9), control \
+                            sequences stripped. A windowed read: only the last `max_bytes` (default \
+                            8192) are returned, never the whole log by default. `from_seq` is the \
+                            live-follow cursor for a running detached job — not yet supported.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["job_id"],
+                "properties": {
+                    "job_id": { "type": "string", "description": "the job id (hex) to read" },
+                    "from_seq": { "type": "integer", "description": "live-follow cursor (a later chunk); ignored here" },
+                    "max_bytes": { "type": "integer", "description": "return only the last N log bytes (default 8192)" },
+                },
+            },
+        }),
+        json!({
+            "name": "job_cancel",
+            "description": "Cancel a running job (spec remote-runner §9): re-dial the runner and \
+                            send JobCancel; the runner stops its unit and the row is marked \
+                            `cancelled`. Returns the final state.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["job_id"],
+                "properties": {
+                    "job_id": { "type": "string", "description": "the job id (hex) to cancel" },
+                },
+            },
+        }),
     ]
 }
 
@@ -1607,6 +1661,115 @@ fn summarize(name: &str, data: &Value) -> String {
     format!("{name}: commit {hash}")
 }
 
+/// The remote-runner MCP verbs (spec §9): `run_job` / `job_log` / `job_cancel`.
+/// These orchestrate over [`softfig_run`] and several keeperd verbs in THIS
+/// process (snapshot/sign/connect/run block on git + the network for the job's
+/// duration), so they bypass the single-op `resolve_tool`/socket path. The
+/// caller's identity is irrelevant here: a run is the requester's own compute
+/// decision, gated by the runner's consent and config — not a garden write.
+fn run_runner_verb(name: &str, args: &Value) -> Result<Value> {
+    let socket = softfig_ipc::runtime_socket_path();
+    match name {
+        "run_job" => {
+            #[derive(Deserialize)]
+            struct Args {
+                repo: String,
+                #[serde(default)]
+                profile: Option<String>,
+                #[serde(default)]
+                cmd: Vec<String>,
+                #[serde(default)]
+                wait_secs: Option<i64>,
+            }
+            let a: Args = serde_json::from_value(args.clone())
+                .map_err(|e| anyhow::anyhow!("run_job args: {e}"))?;
+            // `wait_secs` is accepted for the §9 shape; the run is synchronous to
+            // completion this chunk, bounded by the runner's `time_max` + the
+            // requester's `connect_timeout` (spec §6) rather than a client timer.
+            let _ = a.wait_secs;
+
+            let config = load_config(&socket)?;
+            let repo = PathBuf::from(&a.repo);
+            let ad_hoc = if a.cmd.is_empty() {
+                None
+            } else {
+                Some(a.cmd.clone())
+            };
+            let resolved = config.resolve(&repo, a.profile.as_deref(), ad_hoc)?;
+            let completed =
+                run_remote_job(&socket, &repo, &resolved, &config.use_.peers, None).map_err(
+                    |f| match f {
+                        AttemptFailure::Fatal(e) => e,
+                        AttemptFailure::Runner(r) => anyhow::anyhow!("runner: {}", r.reason()),
+                    },
+                )?;
+
+            let exit = exit_code(&completed.outcome);
+            let state = match exit {
+                Some(0) => "done",
+                _ => "failed",
+            };
+            let attestation = attestation_hash(&completed.outcome)
+                .unwrap_or_else(|| "(none)".to_string());
+            let exit_s = exit.map(|e| e.to_string()).unwrap_or_else(|| "?".to_string());
+            let tail = log_tail(&completed.logs, 60);
+            let text = format!(
+                "run_job {}: {state} (exit {exit_s}) on remote\nattestation: {attestation}\ntail (last 60 lines):\n{tail}",
+                completed.job_id
+            );
+            Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+        }
+        "job_log" => {
+            #[derive(Deserialize)]
+            struct Args {
+                job_id: String,
+                #[serde(default)]
+                from_seq: Option<u64>,
+                #[serde(default)]
+                max_bytes: Option<usize>,
+            }
+            let a: Args = serde_json::from_value(args.clone())
+                .map_err(|e| anyhow::anyhow!("job_log args: {e}"))?;
+            // `from_seq` is the live-follow cursor for a running detached job (a
+            // later chunk); the stored table log has no frame sequence.
+            let _ = a.from_seq;
+
+            let bytes = read_job_log(&socket, &a.job_id)?;
+            let max = a.max_bytes.unwrap_or(8192);
+            let window = if bytes.len() > max {
+                &bytes[bytes.len() - max..]
+            } else {
+                &bytes[..]
+            };
+            let text = String::from_utf8_lossy(window).into_owned();
+            Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+        }
+        "job_cancel" => {
+            #[derive(Deserialize)]
+            struct Args {
+                job_id: String,
+            }
+            let a: Args = serde_json::from_value(args.clone())
+                .map_err(|e| anyhow::anyhow!("job_cancel args: {e}"))?;
+            let text = match cancel_job(&socket, &a.job_id)? {
+                CancelOutcome::Cancelled => format!("job_cancel {}: cancelled", a.job_id),
+                CancelOutcome::Lost => {
+                    format!("job_cancel {}: lost (expired past the TTL)", a.job_id)
+                }
+                CancelOutcome::Rejected(reason) => {
+                    anyhow::bail!(
+                        "job_cancel {}: runner rejected ({})",
+                        a.job_id,
+                        reason.as_str()
+                    )
+                }
+            };
+            Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+        }
+        _ => unreachable!("run_runner_verb called for {name:?}"),
+    }
+}
+
 fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
     // Fail closed on a garbled identity: a member whose `SOFTFIG_MEMBER` can't
     // be read must not be served with a human's reach. growlightd never writes
@@ -1620,6 +1783,15 @@ fn call_tool(caller: &MemberIdentity, params: &Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+
+    // The remote-runner verbs (spec §9) orchestrate snapshot → sign → connect →
+    // run/attach/cancel over softfig-run + several keeperd verbs, in THIS
+    // process (they block on git + the network for the job's duration), so they
+    // bypass the single-op resolve_tool/socket path.
+    if matches!(name, "run_job" | "job_log" | "job_cancel") {
+        return run_runner_verb(name, &args);
+    }
+
     let (op_name, ipc_args) = match route_member_verb(caller, name, args.clone())? {
         Some(MemberRoute::Refused(reply)) => {
             return Ok(json!({
@@ -1663,9 +1835,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_forty_three() {
+    fn tools_list_has_forty_six() {
         let defs = tool_defs();
-        assert_eq!(defs.len(), 43);
+        assert_eq!(defs.len(), 46);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         for n in [
             "replace_file",
@@ -1711,6 +1883,9 @@ mod tests {
             "file_report",
             "update_report",
             "list_reports",
+            "run_job",
+            "job_log",
+            "job_cancel",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -1723,7 +1898,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         );
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 43);
+        assert_eq!(tools.len(), 46);
     }
 
     /// A `tools/call` for a tool that doesn't exist: dispatch refuses it before
@@ -1905,7 +2080,7 @@ mod tests {
         assert!(msg.starts_with("softfig-mcp refuses every verb: SOFTFIG_MEMBER="), "{msg}");
         // Listing the tools stays harmless.
         let resp = handle_line(&caller, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 43);
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 46);
     }
 
     #[test]

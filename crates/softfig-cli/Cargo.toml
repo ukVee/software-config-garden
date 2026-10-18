@@ -22,6 +22,7 @@ softfig-deploy.workspace = true
 softfig-runnerd.workspace = true
 softfig-net.workspace = true
 softfig-source.workspace = true
+softfig-run.workspace = true
 blake3.workspace = true
 base64.workspace = true
 clap.workspace = true

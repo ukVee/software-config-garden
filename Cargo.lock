@@ -3712,6 +3712,7 @@ dependencies = [
  "softfig-keeperd",
  "softfig-net",
  "softfig-onboard",
+ "softfig-run",
  "softfig-runnerd",
  "softfig-source",
  "softfig-store",
@@ -3837,6 +3838,8 @@ dependencies = [
  "serde",
  "serde_json",
  "softfig-ipc",
+ "softfig-net",
+ "softfig-run",
 ]
 
 [[package]]
@@ -3872,6 +3875,21 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "softfig-run"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "base64",
+ "blake3",
+ "hex",
+ "serde",
+ "serde_json",
+ "softfig-ipc",
+ "softfig-net",
+ "softfig-source",
 ]
 
 [[package]]

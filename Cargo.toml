@@ -18,6 +18,7 @@ members = [
     "crates/softfig-net",
     "crates/softfig-sandbox",
     "crates/softfig-source",
+    "crates/softfig-run",
     "crates/softfig-runnerd",
 ]
 
@@ -43,6 +44,7 @@ softfig-net     = { path = "crates/softfig-net" }
 softfig-sandbox = { path = "crates/softfig-sandbox" }
 softfig-source  = { path = "crates/softfig-source" }
 softfig-runnerd = { path = "crates/softfig-runnerd" }
+softfig-run     = { path = "crates/softfig-run" }
 
 # Crypto
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
