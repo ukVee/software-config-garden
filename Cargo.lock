@@ -3869,6 +3869,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "softfig-runnerd"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "softfig-sandbox"
 version = "1.0.0-alpha.1"
 dependencies = [
