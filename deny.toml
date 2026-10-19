@@ -9,8 +9,10 @@
 # binaries, so it is gated here too.
 
 [advisories]
-# A vulnerable, unmaintained, or yanked crate fails the gate (the default lint
-# for the advisories check). `ignore` is the reviewed-and-accepted exception
+# A crate with a known security vulnerability fails the gate — `vulnerability`
+# is the one cargo-deny lint that defaults to `deny`; `unmaintained`,
+# `unsound`, `yanked` and `notice` are the cargo-deny defaults (`warn`).
+# `ignore` is the reviewed-and-accepted exception
 # list: one entry per advisory, with a reason and a re-check date — never a
 # blanket mute. Every entry here is tracked as a growlight report so it is not
 # silently forgotten.

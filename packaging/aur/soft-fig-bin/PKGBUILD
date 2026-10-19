@@ -1,4 +1,6 @@
 # Maintainer: <owner name> <owner email>   # PROPOSED — pending the owner's H9 answer; see ../README.md
+# Maintenance: sole owner; update-latency promise = within 7 days of a tagged
+# release (also PROPOSED pending H9 — see the AUR README's Maintenance section).
 
 pkgname=soft-fig-bin
 pkgver=1.0.0alpha.1

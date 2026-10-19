@@ -104,5 +104,7 @@ pushes/tags/publishes. Before `soft-fig`/`soft-fig-bin` go live, the owner:
    `.SRCINFO` (`makepkg --printsrcinfo > .SRCINFO`).
 5. Uploads each package directory to the AUR as its own git repo.
 
-`soft-fig` and `soft-fig-bin` `conflicts`/`provides` each other (identical
-installed file set); install one or the other, never both.
+`soft-fig-bin` `provides` and `conflicts` `soft-fig`; `soft-fig` only
+`conflicts` `soft-fig-bin` (it does not provide it). The two install the same
+files, so install one or the other, never both — but only `-bin` satisfies a
+dependency on `soft-fig`.

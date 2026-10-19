@@ -9,9 +9,10 @@
 //! - **Plaintext, and the file says so.** There is no key at phase 1 —
 //!   inventing one mid-panic is worse than plaintext on the user's own USB.
 //!   So the file states, in its own header and in a machine-readable field,
-//!   that it is unencrypted and what it contains. It is screened for secrets
-//!   *at write time* (`meta/spec-trust.md`); that screening is
-//!   `recovery-pack-v1`'s allowlist capture, not this slice's.
+//!   that it is unencrypted and what it contains. This slice performs **no
+//!   secret screening** — that is `recovery-pack-v1`'s allowlist capture, not
+//!   this slice's — so the header says so rather than claiming a screen the
+//!   code does not perform.
 //! - **Versioned.** [`CARRY_FORMAT_VERSION`] is stamped into the file so a
 //!   later `onboard` — possibly months newer, offline, with no rendezvous with
 //!   the writing binary — refuses a file newer than it understands with a
@@ -44,9 +45,9 @@ pub const CARRY_HEADER: &str = "\
 # soft-fig carry-file — PLAINTEXT
 # This file is NOT encrypted. It was written by the soft-fig rescue binary to
 # the machine's own writable media (usually the rescue USB) at recovery time.
-# It contains a machine manifest, a step log, and the run outcome. It is
-# screened for secrets before it is written (meta/spec-trust.md).
-# Treat it as sensitive but not secret: do not copy it off the machine it
+# It contains a machine manifest, a step log, and the run outcome. It is not
+# screened for secrets — treat it as sensitive but not secret: do not copy it
+# off the machine it
 # describes without the owner's say-so.
 ";
 

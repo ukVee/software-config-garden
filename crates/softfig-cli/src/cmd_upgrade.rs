@@ -442,8 +442,8 @@ fn warn_if_growlight_live() {
         println!(
             "WARNING: a growlight orchestrator appears to be running. It was started \
              with the pre-upgrade binary and will keep executing it until restarted — \
-             restart the growlight loop by hand (`softfig growlight` restart, or \
-             `systemctl --user restart softfig-growlightd.service`)."
+             restart the growlight loop by hand (`systemctl --user restart \
+             softfig-growlightd.service`)."
         );
     }
 }

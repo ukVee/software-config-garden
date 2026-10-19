@@ -1,4 +1,6 @@
 # Maintainer: <owner name> <owner email>   # PROPOSED — pending the owner's H9 answer; see ../README.md
+# Maintenance: sole owner; update-latency promise = within 7 days of a tagged
+# release (also PROPOSED pending H9 — see the AUR README's Maintenance section).
 
 pkgname=soft-fig
 pkgver=1.0.0alpha.1
@@ -35,14 +37,14 @@ build() {
   cargo build --workspace --release --locked
 }
 
-check() {
-  cd "$srcdir/software-config-garden-"*
-  # The same gate CI runs on push. Tests self-reduce the Argon2id cost to the
-  # minimum (m=8 KiB, t=1, p=1) so the suite stays fast, exactly as the repo's
-  # CLAUDE.md documents — no special profile flag is needed. --locked keeps the
-  # test run from rewriting the committed Cargo.lock.
-  cargo test --workspace --no-fail-fast --locked
-}
+# check() is intentionally omitted. The full workspace suite includes the
+# keeperd spawned-daemon integration tests (crates/softfig-keeperd/tests/
+# daemon.rs), which poll with fixed 2–3 s wall-clock budgets and flake under
+# load on a user's machine (growlight report 045) — a spurious `makepkg`
+# failure for a package that is already compiled and whose full suite the CI
+# gate runs on every push. Restore check() with `cargo test --workspace
+# --no-fail-fast --locked` once report 045 is fixed (readiness-signal wait
+# instead of a wall-clock budget).
 
 package() {
   cd "$srcdir/software-config-garden-"*

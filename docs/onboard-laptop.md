@@ -7,7 +7,10 @@ produces **one standalone garden** that documents *that* machine — it does
 across your devices (`softfig pair`, replica backup, shared subtrees) is a
 separate step after this one.
 
-There are no prebuilt packages yet; building from source is the install path.
+The AUR channel (`soft-fig` source + `soft-fig-bin` prebuilt) ships in this
+release but is not yet published; building from source is the install path
+until it is. `softfig upgrade` and `softfig uninstall` exist (release-pipeline
+slices 007–008) but this runbook's from-source steps remain the manual path.
 
 ## Prerequisites
 
@@ -281,6 +284,8 @@ the line above, you're on a pre-fix build — rebuild and reinstall the binaries
   `{{name}}` substitution, not a templating engine or render-time vault
   secrets/posthooks. A fresh garden has a `config/` dir but no `deploy.toml`;
   add one when you want to deploy dotfiles.
-- **Prebuilt packages + post-install automation** — this runbook and
-  `scripts/onboard-device.sh` are the install path until a release pipeline
-  ships.
+- **Prebuilt packages + post-install automation** — the release pipeline
+  (slices 001–008, `feat/release-pipeline`, unmerged) builds the AUR channel
+  (`soft-fig` + `soft-fig-bin`) and the `softfig-install` helper, but they are
+  not yet published, so this runbook and `scripts/onboard-device.sh` remain the
+  install path.

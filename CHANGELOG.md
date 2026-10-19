@@ -21,6 +21,31 @@ decision record or crate that owns it, rather than at every internal change.
   that `daemon status` and `daemon cycle` need are exempt. The TUI refuses to start,
   and growlightd to boot, against a daemon of another build. `softfig-tui` and
   `softfig-mcp` accept `--version`. (`softfig_ipc::compat`, release-pipeline slice 002)
+- **Release pipeline.** A tag-driven workflow (`.github/workflows/release.yml`)
+  turns a `v*` tag into the artifact set: program tarballs per target (tier 1
+  `x86_64-unknown-linux-gnu` built + tested, tier 2 `aarch64` built + untested,
+  macOS tier 3 source-only), a `SHA256SUMS` manifest, and sigstore provenance
+  attestation gated behind a required-reviewer Environment; a minisign-signed
+  checksum manifest serves consumers without `gh` (release-pipeline slice 004,
+  `meta/spec-release.md`).
+- **The AUR channel.** Two packages — `soft-fig` (source) and `soft-fig-bin`
+  (repackages the tier-1 artifact) — each installing the five-binary installed
+  set, the systemd user units, and the `softfig-tui` desktop entry; `-bin`
+  verifies the signed manifest in `check()` before installing (release-pipeline
+  slice 008). Not yet published.
+- **`softfig-install`.** The downloaded front door: OS/supervisor detection, a
+  toolchain gate, a from-source `--release --locked` build, and the atomic
+  installed-set swap, all behind consented, reversible offers (release-pipeline
+  slice 005).
+- **`softfig-rescue`.** The recovery-wedge artifact — no FUSE, no daemon, no
+  network, minimally linked — that writes the phase-1 carry-file and declares
+  the packs seam (release-pipeline slice 006).
+- **`softfig upgrade` and `softfig uninstall`.** `upgrade` pulls, builds, swaps
+  the installed set atomically, cycles the daemon on the relock-token path (or
+  stops it honestly where no supervisor respawns), runs pending migrations, and
+  confirms the handshake; `uninstall` removes the installed set, the unit and
+  the MCP registration, refusing to touch the store without a separate
+  `--yes-remove-data` confirmation (release-pipeline slice 007).
 
 ### Protocol
 
