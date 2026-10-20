@@ -143,6 +143,9 @@ impl<'a> WorkTree<'a> {
         if !is_backlog_rel(rel) {
             return Ok(());
         }
+        if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+            return Err((ErrorKind::BadArgs, why));
+        }
         if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
             return Err((ErrorKind::BadArgs, why));
         }
@@ -476,6 +479,74 @@ fn is_backlog_rel(rel: &str) -> bool {
     let backlog = super::growlight::paths::backlog_dir();
     rel.strip_prefix(backlog.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The inline `<vault …>…</vault>` regions in `text`, as `(open tag, body)`
+/// pairs in order. A plain scan, deliberately wider than the vault's own
+/// markdown-masked parser (a tag inside a code span counts here too), because
+/// the member guard that reads it fails closed.
+fn vault_regions(text: &str) -> Vec<(&str, &str)> {
+    const CLOSE: &str = "</vault>";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("<vault") {
+        let tag = &rest[i..];
+        let Some(open_end) = tag.find('>') else {
+            out.push((tag, ""));
+            break;
+        };
+        let body = &tag[open_end + 1..];
+        match body.find(CLOSE) {
+            Some(j) => {
+                out.push((&tag[..=open_end], &body[..j]));
+                rest = &body[j + CLOSE.len()..];
+            }
+            None => {
+                out.push((&tag[..=open_end], body));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The member vault-region guard, pure: `Some(refusal)` when replacing `old`
+/// with `new` at `rel` adds, removes or changes an inline `<vault>` region.
+/// Re-sending a region's `[encrypted]` placeholder unchanged — what a member
+/// reads back — leaves it alone.
+///
+/// Review 042 G74-4: the reserved-line and `> Fleet:` guards compare the
+/// plaintext a member writes, so wrapping `> Fleet: no` as
+/// `<vault id="h">\n> Fleet: no\n</vault>` passed them — held before, held
+/// after — while growlightd's redacted read then saw `[encrypted]` and no
+/// hold. Under `growlight/backlog/` a member may not seal anything; the
+/// readers also fail closed on a sealed region
+/// ([`softfig_ipc::item_meta::unreadable_metadata`]). The refusal text leads
+/// with the wire code, `member_not_allowed`.
+pub(crate) fn member_vault_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<String> {
+    let before = old.map(vault_regions).unwrap_or_default();
+    let after = new.map(vault_regions).unwrap_or_default();
+    let unchanged = before.len() == after.len()
+        && before
+            .iter()
+            .zip(&after)
+            .all(|((old_tag, old_body), (new_tag, new_body))| {
+                old_tag == new_tag && (old_body == new_body || *new_body == "[encrypted]")
+            });
+    (!unchanged).then(|| {
+        format!(
+            "member_not_allowed: this write adds, removes or changes an inline `<vault>` region in \
+             {rel}, and fleet member {member} may not seal or unseal anything under \
+             growlight/backlog/ — a sealed region reads as `[encrypted]` to growlightd, so it \
+             could hide a `> Fleet:` / `> Model:` / `> Worktree:` line. Write the text in the \
+             clear; secrets do not belong in backlog docs. (spec-growlight-queue §6.7)"
+        )
+    })
 }
 
 /// Whether canonical `rel` is an item-doc path — a doc a growlight reader looks
@@ -915,6 +986,36 @@ mod tests {
             member_reserved_refusal("c", rel, Some(fenced), Some("# t\n")).is_some(),
             "removing a fenced model line is still refused",
         );
+    }
+
+    /// Review 042 G74-4: a member may not wrap a backlog doc's metadata in an
+    /// inline `<vault>` region (or otherwise add, drop or change one), while
+    /// re-sending an existing region's `[encrypted]` placeholder untouched —
+    /// what a member reads back — still lets it edit around the region.
+    #[test]
+    fn a_member_may_not_seal_a_backlog_line_in_a_vault_region() {
+        let wrapped = "# slice\n\n<vault id=\"h\">\n> Fleet: no\n</vault>\n\nbody\n";
+        let rel = "growlight/backlog/milestones/m/slices/001-a.md";
+        let why = member_vault_refusal("c", rel, Some(FLEET_HELD), Some(wrapped)).unwrap();
+        assert!(why.starts_with("member_not_allowed:"), "{why}");
+        let sealed = "# s\n<vault id=\"k\">c2VjcmV0</vault>\nbody\n";
+        let edited = "# s\n<vault id=\"k\">[encrypted]</vault>\nmore body\n";
+        assert_eq!(member_vault_refusal("c", rel, Some(sealed), Some(edited)), None, "edit around it");
+        assert!(member_vault_refusal("c", rel, Some(sealed), Some("# s\nbody\n")).is_some(), "dropping it");
+        assert!(
+            member_vault_refusal("c", rel, Some(sealed), Some(&sealed.replace("c2VjcmV0", "new"))).is_some(),
+            "re-sealing new text"
+        );
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(SLICE, FLEET_HELD.as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        assert!(wt.write(SLICE, wrapped.as_bytes()).is_err(), "the wrap is refused");
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "nothing written");
+        wt.write("projects/p/notes/001-x.md", wrapped.as_bytes()).expect("outside the backlog");
     }
 
     /// Review 042 G74-2: a member may not create an item doc — a task doc, a

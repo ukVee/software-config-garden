@@ -499,6 +499,11 @@ where
     for (label, content) in docs {
         let Some(content) = content else { continue };
         let content = content.as_ref();
+        // Review 042 G74-4: a sealed region can hide the `> Model:` line, so a
+        // doc whose metadata can't be read is an error, never "undeclared".
+        if let Some(why) = crate::item_meta::unreadable_metadata(content) {
+            bail!("declared by {}: {why}", label.as_ref());
+        }
         let Some(field) = item_model_field(content) else {
             continue;
         };
@@ -529,6 +534,19 @@ mod tests {
 
     // ---- comma lists (§6.4 syntax) -------------------------------------
 
+
+    /// Review 042 G74-4: a doc whose metadata the redacted read view hides is a
+    /// resolution error. Read as "undeclared", the chain would walk past a
+    /// sealed slice doc to the milestone's declaration.
+    #[test]
+    fn a_sealed_doc_is_a_resolution_error_not_undeclared() {
+        let docs = [
+            ("005-x.md", Some("# s\n<vault id=\"h\">[encrypted]</vault>\n")),
+            ("CLAUDE.md", Some("> Model: claude\n")),
+        ];
+        let err = resolve_item_models(docs).unwrap_err().to_string();
+        assert!(err.contains("005-x.md") && err.contains("sealed"), "{err}");
+    }
 
     /// Review 042 G74-2: the one `<number>-*.md` among a listing, or an error
     /// naming every match when two docs claim the number.

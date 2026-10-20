@@ -894,6 +894,25 @@ fn a_member_cannot_create_a_shadow_item_doc() {
     ));
 }
 
+/// Review 042 G74-4: a member's `patch_file` that wraps the held task's
+/// `> Fleet: no` line in an inline `<vault>` region is refused — growlightd's
+/// redacted read would see `[encrypted]` and no hold.
+#[test]
+fn a_member_cannot_hide_a_hold_in_a_vault_region() {
+    let fx = Fixture::start();
+    let rel = held_task(&fx);
+    let before = fx.read(&rel);
+    let resp = as_member(
+        &fx,
+        op::PATCH_FILE,
+        serde_json::json!({
+            "path": rel, "old": "> Fleet: no", "new": "<vault id=\"h\">\n> Fleet: no\n</vault>"
+        }),
+    );
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
+    assert_eq!(fx.read(&rel), before, "nothing written");
+}
+
 // ---- reorder_backlog_item ---------------------------------------------
 
 #[test]

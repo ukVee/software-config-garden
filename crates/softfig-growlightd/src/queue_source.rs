@@ -318,9 +318,21 @@ impl KeeperdItemDocReader {
         }
     }
 
+    /// The doc's redacted content. Review 042 G74-4: a doc whose metadata the
+    /// read view hides — a sealed `<vault>` region, a whole-file seal, a
+    /// malformed tag — is an error, so the claim hold fails closed
+    /// (`ClaimHold::Unreadable`) and the repo probe gives no signal; reading
+    /// it as "no `> Fleet:` line" would free the item.
     fn read(&self, path: String) -> Result<Option<String>, String> {
-        let reply: Option<ReadFileReply> = self.call(op::READ_FILE, ReadFileArgs { path })?;
-        Ok(reply.map(|r| r.content))
+        let reply: Option<ReadFileReply> = self.call(op::READ_FILE, ReadFileArgs { path: path.clone() })?;
+        match reply {
+            Some(r) if r.sealed => Err(format!("{path}: the doc is whole-file sealed")),
+            Some(r) => match softfig_ipc::item_meta::unreadable_metadata(&r.content) {
+                Some(why) => Err(format!("{path}: {why}")),
+                None => Ok(Some(r.content)),
+            },
+            None => Ok(None),
+        }
     }
 }
 

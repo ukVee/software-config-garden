@@ -89,6 +89,30 @@ pub fn reserved_lines<'a>(text: &'a str, keys: &[&'static str]) -> Vec<&'a str> 
         .collect()
 }
 
+/// Why the metadata in `doc` — as keeperd's redacted read view serves it
+/// (`read_file`, the FUSE mount) — cannot be trusted, or `None` when it can.
+///
+/// The read view replaces what a reader may not see: an inline
+/// `<vault id="…">` region's body becomes `[encrypted]`, a whole-file-sealed
+/// doc becomes `[sealed:<path>]`, a doc whose vault tags don't parse becomes
+/// `[malformed vault tag in <path>]`. Any of them may be hiding a metadata
+/// line — wrapping `> Fleet: no` in a region reads as no hold at all (review
+/// 042 G74-4) — so a resolver that meets one fails closed rather than read
+/// "no line" as "no declaration". Prose that merely mentions a `<vault>` tag
+/// is none of these shapes and reads normally.
+pub fn unreadable_metadata(doc: &str) -> Option<&'static str> {
+    let first = doc.lines().next().unwrap_or_default();
+    if first.starts_with("[sealed:") && first.ends_with(']') {
+        Some("the doc is whole-file sealed")
+    } else if first.starts_with("[malformed vault tag in ") {
+        Some("the doc's <vault> tags don't parse")
+    } else if doc.contains("[encrypted]</vault>") {
+        Some("the doc carries a sealed <vault> region, which can hide a metadata line")
+    } else {
+        None
+    }
+}
+
 /// `model` → `Model`: a key as refusal text and docs spell it.
 pub fn display_key(key: &str) -> String {
     let mut chars = key.chars();
@@ -133,6 +157,19 @@ mod tests {
         assert_eq!(reserved_lines(before, &[WORKTREE]), reserved_lines(after, &[WORKTREE]));
         assert_eq!(field(before, WORKTREE), Some("/a"));
         assert_eq!(field(after, WORKTREE), None);
+    }
+
+    #[test]
+    fn a_redacted_read_view_is_unreadable_metadata() {
+        assert!(unreadable_metadata("# t\n<vault id=\"h\">[encrypted]</vault>\n").is_some());
+        assert!(unreadable_metadata("[sealed:growlight/backlog/tasks/066-x.md]\n").is_some());
+        assert!(unreadable_metadata("[malformed vault tag in x.md]\n").is_some());
+        assert_eq!(unreadable_metadata("# t\n> Fleet: no\n"), None);
+        assert_eq!(
+            unreadable_metadata("A member could wrap it as `<vault id=\"h\">…</vault>`.\n"),
+            None,
+            "prose that mentions a vault tag"
+        );
     }
 
     #[test]
