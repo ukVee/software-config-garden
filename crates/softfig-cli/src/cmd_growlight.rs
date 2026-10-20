@@ -3366,22 +3366,9 @@ mod tests {
         path
     }
 
-    /// Run `git -C <repo>` in the test sandbox and fail the test on a non-zero
-    /// exit (the same shell-out [`boot_dirty_check`] performs through
-    /// [`softfig_ipc::item_repo::probe`]).
-    fn run_git(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    // The workspace's one test `git` helper (review 043 G64-4): it carries a
+    // throwaway identity, so the commit below passes on a CI runner too.
+    use softfig_ipc::testing::git as run_git;
 
     /// Backdate a file's mtime to 2000-01-01, so a later tree edit is provably
     /// NEWER than the baton it is compared against (the boot guard's whole test).

@@ -18,6 +18,7 @@ pub mod opencode;
 pub mod proto;
 pub mod queue_v2;
 pub mod socket;
+pub mod testing;
 pub mod usage;
 pub mod verbs;
 

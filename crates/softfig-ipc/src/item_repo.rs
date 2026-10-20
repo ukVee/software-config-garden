@@ -341,9 +341,7 @@ mod tests {
         assert_eq!(resolve_repo(Some("host:/x"), Some("/g"), home), None);
     }
 
-    fn sh_git(repo: &Path, args: &[&str]) {
-        git_with_stdin(repo, args, Stdio::null());
-    }
+    use crate::testing::{git as sh_git, git_with_stdin};
 
     #[test]
     fn probe_tracks_head_and_the_dirty_trees_content() {
@@ -523,18 +521,4 @@ mod tests {
         assert!(ok, "touch {}", path.display());
     }
 
-    fn git_with_stdin(repo: &Path, args: &[&str], stdin: Stdio) {
-        let ok = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .stdin(stdin)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("run git")
-            .success();
-        assert!(ok, "git {args:?}");
-    }
 }

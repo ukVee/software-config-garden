@@ -829,19 +829,7 @@ mod tests {
     /// A git repo with one committed file and `dirty` untracked ones.
     fn git_repo(dirty: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("run git")
-                .success();
-            assert!(ok, "git {args:?}");
-        };
+        let git = |args: &[&str]| softfig_ipc::testing::git(dir.path(), args);
         git(&["init", "-q"]);
         std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
         git(&["add", "."]);
