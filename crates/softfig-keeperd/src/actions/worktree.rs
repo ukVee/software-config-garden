@@ -17,7 +17,11 @@
 //! backend needs none (a staged overlay write fires no kernel event).
 //!
 //! Paths are repo-relative strings (`""` = garden root), the same shape
-//! [`conventions`](super::conventions) and the FUSE handlers use.
+//! [`conventions`](super::conventions) and the FUSE handlers use. Every entry
+//! point canonicalises its path first ([`canonical_rel`]), so the guards below
+//! never see an alias of a path they cover — `growlight/./backlog/…` and
+//! `growlight//backlog/…` name the backlog exactly as `growlight/backlog/…`
+//! does (review 042 G74-3).
 
 use std::path::{Path, PathBuf};
 
@@ -71,18 +75,17 @@ impl<'a> WorkTree<'a> {
         is_garden_rel(rel).then(|| garden_root.join(rel))
     }
 
-    /// The write-side refusal for a non-garden-relative `rel` (both backends:
-    /// the FUSE overlay is keyed by the string, so a `..` there would stage a
-    /// tree entry no path can name).
-    fn require_garden_rel(rel: &str) -> ActionResult {
-        if is_garden_rel(rel) {
-            Ok(())
-        } else {
-            Err((
+    /// The write-side form of [`canonical_rel`]: `rel` rebuilt from its normal
+    /// components, or the refusal for a non-garden-relative `rel` (both
+    /// backends: the FUSE overlay is keyed by the string, so a `..` there would
+    /// stage a tree entry no path can name).
+    fn canonical_or_refuse(rel: &str) -> Result<String, (ErrorKind, String)> {
+        canonical_rel(rel).ok_or_else(|| {
+            (
                 ErrorKind::BadArgs,
                 format!("{rel:?}: not a garden-relative path (no `..`, root, or prefix components)"),
-            ))
-        }
+            )
+        })
     }
 
     /// Every check [`write`](Self::write) applies before it touches anything —
@@ -90,7 +93,7 @@ impl<'a> WorkTree<'a> {
     /// Multi-file verbs (`batch`, the reindex sweep) run this over every target
     /// before the first write, so a refusal can't land half their writes.
     pub fn check_write(&self, rel: &str) -> ActionResult {
-        Self::require_garden_rel(rel)?;
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.refuse_unkeyed_shared(rel)
     }
 
@@ -101,6 +104,7 @@ impl<'a> WorkTree<'a> {
     /// ([`member_fleet_refusal`]). A verb that stages more than one file runs
     /// this over each before its first write, like `check_write`.
     pub fn check_write_bytes(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
         self.guard_member_write(rel, Some(bytes))
     }
@@ -209,11 +213,10 @@ impl<'a> WorkTree<'a> {
     /// Working-tree bytes for repo-relative `rel`, or `None` if absent /
     /// unreadable / a directory.
     pub fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        let rel = &canonical_rel(rel)?;
         match self {
             WorkTree::Disk { garden_root, .. } => std::fs::read(Self::abs(garden_root, rel)?).ok(),
-            WorkTree::Fuse { mount } => {
-                is_garden_rel(rel).then(|| mount.read_workfile(rel).ok().flatten())?
-            }
+            WorkTree::Fuse { mount } => mount.read_workfile(rel).ok().flatten(),
         }
     }
 
@@ -224,30 +227,36 @@ impl<'a> WorkTree<'a> {
 
     /// Whether `rel` resolves to a live file or directory.
     pub fn exists(&self, rel: &str) -> bool {
+        let Some(rel) = &canonical_rel(rel) else {
+            return false;
+        };
         match self {
             WorkTree::Disk { garden_root, .. } => {
                 Self::abs(garden_root, rel).is_some_and(|p| p.exists())
             }
-            WorkTree::Fuse { mount } => is_garden_rel(rel) && mount.path_exists(rel),
+            WorkTree::Fuse { mount } => mount.path_exists(rel),
         }
     }
 
     /// Whether `rel` is a directory.
     pub fn is_dir(&self, rel: &str) -> bool {
+        let Some(rel) = &canonical_rel(rel) else {
+            return false;
+        };
         match self {
             WorkTree::Disk { garden_root, .. } => {
                 Self::abs(garden_root, rel).is_some_and(|p| p.is_dir())
             }
-            WorkTree::Fuse { mount } => is_garden_rel(rel) && mount.path_is_dir(rel),
+            WorkTree::Fuse { mount } => mount.path_is_dir(rel),
         }
     }
 
     /// One-level children of directory `rel` (`""` = garden root). Empty when
     /// the directory is absent. Order is unspecified — callers sort.
     pub fn read_dir(&self, rel: &str) -> Vec<DirEntry> {
-        if !is_garden_rel(rel) {
+        let Some(rel) = &canonical_rel(rel) else {
             return Vec::new();
-        }
+        };
         match self {
             WorkTree::Disk { garden_root, .. } => {
                 let mut out = Vec::new();
@@ -305,6 +314,7 @@ impl<'a> WorkTree<'a> {
     /// `> Worktree:` line (or loosens a `> Fleet:` hold) is refused here
     /// (§6.7) — see [`check_write_bytes`](Self::check_write_bytes).
     pub fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write_bytes(rel, bytes)?;
         self.stage(rel, bytes)
     }
@@ -315,6 +325,7 @@ impl<'a> WorkTree<'a> {
     /// slice carries keeperd's own `> Model:` line, not the caller's. The verb
     /// holds a member's text fields to §6.7 before it gets here.
     pub fn write_structured(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
         self.stage(rel, bytes)
     }
@@ -340,7 +351,7 @@ impl<'a> WorkTree<'a> {
     /// key-before-content refusal (m5f slice 001); the source side stays
     /// unguarded — moving *out* of an unkeyed share adds no blob to it.
     pub fn rename(&self, from: &str, to: &str) -> ActionResult {
-        Self::require_garden_rel(from)?;
+        let (from, to) = (&Self::canonical_or_refuse(from)?, &Self::canonical_or_refuse(to)?);
         self.check_write(to)?;
         self.guard_member_rename(from, to)?;
         match self {
@@ -370,7 +381,7 @@ impl<'a> WorkTree<'a> {
     /// caller today; a removal carries no key-before-content concern (it strips
     /// a blob, never adds one), so no `refuse_unkeyed_shared` guard is needed.
     pub fn remove(&self, rel: &str) -> ActionResult {
-        Self::require_garden_rel(rel)?;
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.guard_member_removal(rel)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
@@ -511,10 +522,32 @@ pub(crate) fn member_fleet_refusal(
 /// 031 D2: a `../../x/notes` tag read and wrote outside the garden in Disk
 /// mode).
 pub fn is_garden_rel(rel: &str) -> bool {
+    canonical_rel(rel).is_some()
+}
+
+/// `rel` rebuilt from its normal components, `/`-joined — the one spelling of
+/// a garden path every guard compares against. A `.` component, a doubled or
+/// trailing `/` all drop out (`growlight/./backlog//x/` → `growlight/backlog/x`;
+/// `""` and `.` are the garden root, `""`). `None` when `rel` is not plain
+/// garden-relative: a `..`, an absolute path, a Windows prefix, or a component
+/// that is not UTF-8.
+///
+/// Review 042 G74-3: without it a member's `growlight/./backlog/…` passed
+/// `validate_repo_path` (an interior `.` is no `..`), skipped the backlog
+/// guards (a raw prefix test), and landed on the real doc — `Path` equality,
+/// the disk join and the FUSE overlay's component-keyed paths all read the
+/// alias as the same file.
+pub fn canonical_rel(rel: &str) -> Option<String> {
     use std::path::Component;
-    Path::new(rel)
-        .components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    let mut parts: Vec<&str> = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// The minimal working-tree surface a `.seq`-numbered doc store needs: read a
@@ -754,6 +787,39 @@ mod tests {
             member_reserved_refusal("c", rel, Some(fenced), Some("# t\n")).is_some(),
             "removing a fenced model line is still refused",
         );
+    }
+
+    /// Review 042 G74-3: every spelling of a garden path canonicalises to one,
+    /// and a member's write, removal or rename through an alias of a guarded
+    /// backlog doc is refused exactly as through its canonical path.
+    #[test]
+    fn a_path_alias_of_the_backlog_is_still_guarded() {
+        assert_eq!(
+            canonical_rel("growlight/./backlog//tasks/001-x.md/").as_deref(),
+            Some("growlight/backlog/tasks/001-x.md")
+        );
+        assert_eq!(canonical_rel("./growlight").as_deref(), Some("growlight"));
+        assert_eq!(canonical_rel(".").as_deref(), Some(""));
+        assert_eq!(canonical_rel("growlight/../etc"), None);
+        assert_eq!(canonical_rel("/etc/passwd"), None);
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(SLICE, FLEET_HELD.as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        for alias in [
+            "growlight/./backlog/milestones/m/slices/001-a.md",
+            "growlight//backlog/milestones/m/slices/001-a.md",
+            "./growlight/backlog/milestones/m/slices/001-a.md",
+        ] {
+            assert!(wt.write(alias, b"# a\n").is_err(), "write {alias}");
+            assert!(wt.remove(alias).is_err(), "remove {alias}");
+            assert!(wt.rename(alias, "archive/001-a.md").is_err(), "rename {alias}");
+        }
+        assert!(wt.remove("growlight/./backlog").is_err(), "an aliased backlog dir");
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "all refused untouched");
     }
 
     /// Review 042 G74-6: a fence line inserted above a `> Worktree:` declaration

@@ -771,6 +771,50 @@ fn a_member_set_item_status_fails_closed_on_an_unknown_holder() {
     assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
 }
 
+// ---- member write guards: the review 042 bypasses ----------------------
+
+/// One request stamped with fleet member `m-a`'s identity, as softfig-mcp
+/// sends it under `SOFTFIG_MEMBER=m-a`.
+fn as_member(fx: &Fixture, op_name: &str, args: serde_json::Value) -> Response {
+    send(&fx.socket, &Request::new(op_name, args).with_member(Some("m-a")))
+}
+
+/// A task doc held human-only, written by the human: the shape each bypass
+/// below tries to free.
+fn held_task(fx: &Fixture) -> String {
+    fx.add_task("loop-self-extend", "Loop self-extend"); // id 001
+    let rel = "growlight/backlog/tasks/001-loop-self-extend.md".to_string();
+    let doc = format!("{}\n> Fleet: no\n", fx.read(&rel));
+    assert!(matches!(
+        fx.call(op::REPLACE_FILE, serde_json::json!({ "path": rel, "content": doc })),
+        Response::Ok { .. }
+    ));
+    rel
+}
+
+/// Review 042 G74-3: `growlight/./backlog/…` and `growlight//backlog/…` are
+/// the backlog. A member's `replace_file` through either alias that drops a
+/// `> Fleet: no` hold is refused like the canonical path, and nothing lands.
+#[test]
+fn a_path_alias_does_not_skip_the_member_guard() {
+    let fx = Fixture::start();
+    let rel = held_task(&fx);
+    let before = fx.read(&rel);
+    for alias in [
+        rel.replace("growlight/backlog", "growlight/./backlog"),
+        rel.replace("growlight/backlog", "growlight//backlog"),
+        format!("./{rel}"),
+    ] {
+        let resp = as_member(
+            &fx,
+            op::REPLACE_FILE,
+            serde_json::json!({ "path": alias, "content": "# freed\n" }),
+        );
+        assert!(err_msg(&resp).contains("`> Fleet:` hold"), "{alias}: {resp:?}");
+        assert_eq!(fx.read(&rel), before, "{alias}: nothing written");
+    }
+}
+
 // ---- reorder_backlog_item ---------------------------------------------
 
 #[test]
