@@ -122,6 +122,16 @@ pub trait QueueSource: Send + Sync + fmt::Debug {
 /// `> Fleet: no` line frees the item within a minute.
 pub const HOLD_RECHECK_SECS: i64 = 60;
 
+/// How often the loop re-asserts each live legacy member's claim to keeperd
+/// (review 042 G74-5). keeperd's holder map is in memory and rebuilt empty on
+/// every daemon start, and task 074 refuses a member's handoff
+/// `set_item_status` on an item with no recorded holder — so after a keeperd
+/// cycle the loop re-records it (`active` + `holder` + `if_status = "active"`,
+/// idempotent, no commit). At this cadence the post-cycle refusal window is
+/// about half a minute, which the refusal text and protocol-fleet step 7c tell
+/// a member to wait out.
+pub const CLAIM_REASSERT_SECS: i64 = 30;
+
 /// The seam the loop **claims** a picked part through before spawning its agent
 /// — the WRITE counterpart to [`QueueSource`]'s read. Marking the part `active`
 /// in keeperd's queue table is what closes the fallback double-assignment window
@@ -144,6 +154,14 @@ pub trait PartClaimer: Send + Sync + fmt::Debug {
     /// another part is active OR the part is held by a different agent — was
     /// unreachable, or the write was ambiguous): the loop must NOT spawn on it.
     fn claim(&self, queue: &str, part: &str, holder: &str) -> Result<(), String>;
+
+    /// Re-record `holder` as `(queue, part)`'s holder while the part is still
+    /// `active` (review 042 G74-5) — the claim again, made conditional so it can
+    /// never re-activate a part its member just handed off. Called after each
+    /// re-roll and every [`CLAIM_REASSERT_SECS`] for each live assignment, which
+    /// heals keeperd's holder map after a cycle. `Err` is journaled and retried
+    /// on the next beat; it gates nothing.
+    fn reassert(&self, queue: &str, part: &str, holder: &str) -> Result<(), String>;
 }
 
 /// The seam the loop **item-parks** a part through when its member exits
@@ -1278,6 +1296,9 @@ pub struct DriveLoop {
     /// shows. A part leaves it when a read finds it claimable again or the queue
     /// stops showing it `queued`.
     announced_holds: std::collections::BTreeMap<(String, String), ClaimHold>,
+    /// When the loop last re-asserted its live legacy claims (review 042 G74-5,
+    /// [`CLAIM_REASSERT_SECS`]); `None` until the first beat.
+    last_claim_reassert: Option<i64>,
     /// When the pre-spawn connectivity gate first held THIS outage (its first offline
     /// tick's `now`), or `None` while online/paused (network-failsafe slice 003).
     /// Drives the sustained-offline alert threshold — a blip clears it before
@@ -1399,6 +1420,7 @@ impl DriveLoop {
             holds: std::collections::BTreeMap::new(),
             spin_parks: std::collections::BTreeMap::new(),
             announced_holds: std::collections::BTreeMap::new(),
+            last_claim_reassert: None,
             offline_since: None,
             offline_alerted: false,
             rate_limit_hold_until: None,
@@ -2372,6 +2394,9 @@ impl DriveLoop {
             for outcome in &report.rerolls {
                 if let RerollOutcome::Rerolled { agent } = outcome {
                     self.reconnecting.remove(agent);
+                    // A re-roll is a new session on the same claim: re-record
+                    // the holder before it can hand off (review 042 G74-5).
+                    self.reassert_claim(agent);
                 }
             }
         }
@@ -2565,6 +2590,26 @@ impl DriveLoop {
         );
         }
 
+        // The claim heartbeat (review 042 G74-5): re-record every live legacy
+        // member's holder, so a keeperd cycle never leaves a member's handoff
+        // refused for longer than one beat.
+        if !v2_mode
+            && self
+                .last_claim_reassert
+                .is_none_or(|last| now - last >= CLAIM_REASSERT_SECS)
+        {
+            self.last_claim_reassert = Some(now);
+            let live: Vec<String> = self
+                .assignments
+                .keys()
+                .filter(|agent| self.supervisor.is_registered(agent))
+                .cloned()
+                .collect();
+            for agent in &live {
+                self.reassert_claim(agent);
+            }
+        }
+
         // Mirror the v2 assignments for the member verbs' assignment-match check
         // (queue-v2-scheduling slice 008): every insert/remove above happened this
         // tick, so the copy is current before any spawned session can call a verb.
@@ -2578,6 +2623,16 @@ impl DriveLoop {
         self.dispatch(&report, now);
 
         report
+    }
+
+    /// Re-assert `agent`'s legacy claim, if it holds one ([`PartClaimer::reassert`]).
+    /// Best-effort: a failure is journaled and the next beat retries.
+    fn reassert_claim(&self, agent: &str) {
+        if let Some((queue, part)) = self.assignments.get(agent)
+            && let Err(e) = self.claimer.reassert(queue, part, agent)
+        {
+            eprintln!("growlightd: claim re-assert for {agent} on {queue}/{part} failed: {e}");
+        }
     }
 
     /// Route a completed tick's events through the single owned
@@ -3780,6 +3835,8 @@ mod tests {
         /// Per-claim holder id (the agent the loop stamped the claim with), in
         /// claim order — proves the member id is plumbed to keeperd's CAS.
         holders: Mutex<Vec<String>>,
+        /// Every claim re-assert (review 042 G74-5), as `(queue, part, holder)`.
+        reasserts: Mutex<Vec<(String, String, String)>>,
         fail: AtomicBool,
         committed: Arc<FixedQueues>,
     }
@@ -3788,6 +3845,7 @@ mod tests {
             Arc::new(Self {
                 claims: Mutex::new(Vec::new()),
                 holders: Mutex::new(Vec::new()),
+                reasserts: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(false),
                 committed,
             })
@@ -3801,6 +3859,9 @@ mod tests {
         fn holders(&self) -> Vec<String> {
             self.holders.lock().unwrap().clone()
         }
+        fn reasserts(&self) -> Vec<(String, String, String)> {
+            self.reasserts.lock().unwrap().clone()
+        }
     }
     impl PartClaimer for Arc<FakeClaimer> {
         fn claim(&self, queue: &str, part: &str, holder: &str) -> Result<(), String> {
@@ -3810,6 +3871,13 @@ mod tests {
             self.claims.lock().unwrap().push((queue.to_string(), part.to_string()));
             self.holders.lock().unwrap().push(holder.to_string());
             self.committed.mark_active(queue, part);
+            Ok(())
+        }
+        fn reassert(&self, queue: &str, part: &str, holder: &str) -> Result<(), String> {
+            self.reasserts
+                .lock()
+                .unwrap()
+                .push((queue.to_string(), part.to_string(), holder.to_string()));
             Ok(())
         }
     }
@@ -5034,6 +5102,37 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(claimer.claims().len(), 1, "the standing claim is reused, not re-claimed");
         assert_eq!(backend.seeds().len(), 1, "a re-roll never re-seeds (carry-forward)");
         assert_eq!(probe.gui_alerts(), 1, "exactly one page across the whole episode");
+    }
+
+    /// Review 042 G74-5: the loop re-asserts each live legacy member's claim —
+    /// on the heartbeat (first beat on the tick that claims, then every
+    /// [`CLAIM_REASSERT_SECS`]) and after every re-roll — so a keeperd cycle that
+    /// empties the holder map never leaves the member's handoff refused for long.
+    #[test]
+    fn the_loop_re_asserts_a_live_members_claim_on_a_beat_and_after_a_re_roll() {
+        let (mut loop_, _d, backend, claimer, _queues, _probe) = make_claiming(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        let beat = ("qa".to_string(), "p1".to_string(), "a1".to_string());
+
+        loop_.tick(0);
+        assert_eq!(claimer.reasserts(), vec![beat.clone()], "the first beat, on the claiming tick");
+        loop_.tick(10);
+        assert_eq!(claimer.reasserts().len(), 1, "no beat inside the interval");
+        loop_.tick(CLAIM_REASSERT_SECS);
+        assert_eq!(claimer.reasserts().len(), 2, "the next beat");
+
+        // A crash, its backoff, then the re-roll onto the same claim: the
+        // re-roll re-asserts at once, between beats.
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        loop_.tick(31);
+        loop_.tick(32);
+        let r = loop_.tick(33);
+        assert_eq!(r.rerolls, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
+        assert_eq!(claimer.reasserts(), vec![beat.clone(), beat.clone(), beat], "the re-roll's");
+        assert_eq!(claimer.claims().len(), 1, "a re-assert is not a fresh claim");
     }
 
     /// TASK 044 — a boundary stop posted while a member is DOWN (crashed,

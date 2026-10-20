@@ -735,17 +735,21 @@ fn a_member_is_held_to_log_baton_and_its_own_items_handoff_status() {
 
 /// Report 036's unknown-holder decision, fail-closed: a part `active` with no
 /// recorded holder (a part left active without a holdered claim, or one whose
-/// holder map was rebuilt empty by a `daemon cycle`) is refused for a member —
-/// the human runs that status change. The member still has `log_baton` and
-/// `post_message` to hand off around it.
+/// holder map was rebuilt empty by a `daemon cycle`) is refused for a member,
+/// with a refusal that says to retry and then `post_message @human`.
+/// growlightd's conditional re-assert (`active` + `holder` + `if_status`)
+/// re-records the holder, and the member's handoff then lands (review 042
+/// G74-5). Review 042 G74-10: the claim records a holder BEFORE the cycle, so
+/// this proves a cycle drops a recorded holder.
 #[test]
 fn a_member_set_item_status_fails_closed_on_an_unknown_holder() {
     let mut fx = Fixture::start();
     fx.add_milestone("m5b", "Backup");
-    // Active WITHOUT a holder: the holder map has no entry — the same state a
-    // cycled daemon starts in for a part left active.
     assert!(matches!(
-        fx.call(op::SET_ITEM_STATUS, serde_json::json!({ "id": "m5b", "status": "active" })),
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "m-a" })
+        ),
         Response::Ok { .. }
     ));
 
@@ -760,15 +764,50 @@ fn a_member_set_item_status_fails_closed_on_an_unknown_holder() {
             .with_member(Some("m-a")),
         )
     };
-    let resp = member_done();
-    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
-
-    // The same refusal holds across a real daemon cycle: the active row
-    // survives (persisted), the holder map does not (in-memory).
+    // A real daemon cycle: the active row survives (persisted), the recorded
+    // holder does not (in-memory), so the member's handoff is refused.
     fx.restart();
     assert!(fx.backlog().contains("| 1 | m5b | milestone | Backup | active |"));
-    let resp = member_done();
-    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
+    let why = err_msg(&member_done());
+    assert!(why.starts_with("member_not_allowed:") && why.contains("no holder is recorded"), "{why}");
+    assert!(why.contains("retry") && why.contains("post_message @human"), "says what to do: {why}");
+
+    // growlightd's re-assert re-records the holder without a commit…
+    let tip_hash = |fx: &Fixture| Repo::open(&fx.garden).unwrap().tip().unwrap();
+    let tip = tip_hash(&fx);
+    let reassert = serde_json::json!({
+        "id": "m5b", "status": "active", "holder": "m-a", "if_status": "active"
+    });
+    let reply: SetItemStatusReply =
+        serde_json::from_value(ok_data(fx.call(op::SET_ITEM_STATUS, reassert.clone()))).unwrap();
+    assert_eq!(reply.status, "active");
+    assert_eq!(tip_hash(&fx), tip, "no commit");
+    // …and the member's handoff lands.
+    assert!(matches!(member_done(), Response::Ok { .. }));
+    assert!(fx.backlog().contains("| 1 | m5b | milestone | Backup | done |"));
+
+    // The re-assert is conditional: on a part that has left `active` it is a
+    // no-op reporting the real status — it never re-activates a handoff.
+    let reply: SetItemStatusReply =
+        serde_json::from_value(ok_data(fx.call(op::SET_ITEM_STATUS, reassert))).unwrap();
+    assert_eq!(reply.status, "done");
+    assert!(fx.backlog().contains("| 1 | m5b | milestone | Backup | done |"), "still done");
+}
+
+/// Review 042 G74-9: refusing another member's item says what to do instead.
+#[test]
+fn another_members_item_refusal_says_what_to_do() {
+    let fx = Fixture::start();
+    fx.add_milestone("theirs", "Theirs");
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "theirs", "status": "active", "holder": "m-b" })
+        ),
+        Response::Ok { .. }
+    ));
+    let why = err_msg(&as_member(&fx, op::SET_ITEM_STATUS, serde_json::json!({ "id": "theirs", "status": "done" })));
+    assert!(why.contains("held by agent \"m-b\"") && why.contains("post_message @human"), "{why}");
 }
 
 // ---- member write guards: the review 042 bypasses ----------------------

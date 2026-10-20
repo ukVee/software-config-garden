@@ -577,9 +577,10 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
         Leave,
     }
 
-    // (wrote?, part key, holder-map update). `wrote == false` is the idempotent
-    // no-op (return the current tip, no commit); `true` means the tree changed.
-    let (wrote, key, holder_op): (bool, holders::PartKey, HolderOp) = {
+    // (wrote?, part key, holder-map update, the status to report). `wrote ==
+    // false` is the idempotent no-op (return the current tip, no commit); `true`
+    // means the tree changed.
+    let (wrote, key, holder_op, status): (bool, holders::PartKey, HolderOp, String) = {
         let wt = WorkTree::new(daemon, &inner);
         if !wt.exists(&rel) {
             return Err((ErrorKind::NotFound, format!("{rel}: no backlog yet")));
@@ -612,7 +613,9 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
                         format!(
                             "member_not_allowed: item {:?} is held by agent {other:?}, not \
                              member {member:?} — a member sets only its own held item's status \
-                             (protocol-fleet.md). (spec-growlight-queue §6.7)",
+                             (protocol-fleet.md). If you are working this item, file_report or \
+                             post_message @human; never set another member's item. \
+                             (spec-growlight-queue §6.7)",
                             args.id
                         ),
                     ))
@@ -623,8 +626,11 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
                         format!(
                             "member_not_allowed: no holder is recorded for item {:?} (a daemon \
                              cycle rebuilds the holder map empty), so member {member:?} cannot \
-                             set its status — the human runs this change. (spec-growlight-queue \
-                             §6.7)",
+                             set its status yet. growlightd re-records its members' holders \
+                             within about 30 seconds of a cycle: retry this call once in a \
+                             minute. If it is still refused, post_message @human with the \
+                             status you meant to set, then finish your handoff (baton + \
+                             log_baton) and exit. (spec-growlight-queue §6.7)",
                             args.id
                         ),
                     ))
@@ -632,65 +638,74 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             }
         }
 
-        // Holder-identity CAS (milestone #40): only the write TO `active` is
-        // gated. A claim of a part already `active` under a *different* holder is
-        // refused here — fail-closed, before any tree change — so a fleet member
-        // never double-claims a part a live peer holds. A granted claim records
-        // the holder after the block (covers a fresh claim, the same holder's
-        // idempotent re-claim, and the unknown-holder post-`daemon cycle` resume
-        // where first-claim-wins). A non-active write drops any holder, so a
-        // later re-activation is a fresh first-claim.
-        let holder_op = if args.status == "active" {
-            match inner.holders.gate(&key, args.holder.as_deref()) {
-                ClaimGate::Deny(h) => {
-                    return Err((
-                        ErrorKind::BadArgs,
-                        format!(
-                            "item {:?} is already claimed by agent {h:?}; \
-                             a different agent cannot claim it while it is active",
-                            args.id
-                        ),
-                    ));
+        // The conditional form (review 042 G74-5): apply only while the item is
+        // still in `if_status`. A mismatch is a no-op — no write, no holder
+        // change — reporting the status the item actually has.
+        if let Some(want) = args.if_status.as_deref()
+            && rows[idx].status != want
+        {
+            (false, key, HolderOp::Leave, rows[idx].status.clone())
+        } else {
+            // Holder-identity CAS (milestone #40): only the write TO `active` is
+            // gated. A claim of a part already `active` under a *different* holder is
+            // refused here — fail-closed, before any tree change — so a fleet member
+            // never double-claims a part a live peer holds. A granted claim records
+            // the holder after the block (covers a fresh claim, the same holder's
+            // idempotent re-claim, and the unknown-holder post-`daemon cycle` resume
+            // where first-claim-wins). A non-active write drops any holder, so a
+            // later re-activation is a fresh first-claim.
+            let holder_op = if args.status == "active" {
+                match inner.holders.gate(&key, args.holder.as_deref()) {
+                    ClaimGate::Deny(h) => {
+                        return Err((
+                            ErrorKind::BadArgs,
+                            format!(
+                                "item {:?} is already claimed by agent {h:?}; \
+                                 a different agent cannot claim it while it is active",
+                                args.id
+                            ),
+                        ));
+                    }
+                    ClaimGate::Grant => {
+                        HolderOp::Record(args.holder.clone().expect("Grant implies a claimant id"))
+                    }
+                    ClaimGate::Untracked => HolderOp::Leave,
                 }
-                ClaimGate::Grant => {
-                    HolderOp::Record(args.holder.clone().expect("Grant implies a claimant id"))
-                }
-                ClaimGate::Untracked => HolderOp::Leave,
+            } else {
+                HolderOp::Clear
+            };
+
+            // Idempotent re-set: no tree change. Return the current tip rather than
+            // minting an empty commit — but the holder op still applies (a post-cycle
+            // first claim of an already-`active` part records its holder with no
+            // commit).
+            if rows[idx].status == args.status {
+                (false, key, holder_op, args.status.clone())
+            } else {
+                // Single-active invariant, now *per queue*: only one item may be
+                // `active` within a given queue at a time. Scoping it to the resolved
+                // region is exactly what lets the fleet run one active part per queue
+                // concurrently; a default-only garden keeps the old global behaviour.
+                if args.status == "active"
+                    && let Some(other) = rows
+                        .iter()
+                        .enumerate()
+                        .find(|(i, r)| *i != idx && r.status == "active")
+                    {
+                        return Err((
+                            ErrorKind::BadArgs,
+                            format!(
+                                "item {:?} is already active; set it done/blocked first",
+                                other.1.id
+                            ),
+                        ));
+                    }
+                rows[idx].status = args.status.clone();
+
+                let new = managed::upsert(&content, &tag, &queue::render(&rows));
+                wt.write_derived(&rel, new.as_bytes())?;
+                (true, key, holder_op, args.status.clone())
             }
-        } else {
-            HolderOp::Clear
-        };
-
-        // Idempotent re-set: no tree change. Return the current tip rather than
-        // minting an empty commit — but the holder op still applies (a post-cycle
-        // first claim of an already-`active` part records its holder with no
-        // commit).
-        if rows[idx].status == args.status {
-            (false, key, holder_op)
-        } else {
-            // Single-active invariant, now *per queue*: only one item may be
-            // `active` within a given queue at a time. Scoping it to the resolved
-            // region is exactly what lets the fleet run one active part per queue
-            // concurrently; a default-only garden keeps the old global behaviour.
-            if args.status == "active"
-                && let Some(other) = rows
-                    .iter()
-                    .enumerate()
-                    .find(|(i, r)| *i != idx && r.status == "active")
-                {
-                    return Err((
-                        ErrorKind::BadArgs,
-                        format!(
-                            "item {:?} is already active; set it done/blocked first",
-                            other.1.id
-                        ),
-                    ));
-                }
-            rows[idx].status = args.status.clone();
-
-            let new = managed::upsert(&content, &tag, &queue::render(&rows));
-            wt.write_derived(&rel, new.as_bytes())?;
-            (true, key, holder_op)
         }
     };
 
@@ -713,7 +728,7 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             .unwrap_or_default();
         return Ok(serde_json::to_value(SetItemStatusReply {
             id: args.id,
-            status: args.status,
+            status,
             path: rel,
             hash: tip,
         })
