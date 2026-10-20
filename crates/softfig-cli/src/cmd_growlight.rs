@@ -583,29 +583,17 @@ fn start(args: StartArgs) -> Result<()> {
 }
 
 /// Task 064 — the semi-auto/CLI half of the boot-time dirty-tree guard: at
-/// `start`, resolve the root baton's active item repo (the item doc's
-/// `> Worktree:` line — the `default` queue the semi-auto loop runs on has no
-/// `## Queues` registry row, so there is no registry fallback) and, when the
-/// repo is dirty AND newer than the baton's last handoff, return the same
-/// journal line growlightd prints before a member spawn, so the human launching
-/// the loop sees it before the agent does new work. Read-only: it only ever
-/// *surfaces* the answer, never reverts, stages or commits. Best-effort — a
-/// missing item, an unprobeable repo or a `git` failure is `None`, never a
-/// launch failure.
+/// `start`, resolve the root baton's active item repo ([`baton_item_repo`]) and,
+/// when the repo is dirty AND newer than the baton's last handoff, return the
+/// same journal line growlightd prints before a member spawn, so the human
+/// launching the loop sees it before the agent does new work. Read-only: it
+/// only ever *surfaces* the answer, never reverts, stages or commits.
+/// Best-effort — a missing item, an unprobeable repo or a `git` failure is
+/// `None`, never a launch failure.
 fn boot_dirty_check(garden_root: &Path, baton_path: &Path) -> Option<String> {
     let view = parse_baton(&fs::read_to_string(baton_path).ok()?);
     let item = view.item.as_deref()?;
-    let worktree = item_doc_candidates(garden_root, item, view.slice.as_deref())
-        .into_iter()
-        .find_map(|doc| {
-            let content = fs::read_to_string(&doc).ok()?;
-            softfig_ipc::item_repo::worktree_field(&content).map(str::to_string)
-        });
-    let repo = softfig_ipc::item_repo::resolve_repo(
-        worktree.as_deref(),
-        None,
-        home_dir().ok().as_deref(),
-    )?;
+    let repo = baton_item_repo(garden_root, item)?;
     let state = softfig_ipc::item_repo::probe(&repo).ok()?;
     let baton_mtime = fs::metadata(baton_path).and_then(|md| md.modified()).ok()?;
     if !softfig_ipc::item_repo::dirty_newer_than(&state, baton_mtime) {
@@ -628,6 +616,49 @@ fn boot_dirty_check(garden_root: &Path, baton_path: &Path) -> Option<String> {
             ),
         },
     )
+}
+
+/// The repo the semi-auto baton's item lands in, through the one resolver
+/// growlightd's repo probe uses (review 043 G64-3,
+/// [`softfig_ipc::item_repo::item_repo_path`]): the item's own doc's
+/// `> Worktree:`, else its queue's `## Queues` registry cell. The baton names
+/// no queue, so the queue is the table that lists the item — semi-auto runs
+/// named queues (psy, fid, irface, roadeye), whose items rarely carry
+/// `> Worktree:`.
+fn baton_item_repo(garden_root: &Path, item: &str) -> Option<PathBuf> {
+    use softfig_ipc::backlog_doc::{queue_of, BACKLOG_DOC, DEFAULT_QUEUE};
+    let backlog = fs::read_to_string(garden_root.join(BACKLOG_DOC)).ok();
+    let queue = backlog
+        .as_deref()
+        .and_then(|doc| queue_of(doc, item))
+        .unwrap_or_else(|| DEFAULT_QUEUE.to_string());
+    let doc = item_own_doc(garden_root, item);
+    let home = home_dir().ok();
+    softfig_ipc::item_repo::item_repo_path(doc.as_deref(), &queue, || backlog, home.as_deref())
+}
+
+/// The item's own doc off the garden mount — the doc growlightd's claim-time
+/// reader reads, never a slice or sub-milestone doc: a task's
+/// `tasks/<id>-*.md` (exactly one; two docs claiming the number name none), else
+/// the milestone's `CLAUDE.md`.
+fn item_own_doc(garden_root: &Path, item: &str) -> Option<String> {
+    use softfig_ipc::backlog_doc::{is_task_id, MILESTONES_DIR, TASKS_DIR};
+    if !is_task_id(item) {
+        return fs::read_to_string(garden_root.join(MILESTONES_DIR).join(item).join("CLAUDE.md")).ok();
+    }
+    let prefix = format!("{item}-");
+    let mut docs = fs::read_dir(garden_root.join(TASKS_DIR)).ok()?.flatten().map(|e| e.path()).filter(
+        |path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".md"))
+        },
+    );
+    let doc = docs.next()?;
+    if docs.next().is_some() {
+        return None;
+    }
+    fs::read_to_string(doc).ok()
 }
 
 /// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
@@ -3430,6 +3461,52 @@ mod tests {
         );
         assert!(line.contains("1 uncommitted path"), "names the count: {line}");
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Review 043 G64-3: a semi-auto item in a named queue whose doc names no
+    /// `> Worktree:` resolves through the queue's `## Queues` registry cell, the
+    /// way growlightd's repo probe resolves it — the fid shape that started
+    /// task 064. A slice doc's `> Worktree:` is not the item's (growlightd never
+    /// reads it), so it does not count.
+    #[test]
+    fn boot_dirty_check_resolves_a_named_queue_item_through_the_registry() {
+        let root = unique_tmp("boot-dirty-registry");
+        let _ = fs::remove_dir_all(&root);
+        let backlog = root.join(PILLAR).join("backlog");
+        let milestone = backlog.join("milestones").join("fid-pam");
+        fs::create_dir_all(milestone.join("slices")).unwrap();
+        let repo = root.join("fid-repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("gate.rs"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        let region = |tag: &str, body: &str| format!("<!-- softfig:{tag} -->\n\n{body}\n\n<!-- /softfig:{tag} -->");
+        let items = "| # | id | type | title | status |\n|---|----|------|-------|--------|\n\
+                     | 1 | fid-pam | milestone | P3 | active |";
+        fs::write(
+            backlog.join("CLAUDE.md"),
+            format!(
+                "# backlog\n\n{}\n\n{}\n\n{}\n",
+                region("queue", "| # | id | type | title | status |\n|---|----|------|-------|--------|"),
+                region("queues", &format!("| queue | repo |\n|---|---|\n| fid | {} |", repo.display())),
+                region("queue:fid", items),
+            ),
+        )
+        .unwrap();
+        fs::write(milestone.join("CLAUDE.md"), "# fid-pam\n\n> Model: claude\n").unwrap();
+        fs::write(milestone.join("slices").join("001-probes.md"), "# probes\n\n> Worktree: /nowhere\n")
+            .unwrap();
+
+        let baton = root.join("baton.md");
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: fid-pam\nslice: 001\n---\n").unwrap();
+        backdate_mtime(&baton);
+        fs::write(repo.join("gate.rs"), "cut off mid-slice\n").unwrap();
+
+        let line = boot_dirty_check(&root, &baton).expect("the registry names the fid repo");
+        assert!(line.contains(&repo.display().to_string()), "names the registry's repo: {line}");
         fs::remove_dir_all(&root).ok();
     }
 

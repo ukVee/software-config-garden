@@ -140,6 +140,28 @@ impl RepoState {
     }
 }
 
+/// The local repo an item's work lands in — the ONE item→repo resolver
+/// growlightd's repo probe and the CLI's semi-auto boot check share (task 064
+/// review G64-3): the item doc's `> Worktree:` (`item_doc` is the item's own
+/// doc — a milestone's `CLAUDE.md` or a task's doc, never a slice), else the
+/// `repo` cell of its `queue` in the backlog's `## Queues` registry, else none,
+/// by [`resolve_repo`]'s rules. `backlog` yields the backlog doc and is called
+/// only when the doc names no worktree.
+pub fn item_repo_path(
+    item_doc: Option<&str>,
+    queue: &str,
+    backlog: impl FnOnce() -> Option<String>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let worktree = item_doc.and_then(worktree_field);
+    // A present `> Worktree:` wins even when it doesn't resolve.
+    let registry = match worktree {
+        Some(_) => None,
+        None => backlog().and_then(|doc| crate::backlog_doc::registry_repo(&doc, queue)),
+    };
+    resolve_repo(worktree, registry.as_deref(), home)
+}
+
 /// The boot-time dirty-tree guard's decision (task 064): does `repo` carry
 /// uncommitted work that is NEWER than the baton's last write (`baton_mtime`)?
 /// That is the signature of a session that did work and was cut off before its

@@ -593,19 +593,11 @@ impl QueueSource for DeferredQueues {
 /// per session — and fed to [`Supervisor::poll_with_progress`]. The production
 /// impl is [`crate::queue_source::KeeperdRepoProbe`]; a test scripts the reads.
 pub trait RepoProbe: Send + Sync + fmt::Debug {
-    /// The current [`RepoState`] of the repo `part` of `queue` lands in, or `None`
-    /// when it has none this machine can probe (or the read failed) — the guard
-    /// then decides on NEXT ACTION alone.
-    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState>;
-
-    /// The resolved local repo PATH `part` of `queue` lands in, or `None` when
-    /// there is none this machine can probe (task 064: the boot dirty-tree guard
-    /// names the repo in its journal line). Default `None` so the spin-guard-only
-    /// probes and test fakes stay unchanged; the live
-    /// [`crate::queue_source::KeeperdRepoProbe`] resolves the real path.
-    fn repo_path(&self, _queue: &str, _part: &str) -> Option<std::path::PathBuf> {
-        None
-    }
+    /// The repo `part` of `queue` lands in and its current [`RepoState`], or
+    /// `None` when it has none this machine can probe (or the read failed) — the
+    /// spin guard then decides on NEXT ACTION alone. The path is the one probed,
+    /// so the boot dirty-tree guard (task 064) names exactly the repo it read.
+    fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)>;
 }
 
 /// The default [`RepoProbe`]: no repo signal, so the spin guard is the
@@ -614,7 +606,7 @@ pub trait RepoProbe: Send + Sync + fmt::Debug {
 pub struct NoRepoProbe;
 
 impl RepoProbe for NoRepoProbe {
-    fn repo_state(&self, _queue: &str, _part: &str) -> Option<RepoState> {
+    fn repo_state(&self, _queue: &str, _part: &str) -> Option<(std::path::PathBuf, RepoState)> {
         None
     }
 }
@@ -828,15 +820,12 @@ fn boot_dirty_check(
     let Some(baton_mtime) = baton.baton_mtime(agent) else {
         return false;
     };
-    let Some(state) = repo_probe.repo_state(queue, part) else {
+    let Some((repo, state)) = repo_probe.repo_state(queue, part) else {
         return false;
     };
     if !softfig_ipc::item_repo::dirty_newer_than(&state, baton_mtime) {
         return false;
     }
-    let repo = repo_probe
-        .repo_path(queue, part)
-        .unwrap_or_else(|| std::path::PathBuf::from("<unknown repo>"));
     let dirty = state.dirty;
     match state.newest_dirty_mtime.and_then(|m| m.duration_since(baton_mtime).ok()) {
         Some(newer_by) => eprintln!(
@@ -1807,7 +1796,8 @@ impl DriveLoop {
                     let assignment = self.assignments.get(agent);
                     let repo_state = || {
                         repo_read = assignment
-                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part));
+                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part))
+                            .map(|(_, state)| state);
                         repo_read.clone()
                     };
                     self.supervisor.poll_with_progress(
@@ -5402,12 +5392,10 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         }
     }
     impl RepoProbe for Arc<ScriptedRepo> {
-        fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
+        fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)> {
             self.1.lock().unwrap().push((queue.into(), part.into()));
-            self.0.lock().unwrap().clone()
-        }
-        fn repo_path(&self, _queue: &str, _part: &str) -> Option<std::path::PathBuf> {
-            self.2.lock().unwrap().clone()
+            let path = self.2.lock().unwrap().clone().unwrap_or_else(|| "/scripted-repo".into());
+            self.0.lock().unwrap().clone().map(|state| (path, state))
         }
     }
 

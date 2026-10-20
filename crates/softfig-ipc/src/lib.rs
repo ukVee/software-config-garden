@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod backlog_doc;
 pub mod baton;
 pub mod client;
 pub mod growlightd;
