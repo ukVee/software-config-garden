@@ -41,6 +41,7 @@
 use std::path::PathBuf;
 
 use softfig_ipc::fleet_marker;
+use softfig_ipc::model_choice::unique_numbered;
 use softfig_ipc::item_repo::{probe, resolve_repo, worktree_field, RepoState};
 use softfig_ipc::verbs::{op, ListTreeArgs, ListTreeReply, ReadFileArgs, ReadFileReply};
 use softfig_ipc::{call_reconnecting, ErrorKind, Request, Response, RetryPolicy};
@@ -330,12 +331,15 @@ impl ItemDocReader for KeeperdItemDocReader {
         }
         let listing: Option<ListTreeReply> =
             self.call(op::LIST_TREE, ListTreeArgs { path: Some(TASKS_DIR.to_string()) })?;
-        let prefix = format!("{id}-");
-        let doc = listing.into_iter().flat_map(|l| l.entries).find(|e| {
-            !e.is_dir && e.name.starts_with(&prefix) && e.name.ends_with(".md")
-        });
-        match doc {
-            Some(entry) => self.read(entry.path),
+        let entries: Vec<_> = listing.into_iter().flat_map(|l| l.entries).filter(|e| !e.is_dir).collect();
+        // Review 042 G74-2: a second `<id>-*.md` beside the real doc is a shadow
+        // — taking the first would let it drop a `> Fleet: no` hold or name
+        // another worktree. Two docs for one id fail closed: the caller holds the
+        // part (`ClaimHold::Unreadable`) and the repo probe gives no signal.
+        let name = unique_numbered(entries.iter().map(|e| e.name.as_str()), id)
+            .map_err(|e| format!("{TASKS_DIR}: {e}"))?;
+        match name.and_then(|n| entries.iter().find(|e| e.name == n)) {
+            Some(entry) => self.read(entry.path.clone()),
             None => Ok(None),
         }
     }

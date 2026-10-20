@@ -149,6 +149,9 @@ impl<'a> WorkTree<'a> {
         if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
             return Err((ErrorKind::BadArgs, why));
         }
+        if old.is_none() && new.is_some() && is_item_doc_path(rel) {
+            return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
+        }
         Ok(())
     }
 
@@ -201,7 +204,31 @@ impl<'a> WorkTree<'a> {
                 };
                 return Err(reserved_refusal(&member, &landing, None, Some(&text)));
             }
+        if let Some(landing) = self.landings(from, to).into_iter().find(|l| is_item_doc_path(l)) {
+            return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, &landing, "rename lands on")));
+        }
         self.guard_member_removal(to)
+    }
+
+    /// Where each file at or under `from` lands when `from` is renamed to
+    /// `to`: `to` itself for a file, `to/<rest>` for each file in a directory.
+    fn landings(&self, from: &str, to: &str) -> Vec<String> {
+        if !self.is_dir(from) {
+            return vec![to.to_string()];
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![from.to_string()];
+        while let Some(dir) = stack.pop() {
+            for entry in self.read_dir(&dir) {
+                let child = format!("{dir}/{}", entry.name);
+                if entry.is_dir {
+                    stack.push(child);
+                } else {
+                    out.push(format!("{to}{}", &child[from.len()..]));
+                }
+            }
+        }
+        out
     }
 
     /// The first file at or under `rel` (a file or a directory) whose text
@@ -449,6 +476,37 @@ fn is_backlog_rel(rel: &str) -> bool {
     let backlog = super::growlight::paths::backlog_dir();
     rel.strip_prefix(backlog.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether canonical `rel` is an item-doc path — a doc a growlight reader looks
+/// an item or slice up by: a task doc (`…/tasks/*.md`), a `CLAUDE.md` (the
+/// backlog doc, a milestone's, a sub-milestone's) or a slice doc
+/// (`…/slices/*.md`), under `growlight/backlog/`.
+fn is_item_doc_path(rel: &str) -> bool {
+    if !is_backlog_rel(rel) {
+        return false;
+    }
+    let mut parts = rel.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    let parent = parts.next().unwrap_or_default();
+    name == "CLAUDE.md" || (name.ends_with(".md") && matches!(parent, "tasks" | "slices"))
+}
+
+/// Review 042 G74-2: a member may not create an item doc, nor rename a file
+/// onto one. The readers find an item's doc by its number, so a second
+/// `066-0.md` beside `066-loop-self-extend.md` could shadow it — dropping its
+/// `> Fleet: no` hold, or naming another model or worktree. (The readers also
+/// fail closed on two docs for one number; this keeps a member from making the
+/// second.) Members are already refused `add_backlog_item` / `add_slice`. The
+/// refusal text leads with the wire code, `member_not_allowed`.
+fn member_item_doc_refusal(member: &str, rel: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} the item doc {rel}, and fleet member {member} may not \
+         create one — a task doc, a backlog / milestone / sub-milestone CLAUDE.md or a slice doc. \
+         Readers look an item up by its number, so a new doc beside the real one would shadow \
+         it. The human seeds items and slices (add_backlog_item / add_slice); under queue v2 a \
+         member adds a slice with slice_insert. (spec-growlight-queue §6.7)"
+    )
 }
 
 /// Whether `rel` is the garden root or an ancestor of `growlight/backlog/`:
@@ -859,6 +917,49 @@ mod tests {
         );
     }
 
+    /// Review 042 G74-2: a member may not create an item doc — a task doc, a
+    /// `CLAUDE.md` under the backlog, a slice doc — nor rename a file or a
+    /// directory onto one. Editing an existing one (no reserved line touched)
+    /// and creating any other backlog file stay allowed.
+    #[test]
+    fn a_member_may_not_create_or_rename_onto_an_item_doc() {
+        assert!(is_item_doc_path("growlight/backlog/tasks/066-0.md"));
+        assert!(is_item_doc_path("growlight/backlog/milestones/m/CLAUDE.md"));
+        assert!(is_item_doc_path("growlight/backlog/milestones/m/subs/s/CLAUDE.md"));
+        assert!(is_item_doc_path("growlight/backlog/milestones/m/slices/002-x.md"));
+        assert!(!is_item_doc_path("growlight/backlog/milestones/m/notes/001-x.md"));
+        assert!(!is_item_doc_path("projects/p/tasks/001-x.md"), "outside the backlog");
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let task = "growlight/backlog/tasks/066-loop-self-extend.md";
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(task, FLEET_HELD.as_bytes()).unwrap();
+        wt.write("projects/p/drafts/tasks/066-0.md", b"# shadow\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        for shadow in [
+            "growlight/backlog/tasks/066-0.md",
+            "growlight/backlog/milestones/n/CLAUDE.md",
+            "growlight/backlog/milestones/m/slices/001-shadow.md",
+        ] {
+            let err = wt.write(shadow, b"# x\n").unwrap_err();
+            assert!(err.1.starts_with("member_not_allowed:") && err.1.contains("write creates"), "{err:?}");
+            assert!(!wt.exists(shadow), "{shadow}: nothing written");
+        }
+        assert!(
+            wt.rename("projects/p/drafts/tasks/066-0.md", "growlight/backlog/tasks/066-0.md").is_err(),
+            "a file renamed onto an item-doc path"
+        );
+        assert!(
+            wt.rename("projects/p/drafts", "growlight/backlog/milestones/m/drafts").is_err(),
+            "a directory whose files land on item-doc paths"
+        );
+        wt.write(task, format!("{FLEET_HELD}more\n").as_bytes()).expect("editing the real doc");
+        wt.write("growlight/backlog/milestones/m/notes/001-x.md", b"# n\n")
+            .expect("a backlog file that is not an item doc");
+    }
+
     /// Review 042 G74-1: a member's own bytes may not change a daemon-managed
     /// region anywhere — edit its body, add one, or drop one — while the
     /// daemon's re-derivation (`write_derived`) still lands under the member's
@@ -1028,9 +1129,14 @@ mod tests {
             assert!(wt.remove("growlight/backlog/milestones/m").is_err(), "a dir holding one");
             assert!(wt.remove("growlight").is_err(), "an ancestor of the backlog");
             assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "all refused untouched");
-            // Moving a held doc INTO the backlog tightens: allowed.
+            // Moving a held doc INTO the backlog tightens: allowed — onto any
+            // path but an item doc's (G74-2: a new slice doc could shadow one).
             wt.write("projects/p/notes/020-z.md", FLEET_HELD.as_bytes()).expect("seed outside");
-            wt.rename("projects/p/notes/020-z.md", "growlight/backlog/milestones/m/slices/020-z.md")
+            let shadow = wt
+                .rename("projects/p/notes/020-z.md", "growlight/backlog/milestones/m/slices/020-z.md")
+                .unwrap_err();
+            assert!(shadow.1.contains("rename lands on the item doc"), "{shadow:?}");
+            wt.rename("projects/p/notes/020-z.md", "growlight/backlog/milestones/m/notes/020-z.md")
                 .expect("moving a held doc in is a tighten");
             // Outside the backlog is not the guard's.
             wt.write("projects/p/notes/021-x.md", FLEET_HELD.as_bytes()).expect("outside add");

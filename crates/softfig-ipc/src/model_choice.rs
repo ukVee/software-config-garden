@@ -391,14 +391,23 @@ const BACKLOG_DIR: &str = "growlight/backlog";
 /// don't know (`005-backend-model-picker.md`), so each is found by its
 /// zero-padded numeric prefix rather than reconstructed. Batons write the slice
 /// unpadded (`6`) as often as padded; the files are always zero-padded.
-pub fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) -> Vec<PathBuf> {
+///
+/// `Err` when two docs share the number being looked up: which one declares the
+/// model is then a guess, and a second `NNN-*.md` beside the real one is
+/// exactly how a shadow doc would steer it (review 042 G74-2), so the lookup
+/// fails closed instead of taking the first.
+pub fn item_doc_candidates(
+    garden_root: &Path,
+    item: &str,
+    slice: Option<&str>,
+) -> Result<Vec<PathBuf>, String> {
     let backlog = garden_root.join(BACKLOG_DIR);
     let top = item.split('/').next().unwrap_or(item);
     if !backlog.join("milestones").join(top).is_dir() {
         // A task (or restack) doc: the single file for the whole chain. A
         // restack's generated doc is queue-v2-git's row; until that lands, the
         // task lookup is the only non-milestone shape.
-        return find_by_number(&backlog.join("tasks"), item).into_iter().collect();
+        return Ok(find_by_number(&backlog.join("tasks"), item)?.into_iter().collect());
     }
 
     let mut candidates = Vec::new();
@@ -406,7 +415,7 @@ pub fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) 
     if let Some(slice) = slice {
         let padded = format!("{:0>3}", slice.trim());
         let slices = garden_root.join(milestone_path(item)).join("slices");
-        if let Some(doc) = find_by_number(&slices, &padded) {
+        if let Some(doc) = find_by_number(&slices, &padded)? {
             candidates.push(doc);
         }
     }
@@ -416,19 +425,52 @@ pub fn item_doc_candidates(garden_root: &Path, item: &str, slice: Option<&str>) 
         let identity = parts[..=depth].join("/");
         candidates.push(garden_root.join(milestone_path(&identity)).join("CLAUDE.md"));
     }
-    candidates
+    Ok(candidates)
 }
 
-/// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`.
-fn find_by_number(dir: &Path, number: &str) -> Option<PathBuf> {
+/// The `NNN-<slug>.md` file in `dir` whose numeric prefix is `number`:
+/// `Ok(None)` when there is none (or `dir` is absent), `Err` when more than one
+/// matches (see [`item_doc_candidates`]).
+fn find_by_number(dir: &Path, number: &str) -> Result<Option<PathBuf>, String> {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let names: Vec<String> = listing
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    Ok(unique_numbered(names.iter().map(String::as_str), number)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .map(|name| dir.join(name)))
+}
+
+/// The one `<number>-*.md` name among `names`: `Ok(None)` when none matches,
+/// `Err` naming every match when more than one does — two docs claiming one
+/// item or slice number make every reader's answer a guess, so each fails
+/// closed (review 042 G74-2). Shared by the model resolver here and
+/// growlightd's claim-time item-doc read.
+pub fn unique_numbered<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    number: &str,
+) -> Result<Option<&'a str>, String> {
     let prefix = format!("{number}-");
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".md"))
-            .then_some(path)
-    })
+    let mut matches: Vec<&str> = names
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".md"))
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => {
+            matches.sort_unstable();
+            Err(format!(
+                "{} docs share number {number} ({}) — ambiguous, so none is trusted until one is \
+                 removed",
+                matches.len(),
+                matches.join(", ")
+            ))
+        }
+    }
 }
 
 /// A resolved declaration, with the declaring doc for messages.
@@ -487,6 +529,18 @@ mod tests {
 
     // ---- comma lists (§6.4 syntax) -------------------------------------
 
+
+    /// Review 042 G74-2: the one `<number>-*.md` among a listing, or an error
+    /// naming every match when two docs claim the number.
+    #[test]
+    fn unique_numbered_fails_closed_on_two_docs_for_one_number() {
+        let names = ["066-loop-self-extend.md", "067-wifi.md", "0660-other.md", "066-notes.txt"];
+        assert_eq!(unique_numbered(names, "066"), Ok(Some("066-loop-self-extend.md")));
+        assert_eq!(unique_numbered(names, "068"), Ok(None));
+        let shadowed = ["066-loop-self-extend.md", "066-0.md"];
+        let err = unique_numbered(shadowed, "066").unwrap_err();
+        assert!(err.contains("066-0.md, 066-loop-self-extend.md"), "{err}");
+    }
     #[test]
     fn a_comma_list_parses_in_order_with_per_entry_variants() {
         let list = match parse_declaration("reasoning, flash variant=high").unwrap() {
@@ -678,14 +732,14 @@ mod tests {
         std::fs::write(m.join("subs/s1/subs/s2/CLAUDE.md"), "").unwrap();
 
         // For a top-level milestone slice: [slice doc, milestone CLAUDE.md].
-        let direct = item_doc_candidates(&root, "m", Some("005"));
+        let direct = item_doc_candidates(&root, "m", Some("005")).unwrap();
         assert_eq!(
             direct,
             vec![m.join("slices/005-picker.md"), m.join("CLAUDE.md")]
         );
 
         // For a slice under m/s1: [slice doc, m/subs/s1/CLAUDE.md, m/CLAUDE.md].
-        let one_sub = item_doc_candidates(&root, "m/s1", Some("7"));
+        let one_sub = item_doc_candidates(&root, "m/s1", Some("7")).unwrap();
         assert_eq!(
             one_sub,
             vec![
@@ -696,7 +750,7 @@ mod tests {
         );
 
         // Nested two deep, innermost first.
-        let two_subs = item_doc_candidates(&root, "m/s1/s2", None);
+        let two_subs = item_doc_candidates(&root, "m/s1/s2", None).unwrap();
         assert_eq!(
             two_subs,
             vec![
@@ -711,9 +765,18 @@ mod tests {
         std::fs::create_dir_all(&tasks).unwrap();
         std::fs::write(tasks.join("047-a-task.md"), "").unwrap();
         assert_eq!(
-            item_doc_candidates(&root, "047", None),
+            item_doc_candidates(&root, "047", None).unwrap(),
             vec![tasks.join("047-a-task.md")]
         );
+
+        // Review 042 G74-2: a second doc claiming a number is a shadow — the
+        // lookup fails closed rather than trust whichever sorts first.
+        std::fs::write(tasks.join("047-0.md"), "> Model: claude\n").unwrap();
+        let err = item_doc_candidates(&root, "047", None).unwrap_err();
+        assert!(err.contains("047-0.md") && err.contains("047-a-task.md"), "{err}");
+        std::fs::write(m.join("slices/005-shadow.md"), "").unwrap();
+        assert!(item_doc_candidates(&root, "m", Some("5")).is_err(), "a shadow slice doc");
+        assert!(item_doc_candidates(&root, "m", None).is_ok(), "no slice asked, no slice read");
 
         let _ = std::fs::remove_dir_all(&root);
     }

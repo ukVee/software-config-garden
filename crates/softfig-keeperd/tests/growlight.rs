@@ -876,6 +876,24 @@ fn a_member_cannot_rewrite_the_queue_tables_with_replace_file() {
     assert!(matches!(resp, Response::Ok { .. }), "a slice edit: {resp:?}");
 }
 
+/// Review 042 G74-2: a member's `replace_file` of a new `001-0.md` beside the
+/// held `001-loop-self-extend.md` is refused, so no shadow doc can sort ahead
+/// of the real one and drop its hold.
+#[test]
+fn a_member_cannot_create_a_shadow_item_doc() {
+    let fx = Fixture::start();
+    held_task(&fx);
+    let shadow = "growlight/backlog/tasks/001-0.md";
+    let resp = as_member(&fx, op::REPLACE_FILE, serde_json::json!({ "path": shadow, "content": "# x\n" }));
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
+    assert!(!fx.garden.join(shadow).exists(), "nothing written");
+    // The human may still create it (break-glass is theirs).
+    assert!(matches!(
+        fx.call(op::REPLACE_FILE, serde_json::json!({ "path": shadow, "content": "# x\n" })),
+        Response::Ok { .. }
+    ));
+}
+
 // ---- reorder_backlog_item ---------------------------------------------
 
 #[test]
