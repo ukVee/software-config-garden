@@ -124,25 +124,50 @@ impl BatonSeeder for FsBatonStore {
         Ok(SeedOutcome::Fresh)
     }
 
+    /// The warning replaces any earlier one in place (review 043 G64-8): a
+    /// guard that fires again on a later spawn leaves one current section, not
+    /// a growing stack, and the baton's frontmatter and sections parse as before.
     fn warn_dirty_tree(&self, agent: &str, signal: &str) -> Result<(), String> {
-        use std::io::Write;
         let path = self.baton_path(agent);
-        let section = format!(
-            "\n# ⚠️ PRE-EXISTING DIRTY TREE\n\n\
-             growlightd, before this session spawned: {signal}.\n\n\
-             A prior session likely worked there and was cut off before committing. Review\n\
-             `git status` in that repo before starting new work, and never discard changes\n\
-             you have not reviewed. This guard is read-only: it reverted, staged and\n\
-             committed nothing.\n"
-        );
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("open baton {} for warn: {e}", path.display()))?;
-        file.write_all(section.as_bytes())
-            .map_err(|e| format!("append warning to baton {}: {e}", path.display()))
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        fs::write(&path, with_dirty_tree_section(&existing, signal))
+            .map_err(|e| format!("write the dirty-tree warning to baton {}: {e}", path.display()))
     }
+}
+
+/// The heading of the boot dirty-tree warning (task 064) in a member's baton.
+const DIRTY_TREE_HEADING: &str = "# ⚠️ PRE-EXISTING DIRTY TREE";
+
+/// `baton` with its boot dirty-tree warning set to one for `signal`: an earlier
+/// warning is removed wherever it stands (its heading to the next `# ` heading,
+/// or the end) and the current one is appended last. Everything else is kept
+/// byte for byte, and the `# ` heading that closes the section keeps NEXT
+/// ACTION and every other section parsing as before (review 043 G64-8).
+fn with_dirty_tree_section(baton: &str, signal: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut in_warning = false;
+    for line in baton.lines() {
+        if line.trim_end() == DIRTY_TREE_HEADING {
+            in_warning = true;
+            continue;
+        }
+        if in_warning && line.starts_with("# ") {
+            in_warning = false;
+        }
+        if !in_warning {
+            kept.push(line);
+        }
+    }
+    let body = kept.join("\n");
+    format!(
+        "{}\n\n{DIRTY_TREE_HEADING}\n\n\
+         growlightd, before this session spawned: {signal}.\n\n\
+         A prior session likely worked there and was cut off before committing. Review\n\
+         `git status` in that repo before starting new work, and never discard changes\n\
+         you have not reviewed. This guard is read-only: it reverted, staged and\n\
+         committed nothing.\n",
+        body.trim_end()
+    )
 }
 
 /// The v2 member-baton copy (queue-v2-scheduling slice 006): write an entry
@@ -667,6 +692,33 @@ mod tests {
         let mtime = s.baton_mtime("a").expect("a seeded baton has an mtime");
         let file_mtime = std::fs::metadata(s.baton_path("a")).unwrap().modified().unwrap();
         assert_eq!(mtime, file_mtime, "the trait reads the real file mtime");
+    }
+
+    /// Review 043 G64-8: a second warning replaces the first in place — one
+    /// current section, the rest of the baton byte for byte — and the baton
+    /// parses exactly as it did before either.
+    #[test]
+    fn the_dirty_tree_warning_replaces_itself_and_leaves_the_parse_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let body = "---\nstatus: IN_PROGRESS\nitem: 064\nslice: 001\niteration: 3\n---\n\n\
+                    # NEXT ACTION\n\nwire the guard\n\n# READ FIRST\n\n- the review\n";
+        std::fs::create_dir_all(s.baton_path("a").parent().unwrap()).unwrap();
+        std::fs::write(s.baton_path("a"), body).unwrap();
+
+        s.warn_dirty_tree("a", "boot dirty tree: x: /r has 2 uncommitted path(s), newest ~5s newer").unwrap();
+        s.warn_dirty_tree("a", "boot dirty tree: x: /r has 3 uncommitted path(s), newest ~9s newer").unwrap();
+        let after = std::fs::read_to_string(s.baton_path("a")).unwrap();
+        assert_eq!(after.matches(DIRTY_TREE_HEADING).count(), 1, "one section: {after}");
+        assert!(after.contains("3 uncommitted") && !after.contains("2 uncommitted"), "{after}");
+        assert!(after.starts_with(body.trim_end()), "the rest is untouched: {after}");
+        assert_eq!(parse_baton(&after), parse_baton(body), "the parse is unchanged");
+
+        // A member that kept the warning above its own sections still loses
+        // only the warning.
+        let mid = format!("{}\n\n# NOTES\n\nmine\n", after.trim_end());
+        let again = with_dirty_tree_section(&mid, "boot dirty tree: x: /r has 1 uncommitted path(s)");
+        assert!(again.contains("# NOTES\n\nmine") && again.matches(DIRTY_TREE_HEADING).count() == 1);
     }
 
     #[test]
