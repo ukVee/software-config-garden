@@ -311,8 +311,10 @@ impl QueueSource for KeeperdQueueSource {
 /// The live [`RepoProbe`] (task 069): which repo a part's work lands in, read
 /// through the same two keeperd docs the queue source reads — the item doc's
 /// `> Worktree:` first, then the queue registry's `repo` cell — and how far it has
-/// moved, through [`probe`]. Called once per member session, on the spin guard's
-/// lazy read, so the keeperd reads and the `git` calls never run per tick.
+/// moved, through [`probe`]. Called on the spin guard's lazy read (once per
+/// member session exit) and by the boot dirty-tree guard (task 064, once before
+/// each member spawn), so the keeperd reads and the `git` calls never run per
+/// tick.
 #[derive(Debug)]
 pub struct KeeperdRepoProbe {
     backlog: Box<dyn BacklogReader>,
