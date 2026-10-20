@@ -197,6 +197,11 @@ pub fn batch(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         added: Vec::new(),
     };
     let mut staged: Vec<Staged> = Vec::new();
+    // Each target's content as the ops so far leave it, for the member guards
+    // (review 042 G74-8): op N is guarded against op N−1's result, not the live
+    // tree — otherwise op 0 adding a `> Fleet: no` and op 1 removing it pass
+    // here and op 1 is refused in phase 2, after op 0 is already staged.
+    let mut guarded: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (i, op) in args.ops.iter().enumerate() {
         validate_op(daemon, &inner, &garden_root, op, &mut sim, &mut staged).map_err(
             |(kind, msg)| (kind, format!("batch op[{i}] ({}) failed: {msg}", op.op)),
@@ -209,10 +214,16 @@ pub fn batch(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         // will stage.
         if let Some(s) = staged.last() {
             let wt = WorkTree::new(daemon, &inner);
-            wt.check_write_bytes(staged_target(&s.mutation), staged_bytes(&s.mutation))
+            let (target, bytes) = (staged_target(&s.mutation), staged_bytes(&s.mutation));
+            let old = match guarded.get(target) {
+                Some(prior) => Some(prior.clone()),
+                None => wt.read(target),
+            };
+            wt.check_write_bytes_over(target, old.as_deref(), bytes)
                 .map_err(|(kind, msg)| {
                     (kind, format!("batch op[{i}] ({}) failed: {msg}", op.op))
                 })?;
+            guarded.insert(target.to_string(), bytes.to_vec());
         }
     }
 

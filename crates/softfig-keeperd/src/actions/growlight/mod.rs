@@ -476,6 +476,15 @@ pub fn add_slice(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
 pub fn add_queue(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
     let args: AddQueueArgs = serde_json::from_value(args)
         .map_err(|e| (ErrorKind::BadArgs, format!("add_queue args: {e}")))?;
+    // Review 042 G74-7: registering a queue writes the registry growlightd
+    // schedules from (and, under folder-grants, a repo's default grant).
+    if let Some(member) = crate::caller::member() {
+        return Err(refuse_member_legacy(
+            &member,
+            "add_queue",
+            "registering a work-stream queue (and the repo it binds) is the human's",
+        ));
+    }
     queues::validate_queue_name(&args.name)?;
     non_empty("repo", &args.repo)?;
 

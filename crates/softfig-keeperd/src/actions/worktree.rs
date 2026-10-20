@@ -129,33 +129,20 @@ impl<'a> WorkTree<'a> {
     /// [`member_reserved_refusal`] / [`member_fleet_refusal`]). A no-op unless
     /// this request runs for a fleet member ([`crate::caller`]).
     fn guard_member_write(&self, rel: &str, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
-        let Some(member) = crate::caller::member() else {
-            return Ok(());
-        };
-        let old = self.read(rel);
-        let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
-        let (old, new) = (text(old.as_deref()), text(new));
-        if bytes == Bytes::Caller
-            && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
-        {
-            return Err((ErrorKind::BadArgs, why));
-        }
-        if !is_backlog_rel(rel) {
+        if crate::caller::member().is_none() {
             return Ok(());
         }
-        if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-            return Err((ErrorKind::BadArgs, why));
-        }
-        if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-            return Err((ErrorKind::BadArgs, why));
-        }
-        if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-            return Err((ErrorKind::BadArgs, why));
-        }
-        if old.is_none() && new.is_some() && is_item_doc_path(rel) {
-            return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
-        }
-        Ok(())
+        guard_member_change(rel, self.read(rel).as_deref(), new, bytes)
+    }
+
+    /// [`check_write_bytes`](Self::check_write_bytes) against a known prior
+    /// content `old` (`None` = absent) instead of the working tree's — for
+    /// `batch`, whose op N must be guarded against op N−1's simulated result,
+    /// not the live tree it has not staged into yet (review 042 G74-8).
+    pub fn check_write_bytes_over(&self, rel: &str, old: Option<&[u8]>, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        self.check_write(rel)?;
+        guard_member_change(rel, old, Some(bytes), Bytes::Caller)
     }
 
     /// The same guard for removing `rel`, which may be a whole directory:
@@ -471,6 +458,38 @@ impl<'a> WorkTree<'a> {
             }
         }
     }
+}
+
+/// The member guards for replacing canonical `rel` from `old` to `new` (`None`
+/// = absent / removed) — see [`WorkTree::guard_member_write`]. A no-op for a
+/// request that runs for no fleet member.
+fn guard_member_change(rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
+    let Some(member) = crate::caller::member() else {
+        return Ok(());
+    };
+    let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
+    let (old, new) = (text(old), text(new));
+    if bytes == Bytes::Caller
+        && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
+    {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if !is_backlog_rel(rel) {
+        return Ok(());
+    }
+    if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if old.is_none() && new.is_some() && is_item_doc_path(rel) {
+        return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
+    }
+    Ok(())
 }
 
 /// Whether repo-relative `rel` lies under `growlight/backlog/` — the tree
@@ -956,6 +975,35 @@ mod tests {
         assert_eq!(wt.read_to_string(note).as_deref(), Some("# x\n\nold\n"), "op 0 unstaged");
         drop(inner);
         super::super::batch(&daemon, args).expect("a human's batch lands");
+    }
+
+    /// Review 042 G74-8: `batch` guards op N against op N−1's simulated result.
+    /// Op 0 adds a `> Fleet: no` (a tighten) and op 1 removes it again: refused
+    /// in validation, with op 0 never staged — before the fix op 1 passed
+    /// validation against the live tree and was refused only after op 0 landed.
+    #[test]
+    fn a_members_batch_is_guarded_against_its_own_earlier_ops() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        {
+            let inner = daemon.inner.lock().unwrap();
+            WorkTree::new(&daemon, &inner).write(SLICE, b"# a\n\nbody\n").unwrap();
+        }
+        let patch = |old: &str, new: &str| {
+            serde_json::json!({ "op": "patch_file", "args": { "path": SLICE, "old": old, "new": new } })
+        };
+        let args = serde_json::json!({ "ops": [
+            patch("body", "> Fleet: no\n\nbody"),
+            patch("> Fleet: no\n\n", ""),
+        ] });
+        let err = {
+            let _member = caller::enter(Some("c".into()));
+            super::super::batch(&daemon, args).unwrap_err()
+        };
+        assert!(err.1.contains("op[1]") && err.1.contains("loosens or removes"), "{err:?}");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some("# a\n\nbody\n"), "op 0 never staged");
     }
 
     #[test]

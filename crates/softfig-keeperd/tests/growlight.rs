@@ -708,6 +708,11 @@ fn a_member_is_held_to_log_baton_and_its_own_items_handoff_status() {
             op::REORDER_BACKLOG_ITEM,
             serde_json::json!({ "id": "001", "position": "top" }),
         ),
+        // Review 042 G74-7: registering a queue (and the repo it binds).
+        (
+            op::ADD_QUEUE,
+            serde_json::json!({ "name": "evil", "repo": "/home/u" }),
+        ),
     ] {
         let resp = member(verb, args);
         assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{verb}");
