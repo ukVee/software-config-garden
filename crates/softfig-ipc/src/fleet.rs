@@ -6,35 +6,14 @@
 /// marks the item human-only unless the value is `yes`. Returns the declared
 /// (non-`yes`) value when the item is held, `None` when it is claimable.
 ///
-/// Read the way `> Model:` is ([`crate::model_choice::item_model_field`]): the
-/// first blockquote line whose key is `fleet`, case-insensitive, anywhere in the
-/// doc. Lines inside a fenced code block don't count, so a doc that shows the
-/// marker as an example does not mark itself. Any value other than `yes` holds —
-/// a typo fails closed. See `growlight/backlog/CLAUDE.md` "Marking an item
+/// Read through the shared scanner ([`crate::item_meta::field`]): the first
+/// blockquote line whose key is `fleet`, case-insensitive, anywhere in the doc.
+/// Lines inside a fenced code block don't count, so a doc that shows the marker
+/// as an example does not mark itself. Any value other than `yes` holds — a typo
+/// or an empty value fails closed. See `growlight/backlog/CLAUDE.md` "Marking an item
 /// human-only".
 pub fn fleet_marker(doc: &str) -> Option<&str> {
-    let mut fenced = false;
-    for line in doc.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
-        }
-        let Some(rest) = trimmed.strip_prefix('>') else {
-            continue;
-        };
-        let Some((key, value)) = rest.trim().split_once(':') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("fleet") {
-            let value = value.trim();
-            return (!value.eq_ignore_ascii_case("yes")).then_some(value);
-        }
-    }
-    None
+    crate::item_meta::field(doc, crate::item_meta::FLEET).filter(|v| !v.eq_ignore_ascii_case("yes"))
 }
 
 /// Whether `doc` is held human-only: [`fleet_marker`] returned a non-`yes`

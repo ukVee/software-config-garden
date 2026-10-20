@@ -145,13 +145,7 @@ pub fn queue_add_entry(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
         .map_err(|e| (ErrorKind::BadArgs, format!("queue_add_entry args: {e}")))?;
     if let Some(member) = crate::caller::member()
         && let Some((field, key)) = member_reserved_field(&args) {
-            let key = {
-                let mut chars = key.chars();
-                match chars.next() {
-                    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-                    None => String::new(),
-                }
-            };
+            let key = softfig_ipc::item_meta::display_key(key);
             return Err((
                 ErrorKind::BadArgs,
                 format!(

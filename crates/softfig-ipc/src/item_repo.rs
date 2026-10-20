@@ -63,32 +63,12 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(10);
 /// The value of the doc's first `> Worktree:` blockquote line outside fenced
 /// code, trimmed; `None` when there is none or it is empty.
 ///
-/// The scan is the one 068's `> Fleet:` marker uses: the key is
-/// case-insensitive, a ```` ``` ```` / `~~~` fence toggles, and prose or inline
-/// code that merely mentions the marker doesn't count.
+/// Read through the shared scanner ([`crate::item_meta::field`]) every
+/// item-doc metadata reader uses: the key is case-insensitive, a ```` ``` ```` /
+/// `~~~` fence toggles, and prose or inline code that merely mentions the
+/// marker doesn't count.
 pub fn worktree_field(doc: &str) -> Option<&str> {
-    let mut fenced = false;
-    for line in doc.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
-        }
-        let Some(rest) = trimmed.strip_prefix('>') else {
-            continue;
-        };
-        let Some((key, value)) = rest.trim().split_once(':') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("worktree") {
-            let value = value.trim();
-            return (!value.is_empty()).then_some(value);
-        }
-    }
-    None
+    crate::item_meta::field(doc, crate::item_meta::WORKTREE).filter(|v| !v.is_empty())
 }
 
 /// The local repo path for an item: `worktree` (the doc's `> Worktree:`) if

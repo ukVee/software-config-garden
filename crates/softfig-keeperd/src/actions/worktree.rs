@@ -427,43 +427,46 @@ fn reserved_refusal(
 /// `old` with `new` at `rel` (`None` = absent / removed) adds, removes or
 /// changes a `> <key>:` line for any key in
 /// [`softfig_ipc::queue_v2::SUB_DOC_RESERVED`] — the `> Model:`, `> Grants:`
-/// and `> Worktree:` lines §6.7 reserves to humans. The refusal text leads with
-/// the wire code, `field_not_allowed`.
+/// and `> Worktree:` lines §6.7 reserves to humans. Two reads of the one
+/// scanner ([`softfig_ipc::item_meta`]) are compared: every raw line (fenced or
+/// not — an edit to a fenced example is refused too), and the value a resolver
+/// reads ([`softfig_ipc::item_meta::field`] — so a fence opened or closed
+/// around a real declaration, which moves no raw line, is refused as well;
+/// review 042 G74-6). The refusal text leads with the wire code,
+/// `field_not_allowed`.
 pub(crate) fn member_reserved_refusal(
     member: &str,
     rel: &str,
     old: Option<&str>,
     new: Option<&str>,
 ) -> Option<String> {
-    use softfig_ipc::queue_v2::{reserved_lines, SUB_DOC_RESERVED};
+    use softfig_ipc::item_meta::{display_key, field, reserved_lines};
+    use softfig_ipc::queue_v2::SUB_DOC_RESERVED;
     for key in SUB_DOC_RESERVED {
         let before = old.map(|t| reserved_lines(t, &[key])).unwrap_or_default();
         let after = new.map(|t| reserved_lines(t, &[key])).unwrap_or_default();
-        if before == after {
-            continue;
-        }
-        let key = capitalized(key);
+        let resolved_same = old.and_then(|t| field(t, key)) == new.and_then(|t| field(t, key));
         let what = match (before.is_empty(), after.is_empty()) {
-            (true, _) => format!("adds a `> {key}:` line"),
-            (false, true) => format!("removes its `> {key}:` line"),
-            (false, false) => format!("changes its `> {key}:` line"),
+            _ if before == after && resolved_same => continue,
+            _ if before == after => format!(
+                "changes which `> {}:` line its resolver reads (a fence opened or closed around \
+                 one)",
+                display_key(key)
+            ),
+            (true, _) => format!("adds a `> {}:` line", display_key(key)),
+            (false, true) => format!("removes its `> {}:` line", display_key(key)),
+            (false, false) => format!("changes its `> {}:` line", display_key(key)),
         };
+        let key = display_key(key);
         return Some(format!(
             "field_not_allowed: this write {what} in {rel}, and fleet member {member} may not \
              add, remove or change a `> {key}:` line under growlight/backlog/ \
-             (spec-growlight-queue §6.7)."
+             (spec-growlight-queue §6.7). Leave the line as it is; if it is wrong, file_report \
+             it or post_message @human. A slice body handed to slice_insert / slice_update may \
+             still declare `> Model:`, a subset of what the entry allows."
         ));
     }
     None
-}
-
-/// `model` → `Model`, for the refusal text.
-fn capitalized(key: &str) -> String {
-    let mut chars = key.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
-    }
 }
 
 /// [`member_fleet_refusal`] as the worktree's error, for a change the caller
@@ -734,11 +737,11 @@ mod tests {
         assert_eq!(member_reserved_refusal("c", rel, Some("`> Worktree: /tmp/x`\n"), None), None);
     }
 
-    /// A reserved line inside a fenced code block still matches, because the
-    /// `> Model:` resolver reads fenced lines too — a guard that ignored fenced
-    /// lines would let a member hide a `> Model:` change in a fence. (Over-
-    /// guarding a fenced `> Grants:` / `> Worktree:` example is a benign false
-    /// positive, not a hole.)
+    /// A reserved line inside a fenced code block still matches: the guard
+    /// compares every raw line, fenced or not, as well as the resolved value,
+    /// so a member can neither edit a fenced line nor toggle a fence to change
+    /// what the resolver reads. (Over-guarding a fenced example is a benign
+    /// false positive, not a hole.)
     #[test]
     fn a_fenced_reserved_line_still_matches() {
         let rel = "growlight/backlog/milestones/m/slices/001-a.md";
@@ -751,6 +754,28 @@ mod tests {
             member_reserved_refusal("c", rel, Some(fenced), Some("# t\n")).is_some(),
             "removing a fenced model line is still refused",
         );
+    }
+
+    /// Review 042 G74-6: a fence line inserted above a `> Worktree:` declaration
+    /// moves no raw line, but the repo resolver stops reading it — refused, in
+    /// both directions, through the pure guard and a real worktree write.
+    #[test]
+    fn a_fence_that_hides_or_reveals_a_reserved_line_is_refused() {
+        let rel = "growlight/backlog/tasks/001-x.md";
+        let declared = "# t\n\n> Worktree: /tmp/x\n";
+        let hidden = "# t\n\n```\n> Worktree: /tmp/x\n";
+        let why = member_reserved_refusal("c", rel, Some(declared), Some(hidden)).unwrap();
+        assert!(why.contains("changes which `> Worktree:` line"), "{why}");
+        assert!(member_reserved_refusal("c", rel, Some(hidden), Some(declared)).is_some(), "un-hiding");
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(rel, declared.as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        assert!(wt.write(rel, hidden.as_bytes()).is_err(), "the fence trick is refused");
+        assert_eq!(wt.read_to_string(rel).as_deref(), Some(declared), "nothing written");
     }
 
     /// The `> Fleet:` guard is tighten-only in the pure sense: a member's write

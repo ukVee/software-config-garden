@@ -12,6 +12,7 @@ pub mod baton;
 pub mod client;
 pub mod fleet;
 pub mod growlightd;
+pub mod item_meta;
 pub mod item_repo;
 pub mod member;
 pub mod model_choice;

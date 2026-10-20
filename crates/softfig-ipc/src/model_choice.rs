@@ -225,17 +225,13 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec> {
 ///
 /// The field rides the same leading blockquote metadata block the item docs
 /// already use for `> Last reviewed:` / `> Design:`, so declaring a model is one
-/// line and needs no new file. Only a blockquote line counts — prose mentioning a
-/// model can't be mistaken for a declaration — and the first one wins. Pure.
+/// line and needs no new file. Read through the shared scanner
+/// ([`crate::item_meta::field`]): only a blockquote line counts — prose
+/// mentioning a model can't be mistaken for a declaration — a line inside a
+/// fenced example doesn't, and the first one wins (an empty first line is no
+/// declaration). Pure.
 pub fn item_model_field(doc: &str) -> Option<&str> {
-    doc.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix('>')?;
-        let (key, value) = rest.trim().split_once(':')?;
-        key.trim()
-            .eq_ignore_ascii_case("model")
-            .then(|| value.trim())
-            .filter(|v| !v.is_empty())
-    })
+    crate::item_meta::field(doc, crate::item_meta::MODEL).filter(|v| !v.is_empty())
 }
 
 /// An ordered, non-empty list of model specs — the comma-list form of §6.4
