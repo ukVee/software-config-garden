@@ -516,7 +516,7 @@ pub fn add_queue(daemon: &Daemon, args: serde_json::Value) -> HandlerResult {
         let item_tag = queues::item_region_tag(&args.name);
         let heading = format!("Queue: {}", args.name);
         let content = upsert_section_region(&content, &heading, &item_tag, &queue::render(&[]));
-        wt.write(&rel, content.as_bytes())?;
+        wt.write_derived(&rel, content.as_bytes())?;
     }
 
     let payload = serde_json::json!({ "name": args.name, "repo": args.repo });
@@ -689,7 +689,7 @@ pub fn set_item_status(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             rows[idx].status = args.status.clone();
 
             let new = managed::upsert(&content, &tag, &queue::render(&rows));
-            wt.write(&rel, new.as_bytes())?;
+            wt.write_derived(&rel, new.as_bytes())?;
             (true, key, holder_op)
         }
     };
@@ -804,7 +804,7 @@ pub fn reorder_backlog_item(daemon: &Daemon, args: serde_json::Value) -> Handler
         // status cell (and which single item is `active`) is preserved. Scoped
         // to the resolved queue's region, so order is reprioritized per queue.
         let new = managed::upsert(&content, &tag, &queue::render(&moved));
-        wt.write(&rel, new.as_bytes())?;
+        wt.write_derived(&rel, new.as_bytes())?;
         new_index
     };
 
@@ -866,7 +866,7 @@ fn enqueue(
     }
     rows.push(row);
     let new = managed::upsert(&content, tag, &queue::render(&rows));
-    wt.write(&rel, new.as_bytes())?;
+    wt.write_derived(&rel, new.as_bytes())?;
     Ok(())
 }
 

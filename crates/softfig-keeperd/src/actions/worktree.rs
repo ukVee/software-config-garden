@@ -32,6 +32,16 @@ use crate::daemon::{Daemon, DaemonInner};
 
 type ActionResult = Result<(), (ErrorKind, String)>;
 
+/// Whose bytes a write carries, for the member guard's managed-region rule
+/// (review 042 G74-1): the caller's own ([`WorkTree::write`]), which may not
+/// change a daemon-managed region, or the daemon's re-derivation of one
+/// ([`WorkTree::write_derived`]), which only ever changes a region.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bytes {
+    Caller,
+    Derived,
+}
+
 /// One entry from [`WorkTree::read_dir`].
 pub struct DirEntry {
     /// Final path component (file or directory name).
@@ -98,33 +108,41 @@ impl<'a> WorkTree<'a> {
     }
 
     /// [`check_write`](Self::check_write) plus the content check
-    /// [`write`](Self::write) makes for these exact bytes: §6.7's guard on a
-    /// member's reserved `> Model:` / `> Grants:` / `> Worktree:` lines
+    /// [`write`](Self::write) makes for these exact bytes: the member guards —
+    /// no hand edit of a daemon-managed region ([`member_region_refusal`]),
+    /// §6.7's reserved `> Model:` / `> Grants:` / `> Worktree:` lines
     /// ([`member_reserved_refusal`]) and the `> Fleet:` hold
     /// ([`member_fleet_refusal`]). A verb that stages more than one file runs
     /// this over each before its first write, like `check_write`.
     pub fn check_write_bytes(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
-        self.guard_member_write(rel, Some(bytes))
+        self.guard_member_write(rel, Some(bytes), Bytes::Caller)
     }
 
-    /// §6.7's member guards for replacing `rel` with `new` (`None` = removing it):
-    /// the three reserved metadata lines (`> Model:`, `> Grants:`, `> Worktree:`)
-    /// are member-immutable and the `> Fleet:` line is member-tighten-only (see
+    /// The member guards for replacing `rel` with `new` (`None` = removing it).
+    /// Anywhere in the garden, the caller's bytes may not change a
+    /// daemon-managed region ([`member_region_refusal`]; `bytes` says whether
+    /// they are the caller's). Under `growlight/backlog/`, the three reserved
+    /// metadata lines (`> Model:`, `> Grants:`, `> Worktree:`) are
+    /// member-immutable and the `> Fleet:` line is member-tighten-only (see
     /// [`member_reserved_refusal`] / [`member_fleet_refusal`]). A no-op unless
-    /// this request runs for a fleet member ([`crate::caller`]) and `rel` lies
-    /// under `growlight/backlog/`.
-    fn guard_member_write(&self, rel: &str, new: Option<&[u8]>) -> ActionResult {
+    /// this request runs for a fleet member ([`crate::caller`]).
+    fn guard_member_write(&self, rel: &str, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
-        if !is_backlog_rel(rel) {
-            return Ok(());
-        }
         let old = self.read(rel);
         let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
         let (old, new) = (text(old.as_deref()), text(new));
+        if bytes == Bytes::Caller
+            && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
+        {
+            return Err((ErrorKind::BadArgs, why));
+        }
+        if !is_backlog_rel(rel) {
+            return Ok(());
+        }
         if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
             return Err((ErrorKind::BadArgs, why));
         }
@@ -155,6 +173,11 @@ impl<'a> WorkTree<'a> {
         }
         if let Some((doc, text)) = self.first_fleet_doc(&scope) {
             return Err(fleet_refusal(&member, &doc, Some(&text), None));
+        }
+        if let Some((doc, text)) = self.first_doc_with(&scope, |t| !super::managed::regions(t).is_empty()) {
+            let why = member_region_refusal(&member, &doc, Some(&text), None)
+                .expect("a doc carrying a managed region");
+            return Err((ErrorKind::BadArgs, why));
         }
         Ok(())
     }
@@ -330,6 +353,20 @@ impl<'a> WorkTree<'a> {
         self.stage(rel, bytes)
     }
 
+    /// [`write`](Self::write) for the daemon's own re-derivation of a managed
+    /// region — an index `Reviewed` cell, a backlinks list, a growlight queue
+    /// table its verb moved, the reports index. The bytes are the doc as it
+    /// stood with only that region rewritten, so the member guard's
+    /// managed-region refusal (review 042 G74-1) does not apply; every other
+    /// check `write` makes still does. A member's own bytes go through
+    /// [`write`](Self::write), never here.
+    pub fn write_derived(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        self.check_write(rel)?;
+        self.guard_member_write(rel, Some(bytes), Bytes::Derived)?;
+        self.stage(rel, bytes)
+    }
+
     /// The backend half of a write, every check already made.
     fn stage(&self, rel: &str, bytes: &[u8]) -> ActionResult {
         match self {
@@ -478,6 +515,39 @@ pub(crate) fn member_reserved_refusal(
         ));
     }
     None
+}
+
+/// The member managed-region guard, pure: `Some(refusal)` when replacing `old`
+/// with `new` at `rel` (`None` = absent / removed) changes a daemon-managed
+/// `<!-- softfig:… -->` region — edits its body, adds one (a new doc carrying
+/// a marker counts), or drops one ([`super::managed::changed_regions`]).
+///
+/// Review 042 G74-1: the region verbs (`patch_file`, the section verbs,
+/// `batch`) already refuse a region change for every caller, but
+/// `replace_file` is break-glass and does not, and growlightd schedules from
+/// the queue tables it would rewrite — another item's status, the row order,
+/// a `## Queues` repo cell (tomorrow's `$REPO` grant). A region is the
+/// daemon's: derived (an index, backlinks) or owned (a queue table only the
+/// growlight verbs move). The human keeps break-glass; a member does not. The
+/// refusal text leads with the wire code, `member_not_allowed`.
+pub(crate) fn member_region_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<String> {
+    let changed = super::managed::changed_regions(old.unwrap_or(""), new.unwrap_or(""));
+    if changed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "member_not_allowed: this write changes the daemon-managed `{}` region in {rel}, and \
+         fleet member {member} may not edit one by hand — an index or backlinks table is \
+         derived, and a growlight queue table moves only through the growlight verbs. Edit \
+         the prose around it; if the region itself is wrong, file_report it or post_message \
+         @human. (spec-growlight-queue §6.7)",
+        changed.join("`, `")
+    ))
 }
 
 /// [`member_fleet_refusal`] as the worktree's error, for a change the caller
@@ -787,6 +857,42 @@ mod tests {
             member_reserved_refusal("c", rel, Some(fenced), Some("# t\n")).is_some(),
             "removing a fenced model line is still refused",
         );
+    }
+
+    /// Review 042 G74-1: a member's own bytes may not change a daemon-managed
+    /// region anywhere — edit its body, add one, or drop one — while the
+    /// daemon's re-derivation (`write_derived`) still lands under the member's
+    /// scope, and the prose around a region stays the member's to edit.
+    #[test]
+    fn a_members_write_may_not_change_a_managed_region() {
+        let host = "growlight/backlog/CLAUDE.md";
+        let table = |status: &str| {
+            format!(
+                "# backlog\n\nprose\n\n<!-- softfig:queue -->\n\n| # | id | type | title | status |\n\
+                 |---|----|------|-------|--------|\n| 1 | 066 | task | T | {status} |\n\n\
+                 <!-- /softfig:queue -->\n"
+            )
+        };
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(host, table("queued").as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.write(host, table("done").as_bytes()).unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:") && err.1.contains("`queue` region"), "{err:?}");
+        assert!(wt.write(host, b"# backlog\n\nthe table is gone\n").is_err(), "dropping it");
+        assert!(wt.check_write_bytes(host, table("done").as_bytes()).is_err(), "the pre-check agrees");
+        assert!(
+            wt.write("projects/p/notes/001-x.md", table("queued").as_bytes()).is_err(),
+            "a new doc carrying a region marker, outside the backlog too"
+        );
+        assert!(wt.remove(host).is_err(), "deleting the queue doc");
+        assert_eq!(wt.read_to_string(host), Some(table("queued")), "all refused untouched");
+        wt.write(host, table("queued").replace("prose", "edited prose").as_bytes())
+            .expect("the prose around the region is the member's");
+        wt.write_derived(host, table("done").replace("prose", "edited prose").as_bytes())
+            .expect("the daemon's re-derivation of the region");
     }
 
     /// Review 042 G74-3: every spelling of a garden path canonicalises to one,

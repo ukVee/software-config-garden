@@ -815,6 +815,67 @@ fn a_path_alias_does_not_skip_the_member_guard() {
     }
 }
 
+/// Review 042 G74-1: a member's `replace_file` of the backlog doc may not
+/// rewrite the queue tables growlightd schedules from — another item's status,
+/// the row order, a `## Queues` repo cell — while the region upkeep the
+/// member's sanctioned verbs trigger still lands: its own item's handoff (the
+/// queue table), `file_report` (the reports index) and an edit to a slice doc
+/// (the milestone's slices index).
+#[test]
+fn a_member_cannot_rewrite_the_queue_tables_with_replace_file() {
+    let fx = Fixture::start();
+    fx.add_milestone("ours", "Ours");
+    fx.add_milestone("theirs", "Theirs");
+    assert!(matches!(
+        fx.call(op::ADD_QUEUE, serde_json::json!({ "name": "psy", "repo": "/home/u/psy" })),
+        Response::Ok { .. }
+    ));
+    let backlog = fx.backlog();
+    for (what, forged) in [
+        ("another item's status", backlog.replace("| Theirs | queued |", "| Theirs | done |")),
+        ("a registry repo cell", backlog.replace("/home/u/psy", "/home/u")),
+    ] {
+        assert_ne!(forged, backlog, "{what}: the forgery changes something");
+        let resp = as_member(
+            &fx,
+            op::REPLACE_FILE,
+            serde_json::json!({ "path": "growlight/backlog/CLAUDE.md", "content": forged }),
+        );
+        assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{what}: {resp:?}");
+        assert_eq!(fx.backlog(), backlog, "{what}: nothing written");
+    }
+
+    // The sanctioned verbs' region upkeep is unaffected.
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "ours", "status": "active", "holder": "m-a" })
+        ),
+        Response::Ok { .. }
+    ));
+    let resp = as_member(&fx, op::SET_ITEM_STATUS, serde_json::json!({ "id": "ours", "status": "deferred" }));
+    assert!(matches!(resp, Response::Ok { .. }), "own handoff: {resp:?}");
+    let resp = as_member(
+        &fx,
+        op::FILE_REPORT,
+        serde_json::json!({
+            "title": "a thing I noticed", "body": "details", "tags": ["type:bug"], "from": "m-a"
+        }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "file_report: {resp:?}");
+    let slice: AddSliceReply = serde_json::from_value(ok_data(fx.call(
+        op::ADD_SLICE,
+        serde_json::json!({ "milestone": "ours", "slug": "first", "body": "plan body" }),
+    )))
+    .unwrap();
+    let resp = as_member(
+        &fx,
+        op::PATCH_FILE,
+        serde_json::json!({ "path": slice.path, "old": "plan body", "new": "plan body, refined" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "a slice edit: {resp:?}");
+}
+
 // ---- reorder_backlog_item ---------------------------------------------
 
 #[test]
