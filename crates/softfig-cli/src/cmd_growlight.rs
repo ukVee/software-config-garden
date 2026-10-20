@@ -464,12 +464,12 @@ fn start(args: StartArgs) -> Result<()> {
     let baton_seeded = seed_if_absent(&baton_path, &seed_baton(garden_name, &today_iso()))?;
     let questions_seeded = seed_if_absent(&questions_path, SEED_QUESTIONS)?;
 
-    // Task 064: surface a repo left dirty AND newer than the baton's last handoff
-    // (report 001's cut-off signature) BEFORE anything is launched. The baton is
-    // seeded by now, so its mtime is the prior handoff — or the just-now seed,
-    // against which a stale tree reads as NOT newer and stays silent. Read-only
-    // and best-effort; a failed probe never blocks a launch.
-    if let Some(line) = boot_dirty_check(&garden_root, &baton_path) {
+    // Task 064: surface a repo whose dirt the baton doesn't know about (report
+    // 001's cut-off signature) BEFORE anything is launched: dirt newer than a
+    // carried baton's last write, or any dirt under a baton just seeded (review
+    // 043 G64-2 — a fresh seed's own mtime is "now", which no dirt is newer than).
+    // Read-only and best-effort; a failed probe never blocks a launch.
+    if let Some(line) = boot_dirty_check(&garden_root, &baton_path, baton_seeded) {
         eprintln!("{line}");
     }
 
@@ -583,39 +583,27 @@ fn start(args: StartArgs) -> Result<()> {
 }
 
 /// Task 064 — the semi-auto/CLI half of the boot-time dirty-tree guard: at
-/// `start`, resolve the root baton's active item repo ([`baton_item_repo`]) and,
-/// when the repo is dirty AND newer than the baton's last handoff, return the
-/// same journal line growlightd prints before a member spawn, so the human
-/// launching the loop sees it before the agent does new work. Read-only: it
-/// only ever *surfaces* the answer, never reverts, stages or commits.
-/// Best-effort — a missing item, an unprobeable repo or a `git` failure is
-/// `None`, never a launch failure.
-fn boot_dirty_check(garden_root: &Path, baton_path: &Path) -> Option<String> {
+/// `start`, resolve the root baton's active item repo ([`baton_item_repo`]) and
+/// return the signal growlightd journals before a member spawn
+/// ([`softfig_ipc::item_repo::boot_signal`] — the same text, so the human
+/// launching the loop sees it before the agent does new work). `seeded` says
+/// the baton was just written (no prior handoff, so any dirt surfaces);
+/// otherwise its last write is the handoff. Read-only: it only ever
+/// *surfaces* the answer, never reverts, stages or commits. Best-effort — a
+/// missing item, an unprobeable repo or a `git` failure is `None`, never a
+/// launch failure.
+fn boot_dirty_check(garden_root: &Path, baton_path: &Path, seeded: bool) -> Option<String> {
+    use softfig_ipc::item_repo::{boot_signal, probe, Handoff};
     let view = parse_baton(&fs::read_to_string(baton_path).ok()?);
     let item = view.item.as_deref()?;
     let repo = baton_item_repo(garden_root, item)?;
-    let state = softfig_ipc::item_repo::probe(&repo).ok()?;
-    let baton_mtime = fs::metadata(baton_path).and_then(|md| md.modified()).ok()?;
-    if !softfig_ipc::item_repo::dirty_newer_than(&state, baton_mtime) {
-        return None;
-    }
-    let dirty = state.dirty;
-    Some(
-        match state
-            .newest_dirty_mtime
-            .and_then(|m| m.duration_since(baton_mtime).ok())
-        {
-            Some(newer_by) => format!(
-                "growlight: boot dirty tree: {item}: {} has {dirty} uncommitted path(s), newest ~{}s newer than the baton handoff",
-                repo.display(),
-                newer_by.as_secs(),
-            ),
-            None => format!(
-                "growlight: boot dirty tree: {item}: {} has {dirty} uncommitted path(s), newest newer than the baton handoff",
-                repo.display(),
-            ),
-        },
-    )
+    let state = probe(&repo).ok()?;
+    let handoff = if seeded {
+        Handoff::Fresh
+    } else {
+        Handoff::At(fs::metadata(baton_path).and_then(|md| md.modified()).ok()?)
+    };
+    boot_signal(item, &repo, &state, handoff).map(|signal| format!("growlight: {signal}"))
 }
 
 /// The repo the semi-auto baton's item lands in, through the one resolver
@@ -3442,17 +3430,17 @@ mod tests {
 
         // No active item -> no signal.
         fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: null\n---\n").unwrap();
-        assert!(boot_dirty_check(&root, &baton).is_none());
+        assert!(boot_dirty_check(&root, &baton, false).is_none());
 
         // A baton naming the item, backdated before the tree's last edit.
         fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: 200\n---\n").unwrap();
         backdate_mtime(&baton);
         // Clean tree -> no signal.
-        assert!(boot_dirty_check(&root, &baton).is_none());
+        assert!(boot_dirty_check(&root, &baton, false).is_none());
 
         // Leave one uncommitted edit, newer than the (backdated) baton.
         fs::write(repo.join("a.txt"), "dirty\n").unwrap();
-        let line = boot_dirty_check(&root, &baton)
+        let line = boot_dirty_check(&root, &baton, false)
             .expect("a dirty tree newer than the baton handoff surfaces");
         assert!(line.contains("200"), "names the item: {line}");
         assert!(
@@ -3505,8 +3493,15 @@ mod tests {
         backdate_mtime(&baton);
         fs::write(repo.join("gate.rs"), "cut off mid-slice\n").unwrap();
 
-        let line = boot_dirty_check(&root, &baton).expect("the registry names the fid repo");
+        let line = boot_dirty_check(&root, &baton, false).expect("the registry names the fid repo");
         assert!(line.contains(&repo.display().to_string()), "names the registry's repo: {line}");
+
+        // Review 043 G64-2: a baton `start` just seeded has no handoff, so the
+        // dirt surfaces even though the seed's mtime is newer than every edit.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: fid-pam\n---\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none(), "a just-written carried baton is newer");
+        let fresh = boot_dirty_check(&root, &baton, true).expect("a fresh seed surfaces any dirt");
+        assert!(fresh.contains("fresh"), "{fresh}");
         fs::remove_dir_all(&root).ok();
     }
 

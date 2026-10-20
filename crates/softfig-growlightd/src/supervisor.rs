@@ -1231,6 +1231,24 @@ impl Supervisor {
         now: i64,
         workable: &dyn Fn(&str) -> bool,
     ) -> Vec<RerollOutcome> {
+        self.tick_with(budget, rate, now, workable, &|_| {})
+    }
+
+    /// Like [`tick`](Self::tick), but calls `pre_spawn(agent)` for each member
+    /// it is about to re-roll — after admission admits the roll, immediately
+    /// before the backend spawns — the re-roll twin of
+    /// [`start_claiming`](Self::start_claiming)'s closure. The drive loop runs
+    /// the boot dirty-tree guard here (task 064 review G64-1), so its warning is
+    /// in the member's baton before the member boots; on the old post-spawn call
+    /// a claude member's SessionStart hook raced the git probe.
+    pub fn tick_with(
+        &mut self,
+        budget: BudgetUsage,
+        rate: RateState,
+        now: i64,
+        workable: &dyn Fn(&str) -> bool,
+        pre_spawn: &dyn Fn(&str),
+    ) -> Vec<RerollOutcome> {
         let candidates: Vec<String> = self
             .agents
             .iter()
@@ -1267,6 +1285,7 @@ impl Supervisor {
                 continue;
             }
             let spec = self.agents[&agent].spec.clone();
+            pre_spawn(&agent);
             match self.backend.spawn(&spec) {
                 Ok(child) => {
                     let sup = self.agents.get_mut(&agent).expect("candidate exists");

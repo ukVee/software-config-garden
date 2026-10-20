@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 use softfig_ipc::baton::parse_baton;
 
-use crate::drive_loop::{BatonRead, BatonSeeder, BatonStatusSource};
+use crate::drive_loop::{BatonRead, BatonSeeder, BatonStatusSource, SeedOutcome};
 use crate::preapproval::agent_paths;
 
 /// The filesystem-backed per-member baton store over the runtime `agents/`
@@ -94,7 +94,7 @@ impl FsBatonStore {
 }
 
 impl BatonSeeder for FsBatonStore {
-    fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<(), String> {
+    fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<SeedOutcome, String> {
         let path = self.baton_path(agent);
         // A fresh start on the SAME item keeps the member's own baton: after a
         // growlightd restart the boot reaper resets the orphaned-`active` item to
@@ -105,9 +105,12 @@ impl BatonSeeder for FsBatonStore {
         // generic template would throw that context away on every daemon bounce
         // (the task-032 phantom stops made bounces a live concern). A baton for a
         // DIFFERENT item (or none, or unparseable) seeds fresh as before.
+        // The kept baton's last write is the item's last handoff (task 064
+        // review G64-2) — the boot dirty-tree guard compares the tree against it.
         if let Ok(existing) = fs::read_to_string(&path)
             && parse_baton(&existing).item.as_deref() == Some(part) {
-                return Ok(());
+                let handoff = fs::metadata(&path).and_then(|md| md.modified()).ok();
+                return Ok(SeedOutcome::Kept { handoff });
             }
         // The agent dir is created by the pre-approval generator on spawn, but the
         // seed is written BEFORE that spawn (so the SessionStart hook finds a
@@ -117,24 +120,20 @@ impl BatonSeeder for FsBatonStore {
                 .map_err(|e| format!("create agent dir {}: {e}", dir.display()))?;
         }
         let body = seed_baton(&self.garden_name, agent, queue, part, &path);
-        fs::write(&path, body).map_err(|e| format!("write baton {}: {e}", path.display()))
+        fs::write(&path, body).map_err(|e| format!("write baton {}: {e}", path.display()))?;
+        Ok(SeedOutcome::Fresh)
     }
 
-    fn warn_dirty_tree(
-        &self,
-        agent: &str,
-        repo: &Path,
-        dirty: usize,
-    ) -> Result<(), String> {
+    fn warn_dirty_tree(&self, agent: &str, signal: &str) -> Result<(), String> {
         use std::io::Write;
         let path = self.baton_path(agent);
         let section = format!(
             "\n# ⚠️ PRE-EXISTING DIRTY TREE\n\n\
-             The repo `{}` had {dirty} uncommitted path(s) when you were spawned,\n\
-             newer than this baton's last handoff — a prior session likely worked and was\n\
-             cut off before committing. Review `git status` there before starting new\n\
-             work. This guard is read-only: it reverted, staged and committed nothing.\n",
-            repo.display()
+             growlightd, before this session spawned: {signal}.\n\n\
+             A prior session likely worked there and was cut off before committing. Review\n\
+             `git status` in that repo before starting new work, and never discard changes\n\
+             you have not reviewed. This guard is read-only: it reverted, staged and\n\
+             committed nothing.\n"
         );
         let mut file = fs::OpenOptions::new()
             .create(true)
