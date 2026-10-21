@@ -37,7 +37,7 @@ use crate::cert::StoredCert;
 use crate::config::{AcceptConfig, ServeConfig};
 use crate::error::{Error, Result};
 use crate::executor::{self, SandboxBinaries};
-use crate::jobs::{append_ndjson, Job, JobRecord, JobTable};
+use crate::jobs::{append_ndjson, Job, JobKey, JobRecord, JobTable};
 use crate::keys::RunnerKeys;
 use crate::log::{read_framed_chunks, JobLogs, LogSink};
 use crate::state::StateRoot;
@@ -194,6 +194,10 @@ impl WireServer {
             Some(frame::Kind::JobOffer(offer)) => {
                 match self.authorize(&offer, &device_id, session.peer_static(), &accept, &serve) {
                     None => {
+                        // The job's name on this runner (m2). A `job_id` that isn't
+                        // 16 bytes drops the connection like any malformed offer,
+                        // before anything is accepted or written.
+                        let key = JobKey::new(device_id, &offer.job_id)?;
                         // Power state (spec §6 step 1): refuse on battery when the
                         // `[serve]` table says refuse, before any source transfer.
                         let on_batt = on_battery(&self.power_supply_path)?;
@@ -208,7 +212,7 @@ impl WireServer {
                             job_id: offer.job_id.clone(),
                             queue_pos: 0,
                         }))?;
-                        self.serve_source(session, &offer, &serve, on_batt, device_id, &cert)?;
+                        self.serve_source(session, &offer, &serve, on_batt, key, &cert)?;
                     }
                     Some(reason) => {
                         session.send_frame(&Frame::job_reject(JobReject {
@@ -326,7 +330,7 @@ impl WireServer {
         offer: &softfig_net::proto::JobOffer,
         serve: &ServeConfig,
         on_battery: bool,
-        requester_device: [u8; 32],
+        key: JobKey,
         cert: &StoredCert,
     ) -> Result<()> {
         let source_id = softfig_source::SourceId::decode(&offer.source_id)
@@ -379,7 +383,7 @@ impl WireServer {
         // `/tmp`: the unit's `PrivateTmp` hides `/tmp` from its payload, and
         // `ProtectSystem=strict` re-opens only the state root via
         // `ReadWritePaths`). Then run the real fetch → run → collect sequence.
-        let job_dir = self.root.jobs_dir().join(hex::encode(&offer.job_id));
+        let job_dir = key.scratch_dir(&self.root);
         std::fs::create_dir_all(&job_dir)?;
         let src_dir = job_dir.join("src");
         backend
@@ -428,8 +432,7 @@ impl WireServer {
         // attach/cancel can find the job while it is still running (spec §6).
         let logs = JobLogs::new();
         let job = Arc::new(Job {
-            job_id: offer.job_id.clone(),
-            requester_device,
+            key,
             unit: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             logs: logs.clone(),
@@ -488,7 +491,7 @@ impl WireServer {
         // file back after the unit completes (unit-mode log capture).
         let started_at = now_unix();
         let unit = if matches!(self.manager, Manager::System | Manager::User) {
-            let name = unit_name(&offer.job_id);
+            let name = unit_name(&key);
             *job.unit.lock().unwrap() = Some(name.clone());
             Some(name)
         } else {
@@ -513,7 +516,7 @@ impl WireServer {
         let writer = match drain.join() {
             Ok(w) => w,
             Err(_) => {
-                self.jobs.remove(&offer.job_id);
+                self.jobs.remove(&key);
                 return Err(Error::Protocol("log drain thread panicked".into()));
             }
         };
@@ -533,7 +536,7 @@ impl WireServer {
                     &repo_key,
                     &outcome,
                     caps_hit,
-                    requester_device,
+                    key.device_id(),
                     cert,
                     &logs,
                     started_at,
@@ -591,7 +594,7 @@ impl WireServer {
                     "softfig-runnerd: job {} rejected (toolchain-missing): {add_cmd}",
                     hex::encode(&offer.job_id)
                 );
-                self.jobs.remove(&offer.job_id);
+                self.jobs.remove(&key);
                 let mut w = writer;
                 w.send_frame(&Frame::job_reject(JobReject {
                     job_id: offer.job_id.clone(),
@@ -599,7 +602,7 @@ impl WireServer {
                 }))?;
             }
             Err(e) => {
-                self.jobs.remove(&offer.job_id);
+                self.jobs.remove(&key);
                 return Err(e);
             }
         }
@@ -742,7 +745,10 @@ impl WireServer {
             }))?;
             return Ok(());
         }
-        let Some(job) = self.jobs.get(&attach.job_id) else {
+        // Keyed by the authenticated requester, so another requester's job
+        // (and a malformed id) is simply not found.
+        let job = JobKey::new(*device_id, &attach.job_id).ok().and_then(|k| self.jobs.get(&k));
+        let Some(job) = job else {
             session.send_frame(&Frame::job_event(JobEvent {
                 job_id: attach.job_id.clone(),
                 state: JobState::Lost as u32,
@@ -750,13 +756,6 @@ impl WireServer {
             }))?;
             return Ok(());
         };
-        if job.requester_device != *device_id {
-            session.send_frame(&Frame::job_reject(JobReject {
-                job_id: attach.job_id.clone(),
-                reason: softfig_net::JobRejectReason::NotGranted.to_u32(),
-            }))?;
-            return Ok(());
-        }
 
         // Replay the retained ring from `from_seq`, then follow live until the
         // result is set (the job completed and stored it).
@@ -816,7 +815,10 @@ impl WireServer {
             }))?;
             return Ok(());
         }
-        let Some(job) = self.jobs.get(&cancel.job_id) else {
+        // Keyed by the authenticated requester, so another requester's job
+        // (and a malformed id) is simply not found.
+        let job = JobKey::new(*device_id, &cancel.job_id).ok().and_then(|k| self.jobs.get(&k));
+        let Some(job) = job else {
             session.send_frame(&Frame::job_event(JobEvent {
                 job_id: cancel.job_id.clone(),
                 state: JobState::Lost as u32,
@@ -824,13 +826,6 @@ impl WireServer {
             }))?;
             return Ok(());
         };
-        if job.requester_device != *device_id {
-            session.send_frame(&Frame::job_reject(JobReject {
-                job_id: cancel.job_id.clone(),
-                reason: softfig_net::JobRejectReason::NotGranted.to_u32(),
-            }))?;
-            return Ok(());
-        }
         job.cancelled.store(true, Ordering::SeqCst);
         if let Some(unit) = job.unit.lock().unwrap().as_ref() {
             stop_unit(self.manager, unit);
@@ -846,8 +841,8 @@ impl WireServer {
     /// Remove jobs whose TTL elapsed, plus their scratch dirs.
     fn sweep_expired(&self) {
         let expired = self.jobs.sweep(self.ttl_secs);
-        for id in expired {
-            let _ = std::fs::remove_dir_all(self.root.jobs_dir().join(hex::encode(id)));
+        for key in expired {
+            let _ = std::fs::remove_dir_all(key.scratch_dir(&self.root));
         }
     }
 }

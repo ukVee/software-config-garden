@@ -49,7 +49,7 @@ pub use config::{AcceptConfig, AcceptedPeer, BatteryCaps, ServeConfig};
 pub use error::{Error, Result};
 pub use executor::{parse_duration, parse_size, Artifact, RunOutcome, SandboxBinaries};
 pub use fetch::{toolchain_add_command, toolchain_missing};
-pub use jobs::{append_ndjson, Job, JobRecord, JobTable};
+pub use jobs::{append_ndjson, Job, JobKey, JobRecord, JobTable, JOB_ID_LEN};
 pub use keys::RunnerKeys;
 pub use log::{read_framed_chunks, write_framed_chunk, DEFAULT_LOG_RING_BYTES, JobLogs, LogChunk, LogSink};
 pub use proxy::{host_allowed, EgressProxy};

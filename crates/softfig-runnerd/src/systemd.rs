@@ -23,14 +23,17 @@ use softfig_sandbox::JobContext;
 use crate::config::ServeConfig;
 use crate::error::{Error, Result};
 use crate::executor::{parse_duration, parse_size, RunOutcome};
+use crate::jobs::JobKey;
 
 /// The default sysfs power-supply root (spec §5.2 "check the power state
 /// through sysfs").
 pub const POWER_SUPPLY_PATH: &str = "/sys/class/power_supply";
 
-/// The transient unit name for a job (spec §6): `softfig-runner-<jobhex>`.
-pub fn unit_name(job_id: &[u8]) -> String {
-    format!("softfig-runner-{}", hex::encode(job_id))
+/// The transient unit name for a job (spec §6):
+/// `softfig-runner-<devicehex>-<jobhex>`, named by the whole [`JobKey`] so two
+/// requesters' jobs never share a unit (pre-merge review m2).
+pub fn unit_name(key: &JobKey) -> String {
+    format!("softfig-runner-{}-{}", hex::encode(key.device_id()), hex::encode(key.job_id()))
 }
 
 /// Which systemd manager a transient unit runs under.

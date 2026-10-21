@@ -72,7 +72,8 @@ impl StateRoot {
     }
 
     /// `jobs/` — per-job scratch (the materialized tree, the transient unit's
-    /// spec/result files, a fresh cache). Lives under the state root rather
+    /// spec/result files, a fresh cache), one `jobs/<devicehex>/<jobhex>` dir
+    /// per job (`JobKey::scratch_dir`). Lives under the state root rather
     /// than `/tmp` because the unit's `PrivateTmp` hides `/tmp` from its
     /// payload, and `ProtectSystem=strict` re-opens only the state root via
     /// `ReadWritePaths` (slice 006 chunk 2).

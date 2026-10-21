@@ -15,16 +15,56 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 
 use crate::attestation::{ExitInfo, ToolchainInfo};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::log::JobLogs;
 use crate::state::StateRoot;
+
+/// `job_id` is a random 128-bit value (spec §6 step 1).
+pub const JOB_ID_LEN: usize = 16;
+
+/// A job's name on this runner: the authenticated requester device id plus its
+/// `job_id` (pre-merge review m2). The table, the scratch dir and attach/cancel
+/// all go through it, so two requesters can't collide on an id and one can't
+/// reach another's job. [`JobKey::new`] is the only constructor and refuses an
+/// id that isn't exactly [`JOB_ID_LEN`] bytes, so no key can name `jobs/` or a
+/// requester's whole subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JobKey {
+    device_id: [u8; 32],
+    job_id: [u8; JOB_ID_LEN],
+}
+
+impl JobKey {
+    pub fn new(device_id: [u8; 32], job_id: &[u8]) -> Result<Self> {
+        let job_id = job_id.try_into().map_err(|_| {
+            Error::Protocol(format!(
+                "job_id is {} bytes; a job id is exactly {JOB_ID_LEN}",
+                job_id.len()
+            ))
+        })?;
+        Ok(Self { device_id, job_id })
+    }
+
+    pub fn device_id(&self) -> [u8; 32] {
+        self.device_id
+    }
+
+    pub fn job_id(&self) -> &[u8] {
+        &self.job_id
+    }
+
+    /// The job's scratch dir: `jobs/<devicehex>/<jobhex>`.
+    pub fn scratch_dir(&self, root: &StateRoot) -> std::path::PathBuf {
+        root.jobs_dir().join(hex::encode(self.device_id)).join(hex::encode(self.job_id))
+    }
+}
 
 /// A live or recently-finished job. Held in the table for attach/cancel and
 /// removed after the TTL.
 pub struct Job {
-    pub job_id: Vec<u8>,
-    /// The submitting requester (attach/cancel are restricted to it).
-    pub requester_device: [u8; 32],
+    /// The submitting requester + its job id; attach/cancel find the job only
+    /// under the same requester.
+    pub key: JobKey,
     /// The transient unit name, once launched (unit mode only).
     pub unit: Mutex<Option<String>>,
     /// Set by `JobCancel`; checked by the run loop and the attestation.
@@ -43,9 +83,9 @@ impl Job {
     }
 }
 
-/// The shared job registry (spec §6 detach/attach/cancel).
+/// The shared job registry (spec §6 detach/attach/cancel), keyed by [`JobKey`].
 pub struct JobTable {
-    inner: Mutex<HashMap<Vec<u8>, Arc<Job>>>,
+    inner: Mutex<HashMap<JobKey, Arc<Job>>>,
 }
 
 impl JobTable {
@@ -54,23 +94,23 @@ impl JobTable {
     }
 
     pub fn insert(&self, job: Arc<Job>) {
-        self.inner.lock().unwrap().insert(job.job_id.clone(), job);
+        self.inner.lock().unwrap().insert(job.key, job);
     }
 
-    pub fn get(&self, job_id: &[u8]) -> Option<Arc<Job>> {
-        self.inner.lock().unwrap().get(job_id).cloned()
+    pub fn get(&self, key: &JobKey) -> Option<Arc<Job>> {
+        self.inner.lock().unwrap().get(key).cloned()
     }
 
-    pub fn remove(&self, job_id: &[u8]) -> Option<Arc<Job>> {
-        self.inner.lock().unwrap().remove(job_id)
+    pub fn remove(&self, key: &JobKey) -> Option<Arc<Job>> {
+        self.inner.lock().unwrap().remove(key)
     }
 
     /// Remove every finished job whose `finished_at` is at least `ttl_secs`
-    /// ago, returning their ids (the caller removes their scratch dirs).
-    pub fn sweep(&self, ttl_secs: i64) -> Vec<Vec<u8>> {
+    /// ago, returning their keys (the caller removes their scratch dirs).
+    pub fn sweep(&self, ttl_secs: i64) -> Vec<JobKey> {
         let now = now_unix();
         let mut inner = self.inner.lock().unwrap();
-        let expired: Vec<Vec<u8>> = inner
+        let expired: Vec<JobKey> = inner
             .iter()
             .filter(|(_, job)| {
                 job.finished_at
@@ -79,10 +119,10 @@ impl JobTable {
                     .map(|f| now - f >= ttl_secs)
                     .unwrap_or(false)
             })
-            .map(|(id, _)| id.clone())
+            .map(|(key, _)| *key)
             .collect();
-        for id in &expired {
-            inner.remove(id);
+        for key in &expired {
+            inner.remove(key);
         }
         expired
     }
@@ -145,36 +185,68 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sweep_removes_only_expired_finished_jobs() {
-        let table = JobTable::new();
-        let finished = Arc::new(Job {
-            job_id: vec![1u8; 16],
-            requester_device: [0u8; 32],
+    fn job(key: JobKey, finished_at: Option<i64>) -> Arc<Job> {
+        Arc::new(Job {
+            key,
             unit: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             logs: JobLogs::new(),
             started_at: 0,
-            finished_at: Mutex::new(Some(now_unix() - 1000)),
+            finished_at: Mutex::new(finished_at),
             result: Mutex::new(None),
-        });
-        let running = Arc::new(Job {
-            job_id: vec![2u8; 16],
-            requester_device: [0u8; 32],
-            unit: Mutex::new(None),
-            cancelled: AtomicBool::new(false),
-            logs: JobLogs::new(),
-            started_at: now_unix(),
-            finished_at: Mutex::new(None),
-            result: Mutex::new(None),
-        });
-        table.insert(finished);
-        table.insert(running);
+        })
+    }
+
+    fn key(device: u8, job: u8) -> JobKey {
+        JobKey::new([device; 32], &[job; JOB_ID_LEN]).unwrap()
+    }
+
+    #[test]
+    fn sweep_removes_only_expired_finished_jobs() {
+        let table = JobTable::new();
+        table.insert(job(key(0, 1), Some(now_unix() - 1000)));
+        table.insert(job(key(0, 2), None));
 
         let expired = table.sweep(60);
-        assert_eq!(expired, vec![vec![1u8; 16]], "only the finished job expired");
-        assert!(table.get(&[1u8; 16]).is_none());
-        assert!(table.get(&[2u8; 16]).is_some());
+        assert_eq!(expired, vec![key(0, 1)], "only the finished job expired");
+        assert!(table.get(&key(0, 1)).is_none());
+        assert!(table.get(&key(0, 2)).is_some());
+    }
+
+    #[test]
+    fn job_key_refuses_an_id_that_is_not_16_bytes() {
+        // m2: an empty id made the scratch dir `jobs/` itself.
+        for len in [0, 1, 15, 17, 32] {
+            let err = JobKey::new([0xAA; 32], &vec![0u8; len]).unwrap_err().to_string();
+            assert!(err.contains(&format!("job_id is {len} bytes")), "{err}");
+        }
+        assert!(JobKey::new([0xAA; 32], &[0u8; 16]).is_ok());
+    }
+
+    #[test]
+    fn scratch_dir_is_always_two_levels_under_jobs() {
+        // m2: cleanup and the TTL sweep remove this dir, so it must never be
+        // `jobs/` or a requester's whole `jobs/<device>/` subtree.
+        let dir = tempfile::tempdir().unwrap();
+        let root = StateRoot::new(dir.path());
+        let k = key(0xAA, 0x01);
+        assert_eq!(
+            k.scratch_dir(&root),
+            root.jobs_dir().join("aa".repeat(32)).join("01".repeat(16))
+        );
+    }
+
+    #[test]
+    fn job_table_keys_by_requester_and_job_id() {
+        let table = JobTable::new();
+        table.insert(job(key(0xAA, 1), None));
+        table.insert(job(key(0xBB, 1), None)); // same job_id, another requester
+
+        assert!(table.get(&key(0xAA, 1)).is_some());
+        assert!(table.get(&key(0xBB, 1)).is_some());
+        assert!(table.remove(&key(0xAA, 1)).is_some());
+        assert!(table.get(&key(0xAA, 1)).is_none());
+        assert!(table.get(&key(0xBB, 1)).is_some(), "removing one requester's job keeps the other's");
     }
 
     #[test]

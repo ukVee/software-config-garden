@@ -684,6 +684,39 @@ fn unknown_requester_is_refused() {
 }
 
 #[test]
+fn malformed_job_id_is_refused_and_never_wipes_jobs_dir() {
+    // m2: an empty `job_id` made the job's scratch dir `jobs/` itself, so the
+    // post-job cleanup wiped every other job's scratch. A short id is just as
+    // malformed. Both are refused at intake, before any scratch dir exists.
+    for job_id in [Vec::new(), vec![0x6d; 15]] {
+        let req = Requester::new(60, 61);
+        let fx = RunnerFixture::new([0x60; 16], NOW + 90 * 24 * 60 * 60);
+        fx.grant(&req);
+        fx.serve_one();
+        let (mut session, _cert) = connect(&req, &fx, None, &[]);
+
+        // Another job's scratch, which this offer must leave alone.
+        let other = fx.root.jobs_dir().join("other-job");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("keep"), "keep").unwrap();
+
+        let snap = SnapshotFixture::new([60u8; 32]);
+        let mut offer = snap.offer();
+        offer.job_id = job_id.clone();
+        offer.signature = req.sign_offer(&offer);
+        let res = softfig_net::run_job(&mut session, &offer, |haves| snap.make_bundle(haves));
+
+        assert!(other.join("keep").exists(), "a {}-byte job_id wiped jobs/", job_id.len());
+        assert!(res.is_err(), "a {}-byte job_id was accepted", job_id.len());
+        let names: Vec<_> = std::fs::read_dir(fx.root.jobs_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["other-job"], "a refused offer creates no scratch dir");
+    }
+}
+
+#[test]
 fn offer_signed_by_wrong_key_is_refused() {
     let req = Requester::new(7, 8);
     let fx = RunnerFixture::new([0xDD; 16], NOW + 90 * 24 * 60 * 60);
@@ -1053,7 +1086,7 @@ fn loopback_job_can_be_cancelled_mid_run() {
     });
 
     // Wait for the transient unit to be running before cancelling.
-    let unit = format!("softfig-runner-{}", hex::encode(&job_id));
+    let unit = softfig_runnerd::unit_name(&softfig_runnerd::JobKey::new(req.device_id, &job_id).unwrap());
     let mut saw_active = false;
     for _ in 0..150 {
         let out = Command::new("systemctl")
