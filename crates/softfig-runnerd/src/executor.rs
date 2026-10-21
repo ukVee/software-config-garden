@@ -206,7 +206,7 @@ pub fn execute(
     // 3. Run the offered command (skip when the offer names none), streaming
     //    its stdout/stderr to `log` when present.
     let (exit_code, signal, sandbox_policy) =
-        run_step(ctx, offer, proxy.as_ref().map(JobProxy::config), bins, log)?;
+        run_step(ctx, offer, skel.toolchain.as_deref(), proxy.as_ref().map(JobProxy::config), bins, log)?;
 
     // 4. Collect the declared artifacts, BLAKE3-ed inside the sandbox view.
     let artifacts = if offer.artifacts.is_empty() {
@@ -251,6 +251,7 @@ fn fetch_step(
 fn run_step(
     ctx: &JobContext,
     offer: &softfig_net::proto::JobOffer,
+    pinned_toolchain: Option<&str>,
     proxy: Option<ProxyConfig>,
     bins: &SandboxBinaries,
     log: Option<&LogSink>,
@@ -269,6 +270,7 @@ fn run_step(
     for e in &offer.env {
         policy.env.insert(e.name.clone(), e.value.clone());
     }
+    apply_job_env(&mut policy, offer, pinned_toolchain);
 
     // The resolved run policy, fingerprinted canonically (spec §8
     // `sandbox_policy`), using the same JCS canonicalizer the attestation
@@ -283,6 +285,21 @@ fn run_step(
         }
     };
     Ok((code, signal, Some(sandbox_policy)))
+}
+
+/// Set the runner-owned job environment (spec §7): `SOFTFIG_JOB_ID` and a pinned
+/// `RUSTUP_TOOLCHAIN` when the tree pins a channel (`offer.toolchain` names a
+/// toolchain *kind*, e.g. `rust`, not a channel, so it is not used here).
+/// Applied after the offer's `env`, so a requester cannot override either.
+fn apply_job_env(
+    policy: &mut Policy,
+    offer: &softfig_net::proto::JobOffer,
+    pinned_toolchain: Option<&str>,
+) {
+    policy.env.insert("SOFTFIG_JOB_ID".into(), hex::encode(&offer.job_id));
+    if let Some(channel) = pinned_toolchain.filter(|c| !c.is_empty()) {
+        policy.env.insert("RUSTUP_TOOLCHAIN".into(), channel.to_string());
+    }
 }
 
 /// BLAKE3 the declared artifact globs inside the collect sandbox.
@@ -515,6 +532,32 @@ impl Drop for JobProxy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_env_sets_job_id_and_pins_the_toolchain() {
+        use softfig_net::proto::{EnvEntry, JobOffer};
+        let offer = JobOffer {
+            job_id: vec![0xab; 16],
+            toolchain: "rust".into(),
+            env: vec![EnvEntry { name: "RUSTUP_TOOLCHAIN".into(), value: "nightly".into() }],
+            ..Default::default()
+        };
+        let mut policy = softfig_sandbox::Policy::default();
+        for e in &offer.env {
+            policy.env.insert(e.name.clone(), e.value.clone());
+        }
+        super::apply_job_env(&mut policy, &offer, Some("1.80.0"));
+        assert_eq!(policy.env["SOFTFIG_JOB_ID"], "ab".repeat(16));
+        assert_eq!(policy.env["RUSTUP_TOOLCHAIN"], "1.80.0", "tree pin wins, and the offer env cannot override");
+
+        policy.env.insert("RUSTUP_TOOLCHAIN".into(), "nightly".into());
+        super::apply_job_env(&mut policy, &offer, None);
+        assert_eq!(policy.env["RUSTUP_TOOLCHAIN"], "nightly", "no pin leaves the offer's own env alone");
+
+        policy.env.clear();
+        super::apply_job_env(&mut policy, &offer, None);
+        assert!(!policy.env.contains_key("RUSTUP_TOOLCHAIN"));
+    }
+
     use super::*;
 
     #[test]
