@@ -85,6 +85,13 @@ pub enum GrowlightCmd {
     /// and `growlight init` already run.
     Start(StartArgs),
 
+    /// Print the boot dirty-tree signal for the root baton's item (task 064):
+    /// the line `start` prints, for the SessionStart hook to inject on every
+    /// boot — a `/clear` re-boot included — so it lands in the agent's own
+    /// context. Prints nothing when the tree is clean or the check can't run;
+    /// never fails, and never reverts, stages or commits.
+    BootCheck(BootCheckArgs),
+
     /// Show the orchestrator daemon's fleet status — a one-shot query to
     /// growlightd's own IPC socket: state, garden root, policy, the admission
     /// gate (`paused`), and one row per live agent.
@@ -267,6 +274,18 @@ pub struct SayArgs {
 /// Shared args for the growlight client subcommands. They talk to growlightd's
 /// OWN socket (a separate process from keeperd — spec §2/§13), so the override
 /// defaults to the growlightd socket, not keeperd's.
+/// Args for `boot-check`. Both paths are passed by the generated `inject.sh`,
+/// so the hook needs no daemon round-trip to find them.
+#[derive(Args, Debug)]
+pub struct BootCheckArgs {
+    /// The garden root (the mount the loop's docs are read from).
+    #[arg(long)]
+    pub garden_root: PathBuf,
+    /// The semi-auto root baton whose item to check.
+    #[arg(long)]
+    pub baton: PathBuf,
+}
+
 #[derive(Args, Debug)]
 pub struct ClientArgs {
     /// Override the growlightd socket path. Defaults to
@@ -331,6 +350,10 @@ pub fn run(cmd: GrowlightCmd) -> Result<()> {
     match cmd {
         GrowlightCmd::Init(args) => init(args),
         GrowlightCmd::Start(args) => start(args),
+        GrowlightCmd::BootCheck(args) => {
+            boot_check(&args);
+            Ok(())
+        }
         GrowlightCmd::Status(args) => client_status(args),
         GrowlightCmd::Watch(args) => client_watch(args),
         GrowlightCmd::Stop(args) => client_stop(args),
@@ -450,7 +473,10 @@ fn start(args: StartArgs) -> Result<()> {
     // project-scoped registration in ~/.claude.json only loads with cwd in the
     // garden). Without it every state-advancing iteration STUCKs (auto-run log).
     write_file(&mcp_path, &mcp_json(&softfig_mcp_path()))?;
-    write_script(&inject_path, &inject_script(&protocol, &baton_path))?;
+    write_script(
+        &inject_path,
+        &inject_script(&protocol, &baton_path, &softfig_bin_path(), &garden_root),
+    )?;
     write_script(
         &statusline_path,
         &statusline_script(&runtime.join("usage.json")),
@@ -463,6 +489,15 @@ fn start(args: StartArgs) -> Result<()> {
         .unwrap_or("garden");
     let baton_seeded = seed_if_absent(&baton_path, &seed_baton(garden_name, &today_iso()))?;
     let questions_seeded = seed_if_absent(&questions_path, SEED_QUESTIONS)?;
+
+    // Task 064: surface a repo whose dirt the baton doesn't know about (report
+    // 001's cut-off signature) BEFORE anything is launched: dirt newer than a
+    // carried baton's last write, or any dirt under a baton just seeded (review
+    // 043 G64-2 — a fresh seed's own mtime is "now", which no dirt is newer than).
+    // Read-only and best-effort; a failed probe never blocks a launch.
+    if let Some(line) = boot_dirty_check(&garden_root, &baton_path, baton_seeded) {
+        eprintln!("{line}");
+    }
 
     print_setup(&runtime, &loop_path, baton_seeded, questions_seeded);
 
@@ -571,6 +606,79 @@ fn start(args: StartArgs) -> Result<()> {
         return Ok(());
     }
     launch_agent(&choice, &launch)
+}
+
+/// Task 064 — the semi-auto/CLI half of the boot-time dirty-tree guard: at
+/// `start`, resolve the root baton's active item repo ([`baton_item_repo`]) and
+/// return the signal growlightd journals before a member spawn
+/// ([`softfig_ipc::item_repo::boot_signal`] — the same text, so the human
+/// launching the loop sees it before the agent does new work). `seeded` says
+/// the baton was just written (no prior handoff, so any dirt surfaces);
+/// otherwise its last write is the handoff. Read-only: it only ever
+/// *surfaces* the answer, never reverts, stages or commits. Best-effort — a
+/// missing item, an unprobeable repo or a `git` failure is `None`, never a
+/// launch failure.
+fn boot_dirty_check(garden_root: &Path, baton_path: &Path, seeded: bool) -> Option<String> {
+    use softfig_ipc::item_repo::{boot_signal, probe, Handoff};
+    let view = parse_baton(&fs::read_to_string(baton_path).ok()?);
+    let item = view.item.as_deref()?;
+    let repo = baton_item_repo(garden_root, item)?;
+    let state = probe(&repo).ok()?;
+    let handoff = if seeded {
+        Handoff::Fresh
+    } else {
+        Handoff::At(fs::metadata(baton_path).and_then(|md| md.modified()).ok()?)
+    };
+    boot_signal(item, &repo, &state, handoff).map(|signal| format!("growlight: {signal}"))
+}
+
+/// The repo the semi-auto baton's item lands in, through the one resolver
+/// growlightd's repo probe uses (review 043 G64-3,
+/// [`softfig_ipc::item_repo::item_repo_path`]): the item's own doc's
+/// `> Worktree:`, else its queue's `## Queues` registry cell. The baton names
+/// no queue, so the queue is the table that lists the item — semi-auto runs
+/// named queues (psy, fid, irface, roadeye), whose items rarely carry
+/// `> Worktree:`.
+fn baton_item_repo(garden_root: &Path, item: &str) -> Option<PathBuf> {
+    use softfig_ipc::backlog_doc::{queue_of, BACKLOG_DOC, DEFAULT_QUEUE};
+    let backlog = fs::read_to_string(garden_root.join(BACKLOG_DOC)).ok();
+    let queue = backlog
+        .as_deref()
+        .and_then(|doc| queue_of(doc, item))
+        .unwrap_or_else(|| DEFAULT_QUEUE.to_string());
+    let doc = item_own_doc(garden_root, item).ok()?;
+    let home = home_dir().ok();
+    softfig_ipc::item_repo::item_repo_path(doc.as_deref(), &queue, || backlog, home.as_deref())
+}
+
+/// The item's own doc off the garden mount — the doc growlightd's claim-time
+/// reader reads, never a slice or sub-milestone doc: a task's
+/// `tasks/<id>-*.md`, else the milestone's `CLAUDE.md`. It fails closed the way
+/// growlightd's reader does, so the two give the same answer: two docs
+/// claiming the number ([`unique_numbered`](softfig_ipc::model_choice::unique_numbered),
+/// review 042 G74-2) or metadata the read view hides
+/// ([`unreadable_metadata`](softfig_ipc::item_meta::unreadable_metadata), G74-4)
+/// is an `Err`, and the caller gives no repo signal rather than a registry guess.
+fn item_own_doc(garden_root: &Path, item: &str) -> Result<Option<String>, String> {
+    use softfig_ipc::backlog_doc::{is_task_id, MILESTONES_DIR, TASKS_DIR};
+    let path = if is_task_id(item) {
+        let tasks = garden_root.join(TASKS_DIR);
+        let names: Vec<String> = match fs::read_dir(&tasks) {
+            Ok(dir) => dir.flatten().filter_map(|e| e.file_name().into_string().ok()).collect(),
+            Err(_) => return Ok(None),
+        };
+        match softfig_ipc::model_choice::unique_numbered(names.iter().map(String::as_str), item)? {
+            Some(name) => tasks.join(name),
+            None => return Ok(None),
+        }
+    } else {
+        garden_root.join(MILESTONES_DIR).join(item).join("CLAUDE.md")
+    };
+    let Ok(doc) = fs::read_to_string(path) else { return Ok(None) };
+    match softfig_ipc::item_meta::unreadable_metadata(&doc) {
+        Some(why) => Err(why.to_string()),
+        None => Ok(Some(doc)),
+    }
 }
 
 /// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
@@ -1039,9 +1147,9 @@ fn softfig_mcp_path() -> PathBuf {
 }
 
 /// SessionStart hook body: emit the fixed protocol (from the garden pillar) +
-/// the current runtime baton to stdout, which Claude Code adds to the fresh
-/// session's context.
-fn inject_script(protocol: &Path, baton: &Path) -> String {
+/// the current runtime baton + the boot dirty-tree check (task 064, protocol
+/// step 1b) to stdout, which Claude Code adds to the fresh session's context.
+fn inject_script(protocol: &Path, baton: &Path, softfig: &Path, garden_root: &Path) -> String {
     const TPL: &str = r#"#!/usr/bin/env bash
 # GENERATED by `softfig growlight start` — do not edit (refreshed each launch).
 # SessionStart hook: injects the fixed operating protocol + the current baton
@@ -1051,9 +1159,28 @@ printf '=== SOFT-FIG GROWLIGHT · OPERATING PROTOCOL ===\n\n'
 cat @PROTOCOL@ 2>/dev/null || printf '(protocol.md missing — run `softfig growlight init`)\n'
 printf '\n\n=== CURRENT BATON (your only carried state) ===\n\n'
 cat @BATON@ 2>/dev/null || printf '(no baton yet — run `softfig growlight start`)\n'
+@SOFTFIG@ growlight boot-check --garden-root @GARDEN@ --baton @BATON@ 2>/dev/null || true
 "#;
     TPL.replace("@PROTOCOL@", &shell_quote(protocol))
         .replace("@BATON@", &shell_quote(baton))
+        .replace("@SOFTFIG@", &shell_quote(softfig))
+        .replace("@GARDEN@", &shell_quote(garden_root))
+}
+
+/// `softfig growlight boot-check`: print the boot dirty-tree signal under a
+/// heading, or nothing. The baton is a carried one here (the hook runs on a
+/// boot or a `/clear`, never right after `start` seeds it), so its last write
+/// is the handoff.
+fn boot_check(args: &BootCheckArgs) {
+    if let Some(line) = boot_dirty_check(&args.garden_root, &args.baton, false) {
+        println!("\n\n=== BOOT DIRTY-TREE CHECK (protocol step 1b) ===\n\n{line}");
+    }
+}
+
+/// The running `softfig` binary, for the generated hook to call back into —
+/// the absolute path of this executable, else `softfig` on `PATH`.
+fn softfig_bin_path() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("softfig"))
 }
 
 /// statusLine hook body: on every render, tee the two budgets to `usage.json`
@@ -2593,12 +2720,20 @@ mod tests {
         let s = inject_script(
             Path::new("/garden/growlight/protocol.md"),
             Path::new("/cfg/softfig/growlight/baton.md"),
+            Path::new("/opt/bin/softfig"),
+            Path::new("/garden"),
         );
         assert!(s.starts_with("#!/usr/bin/env bash"));
         assert!(s.contains("cat '/garden/growlight/protocol.md'"));
         assert!(s.contains("cat '/cfg/softfig/growlight/baton.md'"));
         // protocol injected before the baton.
         assert!(s.find("protocol.md").unwrap() < s.find("baton.md").unwrap());
+        // Task 064 review G64-7: the boot dirty-tree check runs on every boot,
+        // after the baton, and never fails the hook.
+        let check = "'/opt/bin/softfig' growlight boot-check --garden-root '/garden' \
+                     --baton '/cfg/softfig/growlight/baton.md' 2>/dev/null || true";
+        assert!(s.contains(check), "{s}");
+        assert!(s.find("cat '/cfg/softfig/growlight/baton.md'").unwrap() < s.find("boot-check").unwrap());
     }
 
     #[test]
@@ -3314,6 +3449,175 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    // The workspace's one test `git` helper (review 043 G64-4): it carries a
+    // throwaway identity, so the commit below passes on a CI runner too.
+    use softfig_ipc::testing::git as run_git;
+
+    /// Backdate a file's mtime to 2000-01-01, so a later tree edit is provably
+    /// NEWER than the baton it is compared against (the boot guard's whole test).
+    fn backdate_mtime(path: &Path) {
+        let out = std::process::Command::new("touch")
+            .arg("-d")
+            .arg("2000-01-01T00:00:00")
+            .arg(path)
+            .output()
+            .expect("run touch");
+        assert!(out.status.success(), "touch failed");
+    }
+
+    /// TASK 064 — the CLI boot dirty-tree guard surfaces an item repo left dirty
+    /// AND newer than the root baton's last handoff, and stays silent for a
+    /// clean tree / a missing item / a baton with no active item. Read-only:
+    /// nothing is reverted/staged/committed — the only observable effect is the
+    /// returned journal line.
+    #[test]
+    fn boot_dirty_check_surfaces_a_dirty_tree_newer_than_the_baton() {
+        let root = unique_tmp("boot-dirty");
+        let _ = fs::remove_dir_all(&root);
+        let tasks = root.join(PILLAR).join("backlog").join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        // A real repo: one committed base file.
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        fs::write(
+            tasks.join("200-a-task.md"),
+            format!("# Task\n\n> Worktree: {}\n", repo.display()),
+        )
+        .unwrap();
+        let baton = root.join("baton.md");
+
+        // No active item -> no signal.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: null\n---\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none());
+
+        // A baton naming the item, backdated before the tree's last edit.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: 200\n---\n").unwrap();
+        backdate_mtime(&baton);
+        // Clean tree -> no signal.
+        assert!(boot_dirty_check(&root, &baton, false).is_none());
+
+        // Leave one uncommitted edit, newer than the (backdated) baton.
+        fs::write(repo.join("a.txt"), "dirty\n").unwrap();
+        let line = boot_dirty_check(&root, &baton, false)
+            .expect("a dirty tree newer than the baton handoff surfaces");
+        assert!(line.contains("200"), "names the item: {line}");
+        assert!(
+            line.contains(&repo.display().to_string()),
+            "names the repo: {line}"
+        );
+        assert!(line.contains("1 uncommitted path"), "names the count: {line}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Review 043 G64-3: a semi-auto item in a named queue whose doc names no
+    /// `> Worktree:` resolves through the queue's `## Queues` registry cell, the
+    /// way growlightd's repo probe resolves it — the fid shape that started
+    /// task 064. A slice doc's `> Worktree:` is not the item's (growlightd never
+    /// reads it), so it does not count.
+    #[test]
+    fn boot_dirty_check_resolves_a_named_queue_item_through_the_registry() {
+        let root = unique_tmp("boot-dirty-registry");
+        let _ = fs::remove_dir_all(&root);
+        let backlog = root.join(PILLAR).join("backlog");
+        let milestone = backlog.join("milestones").join("fid-pam");
+        fs::create_dir_all(milestone.join("slices")).unwrap();
+        let repo = root.join("fid-repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("gate.rs"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        let region = |tag: &str, body: &str| format!("<!-- softfig:{tag} -->\n\n{body}\n\n<!-- /softfig:{tag} -->");
+        let items = "| # | id | type | title | status |\n|---|----|------|-------|--------|\n\
+                     | 1 | fid-pam | milestone | P3 | active |";
+        fs::write(
+            backlog.join("CLAUDE.md"),
+            format!(
+                "# backlog\n\n{}\n\n{}\n\n{}\n",
+                region("queue", "| # | id | type | title | status |\n|---|----|------|-------|--------|"),
+                region("queues", &format!("| queue | repo |\n|---|---|\n| fid | {} |", repo.display())),
+                region("queue:fid", items),
+            ),
+        )
+        .unwrap();
+        fs::write(milestone.join("CLAUDE.md"), "# fid-pam\n\n> Model: claude\n").unwrap();
+        fs::write(milestone.join("slices").join("001-probes.md"), "# probes\n\n> Worktree: /nowhere\n")
+            .unwrap();
+
+        let baton = root.join("baton.md");
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: fid-pam\nslice: 001\n---\n").unwrap();
+        backdate_mtime(&baton);
+        fs::write(repo.join("gate.rs"), "cut off mid-slice\n").unwrap();
+
+        let line = boot_dirty_check(&root, &baton, false).expect("the registry names the fid repo");
+        assert!(line.contains(&repo.display().to_string()), "names the registry's repo: {line}");
+
+        // Review 043 G64-2: a baton `start` just seeded has no handoff, so the
+        // dirt surfaces even though the seed's mtime is newer than every edit.
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: fid-pam\n---\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none(), "a just-written carried baton is newer");
+        let fresh = boot_dirty_check(&root, &baton, true).expect("a fresh seed surfaces any dirt");
+        assert!(fresh.contains("fresh"), "{fresh}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Reviews 042 G74-2 / G74-4 meet 043 G64-3: an item doc growlightd's
+    /// reader refuses (a shadow `<id>-*.md` beside the real one, or a sealed
+    /// region that could hide a `> Worktree:`) gives the CLI no repo signal
+    /// either. Before the merge fix-up the CLI read "two docs" as "no doc" and
+    /// fell through to the registry cell, naming a repo growlightd never would.
+    #[test]
+    fn boot_dirty_check_gives_no_signal_for_a_doc_growlightd_refuses() {
+        let root = unique_tmp("boot-dirty-refused");
+        let _ = fs::remove_dir_all(&root);
+        let backlog = root.join(PILLAR).join("backlog");
+        let tasks = backlog.join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let repo = root.join("fid-repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("gate.rs"), "base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        let region = |tag: &str, body: &str| format!("<!-- softfig:{tag} -->\n\n{body}\n\n<!-- /softfig:{tag} -->");
+        let items = "| # | id | type | title | status |\n|---|----|------|-------|--------|\n\
+                     | 1 | 201 | task | gate | active |";
+        fs::write(
+            backlog.join("CLAUDE.md"),
+            format!(
+                "# backlog\n\n{}\n\n{}\n\n{}\n",
+                region("queue", "| # | id | type | title | status |\n|---|----|------|-------|--------|"),
+                region("queues", &format!("| queue | repo |\n|---|---|\n| fid | {} |", repo.display())),
+                region("queue:fid", items),
+            ),
+        )
+        .unwrap();
+        fs::write(tasks.join("201-gate.md"), "# gate\n").unwrap();
+
+        let baton = root.join("baton.md");
+        fs::write(&baton, "---\nstatus: IN_PROGRESS\nitem: 201\n---\n").unwrap();
+        backdate_mtime(&baton);
+        fs::write(repo.join("gate.rs"), "cut off mid-slice\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_some(), "one readable doc: the registry repo");
+
+        fs::write(tasks.join("201-shadow.md"), "# shadow\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none(), "two docs for 201: no signal");
+
+        fs::remove_file(tasks.join("201-shadow.md")).unwrap();
+        fs::write(tasks.join("201-gate.md"), "# gate\n\n<vault id=\"w\">[encrypted]</vault>\n").unwrap();
+        assert!(boot_dirty_check(&root, &baton, false).is_none(), "a sealed region: no signal");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

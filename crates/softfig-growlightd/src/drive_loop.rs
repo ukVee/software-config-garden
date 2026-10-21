@@ -56,7 +56,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use softfig_ipc::item_repo::RepoState;
+use softfig_ipc::item_repo::{boot_signal, Handoff, RepoState};
 
 use crate::admission::{BudgetUsage, RateState};
 use crate::agent_harness::StreamError;
@@ -611,10 +611,11 @@ impl QueueSource for DeferredQueues {
 /// per session — and fed to [`Supervisor::poll_with_progress`]. The production
 /// impl is [`crate::queue_source::KeeperdRepoProbe`]; a test scripts the reads.
 pub trait RepoProbe: Send + Sync + fmt::Debug {
-    /// The current [`RepoState`] of the repo `part` of `queue` lands in, or `None`
-    /// when it has none this machine can probe (or the read failed) — the guard
-    /// then decides on NEXT ACTION alone.
-    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState>;
+    /// The repo `part` of `queue` lands in and its current [`RepoState`], or
+    /// `None` when it has none this machine can probe (or the read failed) — the
+    /// spin guard then decides on NEXT ACTION alone. The path is the one probed,
+    /// so the boot dirty-tree guard (task 064) names exactly the repo it read.
+    fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)>;
 }
 
 /// The default [`RepoProbe`]: no repo signal, so the spin guard is the
@@ -623,7 +624,7 @@ pub trait RepoProbe: Send + Sync + fmt::Debug {
 pub struct NoRepoProbe;
 
 impl RepoProbe for NoRepoProbe {
-    fn repo_state(&self, _queue: &str, _part: &str) -> Option<RepoState> {
+    fn repo_state(&self, _queue: &str, _part: &str) -> Option<(std::path::PathBuf, RepoState)> {
         None
     }
 }
@@ -720,6 +721,16 @@ pub trait BatonStatusSource: Send + Sync + fmt::Debug {
     /// written/readable — the clean-exit re-roll fallback), plus a diagnostic when
     /// the read fell back to the misrouted legacy single-agent path (task 042/035).
     fn status(&self, agent: &str) -> BatonRead;
+
+    /// The baton FILE's last-modified time — the "handoff" instant the boot-time
+    /// dirty-tree guard (task 064) compares the repo's newest dirty mtime against
+    /// to tell "the tree moved after the last handoff" from "it did not". `None`
+    /// when the path is unknown or the file is missing/unreadable. The default is
+    /// `None` so the deferred/test sources keep the guard inert; the live
+    /// [`crate::baton_store::FsBatonStore`] reads the real file.
+    fn baton_mtime(&self, _agent: &str) -> Option<std::time::SystemTime> {
+        None
+    }
 }
 
 /// The result of reading an exited member's terminal baton
@@ -774,11 +785,45 @@ impl BatonStatusSource for DeferredBatonStatus {
 /// [`crate::baton_store::FsBatonStore`] over the runtime `agents/` namespace; a
 /// test records or scripts the seed.
 pub trait BatonSeeder: Send + Sync + fmt::Debug {
-    /// Seed `agent`'s baton from the claimed `(queue, part)`. `Ok(())` means the
-    /// baton is laid down (the agent will boot with it); `Err(reason)` aborts the
-    /// spawn fail-closed (a member booting stateless is the bug this slice fixes) —
-    /// the drive loop holds the start and retries next tick.
-    fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<(), String>;
+    /// Seed `agent`'s baton from the claimed `(queue, part)`. `Ok` means the
+    /// baton is laid down (the agent will boot with it) and says whether it is
+    /// the member's own carried baton or a fresh one ([`SeedOutcome`]);
+    /// `Err(reason)` aborts the spawn fail-closed (a member booting stateless is
+    /// the bug this slice fixes) — the drive loop holds the start and retries
+    /// next tick.
+    fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<SeedOutcome, String>;
+
+    /// Put the boot dirty-tree `signal` (task 064) in `agent`'s baton, so the
+    /// member's boot — which cats its baton via the SessionStart hook — sees it
+    /// before it does new work. Read-only otherwise (no revert/stage/commit).
+    /// Default no-op so the deferred/test seeders stay inert;
+    /// [`crate::baton_store::FsBatonStore`] writes it for real.
+    fn warn_dirty_tree(&self, _agent: &str, _signal: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// What a [`BatonSeeder::seed`] laid down (task 064 review G64-2) — which tells
+/// the boot dirty-tree guard what the last handoff on the item was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// The member's own baton for this item was kept (a same-item fresh start,
+    /// e.g. after a growlightd restart), last written at `handoff` — `None` when
+    /// its time can't be read, or no baton store is wired at all.
+    Kept { handoff: Option<std::time::SystemTime> },
+    /// A fresh baton was written: no prior handoff on this item exists.
+    Fresh,
+}
+
+impl SeedOutcome {
+    /// The handoff the boot guard compares against, or `None` when there is
+    /// nothing to compare (the guard then stays silent).
+    fn handoff(self) -> Option<Handoff> {
+        match self {
+            SeedOutcome::Kept { handoff } => handoff.map(Handoff::At),
+            SeedOutcome::Fresh => Some(Handoff::Fresh),
+        }
+    }
 }
 
 /// The deferred [`BatonSeeder`] for the disabled/test seam: seeding is a no-op
@@ -789,9 +834,40 @@ pub trait BatonSeeder: Send + Sync + fmt::Debug {
 pub struct DeferredBatonSeeder;
 
 impl BatonSeeder for DeferredBatonSeeder {
-    fn seed(&self, _agent: &str, _queue: &str, _part: &str) -> Result<(), String> {
-        Ok(())
+    /// Nothing is written, so there is no handoff to compare a tree against.
+    fn seed(&self, _agent: &str, _queue: &str, _part: &str) -> Result<SeedOutcome, String> {
+        Ok(SeedOutcome::Kept { handoff: None })
     }
+}
+
+/// The boot-time dirty-tree guard (task 064): before a member spawns, surface a
+/// repo carrying uncommitted work its baton knows nothing about — dirt newer
+/// than the baton's handoff, or any dirt under a fresh baton ([`boot_signal`]).
+/// That is report 001's signature of a session that worked and was cut off
+/// before it handed off. The ONE guard for both spawn paths (review 043
+/// G64-1/G64-2): the fresh start calls it after the claim lands, the re-roll
+/// from [`Supervisor::tick_with`]'s pre-spawn hook. Read-only: it journals the
+/// signal and puts it in the member's baton; it never reverts, stages or
+/// commits. Returns whether it surfaced a signal.
+fn boot_guard(
+    repo_probe: &dyn RepoProbe,
+    seeder: &dyn BatonSeeder,
+    agent: &str,
+    queue: &str,
+    part: &str,
+    handoff: Handoff,
+) -> bool {
+    let Some((repo, state)) = repo_probe.repo_state(queue, part) else {
+        return false;
+    };
+    let Some(signal) = boot_signal(&format!("{queue}/{part} ({agent})"), &repo, &state, handoff) else {
+        return false;
+    };
+    eprintln!("growlightd: {signal}");
+    if let Err(e) = seeder.warn_dirty_tree(agent, &signal) {
+        eprintln!("growlightd: boot dirty tree: failed to warn {agent}: {e}");
+    }
+    true
 }
 
 // ---- queue v2 scheduling seams (queue-v2-scheduling slice 006) ----
@@ -1750,7 +1826,8 @@ impl DriveLoop {
                     let assignment = self.assignments.get(agent);
                     let repo_state = || {
                         repo_read = assignment
-                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part));
+                            .and_then(|(queue, part)| repo_probe.repo_state(queue, part))
+                            .map(|(_, state)| state);
                         repo_read.clone()
                     };
                     self.supervisor.poll_with_progress(
@@ -2387,7 +2464,20 @@ impl DriveLoop {
                         pick_for(snap, *pin, &reserved).is_some()
                     })
             };
-            report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
+            // The boot dirty-tree guard (task 064), run before each re-roll's
+            // spawn (review 043 G64-1): a re-rolled member boots onto its
+            // carried baton, whose last write is the handoff. A baton with no
+            // readable time has nothing to compare against, so it stays silent.
+            let (repo_probe, baton, seeder) =
+                (self.repo_probe.as_ref(), self.baton.as_ref(), self.seeder.as_ref());
+            let pre_spawn = |agent: &str| {
+                if let Some((queue, part)) = assignments.get(agent)
+                    && let Some(handoff) = baton.baton_mtime(agent)
+                {
+                    boot_guard(repo_probe, seeder, agent, queue, part, Handoff::At(handoff));
+                }
+            };
+            report.rerolls = self.supervisor.tick_with(budget, rate, now, &workable, &pre_spawn);
             // A member that re-rolled has consumed its pending-reconnect latch (slice
             // 002): the fresh session's next exit is a NEW event to classify anew, so a
             // genuine re-crash after a reconnect is never masked by a stale latch.
@@ -2518,15 +2608,24 @@ impl DriveLoop {
                 // agent left running on an unclaimed part, retried next tick. The
                 // claimer/seeder borrows are disjoint fields from `supervisor`.
                 let claimer = &self.claimer;
-                let seeder = &self.seeder;
+                let seeder = self.seeder.as_ref();
+                let repo_probe = self.repo_probe.as_ref();
                 let outcome = self.supervisor.start_claiming(
                     member.spec.clone(),
                     budget,
                     rate,
                     now,
                     || {
-                        seeder.seed(agent, &queue, &part)?;
-                        claimer.claim(&queue, &part, agent)
+                        let seeded = seeder.seed(agent, &queue, &part)?;
+                        claimer.claim(&queue, &part, agent)?;
+                        // The boot dirty-tree guard (task 064), once the claim
+                        // has landed and before the spawn (review 043 G64-2): the
+                        // seed says what the last handoff was — the member's kept
+                        // baton, or none under a fresh one. Read-only; best-effort.
+                        if let Some(handoff) = seeded.handoff() {
+                            boot_guard(repo_probe, seeder, agent, &queue, &part, handoff);
+                        }
+                        Ok(())
                     },
                 );
                 match outcome {
@@ -3531,6 +3630,19 @@ mod tests {
         /// seed the loop writes on a FRESH start. A test asserts a fresh start
         /// seeds and a re-roll does not (carry-across-iterations).
         seeds: Mutex<Vec<(String, String, String)>>,
+        /// Scripted per-agent baton file mtime (task 064 — what the live
+        /// [`crate::baton_store::FsBatonStore`] reads off the real baton file).
+        /// Unset = `None` (no mtime → the boot dirty-tree guard stays inert).
+        baton_mtime: Mutex<BTreeMap<String, std::time::SystemTime>>,
+        /// Recorded boot-guard warnings `(agent, signal)` — what the loop puts in
+        /// a member's baton when the guard surfaces a dirty tree.
+        warns: Mutex<Vec<(String, String)>>,
+        /// When set, `seed` reports a fresh baton (review 043 G64-2); otherwise it
+        /// reports the member's kept baton, last written at its scripted mtime.
+        seed_fresh: AtomicBool,
+        /// `spawn:<agent>` / `warn:<agent>` in call order, so a test can prove the
+        /// boot guard's warning lands before the spawn (review 043 G64-1).
+        events: Mutex<Vec<String>>,
         /// Recorded v2 member-baton writes `(agent, contents)` — the §3.6 copy the
         /// v2 fresh start performs (slice 006); the legacy loop never touches this.
         member_writes: Mutex<Vec<(String, String)>>,
@@ -3613,6 +3725,25 @@ mod tests {
         fn seeds(&self) -> Vec<(String, String, String)> {
             self.seeds.lock().unwrap().clone()
         }
+        /// Script `agent`'s baton file mtime (task 064).
+        fn set_baton_mtime(&self, agent: &str, mtime: std::time::SystemTime) {
+            self.baton_mtime
+                .lock()
+                .unwrap()
+                .insert(agent.to_string(), mtime);
+        }
+        /// The recorded boot-guard warnings `(agent, signal)`, in order.
+        fn warns(&self) -> Vec<(String, String)> {
+            self.warns.lock().unwrap().clone()
+        }
+        /// Script whether `seed` reports a fresh baton (G64-2).
+        fn set_seed_fresh(&self, fresh: bool) {
+            self.seed_fresh.store(fresh, Ordering::SeqCst);
+        }
+        /// The `spawn:` / `warn:` call order (G64-1).
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
         /// Script `agent`'s latest reading of the shared pool (its budget cell).
         fn set_budget(&self, agent: &str, b: BudgetUsage) {
             self.budgets.lock().unwrap().insert(agent.to_string(), b);
@@ -3653,6 +3784,7 @@ mod tests {
     impl AgentBackend for Arc<FakeFleet> {
         fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
+            self.events.lock().unwrap().push(format!("spawn:{}", spec.agent));
             self.spawned_specs.lock().unwrap().push(spec.clone());
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(SpawnError(format!(
@@ -3710,9 +3842,12 @@ mod tests {
                 misroute: None,
             }
         }
+        fn baton_mtime(&self, agent: &str) -> Option<std::time::SystemTime> {
+            self.baton_mtime.lock().unwrap().get(agent).copied()
+        }
     }
     impl BatonSeeder for Arc<FakeFleet> {
-        fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<(), String> {
+        fn seed(&self, agent: &str, queue: &str, part: &str) -> Result<SeedOutcome, String> {
             if self.fail_seed.load(Ordering::SeqCst) {
                 return Err("seed refused".into());
             }
@@ -3720,6 +3855,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((agent.to_string(), queue.to_string(), part.to_string()));
+            Ok(if self.seed_fresh.load(Ordering::SeqCst) {
+                SeedOutcome::Fresh
+            } else {
+                SeedOutcome::Kept { handoff: self.baton_mtime.lock().unwrap().get(agent).copied() }
+            })
+        }
+        fn warn_dirty_tree(&self, agent: &str, signal: &str) -> Result<(), String> {
+            self.warns.lock().unwrap().push((agent.to_string(), signal.to_string()));
+            self.events.lock().unwrap().push(format!("warn:{agent}"));
             Ok(())
         }
     }
@@ -5336,7 +5480,11 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// A scripted [`RepoProbe`] (task 069): every read answers the current state
     /// and is recorded with the `(queue, part)` it asked for.
     #[derive(Debug, Default)]
-    struct ScriptedRepo(Mutex<Option<RepoState>>, Mutex<Vec<(String, String)>>);
+    struct ScriptedRepo(
+        Mutex<Option<RepoState>>,
+        Mutex<Vec<(String, String)>>,
+        Mutex<Option<std::path::PathBuf>>,
+    );
     impl ScriptedRepo {
         fn set(&self, head: &str, dirty: usize, fingerprint: u64) {
             *self.0.lock().unwrap() = Some(RepoState {
@@ -5346,15 +5494,145 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
                 fingerprint,
             });
         }
+        /// Set a repo state with a concrete newest-dirty mtime (task 064).
+        fn set_dirty(&self, head: &str, dirty: usize, fingerprint: u64, mtime: std::time::SystemTime) {
+            *self.0.lock().unwrap() = Some(RepoState {
+                head: Some(head.into()),
+                dirty,
+                newest_dirty_mtime: Some(mtime),
+                fingerprint,
+            });
+        }
+        /// Script the resolved repo path (task 064 — the guard names it).
+        fn set_path(&self, path: &str) {
+            *self.2.lock().unwrap() = Some(path.into());
+        }
         fn reads(&self) -> Vec<(String, String)> {
             self.1.lock().unwrap().clone()
         }
     }
     impl RepoProbe for Arc<ScriptedRepo> {
-        fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
+        fn repo_state(&self, queue: &str, part: &str) -> Option<(std::path::PathBuf, RepoState)> {
             self.1.lock().unwrap().push((queue.into(), part.into()));
-            self.0.lock().unwrap().clone()
+            let path = self.2.lock().unwrap().clone().unwrap_or_else(|| "/scripted-repo".into());
+            self.0.lock().unwrap().clone().map(|state| (path, state))
         }
+    }
+
+    /// TASK 064 — the boot-time dirty-tree guard: at a fresh start, a repo that
+    /// is dirty AND newer than the member's baton handoff is surfaced (a warning
+    /// appended to the baton naming the repo + dirty-path count) BEFORE the spawn.
+    /// A clean tree surfaces nothing, and a baton with no readable mtime keeps the
+    /// guard inert (it can't prove "newer"). Read-only: nothing is reverted/staged/
+    /// committed — the only observable effect is the recorded warn.
+    #[test]
+    fn boot_surfaces_a_dirty_tree_newer_than_the_baton() {
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let future = past + std::time::Duration::from_secs(10);
+
+        // A clean tree surfaces nothing, even with a baton mtime present.
+        let (loop_, _d, backend, _c, _p, _q, _pr) = make_full(
+            vec![member("a1", "psy")],
+            vec![q("psy", &[("booking", "queued")])],
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        backend.set_baton_mtime("a1", past);
+        repo.set("h1", 0, 0);
+        loop_.tick(0);
+        assert!(backend.warns().is_empty(), "a clean tree produces no warning");
+
+        // No baton mtime -> the guard is inert (it cannot prove "newer").
+        let (loop_, _d, backend, _c, _p, _q, _pr) = make_full(
+            vec![member("a1", "psy")],
+            vec![q("psy", &[("booking", "queued")])],
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        repo.set_dirty("h1", 3, 7, future);
+        loop_.tick(0);
+        assert!(backend.warns().is_empty(), "no baton mtime reads as no signal");
+
+        // Dirt NEWER than the baton handoff: the guard fires and warns, naming the
+        // repo and the dirty-path count.
+        let (loop_, _d, backend, _c, _p, _q, _pr) = make_full(
+            vec![member("a1", "psy")],
+            vec![q("psy", &[("booking", "queued")])],
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        backend.set_baton_mtime("a1", past);
+        repo.set_dirty("h1", 3, 7, future);
+        repo.set_path("/repo");
+        loop_.tick(0);
+        let warns = backend.warns();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].1.contains("/repo has 3 uncommitted path(s)") && warns[0].1.contains("newer than the baton"),
+            "the guard names the repo, the dirty-path count and the recency: {warns:?}",
+        );
+    }
+
+    /// Review 043 G64-2: a fresh start whose seed wrote a NEW baton (the member
+    /// last worked a different item, or never) has no handoff to compare against,
+    /// so any dirt in the item's repo surfaces — the dirty tree its baton cannot
+    /// know about. Before the fix the guard compared against the just-written
+    /// seed's "now" and could never fire.
+    #[test]
+    fn a_fresh_baton_surfaces_any_dirt_in_the_items_repo() {
+        let (loop_, _d, backend, _c, _p, _q, _pr) = make_full(
+            vec![member("a1", "psy")],
+            vec![q("psy", &[("booking", "queued")])],
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        backend.set_seed_fresh(true);
+        let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        repo.set_dirty("h1", 2, 7, long_ago);
+        repo.set_path("/psy");
+        loop_.tick(0);
+        let warns = backend.warns();
+        assert_eq!(warns.len(), 1, "a fresh baton surfaces old dirt too: {warns:?}");
+        assert!(warns[0].1.contains("/psy has 2 uncommitted path(s)") && warns[0].1.contains("fresh"));
+        assert_eq!(backend.events(), vec!["warn:a1", "spawn:a1"], "before the spawn");
+    }
+
+    /// Review 043 G64-1: on a re-roll the guard runs in the supervisor's
+    /// pre-spawn hook, so the warning is in the member's baton before the member
+    /// boots — on the old post-spawn call it raced the SessionStart hook.
+    #[test]
+    fn a_re_roll_warns_before_it_spawns() {
+        let (loop_, _d, backend, _c, _p, _q, _pr) = make_full(
+            vec![member("a1", "psy")],
+            vec![q("psy", &[("booking", "queued")])],
+            Policy::default(),
+        );
+        let repo = Arc::new(ScriptedRepo::default());
+        let mut loop_ = loop_.with_repo_probe(Box::new(Arc::clone(&repo)));
+        let handoff = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        backend.set_baton_mtime("a1", handoff);
+        repo.set("h1", 0, 0);
+        loop_.tick(0); // fresh start on a clean tree: nothing to surface
+        assert_eq!(backend.events(), vec!["spawn:a1"]);
+
+        // The session is cut off by the network (a transient exit → reconnect
+        // re-roll, report 001's path), leaving work newer than its handoff.
+        repo.set_dirty("h1", 4, 9, handoff + std::time::Duration::from_secs(60));
+        backend.set_health("a1", AgentHealth::Exited { code: 1 });
+        backend.set_stderr("a1", &["error: getaddrinfo ENOTFOUND api.anthropic.com"]);
+        let mut rerolled = false;
+        for now in 1..40 {
+            if loop_.tick(now).rerolls.contains(&RerollOutcome::Rerolled { agent: "a1".into() }) {
+                rerolled = true;
+                break;
+            }
+        }
+        assert!(rerolled, "the member re-rolls");
+        assert_eq!(backend.events(), vec!["spawn:a1", "warn:a1", "spawn:a1"], "warned, then spawned");
     }
 
     fn alert_lines(probe: &Probe) -> Vec<String> {

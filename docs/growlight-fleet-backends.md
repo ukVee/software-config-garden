@@ -327,6 +327,37 @@ both are forgotten once the item leaves the parked set. The spin record is kept 
 memory only, so after a growlightd restart a spin park that is still standing pages as a
 human block.
 
+## Before a member boots: the dirty-tree guard
+
+Report 001's failure was a member cut off mid-slice by a network drop. It left
+uncommitted edits, no baton rewrite and no commit, and the next session booted onto a
+baton that knew nothing about them (task 064). So before each member spawns, growlightd
+checks the item's repo, resolved exactly as the spin guard resolves it, against the
+member's baton:
+
+- a **re-roll** boots onto its carried baton, so dirt newer than the baton's last write
+  is surfaced (checked in the supervisor's pre-spawn hook, so it lands before the member
+  boots);
+- a **fresh start** that keeps the member's own baton for the item compares the same way;
+- a fresh start that seeds a **new** baton has no handoff to compare against, so any dirt
+  is surfaced.
+
+A hit is one journal line and a `# ⚠️ PRE-EXISTING DIRTY TREE` section in the member's
+baton, replaced in place if it fires again:
+
+```
+growlightd: boot dirty tree: psy/booking (a): /home/u/psy has 3 uncommitted path(s), newest ~840s newer than the baton handoff
+```
+
+The guard is read-only: it never reverts, stages or commits, and ignored paths such as
+`target/` don't count. Semi-auto gets the same line from `softfig growlight start` and,
+on every boot and `/clear`, from the `softfig growlight boot-check` call in the generated
+`inject.sh`. Protocol step 1b tells the member what to do with it.
+
+Not yet covered: under `queue = "v2"` the guard is not wired (the v2 start rewrites the
+member baton from the entry baton, so the entry baton's time is the handoff there). That
+is part of `queue-v2-git-hardening`, before the v2 flip.
+
 ## Known gaps
 
 The `growlight` **GUI**'s fleet panel does not yet show backend or spend — its per-agent

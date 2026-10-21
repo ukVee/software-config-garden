@@ -41,26 +41,25 @@
 use std::path::PathBuf;
 
 use softfig_ipc::fleet_marker;
+use softfig_ipc::item_repo::{item_repo_path, probe, RepoState};
 use softfig_ipc::model_choice::unique_numbered;
-use softfig_ipc::item_repo::{probe, resolve_repo, worktree_field, RepoState};
 use softfig_ipc::verbs::{op, ListTreeArgs, ListTreeReply, ReadFileArgs, ReadFileReply};
 use softfig_ipc::{call_reconnecting, ErrorKind, Request, Response, RetryPolicy};
 
 use crate::drive_loop::{QueueSource, RepoProbe};
 use crate::scheduler::{ClaimHold, PartView, QueueView, Snapshot};
 
-/// The garden-relative backlog doc that hosts every queue's managed region.
-pub const BACKLOG_DOC: &str = "growlight/backlog/CLAUDE.md";
-
-/// Where a milestone's doc lives: `<MILESTONES_DIR>/<id>/CLAUDE.md`.
-const MILESTONES_DIR: &str = "growlight/backlog/milestones";
-/// Where a task's doc lives: `<TASKS_DIR>/<id>-<slug>.md` (task ids are its number).
-const TASKS_DIR: &str = "growlight/backlog/tasks";
+/// The garden-relative backlog doc that hosts every queue's managed region
+/// (the one definition lives in [`softfig_ipc::backlog_doc`]).
+pub use softfig_ipc::backlog_doc::BACKLOG_DOC;
+use softfig_ipc::backlog_doc::{
+    is_task_id, item_rows, region_body, registry_rows, MILESTONES_DIR, TASKS_DIR,
+};
 
 /// The scheduler name of the implicit default queue. Matches keeperd's
 /// `DEFAULT_QUEUE` / `add_backlog_item`'s implicit queue, so a fleet member
 /// pinned to `"default"` resolves to this queue in [`pick`](crate::scheduler::pick).
-pub const DEFAULT_QUEUE_NAME: &str = "default";
+pub const DEFAULT_QUEUE_NAME: &str = softfig_ipc::backlog_doc::DEFAULT_QUEUE;
 
 // ---------------------------------------------------------------------------
 // Pure parse: backlog doc markdown -> Snapshot.
@@ -96,31 +95,12 @@ fn region_parts(doc: &str, tag: &str) -> Vec<PartView> {
     }
 }
 
-/// Parse a queue item table's rows into [`PartView`]s, in row order. Mirrors
-/// keeperd's `queue::parse`: only well-formed 5-cell data rows are kept (`# | id
-/// | type | title | status`); the header and separator rows are skipped, and the
-/// `#` order cell is discarded (the scheduler relies on row order, not the cell).
-/// The status string is classified through [`PartView::new`].
+/// Parse a queue item table's rows into [`PartView`]s, in row order, through
+/// the shared table parser ([`item_rows`] — 5-cell data rows, header and
+/// separator skipped; the `#` order cell is discarded, the scheduler relies on
+/// row order). The status string is classified through [`PartView::new`].
 fn parse_item_rows(body: &str) -> Vec<PartView> {
-    let mut parts = Vec::new();
-    for line in body.lines() {
-        let line = line.trim();
-        if !line.starts_with('|') {
-            continue;
-        }
-        let cells = split_row(line);
-        if cells.len() != 5 {
-            continue;
-        }
-        if cells[0] == "#" && cells[1] == "id" {
-            continue; // header
-        }
-        if is_separator_row(&cells) {
-            continue;
-        }
-        parts.push(PartView::new(cells[1].clone(), &cells[4]));
-    }
-    parts
+    item_rows(body).into_iter().map(|(id, status)| PartView::new(id, &status)).collect()
 }
 
 /// Parse the queue registry region's queue names, in row order — the order the
@@ -129,103 +109,6 @@ fn registry_names(doc: &str) -> Vec<String> {
     registry_rows(doc).into_iter().map(|(name, _)| name).collect()
 }
 
-/// The registry's `repo` cell for `queue`, raw (task 069): the spin guard's
-/// second repo source after the item doc's `> Worktree:`.
-/// [`resolve_repo`](softfig_ipc::item_repo::resolve_repo) decides whether it is a
-/// path this machine can probe — a remote `host:/path` cell is returned as-is
-/// here and resolves to no repo there. `None` for an unregistered queue (the
-/// default queue never has a row).
-pub(crate) fn registry_repo(doc: &str, queue: &str) -> Option<String> {
-    registry_rows(doc).into_iter().find(|(name, _)| name == queue).map(|(_, repo)| repo)
-}
-
-/// The queue registry region's `(queue, repo)` rows, in row order. Mirrors
-/// keeperd's `queues::parse`: 2-cell data rows (`queue | repo`) with a non-empty
-/// name, header/separator skipped.
-fn registry_rows(doc: &str) -> Vec<(String, String)> {
-    let Some(body) = region_body(doc, "queues") else {
-        return Vec::new(); // no named queues registered
-    };
-    let mut rows = Vec::new();
-    for line in body.lines() {
-        let line = line.trim();
-        if !line.starts_with('|') {
-            continue;
-        }
-        let cells = split_row(line);
-        if cells.len() != 2 {
-            continue;
-        }
-        if cells[0] == "queue" && cells[1] == "repo" {
-            continue; // header
-        }
-        if is_separator_row(&cells) {
-            continue;
-        }
-        if cells[0].is_empty() {
-            continue;
-        }
-        rows.push((cells[0].clone(), cells[1].clone()));
-    }
-    rows
-}
-
-/// A markdown table separator row (`|---|---|`): every cell non-empty and made
-/// only of `-`/`:`. Mirrors keeperd's row parsers so a hand-edited table parses
-/// identically on both sides.
-fn is_separator_row(cells: &[String]) -> bool {
-    cells
-        .iter()
-        .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
-}
-
-/// Split one `| a | b | … |` table line into trimmed, `\|`-unescaped cells.
-/// A faithful copy of keeperd's `queue::split_row` so escaped pipes in a title
-/// round-trip identically.
-fn split_row(line: &str) -> Vec<String> {
-    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
-    let mut cells = Vec::new();
-    let mut cur = String::new();
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if chars.peek() == Some(&'|') => {
-                cur.push('|');
-                chars.next();
-            }
-            '|' => {
-                cells.push(cur.trim().to_string());
-                cur.clear();
-            }
-            _ => cur.push(c),
-        }
-    }
-    cells.push(cur.trim().to_string());
-    cells
-}
-
-/// Extract the inner body of the managed region tagged `tag` — the lines between
-/// `<!-- softfig:<tag> -->` and `<!-- /softfig:<tag> -->`, with the one blank pad
-/// line on each side stripped, `\n`-joined. `None` when the region is absent.
-/// A faithful copy of keeperd's `managed::region_body` (markers matched by their
-/// trimmed text, exact line equality, so `queue` / `queues` / `queue:x` never
-/// collide).
-fn region_body(content: &str, tag: &str) -> Option<String> {
-    let open = format!("<!-- softfig:{tag} -->");
-    let close = format!("<!-- /softfig:{tag} -->");
-    let lines: Vec<&str> = content.split('\n').collect();
-    let open_idx = lines.iter().position(|l| l.trim() == open)?;
-    let close_rel = lines[open_idx + 1..].iter().position(|l| l.trim() == close)?;
-    let close_idx = open_idx + 1 + close_rel;
-    let mut body = &lines[open_idx + 1..close_idx];
-    while body.first().is_some_and(|l| l.trim().is_empty()) {
-        body = &body[1..];
-    }
-    while body.last().is_some_and(|l| l.trim().is_empty()) {
-        body = &body[..body.len() - 1];
-    }
-    Some(body.join("\n"))
-}
 
 // ---------------------------------------------------------------------------
 // The live source: read the backlog doc from keeperd, then parse it.
@@ -338,7 +221,7 @@ impl KeeperdItemDocReader {
 
 impl ItemDocReader for KeeperdItemDocReader {
     fn read_item_doc(&self, id: &str) -> Result<Option<String>, String> {
-        if !id.chars().all(|c| c.is_ascii_digit()) {
+        if !is_task_id(id) {
             return self.read(format!("{MILESTONES_DIR}/{id}/CLAUDE.md"));
         }
         let listing: Option<ListTreeReply> =
@@ -409,8 +292,10 @@ impl QueueSource for KeeperdQueueSource {
 /// The live [`RepoProbe`] (task 069): which repo a part's work lands in, read
 /// through the same two keeperd docs the queue source reads — the item doc's
 /// `> Worktree:` first, then the queue registry's `repo` cell — and how far it has
-/// moved, through [`probe`]. Called once per member session, on the spin guard's
-/// lazy read, so the keeperd reads and the `git` calls never run per tick.
+/// moved, through [`probe`]. Called on the spin guard's lazy read (once per
+/// member session exit) and by the boot dirty-tree guard (task 064, once before
+/// each member spawn), so the keeperd reads and the `git` calls never run per
+/// tick.
 #[derive(Debug)]
 pub struct KeeperdRepoProbe {
     backlog: Box<dyn BacklogReader>,
@@ -431,13 +316,14 @@ impl KeeperdRepoProbe {
     }
 }
 
-impl RepoProbe for KeeperdRepoProbe {
-    /// Every failure is "no repo signal" (the NEXT-ACTION-only guard), never an
-    /// error: a doc keeperd can't serve and a repo `git` can't read are journaled,
-    /// and the guard decides on NEXT ACTION alone.
-    fn repo_state(&self, queue: &str, part: &str) -> Option<RepoState> {
-        // An unreadable doc might name a worktree the registry would contradict,
-        // so it is no signal rather than a registry guess.
+impl KeeperdRepoProbe {
+    /// Resolve the local repo path for `(queue, part)` through the shared
+    /// resolver ([`item_repo_path`]: the doc's `> Worktree:`, then the queue
+    /// registry's `repo` cell), journaling an unreadable doc or backlog rather
+    /// than guessing. `None` = no repo signal (never an error); an unreadable doc
+    /// might name a worktree the registry would contradict, so it is no signal
+    /// rather than a registry guess.
+    fn resolve(&self, queue: &str, part: &str) -> Option<PathBuf> {
         let doc = self
             .docs
             .read_item_doc(part)
@@ -445,23 +331,29 @@ impl RepoProbe for KeeperdRepoProbe {
                 eprintln!("growlightd: repo probe: item doc for {queue}/{part} unreadable: {e}");
             })
             .ok()?;
-        let worktree = doc.as_deref().and_then(worktree_field);
-        // The registry is only read when the doc names no worktree: a present
-        // `> Worktree:` wins even when it doesn't resolve.
-        let registry = match worktree {
-            Some(_) => None,
-            None => match self.backlog.read_backlog() {
-                Ok(backlog) => registry_repo(&backlog, queue),
-                Err(e) => {
+        let backlog = || {
+            self.backlog
+                .read_backlog()
+                .inspect_err(|e| {
                     eprintln!("growlightd: repo probe: backlog unreadable for {queue}/{part}: {e}");
-                    None
-                }
-            },
+                })
+                .ok()
         };
-        let repo = resolve_repo(worktree, registry.as_deref(), self.home.as_deref())?;
-        probe(&repo)
+        item_repo_path(doc.as_deref(), queue, backlog, self.home.as_deref())
+    }
+}
+
+impl RepoProbe for KeeperdRepoProbe {
+    /// Every failure is "no repo signal" (the NEXT-ACTION-only guard), never an
+    /// error: a doc keeperd can't serve and a repo `git` can't read are journaled,
+    /// and the guard decides on NEXT ACTION alone. The path is the one probed
+    /// (review 043 G64-9: no second resolution that could name another repo).
+    fn repo_state(&self, queue: &str, part: &str) -> Option<(PathBuf, RepoState)> {
+        let repo = self.resolve(queue, part)?;
+        let state = probe(&repo)
             .inspect_err(|e| eprintln!("growlightd: repo probe: {queue}/{part}: {e}"))
-            .ok()
+            .ok()?;
+        Some((repo, state))
     }
 }
 
@@ -469,6 +361,7 @@ impl RepoProbe for KeeperdRepoProbe {
 mod tests {
     use super::*;
     use crate::scheduler::PartStatus;
+    use softfig_ipc::backlog_doc::registry_repo;
     use std::sync::Mutex;
 
     /// Wrap a body in the managed-region markers exactly as keeperd's
@@ -771,19 +664,7 @@ mod tests {
     /// A git repo with one committed file and `dirty` untracked ones.
     fn git_repo(dirty: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("run git")
-                .success();
-            assert!(ok, "git {args:?}");
-        };
+        let git = |args: &[&str]| softfig_ipc::testing::git(dir.path(), args);
         git(&["init", "-q"]);
         std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
         git(&["add", "."]);
@@ -799,7 +680,11 @@ mod tests {
         let repo = git_repo(2);
         let doc = format!("# 069\n> Worktree: `{}`\n", repo.path().display());
         let state = repo_probe(Box::new(UnreadBacklog), Ok(Some(doc))).repo_state("psy", "069");
-        assert_eq!(state.map(|s| s.dirty), Some(2));
+        assert_eq!(
+            state.map(|(path, s)| (path, s.dirty)),
+            Some((repo.path().to_path_buf(), 2)),
+            "the probed repo's path comes back with its state"
+        );
 
         // A worktree this machine can't probe is no signal — not a registry guess.
         let remote = repo_probe(Box::new(UnreadBacklog), Ok(Some("> Worktree: host:/x\n".into())));
@@ -812,7 +697,7 @@ mod tests {
         let registry = format!("| queue | repo |\n|---|---|\n| psy | {} |", repo.path().display());
         let backlog = Box::new(FakeReader { doc: region("queues", &registry) });
         let probe = repo_probe(backlog, Ok(Some("# booking\n> Model: claude\n".into())));
-        assert_eq!(probe.repo_state("psy", "booking").map(|s| s.dirty), Some(1));
+        assert_eq!(probe.repo_state("psy", "booking").map(|(_, s)| s.dirty), Some(1));
         // The default queue has no registry row: no repo until its doc names one.
         assert_eq!(probe.repo_state("default", "booking"), None);
     }

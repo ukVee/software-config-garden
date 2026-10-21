@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod backlog_doc;
 pub mod baton;
 pub mod client;
 pub mod fleet;
@@ -20,6 +21,7 @@ pub mod opencode;
 pub mod proto;
 pub mod queue_v2;
 pub mod socket;
+pub mod testing;
 pub mod usage;
 pub mod verbs;
 

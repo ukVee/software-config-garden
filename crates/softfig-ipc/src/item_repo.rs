@@ -120,6 +120,84 @@ impl RepoState {
     }
 }
 
+/// The local repo an item's work lands in — the ONE item→repo resolver
+/// growlightd's repo probe and the CLI's semi-auto boot check share (task 064
+/// review G64-3): the item doc's `> Worktree:` (`item_doc` is the item's own
+/// doc — a milestone's `CLAUDE.md` or a task's doc, never a slice), else the
+/// `repo` cell of its `queue` in the backlog's `## Queues` registry, else none,
+/// by [`resolve_repo`]'s rules. `backlog` yields the backlog doc and is called
+/// only when the doc names no worktree.
+pub fn item_repo_path(
+    item_doc: Option<&str>,
+    queue: &str,
+    backlog: impl FnOnce() -> Option<String>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let worktree = item_doc.and_then(worktree_field);
+    // A present `> Worktree:` wins even when it doesn't resolve.
+    let registry = match worktree {
+        Some(_) => None,
+        None => backlog().and_then(|doc| crate::backlog_doc::registry_repo(&doc, queue)),
+    };
+    resolve_repo(worktree, registry.as_deref(), home)
+}
+
+/// The boot-time dirty-tree guard's decision (task 064): does `repo` carry
+/// uncommitted work that is NEWER than the baton's last write (`baton_mtime`)?
+/// That is the signature of a session that did work and was cut off before its
+/// handoff — a dirty tree the baton does not know about. Pure over
+/// [`RepoState`], so growlightd (fleet member spawn) and the single-agent /
+/// semi-auto boot decide identically. Read-only: the caller only ever
+/// *surfaces* the answer, never reverts, stages or commits.
+pub fn dirty_newer_than(state: &RepoState, baton_mtime: SystemTime) -> bool {
+    state.dirty > 0 && state.newest_dirty_mtime.is_some_and(|m| m > baton_mtime)
+}
+
+/// What a member's baton says about the last handoff on its item, for the boot
+/// dirty-tree guard (task 064 review G64-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// The baton carried over from the item's last session, last written at
+    /// this instant: dirt newer than it is a session cut off before handing off.
+    At(SystemTime),
+    /// The baton was just written fresh for this item, so no prior handoff
+    /// exists and every dirty path is one the baton knows nothing about. (A
+    /// fresh seed's own mtime is "now", against which no dirt could ever read
+    /// as newer — the miss G64-2 found.)
+    Fresh,
+}
+
+/// The boot dirty-tree signal (task 064): the one line growlightd journals
+/// before a member spawn and the CLI prints at `growlight start`, or `None`
+/// when there is nothing to surface — a clean tree, or (for
+/// [`Handoff::At`]) dirt no newer than the handoff ([`dirty_newer_than`]).
+/// `label` names the item (and the member, for growlightd). Pure; the caller
+/// only ever surfaces it — never reverts, stages or commits.
+pub fn boot_signal(label: &str, repo: &Path, state: &RepoState, handoff: Handoff) -> Option<String> {
+    let dirty = state.dirty;
+    let recency = match handoff {
+        Handoff::At(baton) => {
+            if !dirty_newer_than(state, baton) {
+                return None;
+            }
+            match state.newest_dirty_mtime.and_then(|m| m.duration_since(baton).ok()) {
+                Some(by) => format!("newest ~{}s newer than the baton handoff", by.as_secs()),
+                None => "newest newer than the baton handoff".to_string(),
+            }
+        }
+        Handoff::Fresh => {
+            if dirty == 0 {
+                return None;
+            }
+            "and the baton is fresh — no prior handoff on this item accounts for them".to_string()
+        }
+    };
+    Some(format!(
+        "boot dirty tree: {label}: {} has {dirty} uncommitted path(s), {recency}",
+        repo.display()
+    ))
+}
+
 /// Read `repo`'s [`RepoState`] through `git`. `Err` when `repo` is not a git
 /// repo, `git` can't be run, or a call outlives its timeout.
 pub fn probe(repo: &Path) -> Result<RepoState, String> {
@@ -310,9 +388,7 @@ mod tests {
         assert_eq!(resolve_repo(Some("host:/x"), Some("/g"), home), None);
     }
 
-    fn sh_git(repo: &Path, args: &[&str]) {
-        git_with_stdin(repo, args, Stdio::null());
-    }
+    use crate::testing::{git as sh_git, git_with_stdin};
 
     #[test]
     fn probe_tracks_head_and_the_dirty_trees_content() {
@@ -380,6 +456,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(probe(dir.path()).is_err());
         assert!(probe(&dir.path().join("absent")).is_err());
+    }
+
+    #[test]
+    fn dirty_newer_than_flags_work_newer_than_the_baton_write() {
+        let t = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        let state = |dirty: usize, mtime: Option<SystemTime>| RepoState {
+            head: Some("abc".into()),
+            dirty,
+            newest_dirty_mtime: mtime,
+            fingerprint: 0,
+        };
+
+        // A clean tree never flags, however new.
+        assert!(!dirty_newer_than(&state(0, Some(t(2))), t(1)));
+        // Dirt with no readable mtime can't prove "newer" — no flag.
+        assert!(!dirty_newer_than(&state(1, None), t(1)));
+        // Dirt OLDER than the baton is a prior handoff's state — no flag.
+        assert!(!dirty_newer_than(&state(1, Some(t(1))), t(2)));
+        assert!(!dirty_newer_than(&state(1, Some(t(1))), t(1)), "equal is not newer");
+        // Dirt NEWER than the baton write is the cut-off-session signature.
+        assert!(dirty_newer_than(&state(1, Some(t(3))), t(2)));
+        // An unborn HEAD still flags on dirty+newer (head is not the signal).
+        let unborn = RepoState { head: None, dirty: 2, newest_dirty_mtime: Some(t(5)), fingerprint: 0 };
+        assert!(dirty_newer_than(&unborn, t(4)));
+    }
+
+    /// Review 043 G64-2: a fresh baton has no handoff to be newer than, so any
+    /// dirt surfaces; a carried one surfaces only dirt newer than its write.
+    #[test]
+    fn boot_signal_surfaces_any_dirt_on_a_fresh_baton_and_newer_dirt_on_a_carried_one() {
+        let t = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        let state = |dirty: usize, mtime: u64| RepoState {
+            head: Some("abc".into()),
+            dirty,
+            newest_dirty_mtime: Some(t(mtime)),
+            fingerprint: 0,
+        };
+        let repo = Path::new("/r");
+        assert_eq!(boot_signal("x", repo, &state(0, 9), Handoff::Fresh), None, "clean");
+        let fresh = boot_signal("064", repo, &state(2, 1), Handoff::Fresh).unwrap();
+        assert!(fresh.contains("/r has 2 uncommitted path(s)") && fresh.contains("fresh"), "{fresh}");
+        assert_eq!(boot_signal("x", repo, &state(2, 1), Handoff::At(t(5))), None, "older dirt");
+        let carried = boot_signal("064", repo, &state(1, 8), Handoff::At(t(5))).unwrap();
+        assert!(carried.ends_with("newest ~3s newer than the baton handoff"), "{carried}");
     }
 
     /// A tracked FIFO in the dirty tree must never be opened: open(2) on a FIFO
@@ -468,18 +588,4 @@ mod tests {
         assert!(ok, "touch {}", path.display());
     }
 
-    fn git_with_stdin(repo: &Path, args: &[&str], stdin: Stdio) {
-        let ok = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .stdin(stdin)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("run git")
-            .success();
-        assert!(ok, "git {args:?}");
-    }
 }
