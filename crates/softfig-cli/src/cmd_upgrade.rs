@@ -10,13 +10,15 @@
 //! 2. fetch it (`git pull --ff-only` for a checkout; a tagged clone is already
 //!    at the tag);
 //! 3. pre-check the support window against the source's *declared* version,
-//!    before the build (refuse from older than the previous minor —
-//!    `meta/spec-release.md` → "Support window");
+//!    and refuse a store-schema change, both before the build (refuse from
+//!    older than the previous minor — `meta/spec-release.md` → "Support
+//!    window"; no store migration exists yet — report 079);
 //! 4. `cargo build --release --locked`;
 //! 5. stage + atomic install of the reconciled set (slice 003's swap);
-//! 6. safely cycle the daemon (the `daemon cycle` relock-token path);
-//! 7. run pending migrations (`migrate` status → `migrate finalize` if
-//!    prepared);
+//! 6. finish an unfinished M2a migration (`migrate` status → `migrate
+//!    finalize` if prepared), before the cycle;
+//! 7. safely cycle the daemon (the `daemon cycle` relock-token path), or stop
+//!    it where no cycle is possible;
 //! 8. confirm the running daemon now reports the new version (slice 002's
 //!    handshake, checked against the *built* version — this process is the
 //!    pre-upgrade binary, so `binary_version()` is the old one).
@@ -153,6 +155,13 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     let declared = declared_version(source.path())?;
     check_support_window(&prefix, &declared)?;
 
+    // 2b. Refuse a release that changes the store schema, also before the
+    //     build. soft-fig has no store migration yet — `Db::open` refuses any
+    //     `user_version` but its own — so a schema-bumping release would cycle
+    //     the daemon into a binary that cannot open the store (report 079).
+    let current_schema = daemon.store_schema.unwrap_or(softfig_store::db::SCHEMA_VERSION);
+    check_store_schema(current_schema, declared_store_schema(source.path())?)?;
+
     // 3. Build the program from source (the same build the release workflow
     //    runs — `--locked` against the committed Cargo.lock).
     build_program(source.path())?;
@@ -215,7 +224,7 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     //    explicitly — this process's cwd is the source checkout, never the
     //    garden.
     if !args.no_migrate {
-        run_migrations(&prefix, daemon.garden_root.as_deref())?;
+        run_migrations(&prefix, daemon.garden_root.as_deref(), &socket)?;
     }
 
     // 6. Warn about a live growlight loop (spec-growlight §12), then cycle the
@@ -395,6 +404,9 @@ struct DaemonState {
     locked: bool,
     relock_enabled: bool,
     garden_root: Option<String>,
+    /// The store schema the running daemon's build opens (`axes.store_schema`);
+    /// `None` without a daemon or from a pre-stamp build.
+    store_schema: Option<u32>,
 }
 
 /// Read the daemon's state in one `status` call. A missing daemon (or an
@@ -407,6 +419,7 @@ fn daemon_state(socket: &Path) -> DaemonState {
                 running: true,
                 locked: r.state == "locked",
                 relock_enabled: r.relock_enabled,
+                store_schema: r.axes.as_ref().map(|a| a.store_schema),
                 garden_root: (!r.garden_root.is_empty()).then_some(r.garden_root),
             },
             Err(_) => DaemonState {
@@ -414,6 +427,7 @@ fn daemon_state(socket: &Path) -> DaemonState {
                 locked: false,
                 relock_enabled: false,
                 garden_root: None,
+                store_schema: None,
             },
         },
         _ => DaemonState {
@@ -421,6 +435,7 @@ fn daemon_state(socket: &Path) -> DaemonState {
             locked: false,
             relock_enabled: false,
             garden_root: None,
+            store_schema: None,
         },
     }
 }
@@ -471,15 +486,19 @@ fn warn_if_growlight_live() {
 /// `migrate finalize`. A failed migration now fails the upgrade with the remedy
 /// instead of being swallowed. The one-time `split` / `config` / `reindex`
 /// conversions are idempotent and remain manual.
-fn run_migrations(prefix: &Path, garden_root: Option<&str>) -> Result<()> {
+///
+/// There is no store-schema migration to run: none exists yet, and step 2b
+/// refuses a release whose store schema differs, so a schema change never
+/// reaches this step (report 079).
+fn run_migrations(prefix: &Path, garden_root: Option<&str>, socket: &Path) -> Result<()> {
     let softfig = prefix.join("softfig");
 
-    // No daemon ⇒ no garden to migrate: the store-schema gate runs the
-    // migration at the next daemon boot, so there is nothing to do here.
+    // No daemon ⇒ no garden to check for an unfinished M2a migration.
     let Some(garden) = garden_root else {
-        println!("daemon not running — migrations will run at the next daemon boot.");
+        println!("daemon not running — no garden to check for an unfinished migration.");
         return Ok(());
     };
+    let socket = socket.to_string_lossy();
 
     println!("checking migrations (`softfig migrate --garden {garden}`)…");
     let status = run_captured(&softfig, &["migrate", "--garden", garden])
@@ -487,11 +506,37 @@ fn run_migrations(prefix: &Path, garden_root: Option<&str>) -> Result<()> {
     print!("{status}");
     if needs_finalize(&status) {
         println!("finalizing the migration (`softfig migrate finalize`)…");
-        let out = run_captured(&softfig, &["migrate", "finalize"])
+        let out = run_captured(&softfig, &["migrate", "finalize", "--socket", &socket])
             .with_context(|| "migration failed — fix it by hand (`softfig migrate`), then re-run `softfig upgrade`")?;
         print!("{out}");
     }
     Ok(())
+}
+
+/// The store schema a source declares: `SCHEMA_VERSION` in
+/// `crates/softfig-store/src/db.rs`, read before the build like the version.
+/// A source this can't read is refused rather than guessed.
+fn declared_store_schema(source: &Path) -> Result<u32> {
+    let path = source.join("crates/softfig-store/src/db.rs");
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    text.lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("pub const SCHEMA_VERSION: u32 =")?;
+            rest.trim().trim_end_matches(';').trim().parse().ok()
+        })
+        .ok_or_else(|| anyhow::anyhow!("no `pub const SCHEMA_VERSION: u32` in {} — cannot check the store schema", path.display()))
+}
+
+/// Refuse an upgrade across a store-schema change (report 079).
+fn check_store_schema(current: u32, declared: u32) -> Result<()> {
+    if current == declared {
+        return Ok(());
+    }
+    bail!(
+        "this release changes the store schema ({current} → {declared}), and soft-fig \
+         has no store migration yet: the new daemon would refuse your store. \
+         Nothing was built or installed."
+    )
 }
 
 /// Does a `migrate` status output name a prepared-but-not-finalized garden?
@@ -651,6 +696,7 @@ mod tests {
             locked,
             relock_enabled,
             garden_root: None,
+            store_schema: None,
         }
     }
 
@@ -745,6 +791,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nversion = \"0.1.0\"\n").unwrap();
         assert_eq!(declared_version(dir.path()).unwrap(), "0.1.0");
+    }
+
+    /// Report 079: the store schema a source declares is read before the
+    /// build, and an upgrade across a schema change is refused.
+    #[test]
+    fn a_store_schema_change_is_refused_before_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("crates/softfig-store/src");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("db.rs"), "use x;\n\npub const SCHEMA_VERSION: u32 = 2;\n").unwrap();
+        assert_eq!(declared_store_schema(dir.path()).unwrap(), 2);
+
+        let err = check_store_schema(1, 2).unwrap_err().to_string();
+        assert!(err.contains("store schema (1 → 2)"), "{err}");
+        assert!(check_store_schema(1, 1).is_ok());
+    }
+
+    #[test]
+    fn a_source_without_a_store_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(declared_store_schema(dir.path()).is_err());
+    }
+
+    /// This workspace's own source declares the schema this binary opens.
+    #[test]
+    fn this_source_declares_this_builds_store_schema() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(declared_store_schema(&root).unwrap(), softfig_store::db::SCHEMA_VERSION);
     }
 
     #[test]

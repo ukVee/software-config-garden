@@ -404,10 +404,53 @@ fn print_status(args: StatusArgs) -> Result<()> {
             }
             None => println!("phase             unmigrated (keeper.toml has no state_root)"),
         }
+    } else if is_fuse_mountpoint(&fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(), &garden) {
+        // A running daemon's FUSE view hides the on-disk `.softfig/keeper.toml`
+        // pointer, so "no keeper.toml" here would be false (report 079).
+        println!("phase             mounted (the daemon serves this garden over FUSE)");
+        println!(
+            "next              nothing to check through the mount; to read the on-disk \
+             phase, stop the daemon and re-run `softfig migrate`"
+        );
     } else {
         println!("phase             unmigrated (no keeper.toml)");
     }
     Ok(())
+}
+
+/// Is `path` the mount point of a FUSE mount in `mountinfo` (the
+/// `/proc/self/mountinfo` format: field 5 is the mount point, octal-escaped;
+/// the filesystem type follows the ` - ` separator)?
+fn is_fuse_mountpoint(mountinfo: &str, path: &Path) -> bool {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = path.to_string_lossy();
+    mountinfo.lines().any(|line| {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            return false;
+        };
+        let fstype = post.split(' ').next().unwrap_or("");
+        fstype.starts_with("fuse") && pre.split(' ').nth(4).map(unescape_mountinfo).as_deref() == Some(&*path)
+    })
+}
+
+/// Undo mountinfo's `\ooo` octal escapes (space, tab, newline, backslash).
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && let Some(code) = field.get(i + 1..i + 4)
+            && let Ok(b) = u8::from_str_radix(code, 8)
+        {
+            out.push(b);
+            i += 4;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---- helpers ----
@@ -487,4 +530,29 @@ pub fn assert_state_mountable(state_root: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Report 079: a garden the daemon has mounted reads as mounted, not
+    /// "unmigrated (no keeper.toml)".
+    #[test]
+    fn a_fuse_mounted_garden_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let garden = fs::canonicalize(dir.path()).unwrap();
+        let line = |mp: &str, fstype: &str| {
+            format!("36 25 0:45 / {mp} rw,nosuid shared:1 - {fstype} softfig rw,user_id=1000\n")
+        };
+        let g = garden.to_str().unwrap();
+        assert!(is_fuse_mountpoint(&line(g, "fuse.softfig"), &garden));
+        assert!(!is_fuse_mountpoint(&line(g, "ext4"), &garden));
+        assert!(!is_fuse_mountpoint(&line("/elsewhere", "fuse"), &garden));
+        // A mount point with a space is octal-escaped in mountinfo.
+        let spaced = garden.join("my garden");
+        fs::create_dir_all(&spaced).unwrap();
+        let escaped = format!("{g}/my\\040garden");
+        assert!(is_fuse_mountpoint(&line(&escaped, "fuse"), &spaced));
+    }
 }
