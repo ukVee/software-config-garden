@@ -42,12 +42,13 @@ fn serve_hello() -> u16 {
 
 fn run_curl(port: u16, allowed_port: u16) -> i32 {
     let work = tempfile::tempdir().unwrap();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let ctx = JobContext {
         src: work.path().to_path_buf(),
-        target_cache: tempfile::tempdir().unwrap().keep(),
-        toolchain: tempfile::tempdir().unwrap().keep(),
-        cargo_home: tempfile::tempdir().unwrap().keep(),
-        etc: tempfile::tempdir().unwrap().keep(),
+        target_cache: dirs[0].path().to_path_buf(),
+        toolchain: dirs[1].path().to_path_buf(),
+        cargo_home: dirs[2].path().to_path_buf(),
+        etc: work.path().to_path_buf(),
         scratch_size: 16 * 1024 * 1024,
     };
     let serve =
