@@ -32,7 +32,8 @@ use crate::error::{Error, Result};
 /// Decide whether a CONNECT target host (with `port`) is allowed by the
 /// `[serve] egress` allowlist. Entries are hostnames, matched case-insensitively
 /// and exactly (no subdomain wildcards — the list is explicit). An entry may
-/// pin a port as `host:port`.
+/// pin a port as `host:port`; an entry with no port allows 443 only (the
+/// registry and git-over-https traffic the fetch step needs), never every port.
 pub fn host_allowed(host: &str, port: u16, allowlist: &[String]) -> bool {
     let host = host.trim().to_ascii_lowercase();
     if host.is_empty() {
@@ -42,7 +43,7 @@ pub fn host_allowed(host: &str, port: u16, allowlist: &[String]) -> bool {
         let e = e.trim().to_ascii_lowercase();
         match e.rsplit_once(':') {
             Some((eh, ep)) => eh == host && ep.parse::<u16>().is_ok_and(|p| p == port),
-            None => e == host,
+            None => e == host && port == 443,
         }
     })
 }
@@ -261,7 +262,9 @@ mod tests {
     fn allowlist_matches_exact_host_and_pinned_port() {
         let list = vec!["index.crates.io".to_string(), "github.com:443".to_string()];
         assert!(host_allowed("index.crates.io", 443, &list));
-        assert!(host_allowed("INDEX.CRATES.IO", 80, &list), "case-insensitive");
+        assert!(host_allowed("INDEX.CRATES.IO", 443, &list), "case-insensitive");
+        assert!(!host_allowed("index.crates.io", 80, &list), "a portless entry means 443 only");
+        assert!(!host_allowed("index.crates.io", 22, &list), "a portless entry means 443 only");
         assert!(host_allowed("github.com", 443, &list));
         assert!(!host_allowed("github.com", 80, &list), "port pin must match");
         assert!(!host_allowed("example.com", 443, &list));
