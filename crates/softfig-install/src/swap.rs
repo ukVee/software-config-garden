@@ -82,6 +82,13 @@ fn swap_binaries_inner(
         .consistent_identity()
         .map(|(version, build_id)| (version.to_string(), build_id.to_string()));
     write_swap_marker(target_dir, staged_identity.as_ref(), set)?;
+    // ...and its directory entry durable too, before the first rename.
+    std::fs::File::open(target_dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|source| SwapError::Io {
+            path: target_dir.to_path_buf(),
+            source,
+        })?;
 
     for (i, &name) in set.iter().enumerate() {
         before_rename(name)?;
@@ -115,8 +122,14 @@ fn write_swap_marker(
         None => content.push_str("version unknown\nbuild_id unknown\n"),
     }
     content.push_str(&format!("remaining {}\n", remaining.join(" ")));
+    // Durable before the rename it guards: a crash must never leave a renamed
+    // binary with no marker on disk to say the set is partial.
     let path = target_dir.join(SWAP_IN_PROGRESS_MARKER);
-    std::fs::write(&path, content).map_err(|source| SwapError::Io { path, source })
+    let written = std::fs::File::create(&path).and_then(|mut f| {
+        std::io::Write::write_all(&mut f, content.as_bytes())?;
+        f.sync_all()
+    });
+    written.map_err(|source| SwapError::Io { path, source })
 }
 
 /// Remove the swap-in-progress marker after the last rename. A missing marker

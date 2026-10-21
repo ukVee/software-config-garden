@@ -145,7 +145,7 @@ pub fn stage_and_swap(source: &Path, prefix: &Path, force: bool) -> Result<Stage
     // the swap writes on the *target* side).
     fsync_staged(staging.path())?;
 
-    // Keep the superseded set recoverable: move the current binaries into the
+    // Keep the superseded set recoverable: link the current binaries into the
     // one `.previous` sibling before the swap, so `--rollback` can restore
     // them.
     save_previous(prefix)?;
@@ -257,33 +257,39 @@ fn acquire_install_lock(prefix: &Path) -> Result<std::fs::File> {
     }
 }
 
-/// Move the currently-installed binaries into the one `.previous` sibling, so
-/// the swap it precedes stays recoverable. A prior `.previous` is discarded
-/// first (one set, never a stack); a prefix with nothing installed leaves no
+/// Keep the superseded set recoverable for `--rollback`: hard-link each
+/// installed binary into a fresh `.previous` (copying where the filesystem
+/// refuses a link). The prefix itself is untouched until the swap renames the
+/// new set over it, so it never goes empty and each name still flips by one
+/// atomic rename (report 074). A prefix with nothing installed leaves no
 /// `.previous` at all.
+///
+/// Only a *consistent* installed set replaces `.previous` (one set, never a
+/// stack). A PARTIAL prefix — an interrupted swap's marker, or a mix of
+/// builds — is half old and half new, while the intact old set already sits
+/// in `.previous`; deleting that would lose `--rollback` exactly when it is
+/// needed. So a partial prefix keeps `.previous` as it is.
 fn save_previous(prefix: &Path) -> Result<()> {
+    if SetReport::scan(prefix).consistent_identity().is_none() {
+        return Ok(());
+    }
     let previous = prefix.join(PREVIOUS_SET_DIR);
     if previous.exists() {
         std::fs::remove_dir_all(&previous)
             .with_context(|| format!("removing the prior previous set {}", previous.display()))?;
     }
-    let mut moved = false;
+    std::fs::create_dir_all(&previous).with_context(|| format!("creating {}", previous.display()))?;
     for name in INSTALLED_SET {
-        let from = prefix.join(name);
-        if from.exists() {
-            if !moved {
-                std::fs::create_dir_all(&previous)
-                    .with_context(|| format!("creating {}", previous.display()))?;
-                moved = true;
-            }
-            std::fs::rename(&from, previous.join(name))
-                .with_context(|| format!("moving {} into {}", from.display(), previous.display()))?;
+        let (from, to) = (prefix.join(name), previous.join(name));
+        if std::fs::hard_link(&from, &to).is_err() {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("keeping {} in {}", from.display(), previous.display()))?;
+            std::fs::File::open(&to)
+                .and_then(|f| f.sync_all())
+                .with_context(|| format!("fsyncing {}", to.display()))?;
         }
     }
-    if moved {
-        fsync_dir(&previous)?;
-    }
-    Ok(())
+    fsync_dir(&previous)
 }
 
 /// `fsync` every staged binary (the freshly-copied set) so each is durable
@@ -608,6 +614,51 @@ mod tests {
 
     /// A fresh install (nothing previously installed) keeps no `.previous` —
     /// there is no superseded set to roll back to.
+    /// Report 074: a re-run after a swap interrupted part-way keeps the
+    /// intact `.previous` set, so `--rollback` still restores the original.
+    #[test]
+    fn a_rerun_after_an_interrupted_swap_keeps_the_rollback_set() {
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_set_id(&prefix, "1.0.0", "old");
+        // The first upgrade saved the old set, then died after two renames.
+        let previous = prefix.join(PREVIOUS_SET_DIR);
+        std::fs::create_dir_all(&previous).unwrap();
+        write_set_id(&previous, "1.0.0", "old");
+        for name in &INSTALLED_SET[..2] {
+            write_binary_id(&prefix, name, "1.0.1", "new");
+        }
+        std::fs::write(prefix.join(SWAP_IN_PROGRESS_MARKER), "remaining …\n").unwrap();
+
+        let source = source_with_id("1.0.1", "new");
+        let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
+        assert!(!outcome.is_noop());
+        assert_eq!(SetReport::scan(&prefix).consistent_identity(), Some(("1.0.1", "new")));
+        assert_eq!(SetReport::scan(&previous).consistent_identity(), Some(("1.0.0", "old")));
+
+        let restored = rollback(&prefix).unwrap();
+        assert_eq!((restored.version.as_str(), restored.build_id.as_str()), ("1.0.0", "old"));
+        assert_eq!(SetReport::scan(&prefix).consistent_identity(), Some(("1.0.0", "old")));
+    }
+
+    /// Report 074: saving the previous set leaves the prefix whole — the old
+    /// binaries stay in place until the swap renames the new ones over them.
+    #[test]
+    fn saving_the_previous_set_never_empties_the_prefix() {
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_set_id(&prefix, "1.0.0", "old");
+
+        save_previous(&prefix).unwrap();
+
+        assert_eq!(SetReport::scan(&prefix).consistent_identity(), Some(("1.0.0", "old")));
+        let previous = prefix.join(PREVIOUS_SET_DIR);
+        assert_eq!(SetReport::scan(&previous).consistent_identity(), Some(("1.0.0", "old")));
+        assert!(sets_byte_identical(&prefix, &previous));
+    }
+
     #[test]
     fn a_fresh_install_keeps_no_previous_set() {
         let source = source_with("1.0.1");
