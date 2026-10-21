@@ -40,7 +40,9 @@ decision record or crate that owns it, rather than at every internal change.
 - **`softfig-rescue`.** The recovery-wedge artifact — no FUSE, no daemon, no
   network, minimally linked — that writes the phase-1 carry-file and declares
   the packs seam (release-pipeline slice 006).
-- **`softfig upgrade` and `softfig uninstall`.** `upgrade` pulls, builds, swaps
+- **`softfig upgrade` and `softfig uninstall`.** With no source named, `upgrade`
+  builds the newest release tag newer than the running binary (or says it is
+  already current); otherwise it builds the given checkout or tag. It pulls, builds, swaps
   the installed set atomically, cycles the daemon on the relock-token path (or
   stops it honestly where no supervisor respawns), runs pending migrations, and
   confirms the handshake; `uninstall` removes the installed set, the unit and

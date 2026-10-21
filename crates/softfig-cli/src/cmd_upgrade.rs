@@ -4,7 +4,9 @@
 //!
 //! 1. resolve a real source — an explicit `--source` checkout, an explicit
 //!    `--repo`/`--ref` clone, the source recorded at install, or the baked
-//!    repo + tag (never the current dir);
+//!    repo's newest release tag newer than this binary (never the current
+//!    dir, never the installed version's own tag; nothing newer → "already at
+//!    the newest release", no build);
 //! 2. fetch it (`git pull --ff-only` for a checkout; a tagged clone is already
 //!    at the tag);
 //! 3. pre-check the support window against the source's *declared* version,
@@ -98,14 +100,28 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
 
     // M8: resolve a *real* source — the explicit `--source` checkout, an
     // explicit `--repo`/`--ref` clone, the source recorded at install, or the
-    // baked repo + tag. Never silently build the current dir.
+    // baked repo's newest release newer than this binary (report 076). Never
+    // silently build the current dir, and never re-clone the installed tag.
     let recorded = source::recorded_source(&prefix);
-    let source = source::resolve(
+    let running = softfig_ipc::compat::binary_version();
+    let running = Version::parse(running)
+        .with_context(|| format!("this binary's version {running} is not semver"))?;
+    let source = match source::resolve_upgrade(
         args.source.as_deref(),
         args.repo.as_deref(),
         args.r#ref.as_deref(),
         recorded.as_deref(),
-    )?;
+        &running,
+    )? {
+        source::UpgradeSource::Build(source) => source,
+        source::UpgradeSource::UpToDate { newest } => {
+            println!(
+                "already at the newest release ({newest}) — nothing to upgrade.\n  \
+                 To rebuild a specific release: softfig upgrade --repo <url> --ref vX.Y.Z"
+            );
+            return Ok(());
+        }
+    };
     let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
 
     // Refuse a package-owned prefix before pulling/building/swapping: the

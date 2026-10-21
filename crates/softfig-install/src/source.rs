@@ -10,6 +10,12 @@
 //! 3. the source recorded at install (upgrade only);
 //! 4. the baked repo + tag (clone the tag this binary was cut from);
 //! 5. otherwise fail with the explicit `--repo`/`--ref` instruction.
+//!
+//! `upgrade` differs at step 4 ([`resolve_upgrade`]): it clones the baked
+//! repo's newest release tag *newer than the running binary*, or reports it is
+//! already current. Cloning the running binary's own tag — right for a
+//! reinstall — rebuilt the installed version and never reached a newer one
+//! (report 076).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -91,13 +97,98 @@ pub fn resolve(
     )
 }
 
-/// `git clone --depth 1 --branch <tag> <repo>` into a kept-alive temp dir.
+/// What `softfig upgrade` resolved to.
+pub enum UpgradeSource {
+    /// Build this source.
+    Build(Source),
+    /// No source was named and the baked repo has no release newer than the
+    /// running binary: there is nothing to upgrade to.
+    UpToDate { newest: String },
+}
+
+/// Resolve `upgrade`'s source. An explicit `--source`, `--repo`/`--ref` or the
+/// recorded install source behave as in [`resolve`]. With none of them, the
+/// baked repo's newest release tag newer than `running` is cloned
+/// ([`newest_release`]); never `running`'s own tag.
+pub fn resolve_upgrade(
+    explicit_source: Option<&Path>,
+    repo: Option<&str>,
+    r#ref: Option<&str>,
+    recorded: Option<&Path>,
+    running: &semver::Version,
+) -> Result<UpgradeSource> {
+    if explicit_source.is_some() || repo.is_some() || recorded.is_some() {
+        return resolve(explicit_source, repo, r#ref, recorded).map(UpgradeSource::Build);
+    }
+    let Some((repo, _)) = baked_source() else {
+        return resolve(None, None, None, None).map(UpgradeSource::Build);
+    };
+    let tags = remote_tags(repo)?;
+    match newest_release(&tags, running) {
+        Some(tag) => clone(repo, &tag).map(UpgradeSource::Build),
+        None => Ok(UpgradeSource::UpToDate {
+            newest: format!("v{running}"),
+        }),
+    }
+}
+
+/// The tag names `repo` publishes (`git ls-remote --tags --refs`).
+pub fn remote_tags(repo: &str) -> Result<Vec<String>> {
+    println!("checking {repo} for a newer release…");
+    let out = Command::new("git")
+        .args(["ls-remote", "--tags", "--refs", repo])
+        .output()
+        .context("running git ls-remote")?;
+    if !out.status.success() {
+        bail!(
+            "could not list the releases at {repo} (git ls-remote exit {}): {}\n  \
+             Name the release to build instead: --repo <url> --ref vX.Y.Z",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1)?.strip_prefix("refs/tags/"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// The newest `v<semver>` release tag strictly newer than `running`, or `None`
+/// when `running` is already the newest. A stable `running` only moves to
+/// stable releases; a pre-release `running` also takes newer pre-releases.
+/// Tags that are not `v<semver>` are ignored.
+pub fn newest_release(tags: &[String], running: &semver::Version) -> Option<String> {
+    tags.iter()
+        .filter_map(|tag| Some((semver::Version::parse(tag.strip_prefix('v')?).ok()?, tag)))
+        .filter(|(v, _)| v > running && (v.pre.is_empty() || !running.pre.is_empty()))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag.clone())
+}
+
+/// Where a clone and its release build go: `$XDG_CACHE_HOME/softfig/src`
+/// (else `~/.cache/softfig/src`). Not `/tmp`, which is a RAM-backed tmpfs on
+/// Arch and Fedora — a full workspace release build there competes with RAM
+/// or runs out of space (report 076).
+fn clone_parent() -> Result<PathBuf> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .ok_or_else(|| anyhow::anyhow!("neither XDG_CACHE_HOME nor HOME is set"))?;
+    let dir = cache.join("softfig/src");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// `git clone --depth 1 --branch <tag> <repo>` into a kept-alive dir under
+/// [`clone_parent`], removed when the [`Source`] drops.
 fn clone(repo: &str, tag: &str) -> Result<Source> {
     println!("cloning {repo} at {tag}…");
     let dir = tempfile::Builder::new()
         .prefix("softfig-src-")
-        .tempdir()
-        .context("creating a temp dir for the clone")?;
+        .tempdir_in(clone_parent()?)
+        .context("creating a dir for the clone")?;
     let status = Command::new("git")
         .args(["clone", "--depth", "1", "--branch", tag, repo])
         .arg(dir.path())
@@ -142,6 +233,65 @@ pub fn remove_source_record(prefix: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tags(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn v(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    /// Report 076: the default upgrade target is never the running version's
+    /// own tag, and nothing newer means "up to date", not a rebuild.
+    #[test]
+    fn newest_release_never_picks_the_running_version() {
+        let all = tags(&["v1.0.0", "v0.9.0"]);
+        assert_eq!(newest_release(&all, &v("1.0.0")), None);
+        assert_eq!(newest_release(&all, &v("0.9.0")).as_deref(), Some("v1.0.0"));
+    }
+
+    #[test]
+    fn newest_release_takes_the_maximum_and_ignores_non_release_tags() {
+        let all = tags(&["v1.0.1", "v1.2.0", "v1.10.0", "nightly", "v1.3", "release-2.0.0"]);
+        assert_eq!(newest_release(&all, &v("1.0.0")).as_deref(), Some("v1.10.0"));
+    }
+
+    #[test]
+    fn a_stable_install_skips_pre_releases_and_a_pre_release_takes_them() {
+        let all = tags(&["v1.0.0-alpha.1", "v1.0.0-alpha.2", "v1.1.0-beta.1"]);
+        assert_eq!(newest_release(&all, &v("1.0.0")), None);
+        assert_eq!(newest_release(&all, &v("1.0.0-alpha.1")).as_deref(), Some("v1.1.0-beta.1"));
+        let with_final = tags(&["v1.0.0-alpha.2", "v1.0.0"]);
+        assert_eq!(newest_release(&with_final, &v("1.0.0-alpha.1")).as_deref(), Some("v1.0.0"));
+    }
+
+    /// `remote_tags` reads a real remote: a local repo with two tags.
+    #[test]
+    fn remote_tags_lists_a_repos_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"])
+                .args(["-c", "tag.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "c"]);
+        git(&["tag", "v1.0.0"]);
+        git(&["tag", "-a", "v1.1.0", "-m", "annotated"]);
+
+        let mut found = remote_tags(dir.path().to_str().unwrap()).unwrap();
+        found.sort();
+        assert_eq!(found, tags(&["v1.0.0", "v1.1.0"]));
+    }
 
     #[test]
     fn the_baked_tag_is_the_version_with_a_leading_v() {
