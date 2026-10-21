@@ -150,6 +150,7 @@ impl Caps {
             "KillMode=control-group".to_string(),
             "NoNewPrivileges=yes".to_string(),
             "CapabilityBoundingSet=".to_string(),
+            "SystemCallArchitectures=native".to_string(),
             "ProtectSystem=strict".to_string(),
             "ProtectHome=yes".to_string(),
             "PrivateDevices=yes".to_string(),
@@ -464,6 +465,7 @@ mod tests {
         assert!(props.contains(&"RuntimeMaxSec=3600".to_string()));
         assert!(props.contains(&"KillMode=control-group".to_string()));
         assert!(props.contains(&"NoNewPrivileges=yes".to_string()));
+        assert!(props.contains(&"SystemCallArchitectures=native".to_string()));
         assert!(props.contains(&"ProtectSystem=strict".to_string()));
         assert!(props.contains(&"ProtectHome=yes".to_string()));
         assert!(props.contains(&"PrivateDevices=yes".to_string()));

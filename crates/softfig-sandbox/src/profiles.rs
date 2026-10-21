@@ -53,6 +53,14 @@ fn seccomp_deny() -> SeccompDeny {
             "kexec_load".into(),
             "kexec_file_load".into(),
             "personality".into(),
+            "request_key".into(),
+            "fsopen".into(),
+            "fsconfig".into(),
+            "fsmount".into(),
+            "fspick".into(),
+            "move_mount".into(),
+            "open_tree".into(),
+            "mount_setattr".into(),
         ],
     }
 }
@@ -197,6 +205,17 @@ pub fn profile_collect(ctx: &JobContext) -> Policy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deny_list_has_key_and_new_mount_syscalls() {
+        let deny = super::seccomp_deny().syscalls;
+        for name in [
+            "request_key", "fsopen", "fsconfig", "fsmount", "fspick", "move_mount", "open_tree",
+            "mount_setattr",
+        ] {
+            assert!(deny.iter().any(|d| d == name), "{name} missing from the deny list");
+        }
+    }
+
     use std::path::Path;
 
     use super::*;

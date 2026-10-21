@@ -33,20 +33,57 @@ fn syscall_number(name: &str) -> Option<i64> {
         "kexec_load" => libc::SYS_kexec_load,
         "kexec_file_load" => libc::SYS_kexec_file_load,
         "personality" => libc::SYS_personality,
+        "request_key" => libc::SYS_request_key,
+        "fsopen" => libc::SYS_fsopen,
+        "fsconfig" => libc::SYS_fsconfig,
+        "fsmount" => libc::SYS_fsmount,
+        "fspick" => libc::SYS_fspick,
+        "move_mount" => libc::SYS_move_mount,
+        "open_tree" => libc::SYS_open_tree,
+        "mount_setattr" => libc::SYS_mount_setattr,
         _ => return None,
     };
     Some(nr)
+}
+
+/// The x32 ABI flag on an x86_64 syscall number. A kernel built with
+/// `CONFIG_X86_X32_ABI` reports x32 calls under the x86_64 audit arch with this
+/// bit set, so a filter that only lists the plain numbers never sees them.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+
+/// x32's own number for `ptrace`; unlike the calls above (shared numbers with the
+/// x32 bit set) it has a dedicated entry in the x32 table.
+#[cfg(target_arch = "x86_64")]
+const X32_SYS_PTRACE: i64 = X32_SYSCALL_BIT | 521;
+
+/// Every syscall number the deny list covers on this target: each name's
+/// native number, plus (x86_64) its x32 alias, which would otherwise bypass the
+/// filter.
+fn denied_numbers(deny: &[String]) -> Vec<i64> {
+    let mut nrs = Vec::new();
+    for name in deny {
+        if let Some(nr) = syscall_number(name) {
+            nrs.push(nr);
+            #[cfg(target_arch = "x86_64")]
+            {
+                nrs.push(nr | X32_SYSCALL_BIT);
+                if nr == libc::SYS_ptrace {
+                    nrs.push(X32_SYS_PTRACE);
+                }
+            }
+        }
+    }
+    nrs
 }
 
 /// Build a seccomp BPF program that returns `EPERM` for every listed syscall
 /// and allows everything else. Unknown names are skipped.
 pub fn build_seccomp_filter(deny: &[String]) -> Result<BpfProgram, Box<dyn Error + Send + Sync>> {
     let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
-    for name in deny {
-        if let Some(nr) = syscall_number(name) {
-            // An empty rule vector matches the syscall regardless of arguments.
-            rules.entry(nr).or_default();
-        }
+    for nr in denied_numbers(deny) {
+        // An empty rule vector matches the syscall regardless of arguments.
+        rules.entry(nr).or_default();
     }
 
     let arch = TargetArch::try_from(std::env::consts::ARCH)
@@ -74,6 +111,26 @@ mod tests {
         assert_ne!(ptrace, bpf);
         assert_ne!(bpf, mount);
         assert_eq!(ptrace, libc::SYS_ptrace);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn deny_list_covers_the_x32_aliases() {
+        let deny = vec!["io_uring_setup".to_string(), "ptrace".to_string()];
+        let nrs = denied_numbers(&deny);
+        assert!(nrs.contains(&libc::SYS_io_uring_setup));
+        assert!(nrs.contains(&(libc::SYS_io_uring_setup | X32_SYSCALL_BIT)));
+        assert!(nrs.contains(&X32_SYS_PTRACE));
+    }
+
+    #[test]
+    fn new_mount_api_and_request_key_resolve() {
+        for name in [
+            "request_key", "fsopen", "fsconfig", "fsmount", "fspick", "move_mount", "open_tree",
+            "mount_setattr",
+        ] {
+            assert!(syscall_number(name).is_some(), "{name} must resolve");
+        }
     }
 
     #[test]
