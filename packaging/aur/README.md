@@ -11,7 +11,7 @@ shipped binaries.
 
 | Package | Builds from | `check()` | arch |
 |---|---|---|---|
-| `soft-fig` | the tagged source tarball (`git` tag archive) | the full test suite (`cargo test --workspace`, reduced-Argon2 as CI does) | `x86_64` |
+| `soft-fig` | the tagged source tarball (`git` tag archive) | none — omitted on purpose: the daemon integration tests flake under load (report 045), and CI's gate runs the full suite on every push | `x86_64` |
 | `soft-fig-bin` | the tier-1 program tarball from GitHub Releases | verifies the `SHA256SUMS` minisign signature, then the tarball's `SHA256SUMS` entry | `x86_64` |
 
 Both install the **installed set** — the five binaries
@@ -100,17 +100,26 @@ pushes/tags/publishes. Before `soft-fig`/`soft-fig-bin` go live, the owner:
 2. **Creates the minisign signing keypair** — commit the public key as
    `packaging/signing/minisign.pub`, store the secret key as the
    `MINISIGN_SECRET_KEY` repository secret. See `packaging/signing/README.md`.
-3. Cuts the tag `v1.0.0-alpha.1` and lets the release workflow build the
+3. Moves the `## [Unreleased]` entries in `CHANGELOG.md` into the tag's own
+   `## [X.Y.Z] - <date>` section and commits that to `main`. The release
+   workflow's `gate` refuses a tag whose section is missing or empty, or that
+   leaves entries under `[Unreleased]` (`scripts/release-notes.sh`). Decide the
+   version first: `CHANGELOG.md` already has a pre-pipeline
+   `## [1.0.0-alpha.1] - 2026-10-17`, so the first pipeline release either
+   folds the new entries into that section and reuses `v1.0.0-alpha.1`, or
+   bumps the workspace version (say `1.0.0-alpha.2`) and both PKGBUILDs'
+   `pkgver`/`_tag` with it.
+4. Cuts the tag (`v1.0.0-alpha.1`, or the version step 3 bumped to) and lets the release workflow build the
    artifacts (the tarball, `SHA256SUMS` and `SHA256SUMS.minisig` that this
    `-bin` package downloads).
-4. Copies the committed `packaging/signing/minisign.pub` into
+5. Copies the committed `packaging/signing/minisign.pub` into
    `packaging/aur/soft-fig-bin/minisign.pub` and pins its sha256 **from that
    committed copy** — never from the release download, which is what the pin
    protects against.
-5. Fills the real `sha256sums=` into both PKGBUILDs — they are **all-zero
+6. Fills the real `sha256sums=` into both PKGBUILDs — they are **all-zero
    placeholders that fail closed** until the tag exists — and regenerates
    `.SRCINFO` (`makepkg --printsrcinfo > .SRCINFO`).
-6. Uploads each package directory to the AUR as its own git repo
+7. Uploads each package directory to the AUR as its own git repo
    (`soft-fig-bin`'s includes `minisign.pub`).
 
 `soft-fig-bin` `provides` and `conflicts` `soft-fig`; `soft-fig` only

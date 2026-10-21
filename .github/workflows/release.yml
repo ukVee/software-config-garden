@@ -101,6 +101,12 @@ jobs:
             echo "the tagged commit is not an ancestor of origin/main" >&2
             exit 1
           }
+      - name: Check the tag's release notes
+        # Blank or stale notes fail here, before any build or approval
+        # (report 080); `publish` extracts them with the same script.
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: scripts/release-notes.sh "${TAG_NAME#v}" CHANGELOG.md > /dev/null
       - name: Test (locked)
         run: cargo test --workspace --no-fail-fast --locked
       - name: Clippy (locked, -D warnings)
@@ -415,11 +421,7 @@ jobs:
       - name: Extract release notes from CHANGELOG
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          awk -v v="$version" '
-            /^## \[/ { if (in_section) exit; if ($0 ~ ("^## \\[" v "\\]")) in_section = 1 }
-            in_section { print }
-          ' CHANGELOG.md > release-notes.md
+          scripts/release-notes.sh "${GITHUB_REF_NAME#v}" CHANGELOG.md > release-notes.md
       - name: Publish the GitHub release (as a draft)
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:

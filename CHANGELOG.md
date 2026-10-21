@@ -42,12 +42,20 @@ decision record or crate that owns it, rather than at every internal change.
   the packs seam (release-pipeline slice 006).
 - **`softfig upgrade` and `softfig uninstall`.** With no source named, `upgrade`
   builds the newest release tag newer than the running binary (or says it is
-  already current); otherwise it builds the given checkout or tag. It pulls, builds, swaps
+  already current); otherwise it builds the given checkout or tag. It refuses a
+  release that changes the store schema before building. It pulls, builds, swaps
   the installed set atomically, cycles the daemon on the relock-token path (or
   stops it honestly where no supervisor respawns), runs pending migrations, and
   confirms the handshake; `uninstall` removes the installed set, the unit and
   the MCP registration, refusing to touch the store without a separate
   `--yes-remove-data` confirmation (release-pipeline slice 007).
+- **Build identity, rollback and re-install.** Every binary's build stamp carries
+  the git commit it was built from (`-dirty` for an uncommitted tree), so a
+  same-version rebuild swaps instead of no-oping and `softfig daemon status` names
+  a set mixing two builds. Each swap keeps the replaced set in `<prefix>/.previous`;
+  `softfig upgrade --rollback` restores it (then cycle the daemon), and
+  `--force` re-installs even an identical build. `uninstall` removes the kept set
+  and the install lock too.
 
 ### Protocol
 
