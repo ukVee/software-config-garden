@@ -610,6 +610,353 @@ fn leaving_active_drops_the_holder() {
     ));
 }
 
+// ---- set_item_status: member write guards (report 036) ----------------
+
+/// Unwrap an `Err` response's message, panicking if it was `Ok`.
+fn err_msg(resp: &Response) -> String {
+    match resp {
+        Response::Err { error, .. } => error.clone(),
+        Response::Ok { data, .. } => panic!("expected Err, got Ok: {data}"),
+    }
+}
+
+/// Report 036: a member's reach over the legacy growlight verbs is exactly
+/// `log_baton` and `set_item_status` on its OWN held item to a handoff status
+/// (`done` | `deferred` | `blocked`). A claim (`active`), a resume (`queued`),
+/// another item's status, and every shaping verb (`add_backlog_item`,
+/// `add_slice`, `reorder_backlog_item`) are refused `member_not_allowed`; the
+/// human is unrestricted.
+#[test]
+fn a_member_is_held_to_log_baton_and_its_own_items_handoff_status() {
+    let fx = Fixture::start();
+    fx.add_milestone("done", "Done");
+    fx.add_milestone("deferred", "Deferred");
+    fx.add_milestone("blocked", "Blocked");
+    fx.add_task("unmount", "Unmount"); // id 001
+
+    let member = |op_name: &str, args: serde_json::Value| {
+        send(
+            &fx.socket,
+            &Request::new(op_name, args).with_member(Some("m-a")),
+        )
+    };
+
+    // log_baton is a member verb (protocol-fleet.md step 5b).
+    assert!(matches!(
+        member(
+            op::LOG_BATON,
+            serde_json::json!({ "item": "done", "iteration": 1, "summary": "handed off" })
+        ),
+        Response::Ok { .. }
+    ));
+
+    // A claim (`active`) and a resume (`queued`) are refused, even on the
+    // member's own item — those are growlightd's / the human's.
+    for status in ["active", "queued"] {
+        let resp = member(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "done", "status": status }),
+        );
+        assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{status}");
+    }
+
+    // Each own held item may go to exactly the handoff statuses.
+    for (id, status) in [("done", "done"), ("deferred", "deferred"), ("blocked", "blocked")] {
+        // growlightd records the holder on the claim; the member then hands off.
+        assert!(matches!(
+            fx.call(
+                op::SET_ITEM_STATUS,
+                serde_json::json!({ "id": id, "status": "active", "holder": "m-a" })
+            ),
+            Response::Ok { .. }
+        ));
+        let resp = member(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": id, "status": status }),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{id} {status}: {resp:?}");
+    }
+
+    // Another agent's held item is refused (the member holds only its own).
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "001", "status": "active", "holder": "m-b" })
+        ),
+        Response::Ok { .. }
+    ));
+    let resp = member(
+        op::SET_ITEM_STATUS,
+        serde_json::json!({ "id": "001", "status": "done" }),
+    );
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "another item");
+
+    // The shaping verbs are refused outright.
+    for (verb, args) in [
+        (
+            op::ADD_BACKLOG_ITEM,
+            serde_json::json!({
+                "item_type": "task", "slug": "x", "title": "X",
+                "mission": "m", "finish_criteria": "f"
+            }),
+        ),
+        (
+            op::ADD_SLICE,
+            serde_json::json!({ "milestone": "done", "slug": "s", "body": "b" }),
+        ),
+        (
+            op::REORDER_BACKLOG_ITEM,
+            serde_json::json!({ "id": "001", "position": "top" }),
+        ),
+        // Review 042 G74-7: registering a queue (and the repo it binds).
+        (
+            op::ADD_QUEUE,
+            serde_json::json!({ "name": "evil", "repo": "/home/u" }),
+        ),
+    ] {
+        let resp = member(verb, args);
+        assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{verb}");
+    }
+
+    // The human's calls are unchanged.
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "001", "status": "done" })
+        ),
+        Response::Ok { .. }
+    ));
+    assert!(matches!(
+        fx.call(
+            op::ADD_BACKLOG_ITEM,
+            serde_json::json!({
+                "item_type": "task", "slug": "human", "title": "H",
+                "mission": "m", "finish_criteria": "f"
+            })
+        ),
+        Response::Ok { .. }
+    ));
+}
+
+/// Report 036's unknown-holder decision, fail-closed: a part `active` with no
+/// recorded holder (a part left active without a holdered claim, or one whose
+/// holder map was rebuilt empty by a `daemon cycle`) is refused for a member,
+/// with a refusal that says to retry and then `post_message @human`.
+/// growlightd's conditional re-assert (`active` + `holder` + `if_status`)
+/// re-records the holder, and the member's handoff then lands (review 042
+/// G74-5). Review 042 G74-10: the claim records a holder BEFORE the cycle, so
+/// this proves a cycle drops a recorded holder.
+#[test]
+fn a_member_set_item_status_fails_closed_on_an_unknown_holder() {
+    let mut fx = Fixture::start();
+    fx.add_milestone("m5b", "Backup");
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "m5b", "status": "active", "holder": "m-a" })
+        ),
+        Response::Ok { .. }
+    ));
+
+    let socket = fx.socket.clone();
+    let member_done = move || {
+        send(
+            &socket,
+            &Request::new(
+                op::SET_ITEM_STATUS,
+                serde_json::json!({ "id": "m5b", "status": "done" }),
+            )
+            .with_member(Some("m-a")),
+        )
+    };
+    // A real daemon cycle: the active row survives (persisted), the recorded
+    // holder does not (in-memory), so the member's handoff is refused.
+    fx.restart();
+    assert!(fx.backlog().contains("| 1 | m5b | milestone | Backup | active |"));
+    let why = err_msg(&member_done());
+    assert!(why.starts_with("member_not_allowed:") && why.contains("no holder is recorded"), "{why}");
+    assert!(why.contains("retry") && why.contains("post_message @human"), "says what to do: {why}");
+
+    // growlightd's re-assert re-records the holder without a commit…
+    let tip_hash = |fx: &Fixture| Repo::open(&fx.garden).unwrap().tip().unwrap();
+    let tip = tip_hash(&fx);
+    let reassert = serde_json::json!({
+        "id": "m5b", "status": "active", "holder": "m-a", "if_status": "active"
+    });
+    let reply: SetItemStatusReply =
+        serde_json::from_value(ok_data(fx.call(op::SET_ITEM_STATUS, reassert.clone()))).unwrap();
+    assert_eq!(reply.status, "active");
+    assert_eq!(tip_hash(&fx), tip, "no commit");
+    // …and the member's handoff lands.
+    assert!(matches!(member_done(), Response::Ok { .. }));
+    assert!(fx.backlog().contains("| 1 | m5b | milestone | Backup | done |"));
+
+    // The re-assert is conditional: on a part that has left `active` it is a
+    // no-op reporting the real status — it never re-activates a handoff.
+    let reply: SetItemStatusReply =
+        serde_json::from_value(ok_data(fx.call(op::SET_ITEM_STATUS, reassert))).unwrap();
+    assert_eq!(reply.status, "done");
+    assert!(fx.backlog().contains("| 1 | m5b | milestone | Backup | done |"), "still done");
+}
+
+/// Review 042 G74-9: refusing another member's item says what to do instead.
+#[test]
+fn another_members_item_refusal_says_what_to_do() {
+    let fx = Fixture::start();
+    fx.add_milestone("theirs", "Theirs");
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "theirs", "status": "active", "holder": "m-b" })
+        ),
+        Response::Ok { .. }
+    ));
+    let why = err_msg(&as_member(&fx, op::SET_ITEM_STATUS, serde_json::json!({ "id": "theirs", "status": "done" })));
+    assert!(why.contains("held by agent \"m-b\"") && why.contains("post_message @human"), "{why}");
+}
+
+// ---- member write guards: the review 042 bypasses ----------------------
+
+/// One request stamped with fleet member `m-a`'s identity, as softfig-mcp
+/// sends it under `SOFTFIG_MEMBER=m-a`.
+fn as_member(fx: &Fixture, op_name: &str, args: serde_json::Value) -> Response {
+    send(&fx.socket, &Request::new(op_name, args).with_member(Some("m-a")))
+}
+
+/// A task doc held human-only, written by the human: the shape each bypass
+/// below tries to free.
+fn held_task(fx: &Fixture) -> String {
+    fx.add_task("loop-self-extend", "Loop self-extend"); // id 001
+    let rel = "growlight/backlog/tasks/001-loop-self-extend.md".to_string();
+    let doc = format!("{}\n> Fleet: no\n", fx.read(&rel));
+    assert!(matches!(
+        fx.call(op::REPLACE_FILE, serde_json::json!({ "path": rel, "content": doc })),
+        Response::Ok { .. }
+    ));
+    rel
+}
+
+/// Review 042 G74-3: `growlight/./backlog/…` and `growlight//backlog/…` are
+/// the backlog. A member's `replace_file` through either alias that drops a
+/// `> Fleet: no` hold is refused like the canonical path, and nothing lands.
+#[test]
+fn a_path_alias_does_not_skip_the_member_guard() {
+    let fx = Fixture::start();
+    let rel = held_task(&fx);
+    let before = fx.read(&rel);
+    for alias in [
+        rel.replace("growlight/backlog", "growlight/./backlog"),
+        rel.replace("growlight/backlog", "growlight//backlog"),
+        format!("./{rel}"),
+    ] {
+        let resp = as_member(
+            &fx,
+            op::REPLACE_FILE,
+            serde_json::json!({ "path": alias, "content": "# freed\n" }),
+        );
+        assert!(err_msg(&resp).contains("`> Fleet:` hold"), "{alias}: {resp:?}");
+        assert_eq!(fx.read(&rel), before, "{alias}: nothing written");
+    }
+}
+
+/// Review 042 G74-1: a member's `replace_file` of the backlog doc may not
+/// rewrite the queue tables growlightd schedules from — another item's status,
+/// the row order, a `## Queues` repo cell — while the region upkeep the
+/// member's sanctioned verbs trigger still lands: its own item's handoff (the
+/// queue table), `file_report` (the reports index) and an edit to a slice doc
+/// (the milestone's slices index).
+#[test]
+fn a_member_cannot_rewrite_the_queue_tables_with_replace_file() {
+    let fx = Fixture::start();
+    fx.add_milestone("ours", "Ours");
+    fx.add_milestone("theirs", "Theirs");
+    assert!(matches!(
+        fx.call(op::ADD_QUEUE, serde_json::json!({ "name": "psy", "repo": "/home/u/psy" })),
+        Response::Ok { .. }
+    ));
+    let backlog = fx.backlog();
+    for (what, forged) in [
+        ("another item's status", backlog.replace("| Theirs | queued |", "| Theirs | done |")),
+        ("a registry repo cell", backlog.replace("/home/u/psy", "/home/u")),
+    ] {
+        assert_ne!(forged, backlog, "{what}: the forgery changes something");
+        let resp = as_member(
+            &fx,
+            op::REPLACE_FILE,
+            serde_json::json!({ "path": "growlight/backlog/CLAUDE.md", "content": forged }),
+        );
+        assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{what}: {resp:?}");
+        assert_eq!(fx.backlog(), backlog, "{what}: nothing written");
+    }
+
+    // The sanctioned verbs' region upkeep is unaffected.
+    assert!(matches!(
+        fx.call(
+            op::SET_ITEM_STATUS,
+            serde_json::json!({ "id": "ours", "status": "active", "holder": "m-a" })
+        ),
+        Response::Ok { .. }
+    ));
+    let resp = as_member(&fx, op::SET_ITEM_STATUS, serde_json::json!({ "id": "ours", "status": "deferred" }));
+    assert!(matches!(resp, Response::Ok { .. }), "own handoff: {resp:?}");
+    let resp = as_member(
+        &fx,
+        op::FILE_REPORT,
+        serde_json::json!({
+            "title": "a thing I noticed", "body": "details", "tags": ["type:bug"], "from": "m-a"
+        }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "file_report: {resp:?}");
+    let slice: AddSliceReply = serde_json::from_value(ok_data(fx.call(
+        op::ADD_SLICE,
+        serde_json::json!({ "milestone": "ours", "slug": "first", "body": "plan body" }),
+    )))
+    .unwrap();
+    let resp = as_member(
+        &fx,
+        op::PATCH_FILE,
+        serde_json::json!({ "path": slice.path, "old": "plan body", "new": "plan body, refined" }),
+    );
+    assert!(matches!(resp, Response::Ok { .. }), "a slice edit: {resp:?}");
+}
+
+/// Review 042 G74-2: a member's `replace_file` of a new `001-0.md` beside the
+/// held `001-loop-self-extend.md` is refused, so no shadow doc can sort ahead
+/// of the real one and drop its hold.
+#[test]
+fn a_member_cannot_create_a_shadow_item_doc() {
+    let fx = Fixture::start();
+    held_task(&fx);
+    let shadow = "growlight/backlog/tasks/001-0.md";
+    let resp = as_member(&fx, op::REPLACE_FILE, serde_json::json!({ "path": shadow, "content": "# x\n" }));
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
+    assert!(!fx.garden.join(shadow).exists(), "nothing written");
+    // The human may still create it (break-glass is theirs).
+    assert!(matches!(
+        fx.call(op::REPLACE_FILE, serde_json::json!({ "path": shadow, "content": "# x\n" })),
+        Response::Ok { .. }
+    ));
+}
+
+/// Review 042 G74-4: a member's `patch_file` that wraps the held task's
+/// `> Fleet: no` line in an inline `<vault>` region is refused — growlightd's
+/// redacted read would see `[encrypted]` and no hold.
+#[test]
+fn a_member_cannot_hide_a_hold_in_a_vault_region() {
+    let fx = Fixture::start();
+    let rel = held_task(&fx);
+    let before = fx.read(&rel);
+    let resp = as_member(
+        &fx,
+        op::PATCH_FILE,
+        serde_json::json!({
+            "path": rel, "old": "> Fleet: no", "new": "<vault id=\"h\">\n> Fleet: no\n</vault>"
+        }),
+    );
+    assert!(err_msg(&resp).starts_with("member_not_allowed:"), "{resp:?}");
+    assert_eq!(fx.read(&rel), before, "nothing written");
+}
+
 // ---- reorder_backlog_item ---------------------------------------------
 
 #[test]

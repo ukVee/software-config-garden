@@ -106,3 +106,11 @@ protocol is fixed; the baton changes each iteration.
    `deferred` item waits for the human and never re-enters the loop. Reserve
    `blocked`/BLOCKED_ON_HUMAN strictly for when YOU can't proceed without a human
    decision or config change (steps 4, 3b).
+
+7c. HANDOFF REFUSED. If your handoff set_item_status (step 7 or 7b, or the
+   `blocked` of step 4) is refused member_not_allowed because no holder is
+   recorded — a keeperd cycle rebuilds that map empty, and growlightd re-records
+   it within about 30 seconds — wait a minute and retry it once. If it is still
+   refused, or the refusal names another holder, do not retry again:
+   post_message @human with the item and the status you meant to set, finish the
+   rest of the handoff (baton + log_baton), then EXIT.

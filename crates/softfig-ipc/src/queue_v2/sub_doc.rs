@@ -17,36 +17,19 @@
 
 /// The blockquote metadata keys a member may not write into a sub-milestone
 /// (§6.7), lowercase.
-pub const SUB_DOC_RESERVED: [&str; 3] = ["model", "grants", "worktree"];
+pub const SUB_DOC_RESERVED: [&str; 3] =
+    [crate::item_meta::MODEL, crate::item_meta::GRANTS, crate::item_meta::WORKTREE];
 
 /// The reserved keys a member-supplied slice body may not carry: everything
 /// but `model`, which §6.7 lets a slice body declare (subset-checked).
-pub const SLICE_BODY_RESERVED: [&str; 2] = ["grants", "worktree"];
+pub const SLICE_BODY_RESERVED: [&str; 2] = [crate::item_meta::GRANTS, crate::item_meta::WORKTREE];
 
-/// The first `> <key>:` metadata line in `text` whose key is one of `keys`,
-/// as that key. A line counts the way [`crate::model_choice::item_model_field`]
-/// reads a declaration — a blockquote line, key before the first `:`, case
-/// ignored — so any line a resolver would read is a line this finds. Unlike
-/// the resolver it ignores the value: an empty `> Model:` is refused too.
-pub fn reserved_field(text: &str, keys: &[&'static str]) -> Option<&'static str> {
-    text.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix('>')?;
-        let (key, _) = rest.trim().split_once(':')?;
-        let key = key.trim();
-        keys.iter().copied().find(|k| key.eq_ignore_ascii_case(k))
-    })
-}
-
-/// Every `> Model:` metadata line in `text`, in order, trimmed — each line
-/// [`reserved_field`] would report as `model`. §6.7's guard on a member's
-/// write under `growlight/backlog/` compares these before and after: any
-/// difference adds, removes or changes a `> Model:` line.
-pub fn model_lines(text: &str) -> Vec<&str> {
-    text.lines()
-        .filter(|line| reserved_field(line, &["model"]).is_some())
-        .map(str::trim)
-        .collect()
-}
+/// The guard-side reads of the shared metadata scanner, re-exported where the
+/// §6.7 rule has always named them: [`reserved_field`] finds the first
+/// `> <key>:` line for any of `keys` (fenced or not, value ignored, so an empty
+/// `> Model:` is refused too), and [`reserved_lines`] lists every such line —
+/// keeperd's member-write guard compares those before and after a write.
+pub use crate::item_meta::{reserved_field, reserved_lines};
 
 /// One slice of a member's sub-milestone, as the rule reads it.
 #[derive(Debug, Clone, Copy)]
@@ -68,7 +51,7 @@ pub struct FieldViolation {
 impl FieldViolation {
     /// The refusal text: what was refused and why.
     pub fn message(&self) -> String {
-        let key = capitalized(self.key);
+        let key = crate::item_meta::display_key(self.key);
         format!(
             "`{}` carries a `> {key}:` line — keeperd writes a sub-milestone's docs from \
              its fields, and a member may not set {} there{}",
@@ -84,14 +67,6 @@ impl FieldViolation {
                 ""
             }
         )
-    }
-}
-
-fn capitalized(key: &str) -> String {
-    let mut chars = key.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
     }
 }
 
@@ -138,10 +113,11 @@ mod tests {
     }
 
     #[test]
-    fn model_lines_are_every_model_metadata_line_in_order() {
+    fn reserved_lines_are_every_matching_metadata_line_in_order() {
         let doc = "# t\n\n> Model: flash\nprose Model: x\n  >  model : claude \n> Grants: ~/x\n";
-        assert_eq!(model_lines(doc), vec!["> Model: flash", ">  model : claude"]);
-        assert!(model_lines("# no metadata\n").is_empty());
+        assert_eq!(reserved_lines(doc, &["model"]), vec!["> Model: flash", ">  model : claude"]);
+        assert_eq!(reserved_lines(doc, &["grants"]), vec!["> Grants: ~/x"]);
+        assert!(reserved_lines("# no metadata\n", &SUB_DOC_RESERVED).is_empty());
     }
 
     #[test]

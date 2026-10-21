@@ -734,7 +734,14 @@ fn declared_model(garden_root: &Path, baton_path: &Path) -> ModelChoice {
         return default();
     };
 
-    let docs = item_doc_candidates(garden_root, item, view.slice.as_deref())
+    let candidates = match item_doc_candidates(garden_root, item, view.slice.as_deref()) {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            println!("growlight decides: {DEFAULT_OPENCODE_MODEL} — ignoring the declarations: {e}");
+            return default();
+        }
+    };
+    let docs = candidates
         .into_iter()
         .map(|doc_path| {
             let label = doc_path

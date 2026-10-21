@@ -46,9 +46,9 @@ pub fn migrate_reindex(daemon: &Daemon, args: serde_json::Value) -> HandlerResul
             // wrong intent (review 031 gap 3).
             let wt = WorkTree::new(daemon, &inner);
             for (i, h) in hosts.iter().enumerate() {
-                if let Err(e) = wt.write(&h.host, h.content.as_bytes()) {
+                if let Err(e) = wt.write_derived(&h.host, h.content.as_bytes()) {
                     for done in &hosts[..i] {
-                        let _ = wt.write(&done.host, done.original.as_bytes());
+                        let _ = wt.write_derived(&done.host, done.original.as_bytes());
                     }
                     return Err(e);
                 }

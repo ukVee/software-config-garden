@@ -10,7 +10,9 @@
 
 pub mod baton;
 pub mod client;
+pub mod fleet;
 pub mod growlightd;
+pub mod item_meta;
 pub mod item_repo;
 pub mod member;
 pub mod model_choice;
@@ -25,6 +27,7 @@ pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};
 pub use client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };
+pub use fleet::fleet_marker;
 pub use member::{is_safe_member_id, MemberIdentity, MEMBER_ENV};
 pub use model_choice::{
     Backend, Declaration, DeclaredModels, ModelChoice, ModelList, ModelRuleError, ModelSpec,

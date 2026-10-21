@@ -2887,11 +2887,15 @@ fn validate_reveal_id(id: &str) -> std::result::Result<(), (ErrorKind, String)> 
     Ok(())
 }
 
+/// `abs` relative to `garden_root`, canonicalised by
+/// [`crate::actions::worktree::canonical_rel`] — the same spelling the
+/// worktree's guards compare against. `strip_prefix` alone keeps the raw slice,
+/// so `growlight/./backlog/x` would come back with its `./` (review 042 G74-3).
 pub(crate) fn path_to_repo_rel_string(garden_root: &Path, abs: &Path) -> Option<String> {
     abs.strip_prefix(garden_root)
         .ok()
         .and_then(|p| p.to_str())
-        .map(|s| s.replace('\\', "/"))
+        .and_then(|s| crate::actions::worktree::canonical_rel(&s.replace('\\', "/")))
 }
 
 pub(crate) fn require_unlocked(inner: &crate::daemon::DaemonInner) -> std::result::Result<(), (ErrorKind, String)> {

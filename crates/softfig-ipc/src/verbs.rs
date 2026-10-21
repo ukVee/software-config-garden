@@ -2129,6 +2129,15 @@ pub struct SetItemStatusArgs {
     /// default) opts out of the CAS — back-compat, unchanged behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<String>,
+    /// Apply the change only while the item's status is still this one;
+    /// otherwise the call is a no-op (`Ok`, no write, no holder change, the
+    /// reply's `status` = the status the item actually has). growlightd's claim
+    /// re-assert (`active` + `holder` + `if_status = "active"`) uses it to
+    /// re-record a live member's holder after a keeperd cycle without ever
+    /// flipping an item its member just handed off back to `active` (review 042
+    /// G74-5). `None` (every other caller) applies unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

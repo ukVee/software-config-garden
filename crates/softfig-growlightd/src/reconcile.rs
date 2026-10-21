@@ -190,7 +190,7 @@ impl StatusResetter for KeeperdStatusResetter {
         // No holder: a reset OUT of `active` is not a write TO `active`, so keeperd's
         // holder-identity CAS never guards it (and the dead holder is unknowable
         // anyway). keeperd flips any status to the target, so `active → queued` lands.
-        write_item_status(&self.keeperd_socket, "reap", queue, item, REAP_STATUS, None)
+        write_item_status(&self.keeperd_socket, "reap", queue, item, REAP_STATUS, None, None)
     }
 }
 
