@@ -226,7 +226,14 @@ fn fetch_step(
     proxy: &ProxyConfig,
     bins: &SandboxBinaries,
 ) -> Result<i32> {
-    let policy = profile_fetch(ctx, skel_dir.to_path_buf(), proxy.clone());
+    // The fetch step alone gets the etc that carries a `resolv.conf`, when the
+    // runner built one (`etc::fetch_etc_for`).
+    let fetch_etc = crate::etc::fetch_etc_for(&ctx.etc);
+    let mut fetch_ctx = ctx.clone();
+    if fetch_etc.is_dir() {
+        fetch_ctx.etc = fetch_etc;
+    }
+    let policy = profile_fetch(&fetch_ctx, skel_dir.to_path_buf(), proxy.clone());
     let out = run_sandboxed(
         &policy,
         &["cargo".into(), "fetch".into(), "--locked".into()],

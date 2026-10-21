@@ -16,7 +16,7 @@
 //! `cert.toml` + `accept.toml` + `serve.toml` in its own state root.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,7 @@ use crate::attestation::{
 use crate::cert::StoredCert;
 use crate::config::{AcceptConfig, ServeConfig};
 use crate::error::{Error, Result};
+use crate::etc;
 use crate::executor::{self, SandboxBinaries};
 use crate::jobs::{append_ndjson, Job, JobKey, JobRecord, JobTable};
 use crate::keys::RunnerKeys;
@@ -407,12 +408,18 @@ impl WireServer {
                 .join("target")
         };
 
+        // A minimal `/etc` (spec §7.1) per job, never the host's: the run etc
+        // has no resolver; the fetch step's sibling carries `resolv.conf`.
+        let etc_dir = job_dir.join("etc");
+        etc::build_minimal_etc(&etc_dir, Path::new("/etc"), false)?;
+        etc::build_minimal_etc(&etc::fetch_etc_for(&etc_dir), Path::new("/etc"), true)?;
+
         let ctx = JobContext {
             src: src_dir,
             target_cache,
             toolchain: self.root.rustup_home(),
             cargo_home: self.root.cargo_home_dir(),
-            etc: std::path::PathBuf::from("/etc"),
+            etc: etc_dir,
             scratch_size: executor::parse_size(&serve.scratch_max)?,
         };
         // bwrap binds require the source paths to exist.

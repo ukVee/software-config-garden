@@ -25,6 +25,7 @@ pub mod cert;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod etc;
 pub mod executor;
 pub mod fetch;
 pub mod jobs;
