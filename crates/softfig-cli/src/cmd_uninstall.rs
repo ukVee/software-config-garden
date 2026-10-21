@@ -16,7 +16,8 @@ use clap::Args;
 use softfig_install::detect::{package_owned, package_owned_message, Distro};
 use softfig_install::prompt::{Answer, Consent, Fixed, Offer, Tty};
 use softfig_install::source;
-use softfig_ipc::compat::INSTALLED_SET;
+use softfig_install::stage::{INSTALL_LOCK_FILE, PREVIOUS_SET_DIR};
+use softfig_ipc::compat::{INSTALLED_SET, SWAP_IN_PROGRESS_MARKER};
 use softfig_ipc::{runtime_socket_path, verbs::op, StatusReply};
 
 use crate::cmd_daemon::try_daemon_call;
@@ -87,9 +88,9 @@ pub fn run(args: UninstallArgs) -> Result<()> {
     let offer = Offer {
         id: "remove-program",
         summary: format!(
-            "Remove the soft-fig program: {} binary/ies from {}, the systemd \
-             user units, and the MCP registration? (your store and garden will \
-             NOT be touched)",
+            "Remove the soft-fig program: {} binary/ies and the install state \
+             from {}, the systemd user units, and the MCP registration? (your \
+             store and garden will NOT be touched)",
             plan.binaries.len(),
             prefix.display()
         ),
@@ -103,6 +104,7 @@ pub fn run(args: UninstallArgs) -> Result<()> {
     stop_daemon(&socket);
     stop_units();
     remove_binaries(&plan)?;
+    remove_install_state(&plan)?;
     remove_units()?;
     remove_mcp()?;
 
@@ -164,9 +166,22 @@ pub fn removal_plan(prefix: &Path) -> RemovalPlan {
     let has_mcp = which_claude();
     RemovalPlan {
         binaries,
+        install_state: install_state_in(prefix),
         units,
         has_mcp,
     }
+}
+
+/// The bookkeeping an install or upgrade swap leaves in `prefix` (report
+/// 075): the kept previous set `upgrade --rollback` restores — a complete,
+/// runnable copy of the old program — the install lock, and the marker an
+/// interrupted swap leaves. Only what exists.
+fn install_state_in(prefix: &Path) -> Vec<PathBuf> {
+    [PREVIOUS_SET_DIR, INSTALL_LOCK_FILE, SWAP_IN_PROGRESS_MARKER]
+        .iter()
+        .map(|name| prefix.join(name))
+        .filter(|p| p.symlink_metadata().is_ok())
+        .collect()
 }
 
 /// The full list of what `uninstall` removes.
@@ -174,6 +189,9 @@ pub fn removal_plan(prefix: &Path) -> RemovalPlan {
 pub struct RemovalPlan {
     /// Absolute paths of the binaries to remove (installed set + opt-in GUI).
     pub binaries: Vec<PathBuf>,
+    /// The swap's bookkeeping in the prefix: `.previous/`, the install lock
+    /// and a stale swap marker (whichever exist).
+    pub install_state: Vec<PathBuf>,
     /// The systemd user unit files that exist (keeperd + growlightd).
     pub units: Vec<PathBuf>,
     /// The `claude` CLI is present, so an MCP registration may exist (removal
@@ -189,6 +207,10 @@ fn print_plan(plan: &RemovalPlan, store: Option<&StorePaths>, recorded: Option<&
         for b in &plan.binaries {
             println!("  binary        {}", b.display());
         }
+    }
+    for p in &plan.install_state {
+        let what = if p.ends_with(PREVIOUS_SET_DIR) { " (the previous set kept for rollback)" } else { "" };
+        println!("  install state {}{what}", p.display());
     }
     if plan.units.is_empty() {
         println!("  systemd unit  (none)");
@@ -234,6 +256,28 @@ fn remove_binaries(plan: &RemovalPlan) -> Result<()> {
         match std::fs::remove_file(b) {
             Ok(()) => println!("removed {}", b.display()),
             Err(e) => failures.push(format!("{}: {e}", b.display())),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", failures.join("; "))
+    }
+}
+
+/// Remove the swap's bookkeeping, failing the uninstall on any failed removal
+/// like the binaries do: a leftover `.previous/` is a whole runnable program.
+fn remove_install_state(plan: &RemovalPlan) -> Result<()> {
+    let mut failures = Vec::new();
+    for p in &plan.install_state {
+        let removed = if p.is_dir() && !p.is_symlink() {
+            std::fs::remove_dir_all(p)
+        } else {
+            std::fs::remove_file(p)
+        };
+        match removed {
+            Ok(()) => println!("removed {}", p.display()),
+            Err(e) => failures.push(format!("{}: {e}", p.display())),
         }
     }
     if failures.is_empty() {
@@ -494,6 +538,36 @@ mod tests {
         assert_eq!(names, want);
     }
 
+    /// Report 075: the swap's bookkeeping — the kept previous set, the lock
+    /// and a stale marker — is planned and removed with the program.
+    #[test]
+    fn uninstall_removes_the_previous_set_lock_and_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in INSTALLED_SET {
+            write_binary(dir.path(), name);
+        }
+        let previous = dir.path().join(PREVIOUS_SET_DIR);
+        std::fs::create_dir_all(&previous).unwrap();
+        write_binary(&previous, "softfig");
+        std::fs::write(dir.path().join(INSTALL_LOCK_FILE), b"").unwrap();
+        std::fs::write(dir.path().join(SWAP_IN_PROGRESS_MARKER), b"").unwrap();
+
+        let plan = removal_plan(dir.path());
+        assert_eq!(plan.install_state.len(), 3, "{:?}", plan.install_state);
+        remove_binaries(&plan).unwrap();
+        remove_install_state(&plan).unwrap();
+
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(left.is_empty(), "the prefix still holds {left:?}");
+    }
+
+    #[test]
+    fn a_fresh_prefix_has_no_install_state() {
+        let dir = tempfile::tempdir().unwrap();
+        write_binary(dir.path(), "softfig");
+        assert!(removal_plan(dir.path()).install_state.is_empty());
+    }
+
     #[test]
     fn a_partial_install_names_only_what_exists() {
         let dir = tempfile::tempdir().unwrap();
@@ -577,6 +651,7 @@ mod tests {
 
         let plan = RemovalPlan {
             binaries: vec![not_a_file],
+            install_state: vec![],
             units: vec![],
             has_mcp: false,
         };
@@ -587,6 +662,7 @@ mod tests {
     fn no_binaries_is_not_an_error() {
         let plan = RemovalPlan {
             binaries: vec![],
+            install_state: vec![],
             units: vec![],
             has_mcp: false,
         };

@@ -19,7 +19,7 @@ pub const PREVIOUS_SET_DIR: &str = ".previous";
 
 /// The advisory lock file the stage+swap takes in the install prefix, so two
 /// concurrent installs/upgrades cannot interleave their swaps.
-const INSTALL_LOCK_FILE: &str = ".softfig.lock";
+pub const INSTALL_LOCK_FILE: &str = ".softfig.lock";
 
 /// What [`stage_and_swap`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
