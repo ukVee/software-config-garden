@@ -458,13 +458,24 @@ impl fmt::Display for SetReport {
     /// <dir> — ` and each group of binaries by what was found.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let dir = self.dir.display();
-        if let Some(version) = self.consistent_version() {
+        if let Some((version, _)) = self.consistent_identity() {
             return write!(f, "{n}/{n} at {version} in {dir}", n = self.bins.len());
         }
+        // When every stamped binary carries one version, the difference (if
+        // any) is the build, so the groups name it — otherwise a same-version
+        // mix of two builds would print as one group (report 073).
+        let mut versions = self.bins.iter().filter_map(|(_, stamp)| match stamp {
+            BinStamp::Stamped { version, .. } => Some(version.as_str()),
+            _ => None,
+        });
+        let one_version = versions.next().is_some_and(|first| versions.all(|v| v == first));
         // Group in order of first appearance so the line reads like the set.
         let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
         for (name, stamp) in &self.bins {
             let label = match stamp {
+                BinStamp::Stamped { version, build_id } if one_version => {
+                    format!("at {version} build {build_id}")
+                }
                 BinStamp::Stamped { version, .. } => format!("at {version}"),
                 BinStamp::Unstamped => "unstamped, older than version stamping".to_string(),
                 BinStamp::Missing => "missing".to_string(),

@@ -256,7 +256,9 @@ fn report_status(socket: &Path, set: std::io::Result<SetReport>) -> Result<()> {
                      re-run the install/upgrade to converge",
                     set.dir.display()
                 ));
-            } else if set.consistent_version().is_none() {
+            } else if set.consistent_identity().is_none() {
+                // Identity, not version: a same-version mix of two builds is
+                // as partial as two versions (report 073).
                 problems.push(format!("partial install: {set}"));
             }
             if handshake_ok
@@ -651,6 +653,26 @@ mod tests {
         assert!(err.contains("1 at 0.0.1 (softfig-mcp)"), "{err}");
         let (_set_dir, set) = fake_set(&[], binary_version());
         report_status(&socket, Ok(set)).expect("a consistent set and no daemon is fine");
+    }
+
+    /// Report 073: one version at two build ids is a partial install, and
+    /// the report names the builds. `consistent_version()` passed this.
+    #[test]
+    fn status_flags_a_same_version_mix_of_two_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("absent.sock");
+        let set_dir = tempfile::tempdir().unwrap();
+        for (i, name) in softfig_ipc::compat::INSTALLED_SET.iter().enumerate() {
+            let id = if i == 0 { "aaa" } else { "bbb" };
+            let bytes = softfig_ipc::compat::stamp_with_identity(binary_version(), id);
+            std::fs::write(set_dir.path().join(name), bytes).unwrap();
+        }
+        let set = SetReport::scan(set_dir.path());
+        assert_eq!(set.consistent_version(), Some(binary_version()));
+        let err = report_status(&socket, Ok(set)).unwrap_err().to_string();
+        assert!(err.starts_with("partial install: PARTIAL in "), "{err}");
+        assert!(err.contains(&format!("at {} build aaa", binary_version())), "{err}");
+        assert!(err.contains(&format!("at {} build bbb", binary_version())), "{err}");
     }
 
     #[test]

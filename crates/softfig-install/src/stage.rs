@@ -25,7 +25,7 @@ const INSTALL_LOCK_FILE: &str = ".softfig.lock";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageOutcome {
     /// The installed set already matches the built set at this identity
-    /// (`version`, `build_id`); nothing changed (a re-run converges to a no-op,
+    /// (`version`, `build_id`), byte for byte; nothing changed (a re-run converges to a no-op,
     /// the idempotency property).
     Noop { version: String, build_id: String },
     /// The staged set was swapped into `prefix` at `version`. `from` is the
@@ -95,13 +95,18 @@ pub fn stage_and_swap(source: &Path, prefix: &Path, force: bool) -> Result<Stage
     };
 
     // Idempotency short-circuit: the installed set and the built set agree on
-    // one `(version, build_id)` ⇒ nothing to do, unless `--force` asks to
-    // re-install anyway.
+    // one `(version, build_id)` *and* every binary is byte-identical ⇒ nothing
+    // to do, unless `--force` asks to re-install anyway. The bytes are the
+    // check that cannot go stale: the build id is only as fresh as the build
+    // script's last run (an uncommitted edit does not re-run it, and a source
+    // tree with no `.git` has no commit to name), so equal ids alone once
+    // no-oped an upgrade onto changed binaries (report 073).
     let installed_id = installed.consistent_identity();
     if !force
         && let Some((installed_version, installed_build)) = installed_id
         && installed_version == built_version
         && installed_build == built_id
+        && sets_byte_identical(prefix, &target_dir)
     {
         return Ok(StageOutcome::Noop {
             version: built_version.to_string(),
@@ -195,6 +200,35 @@ pub fn rollback(prefix: &Path) -> Result<RollbackOutcome> {
         version: version.to_string(),
         build_id: build_id.to_string(),
     })
+}
+
+/// Every member of the installed set in `a` has exactly the bytes of its
+/// counterpart in `b`. A missing or unreadable file on either side is a
+/// difference. Streams in fixed chunks so a release binary is never held in
+/// memory twice.
+fn sets_byte_identical(a: &Path, b: &Path) -> bool {
+    INSTALLED_SET
+        .iter()
+        .all(|name| files_identical(&a.join(name), &b.join(name)).unwrap_or(false))
+}
+
+fn files_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Take the advisory exclusive `flock` on the install lock file in `prefix`,
@@ -363,6 +397,26 @@ mod tests {
         let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
         assert!(outcome.is_noop(), "{outcome:?}");
         assert_eq!(outcome.version(), "1.0.1");
+    }
+
+    /// Report 073: equal `(version, build_id)` is not enough for a no-op.
+    /// A stale build id (an edit the build script never saw) on changed
+    /// binaries must still swap them in.
+    #[test]
+    fn a_matching_identity_with_different_bytes_swaps() {
+        let source = source_with("1.0.1");
+        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        std::fs::create_dir_all(&prefix).unwrap();
+        write_set(&prefix, "1.0.1");
+        // Same stamp, different code: what a stale-id rebuild produces.
+        let built = source.path().join("target/release/softfig-keeperd");
+        let mut bytes = std::fs::read(&built).unwrap();
+        bytes.extend_from_slice(b"changed code");
+        std::fs::write(&built, &bytes).unwrap();
+
+        let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
+        assert!(!outcome.is_noop(), "changed bytes must swap: {outcome:?}");
+        assert_eq!(std::fs::read(prefix.join("softfig-keeperd")).unwrap(), bytes);
     }
 
     /// A partial built set must abort before any rename — the staging step
