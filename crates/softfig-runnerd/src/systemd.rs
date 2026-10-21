@@ -149,6 +149,7 @@ impl Caps {
             format!("RuntimeMaxSec={}", self.time_max_sec),
             "KillMode=control-group".to_string(),
             "NoNewPrivileges=yes".to_string(),
+            "CapabilityBoundingSet=".to_string(),
             "ProtectSystem=strict".to_string(),
             "ProtectHome=yes".to_string(),
             "PrivateDevices=yes".to_string(),
@@ -209,6 +210,49 @@ pub enum UnitResult {
     Failed,
 }
 
+/// The unprivileged account every job unit runs as (spec §7.1). The unit must
+/// never run the payload, the skeleton extraction or bwrap as root, whichever
+/// route the manager authorizes the `systemd-run` call by.
+pub const RUNNER_USER: &str = "softfig-runner";
+
+/// The full `systemd-run` argv (without the program name) for a job unit:
+/// manager flag, unit name, `--wait --collect`, the identity + capability
+/// properties, the [`Caps`] hardening set, the read-write paths, then the
+/// payload.
+///
+/// `User=`/`Group=` are system-manager properties: a `--user` manager already
+/// runs the unit as the calling user and refuses to switch.
+pub fn run_unit_args(
+    manager: Manager,
+    unit: &str,
+    caps: &Caps,
+    payload: &[String],
+    read_write: &[PathBuf],
+) -> Vec<String> {
+    let mut args = Vec::new();
+    match manager {
+        Manager::System => args.push("--system".to_string()),
+        Manager::User => args.push("--user".to_string()),
+        Manager::Direct => unreachable!("run_unit never takes Direct"),
+    }
+    args.push("--unit".to_string());
+    args.push(unit.to_string());
+    args.push("--wait".to_string());
+    args.push("--collect".to_string());
+    if matches!(manager, Manager::System) {
+        args.push(format!("--property=User={RUNNER_USER}"));
+        args.push(format!("--property=Group={RUNNER_USER}"));
+    }
+    for p in caps.properties() {
+        args.push(format!("--property={p}"));
+    }
+    for rw in read_write {
+        args.push(format!("--property=ReadWritePaths={}", rw.display()));
+    }
+    args.extend(payload.iter().cloned());
+    args
+}
+
 /// Run a payload command inside a transient unit with `caps`, under `manager`.
 ///
 /// `unit` is the transient unit name; `payload` is the full argv; `read_write`
@@ -229,24 +273,7 @@ pub fn run_unit(
     assert!(!matches!(manager, Manager::Direct), "run_unit never takes Direct");
 
     let mut cmd = Command::new("systemd-run");
-    match manager {
-        Manager::System => {
-            cmd.arg("--system");
-        }
-        Manager::User => {
-            cmd.arg("--user");
-        }
-        Manager::Direct => unreachable!("asserted above"),
-    }
-    cmd.arg("--unit").arg(unit);
-    cmd.arg("--wait");
-    for p in caps.properties() {
-        cmd.arg(format!("--property={p}"));
-    }
-    for rw in read_write {
-        cmd.arg(format!("--property=ReadWritePaths={}", rw.display()));
-    }
-    cmd.args(payload);
+    cmd.args(run_unit_args(manager, unit, caps, payload, read_write));
 
     let out = cmd.output().map_err(Error::Io)?;
     let text = format!(
@@ -394,6 +421,25 @@ mod tests {
         assert_eq!(batt.memory_max, 4 * 1024 * 1024 * 1024);
         assert_eq!(batt.tasks_max, 2048);
         assert_eq!(batt.time_max_sec, 1200);
+    }
+
+    #[test]
+    fn run_unit_argv_drops_root_and_caps() {
+        let caps = Caps::resolve(&ServeConfig::default(), false).unwrap();
+        let payload = vec!["/bin/true".to_string()];
+        let rw = [PathBuf::from("/var/lib/softfig-runner")];
+        let args = run_unit_args(Manager::System, "u1", &caps, &payload, &rw);
+        assert_eq!(args[..5], ["--system", "--unit", "u1", "--wait", "--collect"]);
+        assert!(args.contains(&"--property=User=softfig-runner".to_string()));
+        assert!(args.contains(&"--property=Group=softfig-runner".to_string()));
+        assert!(args.contains(&"--property=CapabilityBoundingSet=".to_string()));
+        assert!(args.contains(&"--property=ReadWritePaths=/var/lib/softfig-runner".to_string()));
+        assert_eq!(args.last().unwrap(), "/bin/true");
+
+        let user = run_unit_args(Manager::User, "u2", &caps, &payload, &rw);
+        assert_eq!(user[0], "--user");
+        assert!(!user.iter().any(|a| a.starts_with("--property=User=")));
+        assert!(user.contains(&"--property=CapabilityBoundingSet=".to_string()));
     }
 
     #[test]
