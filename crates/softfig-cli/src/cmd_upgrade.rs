@@ -70,7 +70,8 @@ pub struct UpgradeArgs {
     /// Skip the migration step (build + swap + cycle only).
     #[arg(long)]
     pub no_migrate: bool,
-    /// Pull + build + check, then stop before the swap.
+    /// Print what the upgrade would do — source, checks, prefix, daemon
+    /// handling — and stop before any clone, pull or build.
     #[arg(long)]
     pub dry_run: bool,
     /// Re-install even when the installed set already matches the built set
@@ -97,6 +98,12 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
             outcome.build_id,
             prefix.display()
         );
+        // The swap replaced the files, not the running daemon (report 081
+        // item 11).
+        println!(
+            "the running daemon still runs the build you rolled back from — \
+             cycle it onto the restored set: softfig daemon cycle"
+        );
         return Ok(());
     }
 
@@ -105,6 +112,15 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     // baked repo's newest release newer than this binary (report 076). Never
     // silently build the current dir, and never re-clone the installed tag.
     let recorded = source::recorded_source(&prefix);
+    let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
+
+    // --dry-run prints the plan and stops before any clone, pull or build
+    // (report 081 item 6).
+    if args.dry_run {
+        print_plan(&args, &prefix, recorded.as_deref(), &socket);
+        return Ok(());
+    }
+
     let running = softfig_ipc::compat::binary_version();
     let running = Version::parse(running)
         .with_context(|| format!("this binary's version {running} is not semver"))?;
@@ -124,7 +140,6 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
             return Ok(());
         }
     };
-    let socket = args.socket.clone().unwrap_or_else(runtime_socket_path);
 
     // Refuse a package-owned prefix before pulling/building/swapping: the
     // helper must never write over `/usr/bin` (an AUR install).
@@ -133,14 +148,13 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
         bail!("{}", package_owned_message(&prefix));
     }
 
-    // 0. Preflight the daemon ONCE, before anything is swapped: is one
-    //    running, is it locked, and can it be relock-cycled? The cycle
-    //    capability must be known *before* the swap — after the swap the only
-    //    safe non-cycle move is a shutdown (the running daemon is the old
-    //    binary against a new set).
+    // 0. Preflight the daemon before the build: its store schema gates the
+    //    upgrade (step 2b). Whether it can be relock-cycled is decided from a
+    //    fresh read just before the swap — after the swap the only safe
+    //    non-cycle move is a shutdown (the running daemon is the old binary
+    //    against a new set).
     let supervisor = Supervisor::detect();
     let daemon = daemon_state(&socket);
-    let cycle_ok = can_cycle(supervisor, &daemon);
 
     // 1. Fetch the source: a checkout gets `git pull --ff-only`; a fresh
     //    clone of a pinned tag is already at the tag, so there is nothing to
@@ -178,13 +192,11 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
              `cargo build --release` produce the installed set?",
         )?;
 
-    if args.dry_run {
-        println!(
-            "dry run: support-window check passed + built {target}; stopping \
-             before the swap."
-        );
-        return Ok(());
-    }
+    // Re-read the daemon now: the preflight is minutes old after the build,
+    // and a lock or relock change since then would make the post-swap cycle
+    // bail with the new binaries against the old daemon (report 081 item 9).
+    let daemon = daemon_state(&socket);
+    let cycle_ok = can_cycle(supervisor, &daemon);
 
     // 4. Stage + atomically install the reconciled set (idempotent by
     //    identity; --force re-swaps even an identical identity).
@@ -196,7 +208,7 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
             match from {
                 Some((prev_version, prev_build_id)) if prev_version == version => {
                     println!(
-                        "installed: same version {version}, new build {build_id}                      (was {prev_build_id}) in {}",
+                        "installed: same version {version}, new build {build_id} (was {prev_build_id}) in {}",
                         prefix.display()
                     );
                 }
@@ -246,13 +258,9 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
         // disabled): stop it, tell the human how to bring it back, and skip the
         // confirm — the daemon is down, so confirming would only report it
         // absent.
+        let unit_managed = supervisor == Supervisor::SystemdUser && keeperd_unit_active();
         stop_daemon(&socket)?;
-        println!(
-            "cannot cycle the daemon automatically ({}); stopped it so it does not\n\
-             keep running the pre-upgrade binary. Start + unlock it by hand:\n  \
-             softfig daemon start\n  softfig daemon unlock",
-            no_cycle_reason(supervisor, &daemon)
-        );
+        println!("{}", non_cycle_message(no_cycle_reason(supervisor, &daemon), unit_managed));
     } else {
         println!("daemon not running — start it with `softfig daemon start`.");
     }
@@ -449,6 +457,69 @@ fn can_cycle(supervisor: Supervisor, daemon: &DaemonState) -> bool {
         && daemon.running
         && !daemon.locked
         && daemon.relock_enabled
+}
+
+/// What to tell the human after the shutdown path stopped a daemon it could
+/// not cycle. Under the `softfig-keeperd` unit (`Restart=always`) systemd
+/// brings it straight back on the new binary, locked — a hand `daemon start`
+/// would collide with it (report 081 item 8).
+fn non_cycle_message(reason: &str, unit_managed: bool) -> String {
+    if unit_managed {
+        format!(
+            "cannot cycle the daemon automatically ({reason}); stopped it, and its \
+             systemd unit restarts it on the new binary, locked. Unlock it:\n  \
+             softfig daemon unlock"
+        )
+    } else {
+        format!(
+            "cannot cycle the daemon automatically ({reason}); stopped it so it does not\n\
+             keep running the pre-upgrade binary. Start + unlock it by hand:\n  \
+             softfig daemon start\n  softfig daemon unlock"
+        )
+    }
+}
+
+/// Is the daemon running under its `softfig-keeperd` systemd user unit?
+fn keeperd_unit_active() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "softfig-keeperd.service"])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The `--dry-run` plan: what the upgrade would do, with nothing cloned,
+/// pulled, built, swapped or stopped. Only a read-only daemon `status`.
+fn print_plan(args: &UpgradeArgs, prefix: &Path, recorded: Option<&Path>, socket: &Path) {
+    let explicit = args.source.is_some() || args.repo.is_some() || recorded.is_some();
+    let described = if explicit {
+        source::describe(args.source.as_deref(), args.repo.as_deref(), args.r#ref.as_deref(), recorded)
+    } else {
+        format!(
+            "the newest release newer than {} at {} (looked up when run for real)",
+            softfig_ipc::compat::binary_version(),
+            source::REPOSITORY
+        )
+    };
+    let supervisor = Supervisor::detect();
+    let daemon = daemon_state(socket);
+    println!("dry run — softfig upgrade would:");
+    println!("  source        build {described}");
+    if args.source.is_some() || recorded.is_some() {
+        println!("  pull          {}", if args.no_pull { "skipped (--no-pull)" } else { "git pull --ff-only" });
+    }
+    println!("  check         the support window and the store schema, before the build");
+    println!("  build         cargo build --release --locked");
+    println!("  install       swap the set into {} (previous set kept for --rollback)", prefix.display());
+    println!("  migrate       {}", if args.no_migrate { "skipped (--no-migrate)" } else { "finish an unfinished M2a migration" });
+    let daemon_plan = if !daemon.running {
+        "not running — nothing to cycle".to_string()
+    } else if can_cycle(supervisor, &daemon) {
+        "cycle it onto the new build (relock token)".to_string()
+    } else {
+        format!("stop it ({})", no_cycle_reason(supervisor, &daemon))
+    };
+    println!("  daemon        {daemon_plan}");
+    println!("nothing cloned, pulled, built or installed.");
 }
 
 /// Why a running daemon cannot be cycled, for the shutdown path's message. The
@@ -819,6 +890,16 @@ mod tests {
     fn this_source_declares_this_builds_store_schema() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         assert_eq!(declared_store_schema(&root).unwrap(), softfig_store::db::SCHEMA_VERSION);
+    }
+
+    /// Report 081 item 8: under the keeperd unit the human only unlocks; a
+    /// hand `daemon start` would collide with systemd's respawn.
+    #[test]
+    fn the_non_cycle_message_fits_the_supervisor() {
+        let unit = non_cycle_message("the daemon is locked", true);
+        assert!(unit.contains("softfig daemon unlock") && !unit.contains("daemon start"), "{unit}");
+        let manual = non_cycle_message("no systemd user bus detected", false);
+        assert!(manual.contains("softfig daemon start"), "{manual}");
     }
 
     #[test]

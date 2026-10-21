@@ -88,6 +88,14 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
     // Resolve the garden too — the unit render and the hand-off both name it.
     let garden = cli.garden.clone().unwrap_or_else(default_garden);
 
+    // Dry run: print the plan and stop before any clone, build or
+    //    filesystem touch (report 081 item 6). The gate needs the source on
+    //    disk, so it runs here only for an existing --source checkout.
+    if cli.dry_run {
+        print_plan(&cli, &prefix, &garden);
+        return Ok(());
+    }
+
     // 3. Resolve a real source: an explicit --source checkout, an explicit
     //    --repo/--ref clone, or the baked repo + tag — never the current dir.
     //    Resolved *before* the gate: the gate reads the required rustc from the
@@ -99,13 +107,6 @@ fn run(cli: Cli, consent: &mut dyn Consent) -> Result<()> {
     if !gate.is_ok() {
         println!("{}", gate::failure_message(&gate));
         anyhow::bail!("toolchain gate failed");
-    }
-
-    // 5. Dry run: detection + gate passed; stop before the build (which is
-    //    real work) and before any filesystem touch.
-    if cli.dry_run {
-        println!("dry run: detection + toolchain gate passed; stopping before build/install.");
-        return Ok(());
     }
 
     // 6. Build the program from source.
@@ -149,6 +150,25 @@ fn default_garden() -> PathBuf {
 
 /// Resolve a real source: an explicit `--source` checkout, an explicit
 /// `--repo`/`--ref` clone, or the baked repo + tag — never the current dir.
+/// The `--dry-run` plan: everything the install would do, nothing done.
+fn print_plan(cli: &Cli, prefix: &Path, garden: &Path) {
+    let described = source::describe(cli.source.as_deref(), cli.repo.as_deref(), cli.r#ref.as_deref(), None);
+    println!("dry run — softfig-install would:");
+    println!("  source        build {described}");
+    match cli.source.as_deref().map(Gate::probe) {
+        Some(Ok(gate)) if gate.is_ok() => println!("  toolchain     ok"),
+        Some(Ok(gate)) => println!("  toolchain     FAILS — {}", gate::failure_message(&gate).lines().next().unwrap_or("")),
+        Some(Err(e)) => println!("  toolchain     cannot check: {e}"),
+        None => println!("  toolchain     checked after the clone"),
+    }
+    println!("  build         cargo build --release --locked");
+    println!("  install       the installed set into {}", prefix.display());
+    println!("  offer         the softfig-keeperd systemd user unit (--garden {})", garden.display());
+    println!("  offer         the softfig-mcp registration with Claude Code");
+    println!("  then          softfig onboard (garden at {})", garden.display());
+    println!("nothing cloned, built or installed.");
+}
+
 fn resolve_source(cli: &Cli) -> Result<Source> {
     source::resolve(
         cli.source.as_deref(),
@@ -279,12 +299,44 @@ fn offer_unit(
         return;
     }
     // daemon-reload AFTER the write, BEFORE enable — systemd must load the
-    // rendered unit we just wrote, not a stale cached copy.
-    let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", "softfig-keeperd.service"])
-        .status();
-    println!("unit enabled (reversible: {})", offer.undo);
+    // rendered unit we just wrote, not a stale cached copy. Both statuses are
+    // checked: a failure is reported with the undo, never "unit enabled"
+    // (report 081 item 1).
+    let garden_exists = garden.is_dir();
+    let enabled = systemctl(&["--user", "daemon-reload"])
+        .and_then(|()| systemctl(&enable_args(garden_exists)));
+    match enabled {
+        Ok(()) if garden_exists => println!("unit enabled and started (reversible: {})", offer.undo),
+        Ok(()) => println!(
+            "unit enabled; it starts at your next login. Start it now, after \
+             `softfig onboard` has created the garden: systemctl --user start \
+             softfig-keeperd (reversible: {})",
+            offer.undo
+        ),
+        Err(e) => println!("unit written but not enabled: {e}\n  undo: {}", offer.undo),
+    }
+}
+
+/// `systemctl` arguments that enable the unit — with `--now` only when the
+/// garden already exists. Started before `onboard` creates it, the daemon
+/// boots against a path it cannot use (report 081 item 2; the AUR README's
+/// install order).
+fn enable_args(garden_exists: bool) -> Vec<&'static str> {
+    let mut args = vec!["--user", "enable"];
+    if garden_exists {
+        args.push("--now");
+    }
+    args.push("softfig-keeperd.service");
+    args
+}
+
+/// Run `systemctl <args>`, failing on a spawn error or a non-zero exit.
+fn systemctl(args: &[&str]) -> std::result::Result<(), String> {
+    match std::process::Command::new("systemctl").args(args).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("`systemctl {}` exited {status}", args.join(" "))),
+        Err(e) => Err(format!("`systemctl {}` could not run: {e}", args.join(" "))),
+    }
 }
 
 fn install_unit(rendered: &str, dir: &Path) -> std::io::Result<()> {
@@ -341,4 +393,23 @@ fn handoff(prefix: &Path, garden: &Path) {
     println!("  2. Unlock the session once per boot:");
     println!("       {} daemon unlock", softfig.display());
     println!("See docs/onboard-laptop.md for the full walkthrough.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Report 081 item 2: on a fresh box (no garden yet) the unit is enabled
+    /// but not started; once the garden exists, `--now` starts it.
+    #[test]
+    fn the_unit_starts_now_only_when_the_garden_exists() {
+        assert_eq!(enable_args(false), ["--user", "enable", "softfig-keeperd.service"]);
+        assert_eq!(enable_args(true), ["--user", "enable", "--now", "softfig-keeperd.service"]);
+    }
+
+    /// Report 081 item 1: a failing `systemctl` is an error, not "enabled".
+    #[test]
+    fn a_failing_systemctl_is_an_error() {
+        assert!(systemctl(&["--this-flag-does-not-exist"]).is_err());
+    }
 }

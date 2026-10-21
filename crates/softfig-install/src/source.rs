@@ -97,6 +97,24 @@ pub fn resolve(
     )
 }
 
+/// Which source [`resolve`] would pick, in words, without fetching anything
+/// — what a `--dry-run` prints (report 081 item 6).
+pub fn describe(explicit_source: Option<&Path>, repo: Option<&str>, r#ref: Option<&str>, recorded: Option<&Path>) -> String {
+    if let Some(path) = explicit_source {
+        return format!("the checkout {}", path.display());
+    }
+    if let Some(repo) = repo {
+        return format!("a clone of {repo} at {}", r#ref.unwrap_or("(missing --ref)"));
+    }
+    if let Some(path) = recorded {
+        return format!("the checkout recorded at install, {}", path.display());
+    }
+    match baked_source() {
+        Some((repo, tag)) => format!("a clone of {repo} at {tag}"),
+        None => "none (pass --source or --repo/--ref)".to_string(),
+    }
+}
+
 /// What `softfig upgrade` resolved to.
 pub enum UpgradeSource {
     /// Build this source.
@@ -240,6 +258,14 @@ mod tests {
 
     fn v(s: &str) -> semver::Version {
         semver::Version::parse(s).unwrap()
+    }
+
+    /// Report 081 item 6: a dry run names the source without fetching it.
+    #[test]
+    fn describe_names_the_source_without_fetching() {
+        assert_eq!(describe(Some(Path::new("/src")), None, None, None), "the checkout /src");
+        assert_eq!(describe(None, Some("https://r"), Some("v1.2.0"), None), "a clone of https://r at v1.2.0");
+        assert!(describe(None, None, None, Some(Path::new("/rec"))).contains("/rec"));
     }
 
     /// Report 076: the default upgrade target is never the running version's

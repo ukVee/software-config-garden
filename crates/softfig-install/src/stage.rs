@@ -366,7 +366,8 @@ mod tests {
     #[test]
     fn a_fresh_prefix_swaps_in_the_built_set() {
         let source = source_with("1.0.1");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
 
         let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
         assert_eq!(outcome.version(), "1.0.1");
@@ -380,7 +381,8 @@ mod tests {
     #[test]
     fn a_clean_swap_leaves_no_swap_marker() {
         let source = source_with("1.0.1");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
 
         let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
         assert!(!outcome.is_noop());
@@ -396,7 +398,8 @@ mod tests {
     #[test]
     fn a_rerun_over_a_matching_prefix_is_a_noop() {
         let source = source_with("1.0.1");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set(&prefix, "1.0.1");
 
@@ -411,7 +414,8 @@ mod tests {
     #[test]
     fn a_matching_identity_with_different_bytes_swaps() {
         let source = source_with("1.0.1");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set(&prefix, "1.0.1");
         // Same stamp, different code: what a stale-id rebuild produces.
@@ -436,7 +440,8 @@ mod tests {
         for name in &INSTALLED_SET[..4] {
             write_binary(&target, name, "1.0.1");
         }
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
 
         let err = stage_and_swap(source.path(), &prefix, false).unwrap_err();
         assert!(format!("{err:#}").contains("not one consistent version"), "{err:#}");
@@ -447,7 +452,8 @@ mod tests {
     #[test]
     fn a_same_version_rebuild_swaps_not_noop() {
         let source = source_with_id("1.0.0-alpha.1", "bbb");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set_id(&prefix, "1.0.0-alpha.1", "aaa");
 
@@ -472,7 +478,8 @@ mod tests {
     #[test]
     fn a_same_version_mixed_prefix_swaps_not_noop() {
         let source = source_with_id("1.0.0-alpha.1", "bbb");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         // Mid-swap: three binaries already at the new build, two still the old
         // build — same version throughout, no marker.
@@ -504,7 +511,8 @@ mod tests {
     #[test]
     fn a_rerun_repairs_an_interrupted_same_version_swap() {
         let source = source_with_id("1.0.0-alpha.1", "bbb");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         // Mid-rename: some binaries at the new build, some at the old, and the
         // swap-in-progress marker left behind by the crash.
@@ -531,7 +539,8 @@ mod tests {
     #[test]
     fn a_version_bump_records_the_replaced_version() {
         let source = source_with_id("1.0.1", "bbb");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set_id(&prefix, "1.0.0", "aaa");
 
@@ -548,7 +557,8 @@ mod tests {
     #[test]
     fn force_reswaps_an_identical_identity() {
         let source = source_with_id("1.0.1", "bbb");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set_id(&prefix, "1.0.1", "bbb");
 
@@ -576,7 +586,8 @@ mod tests {
     /// never a history stack).
     #[test]
     fn a_second_swap_keeps_exactly_one_previous_set() {
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set_id(&prefix, "1.0.0", "aaa");
 
@@ -662,7 +673,8 @@ mod tests {
     #[test]
     fn a_fresh_install_keeps_no_previous_set() {
         let source = source_with("1.0.1");
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
 
         let outcome = stage_and_swap(source.path(), &prefix, false).unwrap();
         assert!(!outcome.is_noop());
@@ -677,7 +689,8 @@ mod tests {
     /// file in one process still conflict.)
     #[test]
     fn a_held_lock_refuses_a_concurrent_swap() {
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set(&prefix, "1.0.0");
 
@@ -704,7 +717,8 @@ mod tests {
     /// `rollback` restores the one previous set over the current set.
     #[test]
     fn rollback_restores_the_previous_set() {
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set_id(&prefix, "1.0.0", "aaa");
 
@@ -728,7 +742,8 @@ mod tests {
     /// set untouched.
     #[test]
     fn rollback_errors_when_there_is_no_previous_set() {
-        let prefix = tempfile::tempdir().unwrap().path().join(".local/bin");
+        let prefix_root = tempfile::tempdir().unwrap();
+        let prefix = prefix_root.path().join(".local/bin");
         std::fs::create_dir_all(&prefix).unwrap();
         write_set(&prefix, "1.0.0");
 

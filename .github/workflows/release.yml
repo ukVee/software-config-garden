@@ -234,14 +234,19 @@ jobs:
           cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Build the rescue artifact (static musl, no system deps)
         run: cargo build -p softfig-rescue --release --locked --target ${{ matrix.target }}
-      - name: Prove the rescue binary needs no libfuse3
+      - name: Prove the rescue binary is statically linked
+        # No NEEDED entries at all, not just no libfuse: a live USB or chroot
+        # may lack any shared library (report 081 item 5). readelf must read
+        # the file, so a missing binary fails instead of passing vacuously.
         run: |
           set -euo pipefail
-          if readelf -d "target/${{ matrix.target }}/release/softfig-rescue" 2>/dev/null | grep -qi 'libfuse'; then
-            echo "softfig-rescue needs libfuse — the rescue profile must not require FUSE" >&2
+          dyn="$(readelf -d "target/${{ matrix.target }}/release/softfig-rescue")"
+          if printf '%s\n' "$dyn" | grep -q '(NEEDED)'; then
+            printf '%s\n' "$dyn" | grep '(NEEDED)' >&2
+            echo "softfig-rescue has dynamic NEEDED entries — the rescue artifact must be statically linked" >&2
             exit 1
           fi
-          echo "rescue binary needs no libfuse"
+          echo "rescue binary is statically linked"
       - name: Compute the release version (validated tag without the leading v)
         id: version
         env:
@@ -309,7 +314,9 @@ jobs:
       - name: Prove the helper binary is statically linked
         run: |
           set -euo pipefail
-          if readelf -d "target/${{ matrix.target }}/release/softfig-install" 2>/dev/null | grep -qi 'NEEDED'; then
+          dyn="$(readelf -d "target/${{ matrix.target }}/release/softfig-install")"
+          if printf '%s\n' "$dyn" | grep -q '(NEEDED)'; then
+            printf '%s\n' "$dyn" | grep '(NEEDED)' >&2
             echo "softfig-install has dynamic NEEDED entries — the helper must be statically linked" >&2
             exit 1
           fi

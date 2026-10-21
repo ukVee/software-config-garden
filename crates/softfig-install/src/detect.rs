@@ -83,15 +83,28 @@ fn unquote(v: &str) -> &str {
     v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v)
 }
 
-/// Classify a parsed release into one of the four target distros.
+/// Classify a parsed release into one of the four target distros. A
+/// derivative (`ID=manjaro`, `ID_LIKE=arch`) classifies as the first known
+/// distro its `ID_LIKE` names, in order: it shares that distro's package
+/// manager, which is what `package_owned` asks about (report 081 item 3).
 pub fn distro_from(release: &OsRelease) -> Distro {
-    match release.id.as_str() {
-        "arch" => Distro::Arch,
-        "debian" => Distro::Debian,
-        "ubuntu" => Distro::Ubuntu,
-        "fedora" => Distro::Fedora,
-        "" => Distro::Unknown,
-        _ => Distro::Other(release.name.clone()),
+    let known = |id: &str| match id {
+        "arch" => Some(Distro::Arch),
+        "debian" => Some(Distro::Debian),
+        "ubuntu" => Some(Distro::Ubuntu),
+        "fedora" => Some(Distro::Fedora),
+        _ => None,
+    };
+    if let Some(distro) = known(&release.id) {
+        return distro;
+    }
+    if let Some(distro) = release.id_like.iter().find_map(|id| known(id)) {
+        return distro;
+    }
+    if release.id.is_empty() {
+        Distro::Unknown
+    } else {
+        Distro::Other(release.name.clone())
     }
 }
 
@@ -248,6 +261,20 @@ mod tests {
     fn an_unrecognized_id_carries_its_name() {
         let r = parse_os_release("ID=nixos\nNAME=\"NixOS\"\n");
         assert_eq!(distro_from(&r), Distro::Other("NixOS".to_string()));
+    }
+
+    /// Report 081 item 3: an Arch derivative is Arch, so an AUR `/usr/bin`
+    /// install there is recognised as package-owned.
+    #[test]
+    fn a_derivative_classifies_by_id_like() {
+        let manjaro = parse_os_release("ID=manjaro\nNAME=\"Manjaro Linux\"\nID_LIKE=arch\n");
+        assert_eq!(distro_from(&manjaro), Distro::Arch);
+        let endeavour = parse_os_release("ID=endeavouros\nNAME=EndeavourOS\nID_LIKE=\"arch\"\n");
+        assert_eq!(distro_from(&endeavour), Distro::Arch);
+        let mint = parse_os_release("ID=linuxmint\nNAME=\"Linux Mint\"\nID_LIKE=\"ubuntu debian\"\n");
+        assert_eq!(distro_from(&mint), Distro::Ubuntu);
+        let alma = parse_os_release("ID=almalinux\nNAME=AlmaLinux\nID_LIKE=\"rhel centos fedora\"\n");
+        assert_eq!(distro_from(&alma), Distro::Fedora);
     }
 
     #[test]

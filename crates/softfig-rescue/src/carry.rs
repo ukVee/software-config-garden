@@ -47,8 +47,7 @@ pub const CARRY_HEADER: &str = "\
 # the machine's own writable media (usually the rescue USB) at recovery time.
 # It contains a machine manifest, a step log, and the run outcome. It is not
 # screened for secrets — treat it as sensitive but not secret: do not copy it
-# off the machine it
-# describes without the owner's say-so.
+# off the machine it describes without the owner's say-so.
 ";
 
 /// A carry-file: the header fields plus the three sections `recovery-pack-v1`
@@ -105,12 +104,41 @@ impl CarryFile {
         doc
     }
 
-    /// Write this carry-file to `path`.
+    /// Write this carry-file to `path`: owner-only (0600 — it is plaintext
+    /// and unscreened), and atomically (a sibling temp file, fsynced, renamed
+    /// over `path`), so a crash or a yanked USB never leaves a half-written
+    /// carry-file (report 081 item 4).
     pub fn write_to(&self, path: &Path) -> Result<(), CarryError> {
-        std::fs::write(path, self.to_document()).map_err(|source| CarryError::Io {
+        let io_err = |source| CarryError::Io {
             path: path.to_path_buf(),
             source,
-        })
+        };
+        let name = path.file_name().ok_or_else(|| io_err(io::Error::other("no file name")))?;
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".tmp-{}", std::process::id()));
+        let tmp = path.with_file_name(tmp_name);
+        let written = (|| {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(self.to_document().as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            // The rename's directory entry, durable too.
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.map_err(io_err)
     }
 
     /// Read and validate a carry-file from `path`. Refuses a file that is not
@@ -244,6 +272,24 @@ mod tests {
         carry.write_to(&path).unwrap();
         let back = CarryFile::read_from(&path).unwrap();
         assert_eq!(back, carry);
+    }
+
+    /// Report 081 item 4: the plaintext carry-file is owner-only, replaces an
+    /// existing file whole, and leaves no temp file behind.
+    #[test]
+    fn the_carry_file_is_written_0600_and_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carry.toml");
+        std::fs::write(&path, "stale").unwrap();
+
+        CarryFile::new(0).write_to(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:o}");
+        assert!(CarryFile::read_from(&path).is_ok());
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["carry.toml"], "a temp file was left behind");
     }
 
     #[test]
