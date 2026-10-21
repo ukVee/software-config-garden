@@ -14,6 +14,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every job builds with the rust-toolchain.toml pin, stated explicitly and
+  # asserted below; the msrv job overrides it with the declared MSRV. Without
+  # RUSTUP_TOOLCHAIN the rust-toolchain.toml directory override beats
+  # `rustup default`, so the msrv job silently compiled on 1.95.0 and MSRV
+  # 1.88 was proven nowhere (report 077).
+  RUSTUP_TOOLCHAIN: 1.95.0
 
 # No `cargo fmt` job here: the tree is not yet rustfmt-clean, so fmt would be
 # red on arrival. `cargo clippy --all-targets --locked -- -D warnings` (the clippy job
@@ -31,8 +37,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.95.0
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -43,7 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo test --workspace --no-fail-fast --locked
@@ -54,7 +75,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo build --workspace --release --locked
@@ -69,7 +98,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the pinned toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.95\.0'
+          cargo --version | grep -q '^cargo 1\.95\.0'
       - name: Build the rescue artifact (no system deps)
         run: cargo build -p softfig-rescue --release --locked
       - name: Prove the rescue binary needs no libfuse3
@@ -84,12 +121,22 @@ jobs:
   msrv:
     name: msrv
     runs-on: ubuntu-latest
+    env:
+      # The declared MSRV (Cargo.toml `rust-version`), overriding both the
+      # workflow-level pin and the rust-toolchain.toml directory override.
+      RUSTUP_TOOLCHAIN: "1.88"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the MSRV toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc --version | grep -q '^rustc 1\.88\.'
+          cargo --version | grep -q '^cargo 1\.88\.'
       - name: Install system deps (protoc + libfuse3)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
       - run: cargo check --workspace --all-targets --locked

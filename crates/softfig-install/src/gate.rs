@@ -29,6 +29,10 @@ pub enum Gate {
     TooOld { version: Version, required: Version },
     /// `rustc` not found (or its `--version` output didn't parse).
     Absent { required: Version },
+    /// The source pins an exact toolchain (`rust-toolchain.toml`) that is not
+    /// installed, so `rustc` in the source dir fails. "Install the latest
+    /// stable" can never satisfy an exact pin, so this names it (report 077).
+    PinMissing { pin: String, required: Version },
 }
 
 impl Gate {
@@ -63,7 +67,16 @@ impl Gate {
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-        Ok(Gate::check(&required, out.as_deref()))
+        Ok(Gate::check_pinned(&required, out.as_deref(), toolchain_pin(source)))
+    }
+
+    /// [`Gate::check`], knowing the source's toolchain pin: a failed probe
+    /// under a pin means the pinned toolchain is missing, not that Rust is.
+    pub fn check_pinned(required: &Version, rustc_version_output: Option<&str>, pin: Option<String>) -> Gate {
+        match (Gate::check(required, rustc_version_output), pin) {
+            (Gate::Absent { required }, Some(pin)) => Gate::PinMissing { pin, required },
+            (gate, _) => gate,
+        }
     }
 
     pub fn is_ok(&self) -> bool {
@@ -122,6 +135,18 @@ fn version_from_rustc_output(output: &str) -> Option<Version> {
     Version::parse(core).ok()
 }
 
+/// The exact toolchain the source pins in `rust-toolchain.toml` (or the
+/// legacy one-line `rust-toolchain`), if any.
+pub fn toolchain_pin(source: &Path) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(source.join("rust-toolchain.toml")) {
+        let doc: toml::Value = toml::from_str(&text).ok()?;
+        return doc.get("toolchain")?.get("channel")?.as_str().map(str::to_string);
+    }
+    let legacy = std::fs::read_to_string(source.join("rust-toolchain")).ok()?;
+    let channel = legacy.trim();
+    (!channel.is_empty() && !channel.contains('[')).then(|| channel.to_string())
+}
+
 /// The canonical rustup bootstrap command, printed verbatim on a failed gate.
 /// `RUSTUP_AUTO_INSTALL=0` carries the gate's fail-closed posture through to
 /// the copy-paste command: rustup installs *itself* but not a toolchain — the
@@ -138,6 +163,21 @@ pub fn failure_message(gate: &Gate) -> String {
             format!("rustc {version} is older than the required {required}"),
             required.clone(),
         ),
+        Gate::PinMissing { pin, required } => {
+            return format!(
+                "this source pins rustc {pin} (rust-toolchain.toml), and that \
+                 toolchain is not installed.\n\
+                 soft-fig builds from source with exactly that compiler (it \
+                 needs rustc >= {required}). Install it with rustup:\n\
+                 \n    rustup toolchain install {pin}\n\
+                 \n\
+                 No rustup yet? Bootstrap it first:\n\
+                 \n    {RUSTUP_BOOTSTRAP}\n\
+                 \n\
+                 …then re-run softfig-install. (This helper never installs a \
+                 toolchain for you — that is your choice to make.)"
+            );
+        }
         Gate::Recent { .. } => return String::new(),
     };
     format!(
@@ -210,6 +250,39 @@ mod tests {
             failure_message(&Gate::check(&required(), Some("rustc 1.95.0 (x)"))),
             ""
         );
+    }
+
+    /// Report 077: a probe that fails in a source pinning an exact toolchain
+    /// names the pin and the `rustup toolchain install` that satisfies it,
+    /// not "install the latest stable", which never can.
+    #[test]
+    fn a_missing_pinned_toolchain_names_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"0.0.1\"\n",
+        )
+        .unwrap();
+        let pin = toolchain_pin(dir.path());
+        assert_eq!(pin.as_deref(), Some("0.0.1"));
+
+        // The probe under a missing pin fails: no `rustc --version` output.
+        let gate = Gate::check_pinned(&required(), None, pin);
+        assert_eq!(gate, Gate::PinMissing { pin: "0.0.1".into(), required: required() });
+        // A probe that ran is judged on its version, pin or not.
+        assert!(Gate::check_pinned(&required(), Some("rustc 1.95.0 (x 2026-01-01)"), Some("1.95.0".into())).is_ok());
+        let msg = failure_message(&gate);
+        assert!(msg.contains("pins rustc 0.0.1"), "{msg}");
+        assert!(msg.contains("rustup toolchain install 0.0.1"), "{msg}");
+        assert!(!msg.contains("latest stable"), "{msg}");
+    }
+
+    #[test]
+    fn no_pin_file_means_no_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(toolchain_pin(dir.path()), None);
+        std::fs::write(dir.path().join("rust-toolchain"), "1.90.0\n").unwrap();
+        assert_eq!(toolchain_pin(dir.path()).as_deref(), Some("1.90.0"));
     }
 
     #[test]

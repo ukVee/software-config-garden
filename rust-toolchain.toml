@@ -4,10 +4,12 @@
 # release workflow — uses exactly this toolchain, so a release artifact is
 # reproducible against the committed Cargo.lock.
 #
-# 1.95.0 is what this device builds with and the workspace gate is green on it;
-# the CI jobs (`dtolnay/rust-toolchain`) read this file when no `toolchain:`
-# input is given. Bump it deliberately, never on a whim — a bump re-proves the
-# clippy/test/release gate against the new compiler.
+# 1.95.0 is what this device builds with and the workspace gate is green on it.
+# Both workflows state the same pin explicitly (`RUSTUP_TOOLCHAIN: 1.95.0` +
+# a per-job version assert), and ci.yml's msrv job overrides it with the
+# declared MSRV — RUSTUP_TOOLCHAIN beats this file, `rustup default` does not.
+# Bump this file and both workflows together, deliberately — a bump re-proves
+# the clippy/test/release gate against the new compiler.
 [toolchain]
 channel = "1.95.0"
 profile = "minimal"
