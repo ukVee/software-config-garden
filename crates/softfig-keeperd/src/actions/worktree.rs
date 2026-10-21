@@ -17,7 +17,11 @@
 //! backend needs none (a staged overlay write fires no kernel event).
 //!
 //! Paths are repo-relative strings (`""` = garden root), the same shape
-//! [`conventions`](super::conventions) and the FUSE handlers use.
+//! [`conventions`](super::conventions) and the FUSE handlers use. Every entry
+//! point canonicalises its path first ([`canonical_rel`]), so the guards below
+//! never see an alias of a path they cover — `growlight/./backlog/…` and
+//! `growlight//backlog/…` name the backlog exactly as `growlight/backlog/…`
+//! does (review 042 G74-3).
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +31,16 @@ use softfig_ipc::ErrorKind;
 use crate::daemon::{Daemon, DaemonInner};
 
 type ActionResult = Result<(), (ErrorKind, String)>;
+
+/// Whose bytes a write carries, for the member guard's managed-region rule
+/// (review 042 G74-1): the caller's own ([`WorkTree::write`]), which may not
+/// change a daemon-managed region, or the daemon's re-derivation of one
+/// ([`WorkTree::write_derived`]), which only ever changes a region.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bytes {
+    Caller,
+    Derived,
+}
 
 /// One entry from [`WorkTree::read_dir`].
 pub struct DirEntry {
@@ -71,18 +85,17 @@ impl<'a> WorkTree<'a> {
         is_garden_rel(rel).then(|| garden_root.join(rel))
     }
 
-    /// The write-side refusal for a non-garden-relative `rel` (both backends:
-    /// the FUSE overlay is keyed by the string, so a `..` there would stage a
-    /// tree entry no path can name).
-    fn require_garden_rel(rel: &str) -> ActionResult {
-        if is_garden_rel(rel) {
-            Ok(())
-        } else {
-            Err((
+    /// The write-side form of [`canonical_rel`]: `rel` rebuilt from its normal
+    /// components, or the refusal for a non-garden-relative `rel` (both
+    /// backends: the FUSE overlay is keyed by the string, so a `..` there would
+    /// stage a tree entry no path can name).
+    fn canonical_or_refuse(rel: &str) -> Result<String, (ErrorKind, String)> {
+        canonical_rel(rel).ok_or_else(|| {
+            (
                 ErrorKind::BadArgs,
                 format!("{rel:?}: not a garden-relative path (no `..`, root, or prefix components)"),
-            ))
-        }
+            )
+        })
     }
 
     /// Every check [`write`](Self::write) applies before it touches anything —
@@ -90,44 +103,54 @@ impl<'a> WorkTree<'a> {
     /// Multi-file verbs (`batch`, the reindex sweep) run this over every target
     /// before the first write, so a refusal can't land half their writes.
     pub fn check_write(&self, rel: &str) -> ActionResult {
-        Self::require_garden_rel(rel)?;
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.refuse_unkeyed_shared(rel)
     }
 
     /// [`check_write`](Self::check_write) plus the content check
-    /// [`write`](Self::write) makes for these exact bytes: §6.7's guard on a
-    /// member's `> Model:` lines ([`member_model_refusal`]). A verb that stages
-    /// more than one file runs this over each before its first write, like
-    /// `check_write`.
+    /// [`write`](Self::write) makes for these exact bytes: the member guards —
+    /// no hand edit of a daemon-managed region ([`member_region_refusal`]),
+    /// §6.7's reserved `> Model:` / `> Grants:` / `> Worktree:` lines
+    /// ([`member_reserved_refusal`]) and the `> Fleet:` hold
+    /// ([`member_fleet_refusal`]). A verb that stages more than one file runs
+    /// this over each before its first write, like `check_write`.
     pub fn check_write_bytes(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
-        self.guard_member_models(rel, Some(bytes))
+        self.guard_member_write(rel, Some(bytes), Bytes::Caller)
     }
 
-    /// §6.7's `> Model:` guard for replacing `rel` with `new` (`None` = removing
-    /// it): a no-op unless this request runs for a fleet member
-    /// ([`crate::caller`]) and `rel` lies under `growlight/backlog/`.
-    fn guard_member_models(&self, rel: &str, new: Option<&[u8]>) -> ActionResult {
-        let Some(member) = crate::caller::member() else {
-            return Ok(());
-        };
-        if !is_backlog_rel(rel) {
+    /// The member guards for replacing `rel` with `new` (`None` = removing it).
+    /// Anywhere in the garden, the caller's bytes may not change a
+    /// daemon-managed region ([`member_region_refusal`]; `bytes` says whether
+    /// they are the caller's). Under `growlight/backlog/`, the three reserved
+    /// metadata lines (`> Model:`, `> Grants:`, `> Worktree:`) are
+    /// member-immutable and the `> Fleet:` line is member-tighten-only (see
+    /// [`member_reserved_refusal`] / [`member_fleet_refusal`]). A no-op unless
+    /// this request runs for a fleet member ([`crate::caller`]).
+    fn guard_member_write(&self, rel: &str, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
+        if crate::caller::member().is_none() {
             return Ok(());
         }
-        let old = self.read(rel);
-        let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
-        let (old, new) = (text(old.as_deref()), text(new));
-        match member_model_refusal(&member, rel, old.as_deref(), new.as_deref()) {
-            Some(why) => Err((ErrorKind::BadArgs, why)),
-            None => Ok(()),
-        }
+        guard_member_change(rel, self.read(rel).as_deref(), new, bytes)
+    }
+
+    /// [`check_write_bytes`](Self::check_write_bytes) against a known prior
+    /// content `old` (`None` = absent) instead of the working tree's — for
+    /// `batch`, whose op N must be guarded against op N−1's simulated result,
+    /// not the live tree it has not staged into yet (review 042 G74-8).
+    pub fn check_write_bytes_over(&self, rel: &str, old: Option<&[u8]>, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        self.check_write(rel)?;
+        guard_member_change(rel, old, Some(bytes), Bytes::Caller)
     }
 
     /// The same guard for removing `rel`, which may be a whole directory:
-    /// refused for a member when it removes a `> Model:` line under
-    /// `growlight/backlog/` — a doc there carrying one, a directory holding
-    /// such a doc, or an ancestor of the backlog itself.
-    fn guard_member_model_removal(&self, rel: &str) -> ActionResult {
+    /// refused for a member when it removes a reserved `> Model:` / `> Grants:`
+    /// / `> Worktree:` line or loosens a held `> Fleet:` line under
+    /// `growlight/backlog/` — a doc there carrying one, a directory holding such
+    /// a doc, or an ancestor of the backlog itself.
+    fn guard_member_removal(&self, rel: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
@@ -138,52 +161,102 @@ impl<'a> WorkTree<'a> {
         } else {
             return Ok(());
         };
-        match self.first_model_doc(&scope) {
-            Some((doc, text)) => Err(refusal(&member, &doc, Some(&text), None)),
-            None => Ok(()),
+        if let Some((doc, text)) = self.first_reserved_doc(&scope) {
+            return Err(reserved_refusal(&member, &doc, Some(&text), None));
         }
+        if let Some((doc, text)) = self.first_fleet_doc(&scope) {
+            return Err(fleet_refusal(&member, &doc, Some(&text), None));
+        }
+        if let Some((doc, text)) = self.first_doc_with(&scope, |t| !super::managed::regions(t).is_empty()) {
+            let why = member_region_refusal(&member, &doc, Some(&text), None)
+                .expect("a doc carrying a managed region");
+            return Err((ErrorKind::BadArgs, why));
+        }
+        Ok(())
     }
 
     /// The guard for a rename: moving `from` removes its lines from where they
     /// were, moving it into the backlog adds them at `to` (whatever `from`
-    /// is), and replacing an existing `to` removes the destination's.
+    /// is), and replacing an existing `to` removes the destination's. A reserved
+    /// `> Model:` / `> Grants:` / `> Worktree:` line is refused in both
+    /// directions; `> Fleet:` only in the loosening one (a member may move a
+    /// held doc *into* the backlog — that tightens).
     fn guard_member_rename(&self, from: &str, to: &str) -> ActionResult {
         let Some(member) = crate::caller::member() else {
             return Ok(());
         };
-        self.guard_member_model_removal(from)?;
+        self.guard_member_removal(from)?;
         if (is_backlog_rel(to) || spans_backlog(to))
-            && let Some((doc, text)) = self.first_model_doc(from) {
+            && let Some((doc, text)) = self.first_reserved_doc(from) {
                 let landing = match doc.strip_prefix(from) {
                     Some(rest) => format!("{to}{rest}"),
                     None => to.to_string(),
                 };
-                return Err(refusal(&member, &landing, None, Some(&text)));
+                return Err(reserved_refusal(&member, &landing, None, Some(&text)));
             }
-        self.guard_member_model_removal(to)
+        if let Some(landing) = self.landings(from, to).into_iter().find(|l| is_item_doc_path(l)) {
+            return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, &landing, "rename lands on")));
+        }
+        self.guard_member_removal(to)
     }
 
-    /// The first file at or under `rel` (a file or a directory) carrying a
-    /// `> Model:` line, with its text.
-    fn first_model_doc(&self, rel: &str) -> Option<(String, String)> {
+    /// Where each file at or under `from` lands when `from` is renamed to
+    /// `to`: `to` itself for a file, `to/<rest>` for each file in a directory.
+    fn landings(&self, from: &str, to: &str) -> Vec<String> {
+        if !self.is_dir(from) {
+            return vec![to.to_string()];
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![from.to_string()];
+        while let Some(dir) = stack.pop() {
+            for entry in self.read_dir(&dir) {
+                let child = format!("{dir}/{}", entry.name);
+                if entry.is_dir {
+                    stack.push(child);
+                } else {
+                    out.push(format!("{to}{}", &child[from.len()..]));
+                }
+            }
+        }
+        out
+    }
+
+    /// The first file at or under `rel` (a file or a directory) whose text
+    /// satisfies `pred`, with its text.
+    fn first_doc_with(
+        &self,
+        rel: &str,
+        pred: impl Fn(&str) -> bool + Copy,
+    ) -> Option<(String, String)> {
         if self.is_dir(rel) {
-            return self
-                .read_dir(rel)
-                .into_iter()
-                .find_map(|entry| self.first_model_doc(&format!("{rel}/{}", entry.name)));
+            return self.read_dir(rel).into_iter().find_map(|entry| {
+                self.first_doc_with(&format!("{rel}/{}", entry.name), pred)
+            });
         }
         let text = String::from_utf8_lossy(&self.read(rel)?).into_owned();
-        (!softfig_ipc::queue_v2::model_lines(&text).is_empty()).then(|| (rel.to_string(), text))
+        pred(&text).then(|| (rel.to_string(), text))
+    }
+
+    /// The first file at or under `rel` carrying a reserved `> Model:` /
+    /// `> Grants:` / `> Worktree:` line, with its text.
+    fn first_reserved_doc(&self, rel: &str) -> Option<(String, String)> {
+        use softfig_ipc::queue_v2::{reserved_field, SUB_DOC_RESERVED};
+        self.first_doc_with(rel, |t| reserved_field(t, &SUB_DOC_RESERVED).is_some())
+    }
+
+    /// The first file at or under `rel` carrying a held `> Fleet:` line, with
+    /// its text.
+    fn first_fleet_doc(&self, rel: &str) -> Option<(String, String)> {
+        self.first_doc_with(rel, softfig_ipc::fleet::held)
     }
 
     /// Working-tree bytes for repo-relative `rel`, or `None` if absent /
     /// unreadable / a directory.
     pub fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        let rel = &canonical_rel(rel)?;
         match self {
             WorkTree::Disk { garden_root, .. } => std::fs::read(Self::abs(garden_root, rel)?).ok(),
-            WorkTree::Fuse { mount } => {
-                is_garden_rel(rel).then(|| mount.read_workfile(rel).ok().flatten())?
-            }
+            WorkTree::Fuse { mount } => mount.read_workfile(rel).ok().flatten(),
         }
     }
 
@@ -194,30 +267,36 @@ impl<'a> WorkTree<'a> {
 
     /// Whether `rel` resolves to a live file or directory.
     pub fn exists(&self, rel: &str) -> bool {
+        let Some(rel) = &canonical_rel(rel) else {
+            return false;
+        };
         match self {
             WorkTree::Disk { garden_root, .. } => {
                 Self::abs(garden_root, rel).is_some_and(|p| p.exists())
             }
-            WorkTree::Fuse { mount } => is_garden_rel(rel) && mount.path_exists(rel),
+            WorkTree::Fuse { mount } => mount.path_exists(rel),
         }
     }
 
     /// Whether `rel` is a directory.
     pub fn is_dir(&self, rel: &str) -> bool {
+        let Some(rel) = &canonical_rel(rel) else {
+            return false;
+        };
         match self {
             WorkTree::Disk { garden_root, .. } => {
                 Self::abs(garden_root, rel).is_some_and(|p| p.is_dir())
             }
-            WorkTree::Fuse { mount } => is_garden_rel(rel) && mount.path_is_dir(rel),
+            WorkTree::Fuse { mount } => mount.path_is_dir(rel),
         }
     }
 
     /// One-level children of directory `rel` (`""` = garden root). Empty when
     /// the directory is absent. Order is unspecified — callers sort.
     pub fn read_dir(&self, rel: &str) -> Vec<DirEntry> {
-        if !is_garden_rel(rel) {
+        let Some(rel) = &canonical_rel(rel) else {
             return Vec::new();
-        }
+        };
         match self {
             WorkTree::Disk { garden_root, .. } => {
                 let mut out = Vec::new();
@@ -271,20 +350,37 @@ impl<'a> WorkTree<'a> {
     /// event, then write. FUSE: stage into the overlay (no kernel event).
     ///
     /// For a fleet member's request, a write under `growlight/backlog/` that
-    /// adds, removes or changes a `> Model:` line is refused here (§6.7) —
-    /// see [`check_write_bytes`](Self::check_write_bytes).
+    /// adds, removes or changes a reserved `> Model:` / `> Grants:` /
+    /// `> Worktree:` line (or loosens a `> Fleet:` hold) is refused here
+    /// (§6.7) — see [`check_write_bytes`](Self::check_write_bytes).
     pub fn write(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write_bytes(rel, bytes)?;
         self.stage(rel, bytes)
     }
 
-    /// [`write`](Self::write) without §6.7's member `> Model:` guard, for the
-    /// docs keeperd builds itself from a verb's typed fields — the v2 queue
+    /// [`write`](Self::write) without §6.7's member reserved-line guard, for
+    /// the docs keeperd builds itself from a verb's typed fields — the v2 queue
     /// writer ([`super::growlight::v2::apply`]), whose generated `001-plan`
     /// slice carries keeperd's own `> Model:` line, not the caller's. The verb
     /// holds a member's text fields to §6.7 before it gets here.
     pub fn write_structured(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
         self.check_write(rel)?;
+        self.stage(rel, bytes)
+    }
+
+    /// [`write`](Self::write) for the daemon's own re-derivation of a managed
+    /// region — an index `Reviewed` cell, a backlinks list, a growlight queue
+    /// table its verb moved, the reports index. The bytes are the doc as it
+    /// stood with only that region rewritten, so the member guard's
+    /// managed-region refusal (review 042 G74-1) does not apply; every other
+    /// check `write` makes still does. A member's own bytes go through
+    /// [`write`](Self::write), never here.
+    pub fn write_derived(&self, rel: &str, bytes: &[u8]) -> ActionResult {
+        let rel = &Self::canonical_or_refuse(rel)?;
+        self.check_write(rel)?;
+        self.guard_member_write(rel, Some(bytes), Bytes::Derived)?;
         self.stage(rel, bytes)
     }
 
@@ -309,7 +405,7 @@ impl<'a> WorkTree<'a> {
     /// key-before-content refusal (m5f slice 001); the source side stays
     /// unguarded — moving *out* of an unkeyed share adds no blob to it.
     pub fn rename(&self, from: &str, to: &str) -> ActionResult {
-        Self::require_garden_rel(from)?;
+        let (from, to) = (&Self::canonical_or_refuse(from)?, &Self::canonical_or_refuse(to)?);
         self.check_write(to)?;
         self.guard_member_rename(from, to)?;
         match self {
@@ -339,8 +435,8 @@ impl<'a> WorkTree<'a> {
     /// caller today; a removal carries no key-before-content concern (it strips
     /// a blob, never adds one), so no `refuse_unkeyed_shared` guard is needed.
     pub fn remove(&self, rel: &str) -> ActionResult {
-        Self::require_garden_rel(rel)?;
-        self.guard_member_model_removal(rel)?;
+        let rel = &Self::canonical_or_refuse(rel)?;
+        self.guard_member_removal(rel)?;
         match self {
             WorkTree::Disk { daemon, garden_root } => {
                 let abs = garden_root.join(rel);
@@ -364,12 +460,143 @@ impl<'a> WorkTree<'a> {
     }
 }
 
+/// The member guards for replacing canonical `rel` from `old` to `new` (`None`
+/// = absent / removed) — see [`WorkTree::guard_member_write`]. A no-op for a
+/// request that runs for no fleet member.
+fn guard_member_change(rel: &str, old: Option<&[u8]>, new: Option<&[u8]>, bytes: Bytes) -> ActionResult {
+    let Some(member) = crate::caller::member() else {
+        return Ok(());
+    };
+    let text = |b: Option<&[u8]>| b.map(|b| String::from_utf8_lossy(b).into_owned());
+    let (old, new) = (text(old), text(new));
+    if bytes == Bytes::Caller
+        && let Some(why) = member_region_refusal(&member, rel, old.as_deref(), new.as_deref())
+    {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if !is_backlog_rel(rel) {
+        return Ok(());
+    }
+    if let Some(why) = member_vault_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if let Some(why) = member_reserved_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if let Some(why) = member_fleet_refusal(&member, rel, old.as_deref(), new.as_deref()) {
+        return Err((ErrorKind::BadArgs, why));
+    }
+    if old.is_none() && new.is_some() && is_item_doc_path(rel) {
+        return Err((ErrorKind::BadArgs, member_item_doc_refusal(&member, rel, "write creates")));
+    }
+    Ok(())
+}
+
 /// Whether repo-relative `rel` lies under `growlight/backlog/` — the tree
-/// §6.7's `> Model:` guard covers.
+/// §6.7's reserved-line and `> Fleet:` guards cover.
 fn is_backlog_rel(rel: &str) -> bool {
     let backlog = super::growlight::paths::backlog_dir();
     rel.strip_prefix(backlog.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The inline `<vault …>…</vault>` regions in `text`, as `(open tag, body)`
+/// pairs in order. A plain scan, deliberately wider than the vault's own
+/// markdown-masked parser (a tag inside a code span counts here too), because
+/// the member guard that reads it fails closed.
+fn vault_regions(text: &str) -> Vec<(&str, &str)> {
+    const CLOSE: &str = "</vault>";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("<vault") {
+        let tag = &rest[i..];
+        let Some(open_end) = tag.find('>') else {
+            out.push((tag, ""));
+            break;
+        };
+        let body = &tag[open_end + 1..];
+        match body.find(CLOSE) {
+            Some(j) => {
+                out.push((&tag[..=open_end], &body[..j]));
+                rest = &body[j + CLOSE.len()..];
+            }
+            None => {
+                out.push((&tag[..=open_end], body));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The member vault-region guard, pure: `Some(refusal)` when replacing `old`
+/// with `new` at `rel` adds, removes or changes an inline `<vault>` region.
+/// Re-sending a region's `[encrypted]` placeholder unchanged — what a member
+/// reads back — leaves it alone.
+///
+/// Review 042 G74-4: the reserved-line and `> Fleet:` guards compare the
+/// plaintext a member writes, so wrapping `> Fleet: no` as
+/// `<vault id="h">\n> Fleet: no\n</vault>` passed them — held before, held
+/// after — while growlightd's redacted read then saw `[encrypted]` and no
+/// hold. Under `growlight/backlog/` a member may not seal anything; the
+/// readers also fail closed on a sealed region
+/// ([`softfig_ipc::item_meta::unreadable_metadata`]). The refusal text leads
+/// with the wire code, `member_not_allowed`.
+pub(crate) fn member_vault_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<String> {
+    let before = old.map(vault_regions).unwrap_or_default();
+    let after = new.map(vault_regions).unwrap_or_default();
+    let unchanged = before.len() == after.len()
+        && before
+            .iter()
+            .zip(&after)
+            .all(|((old_tag, old_body), (new_tag, new_body))| {
+                old_tag == new_tag && (old_body == new_body || *new_body == "[encrypted]")
+            });
+    (!unchanged).then(|| {
+        format!(
+            "member_not_allowed: this write adds, removes or changes an inline `<vault>` region in \
+             {rel}, and fleet member {member} may not seal or unseal anything under \
+             growlight/backlog/ — a sealed region reads as `[encrypted]` to growlightd, so it \
+             could hide a `> Fleet:` / `> Model:` / `> Worktree:` line. Write the text in the \
+             clear; secrets do not belong in backlog docs. (spec-growlight-queue §6.7)"
+        )
+    })
+}
+
+/// Whether canonical `rel` is an item-doc path — a doc a growlight reader looks
+/// an item or slice up by: a task doc (`…/tasks/*.md`), a `CLAUDE.md` (the
+/// backlog doc, a milestone's, a sub-milestone's) or a slice doc
+/// (`…/slices/*.md`), under `growlight/backlog/`.
+fn is_item_doc_path(rel: &str) -> bool {
+    if !is_backlog_rel(rel) {
+        return false;
+    }
+    let mut parts = rel.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    let parent = parts.next().unwrap_or_default();
+    name == "CLAUDE.md" || (name.ends_with(".md") && matches!(parent, "tasks" | "slices"))
+}
+
+/// Review 042 G74-2: a member may not create an item doc, nor rename a file
+/// onto one. The readers find an item's doc by its number, so a second
+/// `066-0.md` beside `066-loop-self-extend.md` could shadow it — dropping its
+/// `> Fleet: no` hold, or naming another model or worktree. (The readers also
+/// fail closed on two docs for one number; this keeps a member from making the
+/// second.) Members are already refused `add_backlog_item` / `add_slice`. The
+/// refusal text leads with the wire code, `member_not_allowed`.
+fn member_item_doc_refusal(member: &str, rel: &str, what: &str) -> String {
+    format!(
+        "member_not_allowed: this {what} the item doc {rel}, and fleet member {member} may not \
+         create one — a task doc, a backlog / milestone / sub-milestone CLAUDE.md or a slice doc. \
+         Readers look an item up by its number, so a new doc beside the real one would shadow \
+         it. The human seeds items and slices (add_backlog_item / add_slice); under queue v2 a \
+         member adds a slice with slice_insert. (spec-growlight-queue §6.7)"
+    )
 }
 
 /// Whether `rel` is the garden root or an ancestor of `growlight/backlog/`:
@@ -378,40 +605,130 @@ fn spans_backlog(rel: &str) -> bool {
     rel.is_empty() || super::growlight::paths::backlog_dir().starts_with(&format!("{rel}/"))
 }
 
-/// [`member_model_refusal`] as the worktree's error, for a change the caller
-/// already knows touches a `> Model:` line.
-fn refusal(member: &str, rel: &str, old: Option<&str>, new: Option<&str>) -> (ErrorKind, String) {
-    let why = member_model_refusal(member, rel, old, new)
-        .expect("the caller found a `> Model:` line this change touches");
+/// [`member_reserved_refusal`] as the worktree's error, for a change the caller
+/// already knows touches a reserved `> Model:` / `> Grants:` / `> Worktree:`
+/// line.
+fn reserved_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> (ErrorKind, String) {
+    let why = member_reserved_refusal(member, rel, old, new)
+        .expect("the caller found a reserved `> key:` line this change touches");
     (ErrorKind::BadArgs, why)
 }
 
-/// §6.7's member `> Model:` guard, pure: `Some(refusal)` when replacing
+/// §6.7's member reserved-line guard, pure: `Some(refusal)` when replacing
 /// `old` with `new` at `rel` (`None` = absent / removed) adds, removes or
-/// changes a `> Model:` line ([`softfig_ipc::queue_v2::model_lines`]). The
-/// refusal text leads with the wire code, `field_not_allowed`.
-pub(crate) fn member_model_refusal(
+/// changes a `> <key>:` line for any key in
+/// [`softfig_ipc::queue_v2::SUB_DOC_RESERVED`] — the `> Model:`, `> Grants:`
+/// and `> Worktree:` lines §6.7 reserves to humans. Two reads of the one
+/// scanner ([`softfig_ipc::item_meta`]) are compared: every raw line (fenced or
+/// not — an edit to a fenced example is refused too), and the value a resolver
+/// reads ([`softfig_ipc::item_meta::field`] — so a fence opened or closed
+/// around a real declaration, which moves no raw line, is refused as well;
+/// review 042 G74-6). The refusal text leads with the wire code,
+/// `field_not_allowed`.
+pub(crate) fn member_reserved_refusal(
     member: &str,
     rel: &str,
     old: Option<&str>,
     new: Option<&str>,
 ) -> Option<String> {
-    use softfig_ipc::queue_v2::model_lines;
-    let before = old.map(model_lines).unwrap_or_default();
-    let after = new.map(model_lines).unwrap_or_default();
-    if before == after {
+    use softfig_ipc::item_meta::{display_key, field, reserved_lines};
+    use softfig_ipc::queue_v2::SUB_DOC_RESERVED;
+    for key in SUB_DOC_RESERVED {
+        let before = old.map(|t| reserved_lines(t, &[key])).unwrap_or_default();
+        let after = new.map(|t| reserved_lines(t, &[key])).unwrap_or_default();
+        let resolved_same = old.and_then(|t| field(t, key)) == new.and_then(|t| field(t, key));
+        let what = match (before.is_empty(), after.is_empty()) {
+            _ if before == after && resolved_same => continue,
+            _ if before == after => format!(
+                "changes which `> {}:` line its resolver reads (a fence opened or closed around \
+                 one)",
+                display_key(key)
+            ),
+            (true, _) => format!("adds a `> {}:` line", display_key(key)),
+            (false, true) => format!("removes its `> {}:` line", display_key(key)),
+            (false, false) => format!("changes its `> {}:` line", display_key(key)),
+        };
+        let key = display_key(key);
+        return Some(format!(
+            "field_not_allowed: this write {what} in {rel}, and fleet member {member} may not \
+             add, remove or change a `> {key}:` line under growlight/backlog/ \
+             (spec-growlight-queue §6.7). Leave the line as it is; if it is wrong, file_report \
+             it or post_message @human. A slice body handed to slice_insert / slice_update may \
+             still declare `> Model:`, a subset of what the entry allows."
+        ));
+    }
+    None
+}
+
+/// The member managed-region guard, pure: `Some(refusal)` when replacing `old`
+/// with `new` at `rel` (`None` = absent / removed) changes a daemon-managed
+/// `<!-- softfig:… -->` region — edits its body, adds one (a new doc carrying
+/// a marker counts), or drops one ([`super::managed::changed_regions`]).
+///
+/// Review 042 G74-1: the region verbs (`patch_file`, the section verbs,
+/// `batch`) already refuse a region change for every caller, but
+/// `replace_file` is break-glass and does not, and growlightd schedules from
+/// the queue tables it would rewrite — another item's status, the row order,
+/// a `## Queues` repo cell (tomorrow's `$REPO` grant). A region is the
+/// daemon's: derived (an index, backlinks) or owned (a queue table only the
+/// growlight verbs move). The human keeps break-glass; a member does not. The
+/// refusal text leads with the wire code, `member_not_allowed`.
+pub(crate) fn member_region_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<String> {
+    let changed = super::managed::changed_regions(old.unwrap_or(""), new.unwrap_or(""));
+    if changed.is_empty() {
         return None;
     }
-    let what = match (before.is_empty(), after.is_empty()) {
-        (true, _) => "adds a `> Model:` line",
-        (false, true) => "removes its `> Model:` line",
-        (false, false) => "changes its `> Model:` line",
-    };
     Some(format!(
-        "field_not_allowed: this write {what} in {rel}, and fleet member {member} may not set a \
-         unit's model under growlight/backlog/ (spec-growlight-queue §6.7). A slice body passed to \
-         slice_insert, or a member verb's new slice, may declare a subset of what it inherits."
+        "member_not_allowed: this write changes the daemon-managed `{}` region in {rel}, and \
+         fleet member {member} may not edit one by hand — an index or backlinks table is \
+         derived, and a growlight queue table moves only through the growlight verbs. Edit \
+         the prose around it; if the region itself is wrong, file_report it or post_message \
+         @human. (spec-growlight-queue §6.7)",
+        changed.join("`, `")
     ))
+}
+
+/// [`member_fleet_refusal`] as the worktree's error, for a change the caller
+/// already knows loosens or removes a held `> Fleet:` line.
+fn fleet_refusal(member: &str, rel: &str, old: Option<&str>, new: Option<&str>) -> (ErrorKind, String) {
+    let why = member_fleet_refusal(member, rel, old, new)
+        .expect("the caller found a held `> Fleet:` line this change loosens");
+    (ErrorKind::BadArgs, why)
+}
+
+/// The member `> Fleet:` guard, pure: `Some(refusal)` when replacing `old`
+/// with `new` at `rel` (`None` = absent / removed) loosens or removes a
+/// `> Fleet:` hold ([`softfig_ipc::fleet_marker`]): the doc goes from held (a
+/// non-`yes` value) to claimable (`yes`, or no line). Adding a line or
+/// tightening one — claimable → held — is allowed, because it fails closed.
+/// The refusal text leads with the wire code, `field_not_allowed`.
+pub(crate) fn member_fleet_refusal(
+    member: &str,
+    rel: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<String> {
+    let before = old.and_then(softfig_ipc::fleet_marker);
+    let after = new.and_then(softfig_ipc::fleet_marker);
+    if before.is_some() && after.is_none() {
+        Some(format!(
+            "field_not_allowed: this write loosens or removes the `> Fleet:` hold in {rel}, and \
+             fleet member {member} may only add or tighten one (growlight/backlog/CLAUDE.md \
+             'Marking an item human-only'). Only the human removes it to free the item."
+        ))
+    } else {
+        None
+    }
 }
 
 /// Whether `rel` is a plain garden-relative path: `""` (the garden root) or
@@ -423,10 +740,32 @@ pub(crate) fn member_model_refusal(
 /// 031 D2: a `../../x/notes` tag read and wrote outside the garden in Disk
 /// mode).
 pub fn is_garden_rel(rel: &str) -> bool {
+    canonical_rel(rel).is_some()
+}
+
+/// `rel` rebuilt from its normal components, `/`-joined — the one spelling of
+/// a garden path every guard compares against. A `.` component, a doubled or
+/// trailing `/` all drop out (`growlight/./backlog//x/` → `growlight/backlog/x`;
+/// `""` and `.` are the garden root, `""`). `None` when `rel` is not plain
+/// garden-relative: a `..`, an absolute path, a Windows prefix, or a component
+/// that is not UTF-8.
+///
+/// Review 042 G74-3: without it a member's `growlight/./backlog/…` passed
+/// `validate_repo_path` (an interior `.` is no `..`), skipped the backlog
+/// guards (a raw prefix test), and landed on the real doc — `Path` equality,
+/// the disk join and the FUSE overlay's component-keyed paths all read the
+/// alias as the same file.
+pub fn canonical_rel(rel: &str) -> Option<String> {
     use std::path::Component;
-    Path::new(rel)
-        .components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    let mut parts: Vec<&str> = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// The minimal working-tree surface a `.seq`-numbered doc store needs: read a
@@ -472,6 +811,7 @@ mod tests {
     use super::*;
 
     const DOC: &str = "# slice\n\n> Model: flash\n\nbody\n";
+    const FLEET_HELD: &str = "# slice\n\n> Fleet: no\n\nbody\n";
 
     #[test]
     fn the_guard_covers_growlight_backlog_only() {
@@ -483,18 +823,25 @@ mod tests {
     }
 
     #[test]
-    fn adding_removing_or_changing_a_model_line_is_refused() {
+    fn adding_removing_or_changing_a_reserved_line_is_refused() {
         let rel = "growlight/backlog/milestones/m/slices/001-a.md";
-        let add = member_model_refusal("c", rel, Some("# slice\n\nbody\n"), Some(DOC)).unwrap();
-        assert!(add.starts_with("field_not_allowed: this write adds"), "{add}");
-        let new_file = member_model_refusal("c", rel, None, Some(DOC)).unwrap();
-        assert!(new_file.contains("adds"), "{new_file}");
-        let change =
-            member_model_refusal("c", rel, Some(DOC), Some(&DOC.replace("flash", "claude"))).unwrap();
-        assert!(change.contains("changes"), "{change}");
-        let remove = member_model_refusal("c", rel, Some(DOC), Some("# slice\n")).unwrap();
-        assert!(remove.contains("removes"), "{remove}");
-        assert!(member_model_refusal("c", rel, Some(DOC), None).unwrap().contains("removes"));
+        let cases = [
+            ("Model", "# slice\n\n> Model: flash\n\nbody\n", "# slice\n\n> Model: claude\n\nbody\n"),
+            ("Grants", "# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
+            ("Worktree", "# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+        ];
+        for (key, doc, changed) in cases {
+            let add = member_reserved_refusal("c", rel, Some("# slice\n\nbody\n"), Some(doc)).unwrap();
+            assert!(add.starts_with("field_not_allowed: this write adds"), "{add}");
+            assert!(add.contains(&format!("`> {key}:`")), "{add}");
+            let new_file = member_reserved_refusal("c", rel, None, Some(doc)).unwrap();
+            assert!(new_file.contains("adds"), "{new_file}");
+            let change = member_reserved_refusal("c", rel, Some(doc), Some(changed)).unwrap();
+            assert!(change.contains("changes"), "{change}");
+            let remove = member_reserved_refusal("c", rel, Some(doc), Some("# slice\n")).unwrap();
+            assert!(remove.contains("removes"), "{remove}");
+            assert!(member_reserved_refusal("c", rel, Some(doc), None).unwrap().contains("removes"));
+        }
     }
 
     use super::super::growlight::unlocked;
@@ -503,11 +850,13 @@ mod tests {
     const SLICE: &str = "growlight/backlog/milestones/m/slices/001-a.md";
 
     /// The guard where every action writes: a member's write under the backlog
-    /// that adds, changes or removes a `> Model:` line is refused before it
-    /// lands; one that leaves them alone, one outside the backlog, a human's,
-    /// and keeperd's own structured write all pass.
+    /// that adds, changes or removes a reserved `> Model:` / `> Grants:` /
+    /// `> Worktree:` line is refused before it lands; one that leaves them
+    /// alone, one outside the backlog, a human's, and keeperd's own structured
+    /// write all pass. The `> Model:` flow is exercised here; the grants and
+    /// worktree keys get their own matrix in the next test.
     #[test]
-    fn a_members_backlog_write_may_not_touch_a_model_line() {
+    fn a_members_backlog_write_may_not_touch_a_reserved_line() {
         let garden = tempfile::tempdir().unwrap();
         let daemon = unlocked(garden.path());
         let inner = daemon.inner.lock().unwrap();
@@ -541,6 +890,43 @@ mod tests {
             wt.rename("projects/p/notes/001-x.md", "projects/p/notes/003-x.md")
                 .expect("a rename outside the backlog is not the guard's");
             wt.write_structured(SLICE, b"# a\n").expect("keeperd's own structured write");
+        }
+    }
+
+    /// The same worktree-level guard refuses a member's add, change and remove
+    /// of a `> Grants:` or `> Worktree:` line (report 020), across write,
+    /// `check_write_bytes`, `unlink` (remove) and rename-out. A human may set
+    /// and change either.
+    #[test]
+    fn a_members_backlog_write_may_not_touch_a_grants_or_worktree_line() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        let cases = [
+            ("# slice\n\n> Grants: ~/x\n\nbody\n", "# slice\n\n> Grants: ~/y\n\nbody\n"),
+            ("# slice\n\n> Worktree: /tmp/x\n\nbody\n", "# slice\n\n> Worktree: /tmp/y\n\nbody\n"),
+        ];
+        for (doc, changed) in cases {
+            wt.write(SLICE, b"# a\n\nbody\n").expect("reset");
+            {
+                let _member = caller::enter(Some("c".into()));
+                let err = wt.write(SLICE, doc.as_bytes()).unwrap_err();
+                assert_eq!(err.0, ErrorKind::BadArgs);
+                assert!(err.1.starts_with("field_not_allowed:"), "{err:?}");
+                assert_eq!(wt.read_to_string(SLICE).as_deref(), Some("# a\n\nbody\n"), "add refused");
+                wt.write(SLICE, b"# a\n\nmore\n").expect("a write touching no reserved line");
+            }
+            wt.write(SLICE, doc.as_bytes()).expect("a human may set the line");
+            {
+                let _member = caller::enter(Some("c".into()));
+                assert!(wt.write(SLICE, changed.as_bytes()).is_err(), "change refused");
+                assert!(wt.write(SLICE, b"# a\n").is_err(), "remove refused");
+                assert!(wt.check_write_bytes(SLICE, b"# a\n").is_err(), "pre-check agrees");
+                assert!(wt.remove(SLICE).is_err(), "unlink removes the line");
+                assert!(wt.rename(SLICE, "archive/001-a.md").is_err(), "rename-out removes it");
+                assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(doc), "untouched");
+            }
         }
     }
 
@@ -591,11 +977,354 @@ mod tests {
         super::super::batch(&daemon, args).expect("a human's batch lands");
     }
 
+    /// Review 042 G74-8: `batch` guards op N against op N−1's simulated result.
+    /// Op 0 adds a `> Fleet: no` (a tighten) and op 1 removes it again: refused
+    /// in validation, with op 0 never staged — before the fix op 1 passed
+    /// validation against the live tree and was refused only after op 0 landed.
     #[test]
-    fn a_write_that_leaves_the_model_lines_alone_passes() {
+    fn a_members_batch_is_guarded_against_its_own_earlier_ops() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        {
+            let inner = daemon.inner.lock().unwrap();
+            WorkTree::new(&daemon, &inner).write(SLICE, b"# a\n\nbody\n").unwrap();
+        }
+        let patch = |old: &str, new: &str| {
+            serde_json::json!({ "op": "patch_file", "args": { "path": SLICE, "old": old, "new": new } })
+        };
+        let args = serde_json::json!({ "ops": [
+            patch("body", "> Fleet: no\n\nbody"),
+            patch("> Fleet: no\n\n", ""),
+        ] });
+        let err = {
+            let _member = caller::enter(Some("c".into()));
+            super::super::batch(&daemon, args).unwrap_err()
+        };
+        assert!(err.1.contains("op[1]") && err.1.contains("loosens or removes"), "{err:?}");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some("# a\n\nbody\n"), "op 0 never staged");
+    }
+
+    #[test]
+    fn a_write_that_leaves_the_reserved_lines_alone_passes() {
         let rel = "growlight/backlog/milestones/m/CLAUDE.md";
-        assert_eq!(member_model_refusal("c", rel, Some(DOC), Some(&format!("{DOC}more\n"))), None);
-        assert_eq!(member_model_refusal("c", rel, None, Some("# new doc, no model\n")), None);
-        assert_eq!(member_model_refusal("c", rel, Some("prose\n"), None), None);
+        assert_eq!(member_reserved_refusal("c", rel, Some(DOC), Some(&format!("{DOC}more\n"))), None);
+        assert_eq!(member_reserved_refusal("c", rel, None, Some("# new doc, no reserved line\n")), None);
+        assert_eq!(member_reserved_refusal("c", rel, Some("prose\n"), None), None);
+        // Prose and inline-code mentions are not metadata lines: no refusal.
+        assert_eq!(member_reserved_refusal("c", rel, Some("Grants: ~/x in prose\n"), Some("ok\n")), None);
+        assert_eq!(member_reserved_refusal("c", rel, Some("`> Worktree: /tmp/x`\n"), None), None);
+    }
+
+    /// A reserved line inside a fenced code block still matches: the guard
+    /// compares every raw line, fenced or not, as well as the resolved value,
+    /// so a member can neither edit a fenced line nor toggle a fence to change
+    /// what the resolver reads. (Over-guarding a fenced example is a benign
+    /// false positive, not a hole.)
+    #[test]
+    fn a_fenced_reserved_line_still_matches() {
+        let rel = "growlight/backlog/milestones/m/slices/001-a.md";
+        let fenced = "```\n> Model: flash\n```\n";
+        assert!(
+            member_reserved_refusal("c", rel, Some("# t\n"), Some(fenced)).is_some(),
+            "adding a fenced model line is still refused",
+        );
+        assert!(
+            member_reserved_refusal("c", rel, Some(fenced), Some("# t\n")).is_some(),
+            "removing a fenced model line is still refused",
+        );
+    }
+
+    /// Review 042 G74-4: a member may not wrap a backlog doc's metadata in an
+    /// inline `<vault>` region (or otherwise add, drop or change one), while
+    /// re-sending an existing region's `[encrypted]` placeholder untouched —
+    /// what a member reads back — still lets it edit around the region.
+    #[test]
+    fn a_member_may_not_seal_a_backlog_line_in_a_vault_region() {
+        let wrapped = "# slice\n\n<vault id=\"h\">\n> Fleet: no\n</vault>\n\nbody\n";
+        let rel = "growlight/backlog/milestones/m/slices/001-a.md";
+        let why = member_vault_refusal("c", rel, Some(FLEET_HELD), Some(wrapped)).unwrap();
+        assert!(why.starts_with("member_not_allowed:"), "{why}");
+        let sealed = "# s\n<vault id=\"k\">c2VjcmV0</vault>\nbody\n";
+        let edited = "# s\n<vault id=\"k\">[encrypted]</vault>\nmore body\n";
+        assert_eq!(member_vault_refusal("c", rel, Some(sealed), Some(edited)), None, "edit around it");
+        assert!(member_vault_refusal("c", rel, Some(sealed), Some("# s\nbody\n")).is_some(), "dropping it");
+        assert!(
+            member_vault_refusal("c", rel, Some(sealed), Some(&sealed.replace("c2VjcmV0", "new"))).is_some(),
+            "re-sealing new text"
+        );
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(SLICE, FLEET_HELD.as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        assert!(wt.write(SLICE, wrapped.as_bytes()).is_err(), "the wrap is refused");
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "nothing written");
+        wt.write("projects/p/notes/001-x.md", wrapped.as_bytes()).expect("outside the backlog");
+    }
+
+    /// Review 042 G74-2: a member may not create an item doc — a task doc, a
+    /// `CLAUDE.md` under the backlog, a slice doc — nor rename a file or a
+    /// directory onto one. Editing an existing one (no reserved line touched)
+    /// and creating any other backlog file stay allowed.
+    #[test]
+    fn a_member_may_not_create_or_rename_onto_an_item_doc() {
+        assert!(is_item_doc_path("growlight/backlog/tasks/066-0.md"));
+        assert!(is_item_doc_path("growlight/backlog/milestones/m/CLAUDE.md"));
+        assert!(is_item_doc_path("growlight/backlog/milestones/m/subs/s/CLAUDE.md"));
+        assert!(is_item_doc_path("growlight/backlog/milestones/m/slices/002-x.md"));
+        assert!(!is_item_doc_path("growlight/backlog/milestones/m/notes/001-x.md"));
+        assert!(!is_item_doc_path("projects/p/tasks/001-x.md"), "outside the backlog");
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let task = "growlight/backlog/tasks/066-loop-self-extend.md";
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(task, FLEET_HELD.as_bytes()).unwrap();
+        wt.write("projects/p/drafts/tasks/066-0.md", b"# shadow\n").unwrap();
+        let _member = caller::enter(Some("c".into()));
+        for shadow in [
+            "growlight/backlog/tasks/066-0.md",
+            "growlight/backlog/milestones/n/CLAUDE.md",
+            "growlight/backlog/milestones/m/slices/001-shadow.md",
+        ] {
+            let err = wt.write(shadow, b"# x\n").unwrap_err();
+            assert!(err.1.starts_with("member_not_allowed:") && err.1.contains("write creates"), "{err:?}");
+            assert!(!wt.exists(shadow), "{shadow}: nothing written");
+        }
+        assert!(
+            wt.rename("projects/p/drafts/tasks/066-0.md", "growlight/backlog/tasks/066-0.md").is_err(),
+            "a file renamed onto an item-doc path"
+        );
+        assert!(
+            wt.rename("projects/p/drafts", "growlight/backlog/milestones/m/drafts").is_err(),
+            "a directory whose files land on item-doc paths"
+        );
+        wt.write(task, format!("{FLEET_HELD}more\n").as_bytes()).expect("editing the real doc");
+        wt.write("growlight/backlog/milestones/m/notes/001-x.md", b"# n\n")
+            .expect("a backlog file that is not an item doc");
+    }
+
+    /// Review 042 G74-1: a member's own bytes may not change a daemon-managed
+    /// region anywhere — edit its body, add one, or drop one — while the
+    /// daemon's re-derivation (`write_derived`) still lands under the member's
+    /// scope, and the prose around a region stays the member's to edit.
+    #[test]
+    fn a_members_write_may_not_change_a_managed_region() {
+        let host = "growlight/backlog/CLAUDE.md";
+        let table = |status: &str| {
+            format!(
+                "# backlog\n\nprose\n\n<!-- softfig:queue -->\n\n| # | id | type | title | status |\n\
+                 |---|----|------|-------|--------|\n| 1 | 066 | task | T | {status} |\n\n\
+                 <!-- /softfig:queue -->\n"
+            )
+        };
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(host, table("queued").as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        let err = wt.write(host, table("done").as_bytes()).unwrap_err();
+        assert!(err.1.starts_with("member_not_allowed:") && err.1.contains("`queue` region"), "{err:?}");
+        assert!(wt.write(host, b"# backlog\n\nthe table is gone\n").is_err(), "dropping it");
+        assert!(wt.check_write_bytes(host, table("done").as_bytes()).is_err(), "the pre-check agrees");
+        assert!(
+            wt.write("projects/p/notes/001-x.md", table("queued").as_bytes()).is_err(),
+            "a new doc carrying a region marker, outside the backlog too"
+        );
+        assert!(wt.remove(host).is_err(), "deleting the queue doc");
+        assert_eq!(wt.read_to_string(host), Some(table("queued")), "all refused untouched");
+        wt.write(host, table("queued").replace("prose", "edited prose").as_bytes())
+            .expect("the prose around the region is the member's");
+        wt.write_derived(host, table("done").replace("prose", "edited prose").as_bytes())
+            .expect("the daemon's re-derivation of the region");
+    }
+
+    /// Review 042 G74-3: every spelling of a garden path canonicalises to one,
+    /// and a member's write, removal or rename through an alias of a guarded
+    /// backlog doc is refused exactly as through its canonical path.
+    #[test]
+    fn a_path_alias_of_the_backlog_is_still_guarded() {
+        assert_eq!(
+            canonical_rel("growlight/./backlog//tasks/001-x.md/").as_deref(),
+            Some("growlight/backlog/tasks/001-x.md")
+        );
+        assert_eq!(canonical_rel("./growlight").as_deref(), Some("growlight"));
+        assert_eq!(canonical_rel(".").as_deref(), Some(""));
+        assert_eq!(canonical_rel("growlight/../etc"), None);
+        assert_eq!(canonical_rel("/etc/passwd"), None);
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(SLICE, FLEET_HELD.as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        for alias in [
+            "growlight/./backlog/milestones/m/slices/001-a.md",
+            "growlight//backlog/milestones/m/slices/001-a.md",
+            "./growlight/backlog/milestones/m/slices/001-a.md",
+        ] {
+            assert!(wt.write(alias, b"# a\n").is_err(), "write {alias}");
+            assert!(wt.remove(alias).is_err(), "remove {alias}");
+            assert!(wt.rename(alias, "archive/001-a.md").is_err(), "rename {alias}");
+        }
+        assert!(wt.remove("growlight/./backlog").is_err(), "an aliased backlog dir");
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "all refused untouched");
+    }
+
+    /// Review 042 G74-6: a fence line inserted above a `> Worktree:` declaration
+    /// moves no raw line, but the repo resolver stops reading it — refused, in
+    /// both directions, through the pure guard and a real worktree write.
+    #[test]
+    fn a_fence_that_hides_or_reveals_a_reserved_line_is_refused() {
+        let rel = "growlight/backlog/tasks/001-x.md";
+        let declared = "# t\n\n> Worktree: /tmp/x\n";
+        let hidden = "# t\n\n```\n> Worktree: /tmp/x\n";
+        let why = member_reserved_refusal("c", rel, Some(declared), Some(hidden)).unwrap();
+        assert!(why.contains("changes which `> Worktree:` line"), "{why}");
+        assert!(member_reserved_refusal("c", rel, Some(hidden), Some(declared)).is_some(), "un-hiding");
+
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(rel, declared.as_bytes()).unwrap();
+        let _member = caller::enter(Some("c".into()));
+        assert!(wt.write(rel, hidden.as_bytes()).is_err(), "the fence trick is refused");
+        assert_eq!(wt.read_to_string(rel).as_deref(), Some(declared), "nothing written");
+    }
+
+    /// The `> Fleet:` guard is tighten-only in the pure sense: a member's write
+    /// may add a line or tighten one (claimable → held), but never remove or
+    /// loosen one (held → claimable), matching the resolver's "first line wins"
+    /// and "fenced code doesn't count" reads.
+    #[test]
+    fn the_fleet_guard_is_tighten_only() {
+        let rel = "growlight/backlog/milestones/m/CLAUDE.md";
+        // Tighten: claimable → held is allowed (fails closed).
+        assert_eq!(member_fleet_refusal("c", rel, Some("# t\n"), Some("> Fleet: no\n")), None);
+        assert_eq!(member_fleet_refusal("c", rel, Some("> Fleet: yes\n"), Some("> Fleet: no\n")), None);
+        // Loosen / remove: held → claimable is refused.
+        assert!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), Some("> Fleet: yes\n")).is_some());
+        assert!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), Some("# t\n")).is_some());
+        assert!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), None).is_some());
+        // Inserting a `yes` before the first `no` line flips the resolved marker.
+        assert!(
+            member_fleet_refusal(
+                "c",
+                rel,
+                Some("> Fleet: no\n> Fleet: yes\n"),
+                Some("> Fleet: yes\n> Fleet: no\n"),
+            )
+            .is_some()
+        );
+        // A held value changed to another non-`yes` value stays held: allowed.
+        assert_eq!(member_fleet_refusal("c", rel, Some("> Fleet: no\n"), Some("> Fleet: nope\n")), None);
+        // A non-holding line is not protected.
+        assert_eq!(member_fleet_refusal("c", rel, Some("# t\n"), Some("> Fleet: yes\n")), None);
+        assert_eq!(member_fleet_refusal("c", rel, Some("> Fleet: yes\n"), Some("# t\n")), None);
+        // A fenced example is not a marker, so removing it is allowed …
+        assert_eq!(
+            member_fleet_refusal("c", rel, Some("```\n> Fleet: no\n```\n"), Some("# t\n")),
+            None,
+        );
+        // … but a real line after the fence is held, so removing it is refused.
+        assert!(
+            member_fleet_refusal(
+                "c",
+                rel,
+                Some("```\n> Fleet: no\n```\n> Fleet: no\n"),
+                Some("```\n> Fleet: no\n```\n"),
+            )
+            .is_some()
+        );
+    }
+
+    /// The worktree-level `> Fleet:` guard: a member may add/tighten a line but
+    /// never loosen/remove it, across write, `check_write_bytes`, `unlink`
+    /// (remove), `archive` (rename out), directory/ancestor removal, and a
+    /// rename *into* the backlog (which is a tighten, so allowed). A human may
+    /// remove the line.
+    #[test]
+    fn a_members_backlog_write_may_not_loosen_or_remove_a_fleet_line() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        wt.write(SLICE, b"# a\n\nbody\n").unwrap();
+        {
+            let _member = caller::enter(Some("c".into()));
+            // Add a hold: allowed (fails closed).
+            wt.write(SLICE, FLEET_HELD.as_bytes()).expect("adding a hold");
+            assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD));
+            // Loosen: refused.
+            let loosened = FLEET_HELD.replace("> Fleet: no", "> Fleet: yes");
+            let err = wt.write(SLICE, loosened.as_bytes()).unwrap_err();
+            assert_eq!(err.0, ErrorKind::BadArgs);
+            assert!(err.1.contains("loosens or removes") && err.1.contains("member c"), "{err:?}");
+            assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "nothing written");
+            // Remove: refused (and the pre-check agrees).
+            assert!(wt.write(SLICE, b"# slice\n\nbody\n").is_err(), "remove the line");
+            assert!(wt.check_write_bytes(SLICE, b"# slice\n\nbody\n").is_err(), "pre-check");
+            // unlink / archive / directory / ancestor removal all refused.
+            assert!(wt.remove(SLICE).is_err(), "unlink removes the hold");
+            assert!(wt.rename(SLICE, "archive/001-a.md").is_err(), "archive moves it out");
+            assert!(wt.remove("growlight/backlog/milestones/m").is_err(), "a dir holding one");
+            assert!(wt.remove("growlight").is_err(), "an ancestor of the backlog");
+            assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "all refused untouched");
+            // Moving a held doc INTO the backlog tightens: allowed — onto any
+            // path but an item doc's (G74-2: a new slice doc could shadow one).
+            wt.write("projects/p/notes/020-z.md", FLEET_HELD.as_bytes()).expect("seed outside");
+            let shadow = wt
+                .rename("projects/p/notes/020-z.md", "growlight/backlog/milestones/m/slices/020-z.md")
+                .unwrap_err();
+            assert!(shadow.1.contains("rename lands on the item doc"), "{shadow:?}");
+            wt.rename("projects/p/notes/020-z.md", "growlight/backlog/milestones/m/notes/020-z.md")
+                .expect("moving a held doc in is a tighten");
+            // Outside the backlog is not the guard's.
+            wt.write("projects/p/notes/021-x.md", FLEET_HELD.as_bytes()).expect("outside add");
+            wt.write("projects/p/notes/021-x.md", b"# a\n").expect("outside loosen is fine");
+        }
+        // A human may remove the line (this frees the item).
+        wt.write(SLICE, b"# slice\n\nbody\n").expect("the human removes it");
+    }
+
+    /// `batch` validates every op before the first write: a member's op that
+    /// loosens a `> Fleet:` line fails the batch with the ops before it unstaged.
+    #[test]
+    fn a_members_batch_that_loosens_a_fleet_line_stages_nothing() {
+        let garden = tempfile::tempdir().unwrap();
+        let daemon = unlocked(garden.path());
+        let note = "projects/p/notes/001-x.md";
+        {
+            let inner = daemon.inner.lock().unwrap();
+            let wt = WorkTree::new(&daemon, &inner);
+            wt.write(note, b"# x\n\nold\n").unwrap();
+            wt.write(SLICE, FLEET_HELD.as_bytes()).unwrap();
+        }
+        let patch = |path: &str, old: &str, new: &str| {
+            serde_json::json!({ "op": "patch_file", "args": { "path": path, "old": old, "new": new } })
+        };
+        let args = serde_json::json!({ "ops": [
+            patch(note, "old", "new"),
+            patch(SLICE, "> Fleet: no", "> Fleet: yes"),
+        ] });
+        let err = {
+            let _member = caller::enter(Some("c".into()));
+            super::super::batch(&daemon, args.clone()).unwrap_err()
+        };
+        assert!(err.1.contains("op[1]") && err.1.contains("loosens or removes"), "{err:?}");
+        let inner = daemon.inner.lock().unwrap();
+        let wt = WorkTree::new(&daemon, &inner);
+        assert_eq!(wt.read_to_string(note).as_deref(), Some("# x\n\nold\n"), "op 0 unstaged");
+        assert_eq!(wt.read_to_string(SLICE).as_deref(), Some(FLEET_HELD), "op 1 unstaged");
+        drop(inner);
+        super::super::batch(&daemon, args).expect("a human's batch lands");
     }
 }

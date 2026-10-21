@@ -9,6 +9,11 @@ protocol is fixed; the baton changes each iteration.
    ACTION is still valid. If BLOCKED_ON_HUMAN and unanswered: surface it (semi)
    or take the documented default and flag it (auto).
 
+1b. BOOT DIRTY-TREE CHECK. If your baton has a `# ⚠️ PRE-EXISTING DIRTY TREE`
+    section, or `git status` in the item's repo shows changes your baton does not
+    account for, review them before starting new work — a prior session may have
+    been cut off before committing. Never revert or discard them unreviewed.
+
 2. CONTEXT BUDGET. Work band 25-50% of window. At ~50% used: finish the current
    atomic step, then hand off. At ~60%: hand off NOW, recording a precise resume
    point in NEXT ACTION. NEVER /compact — a curated baton beats a lossy summary.
@@ -106,3 +111,11 @@ protocol is fixed; the baton changes each iteration.
    `deferred` item waits for the human and never re-enters the loop. Reserve
    `blocked`/BLOCKED_ON_HUMAN strictly for when YOU can't proceed without a human
    decision or config change (steps 4, 3b).
+
+7c. HANDOFF REFUSED. If your handoff set_item_status (step 7 or 7b, or the
+   `blocked` of step 4) is refused member_not_allowed because no holder is
+   recorded — a keeperd cycle rebuilds that map empty, and growlightd re-records
+   it within about 30 seconds — wait a minute and retry it once. If it is still
+   refused, or the refusal names another holder, do not retry again:
+   post_message @human with the item and the status you meant to set, finish the
+   rest of the handoff (baton + log_baton), then EXIT.

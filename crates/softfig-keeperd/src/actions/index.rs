@@ -119,7 +119,7 @@ fn refresh_folder_index_with(
     if new == content {
         return None;
     }
-    wt.write(&host_rel, new.as_bytes()).ok()?;
+    wt.write_derived(&host_rel, new.as_bytes()).ok()?;
     Some(host_rel)
 }
 

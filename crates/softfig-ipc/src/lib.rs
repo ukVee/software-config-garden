@@ -8,9 +8,12 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod backlog_doc;
 pub mod baton;
 pub mod client;
+pub mod fleet;
 pub mod growlightd;
+pub mod item_meta;
 pub mod item_repo;
 pub mod member;
 pub mod model_choice;
@@ -18,6 +21,7 @@ pub mod opencode;
 pub mod proto;
 pub mod queue_v2;
 pub mod socket;
+pub mod testing;
 pub mod usage;
 pub mod verbs;
 
@@ -25,6 +29,7 @@ pub use baton::{classify_status, parse_baton, BatonDisposition, BatonView};
 pub use client::{
     call, call_reconnecting, connect, connect_stream, ClientError, ReconnectError, RetryPolicy,
 };
+pub use fleet::fleet_marker;
 pub use member::{is_safe_member_id, MemberIdentity, MEMBER_ENV};
 pub use model_choice::{
     Backend, Declaration, DeclaredModels, ModelChoice, ModelList, ModelRuleError, ModelSpec,

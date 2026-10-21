@@ -9,6 +9,11 @@ protocol is fixed; the baton changes each iteration.
    ACTION is still valid. If BLOCKED_ON_HUMAN and unanswered: surface it (semi)
    or take the documented default and flag it (auto).
 
+1b. BOOT DIRTY-TREE CHECK. If your baton has a `# ⚠️ PRE-EXISTING DIRTY TREE`
+    section, or `git status` in the item's repo shows changes your baton does not
+    account for, review them before starting new work — a prior session may have
+    been cut off before committing. Never revert or discard them unreviewed.
+
 2. CONTEXT BUDGET. Work band 25-50% of window. At ~50% used: finish the current
    atomic step, then hand off. At ~60%: hand off NOW, recording a precise resume
    point in NEXT ACTION. NEVER /compact — a curated baton beats a lossy summary.
