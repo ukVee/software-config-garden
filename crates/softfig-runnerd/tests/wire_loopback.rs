@@ -552,7 +552,7 @@ fn run_remote_maps_a_reject_to_a_run_failure() {
         &fx.addr(),
         &mut cache,
         &offer,
-        |_haves| no_bundle(_haves),
+        no_bundle,
         NOW,
     )
     .unwrap_err();
@@ -580,7 +580,7 @@ fn run_remote_maps_a_cert_failure_to_invalid_cert() {
         &fx.addr(),
         &mut cache,
         &offer,
-        |_haves| no_bundle(_haves),
+        no_bundle,
         NOW,
     )
     .unwrap_err();
@@ -606,7 +606,7 @@ fn run_remote_maps_an_unreachable_runner_to_no_runner() {
         &addr,
         &mut cache,
         &offer,
-        |_haves| no_bundle(_haves),
+        no_bundle,
         NOW,
     )
     .unwrap_err();
