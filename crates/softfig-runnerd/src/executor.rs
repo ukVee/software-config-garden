@@ -293,23 +293,24 @@ fn collect_step(ctx: &JobContext, globs: &[String], bins: &SandboxBinaries) -> R
     parse_artifacts(&out.stdout)
 }
 
-/// Parse the collect helper's `<blake3>\t<size>\t<relpath>` lines.
+/// Parse the collect helper's rows: one JSON [`Artifact`] per line. JSON, not
+/// tab-separated fields, because the tree's author names the files and a `\n`
+/// or `\t` in a name must not forge a row (pre-merge review m3). Our own
+/// helper printed these, so a row that doesn't parse fails the step rather
+/// than being dropped from the attestation.
 fn parse_artifacts(stdout: &[u8]) -> Result<Vec<Artifact>> {
-    let text = String::from_utf8_lossy(stdout);
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let mut parts = line.splitn(3, '\t');
-        let (Some(blake3), Some(size), Some(path)) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        out.push(Artifact {
-            path: path.to_string(),
-            size: size.trim().parse().unwrap_or(0),
-            blake3: blake3.trim().to_string(),
-        });
-    }
-    Ok(out)
+    stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice(line).map_err(|e| {
+                Error::Protocol(format!(
+                    "collect step printed a malformed row ({e}): {:?}",
+                    String::from_utf8_lossy(line)
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Build the bwrap [`Command`] for a policy + command: render the argv, add the
@@ -533,9 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_artifacts_reads_collect_lines() {
-        let lines = b"abc123\t42\ttarget/release/softfig\ndef456\t7\ttarget/release/keeperd\n";
-        let got = parse_artifacts(lines).unwrap();
+    fn parse_artifacts_reads_collect_rows() {
+        let rows = br#"{"path":"target/release/softfig","size":42,"blake3":"abc123"}
+{"path":"target/release/keeperd","size":7,"blake3":"def456"}
+"#;
+        let got = parse_artifacts(rows).unwrap();
         assert_eq!(
             got,
             vec![
@@ -543,6 +546,24 @@ mod tests {
                 Artifact { path: "target/release/keeperd".into(), size: 7, blake3: "def456".into() },
             ]
         );
+    }
+
+    #[test]
+    fn parse_artifacts_keeps_a_control_character_name_in_one_row() {
+        // m3: under the old `<hash>\t<size>\t<path>` framing this one file
+        // read as two artifacts, the second chosen by the tree's author.
+        let name = format!("x\n{}\t1\tforged.bin", "0".repeat(64));
+        let row = Artifact { path: name, size: 4, blake3: "ab".repeat(32) };
+        let mut line = serde_json::to_vec(&row).unwrap();
+        line.push(b'\n');
+        assert_eq!(parse_artifacts(&line).unwrap(), vec![row]);
+    }
+
+    #[test]
+    fn parse_artifacts_refuses_a_malformed_row() {
+        let tabbed = format!("{}\t5\ta.txt\n", "ab".repeat(32));
+        let err = parse_artifacts(tabbed.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("malformed row"), "{err}");
     }
 
     #[test]
