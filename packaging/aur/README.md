@@ -44,8 +44,12 @@ and the trust root"):
   minisign -Vm SHA256SUMS -p minisign.pub
   ```
 
-`soft-fig-bin`'s `check()` runs that same `minisign` verification against its
-own checksum-pinned copy of the public key before installing anything.
+`soft-fig-bin`'s `check()` runs that same `minisign` verification before
+installing anything — against its **own** copy of the public key, a local file
+in the AUR package repo pinned from the committed
+`packaging/signing/minisign.pub`. It never uses the `minisign.pub` published on
+the release page: a key from the release under test would vouch for whoever
+controls that release.
 
 ## Install order (fresh box)
 
@@ -97,12 +101,17 @@ pushes/tags/publishes. Before `soft-fig`/`soft-fig-bin` go live, the owner:
    `packaging/signing/minisign.pub`, store the secret key as the
    `MINISIGN_SECRET_KEY` repository secret. See `packaging/signing/README.md`.
 3. Cuts the tag `v1.0.0-alpha.1` and lets the release workflow build the
-   artifacts (the tarball, `SHA256SUMS`, `SHA256SUMS.minisig` and
-   `minisign.pub` that this `-bin` package downloads).
-4. Fills the real `sha256sums=` into both PKGBUILDs — they are **all-zero
+   artifacts (the tarball, `SHA256SUMS` and `SHA256SUMS.minisig` that this
+   `-bin` package downloads).
+4. Copies the committed `packaging/signing/minisign.pub` into
+   `packaging/aur/soft-fig-bin/minisign.pub` and pins its sha256 **from that
+   committed copy** — never from the release download, which is what the pin
+   protects against.
+5. Fills the real `sha256sums=` into both PKGBUILDs — they are **all-zero
    placeholders that fail closed** until the tag exists — and regenerates
    `.SRCINFO` (`makepkg --printsrcinfo > .SRCINFO`).
-5. Uploads each package directory to the AUR as its own git repo.
+6. Uploads each package directory to the AUR as its own git repo
+   (`soft-fig-bin`'s includes `minisign.pub`).
 
 `soft-fig-bin` `provides` and `conflicts` `soft-fig`; `soft-fig` only
 `conflicts` `soft-fig-bin` (it does not provide it). The two install the same

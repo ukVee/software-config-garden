@@ -25,6 +25,11 @@ _tarball="softfig-${_tag}-${_target}-tier1.tar.gz"
 
 # The tier-1 program tarball (repackaged verbatim), the signed checksum manifest
 # it ships with, the manifest's minisign signature, and the public key. The
+# public key is NOT downloaded from the release: a key fetched from the same
+# release as the signature it checks — and pinned from that same download —
+# trusts whoever controls the release (report 078). It is a local file in this
+# AUR package repo, copied from the committed `packaging/signing/minisign.pub`
+# and pinned from that committed copy (../README.md). The
 # systemd units and the desktop entry are NOT fetched from the mutable tag
 # anymore — they are staged INSIDE the tarball by the release workflow (see
 # ../README.md), so every installed file is checksummed and the signature pins
@@ -36,7 +41,7 @@ source=(
   "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/${_tarball}"
   "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/SHA256SUMS"
   "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/SHA256SUMS.minisig"
-  "https://github.com/ukVee/software-config-garden/releases/download/${_tag}/minisign.pub"
+  "minisign.pub"
 )
 sha256sums=(
   '0000000000000000000000000000000000000000000000000000000000000000'
@@ -50,8 +55,9 @@ check() {
 
   # 1) Verify the manifest's signature before trusting it. This breaks the
   #    circular "tarball vs same-origin SHA256SUMS" check the mutable-tag fetch
-  #    used to rely on: the public key is a separate, checksum-pinned source,
-  #    so a forged manifest no longer passes.
+  #    used to rely on: the public key ships in this package repo, pinned from
+  #    the committed copy — not from the release under test — so a forged
+  #    release (manifest, signature and key) no longer passes.
   minisign -V -m SHA256SUMS -x SHA256SUMS.minisig -p minisign.pub
 
   # 2) Verify the tarball's sha256 against its SHA256SUMS entry before anything

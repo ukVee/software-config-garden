@@ -382,13 +382,22 @@ jobs:
           merge-multiple: true
       - name: Checksums (every tarball)
         run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Install minisign
+        # Not in the ubuntu-latest image: without this the signing step below
+        # fails `command not found` on every tag, after the Environment
+        # approval (report 078). Ubuntu universe package.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          minisign -v
       - name: Sign the checksum manifest (minisign)
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
           set -euo pipefail
           # The secret is the base64 of the owner's passwordless minisign
-          # secret-key file (setup in packaging/aur/README.md). Decode to a
+          # secret-key file (setup in packaging/signing/README.md). Decode to a
           # temp file, sign SHA256SUMS, publish the committed public key beside
           # it, then delete the key.
           keyfile="$(mktemp)"

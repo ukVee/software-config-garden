@@ -17,7 +17,12 @@ trust root; the minisign signature is the fallback for the manifest.
    secret key (`~/.minisign/minisign.key`) out of the repo and out of every
    commit.
 
-2. Commit `packaging/signing/minisign.pub` (it is public).
+2. Commit `packaging/signing/minisign.pub` (it is public), and copy it into
+   `packaging/aur/soft-fig-bin/minisign.pub` — the `-bin` package verifies
+   against that pinned copy, never the one on the release page (see
+   `packaging/aur/README.md`). The copy on the release page is a convenience
+   for a manual check; trust it only after comparing it with the committed
+   one.
 
 3. Store the secret key as a repository Actions secret:
 
