@@ -181,7 +181,11 @@ pub fn profile_run(ctx: &JobContext) -> Policy {
 pub fn profile_run_egress(ctx: &JobContext, proxy: ProxyConfig) -> Policy {
     let mut p = profile_run(ctx);
     let listen = proxy.listen.clone();
+    let socket = proxy.socket.clone();
     p.network = Network::Proxy(proxy);
+    // Bind the proxy socket as the fetch profile does, or the in-namespace
+    // forwarder has nothing to pump to and the run has no network at all.
+    p.rw_binds.push(Bind::rw(socket, EGRESS_SOCKET));
     p.env.remove("CARGO_NET_OFFLINE");
     let url = format!("http://{listen}");
     for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
@@ -268,6 +272,8 @@ mod tests {
         assert_eq!(p.network, Network::Proxy(proxy()));
         assert!(!p.env.contains_key("CARGO_NET_OFFLINE"));
         assert_eq!(p.env.get("http_proxy").map(String::as_str), Some("http://127.0.0.1:3128"));
+        // The proxy socket is bound where the forwarder pumps to.
+        assert!(p.rw_binds.iter().any(|b| b.dest.as_path() == Path::new(EGRESS_SOCKET)));
         // Still the full run view.
         assert!(p.rw_binds.iter().any(|b| b.dest.as_path() == Path::new("/src")));
     }
