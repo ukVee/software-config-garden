@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
+mod cmd_claude_login;
 mod cmd_daemon;
 mod cmd_deploy;
 mod cmd_growlight;
@@ -83,6 +84,11 @@ enum Cmd {
     /// launches the agent in loop mode.
     #[command(subcommand)]
     Growlight(cmd_growlight::GrowlightCmd),
+
+    /// Two-account Anthropic login switcher for Claude Code: a profile store
+    /// under `~/.claude/credentials.d/` plus a retargetable top-level symlink.
+    #[command(name = "claude-login", subcommand)]
+    ClaudeLogin(cmd_claude_login::ClaudeLoginCmd),
 }
 
 #[derive(Args, Debug)]
@@ -113,5 +119,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Replica(cmd) => cmd_replica::run(cmd),
         Cmd::SharedSubtree(cmd) => cmd_shared_subtree::run(cmd),
         Cmd::Growlight(cmd) => cmd_growlight::run(cmd),
+        Cmd::ClaudeLogin(cmd) => cmd_claude_login::run(cmd),
     }
 }

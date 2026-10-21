@@ -39,3 +39,6 @@ softfig-growlightd.workspace = true
 # as the binary sends them — the same fixture shape keeperd's own e2e suite
 # uses. Dev-only — the CLI's command code talks to keeperd over IPC only.
 softfig-keeperd.workspace = true
+# claude-login-switcher slice 001: isolate the HOME-rooted filesystem tests in
+# a temp directory. Dev-only — prod uses hand-rolled sibling tempfiles.
+tempfile.workspace = true
