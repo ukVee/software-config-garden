@@ -17,6 +17,11 @@ softfig-store.workspace = true
 softfig-vcs.workspace = true
 softfig-ipc.workspace = true
 softfig-growlightd-client.workspace = true
+# claude-login-switcher slice 002: reuse the growlight.toml `[[fleet]]` parser
+# (FleetConfig::from_growlight_toml) rather than reimplementing it here. The
+# growlightd crate stays lean (serde/toml/thiserror/anyhow/clap/signal-hook/
+# libc/rusqlite — no tokio), so this is one edge, not a transitive bloom.
+softfig-growlightd.workspace = true
 softfig-onboard.workspace = true
 softfig-deploy.workspace = true
 clap.workspace = true
@@ -30,10 +35,6 @@ toml.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-# Tests boot a real growlightd Daemon on a temp socket as the fake-agent fixture
-# for the slice-004 client + e2e tests (spec §13). Dev-only — the CLI client
-# code depends solely on the shared wire types in softfig-ipc::growlightd.
-softfig-growlightd.workspace = true
 # queue-v2-state slice 009: the §6.9 CLI-form e2e test boots a real keeperd on
 # a temp garden + socket (no FUSE) and drives the forms over the wire exactly
 # as the binary sends them — the same fixture shape keeperd's own e2e suite
