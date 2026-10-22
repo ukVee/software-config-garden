@@ -1,10 +1,10 @@
 //! The claude-login profile slot naming rules (`claude-login-switcher`).
 //!
-//! A **slot** names a stored Anthropic OAuth bundle at
-//! `~/.claude/credentials.d/<slot>.json` (slice 001). Three places read the
-//! name: the `softfig claude-login` CLI (slot create/activate), the fleet
-//! config loader (slice 003 — `profile_pool` entries must shape-check), and the
-//! growlightd spawn path (which composes a filename from it). They would read
+//! A **slot** names one Claude Code config dir in the profile store,
+//! `<store>/<slot>/` (slice 006; see [`crate::claude_profiles`]). Three places
+//! read the name: the `softfig claude-login` CLI (slot create/activate), the
+//! fleet config loader (`profile_pool` entries must shape-check), and the
+//! growlightd spawn path (which composes a directory from it). They would read
 //! the same rules three ways if the validator lived next to only one; here is
 //! the shared source.
 //!
@@ -12,11 +12,11 @@
 //! `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. It rejects anything a path separator or
 //! leading dot would make dangerous (`..`, `/etc/passwd`, `.hidden`), and
 //! bounds the length so a slot name never overflows a filesystem's component
-//! cap.
+//! cap. A `.lock` suffix is reserved for Claude Code's own lock dirs.
 //!
-//! Pure, no I/O, no `std::env`: a presence check (does
-//! `~/.claude/credentials.d/<slot>.json` exist?) is a separate concern the
-//! caller runs, so this module stays trivially fuzzable.
+//! Pure, no I/O, no `std::env`: a presence check (does `<store>/<slot>/`
+//! exist?) is a separate concern the caller runs, so this module stays
+//! trivially fuzzable.
 
 use std::fmt;
 
@@ -30,6 +30,10 @@ pub enum SlotNameError {
     BadStart,
     /// Some byte is not in `[A-Za-z0-9._-]`.
     BadChar(char),
+    /// Ends in `.lock`: Claude Code's proper-lockfile takes a legacy
+    /// `<config dir>.lock` directory beside a slot, which would otherwise read
+    /// as a second slot.
+    ReservedSuffix,
 }
 
 impl fmt::Display for SlotNameError {
@@ -42,15 +46,18 @@ impl fmt::Display for SlotNameError {
             SlotNameError::BadChar(c) => {
                 write!(f, "slot name may only contain [A-Za-z0-9._-] (got {c:?})")
             }
+            SlotNameError::ReservedSuffix => {
+                write!(f, "slot name may not end in `.lock` (Claude's lock dirs use it)")
+            }
         }
     }
 }
 
 impl std::error::Error for SlotNameError {}
 
-/// Validate a slot name's shape. `Ok(())` ⇒ the name is safe to use as the
-/// stem of `~/.claude/credentials.d/<slot>.json`; see [`SlotNameError`] for
-/// what each refusal means.
+/// Validate a slot name's shape. `Ok(())` ⇒ the name is safe to use as one
+/// path component under the profile store; see [`SlotNameError`] for what
+/// each refusal means.
 pub fn validate_slot_name(name: &str) -> Result<(), SlotNameError> {
     let len = name.len();
     if len == 0 || len > 64 {
@@ -64,6 +71,9 @@ pub fn validate_slot_name(name: &str) -> Result<(), SlotNameError> {
         if !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
             return Err(SlotNameError::BadChar(b as char));
         }
+    }
+    if name.ends_with(".lock") {
+        return Err(SlotNameError::ReservedSuffix);
     }
     Ok(())
 }
@@ -108,6 +118,13 @@ mod tests {
             validate_slot_name("has\nnewline"),
             Err(SlotNameError::BadChar('\n'))
         ));
+    }
+
+    #[test]
+    fn lock_suffix_is_rejected() {
+        assert_eq!(validate_slot_name("slot1.lock"), Err(SlotNameError::ReservedSuffix));
+        assert!(validate_slot_name("lock").is_ok());
+        assert!(validate_slot_name("slot1.locked").is_ok());
     }
 
     #[test]

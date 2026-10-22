@@ -1,675 +1,1265 @@
-//! `softfig claude-login {list, capture, use, login, status}` — a two-account
-//! Anthropic login switcher for Claude Code.
+//! `softfig claude-login`: a two-account Anthropic login switcher for Claude
+//! Code (milestone `claude-login-switcher`; the slot-store model of slice
+//! 006, decision `decision-claude-login-config-dir-slots`).
 //!
-//! Shape (milestone `claude-login-switcher`, slice 001):
+//! * A **slot** is a real `CLAUDE_CONFIG_DIR` in the profile store,
+//!   `$XDG_DATA_HOME/softfig/claude-profiles/<slot>/`
+//!   ([`softfig_ipc::claude_profiles`] is the one resolver, shared with
+//!   growlightd). Claude owns `.credentials.json`, `.claude.json` and the
+//!   refresh lock inside it. Shared configuration is symlinked in from
+//!   `~/.claude/` ([`crate::slot_layout`]). `HOME` is never overridden.
+//! * The reserved slot `home` is Claude's default config dir with the env
+//!   var unset: the state before `migrate`, and the fallback.
+//! * `<store>/active` names the everyday terminal's slot. The bash `claude()`
+//!   shim in `~/dotfiles` asks `claude-login dir --active` at every exec, so
+//!   a running session is never retargeted.
+//! * **A credential is moved, never copied.** Refresh-token rotation turns a
+//!   copy into a time bomb: whichever copy refreshes first kills the other.
+//!   `migrate` moves the home account into the store; `add` logs a new
+//!   account in with Claude's own `claude auth login`.
 //!
-//! * A profile store at `~/.claude/credentials.d/<name>.json`, each file mode
-//!   `0600`, dir mode `0700`.
-//! * `~/.claude/.credentials.json` becomes a *relative* symlink into the store
-//!   (e.g. `credentials.d/slot1.json`). The relative form matters for the
-//!   per-member overlay HOMEs that slice 002 will build.
-//! * Switching accounts is retargeting the symlink; interactive `claude` keeps
-//!   working, and `claude auth login` writes through the symlink.
-//!
-//! Fleet / overlay / growlightd integration is slices 002–004 — none of that
-//! lives here.
+//! `migrate` is resumable. It assembles the slot in a staging dir
+//! `<store>/.migrate-<slot>/`, moving each account file with `rename(2)` (or
+//! copy + fsync + unlink across filesystems), then renames the staging dir to
+//! `<slot>` in one step. A re-run after an interruption finishes the job: a
+//! file already in staging is not moved again, and a file present in both
+//! places with identical bytes (an interrupted cross-filesystem move) has its
+//! source removed. Different bytes in both places mean a login ran after the
+//! interruption, so the re-run refuses rather than guess which token is live.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
-use serde::Deserialize;
-use softfig_growlightd::FleetConfig;
+use serde_json::{Map, Value};
+use softfig_ipc::claude_profiles::{
+    self as profiles, ACCOUNT_FILE, ACTIVE_LINK, CONFIG_DIR_ENV, CREDENTIALS_FILE,
+    CredentialState, HOME_SLOT, SlotDir, credential_state, read_active, resolve_active,
+};
 
-use crate::overlay_map::{overlay_map, PathClass};
+use crate::slot_layout::{classify, shared_names};
 
 #[derive(Subcommand, Debug)]
 pub enum ClaudeLoginCmd {
-    /// List the profiles in `~/.claude/credentials.d/`, marking the active one.
+    /// List the slots (`home` plus the store) with each one's account email.
+    /// `*` marks the active slot.
     List,
-    /// Snapshot the current `~/.claude/.credentials.json` into
-    /// `credentials.d/<name>.json` (0600) and swap the top-level file for a
-    /// symlink into it.
-    Capture(CaptureArgs),
-    /// Retarget the top-level symlink to a named slot.
-    Use(UseArgs),
-    /// `use <name>`, then run `claude auth login`; if that write replaced the
-    /// symlink with a regular file, fold the new creds into the slot and
-    /// restore the symlink.
-    Login(LoginArgs),
-    /// Print the current symlink target and per-slot account summaries.
+    /// Create a store slot: link the shared config from `~/.claude/`, seed
+    /// `.claude.json` from an allow-list (MCP servers, onboarding,
+    /// per-project trust; never the account or caches), then run
+    /// `claude auth login` in it.
+    Add(AddArgs),
+    /// One time: move the home account (`~/.claude/.credentials.json` and
+    /// `~/.claude.json`) into a new store slot and make it active. Refuses
+    /// while any claude process, the daemon included, is running.
+    Migrate(SlotArg),
+    /// Point `active` at a slot. Only claude sessions started afterwards
+    /// follow it; running ones keep their slot.
+    Use(SlotArg),
+    /// Run a command with `CLAUDE_CONFIG_DIR` set to a slot (unset for
+    /// `home`). `HOME` is left alone.
+    Run(RunArgs),
+    /// Print a slot's config dir, or nothing for `home`. For the shell shim
+    /// and scripts.
+    Dir(DirArgs),
+    /// Read-only health check of the store, every slot and `~/.claude/`.
+    /// Exits non-zero when it finds a problem.
+    Doctor,
+    /// `list`, plus each slot's 5h budget headroom and the fleet members'
+    /// profile pins.
     Status,
-    /// Build per-member overlay HOMEs under
-    /// `$XDG_CONFIG_HOME/softfig/growlight/agents/<id>/home/`, one for each
-    /// `[[fleet]]` member in `growlight.toml`. Idempotent; preserves existing
-    /// per-member content.
-    RefreshMembers(RefreshMembersArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct CaptureArgs {
-    /// Slot name — the filename stem under `credentials.d/`.
-    pub name: String,
-    /// Overwrite a slot that already exists with different contents.
-    #[arg(long)]
-    pub force: bool,
+pub struct SlotArg {
+    /// Slot name, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. `home` is reserved.
+    pub slot: String,
 }
 
 #[derive(Args, Debug)]
-pub struct UseArgs {
-    pub name: String,
+pub struct AddArgs {
+    /// The new slot's name.
+    pub slot: String,
+    /// The slot whose `.claude.json` seeds the new one. Defaults to the
+    /// active slot.
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Create the slot but skip `claude auth login`.
+    #[arg(long)]
+    pub no_login: bool,
 }
 
 #[derive(Args, Debug)]
-pub struct LoginArgs {
-    pub name: String,
+pub struct RunArgs {
+    /// The slot to run under.
+    pub slot: String,
+    /// The command and its arguments, after `--`. Defaults to `claude`.
+    #[arg(last = true)]
+    pub argv: Vec<OsString>,
 }
 
 #[derive(Args, Debug)]
-pub struct RefreshMembersArgs {
-    /// Path to the fleet config (`<garden>/config/growlight.toml`). Required
-    /// in this slice; slice 003 wires garden-root auto-discovery.
+#[group(required = true, multiple = false)]
+pub struct DirArgs {
+    /// The slot to print.
+    pub slot: Option<String>,
+    /// Print the active slot's dir instead.
     #[arg(long)]
-    pub config: PathBuf,
-    /// Agents runtime dir. Defaults to
-    /// `$XDG_CONFIG_HOME/softfig/growlight/agents/`
-    /// (or `~/.config/softfig/growlight/agents/`).
-    #[arg(long)]
-    pub agents_dir: Option<PathBuf>,
-    /// Print the plan without touching the filesystem.
-    #[arg(long)]
-    pub dry_run: bool,
-    /// Remove overlay HOMEs for members no longer in the config. Without this
-    /// flag, stale overlays warn but are preserved — a member's per-member
-    /// mutable state is not lost by a config edit.
-    #[arg(long)]
-    pub prune: bool,
+    pub active: bool,
 }
 
 pub fn run(cmd: ClaudeLoginCmd) -> Result<()> {
-    let home = resolve_claude_home()?;
-    let paths = Paths::new(&home);
+    let env = Env::from_process()?;
+    let mut out = io::stdout().lock();
     match cmd {
-        ClaudeLoginCmd::List => list(&paths),
-        ClaudeLoginCmd::Capture(a) => capture(&paths, &a.name, a.force),
-        ClaudeLoginCmd::Use(a) => use_slot(&paths, &a.name),
-        ClaudeLoginCmd::Login(a) => login(&paths, &a.name),
-        ClaudeLoginCmd::Status => status(&paths),
-        ClaudeLoginCmd::RefreshMembers(a) => {
-            let agents_dir = match a.agents_dir {
-                Some(p) => p,
-                None => default_agents_dir()?,
-            };
-            let plan = plan_refresh(&paths, &a.config, &agents_dir, a.prune)?;
-            let mut out = std::io::stdout().lock();
-            apply_plan(&mut out, &plan, a.dry_run)
+        ClaudeLoginCmd::List => list(&env, &mut out),
+        ClaudeLoginCmd::Add(a) => add_then_login(&env, &a, &mut out, &mut |mut c| c.status()),
+        ClaudeLoginCmd::Migrate(a) => {
+            let procs = ProcScan::system()?;
+            migrate(&env, &a.slot, &procs, rename_file, &mut out)
         }
+        ClaudeLoginCmd::Use(a) => use_slot(&env, &a.slot, &mut out),
+        ClaudeLoginCmd::Run(a) => {
+            let mut cmd = run_command(&env, &a.slot, &a.argv)?;
+            let err = cmd.exec();
+            Err(err).with_context(|| format!("exec {:?}", cmd.get_program()))
+        }
+        ClaudeLoginCmd::Dir(a) => dir(&env, &a, &mut out),
+        ClaudeLoginCmd::Doctor => doctor(&env, &mut out),
+        ClaudeLoginCmd::Status => status(&env, &mut out),
     }
 }
 
-/// `$XDG_CONFIG_HOME/softfig/growlight/agents/`, falling back to
-/// `$HOME/.config/softfig/growlight/agents/`. Same resolution rule the rest
-/// of the growlight runtime uses, so a member's overlay HOME lands as a
-/// sibling of its already-generated loop/mcp configs.
-fn default_agents_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("HOME is not set"))?;
-            home.join(".config")
-        }
-    };
-    Ok(base.join("softfig").join("growlight").join("agents"))
-}
-
-fn resolve_claude_home() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(home.join(".claude"))
-}
-
-struct Paths {
+/// Where everything lives, resolved once from the process environment (or a
+/// tempdir in tests).
+#[derive(Debug, Clone)]
+struct Env {
+    /// The shared config dir `~/.claude/`, which is also the `home` slot's
+    /// config dir.
     claude_home: PathBuf,
+    /// `~/.claude.json`, the `home` slot's account file.
+    home_account: PathBuf,
+    /// The profile store.
     store: PathBuf,
-    top_level: PathBuf,
 }
 
-impl Paths {
-    fn new(claude_home: &Path) -> Self {
+impl Env {
+    fn from_process() -> Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is not set"))?;
+        let store = profiles::store_root(std::env::var_os("XDG_DATA_HOME").as_deref(), &home);
+        Ok(Self::rooted(&home, store))
+    }
+
+    fn rooted(home: &Path, store: PathBuf) -> Self {
         Self {
-            claude_home: claude_home.to_path_buf(),
-            store: claude_home.join("credentials.d"),
-            top_level: claude_home.join(".credentials.json"),
+            claude_home: home.join(".claude"),
+            home_account: home.join(ACCOUNT_FILE),
+            store,
         }
     }
 
-    fn slot(&self, name: &str) -> PathBuf {
-        self.store.join(format!("{name}.json"))
+    /// Shape-check a slot name and say where it points, without touching
+    /// the disk.
+    fn resolve(&self, slot: &str) -> Result<SlotDir> {
+        profiles::slot_dir(&self.store, slot).map_err(|e| anyhow!("slot {slot:?}: {e}"))
     }
 
-    /// The relative target we store in the top-level symlink: literally
-    /// `credentials.d/<name>.json`, so an overlay HOME's symlink resolves
-    /// within its own `.claude/` subtree.
-    fn rel_slot_target(&self, name: &str) -> PathBuf {
-        PathBuf::from("credentials.d").join(format!("{name}.json"))
+    /// [`Env::resolve`], requiring a store slot's directory to exist.
+    fn existing(&self, slot: &str) -> Result<SlotDir> {
+        let dir = self.resolve(slot)?;
+        if let SlotDir::Store(p) = &dir
+            && !is_real_dir(p)
+        {
+            bail!(
+                "no slot {slot:?} in {} (see `softfig claude-login list`)",
+                self.store.display()
+            );
+        }
+        Ok(dir)
     }
-}
 
-/// What the top-level `.credentials.json` currently is.
-#[derive(Debug)]
-enum TopLevel {
-    /// No file at all.
-    Missing,
-    /// A regular file — either upstream `claude auth login` wrote here before
-    /// the switcher adopted it, or a `rename(2)` later replaced our symlink.
-    Plain,
-    /// A symlink into our store: `credentials.d/<name>.json`.
-    SymlinkIn { slot_name: String },
-    /// A symlink pointing elsewhere, or absolute, or dangling at an outside
-    /// location. Treated as unmanaged.
-    SymlinkOut { target: PathBuf },
-}
-
-fn inspect_top_level(paths: &Paths) -> Result<TopLevel> {
-    let md = match fs::symlink_metadata(&paths.top_level) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(TopLevel::Missing),
-        Err(e) => return Err(e).context("stat .credentials.json"),
-    };
-    if !md.file_type().is_symlink() {
-        return Ok(TopLevel::Plain);
+    /// A new store slot's path: refuses `home` and malformed names.
+    fn new_store_slot(&self, slot: &str) -> Result<PathBuf> {
+        match self.resolve(slot)? {
+            SlotDir::Home => bail!(
+                "`{HOME_SLOT}` is reserved: it means Claude's default config dir (~/.claude)"
+            ),
+            SlotDir::Store(p) => Ok(p),
+        }
     }
-    let target = fs::read_link(&paths.top_level).context("read .credentials.json symlink")?;
-    // Match the exact relative shape we write: `credentials.d/<stem>.json`.
-    // Reject names a slot can't have, so a crafted `credentials.d/../x.json`
-    // or similar classes as SymlinkOut rather than being treated as a slot.
-    let in_store = target.parent() == Some(Path::new("credentials.d"))
-        && target.extension().and_then(|s| s.to_str()) == Some("json");
-    if in_store
-        && let Some(stem) = target.file_stem().and_then(|s| s.to_str())
-        && validate_slot_name(stem).is_ok()
-    {
-        return Ok(TopLevel::SymlinkIn {
-            slot_name: stem.to_string(),
-        });
+
+    fn config_dir(&self, dir: &SlotDir) -> PathBuf {
+        match dir {
+            SlotDir::Home => self.claude_home.clone(),
+            SlotDir::Store(p) => p.clone(),
+        }
     }
-    Ok(TopLevel::SymlinkOut { target })
-}
 
-/// Shape we parse out of a slot file. API-key auth has no `claudeAiOauth`
-/// block, which is how we refuse it.
-#[derive(Deserialize)]
-struct OauthWire {
-    #[serde(rename = "claudeAiOauth")]
-    claude_ai_oauth: Option<OauthFields>,
-}
-
-#[derive(Deserialize)]
-struct OauthFields {
-    #[serde(rename = "subscriptionType")]
-    subscription_type: Option<String>,
-    #[serde(rename = "rateLimitTier")]
-    rate_limit_tier: Option<String>,
-    #[serde(rename = "accountEmail")]
-    account_email: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct AccountSummary {
-    subscription_type: Option<String>,
-    rate_limit_tier: Option<String>,
-    account_email: Option<String>,
-    /// Set when the bytes aren't a Claude OAuth bundle.
-    unparseable: Option<String>,
-}
-
-fn parse_account(bytes: &[u8]) -> AccountSummary {
-    match serde_json::from_slice::<OauthWire>(bytes) {
-        Ok(w) => match w.claude_ai_oauth {
-            Some(o) => AccountSummary {
-                subscription_type: o.subscription_type,
-                rate_limit_tier: o.rate_limit_tier,
-                account_email: o.account_email,
-                unparseable: None,
-            },
-            None => AccountSummary {
-                unparseable: Some("no `claudeAiOauth` block (API-key auth?)".into()),
-                ..Default::default()
-            },
-        },
-        Err(e) => AccountSummary {
-            unparseable: Some(format!("invalid json: {e}")),
-            ..Default::default()
-        },
+    fn account_file(&self, dir: &SlotDir) -> PathBuf {
+        match dir {
+            SlotDir::Home => self.home_account.clone(),
+            SlotDir::Store(p) => p.join(ACCOUNT_FILE),
+        }
     }
 }
 
-fn fmt_account(a: &AccountSummary) -> String {
-    if let Some(reason) = &a.unparseable {
-        return format!("<{reason}>");
-    }
-    let sub = a.subscription_type.as_deref().unwrap_or("?");
-    let tier = a.rate_limit_tier.as_deref().unwrap_or("?");
-    match &a.account_email {
-        Some(e) => format!("{sub} / tier {tier} / {e}"),
-        None => format!("{sub} / tier {tier}"),
+fn is_real_dir(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+}
+
+fn lstat(p: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(p) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("stat {}", p.display())),
     }
 }
 
-#[derive(Debug)]
-struct SlotInfo {
-    name: String,
-    mode: u32,
-    account: AccountSummary,
-}
-
-fn read_slots(paths: &Paths) -> Result<Vec<SlotInfo>> {
-    let dir = match fs::read_dir(&paths.store) {
-        Ok(d) => d,
+/// The store's slot directories, sorted. `home`, dot-entries, `*.lock` and
+/// anything that is not a real directory are not slots.
+fn store_slots(store: &Path) -> Result<Vec<String>> {
+    let rd = match fs::read_dir(store) {
+        Ok(rd) => rd,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).context("read credentials.d/"),
+        Err(e) => return Err(e).with_context(|| format!("read {}", store.display())),
     };
     let mut out = Vec::new();
-    for ent in dir {
+    for ent in rd {
         let ent = ent?;
-        let path = ent.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        let Some(name) = ent.file_name().to_str().map(str::to_owned) else {
             continue;
-        }
-        let name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
         };
-        let md = fs::symlink_metadata(&path).context("stat slot file")?;
-        if !md.file_type().is_file() {
-            continue;
+        if name != HOME_SLOT
+            && softfig_ipc::validate_slot_name(&name).is_ok()
+            && ent.file_type().is_ok_and(|t| t.is_dir())
+        {
+            out.push(name);
         }
-        let bytes = fs::read(&path).with_context(|| format!("read slot {name}"))?;
-        out.push(SlotInfo {
-            name,
-            mode: md.permissions().mode(),
-            account: parse_account(&bytes),
-        });
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort();
     Ok(out)
 }
 
-/// Slot-name validation, delegated to [`softfig_ipc::validate_slot_name`] so
-/// the fleet config parser (slice 003) and this CLI read ONE shape rule. The
-/// charset is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`: a path separator, leading
-/// dot (`..` / `.hidden`) and whitespace all fail, which is also what the
-/// symlink-reader uses to decide whether a top-level symlink names a
-/// well-formed slot.
-fn validate_slot_name(name: &str) -> Result<()> {
-    softfig_ipc::validate_slot_name(name).map_err(|e| anyhow::anyhow!(e))
-}
+// ---- small fs helpers -------------------------------------------------------
 
-fn ensure_store_dir(paths: &Paths) -> Result<()> {
-    match fs::symlink_metadata(&paths.store) {
-        Ok(md) if md.file_type().is_dir() => {
-            // Make sure the mode is tight; a 0755 from a careless mkdir -p
-            // would leak later writes to other users on multi-user hosts.
-            let mode = md.permissions().mode() & 0o777;
-            if mode != 0o700 {
-                fs::set_permissions(&paths.store, fs::Permissions::from_mode(0o700))
-                    .context("chmod 0700 credentials.d/")?;
-            }
-            Ok(())
-        }
-        Ok(_) => bail!(
-            "`{}` exists but is not a directory",
-            paths.store.display()
-        ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if !paths.claude_home.exists() {
-                fs::create_dir_all(&paths.claude_home)
-                    .with_context(|| format!("create {}", paths.claude_home.display()))?;
-            }
-            fs::create_dir(&paths.store).context("create credentials.d/")?;
-            fs::set_permissions(&paths.store, fs::Permissions::from_mode(0o700))
-                .context("chmod 0700 credentials.d/")?;
-            Ok(())
-        }
-        Err(e) => Err(e).context("stat credentials.d/"),
-    }
-}
-
-/// Monotone counter so repeated writes in the same microsecond don't collide
-/// on the tempfile name.
+/// Monotone counter so two temp names in one process never collide.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_sibling(path: &Path) -> Result<PathBuf> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
     let fname = path
         .file_name()
         .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut name = OsString::from(fname);
-    name.push(format!(".tmp.{pid}.{nanos}.{seq}", pid = std::process::id()));
-    Ok(dir.join(name))
+    let mut name = OsString::from(".");
+    name.push(fname);
+    name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    Ok(path.with_file_name(name))
 }
 
-/// Atomic write with explicit mode. Same-filesystem tempfile + `rename(2)`.
-fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let tmp = tmp_sibling(path)?;
+/// fsync a directory so a rename or unlink inside it survives a power cut
+/// (this device has thermal power cuts).
+fn sync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("fsync {}", dir.display()))
+}
+
+fn sync_parent(p: &Path) -> Result<()> {
+    match p.parent() {
+        Some(d) => sync_dir(d),
+        None => Ok(()),
+    }
+}
+
+/// Create `dir` with `mode`, or tighten an existing one we own to it.
+fn ensure_dir_mode(dir: &Path, mode: u32) -> Result<()> {
+    match lstat(dir)? {
+        Some(md) if md.is_dir() => {
+            if md.permissions().mode() & 0o777 != mode {
+                fs::set_permissions(dir, fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("chmod {mode:o} {}", dir.display()))?;
+            }
+            Ok(())
+        }
+        Some(_) => bail!("{} exists but is not a directory", dir.display()),
+        None => {
+            if let Some(parent) = dir.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))?;
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode))
+                .with_context(|| format!("chmod {mode:o} {}", dir.display()))
+        }
+    }
+}
+
+/// Write a file that must not exist yet, with `mode`, and fsync it.
+fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
-        .open(&tmp)
-        .with_context(|| format!("create tempfile {}", tmp.display()))?;
-    let r = f.write_all(bytes).and_then(|_| f.sync_all());
-    drop(f);
-    if let Err(e) = r {
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(bytes)
+        .and_then(|_| f.sync_all())
+        .with_context(|| format!("write {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {mode:o} {}", path.display()))
+}
+
+/// Create or atomically retarget `link` to the literal `target`. The temp
+/// link is removed if the rename fails.
+fn atomic_symlink(target: &Path, link: &Path) -> Result<()> {
+    let tmp = tmp_sibling(link)?;
+    symlink(target, &tmp).with_context(|| format!("symlink {}", tmp.display()))?;
+    if let Err(e) = fs::rename(&tmp, link) {
         let _ = fs::remove_file(&tmp);
-        return Err(anyhow!(e).context("write tempfile"));
+        return Err(e).with_context(|| format!("rename into {}", link.display()));
     }
-    // Defensive: process umask could have stripped bits off `.mode()` on
-    // non-Linux unixes; be explicit about the final mode.
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))
-        .context("chmod tempfile before rename")?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    sync_parent(link)
+}
+
+// ---- the active pointer -----------------------------------------------------
+
+/// Point `<store>/active` at `slot`. `home` removes the pointer, which reads
+/// back as `home`.
+fn set_active(store: &Path, slot: &str) -> Result<()> {
+    let link = store.join(ACTIVE_LINK);
+    if slot == HOME_SLOT {
+        return match lstat(&link)? {
+            None => Ok(()),
+            Some(md) if md.file_type().is_symlink() => {
+                fs::remove_file(&link).with_context(|| format!("remove {}", link.display()))?;
+                sync_dir(store)
+            }
+            Some(_) => bail!("{} is not a symlink; refusing to remove it", link.display()),
+        };
+    }
+    if lstat(&link)?.is_some_and(|m| !m.file_type().is_symlink()) {
+        bail!("{} is not a symlink; refusing to replace it", link.display());
+    }
+    atomic_symlink(Path::new(slot), &link)
+}
+
+// ---- account files ----------------------------------------------------------
+
+/// Top-level `.claude.json` keys a new slot inherits.
+const SEED_TOP: &[&str] = &["mcpServers", "hasCompletedOnboarding"];
+/// Per-project `.claude.json` keys a new slot inherits.
+const SEED_PROJECT: &[&str] = &[
+    "hasTrustDialogAccepted",
+    "mcpServers",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+    "allowedTools",
+];
+
+/// The allow-listed projection of a `.claude.json`: what `add` seeds and
+/// what `doctor` compares across slots. Everything else (`oauthAccount`,
+/// `userID`, every cache) is account-bound and never crosses slots.
+fn seed_projection(src: &Value) -> Value {
+    let mut out = Map::new();
+    for k in SEED_TOP {
+        if let Some(v) = src.get(*k) {
+            out.insert((*k).to_string(), v.clone());
+        }
+    }
+    if let Some(projects) = src.get("projects").and_then(Value::as_object) {
+        let mut seeded = Map::new();
+        for (path, p) in projects {
+            let picked: Map<String, Value> = SEED_PROJECT
+                .iter()
+                .filter_map(|k| p.get(*k).map(|v| ((*k).to_string(), v.clone())))
+                .collect();
+            if !picked.is_empty() {
+                seeded.insert(path.clone(), Value::Object(picked));
+            }
+        }
+        if !seeded.is_empty() {
+            out.insert("projects".into(), Value::Object(seeded));
+        }
+    }
+    Value::Object(out)
+}
+
+/// Parse an account file. `Ok(None)` when absent. A parse error names the
+/// position only, never the text, so it cannot quote a secret.
+fn read_account(path: &Path) -> Result<Option<Value>> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => Ok(Some(v)),
+        Ok(_) => bail!("{} is not a JSON object", path.display()),
+        Err(e) => bail!(
+            "{} is not valid JSON (line {}, column {})",
+            path.display(),
+            e.line(),
+            e.column()
+        ),
+    }
+}
+
+fn account_email(v: &Value) -> Option<&str> {
+    v.get("oauthAccount")?.get("emailAddress")?.as_str()
+}
+
+// ---- list -------------------------------------------------------------------
+
+#[derive(Debug)]
+struct SlotRow {
+    name: String,
+    active: bool,
+    email: Option<String>,
+    creds: CredentialState,
+}
+
+/// `home` first, then the store slots. A broken active pointer marks no row
+/// active (`doctor` reports it).
+fn slot_rows(env: &Env) -> Result<Vec<SlotRow>> {
+    let active = read_active(&env.store).ok();
+    let mut names = vec![HOME_SLOT.to_string()];
+    names.extend(store_slots(&env.store)?);
+    names
+        .into_iter()
+        .map(|name| {
+            let dir = env.resolve(&name)?;
+            let creds = credential_state(&env.config_dir(&dir))
+                .with_context(|| format!("inspect slot {name}'s credentials"))?;
+            let email = read_account(&env.account_file(&dir))
+                .ok()
+                .flatten()
+                .and_then(|v| account_email(&v).map(str::to_owned));
+            Ok(SlotRow {
+                active: active.as_deref() == Some(name.as_str()),
+                name,
+                email,
+                creds,
+            })
+        })
+        .collect()
+}
+
+fn fmt_row(r: &SlotRow) -> String {
+    let who = r.email.as_deref().unwrap_or("(no account email)");
+    match r.creds {
+        CredentialState::Ok => who.to_string(),
+        CredentialState::Missing => "(logged out)".to_string(),
+        CredentialState::NotRegular => {
+            format!("{who} [credentials are not a regular file: see doctor]")
+        }
+        CredentialState::LoosePerms(m) => format!("{who} [credentials mode {m:o}]"),
+    }
+}
+
+fn list(env: &Env, out: &mut dyn Write) -> Result<()> {
+    let rows = slot_rows(env)?;
+    writeln!(out, "store: {}", env.store.display())?;
+    let width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    for r in &rows {
+        let marker = if r.active { "*" } else { " " };
+        writeln!(out, "{marker} {:<width$}  {}", r.name, fmt_row(r))?;
+    }
     Ok(())
 }
 
-/// Atomic symlink create/retarget. `target` is written literally — a relative
-/// path means "relative to the link's directory".
-fn atomic_symlink(target: &Path, link_path: &Path) -> Result<()> {
-    let tmp = tmp_sibling(link_path)?;
-    symlink(target, &tmp)
-        .with_context(|| format!("symlink {} -> {}", tmp.display(), target.display()))?;
-    fs::rename(&tmp, link_path).with_context(|| {
-        format!(
-            "rename symlink {} -> {}",
-            tmp.display(),
-            link_path.display()
-        )
-    })?;
-    Ok(())
+// ---- add --------------------------------------------------------------------
+
+/// Link every Shared name whose `~/.claude/` source exists into `slot_dir`.
+/// A link that is already correct is kept, so a resumed `migrate` can call
+/// this again; anything else in the way is refused.
+fn link_shared(claude_home: &Path, slot_dir: &Path) -> Result<Vec<&'static str>> {
+    let mut linked = Vec::new();
+    for name in shared_names() {
+        let src = claude_home.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = slot_dir.join(name);
+        match lstat(&dst)? {
+            None => {
+                symlink(&src, &dst).with_context(|| format!("symlink {}", dst.display()))?
+            }
+            Some(md) if md.file_type().is_symlink() && fs::read_link(&dst)? == src => {}
+            Some(_) => bail!("{} exists and is not the shared link", dst.display()),
+        }
+        linked.push(name);
+    }
+    Ok(linked)
 }
 
-// ---- subcommands -----------------------------------------------------------
+/// Create the store slot `slot` (layout, links, seeded `.claude.json`) and
+/// return its dir. Never logs in: [`add_then_login`] does that.
+fn add(env: &Env, slot: &str, from: Option<&str>, out: &mut dyn Write) -> Result<PathBuf> {
+    let dest = env.new_store_slot(slot)?;
+    if lstat(&dest)?.is_some() {
+        bail!(
+            "slot {slot:?} already exists at {}; to log it in again run \
+             `softfig claude-login run {slot} -- claude auth login`",
+            dest.display()
+        );
+    }
+    let source_name = match from {
+        Some(s) => s.to_string(),
+        None => read_active(&env.store).map_err(|e| anyhow!("{e}; pass --from <slot>"))?,
+    };
+    let source = env.existing(&source_name)?;
+    let seed = read_account(&env.account_file(&source))?.map(|v| seed_projection(&v));
 
-fn list(paths: &Paths) -> Result<()> {
-    let top = inspect_top_level(paths)?;
-    let active: Option<&str> = match &top {
-        TopLevel::SymlinkIn { slot_name } => Some(slot_name.as_str()),
-        _ => None,
+    ensure_dir_mode(&env.store, 0o700)?;
+    let staging = tmp_sibling(&env.store.join(format!("add-{slot}")))?;
+    fs::create_dir(&staging).with_context(|| format!("create {}", staging.display()))?;
+    let built = (|| -> Result<Vec<&'static str>> {
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+        let linked = link_shared(&env.claude_home, &staging)?;
+        if let Some(seed) = &seed {
+            let bytes = serde_json::to_vec_pretty(seed)?;
+            write_new(&staging.join(ACCOUNT_FILE), &bytes, 0o600)?;
+        }
+        sync_dir(&staging)?;
+        fs::rename(&staging, &dest)
+            .with_context(|| format!("rename {} -> {}", staging.display(), dest.display()))?;
+        sync_dir(&env.store)?;
+        Ok(linked)
+    })();
+    let linked = match built {
+        Ok(l) => l,
+        Err(e) => {
+            // The staging dir only ever holds links and the seed: never a
+            // credential, so removing it loses nothing.
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
     };
 
-    match &top {
-        TopLevel::Missing => println!(
-            "top-level: {} (missing — run `claude auth login`)",
-            paths.top_level.display()
-        ),
-        TopLevel::Plain => println!(
-            "top-level: {} (plain file — run `softfig claude-login capture <name>` to adopt)",
-            paths.top_level.display()
-        ),
-        TopLevel::SymlinkIn { slot_name } => println!(
-            "top-level: {} -> credentials.d/{slot_name}.json",
-            paths.top_level.display()
-        ),
-        TopLevel::SymlinkOut { target } => println!(
-            "top-level: {} -> {} (outside credentials.d/)",
-            paths.top_level.display(),
-            target.display()
-        ),
+    writeln!(out, "created slot {slot} at {}", dest.display())?;
+    writeln!(out, "  shared links: {}", if linked.is_empty() { "(none)".into() } else { linked.join(", ") })?;
+    match &seed {
+        Some(v) => {
+            let mcp = v.get("mcpServers").and_then(Value::as_object).map_or(0, Map::len);
+            let projects = v.get("projects").and_then(Value::as_object).map_or(0, Map::len);
+            writeln!(
+                out,
+                "  .claude.json seeded from {source_name}: {mcp} MCP server(s), {projects} project(s)"
+            )?;
+        }
+        None => writeln!(out, "  .claude.json: {source_name} has none, so nothing seeded")?,
     }
+    Ok(dest)
+}
 
-    let slots = read_slots(paths)?;
-    if slots.is_empty() {
-        println!("profiles: (none)");
+/// `add`, then (unless `--no-login`) `claude auth login` inside the new slot
+/// through `launch`, the process seam tests replace.
+fn add_then_login(
+    env: &Env,
+    a: &AddArgs,
+    out: &mut dyn Write,
+    launch: &mut dyn FnMut(Command) -> io::Result<ExitStatus>,
+) -> Result<()> {
+    let dest = add(env, &a.slot, a.from.as_deref(), out)?;
+    let slot = &a.slot;
+    if a.no_login {
+        writeln!(out, "  skipped login; run `softfig claude-login run {slot} -- claude auth login`")?;
         return Ok(());
     }
-    println!("profiles:");
-    for s in &slots {
-        let marker = if Some(s.name.as_str()) == active { "*" } else { " " };
-        let mode_tag = if s.mode & 0o777 == 0o600 {
-            String::new()
-        } else {
-            format!(" [mode {:o}]", s.mode & 0o777)
-        };
-        println!("  {marker} {}  {}{}", s.name, fmt_account(&s.account), mode_tag);
+    out.flush()?;
+    let argv = ["claude", "auth", "login"].map(OsString::from);
+    let status = launch(run_command(env, slot, &argv)?).context("launch `claude auth login`")?;
+    if !status.success() {
+        bail!(
+            "`claude auth login` exited with {status}; the slot exists without credentials. \
+             Retry with `softfig claude-login run {slot} -- claude auth login`"
+        );
+    }
+    match credential_state(&dest)? {
+        CredentialState::Ok => writeln!(out, "slot {slot} is logged in")?,
+        other => writeln!(out, "warning: slot {slot}'s credentials after login: {other:?}")?,
     }
     Ok(())
 }
 
-fn capture(paths: &Paths, name: &str, force: bool) -> Result<()> {
-    validate_slot_name(name)?;
-    let top = inspect_top_level(paths)?;
+// ---- migrate ----------------------------------------------------------------
 
-    if matches!(top, TopLevel::Missing) {
-        bail!(
-            "no `{}` to capture — run `claude auth login` first",
-            paths.top_level.display()
-        );
+/// One live claude process, as `migrate` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveClaude {
+    pid: u32,
+    cmdline: String,
+}
+
+/// The pid-probe seam `migrate` refuses on.
+trait ClaudeProcesses {
+    fn live(&self) -> Result<Vec<LiveClaude>>;
+}
+
+/// Scans a procfs root (`/proc` in production) for this user's claude
+/// processes: the CLI, the daemon, `bg-pty-host` and spares alike.
+struct ProcScan {
+    root: PathBuf,
+    own_pid: u32,
+    own_uid: u32,
+}
+
+impl ProcScan {
+    fn system() -> Result<Self> {
+        let root = PathBuf::from("/proc");
+        let own_uid = fs::metadata(root.join("self"))
+            .context("stat /proc/self (needed to check for running claude)")?
+            .uid();
+        Ok(Self { root, own_pid: std::process::id(), own_uid })
     }
+}
 
-    // `fs::read` follows a symlink, so this gets the live creds whether the
-    // top-level is a plain file or already a symlink into the store.
-    let bytes = fs::read(&paths.top_level).with_context(|| {
-        format!(
-            "read `{}` (dangling symlink?)",
-            paths.top_level.display()
-        )
-    })?;
-
-    let acc = parse_account(&bytes);
-    if let Some(reason) = &acc.unparseable {
-        bail!(
-            "current `.credentials.json` is not a Claude OAuth bundle: {reason} \
-             (API-key auth is out of scope for this switcher)"
-        );
-    }
-
-    ensure_store_dir(paths)?;
-    let slot_path = paths.slot(name);
-    let wrote_slot = match fs::read(&slot_path) {
-        Ok(existing) if existing == bytes => {
-            println!("slot `{name}` already captured (bytes identical)");
-            false
+impl ClaudeProcesses for ProcScan {
+    fn live(&self) -> Result<Vec<LiveClaude>> {
+        let rd = fs::read_dir(&self.root)
+            .with_context(|| format!("scan {} for running claude", self.root.display()))?;
+        let mut live = Vec::new();
+        for ent in rd.flatten() {
+            let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let dir = ent.path();
+            if pid == self.own_pid || !fs::metadata(&dir).is_ok_and(|m| m.uid() == self.own_uid)
+            {
+                continue;
+            }
+            let Ok(raw) = fs::read(dir.join("cmdline")) else {
+                continue;
+            };
+            let argv: Vec<String> = raw
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            let exe = fs::read_link(dir.join("exe")).ok();
+            if is_claude(&argv, exe.as_deref()) {
+                let mut cmdline = argv.join(" ");
+                cmdline.truncate(100);
+                live.push(LiveClaude { pid, cmdline });
+            }
         }
-        Ok(_) if !force => bail!(
-            "slot `{name}` already exists with different contents at {}; \
-             pass --force to overwrite",
-            slot_path.display()
+        live.sort_by_key(|l| l.pid);
+        Ok(live)
+    }
+}
+
+/// A claude process: launched as `claude`, running a native build from
+/// `…/claude/versions/<ver>` (whose `comm` is the version string), or the
+/// npm package under node.
+fn is_claude(argv: &[String], exe: Option<&Path>) -> bool {
+    let Some(argv0) = argv.first() else {
+        return false;
+    };
+    Path::new(argv0).file_name().is_some_and(|n| n == "claude")
+        || exe.is_some_and(|e| e.parent().is_some_and(|p| p.ends_with("claude/versions")))
+        || argv.iter().take(2).any(|a| a.contains("@anthropic-ai/claude-code"))
+}
+
+/// `rename(2)`, the production mover. Tests swap in one that fails with
+/// `EXDEV` to drive the copy fallback.
+type RenameFn = fn(&Path, &Path) -> io::Result<()>;
+
+fn rename_file(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::rename(src, dst)
+}
+
+/// Move `src` to `dst` (which must not exist): `rename(2)`, or across
+/// filesystems copy to a temp + fsync + rename + unlink the source. No
+/// claude is running (`migrate` checked), so the brief two-copy window of the
+/// fallback can't race a token refresh.
+fn move_file(src: &Path, dst: &Path, rename: RenameFn) -> Result<()> {
+    match rename(src, dst) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+            let bytes = fs::read(src).with_context(|| format!("read {}", src.display()))?;
+            let tmp = tmp_sibling(dst)?;
+            if let Err(e) = write_new(&tmp, &bytes, 0o600).and_then(|_| {
+                fs::rename(&tmp, dst)
+                    .with_context(|| format!("rename {} -> {}", tmp.display(), dst.display()))
+            }) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+            sync_parent(dst)?;
+            fs::remove_file(src).with_context(|| format!("remove {}", src.display()))?;
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("move {} -> {}", src.display(), dst.display()));
+        }
+    }
+    sync_parent(dst)?;
+    sync_parent(src)
+}
+
+/// What [`move_once`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum MoveOutcome {
+    Moved,
+    AlreadyThere,
+    /// Both copies existed with identical bytes (an interrupted
+    /// cross-filesystem move); the source was removed.
+    FinishedInterrupted,
+    NothingToMove,
+}
+
+/// The resumable step of `migrate`: move `src` into staging unless an
+/// earlier, interrupted run already did.
+fn move_once(src: &Path, dst: &Path, rename: RenameFn) -> Result<MoveOutcome> {
+    match (lstat(src)?, lstat(dst)?) {
+        (Some(s), _) if !s.is_file() => bail!(
+            "{} is not a regular file; migrate only moves a real file",
+            src.display()
         ),
-        Ok(_) => {
-            atomic_write_mode(&slot_path, &bytes, 0o600)?;
-            println!("overwrote slot `{name}` → {} (0600)", slot_path.display());
-            true
+        (Some(_), None) => move_file(src, dst, rename).map(|_| MoveOutcome::Moved),
+        (None, Some(_)) => Ok(MoveOutcome::AlreadyThere),
+        (None, None) => Ok(MoveOutcome::NothingToMove),
+        (Some(_), Some(_)) => {
+            if fs::read(src)? == fs::read(dst)? {
+                fs::remove_file(src).with_context(|| format!("remove {}", src.display()))?;
+                sync_parent(src)?;
+                Ok(MoveOutcome::FinishedInterrupted)
+            } else {
+                bail!(
+                    "both {} and {} exist and differ: a login probably ran after an \
+                     interrupted migrate. Keep the live one by hand, remove the other, then \
+                     re-run",
+                    src.display(),
+                    dst.display()
+                )
+            }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            atomic_write_mode(&slot_path, &bytes, 0o600)?;
-            println!("wrote slot `{name}` → {} (0600)", slot_path.display());
-            true
+    }
+}
+
+fn migrate(
+    env: &Env,
+    slot: &str,
+    procs: &dyn ClaudeProcesses,
+    rename: RenameFn,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let dest = env.new_store_slot(slot)?;
+    if lstat(&dest)?.is_some() {
+        bail!(
+            "slot {slot:?} already exists at {}; migrate is one-time (`use {slot}` switches to it)",
+            dest.display()
+        );
+    }
+    let live = procs.live()?;
+    if !live.is_empty() {
+        let list: Vec<String> = live.iter().map(|l| format!("  {}  {}", l.pid, l.cmdline)).collect();
+        bail!(
+            "refusing to migrate while claude is running: a token refresh mid-move could \
+             lose the account. Close these first, the daemon included:\n{}",
+            list.join("\n")
+        );
+    }
+
+    let src_creds = env.claude_home.join(CREDENTIALS_FILE);
+    let staging = env.store.join(format!(".migrate-{slot}"));
+    let staged_creds = staging.join(CREDENTIALS_FILE);
+    let resuming = is_real_dir(&staging);
+    // Pre-flight before creating anything: each source is absent or a real
+    // file (a symlinked credential is not ours to move).
+    for src in [&src_creds, &env.home_account] {
+        if lstat(src)?.is_some_and(|m| !m.is_file()) {
+            bail!("{} is not a regular file; migrate only moves a real file", src.display());
         }
-        Err(e) => return Err(e).context("read existing slot"),
+    }
+    if lstat(&src_creds)?.is_none() && !(resuming && lstat(&staged_creds)?.is_some()) {
+        bail!(
+            "no {} to migrate: log in with `claude auth login` first, or create an empty \
+             slot with `softfig claude-login add {slot}`",
+            src_creds.display()
+        );
+    }
+
+    ensure_dir_mode(&env.store, 0o700)?;
+    ensure_dir_mode(&staging, 0o700)?;
+    let creds = move_once(&src_creds, &staged_creds, rename)?;
+    let account = move_once(&env.home_account, &staging.join(ACCOUNT_FILE), rename)?;
+    let linked = link_shared(&env.claude_home, &staging)?;
+    sync_dir(&staging)?;
+    fs::rename(&staging, &dest)
+        .with_context(|| format!("rename {} -> {}", staging.display(), dest.display()))?;
+    sync_dir(&env.store)?;
+    set_active(&env.store, slot)?;
+
+    if resuming {
+        writeln!(out, "resumed an interrupted migrate of {slot}")?;
+    }
+    writeln!(out, "migrated the home account into slot {slot} at {}", dest.display())?;
+    writeln!(out, "  .credentials.json: {creds:?}; .claude.json: {account:?}")?;
+    writeln!(out, "  shared links: {}", linked.join(", "))?;
+    writeln!(out, "active: {slot}")?;
+    writeln!(
+        out,
+        "Plain `claude` now needs the shell shim (or `softfig claude-login run {slot} -- claude`)."
+    )?;
+    Ok(())
+}
+
+// ---- use / run / dir --------------------------------------------------------
+
+fn use_slot(env: &Env, slot: &str, out: &mut dyn Write) -> Result<()> {
+    let dir = env.existing(slot)?;
+    let creds = credential_state(&env.config_dir(&dir))?;
+    set_active(&env.store, slot)?;
+    writeln!(
+        out,
+        "active: {slot}. New claude sessions use it; running ones keep their slot."
+    )?;
+    if creds != CredentialState::Ok {
+        writeln!(
+            out,
+            "warning: slot {slot}'s credentials are {creds:?}; \
+             run `softfig claude-login run {slot} -- claude auth login`"
+        )?;
+    }
+    Ok(())
+}
+
+/// The `Command` for `run <slot> -- <argv…>`: only `CLAUDE_CONFIG_DIR`
+/// changes (set for a store slot, removed for `home`). `HOME` is untouched.
+fn run_command(env: &Env, slot: &str, argv: &[OsString]) -> Result<Command> {
+    let dir = env.existing(slot)?;
+    let (prog, args) = match argv.split_first() {
+        Some((p, rest)) => (p.clone(), rest),
+        None => (OsString::from("claude"), &[][..]),
+    };
+    let mut cmd = Command::new(prog);
+    cmd.args(args);
+    match dir.config_dir_env() {
+        Some(p) => cmd.env(CONFIG_DIR_ENV, p),
+        None => cmd.env_remove(CONFIG_DIR_ENV),
+    };
+    Ok(cmd)
+}
+
+fn dir(env: &Env, a: &DirArgs, out: &mut dyn Write) -> Result<()> {
+    let d = match &a.slot {
+        Some(slot) => env.existing(slot)?,
+        None => {
+            resolve_active(&env.store)
+                .map_err(|e| anyhow!("{e} (see `softfig claude-login doctor`)"))?
+                .1
+        }
+    };
+    if let Some(p) = d.config_dir_env() {
+        writeln!(out, "{}", p.display())?;
+    }
+    Ok(())
+}
+
+// ---- doctor -----------------------------------------------------------------
+
+/// One problem `doctor` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Finding {
+    /// A dir or account file is open to group/other.
+    LoosePerms { path: PathBuf, mode: u32, want: u32 },
+    /// Claude replaced a Shared link with a real file or dir (rename-on-write).
+    SharedReplaced { slot: String, name: &'static str },
+    /// A Shared link points somewhere other than `~/.claude/<name>`.
+    SharedRetargeted { slot: String, name: &'static str, target: PathBuf },
+    /// A Shared link whose `~/.claude/<name>` source is gone.
+    SharedDangling { slot: String, name: &'static str },
+    /// `~/.claude/<name>` exists but the slot has no link to it.
+    SharedMissing { slot: String, name: &'static str },
+    /// A top-level name the slot layout doesn't classify.
+    UnknownName { place: String, name: String },
+    CredentialsMissing { slot: String },
+    CredentialsNotRegular { slot: String },
+    /// `.claude.json` is a symlink or another non-regular file.
+    AccountNotRegular { slot: String },
+    AccountUnreadable { slot: String, why: String },
+    /// An allow-listed `.claude.json` field differs from the active slot's.
+    AccountDrift { slot: String, active: String, detail: String },
+    /// `<store>/active` does not resolve.
+    ActiveBroken(String),
+    /// Something in the store root that is neither a slot nor `active`.
+    StrayStoreEntry { name: String, why: &'static str },
+}
+
+impl std::fmt::Display for Finding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Finding::*;
+        match self {
+            LoosePerms { path, mode, want } => {
+                write!(f, "{} has mode {mode:o}; want {want:o} (chmod {want:o})", path.display())
+            }
+            SharedReplaced { slot, name } => write!(
+                f,
+                "slot {slot}: {name} is a real file, not the shared link (Claude rewrote it \
+                 by rename). Merge it into ~/.claude/{name} by hand, then re-link"
+            ),
+            SharedRetargeted { slot, name, target } => write!(
+                f,
+                "slot {slot}: {name} links to {}, not ~/.claude/{name}",
+                target.display()
+            ),
+            SharedDangling { slot, name } => {
+                write!(f, "slot {slot}: {name} links to ~/.claude/{name}, which is gone")
+            }
+            SharedMissing { slot, name } => write!(
+                f,
+                "slot {slot}: no {name} link, but ~/.claude/{name} exists \
+                 (ln -s ~/.claude/{name} into the slot)"
+            ),
+            UnknownName { place, name } => write!(
+                f,
+                "{place}: unclassified name {name:?} (new Claude Code state? \
+                 classify it in slot_layout.rs)"
+            ),
+            CredentialsMissing { slot } => write!(
+                f,
+                "slot {slot}: no .credentials.json \
+                 (softfig claude-login run {slot} -- claude auth login)"
+            ),
+            CredentialsNotRegular { slot } => write!(
+                f,
+                "slot {slot}: .credentials.json is not a regular file \
+                 (Claude refuses symlinked credentials)"
+            ),
+            AccountNotRegular { slot } => {
+                write!(f, "slot {slot}: .claude.json is not a regular file")
+            }
+            AccountUnreadable { slot, why } => write!(f, "slot {slot}: {why}"),
+            AccountDrift { slot, active, detail } => {
+                write!(f, "slot {slot} differs from active slot {active}: {detail}")
+            }
+            ActiveBroken(why) => write!(f, "{why}"),
+            StrayStoreEntry { name, why } => write!(f, "store: {name:?} {why}"),
+        }
+    }
+}
+
+/// Perms check: a finding when `md` grants anything outside `want`.
+fn check_mode(path: &Path, md: &fs::Metadata, want: u32, findings: &mut Vec<Finding>) {
+    let mode = md.permissions().mode() & 0o777;
+    if mode & !want != 0 {
+        findings.push(Finding::LoosePerms { path: path.to_path_buf(), mode, want });
+    }
+}
+
+/// Every top-level name in `dir` the layout doesn't know.
+fn unknown_names(dir: &Path, place: &str, findings: &mut Vec<Finding>) -> Result<()> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| classify(n).is_none())
+        .collect();
+    names.sort();
+    findings.extend(names.into_iter().map(|name| Finding::UnknownName {
+        place: place.to_string(),
+        name,
+    }));
+    Ok(())
+}
+
+fn check_credentials(
+    slot: &str,
+    config_dir: &Path,
+    missing_is_a_problem: bool,
+    findings: &mut Vec<Finding>,
+) -> Result<()> {
+    match credential_state(config_dir)? {
+        CredentialState::Ok => {}
+        CredentialState::Missing if missing_is_a_problem => {
+            findings.push(Finding::CredentialsMissing { slot: slot.into() })
+        }
+        CredentialState::Missing => {}
+        CredentialState::NotRegular => {
+            findings.push(Finding::CredentialsNotRegular { slot: slot.into() })
+        }
+        CredentialState::LoosePerms(mode) => findings.push(Finding::LoosePerms {
+            path: config_dir.join(CREDENTIALS_FILE),
+            mode,
+            want: 0o600,
+        }),
+    }
+    Ok(())
+}
+
+/// Lstat-check an account file; return its projection when readable.
+fn check_account(slot: &str, path: &Path, findings: &mut Vec<Finding>) -> Result<Option<Value>> {
+    let Some(md) = lstat(path)? else {
+        return Ok(None);
+    };
+    if !md.is_file() {
+        findings.push(Finding::AccountNotRegular { slot: slot.into() });
+        return Ok(None);
+    }
+    check_mode(path, &md, 0o600, findings);
+    match read_account(path) {
+        Ok(v) => Ok(v.map(|v| seed_projection(&v))),
+        Err(e) => {
+            findings.push(Finding::AccountUnreadable { slot: slot.into(), why: e.to_string() });
+            Ok(None)
+        }
+    }
+}
+
+fn check_shared_links(env: &Env, slot: &str, dir: &Path, findings: &mut Vec<Finding>) -> Result<()> {
+    for name in shared_names() {
+        let src = env.claude_home.join(name);
+        let dst = dir.join(name);
+        let slot = slot.to_string();
+        match lstat(&dst)? {
+            None if src.exists() => findings.push(Finding::SharedMissing { slot, name }),
+            None => {}
+            Some(md) if md.file_type().is_symlink() => {
+                let target = fs::read_link(&dst)?;
+                if target != src {
+                    findings.push(Finding::SharedRetargeted { slot, name, target });
+                } else if !dst.exists() {
+                    findings.push(Finding::SharedDangling { slot, name });
+                }
+            }
+            Some(_) => findings.push(Finding::SharedReplaced { slot, name }),
+        }
+    }
+    Ok(())
+}
+
+/// Allow-listed differences between two account projections, one line each.
+fn account_drift(active: &Value, other: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let empty = Map::new();
+    let obj = |v: &Value, k: &str| -> Map<String, Value> {
+        v.get(k).and_then(Value::as_object).cloned().unwrap_or_default()
     };
 
-    // Always re-point the top-level, even if the slot bytes were identical —
-    // capture's job is to leave the switcher in a managed state.
-    let rel = paths.rel_slot_target(name);
-    atomic_symlink(&rel, &paths.top_level)?;
-    if !wrote_slot
-        && matches!(&top, TopLevel::SymlinkIn { slot_name } if slot_name == name)
+    let (a_mcp, o_mcp) = (obj(active, "mcpServers"), obj(other, "mcpServers"));
+    let only = |x: &Map<String, Value>, y: &Map<String, Value>| -> Vec<String> {
+        x.keys().filter(|k| !y.contains_key(*k)).cloned().collect()
+    };
+    let only_active = only(&a_mcp, &o_mcp);
+    let only_other = only(&o_mcp, &a_mcp);
+    let differ: Vec<String> = a_mcp
+        .iter()
+        .filter(|(k, v)| o_mcp.get(*k).is_some_and(|ov| ov != *v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    if !only_active.is_empty() {
+        lines.push(format!("MCP servers missing here: {}", only_active.join(", ")));
+    }
+    if !only_other.is_empty() {
+        lines.push(format!("MCP servers only here: {}", only_other.join(", ")));
+    }
+    if !differ.is_empty() {
+        lines.push(format!("MCP servers configured differently: {}", differ.join(", ")));
+    }
+    if active.get("hasCompletedOnboarding") != other.get("hasCompletedOnboarding") {
+        lines.push("hasCompletedOnboarding differs".into());
+    }
+
+    let (a_proj, o_proj) = (obj(active, "projects"), obj(other, "projects"));
+    let trusted = |p: Option<&Value>| {
+        p.and_then(|p| p.get("hasTrustDialogAccepted")).and_then(Value::as_bool) == Some(true)
+    };
+    let mut trust_lost = Vec::new();
+    let mut trust_extra = Vec::new();
+    let mut settings = Vec::new();
+    for path in a_proj.keys().chain(o_proj.keys().filter(|k| !a_proj.contains_key(*k))) {
+        let (a, o) = (a_proj.get(path), o_proj.get(path));
+        match (trusted(a), trusted(o)) {
+            (true, false) => trust_lost.push(path.clone()),
+            (false, true) => trust_extra.push(path.clone()),
+            _ => {}
+        }
+        let strip = |p: Option<&Value>| -> Map<String, Value> {
+            let mut m = p.and_then(Value::as_object).unwrap_or(&empty).clone();
+            m.remove("hasTrustDialogAccepted");
+            m
+        };
+        if strip(a) != strip(o) {
+            settings.push(path.clone());
+        }
+    }
+    let sample = |v: &[String]| v.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if !trust_lost.is_empty() {
+        lines.push(format!(
+            "{} project(s) trusted in the active slot but not here (e.g. {})",
+            trust_lost.len(),
+            sample(&trust_lost)
+        ));
+    }
+    if !trust_extra.is_empty() {
+        lines.push(format!(
+            "{} project(s) trusted here but not in the active slot (e.g. {})",
+            trust_extra.len(),
+            sample(&trust_extra)
+        ));
+    }
+    if !settings.is_empty() {
+        lines.push(format!(
+            "per-project MCP/tool settings differ for {} project(s) (e.g. {})",
+            settings.len(),
+            sample(&settings)
+        ));
+    }
+    lines
+}
+
+/// The read-only health check behind `doctor`.
+fn diagnose(env: &Env) -> Result<Vec<Finding>> {
+    let mut findings = Vec::new();
+
+    if let Some(md) = lstat(&env.store)? {
+        check_mode(&env.store, &md, 0o700, &mut findings);
+    }
+    let active = match resolve_active(&env.store) {
+        Ok((name, _)) => Some(name),
+        Err(e) => {
+            findings.push(Finding::ActiveBroken(e.to_string()));
+            None
+        }
+    };
+
+    // The store root holds slots, `active`, and Claude's legacy `<slot>.lock`
+    // dirs. Anything else is a leftover worth a look.
+    if let Ok(rd) = fs::read_dir(&env.store) {
+        let slots = store_slots(&env.store)?;
+        let mut names: Vec<String> = rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
+            let why = if name == ACTIVE_LINK || slots.contains(&name) || name.ends_with(".lock") {
+                continue;
+            } else if name.starts_with(".migrate-") {
+                "is an interrupted migrate (re-run `migrate` to finish it)"
+            } else if name.starts_with(".add-") {
+                "is an interrupted add (holds no credential; inspect and remove it)"
+            } else if name == HOME_SLOT {
+                "is shadowed by the reserved slot `home`"
+            } else {
+                "is not a slot directory"
+            };
+            findings.push(Finding::StrayStoreEntry { name, why });
+        }
+    }
+
+    // home: the shared dir itself. Its credentials matter only while it is
+    // the active slot (after `migrate` it has none, by design).
+    unknown_names(&env.claude_home, "~/.claude", &mut findings)?;
+    let home_active = active.as_deref() == Some(HOME_SLOT);
+    check_credentials(HOME_SLOT, &env.claude_home, home_active, &mut findings)?;
+    let mut projections: Vec<(String, Value)> = Vec::new();
+    if let Some(p) = check_account(HOME_SLOT, &env.home_account, &mut findings)? {
+        projections.push((HOME_SLOT.into(), p));
+    }
+
+    for slot in store_slots(&env.store)? {
+        let dir = env.store.join(&slot);
+        if let Some(md) = lstat(&dir)? {
+            check_mode(&dir, &md, 0o700, &mut findings);
+        }
+        check_credentials(&slot, &dir, true, &mut findings)?;
+        if let Some(p) = check_account(&slot, &dir.join(ACCOUNT_FILE), &mut findings)? {
+            projections.push((slot.clone(), p));
+        }
+        check_shared_links(env, &slot, &dir, &mut findings)?;
+        unknown_names(&dir, &format!("slot {slot}"), &mut findings)?;
+    }
+
+    if let Some(active) = &active
+        && let Some((_, reference)) = projections.iter().find(|(s, _)| s == active)
     {
-        // Nothing moved; keep the output quiet.
-    } else {
-        println!(
-            "top-level: {} -> {} (symlink)",
-            paths.top_level.display(),
-            rel.display()
-        );
-    }
-    Ok(())
-}
-
-fn use_slot(paths: &Paths, name: &str) -> Result<()> {
-    validate_slot_name(name)?;
-    let slot = paths.slot(name);
-    let slot_md = fs::symlink_metadata(&slot);
-    match &slot_md {
-        Ok(md) if md.file_type().is_file() => {}
-        Ok(_) => bail!(
-            "slot `{name}` at {} is not a regular file; refusing to point at it",
-            slot.display()
-        ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => bail!(
-            "slot `{name}` does not exist ({}); see `softfig claude-login list`",
-            slot.display()
-        ),
-        Err(e) => return Err(anyhow!(e.to_string())).context("stat slot file"),
-    }
-
-    let top = inspect_top_level(paths)?;
-    let rel = paths.rel_slot_target(name);
-    match top {
-        TopLevel::Missing => {
-            atomic_symlink(&rel, &paths.top_level)?;
-            println!("active profile: `{name}` (new symlink)");
-        }
-        TopLevel::Plain => bail!(
-            "`{}` is a regular file, not managed by this switcher. \
-             Run `softfig claude-login capture <name>` to adopt the current creds first, \
-             or move the file aside manually.",
-            paths.top_level.display()
-        ),
-        TopLevel::SymlinkIn { slot_name } if slot_name == name => {
-            println!("already active: `{name}`");
-        }
-        TopLevel::SymlinkIn { .. } | TopLevel::SymlinkOut { .. } => {
-            atomic_symlink(&rel, &paths.top_level)?;
-            println!("active profile: `{name}`");
-        }
-    }
-    Ok(())
-}
-
-fn login(paths: &Paths, name: &str) -> Result<()> {
-    use_slot(paths, name)?;
-
-    // Spawn (not exec) — we need to inspect the top-level after `claude`
-    // exits in case its atomic write replaced the symlink.
-    let status = Command::new("claude")
-        .args(["auth", "login"])
-        .status()
-        .context("spawn `claude auth login`")?;
-    if !status.success() {
-        bail!("`claude auth login` exited with status {status}");
-    }
-
-    match inspect_top_level(paths)? {
-        TopLevel::SymlinkIn { slot_name } if slot_name == name => {
-            println!("login OK; symlink intact (`{name}`)");
-        }
-        TopLevel::Plain => {
-            // `claude auth login` wrote via `rename(2)` and replaced our
-            // symlink with a regular file. Fold the new creds into the slot
-            // and restore the link.
-            let bytes = fs::read(&paths.top_level)
-                .context("read .credentials.json after login")?;
-            let acc = parse_account(&bytes);
-            if acc.unparseable.is_some() {
-                bail!(
-                    "after `claude auth login`, `.credentials.json` is not a Claude OAuth bundle; \
-                     refusing to repair the symlink. Inspect `{}` manually.",
-                    paths.top_level.display()
-                );
+        for (slot, p) in projections.iter().filter(|(s, _)| s != active) {
+            for detail in account_drift(reference, p) {
+                findings.push(Finding::AccountDrift {
+                    slot: slot.clone(),
+                    active: active.clone(),
+                    detail,
+                });
             }
-            atomic_write_mode(&paths.slot(name), &bytes, 0o600)?;
-            fs::remove_file(&paths.top_level)
-                .context("remove plain .credentials.json before relink")?;
-            atomic_symlink(&paths.rel_slot_target(name), &paths.top_level)?;
-            println!("login OK; re-linked `.credentials.json` into slot `{name}`");
         }
-        TopLevel::Missing => bail!(
-            "after `claude auth login`, `.credentials.json` is missing; inspect `{}` manually",
-            paths.claude_home.display()
-        ),
-        TopLevel::SymlinkIn { slot_name } => bail!(
-            "after `claude auth login`, top-level points at slot `{slot_name}` (expected `{name}`); \
-             inspect manually"
-        ),
-        TopLevel::SymlinkOut { target } => bail!(
-            "after `claude auth login`, top-level points outside the store ({}); inspect manually",
-            target.display()
-        ),
     }
-    Ok(())
+    Ok(findings)
 }
 
-fn status(paths: &Paths) -> Result<()> {
-    list(paths)?;
-    println!();
-    print_profile_headroom(paths)?;
-    println!();
-    println!("per-member profile pins:");
-    print_member_pins(&agents_runtime_dir())?;
-    Ok(())
+fn doctor(env: &Env, out: &mut dyn Write) -> Result<()> {
+    let findings = diagnose(env)?;
+    if findings.is_empty() {
+        writeln!(out, "ok: the store, every slot and ~/.claude look healthy")?;
+        return Ok(());
+    }
+    for f in &findings {
+        writeln!(out, "- {f}")?;
+    }
+    bail!("doctor found {} problem(s)", findings.len())
 }
 
-/// Per-slot 5h headroom from the budget-aware picker's samples
-/// (claude-login-switcher slice 004). Each per-profile file lives at
-/// `$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/<slot>.json`, written
-/// by the fleet member reader thread when a `rate_limit_event` arrives. The
-/// headroom read here is pure over the stored snapshot — the same
-/// [`softfig_growlightd::profile_budget::headroom_from`] the picker calls — so
-/// what the CLI prints is exactly what the next spawn's pick will see.
-fn print_profile_headroom(paths: &Paths) -> Result<()> {
+// ---- status -----------------------------------------------------------------
+
+fn status(env: &Env, out: &mut dyn Write) -> Result<()> {
+    list(env, out)?;
+    writeln!(out)?;
+    let growlight = softfig_growlightd::fleet::runtime_growlight_dir();
+    print_profile_headroom(env, &growlight.join("usage.by-profile"), out)?;
+    writeln!(out)?;
+    writeln!(out, "per-member profile pins:")?;
+    print_member_pins(&growlight.join("agents"), out)
+}
+
+/// Per-slot 5h headroom from the budget-aware picker's samples (slice 004).
+/// The read is the same pure
+/// [`softfig_growlightd::profile_budget::headroom_from`] the picker calls, so
+/// what this prints is what the next spawn's pick sees.
+fn print_profile_headroom(env: &Env, by_profile_dir: &Path, out: &mut dyn Write) -> Result<()> {
     use softfig_growlightd::profile_budget::{headroom_from, read_profile_budget};
 
-    println!("budget headroom (5h window, from usage.by-profile/):");
-    let slots = read_slots(paths)?;
-    if slots.is_empty() {
-        println!("  (no slots to score — run `softfig claude-login capture <name>` first)");
-        return Ok(());
-    }
-    let by_profile_dir = by_profile_runtime_dir();
+    writeln!(out, "budget headroom (5h window, from usage.by-profile/):")?;
     let now = unix_now_seconds();
-    for s in &slots {
-        let snap = read_profile_budget(&by_profile_dir, &s.name);
+    let rows = slot_rows(env)?;
+    let width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    for row in rows {
+        let snap = read_profile_budget(by_profile_dir, &row.name);
         let hr = headroom_from(snap.as_ref(), now);
         let last_seen = snap
             .as_ref()
-            .map(|snap| format_age(now, snap.ts as i64))
+            .map(|s| format_age(now, s.ts as i64))
             .unwrap_or_else(|| "never".to_string());
-        let flag = flag_for_headroom(&hr);
-        println!(
-            "  {name}  headroom {pct:>3}%   last-seen {last_seen}{flag}",
-            name = s.name,
-            pct = hr.pct,
-            last_seen = last_seen,
-            flag = flag,
-        );
+        writeln!(
+            out,
+            "  {:<width$}  headroom {:>3}%   last-seen {last_seen}{}",
+            row.name,
+            hr.pct,
+            flag_for_headroom(&hr)
+        )?;
     }
     Ok(())
 }
 
-/// `(WARN)` when the headroom is below the picker's warn threshold, `(STALL)`
-/// when at or below the stall floor; empty otherwise. Mirrors the thresholds
-/// [`softfig_growlightd::profile_pin::HEADROOM_WARN_PCT`] /
-/// [`softfig_growlightd::profile_pin::HEADROOM_STALL_PCT`] so the CLI's label
-/// never drifts from what the picker actually does.
+/// `(WARN)` below the picker's warn threshold, `(STALL)` at or below its
+/// stall floor; the same constants the picker uses, so the label never
+/// drifts from what the picker does.
 fn flag_for_headroom(hr: &softfig_growlightd::profile_budget::Headroom) -> &'static str {
     use softfig_growlightd::profile_pin::{HEADROOM_STALL_PCT, HEADROOM_WARN_PCT};
     if hr.pct <= HEADROOM_STALL_PCT {
@@ -681,9 +1271,8 @@ fn flag_for_headroom(hr: &softfig_growlightd::profile_budget::Headroom) -> &'sta
     }
 }
 
-/// Format a timestamp's age as a short human-readable string, or `never` when
-/// the reading is unix epoch (default-constructed), which the picker treats as
-/// "no reading" too.
+/// A timestamp's age as a short string, or `never` for the epoch
+/// (default-constructed), which the picker also treats as "no reading".
 fn format_age(now: i64, ts: i64) -> String {
     if ts <= 0 {
         return "never".into();
@@ -700,22 +1289,6 @@ fn format_age(now: i64, ts: i64) -> String {
     }
 }
 
-/// Where the budget-aware picker reads per-profile samples from, mirroring
-/// `softfig_growlightd::fleet::runtime_growlight_dir()/usage.by-profile`.
-fn by_profile_runtime_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/"))
-                .join(".config")
-        });
-    base.join("softfig").join("growlight").join("usage.by-profile")
-}
-
-/// Wall-clock unix seconds, saturating to `0` on a clock predating the epoch.
 fn unix_now_seconds() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -724,586 +1297,700 @@ fn unix_now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-/// Walk the agents runtime dir and print each member's active profile pin,
-/// if any. A member with no pin reads as `unpinned (shared top-level)` —
-/// the pre-slice-003 posture, and what a claude member with no
-/// `profile_pool` always shows.
-fn print_member_pins(agents_dir: &Path) -> Result<()> {
-    let Ok(rd) = fs::read_dir(agents_dir) else {
-        println!("  (no per-member pins — agents dir {} is empty)", agents_dir.display());
-        return Ok(());
-    };
-    let mut rows: Vec<(String, Option<ProfilePinRow>)> = Vec::new();
-    for ent in rd.flatten() {
-        let ft = match ent.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-        let member = ent.file_name().to_string_lossy().into_owned();
-        let pin_path = ent.path().join("profile.pin.json");
-        let row = read_profile_pin_row(&pin_path);
-        rows.push((member, row));
-    }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    if rows.is_empty() {
-        println!("  (no members have overlay HOMEs — run `softfig claude-login refresh-members`)");
+/// Each fleet member's current profile pin. A member with no pin follows the
+/// active slot (or `home`).
+fn print_member_pins(agents_dir: &Path, out: &mut dyn Write) -> Result<()> {
+    use softfig_growlightd::profile_pin::{pin_paths, read_pin};
+
+    let mut members: Vec<String> = fs::read_dir(agents_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    members.sort();
+    if members.is_empty() {
+        writeln!(out, "  (no fleet members under {})", agents_dir.display())?;
         return Ok(());
     }
-    for (member, row) in rows {
-        match row {
-            Some(r) => println!("  {member}: {} (picked_at={}, session={})", r.profile, r.picked_at, r.session_id),
-            None => println!("  {member}: unpinned (shared top-level)"),
-        }
-    }
-    Ok(())
-}
-
-/// A minimal view of `profile.pin.json` the CLI parses — the fields the
-/// human reader cares about. Matches `profile_pin::ProfilePin` on the wire,
-/// but the CLI doesn't depend on softfig-growlightd (the pin layout is
-/// documented alongside the slice), so this is a tiny local decode.
-#[derive(Debug, serde::Deserialize)]
-struct ProfilePinRow {
-    profile: String,
-    picked_at: i64,
-    session_id: String,
-}
-
-fn read_profile_pin_row(path: &Path) -> Option<ProfilePinRow> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// The agents runtime dir the fleet writes pins into. Mirrors
-/// `softfig_growlightd::fleet::runtime_agents_dir`, resolved here from
-/// `XDG_CONFIG_HOME` + `HOME` so this CLI stays independent of growlightd's
-/// internal path.
-fn agents_runtime_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/"))
-                .join(".config")
-        });
-    base.join("softfig").join("growlight").join("agents")
-}
-
-// ---- refresh-members -------------------------------------------------------
-
-/// One leaf operation inside an overlay HOME. `apply_plan` is total over this
-/// enum, and `--dry-run` prints it one op per line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Op {
-    /// Ensure the overlay HOME chain `<agents_dir>/<member>/home/.claude/`
-    /// exists.
-    EnsureOverlayDir { member: String, overlay_claude: PathBuf },
-    /// Create or retarget an absolute symlink at
-    /// `overlay/.claude/<name> -> <target>`.
-    Symlink { member: String, link: PathBuf, target: PathBuf, kind: SymlinkKind },
-    /// Ensure a per-member directory exists (preserving its content).
-    EnsureDir { member: String, path: PathBuf },
-    /// Ensure a per-member file exists, empty (preserving its content).
-    EnsureFile { member: String, path: PathBuf },
-    /// Known-but-ignored name — no filesystem change; appears in the plan
-    /// for traceability only.
-    SkipIgnored { member: String, name: String },
-    /// Prune an overlay HOME that corresponds to no live member.
-    PruneOverlay { member: String, overlay_root: PathBuf },
-    /// A stale overlay was found but `--prune` was not passed. The plan
-    /// records it; `apply_plan` prints a warning (never a mutation).
-    WarnStale { member: String, overlay_root: PathBuf },
-}
-
-/// Why a symlink exists — tagged on each [`Op::Symlink`] so `--dry-run`
-/// output reads at a glance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SymlinkKind {
-    Shared,
-    PerSession,
-}
-
-#[derive(Debug)]
-struct Plan {
-    /// Where real `~/.claude/` content is shared from (absolute).
-    source_claude: PathBuf,
-    /// The agents runtime dir (absolute, as computed/overridden).
-    agents_dir: PathBuf,
-    /// Live members, in config order.
-    live_members: Vec<String>,
-    /// Overlay HOMEs found under `agents_dir` that do not belong to a live
-    /// member. Empty under normal operation.
-    stale_overlays: Vec<String>,
-    /// Whether `--prune` was requested — governs how `stale_overlays`
-    /// translate into ops.
-    prune: bool,
-    /// The ordered op stream.
-    ops: Vec<Op>,
-}
-
-/// Walk growlight.toml for the live member list and build the full op plan,
-/// without touching the filesystem. The function READS the agents dir
-/// (`fs::read_dir`) to discover stale overlays, and resolves the top-level
-/// `.credentials.json` target for the PerSession symlink — both read-only.
-fn plan_refresh(
-    claude_paths: &Paths,
-    config_path: &Path,
-    agents_dir: &Path,
-    prune: bool,
-) -> Result<Plan> {
-    let raw = fs::read_to_string(config_path)
-        .with_context(|| format!("read {}", config_path.display()))?;
-    let fleet = FleetConfig::from_growlight_toml(&raw)
-        .map_err(|e| anyhow!("parse {}: {e}", config_path.display()))?;
-    let live_members: Vec<String> = fleet.members.iter().map(|m| m.agent.clone()).collect();
-
-    let source_claude = claude_paths.claude_home.clone();
-
-    // Resolve the per-session target once: the overlay's `.credentials.json`
-    // points at an absolute path under `~/.claude/`. If the top-level is a
-    // managed symlink into `credentials.d/`, resolve against the real home;
-    // if it is a plain file (not yet captured), point at it directly; if it
-    // is missing, we still write a (dangling) symlink to the expected path
-    // so an overlay-rooted `claude auth login` can write through it.
-    let session_target = resolve_session_target(claude_paths)?;
-
-    let mut ops: Vec<Op> = Vec::new();
-
-    for member in &live_members {
-        let overlay_claude = agents_dir.join(member).join("home").join(".claude");
-        ops.push(Op::EnsureOverlayDir {
-            member: member.clone(),
-            overlay_claude: overlay_claude.clone(),
-        });
-
-        for entry in overlay_map() {
-            let dst = overlay_claude.join(entry.name);
-            match entry.class {
-                PathClass::Shared => {
-                    let target = source_claude.join(entry.name);
-                    ops.push(Op::Symlink {
-                        member: member.clone(),
-                        link: dst,
-                        target,
-                        kind: SymlinkKind::Shared,
-                    });
-                }
-                PathClass::PerMemberDir => ops.push(Op::EnsureDir {
-                    member: member.clone(),
-                    path: dst,
-                }),
-                PathClass::PerMemberFile => ops.push(Op::EnsureFile {
-                    member: member.clone(),
-                    path: dst,
-                }),
-                PathClass::PerSession => ops.push(Op::Symlink {
-                    member: member.clone(),
-                    link: dst,
-                    target: session_target.clone(),
-                    kind: SymlinkKind::PerSession,
-                }),
-                PathClass::Ignored => ops.push(Op::SkipIgnored {
-                    member: member.clone(),
-                    name: entry.name.to_string(),
-                }),
-            }
-        }
-    }
-
-    // Scan for stale overlays — a subdir of agents_dir whose name is not a
-    // live member. Fail-closed: an unreadable agents_dir yields an empty
-    // stale list rather than aborting the plan (fresh install, nothing to
-    // prune).
-    let stale_overlays = scan_stale_overlays(agents_dir, &live_members).unwrap_or_default();
-    for member in &stale_overlays {
-        let overlay_root = agents_dir.join(member);
-        if prune {
-            ops.push(Op::PruneOverlay {
-                member: member.clone(),
-                overlay_root,
-            });
-        } else {
-            ops.push(Op::WarnStale {
-                member: member.clone(),
-                overlay_root,
-            });
-        }
-    }
-
-    Ok(Plan {
-        source_claude,
-        agents_dir: agents_dir.to_path_buf(),
-        live_members,
-        stale_overlays,
-        prune,
-        ops,
-    })
-}
-
-/// The target an overlay's `.credentials.json` symlink should point to, as an
-/// absolute path. Follows slice 001's `inspect_top_level` classes:
-/// a managed symlink resolves to `~/.claude/credentials.d/<slot>.json`
-/// (absolute), a plain file resolves to `~/.claude/.credentials.json`, and a
-/// missing/outside-of-store top-level falls back to that same path so an
-/// overlay-rooted login writes to the real `~/.claude/.credentials.json`.
-fn resolve_session_target(paths: &Paths) -> Result<PathBuf> {
-    match inspect_top_level(paths)? {
-        TopLevel::SymlinkIn { slot_name } => Ok(paths.store.join(format!("{slot_name}.json"))),
-        TopLevel::Plain | TopLevel::Missing | TopLevel::SymlinkOut { .. } => {
-            Ok(paths.top_level.clone())
-        }
-    }
-}
-
-/// Direct children of `agents_dir` whose names are not in `live_members`.
-/// A non-dir entry (file, broken symlink) is ignored — the overlay root is
-/// always a dir, so a stray file is user content we don't own.
-fn scan_stale_overlays(agents_dir: &Path, live_members: &[String]) -> Result<Vec<String>> {
-    let dir = match fs::read_dir(agents_dir) {
-        Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", agents_dir.display())),
-    };
-    let live: std::collections::HashSet<&str> =
-        live_members.iter().map(|s| s.as_str()).collect();
-    let mut out = Vec::new();
-    for ent in dir {
-        let ent = ent?;
-        let md = match ent.file_type() {
-            Ok(ft) if ft.is_dir() => ent.metadata().ok(),
-            _ => continue,
-        };
-        if md.is_none() {
-            continue;
-        }
-        let name = match ent.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue, // non-UTF-8 member id can't come from the parser
-        };
-        if !live.contains(name.as_str()) {
-            out.push(name);
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// Execute (or `--dry-run` print) the plan. Writes the plan header + one
-/// line per op to `out`.
-///
-/// In **apply** mode we execute each op FIRST, then write its line, and
-/// swallow a stdout `BrokenPipe` so a user piping through `head` / `less`
-/// (and quitting mid-stream) does not abandon work that is already in
-/// progress. The next refresh is idempotent either way. In **dry-run** mode
-/// a write failure is propagated — there is no fallback behavior to continue.
-fn apply_plan<W: Write>(out: &mut W, plan: &Plan, dry_run: bool) -> Result<()> {
-    let mut output_live = true;
-    let header_result = write_plan_header(out, plan, dry_run);
-    output_live &= handle_write(header_result, dry_run)?;
-
-    for op in &plan.ops {
-        if !dry_run {
-            execute_op(op)?;
-        }
-        if output_live {
-            let r = write_op_line(out, op);
-            output_live &= handle_write(r, dry_run)?;
-        }
-    }
-    Ok(())
-}
-
-/// Return `Ok(true)` if the write succeeded and output is still live,
-/// `Ok(false)` to go silent (apply + `BrokenPipe`), or `Err` otherwise.
-fn handle_write(r: Result<()>, dry_run: bool) -> Result<bool> {
-    match r {
-        Ok(()) => Ok(true),
-        Err(e) if !dry_run && is_broken_pipe(&e) => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// Walk an anyhow error chain for a `BrokenPipe` `io::Error`.
-fn is_broken_pipe(e: &anyhow::Error) -> bool {
-    e.chain()
-        .filter_map(|s| s.downcast_ref::<io::Error>())
-        .any(|ioe| ioe.kind() == io::ErrorKind::BrokenPipe)
-}
-
-fn write_plan_header<W: Write>(out: &mut W, plan: &Plan, dry_run: bool) -> Result<()> {
-    let mode = if dry_run { "dry-run" } else { "apply" };
-    writeln!(
-        out,
-        "claude-login refresh-members ({mode}): {} member(s), source {}",
-        plan.live_members.len(),
-        plan.source_claude.display()
-    )?;
-    writeln!(out, "  agents-dir: {}", plan.agents_dir.display())?;
-    if plan.live_members.is_empty() {
-        writeln!(
-            out,
-            "  (no [[fleet]] members in the config — nothing to materialize)"
-        )?;
-    } else {
-        writeln!(out, "  members: {}", plan.live_members.join(", "))?;
-    }
-    if !plan.stale_overlays.is_empty() {
-        writeln!(
-            out,
-            "  stale overlays: {} ({} --prune)",
-            plan.stale_overlays.join(", "),
-            if plan.prune { "will remove via" } else { "preserved; pass" }
-        )?;
-    }
-    writeln!(out)?;
-    Ok(())
-}
-
-fn write_op_line<W: Write>(out: &mut W, op: &Op) -> Result<()> {
-    match op {
-        Op::EnsureOverlayDir { member, overlay_claude } => {
-            writeln!(out, "  [{member}] overlay-dir   {}", overlay_claude.display())?;
-        }
-        Op::Symlink { member, link, target, kind } => {
-            let tag = match kind {
-                SymlinkKind::Shared => "symlink-sh",
-                SymlinkKind::PerSession => "symlink-sess",
-            };
-            writeln!(out, "  [{member}] {tag}  {} -> {}", link.display(), target.display())?;
-        }
-        Op::EnsureDir { member, path } => {
-            writeln!(out, "  [{member}] ensure-dir    {}", path.display())?;
-        }
-        Op::EnsureFile { member, path } => {
-            writeln!(out, "  [{member}] ensure-file   {}", path.display())?;
-        }
-        Op::SkipIgnored { member, name } => {
-            writeln!(out, "  [{member}] skip-ignored  {name}")?;
-        }
-        Op::PruneOverlay { member, overlay_root } => {
-            writeln!(out, "  [{member}] prune-stale   {}", overlay_root.display())?;
-        }
-        Op::WarnStale { member, overlay_root } => {
-            writeln!(
+    for m in members {
+        match read_pin(&pin_paths(agents_dir, &m)) {
+            Some(p) => writeln!(
                 out,
-                "  [{member}] warn-stale    {} (pass --prune to remove)",
-                overlay_root.display()
-            )?;
+                "  {m}: {} (picked_at={}, session={})",
+                p.profile, p.picked_at, p.session_id
+            )?,
+            None => writeln!(out, "  {m}: unpinned (follows the active slot)")?,
         }
     }
     Ok(())
 }
-
-fn execute_op(op: &Op) -> Result<()> {
-    match op {
-        Op::EnsureOverlayDir { overlay_claude, .. } => {
-            ensure_overlay_claude_dir(overlay_claude)?;
-        }
-        Op::Symlink { link, target, .. } => {
-            ensure_symlink(link, target)?;
-        }
-        Op::EnsureDir { path, .. } => {
-            ensure_per_member_dir(path)?;
-        }
-        Op::EnsureFile { path, .. } => {
-            ensure_per_member_file(path)?;
-        }
-        Op::SkipIgnored { .. } => {}
-        Op::PruneOverlay { overlay_root, .. } => {
-            match fs::remove_dir_all(overlay_root) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("prune stale overlay {}", overlay_root.display())
-                    });
-                }
-            }
-        }
-        Op::WarnStale { .. } => {
-            // The warning is already printed; nothing to execute.
-        }
-    }
-    Ok(())
-}
-
-/// Create the overlay HOME chain `<agents_dir>/<member>/home/.claude/` (0700
-/// on the leaf, matching the real `~/.claude/`). Parent dirs are mkdir -p
-/// without a tightened mode — they live under `$XDG_CONFIG_HOME/softfig/`,
-/// which the growlight runtime already owns, and we don't want to clobber
-/// a mode the owner tightened intentionally.
-fn ensure_overlay_claude_dir(overlay_claude: &Path) -> Result<()> {
-    if let Some(parent) = overlay_claude.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    match fs::symlink_metadata(overlay_claude) {
-        Ok(md) if md.file_type().is_dir() => {
-            let mode = md.permissions().mode() & 0o777;
-            if mode != 0o700 {
-                fs::set_permissions(overlay_claude, fs::Permissions::from_mode(0o700))
-                    .context("chmod 0700 overlay .claude/")?;
-            }
-            Ok(())
-        }
-        Ok(md) => bail!(
-            "{} exists but is not a directory ({:?})",
-            overlay_claude.display(),
-            md.file_type()
-        ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(overlay_claude)
-                .with_context(|| format!("create {}", overlay_claude.display()))?;
-            fs::set_permissions(overlay_claude, fs::Permissions::from_mode(0o700))
-                .context("chmod 0700 overlay .claude/")?;
-            Ok(())
-        }
-        Err(e) => Err(e).with_context(|| format!("stat {}", overlay_claude.display())),
-    }
-}
-
-/// Create or retarget `link -> target` atomically. If `link` is already a
-/// symlink with the identical target, this is a no-op (so a dry-run of a
-/// steady-state system plans the symlink but execute is cheap, and an
-/// idempotent re-run makes no filesystem writes).
-fn ensure_symlink(link: &Path, target: &Path) -> Result<()> {
-    match fs::read_link(link) {
-        Ok(existing) if existing == target => return Ok(()),
-        Ok(_) => {
-            // Different target or non-symlink content at `link` — retarget
-            // via atomic replace below. We allow replacing a plain file here
-            // (growlightd may have retargeted at session start by writing a
-            // placeholder), but only through `atomic_symlink`'s rename, so
-            // this is still crash-safe.
-        }
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-            // `link` exists but is not a symlink — replace it.
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            // Create below.
-        }
-        Err(e) => {
-            return Err(e).with_context(|| format!("read_link {}", link.display()));
-        }
-    }
-    atomic_symlink(target, link)
-}
-
-/// Create a per-member directory if it is missing. Never recursive; the
-/// overlay HOME chain is created by [`ensure_overlay_claude_dir`]. Mode is
-/// `0700` on first create to match the real `~/.claude/`'s sensitive dirs;
-/// existing dirs are preserved as-is (do not clobber a mode the member set).
-fn ensure_per_member_dir(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_dir() => Ok(()),
-        Ok(md) => bail!(
-            "{} exists but is not a directory ({:?})",
-            path.display(),
-            md.file_type()
-        ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path).with_context(|| format!("create {}", path.display()))?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod 0700 {}", path.display()))?;
-            Ok(())
-        }
-        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
-    }
-}
-
-/// Create an empty per-member file if it is missing. Mode `0600`.
-fn ensure_per_member_file(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_file() => Ok(()),
-        Ok(md) => bail!(
-            "{} exists but is not a regular file ({:?})",
-            path.display(),
-            md.file_type()
-        ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(|| format!("create {}", path.display()))?;
-            Ok(())
-        }
-        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
-    }
-}
-
-// ---- tests -----------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
     use tempfile::TempDir;
 
-    const OAUTH1: &str = r#"{"claudeAiOauth":{"subscriptionType":"pro","rateLimitTier":"standard","accountEmail":"a@example.com","accessToken":"x","refreshToken":"y","expiresAt":0,"scopes":[]}}"#;
-    const OAUTH2: &str = r#"{"claudeAiOauth":{"subscriptionType":"pro","rateLimitTier":"standard","accountEmail":"b@example.com","accessToken":"z","refreshToken":"w","expiresAt":0,"scopes":[]}}"#;
+    /// A fake credential bundle. Never a real token.
+    const FAKE_CREDS: &str = r#"{"claudeAiOauth":{"accessToken":"fake-a","refreshToken":"fake-r","expiresAt":0,"scopes":[],"subscriptionType":"pro"}}"#;
 
-    fn setup() -> (TempDir, Paths) {
-        let td = TempDir::new().unwrap();
-        let claude_home = td.path().join(".claude");
-        fs::create_dir_all(&claude_home).unwrap();
-        let paths = Paths::new(&claude_home);
-        (td, paths)
+    /// A tempdir HOME with a "shared" `~/.claude/` and a store under it.
+    struct Fixture {
+        _td: TempDir,
+        home: PathBuf,
+        env: Env,
     }
 
-    fn write_plain_top_level(paths: &Paths, contents: &str) {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&paths.top_level)
-            .unwrap();
-        f.write_all(contents.as_bytes()).unwrap();
+    impl Fixture {
+        fn new() -> Self {
+            let td = TempDir::new().unwrap();
+            let home = td.path().to_path_buf();
+            let env = Env::rooted(&home, home.join(".local/share/softfig/claude-profiles"));
+            fs::create_dir_all(&env.claude_home).unwrap();
+            for f in ["settings.json", "CLAUDE.md", "statusline-command.sh"] {
+                fs::write(env.claude_home.join(f), "x").unwrap();
+            }
+            for d in ["skills", "plugins", "projects", "sessions"] {
+                fs::create_dir(env.claude_home.join(d)).unwrap();
+            }
+            Self { _td: td, home, env }
+        }
+
+        /// Log the home slot in: fake credentials + an account file.
+        fn home_logged_in(&self, account: &Value) {
+            write_new(&self.env.claude_home.join(CREDENTIALS_FILE), FAKE_CREDS.as_bytes(), 0o600)
+                .unwrap();
+            write_new(&self.env.home_account, account.to_string().as_bytes(), 0o600).unwrap();
+        }
+
+        fn slot(&self, name: &str) -> PathBuf {
+            self.env.store.join(name)
+        }
+
+        /// A healthy, logged-in store slot built the supported way.
+        fn add_logged_in(&self, name: &str) -> PathBuf {
+            let dir = add(&self.env, name, Some(HOME_SLOT), &mut Vec::new()).unwrap();
+            write_new(&dir.join(CREDENTIALS_FILE), FAKE_CREDS.as_bytes(), 0o600).unwrap();
+            dir
+        }
+    }
+
+    fn account_fixture() -> Value {
+        serde_json::json!({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "u"},
+            "userID": "deadbeef",
+            "cachedGrowthBookFeatures": {"f": 1},
+            "statsigCache": {"x": 1},
+            "hasCompletedOnboarding": true,
+            "numStartups": 42,
+            "mcpServers": {"softfig-mcp": {"command": "softfig-mcp"}},
+            "projects": {
+                "/w/one": {
+                    "hasTrustDialogAccepted": true,
+                    "allowedTools": ["Bash"],
+                    "mcpServers": {},
+                    "lastCost": 1.5,
+                    "exampleFiles": ["a.rs"]
+                },
+                "/w/two": {"lastSessionId": "s"}
+            }
+        })
+    }
+
+    struct NoClaude;
+    impl ClaudeProcesses for NoClaude {
+        fn live(&self) -> Result<Vec<LiveClaude>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct SomeClaude;
+    impl ClaudeProcesses for SomeClaude {
+        fn live(&self) -> Result<Vec<LiveClaude>> {
+            Ok(vec![LiveClaude { pid: 4242, cmdline: "claude daemon run".into() }])
+        }
+    }
+
+    fn cross_device(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::CrossesDevices))
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    fn names_in(dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // ---- add ----
+
+    #[test]
+    fn add_builds_layout_links_and_perms() {
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let dir = add(&fx.env, "slot2", None, &mut Vec::new()).unwrap();
+
+        assert_eq!(dir, fx.slot("slot2"));
+        assert_eq!(mode_of(&fx.env.store), 0o700);
+        assert_eq!(mode_of(&dir), 0o700);
+        for name in ["settings.json", "CLAUDE.md", "statusline-command.sh", "skills", "plugins", "projects"] {
+            let link = dir.join(name);
+            assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "{name}");
+            assert_eq!(fs::read_link(&link).unwrap(), fx.env.claude_home.join(name), "{name}");
+        }
+        // Shared names with no source are not linked; per-slot names are
+        // Claude's to create; credentials come only from `auth login`.
+        for absent in ["agents", "commands", "keybindings.json", "sessions", CREDENTIALS_FILE] {
+            assert!(lstat(&dir.join(absent)).unwrap().is_none(), "{absent}");
+        }
+        assert_eq!(mode_of(&dir.join(ACCOUNT_FILE)), 0o600);
+        assert_eq!(
+            names_in(&fx.env.store),
+            BTreeSet::from(["slot2".to_string()]),
+            "no staging leftovers",
+        );
     }
 
     #[test]
+    fn add_seeds_exactly_the_allow_list() {
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let dir = add(&fx.env, "slot2", Some(HOME_SLOT), &mut Vec::new()).unwrap();
+        let seeded: Value =
+            serde_json::from_slice(&fs::read(dir.join(ACCOUNT_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            seeded,
+            serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "mcpServers": {"softfig-mcp": {"command": "softfig-mcp"}},
+                "projects": {
+                    "/w/one": {
+                        "hasTrustDialogAccepted": true,
+                        "allowedTools": ["Bash"],
+                        "mcpServers": {}
+                    }
+                }
+            })
+        );
+        let text = fs::read_to_string(dir.join(ACCOUNT_FILE)).unwrap();
+        for leaked in ["oauthAccount", "userID", "cachedGrowthBookFeatures", "statsigCache", "a@example.com"] {
+            assert!(!text.contains(leaked), "{leaked} must not cross slots");
+        }
+    }
+
+    #[test]
+    fn add_with_no_source_account_seeds_nothing() {
+        let fx = Fixture::new();
+        let dir = add(&fx.env, "slot2", None, &mut Vec::new()).unwrap();
+        assert!(lstat(&dir.join(ACCOUNT_FILE)).unwrap().is_none());
+    }
+
+    #[test]
+    fn add_refuses_home_existing_bad_and_missing_source() {
+        let fx = Fixture::new();
+        assert!(add(&fx.env, HOME_SLOT, None, &mut Vec::new()).is_err());
+        assert!(add(&fx.env, "../x", None, &mut Vec::new()).is_err());
+        assert!(add(&fx.env, "x.lock", None, &mut Vec::new()).is_err());
+        assert!(add(&fx.env, "slot3", Some("ghost"), &mut Vec::new()).is_err());
+        add(&fx.env, "slot2", None, &mut Vec::new()).unwrap();
+        let err = add(&fx.env, "slot2", None, &mut Vec::new()).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn add_no_login_never_launches_and_login_runs_in_the_slot() {
+        let fx = Fixture::new();
+        let mut launched: Vec<Command> = Vec::new();
+        let a = AddArgs { slot: "slot2".into(), from: None, no_login: true };
+        add_then_login(&fx.env, &a, &mut Vec::new(), &mut |c| {
+            launched.push(c);
+            Ok(ExitStatus::default())
+        })
+        .unwrap();
+        assert!(launched.is_empty(), "--no-login must not launch claude");
+
+        let a = AddArgs { slot: "slot3".into(), from: None, no_login: false };
+        add_then_login(&fx.env, &a, &mut Vec::new(), &mut |c| {
+            launched.push(c);
+            Ok(ExitStatus::default())
+        })
+        .unwrap();
+        let [c] = &launched[..] else { panic!("one launch") };
+        assert_eq!(c.get_program(), "claude");
+        assert_eq!(c.get_args().collect::<Vec<_>>(), ["auth", "login"]);
+        let envs: Vec<_> = c.get_envs().collect();
+        assert_eq!(envs, [(OsStr::new(CONFIG_DIR_ENV), Some(fx.slot("slot3").as_os_str()))]);
+    }
+
+    // ---- migrate ----
+
+    #[test]
+    fn migrate_moves_not_copies() {
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let creds = fx.env.claude_home.join(CREDENTIALS_FILE);
+        let (creds_ino, account_ino) =
+            (fs::metadata(&creds).unwrap().ino(), fs::metadata(&fx.env.home_account).unwrap().ino());
+
+        migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut Vec::new()).unwrap();
+
+        let dir = fx.slot("slot1");
+        assert!(lstat(&creds).unwrap().is_none(), "source credential is gone");
+        assert!(lstat(&fx.env.home_account).unwrap().is_none(), "source account file is gone");
+        assert_eq!(fs::metadata(dir.join(CREDENTIALS_FILE)).unwrap().ino(), creds_ino);
+        assert_eq!(fs::metadata(dir.join(ACCOUNT_FILE)).unwrap().ino(), account_ino);
+        assert_eq!(fs::read_to_string(dir.join(CREDENTIALS_FILE)).unwrap(), FAKE_CREDS);
+        assert_eq!(fs::read_link(dir.join("projects")).unwrap(), fx.env.claude_home.join("projects"));
+        assert_eq!(read_active(&fx.env.store).unwrap(), "slot1");
+        assert_eq!(names_in(&fx.env.store), BTreeSet::from(["active".into(), "slot1".into()]));
+    }
+
+    #[test]
+    fn migrate_refuses_with_a_live_claude_and_moves_nothing() {
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let err = migrate(&fx.env, "slot1", &SomeClaude, rename_file, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4242") && err.contains("claude daemon run"), "{err}");
+        assert!(fx.env.claude_home.join(CREDENTIALS_FILE).is_file());
+        assert!(fx.env.home_account.is_file());
+        assert!(lstat(&fx.env.store).unwrap().is_none(), "no store, no staging");
+    }
+
+    #[test]
+    fn migrate_refuses_an_existing_slot_home_and_nothing_to_move() {
+        let fx = Fixture::new();
+        let err = migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("no "), "{err}");
+        fx.home_logged_in(&account_fixture());
+        assert!(migrate(&fx.env, HOME_SLOT, &NoClaude, rename_file, &mut Vec::new()).is_err());
+        fs::create_dir_all(fx.slot("slot1")).unwrap();
+        let err = migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(fx.env.claude_home.join(CREDENTIALS_FILE).is_file(), "untouched");
+    }
+
+    #[test]
+    fn migrate_refuses_a_symlinked_credential() {
+        let fx = Fixture::new();
+        fs::write(fx.home.join("elsewhere.json"), FAKE_CREDS).unwrap();
+        symlink(fx.home.join("elsewhere.json"), fx.env.claude_home.join(CREDENTIALS_FILE)).unwrap();
+        let err = migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(lstat(&fx.slot("slot1")).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_resumes_after_an_interruption() {
+        // Interrupted after the credential moved into staging but before the
+        // account file did: the re-run finishes without moving it twice.
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let staging = fx.env.store.join(".migrate-slot1");
+        ensure_dir_mode(&fx.env.store, 0o700).unwrap();
+        ensure_dir_mode(&staging, 0o700).unwrap();
+        fs::rename(fx.env.claude_home.join(CREDENTIALS_FILE), staging.join(CREDENTIALS_FILE)).unwrap();
+
+        let mut out = Vec::new();
+        migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("resumed"), "{out}");
+        assert!(out.contains(".credentials.json: AlreadyThere; .claude.json: Moved"), "{out}");
+        assert!(fx.slot("slot1").join(CREDENTIALS_FILE).is_file());
+        assert!(fx.slot("slot1").join(ACCOUNT_FILE).is_file());
+        assert!(lstat(&staging).unwrap().is_none());
+        assert_eq!(read_active(&fx.env.store).unwrap(), "slot1");
+    }
+
+    #[test]
+    fn migrate_finishes_an_interrupted_copy_and_refuses_diverged_copies() {
+        // Same bytes in both places: an interrupted cross-device move.
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let staging = fx.env.store.join(".migrate-slot1");
+        ensure_dir_mode(&fx.env.store, 0o700).unwrap();
+        ensure_dir_mode(&staging, 0o700).unwrap();
+        write_new(&staging.join(CREDENTIALS_FILE), FAKE_CREDS.as_bytes(), 0o600).unwrap();
+        migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut Vec::new()).unwrap();
+        assert!(lstat(&fx.env.claude_home.join(CREDENTIALS_FILE)).unwrap().is_none());
+        assert_eq!(fs::read_to_string(fx.slot("slot1").join(CREDENTIALS_FILE)).unwrap(), FAKE_CREDS);
+
+        // Different bytes: a login happened after the interruption. Refuse,
+        // and keep both.
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let staging = fx.env.store.join(".migrate-slot1");
+        ensure_dir_mode(&fx.env.store, 0o700).unwrap();
+        ensure_dir_mode(&staging, 0o700).unwrap();
+        write_new(&staging.join(CREDENTIALS_FILE), b"{\"older\":1}", 0o600).unwrap();
+        let err = migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("differ"), "{err}");
+        assert!(fx.env.claude_home.join(CREDENTIALS_FILE).is_file());
+        assert!(staging.join(CREDENTIALS_FILE).is_file());
+        assert!(lstat(&fx.slot("slot1")).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_falls_back_to_copy_across_filesystems_without_leaving_two_copies() {
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        migrate(&fx.env, "slot1", &NoClaude, cross_device, &mut Vec::new()).unwrap();
+        let dir = fx.slot("slot1");
+        assert!(lstat(&fx.env.claude_home.join(CREDENTIALS_FILE)).unwrap().is_none());
+        assert!(lstat(&fx.env.home_account).unwrap().is_none());
+        assert_eq!(fs::read_to_string(dir.join(CREDENTIALS_FILE)).unwrap(), FAKE_CREDS);
+        assert_eq!(mode_of(&dir.join(CREDENTIALS_FILE)), 0o600);
+        assert!(!names_in(&dir).iter().any(|n| n.contains(".tmp.")), "no temp left behind");
+    }
+
+    // ---- use / dir / run ----
+
+    #[test]
+    fn use_swaps_the_pointer_and_dir_active_follows() {
+        let fx = Fixture::new();
+        let dir_active = || {
+            let mut out = Vec::new();
+            dir(&fx.env, &DirArgs { slot: None, active: true }, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(dir_active(), "", "no store yet: home, prints nothing");
+
+        fx.add_logged_in("slot2");
+        use_slot(&fx.env, "slot2", &mut Vec::new()).unwrap();
+        assert_eq!(fs::read_link(fx.env.store.join(ACTIVE_LINK)).unwrap(), Path::new("slot2"));
+        assert_eq!(dir_active(), format!("{}\n", fx.slot("slot2").display()));
+
+        use_slot(&fx.env, HOME_SLOT, &mut Vec::new()).unwrap();
+        assert!(lstat(&fx.env.store.join(ACTIVE_LINK)).unwrap().is_none());
+        assert_eq!(dir_active(), "");
+        assert!(!names_in(&fx.env.store).iter().any(|n| n.contains(".tmp.")));
+    }
+
+    #[test]
+    fn use_and_dir_refuse_a_missing_slot_and_a_broken_pointer() {
+        let fx = Fixture::new();
+        assert!(use_slot(&fx.env, "ghost", &mut Vec::new()).is_err());
+        assert!(dir(&fx.env, &DirArgs { slot: Some("ghost".into()), active: false }, &mut Vec::new()).is_err());
+        ensure_dir_mode(&fx.env.store, 0o700).unwrap();
+        symlink("ghost", fx.env.store.join(ACTIVE_LINK)).unwrap();
+        assert!(dir(&fx.env, &DirArgs { slot: None, active: true }, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn dir_prints_a_slot_or_nothing_for_home() {
+        let fx = Fixture::new();
+        fx.add_logged_in("slot2");
+        let mut out = Vec::new();
+        dir(&fx.env, &DirArgs { slot: Some("slot2".into()), active: false }, &mut out).unwrap();
+        dir(&fx.env, &DirArgs { slot: Some(HOME_SLOT.into()), active: false }, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", fx.slot("slot2").display()));
+    }
+
+    #[test]
+    fn run_sets_only_claude_config_dir_and_never_home() {
+        let fx = Fixture::new();
+        fx.add_logged_in("slot2");
+        let argv = ["claude", "--version"].map(OsString::from);
+        let c = run_command(&fx.env, "slot2", &argv).unwrap();
+        assert_eq!(c.get_program(), "claude");
+        assert_eq!(c.get_args().collect::<Vec<_>>(), ["--version"]);
+        let envs: Vec<_> = c.get_envs().collect();
+        assert_eq!(envs, [(OsStr::new(CONFIG_DIR_ENV), Some(fx.slot("slot2").as_os_str()))]);
+
+        let c = run_command(&fx.env, HOME_SLOT, &[]).unwrap();
+        assert_eq!(c.get_program(), "claude", "argv defaults to claude");
+        let envs: Vec<_> = c.get_envs().collect();
+        assert_eq!(envs, [(OsStr::new(CONFIG_DIR_ENV), None)], "home unsets, never sets HOME");
+
+        assert!(run_command(&fx.env, "ghost", &argv).is_err(), "fails closed on a missing slot");
+    }
+
+    // ---- list ----
+
+    #[test]
+    fn list_shows_each_slot_email_and_the_active_marker() {
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        let dir = fx.add_logged_in("slot2");
+        fs::write(dir.join(ACCOUNT_FILE), r#"{"oauthAccount":{"emailAddress":"b@example.com"}}"#).unwrap();
+        add(&fx.env, "slot3", None, &mut Vec::new()).unwrap();
+        use_slot(&fx.env, "slot2", &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        list(&fx.env, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(
+            lines,
+            ["  home   a@example.com", "* slot2  b@example.com", "  slot3  (logged out)"],
+            "{out}"
+        );
+    }
+
+    // ---- doctor ----
+
+    fn doctor_findings(fx: &Fixture) -> Vec<Finding> {
+        diagnose(&fx.env).unwrap()
+    }
+
+    /// A healthy migrated store: slot1 active, slot2 added from it.
+    fn healthy() -> Fixture {
+        let fx = Fixture::new();
+        fx.home_logged_in(&account_fixture());
+        migrate(&fx.env, "slot1", &NoClaude, rename_file, &mut Vec::new()).unwrap();
+        let d = add(&fx.env, "slot2", None, &mut Vec::new()).unwrap();
+        write_new(&d.join(CREDENTIALS_FILE), FAKE_CREDS.as_bytes(), 0o600).unwrap();
+        fx
+    }
+
+    #[test]
+    fn doctor_is_quiet_on_a_healthy_store() {
+        let fx = healthy();
+        let f = doctor_findings(&fx);
+        assert!(f.is_empty(), "{f:?}");
+        doctor(&fx.env, &mut Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn doctor_flags_a_shared_link_claude_replaced() {
+        let fx = healthy();
+        let link = fx.slot("slot2").join("settings.json");
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "{}").unwrap();
+        assert_eq!(
+            doctor_findings(&fx),
+            [Finding::SharedReplaced { slot: "slot2".into(), name: "settings.json" }]
+        );
+        assert!(doctor(&fx.env, &mut Vec::new()).is_err(), "non-zero exit on a finding");
+    }
+
+    #[test]
+    fn doctor_flags_retargeted_dangling_and_missing_links() {
+        let fx = healthy();
+        let d = fx.slot("slot2");
+        fs::remove_file(d.join("CLAUDE.md")).unwrap();
+        symlink("/elsewhere/CLAUDE.md", d.join("CLAUDE.md")).unwrap();
+        fs::remove_dir(fx.env.claude_home.join("plugins")).unwrap();
+        fs::remove_file(d.join("statusline-command.sh")).unwrap();
+        let f = doctor_findings(&fx);
+        assert!(f.contains(&Finding::SharedRetargeted {
+            slot: "slot2".into(),
+            name: "CLAUDE.md",
+            target: "/elsewhere/CLAUDE.md".into()
+        }), "{f:?}");
+        assert!(f.contains(&Finding::SharedDangling { slot: "slot1".into(), name: "plugins" }), "{f:?}");
+        assert!(f.contains(&Finding::SharedMissing { slot: "slot2".into(), name: "statusline-command.sh" }), "{f:?}");
+    }
+
+    #[test]
+    fn doctor_runtime_inventory_reports_unknown_names() {
+        let fx = healthy();
+        fs::create_dir(fx.env.claude_home.join("brand-new-state")).unwrap();
+        fs::write(fx.slot("slot1").join("mystery.json"), "{}").unwrap();
+        // Known per-slot state Claude creates is not noise.
+        fs::create_dir(fx.slot("slot1").join("sessions")).unwrap();
+        assert_eq!(
+            doctor_findings(&fx),
+            [
+                Finding::UnknownName { place: "~/.claude".into(), name: "brand-new-state".into() },
+                Finding::UnknownName { place: "slot slot1".into(), name: "mystery.json".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_flags_loose_perms() {
+        let fx = healthy();
+        let chmod = |p: PathBuf, m| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        chmod(fx.env.store.clone(), 0o755);
+        chmod(fx.slot("slot2"), 0o750);
+        chmod(fx.slot("slot2").join(CREDENTIALS_FILE), 0o644);
+        chmod(fx.slot("slot1").join(ACCOUNT_FILE), 0o640);
+        let f = doctor_findings(&fx);
+        let loose: BTreeSet<(PathBuf, u32)> = f
+            .iter()
+            .filter_map(|x| match x {
+                Finding::LoosePerms { path, mode, .. } => Some((path.clone(), *mode)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loose,
+            BTreeSet::from([
+                (fx.env.store.clone(), 0o755),
+                (fx.slot("slot2"), 0o750),
+                (fx.slot("slot2").join(CREDENTIALS_FILE), 0o644),
+                (fx.slot("slot1").join(ACCOUNT_FILE), 0o640),
+            ])
+        );
+        assert_eq!(f.len(), 4, "{f:?}");
+    }
+
+    #[test]
+    fn doctor_flags_missing_and_non_regular_credentials() {
+        let fx = healthy();
+        fs::remove_file(fx.slot("slot2").join(CREDENTIALS_FILE)).unwrap();
+        let c1 = fx.slot("slot1").join(CREDENTIALS_FILE);
+        fs::rename(&c1, fx.home.join("moved.json")).unwrap();
+        symlink(fx.home.join("moved.json"), &c1).unwrap();
+        assert_eq!(
+            doctor_findings(&fx),
+            [
+                Finding::CredentialsNotRegular { slot: "slot1".into() },
+                Finding::CredentialsMissing { slot: "slot2".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_reports_home_credentials_only_while_home_is_active() {
+        let fx = Fixture::new();
+        assert_eq!(doctor_findings(&fx), [Finding::CredentialsMissing { slot: HOME_SLOT.into() }]);
+        let fx = healthy();
+        let f = doctor_findings(&fx);
+        assert!(f.is_empty(), "a migrated home has no credentials by design: {f:?}");
+    }
+
+    #[test]
+    fn doctor_reports_account_drift_against_the_active_slot() {
+        let fx = healthy();
+        let p = fx.slot("slot2").join(ACCOUNT_FILE);
+        let mut v: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        v["mcpServers"] = serde_json::json!({"other": {"command": "x"}});
+        v["projects"]["/w/one"]["hasTrustDialogAccepted"] = Value::Bool(false);
+        fs::write(&p, v.to_string()).unwrap();
+        let details: Vec<String> = doctor_findings(&fx)
+            .into_iter()
+            .map(|f| match f {
+                Finding::AccountDrift { slot, active, detail } => {
+                    assert_eq!((slot.as_str(), active.as_str()), ("slot2", "slot1"));
+                    detail
+                }
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            details,
+            [
+                "MCP servers missing here: softfig-mcp",
+                "MCP servers only here: other",
+                "1 project(s) trusted in the active slot but not here (e.g. /w/one)",
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_flags_an_active_pointer_that_does_not_resolve() {
+        let fx = healthy();
+        fs::remove_file(fx.env.store.join(ACTIVE_LINK)).unwrap();
+        symlink("ghost", fx.env.store.join(ACTIVE_LINK)).unwrap();
+        let f = doctor_findings(&fx);
+        assert!(matches!(&f[..], [Finding::ActiveBroken(why)] if why.contains("ghost")), "{f:?}");
+    }
+
+    #[test]
+    fn doctor_flags_stray_store_entries_and_ignores_claude_lock_dirs() {
+        let fx = healthy();
+        fs::create_dir(fx.env.store.join(".migrate-slot3")).unwrap();
+        fs::create_dir(fx.env.store.join(HOME_SLOT)).unwrap();
+        fs::create_dir(fx.env.store.join("slot1.lock")).unwrap();
+        fs::write(fx.env.store.join("notes.txt"), "").unwrap();
+        let strays: Vec<String> = doctor_findings(&fx)
+            .into_iter()
+            .map(|f| match f {
+                Finding::StrayStoreEntry { name, .. } => name,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(strays, [".migrate-slot3", "home", "notes.txt"]);
+    }
+
+    // ---- clap surface ----
+
+    #[derive(clap::Parser, Debug)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: ClaudeLoginCmd,
+    }
+
+    fn parse(args: &[&str]) -> Result<ClaudeLoginCmd, clap::Error> {
+        use clap::Parser;
+        Cli::try_parse_from(std::iter::once("claude-login").chain(args.iter().copied()))
+            .map(|c| c.cmd)
+    }
+
+    #[test]
+    fn dir_takes_exactly_one_of_a_slot_or_active() {
+        assert!(matches!(parse(&["dir", "--active"]), Ok(ClaudeLoginCmd::Dir(DirArgs { slot: None, active: true }))));
+        assert!(matches!(parse(&["dir", "slot2"]), Ok(ClaudeLoginCmd::Dir(DirArgs { slot: Some(_), active: false }))));
+        assert!(parse(&["dir"]).is_err());
+        assert!(parse(&["dir", "slot2", "--active"]).is_err());
+    }
+
+    #[test]
+    fn run_passes_everything_after_the_separator_through() {
+        let Ok(ClaudeLoginCmd::Run(a)) = parse(&["run", "slot2", "--", "claude", "--resume", "-p"]) else {
+            panic!("run should parse");
+        };
+        assert_eq!(a.slot, "slot2");
+        assert_eq!(a.argv, ["claude", "--resume", "-p"].map(OsString::from));
+        let Ok(ClaudeLoginCmd::Run(a)) = parse(&["run", "home"]) else { panic!() };
+        assert!(a.argv.is_empty());
+    }
+
+    // ---- process probe ----
+
+    #[test]
+    fn proc_scan_finds_every_shape_of_claude_but_not_itself() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let proc = |pid: u32, argv: &[&str], exe: Option<&str>| {
+            let d = root.join(pid.to_string());
+            fs::create_dir(&d).unwrap();
+            fs::write(d.join("cmdline"), argv.join("\0") + "\0").unwrap();
+            if let Some(e) = exe {
+                symlink(e, d.join("exe")).unwrap();
+            }
+        };
+        proc(10, &["/home/u/.local/bin/claude", "daemon", "run"], None);
+        proc(11, &["2.1.308", "--resume", "x"], Some("/home/u/.local/share/claude/versions/2.1.308"));
+        proc(12, &["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], None);
+        proc(13, &["bash"], Some("/usr/bin/bash"));
+        proc(14, &["claude"], None);
+        fs::create_dir(root.join("self")).unwrap();
+
+        let uid = fs::metadata(root).unwrap().uid();
+        let scan = ProcScan { root: root.to_path_buf(), own_pid: 14, own_uid: uid };
+        let pids: Vec<u32> = scan.live().unwrap().iter().map(|l| l.pid).collect();
+        assert_eq!(pids, [10, 11, 12]);
+
+        let other_user = ProcScan { root: root.to_path_buf(), own_pid: 0, own_uid: uid + 1 };
+        assert!(other_user.live().unwrap().is_empty(), "another user's claude is not ours");
+        let gone = ProcScan { root: root.join("missing"), own_pid: 0, own_uid: uid };
+        assert!(gone.live().is_err(), "an unreadable procfs fails closed");
+    }
+
+    // ---- status (slice 004 helpers) ----
+
+    #[test]
     fn status_headroom_flag_matches_picker_thresholds() {
-        // (slice 004) The CLI's `(WARN)` / `(STALL)` label must agree with the
-        // picker's own thresholds — the operator reads this and the picker's
-        // next spawn acts on the same numbers, so a label-only drift would be
-        // the worst case.
         use softfig_growlightd::profile_budget::Headroom;
         use softfig_growlightd::profile_pin::{HEADROOM_STALL_PCT, HEADROOM_WARN_PCT};
-        assert_eq!(
-            flag_for_headroom(&Headroom { pct: 100, resets_at: None }),
-            "",
-            "a healthy slot has no annotation",
-        );
-        assert_eq!(
-            flag_for_headroom(&Headroom { pct: HEADROOM_WARN_PCT, resets_at: None }),
-            "",
-            "exactly at the warn threshold is still healthy (the branch is `<`)",
-        );
-        assert_eq!(
-            flag_for_headroom(&Headroom {
-                pct: HEADROOM_WARN_PCT - 1,
-                resets_at: None,
-            }),
-            "   (WARN)",
-        );
-        assert_eq!(
-            flag_for_headroom(&Headroom {
-                pct: HEADROOM_STALL_PCT,
-                resets_at: None,
-            }),
-            "   (STALL)",
-            "at the stall floor is already treated as exhausted",
-        );
-        assert_eq!(
-            flag_for_headroom(&Headroom { pct: 0, resets_at: None }),
-            "   (STALL)",
-        );
+        let flag = |pct| flag_for_headroom(&Headroom { pct, resets_at: None });
+        assert_eq!(flag(100), "");
+        assert_eq!(flag(HEADROOM_WARN_PCT), "", "the warn branch is `<`");
+        assert_eq!(flag(HEADROOM_WARN_PCT - 1), "   (WARN)");
+        assert_eq!(flag(HEADROOM_STALL_PCT), "   (STALL)", "the stall floor is `<=`");
+        assert_eq!(flag(0), "   (STALL)");
     }
 
     #[test]
@@ -1317,462 +2004,20 @@ mod tests {
     }
 
     #[test]
-    fn fresh_install_capture_refused() {
-        let (_td, paths) = setup();
-        let err = capture(&paths, "slot1", false).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("no `"), "unexpected: {msg}");
-    }
-
-    #[test]
-    fn capture_creates_store_slot_and_symlink() {
-        let (_td, paths) = setup();
-        write_plain_top_level(&paths, OAUTH1);
-        capture(&paths, "slot1", false).unwrap();
-
-        // Store dir is 0700.
-        let store_md = fs::metadata(&paths.store).unwrap();
-        assert_eq!(store_md.permissions().mode() & 0o777, 0o700);
-
-        // Slot file is 0600 with the exact captured bytes.
-        let slot = paths.slot("slot1");
-        let slot_md = fs::symlink_metadata(&slot).unwrap();
-        assert!(slot_md.file_type().is_file());
-        assert_eq!(slot_md.permissions().mode() & 0o777, 0o600);
-        assert_eq!(fs::read_to_string(&slot).unwrap(), OAUTH1);
-
-        // Top-level is now a *relative* symlink into the store.
-        let top_md = fs::symlink_metadata(&paths.top_level).unwrap();
-        assert!(top_md.file_type().is_symlink());
+    fn status_renders_headroom_rows_for_home_and_store_slots() {
+        let fx = healthy();
+        let mut out = Vec::new();
+        print_profile_headroom(&fx.env, &fx.home.join("no-samples"), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let rows: Vec<&str> = out.lines().skip(1).collect();
         assert_eq!(
-            fs::read_link(&paths.top_level).unwrap(),
-            PathBuf::from("credentials.d/slot1.json")
+            rows,
+            [
+                "  home   headroom 100%   last-seen never",
+                "  slot1  headroom 100%   last-seen never",
+                "  slot2  headroom 100%   last-seen never",
+            ],
+            "{out}"
         );
-    }
-
-    #[test]
-    fn capture_refuses_overwrite_without_force() {
-        let (_td, paths) = setup();
-        write_plain_top_level(&paths, OAUTH1);
-        capture(&paths, "slot1", false).unwrap();
-
-        // Different live creds; naming the same slot without --force must fail.
-        fs::remove_file(&paths.top_level).unwrap();
-        write_plain_top_level(&paths, OAUTH2);
-        let err = capture(&paths, "slot1", false).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("already exists"),
-            "unexpected: {err:#}"
-        );
-
-        // With --force it succeeds and the slot is updated.
-        capture(&paths, "slot1", true).unwrap();
-        assert_eq!(fs::read_to_string(paths.slot("slot1")).unwrap(), OAUTH2);
-    }
-
-    #[test]
-    fn capture_idempotent_when_bytes_match() {
-        let (_td, paths) = setup();
-        write_plain_top_level(&paths, OAUTH1);
-        capture(&paths, "slot1", false).unwrap();
-        // Second call reads the same bytes through the symlink → identical → OK.
-        capture(&paths, "slot1", false).unwrap();
-    }
-
-    #[test]
-    fn capture_refuses_non_oauth() {
-        let (_td, paths) = setup();
-        write_plain_top_level(&paths, r#"{"apiKey":"sk-ant-xxx"}"#);
-        let err = capture(&paths, "slot1", false).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("API-key"),
-            "unexpected: {err:#}"
-        );
-    }
-
-    #[test]
-    fn use_requires_existing_slot() {
-        let (_td, paths) = setup();
-        let err = use_slot(&paths, "nope").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("does not exist"),
-            "unexpected: {err:#}"
-        );
-    }
-
-    #[test]
-    fn use_refuses_plain_top_level_before_capture() {
-        let (_td, paths) = setup();
-        ensure_store_dir(&paths).unwrap();
-        atomic_write_mode(&paths.slot("slot1"), OAUTH1.as_bytes(), 0o600).unwrap();
-        write_plain_top_level(&paths, OAUTH1);
-
-        let err = use_slot(&paths, "slot1").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("regular file"), "unexpected: {msg}");
-        assert!(msg.contains("capture"), "should guide to capture: {msg}");
-    }
-
-    #[test]
-    fn use_retargets_symlink_and_is_idempotent() {
-        let (_td, paths) = setup();
-        write_plain_top_level(&paths, OAUTH1);
-        capture(&paths, "slot1", false).unwrap();
-        atomic_write_mode(&paths.slot("slot2"), OAUTH2.as_bytes(), 0o600).unwrap();
-
-        // Retarget to slot2.
-        use_slot(&paths, "slot2").unwrap();
-        assert_eq!(
-            fs::read_link(&paths.top_level).unwrap(),
-            PathBuf::from("credentials.d/slot2.json")
-        );
-        // Repeat use `slot2` — must be idempotent (link unchanged).
-        use_slot(&paths, "slot2").unwrap();
-        assert_eq!(
-            fs::read_link(&paths.top_level).unwrap(),
-            PathBuf::from("credentials.d/slot2.json")
-        );
-        // Flip back.
-        use_slot(&paths, "slot1").unwrap();
-        assert_eq!(
-            fs::read_link(&paths.top_level).unwrap(),
-            PathBuf::from("credentials.d/slot1.json")
-        );
-    }
-
-    #[test]
-    fn slot_mode_preserved_across_rewrites() {
-        let (_td, paths) = setup();
-        write_plain_top_level(&paths, OAUTH1);
-        capture(&paths, "slot1", false).unwrap();
-        // Rewrite with --force; mode must stay 0600.
-        capture(&paths, "slot1", true).unwrap();
-        let md = fs::symlink_metadata(paths.slot("slot1")).unwrap();
-        assert_eq!(md.permissions().mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    fn ensure_store_dir_tightens_loose_mode() {
-        let (_td, paths) = setup();
-        fs::create_dir(&paths.store).unwrap();
-        fs::set_permissions(&paths.store, fs::Permissions::from_mode(0o755)).unwrap();
-        ensure_store_dir(&paths).unwrap();
-        let md = fs::metadata(&paths.store).unwrap();
-        assert_eq!(md.permissions().mode() & 0o777, 0o700);
-    }
-
-    #[test]
-    fn validate_slot_name_rules() {
-        assert!(validate_slot_name("").is_err());
-        assert!(validate_slot_name("/bad").is_err());
-        assert!(validate_slot_name("..").is_err());
-        assert!(validate_slot_name(".leading").is_err());
-        assert!(validate_slot_name("has space").is_err());
-        assert!(validate_slot_name("has\nnewline").is_err());
-        assert!(validate_slot_name(&"x".repeat(65)).is_err());
-
-        assert!(validate_slot_name("good").is_ok());
-        assert!(validate_slot_name("slot1").is_ok());
-        assert!(validate_slot_name("my.slot_1-a").is_ok());
-    }
-
-    #[test]
-    fn inspect_top_level_classifies_variants() {
-        let (_td, paths) = setup();
-        assert!(matches!(inspect_top_level(&paths).unwrap(), TopLevel::Missing));
-
-        write_plain_top_level(&paths, OAUTH1);
-        assert!(matches!(inspect_top_level(&paths).unwrap(), TopLevel::Plain));
-
-        // Symlink-in.
-        fs::remove_file(&paths.top_level).unwrap();
-        ensure_store_dir(&paths).unwrap();
-        atomic_write_mode(&paths.slot("slot1"), OAUTH1.as_bytes(), 0o600).unwrap();
-        atomic_symlink(
-            &PathBuf::from("credentials.d/slot1.json"),
-            &paths.top_level,
-        )
-        .unwrap();
-        match inspect_top_level(&paths).unwrap() {
-            TopLevel::SymlinkIn { slot_name } => assert_eq!(slot_name, "slot1"),
-            other => panic!("expected SymlinkIn, got {other:?}"),
-        }
-
-        // Symlink-out (absolute target → not in store).
-        fs::remove_file(&paths.top_level).unwrap();
-        atomic_symlink(Path::new("/dev/null"), &paths.top_level).unwrap();
-        assert!(matches!(
-            inspect_top_level(&paths).unwrap(),
-            TopLevel::SymlinkOut { .. }
-        ));
-    }
-
-    // ---- refresh-members tests ---------------------------------------------
-
-    /// A `growlight.toml` with the two live members slice 002's finish check
-    /// names (`a` and `d`). `fleet_enabled` stays `true` so the parser builds
-    /// a non-disabled config; the overlay builder itself doesn't read the
-    /// gate.
-    const FLEET_TOML: &str = r#"
-fleet_enabled = true
-[[fleet]]
-agent = "a"
-pin = "default"
-
-[[fleet]]
-agent = "d"
-pin = "remote-runner"
-"#;
-
-    /// Shape of a fake `~/.claude/` with every top-level name the inventory
-    /// test covers. Dirs vs files chosen to match the real device.
-    fn make_fake_claude_home(claude_home: &Path) {
-        fs::create_dir_all(claude_home).unwrap();
-        for d in &[
-            "plugins",
-            "skills",
-            "shell-snapshots",
-            "backups",
-            "projects",
-            "cache",
-            "sessions",
-            "tasks",
-            "telemetry",
-            "jobs",
-            "paste-cache",
-            "file-history",
-            "session-env",
-            "state",
-            "plans",
-            "daemon",
-            "chrome",
-            "downloads",
-        ] {
-            fs::create_dir_all(claude_home.join(d)).unwrap();
-        }
-        for f in &[
-            "settings.json",
-            "settings.local.json",
-            "statusline-command.sh",
-            ".last-cleanup",
-            ".last-update-result.json",
-            "CLAUDE.md",
-            "history.jsonl",
-            "stats-cache.json",
-            "daemon.lock",
-            "daemon.log",
-            "daemon.status.json",
-            ".credentials.json",
-        ] {
-            fs::write(claude_home.join(f), b"").unwrap();
-        }
-    }
-
-    fn write_toml(dir: &Path) -> PathBuf {
-        let p = dir.join("growlight.toml");
-        fs::write(&p, FLEET_TOML).unwrap();
-        p
-    }
-
-    fn refresh(claude_home: &Path, config: &Path, agents_dir: &Path, prune: bool) -> Plan {
-        let paths = Paths::new(claude_home);
-        let plan = plan_refresh(&paths, config, agents_dir, prune).unwrap();
-        let mut sink: Vec<u8> = Vec::new();
-        apply_plan(&mut sink, &plan, false).unwrap();
-        plan
-    }
-
-    #[test]
-    fn refresh_builds_overlay_for_both_members() {
-        let td = TempDir::new().unwrap();
-        let claude_home = td.path().join(".claude");
-        make_fake_claude_home(&claude_home);
-        let config = write_toml(td.path());
-        let agents_dir = td.path().join("agents");
-
-        let plan = refresh(&claude_home, &config, &agents_dir, false);
-        assert_eq!(plan.live_members, vec!["a".to_string(), "d".to_string()]);
-        for m in &["a", "d"] {
-            let overlay = agents_dir.join(m).join("home").join(".claude");
-            assert!(overlay.is_dir(), "overlay dir missing for {m}");
-
-            // Shared symlink shape.
-            let settings = overlay.join("settings.json");
-            let md = fs::symlink_metadata(&settings).unwrap();
-            assert!(md.file_type().is_symlink());
-            assert_eq!(fs::read_link(&settings).unwrap(), claude_home.join("settings.json"));
-
-            // Per-member dir created, 0700.
-            let projects = overlay.join("projects");
-            let pmd = fs::symlink_metadata(&projects).unwrap();
-            assert!(pmd.file_type().is_dir());
-            assert_eq!(pmd.permissions().mode() & 0o777, 0o700);
-
-            // Per-member file created, 0600.
-            let hist = overlay.join("history.jsonl");
-            let hmd = fs::symlink_metadata(&hist).unwrap();
-            assert!(hmd.file_type().is_file());
-            assert_eq!(hmd.permissions().mode() & 0o777, 0o600);
-
-            // Per-session symlink points at the real top-level fallback.
-            let cred = overlay.join(".credentials.json");
-            let cmd_md = fs::symlink_metadata(&cred).unwrap();
-            assert!(cmd_md.file_type().is_symlink());
-            assert_eq!(
-                fs::read_link(&cred).unwrap(),
-                claude_home.join(".credentials.json")
-            );
-
-            // Ignored names never materialize.
-            assert!(!overlay.join("chrome").exists());
-            assert!(!overlay.join("downloads").exists());
-        }
-
-        // Overlay HOME is 0700.
-        let overlay_a = agents_dir.join("a").join("home").join(".claude");
-        let md = fs::symlink_metadata(&overlay_a).unwrap();
-        assert_eq!(md.permissions().mode() & 0o777, 0o700);
-    }
-
-    #[test]
-    fn refresh_dry_run_touches_nothing() {
-        let td = TempDir::new().unwrap();
-        let claude_home = td.path().join(".claude");
-        make_fake_claude_home(&claude_home);
-        let config = write_toml(td.path());
-        let agents_dir = td.path().join("agents");
-
-        let paths = Paths::new(&claude_home);
-        let plan = plan_refresh(&paths, &config, &agents_dir, false).unwrap();
-        let mut sink: Vec<u8> = Vec::new();
-        apply_plan(&mut sink, &plan, /*dry_run*/ true).unwrap();
-
-        // Not even the top-level agents_dir exists.
-        assert!(!agents_dir.exists(), "dry-run must not create agents_dir");
-        // Output names the mode + at least one plan op.
-        let s = String::from_utf8(sink).unwrap();
-        assert!(s.contains("(dry-run)"), "output: {s}");
-        assert!(s.contains("overlay-dir"), "output: {s}");
-    }
-
-    #[test]
-    fn refresh_is_idempotent_and_preserves_mutable_content() {
-        let td = TempDir::new().unwrap();
-        let claude_home = td.path().join(".claude");
-        make_fake_claude_home(&claude_home);
-        let config = write_toml(td.path());
-        let agents_dir = td.path().join("agents");
-
-        refresh(&claude_home, &config, &agents_dir, false);
-
-        // Write a sentinel into a per-member dir.
-        let overlay_a_projects = agents_dir.join("a").join("home").join(".claude").join("projects");
-        fs::write(overlay_a_projects.join("my-project.sentinel"), b"keep me").unwrap();
-
-        // Capture every post-refresh path's inode so a second refresh can be
-        // proven to not relink the symlinks either.
-        fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
-            let mut out = std::collections::BTreeMap::new();
-            fn walk(root: &Path, acc: &mut std::collections::BTreeMap<PathBuf, (u64, u64)>) {
-                for ent in fs::read_dir(root).unwrap().flatten() {
-                    let p = ent.path();
-                    let md = fs::symlink_metadata(&p).unwrap();
-                    use std::os::unix::fs::MetadataExt;
-                    acc.insert(p.clone(), (md.ino(), md.dev()));
-                    if md.file_type().is_dir() {
-                        walk(&p, acc);
-                    }
-                }
-            }
-            walk(root, &mut out);
-            out
-        }
-        let before = snapshot(&agents_dir);
-
-        refresh(&claude_home, &config, &agents_dir, false);
-
-        let after = snapshot(&agents_dir);
-        assert_eq!(before, after, "refresh is not idempotent");
-
-        // Sentinel still there.
-        assert_eq!(
-            fs::read_to_string(overlay_a_projects.join("my-project.sentinel")).unwrap(),
-            "keep me"
-        );
-    }
-
-    #[test]
-    fn refresh_retargets_session_symlink_to_managed_slot() {
-        let td = TempDir::new().unwrap();
-        let claude_home = td.path().join(".claude");
-        make_fake_claude_home(&claude_home);
-        // Replace the plain `.credentials.json` with slice 001's managed form:
-        // `credentials.d/slot1.json` + a symlink into it.
-        fs::remove_file(claude_home.join(".credentials.json")).unwrap();
-        let paths = Paths::new(&claude_home);
-        ensure_store_dir(&paths).unwrap();
-        atomic_write_mode(&paths.slot("slot1"), OAUTH1.as_bytes(), 0o600).unwrap();
-        atomic_symlink(
-            &PathBuf::from("credentials.d/slot1.json"),
-            &paths.top_level,
-        )
-        .unwrap();
-
-        let config = write_toml(td.path());
-        let agents_dir = td.path().join("agents");
-        refresh(&claude_home, &config, &agents_dir, false);
-
-        // Overlay's `.credentials.json` resolves to the ABSOLUTE slot path.
-        let cred = agents_dir.join("a").join("home").join(".claude").join(".credentials.json");
-        assert_eq!(
-            fs::read_link(&cred).unwrap(),
-            claude_home.join("credentials.d").join("slot1.json")
-        );
-    }
-
-    #[test]
-    fn refresh_without_prune_warns_but_keeps_stale_overlay() {
-        let td = TempDir::new().unwrap();
-        let claude_home = td.path().join(".claude");
-        make_fake_claude_home(&claude_home);
-        let config = write_toml(td.path());
-        let agents_dir = td.path().join("agents");
-
-        // Pre-seed a stale overlay for a retired member `x` with mutable
-        // content that must survive a refresh.
-        let stale_overlay = agents_dir.join("x").join("home").join(".claude").join("projects");
-        fs::create_dir_all(&stale_overlay).unwrap();
-        fs::write(stale_overlay.join("preserved.sentinel"), b"keep").unwrap();
-
-        let paths = Paths::new(&claude_home);
-        let plan = plan_refresh(&paths, &config, &agents_dir, false).unwrap();
-        assert_eq!(plan.stale_overlays, vec!["x".to_string()]);
-        let mut sink: Vec<u8> = Vec::new();
-        apply_plan(&mut sink, &plan, false).unwrap();
-        let s = String::from_utf8(sink).unwrap();
-        assert!(s.contains("warn-stale"), "output: {s}");
-
-        // Stale overlay still intact.
-        assert!(stale_overlay.join("preserved.sentinel").exists());
-    }
-
-    #[test]
-    fn refresh_with_prune_removes_stale_overlay() {
-        let td = TempDir::new().unwrap();
-        let claude_home = td.path().join(".claude");
-        make_fake_claude_home(&claude_home);
-        let config = write_toml(td.path());
-        let agents_dir = td.path().join("agents");
-
-        let stale_root = agents_dir.join("x");
-        fs::create_dir_all(stale_root.join("home").join(".claude").join("projects")).unwrap();
-        fs::write(
-            stale_root.join("home").join(".claude").join("projects").join("gone.sentinel"),
-            b"gone",
-        )
-        .unwrap();
-
-        refresh(&claude_home, &config, &agents_dir, /*prune*/ true);
-        assert!(!stale_root.exists(), "--prune should have removed {}", stale_root.display());
     }
 }

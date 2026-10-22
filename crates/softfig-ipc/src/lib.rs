@@ -10,6 +10,7 @@
 
 pub mod backlog_doc;
 pub mod baton;
+pub mod claude_profiles;
 pub mod client;
 pub mod fleet;
 pub mod growlightd;

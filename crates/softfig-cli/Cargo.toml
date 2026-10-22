@@ -17,10 +17,12 @@ softfig-store.workspace = true
 softfig-vcs.workspace = true
 softfig-ipc.workspace = true
 softfig-growlightd-client.workspace = true
-# claude-login-switcher slice 002: reuse the growlight.toml `[[fleet]]` parser
-# (FleetConfig::from_growlight_toml) rather than reimplementing it here. The
-# growlightd crate stays lean (serde/toml/thiserror/anyhow/clap/signal-hook/
-# libc/rusqlite — no tokio), so this is one edge, not a transitive bloom.
+# claude-login-switcher: `claude-login status` reads the budget-aware picker's
+# per-profile samples, pins and runtime dir through growlightd's own functions
+# (profile_budget, profile_pin, fleet::runtime_growlight_dir) rather than
+# re-deriving them. The growlightd crate stays lean (serde/toml/thiserror/
+# anyhow/clap/signal-hook/libc/rusqlite — no tokio), so this is one edge, not
+# a transitive bloom.
 softfig-growlightd.workspace = true
 softfig-onboard.workspace = true
 softfig-deploy.workspace = true
@@ -40,6 +42,6 @@ zeroize.workspace = true
 # as the binary sends them — the same fixture shape keeperd's own e2e suite
 # uses. Dev-only — the CLI's command code talks to keeperd over IPC only.
 softfig-keeperd.workspace = true
-# claude-login-switcher slice 001: isolate the HOME-rooted filesystem tests in
-# a temp directory. Dev-only — prod uses hand-rolled sibling tempfiles.
+# claude-login-switcher: isolate the HOME-rooted filesystem tests in a temp
+# directory. Dev-only — prod uses hand-rolled sibling tempfiles.
 tempfile.workspace = true

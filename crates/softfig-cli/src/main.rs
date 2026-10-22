@@ -14,7 +14,7 @@ mod cmd_shared_subtree;
 mod cmd_vault;
 mod growlight_backend;
 mod opencode_catalog;
-mod overlay_map;
+mod slot_layout;
 
 #[derive(Parser, Debug)]
 #[command(name = "softfig", version, about = "soft-fig: garden tool", long_about = None)]
@@ -86,8 +86,9 @@ enum Cmd {
     #[command(subcommand)]
     Growlight(cmd_growlight::GrowlightCmd),
 
-    /// Two-account Anthropic login switcher for Claude Code: a profile store
-    /// under `~/.claude/credentials.d/` plus a retargetable top-level symlink.
+    /// Two-account Anthropic login switcher for Claude Code: each slot is a
+    /// real `CLAUDE_CONFIG_DIR` in the profile store
+    /// (`~/.local/share/softfig/claude-profiles/`); `home` is the default.
     #[command(name = "claude-login", subcommand)]
     ClaudeLogin(cmd_claude_login::ClaudeLoginCmd),
 }
