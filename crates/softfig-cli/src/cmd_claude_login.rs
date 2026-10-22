@@ -305,24 +305,14 @@ fn read_slots(paths: &Paths) -> Result<Vec<SlotInfo>> {
     Ok(out)
 }
 
-/// Slot-name charset: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
-/// Rejects anything with a path separator or leading-dot (so `..` and
-/// `/etc/passwd` both fail), which is also what the symlink-reader uses to
-/// decide whether a top-level symlink names a well-formed slot.
+/// Slot-name validation, delegated to [`softfig_ipc::validate_slot_name`] so
+/// the fleet config parser (slice 003) and this CLI read ONE shape rule. The
+/// charset is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`: a path separator, leading
+/// dot (`..` / `.hidden`) and whitespace all fail, which is also what the
+/// symlink-reader uses to decide whether a top-level symlink names a
+/// well-formed slot.
 fn validate_slot_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 64 {
-        bail!("slot name length must be 1..=64 bytes (got {})", name.len());
-    }
-    let bytes = name.as_bytes();
-    if !bytes[0].is_ascii_alphanumeric() {
-        bail!("slot name must start with [A-Za-z0-9]");
-    }
-    for &b in bytes {
-        if !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
-            bail!("slot name may only contain [A-Za-z0-9._-]");
-        }
-    }
-    Ok(())
+    softfig_ipc::validate_slot_name(name).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn ensure_store_dir(paths: &Paths) -> Result<()> {
@@ -631,8 +621,79 @@ fn login(paths: &Paths, name: &str) -> Result<()> {
 fn status(paths: &Paths) -> Result<()> {
     list(paths)?;
     println!();
-    println!("(per-member pins: not yet; see slice 003)");
+    println!("per-member profile pins:");
+    print_member_pins(&agents_runtime_dir())?;
     Ok(())
+}
+
+/// Walk the agents runtime dir and print each member's active profile pin,
+/// if any. A member with no pin reads as `unpinned (shared top-level)` —
+/// the pre-slice-003 posture, and what a claude member with no
+/// `profile_pool` always shows.
+fn print_member_pins(agents_dir: &Path) -> Result<()> {
+    let Ok(rd) = fs::read_dir(agents_dir) else {
+        println!("  (no per-member pins — agents dir {} is empty)", agents_dir.display());
+        return Ok(());
+    };
+    let mut rows: Vec<(String, Option<ProfilePinRow>)> = Vec::new();
+    for ent in rd.flatten() {
+        let ft = match ent.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let member = ent.file_name().to_string_lossy().into_owned();
+        let pin_path = ent.path().join("profile.pin.json");
+        let row = read_profile_pin_row(&pin_path);
+        rows.push((member, row));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if rows.is_empty() {
+        println!("  (no members have overlay HOMEs — run `softfig claude-login refresh-members`)");
+        return Ok(());
+    }
+    for (member, row) in rows {
+        match row {
+            Some(r) => println!("  {member}: {} (picked_at={}, session={})", r.profile, r.picked_at, r.session_id),
+            None => println!("  {member}: unpinned (shared top-level)"),
+        }
+    }
+    Ok(())
+}
+
+/// A minimal view of `profile.pin.json` the CLI parses — the fields the
+/// human reader cares about. Matches `profile_pin::ProfilePin` on the wire,
+/// but the CLI doesn't depend on softfig-growlightd (the pin layout is
+/// documented alongside the slice), so this is a tiny local decode.
+#[derive(Debug, serde::Deserialize)]
+struct ProfilePinRow {
+    profile: String,
+    picked_at: i64,
+    session_id: String,
+}
+
+fn read_profile_pin_row(path: &Path) -> Option<ProfilePinRow> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The agents runtime dir the fleet writes pins into. Mirrors
+/// `softfig_growlightd::fleet::runtime_agents_dir`, resolved here from
+/// `XDG_CONFIG_HOME` + `HOME` so this CLI stays independent of growlightd's
+/// internal path.
+fn agents_runtime_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".config")
+        });
+    base.join("softfig").join("growlight").join("agents")
 }
 
 // ---- refresh-members -------------------------------------------------------

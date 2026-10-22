@@ -20,6 +20,7 @@ pub mod model_choice;
 pub mod opencode;
 pub mod proto;
 pub mod queue_v2;
+pub mod slot_name;
 pub mod socket;
 pub mod testing;
 pub mod usage;
@@ -37,6 +38,7 @@ pub use model_choice::{
     resolve_item_models, validate_declared_subset, validate_model_change,
 };
 pub use proto::{ErrorKind, Request, Response};
+pub use slot_name::{validate_slot_name, SlotNameError};
 pub use queue_v2::{
     sub_depth, ArchivedEntry, Entry, EntryKind, EntryStatus, FinalStatus, Lane, Project,
     QueueArchiveToml, QueueRefusal, QueueToml, QueueV2Error, SliceItem, SliceKind, SliceStatus,

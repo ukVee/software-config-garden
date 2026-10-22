@@ -141,6 +141,17 @@ impl BackendHandle {
         }
     }
 
+    /// `agent`'s active claude-login profile slot on this backend, or [`None`]
+    /// (opencode has no profile concept; a claude member with no `profile_pool`
+    /// or whose pin is unreadable also answers `None`). Reads the on-disk pin
+    /// (claude-login-switcher slice 003).
+    fn active_profile(&self, agent: &str) -> Option<String> {
+        match self {
+            Self::Claude(b) => b.active_profile(agent),
+            Self::Opencode(_) => None,
+        }
+    }
+
     /// `agent`'s accumulated metered spend on this backend, or [`None`] when this
     /// backend is not metered.
     ///
@@ -252,6 +263,16 @@ impl BackendRouter {
     /// the unrouted case cannot reach a render.
     pub fn spend(&self, agent: &str) -> Option<AgentSpend> {
         self.backend_for(agent).and_then(|b| b.spend(agent))
+    }
+
+    /// `agent`'s active claude-login profile slot, or [`None`] when none is
+    /// pinned (opencode member, claude member with no `profile_pool`, or the
+    /// pin file is unreadable). Reads the on-disk pin — pointer, not a cache,
+    /// so the display always matches the pick the last spawn made (slice 003
+    /// finish-check 5). An unrouted agent is `None` for the same fail-closed
+    /// reason the other read seams here answer `None`.
+    pub fn active_profile(&self, agent: &str) -> Option<String> {
+        self.backend_for(agent).and_then(|b| b.active_profile(agent))
     }
 }
 

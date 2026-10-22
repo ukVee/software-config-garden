@@ -393,19 +393,32 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
         model: Option<&crate::opencode_backend::ModelSelection>,
     ) -> Vec<OsString>;
 
-    /// Extra environment variables this spawn's child needs, given the paths its
-    /// pre-approval just wrote. Applied on top of growlightd's own environment,
-    /// which the child inherits.
+    /// Extra environment variables this spawn's child needs, given the agent
+    /// being launched and the paths its pre-approval just wrote. Applied on
+    /// top of growlightd's own environment, which the child inherits.
     ///
     /// `systemd-run --scope` runs the command as its **own child** in the new
     /// scope (unlike `--service`, which goes through PID 1), so the environment
     /// and working directory set here reach the real process.
     ///
-    /// claude returns none — it carries its whole config on argv
-    /// (`--settings`/`--mcp-config`). opencode has no such flags: its single
-    /// generated config is named by `OPENCODE_CONFIG`, so for it this is as
-    /// load-bearing as the pre-approval it points at.
-    fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)>;
+    /// claude returned nothing before `claude-login-switcher` slice 003 — it
+    /// carries its whole per-agent config on argv (`--settings`/`--mcp-config`).
+    /// It now RETARGETS the member's overlay `~/.claude/.credentials.json`
+    /// symlink to the picked profile slot and sets `HOME` to that overlay root
+    /// when (and only when) the member declares a `profile_pool`.
+    /// opencode has no such flags: its single generated config is named by
+    /// `OPENCODE_CONFIG`, so for it this is as load-bearing as the pre-approval
+    /// it points at.
+    ///
+    /// `Err` fails the spawn closed (e.g. a profile pin retarget whose source
+    /// slot is missing). A member whose pin cannot be laid down must not
+    /// silently fall back to the top-level credential — that is the exact
+    /// hazard the switcher removes.
+    fn child_env(
+        &self,
+        agent: &str,
+        paths: &AgentPaths,
+    ) -> Result<Vec<(OsString, OsString)>, SpawnError>;
 
     /// The directory the child runs in, or `None` to inherit growlightd's own.
     /// Constant per backend, so it takes no per-spawn input.
@@ -908,7 +921,7 @@ impl Harness {
         // are ordinary in-project reads. Applied to the `systemd-run` process,
         // which `--scope` runs the real command as a direct child of, so both
         // reach it.
-        for (key, value) in self.flavor.child_env(&paths) {
+        for (key, value) in self.flavor.child_env(&spec.agent, &paths)? {
             cmd.env(key, value);
         }
         if let Some(dir) = self.flavor.working_dir() {

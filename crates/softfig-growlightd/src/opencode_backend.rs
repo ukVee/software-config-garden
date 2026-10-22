@@ -741,11 +741,15 @@ impl BackendFlavor for OpencodeFlavor {
         )
     }
 
-    fn child_env(&self, paths: &AgentPaths) -> Vec<(OsString, OsString)> {
-        vec![(
+    fn child_env(
+        &self,
+        _agent: &str,
+        paths: &AgentPaths,
+    ) -> Result<Vec<(OsString, OsString)>, crate::supervisor::SpawnError> {
+        Ok(vec![(
             OPENCODE_CONFIG_ENV.into(),
             paths.opencode_config.clone().into_os_string(),
-        )]
+        )])
     }
 
     fn working_dir(&self) -> Option<PathBuf> {
@@ -1679,7 +1683,7 @@ mod tests {
         // OPENCODE_CONFIG names THIS member's generated file — opencode's analog of
         // claude's `--settings`, and an env var rather than a flag, which is why
         // the harness seam carries an env at all.
-        let env = f.child_env(&paths);
+        let env = f.child_env("a1", &paths).expect("opencode child_env never fails");
         assert_eq!(env.len(), 1, "one variable, nothing incidental: {env:?}");
         assert_eq!(env[0].0, OsString::from("OPENCODE_CONFIG"));
         assert_eq!(env[0].1, paths.opencode_config.clone().into_os_string());

@@ -45,6 +45,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
@@ -817,6 +818,33 @@ fn claude_command_argv(
 
 /// Claude's [`BackendFlavor`]: the three things the shared harness cannot know —
 /// the argv, the fail-closed pre-approval, and the stream-json per-line fold.
+/// The per-member claude-login profile machinery handed to [`ClaudeFlavor`]
+/// (claude-login-switcher slice 003). An empty `pools` map ⇒ nothing to do:
+/// every member runs on today's semantics (shared top-level credential, real
+/// `$HOME`).
+#[derive(Debug, Clone, Default)]
+pub struct ProfileContext {
+    /// `$XDG_CONFIG_HOME/softfig/growlight/agents` — the parent of each
+    /// member's overlay HOME `<agents_dir>/<id>/home/`.
+    pub agents_dir: PathBuf,
+    /// Real `~/.claude`, which holds the stored profile slots at
+    /// `credentials.d/<slot>.json`. The retarget points the overlay symlink
+    /// here, so each profile is read from the one on-disk copy (never a
+    /// per-member bundle — operator trust is in one place).
+    pub claude_home: PathBuf,
+    /// Per-member profile pool, in config order. Keyed by agent id; a member
+    /// not present ⇒ no pool, which the flavor treats as the pre-slice-003
+    /// semantics.
+    pub pools: BTreeMap<String, Vec<String>>,
+}
+
+impl ProfileContext {
+    /// `true` ⇒ nothing to do on any spawn (byte-identical to pre-slice-003).
+    fn is_disabled(&self) -> bool {
+        self.pools.is_empty()
+    }
+}
+
 #[derive(Debug)]
 struct ClaudeFlavor {
     bin: String,
@@ -827,6 +855,17 @@ struct ClaudeFlavor {
     /// session never errors out on a missing allow-rule. Generation failure ⇒ no
     /// spawn (a `SpawnError`).
     preapproval: PreApproval,
+    /// Per-member profile pools + the symlink retarget machinery (slice 003).
+    /// Set once by [`ClaudeBackend::with_profiles`] from the fleet assembly;
+    /// an unset or [`ProfileContext::is_disabled`] context ⇒ byte-identical
+    /// to pre-slice-003 (today's semantics, no overlay).
+    profiles: OnceLock<ProfileContext>,
+    /// Monotonic per-spawn counter stamped into the profile pin's `session_id`
+    /// so audit history can tell successive spawns apart within one process
+    /// (the harness has its own `scope_gen`, but it is not reachable from the
+    /// flavor seam). The counter is best-effort — pin history reads it only
+    /// for human-visible ordering, never for admission decisions.
+    spawn_gen: AtomicU64,
     /// Per-agent budget cells (latest best-effort shared-pool reserve), keyed by
     /// agent id; the drive loop folds these into its [`crate::usage::UsageAggregator`]
     /// via [`budget`](ClaudeBackend::budget). Re-spawn replaces the cell — the same
@@ -937,11 +976,110 @@ impl BackendFlavor for ClaudeFlavor {
         )
     }
 
-    fn child_env(&self, _paths: &AgentPaths) -> Vec<(OsString, OsString)> {
-        // Nothing: claude carries its whole per-agent config on argv
-        // (`--settings` + `--mcp-config`), so the spawn's environment is
-        // growlightd's own, exactly as before the seam existed.
-        Vec::new()
+    fn child_env(
+        &self,
+        agent: &str,
+        _paths: &AgentPaths,
+    ) -> Result<Vec<(OsString, OsString)>, SpawnError> {
+        // No pools configured ⇒ byte-identical to the pre-slice-003 spawn:
+        // the harness-inherited `$HOME` + the top-level credential symlink
+        // under the human's real `~/.claude`.
+        let Some(profiles) = self.profiles.get() else {
+            return Ok(Vec::new());
+        };
+        if profiles.is_disabled() {
+            return Ok(Vec::new());
+        }
+        let Some(pool) = profiles.pools.get(agent) else {
+            // The member has no profile_pool declared — share today's
+            // top-level credential. Mirror of the whole-flavor-disabled case
+            // for a member in a MIXED roster.
+            return Ok(Vec::new());
+        };
+        // Pick the slot least-recently used across the pool, write the pin,
+        // and retarget the member's overlay credential symlink to it. Any
+        // step failure fails the spawn closed: a member that cannot land on
+        // its intended profile must not silently fall back to the shared
+        // top-level credential, which is the exact hazard the switcher
+        // exists to remove.
+        let pin_paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
+        let history = crate::profile_pin::read_pin_history(&pin_paths);
+        let Some(slot) = crate::profile_pin::pick_round_robin(pool, &history) else {
+            return Err(SpawnError(format!(
+                "agent {agent:?} declares profile_pool but the pool resolved to \
+                 no pickable slot — refuse rather than fall back to the shared \
+                 top-level credential"
+            )));
+        };
+        let slot = slot.to_string();
+
+        // The overlay HOME layout (slice 002's refresh-members shape):
+        //   <agents_dir>/<id>/home/.claude/.credentials.json → symlink into
+        //   <claude_home>/credentials.d/<slot>.json
+        let overlay_home = profiles.agents_dir.join(agent).join("home");
+        let overlay_claude = overlay_home.join(".claude");
+        let overlay_cred = overlay_claude.join(".credentials.json");
+        let source_cred = profiles
+            .claude_home
+            .join(crate::fleet::CREDENTIALS_D)
+            .join(format!("{slot}.json"));
+        if !source_cred.exists() {
+            return Err(SpawnError(format!(
+                "agent {agent:?} profile slot {slot:?}: source credential \
+                 {} is missing — run `softfig claude-login capture` / `login` \
+                 and `softfig claude-login refresh-members` first",
+                source_cred.display()
+            )));
+        }
+        if let Err(e) = std::fs::create_dir_all(&overlay_claude) {
+            return Err(SpawnError(format!(
+                "agent {agent:?}: cannot create overlay HOME {}: {e}",
+                overlay_claude.display()
+            )));
+        }
+        // Unlink any prior pin's symlink (ignore ENOENT), then symlink the
+        // picked slot. The baton authorizes "unlink + symlink" directly: no
+        // other writer touches this per-member overlay file, so no race.
+        match std::fs::remove_file(&overlay_cred) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SpawnError(format!(
+                    "agent {agent:?}: cannot replace overlay credential {}: {e}",
+                    overlay_cred.display()
+                )));
+            }
+        }
+        if let Err(e) = std::os::unix::fs::symlink(&source_cred, &overlay_cred) {
+            return Err(SpawnError(format!(
+                "agent {agent:?}: cannot symlink overlay credential {} → {}: {e}",
+                overlay_cred.display(),
+                source_cred.display()
+            )));
+        }
+        // Write the pin AFTER the retarget (slice-003 FC 3: a crash in spawn
+        // leaves no stale pin). The pin names the generation suffix as its
+        // session_id — unique per spawn, matches the scope unit the harness
+        // builds.
+        let generation = self
+            .spawn_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session_id = format!("spawn-{generation}");
+        let pin = crate::profile_pin::ProfilePin::now(&slot, session_id, None);
+        if let Err(e) = crate::profile_pin::write_pin(&pin_paths, &pin) {
+            return Err(SpawnError(format!(
+                "agent {agent:?}: cannot write profile pin {}: {e}",
+                pin_paths.pin.display()
+            )));
+        }
+
+        // The child inherits every other env var; only HOME is retargeted so
+        // claude's own `~/.claude/.credentials.json` lookup lands on the
+        // picked slot.
+        Ok(vec![(
+            OsString::from("HOME"),
+            overlay_home.into_os_string(),
+        )])
     }
 
     fn working_dir(&self) -> Option<PathBuf> {
@@ -1014,6 +1152,8 @@ impl ClaudeBackend {
             prompt: prompt.into(),
             hub,
             preapproval,
+            profiles: OnceLock::new(),
+            spawn_gen: AtomicU64::new(0),
             budgets: Mutex::new(BTreeMap::new()),
             stream_errs: Mutex::new(BTreeMap::new()),
             usage_capture: OnceLock::new(),
@@ -1038,6 +1178,32 @@ impl ClaudeBackend {
     pub fn with_usage_capture(self, capture: Arc<UsageCapture>) -> Self {
         let _ = self.flavor.usage_capture.set(capture);
         self
+    }
+
+    /// Install the claude-login profile machinery (claude-login-switcher slice
+    /// 003). An empty [`ProfileContext`] disables rotation on every spawn
+    /// (every member runs on today's shared top-level credential, byte-identical
+    /// to pre-slice-003). A non-empty context installs an overlay HOME + a
+    /// per-spawn credential retarget for the members it names, and leaves the
+    /// unnamed members on today's semantics. One-shot like
+    /// [`Self::with_usage_capture`] (set once at construction).
+    pub fn with_profiles(self, profiles: ProfileContext) -> Self {
+        let _ = self.flavor.profiles.set(profiles);
+        self
+    }
+
+    /// `agent`'s active profile slot, from the on-disk pin written by the last
+    /// spawn — or `None` if the member has no pool, has never spawned on one,
+    /// or its pin is unreadable. Reads [`crate::profile_pin::read_pin`] on
+    /// every call; the status surface uses this to render the active slot
+    /// name in the agent row (slice 003 finish-check 5).
+    pub fn active_profile(&self, agent: &str) -> Option<String> {
+        let profiles = self.flavor.profiles.get()?;
+        if !profiles.pools.contains_key(agent) {
+            return None;
+        }
+        let paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
+        crate::profile_pin::read_pin(&paths).map(|p| p.profile)
     }
 
     /// `agent`'s current health (heartbeat-or-exit), or `None` if this backend
