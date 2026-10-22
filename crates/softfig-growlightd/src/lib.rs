@@ -47,6 +47,7 @@ pub mod preapproval;
 pub mod profile_budget;
 pub mod profile_pin;
 pub mod queue_source;
+pub mod rate_limit_holds;
 pub mod reconcile;
 pub mod resume;
 pub mod scheduler;
