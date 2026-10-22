@@ -57,6 +57,14 @@ pub struct UsageSnapshot {
     pub rate_limits: RateLimits,
     /// When this reading was taken, unix seconds (the statusline tee's `ts`).
     pub ts: f64,
+    /// The claude-login profile slot the reading was taken under, when known
+    /// (`claude-login-switcher` slice 004 — the budget-aware picker buckets by
+    /// this). Additive and defaulted: the top-level `usage.json` reflects
+    /// whichever member last recorded, so this field names that member's slot
+    /// rather than being authoritative for the pool; a per-profile file
+    /// (`usage.by-profile/<slot>.json`) names its own slot definitively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// The writing session's context window.

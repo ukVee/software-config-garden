@@ -873,6 +873,12 @@ fn claude_profile_context(
         agents_dir: agents_dir.to_path_buf(),
         claude_home: claude_dir(),
         pools,
+        // Per-profile tees land under
+        // `$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/` (slice 004),
+        // a sibling of the shared `usage.json` the task-048 tee writes. Both
+        // files ride ONE grant root (the runtime pillar), so a member's
+        // permission floor already covers them.
+        by_profile_dir: Some(runtime_growlight_dir().join(BY_PROFILE_SUBDIR)),
     }
 }
 
@@ -1006,6 +1012,12 @@ const FLEET_PROTOCOL_FILE: &str = "protocol-fleet.md";
 /// the `--auto` governor, the human) reads. Named here rather than inline so the
 /// writer and `softfig growlight start`'s statusline tee cannot drift apart.
 const USAGE_FILE: &str = "usage.json";
+
+/// Where per-profile budget samples live under the runtime pillar
+/// (`<pillar>/usage.by-profile/<slot>.json`) — claude-login-switcher slice 004.
+/// The dir sits next to [`USAGE_FILE`] so a member's permission floor covers
+/// both without a new grant.
+const BY_PROFILE_SUBDIR: &str = "usage.by-profile";
 
 /// The garden path to the fleet-member protocol the SessionStart hook injects.
 /// Pure + named so the fleet/single-agent split is a tested choice, not an inline

@@ -32,8 +32,12 @@
 //! - The **reader** is used both for the per-member credential retarget (in
 //!   claude_backend's spawn seam) and for the status surfaces (growlightd
 //!   `status` + `softfig claude-login status`).
-//! - Budget awareness is slice 004, not here: the picker owns the
-//!   round-robin policy; budget-aware fallback is a future layer.
+//! - **Budget awareness** is slice 004: [`pick_with_budget`] wraps the pure
+//!   round-robin picker with a per-slot headroom sort, returning
+//!   [`PickResult::Chose`] / [`PickResult::Warn`] / [`PickResult::Stall`]
+//!   depending on where the pool sits versus [`HEADROOM_WARN_PCT`] and
+//!   [`HEADROOM_STALL_PCT`]. The round-robin stays the LRU tiebreak on an
+//!   equal-headroom tier, so a healthy pool still rotates.
 
 use std::fs;
 use std::io::Write;
@@ -42,6 +46,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::profile_budget::Headroom;
 
 /// One pick's record — written when a member starts a session on a claude
 /// profile pool. Small by design (~a dozen bytes of overhead); the fields are
@@ -216,7 +222,130 @@ pub fn pick_round_robin<'a>(pool: &'a [String], history: &[ProfilePin]) -> Optio
     best.map(|(idx, _)| pool[idx].as_str())
 }
 
-fn now_unix() -> i64 {
+/// Headroom (%) below which the budget-aware picker still proceeds but emits a
+/// warning (slice 004 pick rule: `warn` at `< 10%`).
+pub const HEADROOM_WARN_PCT: u8 = 10;
+
+/// Headroom (%) at or below which a slot is "effectively exhausted" and must
+/// not be chosen; if the whole pool is at or below this floor, the picker
+/// returns [`PickResult::Stall`] (slice 004 pick rule: stall at `< 2%` across
+/// every pool slot). A slot sitting exactly on the floor is treated as
+/// exhausted so a `rejected` reading maps there cleanly (headroom 0).
+pub const HEADROOM_STALL_PCT: u8 = 2;
+
+/// Result of a budget-aware pick ([`pick_with_budget`]). The caller — the
+/// `ClaudeFlavor` spawn seam — maps `Chose` → unchanged spawn, `Warn` → the
+/// same spawn with a journalled warning, `Stall` → a `SpawnError` that the
+/// drive loop surfaces as a human-visible hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickResult {
+    /// A healthy pick: `slot` has `>= HEADROOM_WARN_PCT` headroom. Spawn as
+    /// usual (`headroom_pct` carried for status surfaces).
+    Chose {
+        /// The slot picked.
+        slot: String,
+        /// Current 5h headroom of the chosen slot (`0..=100`).
+        headroom_pct: u8,
+    },
+    /// A low-headroom pick: `slot` is below [`HEADROOM_WARN_PCT`] but above
+    /// the stall floor; the spawn proceeds and the caller journals a warning
+    /// so the operator can see the fleet about to exhaust.
+    Warn {
+        /// The slot picked (the best available).
+        slot: String,
+        /// Current 5h headroom of the chosen slot (`0..=100`).
+        headroom_pct: u8,
+    },
+    /// Every pool slot sits at or below [`HEADROOM_STALL_PCT`]: the member
+    /// stalls until the earliest known `resets_at`, which the drive loop uses
+    /// as the retry pin. `None` when no slot carried a boundary (the picker
+    /// has nothing to pin, so admission falls back to its own age bound).
+    Stall {
+        /// Earliest 5h-window reset time across the stalled pool, unix
+        /// seconds — or `None` when no slot carries one.
+        until_at: Option<i64>,
+    },
+}
+
+/// Budget-aware pick: prefer the slot with the highest headroom, breaking a
+/// tie by [`pick_round_robin`] (LRU over the pin history). Pure over its
+/// inputs — `pool`, `history`, and `headroom` (one entry per `pool` slot in
+/// pool order, as [`crate::profile_budget::pool_headroom`] returns it).
+///
+/// Returns `None` when `pool` is empty; a `profile_pool = []` is refused at
+/// parse (see `fleet::validate_profile_pool_shape`), so a production caller
+/// never reaches that branch — expressed with `Option` anyway so the error
+/// path stays proof-sound.
+///
+/// Policy:
+///
+/// 1. If every slot has `pct <= HEADROOM_STALL_PCT` ⇒ [`PickResult::Stall`]
+///    pinned to the earliest known `resets_at`.
+/// 2. Otherwise pick from the slots at the highest `pct` tier, breaking the
+///    tie by LRU. A pool where both slots are at `100%` (unused or stale)
+///    then still rotates round-robin, which matches slice 003's rule.
+/// 3. If the winner's `pct` is below [`HEADROOM_WARN_PCT`] ⇒
+///    [`PickResult::Warn`]; otherwise ⇒ [`PickResult::Chose`].
+pub fn pick_with_budget(
+    pool: &[String],
+    history: &[ProfilePin],
+    headroom: &[Headroom],
+) -> Option<PickResult> {
+    if pool.is_empty() {
+        return None;
+    }
+    debug_assert_eq!(
+        pool.len(),
+        headroom.len(),
+        "pick_with_budget: one Headroom per pool slot",
+    );
+    // Stall gate first — all effectively exhausted (`pct <=` the floor).
+    if headroom
+        .iter()
+        .all(|h| h.pct <= HEADROOM_STALL_PCT)
+    {
+        let until_at = headroom.iter().filter_map(|h| h.resets_at).min();
+        return Some(PickResult::Stall { until_at });
+    }
+    // Highest headroom among the slots that are not themselves stalled;
+    // ignore stalled slots for the max so a single-rejected slot doesn't win
+    // on its (lower) `resets_at` tie.
+    let max_pct = headroom
+        .iter()
+        .filter(|h| h.pct > HEADROOM_STALL_PCT)
+        .map(|h| h.pct)
+        .max()
+        .unwrap_or(100);
+    // Narrow the pool + history to the top tier, then LRU over that subset.
+    let tier: Vec<String> = pool
+        .iter()
+        .zip(headroom.iter())
+        .filter(|(_, h)| h.pct == max_pct)
+        .map(|(name, _)| name.clone())
+        .collect();
+    // `tier` is non-empty: `max_pct` came from a slot above the stall floor,
+    // which exists because the stall gate above would have returned Stall.
+    let chosen = pick_round_robin(&tier, history)
+        .map(str::to_string)
+        .unwrap_or_else(|| tier[0].clone());
+    if max_pct < HEADROOM_WARN_PCT {
+        Some(PickResult::Warn {
+            slot: chosen,
+            headroom_pct: max_pct,
+        })
+    } else {
+        Some(PickResult::Chose {
+            slot: chosen,
+            headroom_pct: max_pct,
+        })
+    }
+}
+
+/// Unix seconds since epoch, saturating to `0` if the host clock predates it
+/// (which would be a system misconfig the picker should not panic over).
+/// `pub(crate)` so the spawn seam's budget-aware pick can use the same clock
+/// here reads the pin history from.
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -358,6 +487,131 @@ mod tests {
 
         assert_eq!(first, "slot1");
         assert_eq!(second, "slot2");
+    }
+
+    // --- pick_with_budget (slice 004) ----------------------------------------
+
+    fn hr(pct: u8, resets_at: Option<i64>) -> Headroom {
+        Headroom { pct, resets_at }
+    }
+
+    #[test]
+    fn pick_with_budget_healthy_pool_rotates_lru_at_full_headroom() {
+        // Both slots at 100% (unused / stale / reset) ⇒ LRU wins the tie.
+        // Mirrors slice 003's rotation rule when the budget signal is quiet.
+        let pool = vec!["slot1".to_string(), "slot2".into()];
+        let headroom = vec![hr(100, None), hr(100, None)];
+        assert_eq!(
+            pick_with_budget(&pool, &[], &headroom),
+            Some(PickResult::Chose {
+                slot: "slot1".into(),
+                headroom_pct: 100,
+            }),
+        );
+        // After one pick on slot1, the next lands on slot2.
+        let hist = vec![pin("slot1", 10)];
+        assert_eq!(
+            pick_with_budget(&pool, &hist, &headroom),
+            Some(PickResult::Chose {
+                slot: "slot2".into(),
+                headroom_pct: 100,
+            }),
+        );
+    }
+
+    #[test]
+    fn pick_with_budget_higher_headroom_beats_lru() {
+        // slot1 is older (LRU-preferred) but has 20% headroom; slot2 is
+        // fresher but 100%. Highest-headroom wins — exactly the slice 004
+        // policy "pick the profile with highest headroom".
+        let pool = vec!["slot1".to_string(), "slot2".into()];
+        let hist = vec![pin("slot2", 50), pin("slot1", 10)]; // slot1 oldest
+        let headroom = vec![hr(20, Some(2_000)), hr(100, Some(9_000))];
+        assert_eq!(
+            pick_with_budget(&pool, &hist, &headroom),
+            Some(PickResult::Chose {
+                slot: "slot2".into(),
+                headroom_pct: 100,
+            }),
+        );
+    }
+
+    #[test]
+    fn pick_with_budget_warn_branch_below_ten_percent() {
+        // Every slot below 10% ⇒ pick highest, still proceed, but it's a
+        // Warn — slice spec: "If chosen headroom < 10%, emit `warn` to the
+        // baton-log but still proceed."
+        let pool = vec!["slot1".to_string(), "slot2".into()];
+        let headroom = vec![hr(5, Some(2_000)), hr(7, Some(9_000))];
+        assert_eq!(
+            pick_with_budget(&pool, &[], &headroom),
+            Some(PickResult::Warn {
+                slot: "slot2".into(),
+                headroom_pct: 7,
+            }),
+        );
+    }
+
+    #[test]
+    fn pick_with_budget_stall_branch_when_all_exhausted() {
+        // Both slots at 0% headroom ⇒ Stall at the earliest reset_at
+        // (slice spec: "schedule a retry at the earliest `resets_at`").
+        let pool = vec!["slot1".to_string(), "slot2".into()];
+        let headroom = vec![hr(0, Some(2_000)), hr(0, Some(9_000))];
+        assert_eq!(
+            pick_with_budget(&pool, &[], &headroom),
+            Some(PickResult::Stall {
+                until_at: Some(2_000),
+            }),
+        );
+    }
+
+    #[test]
+    fn pick_with_budget_stall_floor_is_inclusive() {
+        // The stall floor is HEADROOM_STALL_PCT; a slot sitting exactly there
+        // is treated as exhausted, so a pool at 2%/2% stalls.
+        let pool = vec!["slot1".to_string(), "slot2".into()];
+        let headroom = vec![
+            hr(HEADROOM_STALL_PCT, Some(2_000)),
+            hr(HEADROOM_STALL_PCT, Some(9_000)),
+        ];
+        assert!(matches!(
+            pick_with_budget(&pool, &[], &headroom),
+            Some(PickResult::Stall { .. }),
+        ));
+    }
+
+    #[test]
+    fn pick_with_budget_skips_an_exhausted_sibling() {
+        // slot1 is rejected (0%), slot2 is healthy (100%) ⇒ pick slot2 even
+        // though slot1 is LRU-preferred. The fallback path when one 5h
+        // window exhausts and the other is still live.
+        let pool = vec!["slot1".to_string(), "slot2".into()];
+        let hist = vec![pin("slot2", 50)]; // slot1 is LRU
+        let headroom = vec![hr(0, Some(2_000)), hr(100, Some(9_000))];
+        assert_eq!(
+            pick_with_budget(&pool, &hist, &headroom),
+            Some(PickResult::Chose {
+                slot: "slot2".into(),
+                headroom_pct: 100,
+            }),
+        );
+    }
+
+    #[test]
+    fn pick_with_budget_stall_with_no_known_resets() {
+        // Pool fully exhausted but no boundary known ⇒ Stall { None }.
+        let pool = vec!["slot1".to_string(), "slot2".into()];
+        let headroom = vec![hr(0, None), hr(0, None)];
+        assert_eq!(
+            pick_with_budget(&pool, &[], &headroom),
+            Some(PickResult::Stall { until_at: None }),
+        );
+    }
+
+    #[test]
+    fn pick_with_budget_empty_pool_is_none() {
+        assert_eq!(pick_with_budget(&[], &[], &[]), None);
     }
 
     #[test]

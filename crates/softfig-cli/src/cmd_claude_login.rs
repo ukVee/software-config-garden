@@ -621,9 +621,107 @@ fn login(paths: &Paths, name: &str) -> Result<()> {
 fn status(paths: &Paths) -> Result<()> {
     list(paths)?;
     println!();
+    print_profile_headroom(paths)?;
+    println!();
     println!("per-member profile pins:");
     print_member_pins(&agents_runtime_dir())?;
     Ok(())
+}
+
+/// Per-slot 5h headroom from the budget-aware picker's samples
+/// (claude-login-switcher slice 004). Each per-profile file lives at
+/// `$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/<slot>.json`, written
+/// by the fleet member reader thread when a `rate_limit_event` arrives. The
+/// headroom read here is pure over the stored snapshot — the same
+/// [`softfig_growlightd::profile_budget::headroom_from`] the picker calls — so
+/// what the CLI prints is exactly what the next spawn's pick will see.
+fn print_profile_headroom(paths: &Paths) -> Result<()> {
+    use softfig_growlightd::profile_budget::{headroom_from, read_profile_budget};
+
+    println!("budget headroom (5h window, from usage.by-profile/):");
+    let slots = read_slots(paths)?;
+    if slots.is_empty() {
+        println!("  (no slots to score — run `softfig claude-login capture <name>` first)");
+        return Ok(());
+    }
+    let by_profile_dir = by_profile_runtime_dir();
+    let now = unix_now_seconds();
+    for s in &slots {
+        let snap = read_profile_budget(&by_profile_dir, &s.name);
+        let hr = headroom_from(snap.as_ref(), now);
+        let last_seen = snap
+            .as_ref()
+            .map(|snap| format_age(now, snap.ts as i64))
+            .unwrap_or_else(|| "never".to_string());
+        let flag = flag_for_headroom(&hr);
+        println!(
+            "  {name}  headroom {pct:>3}%   last-seen {last_seen}{flag}",
+            name = s.name,
+            pct = hr.pct,
+            last_seen = last_seen,
+            flag = flag,
+        );
+    }
+    Ok(())
+}
+
+/// `(WARN)` when the headroom is below the picker's warn threshold, `(STALL)`
+/// when at or below the stall floor; empty otherwise. Mirrors the thresholds
+/// [`softfig_growlightd::profile_pin::HEADROOM_WARN_PCT`] /
+/// [`softfig_growlightd::profile_pin::HEADROOM_STALL_PCT`] so the CLI's label
+/// never drifts from what the picker actually does.
+fn flag_for_headroom(hr: &softfig_growlightd::profile_budget::Headroom) -> &'static str {
+    use softfig_growlightd::profile_pin::{HEADROOM_STALL_PCT, HEADROOM_WARN_PCT};
+    if hr.pct <= HEADROOM_STALL_PCT {
+        "   (STALL)"
+    } else if hr.pct < HEADROOM_WARN_PCT {
+        "   (WARN)"
+    } else {
+        ""
+    }
+}
+
+/// Format a timestamp's age as a short human-readable string, or `never` when
+/// the reading is unix epoch (default-constructed), which the picker treats as
+/// "no reading" too.
+fn format_age(now: i64, ts: i64) -> String {
+    if ts <= 0 {
+        return "never".into();
+    }
+    let secs = now.saturating_sub(ts).max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Where the budget-aware picker reads per-profile samples from, mirroring
+/// `softfig_growlightd::fleet::runtime_growlight_dir()/usage.by-profile`.
+fn by_profile_runtime_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".config")
+        });
+    base.join("softfig").join("growlight").join("usage.by-profile")
+}
+
+/// Wall-clock unix seconds, saturating to `0` on a clock predating the epoch.
+fn unix_now_seconds() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Walk the agents runtime dir and print each member's active profile pin,
@@ -1167,6 +1265,55 @@ mod tests {
             .open(&paths.top_level)
             .unwrap();
         f.write_all(contents.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn status_headroom_flag_matches_picker_thresholds() {
+        // (slice 004) The CLI's `(WARN)` / `(STALL)` label must agree with the
+        // picker's own thresholds — the operator reads this and the picker's
+        // next spawn acts on the same numbers, so a label-only drift would be
+        // the worst case.
+        use softfig_growlightd::profile_budget::Headroom;
+        use softfig_growlightd::profile_pin::{HEADROOM_STALL_PCT, HEADROOM_WARN_PCT};
+        assert_eq!(
+            flag_for_headroom(&Headroom { pct: 100, resets_at: None }),
+            "",
+            "a healthy slot has no annotation",
+        );
+        assert_eq!(
+            flag_for_headroom(&Headroom { pct: HEADROOM_WARN_PCT, resets_at: None }),
+            "",
+            "exactly at the warn threshold is still healthy (the branch is `<`)",
+        );
+        assert_eq!(
+            flag_for_headroom(&Headroom {
+                pct: HEADROOM_WARN_PCT - 1,
+                resets_at: None,
+            }),
+            "   (WARN)",
+        );
+        assert_eq!(
+            flag_for_headroom(&Headroom {
+                pct: HEADROOM_STALL_PCT,
+                resets_at: None,
+            }),
+            "   (STALL)",
+            "at the stall floor is already treated as exhausted",
+        );
+        assert_eq!(
+            flag_for_headroom(&Headroom { pct: 0, resets_at: None }),
+            "   (STALL)",
+        );
+    }
+
+    #[test]
+    fn status_last_seen_formats_match_each_time_bucket() {
+        assert_eq!(format_age(1_000, 0), "never");
+        assert_eq!(format_age(1_000, -5), "never");
+        assert_eq!(format_age(1_030, 1_000), "30s ago");
+        assert_eq!(format_age(1_000 + 90, 1_000), "1m ago");
+        assert_eq!(format_age(1_000 + 3 * 3_600, 1_000), "3h ago");
+        assert_eq!(format_age(1_000 + 2 * 86_400, 1_000), "2d ago");
     }
 
     #[test]

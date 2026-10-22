@@ -620,12 +620,15 @@ fn reserve_from_result(ev: &Value) -> Option<(BudgetUsage, [bool; 2])> {
 ///
 /// Publishes each content block as an [`Event::AgentDelta`] on `hub`, folds each
 /// `rate_limit_event` line's account-wide reserve status into `budget` (the
-/// reliable headless §7 source) and tees the raw reading to the runtime
-/// `usage.json` (task 048), records the terminal `result` line's context
-/// gauge (+ its opportunistic `rate_limits` reserve) and token cost into `rate`,
-/// and latches the last in-band stream error into `stream_err` (task 070). Pure
-/// over its cells: a test drives it through [`pump`] with a scripted fixture +
-/// fake clock, no real spawn.
+/// reliable headless §7 source) and tees the raw reading to BOTH the runtime
+/// `usage.json` (task 048) and this spawn's per-profile file at
+/// `usage.by-profile/<slot>.json` when the member is pinned
+/// (claude-login-switcher slice 004) — the two files always see the same reading
+/// because they fold through this one call. Records the terminal `result` line's
+/// context gauge (+ its opportunistic `rate_limits` reserve) and token cost into
+/// `rate`, and latches the last in-band stream error into `stream_err`
+/// (task 070). Pure over its cells: a test drives it through [`pump`] with a
+/// scripted fixture + fake clock, no real spawn.
 #[allow(clippy::too_many_arguments)]
 fn observe_claude_line(
     line: &str,
@@ -635,6 +638,8 @@ fn observe_claude_line(
     budget: &AgentBudgetState,
     rate: &AgentRateState,
     usage: &UsageCapture,
+    per_profile_usage: &UsageCapture,
+    profile: Option<&str>,
     stream_err: &AgentStreamErrState,
 ) {
     // A `rate_limit_event` reports this agent's reading of the shared
@@ -652,10 +657,13 @@ fn observe_claude_line(
             reopen: reading.resets_at.unwrap_or(at + RATE_LIMIT_FALLBACK_HOLD_SECS),
         });
         budget.record_window(window, pct, trip, reading.resets_at);
-        // Tee the SAME reading to the runtime `usage.json` (task 048): a headless
-        // member has no statusline, so without this the file everyone else reads
-        // fossilizes at the human's last interactive session.
-        usage.record(window, reading, at);
+        // Tee the SAME reading to the runtime `usage.json` (task 048) AND to this
+        // spawn's per-profile file (slice 004) — a headless member has no
+        // statusline, so without the shared tee the file every reader downstream
+        // acts on fossilizes at the human's last interactive session, and without
+        // the per-profile tee a two-slot pool shares one unparseable file.
+        usage.record(window, reading.clone(), at, profile);
+        per_profile_usage.record(window, reading, at, profile);
     }
     for (kind, text) in deltas_for_line(line) {
         hub.publish(Event::agent_delta(agent, kind, text));
@@ -703,6 +711,18 @@ struct ClaudeSpawnObserver {
     budget: Arc<AgentBudgetState>,
     rate: Arc<AgentRateState>,
     usage: Arc<UsageCapture>,
+    /// This spawn's per-profile tee (claude-login-switcher slice 004).
+    /// A [`UsageCapture`] pointed at
+    /// `$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/<slot>.json`
+    /// when the member is pinned, otherwise a disabled capture (writes
+    /// nothing). Frozen for the spawn's lifetime: the slot is locked at
+    /// spawn boundary (slice 003 FC 7), so the file this tee writes never
+    /// changes mid-session.
+    per_profile_usage: Arc<UsageCapture>,
+    /// The slot this spawn is pinned to, when any — stamped onto both captures'
+    /// snapshots as `profile`. `None` for a member without a `profile_pool`
+    /// (today's semantics).
+    profile_name: Option<String>,
     /// This spawn's latched stdout stream-error cell (task 070) — replaced on
     /// every re-roll like `budget`, so the drive loop reads the CURRENT
     /// generation's last in-band error.
@@ -719,6 +739,8 @@ impl LineObserver for ClaudeSpawnObserver {
             &self.budget,
             &self.rate,
             &self.usage,
+            &self.per_profile_usage,
+            self.profile_name.as_deref(),
             &self.stream_err,
         );
     }
@@ -739,6 +761,8 @@ struct ClaudeBorrowedObserver<'a> {
     budget: &'a AgentBudgetState,
     rate: &'a AgentRateState,
     usage: &'a UsageCapture,
+    per_profile_usage: &'a UsageCapture,
+    profile: Option<&'a str>,
     stream_err: &'a AgentStreamErrState,
 }
 
@@ -753,6 +777,8 @@ impl LineObserver for ClaudeBorrowedObserver<'_> {
             self.budget,
             self.rate,
             self.usage,
+            self.per_profile_usage,
+            self.profile,
             self.stream_err,
         );
     }
@@ -775,6 +801,8 @@ fn pump<R: BufRead>(
     budget: &AgentBudgetState,
     rate: &AgentRateState,
     usage: &UsageCapture,
+    per_profile_usage: &UsageCapture,
+    profile: Option<&str>,
     stream_err: &AgentStreamErrState,
     now: &dyn Fn() -> i64,
 ) {
@@ -787,6 +815,8 @@ fn pump<R: BufRead>(
             budget,
             rate,
             usage,
+            per_profile_usage,
+            profile,
             stream_err,
         },
         now,
@@ -836,6 +866,13 @@ pub struct ProfileContext {
     /// not present ⇒ no pool, which the flavor treats as the pre-slice-003
     /// semantics.
     pub pools: BTreeMap<String, Vec<String>>,
+    /// Where per-profile budget samples live
+    /// (`$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/`), when a
+    /// runtime assembly set one (claude-login-switcher slice 004). `None`
+    /// disables the per-profile tee without changing anything else — a
+    /// backend built outside a growlight runtime, and every unit test, gets
+    /// this.
+    pub by_profile_dir: Option<PathBuf>,
 }
 
 impl ProfileContext {
@@ -945,6 +982,37 @@ impl ClaudeFlavor {
             .cloned()
             .unwrap_or_else(|| Arc::new(UsageCapture::disabled()))
     }
+
+    /// Resolve this spawn's per-profile tee + the slot name it writes under
+    /// (claude-login-switcher slice 004). Returns a disabled capture + `None`
+    /// slot when either the profile machinery is not installed, the member
+    /// has no pool declared, no pin is yet on disk, or no `by_profile_dir`
+    /// was configured — every case folds to the shape the shared tee alone
+    /// handles (byte-identical to pre-slice-004 writing).
+    ///
+    /// `child_env` writes the pin BEFORE `new_observer` runs on the same
+    /// spawn, so a pin IS on disk by the time this resolves for a pooled
+    /// member. Reading it here freezes the slot for the observer's lifetime,
+    /// which matches slice 003 FC 7's "lock the slot for the session's
+    /// lifetime; never retarget mid-session".
+    fn per_profile_usage_for(&self, agent: &str) -> (Arc<UsageCapture>, Option<String>) {
+        let disabled = || (Arc::new(UsageCapture::disabled()), None);
+        let Some(profiles) = self.profiles.get() else {
+            return disabled();
+        };
+        let Some(dir) = profiles.by_profile_dir.as_deref() else {
+            return disabled();
+        };
+        if !profiles.pools.contains_key(agent) {
+            return disabled();
+        }
+        let paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
+        let Some(pin) = crate::profile_pin::read_pin(&paths) else {
+            return disabled();
+        };
+        let path = crate::profile_budget::profile_budget_path(dir, &pin.profile);
+        (Arc::new(UsageCapture::new(path)), Some(pin.profile))
+    }
 }
 
 impl BackendFlavor for ClaudeFlavor {
@@ -996,22 +1064,68 @@ impl BackendFlavor for ClaudeFlavor {
             // for a member in a MIXED roster.
             return Ok(Vec::new());
         };
-        // Pick the slot least-recently used across the pool, write the pin,
-        // and retarget the member's overlay credential symlink to it. Any
-        // step failure fails the spawn closed: a member that cannot land on
-        // its intended profile must not silently fall back to the shared
+        // Pick the slot the budget-aware picker (slice 004) prefers: highest
+        // 5h headroom wins, LRU breaks the tie (slice 003's rotation rule
+        // when the budget signal is quiet), a `< 10%` winner proceeds with
+        // a warning, and an all-exhausted pool stalls with the earliest
+        // reset pinned so the drive loop knows when to retry. Any step
+        // failure fails the spawn closed: a member that cannot land on its
+        // intended profile must not silently fall back to the shared
         // top-level credential, which is the exact hazard the switcher
         // exists to remove.
         let pin_paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
         let history = crate::profile_pin::read_pin_history(&pin_paths);
-        let Some(slot) = crate::profile_pin::pick_round_robin(pool, &history) else {
-            return Err(SpawnError(format!(
-                "agent {agent:?} declares profile_pool but the pool resolved to \
-                 no pickable slot — refuse rather than fall back to the shared \
-                 top-level credential"
-            )));
+        let now = crate::profile_pin::now_unix();
+        let headroom_vals: Vec<crate::profile_budget::Headroom> = profiles
+            .by_profile_dir
+            .as_deref()
+            .map(|dir| {
+                crate::profile_budget::pool_headroom(dir, pool, now)
+                    .into_iter()
+                    .map(|(_, h)| h)
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                // No per-profile dir configured ⇒ every slot reads as full
+                // headroom, which collapses the picker back to pure LRU
+                // (byte-identical to slice 003's pre-004 behavior).
+                vec![crate::profile_budget::Headroom::full(); pool.len()]
+            });
+        let pick = crate::profile_pin::pick_with_budget(pool, &history, &headroom_vals);
+        let slot = match pick {
+            Some(crate::profile_pin::PickResult::Chose { slot, .. }) => slot,
+            Some(crate::profile_pin::PickResult::Warn {
+                slot,
+                headroom_pct,
+            }) => {
+                // Still a pick — the slice spec is explicit: `< 10%` emits a
+                // warning but proceeds. The journal line surfaces to the
+                // operator; the drive loop keeps running.
+                eprintln!(
+                    "growlightd: agent {agent:?}: picked claude-login slot {slot:?} \
+                     with low headroom {headroom_pct}% — the pool is close to exhausted"
+                );
+                slot
+            }
+            Some(crate::profile_pin::PickResult::Stall { until_at }) => {
+                return Err(SpawnError(format!(
+                    "agent {agent:?}: all claude-login pool profiles are exhausted \
+                     (< {stall}% 5h headroom across the pool); the drive loop should \
+                     retry at {until}",
+                    stall = crate::profile_pin::HEADROOM_STALL_PCT,
+                    until = until_at
+                        .map(|at| format!("unix seconds {at}"))
+                        .unwrap_or_else(|| "the next tick (no reset known)".into()),
+                )));
+            }
+            None => {
+                return Err(SpawnError(format!(
+                    "agent {agent:?} declares profile_pool but the pool resolved to \
+                     no pickable slot — refuse rather than fall back to the shared \
+                     top-level credential"
+                )));
+            }
         };
-        let slot = slot.to_string();
 
         // The overlay HOME layout (slice 002's refresh-members shape):
         //   <agents_dir>/<id>/home/.claude/.credentials.json → symlink into
@@ -1105,12 +1219,22 @@ impl BackendFlavor for ClaudeFlavor {
             .lock()
             .unwrap()
             .insert(agent.to_string(), Arc::clone(&stream_err));
+        // Per-profile tee (claude-login-switcher slice 004): read the pin
+        // `child_env` just wrote and open a capture at
+        // `usage.by-profile/<slot>.json`. The harness calls `new_observer`
+        // AFTER `child_env` within the same spawn, so the pin is on disk;
+        // a member without a pool, or without a by-profile dir configured,
+        // gets a disabled capture (byte-identical to pre-slice-003 at tee
+        // time).
+        let (per_profile_usage, profile_name) = self.per_profile_usage_for(agent);
         Box::new(ClaudeSpawnObserver {
             agent: agent.to_string(),
             hub: self.hub.clone(),
             budget,
             rate,
             usage: self.usage_capture(),
+            per_profile_usage,
+            profile_name,
             stream_err,
         })
     }
@@ -1397,7 +1521,7 @@ mod tests {
         let clock = AtomicI64::new(0);
         let now = || clock.fetch_add(10, Ordering::SeqCst) + 10;
 
-        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(STREAM), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         // The four content deltas reach the hub in block order, tagged by kind.
         let expect = [
@@ -1442,7 +1566,7 @@ mod tests {
         let stream_err = AgentStreamErrState::default();
         let now = || 100; // init line stamped at t=100, then nothing more
 
-        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(silent), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         // No exit recorded → still Alive, but pinned at the stale init stamp.
         assert_eq!(state.observe(), AgentHealth::Alive { last_active: 100 });
@@ -1631,7 +1755,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         // The non-"allowed" 5h status folded to a saturated 100; the allowed 7d to 0.
         let reserve = budget.observe().expect("a reserve was folded from the events");
@@ -1687,7 +1811,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"warning","resetsAt":1782900000}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         assert_eq!(
             budget.window_resets(),
@@ -1708,7 +1832,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"allowed"}}"#,
             "\n",
         );
-        pump(Cursor::new(no_boundary), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(no_boundary), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
         assert_eq!(
             budget.window_resets(),
             WindowResets::new(None, Some(1782900000)),
@@ -1742,7 +1866,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":1},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "a", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "a", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         let written = UsageSnapshot::load(&path)
             .unwrap()
@@ -1783,7 +1907,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"rejected"}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
         // The pct still saturates (throttles the aggregate)...
         assert_eq!(budget.observe(), Some(BudgetUsage::new(100, 0)));
         // ...and the reopen is the bounded fail-safe off the line's clock (100), not
@@ -1812,7 +1936,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"warning","resetsAt":1782367800}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
         assert_eq!(
             budget.observe(),
             Some(BudgetUsage::new(100, 0)),
@@ -1845,7 +1969,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed","resetsAt":1782900000}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         // Both windows allowed → a fresh (0,0) reserve: no alert, admission admits.
         let reserve = budget.observe().expect("an allowed reading still records (0,0)");
@@ -1906,7 +2030,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","usage":{"input_tokens":80000,"output_tokens":10000},"modelUsage":{"claude-opus-4-8":{"contextWindow":1000000}}}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         // The meter observed 90k tokens / 1 request in the trailing minute.
         let (tpm_used, rpm_used) = rate_meter.window(1000);
@@ -2220,7 +2344,7 @@ mod tests {
             r#"{"type":"result","is_error":true,"result":"You've hit your session limit","error":"rate_limit","apiErrorStatus":429,"resetsAt":1782367800}"#,
             "\n",
         );
-        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &stream_err, &now);
+        pump(Cursor::new(stream), "tab", &hub, &state, &budget, &rate_meter, &usage_cap, &UsageCapture::disabled(), None, &stream_err, &now);
 
         // Last-write-wins: the terminal 429 is what the session died on.
         let latched = stream_err.observe().expect("the stream error is latched");

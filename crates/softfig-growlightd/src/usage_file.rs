@@ -93,14 +93,27 @@ impl UsageCapture {
     }
 
     /// Tee one window's reading — exactly as the wire reported it — into the file,
-    /// stamping the snapshot `at` (unix seconds, the reader thread's clock).
+    /// stamping the snapshot `at` (unix seconds, the reader thread's clock) and
+    /// tagging it with the writing member's `profile` slot (claude-login-switcher
+    /// slice 004) when the member has one pinned. The tag is a hint to readers
+    /// bucketing by profile; the shared top-level `usage.json` reflects the LAST
+    /// writer's slot (one capture, many members), while a per-profile file
+    /// (`usage.by-profile/<slot>.json`) is written by a sibling capture pointed
+    /// at that path with the same slot every time.
     ///
     /// Merges per window: a reading of the 5h window never disturbs what is known
-    /// about the 7d one. Writes when the reading **changed**, or when the last write
-    /// is [`REFRESH_FLOOR_SECS`] old (see the module docs); a write failure is
-    /// reported to the daemon's stderr — the journal — and dropped, because a
-    /// budget tee must never take down an agent's reader thread.
-    pub fn record(&self, window: BudgetWindow, reading: RateWindow, at: i64) {
+    /// about the 7d one. Writes when the reading **changed**, the `profile` tag
+    /// changed, or when the last write is [`REFRESH_FLOOR_SECS`] old (see the
+    /// module docs); a write failure is reported to the daemon's stderr — the
+    /// journal — and dropped, because a budget tee must never take down an
+    /// agent's reader thread.
+    pub fn record(
+        &self,
+        window: BudgetWindow,
+        reading: RateWindow,
+        at: i64,
+        profile: Option<&str>,
+    ) {
         let mut state = self.state.lock().unwrap();
         let slot = match window {
             BudgetWindow::FiveHour => &mut state.snapshot.rate_limits.five_hour,
@@ -108,10 +121,13 @@ impl UsageCapture {
         };
         let changed = *slot != reading;
         *slot = reading;
+        let new_profile = profile.map(str::to_string);
+        let profile_changed = state.snapshot.profile != new_profile;
+        state.snapshot.profile = new_profile;
         let due = state
             .written_at
             .is_none_or(|last| at.saturating_sub(last) >= REFRESH_FLOOR_SECS);
-        if !changed && !due {
+        if !changed && !profile_changed && !due {
             return;
         }
         state.snapshot.ts = at as f64;
@@ -157,8 +173,8 @@ mod tests {
         let path = dir.path().join("growlight").join("usage.json");
         let cap = UsageCapture::new(path.clone());
 
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000);
-        cap.record(BudgetWindow::SevenDay, window("warning", 9_000), 1_001);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000, None);
+        cap.record(BudgetWindow::SevenDay, window("warning", 9_000), 1_001, None);
 
         let raw = std::fs::read_to_string(&path).expect("the capture created the file");
         assert!(
@@ -186,12 +202,12 @@ mod tests {
         let path = dir.path().join("usage.json");
         let cap = UsageCapture::new(path.clone());
 
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000, None);
         let mtime = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
         let first = mtime(&path);
 
         // Re-reported unchanged a minute later: no write, so `ts` still reads 1_000.
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_060);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_060, None);
         assert_eq!(
             UsageSnapshot::load(&path).unwrap().unwrap().ts,
             1_000.0,
@@ -200,17 +216,46 @@ mod tests {
         assert_eq!(mtime(&path), first, "…and the file was not touched at all");
 
         // Past the floor: the same reading is re-stamped so its age stays honest.
-        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000 + REFRESH_FLOOR_SECS);
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000 + REFRESH_FLOOR_SECS, None);
         assert_eq!(
             UsageSnapshot::load(&path).unwrap().unwrap().ts,
             (1_000 + REFRESH_FLOOR_SECS) as f64,
         );
 
         // A changed status is written immediately, floor or no floor.
-        cap.record(BudgetWindow::FiveHour, window("rejected", 2_000), 1_000 + REFRESH_FLOOR_SECS + 1);
+        cap.record(BudgetWindow::FiveHour, window("rejected", 2_000), 1_000 + REFRESH_FLOOR_SECS + 1, None);
         let back = UsageSnapshot::load(&path).unwrap().unwrap();
         assert_eq!(back.rate_limits.five_hour.status.as_deref(), Some("rejected"));
         assert_eq!(back.ts, (1_000 + REFRESH_FLOOR_SECS + 1) as f64);
+    }
+
+    /// The `profile` tag is persisted to the file and a change in the tag alone
+    /// (same reading, different slot) is enough to trigger a write — a per-profile
+    /// capture pointed at `usage.by-profile/<slot>.json` writes its slot name
+    /// definitively every time (claude-login-switcher slice 004 FC: "`usage.json`
+    /// carries a `profile` field; a tagged tee from `ClaudeFlavor` fills it per
+    /// member").
+    #[test]
+    fn a_profile_tag_is_persisted_and_a_tag_change_forces_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let cap = UsageCapture::new(path.clone());
+
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_000, Some("slot1"));
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert_eq!(back.profile.as_deref(), Some("slot1"));
+
+        // Same reading, different slot — the tag flip alone forces a write
+        // (so a shared `usage.json` reflects the LAST writer's slot honestly).
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_030, Some("slot2"));
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert_eq!(back.profile.as_deref(), Some("slot2"));
+        assert_eq!(back.ts, 1_030.0);
+
+        // Dropping the tag back to None also counts as a change.
+        cap.record(BudgetWindow::FiveHour, window("allowed", 2_000), 1_060, None);
+        let back = UsageSnapshot::load(&path).unwrap().unwrap();
+        assert!(back.profile.is_none());
     }
 
     /// A disabled capture folds readings in memory and never creates a file — the
@@ -219,7 +264,7 @@ mod tests {
     #[test]
     fn a_disabled_capture_never_touches_disk() {
         let cap = UsageCapture::disabled();
-        cap.record(BudgetWindow::FiveHour, window("rejected", 5), 1);
+        cap.record(BudgetWindow::FiveHour, window("rejected", 5), 1, None);
         assert_eq!(
             cap.snapshot().rate_limits.five_hour.status.as_deref(),
             Some("rejected"),

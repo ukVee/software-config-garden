@@ -44,6 +44,7 @@ pub mod opencode_preapproval;
 pub mod peer;
 pub mod persist;
 pub mod preapproval;
+pub mod profile_budget;
 pub mod profile_pin;
 pub mod queue_source;
 pub mod reconcile;
@@ -92,7 +93,14 @@ pub use opencode_backend::{AgentSpend, ModelSelection, OpencodeBackend, Opencode
 pub use opencode_preapproval::OpencodePreApproval;
 pub use persist::{KeeperdResourcePersister, ResourcePersister};
 pub use preapproval::{agent_paths, AgentPaths, GenError, PreApproval, ALLOW};
-pub use profile_pin::{pick_round_robin, pin_paths, read_pin, read_pin_history, write_pin, PinPaths, ProfilePin};
+pub use profile_budget::{
+    headroom_from, pool_headroom, profile_budget_path, read_profile_budget, Headroom,
+    STALE_FLOOR_SECS,
+};
+pub use profile_pin::{
+    pick_round_robin, pick_with_budget, pin_paths, read_pin, read_pin_history, write_pin, PickResult,
+    PinPaths, ProfilePin, HEADROOM_STALL_PCT, HEADROOM_WARN_PCT,
+};
 pub use queue_source::{
     parse_snapshot, KeeperdQueueSource, KeeperdRepoProbe, BACKLOG_DOC, DEFAULT_QUEUE_NAME,
 };
