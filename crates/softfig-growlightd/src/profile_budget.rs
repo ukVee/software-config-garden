@@ -34,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
-use softfig_ipc::usage::UsageSnapshot;
+use softfig_ipc::usage::{RateWindow, UsageSnapshot};
 
 /// How old a per-profile reading may be before the picker treats it as a
 /// fresh/unused pool rather than a stall. Six hours = one 5h window plus
@@ -82,22 +82,34 @@ pub fn profile_budget_path(by_profile_dir: &Path, slot: &str) -> PathBuf {
 
 /// Headroom from one reading at `now` (unix seconds). Pure.
 ///
+/// Combines **both** the 5h and 7d windows (slice 009 S2): a slot's headroom is
+/// `min(5h, 7d)` and the hold's `resets_at` is the binding window's. A
+/// weekly-exhausted slot therefore reads as 0 and is never picked, and its hold
+/// waits for the 7d reopen, not the 5h one.
+///
 /// Priority:
 /// 1. No reading ⇒ [`Headroom::full`] (never used, so no case to deny).
 /// 2. Reading older than [`STALE_FLOOR_SECS`] ⇒ full. The sample is a fossil;
 ///    treating it as "unknown-but-unused" avoids stalling on days-old data
 ///    (the task-048 fossil hazard, now per-profile).
-/// 3. The 5h window has demonstrably reset by `now`
-///    ([`softfig_ipc::usage::RateWindow::window_reset_by`]) ⇒ full. A reading
-///    older than its own boundary describes a window that no longer exists.
-/// 4. A vouchable percentage ([`softfig_ipc::usage::RateWindow::vouchable_pct_at`])
-///    ⇒ `100 - used`. Interactive statuslines write a percentage; this is the
-///    high-fidelity path when it is available.
-/// 5. The coarse per-window `status` string: `"allowed"` ⇒ full,
-///    `"warning"` ⇒ `5%` (below the warn threshold but above stall), `"rejected"`
-///    ⇒ `0%`. The headless `rate_limit_event` wire carries only this coarse
-///    label (no percentage), so it is the realistic headroom source for the
-///    fleet path.
+/// 3. For each window: a demonstrably-reset window
+///    ([`softfig_ipc::usage::RateWindow::window_reset_by`]) folds to full for
+///    that window. Then take the min of the two.
+///
+/// Within one window ([`window_headroom`]):
+/// - A vouchable percentage ([`softfig_ipc::usage::RateWindow::vouchable_pct_at`])
+///   yields `100 - used`. Interactive statuslines write a percentage; this is
+///   the high-fidelity path when it is available.
+/// - The coarse per-window `status` string (slice 009 S1 — real wire form):
+///   `"allowed"` ⇒ full, `"rejected"` ⇒ `0`, anything else (including the real
+///   wire form `"allowed_warning"`, confirmed in `auto-run.log`) ⇒ `5` (below
+///   the warn threshold but above stall). The headless `rate_limit_event` wire
+///   carries only this coarse label (no percentage), so it is the realistic
+///   headroom source for the fleet path.
+/// - **Take the smaller** when both a vouchable pct and a non-`allowed` status
+///   are present (slice 009 S1). The invariants under this rule: a vouchable
+///   pct never overrules a `rejected` wire status, and `allowed` plus a pct
+///   degrades gracefully to the pct.
 pub fn headroom_from(snapshot: Option<&UsageSnapshot>, now: i64) -> Headroom {
     let Some(snap) = snapshot else {
         return Headroom::full();
@@ -107,25 +119,62 @@ pub fn headroom_from(snapshot: Option<&UsageSnapshot>, now: i64) -> Headroom {
     if age > STALE_FLOOR_SECS {
         return Headroom::full();
     }
-    let w = &snap.rate_limits.five_hour;
+    let five = window_headroom(&snap.rate_limits.five_hour, now);
+    let seven = window_headroom(&snap.rate_limits.seven_day, now);
+    binding_headroom(five, seven)
+}
+
+/// Per-window headroom with the S1 take-smaller rule applied. A window whose
+/// own boundary has passed folds to full (its reading describes a window that
+/// no longer exists).
+fn window_headroom(w: &RateWindow, now: i64) -> Headroom {
     if w.window_reset_by(now) {
         return Headroom::full();
     }
-    if let Some(used) = w.vouchable_pct_at(now) {
-        let pct = 100_u8.saturating_sub(used.min(100));
-        return Headroom {
-            pct,
-            resets_at: w.resets_at,
-        };
-    }
-    let pct = match w.status.as_deref() {
-        Some("rejected") => 0,
-        Some("warning") => 5,
-        _ => 100,
+    let pct_from_pct = w
+        .vouchable_pct_at(now)
+        .map(|used| 100_u8.saturating_sub(used.min(100)));
+    // Slice 009 S1: real wire strings. Any status other than `allowed` is low
+    // (the real wire form is `allowed_warning`, not the invented `warning`); the
+    // headless `rate_limit_event` wire carries this label with no percentage.
+    let pct_from_status = w.status.as_deref().map(|s| match s {
+        "allowed" => 100_u8,
+        "rejected" => 0,
+        // `allowed_warning` and any future low-but-not-rejected label.
+        _ => 5,
+    });
+    // Take the smaller when both are present — `rejected` must always bind,
+    // and `allowed` + a pct must degrade to the pct, not to full.
+    let pct = match (pct_from_pct, pct_from_status) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(p), None) | (None, Some(p)) => p,
+        (None, None) => 100,
     };
     Headroom {
         pct,
         resets_at: w.resets_at,
+    }
+}
+
+/// Combine the 5h and 7d headrooms into one binding reading (slice 009 S2).
+///
+/// The binding window is the one with lower `pct` — that is the window that
+/// denies. On a tie, use the later `resets_at`: when both are exhausted the
+/// slot stays denied until BOTH reopen, and when both are healthy the exact
+/// value does not matter for admission. A `None`/`Some` tie falls through to
+/// the known boundary.
+fn binding_headroom(five: Headroom, seven: Headroom) -> Headroom {
+    use std::cmp::Ordering;
+    match five.pct.cmp(&seven.pct) {
+        Ordering::Less => five,
+        Ordering::Greater => seven,
+        Ordering::Equal => Headroom {
+            pct: five.pct,
+            resets_at: match (five.resets_at, seven.resets_at) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            },
+        },
     }
 }
 
@@ -228,16 +277,110 @@ mod tests {
     }
 
     #[test]
-    fn coarse_warning_maps_to_low_but_pickable() {
-        let s = snap(rw_status("warning", 2_000), RateWindow::default(), 100);
+    fn coarse_allowed_warning_maps_to_warn_tier() {
+        // Slice 009 S1: `allowed_warning` is the real wire string
+        // (3× in `auto-run.log`); the pre-slice-009 code matched an invented
+        // `"warning"` and read every real reading as `allowed` ⇒ 100.
+        let s = snap(rw_status("allowed_warning", 2_000), RateWindow::default(), 100);
         let hr = headroom_from(Some(&s), 500);
-        // Below the 10% warn threshold (slice spec), above the 2% stall floor,
-        // so a lone-warning slot is still pickable with a warn log.
+        // Below the 10% warn threshold, above the 2% stall floor — pickable
+        // but logged.
         assert_eq!(hr.pct, 5);
     }
 
     #[test]
     fn coarse_allowed_is_full_headroom() {
+        let s = snap(rw_status("allowed", 2_000), RateWindow::default(), 100);
+        let hr = headroom_from(Some(&s), 500);
+        assert_eq!(hr.pct, 100);
+    }
+
+    #[test]
+    fn status_and_pct_take_the_smaller() {
+        // Slice 009 S1: a vouchable pct does NOT overrule a `rejected` status.
+        // 90% used would give 10 headroom, but the wire said rejected ⇒ 0 binds.
+        let s = snap(rw_pct(90, "rejected", 2_000), RateWindow::default(), 100);
+        let hr = headroom_from(Some(&s), 500);
+        assert_eq!(hr.pct, 0);
+        assert_eq!(hr.resets_at, Some(2_000));
+    }
+
+    #[test]
+    fn status_allowed_degrades_to_the_pct() {
+        // `allowed` + 73% used ⇒ 27 headroom (pct wins because status is full).
+        // This is the test the pre-slice-009 code happened to pass under the
+        // old "vouchable-pct wins" rule; the new min-rule reduces to the same.
+        let s = snap(rw_pct(73, "allowed", 2_000), RateWindow::default(), 100);
+        let hr = headroom_from(Some(&s), 500);
+        assert_eq!(hr.pct, 27);
+    }
+
+    // ---- Slice 009 S2: the 7d window ---------------------------------------
+
+    #[test]
+    fn seven_day_rejected_binds_hold_even_when_five_hour_is_healthy() {
+        // The headline S2 case: 5h is allowed, 7d is rejected. The slot is not
+        // pickable, and the hold's `resets_at` is the 7d one (90_000), not the
+        // 5h one (2_000) — hold until the binding window reopens.
+        let s = snap(
+            rw_status("allowed", 2_000),
+            rw_status("rejected", 90_000),
+            100,
+        );
+        let hr = headroom_from(Some(&s), 500);
+        assert_eq!(hr.pct, 0, "weekly-exhausted ⇒ not pickable");
+        assert_eq!(
+            hr.resets_at,
+            Some(90_000),
+            "hold waits for the 7d reopen (binding window)",
+        );
+    }
+
+    #[test]
+    fn headroom_is_the_min_of_the_two_windows() {
+        // 5h at 20 headroom (80 used), 7d at 60 headroom (40 used) ⇒ 20 wins
+        // and the 5h boundary binds.
+        let s = snap(rw_pct(80, "allowed", 2_000), rw_pct(40, "allowed", 90_000), 100);
+        let hr = headroom_from(Some(&s), 500);
+        assert_eq!(hr.pct, 20);
+        assert_eq!(hr.resets_at, Some(2_000));
+    }
+
+    #[test]
+    fn both_windows_rejected_pins_to_the_later_reopen() {
+        // On a tie the hold must wait for BOTH windows to reopen — picking the
+        // earlier `resets_at` would re-roll onto a still-rejected 7d and park
+        // again. Max wins.
+        let s = snap(
+            rw_status("rejected", 2_000),
+            rw_status("rejected", 90_000),
+            100,
+        );
+        let hr = headroom_from(Some(&s), 500);
+        assert_eq!(hr.pct, 0);
+        assert_eq!(hr.resets_at, Some(90_000));
+    }
+
+    #[test]
+    fn seven_day_window_already_reset_folds_to_full_within_the_fold() {
+        // 5h at 10 headroom (90 used, status rejected), 7d demonstrably reset.
+        // The 7d window describes a reset-by-now window, so it folds to full
+        // and the 5h binds — 10 headroom, 5h resets_at.
+        let s = snap(
+            rw_pct(90, "rejected", 2_000),
+            rw_status("rejected", 50), // boundary at 50 ≤ now 500 ⇒ reset
+            100,
+        );
+        let hr = headroom_from(Some(&s), 500);
+        assert_eq!(hr.pct, 0, "5h rejected still binds (status takes smaller)");
+        assert_eq!(hr.resets_at, Some(2_000));
+    }
+
+    #[test]
+    fn no_seven_day_info_does_not_falsely_deny() {
+        // A reading with only 5h info (default 7d) ⇒ 7d reads as full and the
+        // 5h binds. Protects against a false-deny when a reader has not yet
+        // observed a 7d event.
         let s = snap(rw_status("allowed", 2_000), RateWindow::default(), 100);
         let hr = headroom_from(Some(&s), 500);
         assert_eq!(hr.pct, 100);
