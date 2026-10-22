@@ -217,6 +217,17 @@ pub trait BudgetSampleSource: Send + Sync + fmt::Debug {
     fn budget_resets(&self, _agent: &str) -> WindowResets {
         WindowResets::UNKNOWN
     }
+
+    /// The claude-login slot name this sample should be tagged with (slice 008),
+    /// or `None` for a source that carries no profile signal. The live
+    /// [`Arc<ClaudeBackend>`] impl returns the member's locked active slot (or
+    /// `home` with no store); opencode's impl stays `None` — opencode's budget
+    /// is `None` anyway, so no sample is written. Defaulted to `None` so test
+    /// fakes without a profile concept continue to work; the step-0 and
+    /// health-pass hold-set sites fold `None` into the `home` back-compat key.
+    fn profile_for(&self, _agent: &str) -> Option<String> {
+        None
+    }
 }
 
 impl BudgetSampleSource for Arc<ClaudeBackend> {
@@ -232,6 +243,45 @@ impl BudgetSampleSource for Arc<ClaudeBackend> {
 
     fn budget_resets(&self, agent: &str) -> WindowResets {
         self.as_ref().budget_resets(agent)
+    }
+
+    fn profile_for(&self, agent: &str) -> Option<String> {
+        self.as_ref().active_profile(agent)
+    }
+}
+
+/// The seam the loop reads a member's **admission profile set** through
+/// (slice 008) — the claude-login slots the member could spawn on this tick.
+/// An unpooled claude member has one slot (its active one, or `home` with no
+/// store); a pooled member has its pool; an opencode member has none (empty).
+///
+/// The hold check `self.rate_limit_holds.member_fully_held(profiles)` reads
+/// this: a member whose every slot is held waits for the earliest window
+/// reopen, while a sibling with any un-held slot keeps running — the exact
+/// per-account isolation review 047 B3 asked for.
+///
+/// Live impl in [`crate::fleet::assemble_fleet`] over the configured fleet +
+/// [`ClaudeBackend::active_profile`] (pooled → the pool, unpooled → `[active]`
+/// or `[home]`). A test fakes it with a scripted
+/// `BTreeMap<agent, Vec<slot>>`; the [`AssumeHomeProfile`] default keeps every
+/// loop built by [`DriveLoop::new`] on the pre-switcher back-compat key
+/// (`["home"]`) so an untouched test continues to behave as it did.
+pub trait ProfileResolver: Send + Sync + fmt::Debug {
+    /// `agent`'s admission profile set as of this tick. An empty vec is never
+    /// held through `RateLimitHolds::member_fully_held` (opencode).
+    fn admission_profiles(&self, agent: &str) -> Vec<String>;
+}
+
+/// The default [`ProfileResolver`]: every agent reports `["home"]` — the
+/// pre-switcher single-slot key. A loop built through [`DriveLoop::new`]
+/// without opting into a resolver reads exactly the pre-slice-008 single
+/// global hold, and the back-compat finish-check reduces to that.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AssumeHomeProfile;
+
+impl ProfileResolver for AssumeHomeProfile {
+    fn admission_profiles(&self, _agent: &str) -> Vec<String> {
+        vec!["home".to_string()]
     }
 }
 
@@ -1384,16 +1434,23 @@ pub struct DriveLoop {
     /// it pages EXACTLY ONCE (not every tick past the threshold) and re-arms only after
     /// a reconnect (network-failsafe slice 003).
     offline_alerted: bool,
-    /// The rate-limit window reopen boundary (unix secs) admission is HELD until, or
-    /// `None` when not rate-limited (task 037). Learned from a running/just-exited
-    /// member's tripped-window `resetsAt` in step 0 and PERSISTED here so the hold
-    /// outlives that member's exit and the task-031 forget (which would otherwise
-    /// free admission and spin-spawn into the still-exhausted window). Self-clearing
-    /// at `now >= it`: the fleet auto-resumes at the reset with no human bounce — the
-    /// capability the deleted `--auto` governor had. Extended (never shortened) to
-    /// the LATER boundary when multiple windows are tripped, so admission reopens
-    /// only once every tripped window has.
-    rate_limit_hold_until: Option<i64>,
+    /// Per-claude-login-slot rate-limit holds (slice 008). A `rejected` from one
+    /// account keys its hold on that account's slot — a co-member running on a
+    /// different account is not halted. Keys are extended (never shortened) to the
+    /// LATER boundary, and self-clear at `now >= hold`: the fleet auto-resumes at
+    /// the reset with no human bounce (the deleted `--auto` governor's timed
+    /// resume, task 037, now per-profile). An opencode member contributes no hold
+    /// here — opencode gating is a separate path. See
+    /// [`crate::rate_limit_holds::RateLimitHolds`] for the value core.
+    rate_limit_holds: crate::rate_limit_holds::RateLimitHolds,
+    /// Per-member admission profile resolver (slice 008). Admission reads
+    /// `profiles_resolver.admission_profiles(agent)` and gates each member on
+    /// `rate_limit_holds.member_fully_held(profiles)` — a pooled member whose
+    /// pool has ANY un-held slot stays admitted; an opencode member (empty vec)
+    /// is never fully held through this map. Defaults to
+    /// [`AssumeHomeProfile`] so every loop built through [`Self::new`] without
+    /// a resolver keeps the pre-switcher single-slot key.
+    profiles_resolver: Box<dyn ProfileResolver>,
     /// The stale-binary guard's on-disk identity probe (task 039). Re-statted each
     /// tick and compared to `exe_baseline`; the live [`SystemExeProbe`] in production
     /// (re-stats growlightd's captured launch path), a scripted fake in tests.
@@ -1499,7 +1556,8 @@ impl DriveLoop {
             last_claim_reassert: None,
             offline_since: None,
             offline_alerted: false,
-            rate_limit_hold_until: None,
+            rate_limit_holds: crate::rate_limit_holds::RateLimitHolds::new(),
+            profiles_resolver: Box::new(AssumeHomeProfile),
             exe_probe,
             exe_baseline: None,
             binary_superseded: false,
@@ -1519,6 +1577,20 @@ impl DriveLoop {
     #[must_use]
     pub fn with_max_iterations(mut self, max: Option<u64>) -> Self {
         self.max_iterations = max;
+        self
+    }
+
+    /// Install a per-member admission profile resolver (slice 008). A builder
+    /// like [`with_max_iterations`](Self::with_max_iterations), so the 15-arg
+    /// [`new`](Self::new) — and every legacy test that builds a loop through
+    /// it — is unchanged; only the live
+    /// [`crate::fleet::assemble_fleet`] and the per-profile tests opt in. With
+    /// a resolver absent, every agent reads back as `["home"]`
+    /// ([`AssumeHomeProfile`]) and the back-compat finish-check reduces to
+    /// the pre-switcher single global hold.
+    #[must_use]
+    pub fn with_profile_resolver(mut self, resolver: Box<dyn ProfileResolver>) -> Self {
+        self.profiles_resolver = resolver;
         self
     }
 
@@ -1686,10 +1758,13 @@ impl DriveLoop {
             // wedge admission. Extend to the LATER boundary so admission reopens only
             // once every rejected window has.
             if let Some(reopen) = self.samples.rate_limit_reopen(agent) {
-                self.rate_limit_hold_until = Some(
-                    self.rate_limit_hold_until
-                        .map_or(reopen, |held| held.max(reopen)),
-                );
+                // Key the hold on the reporting member's claude-login slot so one
+                // account's `rejected` cannot halt a co-member on a different
+                // account (slice 008). An untagged source (test fakes, opencode)
+                // folds into `home` — the back-compat key that equals the
+                // pre-switcher single global hold.
+                let profile = self.samples.profile_for(agent).unwrap_or_else(|| "home".into());
+                self.rate_limit_holds.extend(profile, reopen);
             }
             if self.supervisor.is_running(agent) {
                 if let Some(budget) = self.samples.budget(agent) {
@@ -1699,9 +1774,15 @@ impl DriveLoop {
                     // window boundaries the reading was taken against too, so a
                     // window whose `resets_at` has passed drops from the fold at once
                     // even while the reading is younger than that window (task 048).
+                    // Tag the reading with the member's claude-login slot
+                    // (slice 008) so the per-profile fold routes it to that
+                    // slot's view only. An untagged source folds into every
+                    // profile — the back-compat shim for the pre-switcher
+                    // single-account case.
                     self.aggregator.observe(
                         UsageSample::new(agent.clone(), budget, now)
-                            .with_resets(self.samples.budget_resets(agent)),
+                            .with_resets(self.samples.budget_resets(agent))
+                            .with_profile(self.samples.profile_for(agent)),
                     );
                 }
             } else {
@@ -1715,10 +1796,7 @@ impl DriveLoop {
         // that pass extends the hold from the stdout stream error's `resets_at`, and
         // the elapsed-clear must run against the extended value or a freshly-pinned
         // hold would be wiped the same tick it was set.)
-        if let Some(until) = self.rate_limit_hold_until
-            && now >= until {
-                self.rate_limit_hold_until = None;
-            }
+        self.rate_limit_holds.clear_elapsed(now);
         let budget = self.aggregator.aggregate_or_fresh_at(now);
         let rate = self.rate.rate(now);
 
@@ -2086,9 +2164,13 @@ impl DriveLoop {
                             self.stream_errs.stream_error(agent).and_then(|e| e.resets_at)
                         });
                         if let Some(reopen) = reopen {
-                            self.rate_limit_hold_until = Some(
-                                self.rate_limit_hold_until.map_or(reopen, |h| h.max(reopen)),
-                            );
+                            // Key the hold on the reporting member's slot (slice
+                            // 008); `home` for an untagged source.
+                            let profile = self
+                                .samples
+                                .profile_for(agent)
+                                .unwrap_or_else(|| "home".into());
+                            self.rate_limit_holds.extend(profile, reopen);
                         }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
@@ -2118,14 +2200,19 @@ impl DriveLoop {
             }
         }
 
-        // A live hold gates every spawn this tick (steps 2 + 3), the pre-spawn HOLD
-        // twin of `offline`: no re-roll, no fresh start, no backoff, no crash count —
-        // the fleet simply waits out the window instead of crash-looping into it.
+        // A live hold gates spawns this tick (steps 2 + 3), the pre-spawn HOLD twin
+        // of `offline`: no re-roll, no fresh start, no backoff, no crash count — the
+        // fleet simply waits out the window instead of crash-looping into it.
         // Computed AFTER the health pass (task 070) so a rate-limit death classified
         // there — whose signal rode the stdout stream, not a step-0 `rate_limit_event`
         // — gates the re-roll the SAME tick it is recognized.
-        let rate_limited = self.rate_limit_hold_until.is_some();
-        report.waiting_for_rate_limit_reset = self.rate_limit_hold_until;
+        //
+        // Since slice 008 the hold is PER-PROFILE: an account's `rejected` keys its
+        // hold on that account's claude-login slot, and only members whose admission
+        // profile set is *fully* held wait. A sibling member on a different account
+        // (or a different pool) is unaffected. The single `earliest()` boundary is
+        // what `report.waiting_for_rate_limit_reset` renders for status.
+        report.waiting_for_rate_limit_reset = self.rate_limit_holds.earliest();
 
         // ---- queue v2 scheduling (slice 006): steps 2 + 3 on the v2 source ----
         //
@@ -2202,9 +2289,19 @@ impl DriveLoop {
                 // member's own entry still standing `active` in the fresh snapshot
                 // is workable (resume own work — `pick_v2` alone would skip it as
                 // held), as is anything `pick_v2` would hand it.
-                if !paused && !offline && !rate_limited && !superseded && !bound_reached {
+                if !paused && !offline && !superseded && !bound_reached {
                     let assignments = &self.v2_assignments;
+                    let holds = &self.rate_limit_holds;
+                    let profiles_resolver = self.profiles_resolver.as_ref();
                     let workable = |agent: &str| -> bool {
+                        // Per-member rate-limit filter (slice 008): a member
+                        // whose every admission profile is held waits here,
+                        // emitted as `HeldNoWork` — zero `AgentCrashed`, zero
+                        // crash-backoff. A sibling with any un-held slot keeps
+                        // going.
+                        if holds.member_fully_held(&profiles_resolver.admission_profiles(agent)) {
+                            return false;
+                        }
                         let resumes_own = assignments.get(agent).is_some_and(|a| {
                             snapshot.entries.iter().any(|e| {
                                 e.id == a.entry && e.status == EntryStatus::Active
@@ -2228,7 +2325,7 @@ impl DriveLoop {
                 // and the §3.6 baton copy sit between admission and the spawn,
                 // exactly where the legacy seed + claim sit: a failed claim or
                 // copy aborts the start fail-closed before any child exists.
-                if !paused && !offline && !rate_limited && !superseded && !bound_reached {
+                if !paused && !offline && !superseded && !bound_reached {
                     // Entries already spoken for — every live member's recorded
                     // assignment (cross-tick), extended per-tick below — so the
                     // SAME entry is never assigned twice.
@@ -2236,6 +2333,16 @@ impl DriveLoop {
                         self.v2_assignments.values().map(|a| a.entry.clone()).collect();
                     for member in &fleet {
                         let agent = &member.spec.agent;
+                        // Per-member rate-limit filter (slice 008): skip a
+                        // member whose every admission profile is held. No
+                        // claim, no spawn, no backoff, no page — the hold
+                        // elapses on its own at the window's `resets_at`.
+                        if self
+                            .rate_limit_holds
+                            .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
+                        {
+                            continue;
+                        }
                         // A stopping/stopped agent is never (re-)started; a registered
                         // one re-rolls via step 2, it is not re-`start`ed.
                         if self.retiring.contains(agent) || self.stopped.contains(agent) {
@@ -2428,7 +2535,7 @@ impl DriveLoop {
         //    session on the SUPERSEDED daemon build — the very thing the guard exists to
         //    stop. Held here (TERMINAL, unlike the transient holds above) until a human
         //    restarts the daemon onto the new binary.
-        if !paused && !offline && !rate_limited && !superseded && !bound_reached {
+        if !paused && !offline && !superseded && !bound_reached {
             // Map each configured member to its pin so the queue-gate can ask "is
             // there workable work for this agent?" via the same `pick` a fresh
             // start uses. A member not in the configured fleet (shouldn't happen)
@@ -2441,7 +2548,17 @@ impl DriveLoop {
             let assignments = &self.assignments;
             let draining = draining_queues(&draining_at_start, &self.assignments);
             let (retiring, stopped) = (&self.retiring, &self.stopped);
+            let holds = &self.rate_limit_holds;
+            let profiles_resolver = self.profiles_resolver.as_ref();
             let workable = |agent: &str| -> bool {
+                // Per-member rate-limit filter (slice 008): a member whose
+                // every admission profile is held is not workable, emitted as
+                // `HeldNoWork` by `tick_with` — no re-roll, no backoff, no
+                // crash count. A sibling member on a different account keeps
+                // rolling.
+                if holds.member_fully_held(&profiles_resolver.admission_profiles(agent)) {
+                    return false;
+                }
                 // A down member's OWN in-progress part is workable — for itself.
                 // Its claim marked the part `active`, and `pick`'s fallback
                 // deliberately skips `active` heads (they are someone's work —
@@ -2509,7 +2626,7 @@ impl DriveLoop {
         //    seed + spawn a new part on a SUPERSEDED daemon build, so once the launch
         //    binary is replaced mid-run no fresh start is admitted — terminally, until a
         //    daemon restart. No claim, no seed, no spawn.
-        if !paused && !offline && !rate_limited && !superseded && !bound_reached {
+        if !paused && !offline && !superseded && !bound_reached {
             // Parts already SPOKEN FOR — excluded before a fresh start so the SAME
             // `(queue, part)` is never assigned twice. SEEDED from the LIVE
             // `assignments` (every part a registered member already holds, recorded on
@@ -2533,6 +2650,16 @@ impl DriveLoop {
                 if self.retiring.contains(agent)
                     || self.stopped.contains(agent)
                     || self.supervisor.is_registered(agent)
+                {
+                    continue;
+                }
+                // Per-member rate-limit filter (slice 008): a member whose
+                // every admission profile is held is not admitted this tick —
+                // no claim, no spawn, no backoff, no page. The hold elapses
+                // on its own at the window's `resets_at`.
+                if self
+                    .rate_limit_holds
+                    .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
                 {
                     continue;
                 }
@@ -3667,6 +3794,13 @@ mod tests {
         /// identity to arm the baseline, then to a DIFFERENT one to simulate a mid-run
         /// reinstall and trip the guard.
         exe_identity: Mutex<Option<ExeIdentity>>,
+        /// Scripted claude-login slot tag per agent (slice 008 — the live
+        /// backend reads this off [`ClaudeBackend::active_profile`]; here a
+        /// test writes it directly). An entry's `Some(..)` tags the member's
+        /// `UsageSample` with that slot AND the step-0 rate-limit hold is
+        /// keyed on it; `None` (or absent) leaves the sample untagged → folds
+        /// into every profile → back-compat with the pre-switcher behaviour.
+        profile_tags: Mutex<BTreeMap<String, Option<String>>>,
     }
     impl FakeFleet {
         fn new() -> Arc<Self> {
@@ -3762,6 +3896,12 @@ mod tests {
         }
         /// Clear `agent`'s scripted reopen — models the budget cell being replaced on
         /// the next spawn (a fresh session reads a not-yet-rejected window).
+        fn set_profile_tag(&self, agent: &str, tag: Option<&str>) {
+            self.profile_tags
+                .lock()
+                .unwrap()
+                .insert(agent.into(), tag.map(|s| s.to_string()));
+        }
         fn clear_budget_reset(&self, agent: &str) {
             self.rate_limit_reopens.lock().unwrap().remove(agent);
         }
@@ -3832,6 +3972,9 @@ mod tests {
         }
         fn rate_limit_reopen(&self, agent: &str) -> Option<i64> {
             self.rate_limit_reopens.lock().unwrap().get(agent).copied()
+        }
+        fn profile_for(&self, agent: &str) -> Option<String> {
+            self.profile_tags.lock().unwrap().get(agent).cloned().flatten()
         }
     }
     impl BatonStatusSource for Arc<FakeFleet> {
@@ -6627,7 +6770,15 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             Some(100),
             "the hold persists past the member's exit — it survives the task-031 forget",
         );
-        assert!(r10.rerolls.is_empty(), "no re-roll while the window is held");
+        // Slice 008 refactor: the hold is now a per-member filter in `workable`,
+        // not a fleet-wide short-circuit, so `tick_with` runs and emits
+        // `HeldNoWork` for the held member — semantically identical to the pre-
+        // slice-008 empty vec, surfacing the hold instead of hiding it.
+        assert_eq!(
+            r10.rerolls,
+            vec![RerollOutcome::HeldNoWork { agent: "a1".into() }],
+            "the window-held member is reported as `HeldNoWork`, not re-rolled",
+        );
         assert_eq!(
             backend.spawns(),
             vec!["a1"],
@@ -9061,5 +9212,280 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             vec![("m1", &Unit::Slice { milestone: "m1".into(), slice: "002".into() })],
         );
         assert!(parker.paused.lock().unwrap().is_empty(), "the member never left its entry");
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 008 finish-check tests — per-profile admission (B3/S4).
+    //
+    // These prove the four properties the slice promises: a `rejected` on one
+    // claude-login slot does not halt a sibling pooled on a different slot;
+    // every pool slot held is a HOLD, not an `AgentCrashed` page; a restart
+    // with exhausted per-profile files stays quiet; and no pools anywhere
+    // reduces exactly to the pre-slice-008 fleet-wide hold.
+    // ------------------------------------------------------------------
+
+    /// Scripted [`ProfileResolver`] for the slice-008 tests — the drive-loop
+    /// test fixture does not know about `ClaudeFlavor::profiles`, so a test
+    /// just scripts `agent → admission profile set` directly. An unlisted
+    /// agent reads back as `AssumeHomeProfile`'s default (`["home"]`),
+    /// matching the back-compat case so a mixed test can keep most members on
+    /// the default and single out the ones it cares about.
+    #[derive(Debug, Default, Clone)]
+    struct ScriptedResolver {
+        pools: std::collections::BTreeMap<String, Vec<String>>,
+    }
+
+    impl ScriptedResolver {
+        fn new(entries: &[(&str, &[&str])]) -> Self {
+            let pools = entries
+                .iter()
+                .map(|(agent, slots)| {
+                    (
+                        (*agent).to_string(),
+                        slots.iter().map(|s| (*s).to_string()).collect(),
+                    )
+                })
+                .collect();
+            Self { pools }
+        }
+    }
+
+    impl ProfileResolver for ScriptedResolver {
+        fn admission_profiles(&self, agent: &str) -> Vec<String> {
+            self.pools
+                .get(agent)
+                .cloned()
+                .unwrap_or_else(|| vec!["home".to_string()])
+        }
+    }
+
+    /// Finish-check 1 — a `rejected` on one slot never halts a sibling pooled
+    /// on a different slot. a1 is unpooled on slot1 and reports the window
+    /// `rejected` with `resets_at = 100`; d1 is pooled on [slot1,slot2] and
+    /// keeps running. a1's exit is held (`HeldNoWork` — the per-member filter
+    /// substituting the retired fleet-wide `rate_limited` short-circuit),
+    /// while d1 is not held by anything — the whole point of slice 008.
+    #[test]
+    fn a_on_slot1_rejected_leaves_d_pool_slot1_slot2_admitted_on_slot2() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa"), member("d1", "qd")],
+            vec![
+                q("qa", &[("pa", "queued")]),
+                q("qd", &[("pd", "queued")]),
+            ],
+            Policy::default(),
+        );
+        // a1 is unpooled on slot1; d1 is pooled on [slot1, slot2].
+        loop_ = loop_.with_profile_resolver(Box::new(ScriptedResolver::new(&[
+            ("a1", &["slot1"]),
+            ("d1", &["slot1", "slot2"]),
+        ])));
+        backend.set_profile_tag("a1", Some("slot1"));
+        // d1's current session is reading from slot1 (what the live backend
+        // reports through `ClaudeBackend::active_profile`); the trip is a1's
+        // alone, so this tag never contributes to the hold.
+        backend.set_profile_tag("d1", Some("slot1"));
+
+        // Tick 0: both start.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1", "d1"]);
+
+        // a1 trips the 5h window with `resets_at = 100` on slot1 and exits
+        // on `HALTED_RATE_LIMIT`. d1 stays alive (Healthy) and keeps running.
+        backend.set_budget("a1", hot_budget());
+        backend.set_budget_reset("a1", 100);
+        backend.set_baton("a1", "HALTED_RATE_LIMIT");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_health("d1", AgentHealth::Alive { last_active: 1 });
+
+        let r = loop_.tick(1);
+        assert_eq!(
+            r.waiting_for_rate_limit_reset,
+            Some(100),
+            "slot1's hold shows the earliest reopen; the surface is unchanged",
+        );
+        // a1 is the only down candidate — and it is held, not re-rolled.
+        assert_eq!(
+            r.rerolls,
+            vec![RerollOutcome::HeldNoWork { agent: "a1".into() }],
+            "a1 (slot1-only) is held by slot1's `resets_at`; nothing re-rolls",
+        );
+        // d1 was never halted — no spawn attempted (it is still running),
+        // no `HeldForAdmission`, no `SpawnFailed`, no `AgentCrashed`. The
+        // pre-slice-008 fleet-wide `rate_limited` short-circuit would have
+        // forbidden every spawn from either member on this tick; the slice
+        // isolates the hold to slot1.
+        assert_eq!(
+            backend.spawns(),
+            vec!["a1", "d1"],
+            "no re-roll of either — a1 is held, d1 is still running",
+        );
+    }
+
+    /// Finish-check 2 — every slot in the pool is held → the member holds
+    /// without an `AgentCrashed` page and without a crash-backoff bump. The
+    /// hold is a HOLD, not a crash: `RerollOutcome::HeldNoWork` (zero
+    /// `AgentCrashed`, zero `SpawnFailed`) and no spawn.
+    #[test]
+    fn every_pool_slot_held_holds_the_member_with_no_agent_crashed() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("pa", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_.with_profile_resolver(Box::new(ScriptedResolver::new(&[(
+            "a1",
+            &["slot1", "slot2"],
+        )])));
+        backend.set_profile_tag("a1", Some("slot1"));
+
+        // Tick 0: a1 starts.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // a1 reports a `rejected` on slot1. Then (same wall-second, as if
+        // the next member's wire error carried its own) a1 reports on slot2.
+        // Both windows end up in the hold map; the member is now fully held.
+        backend.set_budget("a1", hot_budget());
+        backend.set_budget_reset("a1", 100);
+        backend.set_baton("a1", "HALTED_RATE_LIMIT");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        // Tick 1 — slot1 is held.
+        loop_.tick(1);
+        // Tick 2 — switch the tag to slot2 and re-report. This simulates the
+        // sibling spawn on slot2 that then also tripped. The hold map now
+        // carries both slots.
+        backend.set_profile_tag("a1", Some("slot2"));
+        backend.set_budget_reset("a1", 200);
+        let r2 = loop_.tick(2);
+        // slot2's hold is later, so the earliest reopen is still slot1.
+        assert_eq!(r2.waiting_for_rate_limit_reset, Some(100));
+
+        // Tick 5 (long before the earliest reset) — the member is fully
+        // held: HeldNoWork, no SpawnFailed, no AgentCrashed.
+        let r5 = loop_.tick(5);
+        assert_eq!(
+            r5.rerolls,
+            vec![RerollOutcome::HeldNoWork { agent: "a1".into() }],
+            "both slots held ⇒ HeldNoWork, never SpawnFailed",
+        );
+        assert_eq!(
+            backend.spawns(),
+            vec!["a1"],
+            "no second spawn — no crash-into-exhaustion loop",
+        );
+        // The alerts hub must not have carried an `AgentCrashed` page.
+        let mut alerts = Vec::new();
+        while let Ok(ev) = probe.alerts.try_recv() {
+            alerts.push(ev);
+        }
+        assert!(
+            alerts.iter().all(|a| !format!("{a:?}").contains("AgentCrashed")),
+            "no `AgentCrashed` page for a rate-held member (B3/S4): {alerts:?}",
+        );
+    }
+
+    /// Finish-check 3 — restart with per-profile holds already active
+    /// (modelled here by seeding the DriveLoop with a hold BEFORE the first
+    /// tick) stays quiet: no page, no crash, no per-tick spawn. In production
+    /// a daemon restart re-derives these from `usage.by-profile/<slot>.json`
+    /// (slice 009's per-slot capture); here we inject the end state directly
+    /// since the finish-check is the drive-loop level invariant.
+    #[test]
+    fn restart_with_exhausted_per_profile_files_holds_quietly() {
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("pa", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_.with_profile_resolver(Box::new(ScriptedResolver::new(&[(
+            "a1",
+            &["slot1"],
+        )])));
+        // Simulate the restart's re-derivation: the hold is already present
+        // before any tick runs (the live loop reads it from
+        // `usage.by-profile/slot1.json` at construction / first tick).
+        loop_.rate_limit_holds.extend("slot1".to_string(), 500);
+
+        // Three consecutive ticks under the hold.
+        for t in 0..3 {
+            let r = loop_.tick(t);
+            assert_eq!(r.waiting_for_rate_limit_reset, Some(500));
+            // No spawn ever happens.
+            assert!(backend.spawns().is_empty(), "no spawn under a seeded hold");
+            // No alerts page.
+            let mut alerts = Vec::new();
+            while let Ok(ev) = probe.alerts.try_recv() {
+                alerts.push(ev);
+            }
+            assert!(alerts.is_empty(), "quiet hold emits no alerts: {alerts:?}");
+        }
+    }
+
+    /// Finish-check 4 — no pools anywhere ≡ the pre-slice-008 fleet-wide
+    /// hold. Every member defaults to `["home"]`, the step-0 observes an
+    /// untagged sample folding into `home`, and admission reads exactly as it
+    /// did before the switcher.
+    #[test]
+    fn no_pools_anywhere_equals_the_old_global_hold() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa"), member("b1", "qb")],
+            vec![
+                q("qa", &[("pa", "queued")]),
+                q("qb", &[("pb", "queued")]),
+            ],
+            Policy::default(),
+        );
+        // Deliberately NO `with_profile_resolver` — every member reads
+        // `["home"]` through `AssumeHomeProfile`. Neither member tags its
+        // samples (default `None` from `set_profile_tag`).
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1", "b1"]);
+
+        // a1 reports a `rejected`; its untagged reading folds into `home`
+        // → every member is now fully held on `home` (the pre-switcher
+        // behaviour: one `rejected` halts the fleet).
+        backend.set_budget("a1", hot_budget());
+        backend.set_budget_reset("a1", 100);
+        backend.set_baton("a1", "HALTED_RATE_LIMIT");
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("b1", "IN_PROGRESS");
+        backend.set_health("b1", AgentHealth::Exited { code: 0 });
+
+        let r = loop_.tick(1);
+        assert_eq!(r.waiting_for_rate_limit_reset, Some(100));
+        // Both members held — exactly the pre-slice-008 "every member waits
+        // for the window reset" behaviour.
+        let mut held: Vec<&str> = r
+            .rerolls
+            .iter()
+            .filter_map(|o| match o {
+                RerollOutcome::HeldNoWork { agent } => Some(agent.as_str()),
+                _ => None,
+            })
+            .collect();
+        held.sort();
+        assert_eq!(
+            held,
+            vec!["a1", "b1"],
+            "home-fallback keys the hold on `home` and halts every member — regression guard",
+        );
+        let rerolled: Vec<&str> = r
+            .rerolls
+            .iter()
+            .filter_map(|o| match o {
+                RerollOutcome::Rerolled { agent } => Some(agent.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rerolled.is_empty(),
+            "no member re-rolls while `home` is held",
+        );
+        assert_eq!(
+            backend.spawns(),
+            vec!["a1", "b1"],
+            "no re-spawn into the exhausted window",
+        );
     }
 }
