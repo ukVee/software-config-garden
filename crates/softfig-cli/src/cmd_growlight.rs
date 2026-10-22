@@ -24,6 +24,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     ClientError, ErrorKind, Request, growlightd_runtime_socket_path, runtime_socket_path,
     baton::parse_baton,
+    claude_profiles,
     growlightd::{
         self, AgentDeltaKind, BuildCapsSummary, Event, FleetStatusReply, ForceStopArgs,
         PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
@@ -42,9 +43,10 @@ use softfig_growlightd_client::{decode_frame, Frame};
 
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
-    Backend, DEEPSEEK_FLASH, DEEPSEEK_REASONING, InteractiveLaunch, ModelChoice, ModelSpec,
-    OpencodeConfigInputs, agent_bin, interactive_command, item_doc_candidates, opencode_config,
-    opencode_context, opencode_interactive_args, parse_model_spec, resolve_item_models,
+    Backend, DEEPSEEK_FLASH, DEEPSEEK_REASONING, InteractiveLaunch, LaunchSlot, ModelChoice,
+    ModelSpec, OpencodeConfigInputs, agent_bin, interactive_command, item_doc_candidates,
+    opencode_config, opencode_context, opencode_interactive_args, parse_model_spec,
+    resolve_item_models,
 };
 use crate::opencode_catalog;
 
@@ -248,6 +250,11 @@ pub struct StartArgs {
     /// declares in its `> Model:` line, defaulting to deepseek flash.
     #[arg(long, conflicts_with_all = ["backend", "opencode"])]
     pub model: Option<String>,
+    /// The claude-login slot the claude session runs on (its
+    /// `CLAUDE_CONFIG_DIR`; `home` = Claude's default config dir). Defaults to
+    /// the store's active slot (`softfig claude-login use`). claude only.
+    #[arg(long, value_name = "SLOT")]
+    pub profile: Option<String>,
 }
 
 /// Args for `say` — the human-post seam. Unlike the growlightd client verbs,
@@ -518,6 +525,19 @@ fn start(args: StartArgs) -> Result<()> {
     // "let growlight decide" can read the active item's declaration.
     let choice = resolve_model_choice(&args, &garden_root, &baton_path)?;
     let backend = choice.backend;
+    // The claude-login slot, resolved and checked before anything launches
+    // (claude-login-switcher slice 007): the same resolver growlightd's spawn
+    // seam uses, so a slot the fleet would refuse is refused here too.
+    let claude_slot = match backend {
+        Backend::Claude => Some(resolve_launch_slot(
+            claude_profiles::store_root_from_env().as_deref(),
+            args.profile.as_deref(),
+        )?),
+        Backend::Opencode if args.profile.is_some() => {
+            bail!("--profile selects a claude-login slot; it has no meaning for opencode")
+        }
+        Backend::Opencode => None,
+    };
 
     // The opencode-native equivalent of loop.json + mcp.json (`softfig-loop` agent
     // = protocol-by-reference + step-0 baton boot + the session context (garden
@@ -599,6 +619,7 @@ fn start(args: StartArgs) -> Result<()> {
         garden_root: &garden_root,
         opencode_config: &opencode_path,
         boot_prompt: OPENCODE_KICK,
+        claude_slot: claude_slot.as_ref(),
     };
 
     if args.no_launch {
@@ -681,6 +702,25 @@ fn item_own_doc(garden_root: &Path, item: &str) -> Result<Option<String>, String
     }
 }
 
+/// The slot an interactive claude session runs on: `--profile`, else the
+/// store's `active` pointer, checked by the resolver growlightd's spawn seam
+/// uses ([`claude_profiles::launch_slot`]), so a missing dir or an unusable
+/// credential refuses the launch rather than run on another account. With no
+/// store (no `$HOME`) only `home` exists.
+fn resolve_launch_slot(store: Option<&Path>, profile: Option<&str>) -> Result<LaunchSlot> {
+    let (name, dir) = match (store, profile) {
+        (Some(store), Some(slot)) => (slot.to_string(), claude_profiles::launch_slot(store, slot)?),
+        (Some(store), None) => claude_profiles::launch_active(store)?,
+        (None, None | Some(claude_profiles::HOME_SLOT)) => {
+            (claude_profiles::HOME_SLOT.to_string(), claude_profiles::SlotDir::Home)
+        }
+        (None, Some(slot)) => bail!(
+            "claude-login slot {slot:?}: no slot store can be named (is $HOME set?)"
+        ),
+    };
+    Ok(LaunchSlot { name, dir })
+}
+
 /// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
 /// and built from the very [`InteractiveLaunch`] the spawn would consume, so a
 /// test can assert the hint names the same cwd the launcher really uses.
@@ -697,9 +737,25 @@ fn item_own_doc(garden_root: &Path, item: &str) -> Result<Option<String>, String
 fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
     let garden = launch.garden_root.display();
     match choice.backend {
+        // The slot goes through `env`, which also bypasses the bash `claude()`
+        // shim: a bare `claude` there would re-resolve the active slot, and
+        // `--profile` may have named another one.
         Backend::Claude => format!(
-            "(--no-launch) runtime ready. launch with:\n  cd {garden} && {AGENT_BIN} \
+            "(--no-launch) runtime ready{}. launch with:\n  cd {garden} && {}{AGENT_BIN} \
              --name {AGENT_NAME} --settings {} --mcp-config {}",
+            launch
+                .claude_slot
+                .map(|s| format!(" (claude-login slot {})", s.name))
+                .unwrap_or_default(),
+            match launch.claude_slot.map(|s| &s.dir) {
+                Some(claude_profiles::SlotDir::Store(dir)) => {
+                    format!("env {}={} ", claude_profiles::CONFIG_DIR_ENV, dir.display())
+                }
+                Some(claude_profiles::SlotDir::Home) => {
+                    format!("env -u {} ", claude_profiles::CONFIG_DIR_ENV)
+                }
+                None => String::new(),
+            },
             launch.loop_settings.display(),
             launch.mcp_config.display(),
         ),
@@ -919,7 +975,13 @@ fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> 
     let mut cmd = interactive_command(backend, launch)?;
     let bin = agent_bin(backend);
     match backend {
-        Backend::Claude => println!("\nlaunching {bin} --name {AGENT_NAME} …\n"),
+        Backend::Claude => {
+            let slot = launch
+                .claude_slot
+                .map(|s| format!(" on claude-login slot {}", s.name))
+                .unwrap_or_default();
+            println!("\nlaunching {bin} --name {AGENT_NAME}{slot} …\n");
+        }
         // Name the model: with four ways to pick one, the human should never have
         // to guess which one is about to burn tokens.
         Backend::Opencode => {
@@ -1371,7 +1433,7 @@ fn print_fleet_status(r: &FleetStatusReply) {
     } else {
         println!("agents:");
         for a in &r.agents {
-            println!("  {:<16} {:<12} {}", a.id, a.status, agent_accounting(a));
+            println!("{}", agent_row(a));
         }
     }
     // The parts the fleet is leaving for the human (task 068), with the skip reason
@@ -1385,6 +1447,18 @@ fn print_fleet_status(r: &FleetStatusReply) {
             println!("  {:<32} {}", format!("{}/{}", h.queue, h.part), h.reason);
         }
     }
+}
+
+/// One `agents:` row: id, status, the claude-login slot the member's last
+/// session ran on (claude-login-switcher slice 007; blank for opencode or a
+/// member not yet spawned), then [`agent_accounting`]. Pure over the reply.
+fn agent_row(a: &growlightd::AgentSummary) -> String {
+    let profile = a
+        .profile
+        .as_deref()
+        .map(|p| format!("profile={p}"))
+        .unwrap_or_default();
+    format!("  {:<16} {:<12} {:<16} {}", a.id, a.status, profile, agent_accounting(a))
 }
 
 /// The accounting half of an `agents:` row: which backend serves the member and —
@@ -3286,6 +3360,7 @@ mod tests {
             garden_root: garden,
             opencode_config: Path::new("/rt/opencode.json"),
             boot_prompt: OPENCODE_KICK,
+            claude_slot: None,
         };
 
         for choice in [
@@ -3342,6 +3417,77 @@ mod tests {
         assert!(!claude.contains("OPENCODE_CONFIG"));
     }
 
+    /// claude-login-switcher slice 007 finish-check: `growlight start --profile
+    /// slot2 --no-launch` prints a hint that carries `CLAUDE_CONFIG_DIR`, with
+    /// the claude argv otherwise unchanged; `home` unsets it.
+    #[test]
+    fn the_no_launch_hint_carries_the_claude_login_slot() {
+        let launch_on = |slot: Option<&LaunchSlot>| -> String {
+            let launch = InteractiveLaunch {
+                agent_name: AGENT_NAME,
+                loop_settings: Path::new("/rt/loop.json"),
+                mcp_config: Path::new("/rt/mcp.json"),
+                garden_root: Path::new("/g"),
+                opencode_config: Path::new("/rt/opencode.json"),
+                boot_prompt: OPENCODE_KICK,
+                claude_slot: slot,
+            };
+            no_launch_hint(&ModelChoice::claude(), &launch)
+        };
+        let argv = format!("{AGENT_BIN} --name {AGENT_NAME} --settings /rt/loop.json --mcp-config /rt/mcp.json");
+
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path();
+        std::fs::create_dir(store.join("slot2")).unwrap();
+        let creds = store.join("slot2").join(claude_profiles::CREDENTIALS_FILE);
+        std::fs::write(&creds, "{}").unwrap();
+        std::fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        let slot2 = resolve_launch_slot(Some(store), Some("slot2")).unwrap();
+        let hint = launch_on(Some(&slot2));
+        assert!(
+            hint.ends_with(&format!(
+                "cd /g && env CLAUDE_CONFIG_DIR={} {argv}",
+                store.join("slot2").display()
+            )),
+            "{hint}"
+        );
+        assert!(hint.contains("(claude-login slot slot2)"), "{hint}");
+
+        let home = resolve_launch_slot(Some(store), Some("home")).unwrap();
+        assert!(launch_on(Some(&home)).ends_with(&format!("cd /g && env -u CLAUDE_CONFIG_DIR {argv}")));
+        assert!(launch_on(None).ends_with(&format!("cd /g && {argv}")), "no slot ⇒ the old hint");
+    }
+
+    #[test]
+    fn the_launch_slot_defaults_to_active_and_fails_closed() {
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path();
+        // No pointer ⇒ home; no store at all ⇒ home too, but a named slot needs one.
+        assert_eq!(resolve_launch_slot(Some(store), None).unwrap().name, "home");
+        assert_eq!(resolve_launch_slot(None, None).unwrap().dir, claude_profiles::SlotDir::Home);
+        assert!(resolve_launch_slot(None, Some("slot1")).is_err());
+
+        // A slot with no credential is refused by name, whether named or active.
+        std::fs::create_dir(store.join("slot1")).unwrap();
+        let err = resolve_launch_slot(Some(store), Some("slot1")).unwrap_err().to_string();
+        assert!(err.contains("\"slot1\"") && err.contains("not logged in"), "{err}");
+        std::os::unix::fs::symlink("slot1", store.join(claude_profiles::ACTIVE_LINK)).unwrap();
+        assert!(resolve_launch_slot(Some(store), None).is_err());
+        assert!(resolve_launch_slot(Some(store), Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn an_agents_row_shows_the_claude_login_slot() {
+        use softfig_ipc::growlightd::AgentSummary;
+        let row = agent_row(&AgentSummary::new("a", "running", true).with_profile(Some("slot2".into())));
+        assert!(row.contains(" profile=slot2 "), "{row:?}");
+        assert!(row.ends_with("claude"), "{row:?}");
+        let bare = agent_row(&AgentSummary::new("oc", "idle", false));
+        assert!(!bare.contains("profile="), "{bare:?}");
+        // The accounting column starts at the same offset either way.
+        assert_eq!(row.find("claude"), bare.find("claude"));
+    }
+
     #[test]
     fn start_args_parse_the_model_flag_and_keep_the_selectors_exclusive() {
         use clap::Parser;
@@ -3380,6 +3526,13 @@ mod tests {
         assert!(start(&["g", "start", "--model", "flash", "--opencode"]).is_err());
         assert!(start(&["g", "start", "--model", "claude", "--backend", "claude"]).is_err());
         assert!(start(&["g", "start", "--opencode", "--backend", "claude"]).is_err());
+
+        // claude-login-switcher slice 007: `--profile` names the slot.
+        assert_eq!(bare.profile, None, "default = the store's active slot");
+        assert_eq!(
+            start(&["g", "start", "--profile", "slot2", "--no-launch"]).unwrap().profile.as_deref(),
+            Some("slot2")
+        );
     }
 
     /// A garden with one milestone (slices + CLAUDE.md) and one task, plus a

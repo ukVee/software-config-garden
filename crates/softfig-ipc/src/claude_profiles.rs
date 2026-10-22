@@ -192,6 +192,90 @@ pub fn credential_state(config_dir: &Path) -> io::Result<CredentialState> {
     }
 }
 
+/// Why a slot cannot be handed to a `claude` launch (slice 007). Every
+/// variant names the slot, so a refused spawn says which account it was for.
+#[derive(Debug)]
+pub enum LaunchSlotError {
+    /// The name is not a slot name.
+    BadName(String, SlotNameError),
+    /// `<store>/active` does not name a usable slot.
+    Active(ActiveError),
+    /// The store slot has no directory (or it is not a directory).
+    MissingDir(String, PathBuf),
+    /// The slot's `.credentials.json` is absent, not a regular file, or
+    /// readable by group/other.
+    Credential(String, CredentialState),
+    /// `lstat` failed on the slot or its credential.
+    Io(String, io::Error),
+}
+
+impl fmt::Display for LaunchSlotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LaunchSlotError::BadName(s, e) => write!(f, "claude-login slot {s:?}: {e}"),
+            LaunchSlotError::Active(e) => write!(f, "claude-login: {e}"),
+            LaunchSlotError::MissingDir(s, p) => write!(
+                f,
+                "claude-login slot {s:?} has no directory at {} — `softfig claude-login add {s}`",
+                p.display()
+            ),
+            LaunchSlotError::Credential(s, state) => {
+                let what = match state {
+                    CredentialState::Missing => "has no .credentials.json (not logged in)".into(),
+                    CredentialState::NotRegular => {
+                        ".credentials.json is not a regular file".to_string()
+                    }
+                    CredentialState::LoosePerms(m) => {
+                        format!(".credentials.json has loose mode {m:o} (want 0600)")
+                    }
+                    CredentialState::Ok => "is ok".into(),
+                };
+                write!(f, "claude-login slot {s:?} {what} — see `softfig claude-login doctor`")
+            }
+            LaunchSlotError::Io(s, e) => write!(f, "claude-login slot {s:?}: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LaunchSlotError {}
+
+/// Resolve `slot` for a `claude` launch, failing closed. [`HOME_SLOT`] is
+/// returned unchecked: it is Claude's own default config dir, exactly what
+/// every launch used before the store existed. A store slot must be a real
+/// directory (not a symlink) whose `.credentials.json` is
+/// [`CredentialState::Ok`]. There is no fallback to `home` or to another
+/// slot: a launch meant for one account never silently runs on another.
+///
+/// growlightd's spawn seam and `softfig growlight start --profile` both call
+/// this, so the fleet and the interactive loop refuse the same slots.
+pub fn launch_slot(store: &Path, slot: &str) -> Result<SlotDir, LaunchSlotError> {
+    let dir = slot_dir(store, slot).map_err(|e| LaunchSlotError::BadName(slot.into(), e))?;
+    let SlotDir::Store(path) = &dir else {
+        return Ok(dir);
+    };
+    match fs::symlink_metadata(path) {
+        Ok(md) if md.is_dir() => {}
+        Ok(_) => return Err(LaunchSlotError::MissingDir(slot.into(), path.clone())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(LaunchSlotError::MissingDir(slot.into(), path.clone()))
+        }
+        Err(e) => return Err(LaunchSlotError::Io(slot.into(), e)),
+    }
+    match credential_state(path) {
+        Ok(CredentialState::Ok) => Ok(dir),
+        Ok(state) => Err(LaunchSlotError::Credential(slot.into(), state)),
+        Err(e) => Err(LaunchSlotError::Io(slot.into(), e)),
+    }
+}
+
+/// [`launch_slot`] on whatever `<store>/active` names (absent = [`HOME_SLOT`]),
+/// read now, so a launch follows the human's latest `use`.
+pub fn launch_active(store: &Path) -> Result<(String, SlotDir), LaunchSlotError> {
+    let name = read_active(store).map_err(LaunchSlotError::Active)?;
+    let dir = launch_slot(store, &name)?;
+    Ok((name, dir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +376,72 @@ mod tests {
         fs::write(d.join("real.json"), "{}").unwrap();
         symlink(d.join("real.json"), d.join(CREDENTIALS_FILE)).unwrap();
         assert_eq!(credential_state(d).unwrap(), CredentialState::NotRegular);
+    }
+
+    fn slot_with_creds(store: &Path, slot: &str, mode: u32) {
+        fs::create_dir_all(store.join(slot)).unwrap();
+        let creds = store.join(slot).join(CREDENTIALS_FILE);
+        fs::write(&creds, "{}").unwrap();
+        fs::set_permissions(&creds, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn launch_slot_accepts_home_unchecked_and_a_healthy_store_slot() {
+        let td = tempfile::TempDir::new().unwrap();
+        let store = td.path();
+        assert_eq!(launch_slot(store, HOME_SLOT).unwrap(), SlotDir::Home);
+        slot_with_creds(store, "slot1", 0o600);
+        assert_eq!(launch_slot(store, "slot1").unwrap(), SlotDir::Store(store.join("slot1")));
+    }
+
+    #[test]
+    fn launch_slot_fails_closed_naming_the_slot() {
+        let td = tempfile::TempDir::new().unwrap();
+        let store = td.path();
+        let err = launch_slot(store, "ghost").unwrap_err();
+        assert!(matches!(err, LaunchSlotError::MissingDir(ref s, _) if s == "ghost"));
+        assert!(err.to_string().contains("\"ghost\""), "{err}");
+
+        fs::create_dir(store.join("bare")).unwrap();
+        assert!(matches!(
+            launch_slot(store, "bare"),
+            Err(LaunchSlotError::Credential(_, CredentialState::Missing))
+        ));
+
+        slot_with_creds(store, "loose", 0o644);
+        assert!(matches!(
+            launch_slot(store, "loose"),
+            Err(LaunchSlotError::Credential(_, CredentialState::LoosePerms(0o644)))
+        ));
+
+        fs::create_dir(store.join("linked")).unwrap();
+        fs::write(td.path().join("real.json"), "{}").unwrap();
+        symlink(td.path().join("real.json"), store.join("linked").join(CREDENTIALS_FILE)).unwrap();
+        assert!(matches!(
+            launch_slot(store, "linked"),
+            Err(LaunchSlotError::Credential(_, CredentialState::NotRegular))
+        ));
+
+        // A symlinked slot dir is not a slot: `active`'s resolver refuses it too.
+        slot_with_creds(store, "real", 0o600);
+        symlink(store.join("real"), store.join("alias")).unwrap();
+        assert!(matches!(launch_slot(store, "alias"), Err(LaunchSlotError::MissingDir(..))));
+
+        assert!(matches!(launch_slot(store, "../x"), Err(LaunchSlotError::BadName(..))));
+    }
+
+    #[test]
+    fn launch_active_follows_the_pointer() {
+        let td = tempfile::TempDir::new().unwrap();
+        let store = td.path();
+        assert_eq!(launch_active(store).unwrap(), (HOME_SLOT.into(), SlotDir::Home));
+        slot_with_creds(store, "slot2", 0o600);
+        symlink("slot2", store.join(ACTIVE_LINK)).unwrap();
+        assert_eq!(
+            launch_active(store).unwrap(),
+            ("slot2".into(), SlotDir::Store(store.join("slot2")))
+        );
+        fs::remove_file(store.join("slot2").join(CREDENTIALS_FILE)).unwrap();
+        assert!(matches!(launch_active(store), Err(LaunchSlotError::Credential(..))));
     }
 }

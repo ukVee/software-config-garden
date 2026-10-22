@@ -317,9 +317,9 @@ fn agent_summary(
         matches!(health, Some(AgentHealth::Alive { .. })),
     )
     // The claude-login profile slot the member's last spawn ran under
-    // (claude-login-switcher slice 003). `None` for opencode / for a claude
-    // member with no pool, which the status renderer treats as "unpinned
-    // (shared top-level)".
+    // (claude-login-switcher slices 003, 007). `None` for opencode, or for a
+    // claude member that has not spawned yet, which the status renderer shows
+    // as `-`.
     .with_profile(router.active_profile(&m.agent));
     match &m.backend {
         // A subscription member: no per-member dollar figure exists, and the row

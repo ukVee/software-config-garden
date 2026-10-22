@@ -42,20 +42,21 @@
 //! fixture and a fake clock — no real `claude` is ever spawned in tests (the §7b
 //! on-device run is the human's).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
+use softfig_ipc::claude_profiles::{self, SlotDir};
 use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 use softfig_ipc::usage::RateWindow;
 
 use crate::admission::BudgetUsage;
 use crate::agent_harness::{
-    AgentRateState, AgentStreamErrState, BackendFlavor, Harness, LineObserver, StreamError,
-    StreamErrorKind, TOOL_RENDER_MAX_CHARS, truncate_chars,
+    AgentRateState, AgentStreamErrState, BackendFlavor, EnvChange, Harness, LineObserver,
+    StreamError, StreamErrorKind, TOOL_RENDER_MAX_CHARS, truncate_chars,
 };
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
@@ -846,25 +847,24 @@ fn claude_command_argv(
     ]
 }
 
-/// Claude's [`BackendFlavor`]: the three things the shared harness cannot know —
-/// the argv, the fail-closed pre-approval, and the stream-json per-line fold.
-/// The per-member claude-login profile machinery handed to [`ClaudeFlavor`]
-/// (claude-login-switcher slice 003). An empty `pools` map ⇒ nothing to do:
-/// every member runs on today's semantics (shared top-level credential, real
-/// `$HOME`).
+/// The claude-login slot machinery handed to [`ClaudeFlavor`]
+/// (claude-login-switcher slices 003 and 007). A slot is a real
+/// `CLAUDE_CONFIG_DIR` in the store; `home` is Claude's default config dir with
+/// the variable unset. The default (no store) leaves every spawn as it was
+/// before the switcher: no env, real `$HOME`.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileContext {
-    /// `$XDG_CONFIG_HOME/softfig/growlight/agents` — the parent of each
-    /// member's overlay HOME `<agents_dir>/<id>/home/`.
+    /// `$XDG_CONFIG_HOME/softfig/growlight/agents` — each member's pin and pick
+    /// history live in `<agents_dir>/<id>/` (see [`crate::profile_pin`]).
     pub agents_dir: PathBuf,
-    /// Real `~/.claude`, which holds the stored profile slots at
-    /// `credentials.d/<slot>.json`. The retarget points the overlay symlink
-    /// here, so each profile is read from the one on-disk copy (never a
-    /// per-member bundle — operator trust is in one place).
-    pub claude_home: PathBuf,
+    /// The slot store (`softfig_ipc::claude_profiles::store_root`). `None`
+    /// means no store could be named (no `$HOME`), or a backend built outside a
+    /// growlight runtime: an unpooled member then gets no env, and a pooled one
+    /// is refused, since it cannot land on the account it asked for.
+    pub store: Option<PathBuf>,
     /// Per-member profile pool, in config order. Keyed by agent id; a member
-    /// not present ⇒ no pool, which the flavor treats as the pre-slice-003
-    /// semantics.
+    /// not present has no pool and follows the store's `active` slot, read at
+    /// each spawn.
     pub pools: BTreeMap<String, Vec<String>>,
     /// Where per-profile budget samples live
     /// (`$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/`), when a
@@ -875,13 +875,19 @@ pub struct ProfileContext {
     pub by_profile_dir: Option<PathBuf>,
 }
 
-impl ProfileContext {
-    /// `true` ⇒ nothing to do on any spawn (byte-identical to pre-slice-003).
-    fn is_disabled(&self) -> bool {
-        self.pools.is_empty()
-    }
+/// The slot one spawn's [`BackendFlavor::child_env`] chose, held until the
+/// harness reports the child really started ([`BackendFlavor::spawned`]).
+#[derive(Debug, Clone)]
+struct ChosenSlot {
+    slot: String,
+    /// Picked from a `profile_pool` (so it is pinned and enters the history),
+    /// rather than followed from the store's `active` pointer.
+    pooled: bool,
 }
 
+/// Claude's [`BackendFlavor`]: the things the shared harness cannot know — the
+/// argv, the fail-closed pre-approval, the claude-login slot env, and the
+/// stream-json per-line fold.
 #[derive(Debug)]
 struct ClaudeFlavor {
     bin: String,
@@ -892,11 +898,21 @@ struct ClaudeFlavor {
     /// session never errors out on a missing allow-rule. Generation failure ⇒ no
     /// spawn (a `SpawnError`).
     preapproval: PreApproval,
-    /// Per-member profile pools + the symlink retarget machinery (slice 003).
-    /// Set once by [`ClaudeBackend::with_profiles`] from the fleet assembly;
-    /// an unset or [`ProfileContext::is_disabled`] context ⇒ byte-identical
-    /// to pre-slice-003 (today's semantics, no overlay).
+    /// The claude-login slot store + per-member pools (slices 003, 007). Set
+    /// once by [`ClaudeBackend::with_profiles`] from the fleet assembly; unset,
+    /// or set without a store, every unpooled spawn carries no env at all.
     profiles: OnceLock<ProfileContext>,
+    /// The harness's live agent → running-scope registry (shared, never
+    /// written here). An agent listed in it has a session running now, so the
+    /// slot it runs on is demoted for the next pick (review 047 S3).
+    live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
+    /// The slot each agent's in-flight spawn chose in `child_env`, committed by
+    /// `spawned` or overwritten by the next attempt if the launch failed.
+    chosen: Mutex<BTreeMap<String, ChosenSlot>>,
+    /// The slot each agent's most recent started session runs on. Read for
+    /// live demotion (only while the agent is in `live_scopes`), the
+    /// per-profile tee, and `status`.
+    session_slots: Mutex<BTreeMap<String, String>>,
     /// Monotonic per-spawn counter stamped into the profile pin's `session_id`
     /// so audit history can tell successive spawns apart within one process
     /// (the harness has its own `scope_gen`, but it is not reachable from the
@@ -986,15 +1002,14 @@ impl ClaudeFlavor {
     /// Resolve this spawn's per-profile tee + the slot name it writes under
     /// (claude-login-switcher slice 004). Returns a disabled capture + `None`
     /// slot when either the profile machinery is not installed, the member
-    /// has no pool declared, no pin is yet on disk, or no `by_profile_dir`
-    /// was configured — every case folds to the shape the shared tee alone
-    /// handles (byte-identical to pre-slice-004 writing).
+    /// has no pool declared, no session slot is recorded, or no
+    /// `by_profile_dir` was configured — every case folds to the shape the
+    /// shared tee alone handles (byte-identical to pre-slice-004 writing).
     ///
-    /// `child_env` writes the pin BEFORE `new_observer` runs on the same
-    /// spawn, so a pin IS on disk by the time this resolves for a pooled
-    /// member. Reading it here freezes the slot for the observer's lifetime,
-    /// which matches slice 003 FC 7's "lock the slot for the session's
-    /// lifetime; never retarget mid-session".
+    /// The harness calls `spawned` (which records the session slot) before
+    /// `new_observer` on the same spawn. Reading it here freezes the slot for
+    /// the observer's lifetime, which matches slice 003 FC 7's "lock the slot
+    /// for the session's lifetime; never retarget mid-session".
     fn per_profile_usage_for(&self, agent: &str) -> (Arc<UsageCapture>, Option<String>) {
         let disabled = || (Arc::new(UsageCapture::disabled()), None);
         let Some(profiles) = self.profiles.get() else {
@@ -1006,12 +1021,97 @@ impl ClaudeFlavor {
         if !profiles.pools.contains_key(agent) {
             return disabled();
         }
-        let paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
-        let Some(pin) = crate::profile_pin::read_pin(&paths) else {
+        let Some(slot) = self.session_slots.lock().unwrap().get(agent).cloned() else {
             return disabled();
         };
-        let path = crate::profile_budget::profile_budget_path(dir, &pin.profile);
-        (Arc::new(UsageCapture::new(path)), Some(pin.profile))
+        let path = crate::profile_budget::profile_budget_path(dir, &slot);
+        (Arc::new(UsageCapture::new(path)), Some(slot))
+    }
+
+    /// The slots other members' running sessions are on (review 047 S3): a
+    /// pick avoids them while any other slot has headroom, so two members on
+    /// one two-slot pool land on different accounts. `agent` itself is
+    /// excluded: its previous session has exited if it is being spawned again.
+    fn live_slots(&self, agent: &str) -> BTreeSet<String> {
+        let live: Vec<String> = self
+            .live_scopes
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|id| id.as_str() != agent)
+            .cloned()
+            .collect();
+        let slots = self.session_slots.lock().unwrap();
+        live.iter().filter_map(|id| slots.get(id).cloned()).collect()
+    }
+
+    /// Pick the slot a pooled member's next session runs on (slices 003, 004,
+    /// 007). Highest 5h headroom wins, except that a slot a live member is on
+    /// is used only when every other slot is exhausted; LRU over every pooled
+    /// member's pin history breaks a tie, so the fleet rotates as one rather
+    /// than each member in lockstep. A `< 10%` winner proceeds with a journal
+    /// warning, and an all-exhausted pool refuses the spawn.
+    fn pick_pool_slot(
+        &self,
+        profiles: &ProfileContext,
+        agent: &str,
+        pool: &[String],
+    ) -> Result<String, SpawnError> {
+        use crate::profile_pin::{self as pin, PickResult};
+        let histories: Vec<Vec<pin::ProfilePin>> = profiles
+            .pools
+            .keys()
+            .map(|id| pin::read_pin_history(&pin::pin_paths(&profiles.agents_dir, id)))
+            .collect();
+        let last_used = pin::last_used(&histories);
+        let live = self.live_slots(agent);
+        let headroom_vals: Vec<crate::profile_budget::Headroom> = profiles
+            .by_profile_dir
+            .as_deref()
+            .map(|dir| {
+                crate::profile_budget::pool_headroom(dir, pool, pin::now_unix())
+                    .into_iter()
+                    .map(|(_, h)| h)
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                // No per-profile dir configured ⇒ every slot reads as full
+                // headroom, which collapses the picker back to LRU + live
+                // demotion.
+                vec![crate::profile_budget::Headroom::full(); pool.len()]
+            });
+        match pin::pick_with_budget(pool, &last_used, &live, &headroom_vals) {
+            Some(PickResult::Chose { slot, headroom_pct }) => {
+                eprintln!(
+                    "growlightd: agent {agent:?}: claude-login slot {slot:?} \
+                     ({headroom_pct}% 5h headroom; pool {pool:?}; live elsewhere {live:?})"
+                );
+                Ok(slot)
+            }
+            Some(PickResult::Warn { slot, headroom_pct }) => {
+                // Still a pick — the slice spec is explicit: `< 10%` emits a
+                // warning but proceeds. The journal line surfaces to the
+                // operator; the drive loop keeps running.
+                eprintln!(
+                    "growlightd: agent {agent:?}: picked claude-login slot {slot:?} \
+                     with low headroom {headroom_pct}% — the pool is close to exhausted"
+                );
+                Ok(slot)
+            }
+            Some(PickResult::Stall { until_at }) => Err(SpawnError(format!(
+                "agent {agent:?}: all claude-login pool profiles are exhausted \
+                 (< {stall}% 5h headroom across the pool); the drive loop should \
+                 retry at {until}",
+                stall = pin::HEADROOM_STALL_PCT,
+                until = until_at
+                    .map(|at| format!("unix seconds {at}"))
+                    .unwrap_or_else(|| "the next tick (no reset known)".into()),
+            ))),
+            None => Err(SpawnError(format!(
+                "agent {agent:?} declares profile_pool but the pool resolved to \
+                 no pickable slot — refuse rather than fall back to another account"
+            ))),
+        }
     }
 }
 
@@ -1044,156 +1144,60 @@ impl BackendFlavor for ClaudeFlavor {
         )
     }
 
-    fn child_env(
-        &self,
-        agent: &str,
-        _paths: &AgentPaths,
-    ) -> Result<Vec<(OsString, OsString)>, SpawnError> {
-        // No pools configured ⇒ byte-identical to the pre-slice-003 spawn:
-        // the harness-inherited `$HOME` + the top-level credential symlink
-        // under the human's real `~/.claude`.
+    fn child_env(&self, agent: &str, _paths: &AgentPaths) -> Result<Vec<EnvChange>, SpawnError> {
+        // No slot machinery installed (a backend built outside a growlight
+        // runtime) ⇒ byte-identical to the pre-switcher spawn.
         let Some(profiles) = self.profiles.get() else {
             return Ok(Vec::new());
         };
-        if profiles.is_disabled() {
-            return Ok(Vec::new());
-        }
-        let Some(pool) = profiles.pools.get(agent) else {
-            // The member has no profile_pool declared — share today's
-            // top-level credential. Mirror of the whole-flavor-disabled case
-            // for a member in a MIXED roster.
-            return Ok(Vec::new());
+        let pool = profiles.pools.get(agent);
+        let Some(store) = profiles.store.as_deref() else {
+            return match pool {
+                None => Ok(Vec::new()),
+                Some(_) => Err(SpawnError(format!(
+                    "agent {agent:?} declares profile_pool but no claude-login store \
+                     could be named (is $HOME set?) — refusing rather than run on \
+                     another account"
+                ))),
+            };
         };
-        // Pick the slot the budget-aware picker (slice 004) prefers: highest
-        // 5h headroom wins, LRU breaks the tie (slice 003's rotation rule
-        // when the budget signal is quiet), a `< 10%` winner proceeds with
-        // a warning, and an all-exhausted pool stalls with the earliest
-        // reset pinned so the drive loop knows when to retry. Any step
-        // failure fails the spawn closed: a member that cannot land on its
-        // intended profile must not silently fall back to the shared
-        // top-level credential, which is the exact hazard the switcher
-        // exists to remove.
-        let pin_paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
-        let history = crate::profile_pin::read_pin_history(&pin_paths);
-        let now = crate::profile_pin::now_unix();
-        let headroom_vals: Vec<crate::profile_budget::Headroom> = profiles
-            .by_profile_dir
-            .as_deref()
-            .map(|dir| {
-                crate::profile_budget::pool_headroom(dir, pool, now)
-                    .into_iter()
-                    .map(|(_, h)| h)
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                // No per-profile dir configured ⇒ every slot reads as full
-                // headroom, which collapses the picker back to pure LRU
-                // (byte-identical to slice 003's pre-004 behavior).
-                vec![crate::profile_budget::Headroom::full(); pool.len()]
-            });
-        let pick = crate::profile_pin::pick_with_budget(pool, &history, &headroom_vals);
-        let slot = match pick {
-            Some(crate::profile_pin::PickResult::Chose { slot, .. }) => slot,
-            Some(crate::profile_pin::PickResult::Warn {
+        // A pooled member picks; an unpooled one follows the human's `active`
+        // slot, read now, so it moves with `softfig claude-login use|migrate`.
+        // Either way the slot is checked here and the spawn fails closed on a
+        // missing dir or an unusable credential: no fallback to `home` or to
+        // another slot.
+        let (slot, dir) = match pool {
+            Some(pool) => {
+                let slot = self.pick_pool_slot(profiles, agent, pool)?;
+                let dir = claude_profiles::launch_slot(store, &slot)
+                    .map_err(|e| SpawnError(format!("agent {agent:?}: {e}")))?;
+                (slot, dir)
+            }
+            None => claude_profiles::launch_active(store)
+                .map_err(|e| SpawnError(format!("agent {agent:?}: {e}")))?,
+        };
+        if pool.is_none() && dir != SlotDir::Home {
+            eprintln!("growlightd: agent {agent:?}: claude-login active slot {slot:?}");
+        }
+        let env = match &dir {
+            SlotDir::Store(path) => vec![(
+                claude_profiles::CONFIG_DIR_ENV.into(),
+                Some(path.clone().into_os_string()),
+            )],
+            // A pooled pick of `home` is a decision, so it is enforced even if
+            // growlightd itself inherited the variable.
+            SlotDir::Home if pool.is_some() => vec![(claude_profiles::CONFIG_DIR_ENV.into(), None)],
+            // Unpooled on `home`: exactly the spawn there was before the store.
+            SlotDir::Home => Vec::new(),
+        };
+        self.chosen.lock().unwrap().insert(
+            agent.to_string(),
+            ChosenSlot {
                 slot,
-                headroom_pct,
-            }) => {
-                // Still a pick — the slice spec is explicit: `< 10%` emits a
-                // warning but proceeds. The journal line surfaces to the
-                // operator; the drive loop keeps running.
-                eprintln!(
-                    "growlightd: agent {agent:?}: picked claude-login slot {slot:?} \
-                     with low headroom {headroom_pct}% — the pool is close to exhausted"
-                );
-                slot
-            }
-            Some(crate::profile_pin::PickResult::Stall { until_at }) => {
-                return Err(SpawnError(format!(
-                    "agent {agent:?}: all claude-login pool profiles are exhausted \
-                     (< {stall}% 5h headroom across the pool); the drive loop should \
-                     retry at {until}",
-                    stall = crate::profile_pin::HEADROOM_STALL_PCT,
-                    until = until_at
-                        .map(|at| format!("unix seconds {at}"))
-                        .unwrap_or_else(|| "the next tick (no reset known)".into()),
-                )));
-            }
-            None => {
-                return Err(SpawnError(format!(
-                    "agent {agent:?} declares profile_pool but the pool resolved to \
-                     no pickable slot — refuse rather than fall back to the shared \
-                     top-level credential"
-                )));
-            }
-        };
-
-        // The overlay HOME layout (slice 002's refresh-members shape):
-        //   <agents_dir>/<id>/home/.claude/.credentials.json → symlink into
-        //   <claude_home>/credentials.d/<slot>.json
-        let overlay_home = profiles.agents_dir.join(agent).join("home");
-        let overlay_claude = overlay_home.join(".claude");
-        let overlay_cred = overlay_claude.join(".credentials.json");
-        let source_cred = profiles
-            .claude_home
-            .join(crate::fleet::CREDENTIALS_D)
-            .join(format!("{slot}.json"));
-        if !source_cred.exists() {
-            return Err(SpawnError(format!(
-                "agent {agent:?} profile slot {slot:?}: source credential \
-                 {} is missing — run `softfig claude-login capture` / `login` \
-                 and `softfig claude-login refresh-members` first",
-                source_cred.display()
-            )));
-        }
-        if let Err(e) = std::fs::create_dir_all(&overlay_claude) {
-            return Err(SpawnError(format!(
-                "agent {agent:?}: cannot create overlay HOME {}: {e}",
-                overlay_claude.display()
-            )));
-        }
-        // Unlink any prior pin's symlink (ignore ENOENT), then symlink the
-        // picked slot. The baton authorizes "unlink + symlink" directly: no
-        // other writer touches this per-member overlay file, so no race.
-        match std::fs::remove_file(&overlay_cred) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(SpawnError(format!(
-                    "agent {agent:?}: cannot replace overlay credential {}: {e}",
-                    overlay_cred.display()
-                )));
-            }
-        }
-        if let Err(e) = std::os::unix::fs::symlink(&source_cred, &overlay_cred) {
-            return Err(SpawnError(format!(
-                "agent {agent:?}: cannot symlink overlay credential {} → {}: {e}",
-                overlay_cred.display(),
-                source_cred.display()
-            )));
-        }
-        // Write the pin AFTER the retarget (slice-003 FC 3: a crash in spawn
-        // leaves no stale pin). The pin names the generation suffix as its
-        // session_id — unique per spawn, matches the scope unit the harness
-        // builds.
-        let generation = self
-            .spawn_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let session_id = format!("spawn-{generation}");
-        let pin = crate::profile_pin::ProfilePin::now(&slot, session_id, None);
-        if let Err(e) = crate::profile_pin::write_pin(&pin_paths, &pin) {
-            return Err(SpawnError(format!(
-                "agent {agent:?}: cannot write profile pin {}: {e}",
-                pin_paths.pin.display()
-            )));
-        }
-
-        // The child inherits every other env var; only HOME is retargeted so
-        // claude's own `~/.claude/.credentials.json` lookup lands on the
-        // picked slot.
-        Ok(vec![(
-            OsString::from("HOME"),
-            overlay_home.into_os_string(),
-        )])
+                pooled: pool.is_some(),
+            },
+        );
+        Ok(env)
     }
 
     fn working_dir(&self) -> Option<PathBuf> {
@@ -1201,6 +1205,38 @@ impl BackendFlavor for ClaudeFlavor {
         // `additionalDirectories` grant + the agent cd-ing to the item's repo) is
         // unchanged by the seam, and pinning one here would be a behavior change.
         None
+    }
+
+    fn spawned(&self, agent: &str) {
+        let Some(chosen) = self.chosen.lock().unwrap().remove(agent) else {
+            return;
+        };
+        self.session_slots
+            .lock()
+            .unwrap()
+            .insert(agent.to_string(), chosen.slot.clone());
+        if !chosen.pooled {
+            return;
+        }
+        let Some(profiles) = self.profiles.get() else {
+            return;
+        };
+        // The pin + history are written only now that the session exists
+        // (review 047 nit): a launch that failed leaves the picker's history
+        // untouched. The child is already running on the slot, so a write
+        // failure is journalled, not fatal.
+        let generation = self
+            .spawn_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pin = crate::profile_pin::ProfilePin::now(&chosen.slot, format!("spawn-{generation}"), None);
+        let paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
+        if let Err(e) = crate::profile_pin::write_pin(&paths, &pin) {
+            eprintln!(
+                "growlightd: agent {agent:?}: cannot record profile pin {} (slot {:?}): {e}",
+                paths.pin.display(),
+                chosen.slot
+            );
+        }
     }
 
     fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
@@ -1277,6 +1313,9 @@ impl ClaudeBackend {
             hub,
             preapproval,
             profiles: OnceLock::new(),
+            live_scopes: Arc::clone(&live_scopes),
+            chosen: Mutex::new(BTreeMap::new()),
+            session_slots: Mutex::new(BTreeMap::new()),
             spawn_gen: AtomicU64::new(0),
             budgets: Mutex::new(BTreeMap::new()),
             stream_errs: Mutex::new(BTreeMap::new()),
@@ -1304,24 +1343,26 @@ impl ClaudeBackend {
         self
     }
 
-    /// Install the claude-login profile machinery (claude-login-switcher slice
-    /// 003). An empty [`ProfileContext`] disables rotation on every spawn
-    /// (every member runs on today's shared top-level credential, byte-identical
-    /// to pre-slice-003). A non-empty context installs an overlay HOME + a
-    /// per-spawn credential retarget for the members it names, and leaves the
-    /// unnamed members on today's semantics. One-shot like
-    /// [`Self::with_usage_capture`] (set once at construction).
+    /// Install the claude-login slot machinery (claude-login-switcher slices
+    /// 003, 007). With a store, every spawn runs on a slot: a pooled member's
+    /// pick, an unpooled member's `active` slot read at spawn. Without one
+    /// (the default context), unpooled spawns carry no env and pooled ones are
+    /// refused. One-shot like [`Self::with_usage_capture`] (set once at
+    /// construction).
     pub fn with_profiles(self, profiles: ProfileContext) -> Self {
         let _ = self.flavor.profiles.set(profiles);
         self
     }
 
-    /// `agent`'s active profile slot, from the on-disk pin written by the last
-    /// spawn — or `None` if the member has no pool, has never spawned on one,
-    /// or its pin is unreadable. Reads [`crate::profile_pin::read_pin`] on
-    /// every call; the status surface uses this to render the active slot
-    /// name in the agent row (slice 003 finish-check 5).
+    /// The claude-login slot `agent`'s last session ran on: the one this
+    /// process started, else (for a pooled member, across a daemon restart)
+    /// its on-disk pin. `None` before a pooled member's first pin, or for an
+    /// unpooled member this process has not spawned. The status surface
+    /// renders it as the agent row's profile (slice 003 finish-check 5).
     pub fn active_profile(&self, agent: &str) -> Option<String> {
+        if let Some(slot) = self.flavor.session_slots.lock().unwrap().get(agent) {
+            return Some(slot.clone());
+        }
         let profiles = self.flavor.profiles.get()?;
         if !profiles.pools.contains_key(agent) {
             return None;
@@ -2350,5 +2391,257 @@ mod tests {
         let latched = stream_err.observe().expect("the stream error is latched");
         assert_eq!(latched.kind, StreamErrorKind::RateLimit);
         assert_eq!(latched.resets_at, Some(1782367800));
+    }
+
+    // ---- claude-login slot env (claude-login-switcher slice 007) -----------
+
+    /// A backend with the slot machinery installed over a tempdir store, plus
+    /// the live-scope registry the harness would fill as members run.
+    struct SlotFixture {
+        _tmp: tempfile::TempDir,
+        store: std::path::PathBuf,
+        agents: std::path::PathBuf,
+        live: Arc<Mutex<BTreeMap<String, String>>>,
+        backend: ClaudeBackend,
+    }
+
+    impl SlotFixture {
+        fn new(pools: &[(&str, &[&str])]) -> Self {
+            Self::with_store(pools, true)
+        }
+
+        fn with_store(pools: &[(&str, &[&str])], has_store: bool) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = tmp.path().join("claude-profiles");
+            let agents = tmp.path().join("agents");
+            std::fs::create_dir_all(&store).unwrap();
+            let live = Arc::new(Mutex::new(BTreeMap::new()));
+            let pre = PreApproval::new(
+                &agents,
+                tmp.path().join("protocol.md"),
+                tmp.path().to_path_buf(),
+                std::path::PathBuf::from("softfig-mcp"),
+                tmp.path().join(".claude"),
+            );
+            let backend = ClaudeBackend::new(
+                "claude",
+                "kick",
+                EventHub::new(),
+                pre,
+                Arc::new(Mutex::new(BuildCaps::default())),
+                Arc::clone(&live),
+                Arc::new(Mutex::new(BTreeMap::new())),
+            )
+            .with_profiles(ProfileContext {
+                agents_dir: agents.clone(),
+                store: has_store.then(|| store.clone()),
+                pools: pools
+                    .iter()
+                    .map(|(id, pool)| (id.to_string(), pool.iter().map(|s| s.to_string()).collect()))
+                    .collect(),
+                by_profile_dir: None,
+            });
+            Self {
+                _tmp: tmp,
+                store,
+                agents,
+                live,
+                backend,
+            }
+        }
+
+        /// A logged-in store slot: a dir holding a 0600 `.credentials.json`.
+        fn slot(&self, name: &str) -> &Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = self.store.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let creds = dir.join(claude_profiles::CREDENTIALS_FILE);
+            std::fs::write(&creds, "{\"fake\":true}").unwrap();
+            std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o600)).unwrap();
+            self
+        }
+
+        fn activate(&self, name: &str) {
+            std::os::unix::fs::symlink(name, self.store.join(claude_profiles::ACTIVE_LINK)).unwrap();
+        }
+
+        fn env(&self, agent: &str) -> Result<Vec<EnvChange>, SpawnError> {
+            let paths = crate::preapproval::agent_paths(&self.agents, agent);
+            self.backend.flavor.child_env(agent, &paths)
+        }
+
+        /// One full spawn as the harness drives it: env, then the child starts,
+        /// then the agent is live in the scope registry.
+        fn spawn(&self, agent: &str) -> Vec<EnvChange> {
+            let env = self.env(agent).expect("spawn env");
+            self.backend.flavor.spawned(agent);
+            self.live
+                .lock()
+                .unwrap()
+                .insert(agent.to_string(), format!("growlight-agent-{agent}-0.scope"));
+            env
+        }
+
+        fn exit(&self, agent: &str) {
+            self.live.lock().unwrap().remove(agent);
+        }
+
+        fn history(&self, agent: &str) -> Vec<crate::profile_pin::ProfilePin> {
+            crate::profile_pin::read_pin_history(&crate::profile_pin::pin_paths(&self.agents, agent))
+        }
+    }
+
+    fn set_to(path: &Path) -> Vec<EnvChange> {
+        vec![(OsString::from("CLAUDE_CONFIG_DIR"), Some(path.as_os_str().to_owned()))]
+    }
+
+    fn assert_no_home(env: &[EnvChange]) {
+        assert!(
+            env.iter().all(|(k, _)| k != "HOME"),
+            "the slot model never overrides HOME: {env:?}",
+        );
+    }
+
+    #[test]
+    fn a_pooled_member_runs_on_its_picked_slot() {
+        let fx = SlotFixture::new(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        let env = fx.spawn("a");
+        assert_eq!(env, set_to(&fx.store.join("slot1")));
+        assert_no_home(&env);
+        assert_eq!(fx.backend.active_profile("a").as_deref(), Some("slot1"));
+    }
+
+    #[test]
+    fn a_pooled_pick_of_home_unsets_the_config_dir() {
+        let fx = SlotFixture::new(&[("a", &["home"])]);
+        let env = fx.spawn("a");
+        assert_eq!(env, vec![(OsString::from("CLAUDE_CONFIG_DIR"), None)]);
+        assert_no_home(&env);
+        assert_eq!(fx.backend.active_profile("a").as_deref(), Some("home"));
+    }
+
+    #[test]
+    fn an_unpooled_member_on_home_spawns_exactly_as_before() {
+        // The byte-identical regression guard: no pool + no `active` pointer
+        // (today's device) and an explicit `active -> home` both add nothing.
+        let fx = SlotFixture::new(&[]);
+        assert_eq!(fx.env("b").unwrap(), Vec::<EnvChange>::new());
+        fx.activate("home");
+        assert_eq!(fx.env("b").unwrap(), Vec::<EnvChange>::new());
+        // No store at all (no $HOME) is also no env for an unpooled member.
+        let bare = SlotFixture::with_store(&[], false);
+        assert_eq!(bare.env("b").unwrap(), Vec::<EnvChange>::new());
+        // And no slot machinery installed at all.
+        let none = SlotFixture::new(&[]);
+        let plain = ClaudeBackend::new(
+            "claude",
+            "kick",
+            EventHub::new(),
+            PreApproval::new(&none.agents, "p", "g", "m", "c"),
+            Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        );
+        let paths = crate::preapproval::agent_paths(&none.agents, "b");
+        assert_eq!(plain.flavor.child_env("b", &paths).unwrap(), Vec::<EnvChange>::new());
+    }
+
+    #[test]
+    fn an_unpooled_member_follows_the_active_slot_at_spawn() {
+        let fx = SlotFixture::new(&[]);
+        fx.slot("slot2");
+        fx.activate("slot2");
+        let env = fx.spawn("b");
+        assert_eq!(env, set_to(&fx.store.join("slot2")));
+        assert_no_home(&env);
+        assert_eq!(fx.backend.active_profile("b").as_deref(), Some("slot2"));
+        assert!(fx.history("b").is_empty(), "only pooled picks enter the history");
+    }
+
+    #[test]
+    fn a_missing_slot_dir_fails_the_spawn_closed() {
+        let fx = SlotFixture::new(&[("a", &["slot1"])]);
+        let err = fx.env("a").expect_err("no slot1 dir");
+        assert!(err.0.contains("\"slot1\"") && err.0.contains("\"a\""), "{err}");
+
+        // The unpooled path refuses a dangling `active` too — never home.
+        fx.activate("ghost");
+        let err = fx.env("b").expect_err("active names a missing slot");
+        assert!(err.0.contains("\"ghost\""), "{err}");
+    }
+
+    #[test]
+    fn an_unusable_credential_fails_the_spawn_closed() {
+        let fx = SlotFixture::new(&[("a", &["slot1"]), ("d", &["slot2"]), ("e", &["slot3"])]);
+        // A symlinked credential (what the old overlay model produced).
+        std::fs::create_dir_all(fx.store.join("slot1")).unwrap();
+        std::fs::write(fx._tmp.path().join("real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(
+            fx._tmp.path().join("real.json"),
+            fx.store.join("slot1").join(claude_profiles::CREDENTIALS_FILE),
+        )
+        .unwrap();
+        let err = fx.env("a").expect_err("symlinked credential");
+        assert!(err.0.contains("not a regular file") && err.0.contains("\"slot1\""), "{err}");
+        // A directory where the credential belongs.
+        std::fs::create_dir_all(fx.store.join("slot2").join(claude_profiles::CREDENTIALS_FILE)).unwrap();
+        assert!(fx.env("d").is_err());
+        // A logged-out slot (dir, no credential).
+        std::fs::create_dir_all(fx.store.join("slot3")).unwrap();
+        let err = fx.env("e").expect_err("no credential");
+        assert!(err.0.contains("not logged in"), "{err}");
+        // Nothing was chosen, so nothing can be committed.
+        fx.backend.flavor.spawned("a");
+        assert!(fx.history("a").is_empty());
+    }
+
+    #[test]
+    fn a_pooled_member_without_a_store_is_refused() {
+        let fx = SlotFixture::with_store(&[("a", &["home"])], false);
+        let err = fx.env("a").expect_err("no store to place a pool in");
+        assert!(err.0.contains("profile_pool"), "{err}");
+    }
+
+    #[test]
+    fn two_live_members_on_one_pool_land_on_different_slots() {
+        // Review 047 S3 / the milestone smoke: `a` and `d` share a two-slot
+        // pool. With `a` still running, `d` takes the other account.
+        let fx = SlotFixture::new(&[("a", &["slot1", "slot2"]), ("d", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot1")));
+        assert_eq!(fx.spawn("d"), set_to(&fx.store.join("slot2")));
+
+        // `a` re-rolls after exiting while `d` is still live on slot2: the
+        // fleet-wide LRU says slot1, and slot2 is demoted anyway.
+        fx.exit("a");
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot1")));
+        // `d` re-rolls with `a` live on slot1: slot2 again, not lockstep.
+        fx.exit("d");
+        assert_eq!(fx.spawn("d"), set_to(&fx.store.join("slot2")));
+    }
+
+    #[test]
+    fn an_unpooled_member_on_a_slot_demotes_it_for_pooled_picks() {
+        let fx = SlotFixture::new(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        fx.activate("slot1");
+        fx.spawn("b"); // unpooled, live on slot1
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+    }
+
+    #[test]
+    fn a_failed_launch_appends_nothing_and_the_retry_appends_once() {
+        let fx = SlotFixture::new(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        // `child_env` ran but the child never started (no `spawned`).
+        assert_eq!(fx.env("a").unwrap(), set_to(&fx.store.join("slot1")));
+        assert!(fx.history("a").is_empty(), "a failed launch records no pick");
+        assert_eq!(fx.backend.active_profile("a"), None);
+        // The retry picks the same slot (nothing was used) and records it once.
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot1")));
+        let hist = fx.history("a");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].profile, "slot1");
     }
 }

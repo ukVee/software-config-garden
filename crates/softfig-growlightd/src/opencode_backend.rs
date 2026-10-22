@@ -99,7 +99,8 @@ use softfig_ipc::growlightd::{AgentDeltaKind, Event};
 
 use crate::admission::BudgetUsage;
 use crate::agent_harness::{
-    AgentRateState, BackendFlavor, Harness, LineObserver, TOOL_RENDER_MAX_CHARS, truncate_chars,
+    AgentRateState, BackendFlavor, EnvChange, Harness, LineObserver, TOOL_RENDER_MAX_CHARS,
+    truncate_chars,
 };
 use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
@@ -745,15 +746,19 @@ impl BackendFlavor for OpencodeFlavor {
         &self,
         _agent: &str,
         paths: &AgentPaths,
-    ) -> Result<Vec<(OsString, OsString)>, crate::supervisor::SpawnError> {
+    ) -> Result<Vec<EnvChange>, crate::supervisor::SpawnError> {
         Ok(vec![(
             OPENCODE_CONFIG_ENV.into(),
-            paths.opencode_config.clone().into_os_string(),
+            Some(paths.opencode_config.clone().into_os_string()),
         )])
     }
 
     fn working_dir(&self) -> Option<PathBuf> {
         Some(self.launch.garden_root.clone())
+    }
+
+    fn spawned(&self, _agent: &str) {
+        // Nothing to commit: opencode picks no account per spawn.
     }
 
     fn new_observer(&self, agent: &str, rate: Arc<AgentRateState>) -> Box<dyn LineObserver> {
@@ -1686,7 +1691,7 @@ mod tests {
         let env = f.child_env("a1", &paths).expect("opencode child_env never fails");
         assert_eq!(env.len(), 1, "one variable, nothing incidental: {env:?}");
         assert_eq!(env[0].0, OsString::from("OPENCODE_CONFIG"));
-        assert_eq!(env[0].1, paths.opencode_config.clone().into_os_string());
+        assert_eq!(env[0].1, Some(paths.opencode_config.clone().into_os_string()));
         assert!(
             paths.opencode_config.ends_with("agents/a1/opencode.json"),
             "the per-member config, not a shared one: {}",

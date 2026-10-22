@@ -331,9 +331,10 @@ pub struct AgentSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<AgentSpendSummary>,
     /// The claude-login profile slot this member's last spawn ran under
-    /// (`claude-login-switcher` slice 003). `Some(name)` on a claude member
-    /// with a `profile_pool` whose pin file resolves; `None` otherwise
-    /// (no pool, pre-first-spawn, or pin unreadable). Additive and defaulted
+    /// (`claude-login-switcher` slices 003, 007). `Some(name)` on a claude
+    /// member that this daemon has spawned (pooled or following `active`;
+    /// `home` included), or whose pool pin file resolves; `None` otherwise
+    /// (opencode, pre-first-spawn, or pin unreadable). Additive and defaulted
     /// for wire back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
