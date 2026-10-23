@@ -181,18 +181,18 @@ impl BackendHandle {
     /// The argv `agent` would be exec'd with on this backend (after the
     /// `systemd-run … --` separator). The routing assertion: a member's backend is
     /// only *really* the one the operator asked for if this is that backend's
-    /// command line. `model` is the per-spawn override the
-    /// [`crate::supervisor::AgentSpec`] carries (slice 006), `None` = the roster
-    /// default.
+    /// command line. `choice` is the resolved per-spawn model the
+    /// [`crate::supervisor::AgentSpec`] carries (slice 006 + claude-model-select
+    /// slice 003), `None` = the roster default.
     fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
         match self {
-            Self::Claude(b) => b.command_argv(agent, paths, model),
-            Self::Opencode(b) => b.command_argv(agent, paths, model),
+            Self::Claude(b) => b.command_argv(agent, paths, choice),
+            Self::Opencode(b) => b.command_argv(agent, paths, choice),
         }
     }
 }

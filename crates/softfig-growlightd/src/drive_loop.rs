@@ -67,7 +67,7 @@ use crate::daemon::Daemon;
 use crate::fleet::QueueMode;
 use crate::notifications::NotifyEvent;
 use crate::notify_dispatch::NotifyDispatcher;
-use crate::opencode_backend::{ModelSelection, OpencodeBackend};
+use crate::opencode_backend::OpencodeBackend;
 use crate::scheduler::{
     classify_queue, parked, pick_for, ClaimHold, PartStatus, QueueState, Snapshot,
 };
@@ -1003,7 +1003,7 @@ impl FleetMember {
         Self {
             spec,
             pin: Some(pin.into()),
-            backend: crate::fleet::MemberBackend::Claude,
+            backend: crate::fleet::MemberBackend::Claude { model: None, effort: None },
         }
     }
 
@@ -1012,7 +1012,7 @@ impl FleetMember {
         Self {
             spec,
             pin: None,
-            backend: crate::fleet::MemberBackend::Claude,
+            backend: crate::fleet::MemberBackend::Claude { model: None, effort: None },
         }
     }
 
@@ -1900,6 +1900,19 @@ impl DriveLoop {
                                     .stream_error(agent)
                                     .is_some_and(|e| e.is_rate_limit()))
                     };
+                    // claude-model-select slice 003: a crashed exit whose latched
+                    // stream error is `ModelRefused` is a configuration refusal,
+                    // not a crash. The classifier returns the refusal reason the
+                    // supervisor surfaces on the alert; `None` → not a refusal.
+                    let model_refused_exit = || {
+                        if !matches!(health, AgentHealth::Exited { .. }) {
+                            return None;
+                        }
+                        stream_errs
+                            .stream_error(agent)
+                            .filter(|e| e.is_model_refused())
+                            .map(|e| e.text.clone())
+                    };
                     let repo_probe = &self.repo_probe;
                     let assignment = self.assignments.get(agent);
                     let repo_state = || {
@@ -1916,6 +1929,7 @@ impl DriveLoop {
                         now,
                         network_exit,
                         rate_limit_exit,
+                        model_refused_exit,
                         repo_state,
                     )
                 };
@@ -2178,6 +2192,29 @@ impl DriveLoop {
                             self.aggregator.forget(agent);
                         }
                     }
+                    PollOutcome::ModelRefused { event, reason } => {
+                        // claude-model-select slice 003: the backend refused the
+                        // configured `--model`. The member is parked indefinitely
+                        // (`not_before = i64::MAX` in the supervisor); a visible
+                        // alert naming the reason fires so the human sees it. No
+                        // retry will succeed until the roster/item declaration is
+                        // edited and the daemon re-admits the member. The alert
+                        // is dispatched exactly like a crash alert (same channel,
+                        // same shape), with the stream-error text replacing the
+                        // bare `systemd-run` banner so the message names the
+                        // model and the API's refusal reason.
+                        let event = event
+                            .with_stdout_error(Some(format!("model refused: {reason}")))
+                            .with_stderr_tail(filter_systemd_banner(
+                                &self.stderr.stderr_tail(agent),
+                            ));
+                        report.crashes.push(event);
+                        if self.retiring.remove(agent) {
+                            self.retire(agent, &mut report);
+                        } else {
+                            self.aggregator.forget(agent);
+                        }
+                    }
                     PollOutcome::Down => {
                         // A re-observation of an exit already consumed (task 044):
                         // the crash tick armed the backoff and `Supervisor::tick`
@@ -2401,19 +2438,24 @@ impl DriveLoop {
                         // (`BackendMismatch` skips otherwise), so the `and_then`
                         // falling through to the default is the undeclared case.
                         let resolved = resolve_v2_model(&pick, member);
-                        // The spawn spec: an opencode member carries the override on
-                        // argv `--model`; a claude member's spec carries `None`
-                        // (claude's model is the harness's own).
-                        let spec = match &resolved {
+                        // The spawn spec: the resolved §6.4 choice rides argv
+                        // for its backend. opencode's goes to `--model` (slice
+                        // 006), claude's to `--model`/`--effort`
+                        // (claude-model-select slice 003). A choice that
+                        // amounts to the harness default (claude with no model
+                        // and no effort) is carried as `None` so the spawn
+                        // argv stays byte-identical to the legacy invocation.
+                        let override_choice = match &resolved {
                             ModelChoice {
-                                backend: softfig_ipc::model_choice::Backend::Opencode,
-                                model: Some(model),
-                                variant,
-                            } => member.spec.clone().with_model(ModelSelection {
-                                model: model.clone(),
-                                variant: variant.clone(),
-                            }),
-                            _ => member.spec.clone(),
+                                backend: softfig_ipc::model_choice::Backend::Claude,
+                                model: None,
+                                variant: None,
+                            } => None,
+                            other => Some(other.clone()),
+                        };
+                        let spec = match override_choice {
+                            Some(c) => member.spec.clone().with_model(c),
+                            None => member.spec.clone(),
                         };
                         // The entry id the per-entry store keys on: the TOP-LEVEL
                         // entry (a `"parent/sub"` identity shares its top-level
@@ -3379,6 +3421,8 @@ fn exit_disposition_label(outcome: &PollOutcome) -> &'static str {
         PollOutcome::ParkedRateLimited => "held (rate-limited)",
         // Task 070: a rate-limit DEATH reads as the hold it is — never "crashed".
         PollOutcome::RateLimitDeath => "held (rate-limited)",
+        // claude-model-select slice 003: a configuration refusal reads as a park.
+        PollOutcome::ModelRefused { .. } => "parked (model refused)",
         PollOutcome::Healthy => "healthy",
         PollOutcome::Unknown => "unknown",
     }
@@ -8079,7 +8123,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
     /// An opencode member on the flash roster default, unpinned.
     fn opencode_member(id: &str) -> FleetMember {
         FleetMember::unpinned(spec(id)).with_backend(crate::fleet::MemberBackend::Opencode(
-            ModelSelection::model("deepseek/deepseek-flash"),
+            crate::opencode_backend::ModelSelection::model("deepseek/deepseek-flash"),
         ))
     }
 
@@ -8137,7 +8181,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(specs.len(), 1, "exactly one spawn: {specs:?}");
         assert_eq!(
             specs[0].model,
-            Some(ModelSelection::model(softfig_ipc::model_choice::DEEPSEEK_REASONING)),
+            Some(ModelChoice::opencode(softfig_ipc::model_choice::DEEPSEEK_REASONING)),
             "the unit's declared reasoning model overrides the flash roster default",
         );
         // The §3.6 copy: the never-claimed entry was seeded from the template
@@ -8159,6 +8203,107 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert_eq!(
             writes[0].1, seeded,
             "the member's baton is a verbatim copy of the entry baton",
+        );
+    }
+
+    /// A claude member with its own roster model + effort (claude-model-select
+    /// slice 003), unpinned.
+    fn claude_member_with(id: &str, model: Option<&str>, effort: Option<&str>) -> FleetMember {
+        FleetMember::unpinned(spec(id)).with_backend(crate::fleet::MemberBackend::Claude {
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+        })
+    }
+
+    /// claude-model-select slice 003 — precedence over claude: the unit's
+    /// `> Model: claude:<id>` declaration overrides the member's roster
+    /// (`claude:opus effort=high`), reaching the spawn as a per-spawn
+    /// `ModelChoice` override. When the item declares none, the roster is the
+    /// §6.4 default — and `None` on both means harness default (no override).
+    #[test]
+    fn v2_mode_a_claude_members_precedence_is_item_then_roster_then_default() {
+        // ---- 1. Item declaration overrides the roster.
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-cms-item-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_with("c1", Some("opus"), Some("high"))],
+            FakeV2Source::with(v2_milestone(
+                "m1",
+                EntryStatus::Queued,
+                "001",
+                Some("claude:haiku"),
+            )),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1, "the claude member starts: {r:?}");
+        assert_eq!(
+            r.v2_started[0].resolved_model,
+            ModelChoice::claude_on(Some("haiku".into()), None),
+            "item declaration wins",
+        );
+        let specs = backend.spawned_specs();
+        assert_eq!(
+            specs[0].model,
+            Some(ModelChoice::claude_on(Some("haiku".into()), None)),
+            "the spawn carries the item's claude:haiku, not the roster's opus+high",
+        );
+
+        // ---- 2. No item declaration → the roster's (opus, high) is the default.
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-cms-roster-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_with("c1", Some("opus"), Some("high"))],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1);
+        assert_eq!(
+            r.v2_started[0].resolved_model,
+            ModelChoice::claude_on(Some("opus".into()), Some("high".into())),
+            "no item declaration → the roster is the §6.4 default",
+        );
+        let specs = backend.spawned_specs();
+        assert_eq!(
+            specs[0].model,
+            Some(ModelChoice::claude_on(Some("opus".into()), Some("high".into()))),
+            "the spawn carries the roster's claude:opus effort=high",
+        );
+
+        // ---- 3. Neither roster nor item → harness default (no override).
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-cms-default-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_with("c1", None, None)],
+            FakeV2Source::with(v2_milestone("m1", EntryStatus::Queued, "001", None)),
+            entries_dir,
+            Arc::new(FakeV2Claimer::default()),
+            Arc::new(FakeV2Parker::default()),
+            Policy::default(),
+        );
+        let r = loop_.tick(0);
+        assert_eq!(r.v2_started.len(), 1);
+        let specs = backend.spawned_specs();
+        assert_eq!(
+            specs[0].model, None,
+            "a bare claude member with no roster/item declaration carries no override — \
+             byte-identical to the pre-slice-003 invocation",
         );
     }
 

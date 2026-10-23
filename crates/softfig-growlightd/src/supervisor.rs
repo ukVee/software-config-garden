@@ -139,13 +139,15 @@ pub struct AgentSpec {
     pub loop_settings: PathBuf,
     /// Per-agent `mcp.json` — the softfig-mcp attach config.
     pub mcp_config: PathBuf,
-    /// The per-spawn model override (queue-v2-scheduling slice 006): the
-    /// assignment's resolved `> Model:` choice for an opencode member, carried
-    /// on argv `--model` for THIS spawn. `None` = the backend's roster default
-    /// (every legacy spawn). A claude member's assignment resolves to `None` —
-    /// claude carries its whole config on argv and its model is the harness's
-    /// own, not settable from this launch path.
-    pub model: Option<crate::opencode_backend::ModelSelection>,
+    /// The per-spawn resolved §6.4 model (queue-v2-scheduling slice 006 +
+    /// claude-model-select slice 003): the assignment's choice (item declaration
+    /// beats roster entry beats backend default) carried on argv `--model` and
+    /// (for claude) `--effort` for THIS spawn. `None` = the backend's roster
+    /// default (every legacy spawn). The flavor matches on
+    /// [`ModelChoice::backend`](softfig_ipc::model_choice::ModelChoice) and
+    /// extracts its own argv shape; a mismatch is ignored defensively (the
+    /// drive loop never routes a claude choice to opencode or vice versa).
+    pub model: Option<softfig_ipc::model_choice::ModelChoice>,
 }
 
 impl AgentSpec {
@@ -164,12 +166,14 @@ impl AgentSpec {
         }
     }
 
-    /// Pin this spawn's opencode `--model` argv value (slice 006): the unit's
-    /// resolved model, overriding the backend's roster default for THIS spawn.
+    /// Pin this spawn's resolved model (queue-v2-scheduling slice 006 +
+    /// claude-model-select slice 003): the unit's resolved §6.4 choice,
+    /// overriding the backend's roster default for THIS spawn. The choice
+    /// carries its own backend; each flavor extracts the argv shape it needs.
     #[must_use]
     pub fn with_model(
         mut self,
-        model: crate::opencode_backend::ModelSelection,
+        model: softfig_ipc::model_choice::ModelChoice,
     ) -> Self {
         self.model = Some(model);
         self
@@ -406,6 +410,25 @@ pub enum PollOutcome {
         /// Earliest Unix-seconds a re-roll may spawn.
         not_before: i64,
     },
+    /// The configured `--model` was refused by the backend (claude-model-select
+    /// slice 003): the exit coincides with the backend's latched
+    /// [`StreamErrorKind::ModelRefused`](crate::agent_harness::StreamErrorKind)
+    /// — the terminal `result` carried `error: "model_not_found"` /
+    /// `api_error_status: 404`. The member is brought down-but-registered with
+    /// NO failure-streak bump and NO backoff schedule (`not_before = i64::MAX`
+    /// — nothing but an operator edit will cause a retry); an
+    /// [`NotifyEvent::AgentCrashed`]-shaped alert still fires so the human
+    /// sees it, carrying the model name and the refusal reason. Semantically a
+    /// configuration refusal, not a crash: no spin re-roll, no punitive streak.
+    ModelRefused {
+        /// The [`NotifyEvent::AgentCrashed`] to dispatch, with the model-refused
+        /// reason text so the alert reads "model refused: …" rather than
+        /// "crashed".
+        event: NotifyEvent,
+        /// Human-readable refusal reason (the stream error's text — the model
+        /// name is embedded by `claude -p`'s message).
+        reason: String,
+    },
     /// A non-zero exit the network classifier attributed to a TRANSIENT network
     /// death (network-failsafe slice 002): the peer lost its API connection mid-
     /// session (link dropped / DNS / TLS / connection reset) rather than genuinely
@@ -458,6 +481,11 @@ pub enum MemberLifecycle {
     /// Rate-limited — a clean `HALTED_RATE_LIMIT` park OR a rate-limit death
     /// (task 070): `status` shows the hold, never `crashed (n)`.
     RateLimitedHeld,
+    /// Parked on a model refusal (claude-model-select slice 003): the backend
+    /// rejected the configured `--model`, so no retry will succeed until the
+    /// operator edits the roster or the item declaration. `status` shows the
+    /// park with its reason, never `crashed (n)`.
+    ParkedModelRefused,
 }
 
 impl MemberLifecycle {
@@ -470,6 +498,7 @@ impl MemberLifecycle {
         match self {
             Self::RateLimitedHeld => Some("held (rate-limited)".to_string()),
             Self::Reconnecting => Some("reconnecting (transient network)".to_string()),
+            Self::ParkedModelRefused => Some("parked (model refused)".to_string()),
             Self::Crashed => Some(match health {
                 Some(AgentHealth::Exited { code }) => format!("crashed ({code})"),
                 _ => "crashed".to_string(),
@@ -494,6 +523,7 @@ pub fn poll_outcome_lifecycle(outcome: &PollOutcome) -> Option<MemberLifecycle> 
         PollOutcome::ParkedRateLimited | PollOutcome::RateLimitDeath => {
             Some(MemberLifecycle::RateLimitedHeld)
         }
+        PollOutcome::ModelRefused { .. } => Some(MemberLifecycle::ParkedModelRefused),
         PollOutcome::Crashed { .. } => Some(MemberLifecycle::Crashed),
         PollOutcome::Reconnecting => Some(MemberLifecycle::Reconnecting),
         PollOutcome::Down | PollOutcome::Unknown => None,
@@ -841,6 +871,8 @@ impl Supervisor {
             now,
             network_exit,
             rate_limit_exit,
+            // No model-refused classifier → never a configuration refusal.
+            || None,
             // The pre-task-069 behaviour: no repo signal, NEXT ACTION alone decides.
             || None,
         )
@@ -859,6 +891,7 @@ impl Supervisor {
         F: FnOnce() -> bool,
         G: FnOnce() -> bool,
         H: FnOnce() -> Option<RepoState>,
+        R: FnOnce() -> Option<String>,
     >(
         &mut self,
         agent: &str,
@@ -868,6 +901,7 @@ impl Supervisor {
         now: i64,
         network_exit: F,
         rate_limit_exit: G,
+        model_refused_exit: R,
         repo_state: H,
     ) -> PollOutcome {
         let hang_secs = self.hang_secs;
@@ -918,7 +952,8 @@ impl Supervisor {
                     // (A rate-limit death is consumed the same way — its first
                     // observation took the child; re-observations are `Down`,
                     // and the timed rate-limit hold, not a re-classification,
-                    // gates the re-roll until `resets_at`.)
+                    // gates the re-roll until `resets_at`. The model-refused
+                    // park, below, consumes the same way.)
                     PollOutcome::Down
                 } else if rate_limit_exit() {
                     // The quota wall, not a bug (task 070): the exit coincides
@@ -927,6 +962,14 @@ impl Supervisor {
                     // streak, no backoff; the drive loop's rate-limit hold
                     // gates the re-roll until the window resets.
                     self.on_rate_limit_exit(agent, health, now)
+                } else if let Some(reason) = model_refused_exit() {
+                    // claude-model-select slice 003: the backend refused the
+                    // configured `--model`. Not a crash — a configuration
+                    // refusal that no retry will resolve. Parked indefinitely
+                    // (`not_before = i64::MAX`) with a visible alert naming
+                    // the reason; the operator edits the roster / item
+                    // declaration and the next reconcile re-admits the member.
+                    self.on_model_refused_exit(agent, health, reason)
                 } else {
                     self.on_crash(agent, health, now)
                 }
@@ -1011,6 +1054,41 @@ impl Supervisor {
         sup.seen_repo.clear();
         sup.repo_excused = 0;
         PollOutcome::RateLimitDeath
+    }
+
+    /// Handle a **model-refused** exit (claude-model-select slice 003): the exit
+    /// coincides with a [`StreamErrorKind::ModelRefused`] latch — the backend
+    /// rejected the configured `--model` (e.g. an alias/id Claude Code does not
+    /// recognize). Not a crash: no backoff, no failure-streak bump, no
+    /// `AgentCrashed` alert, no re-spawn. Instead the member is parked
+    /// indefinitely (`not_before = i64::MAX`) and the drive loop surfaces a
+    /// visible alert naming the refusal reason; no retry will succeed until the
+    /// operator edits the roster or the item declaration.
+    fn on_model_refused_exit(
+        &mut self,
+        agent: &str,
+        _health: AgentHealth,
+        reason: String,
+    ) -> PollOutcome {
+        let sup = self
+            .agents
+            .get_mut(agent)
+            .expect("agent exists (checked in poll)");
+        // The child EXITED (same precondition as the rate-limit path) — drop the
+        // handle; nothing to kill.
+        let _ = sup.child.take();
+        // No retry is possible until the config changes. Pin `not_before` past
+        // every reasonable now so `tick` never re-rolls this agent; a daemon
+        // reconcile re-admits it with fresh state.
+        sup.not_before = i64::MAX;
+        sup.last_next_action = None;
+        sup.unchanged_streak = 0;
+        sup.seen_repo.clear();
+        sup.repo_excused = 0;
+        PollOutcome::ModelRefused {
+            event: NotifyEvent::agent_crashed(agent),
+            reason,
+        }
     }
 
     /// Decide what a clean (code-0) exit means by reading the agent's terminal
@@ -1689,6 +1767,53 @@ mod tests {
             s2.poll_with_exits("a1", AgentHealth::Exited { code: 1 }, None, None, 1, || false, || true),
             PollOutcome::Down,
             "the consumed rate-limit death re-observes inert",
+        );
+    }
+
+    /// claude-model-select slice 003 — a non-zero exit the model-refused
+    /// classifier attributes to a configuration refusal (claude's `--model`
+    /// rejected) is a **park**, not a crash: brought down-but-registered with
+    /// a visible alert (`PollOutcome::ModelRefused`), NO failure-streak bump,
+    /// and NO re-roll — `tick` leaves it alone (parked indefinitely) until the
+    /// operator edits the roster/item and the daemon reconciles.
+    #[test]
+    fn poll_classifies_a_model_refused_exit_as_a_park_without_backoff_or_reroll() {
+        let backend = FakeBackend::new();
+        let mut s = sup(Arc::clone(&backend));
+        s.start(spec("a1"), fresh_budget(), fresh_rate(), 0);
+
+        let out = s.poll_with_progress(
+            "a1",
+            AgentHealth::Exited { code: 1 },
+            None,
+            None,
+            0,
+            || false,
+            || false,
+            || Some("model refused: model_not_found (does-not-exist-7b)".to_string()),
+            || None,
+        );
+        match out {
+            PollOutcome::ModelRefused { ref reason, .. } => {
+                assert!(reason.contains("model_not_found"), "reason carries API text: {reason}");
+            }
+            other => panic!("expected ModelRefused, got {other:?}"),
+        }
+        assert_eq!(
+            s.failures("a1"),
+            0,
+            "a model-refused park never bumps the crash streak",
+        );
+        assert!(!s.is_running("a1"), "the dead child was dropped");
+
+        // `tick` must NOT re-roll a model-refused member: `not_before =
+        // i64::MAX` pins its re-roll past every reasonable now. `tick`
+        // records a HeldForBackoff — the member is still registered — but
+        // never a Rerolled; only a daemon reconcile re-admits it.
+        let out = s.tick(fresh_budget(), fresh_rate(), 10, &any_work);
+        assert!(
+            out.iter().all(|o| !matches!(o, RerollOutcome::Rerolled { .. })),
+            "a parked model-refused member is NEVER re-rolled: {out:?}",
         );
     }
 
@@ -2580,6 +2705,7 @@ mod tests {
             now,
             || false,
             || false,
+            || None,
             || state,
         );
         s.tick(fresh_budget(), fresh_rate(), now, &any_work);
@@ -2751,6 +2877,7 @@ mod tests {
                 5,
                 || false,
                 || false,
+                || None,
                 never,
             ),
             PollOutcome::Rolling,
@@ -2765,6 +2892,7 @@ mod tests {
                 6,
                 || false,
                 || false,
+                || None,
                 never,
             ),
             PollOutcome::Down,

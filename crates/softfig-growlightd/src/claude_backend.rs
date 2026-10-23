@@ -489,6 +489,36 @@ fn is_rate_limit_error(ev: &Value) -> bool {
     ev.get("apiErrorStatus").and_then(Value::as_i64) == Some(429)
 }
 
+/// Whether a `result`-line error field is a **model-refused** rejection
+/// (claude-model-select slice 003). The probe (2026-10-23 against claude-code
+/// 2.1.308) found two deterministic markers:
+///
+/// 1. Stderr: `[claude-code:unrecognized_model] {"model":"<name>","query_source":"sdk"}`
+/// 2. Stdout stream-json terminal `result`: `error: "model_not_found"` plus
+///    `api_error_status: 404` and `terminal_reason: "api_error"`.
+///
+/// We classify on the stream event (it carries the model name in the apiError
+/// text and is already parsed by this fold). Both the camelCase (`apiError*`)
+/// and snake_case (`api_error*`) spellings are honored because stream-json has
+/// used both shapes in prior releases and no breaking schema change is marked.
+fn is_model_refused_error(ev: &Value) -> bool {
+    let field = |name: &str| {
+        ev.get(name)
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+    };
+    if let Some(e) = field("error").or_else(|| field("apiError"))
+        && e == "model_not_found"
+    {
+        return true;
+    }
+    let status = ev
+        .get("apiErrorStatus")
+        .or_else(|| ev.get("api_error_status"))
+        .and_then(Value::as_i64);
+    status == Some(404)
+}
+
 /// The `resetsAt` a rate-limit `result` line carried, if any — the top-level
 /// field, else the LATER of the `rate_limits` windows' (the transcript shape the
 /// 2026-10-16 death carried). `None` when the wire gave no boundary.
@@ -536,18 +566,36 @@ fn stream_error_for_line(line: &str, at: i64) -> Option<StreamError> {
     // twin; honor both.
     if type_ == Some("result") && ev.get("is_error").and_then(Value::as_bool) == Some(true) {
         let rate = is_rate_limit_error(&ev);
+        // claude-model-select slice 003: a model-refused rejection reads as a
+        // configuration refusal, not a crash. Rate-limit takes precedence
+        // (defensive — the two markers are structurally disjoint on the wire,
+        // but a wire that carried both would be a quota-driven refusal).
+        let model_refused = !rate && is_model_refused_error(&ev);
         let text = ev
             .get("result")
             .and_then(Value::as_str)
             .or_else(|| ev.get("error").and_then(Value::as_str))
-            .unwrap_or(if rate { "rate limit" } else { "unknown error" });
+            .unwrap_or(if rate {
+                "rate limit"
+            } else if model_refused {
+                "model refused"
+            } else {
+                "unknown error"
+            });
         let resets_at = if rate {
             Some(resets_at_from_result(&ev).unwrap_or(at + RATE_LIMIT_FALLBACK_HOLD_SECS))
         } else {
             None
         };
+        let kind = if rate {
+            StreamErrorKind::RateLimit
+        } else if model_refused {
+            StreamErrorKind::ModelRefused
+        } else {
+            StreamErrorKind::Other
+        };
         return Some(StreamError {
-            kind: if rate { StreamErrorKind::RateLimit } else { StreamErrorKind::Other },
+            kind,
             text: text.to_string(),
             resets_at,
         });
@@ -827,13 +875,21 @@ fn pump<R: BufRead>(
 /// The `claude -p` invocation that goes AFTER the harness's `systemd-run … --`
 /// separator — the argv half that is genuinely claude's (spec §12). The wrapper
 /// half (scope, `--collect`, `--unit=`, the gentle build caps) is the harness's.
+///
+/// `claude_tail` is the per-spawn `--model`/`--effort` fragment the resolved §6.4
+/// choice emits (claude-model-select slice 003 —
+/// [`softfig_ipc::model_choice::ModelChoice::claude_argv`]). It lands AFTER
+/// `--mcp-config` and before `--output-format`, matching the slice-002 semi-auto
+/// layout so both paths spawn with the same argv shape; an empty tail is
+/// byte-identical to the pre-slice-003 invocation.
 fn claude_command_argv(
     bin: &str,
     prompt: &str,
     loop_settings: &Path,
     mcp_config: &Path,
+    claude_tail: &[String],
 ) -> Vec<OsString> {
-    vec![
+    let mut argv: Vec<OsString> = vec![
         bin.into(),
         "-p".into(),
         prompt.into(),
@@ -841,10 +897,14 @@ fn claude_command_argv(
         loop_settings.as_os_str().to_os_string(),
         "--mcp-config".into(),
         mcp_config.as_os_str().to_os_string(),
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-    ]
+    ];
+    for word in claude_tail {
+        argv.push(word.into());
+    }
+    argv.push("--output-format".into());
+    argv.push("stream-json".into());
+    argv.push("--verbose".into());
+    argv
 }
 
 /// The claude-login slot machinery handed to [`ClaudeFlavor`]
@@ -1146,19 +1206,27 @@ impl BackendFlavor for ClaudeFlavor {
         &self,
         _agent: &str,
         paths: &AgentPaths,
-        _model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
         // claude names nothing per-member on its own command line — the member's
         // identity reaches it through the generated `--settings` (whose
-        // SessionStart hook cats THIS agent's baton), not through argv. The
-        // per-spawn model override is deliberately ignored: claude's model and
-        // effort are the harness's own, not settable from this launch path
-        // (§6.4 — a `claude` assignment simply runs claude).
+        // SessionStart hook cats THIS agent's baton), not through argv.
+        // claude-model-select slice 003: a claude-shaped resolved choice pins
+        // `--model`/`--effort` for THIS spawn via `ModelChoice::claude_argv`;
+        // an opencode-shaped choice (which the drive loop would never route
+        // here) is ignored defensively, and `None` keeps the pre-slice-003
+        // harness default. A `ModelChoice::claude()` with no model and no
+        // effort yields an empty tail → byte-identical to the legacy spawn.
+        let claude_tail: Vec<String> = choice
+            .filter(|c| c.backend == softfig_ipc::model_choice::Backend::Claude)
+            .map(|c| c.claude_argv())
+            .unwrap_or_default();
         claude_command_argv(
             &self.bin,
             &self.prompt,
             &paths.loop_settings,
             &paths.mcp_config,
+            &claude_tail,
         )
     }
 
@@ -1470,14 +1538,16 @@ impl ClaudeBackend {
     /// invocation, wrapper excluded. The routing seam (slice 005) asserts a
     /// claude-backed member through it; the wrapper half is pinned separately by
     /// `the_claude_argv_is_byte_identical_to_the_pre_harness_invocation`.
-    /// `model` is the per-spawn override (slice 006), which claude ignores.
+    /// `choice` is the per-spawn override (slice 006 + claude-model-select
+    /// slice 003); a claude-shaped choice pins `--model`/`--effort` for this
+    /// spawn, `None` keeps the harness default.
     pub fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
-        self.harness.command_argv(agent, paths, model)
+        self.harness.command_argv(agent, paths, choice)
     }
 }
 
@@ -1512,7 +1582,7 @@ mod tests {
         spawn_argv(
             scope_base,
             caps,
-            claude_command_argv(bin, prompt, loop_settings, mcp_config),
+            claude_command_argv(bin, prompt, loop_settings, mcp_config, &[]),
         )
     }
 
@@ -2313,6 +2383,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_tail_rides_argv_after_mcp_config_before_output_format() {
+        // claude-model-select slice 003: a claude-shaped resolved choice pins
+        // `--model`/`--effort` for THIS spawn. The tail lands AFTER `--mcp-config`
+        // and BEFORE `--output-format`, matching the slice-002 semi-auto layout
+        // so both paths spawn with the same argv shape.
+        let tail = softfig_ipc::model_choice::ModelChoice::claude_on(
+            Some("claude-opus-4-7".into()),
+            Some("high".into()),
+        )
+        .claude_argv();
+        let argv = claude_command_argv(
+            "claude",
+            "kick",
+            Path::new("/run/agents/a1/loop.json"),
+            Path::new("/run/agents/a1/mcp.json"),
+            &tail,
+        );
+        let s: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            s,
+            vec![
+                "claude",
+                "-p",
+                "kick",
+                "--settings",
+                "/run/agents/a1/loop.json",
+                "--mcp-config",
+                "/run/agents/a1/mcp.json",
+                "--model",
+                "claude-opus-4-7",
+                "--effort",
+                "high",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ],
+            "the claude tail lands after --mcp-config, before --output-format",
+        );
+        // No tail → byte-identical to the pre-slice-003 invocation.
+        let bare = claude_command_argv(
+            "claude",
+            "kick",
+            Path::new("/run/agents/a1/loop.json"),
+            Path::new("/run/agents/a1/mcp.json"),
+            &[],
+        );
+        assert!(
+            !bare.iter().any(|a| a.to_string_lossy() == "--model"),
+            "an empty tail carries no `--model`",
+        );
+    }
+
     /// TASK 070 — the in-band stream-error detector: a 429 / `usage_limit_reached` /
     /// `rate_limit` errored result reads as a rate-limit signal carrying a CONCRETE
     /// reopen (the wire's `resetsAt`, else the pinned fail-safe); an unrelated
@@ -2370,6 +2493,41 @@ mod tests {
         assert_eq!(other.kind, StreamErrorKind::Other);
         assert!(!other.is_rate_limit());
         assert_eq!(other.resets_at, None, "a non-rate-limit error holds nothing");
+
+        // claude-model-select slice 003 — the model-refused signatures (the
+        // 2026-10-23 probe against claude-code 2.1.308): the terminal result's
+        // `error: "model_not_found"` and/or `api_error_status: 404`. The latched
+        // kind is `ModelRefused`, carrying NO reopen (no retry succeeds until
+        // the roster or item declaration is edited); the supervisor parks the
+        // member rather than crashing it.
+        let model_404 = stream_error_for_line(
+            r#"{"type":"result","is_error":true,"result":"There's an issue with the selected model (does-not-exist-7b).","error":"model_not_found","api_error_status":404,"terminal_reason":"api_error"}"#,
+            60,
+        )
+        .expect("a model_not_found result latches");
+        assert_eq!(model_404.kind, StreamErrorKind::ModelRefused);
+        assert!(model_404.is_model_refused());
+        assert_eq!(
+            model_404.resets_at, None,
+            "no retry window for a configuration refusal",
+        );
+        // The camelCase shape (prior stream-json releases) latches the same way.
+        let model_camel = stream_error_for_line(
+            r#"{"type":"result","is_error":true,"error":"model_not_found","apiErrorStatus":404}"#,
+            70,
+        )
+        .expect("the apiErrorStatus spelling latches");
+        assert_eq!(model_camel.kind, StreamErrorKind::ModelRefused);
+        // A 404 WITHOUT the model_not_found text still reads as model-refused —
+        // claude's `--model` validation path is the only 404 the backend emits
+        // on the terminal result, so the status alone is a confident classifier
+        // when the error text is empty / renamed.
+        let bare_404 = stream_error_for_line(
+            r#"{"type":"result","is_error":true,"api_error_status":404}"#,
+            80,
+        )
+        .expect("a bare 404 result latches");
+        assert_eq!(bare_404.kind, StreamErrorKind::ModelRefused);
 
         // Clean lines latch nothing.
         assert!(

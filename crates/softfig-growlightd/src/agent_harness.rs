@@ -270,6 +270,14 @@ pub enum StreamErrorKind {
     /// An API rate-limit rejection — a 429 / `usage_limit_reached` / `rate_limit`
     /// error. A member dying on one is a rate-limit death, not a crash (task 070).
     RateLimit,
+    /// The configured `--model` was refused by the backend (claude-model-select
+    /// slice 003 — the probe found a 404 `model_not_found` on the terminal
+    /// `result` line, plus `[claude-code:unrecognized_model]` on stderr). A
+    /// member dying on this is a configuration refusal, not a crash: the
+    /// supervisor parks the member (no backoff, no spin re-roll) and surfaces
+    /// a visible alert naming the bad model, since no retry will succeed until
+    /// the roster or item declaration is edited.
+    ModelRefused,
     /// Any other in-band stream error (a permission failure, a provider error) —
     /// still the crash *reason*, but not a rate-limit signal.
     Other,
@@ -297,6 +305,12 @@ impl StreamError {
     /// Whether this is a rate-limit signal (task 070's classifier).
     pub fn is_rate_limit(&self) -> bool {
         self.kind == StreamErrorKind::RateLimit
+    }
+
+    /// Whether this is a model-refused signal (claude-model-select slice 003).
+    /// A member dying on this is parked by the supervisor rather than crashed.
+    pub fn is_model_refused(&self) -> bool {
+        self.kind == StreamErrorKind::ModelRefused
     }
 }
 
@@ -388,16 +402,19 @@ pub trait BackendFlavor: std::fmt::Debug + Send + Sync {
     /// wrote. The scope wrapper half is the harness's ([`scope_wrapper_argv`]) —
     /// this is only the backend's own invocation. `agent` is passed because a
     /// backend may need to name the member on its own command line (opencode's
-    /// `--agent`), which the paths alone do not carry. `model` is the per-spawn
-    /// override the [`crate::supervisor::AgentSpec`] carries (queue-v2-scheduling
-    /// slice 006): `Some` pins an opencode member's `--model` argv for THIS
-    /// spawn; `None` runs the backend's roster default (claude ignores it — its
-    /// model is the harness's own).
+    /// `--agent`), which the paths alone do not carry. `choice` is the resolved
+    /// per-spawn model (queue-v2-scheduling slice 006 + claude-model-select
+    /// slice 003): `Some(ModelChoice{backend: Opencode, …})` pins an opencode
+    /// member's `--model` argv for THIS spawn; `Some(ModelChoice{backend:
+    /// Claude, …})` pins a claude member's `--model`/`--effort` argv for THIS
+    /// spawn; `None` runs the backend's roster default. Each flavor matches on
+    /// the backend of the choice and ignores a mismatch (defensive — the drive
+    /// loop never routes a claude choice to opencode or vice versa).
     fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString>;
 
     /// Extra environment variables this spawn's child needs, given the agent
@@ -866,15 +883,15 @@ impl Harness {
     /// runs on what" is a routing decision, and the only honest proof that a member
     /// routes where the operator asked is the command line it would be launched
     /// with. Pure: it spawns nothing and writes nothing (the paths are an input,
-    /// not a generation). `model` is the per-spawn override the caller (a
+    /// not a generation). `choice` is the resolved per-spawn model the caller (a
     /// [`crate::supervisor::AgentSpec`]) carries, `None` = the roster default.
     pub fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
-        self.flavor.command_argv(agent, paths, model)
+        self.flavor.command_argv(agent, paths, choice)
     }
 
     /// Spawn `spec`'s agent: generate its pre-approval fail-closed, launch the
@@ -1406,7 +1423,7 @@ mod tests {
                 &self,
                 _agent: &str,
                 _paths: &AgentPaths,
-                _model: Option<&crate::opencode_backend::ModelSelection>,
+                _choice: Option<&softfig_ipc::model_choice::ModelChoice>,
             ) -> Vec<OsString> {
                 vec!["true".into()]
             }

@@ -180,7 +180,7 @@ const CLAUDE_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "fable"];
 /// The closed `effort=` / `variant=` set on claude: `claude --effort` takes one
 /// of these words. Opencode's `variant` stays free-form (the agent config
 /// accepts any string an opencode model declares).
-pub(crate) const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// The `[1m]` 1M-context suffix allowed on either an alias or a full id, and
 /// preserved verbatim into `--model`.
@@ -449,15 +449,22 @@ pub fn parse_declaration(field: &str) -> Result<Declaration> {
 }
 
 /// The allowed list for a unit that declares nothing (§6.4 member default): a
-/// single model — the opencode roster's `model` + `variant` (or
-/// [`DEEPSEEK_FLASH`] when they're absent), or `claude` for a claude member.
+/// single model — the roster entry's own `model` + `variant` (claude-model-select
+/// slice 003: a claude member may pin its `--model`/`--effort` on the roster,
+/// just like an opencode member pins its `provider/model` + `variant`), or the
+/// backend's harness default when both are absent. For opencode that default is
+/// [`DEEPSEEK_FLASH`]; for claude it is [`ModelChoice::claude`], which carries
+/// no `--model`/`--effort` and lets `~/.claude/settings.json` decide.
 pub fn member_default(
     backend: Backend,
     roster_model: Option<&str>,
     roster_variant: Option<&str>,
 ) -> ModelList {
     match backend {
-        Backend::Claude => ModelList::single(ModelChoice::claude()),
+        Backend::Claude => ModelList::single(ModelChoice::claude_on(
+            roster_model.map(str::to_string),
+            roster_variant.map(str::to_string),
+        )),
         Backend::Opencode => {
             let mut choice = ModelChoice::opencode(roster_model.unwrap_or(DEEPSEEK_FLASH));
             choice.variant = roster_variant.map(str::to_string);
@@ -759,9 +766,19 @@ mod tests {
 
     #[test]
     fn the_member_default_is_the_single_model_for_undeclared_work() {
-        // claude member → claude.
-        let claude = member_default(Backend::Claude, Some("deepseek/deepseek-v4-pro"), None);
-        assert_eq!(claude.entries(), &[ModelChoice::claude()]);
+        // claude member with no roster override → the harness default (no
+        // `--model`, no `--effort`).
+        let bare_claude = member_default(Backend::Claude, None, None);
+        assert_eq!(bare_claude.entries(), &[ModelChoice::claude()]);
+
+        // claude-model-select slice 003: a claude member whose roster pins model
+        // + effort carries them as the member default — the roster is the §6.4
+        // default, exactly like an opencode member.
+        let claude_pinned = member_default(Backend::Claude, Some("claude-opus-4-7"), Some("high"));
+        assert_eq!(
+            claude_pinned.entries(),
+            &[ModelChoice::claude_on(Some("claude-opus-4-7".into()), Some("high".into()))],
+        );
 
         // opencode member with a roster model+variant → that model+variant.
         let with_roster = member_default(Backend::Opencode, Some("deepseek/deepseek-flash"), Some("high"));
