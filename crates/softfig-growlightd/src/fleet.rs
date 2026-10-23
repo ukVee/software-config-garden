@@ -444,7 +444,28 @@ impl FleetMemberConfig {
     /// writes, so the spec the backend shells and the generated files never drift).
     fn to_member(&self, agents_dir: &Path) -> FleetMember {
         let paths = agent_paths(agents_dir, &self.agent);
-        let spec = AgentSpec::new(&self.agent, paths.loop_settings, paths.mcp_config);
+        let base = AgentSpec::new(&self.agent, paths.loop_settings, paths.mcp_config);
+        // Review 048 M-D: lift a claude member's roster `--model`/`--effort`
+        // onto the spec so the LEGACY queue mode's fresh-start AND re-roll
+        // (`drive_loop.rs:2782`, `supervisor.rs:1365`) carry them to argv.
+        // The v2 path replaces this with its resolved §6.4 choice via
+        // `.with_model(c)` at `drive_loop.rs:2457`, so the lift is harmless for
+        // v2 and corrective for legacy. Only lifted when the roster declares
+        // either value — a plain `backend = "claude"` member stays byte-identical
+        // to the pre-M-D None (`claude_argv` on `None/None` returns empty too,
+        // but keeping `AgentSpec.model = None` preserves the fingerprint the
+        // `parses_a_growlight_fleet_table_into_members` test asserts).
+        let spec = match &self.backend {
+            MemberBackend::Claude { model, effort }
+                if model.is_some() || effort.is_some() =>
+            {
+                base.with_model(ipc::model_choice::ModelChoice::claude_on(
+                    model.clone(),
+                    effort.clone(),
+                ))
+            }
+            _ => base,
+        };
         let member = match &self.pin {
             Some(pin) => FleetMember::pinned(spec, pin.clone()),
             None => FleetMember::unpinned(spec),
@@ -1855,6 +1876,84 @@ agent = "reviewer"
             cfg.members[0].backend.roster_model(),
             Some("claude-opus-4-7[1m]"),
             "the 1M-context suffix survives verbatim",
+        );
+    }
+
+    #[test]
+    fn to_member_lifts_the_claude_roster_model_and_effort_onto_the_agent_spec() {
+        // Review 048 M-D regression. The roster's `model`/`variant` reach the
+        // `MemberBackend::Claude` struct, but before this fix `to_member` built
+        // the `AgentSpec` with `model: None`, so the LEGACY queue mode's
+        // fresh-start (`drive_loop.rs:2782`) and re-roll
+        // (`supervisor.rs:1365` reusing the stored spec) both passed `None`
+        // into `ClaudeFlavor::command_argv`, dropping `--model`/`--effort`
+        // silently. The claim "the smoke runbook pins the model" would fail
+        // under legacy mode (the live default and `config/growlight.toml`
+        // mode).
+        //
+        // The lift happens at `to_member`, so both legacy spawn paths carry
+        // the roster-pinned ModelChoice into argv via `AgentSpec.model`.
+        // (The v2 path overrides this with the §6.4 resolved choice via
+        // `.with_model(c)` at `drive_loop.rs:2457`, so the lift is harmless
+        // for v2 and corrective for legacy — proven by the second case.)
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "model = \"claude:claude-opus-4-7\"\nvariant = \"high\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        let agents = Path::new("/cfg/agents");
+        let member = cfg.members[0].to_member(agents);
+        assert_eq!(
+            member.spec.model,
+            Some(softfig_ipc::model_choice::ModelChoice::claude_on(
+                Some("claude-opus-4-7".into()),
+                Some("high".into()),
+            )),
+            "the roster model + effort reach AgentSpec.model so both legacy \
+             fresh-start AND re-roll build `--model`/`--effort` argv",
+        );
+        // And argv ships them: the per-spawn tail `ClaudeFlavor::command_argv`
+        // builds from `spec.model.as_ref()` is non-empty.
+        assert_eq!(
+            member.spec.model.as_ref().unwrap().claude_argv(),
+            vec![
+                "--model".to_string(),
+                "claude-opus-4-7".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+            ],
+            "the claude argv tail carries both switches verbatim",
+        );
+
+        // Effort-only (no model) also lifts.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "variant = \"low\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        let member = cfg.members[0].to_member(agents);
+        assert_eq!(
+            member.spec.model.as_ref().unwrap().claude_argv(),
+            vec!["--effort".to_string(), "low".to_string()],
+            "an effort-only roster still reaches argv as `--effort <v>` alone",
+        );
+
+        // A bare `backend = "claude"` with no model AND no effort stays
+        // byte-identical to pre-M-D: `AgentSpec.model = None`, no `--model`/
+        // `--effort` tail. This preserves the fingerprint the existing
+        // `parses_a_growlight_fleet_table_into_members` test asserts.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        let member = cfg.members[0].to_member(agents);
+        assert_eq!(
+            member.spec.model, None,
+            "no roster → no lift → `AgentSpec.model = None` (byte-identical \
+             to the pre-M-D legacy spawn)",
         );
     }
 

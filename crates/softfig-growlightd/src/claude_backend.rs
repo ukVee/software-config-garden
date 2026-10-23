@@ -1558,6 +1558,21 @@ impl AgentBackend for Arc<ClaudeBackend> {
 }
 
 #[cfg(test)]
+impl ClaudeBackend {
+    /// Test-only: pre-populate `agent`'s session slot. The real path writes it
+    /// from `child_env` → `spawned`; this helper lets a cross-module test (the
+    /// router-level `profile_for` forward) assert a routed `Some` without
+    /// driving a full spawn.
+    pub(crate) fn inject_session_slot(&self, agent: &str, slot: &str) {
+        self.flavor
+            .session_slots
+            .lock()
+            .unwrap()
+            .insert(agent.to_string(), slot.to_string());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_harness::{scope_base_name_gen, spawn_argv};
