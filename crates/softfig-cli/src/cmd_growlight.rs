@@ -754,7 +754,7 @@ fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
         // `--profile` may have named another one.
         Backend::Claude => format!(
             "(--no-launch) runtime ready{}. launch with:\n  cd {garden} && {}{AGENT_BIN} \
-             --name {AGENT_NAME} --settings {} --mcp-config {}",
+             --name {AGENT_NAME} --settings {} --mcp-config {}{}",
             launch
                 .claude_slot
                 .map(|s| format!(" (claude-login slot {})", s.name))
@@ -770,6 +770,17 @@ fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
             },
             launch.loop_settings.display(),
             launch.mcp_config.display(),
+            // Slice 002: the `--model`/`--effort` tail only prints when one is
+            // pinned; `claude` on the harness default stays byte-identical to
+            // the pre-slice-002 hint.
+            {
+                let argv = choice.claude_argv();
+                if argv.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", argv.join(" "))
+                }
+            },
         ),
         // The opencode config is handed over via `OPENCODE_CONFIG` (its analog of
         // claude's `--settings`), so there is no `--settings`/`--mcp-config` here.
@@ -807,7 +818,19 @@ fn resolve_model_choice(
     let flagged = args.opencode || args.backend.is_some() || args.model.is_some();
 
     let spec = if should_prompt(flagged, args.no_launch, stdin().is_terminal()) {
-        prompt_for_model()?
+        // Slice 002: the picker lists all available claude models. The extras
+        // come from two best-effort sources — the active slot's `.claude.json`
+        // `additionalModelOptionsCache[].value` (pre-switcher-merge the slot's
+        // `.claude.json` is `~/.claude.json`) and `config/growlight.toml`
+        // `[claude] models = [...]`, in that order, deduped first-wins. Any
+        // read error → the row is simply absent.
+        let claude_json = home_dir().ok().map(|h| h.join(".claude.json"));
+        let growlight_toml = garden_root
+            .join("config")
+            .join(softfig_ipc::GROWLIGHT_CONFIG_FILE);
+        let extras = claude_picker_extras(claude_json.as_deref(), Some(&growlight_toml));
+        let mut stdin = BufReader::new(stdin().lock());
+        prompt_for_model_in(&mut stdin, &extras)?
     } else if let Some(spec) = flag_spec(args)? {
         spec
     } else {
@@ -861,31 +884,174 @@ fn should_prompt(flagged: bool, no_launch: bool, stdin_is_tty: bool) -> bool {
     !flagged && !no_launch && stdin_is_tty
 }
 
-/// The interactive picker (spec: the confirmed `1/2/3/4` UX). Reads one line from
-/// stdin; a bare Enter takes option 1, and EOF (stdin closed mid-run) falls back
-/// to the same default rather than erroring out of a launch the human asked for.
-fn prompt_for_model() -> Result<ModelSpec> {
-    println!("\nbackend + model:");
-    println!("  1) claude                (default)");
-    println!("  2) deepseek reasoning    ({DEEPSEEK_REASONING})");
-    println!("  3) deepseek flash        ({DEEPSEEK_FLASH})");
-    println!("  4) let growlight decide  (the active backlog item's `> Model:`, else flash)");
-    print!("choice [1]: ");
-    // The prompt has no newline, so it sits in the line buffer until flushed.
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+/// The claude-alias rows the picker always shows after `1) claude`, in menu
+/// order: `opus | sonnet | haiku | fable`. Slice 002 widened the picker to
+/// cover claude's full family without the human having to type the suffix.
+const CLAUDE_PICKER_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "fable"];
 
-    let mut line = String::new();
-    if stdin().read_line(&mut line).unwrap_or(0) == 0 {
-        println!();
+/// The interactive picker (slice 002). Thin wrapper around
+/// [`prompt_for_model_in`] that locks real stdin.
+fn prompt_for_model_in<R: BufRead>(reader: &mut R, extras: &[String]) -> Result<ModelSpec> {
+    // The extras list is capped only by what the sources deliver; the picker
+    // never limits it, so a human who added five entries to `[claude] models`
+    // can select any of them by number.
+    let first_extra = 2 + CLAUDE_PICKER_ALIASES.len();
+    loop {
+        println!("\nbackend + model:");
+        println!("  1) claude                (harness default)");
+        for (i, alias) in CLAUDE_PICKER_ALIASES.iter().enumerate() {
+            println!("  {}) claude:{alias}", 2 + i);
+        }
+        for (i, extra) in extras.iter().enumerate() {
+            println!("  {}) claude:{extra}", first_extra + i);
+        }
+        println!("  r) reasoning            ({DEEPSEEK_REASONING})");
+        println!("  f) flash                ({DEEPSEEK_FLASH})");
+        println!("  a) let growlight decide (the active backlog item's `> Model:`, else flash)");
+        println!("     or type any spec, e.g. `claude:claude-opus-4-7 effort=high`");
+        print!("choice [1]: ");
+        // The prompt has no newline, so it sits in the line buffer until flushed.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        if n == 0 {
+            // EOF (stdin closed mid-run): fall back to the documented default
+            // rather than loop forever on empty reads.
+            println!();
+            return Ok(ModelSpec::Fixed(ModelChoice::claude()));
+        }
+        let input = line.trim();
+        if let Some(spec) = picker_fixed_choice(input, extras)? {
+            return Ok(spec);
+        }
+        // Typed input: route through the shared grammar so the words that work
+        // here, on `--model`, and on `> Model:` lines stay the same.
+        match parse_model_spec(input) {
+            Ok(spec) => return Ok(spec),
+            Err(e) => {
+                // A bad typed spec re-prompts rather than failing the launch —
+                // the picker is the last thing between the human and the agent.
+                eprintln!("  not understood ({e}); try again");
+            }
+        }
     }
-    Ok(match line.trim() {
+}
+
+/// Resolve one picker key — the fixed menu rows (`1`, `2..=5`, extras numbers,
+/// `r`/`R`, `f`/`F`, `a`/`A`, empty) to a `ModelSpec`. Returns `Ok(None)` for
+/// anything that isn't a menu key, so the caller can try the typed-spec path.
+/// Pure, so the number mapping (aliases + extras ordering) is unit-testable
+/// without the stdin seam.
+fn picker_fixed_choice(input: &str, extras: &[String]) -> Result<Option<ModelSpec>> {
+    let first_extra = 2 + CLAUDE_PICKER_ALIASES.len();
+    Ok(Some(match input {
         "" | "1" => ModelSpec::Fixed(ModelChoice::claude()),
-        "2" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_REASONING)),
-        "3" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_FLASH)),
-        "4" => ModelSpec::Auto,
-        // A typo shouldn't silently run the wrong (possibly pricier) model.
-        other => bail!("unknown choice `{other}` — pick 1, 2, 3, or 4"),
-    })
+        "r" | "R" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_REASONING)),
+        "f" | "F" => ModelSpec::Fixed(ModelChoice::opencode(DEEPSEEK_FLASH)),
+        "a" | "A" => ModelSpec::Auto,
+        other => {
+            if let Ok(n) = other.parse::<usize>() {
+                if (2..first_extra).contains(&n) {
+                    let alias = CLAUDE_PICKER_ALIASES[n - 2];
+                    return Ok(Some(ModelSpec::Fixed(ModelChoice::claude_on(
+                        Some(alias.to_string()),
+                        None,
+                    ))));
+                }
+                if n >= first_extra && n < first_extra + extras.len() {
+                    let m = &extras[n - first_extra];
+                    // Validate through the shared parser so a slot-local id
+                    // picked by number produces the same argv a typed
+                    // `claude:<m>` would.
+                    return Ok(Some(parse_model_spec(&format!("claude:{m}")).with_context(
+                        || format!("picker extra `claude:{m}` (from .claude.json / growlight.toml)"),
+                    )?));
+                }
+            }
+            return Ok(None);
+        }
+    }))
+}
+
+/// The extras list the picker shows under `6…)`: the active slot's
+/// `.claude.json` `additionalModelOptionsCache[].value` first, then
+/// `config/growlight.toml`'s `[claude] models = [...]`, deduped **first-wins**.
+/// Any read / parse error → the source is simply absent (best-effort), because
+/// a stale user file must never block the launch picker. An entry that duplicates
+/// a built-in alias (`opus`/`sonnet`/`haiku`/`fable`) is dropped — the alias
+/// already has a numbered row.
+fn claude_picker_extras(
+    claude_json: Option<&Path>,
+    growlight_toml: Option<&Path>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(path) = claude_json {
+        out.extend(read_claude_json_models(path));
+    }
+    if let Some(path) = growlight_toml {
+        out.extend(read_growlight_toml_claude_models(path));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|v| {
+        if CLAUDE_PICKER_ALIASES.contains(&v.as_str()) {
+            return false;
+        }
+        seen.insert(v.clone())
+    });
+    out
+}
+
+/// Pull `additionalModelOptionsCache[].value` out of a `.claude.json`
+/// (claude-login-switcher-aware eventually; today it points at the active slot's
+/// `.claude.json`, else `~/.claude.json`). Best-effort: an absent file, an
+/// unreadable file, malformed JSON or a missing/wrong-shaped key all yield an
+/// empty list — the picker row is quietly absent, never a launch failure.
+fn read_claude_json_models(path: &Path) -> Vec<String> {
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(arr) = root
+        .get("additionalModelOptionsCache")
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| entry.get("value").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Pull `[claude] models = [...]` out of `config/growlight.toml`. Same
+/// best-effort posture as [`read_claude_json_models`]: a missing file / bad
+/// TOML / wrong-shaped section is an empty list. The growlightd parse of the
+/// same file does not know about `[claude]` and ignores it (the top-level
+/// `Doc` struct has no `deny_unknown_fields`), so adding this section cannot
+/// disable the fleet.
+fn read_growlight_toml_claude_models(path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(arr) = root
+        .get("claude")
+        .and_then(|c| c.get("models"))
+        .and_then(|m| m.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// "Let growlight decide": use the model the ACTIVE backlog item declares for
@@ -978,13 +1144,27 @@ fn resolve_garden_root(socket: &Path, override_: Option<PathBuf>) -> Result<Path
     }
 }
 
+/// The ` --model <m> --effort <e>` fragment the claude banner echoes when
+/// either is pinned, built from the same `claude_argv()` the spawn argv uses so
+/// the two cannot drift. Returns an empty string on the harness default (so
+/// `launching claude --name softfig-loop …` stays byte-identical to today).
+fn banner_model_tail(choice: &ModelChoice) -> String {
+    let argv = choice.claude_argv();
+    if argv.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", argv.join(" "))
+    }
+}
+
 fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> {
     // The interactive argv/env/cwd is owned by the backend seam; for `claude`
-    // this is the original hardwired argv rooted at the garden, and for
-    // `opencode` it wires `OPENCODE_CONFIG` + the runtime cwd + the first-turn
-    // kick (slice 003).
+    // this is the original hardwired argv rooted at the garden plus the slice
+    // 002 `--model`/`--effort` tail, and for `opencode` it wires
+    // `OPENCODE_CONFIG` + the runtime cwd + the first-turn kick (slice 003).
     let backend = choice.backend;
-    let mut cmd = interactive_command(backend, launch)?;
+    let claude_argv = choice.claude_argv();
+    let mut cmd = interactive_command(backend, launch, &claude_argv)?;
     let bin = agent_bin(backend);
     match backend {
         Backend::Claude => {
@@ -992,7 +1172,11 @@ fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> 
                 .claude_slot
                 .map(|s| format!(" on claude-login slot {}", s.name))
                 .unwrap_or_default();
-            println!("\nlaunching {bin} --name {AGENT_NAME}{slot} …\n");
+            // Name the model + effort when either is pinned, so the human can
+            // see what is about to launch; `claude` on the harness default
+            // stays "launching claude --name …" exactly as before.
+            let tail = banner_model_tail(choice);
+            println!("\nlaunching {bin} --name {AGENT_NAME}{slot}{tail} …\n");
         }
         // Name the model: with four ways to pick one, the human should never have
         // to guess which one is about to burn tokens.
@@ -3537,7 +3721,7 @@ mod tests {
             ModelChoice::opencode(DEEPSEEK_FLASH),
         ] {
             let hint = no_launch_hint(&choice, &launch);
-            let cwd = interactive_command(choice.backend, &launch)
+            let cwd = interactive_command(choice.backend, &launch, &choice.claude_argv())
                 .unwrap()
                 .get_current_dir()
                 .map(Path::to_path_buf)
@@ -3560,7 +3744,7 @@ mod tests {
         // pasted command attaches to the shared service, which ignores
         // OPENCODE_CONFIG (slice 001 finding 1). The hint's argv is the launch's
         // argv minus the trailing `--prompt <kick>`, which the human types instead.
-        let spawned: Vec<String> = interactive_command(Backend::Opencode, &launch)
+        let spawned: Vec<String> = interactive_command(Backend::Opencode, &launch, &[])
             .unwrap()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -4727,5 +4911,320 @@ mod tests {
         handle.shutdown();
         handle.join().unwrap();
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- slice 002: launch argv, picker, extras, auto resolution ---------
+
+    /// claude-model-select slice 002 argv check: `claude` on the harness
+    /// default is byte-identical to today, `claude:opus` becomes
+    /// `--model opus`, and `claude:claude-opus-4-7 effort=high` becomes
+    /// `--model claude-opus-4-7 --effort high`. Together with
+    /// `claude_interactive_command_is_the_hardwired_argv_rooted_at_the_garden`
+    /// in `growlight_backend` (the no-model case), this covers the finish-check
+    /// matrix for argv construction.
+    #[test]
+    fn slice_002_claude_argv_covers_default_alias_and_full_id_with_effort() {
+        use std::ffi::OsString;
+        let launch = InteractiveLaunch {
+            agent_name: AGENT_NAME,
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: Path::new("/g"),
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: OPENCODE_KICK,
+            claude_slot: None,
+        };
+        let argv_of = |choice: &ModelChoice| -> Vec<String> {
+            interactive_command(choice.backend, &launch, &choice.claude_argv())
+                .unwrap()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Harness default: no `--model`/`--effort` tail at all.
+        let default = argv_of(&ModelChoice::claude());
+        assert_eq!(
+            default,
+            vec![
+                "--name".to_string(),
+                AGENT_NAME.to_string(),
+                "--settings".to_string(),
+                "/rt/loop.json".to_string(),
+                "--mcp-config".to_string(),
+                "/rt/mcp.json".to_string(),
+            ],
+            "the harness default argv must be byte-identical to the pre-slice-002 invocation",
+        );
+
+        // Alias: `claude:opus` → `--model opus`.
+        let opus = match parse_model_spec("claude:opus").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => panic!("`claude:opus` must not resolve to auto"),
+        };
+        assert_eq!(
+            argv_of(&opus).into_iter().rev().take(2).collect::<Vec<_>>(),
+            vec!["opus".to_string(), "--model".to_string()],
+            "claude:opus must land on `--model opus`",
+        );
+        // ... and never leaks an `--effort` when none was declared.
+        assert!(!argv_of(&opus).iter().any(|a| a == "--effort"));
+
+        // Full id + closed-set effort: `claude:claude-opus-4-7 effort=high`
+        // → `--model claude-opus-4-7 --effort high`.
+        let full = match parse_model_spec("claude:claude-opus-4-7 effort=high").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => panic!("not auto"),
+        };
+        let full_argv = argv_of(&full);
+        let tail: Vec<OsString> = full_argv
+            .iter()
+            .skip_while(|a| a.as_str() != "--model")
+            .map(OsString::from)
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                OsString::from("--model"),
+                OsString::from("claude-opus-4-7"),
+                OsString::from("--effort"),
+                OsString::from("high"),
+            ],
+            "argv tail for a declared model + effort",
+        );
+    }
+
+    /// The picker's number mapping is pure: `1`/Enter is the harness default,
+    /// `2..=5` are the aliases in menu order, `6..` are the extras in the
+    /// order the dedup produced, and `r`/`f`/`a` take DeepSeek + auto. A key
+    /// outside the menu returns `None` so the caller tries a typed spec.
+    #[test]
+    fn slice_002_picker_number_mapping_covers_aliases_and_extras() {
+        let extras = vec!["claude-opus-4-7".to_string(), "claude-fable-5-1[1m]".to_string()];
+
+        // Enter and `1` both resolve to the harness default (muscle memory).
+        for key in ["", "1"] {
+            match picker_fixed_choice(key, &extras).unwrap().unwrap() {
+                ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::claude()),
+                ModelSpec::Auto => panic!("`{key}` must not resolve to auto"),
+            }
+        }
+
+        // 2..=5 → opus/sonnet/haiku/fable, in menu order.
+        for (n, alias) in ["2", "3", "4", "5"].iter().zip(CLAUDE_PICKER_ALIASES) {
+            match picker_fixed_choice(n, &extras).unwrap().unwrap() {
+                ModelSpec::Fixed(c) => assert_eq!(
+                    c,
+                    ModelChoice::claude_on(Some((*alias).to_string()), None),
+                    "`{n}` must map to `claude:{alias}`",
+                ),
+                ModelSpec::Auto => panic!("`{n}` must not resolve to auto"),
+            }
+        }
+
+        // 6/7 are the two extras — same identity as a typed `claude:<extra>`
+        // (validated through `parse_model_spec`).
+        let typed6 = match parse_model_spec("claude:claude-opus-4-7").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => unreachable!(),
+        };
+        match picker_fixed_choice("6", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, typed6),
+            ModelSpec::Auto => panic!(),
+        }
+        let typed7 = match parse_model_spec("claude:claude-fable-5-1[1m]").unwrap() {
+            ModelSpec::Fixed(c) => c,
+            ModelSpec::Auto => unreachable!(),
+        };
+        match picker_fixed_choice("7", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, typed7),
+            ModelSpec::Auto => panic!(),
+        }
+
+        // Letter keys cover opencode + auto.
+        match picker_fixed_choice("r", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::opencode(DEEPSEEK_REASONING)),
+            ModelSpec::Auto => panic!(),
+        }
+        match picker_fixed_choice("f", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::opencode(DEEPSEEK_FLASH)),
+            ModelSpec::Auto => panic!(),
+        }
+        match picker_fixed_choice("a", &extras).unwrap().unwrap() {
+            ModelSpec::Fixed(_) => panic!("`a` is let-growlight-decide"),
+            ModelSpec::Auto => {}
+        }
+
+        // Out-of-range numbers and arbitrary words aren't menu keys — the
+        // caller must try the typed-spec path, not refuse the launch.
+        assert!(picker_fixed_choice("8", &extras).unwrap().is_none());
+        assert!(picker_fixed_choice("99", &extras).unwrap().is_none());
+        assert!(picker_fixed_choice("claude:opus", &extras).unwrap().is_none());
+    }
+
+    /// The picker stdin seam carries typed specs through the shared grammar;
+    /// an unparseable one re-prompts rather than fails the launch.
+    #[test]
+    fn slice_002_picker_typed_spec_through_shared_grammar_and_reprompts() {
+        // Typed `claude:opus` resolves to the same choice the number row does.
+        let mut r = std::io::Cursor::new(b"claude:opus\n".to_vec());
+        match prompt_for_model_in(&mut r, &[]).unwrap() {
+            ModelSpec::Fixed(c) => {
+                assert_eq!(c, ModelChoice::claude_on(Some("opus".to_string()), None))
+            }
+            ModelSpec::Auto => panic!("typed `claude:opus` must not be auto"),
+        }
+
+        // A bad spec re-prompts; the second line is a good one.
+        let mut r = std::io::Cursor::new(b"not-a-model\nclaude\n".to_vec());
+        match prompt_for_model_in(&mut r, &[]).unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::claude()),
+            ModelSpec::Auto => panic!(),
+        }
+
+        // EOF (closed stdin mid-run) falls back to the harness default rather
+        // than looping — the same posture as the pre-slice-002 picker.
+        let mut r = std::io::Cursor::new(Vec::new());
+        match prompt_for_model_in(&mut r, &[]).unwrap() {
+            ModelSpec::Fixed(c) => assert_eq!(c, ModelChoice::claude()),
+            ModelSpec::Auto => panic!(),
+        }
+    }
+
+    /// `claude_picker_extras` orders .claude.json first, then growlight.toml,
+    /// first-wins dedup across the two sources, and drops entries that
+    /// duplicate a built-in alias row.
+    #[test]
+    fn slice_002_claude_picker_extras_order_and_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_json = dir.path().join(".claude.json");
+        // One real id, one duplicate of a built-in alias (must be dropped), one
+        // id that growlight.toml will also list (first-wins dedup).
+        fs::write(
+            &claude_json,
+            r#"{"additionalModelOptionsCache":[
+                {"value":"claude-opus-4-7"},
+                {"value":"opus"},
+                {"value":"claude-fable-5-1[1m]"}
+            ]}"#,
+        )
+        .unwrap();
+        let growlight = dir.path().join("growlight.toml");
+        // Overlaps `claude-opus-4-7` (dropped by dedup since .claude.json wins
+        // on order) and adds a new id.
+        fs::write(
+            &growlight,
+            "[claude]\nmodels = [\"claude-opus-4-7\", \"claude-sonnet-5-5\"]\n",
+        )
+        .unwrap();
+
+        let extras = claude_picker_extras(Some(&claude_json), Some(&growlight));
+        assert_eq!(
+            extras,
+            vec![
+                "claude-opus-4-7".to_string(),
+                "claude-fable-5-1[1m]".to_string(),
+                "claude-sonnet-5-5".to_string(),
+            ],
+        );
+    }
+
+    /// The .claude.json reader is best-effort: an absent file, malformed JSON,
+    /// and a missing/wrong-shaped key all yield an empty list rather than
+    /// failing the launch.
+    #[test]
+    fn slice_002_read_claude_json_models_is_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Absent file → empty.
+        let missing = dir.path().join("none.json");
+        assert!(read_claude_json_models(&missing).is_empty());
+
+        // Malformed JSON → empty, no panic.
+        let bad = dir.path().join("bad.json");
+        fs::write(&bad, b"this is not json").unwrap();
+        assert!(read_claude_json_models(&bad).is_empty());
+
+        // Missing key → empty.
+        let no_key = dir.path().join("no-key.json");
+        fs::write(&no_key, b"{\"other\": []}").unwrap();
+        assert!(read_claude_json_models(&no_key).is_empty());
+
+        // Normal list → entries, in file order; non-string / missing-value
+        // entries are quietly skipped.
+        let good = dir.path().join("good.json");
+        fs::write(
+            &good,
+            r#"{"additionalModelOptionsCache":[
+                {"value":"claude-opus-4-7","label":"Opus"},
+                {"label":"no value"},
+                {"value":""},
+                {"value":"claude-fable-5-1[1m]"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_claude_json_models(&good),
+            vec![
+                "claude-opus-4-7".to_string(),
+                "claude-fable-5-1[1m]".to_string()
+            ],
+        );
+    }
+
+    /// A slice doc's `> Model: claude:claude-opus-4-7` overrides a milestone's
+    /// `> Model: claude` under the `--model auto` path — the finish-check for
+    /// "`auto` honours a `claude:` declaration".
+    #[test]
+    fn slice_002_auto_resolution_slice_claude_id_overrides_milestone_claude() {
+        let docs = [
+            ("005-pick-opus.md", Some("> Model: claude:claude-opus-4-7\n")),
+            ("CLAUDE.md", Some("> Model: claude\n")),
+        ];
+        let resolved = resolve_item_models(docs).unwrap().unwrap();
+        assert_eq!(resolved.origin, "005-pick-opus.md");
+        let first = resolved.list.first().clone();
+        assert_eq!(first.backend, Backend::Claude);
+        assert_eq!(first.model.as_deref(), Some("claude-opus-4-7"));
+        // Resolved choice → `--model claude-opus-4-7` on the spawn argv.
+        assert_eq!(
+            first.claude_argv(),
+            vec!["--model".to_string(), "claude-opus-4-7".to_string()],
+        );
+    }
+
+    /// `--no-launch` hint carries the `--model <m>` tail when the choice names
+    /// one; a bare `claude` keeps the old settings-pair-only hint byte-identical.
+    #[test]
+    fn slice_002_no_launch_hint_names_the_model() {
+        let launch = InteractiveLaunch {
+            agent_name: AGENT_NAME,
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: Path::new("/g"),
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: OPENCODE_KICK,
+            claude_slot: None,
+        };
+        let bare = no_launch_hint(&ModelChoice::claude(), &launch);
+        assert!(!bare.contains("--model"));
+        assert!(!bare.contains("--effort"));
+
+        let opus = ModelChoice::claude_on(Some("opus".to_string()), None);
+        let hint = no_launch_hint(&opus, &launch);
+        assert!(
+            hint.contains("--mcp-config /rt/mcp.json --model opus"),
+            "hint carries --model after --mcp-config: {hint}",
+        );
+
+        let o47h = ModelChoice::claude_on(
+            Some("claude-opus-4-7".to_string()),
+            Some("high".to_string()),
+        );
+        let hint = no_launch_hint(&o47h, &launch);
+        assert!(
+            hint.ends_with("--model claude-opus-4-7 --effort high"),
+            "hint tail: {hint}",
+        );
     }
 }
