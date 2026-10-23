@@ -879,9 +879,20 @@ fn build_claude_backend(
     // (`incident-20260720-m5f-double-park`). Claude-only by construction: the
     // capture describes the Anthropic pool, and opencode members contribute no
     // reserve (the milestone's locked no-synthetic-budget decision).
-    .with_usage_capture(Arc::new(UsageCapture::new(
-        runtime_growlight_dir().join(USAGE_FILE),
-    )))
+    .with_usage_capture(Arc::new({
+        // Slice 009 S8: the shared `usage.json` holds the human's `active`
+        // slot's readings only, never a mix. The gate rides `read_active` of
+        // the slot store at write time (so a `softfig claude-login use` moves
+        // which readings fill the file the same way it moves the next spawn).
+        // Without a store (no `$HOME`, pre-migration) a plain capture is
+        // installed: there is no `active` to compare against, so every reading
+        // writes — byte-identical to pre-slice-009.
+        let path = runtime_growlight_dir().join(USAGE_FILE);
+        match claude_profiles::store_root_from_env() {
+            Some(store) => UsageCapture::new_shared_with_active_gate(path, store),
+            None => UsageCapture::new(path),
+        }
+    }))
     // The claude-login slot machinery (claude-login-switcher slices 003, 007):
     // the slot store plus the per-member pools from the roster. An unpooled
     // member follows the store's `active` slot at each spawn, which is `home`

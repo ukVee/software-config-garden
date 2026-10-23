@@ -938,6 +938,12 @@ struct ClaudeFlavor {
     /// [`ClaudeBackend::with_usage_capture`]); a backend built outside a growlight
     /// runtime (a test) leaves it unset and writes nothing.
     usage_capture: OnceLock<Arc<UsageCapture>>,
+    /// Per-slot captures for the per-profile tees (claude-login-switcher slice
+    /// 009 S7). Keyed by slot name; owned here so one `UsageCapture` is reused
+    /// across spawns of the same slot, seeded from disk on first access per
+    /// slot. Without this cache every spawn would re-construct an empty
+    /// capture and the first write would lose whatever was on disk.
+    per_slot_captures: Mutex<BTreeMap<String, Arc<UsageCapture>>>,
 }
 
 impl ClaudeFlavor {
@@ -1024,8 +1030,19 @@ impl ClaudeFlavor {
         let Some(slot) = self.session_slots.lock().unwrap().get(agent).cloned() else {
             return disabled();
         };
-        let path = crate::profile_budget::profile_budget_path(dir, &slot);
-        (Arc::new(UsageCapture::new(path)), Some(slot))
+        // Slice 009 S7: one capture per slot, seeded from disk on first use.
+        // A re-spawn of the same slot reuses the same `Arc<UsageCapture>`, so
+        // its loaded on-disk state survives, and interleaved writes against
+        // one file ride through a single serialising Mutex.
+        let mut captures = self.per_slot_captures.lock().unwrap();
+        let cap = captures
+            .entry(slot.clone())
+            .or_insert_with(|| {
+                let path = crate::profile_budget::profile_budget_path(dir, &slot);
+                Arc::new(UsageCapture::seeded(path))
+            })
+            .clone();
+        (cap, Some(slot))
     }
 
     /// The slots other members' running sessions are on (review 047 S3): a
@@ -1320,6 +1337,7 @@ impl ClaudeBackend {
             budgets: Mutex::new(BTreeMap::new()),
             stream_errs: Mutex::new(BTreeMap::new()),
             usage_capture: OnceLock::new(),
+            per_slot_captures: Mutex::new(BTreeMap::new()),
         });
         Self {
             harness: Harness::new(

@@ -40,8 +40,17 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+/// Monotonic counter folded into every `write_atomic` temp-file name, so two
+/// threads (or two captures) writing the same `usage.json` sibling never collide
+/// on one `*.json.tmp` and corrupt each other's write. Pid is sufficient across
+/// processes; the counter covers within-process concurrency. Both are
+/// best-effort — `rename(2)` is atomic on the usual filesystems, so a stale temp
+/// from a crashed writer is garbage, not a block.
+static WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// One reading of the budget pool, in the shape the file holds.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -154,7 +163,11 @@ impl UsageSnapshot {
 
     /// Write this snapshot to `path` atomically (write a sibling temp, then
     /// rename), so a reader — a booting member reading its budget, the human —
-    /// never observes a half-written file. Creates the parent directory if needed.
+    /// never observes a half-written file. Creates the parent directory if
+    /// needed. The temp sibling is named `<file>.<pid>.<counter>.tmp`, unique
+    /// per writer, so two concurrent writers (per-slot captures in the fleet,
+    /// claude-login-switcher slice 009 S7) cannot collide on one fixed
+    /// `*.json.tmp` and leave a torn file.
     pub fn write_atomic(&self, path: &Path) -> io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -162,7 +175,13 @@ impl UsageSnapshot {
         let body = serde_json::to_string_pretty(self)
             .map(|j| format!("{j}\n"))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let tmp = path.with_extension("json.tmp");
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "usage.json".into());
+        let counter = WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp = path.with_file_name(format!("{file_name}.{pid}.{counter}.tmp"));
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, path)
     }

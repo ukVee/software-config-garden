@@ -180,23 +180,51 @@ fn binding_headroom(five: Headroom, seven: Headroom) -> Headroom {
 
 /// Read `<slot>`'s per-profile budget file under `by_profile_dir`, or `None`
 /// when it does not exist / is malformed. A corrupt file reads as `None`:
-/// the picker then treats the slot as [`Headroom::full`], which matches the
-/// writer's own policy of preferring usage over refusal on a bad sample.
+/// callers that use this directly (the human-facing CLI listing) treat it as
+/// "never-written". The admission path reads through [`slot_headroom`]
+/// instead, which fails closed on a torn file.
 pub fn read_profile_budget(by_profile_dir: &Path, slot: &str) -> Option<UsageSnapshot> {
     UsageSnapshot::load(&profile_budget_path(by_profile_dir, slot))
         .ok()
         .flatten()
 }
 
+/// Headroom for one slot's on-disk file, failing closed on a torn or
+/// unreadable file (claude-login-switcher slice 009 S7). The three cases:
+/// - **Absent** (file does not exist) ⇒ [`Headroom::full`]. Nothing to deny.
+/// - **Loaded** ⇒ [`headroom_from`] of the parsed reading.
+/// - **Unreadable** (parse error, or I/O other than `NotFound`) ⇒ one short
+///   retry (a reader may have observed a half-written moment between a
+///   writer's `write` and `rename`), then warn tier
+///   `Headroom { pct: 5, resets_at: None }`. Never full — a slot whose file
+///   is unreadable at pick time must not be preferred over one that is.
+///
+/// The retry is a single immediate re-read. The underlying `write_atomic` is
+/// a rename, so a reader never observes a torn file in the middle of ONE
+/// write — but [`UsageSnapshot::load`] does its own re-open and the file can
+/// change between the two syscalls, which is what the retry covers.
+pub fn slot_headroom(by_profile_dir: &Path, slot: &str, now: i64) -> Headroom {
+    let path = profile_budget_path(by_profile_dir, slot);
+    for _ in 0..2 {
+        match UsageSnapshot::load(&path) {
+            Ok(Some(snap)) => return headroom_from(Some(&snap), now),
+            Ok(None) => return Headroom::full(),
+            Err(_) => continue,
+        }
+    }
+    Headroom {
+        pct: 5,
+        resets_at: None,
+    }
+}
+
 /// Snapshot every slot in `pool` to `(slot, headroom)` pairs, in pool order.
 /// One disk read per slot (file sizes are small, a few hundred bytes); called
-/// once per spawn pick and once per status render.
+/// once per spawn pick and once per status render. A torn file lands in the
+/// warn tier via [`slot_headroom`], never as full headroom.
 pub fn pool_headroom(by_profile_dir: &Path, pool: &[String], now: i64) -> Vec<(String, Headroom)> {
     pool.iter()
-        .map(|slot| {
-            let snap = read_profile_budget(by_profile_dir, slot);
-            (slot.clone(), headroom_from(snap.as_ref(), now))
-        })
+        .map(|slot| (slot.clone(), slot_headroom(by_profile_dir, slot, now)))
         .collect()
 }
 
@@ -412,5 +440,28 @@ mod tests {
     fn profile_budget_path_names_the_file_as_slot_json() {
         let p = profile_budget_path(Path::new("/x"), "slot1");
         assert_eq!(p, PathBuf::from("/x/slot1.json"));
+    }
+
+    /// Slice 009 S7: a torn or otherwise unreadable file lands in the warn
+    /// tier — never full headroom — so the picker cannot prefer a slot whose
+    /// file it can't read over one it can.
+    #[test]
+    fn a_torn_read_lands_in_the_warn_tier_not_full_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = profile_budget_path(dir.path(), "slot1");
+        std::fs::write(&path, "{this is not json").unwrap();
+
+        let hr = slot_headroom(dir.path(), "slot1", 500);
+        assert_eq!(hr.pct, 5, "torn file reads as warn tier");
+        assert_eq!(hr.resets_at, None);
+    }
+
+    #[test]
+    fn an_absent_file_still_reads_as_full_headroom() {
+        // Explicit regression guard: the S7 flip must not deny a never-written
+        // slot. Only an *unreadable* file is a signal; an absent one is nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let hr = slot_headroom(dir.path(), "slot-never-written", 500);
+        assert_eq!(hr, Headroom::full());
     }
 }
