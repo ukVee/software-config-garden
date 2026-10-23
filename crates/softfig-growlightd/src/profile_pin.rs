@@ -136,7 +136,9 @@ pub fn read_pin_history(paths: &PinPaths) -> Vec<ProfilePin> {
 }
 
 /// Write `bytes` to `path` atomically: a `0600` temp sibling, fsynced, then
-/// renamed over it. The temp is removed if any step fails.
+/// renamed over it, then the parent dir is fsynced so the rename itself
+/// survives a power cut (this device has thermal power cuts — review 047
+/// nit). The temp is removed if any step fails.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("pin");
@@ -150,7 +152,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        fs::File::open(dir).and_then(|d| d.sync_all())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);

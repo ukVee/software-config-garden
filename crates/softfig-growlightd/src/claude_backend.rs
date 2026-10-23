@@ -913,11 +913,12 @@ struct ClaudeFlavor {
     /// live demotion (only while the agent is in `live_scopes`), the
     /// per-profile tee, and `status`.
     session_slots: Mutex<BTreeMap<String, String>>,
-    /// Monotonic per-spawn counter stamped into the profile pin's `session_id`
-    /// so audit history can tell successive spawns apart within one process
-    /// (the harness has its own `scope_gen`, but it is not reachable from the
-    /// flavor seam). The counter is best-effort — pin history reads it only
-    /// for human-visible ordering, never for admission decisions.
+    /// Monotonic per-spawn counter paired with the process id in the profile
+    /// pin's `session_id` (`<pid>-<gen>`) so audit history can tell successive
+    /// spawns apart across daemon restarts — a bare counter resets each run
+    /// (review 047 nit). The harness has its own `scope_gen`, but it is not
+    /// reachable from the flavor seam. The value is best-effort — pin history
+    /// reads it only for human-visible ordering, never for admission.
     spawn_gen: AtomicU64,
     /// Per-agent budget cells (latest best-effort shared-pool reserve), keyed by
     /// agent id; the drive loop folds these into its [`crate::usage::UsageAggregator`]
@@ -1245,7 +1246,8 @@ impl BackendFlavor for ClaudeFlavor {
         let generation = self
             .spawn_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pin = crate::profile_pin::ProfilePin::now(&chosen.slot, format!("spawn-{generation}"), None);
+        let session_id = format!("{}-{generation}", std::process::id());
+        let pin = crate::profile_pin::ProfilePin::now(&chosen.slot, session_id, None);
         let paths = crate::profile_pin::pin_paths(&profiles.agents_dir, agent);
         if let Err(e) = crate::profile_pin::write_pin(&paths, &pin) {
             eprintln!(
