@@ -58,6 +58,44 @@ carries no model key at all. The member's `opencode.json` (still written fresh p
 still holding the permission map) and the argv are built by the same spawn path, so the
 model a member runs on and the permission map that member was granted cannot drift apart.
 
+## Declaring a claude member's model
+
+A claude member picks up its model and effort from the same `[[fleet]]` block,
+in a grammar that mirrors `claude -p`'s own `--model` / `--effort`:
+
+```toml
+[[fleet]]
+agent   = "a"                            # backend omitted ⇒ claude, no --model/--effort
+# model   = "claude:claude-opus-4-7"     # optional; spawn adds `--model claude-opus-4-7`
+# variant = "high"                       # optional; spawn adds `--effort high`
+
+[[fleet]]
+agent   = "b"
+backend = "claude"
+model   = "claude:fable[1m]"             # alias + 1M-context suffix also parse
+variant = "max"                          # closed set: low | medium | high | xhigh | max
+```
+
+- `model` on a claude member is **optional**. Omitting it spawns `claude -p`
+  without `--model`, which is byte-identical to a pre-`claude-model-select`
+  claude member.
+- When set, it must be prefixed `claude:<alias|id>`; `<alias>` is one of
+  `opus | sonnet | haiku | fable`, `<id>` matches
+  `claude-[a-z0-9]+(-[a-z0-9]+)*`, and either may carry the `[1m]` suffix. A
+  bare `<id>` without the `claude:` prefix is refused at arm time with a parse
+  message naming the fix. An opencode-shape `provider/model` on a claude member
+  stays refused as opencode-only.
+- `variant` names the effort and is passed as `--effort <v>`. It is a **closed
+  set** on claude: `low | medium | high | xhigh | max`; a value outside the set
+  is refused at parse time.
+- An item's declared `> Model: claude:<m>` (plus optional `effort=`) overrides
+  the roster entry on spawn; the roster entry is the member's default for work
+  with no `> Model:` line. See `spec-growlight-queue.md` §6.4 for the full
+  resolution chain.
+- When Claude Code refuses the requested model (`model_not_found` / 404), the
+  member parks the unit with an alert carrying the refusal reason — there is no
+  crash loop and no backoff retry (`claude-model-select` slice 003, 2026-10-23).
+
 ## What is refused
 
 Four config mistakes are reported and refused at arm time rather than defaulted. All

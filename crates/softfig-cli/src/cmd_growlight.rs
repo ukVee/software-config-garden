@@ -244,8 +244,13 @@ pub struct StartArgs {
     #[arg(long, conflicts_with = "backend")]
     pub opencode: bool,
     /// Backend + model in one word, bypassing the picker:
-    /// `claude` | `reasoning` | `flash` | `auto` | `provider/model`, with an
-    /// optional ` variant=<v>` (alias ` effort=<v>`) tail for opencode.
+    /// `claude` | `claude:<alias|id>[1m]` | `reasoning` | `flash` |
+    /// `auto` | `provider/model`, with an optional ` variant=<v>` (alias
+    /// ` effort=<v>`) tail. On opencode `variant` is free-form; on claude the
+    /// effort set is closed to `low|medium|high|xhigh|max`. A bare `claude` is
+    /// the harness default (no `--model`/`--effort`); `claude:opus` becomes
+    /// `--model opus`; `claude:claude-opus-4-7 effort=high` becomes
+    /// `--model claude-opus-4-7 --effort high`.
     /// `auto` = "let growlight decide": use the model the active backlog item
     /// declares in its `> Model:` line, defaulting to deepseek flash.
     #[arg(long, conflicts_with_all = ["backend", "opencode"])]
