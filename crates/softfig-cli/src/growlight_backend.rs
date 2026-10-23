@@ -811,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn model_spec_carries_variant_on_opencode_and_drops_it_on_claude() {
+    fn model_spec_carries_variant_on_both_backends() {
         let opencode = match parse_model_spec("flash effort=high").unwrap() {
             ModelSpec::Fixed(c) => c,
             ModelSpec::Auto => unreachable!(),
@@ -823,13 +823,19 @@ mod tests {
             ModelSpec::Fixed(opencode)
         );
 
-        // claude's effort isn't settable from this launch path, so a variant on a
-        // claude spec parses (no error for the human) but is not carried.
-        let claude = match parse_model_spec("claude variant=high").unwrap() {
+        // claude-model-select slice 001: `claude effort=high` was silently
+        // dropped before this milestone and now carries the effort on the
+        // `--effort` argv. The value must be in claude's closed set.
+        let claude = match parse_model_spec("claude effort=high").unwrap() {
             ModelSpec::Fixed(c) => c,
             ModelSpec::Auto => unreachable!(),
         };
-        assert_eq!(claude, ModelChoice::claude());
+        assert_eq!(claude.variant.as_deref(), Some("high"));
+        assert_eq!(claude.model, None);
+        assert!(
+            parse_model_spec("claude effort=insane").is_err(),
+            "claude's effort set is closed"
+        );
 
         assert!(parse_model_spec("flash speed=fast").is_err(), "unknown key");
         assert!(parse_model_spec("flash high").is_err(), "not key=value");
