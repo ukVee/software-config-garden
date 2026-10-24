@@ -784,6 +784,22 @@ fn build_opencode_backend(
         // the drive loop updates. Empty until the drive-loop hook lands, which
         // the flavor treats as the floor-only case.
         Arc::new(daemon.member_claims.clone()),
+        // The lifetime-stable half of the grant resolver's inputs
+        // (folder-grants slice 002 part B.2). `extra_ceiling` is empty today —
+        // `config/growlight.toml`'s `grant_ceiling_extra` config plumbing is
+        // slice 003 territory; empty is the strictest (safest) default.
+        // `keeperd_state_root` / `keeperd_vault_root` are left `None` because
+        // keeperd state typically lives outside `$HOME` and the fixed ceiling
+        // already covers the sensitive paths under `$HOME`. `garden_mount` is
+        // `None` because the garden is a regular directory on this device.
+        crate::opencode_backend::OpencodeSpawnContext {
+            home: home_dir(),
+            extra_ceiling: Vec::new(),
+            keeperd_state_root: None,
+            keeperd_vault_root: None,
+            softfig_runtime_root: Some(runtime_grant_root()),
+            garden_mount: None,
+        },
     )
 }
 

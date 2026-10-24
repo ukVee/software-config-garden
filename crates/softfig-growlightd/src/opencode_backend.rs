@@ -90,12 +90,17 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use softfig_ipc::growlightd::{AgentDeltaKind, Event};
+use softfig_ipc::grants::{GitProbe, ProjectRepo};
+use softfig_ipc::spawn_resolve::{SpawnResolveCtx, resolve_from_baton};
+use softfig_ipc::backlog_doc::registry_repo;
+use softfig_ipc::item_repo::item_repo_path;
+use softfig_ipc::model_choice::{Backend as GrantsBackend, item_doc_candidates};
 
 use crate::admission::BudgetUsage;
 use crate::agent_harness::{
@@ -233,6 +238,11 @@ impl AgentErrorState {
 struct MemberCells {
     spend: AgentSpendState,
     errors: AgentErrorState,
+    /// The §5-resolved grant list this member was spawned with, held in memory
+    /// for slice 005's `growlight status` + `opencode.json` emission. Replaced
+    /// on every re-spawn so `grants.md` always describes the CURRENT child
+    /// (folder-grants slice 002 part B.2).
+    resolved_grants: Mutex<Vec<softfig_ipc::grants::Grant>>,
 }
 
 /// One run's bookkeeping, private to its fold: what the run-end settlement needs to
@@ -627,6 +637,48 @@ pub struct OpencodeLaunch {
     pub garden_root: PathBuf,
 }
 
+/// The per-garden spawn context the grant resolver needs beyond the member's
+/// seeded baton and the live claim — the subset of [`SpawnResolveCtx`] that is
+/// stable for the lifetime of this backend (folder-grants slice 002 part B.2).
+///
+/// Grouped rather than six more positional arguments to [`OpencodeBackend::new`]
+/// — several are optional paths and a value in the wrong slot would silently
+/// mis-ceiling the grants.
+#[derive(Debug, Clone)]
+pub struct OpencodeSpawnContext {
+    /// `$HOME` — for `~` expansion in grant lines and the fixed ceiling (§6).
+    pub home: PathBuf,
+    /// Extra ceiling entries from `config/growlight.toml`'s
+    /// `grant_ceiling_extra` (§6). Add-only; strictest when empty, which is
+    /// where the config plumbing currently stands (owed by slice 003).
+    pub extra_ceiling: Vec<PathBuf>,
+    /// keeperd's state root; `None` leaves it out of the ceiling.
+    pub keeperd_state_root: Option<PathBuf>,
+    /// keeperd's vault key material path; `None` leaves it out.
+    pub keeperd_vault_root: Option<PathBuf>,
+    /// softfig's runtime root (`$XDG_CONFIG_HOME/softfig`), floor-managed per
+    /// §6. `None` leaves it out.
+    pub softfig_runtime_root: Option<PathBuf>,
+    /// The garden mount path when the garden is a mount; `None` leaves it
+    /// out of the ceiling.
+    pub garden_mount: Option<PathBuf>,
+}
+
+impl OpencodeSpawnContext {
+    /// A context with every optional path unset — the strict-ceiling default
+    /// production uses when the daemon has nothing extra to add.
+    pub fn minimal(home: PathBuf) -> Self {
+        Self {
+            home,
+            extra_ceiling: Vec::new(),
+            keeperd_state_root: None,
+            keeperd_vault_root: None,
+            softfig_runtime_root: None,
+            garden_mount: None,
+        }
+    }
+}
+
 /// opencode's [`BackendFlavor`]: the five things the shared harness cannot know —
 /// the fail-closed pre-approval, the argv, the child's env and cwd, and the NDJSON
 /// fold with its run-end settlement.
@@ -650,6 +702,12 @@ struct OpencodeFlavor {
     /// until the drive-loop hook lands, which the flavor treats as the
     /// floor-only case (no live claim ⇒ no project repo to anchor grants to).
     claim_lookup: Arc<dyn MemberClaimLookup>,
+    /// The lifetime-stable half of [`SpawnResolveCtx`] (home, ceiling adds,
+    /// optional roots), captured at construction. Combined with the per-spawn
+    /// `(queue, part)` from `claim_lookup` and the per-spawn baton to call
+    /// [`resolve_from_baton`] on every opencode spawn (folder-grants slice 002
+    /// part B.2).
+    spawn_context: OpencodeSpawnContext,
     /// Per-agent spend + error cells, keyed by agent id; re-spawn replaces the
     /// cell, the same lifecycle the harness gives its own health/rate/stderr cells.
     members: Mutex<BTreeMap<String, Arc<MemberCells>>>,
@@ -674,6 +732,135 @@ impl OpencodeFlavor {
             .map(|m| m.errors.lines())
             .unwrap_or_default()
     }
+
+    /// Resolve the item's project repo for a `(queue, part)` claim —
+    /// [`item_repo_path`]'s rules: the item doc's `> Worktree:` first, else the
+    /// queue registry's `repo` cell, else `None`. A local absolute path becomes
+    /// [`ProjectRepo::Local`]; a `host:path` returned by the registry triggers
+    /// the §9 remote-repo refusal inside the resolver (opencode never spawns
+    /// against a remote repo); a `None` or non-local path leaves `project_repo`
+    /// as [`ProjectRepo::None`] so any `$REPO`-using grant line fails closed in
+    /// `grants::resolve` (§5).
+    ///
+    /// Returns an owned sum so the caller can keep the string / path on the
+    /// stack and build the borrowed [`ProjectRepo`] against it (no leaks per
+    /// spawn, no `'static` smuggling).
+    fn resolve_project_repo(&self, queue: &str, part: &str) -> OwnedProjectRepo {
+        let garden = &self.launch.garden_root;
+        // The item's own doc (never a slice): `item_doc_candidates` with no
+        // slice emits the milestone's `CLAUDE.md` or the task's single doc as
+        // its first (and, for a task, only) candidate. Fail-silent — a doc
+        // chain that cannot be enumerated here just makes the registry
+        // fallback the sole source, which `item_repo_path` then handles.
+        let item_doc_body: Option<String> = item_doc_candidates(garden, part, None)
+            .ok()
+            .and_then(|cands| cands.into_iter().next())
+            .and_then(|p| std::fs::read_to_string(&p).ok());
+        let backlog_body = std::fs::read_to_string(garden.join("growlight/backlog/CLAUDE.md"));
+        let path = item_repo_path(
+            item_doc_body.as_deref(),
+            queue,
+            || backlog_body.as_ref().ok().cloned(),
+            Some(&self.spawn_context.home),
+        );
+        // The registry cell might name a remote `host:/path`; `item_repo_path`
+        // returns `None` for a non-local, so we re-check the raw registry cell
+        // to drive the §9 remote-repo refusal rather than silently falling to
+        // `None`. A `> Worktree:` line pointing at a remote host is likewise
+        // caught here when the registry has no row to shadow it.
+        if path.is_none()
+            && let Ok(backlog) = &backlog_body
+            && let Some(cell) = registry_repo(backlog, queue)
+            && cell.contains(':')
+            && !cell.starts_with('/')
+            && !cell.starts_with('~')
+        {
+            return OwnedProjectRepo::Remote(cell);
+        }
+        match path {
+            Some(p) => OwnedProjectRepo::Local(p),
+            None => OwnedProjectRepo::None,
+        }
+    }
+
+    /// Replace `agent`'s resolved-grant cell with `grants`. A re-spawn
+    /// overwrites, so `grants.md` always describes the CURRENT child.
+    fn store_resolved_grants(&self, agent: &str, grants: Vec<softfig_ipc::grants::Grant>) {
+        let mut members = self.members.lock().unwrap();
+        let cell = members
+            .entry(agent.to_string())
+            .or_insert_with(|| Arc::new(MemberCells::default()));
+        *cell.resolved_grants.lock().unwrap() = grants;
+    }
+
+    /// Read `agent`'s resolved grants (slice 005 territory; today only
+    /// exercised in tests).
+    #[cfg(test)]
+    fn resolved_grants(&self, agent: &str) -> Vec<softfig_ipc::grants::Grant> {
+        self.member(agent)
+            .map(|m| m.resolved_grants.lock().unwrap().clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Owned twin of [`ProjectRepo`] — holds the storage so a per-spawn
+/// `ProjectRepo` can borrow against a local on the caller's stack rather than
+/// leaking (slice 002 part B.2).
+#[derive(Debug)]
+enum OwnedProjectRepo {
+    Local(PathBuf),
+    Remote(String),
+    None,
+}
+
+impl OwnedProjectRepo {
+    fn as_project_repo(&self) -> ProjectRepo<'_> {
+        match self {
+            OwnedProjectRepo::Local(p) => ProjectRepo::Local(p),
+            OwnedProjectRepo::Remote(s) => ProjectRepo::Remote(s),
+            OwnedProjectRepo::None => ProjectRepo::None,
+        }
+    }
+}
+
+/// The production [`GitProbe`]: shells `git rev-parse --git-common-dir` under
+/// each path and canonicalises the result, so a worktree whose `.git` is a
+/// gitdir pointer compares equal to the main repo it points at. Fails closed
+/// — any git error or non-canonicalisable path reads as "not the same",
+/// matching [`SpawnResolveCtx`]'s overall fail-closed shape.
+///
+/// Only used by [`OpencodeFlavor::generate_preapproval`], so the one short
+/// implementation lives here beside its only caller.
+#[derive(Debug)]
+struct ShellGitProbe;
+
+impl GitProbe for ShellGitProbe {
+    fn same_common_dir(&self, worktree: &Path, repo: &Path) -> bool {
+        match (read_git_common_dir(worktree), read_git_common_dir(repo)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+fn read_git_common_dir(dir: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["--no-optional-locks", "rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let path = PathBuf::from(text.trim());
+    let abs = if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    };
+    std::fs::canonicalize(abs).ok()
 }
 
 /// The `opencode run` invocation that goes AFTER the harness's `systemd-run … --`
@@ -729,19 +916,40 @@ impl BackendFlavor for OpencodeFlavor {
                     "opencode pre-approval generation failed for agent {agent}: {e}"
                 ))
             })?;
-        // Grant resolution hook (folder-grants slice 002 part B): a live
-        // `(queue, part)` is the input the shared
-        // `softfig_ipc::spawn_resolve::resolve_from_baton` helper needs to walk
-        // the item's doc chain. Until the drive-loop hook lands the view is
-        // empty, so this is just a probe: `None` is the floor-only case, same
-        // as a baton with no `item:`. The next iteration swaps this for the
-        // real `resolve_from_baton` call plus the `SpawnError` refusal path.
-        if let Some((queue, part)) = self.claim_lookup.claim_for(agent) {
-            eprintln!(
-                "growlightd: opencode spawn: {agent} claim ({queue}, {part}) \
-                 — grants resolution deferred to the next iteration",
-            );
-        }
+        // Grant resolution (folder-grants slice 002 part B.2): the shared
+        // `resolve_from_baton` helper reads the member's seeded baton, walks
+        // the item's doc chain and runs §5's fail-closed resolver. On refusal
+        // the spawn is a `SpawnError` and the drive loop parks the member once
+        // with no re-roll (§8). An empty claim view (pre-claim or no
+        // drive-loop hook written yet) is the floor-only case: no item in the
+        // baton means no chain to walk and no grants to resolve, so the spawn
+        // proceeds on the fixed floor alone.
+        let Some((queue, part)) = self.claim_lookup.claim_for(agent) else {
+            return Ok(paths);
+        };
+        let baton_body = std::fs::read_to_string(&paths.baton).unwrap_or_default();
+        let probe = ShellGitProbe;
+        let owned_repo = self.resolve_project_repo(&queue, &part);
+        let ctx = SpawnResolveCtx {
+            garden_root: &self.launch.garden_root,
+            home: &self.spawn_context.home,
+            project_repo: owned_repo.as_project_repo(),
+            backend: GrantsBackend::Opencode,
+            extra_ceiling: &self.spawn_context.extra_ceiling,
+            keeperd_state_root: self.spawn_context.keeperd_state_root.as_deref(),
+            keeperd_vault_root: self.spawn_context.keeperd_vault_root.as_deref(),
+            softfig_runtime_root: self.spawn_context.softfig_runtime_root.as_deref(),
+            garden_mount: self.spawn_context.garden_mount.as_deref(),
+        };
+        let resolution = resolve_from_baton(&baton_body, &ctx, &probe).map_err(|e| {
+            SpawnError(format!(
+                "opencode grant resolution refused for agent {agent} on {queue}/{part}: {e}"
+            ))
+        })?;
+        // Slice 005 will emit `resolution.grants` into opencode.json and surface
+        // it through `growlight status`; today we hold it in memory on the member
+        // cell so the next slice can read without re-resolving.
+        self.store_resolved_grants(agent, resolution.grants);
         Ok(paths)
     }
 
@@ -837,6 +1045,7 @@ impl OpencodeBackend {
         live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
         kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
         claim_lookup: Arc<dyn MemberClaimLookup>,
+        spawn_context: OpencodeSpawnContext,
     ) -> Self {
         let flavor = Arc::new(OpencodeFlavor {
             launch,
@@ -844,6 +1053,7 @@ impl OpencodeBackend {
             preapproval,
             ledger,
             claim_lookup,
+            spawn_context,
             members: Mutex::new(BTreeMap::new()),
         });
         Self {
@@ -1569,6 +1779,7 @@ mod tests {
             ),
             ledger: Arc::new(FakeLedger::default()),
             claim_lookup: Arc::new(crate::member_claim::SharedClaimView::new()),
+            spawn_context: OpencodeSpawnContext::minimal(tmp.to_path_buf()),
             members: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1584,6 +1795,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(crate::member_claim::SharedClaimView::new()),
+            OpencodeSpawnContext::minimal(tmp.to_path_buf()),
         ))
     }
 
@@ -1755,6 +1967,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(crate::member_claim::SharedClaimView::new()),
+            OpencodeSpawnContext::minimal(tmp.path().to_path_buf()),
         ));
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
@@ -1828,6 +2041,7 @@ mod tests {
             ),
             ledger: Arc::new(FakeLedger::default()),
             claim_lookup: Arc::clone(&lookup) as Arc<dyn crate::member_claim::MemberClaimLookup>,
+            spawn_context: OpencodeSpawnContext::minimal(tmp.path().to_path_buf()),
             members: Mutex::new(BTreeMap::new()),
         };
 
@@ -1866,6 +2080,7 @@ mod tests {
             ),
             ledger: Arc::new(FakeLedger::default()),
             claim_lookup: Arc::new(crate::member_claim::SharedClaimView::new()),
+            spawn_context: OpencodeSpawnContext::minimal(tmp.path().to_path_buf()),
             members: Mutex::new(BTreeMap::new()),
         };
 
@@ -1947,5 +2162,204 @@ mod tests {
         // What opencode does report IS metered: the provider-neutral rolling-minute
         // window is live from the first spawn (zero until one meters).
         assert_eq!(backend.rate_used(1_000), (0, 0));
+    }
+
+    // -- folder-grants slice 002 part B.2 --------------------------------------
+
+    /// Build a mini garden at `root` with a `demo` milestone that declares one
+    /// `rw` grant on `extra`, plus the `growlight/backlog/` layout the chain
+    /// walk needs. Mirrors the pattern of `softfig_ipc::spawn_resolve`'s own
+    /// tests, specialised for the opencode-backend test fixture.
+    fn write_demo_milestone(root: &Path, extra: &Path) {
+        std::fs::create_dir_all(root.join("growlight/backlog/milestones/demo/slices")).unwrap();
+        std::fs::create_dir_all(root.join("growlight/backlog/tasks")).unwrap();
+        std::fs::write(
+            root.join("growlight/backlog/milestones/demo/CLAUDE.md"),
+            format!("# demo\n> Grants: rw {}\n", extra.display()),
+        )
+        .unwrap();
+    }
+
+    fn write_backlog_registry(root: &Path, queue_name: &str, repo: &Path) {
+        std::fs::create_dir_all(root.join("growlight/backlog")).unwrap();
+        std::fs::write(
+            root.join("growlight/backlog/CLAUDE.md"),
+            format!(
+                "# backlog\n\n<!-- softfig:queues -->\n| queue | repo |\n|-------|------|\n| {} | {} |\n<!-- /softfig:queues -->\n",
+                queue_name,
+                repo.display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Seed `agent`'s baton file at `paths.baton` with the given item + slice.
+    /// Preapproval generation never writes the baton (the drive loop seeds it);
+    /// these tests prove the generate_preapproval → resolver path reads what
+    /// the loop would have seeded.
+    fn seed_baton(baton: &Path, item: &str, slice: Option<&str>) {
+        if let Some(parent) = baton.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut body = String::from("---\nstatus: IN_PROGRESS\n");
+        body.push_str(&format!("item: {item}\n"));
+        if let Some(s) = slice {
+            body.push_str(&format!("slice: {s}\n"));
+        }
+        body.push_str("---\n");
+        std::fs::write(baton, body).unwrap();
+    }
+
+    #[test]
+    fn generate_preapproval_resolves_grants_from_the_baton_and_stashes_them() {
+        // folder-grants slice 002 part B.2 happy path: the baton names an
+        // item, the lookup returns its live `(queue, part)`, `resolve_from_baton`
+        // walks the garden, the item's milestone chain declares a grant, and
+        // the resolved grant list reaches the member cell for slice 005.
+        let tmp = tempfile::tempdir().unwrap();
+        let garden = tmp.path().join("garden");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let extra = home.join("dotfiles");
+        for d in [&garden, &home, &repo, &extra] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        write_demo_milestone(&garden, &extra);
+        write_backlog_registry(&garden, "default", &repo);
+
+        let lookup = Arc::new(RecordingClaimLookup::answering("default", "demo"));
+        let flavor = OpencodeFlavor {
+            launch: OpencodeLaunch {
+                bin: "opencode".to_string(),
+                prompt: "kick".to_string(),
+                model: ModelSelection::model("deepseek/deepseek-flash"),
+                garden_root: garden.clone(),
+            },
+            hub: EventHub::new(),
+            preapproval: OpencodePreApproval::new(
+                tmp.path().join("agents"),
+                &garden,
+                garden.join("growlight/protocol-fleet.md"),
+                tmp.path().join("runtime"),
+                PathBuf::from("softfig-mcp"),
+                tmp.path().join(".claude"),
+                tmp.path().join("opencode-data"),
+            ),
+            ledger: Arc::new(FakeLedger::default()),
+            claim_lookup: Arc::clone(&lookup) as Arc<dyn crate::member_claim::MemberClaimLookup>,
+            spawn_context: OpencodeSpawnContext {
+                home: home.clone(),
+                extra_ceiling: Vec::new(),
+                keeperd_state_root: None,
+                keeperd_vault_root: None,
+                softfig_runtime_root: None,
+                garden_mount: None,
+            },
+            members: Mutex::new(BTreeMap::new()),
+        };
+
+        // Seed the baton so parse_baton finds `item: demo`; preapproval
+        // generation runs first, then our seed overwrites it. (The actual
+        // production baton seeder runs BEFORE generate_preapproval, but order
+        // doesn't matter here — we only exercise generate_preapproval and
+        // seed the file it will read.)
+        let baton = tmp.path().join("agents/a1/baton.md");
+        std::fs::create_dir_all(baton.parent().unwrap()).unwrap();
+        seed_baton(&baton, "demo", None);
+
+        let _paths = flavor
+            .generate_preapproval("a1")
+            .expect("the resolve succeeds on a clean mini-garden");
+
+        // The milestone's `rw <extra>` is tagged MilestoneOrTask by the resolver;
+        // the project default (`rw <repo>` tagged ProjectDefault) is there too.
+        let grants = flavor.resolved_grants("a1");
+        let non_ceiling: Vec<_> = grants
+            .iter()
+            .filter(|g| {
+                g.origin.tier != softfig_ipc::grants::Tier::CeilingDeny
+                    && g.origin.tier != softfig_ipc::grants::Tier::GitGuard
+            })
+            .map(|g| (g.mode, g.origin.tier))
+            .collect();
+        assert!(
+            non_ceiling.contains(&(softfig_ipc::grants::Mode::Rw, softfig_ipc::grants::Tier::ProjectDefault)),
+            "project default rw $REPO was emitted: {non_ceiling:?}",
+        );
+        assert!(
+            non_ceiling.contains(&(softfig_ipc::grants::Mode::Rw, softfig_ipc::grants::Tier::MilestoneOrTask)),
+            "the milestone's rw grant reached the member cell: {non_ceiling:?}",
+        );
+    }
+
+    #[test]
+    fn generate_preapproval_refuses_to_spawn_on_a_ceiling_hitting_grant() {
+        // The fail-closed path (§8): a grant that targets a ceiling root
+        // (`~/.ssh`) propagates as `SpawnError`, so the drive loop parks the
+        // member with one alert and never re-rolls. Deterministic — the same
+        // garden input returns the same refusal every spawn.
+        let tmp = tempfile::tempdir().unwrap();
+        let garden = tmp.path().join("garden");
+        let home = tmp.path().join("home");
+        let ssh = home.join(".ssh");
+        for d in [&garden, &home, &ssh] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(garden.join("growlight/backlog/milestones/demo")).unwrap();
+        std::fs::write(
+            garden.join("growlight/backlog/milestones/demo/CLAUDE.md"),
+            format!("# demo\n> Grants: ro {}\n", ssh.display()),
+        )
+        .unwrap();
+
+        let lookup = Arc::new(RecordingClaimLookup::answering("default", "demo"));
+        let flavor = OpencodeFlavor {
+            launch: OpencodeLaunch {
+                bin: "opencode".to_string(),
+                prompt: "kick".to_string(),
+                model: ModelSelection::model("deepseek/deepseek-flash"),
+                garden_root: garden.clone(),
+            },
+            hub: EventHub::new(),
+            preapproval: OpencodePreApproval::new(
+                tmp.path().join("agents"),
+                &garden,
+                garden.join("growlight/protocol-fleet.md"),
+                tmp.path().join("runtime"),
+                PathBuf::from("softfig-mcp"),
+                tmp.path().join(".claude"),
+                tmp.path().join("opencode-data"),
+            ),
+            ledger: Arc::new(FakeLedger::default()),
+            claim_lookup: Arc::clone(&lookup) as Arc<dyn crate::member_claim::MemberClaimLookup>,
+            spawn_context: OpencodeSpawnContext {
+                home: home.clone(),
+                extra_ceiling: Vec::new(),
+                keeperd_state_root: None,
+                keeperd_vault_root: None,
+                softfig_runtime_root: None,
+                garden_mount: None,
+            },
+            members: Mutex::new(BTreeMap::new()),
+        };
+
+        let baton = tmp.path().join("agents/a1/baton.md");
+        std::fs::create_dir_all(baton.parent().unwrap()).unwrap();
+        seed_baton(&baton, "demo", None);
+
+        let err = flavor
+            .generate_preapproval("a1")
+            .expect_err("a ceiling-hitting grant parks the spawn");
+        let msg = err.0;
+        assert!(
+            msg.contains("grant resolution refused"),
+            "the park message names the refusal: {msg}",
+        );
+        // A refused spawn stores no grants on the cell — the next re-roll
+        // would hit the same refusal, so a stale list is worse than empty.
+        assert!(
+            flavor.resolved_grants("a1").is_empty(),
+            "refused spawn ⇒ no stashed grants",
+        );
     }
 }

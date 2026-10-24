@@ -1956,6 +1956,9 @@ impl DriveLoop {
                             self.v2_assignments.remove(agent);
                         } else {
                             self.assignments.remove(agent);
+                            // Mirror on the daemon-wide claim view
+                            // (folder-grants slice 002 part B.2).
+                            self.daemon.member_claims.release(agent);
                         }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
@@ -1982,6 +1985,9 @@ impl DriveLoop {
                             self.v2_assignments.remove(agent);
                         } else {
                             self.assignments.remove(agent);
+                            // Mirror on the daemon-wide claim view
+                            // (folder-grants slice 002 part B.2).
+                            self.daemon.member_claims.release(agent);
                         }
                         // A human boundary stop OR a reached bounded-run limit (task 040)
                         // retires the member — an item boundary is a completed iteration
@@ -2030,6 +2036,10 @@ impl DriveLoop {
                                 report.v2_parked.push(assignment);
                             }
                         } else if let Some((queue, part)) = self.assignments.remove(agent) {
+                            // Mirror on the daemon-wide claim view
+                            // (folder-grants slice 002 part B.2) now that the
+                            // local map released the row.
+                            self.daemon.member_claims.release(agent);
                             if let Err(_e) = self.parker.park_item(&queue, &part) {
                                 // Fail-soft (see the arm comment): the member is
                                 // already released and the local item-park below still
@@ -2638,6 +2648,13 @@ impl DriveLoop {
                         // is overwritten only on its next fresh start.
                         self.assignments
                             .insert(agent.clone(), (queue.clone(), part.clone()));
+                        // Mirror the live claim onto the daemon-wide member-claim
+                        // view (folder-grants slice 002 part B.2): every opencode
+                        // backend reads this view at spawn to resolve the item's
+                        // grants from the member's seeded baton. The view is
+                        // overwritten atomically with every record, so a re-pick
+                        // onto a different part replaces the row cleanly.
+                        self.daemon.member_claims.record(agent.as_str(), &queue, &part);
                         report.started.push(Assignment {
                             agent: agent.clone(),
                             queue,
@@ -2860,6 +2877,10 @@ impl DriveLoop {
         // and its assignment so a stale part is never item-parked later.
         self.aggregator.forget(agent);
         self.assignments.remove(agent);
+        // Mirror the release onto the daemon-wide claim view
+        // (folder-grants slice 002 part B.2); a no-op on an agent that was v2
+        // or never recorded.
+        self.daemon.member_claims.release(agent);
         // The v2 twin (slice 006) — a no-op on a legacy loop's always-empty map.
         self.v2_assignments.remove(agent);
         self.stopped.insert(agent.to_string());
