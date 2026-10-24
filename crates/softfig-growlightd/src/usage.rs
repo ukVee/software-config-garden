@@ -171,6 +171,14 @@ impl WindowResets {
 /// unchanged re-report keeps its original `read_at` (see
 /// [`UsageAggregator::observe`]) and a wedged agent's frozen sample ages out of its
 /// window rather than pinning the fold forever.
+///
+/// `profile` (claude-login-switcher slice 008) tags the Anthropic *account* the
+/// reading drew from — a claude-login slot name (or `home`) — so a reading
+/// against slot1 never pins the aggregate used to admit a slot2 member. `None`
+/// is the pre-switcher behaviour: one shared account for the whole fleet, so a
+/// `None`-tagged reading folds into every profile's view and matches the old
+/// fleet-wide max. Opencode never writes a sample here at all (its `budget()`
+/// returns `None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageSample {
     /// The reporting agent's bus id (the `@`-stripped work-stream name).
@@ -185,6 +193,13 @@ pub struct UsageSample {
     /// the age bound cannot see that, because the windows are anchored rather than
     /// rolling from the read. Unknown boundaries fall back to the age bound.
     pub resets_at: WindowResets,
+    /// The claude-login profile the reading drew from, if known (slice 008). A
+    /// `Some(slot)` reading folds into that profile's view only, so the fleet
+    /// aggregate used to gate a `slot2` member ignores a `slot1` member's
+    /// `rejected`. `None` matches the pre-switcher single-account fleet: the
+    /// reading contributes to every profile's view the same way the fleet-wide
+    /// max did. See [`UsageAggregator::aggregate_for_profile_at`].
+    pub profile: Option<String>,
 }
 
 impl UsageSample {
@@ -197,12 +212,21 @@ impl UsageSample {
             budget,
             read_at,
             resets_at: WindowResets::UNKNOWN,
+            profile: None,
         }
     }
 
     /// The same reading, carrying the window boundaries it was read against.
     pub fn with_resets(mut self, resets_at: WindowResets) -> Self {
         self.resets_at = resets_at;
+        self
+    }
+
+    /// The same reading, tagged with the claude-login profile it drew from
+    /// (slice 008). Opencode never calls this (it writes no sample); a claude
+    /// member tags its reading with the slot its spawn ran on.
+    pub fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
         self
     }
 }
@@ -287,13 +311,61 @@ impl UsageAggregator {
     /// own. `None` when no agent has reported at all; `Some((0, 0))` when every
     /// contributing reading is void (an effectively fresh pool). See the module docs
     /// for why max within a live window and why these bounds are what void one.
+    ///
+    /// This is the fleet-wide view used by the §9 usage alert
+    /// ([`fleet_alert_at`](Self::fleet_alert_at)): every reading contributes,
+    /// regardless of profile. For admission, see
+    /// [`aggregate_for_profile_at`](Self::aggregate_for_profile_at), which folds
+    /// only the readings taken against a given claude-login slot (slice 008).
     pub fn aggregate_at(&self, now: i64) -> Option<BudgetUsage> {
-        if self.latest.is_empty() {
-            return None;
-        }
+        self.aggregate_filtered_at(now, |_| true)
+    }
+
+    /// The reserve as of `now` for a specific claude-login profile (slice 008): the
+    /// per-field **maximum** across every reading tagged with the same `profile`
+    /// (or carrying `None`, which is the pre-switcher "one shared account" sample —
+    /// it folds into every profile's view like the old fleet-wide max). The two
+    /// staleness bounds (`age` and `resets_at`) apply exactly as in
+    /// [`aggregate_at`](Self::aggregate_at). A reading tagged with a *different*
+    /// profile is skipped — the whole point of the per-profile fold is that a
+    /// `slot1` `rejected` never pins the admission used to start a `slot2` member.
+    ///
+    /// `None` when no reading contributes (no sample at all for this profile and
+    /// no untagged sample); `Some((0, 0))` when every contributing reading is void.
+    pub fn aggregate_for_profile_at(
+        &self,
+        profile: &str,
+        now: i64,
+    ) -> Option<BudgetUsage> {
+        self.aggregate_filtered_at(now, |s| {
+            s.profile.as_deref().is_none_or(|p| p == profile)
+        })
+    }
+
+    /// The reserve as of `now` for a specific profile, defaulting to a fresh pool
+    /// when no reading contributes — the per-member form the admission governor
+    /// reads directly (slice 008). Back-compat: with no profile tags at all this
+    /// equals [`aggregate_or_fresh_at`](Self::aggregate_or_fresh_at), because every
+    /// untagged reading folds into every profile's view.
+    pub fn aggregate_or_fresh_for_profile_at(&self, profile: &str, now: i64) -> BudgetUsage {
+        self.aggregate_for_profile_at(profile, now)
+            .unwrap_or(BudgetUsage::new(0, 0))
+    }
+
+    /// Internal fold: per-field max over readings matching `include`, with both
+    /// staleness bounds applied. Shared by the fleet-wide and per-profile views.
+    fn aggregate_filtered_at<F>(&self, now: i64, include: F) -> Option<BudgetUsage>
+    where
+        F: Fn(&UsageSample) -> bool,
+    {
         let mut five_h = 0u8;
         let mut seven_d = 0u8;
+        let mut any = false;
         for s in self.latest.values() {
+            if !include(s) {
+                continue;
+            }
+            any = true;
             let age = now.saturating_sub(s.read_at);
             if age < FIVE_H_WINDOW_SECS && !WindowResets::passed(s.resets_at.five_h, now) {
                 five_h = five_h.max(s.budget.session_5h_pct);
@@ -301,6 +373,9 @@ impl UsageAggregator {
             if age < SEVEN_D_WINDOW_SECS && !WindowResets::passed(s.resets_at.seven_d, now) {
                 seven_d = seven_d.max(s.budget.session_7d_pct);
             }
+        }
+        if !any {
+            return None;
         }
         Some(BudgetUsage::new(five_h, seven_d))
     }
@@ -653,6 +728,92 @@ mod tests {
             }
         }
         assert_eq!(fires, 1, "exactly one alert across the whole rising burn");
+    }
+
+    /// SLICE 008 (per-profile Budget5h fold): a `slot1` member's near-full
+    /// reading pins the aggregate for `slot1` admission but leaves `slot2`
+    /// clear — the whole point of a per-profile fold. The fleet-wide
+    /// `aggregate_at` still sees every reading (that view is what the §9 usage
+    /// alert reads, which is deliberately fleet-wide).
+    #[test]
+    fn aggregate_for_profile_folds_only_matching_readings() {
+        let mut agg = UsageAggregator::new();
+        agg.observe(
+            UsageSample::new("a", BudgetUsage::new(98, 20), 0)
+                .with_profile(Some("slot1".into())),
+        );
+        agg.observe(
+            UsageSample::new("d", BudgetUsage::new(10, 5), 0)
+                .with_profile(Some("slot2".into())),
+        );
+        // The fleet-wide view (§9 alert) still sees max 98/20.
+        assert_eq!(agg.aggregate_at(0), Some(BudgetUsage::new(98, 20)));
+        // Per-profile: slot1 reads 98 (a's reading), slot2 reads 10 (d's).
+        assert_eq!(
+            agg.aggregate_for_profile_at("slot1", 0),
+            Some(BudgetUsage::new(98, 20))
+        );
+        assert_eq!(
+            agg.aggregate_for_profile_at("slot2", 0),
+            Some(BudgetUsage::new(10, 5))
+        );
+        // A profile with no reading at all folds nothing.
+        assert_eq!(agg.aggregate_for_profile_at("slot3", 0), None);
+    }
+
+    /// Per-profile back-compat: with every reading untagged (the pre-slice-008
+    /// posture, equivalent to a single-account fleet or a `home`-only roster),
+    /// `aggregate_for_profile_at(any, now)` equals the fleet-wide
+    /// `aggregate_at(now)` — the "no pools anywhere" guard the slice spec names
+    /// in its finish checks.
+    #[test]
+    fn an_untagged_reading_folds_into_every_profile_view() {
+        let mut agg = UsageAggregator::new();
+        agg.observe(sample("a", 80, 30));
+        agg.observe(sample("b", 50, 10));
+        let fleet = agg.aggregate_at(0);
+        for profile in ["slot1", "slot2", "home", "whatever"] {
+            assert_eq!(
+                agg.aggregate_for_profile_at(profile, 0),
+                fleet,
+                "untagged readings fold into every profile view (back-compat)",
+            );
+        }
+    }
+
+    /// The admission governor refuses a per-profile Budget5h breach only for
+    /// the breached profile; a sibling profile at the same instant still
+    /// admits. This is the finish-check-1 shape the slice names: `a` on slot1
+    /// at 98% refuses admission against slot1, while slot2 is clear.
+    #[test]
+    fn the_governor_refuses_per_profile_without_pinning_the_fleet() {
+        let g = AdmissionGovernor::new(Policy::default()); // 5h halt 85
+        let mut agg = UsageAggregator::new();
+        agg.observe(
+            UsageSample::new("a", BudgetUsage::new(98, 20), 0)
+                .with_profile(Some("slot1".into())),
+        );
+        // slot1 breaches the 5h rail; a start keyed on slot1 is refused.
+        assert_eq!(
+            g.decide(
+                Intent::Start,
+                0,
+                agg.aggregate_or_fresh_for_profile_at("slot1", 0),
+                fresh_rate(),
+            ),
+            AdmissionDecision::Refuse {
+                reason: RefuseReason::Budget5h,
+            }
+        );
+        // slot2 has no reading at all → a fresh (0, 0) pool → admit.
+        assert!(g
+            .decide(
+                Intent::Start,
+                0,
+                agg.aggregate_or_fresh_for_profile_at("slot2", 0),
+                fresh_rate(),
+            )
+            .is_admit());
     }
 
     /// A jump straight past the rung announces it once, then stays quiet.

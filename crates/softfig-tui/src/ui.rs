@@ -39,6 +39,15 @@ fn fleet_agent_cell(a: &softfig_ipc::growlightd::AgentSummary) -> String {
         cell.push_str(" · ");
         cell.push_str(model);
     }
+    // Claude-login profile slot the member's last spawn ran under
+    // (claude-login-switcher slice 003). Rendered as `profile:<slot>` so it
+    // is distinct at a glance from the model id, and left off entirely on an
+    // unpinned claude member (shared top-level credential) or any opencode
+    // member — a reader scanning for rotation only cares when it is on.
+    if let Some(profile) = &a.profile {
+        cell.push_str(" · profile:");
+        cell.push_str(profile);
+    }
     if let Some(spend) = &a.spend {
         cell.push_str(" · ");
         cell.push_str(&spend.dollars());
@@ -3013,6 +3022,25 @@ mod tests {
         let fresh = AgentSummary::new("c", "exited", false)
             .on_opencode(None, AgentSpendSummary::default());
         assert_eq!(fleet_agent_cell(&fresh), "c:exited · opencode · $0.00");
+    }
+
+    #[test]
+    fn a_fleet_agent_cell_shows_the_claude_login_profile_slot_when_pinned() {
+        use softfig_ipc::growlightd::AgentSummary;
+
+        // claude-login-switcher slice 003 finish-check 5: the active profile
+        // slot shows between the backend and the spend column (opencode has
+        // no profile, so the slot is left off there too).
+        let pinned = AgentSummary::new("a", "running", true).with_profile(Some("slot1".into()));
+        assert_eq!(
+            fleet_agent_cell(&pinned),
+            "a:running · claude · profile:slot1",
+        );
+
+        // A claude member with no pool reads unchanged — the shared top-level
+        // credential (today's semantics).
+        let unpinned = AgentSummary::new("a", "running", true).with_profile(None);
+        assert_eq!(fleet_agent_cell(&unpinned), "a:running · claude");
     }
 
     #[test]

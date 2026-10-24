@@ -14,6 +14,7 @@ use std::process::Command;
 
 use anyhow::Result;
 use serde_json::Value;
+use softfig_ipc::claude_profiles::{CONFIG_DIR_ENV, SlotDir};
 use softfig_ipc::opencode::{
     Context as SessionContext, Floor, MemoryPolicy, Posture, context, file_ref, floor,
 };
@@ -46,6 +47,17 @@ fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
         Some(variant) => format!("{model}#{variant}"),
         None => model.to_string(),
     }
+}
+
+/// The claude-login slot an interactive claude session runs on
+/// (`claude-login-switcher` slice 007): the name, for the banner and the
+/// `--no-launch` hint, and where it resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSlot {
+    /// The slot name (`home` or a store slot).
+    pub name: String,
+    /// What the name resolved to: unset `CLAUDE_CONFIG_DIR`, or set it here.
+    pub dir: SlotDir,
 }
 
 /// The inputs an interactive launch needs, across backends. Each backend
@@ -90,6 +102,10 @@ pub struct InteractiveLaunch<'a> {
     /// claude's interactive TUI takes no kick — the human sends the first turn —
     /// so this is opencode-only.
     pub boot_prompt: &'a str,
+    /// claude's claude-login slot: `CLAUDE_CONFIG_DIR` set to a store slot, or
+    /// removed for `home`. `None` adds no env change at all (the pre-switcher
+    /// launch). Ignored by opencode.
+    pub claude_slot: Option<&'a LaunchSlot>,
 }
 
 /// Build the interactive loop command for a backend. Pure (constructs,
@@ -126,6 +142,17 @@ pub fn interactive_command(backend: Backend, launch: &InteractiveLaunch) -> Resu
                 .arg("--mcp-config")
                 .arg(launch.mcp_config)
                 .current_dir(launch.garden_root);
+            // The slot rides the env, never argv, so the argv above stays the
+            // hardwired seam contract whatever account the session is on.
+            match launch.claude_slot.map(|s| &s.dir) {
+                Some(SlotDir::Store(dir)) => {
+                    cmd.env(CONFIG_DIR_ENV, dir);
+                }
+                Some(SlotDir::Home) => {
+                    cmd.env_remove(CONFIG_DIR_ENV);
+                }
+                None => {}
+            }
         }
         Backend::Opencode => {
             cmd.args(opencode_interactive_args())
@@ -392,6 +419,7 @@ mod tests {
             // opencode-only fields — the claude arm must ignore them entirely.
             opencode_config: Path::new("/run/softfig/growlight/opencode.json"),
             boot_prompt: "begin",
+            claude_slot: None,
         };
         let cmd =
             interactive_command(Backend::Claude, &launch).expect("claude backend builds a command");
@@ -416,6 +444,57 @@ mod tests {
             !cmd.get_envs()
                 .any(|(k, _)| k == OsStr::new("OPENCODE_CONFIG")),
             "claude must not set OPENCODE_CONFIG"
+        );
+    }
+
+    /// claude-login-switcher slice 007: the slot reaches claude as an env
+    /// change (set for a store slot, removed for `home`), and the argv is the
+    /// same with or without one.
+    #[test]
+    fn the_claude_slot_rides_the_env_and_leaves_the_argv_alone() {
+        use std::ffi::OsStr;
+        let base = InteractiveLaunch {
+            agent_name: "softfig-loop",
+            loop_settings: Path::new("/rt/loop.json"),
+            mcp_config: Path::new("/rt/mcp.json"),
+            garden_root: Path::new("/home/u/garden"),
+            opencode_config: Path::new("/rt/opencode.json"),
+            boot_prompt: "begin",
+            claude_slot: None,
+        };
+        let args = |l: &InteractiveLaunch| -> Vec<String> {
+            interactive_command(Backend::Claude, l)
+                .unwrap()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let env = |l: &InteractiveLaunch| -> Vec<(String, Option<String>)> {
+            interactive_command(Backend::Claude, l)
+                .unwrap()
+                .get_envs()
+                .map(|(k, v)| {
+                    (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+                })
+                .collect()
+        };
+        assert!(env(&base).is_empty(), "no slot ⇒ no env change at all");
+
+        let store = LaunchSlot { name: "slot2".into(), dir: SlotDir::Store("/s/slot2".into()) };
+        let on_store = InteractiveLaunch { claude_slot: Some(&store), ..base };
+        assert_eq!(env(&on_store), [("CLAUDE_CONFIG_DIR".into(), Some("/s/slot2".into()))]);
+        assert_eq!(args(&on_store), args(&base));
+
+        let home = LaunchSlot { name: "home".into(), dir: SlotDir::Home };
+        let on_home = InteractiveLaunch { claude_slot: Some(&home), ..base };
+        assert_eq!(env(&on_home), [("CLAUDE_CONFIG_DIR".into(), None)]);
+        assert_eq!(args(&on_home), args(&base));
+        assert!(
+            interactive_command(Backend::Claude, &on_home)
+                .unwrap()
+                .get_envs()
+                .all(|(k, _)| k != OsStr::new("HOME")),
+            "HOME is never touched",
         );
     }
 
@@ -614,6 +693,10 @@ mod tests {
             garden_root: garden,
             opencode_config: opencode_cfg,
             boot_prompt: "Begin your growlight iteration.",
+            claude_slot: Some(&LaunchSlot {
+                name: "slot2".into(),
+                dir: SlotDir::Store("/s/slot2".into()),
+            }),
         };
         let cmd = interactive_command(Backend::Opencode, &launch)
             .expect("opencode backend builds a command");

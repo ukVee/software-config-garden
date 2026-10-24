@@ -50,6 +50,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use softfig_ipc as ipc;
+use softfig_ipc::claude_profiles::{self, SlotDir};
 
 use crate::admission::AdmissionGovernor;
 use crate::backend_router::{BackendHandle, BackendRouter};
@@ -59,8 +60,8 @@ use crate::claim::{KeeperdItemParker, KeeperdPartClaimer, KeeperdV2Claimer, Keep
 use crate::claude_backend::ClaudeBackend;
 use crate::daemon::Daemon;
 use crate::drive_loop::{
-    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, RateMeter, RouteConnectivity,
-    SystemExeProbe, V2Seams, DRIVE_POLL_MS,
+    spawn_drive_loop, DriveLoop, FleetMember, LiveRate, ProfileResolver, RateMeter,
+    RouteConnectivity, SystemExeProbe, V2Seams, DRIVE_POLL_MS,
 };
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
@@ -167,6 +168,22 @@ pub struct FleetMemberConfig {
     /// The backend this member runs on. [`MemberBackend::Claude`] when the key is
     /// omitted; an unknown value never reaches here — it is refused at parse.
     pub backend: MemberBackend,
+    /// The pool of claude-login profile slot names this member rotates across,
+    /// or `None` to follow the store's `active` slot at each spawn (`home`, and
+    /// so exactly the pre-switcher spawn, until the human migrates). Each name
+    /// is a `CLAUDE_CONFIG_DIR` in the slot store, or the reserved `home`;
+    /// shape is validated at parse via [`softfig_ipc::validate_slot_name`],
+    /// presence separately by [`FleetConfig::missing_profile_pool_slots`] (the
+    /// parser stays pure). An empty vec is rejected at parse (never defaults).
+    ///
+    /// Claude-only: a slot is a Claude Code config dir — an opencode member
+    /// reads no `~/.claude` state. Refused at parse on an opencode member rather
+    /// than silently ignored.
+    ///
+    /// **Deploy order:** a binary that predates the key refuses the whole
+    /// document (`deny_unknown_fields`) and turns the fleet off, so install the
+    /// binary first and add `profile_pool` to the config second.
+    pub profile_pool: Option<Vec<String>>,
 }
 
 /// The raw `[[fleet]]` table as TOML spells it, BEFORE validation.
@@ -194,6 +211,12 @@ struct FleetMemberDoc {
     /// The model's variant — opencode-only.
     #[serde(default)]
     variant: Option<String>,
+    /// Claude-login profile slot pool (claude-only, slice 003 of
+    /// `claude-login-switcher`). Absent = today's behavior. Shape (slot-name
+    /// charset + non-empty vec) is enforced in [`FleetMemberDoc::validate`];
+    /// slot presence on disk is a separate check (parser stays pure).
+    #[serde(default)]
+    profile_pool: Option<Vec<String>>,
 }
 
 impl FleetMemberDoc {
@@ -220,6 +243,16 @@ impl FleetMemberDoc {
                 MemberBackend::Claude
             }
             Some(BACKEND_OPENCODE) => {
+                if self.profile_pool.is_some() {
+                    // Claude-login profiles are the Anthropic OAuth bundle under
+                    // `~/.claude`; an opencode member reads none of that state, so
+                    // the key either does nothing (hazardous) or means the operator
+                    // meant backend = "claude". Refuse rather than drop it.
+                    return Err(format!(
+                        "fleet member {agent:?} sets profile_pool but runs on the \
+                         {BACKEND_OPENCODE} backend — profile_pool is {BACKEND_CLAUDE}-only"
+                    ));
+                }
                 MemberBackend::Opencode(opencode_selection(&agent, self.model, self.variant)?)
             }
             Some(other) => {
@@ -231,12 +264,44 @@ impl FleetMemberDoc {
                 ))
             }
         };
+        let profile_pool = validate_profile_pool_shape(&agent, self.profile_pool)?;
         Ok(FleetMemberConfig {
             agent,
             pin: self.pin,
             backend,
+            profile_pool,
         })
     }
+}
+
+/// Shape-check a `profile_pool` without touching the filesystem. `Ok(None)`
+/// ⇒ absent (today's behavior); `Ok(Some(_))` ⇒ a non-empty vec of
+/// shape-valid slot names (presence on disk is a later check); an `Err`
+/// explains to the operator what is wrong. The parser stays pure, so slice
+/// 003's finish-check "unit tests cover: absent, pinned (one entry),
+/// rotation (multi), unknown-slot error, empty-vec error" can run without
+/// `$HOME`.
+fn validate_profile_pool_shape(
+    agent: &str,
+    pool: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(pool) = pool else {
+        return Ok(None);
+    };
+    if pool.is_empty() {
+        return Err(format!(
+            "fleet member {agent:?} declares profile_pool = [] — if you mean to opt out, drop \
+             the key"
+        ));
+    }
+    for slot in &pool {
+        if let Err(e) = softfig_ipc::validate_slot_name(slot) {
+            return Err(format!(
+                "fleet member {agent:?} declares profile_pool slot {slot:?}: {e}"
+            ));
+        }
+    }
+    Ok(Some(pool))
 }
 
 /// Validate an opencode member's `model` + `variant` into the [`ModelSelection`]
@@ -457,6 +522,69 @@ impl FleetConfig {
             roll_grace_secs: doc.roll_grace_secs.unwrap_or(DEFAULT_ROLL_GRACE_SECS),
         })
     }
+
+    /// The members whose `profile_pool` names a slot with no directory in the
+    /// slot `store`, each with the reason (its first missing slot). `home` is
+    /// always present. `store` is `None` when no store can be named (no
+    /// `$HOME`), which leaves every pooled member unplaceable.
+    ///
+    /// Deliberately separate from [`from_growlight_toml`] (which stays pure, no
+    /// filesystem reads) so the parser's unit tests run without a store. Only
+    /// the slot dirs are checked here; a slot's credential is checked at every
+    /// spawn, which fails closed on its own.
+    pub fn missing_profile_pool_slots(&self, store: Option<&Path>) -> Vec<(String, String)> {
+        let mut missing = Vec::new();
+        for m in &self.members {
+            let Some(pool) = m.profile_pool.as_deref() else {
+                continue;
+            };
+            let Some(store) = store else {
+                missing.push((
+                    m.agent.clone(),
+                    "it declares profile_pool but no claude-login store can be named \
+                     (is $HOME set?)"
+                        .to_string(),
+                ));
+                continue;
+            };
+            let gone = pool.iter().find_map(|slot| {
+                match claude_profiles::slot_dir(store, slot) {
+                    Ok(SlotDir::Home) => None,
+                    Ok(SlotDir::Store(dir)) if std::fs::symlink_metadata(&dir)
+                        .is_ok_and(|md| md.is_dir()) =>
+                    {
+                        None
+                    }
+                    Ok(SlotDir::Store(dir)) => Some(format!(
+                        "its profile_pool slot {slot:?} has no directory at {} — run \
+                         `softfig claude-login add {slot}` (or migrate) first",
+                        dir.display()
+                    )),
+                    // Shape is checked at parse, so this is unreachable short of
+                    // a hand-built config.
+                    Err(e) => Some(format!("its profile_pool slot {slot:?}: {e}")),
+                }
+            });
+            if let Some(reason) = gone {
+                missing.push((m.agent.clone(), reason));
+            }
+        }
+        missing
+    }
+
+    /// Drop the members [`Self::missing_profile_pool_slots`] names, returning one
+    /// journal line per dropped member. Every other member, pooled or not,
+    /// stays armed (review 047 nit: one missing slot used to turn the whole
+    /// fleet off).
+    pub fn disable_members_with_missing_slots(&mut self, store: Option<&Path>) -> Vec<String> {
+        let missing = self.missing_profile_pool_slots(store);
+        self.members
+            .retain(|m| !missing.iter().any(|(agent, _)| agent == &m.agent));
+        missing
+            .into_iter()
+            .map(|(agent, reason)| format!("fleet member {agent:?} disabled: {reason}"))
+            .collect()
+    }
 }
 
 /// Reject a `[[fleet]]` roster whose agent ids aren't canonical slugs or aren't
@@ -504,16 +632,25 @@ pub fn load_fleet_config(garden_root: &Path) -> FleetConfig {
         Ok(raw) => raw,
         Err(_) => return FleetConfig::disabled(), // absent/unreadable ⇒ no fleet
     };
-    match FleetConfig::from_growlight_toml(&raw) {
+    let mut cfg = match FleetConfig::from_growlight_toml(&raw) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!(
                 "softfig-growlightd: ignoring malformed fleet config at {} ({e}); fleet stays OFF",
                 path.display()
             );
-            FleetConfig::disabled()
+            return FleetConfig::disabled();
         }
+    };
+    // Slot presence (claude-login-switcher slices 003, 007): a member whose
+    // profile_pool names a slot with no directory could never spawn, so it is
+    // left out of the roster at load, by name. The rest of the fleet arms.
+    // Byte-identical to today when no member declares a pool.
+    let store = claude_profiles::store_root_from_env();
+    for line in cfg.disable_members_with_missing_slots(store.as_deref()) {
+        eprintln!("softfig-growlightd: {line} ({})", path.display());
     }
+    cfg
 }
 
 /// Assemble the live [`DriveLoop`] — **iff `fleet.enabled`**. Gate off ⇒ `None`
@@ -593,6 +730,16 @@ pub fn assemble_fleet(
     dispatcher.register(Box::new(GuiNotifier::new(hub)));
     dispatcher.register(Box::new(LogNotifier::stderr()));
 
+    // Per-member admission-profile resolver (claude-login-switcher slice 009
+    // step 1 — makes slice 008's per-member rate holds observable at runtime).
+    // Built from the SAME fleet config + agents_dir + store that
+    // `claude_profile_context` reads, so the admission view and the spawn
+    // view cannot route an agent to different slots. Without this call the
+    // loop runs under `AssumeHomeProfile` — every agent on the `home` key,
+    // byte-identical to the pre-slice-008 single global hold — which is why
+    // the merged iteration-4 crate landing was functionally dark in prod.
+    let profile_resolver = FleetProfileResolver::from_fleet(fleet);
+
     Some(DriveLoop::new(
         daemon.clone(),
         supervisor,
@@ -617,7 +764,9 @@ pub fn assemble_fleet(
     .with_max_iterations(fleet.max_iterations)
     // Repo progress (task 069): the spin guard reads each part's repo through the
     // same keeperd docs the queue source pulls.
-    .with_repo_probe(Box::new(KeeperdRepoProbe::new(keeperd_socket.to_path_buf()))))
+    .with_repo_probe(Box::new(KeeperdRepoProbe::new(keeperd_socket.to_path_buf())))
+    // Per-member admission profiles (slice 009): see the construction above.
+    .with_profile_resolver(Box::new(profile_resolver)))
     .map(|drive| {
         // The queue-v2 scheduling seams (queue-v2-scheduling slice 006): installed
         // whatever the mode — the tick consults them ONLY when `queue = "v2"`, so a
@@ -730,9 +879,150 @@ fn build_claude_backend(
     // (`incident-20260720-m5f-double-park`). Claude-only by construction: the
     // capture describes the Anthropic pool, and opencode members contribute no
     // reserve (the milestone's locked no-synthetic-budget decision).
-    .with_usage_capture(Arc::new(UsageCapture::new(
-        runtime_growlight_dir().join(USAGE_FILE),
-    )))
+    .with_usage_capture(Arc::new({
+        // Slice 009 S8: the shared `usage.json` holds the human's `active`
+        // slot's readings only, never a mix. The gate rides `read_active` of
+        // the slot store at write time (so a `softfig claude-login use` moves
+        // which readings fill the file the same way it moves the next spawn).
+        // Without a store (no `$HOME`, pre-migration) a plain capture is
+        // installed: there is no `active` to compare against, so every reading
+        // writes — byte-identical to pre-slice-009.
+        let path = runtime_growlight_dir().join(USAGE_FILE);
+        match claude_profiles::store_root_from_env() {
+            Some(store) => UsageCapture::new_shared_with_active_gate(path, store),
+            None => UsageCapture::new(path),
+        }
+    }))
+    // The claude-login slot machinery (claude-login-switcher slices 003, 007):
+    // the slot store plus the per-member pools from the roster. An unpooled
+    // member follows the store's `active` slot at each spawn, which is `home`
+    // — no env, byte-identical to pre-switcher — until the human migrates.
+    .with_profiles(claude_profile_context(fleet, agents_dir))
+}
+
+/// Collect the claude members' `profile_pool` roster into a
+/// [`crate::claude_backend::ProfileContext`] the backend installs for the whole
+/// fleet. Only claude members contribute (opencode members have no `~/.claude`
+/// state; parse refuses `profile_pool` on them, so the match is exhaustive by
+/// construction).
+fn claude_profile_context(
+    fleet: &FleetConfig,
+    agents_dir: &Path,
+) -> crate::claude_backend::ProfileContext {
+    let mut pools = std::collections::BTreeMap::new();
+    for m in &fleet.members {
+        if let MemberBackend::Claude = m.backend
+            && let Some(pool) = m.profile_pool.clone()
+        {
+            pools.insert(m.agent.clone(), pool);
+        }
+    }
+    crate::claude_backend::ProfileContext {
+        agents_dir: agents_dir.to_path_buf(),
+        store: claude_profiles::store_root_from_env(),
+        pools,
+        // Per-profile tees land under
+        // `$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/` (slice 004),
+        // a sibling of the shared `usage.json` the task-048 tee writes. Both
+        // files ride ONE grant root (the runtime pillar), so a member's
+        // permission floor already covers them.
+        by_profile_dir: Some(runtime_growlight_dir().join(BY_PROFILE_SUBDIR)),
+    }
+}
+
+/// How the live [`FleetProfileResolver`] derives one agent's admission profile
+/// set at tick time. Fixed at assembly from the configured roster + the slot
+/// store, so the resolver's view and the spawn path's view (`child_env` in
+/// [`crate::claude_backend::ClaudeFlavor`]) cannot disagree on which slots an
+/// agent runs on.
+#[derive(Debug, Clone)]
+enum AgentProfileSource {
+    /// No slot machinery: opencode members (they never touch Anthropic's
+    /// budget), and claude members that configuration refuses to spawn (a
+    /// pool slot with no directory, or `profile_pool` with no store). These
+    /// contribute no slot to the hold check, which `RateLimitHolds::member_fully_held`
+    /// treats as "never held" — matching their inert budget contribution.
+    None,
+    /// A pooled claude member: the pool, verbatim, in config order.
+    Pool(Vec<String>),
+    /// An unpooled claude member: the store's `active` slot, read at every
+    /// tick so a `softfig claude-login use` moves the member's admission the
+    /// same way it moves its next spawn.
+    FollowActive(PathBuf),
+    /// An unpooled claude member with no slot store (no `$HOME`, or a backend
+    /// built outside a growlight runtime): always `home`.
+    AssumeHome,
+}
+
+/// The live [`ProfileResolver`] (slice 009 step 1): read the configured
+/// roster + `ClaudeFlavor::profiles.pools` + `claude_profiles::launch_active`
+/// at assembly and derive each agent's admission profile set per-tick.
+///
+/// `admission_profiles` is called every tick from `member_fully_held`, so the
+/// per-agent branch is cheap: a pooled member clones a short `Vec<String>`,
+/// an unpooled member stats + readlinks one in-process path
+/// ([`claude_profiles::read_active`]), and an opencode member returns `Vec::new()`.
+/// A failed read (missing store, bad symlink) falls back to `["home"]` rather
+/// than returning an empty vec, so an unpooled claude member stays rate-limited
+/// through the same key the pre-switcher fleet used.
+#[derive(Debug)]
+pub(crate) struct FleetProfileResolver {
+    entries: std::collections::BTreeMap<String, AgentProfileSource>,
+}
+
+impl FleetProfileResolver {
+    /// Derive one entry per `[[fleet]]` member from the configured roster. The
+    /// member list and the slot store are both frozen at `assemble_fleet` time
+    /// — a `profile_pool` edit, like every other `config/growlight.toml` edit,
+    /// takes effect at the next arm.
+    fn from_fleet(fleet: &FleetConfig) -> Self {
+        Self::from_fleet_and_store(fleet, claude_profiles::store_root_from_env().as_deref())
+    }
+
+    /// Explicit-store variant for tests. The live path reads the env
+    /// (`claude_profiles::store_root_from_env`), but a unit test driving the
+    /// derivation needs a store it controls, so the environment read happens
+    /// in [`Self::from_fleet`] and the derivation itself takes the store as
+    /// an argument.
+    pub(crate) fn from_fleet_and_store(fleet: &FleetConfig, store: Option<&Path>) -> Self {
+        let mut entries = std::collections::BTreeMap::new();
+        for m in &fleet.members {
+            let source = match (&m.backend, m.profile_pool.as_deref(), store) {
+                (MemberBackend::Opencode(_), _, _) => AgentProfileSource::None,
+                (MemberBackend::Claude, Some(pool), _) => AgentProfileSource::Pool(pool.to_vec()),
+                (MemberBackend::Claude, None, Some(store)) => {
+                    AgentProfileSource::FollowActive(store.to_path_buf())
+                }
+                (MemberBackend::Claude, None, None) => AgentProfileSource::AssumeHome,
+            };
+            entries.insert(m.agent.clone(), source);
+        }
+        Self { entries }
+    }
+}
+
+impl ProfileResolver for FleetProfileResolver {
+    fn admission_profiles(&self, agent: &str) -> Vec<String> {
+        match self.entries.get(agent) {
+            None => Vec::new(),
+            Some(AgentProfileSource::None) => Vec::new(),
+            Some(AgentProfileSource::Pool(pool)) => pool.clone(),
+            Some(AgentProfileSource::FollowActive(store)) => {
+                // `read_active` is stat + readlink only (no credential check,
+                // no slot-dir existence check): fast enough for a per-tick
+                // call. On any error we fall back to the `home` key — a bad
+                // pointer should not quietly make the member unheld by
+                // returning an empty vec.
+                match claude_profiles::read_active(store) {
+                    Ok(name) => vec![name],
+                    Err(_) => vec![claude_profiles::HOME_SLOT.to_string()],
+                }
+            }
+            Some(AgentProfileSource::AssumeHome) => {
+                vec![claude_profiles::HOME_SLOT.to_string()]
+            }
+        }
+    }
 }
 
 /// One member's `opencode run` backend on `model` (slice 005).
@@ -865,6 +1155,12 @@ const FLEET_PROTOCOL_FILE: &str = "protocol-fleet.md";
 /// the `--auto` governor, the human) reads. Named here rather than inline so the
 /// writer and `softfig growlight start`'s statusline tee cannot drift apart.
 const USAGE_FILE: &str = "usage.json";
+
+/// Where per-profile budget samples live under the runtime pillar
+/// (`<pillar>/usage.by-profile/<slot>.json`) — claude-login-switcher slice 004.
+/// The dir sits next to [`USAGE_FILE`] so a member's permission floor covers
+/// both without a new grant.
+const BY_PROFILE_SUBDIR: &str = "usage.by-profile";
 
 /// The garden path to the fleet-member protocol the SessionStart hook injects.
 /// Pure + named so the fleet/single-agent split is a tested choice, not an inline
@@ -1012,11 +1308,13 @@ agent = "reviewer"
                     agent: "builder".into(),
                     pin: Some("queue:build".into()),
                     backend: MemberBackend::Claude,
+                    profile_pool: None,
                 },
                 FleetMemberConfig {
                     agent: "reviewer".into(),
                     pin: None,
                     backend: MemberBackend::Claude,
+                    profile_pool: None,
                 },
             ],
             "the table parses a pinned + an unpinned member, in order, both on the \
@@ -1516,16 +1814,23 @@ agent = "reviewer"
         let d = daemon();
         let router = build_member_backends(&d, &mixed_roster(), Path::new("/cfg/agents"), Path::new("/garden"));
         let backends = router.distinct().len();
-        for (name, count) in [
-            ("build_caps", Arc::strong_count(&d.build_caps)),
-            ("live_scopes", Arc::strong_count(&d.live_scopes)),
-            ("kill_handles", Arc::strong_count(&d.kill_handles)),
+        // The claude flavor reads `live_scopes` too (claude-login-switcher slice
+        // 007: a live member's slot is demoted for the next pick), so each claude
+        // backend holds a second clone of the SAME cell.
+        let claude = router
+            .distinct()
+            .iter()
+            .filter(|b| matches!(b, BackendHandle::Claude(_)))
+            .count();
+        for (name, count, expected) in [
+            ("build_caps", Arc::strong_count(&d.build_caps), 1 + backends),
+            ("live_scopes", Arc::strong_count(&d.live_scopes), 1 + backends + claude),
+            ("kill_handles", Arc::strong_count(&d.kill_handles), 1 + backends),
         ] {
             assert_eq!(
-                count,
-                1 + backends,
-                "{name}: the daemon's cell plus one clone in each of the {backends} \
-                 backends — no backend built its own",
+                count, expected,
+                "{name}: the daemon's cell plus the clones the {backends} backends \
+                 hold — no backend built its own",
             );
         }
     }
@@ -1663,5 +1968,251 @@ agent = "reviewer"
             assemble_fleet(&d, &mixed_roster(), keeperd_socket()).is_some(),
             "a claude+opencode roster assembles",
         );
+    }
+
+    // ---- profile_pool (claude-login-switcher slice 003) ---------------------
+
+    #[test]
+    fn profile_pool_absent_keeps_todays_semantics() {
+        // No `profile_pool` key ⇒ `None`, which the spawn path treats as
+        // "share the top-level `~/.claude/.credentials.json`" (byte-identical
+        // to pre-slice-003 behavior).
+        let cfg =
+            FleetConfig::from_growlight_toml("fleet_enabled = true\n[[fleet]]\nagent = \"a\"\n")
+                .unwrap();
+        assert_eq!(cfg.members[0].profile_pool, None);
+    }
+
+    #[test]
+    fn profile_pool_pinned_single_entry_parses() {
+        // One entry = pinned (no rotation; the member always runs on that slot).
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nprofile_pool = [\"slot1\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.members[0].profile_pool.as_deref(),
+            Some(&["slot1".to_string()][..]),
+        );
+    }
+
+    #[test]
+    fn profile_pool_rotation_multi_entry_parses_in_order() {
+        // Pool order is semantically significant (round-robin ties, picker §4).
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nprofile_pool = [\"slot1\", \"slot2\", \"slot3\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.members[0].profile_pool.as_deref(),
+            Some(&["slot1".to_string(), "slot2".into(), "slot3".into()][..]),
+        );
+    }
+
+    #[test]
+    fn profile_pool_unknown_slot_disables_only_that_member() {
+        // Shape is fine (good charset), but the slot has no directory in the
+        // store — the presence check drops THAT member, by name, and leaves the
+        // unpooled member and the healthy pooled one armed (review 047 nit:
+        // one missing slot used to turn the whole fleet off).
+        let mut cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nprofile_pool = [\"slot1\", \"ghost\"]\n",
+            "[[fleet]]\nagent = \"b\"\n",
+            "[[fleet]]\nagent = \"d\"\nprofile_pool = [\"slot1\", \"home\"]\n",
+        ))
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir(store.path().join("slot1")).unwrap();
+        let lines = cfg.disable_members_with_missing_slots(Some(store.path()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("\"a\"") && lines[0].contains("\"ghost\""), "{}", lines[0]);
+        let left: Vec<&str> = cfg.members.iter().map(|m| m.agent.as_str()).collect();
+        assert_eq!(left, ["b", "d"]);
+        assert!(cfg.enabled, "the gate is untouched");
+    }
+
+    #[test]
+    fn profile_pool_without_a_store_disables_pooled_members_only() {
+        let mut cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nprofile_pool = [\"home\"]\n",
+            "[[fleet]]\nagent = \"b\"\n",
+        ))
+        .unwrap();
+        let lines = cfg.disable_members_with_missing_slots(None);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(cfg.members.len(), 1);
+        assert_eq!(cfg.members[0].agent, "b");
+    }
+
+    #[test]
+    fn profile_pool_empty_vec_is_rejected_at_parse() {
+        // `profile_pool = []` is almost certainly a typo for "omit the key";
+        // defaulting it would silently fall back to today's shared-credential
+        // semantics, which is exactly the hazard this slice fixes. Refuse at
+        // parse — the loader turns the refusal into a disabled fleet.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nprofile_pool = []\n",
+        );
+        let err = FleetConfig::from_growlight_toml(toml).unwrap_err();
+        assert!(err.contains("profile_pool = []"), "cites the empty vec: {err}");
+    }
+
+    #[test]
+    fn profile_pool_slot_name_shape_is_enforced_at_parse() {
+        // The CLI's slot-naming rules apply here too (one validator across
+        // crates). A path separator / leading dot / out-of-charset byte fails.
+        for bad in ["bad/slot", "..", ".hidden", "has space", ""] {
+            let toml = format!(
+                "fleet_enabled = true\n[[fleet]]\nagent = \"a\"\nprofile_pool = [\"{bad}\"]\n"
+            );
+            assert!(
+                FleetConfig::from_growlight_toml(&toml).is_err(),
+                "slot name {bad:?} must be refused at parse",
+            );
+        }
+    }
+
+    #[test]
+    fn profile_pool_presence_check_passes_when_every_slot_is_on_disk() {
+        // The passing side of unknown_slot: a well-formed pool whose slots are
+        // all store dirs (or `home`) keeps every member. A plain file or a
+        // symlink where a slot dir belongs is not a slot.
+        let mut cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nprofile_pool = [\"slot1\", \"slot2\", \"home\"]\n",
+        ))
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        for slot in ["slot1", "slot2"] {
+            std::fs::create_dir(store.path().join(slot)).unwrap();
+        }
+        assert!(cfg.missing_profile_pool_slots(Some(store.path())).is_empty());
+        assert!(cfg.disable_members_with_missing_slots(Some(store.path())).is_empty());
+        assert_eq!(cfg.members.len(), 1);
+
+        std::fs::remove_dir(store.path().join("slot2")).unwrap();
+        std::os::unix::fs::symlink(store.path().join("slot1"), store.path().join("slot2")).unwrap();
+        assert_eq!(cfg.missing_profile_pool_slots(Some(store.path())).len(), 1);
+    }
+
+    #[test]
+    fn profile_pool_on_an_opencode_member_is_refused() {
+        // A slot is a Claude Code config dir, so a pool only makes sense for a
+        // claude member — opencode reads none of that state. Refuse rather
+        // than silently drop the key (same posture as model-on-claude).
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"opencode\"\n",
+            "model = \"deepseek/deepseek-flash\"\nprofile_pool = [\"slot1\"]\n",
+        );
+        let err = FleetConfig::from_growlight_toml(toml).unwrap_err();
+        assert!(
+            err.contains("profile_pool") && err.contains("claude"),
+            "names key + reason: {err}",
+        );
+    }
+
+    // ---- FleetProfileResolver (claude-login-switcher slice 009 step 1) -----
+
+    #[test]
+    fn resolver_pooled_claude_member_returns_the_pool_in_order() {
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nprofile_pool = [\"slot1\", \"slot2\"]\n",
+        ))
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let r = FleetProfileResolver::from_fleet_and_store(&cfg, Some(store.path()));
+        assert_eq!(r.admission_profiles("a"), vec!["slot1", "slot2"]);
+    }
+
+    #[test]
+    fn resolver_unpooled_claude_with_a_store_follows_active() {
+        // No `profile_pool` ⇒ the resolver reads `<store>/active` at every
+        // tick, so a `softfig claude-login use` moves the member's admission
+        // the same way it moves its next spawn.
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\n",
+        ))
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let r = FleetProfileResolver::from_fleet_and_store(&cfg, Some(store.path()));
+
+        // No `active` symlink ⇒ `read_active` returns `HOME_SLOT`.
+        assert_eq!(r.admission_profiles("a"), vec!["home"]);
+
+        // Create a store slot and point `active` at it; the resolver sees the
+        // new value on the next call (no caching).
+        std::fs::create_dir(store.path().join("slot2")).unwrap();
+        std::os::unix::fs::symlink(Path::new("slot2"), store.path().join("active")).unwrap();
+        assert_eq!(r.admission_profiles("a"), vec!["slot2"]);
+    }
+
+    #[test]
+    fn resolver_unpooled_claude_without_a_store_assumes_home() {
+        // No store (no `$HOME` or $XDG_DATA_HOME) ⇒ there is no `active` to
+        // read, so unpooled claude falls back to the `home` key. Keeps the
+        // per-member hold's cardinality the same as the pre-switcher fleet.
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\n",
+        ))
+        .unwrap();
+        let r = FleetProfileResolver::from_fleet_and_store(&cfg, None);
+        assert_eq!(r.admission_profiles("a"), vec!["home"]);
+    }
+
+    #[test]
+    fn resolver_opencode_member_contributes_no_profile() {
+        // Opencode makes no Anthropic call — its admission_profiles is empty,
+        // which `RateLimitHolds::member_fully_held` reads as "never held", the
+        // intended structural property of a non-anthropic backend.
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"oc\"\nbackend = \"opencode\"\n",
+            "model = \"deepseek/deepseek-flash\"\n",
+        ))
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let r = FleetProfileResolver::from_fleet_and_store(&cfg, Some(store.path()));
+        assert!(r.admission_profiles("oc").is_empty());
+    }
+
+    #[test]
+    fn resolver_unknown_agent_returns_empty() {
+        // An agent id not in the roster has no entry — the hold check must
+        // treat it as "no profiles", not panic or default to `home`.
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\n",
+        ))
+        .unwrap();
+        let r = FleetProfileResolver::from_fleet_and_store(&cfg, None);
+        assert!(r.admission_profiles("ghost").is_empty());
+    }
+
+    #[test]
+    fn resolver_follow_active_falls_back_to_home_on_a_bad_pointer() {
+        // A pointer whose target is not a bare slot name is an error from
+        // `read_active`; the resolver falls back to the `home` key rather
+        // than quietly returning an empty vec (which would make the member
+        // never-held). The pre-switcher behaviour is preserved on malformed
+        // state.
+        let cfg = FleetConfig::from_growlight_toml(concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\n",
+        ))
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        // A regular file at `active` ⇒ `NotASymlink`.
+        std::fs::write(store.path().join("active"), b"slot1").unwrap();
+        let r = FleetProfileResolver::from_fleet_and_store(&cfg, Some(store.path()));
+        assert_eq!(r.admission_profiles("a"), vec!["home"]);
     }
 }

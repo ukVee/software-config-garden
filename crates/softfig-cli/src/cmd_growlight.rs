@@ -24,6 +24,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use softfig_ipc::{
     ClientError, ErrorKind, Request, growlightd_runtime_socket_path, runtime_socket_path,
     baton::parse_baton,
+    claude_profiles,
     growlightd::{
         self, AgentDeltaKind, BuildCapsSummary, Event, FleetStatusReply, ForceStopArgs,
         PausedReply, ResumeItemArgs, ResumeItemReply, SetResourcesArgs, SetResourcesReply,
@@ -42,9 +43,10 @@ use softfig_growlightd_client::{decode_frame, Frame};
 
 use crate::cmd_daemon::try_daemon_call;
 use crate::growlight_backend::{
-    Backend, DEEPSEEK_FLASH, DEEPSEEK_REASONING, InteractiveLaunch, ModelChoice, ModelSpec,
-    OpencodeConfigInputs, agent_bin, interactive_command, item_doc_candidates, opencode_config,
-    opencode_context, opencode_interactive_args, parse_model_spec, resolve_item_models,
+    Backend, DEEPSEEK_FLASH, DEEPSEEK_REASONING, InteractiveLaunch, LaunchSlot, ModelChoice,
+    ModelSpec, OpencodeConfigInputs, agent_bin, interactive_command, item_doc_candidates,
+    opencode_config, opencode_context, opencode_interactive_args, parse_model_spec,
+    resolve_item_models,
 };
 use crate::opencode_catalog;
 
@@ -248,6 +250,11 @@ pub struct StartArgs {
     /// declares in its `> Model:` line, defaulting to deepseek flash.
     #[arg(long, conflicts_with_all = ["backend", "opencode"])]
     pub model: Option<String>,
+    /// The claude-login slot the claude session runs on (its
+    /// `CLAUDE_CONFIG_DIR`; `home` = Claude's default config dir). Defaults to
+    /// the store's active slot (`softfig claude-login use`). claude only.
+    #[arg(long, value_name = "SLOT")]
+    pub profile: Option<String>,
 }
 
 /// Args for `say` — the human-post seam. Unlike the growlightd client verbs,
@@ -477,9 +484,21 @@ fn start(args: StartArgs) -> Result<()> {
         &inject_path,
         &inject_script(&protocol, &baton_path, &softfig_bin_path(), &garden_root),
     )?;
+    // Slice 009 S9: the per-profile dir rides next to usage.json under the
+    // same runtime grant, so the statusline needs no new permission to tee
+    // into it. The active-link path is baked in at launch — a session that
+    // outlives a `claude-login use` keeps writing to its per-profile file
+    // either way (slice 009 S8 statusline half).
+    let by_profile_dir = runtime.join("usage.by-profile");
+    let active_link = claude_profiles::store_root_from_env()
+        .map(|s| s.join(claude_profiles::ACTIVE_LINK))
+        // No slot store (no `$HOME`): a sentinel path under the runtime that
+        // will never exist, so the `[ -L ]` guard falls through to the
+        // `home` default and the shared `usage.json` is written as before.
+        .unwrap_or_else(|| runtime.join("no-store-active-sentinel"));
     write_script(
         &statusline_path,
-        &statusline_script(&runtime.join("usage.json")),
+        &statusline_script(&runtime.join("usage.json"), &by_profile_dir, &active_link),
     )?;
 
     // Live loop state → seed once, never clobber an in-flight loop.
@@ -518,6 +537,19 @@ fn start(args: StartArgs) -> Result<()> {
     // "let growlight decide" can read the active item's declaration.
     let choice = resolve_model_choice(&args, &garden_root, &baton_path)?;
     let backend = choice.backend;
+    // The claude-login slot, resolved and checked before anything launches
+    // (claude-login-switcher slice 007): the same resolver growlightd's spawn
+    // seam uses, so a slot the fleet would refuse is refused here too.
+    let claude_slot = match backend {
+        Backend::Claude => Some(resolve_launch_slot(
+            claude_profiles::store_root_from_env().as_deref(),
+            args.profile.as_deref(),
+        )?),
+        Backend::Opencode if args.profile.is_some() => {
+            bail!("--profile selects a claude-login slot; it has no meaning for opencode")
+        }
+        Backend::Opencode => None,
+    };
 
     // The opencode-native equivalent of loop.json + mcp.json (`softfig-loop` agent
     // = protocol-by-reference + step-0 baton boot + the session context (garden
@@ -599,6 +631,7 @@ fn start(args: StartArgs) -> Result<()> {
         garden_root: &garden_root,
         opencode_config: &opencode_path,
         boot_prompt: OPENCODE_KICK,
+        claude_slot: claude_slot.as_ref(),
     };
 
     if args.no_launch {
@@ -681,6 +714,25 @@ fn item_own_doc(garden_root: &Path, item: &str) -> Result<Option<String>, String
     }
 }
 
+/// The slot an interactive claude session runs on: `--profile`, else the
+/// store's `active` pointer, checked by the resolver growlightd's spawn seam
+/// uses ([`claude_profiles::launch_slot`]), so a missing dir or an unusable
+/// credential refuses the launch rather than run on another account. With no
+/// store (no `$HOME`) only `home` exists.
+fn resolve_launch_slot(store: Option<&Path>, profile: Option<&str>) -> Result<LaunchSlot> {
+    let (name, dir) = match (store, profile) {
+        (Some(store), Some(slot)) => (slot.to_string(), claude_profiles::launch_slot(store, slot)?),
+        (Some(store), None) => claude_profiles::launch_active(store)?,
+        (None, None | Some(claude_profiles::HOME_SLOT)) => {
+            (claude_profiles::HOME_SLOT.to_string(), claude_profiles::SlotDir::Home)
+        }
+        (None, Some(slot)) => bail!(
+            "claude-login slot {slot:?}: no slot store can be named (is $HOME set?)"
+        ),
+    };
+    Ok(LaunchSlot { name, dir })
+}
+
 /// The copy-pasteable manual launch printed by `--no-launch`, per backend. Pure,
 /// and built from the very [`InteractiveLaunch`] the spawn would consume, so a
 /// test can assert the hint names the same cwd the launcher really uses.
@@ -697,9 +749,25 @@ fn item_own_doc(garden_root: &Path, item: &str) -> Result<Option<String>, String
 fn no_launch_hint(choice: &ModelChoice, launch: &InteractiveLaunch) -> String {
     let garden = launch.garden_root.display();
     match choice.backend {
+        // The slot goes through `env`, which also bypasses the bash `claude()`
+        // shim: a bare `claude` there would re-resolve the active slot, and
+        // `--profile` may have named another one.
         Backend::Claude => format!(
-            "(--no-launch) runtime ready. launch with:\n  cd {garden} && {AGENT_BIN} \
+            "(--no-launch) runtime ready{}. launch with:\n  cd {garden} && {}{AGENT_BIN} \
              --name {AGENT_NAME} --settings {} --mcp-config {}",
+            launch
+                .claude_slot
+                .map(|s| format!(" (claude-login slot {})", s.name))
+                .unwrap_or_default(),
+            match launch.claude_slot.map(|s| &s.dir) {
+                Some(claude_profiles::SlotDir::Store(dir)) => {
+                    format!("env {}={} ", claude_profiles::CONFIG_DIR_ENV, dir.display())
+                }
+                Some(claude_profiles::SlotDir::Home) => {
+                    format!("env -u {} ", claude_profiles::CONFIG_DIR_ENV)
+                }
+                None => String::new(),
+            },
             launch.loop_settings.display(),
             launch.mcp_config.display(),
         ),
@@ -919,7 +987,13 @@ fn launch_agent(choice: &ModelChoice, launch: &InteractiveLaunch) -> Result<()> 
     let mut cmd = interactive_command(backend, launch)?;
     let bin = agent_bin(backend);
     match backend {
-        Backend::Claude => println!("\nlaunching {bin} --name {AGENT_NAME} …\n"),
+        Backend::Claude => {
+            let slot = launch
+                .claude_slot
+                .map(|s| format!(" on claude-login slot {}", s.name))
+                .unwrap_or_default();
+            println!("\nlaunching {bin} --name {AGENT_NAME}{slot} …\n");
+        }
         // Name the model: with four ways to pick one, the human should never have
         // to guess which one is about to burn tokens.
         Backend::Opencode => {
@@ -1185,29 +1259,70 @@ fn softfig_bin_path() -> PathBuf {
 
 /// statusLine hook body: on every render, tee the two budgets to `usage.json`
 /// (the loop's budget read path) and print a compact mode + budget line.
-fn statusline_script(usage: &Path) -> String {
+///
+/// Slice 009 S9: the snapshot is tagged with the slot derived from
+/// `CLAUDE_CONFIG_DIR` (a store path gives `<slot>`, unset gives `home`), and
+/// a copy is teed into the per-profile file `usage.by-profile/<slot>.json` —
+/// which is the write that makes the budget picker's per-profile
+/// vouchable-pct path live for an interactive session.
+///
+/// Slice 009 S8 (statusline half): the SHARED `usage.json` is only written
+/// when the session's slot matches the active-pointer slot. A session against
+/// an inactive slot leaves no mark on the shared file, so §2b on an active
+/// slot cannot halt on another slot's reading. The active-pointer path is
+/// baked in at launch; a session that outlives a `claude-login use` keeps
+/// writing to the per-profile file either way, so no slot's reading is lost.
+fn statusline_script(usage: &Path, by_profile_dir: &Path, active_link: &Path) -> String {
     const TPL: &str = r#"#!/usr/bin/env bash
 # GENERATED by `softfig growlight start` — do not edit (refreshed each launch).
 # statusLine hook: tee the two budgets to usage.json (spec-growlight.md §6, the
 # loop's budget read path) and print a compact mode + budget line.
 set -u
 input=$(cat)
+# Slice 009 S9: derive the slot from CLAUDE_CONFIG_DIR — a store path gives
+# <slot>, unset gives "home" (the fallback slot). The slot tags every snapshot
+# and names the per-profile file, so the picker's per-profile vouchable-pct
+# path is live for this session.
+slot=home
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    slot=$(basename -- "$CLAUDE_CONFIG_DIR")
+fi
 # Claude Code derives context_window.used_percentage from a cumulative token
 # total over the window, so it can exceed 100 in a long session. Clamp it to a
 # sane 0..100 the governor can trust (spec-growlight.md §6) BEFORE teeing — but
 # only when it is actually a number, so a missing % stays absent (never coerced
 # to a false 0), and keep remaining_percentage consistent with the clamp.
-printf '%s' "$input" | jq '
+snap=$(printf '%s' "$input" | jq --arg profile "$slot" '
   (if (.context_window.used_percentage | type) == "number" then
         .context_window.used_percentage |= ([., 100] | min) | .context_window.used_percentage |= ([., 0] | max)
       | .context_window.remaining_percentage = (100 - .context_window.used_percentage)
    else . end)
-  | {context_window, rate_limits, ts: now}' > @USAGE@ 2>/dev/null || true
+  | {context_window, rate_limits, ts: now, profile: $profile}' 2>/dev/null) || snap=
+if [ -n "$snap" ]; then
+    # Slice 009 S9: per-profile tee. The dir rides the same runtime grant as
+    # usage.json, so a member's permission floor already covers it.
+    mkdir -p @BY_PROFILE_DIR@ 2>/dev/null || true
+    printf '%s' "$snap" > @BY_PROFILE_DIR@/"$slot".json 2>/dev/null || true
+    # Slice 009 S8: the shared usage.json holds the active slot ONLY. An
+    # inactive-slot session (e.g. one started before a `claude-login use`
+    # swap) tees to its per-profile file above and no further — the shared
+    # file never mixes accounts, and §2b on the active slot cannot halt on
+    # a stale sibling's reading.
+    active=home
+    if [ -L @ACTIVE_LINK@ ]; then
+        active=$(readlink @ACTIVE_LINK@ 2>/dev/null || echo home)
+    fi
+    if [ "$slot" = "$active" ]; then
+        printf '%s' "$snap" > @USAGE@ 2>/dev/null || true
+    fi
+fi
 ctx=$(printf '%s' "$input" | jq -r '([(.context_window.used_percentage // 0), 100] | min)' 2>/dev/null || echo 0)
 five=$(printf '%s' "$input" | jq -r '.rate_limits.five_hour.used_percentage // 0' 2>/dev/null || echo 0)
 printf 'softfig-loop · ctx %s%% · 5h %s%%' "$ctx" "$five"
 "#;
     TPL.replace("@USAGE@", &shell_quote(usage))
+        .replace("@BY_PROFILE_DIR@", &shell_quote(by_profile_dir))
+        .replace("@ACTIVE_LINK@", &shell_quote(active_link))
 }
 
 /// The initial baton (spec §5). Seeded once; the loop rewrites it each handoff.
@@ -1371,7 +1486,7 @@ fn print_fleet_status(r: &FleetStatusReply) {
     } else {
         println!("agents:");
         for a in &r.agents {
-            println!("  {:<16} {:<12} {}", a.id, a.status, agent_accounting(a));
+            println!("{}", agent_row(a));
         }
     }
     // The parts the fleet is leaving for the human (task 068), with the skip reason
@@ -1385,6 +1500,18 @@ fn print_fleet_status(r: &FleetStatusReply) {
             println!("  {:<32} {}", format!("{}/{}", h.queue, h.part), h.reason);
         }
     }
+}
+
+/// One `agents:` row: id, status, the claude-login slot the member's last
+/// session ran on (claude-login-switcher slice 007; blank for opencode or a
+/// member not yet spawned), then [`agent_accounting`]. Pure over the reply.
+fn agent_row(a: &growlightd::AgentSummary) -> String {
+    let profile = a
+        .profile
+        .as_deref()
+        .map(|p| format!("profile={p}"))
+        .unwrap_or_default();
+    format!("  {:<16} {:<12} {:<16} {}", a.id, a.status, profile, agent_accounting(a))
 }
 
 /// The accounting half of an `agents:` row: which backend serves the member and —
@@ -2738,7 +2865,11 @@ mod tests {
 
     #[test]
     fn statusline_script_tees_both_budgets_to_usage_json() {
-        let s = statusline_script(Path::new("/cfg/softfig/growlight/usage.json"));
+        let s = statusline_script(
+            Path::new("/cfg/softfig/growlight/usage.json"),
+            Path::new("/cfg/softfig/growlight/usage.by-profile"),
+            Path::new("/d/claude-profiles/active"),
+        );
         assert!(s.starts_with("#!/usr/bin/env bash"));
         assert!(s.contains("> '/cfg/softfig/growlight/usage.json'"));
         assert!(s.contains("context_window"));
@@ -2747,12 +2878,37 @@ mod tests {
         // The tee must clamp a >100 used_percentage (spec §6) — see the
         // behavioral test below for the runtime proof.
         assert!(s.contains("used_percentage |= ([., 100] | min)"));
+        // Slice 009 S9: snapshot carries the slot tag + is teed to the
+        // per-profile file. The exact paths are baked at launch, so the
+        // script references both the profile tag JSON key and the dir.
+        assert!(s.contains("profile: $profile"), "snapshot tagged with slot: {s}");
+        assert!(
+            s.contains("'/cfg/softfig/growlight/usage.by-profile'"),
+            "per-profile dir baked in: {s}",
+        );
+        // Slice 009 S8: the shared file write is now guarded on slot==active.
+        assert!(s.contains("if [ \"$slot\" = \"$active\" ]; then"));
     }
 
     // Run the generated statusline through real jq+bash to prove the clamp.
     // Self-skips when jq is unavailable (the script can't write usage.json then
     // anyway — see the jq warning in `cmd_growlight`).
     fn run_statusline(input: &str) -> serde_json::Value {
+        // No CLAUDE_CONFIG_DIR, no active-link ⇒ slot = active = home, so the
+        // shared file is written exactly as before the switcher.
+        let (shared, _per_slot) = run_statusline_full(input, &[], None);
+        shared.expect("home slot's shared usage.json is always written")
+    }
+
+    /// Run the statusline against a controlled slot (`CLAUDE_CONFIG_DIR` env)
+    /// and an optional active-pointer link. Returns `(shared, per_slot_for_env)`
+    /// where `shared` is `None` when the slot-vs-active guard suppressed the
+    /// shared write.
+    fn run_statusline_full(
+        input: &str,
+        env: &[(&str, &str)],
+        active_link_target: Option<&str>,
+    ) -> (Option<serde_json::Value>, serde_json::Value) {
         let dir = std::env::temp_dir().join(format!(
             "softfig-statusline-{}-{:?}",
             std::process::id(),
@@ -2760,15 +2916,29 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let usage = dir.join("usage.json");
+        let by_profile_dir = dir.join("usage.by-profile");
+        let active_link = dir.join("active");
+        if let Some(target) = active_link_target {
+            std::os::unix::fs::symlink(target, &active_link).unwrap();
+        }
         let script = dir.join("statusline.sh");
-        std::fs::write(&script, statusline_script(&usage)).unwrap();
+        std::fs::write(
+            &script,
+            statusline_script(&usage, &by_profile_dir, &active_link),
+        )
+        .unwrap();
 
-        let mut child = std::process::Command::new("bash")
-            .arg(&script)
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&script)
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+            .stdout(std::process::Stdio::null());
+        // Scrub CLAUDE_CONFIG_DIR by default so the host env can't leak in;
+        // explicit overrides below set it when the test wants an inactive slot.
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
         use std::io::Write as _;
         child
             .stdin
@@ -2778,10 +2948,21 @@ mod tests {
             .unwrap();
         child.wait().unwrap();
 
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&usage).unwrap()).unwrap();
+        // Derive the slot the way the script does, so the test reads the same
+        // per-profile file the script wrote.
+        let slot = env
+            .iter()
+            .find(|(k, _)| *k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| std::path::Path::new(v).file_name().unwrap().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "home".to_string());
+        let per_slot_path = by_profile_dir.join(format!("{slot}.json"));
+        let per_slot: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&per_slot_path).unwrap()).unwrap();
+        let shared = std::fs::read_to_string(&usage)
+            .ok()
+            .map(|raw| serde_json::from_str(&raw).unwrap());
         std::fs::remove_dir_all(&dir).ok();
-        v
+        (shared, per_slot)
     }
 
     #[test]
@@ -2811,6 +2992,68 @@ mod tests {
             v["context_window"]["used_percentage"].is_null(),
             "missing % must not be coerced to 0: {v}"
         );
+    }
+
+    #[test]
+    fn statusline_under_claude_config_dir_slot2_tees_to_slot2_json() {
+        // Slice 009 S9 finish-check: a session with CLAUDE_CONFIG_DIR pointing
+        // at <store>/slot2 derives slot=slot2, tags the snapshot with it, and
+        // writes to `usage.by-profile/slot2.json`.
+        if !jq_present() {
+            return;
+        }
+        let input = r#"{"context_window":{"used_percentage":12},"rate_limits":{"five_hour":{"used_percentage":37,"status":"allowed_warning"}}}"#;
+        // Active pointer names "slot1", so slot2 is INACTIVE and the shared
+        // file should NOT be written (slice 009 S8 half).
+        let (shared, per_slot) = run_statusline_full(
+            input,
+            &[("CLAUDE_CONFIG_DIR", "/some/store/slot2")],
+            Some("slot1"),
+        );
+        assert_eq!(
+            per_slot["profile"], "slot2",
+            "snapshot carries the slot tag: {per_slot}",
+        );
+        assert_eq!(per_slot["rate_limits"]["five_hour"]["status"], "allowed_warning");
+        assert!(
+            shared.is_none(),
+            "the shared usage.json is only written when slot == active (S8): {shared:?}",
+        );
+    }
+
+    #[test]
+    fn statusline_shared_write_fires_when_the_session_is_on_the_active_slot() {
+        // Slice 009 S8 counter-case: when CLAUDE_CONFIG_DIR's slot IS the
+        // active pointer's slot, the shared file writes normally — this is
+        // the common everyday case (one slot, interactive).
+        if !jq_present() {
+            return;
+        }
+        let input = r#"{"context_window":{"used_percentage":5},"rate_limits":{"five_hour":{"used_percentage":10,"status":"allowed"}}}"#;
+        let (shared, per_slot) = run_statusline_full(
+            input,
+            &[("CLAUDE_CONFIG_DIR", "/some/store/slot1")],
+            Some("slot1"),
+        );
+        let shared = shared.expect("slot == active ⇒ shared is written");
+        assert_eq!(shared["profile"], "slot1");
+        assert_eq!(per_slot["profile"], "slot1");
+        assert_eq!(shared["rate_limits"]["five_hour"]["status"], "allowed");
+    }
+
+    #[test]
+    fn statusline_home_slot_without_an_active_link_still_writes_the_shared_file() {
+        // Back-compat: a human not using the switcher has no store, no active
+        // link, CLAUDE_CONFIG_DIR unset. slot = active = home ⇒ the shared
+        // file is written exactly as before slice 009 landed.
+        if !jq_present() {
+            return;
+        }
+        let input = r#"{"context_window":{"used_percentage":5},"rate_limits":{"five_hour":{"used_percentage":1,"status":"allowed"}}}"#;
+        let (shared, per_slot) = run_statusline_full(input, &[], None);
+        let shared = shared.expect("home slot's shared file is always written");
+        assert_eq!(shared["profile"], "home");
+        assert_eq!(per_slot["profile"], "home");
     }
 
     #[test]
@@ -3286,6 +3529,7 @@ mod tests {
             garden_root: garden,
             opencode_config: Path::new("/rt/opencode.json"),
             boot_prompt: OPENCODE_KICK,
+            claude_slot: None,
         };
 
         for choice in [
@@ -3342,6 +3586,77 @@ mod tests {
         assert!(!claude.contains("OPENCODE_CONFIG"));
     }
 
+    /// claude-login-switcher slice 007 finish-check: `growlight start --profile
+    /// slot2 --no-launch` prints a hint that carries `CLAUDE_CONFIG_DIR`, with
+    /// the claude argv otherwise unchanged; `home` unsets it.
+    #[test]
+    fn the_no_launch_hint_carries_the_claude_login_slot() {
+        let launch_on = |slot: Option<&LaunchSlot>| -> String {
+            let launch = InteractiveLaunch {
+                agent_name: AGENT_NAME,
+                loop_settings: Path::new("/rt/loop.json"),
+                mcp_config: Path::new("/rt/mcp.json"),
+                garden_root: Path::new("/g"),
+                opencode_config: Path::new("/rt/opencode.json"),
+                boot_prompt: OPENCODE_KICK,
+                claude_slot: slot,
+            };
+            no_launch_hint(&ModelChoice::claude(), &launch)
+        };
+        let argv = format!("{AGENT_BIN} --name {AGENT_NAME} --settings /rt/loop.json --mcp-config /rt/mcp.json");
+
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path();
+        std::fs::create_dir(store.join("slot2")).unwrap();
+        let creds = store.join("slot2").join(claude_profiles::CREDENTIALS_FILE);
+        std::fs::write(&creds, "{}").unwrap();
+        std::fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        let slot2 = resolve_launch_slot(Some(store), Some("slot2")).unwrap();
+        let hint = launch_on(Some(&slot2));
+        assert!(
+            hint.ends_with(&format!(
+                "cd /g && env CLAUDE_CONFIG_DIR={} {argv}",
+                store.join("slot2").display()
+            )),
+            "{hint}"
+        );
+        assert!(hint.contains("(claude-login slot slot2)"), "{hint}");
+
+        let home = resolve_launch_slot(Some(store), Some("home")).unwrap();
+        assert!(launch_on(Some(&home)).ends_with(&format!("cd /g && env -u CLAUDE_CONFIG_DIR {argv}")));
+        assert!(launch_on(None).ends_with(&format!("cd /g && {argv}")), "no slot ⇒ the old hint");
+    }
+
+    #[test]
+    fn the_launch_slot_defaults_to_active_and_fails_closed() {
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path();
+        // No pointer ⇒ home; no store at all ⇒ home too, but a named slot needs one.
+        assert_eq!(resolve_launch_slot(Some(store), None).unwrap().name, "home");
+        assert_eq!(resolve_launch_slot(None, None).unwrap().dir, claude_profiles::SlotDir::Home);
+        assert!(resolve_launch_slot(None, Some("slot1")).is_err());
+
+        // A slot with no credential is refused by name, whether named or active.
+        std::fs::create_dir(store.join("slot1")).unwrap();
+        let err = resolve_launch_slot(Some(store), Some("slot1")).unwrap_err().to_string();
+        assert!(err.contains("\"slot1\"") && err.contains("not logged in"), "{err}");
+        std::os::unix::fs::symlink("slot1", store.join(claude_profiles::ACTIVE_LINK)).unwrap();
+        assert!(resolve_launch_slot(Some(store), None).is_err());
+        assert!(resolve_launch_slot(Some(store), Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn an_agents_row_shows_the_claude_login_slot() {
+        use softfig_ipc::growlightd::AgentSummary;
+        let row = agent_row(&AgentSummary::new("a", "running", true).with_profile(Some("slot2".into())));
+        assert!(row.contains(" profile=slot2 "), "{row:?}");
+        assert!(row.ends_with("claude"), "{row:?}");
+        let bare = agent_row(&AgentSummary::new("oc", "idle", false));
+        assert!(!bare.contains("profile="), "{bare:?}");
+        // The accounting column starts at the same offset either way.
+        assert_eq!(row.find("claude"), bare.find("claude"));
+    }
+
     #[test]
     fn start_args_parse_the_model_flag_and_keep_the_selectors_exclusive() {
         use clap::Parser;
@@ -3380,6 +3695,13 @@ mod tests {
         assert!(start(&["g", "start", "--model", "flash", "--opencode"]).is_err());
         assert!(start(&["g", "start", "--model", "claude", "--backend", "claude"]).is_err());
         assert!(start(&["g", "start", "--opencode", "--backend", "claude"]).is_err());
+
+        // claude-login-switcher slice 007: `--profile` names the slot.
+        assert_eq!(bare.profile, None, "default = the store's active slot");
+        assert_eq!(
+            start(&["g", "start", "--profile", "slot2", "--no-launch"]).unwrap().profile.as_deref(),
+            Some("slot2")
+        );
     }
 
     /// A garden with one milestone (slices + CLAUDE.md) and one task, plus a

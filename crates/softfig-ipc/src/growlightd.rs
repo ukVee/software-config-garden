@@ -330,6 +330,14 @@ pub struct AgentSummary {
     /// not metered (see the type docs). Never `Some(0)` for a subscription member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<AgentSpendSummary>,
+    /// The claude-login profile slot this member's last spawn ran under
+    /// (`claude-login-switcher` slices 003, 007). `Some(name)` on a claude
+    /// member that this daemon has spawned (pooled or following `active`;
+    /// `home` included), or whose pool pin file resolves; `None` otherwise
+    /// (opencode, pre-first-spawn, or pin unreadable). Additive and defaulted
+    /// for wire back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// The default [`AgentSummary::backend`] for a decoder that predates the field:
@@ -355,7 +363,18 @@ impl AgentSummary {
             backend: BACKEND_CLAUDE.to_string(),
             model: None,
             spend: None,
+            profile: None,
         }
+    }
+
+    /// Attach the claude-login profile slot name this member's last spawn ran
+    /// under (`claude-login-switcher` slice 003). Builder-shape so a row that
+    /// chains after [`new`](Self::new) or [`on_opencode`](Self::on_opencode)
+    /// stays readable.
+    #[must_use]
+    pub fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// Re-point this row at the `opencode` backend, on `model` (its pinned
