@@ -708,6 +708,47 @@ impl AgentStreamErrSource for Arc<OpencodeBackend> {
     }
 }
 
+/// The seam the loop reads a member's **launch-time refusal** signal through
+/// (folder-grants slice 002 part B.2 — closes opencode-v2-repin slice 006's
+/// open finding). Set by [`OpencodeBackend`] when the opencode wire emitted an
+/// `error` event before any `step_start` on a run: the provider rejected the
+/// request before any work ran, so the exit is a §8-style refusal and must
+/// park the member once with no re-roll — never a crash loop. Read when the
+/// supervisor's poll reaches a crash verdict, like `AgentStreamErrSource`.
+pub trait AgentLaunchRefusalSource: Send + Sync + fmt::Debug {
+    /// `true` when the backend's observer latched a launch-time refusal for
+    /// `agent`'s current (or last) run; `false` otherwise (including never
+    /// spawned, and every backend that doesn't produce the signal).
+    fn launch_time_refusal(&self, agent: &str) -> bool;
+}
+
+impl AgentLaunchRefusalSource for Arc<ClaudeBackend> {
+    fn launch_time_refusal(&self, _agent: &str) -> bool {
+        // No launch-time-refusal signal on the claude wire — claude's observer
+        // doesn't track it, and a provider refusal there surfaces as the
+        // existing stream-error / stderr path.
+        false
+    }
+}
+
+impl AgentLaunchRefusalSource for Arc<OpencodeBackend> {
+    fn launch_time_refusal(&self, agent: &str) -> bool {
+        self.as_ref().launch_time_refusal(agent)
+    }
+}
+
+/// The pre-folder-grants fallback source: every agent reads as "no launch-time
+/// refusal", so a loop built without [`with_launch_refusal`](DriveLoop::with_launch_refusal)
+/// behaves exactly as before (poll fall-through to `on_crash`).
+#[derive(Debug, Default)]
+pub struct NoLaunchRefusals;
+
+impl AgentLaunchRefusalSource for NoLaunchRefusals {
+    fn launch_time_refusal(&self, _agent: &str) -> bool {
+        false
+    }
+}
+
 /// The seam the loop reads an EXITED agent's terminal baton status through, to
 /// feed [`Supervisor::poll`]'s retire-vs-park-vs-re-roll decision (the spin fix,
 /// [[decision-growlight-fleet-loop-spin]]). Slice 002 implements it over the

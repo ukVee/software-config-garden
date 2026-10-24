@@ -870,6 +870,50 @@ impl Supervisor {
         rate_limit_exit: G,
         repo_state: H,
     ) -> PollOutcome {
+        self.poll_with_launch_refusal(
+            agent,
+            health,
+            baton_status,
+            next_action,
+            now,
+            network_exit,
+            rate_limit_exit,
+            repo_state,
+            // Pre-folder-grants behaviour: no launch-refusal source.
+            || false,
+        )
+    }
+
+    /// Like [`poll_with_progress`](Self::poll_with_progress), but with a
+    /// `launch_time_refusal_exit` predicate too (folder-grants slice 002 part
+    /// B.2 — closes opencode-v2-repin slice 006's open finding). Evaluated
+    /// only inside the `Verdict::Crashed` arm, after the consumed-exit guard
+    /// and before `rate_limit_exit`: when `true`, the exit is treated as a
+    /// §8-style launch-time refusal (the opencode spawn produced an `error`
+    /// event before any `step_start` — today captured as `provider.no-route`
+    /// on a stale/missing model id) and the member is parked once with no
+    /// re-roll, no streak bump, no backoff ([`PollOutcome::Blocked { spin_guard:
+    /// false, ... }`]), the same classification a `generate_preapproval`
+    /// grant refusal gets. Before this path, every such exit re-rolled on
+    /// crash backoff forever — a false crash loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_with_launch_refusal<
+        F: FnOnce() -> bool,
+        G: FnOnce() -> bool,
+        H: FnOnce() -> Option<RepoState>,
+        J: FnOnce() -> bool,
+    >(
+        &mut self,
+        agent: &str,
+        health: AgentHealth,
+        baton_status: Option<&str>,
+        next_action: Option<&str>,
+        now: i64,
+        network_exit: F,
+        rate_limit_exit: G,
+        repo_state: H,
+        launch_time_refusal_exit: J,
+    ) -> PollOutcome {
         let hang_secs = self.hang_secs;
         if !self.agents.contains_key(agent) {
             return PollOutcome::Unknown;
@@ -920,6 +964,17 @@ impl Supervisor {
                     // and the timed rate-limit hold, not a re-classification,
                     // gates the re-roll until `resets_at`.)
                     PollOutcome::Down
+                } else if launch_time_refusal_exit() {
+                    // Launch-time refusal, not a bug (folder-grants slice 002
+                    // part B.2 — closes opencode-v2-repin slice 006): the
+                    // opencode spawn emitted an `error` event before any
+                    // `step_start`, so the provider rejected the request
+                    // before any work ran (`provider.no-route` on a
+                    // stale/missing model id is the one captured today).
+                    // Park the member once with no re-roll, no streak bump,
+                    // no backoff — the same path a §8 grant-resolution
+                    // refusal takes.
+                    self.on_launch_time_refusal(agent, health, now)
                 } else if rate_limit_exit() {
                     // The quota wall, not a bug (task 070): the exit coincides
                     // with a `rejected` window / a 429 in the member's stdout
@@ -1011,6 +1066,40 @@ impl Supervisor {
         sup.seen_repo.clear();
         sup.repo_excused = 0;
         PollOutcome::RateLimitDeath
+    }
+
+    /// Handle a **launch-time refusal** (folder-grants slice 002 part B.2):
+    /// the exit coincides with the backend's launch-time-refusal signal
+    /// (opencode's `error`-before-`step_start`, i.e. a provider refusal
+    /// before any work ran). The child already exited — drop its handle,
+    /// consume the exit, and surface a Blocked outcome with no re-roll, no
+    /// backoff and no `AgentCrashed` alert, so the drive loop's Blocked arm
+    /// item-parks the member exactly like a §8 grant-resolution refusal.
+    /// `spin_guard: false` keeps the "spin-guard parked" page off a signal
+    /// that is a backend refusal, not a stall.
+    fn on_launch_time_refusal(
+        &mut self,
+        agent: &str,
+        _health: AgentHealth,
+        now: i64,
+    ) -> PollOutcome {
+        let sup = self
+            .agents
+            .get_mut(agent)
+            .expect("agent exists (checked in poll)");
+        let _ = sup.child.take();
+        // Not a stall — reset the spin-guard counters the same way the
+        // rate-limit death does, so a later clean session doesn't inherit a
+        // stale streak.
+        sup.not_before = now;
+        sup.last_next_action = None;
+        sup.unchanged_streak = 0;
+        sup.seen_repo.clear();
+        sup.repo_excused = 0;
+        PollOutcome::Blocked {
+            status: "launch-time refusal (provider rejected before any step)".to_string(),
+            spin_guard: false,
+        }
     }
 
     /// Decide what a clean (code-0) exit means by reading the agent's terminal

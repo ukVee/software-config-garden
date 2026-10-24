@@ -91,7 +91,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -243,6 +243,15 @@ struct MemberCells {
     /// on every re-spawn so `grants.md` always describes the CURRENT child
     /// (folder-grants slice 002 part B.2).
     resolved_grants: Mutex<Vec<softfig_ipc::grants::Grant>>,
+    /// Set by [`Fold::observe`] when a top-level `error` event arrives
+    /// BEFORE any `step_start` on the current run — the opencode signature of
+    /// a launch-time refusal (`provider.no-route` on a stale/missing model id
+    /// is the one captured today). The supervisor reads this through
+    /// [`AgentLaunchRefusalSource`] and classifies the ensuing exit as a
+    /// [`PollOutcome::Blocked`] park with no re-roll (folder-grants slice 002
+    /// part B.2 — the final chunk closes opencode-v2-repin slice 006's open
+    /// finding).
+    launch_time_refusal: AtomicBool,
 }
 
 /// One run's bookkeeping, private to its fold: what the run-end settlement needs to
@@ -257,6 +266,14 @@ struct RunState {
     /// A `step_start` with no `step_finish` yet. On 2.x the final step always ends
     /// open.
     open_step: bool,
+    /// Set by [`Fold::observe`] on the first `step_start` of the run; the
+    /// pre-first-step gate for the launch-time refusal classification
+    /// (folder-grants slice 002 part B.2). An `error` event seen while this
+    /// is still `false` is treated as a launch-time refusal — the member
+    /// never produced a step, which on opencode 2.x means the provider
+    /// rejected the request before any work ran (`provider.no-route` is the
+    /// one captured today).
+    step_start_seen: bool,
 }
 
 /// The content deltas one event carries. Pure. A type that carries no renderable
@@ -447,6 +464,7 @@ impl LineObserver for Fold<'_> {
         if ev.get("type").and_then(Value::as_str) == Some("step_start") {
             self.member.spend.record_step();
             run.open_step = true;
+            run.step_start_seen = true;
         }
         // One `step_finish` == one completed model turn == one real API call
         // costing its tokens. See the module docs on why this is per-step.
@@ -458,6 +476,20 @@ impl LineObserver for Fold<'_> {
         }
         if let Some(reason) = error_of(&ev) {
             self.member.errors.push(reason);
+            // An `error` arriving BEFORE any `step_start` is a launch-time
+            // refusal — the provider rejected the request before the member
+            // ran a single step. On opencode 2.x the one captured today is a
+            // `provider.no-route` crash from a stale/missing model id, which
+            // before this classification re-rolled on crash backoff forever
+            // (opencode-v2-repin slice 006's open finding). The supervisor
+            // reads this flag at exit and parks the member once, no re-roll,
+            // same path as a §8 grant-resolution refusal (folder-grants
+            // slice 002 part B.2 final chunk).
+            if !run.step_start_seen {
+                self.member
+                    .launch_time_refusal
+                    .store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -1125,6 +1157,20 @@ impl OpencodeBackend {
     /// reading if it was never spawned. The accounting slice 006 surfaces.
     pub fn spend(&self, agent: &str) -> AgentSpend {
         self.flavor.spend(agent)
+    }
+
+    /// Whether `agent`'s current (or last) run observed a top-level `error`
+    /// event BEFORE any `step_start` — the opencode signature of a
+    /// launch-time refusal (today captured as `provider.no-route` on a
+    /// stale/missing model id). The drive loop reads this through
+    /// [`AgentLaunchRefusalSource`] to park the member on the next exit
+    /// without re-rolling (folder-grants slice 002 part B.2 — closes the
+    /// opencode-v2-repin slice 006 open finding). `false` when never
+    /// spawned, or when the run saw a `step_start` first.
+    pub fn launch_time_refusal(&self, agent: &str) -> bool {
+        self.flavor
+            .member(agent)
+            .is_some_and(|m| m.launch_time_refusal.load(Ordering::SeqCst))
     }
 
     /// The argv this backend would exec for `agent` after the `systemd-run … --`
