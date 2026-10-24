@@ -107,6 +107,7 @@ use crate::hub::EventHub;
 use crate::opencode_ledger::SessionLedger;
 use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::AgentPaths;
+use crate::member_claim::MemberClaimLookup;
 use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
 
 // Imports for the test-only opencode-shaped `pump` seam below, which wires
@@ -641,6 +642,14 @@ struct OpencodeFlavor {
     /// Where each run's authoritative totals are read at stdout EOF (module docs,
     /// "Run end").
     ledger: Arc<dyn SessionLedger>,
+    /// How a spawn learns the member's current `(queue, part)` — the one piece
+    /// of state the shared grant resolver
+    /// ([`softfig_ipc::spawn_resolve::resolve_from_baton`]) needs beyond the
+    /// member's seeded baton and the garden layout (folder-grants slice 002
+    /// part B). Injected at [`OpencodeBackend::new`]; empty in the stub view
+    /// until the drive-loop hook lands, which the flavor treats as the
+    /// floor-only case (no live claim ⇒ no project repo to anchor grants to).
+    claim_lookup: Arc<dyn MemberClaimLookup>,
     /// Per-agent spend + error cells, keyed by agent id; re-spawn replaces the
     /// cell, the same lifecycle the harness gives its own health/rate/stderr cells.
     members: Mutex<BTreeMap<String, Arc<MemberCells>>>,
@@ -712,13 +721,28 @@ const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG";
 
 impl BackendFlavor for OpencodeFlavor {
     fn generate_preapproval(&self, agent: &str) -> Result<AgentPaths, SpawnError> {
-        self.preapproval
+        let paths = self
+            .preapproval
             .generate(agent)
             .map_err(|e| {
                 SpawnError(format!(
                     "opencode pre-approval generation failed for agent {agent}: {e}"
                 ))
-            })
+            })?;
+        // Grant resolution hook (folder-grants slice 002 part B): a live
+        // `(queue, part)` is the input the shared
+        // `softfig_ipc::spawn_resolve::resolve_from_baton` helper needs to walk
+        // the item's doc chain. Until the drive-loop hook lands the view is
+        // empty, so this is just a probe: `None` is the floor-only case, same
+        // as a baton with no `item:`. The next iteration swaps this for the
+        // real `resolve_from_baton` call plus the `SpawnError` refusal path.
+        if let Some((queue, part)) = self.claim_lookup.claim_for(agent) {
+            eprintln!(
+                "growlightd: opencode spawn: {agent} claim ({queue}, {part}) \
+                 — grants resolution deferred to the next iteration",
+            );
+        }
+        Ok(paths)
     }
 
     fn command_argv(
@@ -803,6 +827,7 @@ impl OpencodeBackend {
     /// The shared `build_caps` / `live_scopes` / `kill_handles` cells are the
     /// daemon's — the same ones a [`ClaudeBackend`](crate::claude_backend::ClaudeBackend)
     /// is given — so `set_resources` and the kill paths reach an opencode member too.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         launch: OpencodeLaunch,
         hub: EventHub,
@@ -811,12 +836,14 @@ impl OpencodeBackend {
         build_caps: Arc<Mutex<BuildCaps>>,
         live_scopes: Arc<Mutex<BTreeMap<String, String>>>,
         kill_handles: Arc<Mutex<BTreeMap<String, LiveKill>>>,
+        claim_lookup: Arc<dyn MemberClaimLookup>,
     ) -> Self {
         let flavor = Arc::new(OpencodeFlavor {
             launch,
             hub,
             preapproval,
             ledger,
+            claim_lookup,
             members: Mutex::new(BTreeMap::new()),
         });
         Self {
@@ -1541,6 +1568,7 @@ mod tests {
                 tmp.join("opencode-data"),
             ),
             ledger: Arc::new(FakeLedger::default()),
+            claim_lookup: Arc::new(crate::member_claim::SharedClaimView::new()),
             members: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1555,6 +1583,7 @@ mod tests {
             Arc::new(Mutex::new(BuildCaps::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(crate::member_claim::SharedClaimView::new()),
         ))
     }
 
@@ -1725,6 +1754,7 @@ mod tests {
             Arc::new(Mutex::new(BuildCaps::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(crate::member_claim::SharedClaimView::new()),
         ));
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
@@ -1739,6 +1769,110 @@ mod tests {
             backend.spend("a1") == AgentSpend::default(),
             "a fail-closed spawn accrues no spend",
         );
+    }
+
+    /// A test-only [`MemberClaimLookup`] that remembers every agent the flavor
+    /// probed, so we can prove `generate_preapproval` consults the seam
+    /// (folder-grants slice 002 part B — the opencode spawn path becomes
+    /// grant-aware by reading each member's `(queue, part)` from the live
+    /// view).
+    #[derive(Debug, Default)]
+    struct RecordingClaimLookup {
+        probes: Mutex<Vec<String>>,
+        answer: Option<(String, String)>,
+    }
+
+    impl RecordingClaimLookup {
+        fn answering(queue: &str, part: &str) -> Self {
+            Self {
+                probes: Mutex::new(Vec::new()),
+                answer: Some((queue.to_string(), part.to_string())),
+            }
+        }
+    }
+
+    impl crate::member_claim::MemberClaimLookup for RecordingClaimLookup {
+        fn claim_for(&self, agent: &str) -> Option<(String, String)> {
+            self.probes.lock().unwrap().push(agent.to_string());
+            self.answer.clone()
+        }
+    }
+
+    #[test]
+    fn generate_preapproval_consults_the_claim_lookup_on_every_spawn() {
+        // The plumbing landing in part B.1: `OpencodeFlavor` carries an
+        // `Arc<dyn MemberClaimLookup>` the shared grant resolver reads to
+        // learn the member's `(queue, part)`. Prove the seam is wired by
+        // injecting a recorder, running `generate_preapproval`, and checking
+        // the recorder saw the agent id. (The real `resolve_from_baton` call
+        // lands in the next iteration.)
+        let tmp = tempfile::tempdir().unwrap();
+        let garden = Path::new("/garden");
+        let lookup = Arc::new(RecordingClaimLookup::answering("default", "folder-grants"));
+        let flavor = OpencodeFlavor {
+            launch: OpencodeLaunch {
+                bin: "opencode".to_string(),
+                prompt: "kick".to_string(),
+                model: ModelSelection::model("deepseek/deepseek-flash"),
+                garden_root: garden.to_path_buf(),
+            },
+            hub: EventHub::new(),
+            preapproval: OpencodePreApproval::new(
+                tmp.path().join("agents"),
+                garden,
+                garden.join("growlight/protocol-fleet.md"),
+                tmp.path().join("runtime"),
+                PathBuf::from("softfig-mcp"),
+                tmp.path().join(".claude"),
+                tmp.path().join("opencode-data"),
+            ),
+            ledger: Arc::new(FakeLedger::default()),
+            claim_lookup: Arc::clone(&lookup) as Arc<dyn crate::member_claim::MemberClaimLookup>,
+            members: Mutex::new(BTreeMap::new()),
+        };
+
+        let paths = flavor
+            .generate_preapproval("a1")
+            .expect("generates when the pre-approval writes");
+        assert!(paths.opencode_config.exists(), "opencode.json was written");
+
+        let probes = lookup.probes.lock().unwrap().clone();
+        assert_eq!(probes, vec!["a1".to_string()], "lookup saw this spawn's agent");
+    }
+
+    #[test]
+    fn generate_preapproval_still_succeeds_when_no_claim_is_recorded() {
+        // An empty [`SharedClaimView`] (the production state before the drive
+        // loop writes anything) is the floor-only case: the probe returns
+        // `None`, generation proceeds as before, and the spawn is allowed.
+        let tmp = tempfile::tempdir().unwrap();
+        let garden = Path::new("/garden");
+        let flavor = OpencodeFlavor {
+            launch: OpencodeLaunch {
+                bin: "opencode".to_string(),
+                prompt: "kick".to_string(),
+                model: ModelSelection::model("deepseek/deepseek-flash"),
+                garden_root: garden.to_path_buf(),
+            },
+            hub: EventHub::new(),
+            preapproval: OpencodePreApproval::new(
+                tmp.path().join("agents"),
+                garden,
+                garden.join("growlight/protocol-fleet.md"),
+                tmp.path().join("runtime"),
+                PathBuf::from("softfig-mcp"),
+                tmp.path().join(".claude"),
+                tmp.path().join("opencode-data"),
+            ),
+            ledger: Arc::new(FakeLedger::default()),
+            claim_lookup: Arc::new(crate::member_claim::SharedClaimView::new()),
+            members: Mutex::new(BTreeMap::new()),
+        };
+
+        let paths = flavor
+            .generate_preapproval("a1")
+            .expect("floor-only is a legal spawn state");
+        assert!(paths.opencode_config.exists(), "opencode.json was written");
     }
 
     #[test]

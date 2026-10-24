@@ -778,6 +778,12 @@ fn build_opencode_backend(
         Arc::clone(&daemon.build_caps),
         Arc::clone(&daemon.live_scopes),
         Arc::clone(&daemon.kill_handles),
+        // The live `(agent -> (queue, part))` view the drive loop writes on
+        // claim/release (folder-grants slice 002 part B). The daemon's shared
+        // view is cloned by `Arc` so every opencode backend reads the same map
+        // the drive loop updates. Empty until the drive-loop hook lands, which
+        // the flavor treats as the floor-only case.
+        Arc::new(daemon.member_claims.clone()),
     )
 }
 

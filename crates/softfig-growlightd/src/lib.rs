@@ -33,6 +33,7 @@ pub mod fleet;
 pub mod handshake;
 pub mod hub;
 pub mod leases;
+pub mod member_claim;
 pub mod member_handoff;
 pub mod member_slices;
 pub mod member_verbs;
@@ -82,6 +83,7 @@ pub use fleet::{
 pub use handshake::{garden_root_via_keeperd, HandshakeError};
 pub use hub::{EventHub, Subscription};
 pub use leases::{LeaseDecision, LeaseTable, ReleaseOutcome, ThrashClear};
+pub use member_claim::{MemberClaimLookup, SharedClaimView};
 pub use notifications::{Channel, NotifyEvent, NotifyPolicy};
 pub use notify_dispatch::{
     BusEmit, GuiNotifier, KeeperdBusEmit, LogNotifier, LogSink, Notifier, NotifyDispatcher,

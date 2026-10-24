@@ -177,6 +177,15 @@ pub struct Daemon {
     /// `main` installs them; a verb that validates without them errors and
     /// leaves the session running.
     pub v2_handoff: Option<Arc<crate::member_handoff::HandoffSeams>>,
+    /// The live `(agent → (queue, part))` view the drive loop writes on claim
+    /// and release, and the opencode spawn path reads per generate_preapproval
+    /// to resolve its item's grants (folder-grants slice 002 part B). Lives
+    /// *outside* `inner` (like `kill_handles`) so a lookup never contends on
+    /// the daemon lock. Cloneable — `SharedClaimView` is `Arc`-backed — so
+    /// every opencode backend holds the same map the drive loop updates.
+    /// Empty on a disarmed fleet and until the drive-loop hook lands; the
+    /// flavor treats an empty row as the floor-only case.
+    pub member_claims: crate::member_claim::SharedClaimView,
 }
 
 /// One member's handoff as the mirror tracks it.
@@ -217,6 +226,7 @@ impl Daemon {
             backends: Arc::new(Mutex::new(None)),
             v2_mirror: Arc::new(Mutex::new(V2Mirror::default())),
             v2_handoff: None,
+            member_claims: crate::member_claim::SharedClaimView::new(),
         }
     }
 
