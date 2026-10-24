@@ -114,7 +114,7 @@ pub use scheduler::{
 pub use state::State;
 pub use supervisor::{
     AgentBackend, AgentHealth, AgentSpec, Backoff, PollOutcome, RerollOutcome, SpawnError,
-    StartOutcome, Supervisor,
+    SpawnKind, StartOutcome, Supervisor,
 };
 pub use thrash_bridge::{parse_target, KeeperThrashClear, TargetClear};
 pub use usage::{

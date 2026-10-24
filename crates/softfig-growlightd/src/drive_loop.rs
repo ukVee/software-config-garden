@@ -132,6 +132,19 @@ pub const HOLD_RECHECK_SECS: i64 = 60;
 /// a member to wait out.
 pub const CLAIM_REASSERT_SECS: i64 = 30;
 
+/// Period (in ticks) between re-scans of the on-disk per-slot usage directory
+/// into [`RateLimitHolds`](crate::rate_limit_holds::RateLimitHolds), when the
+/// live assembly points the loop at one via
+/// [`DriveLoop::with_usage_by_profile_dir`] (claude-login-pool-wiring slice 002
+/// M-B part 1). The first tick runs the seed (count ≡ 0), and every N-th tick
+/// thereafter re-scans so a sibling writer — an interactive statusline, slice
+/// 009's per-slot capture — reaches admission within one window on a running
+/// daemon. Not inotify-driven: on a 1-tick/second loop this is roughly every
+/// ten seconds, which is dense enough that a race between the file write and
+/// a member spawn almost never catches the member's picker before the hold
+/// lands, and sparse enough that a quiet fleet is not thrashing the disk.
+pub const RESCAN_USAGE_BY_PROFILE_EVERY_TICKS: u64 = 10;
+
 /// The seam the loop **claims** a picked part through before spawning its agent
 /// — the WRITE counterpart to [`QueueSource`]'s read. Marking the part `active`
 /// in keeperd's queue table is what closes the fallback double-assignment window
@@ -1451,6 +1464,24 @@ pub struct DriveLoop {
     /// [`AssumeHomeProfile`] so every loop built through [`Self::new`] without
     /// a resolver keeps the pre-switcher single-slot key.
     profiles_resolver: Box<dyn ProfileResolver>,
+    /// On-disk per-slot usage directory
+    /// (`$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/`), set once by
+    /// the live assembly for claude-login-pool-wiring slice 002 M-B part 1.
+    /// `None` keeps the pre-switcher posture: `rate_limit_holds` starts empty
+    /// and only extends from live `rate_limit_event` reports. `Some(dir)`
+    /// seeds the holds on the first tick and re-scans every
+    /// [`RESCAN_USAGE_BY_PROFILE_EVERY_TICKS`] ticks thereafter, so a sibling
+    /// writer (an interactive statusline, slice 009's per-slot capture) reaches
+    /// admission within one re-scan window.
+    usage_by_profile_dir: Option<PathBuf>,
+    /// Tick counter for the periodic
+    /// [`RateLimitHolds::rescan_from_disk`](crate::rate_limit_holds::RateLimitHolds::rescan_from_disk)
+    /// pass (slice 002 M-B part 1). Reset only on
+    /// [`DriveLoop::new`]/`with_usage_by_profile_dir`, bumped every tick, and
+    /// gates the re-scan at `tick_count % N == 0` so a busy 1-tick/second loop
+    /// never thrashes the disk on `rejected`-less idle windows. The seed is
+    /// the `== 0` case — the first tick re-scans before admission runs.
+    rescan_tick_count: u64,
     /// The stale-binary guard's on-disk identity probe (task 039). Re-statted each
     /// tick and compared to `exe_baseline`; the live [`SystemExeProbe`] in production
     /// (re-stats growlightd's captured launch path), a scripted fake in tests.
@@ -1558,6 +1589,8 @@ impl DriveLoop {
             offline_alerted: false,
             rate_limit_holds: crate::rate_limit_holds::RateLimitHolds::new(),
             profiles_resolver: Box::new(AssumeHomeProfile),
+            usage_by_profile_dir: None,
+            rescan_tick_count: 0,
             exe_probe,
             exe_baseline: None,
             binary_superseded: false,
@@ -1591,6 +1624,28 @@ impl DriveLoop {
     #[must_use]
     pub fn with_profile_resolver(mut self, resolver: Box<dyn ProfileResolver>) -> Self {
         self.profiles_resolver = resolver;
+        self
+    }
+
+    /// Point the loop at the on-disk per-slot usage directory
+    /// (`$XDG_CONFIG_HOME/softfig/growlight/usage.by-profile/`) so a daemon
+    /// restart re-derives per-slot rate-limit holds instead of booting with an
+    /// empty map (claude-login-pool-wiring slice 002 M-B part 1). The first
+    /// tick runs
+    /// [`RateLimitHolds::seed_from_disk`](crate::rate_limit_holds::RateLimitHolds::seed_from_disk)
+    /// against `dir` before admission reads the hold map; every
+    /// [`RESCAN_USAGE_BY_PROFILE_EVERY_TICKS`]-th tick thereafter re-scans so a
+    /// sibling writer (slice 009's per-slot capture, an interactive
+    /// statusline) reaches admission without a daemon bounce.
+    ///
+    /// A builder like
+    /// [`with_profile_resolver`](Self::with_profile_resolver): the 15-arg
+    /// [`new`](Self::new) and every pre-slice-002 test stays unchanged (the
+    /// default `None` keeps the empty-map posture).
+    #[must_use]
+    pub fn with_usage_by_profile_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.usage_by_profile_dir = dir;
+        self.rescan_tick_count = 0;
         self
     }
 
@@ -1646,6 +1701,20 @@ impl DriveLoop {
     /// of everything it did.
     pub fn tick(&mut self, now: i64) -> TickReport {
         let mut report = TickReport::default();
+        // Per-slot rate-limit hold re-scan (slice 002 M-B part 1). First tick
+        // seeds from disk BEFORE any admission read; a non-first tick re-scans
+        // every N ticks so a sibling writer reaches admission without a daemon
+        // bounce. Runs before `paused` is read because `paused` does not gate
+        // disk I/O; the admission step itself (step 2/3 below) is paused.
+        if let Some(dir) = self.usage_by_profile_dir.clone() {
+            if self
+                .rescan_tick_count
+                .is_multiple_of(RESCAN_USAGE_BY_PROFILE_EVERY_TICKS)
+            {
+                self.rate_limit_holds.rescan_from_disk(&dir, now);
+            }
+            self.rescan_tick_count = self.rescan_tick_count.saturating_add(1);
+        }
         // Which queue each member was draining as this tick began — read by the
         // fallback reservation (task 068) so a member released by step 1 still
         // holds its pinned queue for its own step-3 pick this same tick.
@@ -2557,6 +2626,33 @@ impl DriveLoop {
                                     outcome,
                                 });
                             }
+                            // Backend picker stalled on an exhausted claude-login
+                            // pool (slice 002 M-B part 2). The claim + baton
+                            // landed inside the start_claiming closure, so keep
+                            // the entry excluded this tick (same as SpawnFailed);
+                            // extend `rate_limit_holds` for every slot the picker
+                            // called exhausted so next tick's admission check
+                            // short-circuits via `member_fully_held` and the
+                            // picker is NOT re-run every tick until the window
+                            // reopens (no per-tick inject.sh/loop.json/mcp.json
+                            // rewrites — the preflight ran before preapproval).
+                            // No `AgentCrashed` alert fires: the dispatcher only
+                            // pages on `SpawnFailed`.
+                            StartOutcome::Hold { slots, until } => {
+                                spoken_for.insert(pick.entry.clone());
+                                let fallback = now
+                                    + crate::profile_budget::STALE_FLOOR_SECS;
+                                for slot in &slots {
+                                    self.rate_limit_holds.extend(
+                                        slot.clone(),
+                                        until.unwrap_or(fallback),
+                                    );
+                                }
+                                report.held_starts.push(HeldStart {
+                                    agent: agent.clone(),
+                                    outcome: StartOutcome::Hold { slots, until },
+                                });
+                            }
                             // Queued / Refused (no claim attempted) or ClaimFailed
                             // (claim refused, fail-closed): nothing claimed, nothing
                             // excluded.
@@ -2864,6 +2960,30 @@ impl DriveLoop {
                         report.held_starts.push(HeldStart {
                             agent: agent.clone(),
                             outcome,
+                        });
+                    }
+                    // Backend picker stalled on an exhausted claude-login pool
+                    // (slice 002 M-B part 2). Claim + baton seed already landed
+                    // inside the start_claiming closure, so mark the part held
+                    // (same as SpawnFailed above) and extend the per-slot
+                    // `rate_limit_holds` so the next tick's admission check
+                    // short-circuits via `member_fully_held` — no per-tick
+                    // preapproval rewrites, no `AgentCrashed` alert, no
+                    // crash-backoff streak.
+                    StartOutcome::Hold { slots, until } => {
+                        snapshot.mark_claimed(&queue, &part);
+                        spoken_for.insert((queue, part));
+                        let fallback = now
+                            + crate::profile_budget::STALE_FLOOR_SECS;
+                        for slot in &slots {
+                            self.rate_limit_holds.extend(
+                                slot.clone(),
+                                until.unwrap_or(fallback),
+                            );
+                        }
+                        report.held_starts.push(HeldStart {
+                            agent: agent.clone(),
+                            outcome: StartOutcome::Hold { slots, until },
                         });
                     }
                     // Queued / Refused (no claim attempted) or ClaimFailed (claim
@@ -3581,6 +3701,11 @@ impl TickLogger {
                 // `Started` never lands in `held_starts`; a spawn failure is
                 // alerted through the dispatcher — no duplicate.
                 StartOutcome::Started | StartOutcome::SpawnFailed { .. } => continue,
+                // Picker stall (claude-login-pool-wiring slice 002 M-B part 2):
+                // the per-slot rate-limit hold already narrates "waiting for
+                // rate limit reset" through the status surface, so skip the
+                // edge-dedup line here to avoid a double-narration.
+                StartOutcome::Hold { .. } => continue,
             };
             held_now.insert((held.agent.clone(), kind));
         }
@@ -3788,7 +3913,7 @@ mod tests {
     use crate::notifications::NotifyPolicy;
     use crate::notify_dispatch::{GuiNotifier, LogNotifier, LogSink};
     use crate::scheduler::{classify_queue, PartView, QueueState, QueueView};
-    use crate::supervisor::{AgentBackend, Backoff, MemberLifecycle, SpawnError};
+    use crate::supervisor::{AgentBackend, Backoff, MemberLifecycle, SpawnError, SpawnKind};
     use softfig_ipc::growlightd::StopLevel;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4007,7 +4132,7 @@ mod tests {
         }
     }
     impl AgentBackend for Arc<FakeFleet> {
-        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
             self.events.lock().unwrap().push(format!("spawn:{}", spec.agent));
             self.spawned_specs.lock().unwrap().push(spec.clone());
@@ -4015,7 +4140,8 @@ mod tests {
                 return Err(SpawnError(format!(
                     "pre-approval generation failed for agent {}",
                     spec.agent
-                )));
+                ))
+                .into());
             }
             Ok(Box::new(FakeChild {
                 kills: Arc::clone(&self.kills),
@@ -9571,29 +9697,48 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         );
     }
 
-    /// Finish-check 3 — restart with per-profile holds already active
-    /// (modelled here by seeding the DriveLoop with a hold BEFORE the first
-    /// tick) stays quiet: no page, no crash, no per-tick spawn. In production
-    /// a daemon restart re-derives these from `usage.by-profile/<slot>.json`
-    /// (slice 009's per-slot capture); here we inject the end state directly
-    /// since the finish-check is the drive-loop level invariant.
+    /// Finish-check 3 — restart with per-profile holds already active stays
+    /// quiet: no page, no crash, no per-tick spawn. This exercises the LIVE
+    /// seed path (claude-login-pool-wiring slice 002 M-B part 1): write
+    /// `usage.by-profile/slot1.json` with a `rejected` + future `resets_at`,
+    /// point the loop at the dir via
+    /// [`with_usage_by_profile_dir`](DriveLoop::with_usage_by_profile_dir),
+    /// and verify the first tick's admission already short-circuits via the
+    /// seeded hold without a hand-extend.
     #[test]
     fn restart_with_exhausted_per_profile_files_holds_quietly() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        // Write slot1's on-disk reading: `rejected` 5h window with
+        // `resets_at = 500` (ahead of the first few ticks, which run at t=0..3).
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: Some(500),
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
         let (mut loop_, _d, backend, probe) = make(
             vec![member("a1", "qa")],
             vec![q("qa", &[("pa", "queued")])],
             Policy::default(),
         );
-        loop_ = loop_.with_profile_resolver(Box::new(ScriptedResolver::new(&[(
-            "a1",
-            &["slot1"],
-        )])));
-        // Simulate the restart's re-derivation: the hold is already present
-        // before any tick runs (the live loop reads it from
-        // `usage.by-profile/slot1.json` at construction / first tick).
-        loop_.rate_limit_holds.extend("slot1".to_string(), 500);
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[("a1", &["slot1"])])))
+            .with_usage_by_profile_dir(Some(tmp.path().to_path_buf()));
 
-        // Three consecutive ticks under the hold.
+        // Three consecutive ticks under the hold — the first tick's
+        // seed_from_disk pulls slot1.json into the hold map BEFORE admission
+        // reads it, so admission skips a1 immediately.
         for t in 0..3 {
             let r = loop_.tick(t);
             assert_eq!(r.waiting_for_rate_limit_reset, Some(500));
@@ -9606,6 +9751,194 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             }
             assert!(alerts.is_empty(), "quiet hold emits no alerts: {alerts:?}");
         }
+    }
+
+    /// Slice 002 M-B part 1 — a cold restart with `rejected` on disk seeds
+    /// the hold BEFORE admission runs, so the first tick's admission check
+    /// is already a quiet hold. The headline symptom the slice removes: zero
+    /// `AgentCrashed` pages, zero `SpawnFailed` outcomes, zero spawns.
+    #[test]
+    fn seed_from_disk_quiets_the_first_tick_after_a_restart() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: Some(2_000),
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("pa", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[("a1", &["slot1"])])))
+            .with_usage_by_profile_dir(Some(tmp.path().to_path_buf()));
+
+        let r = loop_.tick(0);
+        // Admission's hold-sum surface shows slot1's `resets_at`, so the
+        // seed landed before step 3 ran.
+        assert_eq!(
+            r.waiting_for_rate_limit_reset,
+            Some(2_000),
+            "first-tick seed from disk extends the hold BEFORE admission",
+        );
+        // No spawn ever started on the exhausted slot — admission's
+        // `member_fully_held` short-circuit held a1 without reaching the
+        // picker. No `held_starts` from the picker's quiet-stall path either:
+        // the hold check lands first.
+        assert!(backend.spawns().is_empty(), "no spawn on a held slot");
+        assert!(
+            !r.held_starts.iter().any(|h| matches!(h.outcome, StartOutcome::Hold { .. })
+                || matches!(h.outcome, StartOutcome::SpawnFailed { .. })),
+            "no Hold/SpawnFailed in held_starts — the hold short-circuit ran first: {:?}",
+            r.held_starts,
+        );
+        // No alerts page.
+        let mut alerts = Vec::new();
+        while let Ok(ev) = probe.alerts.try_recv() {
+            alerts.push(ev);
+        }
+        assert!(alerts.is_empty(), "quiet seeded hold emits no alerts: {alerts:?}");
+    }
+
+    /// Slice 002 M-B part 1 — a live-updated per-slot file reaches admission
+    /// within one re-scan window. Start with an empty dir, write
+    /// `slot1.json` with `rejected`, drive
+    /// [`RESCAN_USAGE_BY_PROFILE_EVERY_TICKS`] ticks, and verify the hold
+    /// landed quietly before admission tried to spawn on slot1.
+    #[test]
+    fn live_write_reaches_the_hold_within_a_rescan_window() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (mut loop_, _d, backend, probe) = make(
+            vec![member("a1", "qa")],
+            vec![q("qa", &[("pa", "queued")])],
+            Policy::default(),
+        );
+        loop_ = loop_
+            .with_profile_resolver(Box::new(ScriptedResolver::new(&[("a1", &["slot1"])])))
+            .with_usage_by_profile_dir(Some(tmp.path().to_path_buf()));
+
+        // Tick 0 — the dir is empty: no hold, a1 is admitted and spawns.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1"]);
+
+        // Mid-run: an external writer (slice 009's per-slot capture, or the
+        // interactive statusline) lands a `rejected` reading on slot1 with
+        // `resets_at` way out ahead of the test's horizon.
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: Some(1_000_000),
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
+        // Mark a1 Down so step 3 would try to re-roll it (the fresh-start
+        // path, where admission would hit the picker). We've already ticked
+        // once (counter is 1), so to land on the next multiple of N (10) we
+        // tick through to `rescan_tick_count % N == 0` again — i.e. up to
+        // tick 10.
+        backend.set_health("a1", AgentHealth::Exited { code: 0 });
+        backend.set_baton("a1", "ITEM_COMPLETE");
+        let mut saw_rescan = false;
+        for t in 1..=RESCAN_USAGE_BY_PROFILE_EVERY_TICKS as i64 {
+            let r = loop_.tick(t);
+            if r.waiting_for_rate_limit_reset == Some(1_000_000) {
+                saw_rescan = true;
+                break;
+            }
+        }
+        assert!(
+            saw_rescan,
+            "the periodic re-scan picked up the live-written slot1.json \
+             within one N-tick window",
+        );
+        // No `AgentCrashed` alerts fired through the whole run.
+        let mut alerts = Vec::new();
+        while let Ok(ev) = probe.alerts.try_recv() {
+            alerts.push(ev);
+        }
+        assert!(
+            alerts.iter().all(|a| !format!("{a:?}").contains("AgentCrashed")),
+            "live-write hold is quiet, no AgentCrashed: {alerts:?}",
+        );
+    }
+
+    /// Slice 002 M-B part 1 — a `rejected` on disk with `resets_at = null`
+    /// is NOT seeded as a time-pinned hold (there is no concrete instant to
+    /// pin against). The admission picker still sees the same stale file via
+    /// `pool_headroom` → `headroom_from`, where the §9 staleness bound
+    /// ([`STALE_FLOOR_SECS`]) folds the fossil to full after six hours. This
+    /// test exercises the pure headroom contract — the hold map stays empty.
+    #[test]
+    fn seed_from_disk_leaves_null_resets_at_to_the_staleness_bound() {
+        use softfig_ipc::usage::{RateLimits, RateWindow, UsageSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        UsageSnapshot {
+            context_window: None,
+            rate_limits: RateLimits {
+                five_hour: RateWindow {
+                    used_percentage: None,
+                    resets_at: None,
+                    status: Some("rejected".into()),
+                },
+                seven_day: RateWindow::default(),
+            },
+            ts: 0.0,
+            profile: None,
+        }
+        .write_atomic(&crate::profile_budget::profile_budget_path(tmp.path(), "slot1"))
+        .unwrap();
+
+        // Seed the hold map directly through the public verb (also exercised
+        // by the drive loop's first tick). A null `resets_at` MUST NOT
+        // populate a hold entry: the drive-loop Hold path owns the staleness
+        // bound (part 2), not the seed.
+        let holds = crate::rate_limit_holds::RateLimitHolds::seed_from_disk(tmp.path(), 0);
+        assert!(
+            !holds.any_held(),
+            "null resets_at leaves the seed empty — the staleness bound is \
+             the picker's job via §9's `STALE_FLOOR_SECS`",
+        );
+        // And the §9 staleness bound still folds the fossil to full once the
+        // sample's own age crosses it: `headroom_from` on the saved sample at
+        // `now = STALE_FLOOR_SECS + 1` reads as full (unused), not as 0.
+        let snap = softfig_ipc::usage::UsageSnapshot::load(
+            &crate::profile_budget::profile_budget_path(tmp.path(), "slot1"),
+        )
+        .unwrap()
+        .unwrap();
+        let hr = crate::profile_budget::headroom_from(
+            Some(&snap),
+            crate::profile_budget::STALE_FLOOR_SECS + 1,
+        );
+        assert_eq!(
+            hr,
+            crate::profile_budget::Headroom::full(),
+            "post-6h fossil folds to full — the admission picker reopens on its own",
+        );
     }
 
     /// Finish-check 4 — no pools anywhere ≡ the pre-slice-008 fleet-wide

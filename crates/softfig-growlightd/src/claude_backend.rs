@@ -62,7 +62,7 @@ use crate::config::BuildCaps;
 use crate::control::{AgentChild, LiveKill};
 use crate::hub::EventHub;
 use crate::preapproval::{AgentPaths, PreApproval};
-use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
+use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
 use crate::usage::WindowResets;
 use crate::usage_file::UsageCapture;
 
@@ -1128,13 +1128,16 @@ impl ClaudeFlavor {
     /// is used only when every other slot is exhausted; LRU over every pooled
     /// member's pin history breaks a tie, so the fleet rotates as one rather
     /// than each member in lockstep. A `< 10%` winner proceeds with a journal
-    /// warning, and an all-exhausted pool refuses the spawn.
+    /// warning, and an all-exhausted pool returns [`SpawnKind::Hold`] with the
+    /// pool slots and earliest `resets_at` so the drive loop extends per-slot
+    /// holds without paging a crash (claude-login-pool-wiring slice 002 M-B
+    /// part 2).
     fn pick_pool_slot(
         &self,
         profiles: &ProfileContext,
         agent: &str,
         pool: &[String],
-    ) -> Result<String, SpawnError> {
+    ) -> Result<String, SpawnKind> {
         use crate::profile_pin::{self as pin, PickResult};
         let histories: Vec<Vec<pin::ProfilePin>> = profiles
             .pools
@@ -1176,24 +1179,61 @@ impl ClaudeFlavor {
                 );
                 Ok(slot)
             }
-            Some(PickResult::Stall { until_at }) => Err(SpawnError(format!(
-                "agent {agent:?}: all claude-login pool profiles are exhausted \
-                 (< {stall}% 5h headroom across the pool); the drive loop should \
-                 retry at {until}",
-                stall = pin::HEADROOM_STALL_PCT,
-                until = until_at
-                    .map(|at| format!("unix seconds {at}"))
-                    .unwrap_or_else(|| "the next tick (no reset known)".into()),
-            ))),
+            Some(PickResult::Stall { until_at }) => {
+                // Quiet stall (slice 002 M-B part 2): surface as `Hold` carrying
+                // the pool slots + earliest reset so the drive loop extends a
+                // `rate_limit_holds` entry for each slot and NEVER pages
+                // `AgentCrashed` on a known-exhausted pool. No preapproval
+                // files are rewritten this tick either — the harness preflight
+                // runs this picker BEFORE `generate_preapproval`.
+                Err(SpawnKind::Hold {
+                    slots: pool.to_vec(),
+                    until: until_at,
+                })
+            }
             None => Err(SpawnError(format!(
                 "agent {agent:?} declares profile_pool but the pool resolved to \
                  no pickable slot — refuse rather than fall back to another account"
-            ))),
+            ))
+            .into()),
         }
     }
 }
 
 impl BackendFlavor for ClaudeFlavor {
+    /// Preflight the pool-slot pick BEFORE pre-approval generation
+    /// (claude-login-pool-wiring slice 002 M-B part 2). An exhausted pool
+    /// short-circuits here as [`SpawnKind::Hold`] so `inject.sh`/`loop.json`/
+    /// `mcp.json` are NOT rewritten this tick, and the drive loop extends
+    /// `rate_limit_holds` so future ticks skip the picker entirely via
+    /// `member_fully_held`. The pick is cached on `self.chosen` so
+    /// `child_env` reuses it without a second disk read; an unpooled member
+    /// (no `profile_pool`) is a no-op here.
+    fn preflight(&self, agent: &str) -> Result<(), SpawnKind> {
+        let Some(profiles) = self.profiles.get() else {
+            return Ok(());
+        };
+        let Some(pool) = profiles.pools.get(agent) else {
+            return Ok(());
+        };
+        let slot = self.pick_pool_slot(profiles, agent, pool)?;
+        // Cache the picked slot so `child_env` consumes it without re-running
+        // the picker (the picker is pure; the cache saves one disk read AND
+        // guarantees preflight + child_env agree on the same slot even if an
+        // interleaving writer flipped the on-disk headroom between calls). An
+        // unpooled or no-store spawn never populates this cell, and
+        // `child_env`'s fallback inline pick keeps the pre-slice-002 shape for
+        // backends constructed outside the harness (bare tests).
+        self.chosen.lock().unwrap().insert(
+            agent.to_string(),
+            ChosenSlot {
+                slot,
+                pooled: true,
+            },
+        );
+        Ok(())
+    }
+
     fn generate_preapproval(&self, agent: &str) -> Result<AgentPaths, SpawnError> {
         self.preapproval.generate(agent).map_err(|e| {
             SpawnError(format!(
@@ -1230,7 +1270,7 @@ impl BackendFlavor for ClaudeFlavor {
         )
     }
 
-    fn child_env(&self, agent: &str, _paths: &AgentPaths) -> Result<Vec<EnvChange>, SpawnError> {
+    fn child_env(&self, agent: &str, _paths: &AgentPaths) -> Result<Vec<EnvChange>, SpawnKind> {
         // No slot machinery installed (a backend built outside a growlight
         // runtime) ⇒ byte-identical to the pre-switcher spawn.
         let Some(profiles) = self.profiles.get() else {
@@ -1244,7 +1284,8 @@ impl BackendFlavor for ClaudeFlavor {
                     "agent {agent:?} declares profile_pool but no claude-login store \
                      could be named (is $HOME set?) — refusing rather than run on \
                      another account"
-                ))),
+                ))
+                .into()),
             };
         };
         // A pooled member picks; an unpooled one follows the human's `active`
@@ -1254,7 +1295,23 @@ impl BackendFlavor for ClaudeFlavor {
         // another slot.
         let (slot, dir) = match pool {
             Some(pool) => {
-                let slot = self.pick_pool_slot(profiles, agent, pool)?;
+                // Slice 002 M-B part 2: the harness `preflight` populated
+                // `chosen` with THIS spawn's slot before pre-approval ran, so
+                // reuse it here instead of re-running the picker. A bare test
+                // backend that bypasses the harness has no cached entry; fall
+                // back to the inline pick so the pre-slice-002 shape is kept
+                // for those callers.
+                let cached = self
+                    .chosen
+                    .lock()
+                    .unwrap()
+                    .get(agent)
+                    .filter(|c| c.pooled)
+                    .map(|c| c.slot.clone());
+                let slot = match cached {
+                    Some(slot) => slot,
+                    None => self.pick_pool_slot(profiles, agent, pool)?,
+                };
                 let dir = claude_profiles::launch_slot(store, &slot)
                     .map_err(|e| SpawnError(format!("agent {agent:?}: {e}")))?;
                 (slot, dir)
@@ -1552,7 +1609,7 @@ impl ClaudeBackend {
 }
 
 impl AgentBackend for Arc<ClaudeBackend> {
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
         self.harness.spawn(spec)
     }
 }
@@ -2280,6 +2337,9 @@ mod tests {
         let spec = AgentSpec::new("a1", blocker.join("a1/loop.json"), blocker.join("a1/mcp.json"));
 
         let err = backend.spawn(&spec).expect_err("generation failure ⇒ no spawn");
+        let SpawnKind::Failed(err) = err else {
+            panic!("preapproval generation failure must fail hard, never Hold: {err:?}");
+        };
         assert!(
             err.0.contains("pre-approval generation failed"),
             "fail-closed spawn error: {err}",
@@ -2660,7 +2720,15 @@ mod tests {
 
         fn env(&self, agent: &str) -> Result<Vec<EnvChange>, SpawnError> {
             let paths = crate::preapproval::agent_paths(&self.agents, agent);
-            self.backend.flavor.child_env(agent, &paths)
+            // The fixture's env assertion suite predates slice 002's Hold
+            // variant: these tests exercise fail-closed shapes (missing dir,
+            // unusable credential, pool without store) that must all surface
+            // as `Failed`, never `Hold`. Unwrap the kind here so each call
+            // site stays `err.0`-shaped.
+            self.backend
+                .flavor
+                .child_env(agent, &paths)
+                .map_err(SpawnKind::into_failed)
         }
 
         /// One full spawn as the harness drives it: env, then the child starts,

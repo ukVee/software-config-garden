@@ -880,7 +880,13 @@ pub fn assemble_fleet(
     // same keeperd docs the queue source pulls.
     .with_repo_probe(Box::new(KeeperdRepoProbe::new(keeperd_socket.to_path_buf())))
     // Per-member admission profiles (slice 009): see the construction above.
-    .with_profile_resolver(Box::new(profile_resolver)))
+    .with_profile_resolver(Box::new(profile_resolver))
+    // On-disk per-slot rate-limit holds (claude-login-pool-wiring slice 002
+    // M-B part 1): the drive loop seeds the hold map from
+    // `usage.by-profile/<slot>.json` on its first tick and re-scans every N
+    // ticks, so a daemon restart with an exhausted account picks the hold up
+    // instead of spinning the picker's `PickResult::Stall` on every tick.
+    .with_usage_by_profile_dir(Some(runtime_growlight_dir().join(BY_PROFILE_SUBDIR))))
     .map(|drive| {
         // The queue-v2 scheduling seams (queue-v2-scheduling slice 006): installed
         // whatever the mode — the tick consults them ONLY when `queue = "v2"`, so a

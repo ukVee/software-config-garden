@@ -194,6 +194,82 @@ impl fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
+/// How a spawn attempt resolved for admission (claude-login-pool-wiring slice
+/// 002 M-B part 2). Returned from [`AgentBackend::spawn`] and from the backend
+/// flavor seams so the drive loop can distinguish a hard launch failure
+/// ([`Self::Failed`] — operator alert, pages `AgentCrashed`) from a picker
+/// stall ([`Self::Hold`] — admission re-opens by itself at a window `resets_at`,
+/// no page, no backoff, no per-tick preapproval rewrite).
+///
+/// Hold is **not an error** semantically — it is the backend saying "no slot
+/// in this member's pool is pickable right now, come back after `until`". Named
+/// `SpawnKind` rather than `SpawnErrorKind` so the Hold variant does not read
+/// as a failure in the call sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnKind {
+    /// Backend launch failed hard — missing binary, unreadable spec paths,
+    /// unusable credential dir. Mapped to
+    /// [`StartOutcome::SpawnFailed`] and surfaced as an `AgentCrashed` alert.
+    Failed(SpawnError),
+    /// The picker found every pool slot admissibly exhausted
+    /// ([`crate::profile_pin::PickResult::Stall`]). Carries the pool slots the
+    /// stall applied to and the earliest known `resets_at` across them (`None`
+    /// when no slot carried one — the drive-loop Hold path extends with a
+    /// staleness bound in that case). Mapped to [`StartOutcome::Hold`]:
+    /// admission reopens on its own at the window's `resets_at`, with NO alert,
+    /// NO failure-streak bump, and NO preapproval file rewrites this tick.
+    Hold {
+        /// The pool slots the picker found exhausted. The drive loop extends a
+        /// per-slot [`crate::rate_limit_holds::RateLimitHolds`] entry for each
+        /// so the next tick's admission check short-circuits via
+        /// [`crate::rate_limit_holds::RateLimitHolds::member_fully_held`]
+        /// instead of re-running the picker (the per-tick spin fix).
+        slots: Vec<String>,
+        /// Earliest 5h/7d window reset instant the picker saw across the
+        /// stalled pool, or `None` when no slot carried a boundary.
+        until: Option<i64>,
+    },
+}
+
+impl From<SpawnError> for SpawnKind {
+    fn from(e: SpawnError) -> Self {
+        SpawnKind::Failed(e)
+    }
+}
+
+impl fmt::Display for SpawnKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(e) => e.fmt(f),
+            Self::Hold { slots, until } => write!(
+                f,
+                "spawn held: pool {slots:?} is exhausted until {}",
+                match until {
+                    Some(at) => format!("unix seconds {at}"),
+                    None => "the next tick (no reset known)".into(),
+                }
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SpawnKind {}
+
+#[cfg(test)]
+impl SpawnKind {
+    /// Test-only: assert this is [`SpawnKind::Failed`] and return the inner
+    /// [`SpawnError`]. Panics on [`SpawnKind::Hold`] — the shape most
+    /// pre-slice-002 spawn-failure tests already assumed.
+    pub(crate) fn into_failed(self) -> SpawnError {
+        match self {
+            Self::Failed(e) => e,
+            Self::Hold { slots, until } => panic!(
+                "expected SpawnKind::Failed, got Hold {{ slots: {slots:?}, until: {until:?} }}",
+            ),
+        }
+    }
+}
+
 /// The spawn seam: produce a live [`AgentChild`] from a per-agent [`AgentSpec`].
 ///
 /// **Default-absent live binding** (like [`crate::leases::ThrashClear`] /
@@ -203,8 +279,11 @@ impl std::error::Error for SpawnError {}
 /// drive-loop task (the [`crate::notify_dispatch::Notifier`] seam shape).
 pub trait AgentBackend: Send + Sync + fmt::Debug {
     /// Spawn a fresh agent process from `spec`, returning its killable handle.
-    /// `Err` means the launch itself failed (not a later crash).
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError>;
+    /// `Err([`SpawnKind::Failed`])` means the launch itself failed (not a later
+    /// crash); `Err([`SpawnKind::Hold`])` means the backend's admission picker
+    /// found no admissible slot in the member's pool right now and the drive
+    /// loop MUST NOT page or trigger backoff — slice 002 M-B part 2.
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind>;
 }
 
 /// One agent's health as the drive loop observed it. The drive loop derives this
@@ -328,6 +407,25 @@ pub enum StartOutcome {
     SpawnFailed {
         /// The backend's error text.
         error: String,
+    },
+    /// Admission cleared, the claim landed, but the backend's own picker found
+    /// no admissible slot in the member's pool right now
+    /// ([`SpawnKind::Hold`] — claude-login-pool-wiring slice 002 M-B part 2).
+    /// Nothing registered, no preapproval files written, no `AgentCrashed`
+    /// alert fires; the drive loop extends the per-slot
+    /// [`crate::rate_limit_holds::RateLimitHolds`] so next tick's admission
+    /// check skips the member via [`member_fully_held`] instead of re-running
+    /// the picker (the per-tick spin fix). A rate-limit `Hold` is **not** a
+    /// crash — the window reopens on its own.
+    ///
+    /// [`member_fully_held`]: crate::rate_limit_holds::RateLimitHolds::member_fully_held
+    Hold {
+        /// Pool slots the picker found exhausted — the drive loop extends a
+        /// hold for each.
+        slots: Vec<String>,
+        /// Earliest `resets_at` across those slots, or `None` when no slot
+        /// carried one (the drive loop then uses its own staleness bound).
+        until: Option<i64>,
     },
 }
 
@@ -773,7 +871,11 @@ impl Supervisor {
                         );
                         StartOutcome::Started
                     }
-                    Err(e) => StartOutcome::SpawnFailed {
+                    // Backend's picker refused a slot (slice 002 M-B part 2):
+                    // surface as `Hold`, NOT `SpawnFailed`, so the drive loop
+                    // extends `rate_limit_holds` + skips the alert path.
+                    Err(SpawnKind::Hold { slots, until }) => StartOutcome::Hold { slots, until },
+                    Err(SpawnKind::Failed(e)) => StartOutcome::SpawnFailed {
                         error: e.to_string(),
                     },
                 },
@@ -1440,10 +1542,10 @@ mod tests {
     }
 
     impl AgentBackend for Arc<FakeBackend> {
-        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+        fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
             self.spawns.lock().unwrap().push(spec.agent.clone());
             if self.fail.load(Ordering::SeqCst) {
-                return Err(SpawnError("backend down".into()));
+                return Err(SpawnError("backend down".into()).into());
             }
             Ok(Box::new(FakeChild {
                 kills: Arc::clone(&self.kills),

@@ -41,7 +41,7 @@ use crate::drive_loop::{AgentHealthSource, AgentStderrSource, AgentStreamErrSour
 use crate::usage::WindowResets;
 use crate::opencode_backend::{AgentSpend, OpencodeBackend};
 use crate::preapproval::AgentPaths;
-use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError};
+use crate::supervisor::{AgentBackend, AgentHealth, AgentSpec, SpawnError, SpawnKind};
 
 /// One member's live backend. The runtime counterpart of the configured
 /// [`MemberBackend`](crate::fleet::MemberBackend): that one says what the operator
@@ -77,7 +77,7 @@ impl BackendHandle {
     }
 
     /// Spawn `spec`'s agent on this backend.
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
         match self {
             Self::Claude(b) => b.spawn(spec),
             Self::Opencode(b) => b.spawn(spec),
@@ -290,7 +290,7 @@ impl RateMeter for BackendRouter {
 }
 
 impl AgentBackend for Arc<BackendRouter> {
-    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnError> {
+    fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentChild>, SpawnKind> {
         match self.backend_for(&spec.agent) {
             Some(backend) => backend.spawn(spec),
             // Fail-closed: never fall back to "some" backend — the wrong one would
@@ -300,7 +300,8 @@ impl AgentBackend for Arc<BackendRouter> {
                 "no backend is configured for agent {} — the fleet roster and the \
                  backend router disagree",
                 spec.agent
-            ))),
+            ))
+            .into()),
         }
     }
 }
@@ -379,6 +380,9 @@ mod tests {
         // refusal exists to prevent. The message names the agent so the operator can
         // find it.
         let err = router.spawn(&spec).expect_err("an unrouted agent must not spawn");
+        let SpawnKind::Failed(err) = err else {
+            panic!("an unrouted agent must fail (not hold): {err:?}");
+        };
         assert!(err.0.contains("ghost"), "the error names the agent: {}", err.0);
 
         // And every read seam answers "nothing observed" — never another member's
