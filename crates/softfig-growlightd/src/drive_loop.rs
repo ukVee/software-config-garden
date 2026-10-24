@@ -1797,7 +1797,40 @@ impl DriveLoop {
         // the elapsed-clear must run against the extended value or a freshly-pinned
         // hold would be wiped the same tick it was set.)
         self.rate_limit_holds.clear_elapsed(now);
-        let budget = self.aggregator.aggregate_or_fresh_at(now);
+        // Admission's budget fold is PER-MEMBER (slice 001 M-A, review 048):
+        // key the 5h/7d max on the admitting member's claude-login profile
+        // (`samples.profile_for(agent).unwrap_or("home")`, the same resolution
+        // the step-0 + health-pass hold-set sites use) so one slot's
+        // `allowed_warning` cannot halt a sibling pooled on a different slot.
+        // Unpooled / untagged fleets collapse to the pre-switcher fleet-wide
+        // fold through the `"home"` back-compat key. The §9 near-exhaustion
+        // alert below stays fleet-wide — it is a shared-pool fact.
+        //
+        // Pre-compute into an owned map now (while nothing else is borrowing
+        // `self.aggregator` / `self.samples`) so the admission call sites —
+        // which take `&mut self.supervisor` and sibling `&mut self.*` paths —
+        // can look up per-agent budgets without holding a live borrow across
+        // the whole tick body. An agent outside `fleet` falls back to the
+        // fleet-wide fold (symmetric with the pre-switcher behaviour).
+        let per_member_budget: std::collections::HashMap<String, BudgetUsage> = fleet
+            .iter()
+            .map(|m| {
+                let agent = m.spec.agent.clone();
+                let profile = self
+                    .samples
+                    .profile_for(&agent)
+                    .unwrap_or_else(|| "home".into());
+                let b = self.aggregator.aggregate_or_fresh_for_profile_at(&profile, now);
+                (agent, b)
+            })
+            .collect();
+        let budget_fleetwide = self.aggregator.aggregate_or_fresh_at(now);
+        let budget_for = |agent: &str| -> BudgetUsage {
+            per_member_budget
+                .get(agent)
+                .copied()
+                .unwrap_or(budget_fleetwide)
+        };
         let rate = self.rate.rate(now);
 
         // Parts item-parked this tick (a member exited on a human-block): collected
@@ -2349,7 +2382,7 @@ impl DriveLoop {
                                 .get(agent)
                                 .is_some_and(|m| pick_v2(snapshot, m).picked.is_some())
                     };
-                    report.rerolls = self.supervisor.tick(budget, rate, now, &workable);
+                    report.rerolls = self.supervisor.tick(&budget_for, rate, now, &workable);
                     for outcome in &report.rerolls {
                         if let RerollOutcome::Rerolled { agent } = outcome {
                             self.reconnecting.remove(agent);
@@ -2477,9 +2510,12 @@ impl DriveLoop {
                         let entries = &v2_seams.entries;
                         let member_writer = &v2_seams.member_writer;
                         let v2_claimer = &v2_seams.claimer;
+                        // Per-member admission budget (slice 001 M-A): fold on
+                        // this member's claude-login profile only.
+                        let member_budget = budget_for(agent);
                         let outcome = self.supervisor.start_claiming(
                             spec,
-                            budget,
+                            member_budget,
                             rate,
                             now,
                             || {
@@ -2636,7 +2672,9 @@ impl DriveLoop {
                     boot_guard(repo_probe, seeder, agent, queue, part, Handoff::At(handoff));
                 }
             };
-            report.rerolls = self.supervisor.tick_with(budget, rate, now, &workable, &pre_spawn);
+            report.rerolls =
+                self.supervisor
+                    .tick_with(&budget_for, rate, now, &workable, &pre_spawn);
             // A member that re-rolled has consumed its pending-reconnect latch (slice
             // 002): the fresh session's next exit is a NEW event to classify anew, so a
             // genuine re-crash after a reconnect is never masked by a stale latch.
@@ -2779,9 +2817,12 @@ impl DriveLoop {
                 let claimer = &self.claimer;
                 let seeder = self.seeder.as_ref();
                 let repo_probe = self.repo_probe.as_ref();
+                // Per-member admission budget (slice 001 M-A): fold on this
+                // member's claude-login profile only.
+                let member_budget = budget_for(agent);
                 let outcome = self.supervisor.start_claiming(
                     member.spec.clone(),
-                    budget,
+                    member_budget,
                     rate,
                     now,
                     || {
@@ -9631,6 +9672,126 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             backend.spawns(),
             vec!["a1", "b1"],
             "no re-spawn into the exhausted window",
+        );
+    }
+
+    /// Slice 001 M-A finish-check 1 (review 048) — an `allowed_warning` on
+    /// slot1 must NOT halt a sibling pooled on slot2. a1 is unpooled on
+    /// slot1 and reports a 90% 5h reading WITHOUT `rejected` (so the
+    /// per-slot HOLD layer plays no part — only the budget fold does); d1
+    /// is pooled on [slot1, slot2] with its session reading from slot2.
+    /// On tick 1 d1 exits clean on `IN_PROGRESS` → re-roll candidate; the
+    /// per-profile fold at the admission call keys on d1's slot2 profile
+    /// (fresh) and admits the roll. The pre-M-A fleet-wide fold would see
+    /// slot1's 90% and refuse `Intent::Roll` with `Budget5h`.
+    #[test]
+    fn a_warning_on_slot1_admits_d_pool_rolling_on_slot2() {
+        let (mut loop_, _d, backend, _probe) = make(
+            vec![member("a1", "qa"), member("d1", "qd")],
+            vec![
+                q("qa", &[("pa", "queued")]),
+                q("qd", &[("pd", "queued")]),
+            ],
+            Policy::default(),
+        );
+        loop_ = loop_.with_profile_resolver(Box::new(ScriptedResolver::new(&[
+            ("a1", &["slot1"]),
+            ("d1", &["slot1", "slot2"]),
+        ])));
+        backend.set_profile_tag("a1", Some("slot1"));
+        backend.set_profile_tag("d1", Some("slot2"));
+
+        // Tick 0: both start — no readings yet, every profile folds fresh.
+        loop_.tick(0);
+        assert_eq!(backend.spawns(), vec!["a1", "d1"]);
+
+        // a1 reports a hot 5h reading (90%) tagged slot1 and keeps running.
+        // Deliberately NO `set_budget_reset`: a `allowed_warning` carries no
+        // `rejected` boundary, so step-0 extends no hold on slot1 — the
+        // budget fold is the only rail that could refuse d1 here.
+        backend.set_budget("a1", hot_budget());
+        backend.set_health("a1", AgentHealth::Alive { last_active: 1 });
+        // d1 clean-exits on a continue status → the supervisor queues a
+        // re-roll, which admission must gate per-profile for d1 (slot2 is
+        // fresh), not fleet-wide (slot1 is 90%).
+        backend.set_baton("d1", "IN_PROGRESS");
+        backend.set_health("d1", AgentHealth::Exited { code: 0 });
+
+        let r = loop_.tick(1);
+
+        let rerolled: Vec<&str> = r
+            .rerolls
+            .iter()
+            .filter_map(|o| match o {
+                RerollOutcome::Rerolled { agent } => Some(agent.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rerolled,
+            vec!["d1"],
+            "d1 (slot2) is admitted — a1's slot1 90% must not fold into slot2's view",
+        );
+        // No `HeldForAdmission { Budget5h }` on this tick — that is the
+        // fleet-wide-fold symptom the slice retires.
+        for o in &r.rerolls {
+            if let RerollOutcome::HeldForAdmission { agent, decision } = o {
+                let d = format!("{decision:?}");
+                assert!(
+                    !d.contains("Budget5h"),
+                    "{agent}: unexpected Budget5h refuse — fleet-wide fold leaked ({d})",
+                );
+            }
+        }
+        let spawns = backend.spawns();
+        assert_eq!(
+            spawns.iter().filter(|s| **s == *"d1").count(),
+            2,
+            "d1 spawned at tick 0 (fresh) and again at tick 1 (re-roll): {spawns:?}",
+        );
+    }
+
+    /// Slice 001 M-A finish-check 2 — regression. With no `profile_pool`
+    /// anywhere, every reading is untagged and every member resolves to
+    /// `"home"`, so the per-profile fold is byte-identical to the
+    /// fleet-wide fold for the same sample set. The back-compat key is
+    /// what lets admission read exactly as it did pre-switcher when no
+    /// slot is configured. Pure unit shape over `UsageAggregator`.
+    #[test]
+    fn no_pools_per_profile_fold_equals_fleet_wide() {
+        let mut agg = UsageAggregator::new();
+        // Two untagged readings (the pre-switcher sample shape — `profile`
+        // is `None`), with non-equal pcts so the per-field max is
+        // observable from either column.
+        agg.observe(UsageSample::new(
+            "a".to_string(),
+            BudgetUsage::new(40, 10),
+            0,
+        ));
+        agg.observe(UsageSample::new(
+            "b".to_string(),
+            BudgetUsage::new(20, 50),
+            0,
+        ));
+
+        assert_eq!(
+            agg.aggregate_or_fresh_for_profile_at("home", 0),
+            agg.aggregate_or_fresh_at(0),
+            "untagged readings fold identically on `home` and fleet-wide",
+        );
+        assert_eq!(
+            agg.aggregate_or_fresh_for_profile_at("home", 0),
+            BudgetUsage::new(40, 50),
+            "per-field max over the two readings — the admission governor's input",
+        );
+        // An unused profile key sees the SAME untagged readings (they fold
+        // into every profile's view by the `is_none_or` include rule), so
+        // a slot with no reading of its own still inherits the fleet-wide
+        // view — the `home` back-compat invariant generalises.
+        assert_eq!(
+            agg.aggregate_or_fresh_for_profile_at("unused-slot", 0),
+            agg.aggregate_or_fresh_at(0),
+            "an unseen profile inherits the untagged (pre-switcher) readings",
         );
     }
 }

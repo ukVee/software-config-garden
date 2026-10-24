@@ -1304,7 +1304,7 @@ impl Supervisor {
     /// fresh start re-picks the fleet's next workable work (pivot-on-block).
     pub fn tick(
         &mut self,
-        budget: BudgetUsage,
+        budget: &dyn Fn(&str) -> BudgetUsage,
         rate: RateState,
         now: i64,
         workable: &dyn Fn(&str) -> bool,
@@ -1319,9 +1319,15 @@ impl Supervisor {
     /// the boot dirty-tree guard here (task 064 review G64-1), so its warning is
     /// in the member's baton before the member boots; on the old post-spawn call
     /// a claude member's SessionStart hook raced the git probe.
+    ///
+    /// `budget` is a per-agent resolver (slice 001 M-A): the governor keys the
+    /// 5h/7d fold on the admitting member's claude-login profile so one slot's
+    /// `allowed_warning` can't halt a sibling pooled on a different slot. An
+    /// unpooled fleet collapses to the pre-switcher fleet-wide fold through the
+    /// `"home"` back-compat key; test fakes pass `&|_| fresh_budget()`.
     pub fn tick_with(
         &mut self,
-        budget: BudgetUsage,
+        budget: &dyn Fn(&str) -> BudgetUsage,
         rate: RateState,
         now: i64,
         workable: &dyn Fn(&str) -> bool,
@@ -1355,9 +1361,11 @@ impl Supervisor {
             }
             // A roll keeps the agent's slot — the cap never gates it — but the
             // shared budget/rate rails still do (and hold a rate-limited member here
-            // until its window recovers).
+            // until its window recovers). Budget is resolved per-agent (slice 001
+            // M-A) so a sibling pooled on a different claude-login slot is not
+            // refused on another slot's `allowed_warning`.
             let fleet = self.live_count();
-            let decision = self.governor.decide(Intent::Roll, fleet, budget, rate);
+            let decision = self.governor.decide(Intent::Roll, fleet, budget(&agent), rate);
             if !decision.is_admit() {
                 out.push(RerollOutcome::HeldForAdmission { agent, decision });
                 continue;
@@ -1617,7 +1625,7 @@ mod tests {
         assert_eq!(backend.spawn_count(), 1, "no re-spawn for a healthy agent");
         assert_eq!(backend.kill_count(), 0, "no kill for a healthy agent");
         // tick has no candidate (the child is live).
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1000, &any_work).is_empty());
     }
 
     /// An errored exit is detected as a crash, alerts, and re-rolls only after the
@@ -1643,7 +1651,7 @@ mod tests {
 
         // Inside the backoff window → held, no re-spawn.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 1, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1, &any_work),
             vec![RerollOutcome::HeldForBackoff {
                 agent: "a1".into(),
                 not_before: 2
@@ -1653,7 +1661,7 @@ mod tests {
 
         // At the backoff boundary → admission admits the roll → re-spawn.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 2, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
@@ -1711,7 +1719,7 @@ mod tests {
             // Advance to the boundary and let it re-roll for the next crash.
             now = not_before;
             assert_eq!(
-                s.tick(fresh_budget(), fresh_rate(), now, &any_work),
+                s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work),
                 vec![RerollOutcome::Rerolled { agent: "a1".into() }]
             );
         }
@@ -1750,7 +1758,7 @@ mod tests {
         // The drive loop's timed rate-limit hold — not the supervisor — paces the
         // actual re-roll until `resets_at`.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 1, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
 
@@ -1810,7 +1818,7 @@ mod tests {
         // i64::MAX` pins its re-roll past every reasonable now. `tick`
         // records a HeldForBackoff — the member is still registered — but
         // never a Rerolled; only a daemon reconcile re-admits it.
-        let out = s.tick(fresh_budget(), fresh_rate(), 10, &any_work);
+        let out = s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work);
         assert!(
             out.iter().all(|o| !matches!(o, RerollOutcome::Rerolled { .. })),
             "a parked model-refused member is NEVER re-rolled: {out:?}",
@@ -1920,7 +1928,7 @@ mod tests {
         // Build up a failure streak first.
         s.poll("a1", AgentHealth::Exited { code: 1 }, None, 0);
         assert_eq!(s.failures("a1"), 1);
-        s.tick(fresh_budget(), fresh_rate(), 2, &any_work); // re-roll
+        s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work); // re-roll
 
         // Now a clean exit at t=10 with no baton signal (the slice-002 precondition):
         // immediate re-roll, streak cleared, no alert.
@@ -1930,7 +1938,7 @@ mod tests {
         );
         assert_eq!(s.failures("a1"), 0, "a clean run clears the streak");
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
             "no backoff wait after a clean exit"
         );
@@ -1947,7 +1955,7 @@ mod tests {
 
         // Past the backoff window but the budget is hot → held on admission.
         assert_eq!(
-            s.tick(hot_budget(), fresh_rate(), 5, &any_work),
+            s.tick(&|_| hot_budget(), fresh_rate(), 5, &any_work),
             vec![RerollOutcome::HeldForAdmission {
                 agent: "a1".into(),
                 decision: AdmissionDecision::Refuse {
@@ -1959,7 +1967,7 @@ mod tests {
 
         // Budget recovers → the roll is admitted (the cap is irrelevant to a roll).
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 6, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 6, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert!(s.is_running("a1"));
@@ -1975,7 +1983,7 @@ mod tests {
 
         // Backend now refuses to launch.
         backend.set_fail(true);
-        let out = s.tick(fresh_budget(), fresh_rate(), 2, &any_work);
+        let out = s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work);
         assert_eq!(
             out,
             vec![RerollOutcome::SpawnFailed {
@@ -1988,7 +1996,7 @@ mod tests {
 
         // Still held inside the grown backoff (delay(2) == 4 → not_before 6).
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 5, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 5, &any_work),
             vec![RerollOutcome::HeldForBackoff {
                 agent: "a1".into(),
                 not_before: 6
@@ -1998,7 +2006,7 @@ mod tests {
         // Backend recovers → the retry re-rolls.
         backend.set_fail(false);
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 6, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 6, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
     }
@@ -2034,7 +2042,7 @@ mod tests {
         // consumed-exit guard (task 044) makes a DOWN member's re-observation
         // inert, so the genuine-crash half below needs a live child to crash.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 0, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 0, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
 
@@ -2078,7 +2086,7 @@ mod tests {
         // The armed backoff elapses → the re-roll fires. Before the guard this was
         // `HeldForBackoff` on every tick forever — the incident's silent stall.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 2, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 2, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawns(), vec!["a1", "a1"]);
@@ -2217,7 +2225,7 @@ mod tests {
 
         // The whole point: no re-roll. A tick well past any backoff spawns nothing.
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a retired member is never a re-roll candidate"
         );
         assert_eq!(backend.spawn_count(), 1, "NO fresh claude -p on a drained queue");
@@ -2245,7 +2253,7 @@ mod tests {
         assert!(!s.is_registered("a1"), "a blocked member releases its slot");
         assert_eq!(s.committed_count(), 0, "the slot is freed for a pivot");
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a released member has nothing to re-roll"
         );
         assert_eq!(backend.spawn_count(), 1, "no re-roll of a released member");
@@ -2268,7 +2276,7 @@ mod tests {
             }
         );
         assert!(!s.is_registered("a1"), "a blocked member releases its slot");
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
     }
 
     /// An unrecognized terminal status is a `Stuck(_)` disposition — it releases the
@@ -2311,7 +2319,7 @@ mod tests {
 
         // While the window is still hot, the re-arm is HELD by admission — no
         // respawn (it does not spin against the limit).
-        let held = s.tick(hot_budget(), hot_rate(), 1_000, &any_work);
+        let held = s.tick(&|_| hot_budget(), hot_rate(), 1_000, &any_work);
         assert!(
             matches!(held.as_slice(), [RerollOutcome::HeldForAdmission { agent, .. }] if agent == "a1"),
             "a rate-parked member is held, not re-rolled, while the window is hot: {held:?}",
@@ -2319,7 +2327,7 @@ mod tests {
         assert_eq!(backend.spawn_count(), 1, "no respawn while still throttled");
 
         // The window recovers → tick re-arms it (re-rolls) and clears the park.
-        let armed = s.tick(fresh_budget(), fresh_rate(), 2_000, &any_work);
+        let armed = s.tick(&|_| fresh_budget(), fresh_rate(), 2_000, &any_work);
         assert_eq!(
             armed,
             vec![RerollOutcome::Rerolled { agent: "a1".into() }],
@@ -2346,7 +2354,7 @@ mod tests {
 
         // Queue empty for this agent → held, not re-rolled.
         let no_work = |_: &str| false;
-        let held = s.tick(fresh_budget(), fresh_rate(), 20, &no_work);
+        let held = s.tick(&|_| fresh_budget(), fresh_rate(), 20, &no_work);
         assert_eq!(
             held,
             vec![RerollOutcome::HeldNoWork { agent: "a1".into() }],
@@ -2356,7 +2364,7 @@ mod tests {
         assert!(s.is_registered("a1"), "the member keeps its slot");
 
         // Work reappears → it re-rolls.
-        let armed = s.tick(fresh_budget(), fresh_rate(), 21, &any_work);
+        let armed = s.tick(&|_| fresh_budget(), fresh_rate(), 21, &any_work);
         assert_eq!(armed, vec![RerollOutcome::Rerolled { agent: "a1".into() }]);
         assert_eq!(backend.spawn_count(), 2);
     }
@@ -2412,7 +2420,7 @@ mod tests {
         assert!(s.is_registered("a1"));
         // No backoff after a clean exit → an immediate re-roll.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "a continue baton re-rolls");
@@ -2447,7 +2455,7 @@ mod tests {
         );
         assert!(s.is_registered("a1"), "still in the fleet after the first repeat");
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 10, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "the first re-roll fired");
@@ -2471,7 +2479,7 @@ mod tests {
         // Released like an agent-written STUCK — slot freed, never re-rolled, so no
         // further sessions (no shared-budget burn) are spent on the wedged member.
         assert!(!s.is_registered("a1"), "the spun-out member left the fleet");
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
         assert_eq!(backend.spawn_count(), 2, "no re-roll of the released member");
         assert_eq!(backend.kill_count(), 0, "the clean exit needs no kill");
     }
@@ -2507,7 +2515,7 @@ mod tests {
 
         // The re-roll is admission-held (hot budget) — the member stays down.
         assert_eq!(
-            s.tick(hot_budget(), fresh_rate(), 11, &any_work),
+            s.tick(&|_| hot_budget(), fresh_rate(), 11, &any_work),
             vec![RerollOutcome::HeldForAdmission {
                 agent: "a1".into(),
                 decision: AdmissionDecision::Refuse { reason: RefuseReason::Budget5h }
@@ -2534,7 +2542,7 @@ mod tests {
 
         // Admission recovers → the timed resume re-rolls the SAME member.
         assert_eq!(
-            s.tick(fresh_budget(), fresh_rate(), 20, &any_work),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 20, &any_work),
             vec![RerollOutcome::Rerolled { agent: "a1".into() }]
         );
         assert_eq!(backend.spawn_count(), 2, "resumed via the admission window");
@@ -2587,7 +2595,7 @@ mod tests {
             );
             assert!(s.is_registered("a1"));
             // Re-roll it live so the next iteration observes a fresh exit.
-            s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+            s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work);
         }
         assert!(s.is_registered("a1"), "progress never trips the guard");
         assert_eq!(backend.spawn_count(), 5, "start + one re-roll per progressing exit");
@@ -2614,7 +2622,7 @@ mod tests {
             ),
             PollOutcome::Rolling
         );
-        s.tick(fresh_budget(), fresh_rate(), 10, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 10, &any_work);
         // A rate-limit park before the next session clears the streak.
         assert_eq!(
             s.poll_with_network(
@@ -2627,7 +2635,7 @@ mod tests {
             ),
             PollOutcome::ParkedRateLimited
         );
-        s.tick(fresh_budget(), fresh_rate(), 20, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 20, &any_work);
         // Window reopened; the member exits on the SAME NEXT ACTION. With the streak
         // reset this is only the FIRST repeat again → re-roll, not a trip.
         assert_eq!(
@@ -2671,7 +2679,7 @@ mod tests {
                 PollOutcome::Rolling,
                 "no NEXT ACTION signal → historical re-roll (iteration {i})"
             );
-            s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+            s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work);
         }
         assert!(
             s.is_registered("a1"),
@@ -2708,7 +2716,7 @@ mod tests {
             || None,
             || state,
         );
-        s.tick(fresh_budget(), fresh_rate(), now, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), now, &any_work);
         out
     }
 
@@ -2849,7 +2857,7 @@ mod tests {
             ),
             PollOutcome::ParkedRateLimited
         );
-        s.tick(fresh_budget(), fresh_rate(), 100, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 100, &any_work);
         assert_eq!(continue_exit(&mut s, "build it", repo("h1", 0), 110), PollOutcome::Rolling);
         assert_eq!(
             continue_exit(&mut s, "build it", repo("h1", 1), 120),
@@ -2898,7 +2906,7 @@ mod tests {
             PollOutcome::Down,
             "a latched re-observation reads nothing"
         );
-        s.tick(fresh_budget(), fresh_rate(), 6, &any_work);
+        s.tick(&|_| fresh_budget(), fresh_rate(), 6, &any_work);
         assert_eq!(continue_exit(&mut s, "build it", None, 10), PollOutcome::Rolling);
         assert_eq!(continue_exit(&mut s, "build it", None, 20), spin_trip());
     }
@@ -2926,7 +2934,7 @@ mod tests {
 
         // The supervisor never re-rolls it — the finished part is not re-run.
         assert!(
-            s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
+            s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty(),
             "a released member is not a re-roll candidate",
         );
         assert_eq!(backend.spawn_count(), 1, "no supervisor self-roll on an item boundary");
@@ -2945,7 +2953,7 @@ mod tests {
             PollOutcome::Completed
         );
         assert!(!s.is_registered("a1"), "ITEM_DEFERRED also frees the slot");
-        assert!(s.tick(fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
+        assert!(s.tick(&|_| fresh_budget(), fresh_rate(), 1_000, &any_work).is_empty());
         assert_eq!(backend.spawn_count(), 1, "no self-roll on a deferred boundary");
     }
 }
