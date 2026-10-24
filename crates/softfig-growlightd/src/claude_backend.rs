@@ -1005,6 +1005,15 @@ struct ClaudeFlavor {
     /// slot. Without this cache every spawn would re-construct an empty
     /// capture and the first write would lose whatever was on disk.
     per_slot_captures: Mutex<BTreeMap<String, Arc<UsageCapture>>>,
+    /// A read-handle to the drive loop's rate-limit hold map (slice 003 M-C).
+    /// Shared `Arc<Mutex<...>>` with the drive loop so the pool-slot picker's
+    /// pre-filter can drop a slot whose stdout-only 429 wrote only a hold entry
+    /// (no `rate_limit_event` on disk) BEFORE the headroom + LRU sort — the hold
+    /// map is the only live source for that case. `OnceLock` because the fleet
+    /// assembly installs it once at construction via
+    /// [`ClaudeBackend::with_holds_view`]; a bare test backend leaves it unset
+    /// and the pre-filter degrades to credential-only (today's behaviour).
+    holds_view: OnceLock<Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>>,
 }
 
 impl ClaudeFlavor {
@@ -1139,6 +1148,90 @@ impl ClaudeFlavor {
         pool: &[String],
     ) -> Result<String, SpawnKind> {
         use crate::profile_pin::{self as pin, PickResult};
+
+        // Pre-filter (claude-login-pool-wiring slice 003 M-C): drop a slot the
+        // spawn would refuse (credential missing, so `launch_slot` would error
+        // `Credential(Missing)` AFTER the picker chose it) or a slot the drive
+        // loop recorded a hold on (post-H1 keys the entry by slot, so the hold
+        // map is live even when `usage.by-profile/<slot>.json` still reads
+        // `allowed` — the stdout-only 429 case). Without this gate a `None`-LRU
+        // credential-missing slot wins every tie (`None` sorts below every
+        // `Some`), and a stdout-only-429 slot is picked, the spawn fails or
+        // crashes, no pin is written, LRU never moves — a wedge.
+        let holds_view = self.holds_view.get().cloned();
+        let holds_guard = holds_view.as_ref().map(|arc| arc.lock().unwrap());
+        let mut dropped_hold = false;
+        let mut dropped_missing = false;
+        let store = profiles.store.as_deref();
+        let survivors: Vec<String> = pool
+            .iter()
+            .filter(|slot| {
+                if let Some(h) = holds_guard.as_ref()
+                    && h.is_held(slot)
+                {
+                    dropped_hold = true;
+                    return false;
+                }
+                let Some(store) = store else { return true };
+                let dir = match claude_profiles::slot_dir(store, slot) {
+                    Ok(claude_profiles::SlotDir::Store(p)) => p,
+                    // `home` has no credential of its own in the store; it
+                    // reads whatever is at the top-level config dir. The
+                    // picker trusts it the same way `launch_slot` does.
+                    Ok(claude_profiles::SlotDir::Home) => return true,
+                    // A bad slot name is a configured-pool error the picker
+                    // can't hide: keep it in the survivors so `launch_slot`
+                    // surfaces the same `BadName` the pre-filter would mask.
+                    Err(_) => return true,
+                };
+                if matches!(
+                    claude_profiles::credential_state(&dir),
+                    Ok(claude_profiles::CredentialState::Missing)
+                ) {
+                    dropped_missing = true;
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        if survivors.is_empty() && (dropped_hold || dropped_missing) {
+            // Credential beats hold (slice 003 Shape, baton rule): any slot in
+            // the pool with no `.credentials.json` is a human-visible config
+            // problem, not a timed hold — refuse so the operator sees it.
+            if dropped_missing {
+                drop(holds_guard);
+                return Err(SpawnError(format!(
+                    "agent {agent:?} declares profile_pool {pool:?} but no slot \
+                     is logged in — `softfig claude-login add <slot>` the account(s) \
+                     this member should run on"
+                ))
+                .into());
+            }
+            // Every slot is held: quiet stall shape, same as `pick_with_budget`'s
+            // all-exhausted branch. Earliest reset across the pool's holds is
+            // the drive loop's wake instant; the loop then extends each slot's
+            // own hold at `start_claiming` → `StartOutcome::Hold`.
+            let until = holds_guard
+                .as_ref()
+                .and_then(|h| pool.iter().filter_map(|s| h.held_until(s)).min());
+            drop(holds_guard);
+            return Err(SpawnKind::Hold {
+                slots: pool.to_vec(),
+                until,
+            });
+        }
+        drop(holds_guard);
+        // If NOTHING was dropped and the pool is empty, fall through on `pool`
+        // itself so the existing "no pickable slot" error branch below fires
+        // with the same message. Otherwise narrow the headroom + LRU sort to
+        // the survivors — a surviving pool is the picker's new domain.
+        let candidates: &[String] = if survivors.is_empty() {
+            pool
+        } else {
+            survivors.as_slice()
+        };
+
         let histories: Vec<Vec<pin::ProfilePin>> = profiles
             .pools
             .keys()
@@ -1150,7 +1243,7 @@ impl ClaudeFlavor {
             .by_profile_dir
             .as_deref()
             .map(|dir| {
-                crate::profile_budget::pool_headroom(dir, pool, pin::now_unix())
+                crate::profile_budget::pool_headroom(dir, candidates, pin::now_unix())
                     .into_iter()
                     .map(|(_, h)| h)
                     .collect()
@@ -1159,9 +1252,9 @@ impl ClaudeFlavor {
                 // No per-profile dir configured ⇒ every slot reads as full
                 // headroom, which collapses the picker back to LRU + live
                 // demotion.
-                vec![crate::profile_budget::Headroom::full(); pool.len()]
+                vec![crate::profile_budget::Headroom::full(); candidates.len()]
             });
-        match pin::pick_with_budget(pool, &last_used, &live, &headroom_vals) {
+        match pin::pick_with_budget(candidates, &last_used, &live, &headroom_vals) {
             Some(PickResult::Chose { slot, headroom_pct }) => {
                 eprintln!(
                     "growlightd: agent {agent:?}: claude-login slot {slot:?} \
@@ -1465,6 +1558,7 @@ impl ClaudeBackend {
             stream_errs: Mutex::new(BTreeMap::new()),
             usage_capture: OnceLock::new(),
             per_slot_captures: Mutex::new(BTreeMap::new()),
+            holds_view: OnceLock::new(),
         });
         Self {
             harness: Harness::new(
@@ -1496,6 +1590,23 @@ impl ClaudeBackend {
     /// construction).
     pub fn with_profiles(self, profiles: ProfileContext) -> Self {
         let _ = self.flavor.profiles.set(profiles);
+        self
+    }
+
+    /// Share the drive loop's rate-limit hold map with this backend's pool-slot
+    /// picker (claude-login-pool-wiring slice 003 M-C). The picker consults the
+    /// shared map in [`ClaudeFlavor::pick_pool_slot`] to drop a slot that the
+    /// drive loop has recorded a hold on (post-H1 keys the entry by slot) even
+    /// if `usage.by-profile/<slot>.json` still reads `allowed` — the stdout-only
+    /// 429 case the seed-from-disk path can't see. One-shot like
+    /// [`Self::with_profiles`]: set once at construction from
+    /// [`crate::fleet::assemble_fleet`]; a bare test backend leaves it unset
+    /// and the pre-filter degrades to credential-only.
+    pub fn with_holds_view(
+        self,
+        holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
+    ) -> Self {
+        let _ = self.flavor.holds_view.set(holds);
         self
     }
 
@@ -2664,6 +2775,26 @@ mod tests {
         }
 
         fn with_store(pools: &[(&str, &[&str])], has_store: bool) -> Self {
+            Self::assemble(pools, has_store, None)
+        }
+
+        /// A fixture plus a handle to the backend's shared rate-limit hold map
+        /// (claude-login-pool-wiring slice 003 M-C). Writes to the handle are
+        /// visible to the backend's pool-slot picker, so a test can set a hold
+        /// on a slot the same way the drive loop would at a stdout-only 429.
+        fn with_holds(
+            pools: &[(&str, &[&str])],
+        ) -> (Self, Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>) {
+            let holds = Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new()));
+            let fx = Self::assemble(pools, true, Some(Arc::clone(&holds)));
+            (fx, holds)
+        }
+
+        fn assemble(
+            pools: &[(&str, &[&str])],
+            has_store: bool,
+            holds: Option<Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>>,
+        ) -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let store = tmp.path().join("claude-profiles");
             let agents = tmp.path().join("agents");
@@ -2676,7 +2807,7 @@ mod tests {
                 std::path::PathBuf::from("softfig-mcp"),
                 tmp.path().join(".claude"),
             );
-            let backend = ClaudeBackend::new(
+            let mut backend = ClaudeBackend::new(
                 "claude",
                 "kick",
                 EventHub::new(),
@@ -2694,6 +2825,9 @@ mod tests {
                     .collect(),
                 by_profile_dir: None,
             });
+            if let Some(h) = holds {
+                backend = backend.with_holds_view(h);
+            }
             Self {
                 _tmp: tmp,
                 store,
@@ -2848,10 +2982,17 @@ mod tests {
         // A directory where the credential belongs.
         std::fs::create_dir_all(fx.store.join("slot2").join(claude_profiles::CREDENTIALS_FILE)).unwrap();
         assert!(fx.env("d").is_err());
-        // A logged-out slot (dir, no credential).
+        // A logged-out slot (dir, no credential). Slice 003 (M-C) tightens
+        // this: the pool-slot pre-filter drops a `Missing`-credential slot
+        // BEFORE `launch_slot` sees it, so a credential-only wedge (every slot
+        // in the pool missing a credential) surfaces as a pool-level
+        // `declares profile_pool [...] but no slot is logged in` SpawnError
+        // instead of `launch_slot`'s per-slot `has no .credentials.json (not
+        // logged in)`. Either message contains "logged in"; the test asserts
+        // the common substring so it keeps proving the fail-closed shape.
         std::fs::create_dir_all(fx.store.join("slot3")).unwrap();
         let err = fx.env("e").expect_err("no credential");
-        assert!(err.0.contains("not logged in"), "{err}");
+        assert!(err.0.contains("logged in"), "{err}");
         // Nothing was chosen, so nothing can be committed.
         fx.backend.flavor.spawned("a");
         assert!(fx.history("a").is_empty());
@@ -2904,5 +3045,116 @@ mod tests {
         let hist = fx.history("a");
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].profile, "slot1");
+    }
+
+    // ---- claude-login-pool-wiring slice 003 (M-C): pre-filter in `pick_pool_slot` ----
+
+    /// M-C finish check 1 — a slot with no `.credentials.json` (a `claude
+    /// claude-login add --no-login`, or `claude auth logout` run inside it) is
+    /// filtered out BEFORE the LRU sort, so a pooled member never picks it and
+    /// `launch_slot` is never asked to refuse it with `Credential(Missing)`.
+    /// Before this filter, slot2's `None` LRU won every tie (`None` sorts below
+    /// every `Some`), the spawn failed closed, no pin was written, LRU never
+    /// moved — a wedge.
+    #[test]
+    fn credential_missing_slot_never_wins_the_pool_pick() {
+        let (fx, _holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        // slot1 is logged in; slot2 is logged out — a dir with no credential.
+        fx.slot("slot1");
+        std::fs::create_dir_all(fx.store.join("slot2")).unwrap();
+        // Every spawn (even over the LRU rotation window) stays on slot1 —
+        // slot2 cannot win on `None`-LRU because it is dropped before the sort.
+        for _ in 0..4 {
+            assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot1")));
+            fx.exit("a");
+        }
+        // Each spawn committed a pin, so slot2 never ran: all history is slot1.
+        let hist = fx.history("a");
+        assert_eq!(hist.len(), 4);
+        assert!(
+            hist.iter().all(|p| p.profile == "slot1"),
+            "slot2 ran at least once: {hist:?}",
+        );
+    }
+
+    /// M-C finish check 2 — a slot the drive loop recorded a hold on is
+    /// filtered out BEFORE the LRU sort, even though its on-disk
+    /// `usage.by-profile/<slot>.json` still reads `allowed` (the stdout-only
+    /// 429 case). The pick lands on the un-held slot.
+    #[test]
+    fn held_slot_is_deprioritised_before_the_lru_sort() {
+        let (fx, holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        holds.lock().unwrap().extend("slot1", 999_999_999);
+        // Both slots are allowed on disk (no `by_profile_dir`, so headroom
+        // reads full for every slot). The picker still skips slot1.
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+    }
+
+    /// M-C finish check 3a — every slot held = quiet Stall-shape, same as
+    /// `pick_with_budget`'s all-exhausted branch (slice 002 M-B part 2's cold-
+    /// restart test). The returned `until` is the earliest `resets_at` across
+    /// the pool's holds; the drive loop then extends each slot's own hold at
+    /// `StartOutcome::Hold`.
+    #[test]
+    fn all_slots_held_returns_a_quiet_hold() {
+        let (fx, holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        holds.lock().unwrap().extend("slot1", 10_000);
+        holds.lock().unwrap().extend("slot2", 20_000);
+        let paths = crate::preapproval::agent_paths(&fx.agents, "a");
+        match fx.backend.flavor.child_env("a", &paths).expect_err("all held") {
+            SpawnKind::Hold { slots, until } => {
+                assert_eq!(slots, vec!["slot1".to_string(), "slot2".to_string()]);
+                assert_eq!(until, Some(10_000), "earliest reset wins");
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        // Nothing was committed — a stall does not record a pick.
+        assert!(fx.history("a").is_empty());
+        assert_eq!(fx.backend.active_profile("a"), None);
+    }
+
+    /// M-C finish check 3b — every slot credential-missing is a human-visible
+    /// config problem (one that no timed reset can resolve), so it surfaces as
+    /// `Failed`, NOT a `Hold`. The Shape rule is explicit: "if any drop was for
+    /// `Missing`, return a credential-only wedge".
+    #[test]
+    fn all_slots_credential_missing_returns_a_hard_failure() {
+        let (fx, _holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        // Both slot dirs exist but neither has a `.credentials.json`.
+        std::fs::create_dir_all(fx.store.join("slot1")).unwrap();
+        std::fs::create_dir_all(fx.store.join("slot2")).unwrap();
+        let paths = crate::preapproval::agent_paths(&fx.agents, "a");
+        let err = fx
+            .backend
+            .flavor
+            .child_env("a", &paths)
+            .expect_err("no logged-in slot")
+            .into_failed();
+        assert!(
+            err.0.contains("logged in") && err.0.contains("profile_pool"),
+            "{err}",
+        );
+    }
+
+    /// M-C finish check 4 — regression guard: with no slot filtered out (both
+    /// slots logged in, no holds), the picker runs its today's headroom + LRU
+    /// sort unchanged. Picks the first slot once, rotates to the second on the
+    /// next spawn — identical to the pre-slice-003 `two_live_members_…` shape.
+    #[test]
+    fn no_filter_triggers_leaves_the_lru_sort_unchanged() {
+        let (fx, _holds) = SlotFixture::with_holds(&[("a", &["slot1", "slot2"])]);
+        fx.slot("slot1").slot("slot2");
+        // First spawn: full headroom, no history ⇒ pool-order fallback picks
+        // slot1 (identical to `two_live_members_on_one_pool_land_on_different_slots`'s
+        // first assertion).
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot1")));
+        fx.exit("a");
+        // Second: slot1 is now most-recently-used, LRU rotates to slot2.
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot2")));
+        fx.exit("a");
+        // Third: slot2 is now MRU, LRU rotates back to slot1.
+        assert_eq!(fx.spawn("a"), set_to(&fx.store.join("slot1")));
     }
 }

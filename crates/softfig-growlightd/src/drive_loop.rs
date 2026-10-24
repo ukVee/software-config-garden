@@ -52,7 +52,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -1455,7 +1455,7 @@ pub struct DriveLoop {
     /// resume, task 037, now per-profile). An opencode member contributes no hold
     /// here — opencode gating is a separate path. See
     /// [`crate::rate_limit_holds::RateLimitHolds`] for the value core.
-    rate_limit_holds: crate::rate_limit_holds::RateLimitHolds,
+    rate_limit_holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
     /// Per-member admission profile resolver (slice 008). Admission reads
     /// `profiles_resolver.admission_profiles(agent)` and gates each member on
     /// `rate_limit_holds.member_fully_held(profiles)` — a pooled member whose
@@ -1587,7 +1587,7 @@ impl DriveLoop {
             last_claim_reassert: None,
             offline_since: None,
             offline_alerted: false,
-            rate_limit_holds: crate::rate_limit_holds::RateLimitHolds::new(),
+            rate_limit_holds: Arc::new(Mutex::new(crate::rate_limit_holds::RateLimitHolds::new())),
             profiles_resolver: Box::new(AssumeHomeProfile),
             usage_by_profile_dir: None,
             rescan_tick_count: 0,
@@ -1624,6 +1624,25 @@ impl DriveLoop {
     #[must_use]
     pub fn with_profile_resolver(mut self, resolver: Box<dyn ProfileResolver>) -> Self {
         self.profiles_resolver = resolver;
+        self
+    }
+
+    /// Install a shared rate-limit hold map (claude-login-pool-wiring slice
+    /// 003 M-C) in place of the owned default. The fleet assembly builds the
+    /// `Arc<Mutex<RateLimitHolds>>` and hands a clone to
+    /// [`crate::claude_backend::ClaudeBackend::with_holds_view`] so the
+    /// pool-slot picker's pre-filter reads the SAME map the drive loop
+    /// extends — the only live source for a stdout-only 429 (no on-disk
+    /// `rate_limit_event`) whose seed-from-disk path can't see it. A builder
+    /// like [`with_profile_resolver`](Self::with_profile_resolver), so the
+    /// 15-arg [`new`](Self::new) and every pre-slice-003 test stay unchanged
+    /// (the default owned map keeps the pre-slice-003 posture).
+    #[must_use]
+    pub fn with_rate_limit_holds(
+        mut self,
+        holds: Arc<Mutex<crate::rate_limit_holds::RateLimitHolds>>,
+    ) -> Self {
+        self.rate_limit_holds = holds;
         self
     }
 
@@ -1711,7 +1730,7 @@ impl DriveLoop {
                 .rescan_tick_count
                 .is_multiple_of(RESCAN_USAGE_BY_PROFILE_EVERY_TICKS)
             {
-                self.rate_limit_holds.rescan_from_disk(&dir, now);
+                self.rate_limit_holds.lock().unwrap().rescan_from_disk(&dir, now);
             }
             self.rescan_tick_count = self.rescan_tick_count.saturating_add(1);
         }
@@ -1833,7 +1852,7 @@ impl DriveLoop {
                 // folds into `home` — the back-compat key that equals the
                 // pre-switcher single global hold.
                 let profile = self.samples.profile_for(agent).unwrap_or_else(|| "home".into());
-                self.rate_limit_holds.extend(profile, reopen);
+                self.rate_limit_holds.lock().unwrap().extend(profile, reopen);
             }
             if self.supervisor.is_running(agent) {
                 if let Some(budget) = self.samples.budget(agent) {
@@ -1865,7 +1884,7 @@ impl DriveLoop {
         // that pass extends the hold from the stdout stream error's `resets_at`, and
         // the elapsed-clear must run against the extended value or a freshly-pinned
         // hold would be wiped the same tick it was set.)
-        self.rate_limit_holds.clear_elapsed(now);
+        self.rate_limit_holds.lock().unwrap().clear_elapsed(now);
         // Admission's budget fold is PER-MEMBER (slice 001 M-A, review 048):
         // key the 5h/7d max on the admitting member's claude-login profile
         // (`samples.profile_for(agent).unwrap_or("home")`, the same resolution
@@ -2286,7 +2305,7 @@ impl DriveLoop {
                                 .samples
                                 .profile_for(agent)
                                 .unwrap_or_else(|| "home".into());
-                            self.rate_limit_holds.extend(profile, reopen);
+                            self.rate_limit_holds.lock().unwrap().extend(profile, reopen);
                         }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
@@ -2351,7 +2370,7 @@ impl DriveLoop {
         // profile set is *fully* held wait. A sibling member on a different account
         // (or a different pool) is unaffected. The single `earliest()` boundary is
         // what `report.waiting_for_rate_limit_reset` renders for status.
-        report.waiting_for_rate_limit_reset = self.rate_limit_holds.earliest();
+        report.waiting_for_rate_limit_reset = self.rate_limit_holds.lock().unwrap().earliest();
 
         // ---- queue v2 scheduling (slice 006): steps 2 + 3 on the v2 source ----
         //
@@ -2430,7 +2449,7 @@ impl DriveLoop {
                 // held), as is anything `pick_v2` would hand it.
                 if !paused && !offline && !superseded && !bound_reached {
                     let assignments = &self.v2_assignments;
-                    let holds = &self.rate_limit_holds;
+                    let holds = Arc::clone(&self.rate_limit_holds);
                     let profiles_resolver = self.profiles_resolver.as_ref();
                     let workable = |agent: &str| -> bool {
                         // Per-member rate-limit filter (slice 008): a member
@@ -2438,7 +2457,11 @@ impl DriveLoop {
                         // emitted as `HeldNoWork` — zero `AgentCrashed`, zero
                         // crash-backoff. A sibling with any un-held slot keeps
                         // going.
-                        if holds.member_fully_held(&profiles_resolver.admission_profiles(agent)) {
+                        if holds
+                            .lock()
+                            .unwrap()
+                            .member_fully_held(&profiles_resolver.admission_profiles(agent))
+                        {
                             return false;
                         }
                         let resumes_own = assignments.get(agent).is_some_and(|a| {
@@ -2478,6 +2501,8 @@ impl DriveLoop {
                         // elapses on its own at the window's `resets_at`.
                         if self
                             .rate_limit_holds
+                            .lock()
+                            .unwrap()
                             .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
                         {
                             continue;
@@ -2642,11 +2667,14 @@ impl DriveLoop {
                                 spoken_for.insert(pick.entry.clone());
                                 let fallback = now
                                     + crate::profile_budget::STALE_FLOOR_SECS;
-                                for slot in &slots {
-                                    self.rate_limit_holds.extend(
-                                        slot.clone(),
-                                        until.unwrap_or(fallback),
-                                    );
+                                {
+                                    let mut holds = self.rate_limit_holds.lock().unwrap();
+                                    for slot in &slots {
+                                        holds.extend(
+                                            slot.clone(),
+                                            until.unwrap_or(fallback),
+                                        );
+                                    }
                                 }
                                 report.held_starts.push(HeldStart {
                                     agent: agent.clone(),
@@ -2722,7 +2750,7 @@ impl DriveLoop {
             let assignments = &self.assignments;
             let draining = draining_queues(&draining_at_start, &self.assignments);
             let (retiring, stopped) = (&self.retiring, &self.stopped);
-            let holds = &self.rate_limit_holds;
+            let holds = Arc::clone(&self.rate_limit_holds);
             let profiles_resolver = self.profiles_resolver.as_ref();
             let workable = |agent: &str| -> bool {
                 // Per-member rate-limit filter (slice 008): a member whose
@@ -2730,7 +2758,11 @@ impl DriveLoop {
                 // `HeldNoWork` by `tick_with` — no re-roll, no backoff, no
                 // crash count. A sibling member on a different account keeps
                 // rolling.
-                if holds.member_fully_held(&profiles_resolver.admission_profiles(agent)) {
+                if holds
+                    .lock()
+                    .unwrap()
+                    .member_fully_held(&profiles_resolver.admission_profiles(agent))
+                {
                     return false;
                 }
                 // A down member's OWN in-progress part is workable — for itself.
@@ -2835,6 +2867,8 @@ impl DriveLoop {
                 // on its own at the window's `resets_at`.
                 if self
                     .rate_limit_holds
+                    .lock()
+                    .unwrap()
                     .member_fully_held(&self.profiles_resolver.admission_profiles(agent))
                 {
                     continue;
@@ -2975,11 +3009,14 @@ impl DriveLoop {
                         spoken_for.insert((queue, part));
                         let fallback = now
                             + crate::profile_budget::STALE_FLOOR_SECS;
-                        for slot in &slots {
-                            self.rate_limit_holds.extend(
-                                slot.clone(),
-                                until.unwrap_or(fallback),
-                            );
+                        {
+                            let mut holds = self.rate_limit_holds.lock().unwrap();
+                            for slot in &slots {
+                                holds.extend(
+                                    slot.clone(),
+                                    until.unwrap_or(fallback),
+                                );
+                            }
                         }
                         report.held_starts.push(HeldStart {
                             agent: agent.clone(),
