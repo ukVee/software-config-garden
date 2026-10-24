@@ -12,6 +12,7 @@ pub mod backlog_doc;
 pub mod baton;
 pub mod client;
 pub mod fleet;
+pub mod grants;
 pub mod growlightd;
 pub mod item_meta;
 pub mod item_repo;

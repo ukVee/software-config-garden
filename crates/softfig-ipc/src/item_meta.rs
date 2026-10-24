@@ -51,22 +51,89 @@ fn is_fence(line: &str) -> bool {
 /// line. The first line wins even when its value is empty, so every key reads
 /// the same way; each resolver decides what an empty or particular value means.
 pub fn field<'a>(doc: &'a str, key: &str) -> Option<&'a str> {
-    let mut fenced = false;
-    for line in doc.lines() {
-        if is_fence(line) {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
-        }
-        if let Some((k, value)) = metadata_line(line)
-            && k.eq_ignore_ascii_case(key)
-        {
-            return Some(value);
-        }
+    fields(doc, key).next()
+}
+
+/// Every `> <key>:` line in `doc` outside fenced code, in order, trimmed. Keys
+/// a resolver reads as "the first line wins" use [`field`]; keys that
+/// concatenate (`> Grants:` has several lines per doc per
+/// [[spec-growlight-grants]] §3) use this iterator. Still fence-aware: a line
+/// inside a ```` ``` ```` / `~~~` block is skipped the same way, so a doc that
+/// shows a marker as an example does not emit it.
+pub fn fields<'a, 'k>(doc: &'a str, key: &'k str) -> Fields<'a, 'k> {
+    Fields {
+        lines: doc.lines().enumerate(),
+        key,
+        fenced: false,
     }
-    None
+}
+
+/// Iterator over the `> <key>:` lines in a doc — see [`fields`]. Also exposes
+/// each line's 1-indexed line number via [`Fields::with_lineno`], for the
+/// grants resolver's origin records.
+#[derive(Debug, Clone)]
+pub struct Fields<'a, 'k> {
+    lines: std::iter::Enumerate<std::str::Lines<'a>>,
+    key: &'k str,
+    fenced: bool,
+}
+
+impl<'a, 'k> Fields<'a, 'k> {
+    /// Pair each yielded value with its 1-indexed line number in the doc.
+    pub fn with_lineno(self) -> FieldsWithLineno<'a, 'k> {
+        FieldsWithLineno { inner: self }
+    }
+}
+
+impl<'a, 'k> Iterator for Fields<'a, 'k> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (_, line) in self.lines.by_ref() {
+            if is_fence(line) {
+                self.fenced = !self.fenced;
+                continue;
+            }
+            if self.fenced {
+                continue;
+            }
+            if let Some((k, value)) = metadata_line(line)
+                && k.eq_ignore_ascii_case(self.key)
+            {
+                return Some(value);
+            }
+        }
+        None
+    }
+}
+
+/// Iterator yielding `(1-indexed line number, value)` pairs; see
+/// [`Fields::with_lineno`].
+#[derive(Debug, Clone)]
+pub struct FieldsWithLineno<'a, 'k> {
+    inner: Fields<'a, 'k>,
+}
+
+impl<'a, 'k> Iterator for FieldsWithLineno<'a, 'k> {
+    type Item = (usize, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (idx, line) in self.inner.lines.by_ref() {
+            if is_fence(line) {
+                self.inner.fenced = !self.inner.fenced;
+                continue;
+            }
+            if self.inner.fenced {
+                continue;
+            }
+            if let Some((k, value)) = metadata_line(line)
+                && k.eq_ignore_ascii_case(self.inner.key)
+            {
+                return Some((idx + 1, value));
+            }
+        }
+        None
+    }
 }
 
 /// The first `> <key>:` metadata line in `text` whose key is one of `keys`, as
@@ -170,6 +237,25 @@ mod tests {
             None,
             "prose that mentions a vault tag"
         );
+    }
+
+    #[test]
+    fn fields_iterator_yields_every_matching_line_outside_fences() {
+        let doc = "# t\n> Grants: rw $REPO\n```\n> Grants: rw /banned\n```\n> Grants: ro ~/dotfiles\n> Grants:\n";
+        let all: Vec<&str> = fields(doc, GRANTS).collect();
+        assert_eq!(all, vec!["rw $REPO", "ro ~/dotfiles", ""]);
+
+        let numbered: Vec<(usize, &str)> = fields(doc, GRANTS).with_lineno().collect();
+        assert_eq!(numbered, vec![(2, "rw $REPO"), (6, "ro ~/dotfiles"), (7, "")]);
+
+        // `field` is still just the first.
+        assert_eq!(field(doc, GRANTS), Some("rw $REPO"));
+
+        // An unterminated fence hides the rest of the doc from `fields` just as it does from `field`.
+        let dangling = "> Grants: rw /a\n```\n> Grants: rw /b\n";
+        assert_eq!(fields(dangling, GRANTS).collect::<Vec<_>>(), vec!["rw /a"]);
+
+        assert!(fields("# none\n", GRANTS).next().is_none());
     }
 
     #[test]
