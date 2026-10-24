@@ -58,6 +58,62 @@ carries no model key at all. The member's `opencode.json` (still written fresh p
 still holding the permission map) and the argv are built by the same spawn path, so the
 model a member runs on and the permission map that member was granted cannot drift apart.
 
+## Declaring a claude member's model
+
+A claude member picks up its model and effort from the same `[[fleet]]` block,
+in a grammar that mirrors `claude -p`'s own `--model` / `--effort`:
+
+```toml
+[[fleet]]
+agent   = "a"                            # backend omitted ⇒ claude, no --model/--effort
+# model   = "claude:claude-opus-4-7"     # optional; spawn adds `--model claude-opus-4-7`
+# variant = "high"                       # optional; spawn adds `--effort high`
+
+[[fleet]]
+agent   = "b"
+backend = "claude"
+model   = "claude:fable[1m]"             # alias + 1M-context suffix also parse
+variant = "max"                          # closed set: low | medium | high | xhigh | max
+```
+
+- `model` on a claude member is **optional**. Omitting it spawns `claude -p`
+  without `--model`, which is byte-identical to a pre-`claude-model-select`
+  claude member.
+- When set, it must be prefixed `claude:<alias|id>`; `<alias>` is one of
+  `opus | sonnet | haiku | fable`, `<id>` matches
+  `claude-[a-z0-9]+(-[a-z0-9]+)*`, and either may carry the `[1m]` suffix. A
+  bare `<id>` without the `claude:` prefix is refused at arm time with a parse
+  message naming the fix. An opencode-shape `provider/model` on a claude member
+  stays refused as opencode-only.
+- `variant` names the effort and is passed as `--effort <v>`. It is a **closed
+  set** on claude: `low | medium | high | xhigh | max`; a value outside the set
+  is refused at parse time.
+- An item's declared `> Model: claude:<m>` (plus optional `effort=`) overrides
+  the roster entry on spawn; the roster entry is the member's default for work
+  with no `> Model:` line. See `spec-growlight-queue.md` §6.4 for the full
+  resolution chain.
+- When Claude Code refuses the requested model (`model_not_found` / 404), the
+  REFUSING MEMBER parks (its `not_before` is set to `i64::MAX`) with a single
+  alert carrying the refusal reason — there is no crash loop and no backoff
+  retry (`claude-model-select` slice 003, 2026-10-23). **Known gap (review 048
+  M-E, tracked in `claude-login-pool-wiring` milestone):** the parked member
+  does not currently release its claim on the ITEM, so that item stays `active`
+  and no sibling member picks it up until a daemon restart. Editing the item's
+  `> Model:` or the roster's model does NOT yet trigger an in-flight
+  re-admission — recovery today needs a `systemctl --user restart
+  softfig-growlightd.service`.
+- **Known gap (review 048 M-A/M-B/M-C, tracked in `claude-login-pool-wiring`
+  milestone):** with `profile_pool` configured, the admission budget rail folds
+  fleet-wide (one slot's `allowed_warning` can halt members pooled on other
+  accounts), `RateLimitHolds` is memory-only (so a daemon restart loses the
+  hold and may spin the member against a still-closed window until it
+  observes a fresh `rate_limit_event`), and `pick_pool_slot` does not filter
+  credential-missing or already-held slots before its LRU sort (so a slot made
+  with `add --no-login` can keep winning and wedging the member). With no
+  `profile_pool` configured (today's `config/growlight.toml`), behaviour is
+  byte-identical to the pre-switcher spawn, so the gaps are gated behind the
+  owner enabling pools in config.
+
 ## What is refused
 
 Four config mistakes are reported and refused at arm time rather than defaulted. All

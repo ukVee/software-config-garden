@@ -66,6 +66,7 @@ use crate::drive_loop::{
 use crate::notify_dispatch::{GuiNotifier, LogNotifier, NotifyDispatcher};
 use crate::opencode_backend::{OpencodeBackend, OpencodeLaunch};
 use crate::opencode_backend::ModelSelection;
+use softfig_ipc::model_choice::{parse_model_spec, Backend as IpcBackend, CLAUDE_EFFORTS, ModelSpec};
 use crate::opencode_ledger::OpencodeDb;
 use crate::opencode_preapproval::OpencodePreApproval;
 use crate::preapproval::{agent_paths, PreApproval};
@@ -110,8 +111,22 @@ const BACKEND_OPENCODE: &str = "opencode";
 /// field names left compatible with that shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberBackend {
-    /// `claude -p` — the default, and byte-identical to the pre-slice-005 spawn.
-    Claude,
+    /// `claude -p` with the member's roster defaults (claude-model-select slice
+    /// 003): `model` is the `--model` value to pass per-spawn (via the shared
+    /// `claude:<alias|id>[1m]` grammar in [`parse_model_spec`]), `effort` is the
+    /// `--effort` value out of claude's closed set
+    /// ([`CLAUDE_EFFORTS`](softfig_ipc::model_choice::CLAUDE_EFFORTS)). Both
+    /// default to `None` — the harness's own default — so an unchanged
+    /// `config/growlight.toml` keeps spawning claude byte-identically to before.
+    Claude {
+        /// The `--model` value for this member's spawn, or `None` for the
+        /// harness default. Carried verbatim onto argv (incl. any `[1m]` suffix).
+        model: Option<String>,
+        /// The `--effort` value for this member's spawn, or `None` for the
+        /// harness default. One of
+        /// [`CLAUDE_EFFORTS`](softfig_ipc::model_choice::CLAUDE_EFFORTS).
+        effort: Option<String>,
+    },
     /// `opencode run` on the given model/variant. The model is required: an
     /// opencode member with none is refused at parse (see
     /// [`FleetMemberDoc::validate`]), never left to opencode's own default.
@@ -124,24 +139,26 @@ impl MemberBackend {
     /// per-member [`crate::scheduler_v2::Member`].
     pub fn ipc_backend(&self) -> softfig_ipc::model_choice::Backend {
         match self {
-            MemberBackend::Claude => softfig_ipc::model_choice::Backend::Claude,
+            MemberBackend::Claude { .. } => softfig_ipc::model_choice::Backend::Claude,
             MemberBackend::Opencode(_) => softfig_ipc::model_choice::Backend::Opencode,
         }
     }
 
     /// The roster's `model` — the opencode member's default for undeclared work
-    /// (§6.4). `None` for a claude member.
+    /// (§6.4); on a claude member the per-member `--model` override, or `None`
+    /// for the harness default.
     pub fn roster_model(&self) -> Option<&str> {
         match self {
-            MemberBackend::Claude => None,
+            MemberBackend::Claude { model, .. } => model.as_deref(),
             MemberBackend::Opencode(sel) => Some(&sel.model),
         }
     }
 
-    /// The roster's `variant` (opencode-only).
+    /// The roster's `variant` — on opencode the free-form variant name; on
+    /// claude the `--effort` out of the closed set.
     pub fn roster_variant(&self) -> Option<&str> {
         match self {
-            MemberBackend::Claude => None,
+            MemberBackend::Claude { effort, .. } => effort.as_deref(),
             MemberBackend::Opencode(sel) => sel.variant.as_deref(),
         }
     }
@@ -228,19 +245,15 @@ impl FleetMemberDoc {
         let agent = self.agent;
         let backend = match self.backend.as_deref() {
             None | Some(BACKEND_CLAUDE) => {
-                // The likelier slip, and the mirror of the unknown-backend refusal:
-                // a `model` written WITHOUT `backend = "opencode"` reads as "this
-                // member is on DeepSeek" but would spawn `claude -p` on the
-                // Anthropic pool. Refuse it rather than ignore the key.
-                if self.model.is_some() || self.variant.is_some() {
-                    return Err(format!(
-                        "fleet member {agent:?} sets model/variant but runs on the \
-                         {BACKEND_CLAUDE} backend — those keys are {BACKEND_OPENCODE}-only. \
-                         Add backend = \"{BACKEND_OPENCODE}\" if that is what you meant, or \
-                         drop them"
-                    ));
-                }
-                MemberBackend::Claude
+                // claude-model-select slice 003: a claude member may now set
+                // `model = "claude:<alias|id>[1m]"` + `variant = "<effort>"` to
+                // pin `--model`/`--effort` per spawn (§6.4 grammar). A bare
+                // `model = "<id>"` (no `claude:` prefix) stays refused — it
+                // reads as a DeepSeek-shaped assignment and could lead the
+                // operator to believe they moved the member off the Anthropic
+                // pool. The shared parser channels the refusal back to the
+                // grammar.
+                claude_selection(&agent, self.model, self.variant)?
             }
             Some(BACKEND_OPENCODE) => {
                 if self.profile_pool.is_some() {
@@ -304,6 +317,86 @@ fn validate_profile_pool_shape(
     Ok(Some(pool))
 }
 
+/// Validate a claude member's `model` + `variant` into [`MemberBackend::Claude`],
+/// or explain the refusal (claude-model-select slice 003).
+///
+/// Both keys are optional; omitting both yields the harness default, byte-identical
+/// to the pre-slice-003 spawn. When set, `model` parses through the shared
+/// [`parse_model_spec`] grammar — only a `claude:<alias|id>[1m]` spec is accepted.
+/// A bare `<id>` or an opencode-shape `provider/model` is refused with a pointer
+/// at the grammar: the error names the fix (`claude:<id>`) so an operator who
+/// mis-wrote `model = "opus"` is channeled back to the one way to spell it.
+/// `variant` falls into claude's closed effort set
+/// ([`CLAUDE_EFFORTS`](softfig_ipc::model_choice::CLAUDE_EFFORTS)); its presence
+/// is honored even when `model` is absent (effort pinned on the harness-default
+/// model), mirroring the semi-auto picker.
+fn claude_selection(
+    agent: &str,
+    model: Option<String>,
+    variant: Option<String>,
+) -> Result<MemberBackend, String> {
+    // Resolve `model` through the shared grammar. A bare `<id>` without the
+    // `claude:` prefix is channeled back to the grammar (either an opencode
+    // `provider/model`, `reasoning`/`flash` alias, or a free `<token>` the
+    // claude parser rejects — each refusal names what to write instead).
+    let claude_model = match model {
+        None => None,
+        Some(spec) => match parse_model_spec(&spec) {
+            Ok(ModelSpec::Fixed(choice)) if choice.backend == IpcBackend::Claude => {
+                if choice.variant.is_some() {
+                    // The TOML schema spells effort via `variant = "..."`,
+                    // not an inline ` effort=` tail on the model string.
+                    // Rejecting it keeps one source of truth per key.
+                    return Err(format!(
+                        "fleet member {agent:?} declares model {spec:?} with an inline \
+                         `effort=` — write the effort as the sibling TOML key \
+                         `variant = \"<effort>\"` instead"
+                    ));
+                }
+                choice.model
+            }
+            Ok(ModelSpec::Fixed(choice)) if choice.backend == IpcBackend::Opencode => {
+                return Err(format!(
+                    "fleet member {agent:?} declares model {spec:?} but runs on the \
+                     {BACKEND_CLAUDE} backend — opencode-shape ids are {BACKEND_OPENCODE}-only. \
+                     Set backend = \"{BACKEND_OPENCODE}\" if that is what you meant, or \
+                     write a claude model as `claude:<alias|id>` (e.g. \"claude:opus\")"
+                ));
+            }
+            Ok(ModelSpec::Auto) | Ok(ModelSpec::Fixed(_)) => {
+                return Err(format!(
+                    "fleet member {agent:?} declares model {spec:?} — a claude member's \
+                     model must be `claude:<alias|id>[1m]` (e.g. \"claude:opus\")"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "fleet member {agent:?} declares model {spec:?} which does not parse: \
+                     {e:#}. A claude member's model is `claude:<alias|id>[1m]` (e.g. \
+                     \"claude:opus\" or \"claude:claude-opus-4-7\")"
+                ));
+            }
+        },
+    };
+    let effort = match variant {
+        None => None,
+        Some(v) => {
+            if !CLAUDE_EFFORTS.contains(&v.as_str()) {
+                return Err(format!(
+                    "fleet member {agent:?} declares variant {v:?} on the {BACKEND_CLAUDE} \
+                     backend — expected one of {efforts:?} (claude's closed effort set)",
+                    efforts = CLAUDE_EFFORTS
+                ));
+            }
+            Some(v)
+        }
+    };
+    Ok(MemberBackend::Claude {
+        model: claude_model,
+        effort,
+    })
+}
+
 /// Validate an opencode member's `model` + `variant` into the [`ModelSelection`]
 /// its argv carries, or explain the refusal.
 ///
@@ -351,7 +444,28 @@ impl FleetMemberConfig {
     /// writes, so the spec the backend shells and the generated files never drift).
     fn to_member(&self, agents_dir: &Path) -> FleetMember {
         let paths = agent_paths(agents_dir, &self.agent);
-        let spec = AgentSpec::new(&self.agent, paths.loop_settings, paths.mcp_config);
+        let base = AgentSpec::new(&self.agent, paths.loop_settings, paths.mcp_config);
+        // Review 048 M-D: lift a claude member's roster `--model`/`--effort`
+        // onto the spec so the LEGACY queue mode's fresh-start AND re-roll
+        // (`drive_loop.rs:2782`, `supervisor.rs:1365`) carry them to argv.
+        // The v2 path replaces this with its resolved §6.4 choice via
+        // `.with_model(c)` at `drive_loop.rs:2457`, so the lift is harmless for
+        // v2 and corrective for legacy. Only lifted when the roster declares
+        // either value — a plain `backend = "claude"` member stays byte-identical
+        // to the pre-M-D None (`claude_argv` on `None/None` returns empty too,
+        // but keeping `AgentSpec.model = None` preserves the fingerprint the
+        // `parses_a_growlight_fleet_table_into_members` test asserts).
+        let spec = match &self.backend {
+            MemberBackend::Claude { model, effort }
+                if model.is_some() || effort.is_some() =>
+            {
+                base.with_model(ipc::model_choice::ModelChoice::claude_on(
+                    model.clone(),
+                    effort.clone(),
+                ))
+            }
+            _ => base,
+        };
         let member = match &self.pin {
             Some(pin) => FleetMember::pinned(spec, pin.clone()),
             None => FleetMember::unpinned(spec),
@@ -821,7 +935,7 @@ fn build_member_backends(
     let mut claude: Option<Arc<ClaudeBackend>> = None;
     for member in &fleet.members {
         let handle = match &member.backend {
-            MemberBackend::Claude => BackendHandle::Claude(Arc::clone(claude.get_or_insert_with(
+            MemberBackend::Claude { .. } => BackendHandle::Claude(Arc::clone(claude.get_or_insert_with(
                 || Arc::new(build_claude_backend(daemon, fleet, agents_dir, garden_root)),
             ))),
             MemberBackend::Opencode(model) => BackendHandle::Opencode(Arc::new(
@@ -911,7 +1025,7 @@ fn claude_profile_context(
 ) -> crate::claude_backend::ProfileContext {
     let mut pools = std::collections::BTreeMap::new();
     for m in &fleet.members {
-        if let MemberBackend::Claude = m.backend
+        if let MemberBackend::Claude { .. } = m.backend
             && let Some(pool) = m.profile_pool.clone()
         {
             pools.insert(m.agent.clone(), pool);
@@ -989,11 +1103,13 @@ impl FleetProfileResolver {
         for m in &fleet.members {
             let source = match (&m.backend, m.profile_pool.as_deref(), store) {
                 (MemberBackend::Opencode(_), _, _) => AgentProfileSource::None,
-                (MemberBackend::Claude, Some(pool), _) => AgentProfileSource::Pool(pool.to_vec()),
-                (MemberBackend::Claude, None, Some(store)) => {
+                (MemberBackend::Claude { .. }, Some(pool), _) => {
+                    AgentProfileSource::Pool(pool.to_vec())
+                }
+                (MemberBackend::Claude { .. }, None, Some(store)) => {
                     AgentProfileSource::FollowActive(store.to_path_buf())
                 }
-                (MemberBackend::Claude, None, None) => AgentProfileSource::AssumeHome,
+                (MemberBackend::Claude { .. }, None, None) => AgentProfileSource::AssumeHome,
             };
             entries.insert(m.agent.clone(), source);
         }
@@ -1307,13 +1423,13 @@ agent = "reviewer"
                 FleetMemberConfig {
                     agent: "builder".into(),
                     pin: Some("queue:build".into()),
-                    backend: MemberBackend::Claude,
+                    backend: MemberBackend::Claude { model: None, effort: None },
                     profile_pool: None,
                 },
                 FleetMemberConfig {
                     agent: "reviewer".into(),
                     pin: None,
-                    backend: MemberBackend::Claude,
+                    backend: MemberBackend::Claude { model: None, effort: None },
                     profile_pool: None,
                 },
             ],
@@ -1589,7 +1705,10 @@ agent = "reviewer"
             member_toml()
         ))
         .unwrap();
-        assert_eq!(cfg.members[0].backend, MemberBackend::Claude);
+        assert_eq!(
+            cfg.members[0].backend,
+            MemberBackend::Claude { model: None, effort: None }
+        );
         assert_eq!(cfg.bin, DEFAULT_CLAUDE_BIN);
         assert_eq!(cfg.opencode_bin, DEFAULT_OPENCODE_BIN, "unused, still defaulted");
     }
@@ -1688,22 +1807,192 @@ agent = "reviewer"
     }
 
     #[test]
-    fn opencode_only_keys_on_a_claude_member_are_refused() {
-        // The same hazard from the other side, and the likelier slip: `model` written
-        // without `backend = "opencode"` READS as "this member is on DeepSeek" while
-        // spawning claude. Refused, not ignored — both with the key absent (the
-        // default) and with it explicitly claude.
+    fn opencode_shape_model_on_a_claude_member_is_refused() {
+        // The same hazard from the other side, and the likelier slip: an opencode-
+        // shape `model` ("provider/model") written without `backend = "opencode"`
+        // READS as "this member is on DeepSeek" while spawning claude. Refused,
+        // not ignored — both with the backend key absent (the default) and
+        // explicitly `claude`. (claude-model-select slice 003: a claude member
+        // may set `model = "claude:<id>"`, so the refusal targets opencode-shape
+        // ids, not the `model` key itself.)
         for member in [
             "[[fleet]]\nagent = \"a\"\nmodel = \"deepseek/deepseek-flash\"\n",
-            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\nvariant = \"high\"\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\nmodel = \"anthropic/claude-opus\"\n",
         ] {
             let err = FleetConfig::from_growlight_toml(&format!("fleet_enabled = true\n{member}"))
                 .unwrap_err();
             assert!(
                 err.contains("opencode-only"),
-                "the message explains the keys are opencode's: {err}",
+                "the message explains an opencode-shape id is opencode's: {err}",
             );
         }
+    }
+
+    #[test]
+    fn a_claude_member_takes_a_prefixed_model_and_claude_variant() {
+        // claude-model-select slice 003: a claude member sets `model = "claude:<id>"`
+        // + `variant = "<effort>"`, parsed through the shared §6.4 grammar. The
+        // backend carries them, and `roster_model`/`roster_variant` expose them so
+        // the spawn seam can thread them onto `claude -p`'s argv.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "model = \"claude:claude-opus-4-7\"\nvariant = \"high\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).expect("valid claude declaration");
+        assert_eq!(
+            cfg.members[0].backend,
+            MemberBackend::Claude {
+                model: Some("claude-opus-4-7".into()),
+                effort: Some("high".into()),
+            },
+            "claude member carries its model + effort",
+        );
+        assert_eq!(cfg.members[0].backend.roster_model(), Some("claude-opus-4-7"));
+        assert_eq!(cfg.members[0].backend.roster_variant(), Some("high"));
+        // An alias resolves to the alias token (what `claude --model` takes),
+        // not the full id — `parse_claude_model` is the canonicaliser.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "model = \"claude:opus\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        assert_eq!(
+            cfg.members[0].backend,
+            MemberBackend::Claude {
+                model: Some("opus".into()),
+                effort: None,
+            },
+        );
+        // `[1m]` rides into `--model` verbatim.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "model = \"claude:claude-opus-4-7[1m]\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        assert_eq!(
+            cfg.members[0].backend.roster_model(),
+            Some("claude-opus-4-7[1m]"),
+            "the 1M-context suffix survives verbatim",
+        );
+    }
+
+    #[test]
+    fn to_member_lifts_the_claude_roster_model_and_effort_onto_the_agent_spec() {
+        // Review 048 M-D regression. The roster's `model`/`variant` reach the
+        // `MemberBackend::Claude` struct, but before this fix `to_member` built
+        // the `AgentSpec` with `model: None`, so the LEGACY queue mode's
+        // fresh-start (`drive_loop.rs:2782`) and re-roll
+        // (`supervisor.rs:1365` reusing the stored spec) both passed `None`
+        // into `ClaudeFlavor::command_argv`, dropping `--model`/`--effort`
+        // silently. The claim "the smoke runbook pins the model" would fail
+        // under legacy mode (the live default and `config/growlight.toml`
+        // mode).
+        //
+        // The lift happens at `to_member`, so both legacy spawn paths carry
+        // the roster-pinned ModelChoice into argv via `AgentSpec.model`.
+        // (The v2 path overrides this with the §6.4 resolved choice via
+        // `.with_model(c)` at `drive_loop.rs:2457`, so the lift is harmless
+        // for v2 and corrective for legacy — proven by the second case.)
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "model = \"claude:claude-opus-4-7\"\nvariant = \"high\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        let agents = Path::new("/cfg/agents");
+        let member = cfg.members[0].to_member(agents);
+        assert_eq!(
+            member.spec.model,
+            Some(softfig_ipc::model_choice::ModelChoice::claude_on(
+                Some("claude-opus-4-7".into()),
+                Some("high".into()),
+            )),
+            "the roster model + effort reach AgentSpec.model so both legacy \
+             fresh-start AND re-roll build `--model`/`--effort` argv",
+        );
+        // And argv ships them: the per-spawn tail `ClaudeFlavor::command_argv`
+        // builds from `spec.model.as_ref()` is non-empty.
+        assert_eq!(
+            member.spec.model.as_ref().unwrap().claude_argv(),
+            vec![
+                "--model".to_string(),
+                "claude-opus-4-7".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+            ],
+            "the claude argv tail carries both switches verbatim",
+        );
+
+        // Effort-only (no model) also lifts.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "variant = \"low\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        let member = cfg.members[0].to_member(agents);
+        assert_eq!(
+            member.spec.model.as_ref().unwrap().claude_argv(),
+            vec!["--effort".to_string(), "low".to_string()],
+            "an effort-only roster still reaches argv as `--effort <v>` alone",
+        );
+
+        // A bare `backend = "claude"` with no model AND no effort stays
+        // byte-identical to pre-M-D: `AgentSpec.model = None`, no `--model`/
+        // `--effort` tail. This preserves the fingerprint the existing
+        // `parses_a_growlight_fleet_table_into_members` test asserts.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+        );
+        let cfg = FleetConfig::from_growlight_toml(toml).unwrap();
+        let member = cfg.members[0].to_member(agents);
+        assert_eq!(
+            member.spec.model, None,
+            "no roster → no lift → `AgentSpec.model = None` (byte-identical \
+             to the pre-M-D legacy spawn)",
+        );
+    }
+
+    #[test]
+    fn a_bare_claude_model_names_the_claude_prefix_fix() {
+        // The point of the §6.4 grammar: a bare `<id>` on a claude member is the
+        // same hazard the opencode-shape refusal catches from the other side —
+        // reads as "pin this model" but spells no backend. Refused, with a message
+        // that names the fix (`claude:<id>`) so the operator is channeled to the
+        // one grammar.
+        for bare in ["opus", "claude-opus-4-7", "sonnet"] {
+            let toml = format!(
+                "fleet_enabled = true\n\
+                 [[fleet]]\nagent = \"a\"\nbackend = \"claude\"\nmodel = {bare:?}\n"
+            );
+            let err = FleetConfig::from_growlight_toml(&toml).unwrap_err();
+            assert!(
+                err.contains("claude:"),
+                "the refusal names the `claude:<id>` grammar for {bare}: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_claude_variant_out_of_the_closed_set_is_refused() {
+        // Opencode's `variant` is free-form, but claude's `--effort` is a closed
+        // set (low | medium | high | xhigh | max). The fleet refuses anything else
+        // rather than passing an unknown effort to `claude -p` and reading its
+        // error back on stderr.
+        let toml = concat!(
+            "fleet_enabled = true\n",
+            "[[fleet]]\nagent = \"a\"\nbackend = \"claude\"\n",
+            "model = \"claude:opus\"\nvariant = \"ultra\"\n",
+        );
+        let err = FleetConfig::from_growlight_toml(toml).unwrap_err();
+        assert!(
+            err.contains("closed effort set") || err.contains("effort"),
+            "the refusal names the closed effort set: {err}",
+        );
     }
 
     #[test]

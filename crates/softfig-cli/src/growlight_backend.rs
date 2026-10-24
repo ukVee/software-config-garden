@@ -114,10 +114,13 @@ pub struct InteractiveLaunch<'a> {
 /// side stayed here.)
 ///
 /// - **claude** reproduces the original hardwired argv exactly —
-///   `claude --name <name> --settings <loop.json> --mcp-config <mcp.json>` —
-///   inheriting the caller's environment, and rooted at the garden
-///   (`launch.garden_root`, slice 005's auto-cd) instead of wherever the human
-///   invoked it from. It still sets no env.
+///   `claude --name <name> --settings <loop.json> --mcp-config <mcp.json>
+///   [--model <m>] [--effort <e>]` — inheriting the caller's environment, and
+///   rooted at the garden (`launch.garden_root`, slice 005's auto-cd) instead
+///   of wherever the human invoked it from. It still sets no env. The optional
+///   `--model`/`--effort` tail is `claude_argv` (built upstream from the
+///   resolved `ModelChoice::claude_argv()`); with no model and no effort the
+///   argv is byte-identical to the pre-slice-002 invocation.
 /// - **opencode** launches the TUI on the generated agent —
 ///   `opencode --standalone --prompt <boot>` (see [`opencode_interactive_args`]
 ///   for why `--standalone`, and why no `--agent`) — with `OPENCODE_CONFIG`
@@ -131,7 +134,11 @@ pub struct InteractiveLaunch<'a> {
 ///   is the reseed kick: opencode has no SessionStart hook, so the roll is the
 ///   agent prompt's step-0 baton read, and this first turn nudges the fresh
 ///   session into it.
-pub fn interactive_command(backend: Backend, launch: &InteractiveLaunch) -> Result<Command> {
+pub fn interactive_command(
+    backend: Backend,
+    launch: &InteractiveLaunch,
+    claude_argv: &[String],
+) -> Result<Command> {
     let mut cmd = Command::new(agent_bin(backend));
     match backend {
         Backend::Claude => {
@@ -141,6 +148,7 @@ pub fn interactive_command(backend: Backend, launch: &InteractiveLaunch) -> Resu
                 .arg(launch.loop_settings)
                 .arg("--mcp-config")
                 .arg(launch.mcp_config)
+                .args(claude_argv)
                 .current_dir(launch.garden_root);
             // The slot rides the env, never argv, so the argv above stays the
             // hardwired seam contract whatever account the session is on.
@@ -421,8 +429,8 @@ mod tests {
             boot_prompt: "begin",
             claude_slot: None,
         };
-        let cmd =
-            interactive_command(Backend::Claude, &launch).expect("claude backend builds a command");
+        let cmd = interactive_command(Backend::Claude, &launch, &[])
+            .expect("claude backend builds a command");
         assert_eq!(cmd.get_program(), OsStr::new("claude"));
         let args: Vec<OsString> = cmd.get_args().map(OsStr::to_owned).collect();
         assert_eq!(
@@ -463,14 +471,14 @@ mod tests {
             claude_slot: None,
         };
         let args = |l: &InteractiveLaunch| -> Vec<String> {
-            interactive_command(Backend::Claude, l)
+            interactive_command(Backend::Claude, l, &[])
                 .unwrap()
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect()
         };
         let env = |l: &InteractiveLaunch| -> Vec<(String, Option<String>)> {
-            interactive_command(Backend::Claude, l)
+            interactive_command(Backend::Claude, l, &[])
                 .unwrap()
                 .get_envs()
                 .map(|(k, v)| {
@@ -490,7 +498,7 @@ mod tests {
         assert_eq!(env(&on_home), [("CLAUDE_CONFIG_DIR".into(), None)]);
         assert_eq!(args(&on_home), args(&base));
         assert!(
-            interactive_command(Backend::Claude, &on_home)
+            interactive_command(Backend::Claude, &on_home, &[])
                 .unwrap()
                 .get_envs()
                 .all(|(k, _)| k != OsStr::new("HOME")),
@@ -698,7 +706,7 @@ mod tests {
                 dir: SlotDir::Store("/s/slot2".into()),
             }),
         };
-        let cmd = interactive_command(Backend::Opencode, &launch)
+        let cmd = interactive_command(Backend::Opencode, &launch, &[])
             .expect("opencode backend builds a command");
 
         assert_eq!(cmd.get_program(), OsStr::new("opencode"));
@@ -811,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn model_spec_carries_variant_on_opencode_and_drops_it_on_claude() {
+    fn model_spec_carries_variant_on_both_backends() {
         let opencode = match parse_model_spec("flash effort=high").unwrap() {
             ModelSpec::Fixed(c) => c,
             ModelSpec::Auto => unreachable!(),
@@ -823,13 +831,19 @@ mod tests {
             ModelSpec::Fixed(opencode)
         );
 
-        // claude's effort isn't settable from this launch path, so a variant on a
-        // claude spec parses (no error for the human) but is not carried.
-        let claude = match parse_model_spec("claude variant=high").unwrap() {
+        // claude-model-select slice 001: `claude effort=high` was silently
+        // dropped before this milestone and now carries the effort on the
+        // `--effort` argv. The value must be in claude's closed set.
+        let claude = match parse_model_spec("claude effort=high").unwrap() {
             ModelSpec::Fixed(c) => c,
             ModelSpec::Auto => unreachable!(),
         };
-        assert_eq!(claude, ModelChoice::claude());
+        assert_eq!(claude.variant.as_deref(), Some("high"));
+        assert_eq!(claude.model, None);
+        assert!(
+            parse_model_spec("claude effort=insane").is_err(),
+            "claude's effort set is closed"
+        );
 
         assert!(parse_model_spec("flash speed=fast").is_err(), "unknown key");
         assert!(parse_model_spec("flash high").is_err(), "not key=value");

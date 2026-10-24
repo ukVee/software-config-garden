@@ -325,7 +325,7 @@ fn agent_summary(
         // A subscription member: no per-member dollar figure exists, and the row
         // deliberately carries no spend rather than a $0.00 that would read as
         // "metered, spent nothing" (see `AgentSummary`'s docs).
-        MemberBackend::Claude => row,
+        MemberBackend::Claude { .. } => row,
         // A metered member: show what it has actually cost. `spend` is `Some` for
         // every opencode route, but the config has ALREADY established this member
         // is metered, so a missing reading is the zero accounting — never a silent

@@ -726,20 +726,24 @@ impl BackendFlavor for OpencodeFlavor {
         &self,
         agent: &str,
         _paths: &AgentPaths,
-        model: Option<&ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
         // The member id IS the opencode agent name the generated config keys its
         // `agent.<name>` block on — one id names the runtime dir, the baton, and
         // the agent block, so `--agent` can never point at a block that was not
-        // just written. `model` overrides the roster default for THIS spawn
+        // just written. `choice` overrides the roster default for THIS spawn
         // (queue-v2-scheduling slice 006 — the assignment's resolved `> Model:`
         // choice rides argv `--model`, the one path `run` honors fail-closed).
-        opencode_command_argv(
-            &self.launch.bin,
-            &self.launch.prompt,
-            agent,
-            model.unwrap_or(&self.launch.model),
-        )
+        // A claude-shaped choice is ignored defensively; the drive loop never
+        // routes one to this flavor.
+        let override_sel = choice
+            .filter(|c| c.backend == softfig_ipc::model_choice::Backend::Opencode)
+            .map(|c| ModelSelection {
+                model: c.opencode_model().to_string(),
+                variant: c.variant.clone(),
+            });
+        let sel = override_sel.as_ref().unwrap_or(&self.launch.model);
+        opencode_command_argv(&self.launch.bin, &self.launch.prompt, agent, sel)
     }
 
     fn child_env(
@@ -903,15 +907,16 @@ impl OpencodeBackend {
     /// separator, given the paths a spawn's pre-approval writes — `opencode run
     /// --standalone --format json --agent <id> --model <m> <prompt>`, wrapper
     /// excluded. The routing seam
-    /// (slice 005) asserts an opencode-backed member through it. `model` is the
-    /// per-spawn override (slice 006), `None` = the roster default.
+    /// (slice 005) asserts an opencode-backed member through it. `choice` is the
+    /// per-spawn override (slice 006 + claude-model-select slice 003), `None` =
+    /// the roster default.
     pub fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
-        self.harness.command_argv(agent, paths, model)
+        self.harness.command_argv(agent, paths, choice)
     }
 }
 
@@ -1665,7 +1670,7 @@ mod tests {
             .command_argv(
                 "a1",
                 &paths,
-                Some(&ModelSelection::model("deepseek/deepseek-v4-pro")),
+                Some(&softfig_ipc::model_choice::ModelChoice::opencode("deepseek/deepseek-v4-pro")),
             )
             .iter()
             .map(|a| a.to_string_lossy().into_owned())

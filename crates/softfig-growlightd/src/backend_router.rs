@@ -181,18 +181,18 @@ impl BackendHandle {
     /// The argv `agent` would be exec'd with on this backend (after the
     /// `systemd-run … --` separator). The routing assertion: a member's backend is
     /// only *really* the one the operator asked for if this is that backend's
-    /// command line. `model` is the per-spawn override the
-    /// [`crate::supervisor::AgentSpec`] carries (slice 006), `None` = the roster
-    /// default.
+    /// command line. `choice` is the resolved per-spawn model the
+    /// [`crate::supervisor::AgentSpec`] carries (slice 006 + claude-model-select
+    /// slice 003), `None` = the roster default.
     fn command_argv(
         &self,
         agent: &str,
         paths: &AgentPaths,
-        model: Option<&crate::opencode_backend::ModelSelection>,
+        choice: Option<&softfig_ipc::model_choice::ModelChoice>,
     ) -> Vec<OsString> {
         match self {
-            Self::Claude(b) => b.command_argv(agent, paths, model),
-            Self::Opencode(b) => b.command_argv(agent, paths, model),
+            Self::Claude(b) => b.command_argv(agent, paths, choice),
+            Self::Opencode(b) => b.command_argv(agent, paths, choice),
         }
     }
 }
@@ -343,6 +343,21 @@ impl BudgetSampleSource for Arc<BackendRouter> {
             .map(|b| b.budget_resets(agent))
             .unwrap_or(WindowResets::UNKNOWN)
     }
+
+    /// Forward the per-member profile tag (review 048 H1): the trait default is
+    /// `None`, so without this override every production rate-hold would key on
+    /// the back-compat `"home"` instead of the slot the member is actually
+    /// pinned to. That would halve review-047 B3's fix — a hold on one slot's
+    /// 429 would hold every member pooled on another account; a holding member
+    /// on a migrated single-slot setup would spin against a still-closed window
+    /// (the task-037 spin, reinstated). The inherent `BackendRouter::active_profile`
+    /// already dispatches through `backend_for(agent)` to [`ClaudeBackend::active_profile`]
+    /// (opencode returns `None` by shape — opencode's budget is `None` anyway,
+    /// so no sample is written to tag). An unrouted agent answers `None` for the
+    /// same fail-closed reason the other read seams here answer `None`.
+    fn profile_for(&self, agent: &str) -> Option<String> {
+        self.active_profile(agent)
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +393,12 @@ mod tests {
             BudgetSampleSource::budget_resets(&router, "ghost"),
             WindowResets::UNKNOWN,
         );
+        // The `profile_for` seam is the review-048 H1 hole on the fail-closed
+        // side: without the Arc<BackendRouter> override, the trait default
+        // would still return `None` here, so this unrouted case passes either
+        // way. The positive forward (which proves the override is live) is in
+        // `profile_for_forwards_to_a_routed_claude_backends_active_profile`.
+        assert_eq!(BudgetSampleSource::profile_for(&router, "ghost"), None);
         // Spend included: a stranger must not read as a $0.00 metered member
         // either — `None` here means "no metered accounting", which is what keeps
         // the status surface from drawing a dollar figure it cannot justify.
@@ -394,5 +415,72 @@ mod tests {
         // fresh single-backend fleet gives (`sum_rate_windows` over an empty
         // iterator). A router that could not answer would wedge the rate gate.
         assert_eq!(BackendRouter::new().rate_used(1_700_000_000), (0, 0));
+    }
+
+    #[test]
+    fn profile_for_forwards_to_a_routed_claude_backends_active_profile() {
+        // Review 048 H1: production wires `samples` as `Box::new(Arc::clone(&router))`
+        // (`fleet.rs:847`), and the drive loop's hold-set sites read
+        // `samples.profile_for(agent).unwrap_or_else(|| "home".into())`.
+        // Without an override on `impl BudgetSampleSource for Arc<BackendRouter>`,
+        // the trait default yields `None`, so every rate hold keys on the
+        // back-compat `"home"` instead of the slot the member is pinned to.
+        // That halves 047 B3's fix — a 429 on one slot halts every member whose
+        // admission set is `["home"]`, and a holding member on a migrated
+        // single-slot setup spins against a still-closed window (the task-037
+        // spin, back for every migrated setup).
+        //
+        // The positive forward is proven here (negative/unrouted is proven by
+        // `an_unrouted_agent_fails_closed_on_every_seam`). The claude backend's
+        // `active_profile` semantics (session_slots → on-disk pin → None) are
+        // asserted in `claude_backend::tests`; this test proves only that the
+        // router's `BudgetSampleSource::profile_for` reaches it.
+        use crate::claude_backend::ClaudeBackend;
+        use crate::config::BuildCaps;
+        use crate::hub::EventHub;
+        use crate::preapproval::PreApproval;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        let backend = Arc::new(ClaudeBackend::new(
+            "claude",
+            "kick",
+            EventHub::new(),
+            PreApproval::new(&agents, "p", "g", "m", "c"),
+            Arc::new(Mutex::new(BuildCaps::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        ));
+        backend.inject_session_slot("a", "slot1");
+
+        let mut router = BackendRouter::new();
+        router.insert("a", BackendHandle::Claude(Arc::clone(&backend)));
+        let router = Arc::new(router);
+
+        // The inherent reads the session slot the test seeded.
+        assert_eq!(
+            router.active_profile("a").as_deref(),
+            Some("slot1"),
+            "the inherent BackendRouter::active_profile reads session_slots['a']",
+        );
+        // The trait seam forwards to the inherent — the H1 regression.
+        assert_eq!(
+            BudgetSampleSource::profile_for(&router, "a").as_deref(),
+            Some("slot1"),
+            "BudgetSampleSource::profile_for forwards to active_profile — \
+             without this override every production rate hold keys on 'home'",
+        );
+        // A routed-but-not-pinned agent still answers None rather than falling
+        // through to a sibling's slot (fail-closed shape, same as the other
+        // read seams in the unrouted test). Build a second router whose claude
+        // member has no session slot populated.
+        let mut other = BackendRouter::new();
+        other.insert("b", BackendHandle::Claude(Arc::clone(&backend)));
+        let other = Arc::new(other);
+        // Still Some because "a" is the only agent in session_slots and "b" is
+        // not pinned to a slot — but the shared backend answers for "a" only.
+        assert_eq!(BudgetSampleSource::profile_for(&other, "b"), None);
     }
 }
