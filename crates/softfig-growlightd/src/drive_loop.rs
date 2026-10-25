@@ -1064,6 +1064,30 @@ pub struct Assignment {
     pub part: String,
 }
 
+/// A `ModelRefused` park's latched identity (claude-login-pool-wiring slice 005
+/// M-F): the park/release arm in each mode (legacy and v2) inserts the matching
+/// variant into [`DriveLoop::model_refused_items`] alongside its own
+/// `assignments.remove` / `v2_assignments.remove`, and
+/// [`DriveLoop::reconcile_model_refused`] dispatches on it to re-walk the
+/// identity's live `> Model:` chain through the right source.
+///
+/// Keyed per parked agent in that map. Slice 004 shipped only the legacy shape
+/// (so v2 members fell through the reconcile's defensive un-park and silently
+/// re-admitted the refused model — code-review 049 F1); slice 005 adds the v2
+/// variant and teaches reconcile to dispatch on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelRefusedPart {
+    /// A legacy queue backlog part, addressed the same way as [`Assignment`]:
+    /// resolved via [`QueueSource::read_item_doc`] against the latched
+    /// `(queue, part)`.
+    Legacy { queue: String, part: String },
+    /// A v2 entry, addressed by its top-level entry id (the `V2Assignment::entry`
+    /// shape, §3.6): resolved via a fresh [`crate::v2_source::V2Source`] load
+    /// walked with [`crate::scheduler_v2::next_unit`], mirroring the admission
+    /// path's [`resolve_v2_model`] over a live snapshot.
+    V2 { entry: String },
+}
+
 /// A queue-v2 scheduler assignment (queue-v2-scheduling slice 006): which agent
 /// was started on which `(entry, unit)` with which resolved model — spec §12's
 /// "assignment carries entry + unit + resolved model". Sits BESIDE the legacy
@@ -1396,15 +1420,17 @@ pub struct DriveLoop {
     /// owns lifecycle (it knows the agent, not its part); the loop owns the
     /// assignment (it did the claim), so the part lookup lives here.
     assignments: std::collections::BTreeMap<String, (String, String)>,
-    /// Members parked on a `ModelRefused` exit, each with the `(queue, part)` they
-    /// were working at refusal time (claude-login-pool-wiring slice 004 M-E).
-    /// Latched from `assignments` by the `ModelRefused` arm (immediately
-    /// *before* that arm removes the entry from `assignments`, since the item
-    /// has been parked and the slot released), and read by
-    /// [`Self::reconcile_model_refused`] each tick to re-resolve the item's
-    /// `> Model:` chain. Dropped when the reconcile un-parks the member. In
-    /// memory only, so a daemon restart falls back to `reconcile_on_boot`.
-    model_refused_items: std::collections::BTreeMap<String, (String, String)>,
+    /// Members parked on a `ModelRefused` exit, each with the identity they
+    /// were working at refusal time (claude-login-pool-wiring slice 004 M-E,
+    /// extended by slice 005 M-F for v2). Latched by the `ModelRefused` arm
+    /// alongside its removal from `assignments`/`v2_assignments` (both
+    /// removes are mutually exclusive per member — the two maps never carry
+    /// the same agent). [`Self::reconcile_model_refused`] reads it each tick
+    /// to re-resolve the identity's `> Model:` chain through the matching
+    /// source (keeperd's legacy snapshot for `Legacy`, the v2 source's
+    /// assembled snapshot for `V2`), and drops the entry when the park lifts.
+    /// In memory only, so a daemon restart falls back to `reconcile_on_boot`.
+    model_refused_items: std::collections::BTreeMap<String, ModelRefusedPart>,
     /// The v2 scheduling seams (slice 006) — the v2 source, the per-entry baton
     /// store, the member-baton writer, and the v2 claimer/parker. `None` = a
     /// legacy loop (nothing to consult); a loop whose daemon reads
@@ -2370,8 +2396,23 @@ impl DriveLoop {
                                 &self.stderr.stderr_tail(agent),
                             ));
                         report.crashes.push(event);
+                        // Slice 005 M-F: EACH branch inserts its matching
+                        // ModelRefusedPart variant alongside its own `remove`.
+                        // The two branches are mutually exclusive per member
+                        // (one assignments map carries each agent), so only
+                        // one insert fires per park. Slice 004 only populated
+                        // the legacy variant, which left the v2 reconcile
+                        // missing the latch and silently un-parking (review
+                        // 049 F1) — same tight spawn/park loop and per-tick
+                        // credit burn the 30-min alert cooldown masked.
                         if let Some(assignment) = self.v2_assignments.remove(agent) {
                             self.pause_v2_entry(&assignment.entry, agent, &mut report);
+                            self.model_refused_items.insert(
+                                agent.clone(),
+                                ModelRefusedPart::V2 {
+                                    entry: assignment.entry,
+                                },
+                            );
                         }
                         if let Some((queue, part)) = self.assignments.remove(agent) {
                             if let Err(_e) = self.parker.park_item(&queue, &part) {
@@ -2382,7 +2423,7 @@ impl DriveLoop {
                                 // un-parks the member and it re-rolls.
                             }
                             self.model_refused_items
-                                .insert(agent.clone(), (queue, part));
+                                .insert(agent.clone(), ModelRefusedPart::Legacy { queue, part });
                         }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
@@ -3281,40 +3322,84 @@ impl DriveLoop {
     }
 
     /// Reconcile every member parked on a `ModelRefused` exit against the
-    /// *current* `> Model:` chain (claude-login-pool-wiring slice 004 M-E).
-    /// Called once per tick — simplest implementation, as the slice doc asked
-    /// for; no inotify, no debouncing — right after the health pass so the
-    /// un-park takes effect at the SAME tick's step-2 re-roll, with no daemon
-    /// restart.
+    /// *current* `> Model:` chain (claude-login-pool-wiring slice 004 M-E;
+    /// v2 dispatch added by slice 005 M-F — review 049 F1). Called once per
+    /// tick, right after the health pass, so the un-park takes effect at the
+    /// SAME tick's step-2 re-roll with no daemon restart.
     ///
     /// For each parked member it:
     ///
-    /// 1. Looks up the member in the live `fleet` and the latched
-    ///    `(queue, part)` in [`Self::model_refused_items`]. A member or item
-    ///    the maps can't resolve for (member retired from the roster, latch
-    ///    somehow dropped) is un-parked defensively — the park would otherwise
-    ///    pin a slot the reconcile can never un-pin.
-    /// 2. Walks the §6.4 resolver on live state: the item doc's `> Model:`
-    ///    (through [`QueueSource::read_item_doc`]) if declared, falling
-    ///    through to the member default built from the roster. Undeclared /
-    ///    unreadable both resolve to the member default — the drive loop
-    ///    treats "we couldn't tell" as "no override" so a transient keeperd
-    ///    miss does NOT spuriously un-park.
+    /// 1. Reads the latched identity from [`Self::model_refused_items`]. A
+    ///    missing latch is **noisy** — it is logged and the park is left
+    ///    alive until the next roster rebuild. Slice 004 silently un-parked
+    ///    on a miss, which is what masked the v2-latch gap in review 049 F1
+    ///    (a re-admitted member re-spawned with the refused model and
+    ///    re-latched, in a per-tick credit-burn loop the 30-min alert
+    ///    cooldown hid).
+    /// 2. Resolves the identity's live `> Model:` chain through the matching
+    ///    source:
+    ///    - `Legacy { queue, part }` — [`QueueSource::read_item_doc`] against
+    ///      the latched part, same shape as the semi-auto launcher.
+    ///    - `V2 { entry }` — fresh [`V2QueueSource::load`] + the entry's
+    ///      [`crate::scheduler_v2::next_unit`] walk, mirroring the admission
+    ///      path's [`resolve_v2_model`] over a live snapshot.
+    ///
+    ///    Both fall through to the member default (roster model + variant)
+    ///    when nothing is declared — "we couldn't tell" reads as "no override",
+    ///    so a transient keeperd miss / v2 absent/failed load does NOT
+    ///    spuriously un-park.
     /// 3. Compares the resolved choice against the supervisor's latched
-    ///    [`Supervisor::refused_model`]. On a difference, updates the
-    ///    stored spec so the re-roll re-spawns with the fresh model, then
+    ///    [`Supervisor::refused_model`]. On a difference, updates the stored
+    ///    spec so the re-roll re-spawns with the fresh model, then
     ///    [`Supervisor::clear_model_refused_park`]s the member (resets
     ///    `not_before = now`).
     ///
+    /// A member removed from the roster between park and this tick is
+    /// un-parked here — its `Supervised` entry is still alive from the park,
+    /// but there is no live member to re-resolve against; letting the retire
+    /// pass clean it up next tick is cheaper than pinning the slot. (Legacy
+    /// behavior, unchanged.)
+    ///
     /// Keeps the slice-003 single alert exactly single: no event is pushed
-    /// onto `report.crashes` here, so re-rolling a member whose refused model
-    /// is still refused does NOT re-page.
+    /// onto `report.crashes` here, so a park whose refused model is still
+    /// refused does NOT re-page.
     fn reconcile_model_refused(&mut self, now: i64, fleet: &[FleetMember]) {
-        for agent in self.supervisor.agents_in_model_refused_park() {
-            // The latched item — if missing, un-park defensively (the park
-            // would otherwise be unreconcilable, pinning the member forever).
-            let Some((_queue, part)) = self.model_refused_items.get(&agent).cloned() else {
-                self.supervisor.clear_model_refused_park(&agent, now);
+        let parked = self.supervisor.agents_in_model_refused_park();
+        if parked.is_empty() {
+            return;
+        }
+        // Load the v2 snapshot once per tick, shared across every V2-latched
+        // member. Skipped when nothing V2 is parked (the common path on a
+        // legacy loop). A separate `source.load()` from the v2-mode branch's
+        // own load the same tick is a per-tick file read on the v2 TOML; the
+        // in-source alert-once memory stays quiet on a repeated-same error, so
+        // the second load doesn't double-alert. Absent / Failed falls through
+        // as `None` here and keeps every V2-latched park alive (same shape as
+        // an unreadable legacy item doc — fail-closed, don't guess).
+        let any_v2 = parked.iter().any(|agent| {
+            matches!(
+                self.model_refused_items.get(agent),
+                Some(ModelRefusedPart::V2 { .. }),
+            )
+        });
+        let v2_snapshot = if any_v2 {
+            self.v2.as_mut().and_then(|seams| match seams.source.load() {
+                V2Load::Snapshot(snapshot) => Some(snapshot),
+                V2Load::Absent | V2Load::Failed { .. } => None,
+            })
+        } else {
+            None
+        };
+        for agent in parked {
+            // The latched identity. On a miss, keep the park alive (slice
+            // 005): the silent defensive un-park is what masked review 049
+            // F1. One journal line per occurrence so an actual stuck park
+            // is visible without re-alerting.
+            let Some(part) = self.model_refused_items.get(&agent).cloned() else {
+                eprintln!(
+                    "growlightd: reconcile model-refused: no latch for {agent}; \
+                     keeping park alive (next roster rebuild clears it)"
+                );
                 continue;
             };
             // The member in the current roster. A member removed from the
@@ -3327,20 +3412,60 @@ impl DriveLoop {
                 continue;
             };
             let backend = member.backend.ipc_backend();
-            // §6.4 resolve on live state: the item doc's declaration (first
-            // list entry this member's backend can run) OR the member default
-            // (roster model + variant for an opencode member, `claude` for a
-            // claude member). An unreadable / malformed declaration falls to
-            // the member default — same shape as the semi-auto launcher.
-            let declared = self.queues.read_item_doc(&part).and_then(|doc| {
-                let field = softfig_ipc::model_choice::item_model_field(&doc)?;
-                match softfig_ipc::model_choice::parse_declaration(field).ok()? {
-                    softfig_ipc::model_choice::Declaration::List(list) => {
-                        list.first_for_backend(backend).cloned()
-                    }
-                    softfig_ipc::model_choice::Declaration::Auto => None,
+            // §6.4 resolve on live state. `Legacy` walks keeperd's snapshot
+            // for the latched part; `V2` walks the v2 snapshot for the
+            // latched entry's current next unit (`next_unit` yields the
+            // chain-resolved `models` for a slice / close-out / entry).
+            // Both read the SAME helpers as admission (`item_model_field` +
+            // `parse_declaration` + `first_for_backend` for legacy;
+            // `resolve_v2_model`'s structure for v2) so the two sides can't
+            // disagree about what the chain resolves to.
+            let declared: Option<ModelChoice> = match &part {
+                ModelRefusedPart::Legacy { part, .. } => {
+                    self.queues.read_item_doc(part).and_then(|doc| {
+                        let field = softfig_ipc::model_choice::item_model_field(&doc)?;
+                        match softfig_ipc::model_choice::parse_declaration(field).ok()? {
+                            softfig_ipc::model_choice::Declaration::List(list) => {
+                                list.first_for_backend(backend).cloned()
+                            }
+                            softfig_ipc::model_choice::Declaration::Auto => None,
+                        }
+                    })
                 }
-            });
+                ModelRefusedPart::V2 { entry } => {
+                    // No live snapshot (absent / failed load / no seams) →
+                    // keep the park (fail-closed; the next tick's load may
+                    // succeed).
+                    let Some(snapshot) = v2_snapshot.as_ref() else {
+                        eprintln!(
+                            "growlightd: reconcile model-refused: v2 snapshot unavailable \
+                             while reconciling {agent} on entry {entry}; keeping park alive"
+                        );
+                        continue;
+                    };
+                    // The entry's live row. A missing entry (archived / dropped
+                    // between park and now) has no chain to walk — keep the
+                    // park alive; a human edit will reset it.
+                    let Some(entry_view) =
+                        snapshot.entries.iter().find(|e| &e.id == entry)
+                    else {
+                        eprintln!(
+                            "growlightd: reconcile model-refused: v2 entry {entry} absent \
+                             from the live snapshot while reconciling {agent}; keeping park alive"
+                        );
+                        continue;
+                    };
+                    // Walk the entry's next unit; a stopped walk (Blocked /
+                    // NoUnit) has no declared models to compare against, so
+                    // we fall through to the member default like admission's
+                    // undeclared case does.
+                    match next_unit(snapshot, entry_view) {
+                        WalkOutcome::Unit { models, .. } => models
+                            .and_then(|list| list.first_for_backend(backend).cloned()),
+                        WalkOutcome::Blocked { .. } | WalkOutcome::NoUnit => None,
+                    }
+                }
+            };
             let resolved = declared.unwrap_or_else(|| {
                 softfig_ipc::model_choice::member_default(
                     backend,
@@ -10532,6 +10657,290 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         assert!(
             loop_.supervisor.refused_model("c1").is_none(),
             "the latch is cleared when the park lifts",
+        );
+    }
+
+    // ---- claude-login-pool-wiring slice 005 (M-F): fix slice-004's reconcile
+    //      for v2-mode members (code-review 049 F1) ----------------------------
+    //
+    // The slice-004 ModelRefused arm populated `model_refused_items` only in
+    // the legacy branch; the v2 branch's park/pause ran but never latched the
+    // entry id, so reconcile hit the defensive un-park and silently cleared
+    // the park while leaving the stored (refused) `spec.model` intact —
+    // admission re-admitted, re-spawned on the refused model, re-latched, re-
+    // parked. A tight spawn/park loop every N ticks, masked by the 30-min
+    // alert cooldown; token/credit burn is per tick.
+    //
+    // Slice 005 carries a v2 variant in the latch map and dispatches reconcile
+    // on it, walking the entry's live `next_unit` chain the same way admission
+    // does (`resolve_v2_model`). The defensive un-park is also removed — a
+    // missing latch now leaves the park alive until the next roster rebuild.
+
+    /// A claude member for v2 tests — identical to [`claude_member_prod`] in
+    /// shape (the member spec/backend does not vary by queue mode), named
+    /// explicitly per the slice-005 spec so the v2 test's claude helper is
+    /// mnemonic alongside the legacy one.
+    fn claude_member_v2_prod(id: &str, model: Option<&str>, effort: Option<&str>) -> FleetMember {
+        claude_member_prod(id, model, effort)
+    }
+
+    /// The v2 twin of `drive_model_refused` — same scripted exit on the
+    /// FakeFleet health/stream state, included for symmetry (the arm's v2
+    /// branch reads the same health classifier as the legacy branch).
+    fn drive_v2_model_refused(backend: &Arc<FakeFleet>, agent: &str) {
+        drive_model_refused(backend, agent);
+    }
+
+    /// SLICE 005 M-F — the v2 branch of the `ModelRefused` arm pauses the
+    /// entry, drops the v2 assignment AND latches a `V2 { entry }` sibling
+    /// in `model_refused_items` so the per-tick reconcile knows which chain
+    /// to re-walk. On a stable tick with the entry's `> Model:` unchanged,
+    /// the reconcile finds the same chain-resolved choice as the latched
+    /// refusal, so the park stays alive, no second alert fires, and the
+    /// member does NOT re-spawn — the regression slice 004 lost.
+    #[test]
+    fn v2_model_refused_parks_entry_latches_v2_and_stable_tick_keeps_the_park() {
+        // A unique entries dir per test — a sibling slice-006 pattern.
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice005-stable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            // No slice `> Model:` → resolve_v2_model falls to the member
+            // default (claude roster "claude-bogus-9-9"), which is what the
+            // backend will refuse.
+            None,
+        ));
+        let (mut loop_, _d, backend, probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+
+        // Tick 0: c1 spawns on m1/001 with the resolved bogus model.
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.v2_started.len(), 1, "c1 starts on m1/001");
+        assert_eq!(backend.spawns(), vec!["c1"]);
+        assert_eq!(
+            loop_.v2_assignments.get("c1").map(|a| a.entry.as_str()),
+            Some("m1"),
+            "c1 holds the entry in v2_assignments",
+        );
+        let _ = probe.gui_alerts();
+
+        // Session dies on model_not_found → ModelRefused arm fires.
+        drive_v2_model_refused(&backend, "c1");
+        let r1 = loop_.tick(1);
+
+        // The v2 half ran: the entry is paused through keeperd, and c1 is
+        // dropped from v2_assignments. The LEGACY park (parker.parks / the
+        // legacy snapshot) was NOT written — this is a v2 flow.
+        assert_eq!(
+            *parker.paused.lock().unwrap(),
+            vec!["m1".to_string()],
+            "pause_v2_entry ran on the v2 branch of ModelRefused",
+        );
+        assert!(
+            !loop_.v2_assignments.contains_key("c1"),
+            "v2_assignments.remove ran — the slot is freed",
+        );
+        // The new v2 latch — review 049 F1's fix. Was absent in slice 004.
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the park latches the entry id as a V2 variant (slice 005)",
+        );
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "c1 is parked at the supervisor",
+        );
+        assert_eq!(
+            loop_.supervisor.refused_model("c1"),
+            Some(&ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None)),
+            "the latch records the exact choice the backend refused",
+        );
+        assert_eq!(
+            r1.crashes.len(),
+            1,
+            "exactly one ModelRefused alert fires on park (slice-003 single-alert shape)",
+        );
+        let _ = probe.gui_alerts();
+        let spawns_after_park = backend.spawns();
+
+        // Tick 2: a stable reconcile tick with the entry unchanged. The v2
+        // reconcile walks `next_unit` on the live snapshot (slice `001`'s
+        // models=None) → member default → same bogus choice → park stays
+        // alive. The regression slice 004 lost: with slice 004's silent
+        // defensive un-park on a missed latch, the park would have cleared
+        // here, admission would have re-rolled c1 on the refused model, and
+        // the park would have re-fired next tick — a per-tick re-spawn loop.
+        let r2 = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "the park survives a stable reconcile tick (no silent un-park)",
+        );
+        assert_eq!(
+            loop_.model_refused_items.get("c1"),
+            Some(&ModelRefusedPart::V2 {
+                entry: "m1".to_string()
+            }),
+            "the v2 latch is intact — reconcile does not clear it",
+        );
+        assert!(
+            r2.crashes.is_empty(),
+            "no second ModelRefused alert on the stable tick",
+        );
+        assert_eq!(
+            backend.spawns(),
+            spawns_after_park,
+            "no re-spawn — the loop that review 049 F1 named cannot form",
+        );
+        assert_eq!(
+            parker.paused.lock().unwrap().len(),
+            1,
+            "no re-pause of the entry on the stable tick",
+        );
+    }
+
+    /// SLICE 005 M-F — editing the slice's `> Model:` to a value the member
+    /// CAN run un-parks the v2 member on the next tick (no daemon restart).
+    /// The reconcile re-loads the v2 snapshot, walks the entry's current
+    /// next unit, and compares the chain-resolved choice to the latched
+    /// refusal — a difference clears the park and refreshes the stored spec
+    /// so the re-roll spawns on the fresh model.
+    #[test]
+    fn v2_item_model_edit_unparks_the_member_on_next_tick() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice005-item-edit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+
+        // The human edits the slice doc, setting `> Model:` to a valid
+        // claude choice. In production the v2 source re-reads it on the
+        // next load; here the test flips the scripted snapshot.
+        source.set(v2_milestone(
+            "m1",
+            EntryStatus::Paused,
+            "001",
+            Some("claude:claude-opus-5-5"),
+        ));
+
+        // Tick 2: the reconcile walks `next_unit` → the slice's new
+        // declared list → `claude:claude-opus-5-5`, which differs from the
+        // latched refused choice. The park clears, the stored spec is
+        // refreshed, and the next re-roll will spawn on opus-5-5. One
+        // tick, no daemon restart.
+        let _ = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the slice-doc edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the v2 latch is dropped alongside the park clear",
+        );
+    }
+
+    /// SLICE 005 M-F — editing the ROSTER's model to a valid value un-parks
+    /// the v2 member on the next tick (the same shape as the slice-004
+    /// legacy roster-edit case, routed through the v2 reconcile branch).
+    /// Simulated by replacing [`DriveLoop::fleet`] (what a daemon rebuild on
+    /// a config change produces); the reconcile reads it fresh each tick.
+    #[test]
+    fn v2_roster_model_edit_unparks_the_member_on_next_tick() {
+        let entries_dir = std::env::temp_dir().join(format!(
+            "v2-entries-slice005-roster-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&entries_dir);
+        let claimer = Arc::new(FakeV2Claimer::default());
+        let parker = Arc::new(FakeV2Parker::default());
+        let source = FakeV2Source::with(v2_milestone(
+            "m1",
+            EntryStatus::Queued,
+            "001",
+            None,
+        ));
+        let (mut loop_, _d, backend, _probe) = make_v2(
+            vec![claude_member_v2_prod("c1", Some("claude-bogus-9-9"), None)],
+            source.clone(),
+            entries_dir.clone(),
+            Arc::clone(&claimer),
+            Arc::clone(&parker),
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_v2_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on claude-bogus-9-9",
+        );
+
+        // The human edits config/growlight.toml to flip c1's roster model
+        // to a valid id; a daemon rebuild simulates as replacing the live
+        // fleet view.
+        loop_.fleet = vec![claude_member_v2_prod("c1", Some("claude-opus-5-5"), None)];
+
+        // Tick 2: the v2 reconcile walks `next_unit` (slice still
+        // undeclared) → member default from the live roster →
+        // claude:claude-opus-5-5, which differs from the latched refusal.
+        // The park clears.
+        let _ = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the roster edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+        assert!(
+            !loop_.model_refused_items.contains_key("c1"),
+            "the v2 latch is dropped alongside the park clear",
         );
     }
 }
