@@ -114,6 +114,21 @@ pub trait QueueSource: Send + Sync + fmt::Debug {
     fn claim_hold(&self, _queue: &str, _part: &str) -> Option<ClaimHold> {
         None
     }
+
+    /// The current content of `part`'s item doc (claude-login-pool-wiring slice
+    /// 004 M-E): the milestone's `CLAUDE.md` or the task's `tasks/<id>-*.md`,
+    /// whichever shape `part` is. Read FRESH each tick by the reconcile pass
+    /// that un-parks a model-refused member when its item's `> Model:` has
+    /// moved off the latched refusal. `None` means the doc could not be read
+    /// (keeperd Locked, two docs sharing one task number, a sealed region
+    /// hiding the metadata, no such id); the reconcile treats "unreadable"
+    /// exactly like "undeclared" — i.e. it falls back to the member default,
+    /// so a transient read miss never spuriously un-parks. Defaults to `None`
+    /// so a test source that never serves an item doc keeps the pre-slice-004
+    /// shape of "no reconcile un-park ever fires".
+    fn read_item_doc(&self, _part: &str) -> Option<String> {
+        None
+    }
 }
 
 /// How long a claim hold found by the claim-time marker read is trusted before
@@ -1381,6 +1396,15 @@ pub struct DriveLoop {
     /// owns lifecycle (it knows the agent, not its part); the loop owns the
     /// assignment (it did the claim), so the part lookup lives here.
     assignments: std::collections::BTreeMap<String, (String, String)>,
+    /// Members parked on a `ModelRefused` exit, each with the `(queue, part)` they
+    /// were working at refusal time (claude-login-pool-wiring slice 004 M-E).
+    /// Latched from `assignments` by the `ModelRefused` arm (immediately
+    /// *before* that arm removes the entry from `assignments`, since the item
+    /// has been parked and the slot released), and read by
+    /// [`Self::reconcile_model_refused`] each tick to re-resolve the item's
+    /// `> Model:` chain. Dropped when the reconcile un-parks the member. In
+    /// memory only, so a daemon restart falls back to `reconcile_on_boot`.
+    model_refused_items: std::collections::BTreeMap<String, (String, String)>,
     /// The v2 scheduling seams (slice 006) — the v2 source, the per-entry baton
     /// store, the member-baton writer, and the v2 claimer/parker. `None` = a
     /// legacy loop (nothing to consult); a loop whose daemon reads
@@ -1573,6 +1597,7 @@ impl DriveLoop {
             stopped: BTreeSet::new(),
             reconnecting: BTreeSet::new(),
             assignments: std::collections::BTreeMap::new(),
+            model_refused_items: std::collections::BTreeMap::new(),
             v2: None,
             v2_assignments: std::collections::BTreeMap::new(),
             v2_walk_blocked: std::collections::BTreeMap::new(),
@@ -2314,22 +2339,51 @@ impl DriveLoop {
                         }
                     }
                     PollOutcome::ModelRefused { event, reason } => {
-                        // claude-model-select slice 003: the backend refused the
-                        // configured `--model`. The member is parked indefinitely
+                        // claude-model-select slice 003 + claude-login-pool-wiring
+                        // slice 004 (M-E): the backend refused the configured
+                        // `--model`. The member is parked indefinitely
                         // (`not_before = i64::MAX` in the supervisor); a visible
                         // alert naming the reason fires so the human sees it. No
-                        // retry will succeed until the roster/item declaration is
-                        // edited and the daemon re-admits the member. The alert
-                        // is dispatched exactly like a crash alert (same channel,
-                        // same shape), with the stream-error text replacing the
-                        // bare `systemd-run` banner so the message names the
-                        // model and the API's refusal reason.
+                        // retry will succeed until the roster or item declaration
+                        // is edited — and per slice 004 the per-tick reconcile
+                        // pass ([`Self::reconcile_model_refused`]) un-parks the
+                        // member the moment that happens, with NO daemon restart.
+                        //
+                        // Slice 004: park the ITEM too (not just the member) and
+                        // release the slot — mirroring the clean-exit-parks arm
+                        // for `Blocked` above (`park_item` + `pause_v2_entry` +
+                        // the `assignments`/`v2_assignments` removes). Both
+                        // writes are fail-soft: the member is already parked at
+                        // the supervisor and the alert still fires, so a keeperd
+                        // miss means a re-attempt on the next cycle rather than
+                        // a stuck slot.
+                        //
+                        // The alert itself is dispatched exactly like a crash
+                        // alert (same channel, same shape), with the stream-error
+                        // text replacing the bare `systemd-run` banner so the
+                        // message names the model and the API's refusal reason.
+                        // The slice doc is explicit about the alert staying SINGLE
+                        // (not spammy) — the reconcile below MUST NOT re-emit it.
                         let event = event
                             .with_stdout_error(Some(format!("model refused: {reason}")))
                             .with_stderr_tail(filter_systemd_banner(
                                 &self.stderr.stderr_tail(agent),
                             ));
                         report.crashes.push(event);
+                        if let Some(assignment) = self.v2_assignments.remove(agent) {
+                            self.pause_v2_entry(&assignment.entry, agent, &mut report);
+                        }
+                        if let Some((queue, part)) = self.assignments.remove(agent) {
+                            if let Err(_e) = self.parker.park_item(&queue, &part) {
+                                // Fail-soft (see the Blocked arm's park_item
+                                // comment): the member is already parked at the
+                                // supervisor, the alert still fires, and the
+                                // keeperd write is re-asserted when the reconcile
+                                // un-parks the member and it re-rolls.
+                            }
+                            self.model_refused_items
+                                .insert(agent.clone(), (queue, part));
+                        }
                         if self.retiring.remove(agent) {
                             self.retire(agent, &mut report);
                         } else {
@@ -2357,6 +2411,16 @@ impl DriveLoop {
                 }
             }
         }
+
+        // Slice 004 M-E: every tick, walk the model-refused park set and
+        // un-park any member whose live `> Model:` resolution has moved off
+        // the latched refusal (a roster or item-doc edit, both covered by
+        // the §6.4 resolver chain). Runs AFTER the health pass so a member
+        // the ModelRefused arm *just* parked gets its first reconcile pass
+        // on the NEXT tick (not the one that parked it); step 2 below is
+        // where a cleared park actually re-rolls. The slice-003 alert is
+        // not re-emitted here — the reconcile keeps the single alert single.
+        self.reconcile_model_refused(now, &fleet);
 
         // A live hold gates spawns this tick (steps 2 + 3), the pre-spawn HOLD twin
         // of `offline`: no re-roll, no fresh start, no backoff, no crash count — the
@@ -3216,6 +3280,91 @@ impl DriveLoop {
         }
     }
 
+    /// Reconcile every member parked on a `ModelRefused` exit against the
+    /// *current* `> Model:` chain (claude-login-pool-wiring slice 004 M-E).
+    /// Called once per tick — simplest implementation, as the slice doc asked
+    /// for; no inotify, no debouncing — right after the health pass so the
+    /// un-park takes effect at the SAME tick's step-2 re-roll, with no daemon
+    /// restart.
+    ///
+    /// For each parked member it:
+    ///
+    /// 1. Looks up the member in the live `fleet` and the latched
+    ///    `(queue, part)` in [`Self::model_refused_items`]. A member or item
+    ///    the maps can't resolve for (member retired from the roster, latch
+    ///    somehow dropped) is un-parked defensively — the park would otherwise
+    ///    pin a slot the reconcile can never un-pin.
+    /// 2. Walks the §6.4 resolver on live state: the item doc's `> Model:`
+    ///    (through [`QueueSource::read_item_doc`]) if declared, falling
+    ///    through to the member default built from the roster. Undeclared /
+    ///    unreadable both resolve to the member default — the drive loop
+    ///    treats "we couldn't tell" as "no override" so a transient keeperd
+    ///    miss does NOT spuriously un-park.
+    /// 3. Compares the resolved choice against the supervisor's latched
+    ///    [`Supervisor::refused_model`]. On a difference, updates the
+    ///    stored spec so the re-roll re-spawns with the fresh model, then
+    ///    [`Supervisor::clear_model_refused_park`]s the member (resets
+    ///    `not_before = now`).
+    ///
+    /// Keeps the slice-003 single alert exactly single: no event is pushed
+    /// onto `report.crashes` here, so re-rolling a member whose refused model
+    /// is still refused does NOT re-page.
+    fn reconcile_model_refused(&mut self, now: i64, fleet: &[FleetMember]) {
+        for agent in self.supervisor.agents_in_model_refused_park() {
+            // The latched item — if missing, un-park defensively (the park
+            // would otherwise be unreconcilable, pinning the member forever).
+            let Some((_queue, part)) = self.model_refused_items.get(&agent).cloned() else {
+                self.supervisor.clear_model_refused_park(&agent, now);
+                continue;
+            };
+            // The member in the current roster. A member removed from the
+            // fleet config between the park and this tick (operator edit
+            // + daemon rebuild) has no roster to re-resolve against — un-park
+            // defensively; the retiring/stopped pass will clean up next tick.
+            let Some(member) = fleet.iter().find(|m| m.spec.agent == agent) else {
+                self.model_refused_items.remove(&agent);
+                self.supervisor.clear_model_refused_park(&agent, now);
+                continue;
+            };
+            let backend = member.backend.ipc_backend();
+            // §6.4 resolve on live state: the item doc's declaration (first
+            // list entry this member's backend can run) OR the member default
+            // (roster model + variant for an opencode member, `claude` for a
+            // claude member). An unreadable / malformed declaration falls to
+            // the member default — same shape as the semi-auto launcher.
+            let declared = self.queues.read_item_doc(&part).and_then(|doc| {
+                let field = softfig_ipc::model_choice::item_model_field(&doc)?;
+                match softfig_ipc::model_choice::parse_declaration(field).ok()? {
+                    softfig_ipc::model_choice::Declaration::List(list) => {
+                        list.first_for_backend(backend).cloned()
+                    }
+                    softfig_ipc::model_choice::Declaration::Auto => None,
+                }
+            });
+            let resolved = declared.unwrap_or_else(|| {
+                softfig_ipc::model_choice::member_default(
+                    backend,
+                    member.backend.roster_model(),
+                    member.backend.roster_variant(),
+                )
+                .first()
+                .clone()
+            });
+            // Did the resolution move off the latched refusal? If not, keep
+            // the park (the slice-003 single alert stands); if yes, update
+            // the stored spec so the re-roll uses the fresh model, then clear.
+            let differs = self
+                .supervisor
+                .refused_model(&agent)
+                .is_some_and(|r| r != &resolved);
+            if differs {
+                self.supervisor.update_spec_model(&agent, Some(resolved));
+                self.supervisor.clear_model_refused_park(&agent, now);
+                self.model_refused_items.remove(&agent);
+            }
+        }
+    }
+
     /// Retire `agent` from the supervisor on a boundary stop, killing any live
     /// child OUTSIDE any daemon lock (the [`crate::control::AgentChild`] contract).
     /// Records the retire and marks the agent permanently stopped for this run.
@@ -3229,6 +3378,11 @@ impl DriveLoop {
         self.assignments.remove(agent);
         // The v2 twin (slice 006) — a no-op on a legacy loop's always-empty map.
         self.v2_assignments.remove(agent);
+        // Slice 004 (M-E): a retired member is no longer parked at the
+        // supervisor (its `Supervised` entry is gone), so its reconcile latch
+        // must go with it — otherwise the reconcile would read a stale map
+        // forever.
+        self.model_refused_items.remove(agent);
         self.stopped.insert(agent.to_string());
         report.retired.push(agent.to_string());
     }
@@ -4314,49 +4468,73 @@ mod tests {
 
     /// A fixed (mutable) queue snapshot source.
     #[derive(Debug)]
-    struct FixedQueues(Mutex<Snapshot>, Mutex<BTreeMap<String, ClaimHold>>, Mutex<usize>);
+    struct FixedQueues {
+        snapshot: Mutex<Snapshot>,
+        /// `> Fleet:` claim-hold table, keyed by part id (task 068).
+        holds: Mutex<BTreeMap<String, ClaimHold>>,
+        /// Count of `claim_hold` reads (task 068 — proves the marker is read
+        /// afresh at claim time).
+        marker_reads: Mutex<usize>,
+        /// Per-part item-doc text (claude-login-pool-wiring slice 004 M-E): the
+        /// reconcile pass reads this to re-resolve `> Model:`. A part not in
+        /// the map returns `None` — undeclared.
+        item_docs: Mutex<BTreeMap<String, String>>,
+    }
     impl FixedQueues {
         fn new(qs: Vec<QueueView>) -> Arc<Self> {
-            Arc::new(Self(Mutex::new(Snapshot::new(qs)), Mutex::default(), Mutex::default()))
+            Arc::new(Self {
+                snapshot: Mutex::new(Snapshot::new(qs)),
+                holds: Mutex::default(),
+                marker_reads: Mutex::default(),
+                item_docs: Mutex::default(),
+            })
         }
         /// Give a part's item doc a `> Fleet: no` line (task 068).
         fn mark_human_only(&self, part: &str) {
-            self.1.lock().unwrap().insert(part.into(), ClaimHold::HumanOnly("no".into()));
+            self.holds.lock().unwrap().insert(part.into(), ClaimHold::HumanOnly("no".into()));
         }
         /// Remove a part's `> Fleet:` line — the owner authorizes the fleet on it.
         fn clear_marker(&self, part: &str) {
-            self.1.lock().unwrap().remove(part);
+            self.holds.lock().unwrap().remove(part);
         }
         /// How many claim-time marker reads the loop has made.
         fn marker_reads(&self) -> usize {
-            *self.2.lock().unwrap()
+            *self.marker_reads.lock().unwrap()
+        }
+        /// Script `part`'s item doc text (claude-login-pool-wiring slice 004
+        /// M-E) — what the reconcile pass reads to walk the `> Model:` chain.
+        fn set_item_doc(&self, part: &str, doc: &str) {
+            self.item_docs.lock().unwrap().insert(part.into(), doc.into());
         }
         /// Mark a part `blocked` in the shared snapshot — models keeperd's
         /// committed item-park write, so the NEXT `snapshot()` shows it blocked (the
         /// cross-tick half of pivot-on-block).
         fn mark_blocked(&self, queue: &str, part: &str) {
-            self.0.lock().unwrap().mark_blocked(queue, part);
+            self.snapshot.lock().unwrap().mark_blocked(queue, part);
         }
         /// Mark a part `active` in the shared snapshot — models keeperd's
         /// committed claim write, so the NEXT `snapshot()` shows it claimed (the
         /// cross-tick half of the double-assignment fix).
         fn mark_active(&self, queue: &str, part: &str) {
-            self.0.lock().unwrap().mark_claimed(queue, part);
+            self.snapshot.lock().unwrap().mark_claimed(queue, part);
         }
         /// Replace the whole snapshot — models the queue tables moving on between
         /// ticks (e.g. an agent marked its item `done` before reporting
         /// QUEUE_EMPTY, so the next tick sees a drained queue).
         fn set(&self, qs: Vec<QueueView>) {
-            *self.0.lock().unwrap() = Snapshot::new(qs);
+            *self.snapshot.lock().unwrap() = Snapshot::new(qs);
         }
     }
     impl QueueSource for Arc<FixedQueues> {
         fn snapshot(&self) -> Snapshot {
-            self.0.lock().unwrap().clone()
+            self.snapshot.lock().unwrap().clone()
         }
         fn claim_hold(&self, _queue: &str, part: &str) -> Option<ClaimHold> {
-            *self.2.lock().unwrap() += 1;
-            self.1.lock().unwrap().get(part).cloned()
+            *self.marker_reads.lock().unwrap() += 1;
+            self.holds.lock().unwrap().get(part).cloned()
+        }
+        fn read_item_doc(&self, part: &str) -> Option<String> {
+            self.item_docs.lock().unwrap().get(part).cloned()
         }
     }
 
@@ -5799,7 +5977,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // keeperd now holds p1 `blocked` (committed by the parker) — so a later
         // snapshot keeps pivoting past it until a human clears it (slice 004).
         assert_eq!(
-            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
             QueueState::Blocked("p1".into()),
         );
     }
@@ -5863,7 +6041,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
 
         // keeperd now holds p1 `blocked` — later snapshots keep pivoting past it.
         assert_eq!(
-            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
             QueueState::Blocked("p1".into()),
         );
     }
@@ -6175,7 +6353,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             assert!(parker.parks().is_empty(), "nothing is written `blocked` in keeperd (tick {t})");
             assert_eq!(probe.gui_alerts(), 0, "no blocked-on-human alert while merely held (tick {t})");
             assert_eq!(
-                classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+                classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
                 QueueState::Active("p1".into()),
                 "a1's part stays active/workable while held (tick {t})",
             );
@@ -6229,7 +6407,7 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         // keeperd's qa/p1 was NOT committed blocked (the write failed) — it lingers
         // `active`, to be re-blocked when the member next resolves to it. No sticky slot.
         assert_eq!(
-            classify_queue(queues.0.lock().unwrap().queue("qa").unwrap()),
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
             QueueState::Active("p1".into()),
             "the uncommitted block left the part active in keeperd (fail-soft)",
         );
@@ -10162,6 +10340,198 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
             agg.aggregate_or_fresh_for_profile_at("unused-slot", 0),
             agg.aggregate_or_fresh_at(0),
             "an unseen profile inherits the untagged (pre-switcher) readings",
+        );
+    }
+
+    // ---- claude-login-pool-wiring slice 004 (M-E): park ITEM on ModelRefused +
+    //      per-tick reconcile on roster/item edit ----------------------------
+
+    /// A claude member whose spec also lifts the roster model/effort — matches
+    /// what [`crate::fleet::FleetMemberConfig::to_member`] builds in production,
+    /// so slice-004's latch at park time sees the same `spec.model` the real
+    /// loop would. Different from `claude_member_with`, which only sets the
+    /// roster side (useful for v2 picks that resolve freshly each tick).
+    fn claude_member_prod(id: &str, model: Option<&str>, effort: Option<&str>) -> FleetMember {
+        let base = AgentSpec::new(id, format!("/cfg/{id}/loop.json"), format!("/cfg/{id}/mcp.json"));
+        let spec = if model.is_some() || effort.is_some() {
+            base.with_model(ModelChoice::claude_on(
+                model.map(str::to_string),
+                effort.map(str::to_string),
+            ))
+        } else {
+            base
+        };
+        FleetMember::unpinned(spec).with_backend(crate::fleet::MemberBackend::Claude {
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+        })
+    }
+
+    /// Drive the member to a `ModelRefused` exit on `agent`'s current session —
+    /// latch a stdout `StreamError::ModelRefused`, flip health to a non-zero
+    /// `Exited`, and leave no baton (so the clean-exit path is not reached).
+    fn drive_model_refused(backend: &Arc<FakeFleet>, agent: &str) {
+        backend.set_stream_error(
+            agent,
+            crate::agent_harness::StreamError {
+                kind: crate::agent_harness::StreamErrorKind::ModelRefused,
+                text: "model refused: model_not_found (claude:claude-bogus-9-9)".into(),
+                resets_at: None,
+            },
+        );
+        backend.set_health(agent, AgentHealth::Exited { code: 1 });
+    }
+
+    /// SLICE 004 M-E — the ModelRefused arm now PARKS THE ITEM (not just the
+    /// member) and RELEASES the slot. The member is dropped from
+    /// [`DriveLoop::assignments`], the parker gets the (queue, part) write,
+    /// the supervisor stays registered with `last_refused_model` latched, and
+    /// the single alert fires exactly once. Replaces the pre-slice-004 shape
+    /// where the item lingered `active` behind a parked member.
+    #[test]
+    fn model_refused_parks_the_item_and_frees_the_member_slot() {
+        let (mut loop_, _d, backend, _claimer, parker, queues, probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        // Tick 0: c1 starts on qa/p1 (declared bogus roster model).
+        let r0 = loop_.tick(0);
+        assert_eq!(r0.started.len(), 1, "c1 starts on p1");
+        assert_eq!(backend.spawns(), vec!["c1"]);
+        // Drain any `started` subscribe events so the slice-003 "single alert"
+        // assertion below reads only what the ModelRefused tick fired.
+        let _ = probe.gui_alerts();
+
+        // Session dies on a `model_not_found` result → ModelRefused.
+        drive_model_refused(&backend, "c1");
+        let r1 = loop_.tick(1);
+
+        // The slot is freed: the member is no longer in `assignments`, and
+        // the item is `blocked`/`parked` in the shared snapshot (what keeperd
+        // would commit via `park_item`).
+        assert_eq!(parker.parks(), vec![("qa".into(), "p1".into())]);
+        assert_eq!(
+            classify_queue(queues.snapshot.lock().unwrap().queue("qa").unwrap()),
+            QueueState::Blocked("p1".into()),
+            "the parker's write marks the part blocked for the next snapshot",
+        );
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "c1 is parked on a model refusal",
+        );
+        assert_eq!(
+            loop_.supervisor.refused_model("c1"),
+            Some(&ModelChoice::claude_on(Some("claude-bogus-9-9".into()), None)),
+            "the latch records the exact choice the backend refused",
+        );
+        assert_eq!(
+            r1.crashes.len(),
+            1,
+            "exactly one ModelRefused alert fires on park (slice-003 single-alert shape)",
+        );
+        // Two GUI alerts for this tick: the ModelRefused crash + the
+        // BlockedOnHuman the item park raised. Both describe DIFFERENT things,
+        // so the "not spammy" constraint is on the SAME alert not re-firing —
+        // asserted on the reconcile tick below.
+        let _ = probe.gui_alerts();
+
+        // A later tick stays silent on the member alert: the reconcile does
+        // NOT re-emit a ModelRefused crash, and the parker is not re-written.
+        let r2 = loop_.tick(2);
+        assert!(r2.crashes.is_empty(), "reconcile does NOT re-alert");
+        assert_eq!(parker.parks().len(), 1, "no re-park");
+    }
+
+    /// SLICE 004 M-E — editing the item's `> Model:` to a value the member
+    /// CAN run un-parks the member on the next tick (no daemon restart). The
+    /// reconcile reads the item doc fresh through [`QueueSource::read_item_doc`]
+    /// and compares the resolved choice to the latched refused one; a
+    /// difference clears the park (resets `not_before = now`) and updates the
+    /// stored spec so the next re-roll spawns with the fresh model. A single
+    /// re-read with no doc change does NOT un-park — the invariant the
+    /// slice-003 single alert depends on.
+    #[test]
+    fn item_model_edit_unparks_the_member_on_next_tick() {
+        let (mut loop_, _d, backend, _claimer, _parker, queues, _probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked",
+        );
+
+        // Tick 2: no doc change — the park must survive the re-read (same
+        // undeclared resolution → same roster default → same latched refusal).
+        let _ = loop_.tick(2);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "an idle reconcile does NOT spuriously un-park",
+        );
+
+        // The human edits the item doc, setting `> Model:` to a valid choice.
+        queues.set_item_doc("p1", "# p1\n\n> Model: claude:claude-opus-5-5\n");
+
+        // Tick 3: the reconcile reads the new doc, resolves to a different
+        // model, and clears the park. The stored spec is updated so the next
+        // re-roll spawns on the fresh model.
+        let _ = loop_.tick(3);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the item-doc edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
+        );
+    }
+
+    /// SLICE 004 M-E — editing the ROSTER's model to a valid value un-parks
+    /// the member the same way an item-doc edit does: the §6.4 resolver's
+    /// member-default branch reads the roster, so any change there reaches
+    /// the reconcile through the live fleet. Simulated here by replacing
+    /// [`DriveLoop::fleet`] (what a daemon rebuild on a config change
+    /// produces); the reconcile reads it fresh each tick.
+    #[test]
+    fn roster_model_edit_unparks_the_member_on_next_tick() {
+        let (mut loop_, _d, backend, _claimer, _parker, _queues, _probe) = make_full(
+            vec![claude_member_prod("c1", Some("claude-bogus-9-9"), None)],
+            vec![q("qa", &[("p1", "queued")])],
+            Policy::default(),
+        );
+        loop_.tick(0);
+        drive_model_refused(&backend, "c1");
+        loop_.tick(1);
+        assert_eq!(
+            loop_.supervisor.agents_in_model_refused_park(),
+            vec!["c1".to_string()],
+            "preamble: c1 is parked on claude-bogus-9-9",
+        );
+
+        // The human edits config/growlight.toml to flip c1's roster model to
+        // a valid id; a daemon rebuild would re-assemble the fleet, which is
+        // simulated here by replacing the loop's live fleet view.
+        loop_.fleet = vec![claude_member_prod("c1", Some("claude-opus-5-5"), None)];
+
+        // Tick 2: the reconcile re-reads the live roster through
+        // `member.backend.roster_model()`, resolves to the new choice, and
+        // clears the park. One tick, no daemon restart.
+        let _ = loop_.tick(2);
+        assert!(
+            loop_.supervisor.agents_in_model_refused_park().is_empty(),
+            "c1 is un-parked by the roster edit",
+        );
+        assert!(
+            loop_.supervisor.refused_model("c1").is_none(),
+            "the latch is cleared when the park lifts",
         );
     }
 }

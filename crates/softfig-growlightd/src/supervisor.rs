@@ -696,6 +696,15 @@ struct Supervised {
     /// Continue-exits the repo signal excused during the current NEXT ACTION run,
     /// capped at [`REPO_EXCUSE_LIMIT`].
     repo_excused: u32,
+    /// The [`ModelChoice`] this member last tried when the backend refused it
+    /// (claude-login-pool-wiring slice 004): latched in
+    /// [`Supervisor::on_model_refused_exit`] from the live `spec.model` at park
+    /// time, read by the drive loop's per-tick reconcile pass through
+    /// [`Supervisor::refused_model`], and cleared by
+    /// [`Supervisor::clear_model_refused_park`] once the resolved choice has
+    /// moved on. `None` means the member is NOT in a model-refused park (every
+    /// other lifecycle leaves it untouched).
+    last_refused_model: Option<softfig_ipc::model_choice::ModelChoice>,
 }
 
 /// The fleet supervisor: owns the spawn seam, the admission governor, and the
@@ -803,6 +812,67 @@ impl Supervisor {
         self.agents.remove(agent).and_then(|s| s.child)
     }
 
+    /// Every registered member currently parked on a backend model refusal
+    /// (claude-login-pool-wiring slice 004 M-E): the id-set the drive loop's
+    /// per-tick reconcile pass walks to decide whether a roster or item-doc
+    /// edit has moved the resolution off the latched refusal. Deterministic
+    /// (`BTreeMap` order), so a test may assert on it directly. The latch
+    /// (`last_refused_model.is_some()`) is the strict gate — a member with
+    /// `not_before = i64::MAX` from some other code path (there is none today,
+    /// but the shape is contractual) is NOT returned.
+    pub fn agents_in_model_refused_park(&self) -> Vec<String> {
+        self.agents
+            .iter()
+            .filter(|(_, s)| s.last_refused_model.is_some())
+            .map(|(a, _)| a.clone())
+            .collect()
+    }
+
+    /// The [`ModelChoice`](softfig_ipc::model_choice::ModelChoice) the backend
+    /// refused for `agent` — latched in
+    /// [`on_model_refused_exit`](Self::on_model_refused_exit) from the member's
+    /// live `spec.model` at park time. `None` when the member is not in a
+    /// model-refused park (the drive loop's reconcile skips it in that case).
+    pub fn refused_model(
+        &self,
+        agent: &str,
+    ) -> Option<&softfig_ipc::model_choice::ModelChoice> {
+        self.agents
+            .get(agent)
+            .and_then(|s| s.last_refused_model.as_ref())
+    }
+
+    /// Clear a model-refused park (slice 004 M-E): drop the latch and bring
+    /// `not_before` back to `now` so [`tick`](Self::tick) re-rolls the member
+    /// off its own baton on the next cycle. Called by the drive loop's
+    /// reconcile pass once the resolver has moved on from the latched refusal
+    /// — a roster edit, an item `> Model:` edit, or either combined with a
+    /// milestone-level fallback. Idempotent on members not currently parked
+    /// on a model refusal (a stray call is a no-op, so the reconcile walk is
+    /// safe to run every tick).
+    pub fn clear_model_refused_park(&mut self, agent: &str, now: i64) {
+        if let Some(sup) = self.agents.get_mut(agent)
+            && sup.last_refused_model.is_some()
+        {
+            sup.not_before = now;
+            sup.last_refused_model = None;
+        }
+    }
+
+    /// Replace `agent`'s stored `spec.model` (slice 004 M-E): the reconcile
+    /// pass calls this before clearing the park so the next re-roll — which
+    /// re-spawns from the stored spec — picks up the fresh resolution rather
+    /// than the model that was just refused. A no-op for an unknown agent.
+    pub fn update_spec_model(
+        &mut self,
+        agent: &str,
+        model: Option<softfig_ipc::model_choice::ModelChoice>,
+    ) {
+        if let Some(sup) = self.agents.get_mut(agent) {
+            sup.spec.model = model;
+        }
+    }
+
     /// Register and start a brand-new agent ([`Intent::Start`]). The cap *and*
     /// budget/rate gate it; on admit the backend spawns it and it joins the
     /// fleet. A queue/refuse leaves it unregistered for the drive loop to retry.
@@ -867,6 +937,7 @@ impl Supervisor {
                                 unchanged_streak: 0,
                                 seen_repo: Vec::new(),
                                 repo_excused: 0,
+                                last_refused_model: None,
                             },
                         );
                         StartOutcome::Started
@@ -1181,12 +1252,27 @@ impl Supervisor {
         let _ = sup.child.take();
         // No retry is possible until the config changes. Pin `not_before` past
         // every reasonable now so `tick` never re-rolls this agent; a daemon
-        // reconcile re-admits it with fresh state.
+        // reconcile re-admits it with fresh state. Slice 004 (M-E): latch the
+        // refused `ModelChoice` (the live `spec.model` the backend was told to
+        // run) so the drive loop's per-tick reconcile pass can un-park the
+        // member on a roster/item-doc edit that moves the resolution off it —
+        // no daemon restart needed.
         sup.not_before = i64::MAX;
         sup.last_next_action = None;
         sup.unchanged_streak = 0;
         sup.seen_repo.clear();
         sup.repo_excused = 0;
+        // A member whose spec carried no override was running the backend's
+        // harness default; latch that as `ModelChoice::claude()` so a roster
+        // edit that then pins a model trips the reconcile. (A model-refused
+        // claude member never has an opencode-shaped spec, so the claude
+        // harness default is the only "no override" shape to latch.)
+        sup.last_refused_model = Some(
+            sup.spec
+                .model
+                .clone()
+                .unwrap_or_else(softfig_ipc::model_choice::ModelChoice::claude),
+        );
         PollOutcome::ModelRefused {
             event: NotifyEvent::agent_crashed(agent),
             reason,
